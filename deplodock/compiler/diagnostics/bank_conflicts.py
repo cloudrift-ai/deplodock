@@ -108,6 +108,12 @@ class BankConflictResult:
     # ``("(0 * 8)", "5")``. Lets visualizers replace symbolic vars with
     # concrete values in the per-cell tooltip.
     full_sweep_subst_idx: dict[tuple[int, int], tuple[str, ...]] = field(default_factory=dict)
+    # Cells that participate in a *real* conflict at some k_iter — i.e.
+    # the LDS that touches the cell has > 1 distinct addresses on the
+    # cell's bank for that k_iter. Distinct from "potential conflict"
+    # which is only a layout property (rows aliasing on a bank). Empty
+    # iff this Load never has bank conflicts across the full sweep.
+    full_sweep_conflict_cells: set[tuple[int, int]] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +339,10 @@ def simulate_graph(
     for r in out:
         binding = bindings_by_key.get((r.tile_op_name, r.stage_name, r.load_name))
         if binding is not None:
-            touched, subst = _full_sweep_touched(binding, warp_id=warp_id)
+            touched, subst, conflicts = _full_sweep_touched(binding, warp_id=warp_id)
             r.full_sweep_touched = touched
             r.full_sweep_subst_idx = subst
+            r.full_sweep_conflict_cells = conflicts
     if load_filter is not None:
         out = [r for r in out if r.load_name in load_filter]
     return out
@@ -343,23 +350,29 @@ def simulate_graph(
 
 def _full_sweep_touched(
     binding: StageBinding, warp_id: int = 0
-) -> tuple[dict[tuple[int, int], list[tuple[int, int]]], dict[tuple[int, int], tuple[str, ...]]]:
+) -> tuple[
+    dict[tuple[int, int], list[tuple[int, int]]],
+    dict[tuple[int, int], tuple[str, ...]],
+    set[tuple[int, int]],
+]:
     """Sweep the deepest enclosing loop axis; record every (row, col)
     cell touched by any (lane, k_iter) pair, plus a substituted index
     string (one per cache axis) using one example (k_iter, lane) that
-    reaches the cell.
+    reaches the cell, plus the set of cells that participate in a real
+    bank conflict at some k_iter (their LDS had > 1 distinct address on
+    the cell's bank).
 
     Returns ``({(row, col) -> [(k_iter, lane), ...]}, {(row, col) ->
-    ("(0 * 8)", "5")})``. Outer enclosing loops and block axes pinned
-    to 0; thread axes decoded per lane. Cell coordinates are
-    reconstructed from the linear smem address using ``alloc_extents``
-    (folds in pad), matching ``simulate``.
+    ("(0 * 8)", "5")}, conflict_cells)``. Outer enclosing loops and
+    block axes pinned to 0; thread axes decoded per lane. Cell
+    coordinates are reconstructed from the linear smem address using
+    ``alloc_extents`` (folds in pad), matching ``simulate``.
     """
     from deplodock.compiler.ir.expr import Literal
 
     stage, load, tile = binding.stage, binding.load, binding.tile
     if not stage.axes or len(load.index) < len(stage.axes):
-        return {}, {}
+        return {}, {}, set()
     cache_idx = tuple(load.index[-len(stage.axes) :])
 
     alloc = list(stage.alloc_extents)
@@ -381,25 +394,38 @@ def _full_sweep_touched(
 
     out: dict[tuple[int, int], list[tuple[int, int]]] = {}
     subst: dict[tuple[int, int], tuple[str, ...]] = {}
+    conflict_cells: set[tuple[int, int]] = set()
     for k in range(loop_extent):
         env_k = dict(base_env)
         if loop_axis_name is not None:
             env_k[loop_axis_name] = k
+        # Per-LDS bank-distinct-addrs accounting (one LDS = one Load at
+        # one k_iter) so we can flag cells that participate in real
+        # conflicts (their bank had > 1 distinct address in this LDS).
+        lds_addrs_per_bank: list[set[int]] = [set() for _ in range(BANKS)]
+        lds_cells: list[tuple[int, int, int]] = []  # (r, c, bank) per lane
         for lane in range(WARP_SIZE):
             env = dict(env_k)
             env.update(thread_axis_env(tile.thread_axes, warp_id * WARP_SIZE + lane))
             try:
                 coords = [int(idx.eval(env)) for idx in cache_idx]
             except (KeyError, TypeError):
-                return {}, {}
+                return {}, {}, set()
             addr = sum(c * s for c, s in zip(coords, strides, strict=True))
             r, c = divmod(addr, row_stride) if row_stride else (0, addr)
+            bank = addr % BANKS
             out.setdefault((r, c), []).append((k, lane))
+            lds_addrs_per_bank[bank].add(addr)
+            lds_cells.append((r, c, bank))
             # First (k, lane) wins as the example for substitution.
             if (r, c) not in subst:
                 lit_env = {name: Literal(v) for name, v in env.items()}
                 subst[(r, c)] = tuple(idx.substitute(lit_env).pretty() for idx in cache_idx)
-    return out, subst
+        # Mark cells that participate in a conflict at this k_iter.
+        for r, c, bank in lds_cells:
+            if len(lds_addrs_per_bank[bank]) > 1:
+                conflict_cells.add((r, c))
+    return out, subst, conflict_cells
 
 
 # ---------------------------------------------------------------------------

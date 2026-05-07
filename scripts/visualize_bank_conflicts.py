@@ -48,8 +48,10 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
     union_source = all_panels_for_union if all_panels_for_union is not None else panels
     # Build per-Stage union: (tile_op_name, stage_name) → {(r,c) → list of
     # (load_name, k_iter, lane, subst_idx_tuple)} merged across all body
-    # Loads of the Stage.
+    # Loads of the Stage. Also a per-Stage set of cells that participate
+    # in a real conflict in any of the Stage's Loads.
     stage_union: dict[tuple[str, str], dict[tuple[int, int], list[tuple]]] = {}
+    stage_conflict_cells: dict[tuple[str, str], set[tuple[int, int]]] = {}
     for p in union_source:
         key = (p.tile_op_name, p.stage_name)
         u = stage_union.setdefault(key, {})
@@ -57,6 +59,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
             subst = p.full_sweep_subst_idx.get(cell, ())
             for k, lane in pairs:
                 u.setdefault(cell, []).append((p.load_name, k, lane, subst))
+        stage_conflict_cells.setdefault(key, set()).update(p.full_sweep_conflict_cells)
     out: list[dict] = []
     for p in panels:
         # Per-lane address-color index: same address → same color, regardless
@@ -102,6 +105,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
             for ln, _k, _l, s in entries:
                 subst_per_cell.setdefault((r, c), {}).setdefault(ln, tuple(s))
         all_cells = sorted(set(touched_now) | set(sweep_per_cell))
+        conflict_cells = stage_conflict_cells.get((p.tile_op_name, p.stage_name), set())
         touched_entries = [
             {
                 "r": r,
@@ -111,6 +115,9 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
                 "sweep": sweep_per_cell.get((r, c), []),
                 # subst_by_load: {load_name: [substituted_index_string, ...]}
                 "subst_by_load": {ln: list(s) for ln, s in subst_per_cell.get((r, c), {}).items()},
+                # True iff this cell participates in a real conflict at
+                # some (Load, k_iter) — its bank had > 1 distinct address.
+                "conflict": (r, c) in conflict_cells,
             }
             for (r, c) in all_cells
         ]
@@ -231,7 +238,8 @@ PAYLOAD.columns.forEach((col,ci)=>{
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
-      <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
+      <div class="ladder" id="l_${id}" style="height:${Math.min(360, 8 + p.layout.rows * 6)}px"></div>
+      ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
 
     const m=echarts.init(document.getElementById(`m_${id}`),null,{renderer:'canvas'});
@@ -305,12 +313,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
     const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
     const substByLoad = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst_by_load]));
+    const conflictCells = new Set(lay.touched.filter(t => t.conflict).map(t => `${t.r},${t.c}`));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
         const k = `${r},${c}`;
         const reachable = sweep.has(k);
+        const isConflict = conflictCells.has(k);
         const color = isPad ? '#3a3f48' : ADDR_PALETTE[bank % ADDR_PALETTE.length];
         ldrData.push({
           value:[c, r, bank],
@@ -318,6 +328,12 @@ PAYLOAD.columns.forEach((col,ci)=>{
             color: color,
             // Reachable cells: medium-bright. Padding / unreachable: dim.
             opacity: (isPad || !reachable) ? 0.18 : 0.7,
+            // Real-conflict cells (touched by an LDS where their bank
+            // had > 1 distinct addr) get a red outline. Layout-only
+            // potential (single-color column the warp never multi-
+            // exercises) stays unmarked.
+            borderColor: isConflict ? '#ff5c7a' : 'transparent',
+            borderWidth: isConflict ? 2 : 0,
           },
         });
       }
@@ -344,7 +360,10 @@ PAYLOAD.columns.forEach((col,ci)=>{
             ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
           );
           const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
-          return head + loadSection + padTag;
+          const conflictTag = conflictCells.has(k)
+            ? `<br/><span style="color:#ff5c7a">⚠ real conflict — this LDS has &gt; 1 distinct addr on bank ${bank}</span>`
+            : '';
+          return head + loadSection + conflictTag + padTag;
         },
       },
       grid:{left:30, right:14, top:6, bottom:18},
