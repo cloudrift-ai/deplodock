@@ -210,8 +210,6 @@ PAYLOAD.columns.forEach((col,ci)=>{
     card.innerHTML=`
       <div class="card-title">${p.panel_title}</div>
       <div class="card-formula">${p.formula}</div>
-      <span class="card-verdict ${verdict(p.max_way)}"><span class="dot"></span>
-        max-way ${p.max_way} · avg ${p.avg_way.toFixed(1)} lane/bank</span>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
