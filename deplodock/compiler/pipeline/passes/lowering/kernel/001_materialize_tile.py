@@ -386,7 +386,35 @@ def _materialize(blk: Tile) -> Stmt:
             prologue.append(Cond(cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")), body=tuple(mbar_inits)))
             prologue.append(Sync())
         new_body = prologue + new_body
-    return Tile(axes=axes, body=new_body)
+    return Tile(axes=axes, body=_drop_redundant_syncs(new_body))
+
+
+def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
+    """Drop ``Sync`` stmts that are guaranteed no-ops at the body level:
+
+    * Two consecutive ``Sync`` stmts collapse to one.
+    * A leading ``Sync`` before any smem access is unnecessary — at kernel
+      entry no thread can hold a stale view of smem because nothing has
+      been written yet.
+
+    Only handles the body-level (no descent into nested ``Loop`` / ``Cond``
+    bodies); the bulk of redundant syncs come from materializer templates
+    that emit a defensive ``Sync()`` at template boundaries, and those
+    surface here.
+    """
+    smem_seen = False
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Sync):
+            if not smem_seen:
+                continue  # nothing for the sync to fence yet
+            if out and isinstance(out[-1], Sync):
+                continue  # back-to-back sync collapses
+        else:
+            if isinstance(s, (Smem, MbarrierInit, MbarrierArriveExpectTx, MbarrierWait, TmaLoad, CpAsyncCopy, CpAsyncCommit, CpAsyncWait, TreeHalve, WarpShuffle)):
+                smem_seen = True
+        out.append(s)
+    return out
 
 
 def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
@@ -576,7 +604,8 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
             ),
             Sync(),
             TreeHalve(buf=smem_name, op=accum.op, length=n_warps, tid_var="warp"),
-            Sync(),
+            # TreeHalve's render ends each loop iter with __syncthreads(), so a
+            # trailing Sync here would be a no-op pair with the loop's last sync.
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
         ]
     smem_name = f"{accum.name}_smem"
@@ -585,7 +614,7 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
         Write(output=smem_name, index=(Var(t),), value=accum.name),
         Sync(),
         TreeHalve(buf=smem_name, op=accum.op, length=n_threads, tid_var=t),
-        Sync(),
+        # See note above on TreeHalve's trailing sync.
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
 

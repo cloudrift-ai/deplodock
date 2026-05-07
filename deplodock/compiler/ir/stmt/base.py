@@ -8,7 +8,7 @@ normalization passes live in ``visit`` and ``normalize``.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.axis import Axis
@@ -44,6 +44,11 @@ class RenderCtx:
     builtins: dict[str, str] = field(default_factory=dict)
     explicit_inits: set[str] = field(default_factory=set)
     literal_constants: dict[str, float] = field(default_factory=dict)
+    # SSA names whose defining Load came from a ``literal_constants``
+    # input — populated by ``render_body`` after scanning the body, and
+    # consumed by ``Var.render`` to inline the float at use sites instead
+    # of emitting a named ``float in0 = 0.044f;`` decl.
+    literal_ssa: dict[str, float] = field(default_factory=dict)
     # Per-buffer byte offsets into a single ``extern __shared__`` pool
     # ``_smem_pool``. When non-empty, ``Smem.render`` emits a pointer
     # alias into the pool instead of a stand-alone ``__shared__`` array
@@ -59,6 +64,7 @@ class RenderCtx:
             builtins=self.builtins,
             explicit_inits=self.explicit_inits,
             literal_constants=self.literal_constants,
+            literal_ssa=self.literal_ssa,
             smem_dynamic_offsets=self.smem_dynamic_offsets,
         )
 
@@ -342,10 +348,31 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
     whose ``input`` resolves to a scalar literal constant, or a run
     that doesn't form a contiguous index sequence) bypass cleanly.
     """
+    from deplodock.compiler.ir.stmt.leaves import Load  # local — avoid cycle
+
+    # Pre-pass: register every literal-constant Load's SSA name in the ctx
+    # so subsequent ``Var(name)`` references render as the literal value.
+    # The Load itself is then skipped — the loop IR pretty printer behaves
+    # the same way (``multiply(in4, 0.044)`` instead of an explicit
+    # ``in0 = load mul_1_c1[0]; multiply(in4, in0)`` chain).
+    if ctx.literal_constants:
+        new_map = dict(ctx.literal_ssa)
+        changed = False
+        for s in body:
+            if isinstance(s, Load) and s.is_literal(ctx.literal_constants):
+                new_map[s.name] = ctx.literal_constants[s.input]
+                changed = True
+        if changed:
+            ctx = replace(ctx, literal_ssa=new_map)
+
     out: list[str] = []
     i = 0
     n = len(body)
     while i < n:
+        s = body[i]
+        if isinstance(s, Load) and s.name in ctx.literal_ssa and s.is_literal(ctx.literal_constants):
+            i += 1
+            continue
         for run_n in (4, 2):
             run = _vec_load_run(body, i, run_n, ctx)
             if run is not None:
@@ -353,7 +380,7 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
                 i += run_n
                 break
         else:
-            out.extend(body[i].render(ctx))
+            out.extend(s.render(ctx))
             i += 1
     return out
 
