@@ -185,13 +185,14 @@ HTML = """<!doctype html>
   .v-ok{color:#3ddc84;} .v-ok .dot{background:#3ddc84;}
   .v-warn{color:#ffb454;} .v-warn .dot{background:#ffb454;}
   .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
-  /* Square punchcard: 32 banks × 32 lanes is intrinsically square
-     data. Capping width keeps cells visibly square instead of squashed
-     wide rectangles when the container is stretched. */
-  .matrix{width:100%;max-width:320px;aspect-ratio:1/1;height:auto;margin:0 auto 10px;}
+  /* Punchcard cells are 3:1 wide rectangles (96×32 nominal plot area
+     for a 32×32 bank×lane grid). The container fills available width
+     and scales height to maintain the aspect ratio, so cells stay
+     proportional regardless of column width. */
+  .matrix{width:100%;aspect-ratio:96/32;height:auto;margin:0 auto 10px;}
   /* Histogram shares the bank axis with the punchcard above —
-     match its max-width so banks line up vertically. */
-  .hist{width:100%;max-width:320px;height:80px;margin:2px auto 0;}
+     match its width so banks line up vertically. */
+  .hist{width:100%;height:80px;margin:2px auto 0;}
   .ladder{margin:4px auto 0;}
   .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
     margin-top:10px;margin-bottom:4px;}
@@ -201,7 +202,7 @@ HTML = """<!doctype html>
   .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
   .bank-legend-shared{margin-top:14px;font-size:10px;}
   .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin:6px auto 0;
-    width:100%;max-width:320px;font-size:10px;color:var(--muted);}
+    width:100%;font-size:10px;color:var(--muted);}
   .hist-legend span{display:inline-flex;align-items:center;gap:5px;}
   .hist-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
