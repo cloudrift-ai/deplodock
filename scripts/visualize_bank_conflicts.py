@@ -166,18 +166,16 @@ HTML = """<!doctype html>
 <title>smem bank conflicts (IR-driven)</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <style>
-  :root { --bg:#0e1014; --panel:#161a21; --panel-2:#1c212b; --fg:#e8eaed; --muted:#6b7280; }
+  :root { --bg:transparent; --panel:transparent; --panel-2:transparent; --fg:#e8eaed; --muted:#6b7280; }
   *{box-sizing:border-box;}
-  html,body{margin:0;background:var(--bg);color:var(--fg);
+  html,body{margin:0;background:transparent;color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
-  .page{max-width:__MAXW__px;margin:0 auto;padding:24px;}
-  .columns{display:grid;grid-template-columns:repeat(__NCOL__,1fr);gap:22px;}
-  .col-head{text-align:center;font-size:12px;text-transform:uppercase;letter-spacing:.18em;
-    color:var(--muted);padding:8px 0;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,.06);}
+  .page{max-width:100%;margin:0;padding:0;}
+  .columns{display:grid;grid-template-columns:repeat(__NCOL__,1fr);gap:8px;}
+  .col-head{text-align:center;font-size:11px;text-transform:uppercase;letter-spacing:.16em;
+    color:var(--muted);padding:4px 0 6px;margin-bottom:6px;border-bottom:1px solid rgba(255,255,255,.06);}
   .col-head .label{color:#7dd3fc;font-weight:600;}
-  .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));
-    border:1px solid rgba(255,255,255,.04);border-radius:14px;padding:18px 16px 12px;
-    box-shadow:0 1px 0 rgba(255,255,255,.03) inset,0 8px 24px rgba(0,0,0,.35);margin-bottom:16px;}
+  .card{background:transparent;border:none;border-radius:0;padding:0;box-shadow:none;margin-bottom:0;}
   .card-title{font-size:14px;font-weight:600;letter-spacing:-.01em;}
   .card-formula{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--muted);margin-top:4px;}
   .card-notes{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--muted);margin-top:6px;line-height:1.55;}
@@ -187,11 +185,11 @@ HTML = """<!doctype html>
   .v-ok{color:#3ddc84;} .v-ok .dot{background:#3ddc84;}
   .v-warn{color:#ffb454;} .v-warn .dot{background:#ffb454;}
   .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
-  .matrix{width:100%;height:240px;margin-bottom:14px;}
-  .hist{width:100%;height:100px;margin-top:4px;}
-  .ladder{width:100%;margin-top:8px;}
-  .ladder-title{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);
-    margin-top:14px;margin-bottom:6px;}
+  .matrix{width:100%;height:200px;margin-bottom:10px;}
+  .hist{width:100%;height:80px;margin-top:2px;}
+  .ladder{width:100%;margin-top:4px;}
+  .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+    margin-top:10px;margin-bottom:4px;}
   .bank-legend{display:grid;grid-template-columns:repeat(8,1fr);gap:3px 6px;margin-top:8px;
     font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
   .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
