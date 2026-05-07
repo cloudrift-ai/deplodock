@@ -46,11 +46,6 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
     Falls back to ``panels`` if not provided.
     """
     union_source = all_panels_for_union if all_panels_for_union is not None else panels
-    # Build per-Stage union: (tile_op_name, stage_name) → {(r,c) → list of
-    # (load_name, k_iter, lane, subst_idx_tuple)} merged across all body
-    # Loads of the Stage. Also a per-cell map of Loads whose LDS conflicts
-    # when touching that cell (so the tooltip can flag conflicts on the
-    # focused Load specifically).
     stage_union: dict[tuple[str, str], dict[tuple[int, int], list[tuple]]] = {}
     stage_conflict_loads: dict[tuple[str, str], dict[tuple[int, int], set[str]]] = {}
     for p in union_source:
@@ -92,11 +87,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
             r, c = divmod(addr, row_stride)
             if 0 <= r < layout_rows and 0 <= c < layout_cols:
                 touched_now.setdefault((r, c), []).append(lane)
-        # Per-Stage UNION across every body Load of the Stage: cell →
-        # list of (load_name, k_iter, lane, subst_idx_tuple). The
-        # ladder shows the union (so it answers "across the K loop,
-        # which cells does this Stage's body ever read"); the top
-        # heatmap stays per-Load (bank conflicts are per-LDS).
+        # Per-Stage UNION across every body Load of the Stage.
         union = stage_union.get((p.tile_op_name, p.stage_name), {})
         sweep_per_cell: dict[tuple[int, int], list[list]] = {}
         subst_per_cell: dict[tuple[int, int], dict[str, tuple]] = {}
@@ -104,7 +95,6 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
             if not (0 <= r < layout_rows and 0 <= c < layout_cols):
                 continue
             sweep_per_cell[(r, c)] = [[ln, k, lane] for (ln, k, lane, _s) in entries]
-            # Keep one substituted form per Load that hits the cell.
             for ln, _k, _l, s in entries:
                 subst_per_cell.setdefault((r, c), {}).setdefault(ln, tuple(s))
         all_cells = sorted(set(touched_now) | set(sweep_per_cell))
@@ -129,6 +119,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
                 "buf_short": p.buf,
                 "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
                 "lane_banks": p.lane_banks,
+                "lane_addrs": list(p.lane_addrs),
                 "lane_addr_idx": lane_addr_idx,
                 "n_unique_addrs": len(unique_addrs),
                 "counts": p.counts,
@@ -161,27 +152,47 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
 
 
 HTML = """<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="__THEME__">
 <head>
 <meta charset="utf-8" />
 <title>smem bank conflicts (IR-driven)</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <style>
-  :root { --bg:transparent; --panel:transparent; --panel-2:transparent; --fg:#e8eaed; --muted:#6b7280; }
+  :root[data-theme="dark"] {
+    --bg:transparent; --fg:#e8eaed; --muted:#6b7280;
+    --rule:rgba(255,255,255,.06); --label-accent:#7dd3fc;
+  }
+  :root[data-theme="light"] {
+    --bg:transparent; --fg:#1f2937; --muted:#4b5563;
+    --rule:rgba(0,0,0,.08); --label-accent:#0369a1;
+  }
   *{box-sizing:border-box;}
   html,body{margin:0;background:transparent;color:var(--fg);
     font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
   /* Center the column grid + shared legend horizontally; shrink to
      content width so unused horizontal space sits outside the page. */
   .page{display:flex;flex-direction:column;align-items:center;margin:0;padding:0;}
-  /* Auto-sized columns: each column shrinks to its content width
-     (the punchcard / ladder), so the whole grid is no wider than the
-     plots need. Centered if the page has more horizontal room. */
-  .columns{display:grid;grid-template-columns:repeat(__NCOL__,auto);gap:20px;justify-content:center;}
+  /* Single page-grid: N auto-sized columns (one per IR variant);
+     shared titles + legends span all columns. justify-content:center
+     so the whole block stays centered when the iframe is wider. */
+  .page-grid{display:grid;gap:8px 20px;justify-content:center;align-items:start;}
+  .page-grid > .col-head,
+  .page-grid > .matrix,
+  .page-grid > .hist,
+  .page-grid > .ladder{justify-self:center;}
+  .page-grid > .section-title{grid-column:1 / -1;}
+  .page-grid > .ladder,
+  .page-grid > .ladder-sub{grid-column:1 / -1;justify-self:center;}
+  .page-grid > .hist-legend-shared,
+  .page-grid > .bank-legend-shared{grid-column:1 / -1;justify-self:center;}
+  .ladder-sub{font-size:13px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+    margin:14px 0 4px;text-align:center;}
+  .ladder-sub .label{color:var(--label-accent);font-weight:600;}
+  .section-title{font-size:16px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--fg);margin:22px 0 8px;text-align:left;}
   .col-head{text-align:center;font-size:14px;text-transform:uppercase;letter-spacing:.16em;
-    color:var(--muted);padding:6px 0 8px;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.06);}
-  .col-head .label{color:#7dd3fc;font-weight:600;}
-  .card{background:transparent;border:none;border-radius:0;padding:0;box-shadow:none;margin-bottom:0;}
+    color:var(--muted);padding:6px 0 8px;border-bottom:1px solid var(--rule);min-width:200px;}
+  .col-head .label{color:var(--label-accent);font-weight:600;}
   .card-title{font-size:14px;font-weight:600;letter-spacing:-.01em;}
   .card-formula{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;color:var(--muted);margin-top:4px;}
   .card-notes{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--muted);margin-top:6px;line-height:1.55;}
@@ -207,9 +218,10 @@ HTML = """<!doctype html>
   .bank-legend i{width:10px;height:10px;border-radius:2px;display:inline-block;flex-shrink:0;}
   .bank-legend-shared{margin-top:18px;font-size:12px;}
   .hist-legend{display:flex;flex-wrap:wrap;gap:5px 16px;margin:8px auto 0;
-    width:100%;max-width:400px;font-size:12px;color:var(--muted);}
+    width:fit-content;font-size:12px;color:var(--muted);}
   .hist-legend span{display:inline-flex;align-items:center;gap:6px;}
   .hist-legend i{width:11px;height:11px;border-radius:2px;display:inline-block;}
+  .hist-legend-shared{margin-top:14px;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
@@ -219,24 +231,26 @@ HTML = """<!doctype html>
 </head>
 <body>
   <div class="page">
-    <div class="columns" id="columns"></div>
-    <div class="bank-legend bank-legend-shared" id="shared-bank-legend"></div>
+    <div class="page-grid" id="page-grid"></div>
   </div>
 <script>
 const PAYLOAD = __PAYLOAD__;
+const THEME = __THEME_JS__;
 const WARP=32, BANKS=32;
-const palette={empty:'#2a2d33',ok:'#3ddc84',warn:'#ffb454',bad:'#ff5c7a'};
+const palette={empty:THEME.empty,ok:'#3ddc84',warn:'#ffb454',bad:'#ff5c7a'};
 const cellColor=c=>c===0?palette.empty:c===1?palette.ok:c<=4?palette.warn:palette.bad;
 const verdict=m=>m>4?'v-bad':m>1?'v-warn':'v-ok';
 // Two distinct palettes — keep "color = bank" (smem layout) and
 // "color = address" (punch card) visually independent so the reader
 // doesn't conflate them.
 //
-// BANK_PALETTE: 16-color rainbow used in the smem-layout ladder. Each
-// hue maps to a bank id (mod 16 — banks 0..15 use the first 16 hues,
-// banks 16..31 reuse them).
+// BANK_PALETTE: 32 distinct hues (one per smem bank). Same color =
+// same bank, so two highlighted cells sharing a color in the layout
+// land on the same bank — direct visual cue for a bank conflict.
 const BANK_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d','#67e8f9','#fb923c',
-                    '#a3e635','#f472b6','#60a5fa','#34d399','#fde047','#fb7185','#818cf8','#facc15'];
+                    '#a3e635','#f472b6','#60a5fa','#34d399','#fde047','#fb7185','#818cf8','#facc15',
+                    '#0ea5e9','#16a34a','#d97706','#dc2626','#9333ea','#ca8a04','#0891b2','#ea580c',
+                    '#65a30d','#db2777','#1d4ed8','#059669','#a16207','#be123c','#4338ca','#b45309'];
 // ADDR_PALETTE: warm-only palette (yellows, oranges, reds, browns) used
 // in the lane×bank punch card. A warp typically has 1-4 distinct
 // addresses per Load, so a short palette is fine. Warm-only avoids
@@ -244,43 +258,109 @@ const BANK_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d',
 // a glance which plot a color belongs to.
 const ADDR_PALETTE=['#fde047','#fb923c','#ef4444','#a3a3a3','#facc15','#fdba74','#dc2626','#78350f'];
 
-const root=document.getElementById('columns');
-PAYLOAD.columns.forEach((col,ci)=>{
-  const colEl=document.createElement('div');
-  colEl.innerHTML=`<div class="col-head"><span class="label">${col.label}</span></div>`;
-  // Append BEFORE init so document.getElementById can find the chart hosts.
-  root.appendChild(colEl);
-  if(col.panels.length===0){
-    const e=document.createElement('div');e.className='empty';e.textContent='no Stages found';
-    colEl.appendChild(e);
+// Layout: one page-grid with N columns (one per IR variant). Rows
+// alternate between shared titles (spanning all columns, left-justified)
+// and per-column plot cells. We render rows of HTML strings into the
+// grid in the right order.
+const root = document.getElementById('page-grid');
+root.style.gridTemplateColumns = `repeat(${PAYLOAD.columns.length}, auto)`;
+
+// Pick the representative stage / buf from the first non-empty panel.
+const firstPanel = PAYLOAD.columns.flatMap(c => c.panels)[0];
+const bufLabel = firstPanel ? firstPanel.buf_short : '';
+
+// 1) Shared punchcard title (above the column headings).
+const punTitle = document.createElement('div');
+punTitle.className = 'section-title';
+punTitle.textContent = `bank access punchcard — ${bufLabel}`;
+root.appendChild(punTitle);
+
+// 2) Column headings.
+PAYLOAD.columns.forEach(col => {
+  const head = document.createElement('div');
+  head.className = 'col-head';
+  head.innerHTML = `<span class="label">${col.label}</span>`;
+  root.appendChild(head);
+});
+
+// 3) Punchcards row.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'no Stages found';
+    root.appendChild(empty);
+  } else {
+    const matrix = document.createElement('div');
+    matrix.className = 'matrix';
+    matrix.id = `m_c${ci}_p0`;
+    root.appendChild(matrix);
   }
-  col.panels.forEach((p,pi)=>{
-    const id=`c${ci}_p${pi}`;
-    const card=document.createElement('div');card.className='card';
-    card.innerHTML=`
-      <div class="ladder-title" style="margin-top:0">bank access punchcard — ${p.buf_short}</div>
-      <div class="matrix" id="m_${id}"></div>
-      <div class="hist" id="h_${id}"></div>
-      <div class="hist-legend">
-        <span><i style="background:#3ddc84"></i>1 lane (no conflict)</span>
-        <span><i style="background:#ffb454"></i>2–4 lanes (mild)</span>
-        <span><i style="background:#ff5c7a"></i>&gt;4 lanes (heavy)</span>
-      </div>
-      <div class="ladder-title">smem layout — bank per (row, col)</div>
-      <div class="ladder" id="l_${id}" style="${(()=>{
-        // Cells are 3:1 wide rectangles when there's room; shrink
-        // cell_w toward cell_h (square) when the column gets narrow.
-        // cell_h is sized by row count (so the slab fits ≤ maxH);
-        // cell_w = min(3 × cell_h, fits_width).
-        const axisW = 44, axisH = 28, maxH = 450, maxW = 475;
-        const cellH = Math.max(3, Math.min(5, Math.floor((maxH - axisH) / p.layout.rows)));
-        const cellW = Math.max(cellH, Math.min(3 * cellH, Math.floor((maxW - axisW) / p.layout.cols)));
-        const w = p.layout.cols * cellW + axisW;
-        const h = p.layout.rows * cellH + axisH;
-        return `width:${w}px; height:${h}px`;
-      })()}"></div>
-      ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
-    colEl.appendChild(card);
+});
+
+// 4) Histograms row.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) {
+    root.appendChild(document.createElement('div'));
+    return;
+  }
+  const hist = document.createElement('div');
+  hist.className = 'hist';
+  hist.id = `h_c${ci}_p0`;
+  root.appendChild(hist);
+});
+
+// 5) Shared severity legend (spans all columns, centered).
+const sevLegend = document.createElement('div');
+sevLegend.className = 'hist-legend hist-legend-shared';
+sevLegend.innerHTML = `
+  <span><i style="background:#3ddc84"></i>1 lane (no conflict)</span>
+  <span><i style="background:#ffb454"></i>2–4 lanes (mild)</span>
+  <span><i style="background:#ff5c7a"></i>&gt;4 lanes (heavy)</span>
+`;
+root.appendChild(sevLegend);
+
+// 6) Shared ladder title.
+const ladTitle = document.createElement('div');
+ladTitle.className = 'section-title';
+ladTitle.textContent = 'smem layout — bank per (row, col)';
+root.appendChild(ladTitle);
+
+// 7) Ladders — stacked vertically, each spanning all columns. Each
+// ladder gets its own sub-heading (the variant label) so the reader
+// can tell them apart without the side-by-side layout.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) return;
+  const p = col.panels[0];
+  const sub = document.createElement('div');
+  sub.className = 'ladder-sub';
+  sub.innerHTML = `<span class="label">${col.label}</span>`;
+  root.appendChild(sub);
+  const ladder = document.createElement('div');
+  ladder.className = 'ladder';
+  ladder.id = `l_c${ci}_p0`;
+  // Stacked layout doubles the available real estate per ladder.
+  const lay = p.layout;
+  const axisW = 56, axisH = 32, maxH = 900, maxW = 960;
+  const cellH = Math.max(6, Math.min(10, Math.floor((maxH - axisH) / lay.rows)));
+  const cellW = Math.max(cellH, Math.min(3 * cellH, Math.floor((maxW - axisW) / lay.cols)));
+  ladder.style.width = `${lay.cols * cellW + axisW}px`;
+  ladder.style.height = `${lay.rows * cellH + axisH}px`;
+  root.appendChild(ladder);
+});
+
+// 8) Shared bank legend.
+const bankLegendEl = document.createElement('div');
+bankLegendEl.className = 'bank-legend bank-legend-shared';
+bankLegendEl.id = 'shared-bank-legend';
+root.appendChild(bankLegendEl);
+
+// Now render plots for each column's first panel.
+PAYLOAD.columns.forEach((col, ci) => {
+  if (!col.panels.length) return;
+  col.panels.forEach((p, pi) => {
+    if (pi > 0) return;  // one panel per column expected
+    const id = `c${ci}_p${pi}`;
 
     const m=echarts.init(document.getElementById(`m_${id}`),null,{renderer:'canvas'});
     const md=[];
@@ -300,39 +380,39 @@ PAYLOAD.columns.forEach((col,ci)=>{
     });
     m.setOption({
       backgroundColor:'transparent',
-      tooltip:{backgroundColor:'#0e1014',borderColor:'#2a2d33',textStyle:{color:'#e8eaed',fontSize:12},
+      tooltip:{backgroundColor:THEME.tooltipBg,borderColor:THEME.axisLine,textStyle:{color:THEME.tooltipText,fontSize:12},
         formatter:pt=>{const [b,l,c]=pt.value;
           if (c === 0) return `bank ${b}<br/><span style="color:#6b7280">no lane</span>`;
-          const ai = pt.data.addrIdx;
+          const addr = p.lane_addrs[l];
           const dist = p.distinct_addrs[b];
           const verdict = dist === 1 ? '<span style="color:#3ddc84">broadcast — 0 events</span>'
                        : dist <= 4 ? `<span style="color:#ffb454">${dist}-way conflict</span>`
                                    : `<span style="color:#ff5c7a">${dist}-way conflict</span>`;
-          return `lane <b>${l}</b> → bank <b>${b}</b>, addr-color <b>#${ai}</b><br/>${verdict}`;
+          return `lane <b>${l}</b> → bank <b>${b}</b>, addr <b>${addr}</b><br/>${verdict}`;
         }},
       grid:{left:38,right:8,top:8,bottom:42},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
-        nameTextStyle:{color:'#6b7280',fontSize:13},axisLine:{lineStyle:{color:'#2a2d33'}},
+        nameTextStyle:{color:'#6b7280',fontSize:13},axisLine:{lineStyle:{color:THEME.axisLine}},
         axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,name:'lane',
         nameLocation:'middle',nameGap:28,nameTextStyle:{color:'#6b7280',fontSize:13},
-        axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
+        axisLine:{lineStyle:{color:THEME.axisLine}},axisTick:{show:false},
         axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       series:[{type:'heatmap',data:md,progressive:0,
-        itemStyle:{borderRadius:2,borderColor:'#161a21',borderWidth:1},
+        itemStyle:{borderRadius:2},
         emphasis:{itemStyle:{borderColor:'#fff',borderWidth:1.5}},
         animationDuration:500,animationEasing:'cubicOut'}]});
 
     const h=echarts.init(document.getElementById(`h_${id}`),null,{renderer:'canvas'});
     h.setOption({
       backgroundColor:'transparent',
-      tooltip:{backgroundColor:'#0e1014',borderColor:'#2a2d33',textStyle:{color:'#e8eaed',fontSize:12},
+      tooltip:{backgroundColor:THEME.tooltipBg,borderColor:THEME.axisLine,textStyle:{color:THEME.tooltipText,fontSize:12},
         formatter:pt=>`bank <b>${pt.name}</b><br/>${pt.value} lane(s)`},
       grid:{left:38,right:8,top:6,bottom:22},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],
-        axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
+        axisLine:{lineStyle:{color:THEME.axisLine}},axisTick:{show:false},
         axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
-      yAxis:{type:'value',min:0,max:8,splitLine:{lineStyle:{color:'#1c212b'}},
+      yAxis:{type:'value',min:0,max:8,splitLine:{lineStyle:{color:THEME.splitLine}},
         axisLabel:{color:'#6b7280',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
       series:[{type:'bar',data:p.distinct_addrs.map(c=>({value:c,itemStyle:{
         color:{type:'linear',x:0,y:0,x2:0,y2:1,
@@ -347,34 +427,24 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const lEl = document.getElementById(`l_${id}`);
     const ldr = echarts.init(lEl, null, {renderer:'canvas'});
     const ldrData = [];
-    // touchedNow: cells the warp accessed AT THE CURRENT k_iter (white outline)
-    // sweep: cells the warp accessed across the full inner-loop sweep
-    //   (tooltip shows the full provenance per cell)
+    // touchedNow: cells the 32 lanes of the focused Load access AT THE
+    // CURRENT k_iter (32 cells, one per lane). These are the only cells
+    // fully opaque — making the conflict reading direct: two opaque
+    // cells sharing a bank color = same bank hit with different
+    // addresses = conflict for this LDS.
     const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
     const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
     const substByLoad = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst_by_load]));
-    // Cells touched by the focused Load (the one this card represents)
-    // across the whole K sweep. Highlighted with a white outline so
-    // the reader can spot when two highlighted cells in the same bank
-    // column share a color = conflict for that LDS.
     const focusLoad = lay.load_name;
-    const focusCells = new Set(
-      lay.touched.filter(t => t.subst_by_load && t.subst_by_load[focusLoad]).map(t => `${t.r},${t.c}`)
-    );
     const conflictLoadsByCell = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.conflict_loads || []]));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
         const k = `${r},${c}`;
-        const reachable = sweep.has(k);
-        const isFocus = focusCells.has(k);
-        const color = isPad ? '#3a3f48' : BANK_PALETTE[bank % BANK_PALETTE.length];
-        // Three opacity levels: focused-Load cells (top), other
-        // reachable cells (middle), padding/unreachable (bottom).
-        // Reading rule: two cells with the high-opacity rows in the
-        // same column sharing a color → conflict for that LDS.
-        const op = isPad ? 0.18 : (isFocus ? 0.95 : (reachable ? 0.32 : 0.18));
+        const isNow = (touchedNow.get(k) || []).length > 0;
+        const color = isPad ? THEME.padCell : BANK_PALETTE[bank % BANK_PALETTE.length];
+        const op = isNow ? THEME.opFocus : THEME.opFaint;
         ldrData.push({
           value:[c, r, bank],
           itemStyle:{color: color, opacity: op},
@@ -423,14 +493,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
       grid:{left:30, right:14, top:6, bottom:18},
       xAxis:{
         type:'category', data:[...Array(lay.cols).keys()],
-        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
+        axisLine:{lineStyle:{color:THEME.axisLine}}, axisTick:{show:false},
         axisLabel:{color:'#6b7280', fontSize:11,
           interval: Math.max(0, Math.floor(lay.cols/8) - 1),
           showMaxLabel: true, showMinLabel: true},
       },
       yAxis:{
         type:'category', data:[...Array(lay.rows).keys()], inverse:true,
-        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
+        axisLine:{lineStyle:{color:THEME.axisLine}}, axisTick:{show:false},
         axisLabel:{color:'#6b7280', fontSize:11,
           interval: Math.max(0, Math.floor(lay.rows/8) - 1),
           showMaxLabel: true, showMinLabel: true},
@@ -468,11 +538,37 @@ PAYLOAD.columns.forEach((col,ci)=>{
 """
 
 
-def emit_html(columns: list[dict], out_path: str) -> None:
+_THEMES = {
+    "dark": {
+        "empty": "#2a2d33",
+        "tooltipBg": "#0e1014",
+        "tooltipText": "#e8eaed",
+        "axisLine": "#2a2d33",
+        "splitLine": "#1c212b",
+        "padCell": "#3a3f48",
+        "opFocus": 1.0,
+        "opFaint": 0.18,
+    },
+    "light": {
+        "empty": "#b8bec7",
+        "tooltipBg": "#ffffff",
+        "tooltipText": "#0f172a",
+        "axisLine": "#6b7280",
+        "splitLine": "#9ca3af",
+        "padCell": "#64748b",
+        "opFocus": 1.0,
+        "opFaint": 0.18,
+    },
+}
+
+
+def emit_html(columns: list[dict], out_path: str, theme: str = "dark") -> None:
     n = max(1, len(columns))
     html = (
         HTML.replace("__MAXW__", str(min(2200, 480 * n + 80)))
         .replace("__NCOL__", str(n))
+        .replace("__THEME__", theme)
+        .replace("__THEME_JS__", json.dumps(_THEMES[theme]))
         .replace("__PAYLOAD__", json.dumps({"columns": columns}))
     )
     with open(out_path, "w") as f:
@@ -503,6 +599,7 @@ def main() -> None:
     p.add_argument("--k-iter", type=int, default=0)
     p.add_argument("--warp-id", type=int, default=0)
     p.add_argument("--out", default="/tmp/bank_conflicts.html")
+    p.add_argument("--theme", choices=("dark", "light"), default="dark")
     args = p.parse_args()
 
     stage_filter = set(args.stage) if args.stage else None
@@ -525,9 +622,6 @@ def main() -> None:
     for arg in args.ir:
         path, label = _parse_ir_arg(arg)
         g = graph_from_ir_path(path)
-        # Run twice when ``--load`` is set: once unfiltered (for the
-        # per-Stage union ladder) and once filtered (for the visible
-        # cards).
         panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
         union_panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, None) if load_filter is not None else panels
         scalar_total = sum(p.conflict_events for p in panels)
@@ -540,7 +634,7 @@ def main() -> None:
             }
         )
 
-    emit_html(columns, args.out)
+    emit_html(columns, args.out, theme=args.theme)
     print(f"saved {args.out}")
 
 
