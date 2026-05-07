@@ -257,7 +257,7 @@ def _format_table(rows: list[PerfRow]) -> str:
     has_ncu = any(r.ncu for r in rows)
     has_compile = any(r.torch_compile_us is not None for r in rows)
 
-    base_headers = ["op", "case", "shape", "torch_us"]
+    base_headers = ["case", "shape", "torch_us"]
     if has_compile:
         base_headers.append("tcomp_us")
     base_headers += ["depl_us", "ratio", "launches", "iters"]
@@ -267,7 +267,7 @@ def _format_table(rows: list[PerfRow]) -> str:
     aggregates = [_aggregate_ncu(r.ncu) for r in rows]
 
     def _row_cells(r: PerfRow, agg: dict[str, float]) -> tuple[str, ...]:
-        base = [r.op, r.name, r.shape, f"{r.torch_us:>8.1f}"]
+        base = [r.name, r.shape, f"{r.torch_us:>8.1f}"]
         if has_compile:
             base.append(f"{r.torch_compile_us:>8.1f}" if r.torch_compile_us is not None else "—")
         base += [
