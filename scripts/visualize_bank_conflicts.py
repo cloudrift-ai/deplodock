@@ -302,10 +302,6 @@ PAYLOAD.columns.forEach((col,ci)=>{
             color: color,
             // Padding: very dim. Reachable-but-not-now: medium. Now: full.
             opacity: isPad ? 0.18 : (accessedNow ? 1.0 : (reachable ? 0.55 : 0.18)),
-            borderColor: accessedNow ? '#ffffff' : 'transparent',
-            borderWidth: accessedNow ? 2 : 0,
-            shadowBlur: accessedNow ? 8 : 0,
-            shadowColor: accessedNow ? '#ffffffaa' : 'transparent',
           },
         });
       }
@@ -363,12 +359,16 @@ PAYLOAD.columns.forEach((col,ci)=>{
             padTag;
         },
       },
-      grid:{left:8, right:8, top:6, bottom:8},
+      grid:{left:30, right:8, top:6, bottom:18},
       xAxis:{
-        type:'category', data:[...Array(lay.cols).keys()], show: false,
+        type:'category', data:[...Array(lay.cols).keys()],
+        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
+        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.cols/8) - 1)},
       },
       yAxis:{
-        type:'category', data:[...Array(lay.rows).keys()], inverse:true, show: false,
+        type:'category', data:[...Array(lay.rows).keys()], inverse:true,
+        axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
+        axisLabel:{color:'#6b7280', fontSize:9, interval: Math.max(0, Math.floor(lay.rows/8) - 1)},
       },
       series:[{
         type:'heatmap', data: ldrData, progressive: 0,
