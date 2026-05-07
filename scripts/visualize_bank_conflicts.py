@@ -36,7 +36,27 @@ def graph_from_ir_path(path: str) -> Graph:
         return Graph.from_dict(json.load(f))
 
 
-def _serialize(panels: list[BankConflictResult]) -> list[dict]:
+def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[BankConflictResult] | None = None) -> list[dict]:
+    """Serialize ``panels`` to JSON-friendly dicts.
+
+    ``all_panels_for_union`` is the un-load-filtered list used to compute
+    the per-Stage union ladder. When ``--load`` filters the visible
+    cards, the ladder still shows the full Stage's footprint (i.e. cells
+    touched by every body Load of the Stage, not just the focused one).
+    Falls back to ``panels`` if not provided.
+    """
+    union_source = all_panels_for_union if all_panels_for_union is not None else panels
+    # Build per-Stage union: (tile_op_name, stage_name) → {(r,c) → list of
+    # (load_name, k_iter, lane, subst_idx_tuple)} merged across all body
+    # Loads of the Stage.
+    stage_union: dict[tuple[str, str], dict[tuple[int, int], list[tuple]]] = {}
+    for p in union_source:
+        key = (p.tile_op_name, p.stage_name)
+        u = stage_union.setdefault(key, {})
+        for cell, pairs in p.full_sweep_touched.items():
+            subst = p.full_sweep_subst_idx.get(cell, ())
+            for k, lane in pairs:
+                u.setdefault(cell, []).append((p.load_name, k, lane, subst))
     out: list[dict] = []
     for p in panels:
         # Per-lane address-color index: same address → same color, regardless
@@ -66,25 +86,31 @@ def _serialize(panels: list[BankConflictResult]) -> list[dict]:
             r, c = divmod(addr, row_stride)
             if 0 <= r < layout_rows and 0 <= c < layout_cols:
                 touched_now.setdefault((r, c), []).append(lane)
-        # Touched across the *full* inner-loop sweep — ``full_sweep_touched``
-        # was populated by ``simulate_graph`` and maps cells to all
-        # (k_iter, lane) pairs that visit them across the loop. Used to
-        # show every cell's access provenance in the tooltip.
-        full_sweep: dict[tuple[int, int], list[list[int]]] = {}
-        for (r, c), pairs in p.full_sweep_touched.items():
-            if 0 <= r < layout_rows and 0 <= c < layout_cols:
-                full_sweep[(r, c)] = [list(t) for t in pairs]
-        # Build a single entries list keyed by (r, c) carrying both
-        # views (current-iter lanes for outline, full-sweep pairs for
-        # tooltip).
-        all_cells = sorted(set(touched_now) | set(full_sweep))
+        # Per-Stage UNION across every body Load of the Stage: cell →
+        # list of (load_name, k_iter, lane, subst_idx_tuple). The
+        # ladder shows the union (so it answers "across the K loop,
+        # which cells does this Stage's body ever read"); the top
+        # heatmap stays per-Load (bank conflicts are per-LDS).
+        union = stage_union.get((p.tile_op_name, p.stage_name), {})
+        sweep_per_cell: dict[tuple[int, int], list[list]] = {}
+        subst_per_cell: dict[tuple[int, int], dict[str, tuple]] = {}
+        for (r, c), entries in union.items():
+            if not (0 <= r < layout_rows and 0 <= c < layout_cols):
+                continue
+            sweep_per_cell[(r, c)] = [[ln, k, lane] for (ln, k, lane, _s) in entries]
+            # Keep one substituted form per Load that hits the cell.
+            for ln, _k, _l, s in entries:
+                subst_per_cell.setdefault((r, c), {}).setdefault(ln, tuple(s))
+        all_cells = sorted(set(touched_now) | set(sweep_per_cell))
         touched_entries = [
             {
                 "r": r,
                 "c": c,
                 "lanes_now": touched_now.get((r, c), []),
-                "sweep": full_sweep.get((r, c), []),
-                "subst": list(p.full_sweep_subst_idx.get((r, c), ())),
+                # sweep: list of [load_name, k_iter, lane]
+                "sweep": sweep_per_cell.get((r, c), []),
+                # subst_by_load: {load_name: [substituted_index_string, ...]}
+                "subst_by_load": {ln: list(s) for ln, s in subst_per_cell.get((r, c), {}).items()},
             }
             for (r, c) in all_cells
         ]
@@ -287,7 +313,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
     //   (tooltip shows the full provenance per cell)
     const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
     const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
-    const substMap = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst]));
+    const substByLoad = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst_by_load]));
     for (let r = 0; r < lay.rows; r++) {
       for (let c = 0; c < lay.cols; c++) {
         const bank = lay.banks[r][c];
@@ -316,24 +342,32 @@ PAYLOAD.columns.forEach((col,ci)=>{
       parts.push(s === e ? `${s}` : `${s}-${e}`);
       return parts.join(', ');
     };
-    // Group sweep pairs by k_iter, list lane ranges per iter (compact
-    // when many iters — show first 6 + "+N more" if longer).
-    const formatSweep = pairs => {
-      if (!pairs.length) return '';
-      const byIter = new Map();
-      pairs.forEach(([k, l]) => {
+    // Group sweep entries by Load name, then by k_iter. Each entry is
+    // [load_name, k_iter, lane]. Renders one section per Load with up
+    // to ``cap`` k_iter lines below it.
+    const formatSweep = entries => {
+      if (!entries.length) return '';
+      const byLoad = new Map();
+      entries.forEach(([ln, k, l]) => {
+        if (!byLoad.has(ln)) byLoad.set(ln, new Map());
+        const byIter = byLoad.get(ln);
         if (!byIter.has(k)) byIter.set(k, []);
         byIter.get(k).push(l);
       });
-      const lines = [...byIter.keys()].sort((a,b)=>a-b).map(k => {
-        const lanes = byIter.get(k).sort((a,b)=>a-b);
-        return `k_iter=<b>${k}</b>: lanes ${compactRanges(lanes)} (${lanes.length}×)`;
-      });
-      const cap = 6;
-      if (lines.length > cap) {
-        return lines.slice(0, cap).join('<br/>') + `<br/><span style="color:#6b7280">… +${lines.length - cap} more iters</span>`;
+      const cap = 4;
+      const sections = [];
+      for (const [ln, byIter] of [...byLoad.entries()].sort()) {
+        const ks = [...byIter.keys()].sort((a,b)=>a-b);
+        const lines = ks.map(k => {
+          const lanes = byIter.get(k).sort((a,b)=>a-b);
+          return `&nbsp;&nbsp;k_iter=<b>${k}</b>: lanes ${compactRanges(lanes)} (${lanes.length}×)`;
+        });
+        const tail = lines.length > cap
+          ? lines.slice(0, cap).concat([`&nbsp;&nbsp;<span style="color:#6b7280">… +${lines.length - cap} more iters</span>`])
+          : lines;
+        sections.push(`<span style="color:#7dd3fc">${ln}</span>:<br/>${tail.join('<br/>')}`);
       }
-      return lines.join('<br/>');
+      return sections.join('<br/>');
     };
     ldr.setOption({
       backgroundColor:'transparent',
@@ -349,13 +383,19 @@ PAYLOAD.columns.forEach((col,ci)=>{
           const isNow = (touchedNow.get(k) || []).length > 0;
           const head = `row=<b>${r}</b>, col=<b>${c}</b>, bank <b>${bank}</b>, addr <b>${r * lay.row_stride + c}</b>`;
           if (!sweepPairs.length) {
-            return head + padTag + `<br/><span style="color:#6b7280">never read by warp ${0} (other warps own this row)</span>`;
+            return head + padTag + `<br/><span style="color:#6b7280">never read by warp 0 (other warps own this row)</span>`;
           }
           const star = isNow ? `<br/><span style="color:#fff">★ accessed at the rendered k_iter</span>` : '';
-          const subst = substMap.get(k) || [];
-          const substExpr = subst.length ? subst.join(', ') : lay.index_expr;
+          // One substituted form per Load that hits this cell.
+          const substMap = substByLoad.get(k) || {};
+          const substLines = Object.entries(substMap).sort().map(
+            ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
+          );
+          const loadSection = substLines.length
+            ? `<br/>${substLines.join('<br/>')}`
+            : '';
           return head +
-            `<br/>load <code style="color:#3ddc84">${lay.load_name}[${substExpr}]</code>` +
+            loadSection +
             star +
             `<br/>${formatSweep(sweepPairs)}` +
             padTag;
@@ -449,14 +489,18 @@ def main() -> None:
     for arg in args.ir:
         path, label = _parse_ir_arg(arg)
         g = graph_from_ir_path(path)
+        # Run twice when ``--load`` is set: once unfiltered (for the
+        # per-Stage union ladder) and once filtered (for the visible
+        # cards).
         panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, load_filter)
+        union_panels = simulate_graph(g, stage_filter, args.k_iter, args.warp_id, None) if load_filter is not None else panels
         scalar_total = sum(p.conflict_events for p in panels)
         vec_total = sum(p.lds128_events for p in panels)
         print(f"{label}: {len(panels)} probes, ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}")
         columns.append(
             {
                 "label": f"{label} · ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}",
-                "panels": _serialize(panels),
+                "panels": _serialize(panels, all_panels_for_union=union_panels),
             }
         )
 
