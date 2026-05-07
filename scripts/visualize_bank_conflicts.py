@@ -177,9 +177,9 @@ HTML = """<!doctype html>
   /* Auto-sized columns: each column shrinks to its content width
      (the punchcard / ladder), so the whole grid is no wider than the
      plots need. Centered if the page has more horizontal room. */
-  .columns{display:grid;grid-template-columns:repeat(__NCOL__,auto);gap:16px;justify-content:center;}
-  .col-head{text-align:center;font-size:11px;text-transform:uppercase;letter-spacing:.16em;
-    color:var(--muted);padding:4px 0 6px;margin-bottom:6px;border-bottom:1px solid rgba(255,255,255,.06);}
+  .columns{display:grid;grid-template-columns:repeat(__NCOL__,auto);gap:20px;justify-content:center;}
+  .col-head{text-align:center;font-size:14px;text-transform:uppercase;letter-spacing:.16em;
+    color:var(--muted);padding:6px 0 8px;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.06);}
   .col-head .label{color:#7dd3fc;font-weight:600;}
   .card{background:transparent;border:none;border-radius:0;padding:0;box-shadow:none;margin-bottom:0;}
   .card-title{font-size:14px;font-weight:600;letter-spacing:-.01em;}
@@ -194,22 +194,22 @@ HTML = """<!doctype html>
   /* Square punchcard: 32 banks × 32 lanes is intrinsically square
      data. Capping width keeps cells visibly square instead of
      squashed into wide rectangles when the container is stretched. */
-  .matrix{width:100%;max-width:320px;aspect-ratio:1/1;height:auto;margin:0 auto 10px;}
+  .matrix{width:100%;max-width:400px;aspect-ratio:1/1;height:auto;margin:0 auto 12px;}
   /* Histogram shares the bank axis with the punchcard above —
      match its max-width so banks line up vertically. */
-  .hist{width:100%;max-width:320px;height:80px;margin:2px auto 0;}
-  .ladder{margin:4px auto 0;}
-  .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
-    margin-top:10px;margin-bottom:4px;}
-  .bank-legend{display:grid;grid-template-columns:repeat(8,auto);gap:3px 12px;margin-top:8px;
-    width:fit-content;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:9px;color:var(--muted);}
-  .bank-legend span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
-  .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
-  .bank-legend-shared{margin-top:14px;font-size:10px;}
-  .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin:6px auto 0;
-    width:100%;max-width:320px;font-size:10px;color:var(--muted);}
-  .hist-legend span{display:inline-flex;align-items:center;gap:5px;}
-  .hist-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
+  .hist{width:100%;max-width:400px;height:100px;margin:2px auto 0;}
+  .ladder{margin:6px auto 0;}
+  .ladder-title{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+    margin-top:12px;margin-bottom:6px;}
+  .bank-legend{display:grid;grid-template-columns:repeat(8,auto);gap:4px 14px;margin-top:10px;
+    width:fit-content;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--muted);}
+  .bank-legend span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;}
+  .bank-legend i{width:10px;height:10px;border-radius:2px;display:inline-block;flex-shrink:0;}
+  .bank-legend-shared{margin-top:18px;font-size:12px;}
+  .hist-legend{display:flex;flex-wrap:wrap;gap:5px 16px;margin:8px auto 0;
+    width:100%;max-width:400px;font-size:12px;color:var(--muted);}
+  .hist-legend span{display:inline-flex;align-items:center;gap:6px;}
+  .hist-legend i{width:11px;height:11px;border-radius:2px;display:inline-block;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
     background:rgba(255,255,255,.02);border-radius:10px;border:1px dashed rgba(255,255,255,.06);}
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
@@ -272,8 +272,8 @@ PAYLOAD.columns.forEach((col,ci)=>{
         // cell_w toward cell_h (square) when the column gets narrow.
         // cell_h is sized by row count (so the slab fits ≤ maxH);
         // cell_w = min(3 × cell_h, fits_width).
-        const axisW = 38, axisH = 24, maxH = 360, maxW = 380;
-        const cellH = Math.max(2, Math.min(4, Math.floor((maxH - axisH) / p.layout.rows)));
+        const axisW = 44, axisH = 28, maxH = 450, maxW = 475;
+        const cellH = Math.max(3, Math.min(5, Math.floor((maxH - axisH) / p.layout.rows)));
         const cellW = Math.max(cellH, Math.min(3 * cellH, Math.floor((maxW - axisW) / p.layout.cols)));
         const w = p.layout.cols * cellW + axisW;
         const h = p.layout.rows * cellH + axisH;
@@ -312,12 +312,12 @@ PAYLOAD.columns.forEach((col,ci)=>{
         }},
       grid:{left:38,right:8,top:8,bottom:42},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],name:'bank',nameLocation:'middle',nameGap:22,
-        nameTextStyle:{color:'#6b7280',fontSize:11},axisLine:{lineStyle:{color:'#2a2d33'}},
-        axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
+        nameTextStyle:{color:'#6b7280',fontSize:13},axisLine:{lineStyle:{color:'#2a2d33'}},
+        axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       yAxis:{type:'category',data:[...Array(WARP).keys()],inverse:true,name:'lane',
-        nameLocation:'middle',nameGap:28,nameTextStyle:{color:'#6b7280',fontSize:11},
+        nameLocation:'middle',nameGap:28,nameTextStyle:{color:'#6b7280',fontSize:13},
         axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
-        axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
+        axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       series:[{type:'heatmap',data:md,progressive:0,
         itemStyle:{borderRadius:2,borderColor:'#161a21',borderWidth:1},
         emphasis:{itemStyle:{borderColor:'#fff',borderWidth:1.5}},
@@ -331,9 +331,9 @@ PAYLOAD.columns.forEach((col,ci)=>{
       grid:{left:38,right:8,top:6,bottom:22},
       xAxis:{type:'category',data:[...Array(BANKS).keys()],
         axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
-        axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
+        axisLabel:{color:'#6b7280',fontSize:12,interval:3,showMaxLabel:true,showMinLabel:true}},
       yAxis:{type:'value',min:0,max:8,splitLine:{lineStyle:{color:'#1c212b'}},
-        axisLabel:{color:'#6b7280',fontSize:10},axisLine:{show:false},axisTick:{show:false}},
+        axisLabel:{color:'#6b7280',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
       series:[{type:'bar',data:p.distinct_addrs.map(c=>({value:c,itemStyle:{
         color:{type:'linear',x:0,y:0,x2:0,y2:1,
           colorStops:[{offset:0,color:cellColor(c)},{offset:1,color:cellColor(c)+'55'}]},
@@ -424,14 +424,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
       xAxis:{
         type:'category', data:[...Array(lay.cols).keys()],
         axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:9,
+        axisLabel:{color:'#6b7280', fontSize:11,
           interval: Math.max(0, Math.floor(lay.cols/8) - 1),
           showMaxLabel: true, showMinLabel: true},
       },
       yAxis:{
         type:'category', data:[...Array(lay.rows).keys()], inverse:true,
         axisLine:{lineStyle:{color:'#2a2d33'}}, axisTick:{show:false},
-        axisLabel:{color:'#6b7280', fontSize:9,
+        axisLabel:{color:'#6b7280', fontSize:11,
           interval: Math.max(0, Math.floor(lay.rows/8) - 1),
           showMaxLabel: true, showMinLabel: true},
       },
