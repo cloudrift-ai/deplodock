@@ -157,7 +157,7 @@ HTML = """<!doctype html>
   .v-ok{color:#3ddc84;} .v-ok .dot{background:#3ddc84;}
   .v-warn{color:#ffb454;} .v-warn .dot{background:#ffb454;}
   .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
-  .matrix{width:100%;height:240px;}
+  .matrix{width:100%;height:240px;margin-bottom:14px;}
   .hist{width:100%;height:100px;margin-top:4px;}
   .ladder{width:100%;margin-top:8px;}
   .ladder-title{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);
@@ -267,7 +267,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
       xAxis:{type:'category',data:[...Array(BANKS).keys()],
         axisLine:{lineStyle:{color:'#2a2d33'}},axisTick:{show:false},
         axisLabel:{color:'#6b7280',fontSize:10,interval:3,showMaxLabel:true,showMinLabel:true}},
-      yAxis:{type:'value',splitLine:{lineStyle:{color:'#1c212b'}},
+      yAxis:{type:'value',min:0,max:8,splitLine:{lineStyle:{color:'#1c212b'}},
         axisLabel:{color:'#6b7280',fontSize:10},axisLine:{show:false},axisTick:{show:false}},
       series:[{type:'bar',data:p.distinct_addrs.map(c=>({value:c,itemStyle:{
         color:{type:'linear',x:0,y:0,x2:0,y2:1,
