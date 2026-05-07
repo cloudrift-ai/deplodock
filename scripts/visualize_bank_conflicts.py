@@ -454,7 +454,7 @@ def main() -> None:
         print(f"{label}: {len(panels)} probes, ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}")
         columns.append(
             {
-                "label": f"{label} · ΣLDS.32={scalar_total}  ΣLDS.128={vec_total}",
+                "label": label,
                 "panels": _serialize(panels, all_panels_for_union=union_panels),
             }
         )
