@@ -126,6 +126,7 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
         out.append(
             {
                 "panel_title": f"{p.stage_name} ← {p.buf}",
+                "buf_short": p.buf,
                 "formula": (f"{p.stage_class}({p.rows}×{p.cols})  " + (f"pad={p.pad}" if p.pad and any(p.pad) else "no pad")),
                 "lane_banks": p.lane_banks,
                 "lane_addr_idx": lane_addr_idx,
@@ -185,14 +186,13 @@ HTML = """<!doctype html>
   .v-ok{color:#3ddc84;} .v-ok .dot{background:#3ddc84;}
   .v-warn{color:#ffb454;} .v-warn .dot{background:#ffb454;}
   .v-bad{color:#ff5c7a;} .v-bad .dot{background:#ff5c7a;}
-  /* Punchcard cells are 3:1 wide rectangles (96×32 nominal plot area
-     for a 32×32 bank×lane grid). The container fills available width
-     and scales height to maintain the aspect ratio, so cells stay
-     proportional regardless of column width. */
-  .matrix{width:100%;aspect-ratio:96/32;height:auto;margin:0 auto 10px;}
+  /* Square punchcard: 32 banks × 32 lanes is intrinsically square
+     data. Capping width keeps cells visibly square instead of
+     squashed into wide rectangles when the container is stretched. */
+  .matrix{width:100%;max-width:320px;aspect-ratio:1/1;height:auto;margin:0 auto 10px;}
   /* Histogram shares the bank axis with the punchcard above —
-     match its width so banks line up vertically. */
-  .hist{width:100%;height:80px;margin:2px auto 0;}
+     match its max-width so banks line up vertically. */
+  .hist{width:100%;max-width:320px;height:80px;margin:2px auto 0;}
   .ladder{margin:4px auto 0;}
   .ladder-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
     margin-top:10px;margin-bottom:4px;}
@@ -202,7 +202,7 @@ HTML = """<!doctype html>
   .bank-legend i{width:8px;height:8px;border-radius:2px;display:inline-block;flex-shrink:0;}
   .bank-legend-shared{margin-top:14px;font-size:10px;}
   .hist-legend{display:flex;flex-wrap:wrap;gap:4px 12px;margin:6px auto 0;
-    width:100%;font-size:10px;color:var(--muted);}
+    width:100%;max-width:320px;font-size:10px;color:var(--muted);}
   .hist-legend span{display:inline-flex;align-items:center;gap:5px;}
   .hist-legend i{width:9px;height:9px;border-radius:2px;display:inline-block;}
   .empty{color:var(--muted);font-size:12px;padding:32px 16px;text-align:center;
@@ -253,7 +253,7 @@ PAYLOAD.columns.forEach((col,ci)=>{
     const id=`c${ci}_p${pi}`;
     const card=document.createElement('div');card.className='card';
     card.innerHTML=`
-      <div class="ladder-title" style="margin-top:0">bank access punchcard — ${p.panel_title}</div>
+      <div class="ladder-title" style="margin-top:0">bank access punchcard — ${p.buf_short}</div>
       <div class="matrix" id="m_${id}"></div>
       <div class="hist" id="h_${id}"></div>
       <div class="hist-legend">
@@ -263,15 +263,14 @@ PAYLOAD.columns.forEach((col,ci)=>{
       </div>
       <div class="ladder-title">smem layout — bank per (row, col)</div>
       <div class="ladder" id="l_${id}" style="${(()=>{
-        // Square cells: pick one cell-size px, then size container to
-        // (cols*N + axis_w) × (rows*N + axis_h). Caps cell-size if the
-        // total height would otherwise blow past 360px.
-        const axisW = 38, axisH = 24;
-        const maxH = 360;
-        const N = Math.max(3, Math.min(6, Math.floor((maxH - axisH) / p.layout.rows)));
-        const w = p.layout.cols * N + axisW;
+        // 3:1 wide rectangles for ladder cells (cell_w = 3 × cell_h).
+        // Container fills column; height = rows × cell_h + axis. Cell
+        // height is computed to keep total ≤ 360 px while ensuring the
+        // 3× wider cells don't exceed 100% column width.
+        const axisH = 24, maxH = 360;
+        const N = Math.max(2, Math.min(6, Math.floor((maxH - axisH) / p.layout.rows)));
         const h = p.layout.rows * N + axisH;
-        return `width:${w}px; height:${h}px`;
+        return `width:100%; height:${h}px`;
       })()}"></div>
       ${p.notes.length ? `<div class="card-notes">${p.notes.join('<br/>')}</div>` : ''}`;
     colEl.appendChild(card);
