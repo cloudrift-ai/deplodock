@@ -18,7 +18,7 @@
   Honors the ``--target sm_NN`` CLI override.
 - :func:`load_thread_axis_coeffs` / :func:`max_bank_conflict` —
   bank-conflict analysis for body Loads of a staged buffer. Used by
-  ``013_pad_smem`` (cp.async / sync stages, +1 padding).
+  ``014_pad_smem`` (cp.async / sync stages, +1 padding).
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -66,7 +66,7 @@ def is_matmul_reduce(loop: Loop) -> bool:
     K is ``loop.axis.name``) plus at least one ``Accum``.
 
     Doesn't check body purity — that lives in :func:`is_matmul_k_outer`.
-    Used directly by ``002_tile_matmul_k`` (which needs to fire on
+    Used directly by ``002_chunk_matmul_k`` (which needs to fire on
     matmul-shaped reduces wherever they sit, not only at the top level
     under a K-outer wrapper).
     """
@@ -115,7 +115,7 @@ def is_matmul_k_outer(
     structural gates pass; rules layer their own constraints (e.g.
     ``≥2 K-indexed buffers`` for register_tile, ``≥1 Stage in
     k_outer.body`` for double_buffer, ``no cross-loop SSA reads`` for
-    pipeline_async) via this hook so the structural part stays in one
+    pipeline_k_outer) via this hook so the structural part stays in one
     place. Idempotence-style markers go in extra_gate too.
     """
     if not (isinstance(loop, Loop) and not loop.is_reduce):
@@ -132,7 +132,7 @@ def is_matmul_k_outer(
 
 
 # ---------------------------------------------------------------------------
-# Bank-conflict analysis (used by 014c pad pass)
+# Bank-conflict analysis (used by 014_pad_smem)
 # ---------------------------------------------------------------------------
 
 
@@ -153,7 +153,7 @@ def load_thread_axis_coeffs(
     Returns ``None`` if any Load is non-affine in the thread-axis vars
     or its index doesn't match the expected dim count — caller skips
     conservatively. ``leading_phase_dim=True`` strips the leading phase
-    index (added by ``009_double_buffer`` for ``BufferedStage`` Loads):
+    index (added by ``010_double_buffer`` for ``BufferedStage`` Loads):
     phase is uniform across threads, contributing no bank-distribution
     effect, so dropping it doesn't change the analysis.
     """

@@ -22,7 +22,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 # M and N must each exceed the per-axis matmul tile widths from
 # ``tuning.thread_tile_shape`` so blockify_launch actually splits each
 # axis into BLOCK + THREAD. Defaults are (BN=128, BM=64); pick 256²
-# to leave headroom on both. K > BK so tile_matmul_k fires.
+# to leave headroom on both. K > BK so chunk_matmul_k fires.
 _M, _K, _N = 256, 64, 256
 
 
@@ -76,33 +76,33 @@ def _make_matmul_then_elwise() -> Graph:
 def test_plain_matmul_fires_split_k_and_blockify(recording_dump):
     run_pipeline(_make_plain_matmul(), TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "tile_matmul_k" in fired
+    assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
     run_pipeline(_make_elwise_lhs_matmul(), TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "tile_matmul_k" in fired
+    assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
     run_pipeline(_make_two_elwise_lhs_matmul(), TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "tile_matmul_k" in fired
+    assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_matmul_then_elwise_fires_split_k_and_blockify(recording_dump):
     run_pipeline(_make_matmul_then_elwise(), TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "tile_matmul_k" in fired
+    assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_pure_elementwise_does_not_fire_split_k(recording_dump):
-    """No matmul-shaped reduce → ``tile_matmul_k`` must not fire, but
+    """No matmul-shaped reduce → ``chunk_matmul_k`` must not fire, but
     ``blockify_launch`` still does (every TileOp gets launch geometry)."""
     g = Graph()
     _input(g, "x", (_M, _N))
@@ -112,7 +112,7 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
 
     run_pipeline(g, TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "tile_matmul_k" not in fired
+    assert "chunk_matmul_k" not in fired
     assert "blockify_launch" in fired
 
 
@@ -133,7 +133,7 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    # Pure elementwise → tile_matmul_k raises RuleSkipped (no matmul-shaped
+    # Pure elementwise → chunk_matmul_k raises RuleSkipped (no matmul-shaped
     # reduce) and cooperative_reduce raises (no reduce Loop). The engine's
     # ``debug_on`` gate keys off the engine logger's level — bump that to
     # DEBUG so ``emit`` actually fires.
@@ -145,7 +145,7 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
 
     out = capsys.readouterr().out
     skip_messages = [ln for ln in out.splitlines() if ln.startswith("--- ") and "skipped" in ln]
-    assert any("tile_matmul_k" in m for m in skip_messages), skip_messages
+    assert any("chunk_matmul_k" in m for m in skip_messages), skip_messages
     assert any("cooperative_reduce" in m for m in skip_messages), skip_messages
 
 
@@ -153,4 +153,4 @@ def test_strip_prefix_handles_letter_suffix():
     assert strip_rule_prefix("004_cooperative_reduce") == "cooperative_reduce"
     assert strip_rule_prefix("004b_cooperative_reduce") == "cooperative_reduce"
     assert strip_rule_prefix("001_tileify") == "tileify"
-    assert strip_rule_prefix("tile_matmul_k") == "tile_matmul_k"
+    assert strip_rule_prefix("chunk_matmul_k") == "chunk_matmul_k"

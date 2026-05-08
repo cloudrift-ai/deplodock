@@ -197,6 +197,13 @@ class Var(_ExprOps):
         return frozenset({self.name})
 
     def render(self, ctx, parent_prec: int = 0) -> str:
+        # If this SSA name was bound by a literal-constant Load, inline the
+        # literal value instead of emitting the variable name. ``render_body``
+        # populates ``literal_ssa`` after scanning the body and skips the
+        # corresponding ``Load`` decl.
+        lit_map = getattr(ctx, "literal_ssa", None)
+        if lit_map and self.name in lit_map:
+            return _float_lit(lit_map[self.name])
         return self.name
 
     def simplify(self, ctx: SimplifyCtx) -> Expr:

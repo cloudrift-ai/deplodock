@@ -5,7 +5,7 @@ eligibility constraints, replace them all with ``TmaBufferedStage`` and
 append a trailing ``AsyncWait`` so the synchronous-style invariant —
 every async load dominated by a wait before its consumer — holds even
 without pipelining. If any stage is ineligible, leave the whole tile
-alone so ``012_async_copy`` puts every stage on cp.async uniformly.
+alone so ``013_async_copy`` puts every stage on cp.async uniformly.
 
 Mixed TMA + cp.async pipelined K-loops force a per-iter
 ``cp.async.wait_group + __syncthreads`` (otherwise the per-CTA
@@ -65,7 +65,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_ca
 logger = logging.getLogger(__name__)
 
 
-# Swizzle picking moved entirely to ``011_split_inner_for_swizzle``.
+# Swizzle picking moved entirely to ``012_split_inner_for_swizzle``.
 # This pass promotes eligible stages with ``swizzle=NONE``; the follow-up
 # pass picks the mode (and optionally splits the inner axis to fit a
 # wider swizzle) and rewrites body Loads in one place.
@@ -141,7 +141,7 @@ def _process(
     ``k_var`` is the immediate-parent ``Loop`` axis name (or ``None`` if
     the body sits at Tile scope). When set and a TMA stage's ``buffer_count
     >= 2``, the inserted ``AsyncWait`` carries the consumer-side mbar
-    ``slot`` and ``phase`` (matching what ``014_pipeline_async`` sets) so
+    ``slot`` and ``phase`` (matching what ``015_pipeline_k_outer`` sets) so
     the materializer lowers the wait to ``MbarrierWait`` rather than the
     cp.async fallback (which doesn't actually wait for TMA bulk loads)."""
     new_body: list[Stmt] = []

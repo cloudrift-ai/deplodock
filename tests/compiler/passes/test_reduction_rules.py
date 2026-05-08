@@ -31,7 +31,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 # Triggers on single-buffer reductions whose first reduce-axis extent is
 # ≥ WARP_SIZE (32) — the threshold dropped from BLOCK_SIZE so softmax /
 # rmsnorm rows in the 32–128 range get a parallel reduce instead of
-# every thread redundantly walking the row. tile_matmul_k skips
+# every thread redundantly walking the row. chunk_matmul_k skips
 # single-buffer reduces, so they reach cooperative_reduce unchanged.
 
 
@@ -40,7 +40,7 @@ _M, _K, _N = 32, 32, 32
 
 def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     """``sum(x, axis=-1)`` with K=256 → cooperative_reduce fires; matmul-
-    shape rule (tile_matmul_k) does not (single-buffer reduce)."""
+    shape rule (chunk_matmul_k) does not (single-buffer reduce)."""
     g = Graph()
     _input(g, "x", (4, 256))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -50,7 +50,7 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     run_pipeline(g, TILE_PASSES, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" in fired
-    assert "tile_matmul_k" not in fired
+    assert "chunk_matmul_k" not in fired
 
 
 def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
@@ -164,7 +164,7 @@ def test_block_cooperative_still_uses_stage_inputs(recording_dump):
 
 
 def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
-    """Matmul-shape reduce → tile_matmul_k handles K splitting; the
+    """Matmul-shape reduce → chunk_matmul_k handles K splitting; the
     cooperative-reduce strategy is for single-buffer reductions and
     must not fire here."""
     g = Graph()

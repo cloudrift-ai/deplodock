@@ -28,7 +28,7 @@ Env vars:
 
 - ``DEPLODOCK_BN``, ``DEPLODOCK_BM`` — per-CTA tile (innermost N, outer M).
 - ``DEPLODOCK_FN``, ``DEPLODOCK_FM`` — per-thread output cells.
-- ``DEPLODOCK_BK`` — K-split size for ``002_tile_matmul_k`` (subject
+- ``DEPLODOCK_BK`` — K-split size for ``002_chunk_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
 - ``DEPLODOCK_SPLITK_WAVES`` — override the auto-splitk waves target.
@@ -37,14 +37,14 @@ Env vars:
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
   weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
   (Hopper / Blackwell), default-off below. ``=1`` forces on, ``=0``
-  forces off. ``010_tma_copy`` gates eligibility on rank ≤ 5,
+  forces off. ``011_tma_copy`` gates eligibility on rank ≤ 5,
   ConstantOp source with a recorded transpose load_op chain, and
   source-inner-extent alignment ≥ 16 B with ≥ 2× headroom past the
   box inner extent.
 - ``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes
   (``SWIZZLE_{128,64,32}B``). ``=1`` enables; default off. Stages whose
   inner box-dim byte size matches a swizzle width pick the matching
-  mode in ``010_tma_copy``; the materializer pairs each swizzled stage
+  mode in ``011_tma_copy``; the materializer pairs each swizzled stage
   with body-Load XOR decoding and a 1024-byte (B128) / 512-byte (B64)
   / 256-byte (B32) smem alignment so the swizzle pattern lines up with
   the buffer base.
@@ -94,7 +94,7 @@ _TILE_SHAPE_FUSED = (64, 64)
 _F_PER_AXIS_FUSED = (4, 4)
 # "Default-large" class: default-class shapes with enough M to fill
 # the grid benefit from doubling the per-thread N register tile from
-# F_N=4 → F_N=8. The chunk pass (``008b``) keeps LDS.128 vectorized
+# F_N=4 → F_N=8. The chunk pass (``009``) keeps LDS.128 vectorized
 # and prevents the F_N=8 bank-conflict cliff. Sweep on RTX 5090 fp32:
 # qwen.q_proj.s512 0.87× → 0.92× (286 → 266µs), qwen.down_proj.s512
 # 0.79× → 0.86× (1434 → 1331µs), tl.gate_proj.s512 0.95× → 0.99×.
@@ -257,7 +257,7 @@ def _tile_class(tile: Tile | None) -> str:
 
     ``"default-large"`` is the default-class subclass for M ≥ 128 +
     N > _COMPACT_N_MAX + N < _HUGE_N_MIN. F_N=8 (vs F_N=4) doubles
-    arithmetic intensity per thread; the chunk pass (``008b``) keeps
+    arithmetic intensity per thread; the chunk pass (``009``) keeps
     LDS.128 vectorized.
     """
     if tile is None or not _has_matmul_reduce(tile.body):
@@ -379,7 +379,7 @@ def forced_bk(tile: Tile | None = None) -> int | None:
     return _bk_fits_smem(tile, bk)
 
 
-# sm_120 hard cap is 48 KB static smem; 013_pad_smem adds +1
+# sm_120 hard cap is 48 KB static smem; 014_pad_smem adds +1
 # row of padding per stage to break 32-way bank conflicts, so reserve
 # ~4 KB of headroom for that swelling.
 _SMEM_BUDGET_BYTES = 44 * 1024

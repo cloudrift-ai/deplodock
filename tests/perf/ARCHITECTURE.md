@@ -55,15 +55,19 @@ matching the pattern in `scripts/bench_block.py:194-202`.
 deplodock_us` ascending — losses (ratio < 1) first:
 
 ```
-op       case                       shape                   torch_us  depl_us  ratio  launches
--------  -------------------------  ----------------------  --------  -------  -----  --------
-matmul   matmul.qwen.gate_proj.s512 (1,512,3584) x (3584,18944)  1230.0  2890.4  0.43x         1
-rmsnorm  rmsnorm.tinyllama.s512     (1,512,2048) x (2048,)         12.1    9.8   1.23x         1
+case                       shape                          torch_us  depl_us  ratio  launches
+-------------------------  -----------------------------  --------  -------  -----  --------
+matmul.qwen.gate_proj.s512 (1,512,3584) x (3584,18944)      1230.0   2890.4  0.43x         1
+rmsnorm.tinyllama.s512     (1,512,2048) x (2048,)             12.1      9.8  1.23x         1
 ...
 ```
 
 The same data is dumped to `tests/perf/.results/<utc-timestamp>.json` for
-cross-run diffing. `DEPLODOCK_GIT_REV` is recorded if set.
+cross-run diffing. `DEPLODOCK_GIT_REV` is recorded if set. A self-contained
+ECharts plot of `ratio` per case (sorted ascending, bars colored by op,
+optional `torch.compile` overlay) is written next to the JSON as
+`<utc-timestamp>.html` — open it in a browser; no server needed (the chart
+loads ECharts from the jsDelivr CDN).
 
 ## Adding a case
 

@@ -162,25 +162,23 @@ class Tile(Stmt):
           extents.
         """
         pad = _pad(ctx.indent)
-        inner = ctx.child()
         if self.block_axes:
-            out = [f"{pad}{{"]
-            out.extend(_render_grid_axis_decode(self.block_axes, "blockIdx.x", inner))
-            out.extend(_render_grid_axis_decode(self.thread_axes, "threadIdx.x", inner))
+            # Stay at the kernel's own brace level — the surrounding ``{ ... }``
+            # is already provided by the ``__global__ void k(...) { ... }``
+            # function body, so no extra inner scope is needed.
+            out: list[str] = []
+            out.extend(_render_grid_axis_decode(self.block_axes, "blockIdx.x", ctx))
+            out.extend(_render_grid_axis_decode(self.thread_axes, "threadIdx.x", ctx))
             # Lane / warp helpers for hierarchical warp-shuffle combines.
-            # Cheap (two bit-ops, register-resident) and only emitted for
-            # multi-warp cooperative tiles where they're actually used.
-            n_threads = 1
-            for ax in self.thread_axes:
-                n_threads *= int(ax.extent)
-            if n_threads > 32:
-                inner_pad = _pad(inner.indent)
-                out.append(f"{inner_pad}int lane = threadIdx.x & 31;")
-                out.append(f"{inner_pad}int warp = threadIdx.x >> 5;")
-            out.extend(render_body(self.body, inner))
-            out.append(f"{pad}}}")
+            # Only emit when the body actually references them — avoids the
+            # noise of unused decls in pointwise / matmul kernels.
+            if _body_uses_lane_warp(self.body):
+                out.append(f"{pad}int lane = threadIdx.x & 31;")
+                out.append(f"{pad}int warp = threadIdx.x >> 5;")
+            out.extend(render_body(self.body, ctx))
             return out
 
+        inner = ctx.child()
         n_threads = 1
         for ax in self.thread_axes:
             n_threads *= int(ax.extent)
@@ -192,6 +190,21 @@ class Tile(Stmt):
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
         return out
+
+
+def _body_uses_lane_warp(body: Body) -> bool:
+    """True iff the body needs the ``lane`` / ``warp`` helper vars.
+
+    The materializer emits ``lane`` / ``warp`` use sites alongside
+    ``WarpShuffle`` and ``TreeHalve`` (the per-warp partial gate
+    ``if (lane == 0)``, ``TreeHalve(..., tid_var="warp")``), so checking
+    for those two primitives covers every kernel that references
+    either helper.
+    """
+    # Local import — kernel-IR primitives sit in a downstream module.
+    from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
+
+    return bool(body.iter_of_type(WarpShuffle, TreeHalve))
 
 
 def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderCtx) -> list[str]:

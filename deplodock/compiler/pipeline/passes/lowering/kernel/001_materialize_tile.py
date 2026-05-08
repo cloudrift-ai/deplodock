@@ -118,7 +118,7 @@ def _materialize(blk: Tile) -> Stmt:
     rename: dict[str, str] = {}
 
     # Body-Load XOR decode for TMA-swizzled stages is now handled by
-    # ``011_split_inner_for_swizzle`` (which both picks the swizzle mode
+    # ``012_split_inner_for_swizzle`` (which both picks the swizzle mode
     # AND rewrites Loads). Materialize just sees the post-rewrite IR.
 
     def transform(s: Stmt) -> Stmt:
@@ -143,7 +143,7 @@ def _materialize(blk: Tile) -> Stmt:
     # multiple K-loops over different stage sets (e.g. SDPA P@V whose
     # softmax-max + softmax-sum + weighted-V reduces have different stage
     # multiplicities) gets per-loop arrive counts and its mbar waits
-    # don't deadlock. ``010_tma_copy`` enforces all-or-nothing TMA
+    # don't deadlock. ``011_tma_copy`` enforces all-or-nothing TMA
     # promotion per tile, so any tile with TMA stages is guaranteed to
     # have no cp.async stages in the same pipelined K-loop and the
     # AsyncWait lowering can stay as a pure ``MbarrierWait``.
@@ -176,7 +176,7 @@ def _materialize(blk: Tile) -> Stmt:
 
     def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
         # TMA path: wait carries the explicit consumer-side phase + slot
-        # set by 014_pipeline_async. The wait targets its pipeline-unit
+        # set by 015_pipeline_k_outer. The wait targets its pipeline-unit
         # group's mbar (each group has its own mbar with arrive count
         # == num distinct stages in that group).
         if stmt.phase is not None and has_tma:
@@ -200,7 +200,7 @@ def _materialize(blk: Tile) -> Stmt:
         # supplies the origin and the slab is scalar in that dim.
         # Per-source-dim box product. When two or more cache axes map to
         # the same source dim, multiplying yields the total slab span on
-        # that dim — except when ``011_split_inner_for_swizzle`` has
+        # that dim — except when ``012_split_inner_for_swizzle`` has
         # split the inner axis: there we want the descriptor to *see* the
         # split as separate inner box dims (so the innermost matches the
         # swizzle width). Detect a tail repeat in ``addressing.dims`` and
@@ -386,7 +386,49 @@ def _materialize(blk: Tile) -> Stmt:
             prologue.append(Cond(cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")), body=tuple(mbar_inits)))
             prologue.append(Sync())
         new_body = prologue + new_body
-    return Tile(axes=axes, body=new_body)
+    return Tile(axes=axes, body=_drop_redundant_syncs(new_body))
+
+
+def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
+    """Drop ``Sync`` stmts that are guaranteed no-ops at the body level:
+
+    * Two consecutive ``Sync`` stmts collapse to one.
+    * A leading ``Sync`` before any smem access is unnecessary — at kernel
+      entry no thread can hold a stale view of smem because nothing has
+      been written yet.
+
+    Only handles the body-level (no descent into nested ``Loop`` / ``Cond``
+    bodies); the bulk of redundant syncs come from materializer templates
+    that emit a defensive ``Sync()`` at template boundaries, and those
+    surface here.
+    """
+    smem_seen = False
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Sync):
+            if not smem_seen:
+                continue  # nothing for the sync to fence yet
+            if out and isinstance(out[-1], Sync):
+                continue  # back-to-back sync collapses
+        else:
+            if isinstance(
+                s,
+                (
+                    Smem,
+                    MbarrierInit,
+                    MbarrierArriveExpectTx,
+                    MbarrierWait,
+                    TmaLoad,
+                    CpAsyncCopy,
+                    CpAsyncCommit,
+                    CpAsyncWait,
+                    TreeHalve,
+                    WarpShuffle,
+                ),
+            ):
+                smem_seen = True
+        out.append(s)
+    return out
 
 
 def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
@@ -484,7 +526,7 @@ def _partition_tma_groups(
             continue
         if isinstance(stmt, AsyncWait):
             # Trailing epilogue wait pairs with the most recent
-            # pipeline-unit group (014_pipeline_async always emits one
+            # pipeline-unit group (015_pipeline_k_outer always emits one
             # epilogue AsyncWait after its main loop). If there's no
             # pipeline group in scope but pending synchronous stages
             # exist, the wait pairs them with the next-to-be-flushed
@@ -576,7 +618,8 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
             ),
             Sync(),
             TreeHalve(buf=smem_name, op=accum.op, length=n_warps, tid_var="warp"),
-            Sync(),
+            # TreeHalve's render ends each loop iter with __syncthreads(), so a
+            # trailing Sync here would be a no-op pair with the loop's last sync.
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
         ]
     smem_name = f"{accum.name}_smem"
@@ -585,7 +628,7 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
         Write(output=smem_name, index=(Var(t),), value=accum.name),
         Sync(),
         TreeHalve(buf=smem_name, op=accum.op, length=n_threads, tid_var=t),
-        Sync(),
+        # See note above on TreeHalve's trailing sync.
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
 
