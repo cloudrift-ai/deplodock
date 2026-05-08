@@ -29,6 +29,7 @@ import os
 
 from deplodock.compiler.diagnostics.bank_conflicts import BankConflictResult, simulate_graph
 from deplodock.compiler.graph import Graph
+from deplodock.visualize.page import render_html
 
 
 def graph_from_ir_path(path: str) -> Graph:
@@ -151,24 +152,8 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
     return out
 
 
-HTML = """<!doctype html>
-<html lang="en" data-theme="__THEME__">
-<head>
-<meta charset="utf-8" />
-<title>smem bank conflicts (IR-driven)</title>
-<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-<style>
-  :root[data-theme="dark"] {
-    --bg:transparent; --fg:#e8eaed; --muted:#6b7280;
-    --rule:rgba(255,255,255,.06); --label-accent:#7dd3fc;
-  }
-  :root[data-theme="light"] {
-    --bg:transparent; --fg:#1f2937; --muted:#4b5563;
-    --rule:rgba(0,0,0,.08); --label-accent:#0369a1;
-  }
+EXTRA_CSS = """
   *{box-sizing:border-box;}
-  html,body{margin:0;background:transparent;color:var(--fg);
-    font-family:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;}
   /* Center the column grid + shared legend horizontally; shrink to
      content width so unused horizontal space sits outside the page. */
   .page{display:flex;flex-direction:column;align-items:center;margin:0;padding:0;}
@@ -227,36 +212,23 @@ HTML = """<!doctype html>
   .legend{display:flex;gap:18px;margin-top:28px;color:var(--muted);font-size:12px;}
   .legend span{display:inline-flex;align-items:center;gap:8px;}
   .legend i{width:10px;height:10px;border-radius:3px;display:inline-block;}
-</style>
-</head>
-<body>
+"""
+
+BODY_HTML = """
   <div class="page">
     <div class="page-grid" id="page-grid"></div>
   </div>
-<script>
-const PAYLOAD = __PAYLOAD__;
-const THEME = __THEME_JS__;
+"""
+
+# PALETTE_1 — used for the smem-layout ladder ("color = bank id").
+# PALETTE_2 — used for the lane×bank punch card ("color = address index").
+# Both are 32-color qualitative palettes from deplodock.visualize.theme;
+# kept visually disjoint so a reader never confuses one plot for the other.
+SCRIPTS_JS = r"""
 const WARP=32, BANKS=32;
-const palette={empty:THEME.empty,ok:'#3ddc84',warn:'#ffb454',bad:'#ff5c7a'};
+const palette={empty:THEME.empty,ok:STATUS.ok,warn:STATUS.warn,bad:STATUS.bad};
 const cellColor=c=>c===0?palette.empty:c===1?palette.ok:c<=4?palette.warn:palette.bad;
 const verdict=m=>m>4?'v-bad':m>1?'v-warn':'v-ok';
-// Two distinct palettes — keep "color = bank" (smem layout) and
-// "color = address" (punch card) visually independent so the reader
-// doesn't conflate them.
-//
-// BANK_PALETTE: 32 distinct hues (one per smem bank). Same color =
-// same bank, so two highlighted cells sharing a color in the layout
-// land on the same bank — direct visual cue for a bank conflict.
-const BANK_PALETTE=['#7dd3fc','#3ddc84','#ffb454','#ff5c7a','#c084fc','#fcd34d','#67e8f9','#fb923c',
-                    '#a3e635','#f472b6','#60a5fa','#34d399','#fde047','#fb7185','#818cf8','#facc15',
-                    '#0ea5e9','#16a34a','#d97706','#dc2626','#9333ea','#ca8a04','#0891b2','#ea580c',
-                    '#65a30d','#db2777','#1d4ed8','#059669','#a16207','#be123c','#4338ca','#b45309'];
-// ADDR_PALETTE: warm-only palette (yellows, oranges, reds, browns) used
-// in the lane×bank punch card. A warp typically has 1-4 distinct
-// addresses per Load, so a short palette is fine. Warm-only avoids
-// overlap with the cool/rainbow BANK_PALETTE — the reader can tell at
-// a glance which plot a color belongs to.
-const ADDR_PALETTE=['#fde047','#fb923c','#ef4444','#a3a3a3','#facc15','#fdba74','#dc2626','#78350f'];
 
 // Layout: one page-grid with N columns (one per IR variant). Rows
 // alternate between shared titles (spanning all columns, left-justified)
@@ -369,7 +341,7 @@ PAYLOAD.columns.forEach((col, ci) => {
       // Different colors stacked in one bank column = different addresses
       // serialized = real bank conflict.
       const addrIdx = p.lane_addr_idx[lane];
-      const color = ADDR_PALETTE[addrIdx % ADDR_PALETTE.length];
+      const color = PALETTE_2[addrIdx % PALETTE_2.length];
       md.push({
         value:[bank,lane,1],
         itemStyle:{color: color, shadowBlur:6, shadowColor:color+'66'},
@@ -440,7 +412,7 @@ PAYLOAD.columns.forEach((col, ci) => {
         const isPad = (c >= lay.data_cols) || (r >= lay.data_rows);
         const k = `${r},${c}`;
         const isNow = (touchedNow.get(k) || []).length > 0;
-        const color = isPad ? THEME.padCell : BANK_PALETTE[bank % BANK_PALETTE.length];
+        const color = isPad ? THEME.padCell : PALETTE_1[bank % PALETTE_1.length];
         const op = isNow ? THEME.opFocus : THEME.opFaint;
         const style = {color: color, opacity: op};
         if (isNow) {
@@ -527,53 +499,26 @@ PAYLOAD.columns.forEach((col, ci) => {
   if (!host) return;
   [...banksUsed].sort((a,b)=>a-b).forEach(bank => {
     const chip = document.createElement('span');
-    chip.innerHTML = `<i style="background:${BANK_PALETTE[bank % BANK_PALETTE.length]}"></i>bank ${bank}`;
+    chip.innerHTML = `<i style="background:${PALETTE_1[bank % PALETTE_1.length]}"></i>bank ${bank}`;
     host.appendChild(chip);
   });
 })();
-</script>
-</body>
-</html>
 """
 
 
-_THEMES = {
-    "dark": {
-        "empty": "#2a2d33",
-        "tooltipBg": "#0e1014",
-        "tooltipText": "#e8eaed",
-        "axisLine": "#2a2d33",
-        "splitLine": "#1c212b",
-        "padCell": "#3a3f48",
-        "opFocus": 1.0,
-        "opFaint": 0.45,
-        "focusBorder": "#ffffff",
-    },
-    "light": {
-        "empty": "#b8bec7",
-        "tooltipBg": "#ffffff",
-        "tooltipText": "#0f172a",
-        "axisLine": "#6b7280",
-        "splitLine": "#9ca3af",
-        "padCell": "#64748b",
-        "opFocus": 1.0,
-        "opFaint": 0.45,
-        "focusBorder": "#0f172a",
-    },
-}
-
-
-def emit_html(columns: list[dict], out_path: str, theme: str = "dark") -> None:
-    n = max(1, len(columns))
-    html = (
-        HTML.replace("__MAXW__", str(min(2200, 480 * n + 80)))
-        .replace("__NCOL__", str(n))
-        .replace("__THEME__", theme)
-        .replace("__THEME_JS__", json.dumps(_THEMES[theme]))
-        .replace("__PAYLOAD__", json.dumps({"columns": columns}))
+def emit_html(columns: list[dict], out_path: str, theme: str = "dark", *, transparent: bool = True) -> str:
+    payload_js = f"const PAYLOAD = {json.dumps({'columns': columns})};\n"
+    html = render_html(
+        body_html=BODY_HTML,
+        scripts_js=payload_js + SCRIPTS_JS,
+        theme=theme,
+        title="smem bank conflicts (IR-driven)",
+        extra_css=EXTRA_CSS,
+        transparent=transparent,
     )
     with open(out_path, "w") as f:
         f.write(html)
+    return html
 
 
 def _parse_ir_arg(arg: str) -> tuple[str, str]:
@@ -601,6 +546,15 @@ def main() -> None:
     p.add_argument("--warp-id", type=int, default=0)
     p.add_argument("--out", default="/tmp/bank_conflicts.html")
     p.add_argument("--theme", choices=("dark", "light"), default="dark")
+    p.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Also render to image (format from suffix: .png/.jpg/.webp/.pdf/.svg). Repeatable. Requires '.[visualize]' extra.",
+    )
+    p.add_argument("--transparent", dest="transparent", action="store_true", default=True)
+    p.add_argument("--no-transparent", dest="transparent", action="store_false")
     args = p.parse_args()
 
     stage_filter = set(args.stage) if args.stage else None
@@ -635,8 +589,14 @@ def main() -> None:
             }
         )
 
-    emit_html(columns, args.out, theme=args.theme)
+    html = emit_html(columns, args.out, theme=args.theme, transparent=args.transparent)
     print(f"saved {args.out}")
+
+    for image_path in args.image:
+        from deplodock.visualize.image import render as render_image
+
+        render_image(html, image_path, transparent=args.transparent)
+        print(f"saved {image_path}")
 
 
 if __name__ == "__main__":

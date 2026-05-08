@@ -17,9 +17,10 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff"]
 compile = ["torch", "transformers", "cppyy==3.5.0", "safetensors"]
+visualize = ["playwright>=1.40"]
 # flash-attn requires torch at build time, install separately:
 #   pip install flash-attn --no-build-isolation
-dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0", "safetensors"]
+dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0", "safetensors", "playwright>=1.40"]
 
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
