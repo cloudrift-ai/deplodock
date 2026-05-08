@@ -11,7 +11,7 @@ Cross-checks four points in the env-flag matrix:
 
 Pinned to a matmul size large enough that the K-outer pipeline + the
 swizzle decoder both fire (``N=384`` triggers ``010_double_buffer``,
-``011_tma_copy``, and ``015_pipeline_async``). Swizzle-on at the
+``011_tma_copy``, and ``015_pipeline_k_outer``). Swizzle-on at the
 default ``BN=128`` geometry stays at ``swizzle=NONE`` (inner = 512 B,
 no swizzle width matches), so the swizzle row only meaningfully runs
 when paired with ``BN=BM=32``.

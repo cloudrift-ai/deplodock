@@ -66,7 +66,7 @@ def is_matmul_reduce(loop: Loop) -> bool:
     K is ``loop.axis.name``) plus at least one ``Accum``.
 
     Doesn't check body purity — that lives in :func:`is_matmul_k_outer`.
-    Used directly by ``002_tile_matmul_k`` (which needs to fire on
+    Used directly by ``002_chunk_matmul_k`` (which needs to fire on
     matmul-shaped reduces wherever they sit, not only at the top level
     under a K-outer wrapper).
     """
@@ -115,7 +115,7 @@ def is_matmul_k_outer(
     structural gates pass; rules layer their own constraints (e.g.
     ``≥2 K-indexed buffers`` for register_tile, ``≥1 Stage in
     k_outer.body`` for double_buffer, ``no cross-loop SSA reads`` for
-    pipeline_async) via this hook so the structural part stays in one
+    pipeline_k_outer) via this hook so the structural part stays in one
     place. Idempotence-style markers go in extra_gate too.
     """
     if not (isinstance(loop, Loop) and not loop.is_reduce):

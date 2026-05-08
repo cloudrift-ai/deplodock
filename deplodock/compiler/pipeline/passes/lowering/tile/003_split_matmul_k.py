@@ -2,7 +2,7 @@
 multiple CTAs cooperate on each ``(M, N)`` output tile and atomic-add
 their partial sums.
 
-Runs after ``002_tile_matmul_k`` (which produced the
+Runs after ``002_chunk_matmul_k`` (which produced the
 ``Loop(K_o, body=(Loop(K_i, reduce, ...),))`` chunk structure) and
 before ``005_blockify_launch`` (so the new ``K_split`` axis enters
 ``Tile.axes`` and is partitioned to ``BIND_BLOCK`` like any other free

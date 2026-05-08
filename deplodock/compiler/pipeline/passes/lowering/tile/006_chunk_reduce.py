@@ -7,7 +7,7 @@ axis appearing in the Load index, the candidate slab is
 ``16 × 512 × 4 B = 32 KB`` — over budget, so staging emits nothing and
 the kernel runs with no shared-memory reuse.
 
-Matmul reduces are already chunked by ``002_tile_matmul_k`` (which runs
+Matmul reduces are already chunked by ``002_chunk_matmul_k`` (which runs
 before launch geometry). This rule covers the remaining reduce shapes.
 
 Runs *after* ``005_blockify_launch`` so the trigger can inspect
@@ -24,7 +24,7 @@ Trigger — for a reduce ``Loop(K, body=B)`` inside a ``TileOp``'s ``Tile``:
   ``K × prod(in_axis_extents) × 4 B`` exceeds
   ``007_stage_inputs._MAX_SLAB_BYTES`` (16 KB). Chunking when the slab
   already fits would just bloat IR without enabling new staging.
-- The Loop is not matmul-shaped (deferred to ``002_tile_matmul_k``).
+- The Loop is not matmul-shaped (deferred to ``002_chunk_matmul_k``).
 - The Loop isn't already chunked (immediate body has no nested reduce).
 
 Rewrite::
@@ -95,7 +95,7 @@ def _chunk_in_body(stmts: tuple, thread_axes: tuple[Axis, ...]) -> tuple[tuple, 
 
     Recurses through wrapper Loops / StridedLoops / Conds so reduces
     nested under output-position free loops are reachable. Unlike
-    ``002_tile_matmul_k`` (which fires on the *first* match per body),
+    ``002_chunk_matmul_k`` (which fires on the *first* match per body),
     this pass chunks every qualifying reduce so sibling reductions
     (softmax max, sum, output) all become stage-eligible together.
     """

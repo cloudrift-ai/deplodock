@@ -365,3 +365,164 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     }
     out.write_text(json.dumps(payload, indent=2))
     tw.write_line(f"perf results saved to {out}")
+
+    plot = _RESULTS_DIR / f"{stamp}.html"
+    plot.write_text(_render_plot(rows, stamp))
+    tw.write_line(f"perf plot saved to {plot}")
+
+
+# ---------------------------------------------------------------------------
+# ECharts plot
+# ---------------------------------------------------------------------------
+
+
+def _render_plot(rows: list[PerfRow], stamp: str) -> str:
+    """Render a self-contained HTML page with an Apache ECharts grouped
+    horizontal bar chart of speedup ratio (vs PyTorch eager) per case.
+    Two series: ``torch.compile`` and Deplodock. Eager is the implicit
+    baseline at ratio=1.0 (parity line). Cases sorted by Deplodock
+    ratio ascending so losses cluster at the top.
+
+    Styled for embedding on a dark-themed page: transparent body
+    background and chart canvas; light foreground colors. The chart
+    auto-sizes its height to fit ``len(rows)`` rows."""
+    rows_sorted = sorted(rows, key=lambda r: r.ratio, reverse=True)
+
+    def _tcomp_ratio(r: PerfRow) -> float | None:
+        if r.torch_compile_us is None or r.torch_compile_us <= 0:
+            return None
+        return round(r.torch_us / r.torch_compile_us, 3)
+
+    data = {
+        "names": [r.name for r in rows_sorted],
+        "shapes": [r.shape for r in rows_sorted],
+        "ops": [r.op for r in rows_sorted],
+        "eager_us": [round(r.torch_us, 1) for r in rows_sorted],
+        "tcomp_us": [(round(r.torch_compile_us, 1) if r.torch_compile_us is not None else None) for r in rows_sorted],
+        "depl_us": [round(r.deplodock_us, 1) for r in rows_sorted],
+        "depl_ratio": [round(r.ratio, 3) for r in rows_sorted],
+        "tcomp_ratio": [_tcomp_ratio(r) for r in rows_sorted],
+        "stamp": stamp,
+        "n": len(rows_sorted),
+    }
+    data_json = json.dumps(data)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>deplodock perf — {stamp}</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+  html, body {{ background: transparent; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         margin: 0; padding: 12px; color: #e6e6e6; }}
+  h1 {{ font-size: 15px; margin: 0 0 4px 0; color: #f0f0f0; font-weight: 500; }}
+  .sub {{ font-size: 12px; color: #a0a0a0; margin-bottom: 10px; }}
+  #chart {{ width: 100%; background: transparent; }}
+</style>
+</head>
+<body>
+  <h1>Per-kernel speedup vs PyTorch eager</h1>
+  <div class="sub">FP32 on RTX 5090. Ratio = eager_us / backend_us (higher is faster).
+    Eager is the baseline at 1.0 (dashed line). Sorted by deplodock ratio:
+    wins at top, losses at bottom.</div>
+  <div id="chart"></div>
+<script>
+const D = {data_json};
+const chart = echarts.init(document.getElementById('chart'),
+                           null, {{ renderer: 'canvas' }});
+const rowH = 22, padTop = 60, padBot = 60;
+document.getElementById('chart').style.height =
+  (D.n * rowH + padTop + padBot) + 'px';
+chart.resize();
+
+const COLORS = {{
+  tcomp:   '#ffd166',
+  depl:    '#4dabf7',
+}};
+
+const series = [
+  {{
+    name: 'deplodock / eager',
+    type: 'bar',
+    data: D.depl_ratio,
+    itemStyle: {{ color: COLORS.depl }},
+    barGap: '15%',
+    barCategoryGap: '30%',
+    markLine: {{
+      silent: true,
+      symbol: 'none',
+      lineStyle: {{ type: 'dashed', color: 'rgba(255,255,255,0.35)' }},
+      data: [{{ xAxis: 1, label: {{ formatter: '1.0× (eager)', color: '#a0a0a0' }} }}],
+    }},
+  }},
+  {{
+    name: 'torch.compile / eager',
+    type: 'bar',
+    data: D.tcomp_ratio.map(v => v == null ? '-' : v),
+    itemStyle: {{ color: COLORS.tcomp }},
+  }},
+];
+
+chart.setOption({{
+  backgroundColor: 'transparent',
+  textStyle: {{ color: '#d0d0d0' }},
+  grid: {{ left: 260, right: 50, top: padTop, bottom: padBot, containLabel: false }},
+  legend: {{
+    top: 28,
+    textStyle: {{ color: '#d0d0d0' }},
+    data: series.map(s => s.name),
+    icon: 'rect',
+    itemWidth: 12,
+    itemHeight: 10,
+  }},
+  tooltip: {{
+    trigger: 'axis',
+    axisPointer: {{ type: 'shadow', shadowStyle: {{ color: 'rgba(255,255,255,0.06)' }} }},
+    backgroundColor: 'rgba(20,20,20,0.95)',
+    borderColor: '#444',
+    textStyle: {{ color: '#e0e0e0' }},
+    formatter: (params) => {{
+      const i = params[0].dataIndex;
+      const tr = D.tcomp_ratio[i];
+      const dr = D.depl_ratio[i];
+      const e = D.eager_us[i];
+      const t = D.tcomp_us[i];
+      const d = D.depl_us[i];
+      return [
+        '<b>' + D.names[i] + '</b>',
+        '<span style="color:#888">' + D.shapes[i] + '</span>',
+        '',
+        '<span style="color:#999">■</span> eager: ' + e + ' µs (1.00×)',
+        '<span style="color:' + COLORS.tcomp + '">■</span> torch.compile: ' + (t == null ? '—' : t + ' µs (' + tr.toFixed(2) + '×)'),
+        '<span style="color:' + COLORS.depl  + '">■</span> deplodock: ' + d + ' µs (' + dr.toFixed(2) + '×)',
+      ].join('<br>');
+    }},
+  }},
+  xAxis: {{
+    type: 'value',
+    name: 'speedup vs eager (×)',
+    nameLocation: 'middle',
+    nameGap: 30,
+    nameTextStyle: {{ color: '#a0a0a0' }},
+    axisLine: {{ lineStyle: {{ color: '#555' }} }},
+    axisLabel: {{ color: '#b0b0b0' }},
+    splitLine: {{ lineStyle: {{ color: 'rgba(255,255,255,0.06)' }} }},
+  }},
+  yAxis: {{
+    type: 'category',
+    data: D.names,
+    inverse: true,
+    axisLabel: {{ fontSize: 10, fontFamily: 'monospace', color: '#c0c0c0' }},
+    axisLine: {{ lineStyle: {{ color: '#555' }} }},
+    axisTick: {{ show: false }},
+  }},
+  series: series,
+}});
+
+window.addEventListener('resize', () => chart.resize());
+</script>
+</body>
+</html>
+"""

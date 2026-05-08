@@ -12,7 +12,7 @@ wait before its consumer — holds even without pipelining) when:
 The materializer expands ``AsyncBufferedStage`` to ``Smem`` +
 cooperative ``CpAsyncCopy`` + ``CpAsyncCommit`` only (no implicit wait
 or sync); the explicit ``AsyncWait`` lowers to ``CpAsyncWait(group=0)``
-+ ``Sync()``. The pipelining pass (``015_pipeline_async``) then drops
++ ``Sync()``. The pipelining pass (``015_pipeline_k_outer``) then drops
 these synchronous-style waits and re-emits them at the pipelined
 schedule positions.
 

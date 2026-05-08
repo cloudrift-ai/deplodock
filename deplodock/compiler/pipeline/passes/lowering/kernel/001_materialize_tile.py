@@ -176,7 +176,7 @@ def _materialize(blk: Tile) -> Stmt:
 
     def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
         # TMA path: wait carries the explicit consumer-side phase + slot
-        # set by 015_pipeline_async. The wait targets its pipeline-unit
+        # set by 015_pipeline_k_outer. The wait targets its pipeline-unit
         # group's mbar (each group has its own mbar with arrive count
         # == num distinct stages in that group).
         if stmt.phase is not None and has_tma:
@@ -411,7 +411,21 @@ def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
             if out and isinstance(out[-1], Sync):
                 continue  # back-to-back sync collapses
         else:
-            if isinstance(s, (Smem, MbarrierInit, MbarrierArriveExpectTx, MbarrierWait, TmaLoad, CpAsyncCopy, CpAsyncCommit, CpAsyncWait, TreeHalve, WarpShuffle)):
+            if isinstance(
+                s,
+                (
+                    Smem,
+                    MbarrierInit,
+                    MbarrierArriveExpectTx,
+                    MbarrierWait,
+                    TmaLoad,
+                    CpAsyncCopy,
+                    CpAsyncCommit,
+                    CpAsyncWait,
+                    TreeHalve,
+                    WarpShuffle,
+                ),
+            ):
                 smem_seen = True
         out.append(s)
     return out
@@ -512,7 +526,7 @@ def _partition_tma_groups(
             continue
         if isinstance(stmt, AsyncWait):
             # Trailing epilogue wait pairs with the most recent
-            # pipeline-unit group (015_pipeline_async always emits one
+            # pipeline-unit group (015_pipeline_k_outer always emits one
             # epilogue AsyncWait after its main loop). If there's no
             # pipeline group in scope but pending synchronous stages
             # exist, the wait pairs them with the next-to-be-flushed

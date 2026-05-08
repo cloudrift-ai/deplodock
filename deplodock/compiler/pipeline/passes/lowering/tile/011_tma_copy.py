@@ -141,7 +141,7 @@ def _process(
     ``k_var`` is the immediate-parent ``Loop`` axis name (or ``None`` if
     the body sits at Tile scope). When set and a TMA stage's ``buffer_count
     >= 2``, the inserted ``AsyncWait`` carries the consumer-side mbar
-    ``slot`` and ``phase`` (matching what ``015_pipeline_async`` sets) so
+    ``slot`` and ``phase`` (matching what ``015_pipeline_k_outer`` sets) so
     the materializer lowers the wait to ``MbarrierWait`` rather than the
     cp.async fallback (which doesn't actually wait for TMA bulk loads)."""
     new_body: list[Stmt] = []

@@ -63,7 +63,11 @@ rmsnorm.tinyllama.s512     (1,512,2048) x (2048,)             12.1      9.8  1.2
 ```
 
 The same data is dumped to `tests/perf/.results/<utc-timestamp>.json` for
-cross-run diffing. `DEPLODOCK_GIT_REV` is recorded if set.
+cross-run diffing. `DEPLODOCK_GIT_REV` is recorded if set. A self-contained
+ECharts plot of `ratio` per case (sorted ascending, bars colored by op,
+optional `torch.compile` overlay) is written next to the JSON as
+`<utc-timestamp>.html` — open it in a browser; no server needed (the chart
+loads ECharts from the jsDelivr CDN).
 
 ## Adding a case
 
