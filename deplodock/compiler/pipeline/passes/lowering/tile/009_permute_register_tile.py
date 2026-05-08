@@ -61,16 +61,15 @@ import logging
 import os
 from dataclasses import replace as dc_replace
 
+from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Tile, Write
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
-    load_thread_axis_coeffs,
     loads_reading,
-    max_bank_conflict,
     single_tile,
 )
 
@@ -98,7 +97,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
 
-    thread_axes = tuple(ba.axis for ba in tile.axes if ba.bind == BIND_THREAD)
+    thread_axes = tile.thread_axes
     if len(thread_axes) < 2:
         raise RuleSkipped("need >=2 THREAD axes (matmul-shaped tile)")
 
@@ -121,7 +120,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
     lane, F = candidates[0]
     lane_ext = int(lane.extent)
 
-    if not _swap_helps_any_stage(tile, thread_axes, lane.name, F, lane_ext):
+    if not _swap_helps_any_stage(tile, lane.name, F, lane_ext):
         raise RuleSkipped("no Stage has a fixable lane-stride bank conflict")
 
     chunk_stride = _LDS128_FLOATS * lane_ext
@@ -171,18 +170,35 @@ def _infer_lane_stride(body: Body, lane_var: str) -> int | None:
     return F
 
 
-def _swap_helps_any_stage(tile: Tile, thread_axes: tuple[Axis, ...], lane_var: str, F: int, lane_ext: int) -> bool:
-    """At least one Stage has a fixable bank conflict that the chunked
-    rewrite would drive lower. Reuses the affine analyzer from
-    ``014_pad_smem``.
+def _stage_max_way(loads: list[Load], extents: tuple[int, ...], leading_phase: bool, tile: Tile) -> int | None:
+    """Worst-case ``max_way`` across body ``loads`` of one Stage at the
+    given (un-padded) cache extents. ``None`` when any Load can't be
+    evaluated (rank mismatch). Auto-zero-binds non-thread free vars,
+    so non-affine loop-dependent indices work out of the box."""
+    worst = 1
+    for ld in loads:
+        cache_idx = ld.index[1:] if leading_phase else ld.index
+        if len(cache_idx) != len(extents):
+            return None
+        dist = lane_bank_distribution(tuple(cache_idx), extents, tile.thread_axes)
+        if dist is None:
+            return None
+        worst = max(worst, dist.max_way)
+    return worst
 
-    Note the analyzer is a coarse predictor — it counts bank conflicts
+
+def _swap_helps_any_stage(tile: Tile, lane_var: str, F: int, lane_ext: int) -> bool:
+    """At least one Stage has a fixable bank conflict that the chunked
+    rewrite would drive lower. Reuses the shared bank kernel from
+    ``compiler/diagnostics/bank_conflicts``.
+
+    Note the kernel is a coarse predictor — it counts bank conflicts
     treating each Load as a single-element access (i.e. as if hardware
     issued LDS.32). For ``F=4`` with LDS.128 the hardware actually
     collapses 4 lanes' contiguous reads into one 32-bank phase (no
-    conflict) but the analyzer still scores ``F=4`` as 4-way. So we
+    conflict) but the kernel still scores ``F=4`` as 4-way. So we
     just check ``post < pre`` — if the rewrite at least doesn't worsen
-    the analyzer's score, the hardware will see a real improvement
+    the model's score, the hardware will see a real improvement
     (no more cross-phase 8-way collisions for ``F>=8``).
     """
     for s in tile.body.iter():
@@ -191,21 +207,16 @@ def _swap_helps_any_stage(tile: Tile, thread_axes: tuple[Axis, ...], lane_var: s
         loads = loads_reading(tile.body, s.name)
         if not loads:
             continue
-        n_axes = len(s.axes)
         leading_phase = isinstance(s, BufferedStage)
-        coeffs_pre = load_thread_axis_coeffs(loads, n_axes, thread_axes, leading_phase_dim=leading_phase)
-        if coeffs_pre is None:
-            continue
         extents = tuple(int(ax.extent) for ax in s.axes)
-        pre = max_bank_conflict(coeffs_pre, extents, thread_axes)
-        if pre <= 1:
+        pre = _stage_max_way(loads, extents, leading_phase, tile)
+        if pre is None or pre <= 1:
             continue
         chunk_stride = _LDS128_FLOATS * lane_ext
         rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride) for ld in loads]
-        coeffs_post = load_thread_axis_coeffs(rewritten, n_axes, thread_axes, leading_phase_dim=leading_phase)
-        if coeffs_post is None:
+        post = _stage_max_way(rewritten, extents, leading_phase, tile)
+        if post is None:
             continue
-        post = max_bank_conflict(coeffs_post, extents, thread_axes)
         if post < pre:
             logger.debug("Stage %s: bank conflict %d -> %d under chunk rewrite", s.name, pre, post)
             return True

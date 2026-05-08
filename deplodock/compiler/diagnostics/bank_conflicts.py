@@ -212,6 +212,106 @@ def thread_axis_env(thread_axes: tuple[Axis, ...], tid: int) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Shared lane→bank kernel
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BankDistribution:
+    """Per-lane bank allocation for one warp evaluating one Load index.
+
+    Pure layout output — no Stage / Load / Tile identifiers. ``simulate``
+    composes this with names and provenance into a ``BankConflictResult``;
+    the lowering rules in ``compiler/pipeline/passes/lowering/tile``
+    consume the raw fields directly to score candidate smem layouts.
+    """
+
+    lane_addrs: list[int]  # length WARP_SIZE — pre-mod linear smem address
+    lane_banks: list[int]  # length WARP_SIZE
+    counts: list[int]  # length BANKS — lanes per bank
+    distinct_addrs: list[int]  # length BANKS — distinct addresses per bank
+    max_way: int  # max(distinct_addrs) — broadcast-corrected
+    raw_max_way: int  # max(counts) — upper bound w/o broadcast
+    conflict_events: int  # sum(d - 1 for d in distinct_addrs if d > 0)
+
+
+def _row_major_strides(extents: tuple[int, ...]) -> list[int]:
+    strides = [1] * len(extents)
+    for i in range(len(extents) - 2, -1, -1):
+        strides[i] = strides[i + 1] * extents[i + 1]
+    return strides
+
+
+def lane_bank_distribution(
+    cache_index: tuple[Expr, ...],
+    cache_extents: tuple[int, ...],
+    thread_axes: tuple[Axis, ...],
+    *,
+    extra_env: dict[str, int] | None = None,
+    warp_id: int = 0,
+) -> BankDistribution | None:
+    """Decode ``threadIdx.x = warp_id*WARP_SIZE + lane`` into per-axis
+    ints, evaluate ``cache_index`` per lane against row-major strides
+    over ``cache_extents``, and tally per-bank distinct-address counts.
+
+    ``cache_index`` must already be trimmed to ``len(cache_extents)``
+    cache dimensions (e.g. drop a ``BufferedStage``'s leading slot
+    index — uniform across the warp at one moment, doesn't shift the
+    bank pattern). Free vars in ``cache_index`` not in ``thread_axes``
+    and not in ``extra_env`` are zero-bound; bank distribution is
+    invariant to additive warp-uniform offsets, so this matches the
+    "drop ``warp_const``" simplification of the affine analyzer that
+    used to live in ``passes/lowering/tile/_helpers.py``. Pass
+    ``extra_env`` to pin a specific loop iter or block coord (e.g.
+    ``{k_loop: 5}``).
+
+    Returns ``None`` if ``len(cache_index) != len(cache_extents)`` or
+    if ``Expr.eval`` raises (KeyError / TypeError) for any lane.
+    """
+    if len(cache_index) != len(cache_extents) or not cache_extents:
+        return None
+
+    strides = _row_major_strides(cache_extents)
+
+    thread_names = {ax.name for ax in thread_axes}
+    free: set[str] = set()
+    for e in cache_index:
+        free |= e.free_vars()
+    base_env: dict[str, int] = {n: 0 for n in free - thread_names}
+    if extra_env:
+        base_env.update(extra_env)
+
+    lane_addrs: list[int] = []
+    lane_banks: list[int] = []
+    for lane in range(WARP_SIZE):
+        env: dict[str, object] = dict(base_env)
+        env.update(thread_axis_env(thread_axes, warp_id * WARP_SIZE + lane))
+        try:
+            coords = [int(idx.eval(env)) for idx in cache_index]
+        except (KeyError, TypeError):
+            return None
+        addr = sum(c * s for c, s in zip(coords, strides, strict=True))
+        lane_addrs.append(addr)
+        lane_banks.append(addr % BANKS)
+
+    counts = [0] * BANKS
+    addrs_per_bank: list[set[int]] = [set() for _ in range(BANKS)]
+    for b, a in zip(lane_banks, lane_addrs, strict=True):
+        counts[b] += 1
+        addrs_per_bank[b].add(a)
+    distinct = [len(s) for s in addrs_per_bank]
+    return BankDistribution(
+        lane_addrs=lane_addrs,
+        lane_banks=lane_banks,
+        counts=counts,
+        distinct_addrs=distinct,
+        max_way=max(distinct) if distinct else 0,
+        raw_max_way=max(counts) if counts else 0,
+        conflict_events=sum(d - 1 for d in distinct if d > 0),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-binding simulation
 # ---------------------------------------------------------------------------
 
@@ -234,45 +334,23 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         return None
     cache_idx: tuple[Expr, ...] = tuple(load.index[-len(stage.axes) :])
 
-    # Strides over alloc_extents (cache extents + per-axis pad).
-    alloc = list(stage.alloc_extents)
-    strides = [1] * len(alloc)
-    for i in range(len(alloc) - 2, -1, -1):
-        strides[i] = strides[i + 1] * alloc[i + 1]
-
-    # Base env: zero out block axes and outer enclosing loops; pin the
-    # innermost loop axis to ``k_iter``.
-    base_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
+    extra_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
     enc = list(binding.enclosing_loop_axes)
     if enc:
         for ax in enc[:-1]:
-            base_env.setdefault(ax.name, 0)
-        base_env[enc[-1].name] = k_iter
+            extra_env.setdefault(ax.name, 0)
+        extra_env[enc[-1].name] = k_iter
 
-    lane_banks: list[int] = []
-    lane_addrs: list[int] = []
-    for lane in range(WARP_SIZE):
-        env = dict(base_env)
-        env.update(thread_axis_env(tile.thread_axes, warp_id * WARP_SIZE + lane))
-        try:
-            coords = [int(idx.eval(env)) for idx in cache_idx]
-        except (KeyError, TypeError):
-            return None
-        addr = sum(c * s for c, s in zip(coords, strides, strict=True))
-        lane_addrs.append(addr)
-        lane_banks.append(addr % BANKS)
-
-    counts = [0] * BANKS
-    addrs_per_bank: list[set[int]] = [set() for _ in range(BANKS)]
-    for lane, (b, a) in enumerate(zip(lane_banks, lane_addrs, strict=True)):
-        del lane  # unused
-        counts[b] += 1
-        addrs_per_bank[b].add(a)
-    distinct_addrs = [len(s) for s in addrs_per_bank]
-    raw_max_way = max(counts)
-    max_way = max(distinct_addrs) if distinct_addrs else 0
-    conflict_events = sum(d - 1 for d in distinct_addrs if d > 0)
-    nz = [c for c in counts if c > 0]
+    dist = lane_bank_distribution(
+        cache_idx,
+        stage.alloc_extents,
+        tile.thread_axes,
+        extra_env=extra_env,
+        warp_id=warp_id,
+    )
+    if dist is None:
+        return None
+    nz = [c for c in dist.counts if c > 0]
     avg = sum(nz) / len(nz) if nz else 0.0
 
     return BankConflictResult(
@@ -286,16 +364,16 @@ def simulate(binding: StageBinding, k_iter: int = 0, warp_id: int = 0) -> BankCo
         load_name=load.name,
         tile_op_name=binding.tile_op_name,
         index_repr=tuple(e.pretty() for e in cache_idx),
-        lane_banks=lane_banks,
-        lane_addrs=lane_addrs,
-        counts=counts,
-        distinct_addrs=distinct_addrs,
-        max_way=max_way,
-        raw_max_way=raw_max_way,
-        conflict_events=conflict_events,
+        lane_banks=dist.lane_banks,
+        lane_addrs=dist.lane_addrs,
+        counts=dist.counts,
+        distinct_addrs=dist.distinct_addrs,
+        max_way=dist.max_way,
+        raw_max_way=dist.raw_max_way,
+        conflict_events=dist.conflict_events,
         # Initial scalar (LDS.32) value; ``annotate_lds128`` upgrades
         # vectorizable runs in-place with the absorption-aware count.
-        lds128_events=conflict_events,
+        lds128_events=dist.conflict_events,
         vec_group_size=1,
         avg_way=avg,
         enclosing_axes=tuple(ax.name for ax in binding.enclosing_loop_axes),
