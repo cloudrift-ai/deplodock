@@ -23,7 +23,7 @@ from deplodock.compiler.pipeline.engine import Pattern
 PATTERN = [Pattern("root", GatherOp)]
 
 
-def rewrite(graph: Graph, root: Node, inp_data: Node, inp_idx: Node, out: Tensor) -> Graph | None:
+def rewrite(root: Node, inp_data: Node, inp_idx: Node, out: Tensor) -> Graph | None:
     out_shape = tuple(out.shape)
     ndim = len(out_shape)
     axis = int(root.op.axis) if int(root.op.axis) >= 0 else ndim + int(root.op.axis)

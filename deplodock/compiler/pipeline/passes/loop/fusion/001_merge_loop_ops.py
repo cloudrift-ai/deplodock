@@ -139,7 +139,8 @@ PATTERN = [
 ]
 
 
-def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph | None:
+def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
+    graph = match.graph
     if not isinstance(producer.op, LoopOp) or not isinstance(consumer.op, LoopOp):
         raise RuleSkipped("producer or consumer is no longer a LoopOp")
     if producer.id not in consumer.inputs:

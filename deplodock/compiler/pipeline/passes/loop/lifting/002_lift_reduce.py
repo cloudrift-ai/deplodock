@@ -15,7 +15,7 @@ from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", ReduceOp)]
 
@@ -25,7 +25,8 @@ PATTERN = [Pattern("root", ReduceOp)]
 _COMBINE: dict[str, str] = {"sum": "add", "maximum": "maximum", "prod": "multiply", "minimum": "minimum"}
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:
+    graph = match.graph
     src_id = root.inputs[0]
     src_node = graph.nodes.get(src_id)
     if src_node is None:

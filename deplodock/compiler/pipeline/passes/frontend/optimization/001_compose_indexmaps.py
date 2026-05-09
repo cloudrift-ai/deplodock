@@ -30,7 +30,8 @@ PATTERN = [
 ]
 
 
-def rewrite(graph: Graph, match: Match, producer: Node, consumer: Node) -> Graph | None:
+def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
+    graph = match.graph
     producer_op = producer.op
     consumer_op = consumer.op
     if not isinstance(producer_op, IndexMapOp) or not isinstance(consumer_op, IndexMapOp):

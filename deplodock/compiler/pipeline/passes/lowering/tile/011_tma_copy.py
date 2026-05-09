@@ -60,7 +60,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     TmaBufferedStage,
 )
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,8 @@ _MAX_RANK = 5
 _TMA_ALIGN_BYTES = 16
 
 
-def rewrite(ctx: Context, graph: Graph, root: Node) -> Graph | None:
+def rewrite(ctx: Context, match: Match, root: Node) -> Graph | None:
+    graph = match.graph
     # TMA is on by default on sm_90+ (Hopper / Blackwell — the hardware
     # that has ``cp.async.bulk.tensor``). ``DEPLODOCK_TMA=0`` forces
     # the cp.async + ``+1`` padding baseline for A/B comparison.

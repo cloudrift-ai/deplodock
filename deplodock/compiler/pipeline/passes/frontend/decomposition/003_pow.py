@@ -3,13 +3,14 @@
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "pow"})]
 
 
-def rewrite(graph: Graph, inp_x: Node, inp_exp: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, inp_x: Node, inp_exp: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     """Replace pow(x, 2) with mul(x, x) — enables RMSNorm pattern matching."""
     if inp_exp and isinstance(inp_exp.op, ConstantOp) and inp_exp.op.value != 2.0:
         raise RuleSkipped(f"only pow(x, 2) is decomposed; got exponent {inp_exp.op.value}")

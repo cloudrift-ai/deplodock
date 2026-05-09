@@ -12,7 +12,7 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     const_bc,
     gqa_broadcast,
@@ -48,7 +48,8 @@ def _maybe_gqa(frag: Graph, src: Node | str, q_batch: tuple, src_batch: tuple, t
     )
 
 
-def rewrite(graph: Graph, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     q_shape = inp_q.output.shape
     k_shape = inp_k.output.shape
     v_shape = inp_v.output.shape

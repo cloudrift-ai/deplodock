@@ -10,7 +10,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", ReshapeOp)]
@@ -55,7 +55,8 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     return tuple(coords)
 
 
-def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     in_shape = tuple(inp_x.output.shape)
     out_shape = root.op.infer_output_shape([in_shape])
 

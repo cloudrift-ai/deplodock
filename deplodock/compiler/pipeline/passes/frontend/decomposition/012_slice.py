@@ -9,13 +9,14 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SliceOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", SliceOp)]
 
 
-def rewrite(graph: Graph, inp_x: Node, inp_dim: Node, inp_start: Node, inp_end: Node | None, out: Tensor) -> Graph | None:
+def rewrite(match: Match, inp_x: Node, inp_dim: Node, inp_start: Node, inp_end: Node | None, out: Tensor) -> Graph | None:
+    graph = match.graph
     in_shape = tuple(inp_x.output.shape)
     out_shape = tuple(out.shape)
     ndim = len(in_shape)

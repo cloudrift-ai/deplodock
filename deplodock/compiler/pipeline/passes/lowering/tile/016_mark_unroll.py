@@ -31,7 +31,7 @@ PATTERN = [Pattern("root", TileOp)]
 _MAX_UNROLL_TRIPS = 64
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body, changed = _walk_body(root.op.body)
     if not changed:
         raise RuleSkipped(f"no Loop nest with total trips <= {_MAX_UNROLL_TRIPS} found")

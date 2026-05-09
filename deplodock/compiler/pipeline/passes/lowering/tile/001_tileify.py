@@ -41,7 +41,7 @@ from deplodock.compiler.pipeline.engine import Pattern
 PATTERN = [Pattern("root", LoopOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     kname = _kernel_name_for(root.op, root.id)
     return tileify(root.op, kname)
 

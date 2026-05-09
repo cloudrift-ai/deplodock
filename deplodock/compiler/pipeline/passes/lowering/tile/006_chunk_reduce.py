@@ -67,7 +67,7 @@ _MAX_SLAB_BYTES_HEADROOM = 8 * 1024
 _BK_CANDIDATES = (128, 64, 32, 16, 8)
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")

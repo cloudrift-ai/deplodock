@@ -74,7 +74,7 @@ _SHIFT_FOR = {SwizzleMode.B128: 4, SwizzleMode.B64: 2, SwizzleMode.B32: 1}
 _ROW_MASK_FOR = {SwizzleMode.B128: 7, SwizzleMode.B64: 6, SwizzleMode.B32: 4}
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     from deplodock.compiler.tuning import _tma_swizzle_enabled  # noqa: PLC0415
 
     if not _tma_swizzle_enabled():

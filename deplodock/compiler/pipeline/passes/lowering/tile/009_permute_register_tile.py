@@ -83,7 +83,7 @@ _LDS128_FLOATS = 4
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")

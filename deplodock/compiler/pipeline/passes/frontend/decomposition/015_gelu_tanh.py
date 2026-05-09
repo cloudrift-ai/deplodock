@@ -12,7 +12,7 @@ import math
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "gelu_tanh"})]
@@ -21,7 +21,8 @@ _C0 = math.sqrt(2.0 / math.pi)
 _C1 = 0.044715
 
 
-def rewrite(graph: Graph, inp_x: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, inp_x: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     frag = open_fragment(graph, [inp_x])
     name = out.name
 

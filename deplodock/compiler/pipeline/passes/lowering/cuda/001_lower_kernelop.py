@@ -18,7 +18,7 @@ from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", KernelOp)]
 
@@ -27,7 +27,8 @@ _BLOCK = 256
 _DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2}
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:
+    graph = match.graph
     shapes: dict[str, tuple[int, ...]] = {bid: tuple(graph.nodes[bid].output.shape) for bid in root.op.inputs}
     for out in root.op.outputs:
         shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(root.output.shape)

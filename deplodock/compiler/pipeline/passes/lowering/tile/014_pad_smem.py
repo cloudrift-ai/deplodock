@@ -77,7 +77,7 @@ PATTERN = [Pattern("root", TileOp)]
 _MAX_PADDED_SLAB_BYTES = 20 * 1024
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("no Stage benefited from padding")

@@ -77,7 +77,7 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, Tile):

@@ -96,17 +96,60 @@ class Pattern:
 class Match:
     """Result of matching a pattern against a graph.
 
-    ``nodes`` maps each pattern entry's name to the matched ``Node``.
-    ``consumed`` and ``output`` may be overwritten by the rewrite
-    function to control which nodes the rewriter removes and which node
-    its edges get redirected to. ``output`` defaults to ``root_node_id``
-    when left as ``None``.
+    ``graph`` is the graph this match was built against (rules access
+    it via ``match.graph`` for ad-hoc lookups). ``nodes`` maps each
+    pattern entry's name to the matched node id. ``consumed`` and
+    ``output`` may be overwritten by the rewrite function to control
+    which nodes the rewriter removes and which node its edges get
+    redirected to. ``output`` defaults to ``root_node_id`` when left
+    as ``None``.
+
+    Use the helpers (``root``, ``node()``, ``input()``, ``is_alive()``)
+    to resolve ids to ``Node`` objects through ``graph`` — they're the
+    intended access pattern for rules that need graph-wide lookups.
     """
 
+    graph: Graph
     root_node_id: str
-    nodes: dict[str, Node] = field(default_factory=dict)
+    nodes: dict[str, str] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
     output: str | None = None
+    # Snapshot of id(Node) at match time for every consumed node. The
+    # ``is_alive`` check uses this to detect the case where an earlier
+    # match in the same batch removed a consumed node and a different
+    # node was added at the same id (e.g. splicer auto-rename hitting
+    # a recently-freed name). Pure id-existence wouldn't catch that.
+    _identities: dict[str, int] = field(default_factory=dict, repr=False)
+
+    @property
+    def root(self) -> Node:
+        """The root ``Node`` (matched by the first ``Pattern`` entry)."""
+        return self.graph.nodes[self.root_node_id]
+
+    def node(self, name_or_id: str) -> Node:
+        """Resolve a pattern name (e.g. ``"producer"``) OR a raw node id
+        to the current ``Node`` in ``graph``. Raises ``KeyError`` if the
+        node has been removed."""
+        nid = self.nodes.get(name_or_id, name_or_id)
+        return self.graph.nodes[nid]
+
+    def input(self, i: int) -> Node | None:
+        """Root's ``i``-th input as a ``Node``, or ``None`` when ``i``
+        exceeds the input count or the input node was removed."""
+        root = self.root
+        if i >= len(root.inputs):
+            return None
+        return self.graph.nodes.get(root.inputs[i])
+
+    def is_alive(self) -> bool:
+        """``True`` when every consumed node still resolves to the same
+        ``Node`` object captured at match time. Catches both removal and
+        the "removed-then-re-added under same id" case."""
+        for nid in self.consumed:
+            n = self.graph.nodes.get(nid)
+            if n is None or id(n) != self._identities.get(nid):
+                return False
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +228,9 @@ def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
 
 def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
     cursor: str | None = start
-    nodes: dict[str, Node] = {}
+    nodes: dict[str, str] = {}
     consumed: set[str] = set()
+    identities: dict[str, int] = {}
     for prod in pattern:
         if cursor is None:
             return None
@@ -195,10 +239,11 @@ def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
             return None
         if not _check_constraints(node, prod):
             return None
-        nodes[prod.name] = node
+        nodes[prod.name] = cursor
         consumed.add(cursor)
+        identities[cursor] = id(node)
         cursor = _sole_consumer(graph, cursor)
-    return Match(root_node_id=start, nodes=nodes, consumed=consumed)
+    return Match(graph=graph, root_node_id=start, nodes=nodes, consumed=consumed, _identities=identities)
 
 
 def _check_constraints(node, prod: Pattern) -> bool:
@@ -236,11 +281,15 @@ class _Rule:
     The "anything else" rule lets rewrites read input slots straight off
     the signature::
 
-        def rewrite(graph, inp_x, inp_w, inp_b, out):
+        def rewrite(inp_x, inp_w, inp_b, out):
             # inp_x = graph.nodes[root.inputs[0]]            (Node)
             # inp_w = graph.nodes[root.inputs[1]]            (Node)
             # inp_b = graph.nodes[root.inputs[2]] or None    (Node | None)
             # out   = root.output                            (Tensor)
+
+    Rules that need ad-hoc graph-wide lookups take ``match`` and use
+    ``match.graph`` / ``match.node(id)`` — there's no ``graph`` reserved
+    kwarg.
     """
 
     name: str
@@ -278,30 +327,26 @@ def _load_rule(path: Path) -> _Rule:
     return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names)
 
 
-def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match, ctx: Context | None = None) -> dict | None:
+def _build_rewrite_kwargs(rule: _Rule, match: Match, ctx: Context | None = None) -> dict | None:
     """Bind each ``rewrite`` param to its source.
 
-    Reserved-name params (``graph`` / ``match`` / ``root`` / ``out`` /
-    ``ctx``) and ``PATTERN``-name params bind by name; every remaining
-    param binds positionally to ``root.inputs[i]`` (in declaration
-    order, ``None`` when the position exceeds the available inputs).
+    Reserved-name params (``match`` / ``root`` / ``out`` / ``ctx``) and
+    ``PATTERN``-name params bind by name; every remaining param binds
+    positionally to ``root.inputs[i]`` (in declaration order, ``None``
+    when the position exceeds the available inputs).
 
-    Returns ``None`` when a pattern-name param's matched node has been
-    deleted from the graph between match enumeration and rewrite — a
-    safety net for the case the outer ``match.consumed`` check misses.
-    """
-    pattern_names = {p.name for p in rule.pattern}
-    nid = match.root_node_id
-    root_node = graph.nodes.get(nid)
-    if root_node is None:
+    Returns ``None`` when the match is no longer alive (caller should
+    treat as a skipped match)."""
+    if not match.is_alive():
         return None
+    pattern_names = {p.name for p in rule.pattern}
+    root_node = match.root
+    graph = match.graph
 
     kwargs: dict = {}
     input_slot = 0
     for pname in rule.param_names:
-        if pname == "graph":
-            kwargs[pname] = graph
-        elif pname == "match":
+        if pname == "match":
             kwargs[pname] = match
         elif pname == "root":
             kwargs[pname] = root_node
@@ -310,13 +355,7 @@ def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match, ctx: Context 
         elif pname == "ctx":
             kwargs[pname] = ctx
         elif pname in pattern_names:
-            n = match.nodes.get(pname)
-            # Identity check (not just id-existence): an earlier match in
-            # this batch may have removed n and a different node may now
-            # occupy the same id, leaving our cached Node ref stale.
-            if n is None or graph.nodes.get(n.id) is not n:
-                return None
-            kwargs[pname] = n
+            kwargs[pname] = match.node(pname)
         else:
             if input_slot < len(root_node.inputs):
                 kwargs[pname] = graph.nodes.get(root_node.inputs[input_slot])
@@ -407,10 +446,10 @@ def _apply_rules(
                     break
                 rule_changed = False
                 for match in matches:
-                    if any(nid not in graph.nodes for nid in match.consumed):
+                    if not match.is_alive():
                         continue
                     t1 = time.monotonic()
-                    kwargs = _build_rewrite_kwargs(rule, graph, match, ctx)
+                    kwargs = _build_rewrite_kwargs(rule, match, ctx)
                     if kwargs is None:
                         continue
                     try:
@@ -476,15 +515,17 @@ def _apply_rules(
 
 
 def _remap_match_to(forked_graph: Graph, match: Match) -> Match:
-    """Re-resolve ``match`` against ``forked_graph`` (a deep copy).
-    The original ``Match.nodes`` holds Node refs from the source graph;
-    after deepcopy those refs point into the wrong graph. Re-resolve by
-    id so dispatcher checks (identity / removal) work on the fork."""
+    """Build a fresh ``Match`` against ``forked_graph`` (a deep copy)
+    that mirrors ``match``'s ids. Re-snapshot ``_identities`` against
+    the forked nodes so the new match's ``is_alive`` check works."""
+    identities = {nid: id(forked_graph.nodes[nid]) for nid in match.consumed if nid in forked_graph.nodes}
     return Match(
+        graph=forked_graph,
         root_node_id=match.root_node_id,
-        nodes={name: forked_graph.nodes[n.id] for name, n in match.nodes.items() if n.id in forked_graph.nodes},
+        nodes=dict(match.nodes),
         consumed=set(match.consumed),
         output=match.output,
+        _identities=identities,
     )
 
 
@@ -498,7 +539,7 @@ def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Gr
     by ``>>> name`` / ``<<< name`` markers (see ``rule_diff``). Kernel
     ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
     dedicated printers rather than dumped as a body repr."""
-    matched_ids: set[str] = set(match.consumed) | {n.id for n in match.nodes.values()}
+    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
     matched_ids.add(match.root_node_id)
     matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
     before = _format_nodes(matched_nodes, graph)
@@ -534,11 +575,11 @@ def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dic
     dicts so post-hoc scripts (and the article-side analysis) can iterate
     rule applications without re-parsing the text snapshot.
     """
-    matched_ids: set[str] = set(match.consumed) | {n.id for n in match.nodes.values()}
+    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
     matched_ids.add(match.root_node_id)
     return {
         "root": match.root_node_id,
-        "matched_pattern_nodes": {name: n.id for name, n in match.nodes.items()},
+        "matched_pattern_nodes": dict(match.nodes),
         "before": [_node_to_dict(graph.nodes[nid]) for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes],
         "after": [_node_to_dict(fragment.nodes[nid]) for nid in fragment.topological_order()],
     }

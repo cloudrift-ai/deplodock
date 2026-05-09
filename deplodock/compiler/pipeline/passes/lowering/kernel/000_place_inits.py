@@ -36,7 +36,7 @@ from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body = _place_inits_in_body(root.op.body)
     if new_body == root.op.body:
         raise RuleSkipped("no Accum needs an Init placed (already placed or no reduce in body)")
