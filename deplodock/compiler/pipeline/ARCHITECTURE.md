@@ -48,27 +48,25 @@ Every file named `NNN_<name>.py` under a pass directory is a rule:
 
 ```python
 PATTERN = [Pattern("root", SomeOp), ...]   # required
-IN_PLACE = True                            # optional; defaults to False
-def rewrite(graph: Graph, match: Match) -> Graph | None:
+def rewrite(graph: Graph, match: Match) -> Graph | Op:
     ...
 ```
 
-Two flavors, distinguished by the module-level `IN_PLACE` attribute:
+The return type discriminates the rewrite flavor:
 
-- **Functional** (default, `IN_PLACE = False`): `rewrite` returns a
-  `Graph` fragment that gets spliced in place of `match.output`
-  (defaults to `match.root_node_id`); fragment `InputOp` nodes reference
-  existing graph nodes by id, non-Input nodes get fresh ids.
-- **In-place** (`IN_PLACE = True`): `rewrite` mutates nodes/ops directly
-  (e.g. `root.op = TileOp(...)`) and returns `None`. Used by the lowering
-  rules because `KernelOp.arg_order` / `CudaOp.arg_order` embed the
-  original node id as the output buffer name, so a fresh id from
-  splicing would break the generated kernel's buffer binding.
+- **Functional** — returns a `Graph` fragment, spliced in place of
+  `match.output` (defaults to `match.root_node_id`); fragment `InputOp`
+  nodes reference existing graph nodes by id, non-Input nodes get fresh
+  ids.
+- **In-place** — returns an `Op`. The engine assigns it to `root.op`
+  directly, preserving the node id, inputs list, output Tensor, and
+  hints. Used by the lowering rules because `KernelOp.arg_order` /
+  `CudaOp.arg_order` embed the original node id as the output buffer
+  name, so a fresh id from splicing would break the generated kernel's
+  buffer binding.
 
-Either flavor raises `RuleSkipped(reason)` to decline a match — the
-engine logs the reason at DEBUG and moves on. In-place rules MUST raise
-`RuleSkipped` rather than returning without mutating; the engine
-unconditionally counts every non-skipped in-place rewrite as applied.
+Raise `RuleSkipped(reason)` to decline a match — the engine logs the
+reason at DEBUG and moves on.
 
 Files starting with `_` (e.g. `_broadcast.py`) are **not** loaded as
 rules — they're shared helpers for the pass's rule modules.

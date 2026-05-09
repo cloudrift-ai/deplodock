@@ -68,7 +68,6 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline.engine import Pattern
 
-IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 
@@ -86,8 +85,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         else:
             new_body.append(s)
 
-    root.op = KernelOp(body=new_body, name=root.op.name)
-    return None
+    return KernelOp(body=new_body, name=root.op.name)
 
 
 # ---------------------------------------------------------------------------

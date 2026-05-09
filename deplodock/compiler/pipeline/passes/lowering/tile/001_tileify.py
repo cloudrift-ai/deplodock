@@ -38,14 +38,12 @@ from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
 from deplodock.compiler.pipeline.engine import Pattern
 
-IN_PLACE = True
 PATTERN = [Pattern("root", LoopOp)]
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     kname = _kernel_name_for(root.op, root.id)
-    root.op = tileify(root.op, kname)
-    return None
+    return tileify(root.op, kname)
 
 
 def tileify(loop_op: LoopOp, kernel_name: str = "") -> TileOp:

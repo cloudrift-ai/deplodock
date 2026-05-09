@@ -54,7 +54,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 logger = logging.getLogger(__name__)
 
-IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 _SHIFT_FOR = {SwizzleMode.B128: 4, SwizzleMode.B64: 2, SwizzleMode.B32: 1}
@@ -83,8 +82,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+    return TileOp(body=new_body, name=root.op.name)
 
 
 def _pick_split_swizzle(inner_extent_bytes: int) -> tuple[SwizzleMode, int] | None:

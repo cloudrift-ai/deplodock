@@ -26,7 +26,6 @@ from deplodock.compiler.ir.stmt import Body, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
-IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 _MAX_UNROLL_TRIPS = 64
@@ -36,8 +35,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body, changed = _walk_body(root.op.body)
     if not changed:
         raise RuleSkipped(f"no Loop nest with total trips <= {_MAX_UNROLL_TRIPS} found")
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+    return TileOp(body=new_body, name=root.op.name)
 
 
 def _walk_body(body: Body) -> tuple[Body, bool]:

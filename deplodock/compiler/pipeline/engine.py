@@ -8,13 +8,11 @@ Public surface:
   topo-ordered seed along fan-out-1 consumer edges.
 - ``run_rule`` / ``run_pass`` — apply one rule module / every rule
   module in a directory to fixed point. Rule modules declare
-  ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(...)`` function.
-  Two flavors:
-  * Functional (default): ``rewrite`` returns a ``Graph`` fragment that
-    gets spliced into the graph.
-  * In-place: module sets ``IN_PLACE = True`` and ``rewrite`` mutates
-    nodes/ops directly, returning ``None``.
-  Either flavor raises ``RuleSkipped`` to decline a match.
+  ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(...)`` function
+  whose return type discriminates the rewrite flavor:
+  * ``Graph`` — functional fragment, spliced in place of the match.
+  * ``Op`` — in-place rebind of ``root.op`` (id, inputs, hints kept).
+  Raise ``RuleSkipped`` to decline a match.
 - ``run_pipeline(graph, passes, dump=None)`` — run each named pass
   directory in order, dispatching ``dump.on_pass`` after each.
 """
@@ -32,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
 
@@ -179,9 +177,8 @@ class _Rule:
 
     name: str
     pattern: list[Pattern]
-    rewrite: Callable[..., Graph | None]
+    rewrite: Callable[..., Graph | Op | None]
     param_names: tuple[str, ...]
-    in_place: bool
 
 
 def _load_rules(pass_dir: Path) -> list[_Rule]:
@@ -210,8 +207,7 @@ def _load_rule(path: Path) -> _Rule:
     if rewrite_fn is None:
         raise ValueError(f"Rule {path} missing rewrite() function")
     param_names = tuple(inspect.signature(rewrite_fn).parameters.keys())
-    in_place = bool(getattr(module, "IN_PLACE", False))
-    return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names, in_place=in_place)
+    return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names)
 
 
 def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | None:
@@ -322,58 +318,44 @@ def _apply_rules(
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
                     t1 = time.monotonic()
-                    # In-place rules need pre-rewrite snapshots so the
-                    # formatter can render the diff. ``pre_names``
-                    # (output-name → pre-rewrite id) lets the formatter
-                    # follow rule-driven renames (e.g. ``tileify`` mutates
-                    # the op AND ``rename_node`` to a friendlier id).
-                    if rule.in_place:
-                        pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
-                        pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops} if need_text else {}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
                     try:
-                        fragment = rule.rewrite(**kwargs)
+                        result = rule.rewrite(**kwargs)
                     except RuleSkipped as exc:
                         if debug_on:
                             emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
                         stats[2] += time.monotonic() - t1
                         continue
-                    if rule.in_place:
-                        # In-place rules signal "applied" by returning
-                        # (anything not raised). Decline via RuleSkipped.
-                        # In-place mutations don't re-trigger this rule
-                        # (one batch per ``while True`` iteration); they
-                        # mutate to a state the same pattern won't match
-                        # again, and rules are ordered deliberately so
-                        # re-running prior rules isn't expected.
-                        text = (
-                            _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
-                            if need_text
-                            else None
-                        )
-                        if debug_on:
-                            emit(text)
-                        if dump_on:
-                            record = _record_inplace_application(graph, match, pre_ops)
-                            dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-                        stats[0] += 1
-                        stats[2] += time.monotonic() - t1
+                    # An ``Op`` return is shorthand for "rebind ``root.op``
+                    # in place" — wrapped in a single-node fragment so the
+                    # diff renderer and dump path are shared with the
+                    # functional case. In-place rebinds don't re-trigger
+                    # this rule (the same pattern won't match the new op),
+                    # so we don't set ``rule_changed`` / ``outer_changed``.
+                    inplace = isinstance(result, Op)
+                    if inplace:
+                        fragment = _wrap_op_as_fragment(graph, match.root_node_id, result)
                     else:
-                        # Functional rule: ``rewrite`` must return a Fragment.
-                        assert fragment is not None, f"functional rule {rule.name} returned None — use RuleSkipped or set IN_PLACE = True"
-                        text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
-                        if debug_on:
-                            emit(text)
-                        if dump_on:
-                            record = _record_rule_application(graph, match, fragment)
-                            dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+                        assert isinstance(result, Graph), (
+                            f"rule {rule.name} returned {type(result).__name__}; expected Graph, Op, or RuleSkipped"
+                        )
+                        fragment = result
+                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
+                    if debug_on:
+                        emit(text)
+                    if dump_on:
+                        record = _record_rule_application(graph, match, fragment)
+                        dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+                    if inplace:
+                        graph.nodes[match.root_node_id].op = result
+                    else:
                         graph = _apply_replacement(graph, match, fragment)
-                        stats[2] += time.monotonic() - t1
-                        stats[0] += 1
                         rule_changed = True
                         outer_changed = True
+                    stats[2] += time.monotonic() - t1
+                    stats[0] += 1
                 if not rule_changed:
                     break
     for name, (n, mt, rt) in sorted(rule_stats.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
@@ -401,52 +383,24 @@ def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Gr
     return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id}")
 
 
-def _format_inplace_application(
-    name: str,
-    graph: Graph,
-    match: Match,
-    pre_ops: dict,
-    *,
-    pass_name: str | None = None,
-    pre_names: dict[str, str] | None = None,
-) -> str:
-    """Snapshot for rules that mutate ``node.op`` in place and return
-    None (e.g. lowering/tile). Renders before/after of the mutated
-    nodes as a unified diff by swapping their op temporarily for the
-    "before" view.
-
-    Some rules (notably ``tileify``) mutate the op AND rename the node
-    to a friendlier id. ``pre_names`` (output-name → pre-rewrite id)
-    lets the formatter resolve a renamed-away id to its post-rewrite
-    counterpart by matching on output name, which is preserved across
-    ``rename_node``."""
-    # Build a "current id" for each pre_ops entry, following any rename
-    # that happened during the rewrite.
-    name_to_post_id = {graph.nodes[nid].output.name: nid for nid in graph.nodes} if pre_names else {}
-    pre_to_post: dict[str, str] = {}
-    for nid in pre_ops:
-        if nid in graph.nodes:
-            pre_to_post[nid] = nid
-        elif pre_names is not None:
-            for out_name, old_id in pre_names.items():
-                if old_id == nid and out_name in name_to_post_id:
-                    pre_to_post[nid] = name_to_post_id[out_name]
-                    break
-
-    mutated_pre = [nid for nid in pre_ops if nid in pre_to_post and graph.nodes[pre_to_post[nid]].op is not pre_ops[nid]]
-    post_ids = [pre_to_post[nid] for nid in mutated_pre]
-    post_ops = {pid: graph.nodes[pid].op for pid in post_ids}
-    # Render "before": swap each post-id node's op back to the pre op.
-    for nid in mutated_pre:
-        graph.nodes[pre_to_post[nid]].op = pre_ops[nid]
-    before_nodes = [graph.nodes[pid] for pid in graph.topological_order() if pid in post_ids]
-    before = _format_nodes(before_nodes, graph)
-    # Restore.
-    for pid in post_ids:
-        graph.nodes[pid].op = post_ops[pid]
-    after_nodes = [graph.nodes[pid] for pid in graph.topological_order() if pid in post_ids]
-    after = _format_nodes(after_nodes, graph)
-    return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id} (in-place)")
+def _wrap_op_as_fragment(graph: Graph, root_id: str, new_op: Op) -> Graph:
+    """Build a single-node fragment that mirrors ``graph.nodes[root_id]``
+    with ``new_op`` substituted. Lets the engine render an in-place op
+    rebind through the same diff/dump path as a functional fragment splice
+    (the engine then assigns ``root.op = new_op`` directly, bypassing the
+    splicer — node id, inputs list, hints, and output Tensor are kept)."""
+    root = graph.nodes[root_id]
+    frag = Graph()
+    for inp_id in root.inputs:
+        if inp_id in frag.nodes:
+            continue
+        inp = graph.nodes.get(inp_id)
+        shape = inp.output.shape if inp is not None else ()
+        dtype = inp.output.dtype if inp is not None else "f32"
+        frag.add_node(InputOp(), [], Tensor(inp_id, shape, dtype), node_id=inp_id)
+    out_id = frag.add_node(new_op, list(root.inputs), root.output, node_id=root.id)
+    frag.outputs = [out_id]
+    return frag
 
 
 def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dict:
@@ -463,16 +417,6 @@ def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dic
         "matched_pattern_nodes": {name: n.id for name, n in match.nodes.items()},
         "before": [_node_to_dict(graph.nodes[nid]) for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes],
         "after": [_node_to_dict(fragment.nodes[nid]) for nid in fragment.topological_order()],
-    }
-
-
-def _record_inplace_application(graph: Graph, match: Match, pre_ops: dict) -> dict:
-    mutated = [nid for nid, prev in pre_ops.items() if nid in graph.nodes and graph.nodes[nid].op is not prev]
-    return {
-        "root": match.root_node_id,
-        "in_place": True,
-        "before": [{"id": nid, "op_class": type(pre_ops[nid]).__name__} for nid in mutated],
-        "after": [_node_to_dict(graph.nodes[nid]) for nid in mutated],
     }
 
 
