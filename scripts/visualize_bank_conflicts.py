@@ -2,9 +2,13 @@
 
 Takes one or more IR JSON paths and renders one column per input. Each
 column contains a card per ``(Stage, body-Load)`` pair showing the warp's
-per-lane smem bank at one inner-loop iteration. Simulation lives in
-``deplodock.compiler.diagnostics.bank_conflicts``; this script is a thin
-CLI + ECharts emitter.
+per-lane smem bank at one inner-loop iteration.
+
+Simulation: lives in
+``deplodock.compiler.diagnostics.bank_conflicts_dynamic`` — the kernel is
+compiled, instrumented at the kernel-lowering stage, and run on one CTA
+to record actual smem addresses per lane. This script is a thin CLI +
+ECharts emitter. **Requires CUDA** — compile and launch must succeed.
 
 Workflow — produce IRs via the compiler with whatever pass gates you
 want, then feed the dumped JSONs in::
@@ -27,7 +31,8 @@ import argparse
 import json
 import os
 
-from deplodock.compiler.diagnostics.bank_conflicts import BankConflictResult, simulate_graph
+from deplodock.compiler.diagnostics.bank_conflicts import BankConflictResult
+from deplodock.compiler.diagnostics.bank_conflicts_dynamic import simulate_graph_dynamic as simulate_graph
 from deplodock.compiler.graph import Graph
 from deplodock.visualize.page import render_html
 

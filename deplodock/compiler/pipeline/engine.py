@@ -189,10 +189,18 @@ def _load_rules(pass_dir: Path) -> list[_Rule]:
 
 
 def _load_rule(path: Path) -> _Rule:
+    import sys
+
     spec = importlib.util.spec_from_file_location(path.stem, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load rule from {path}")
     module = importlib.util.module_from_spec(spec)
+    # Register before exec so any ``@dataclass`` defined in the rule
+    # module can resolve its own module via ``sys.modules`` —
+    # ``dataclasses._is_type`` looks up ``cls.__module__`` there to
+    # check for ``KW_ONLY`` and raises ``AttributeError`` on a missing
+    # entry.
+    sys.modules[path.stem] = module
     spec.loader.exec_module(module)
     pattern = getattr(module, "PATTERN", None)
     rewrite_fn = getattr(module, "rewrite", None)

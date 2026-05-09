@@ -1,7 +1,15 @@
-"""Static diagnostics over Tile IR — no GPU required.
+"""Diagnostics over the compiler IR.
 
-These helpers walk a compiled ``Graph`` and report properties that would
-otherwise need a profiler (ncu / nsys) to surface. Today's only module is
-``bank_conflicts`` (smem bank-conflict simulation per Stage); future
-modules might add occupancy estimation, smem footprint heatmaps, etc.
+Two paths share the ``BankConflictResult`` shape:
+
+- :mod:`.bank_conflicts` — static simulator over Tile IR. Symbolic
+  ``Expr.eval`` per lane against declared smem layouts. Fast, GPU-free,
+  used by Tile-IR passes (``014_pad_smem``, ``009_permute_register_tile``)
+  to score candidate rewrites.
+- :mod:`.bank_conflicts_dynamic` — dynamic simulator. Compiles the graph
+  with smem-Load instrumentation enabled (sets ``DEPLODOCK_BANK_TRACE=1``
+  for the rule
+  ``pipeline/passes/lowering/kernel/002_instrument_smem_loads``), runs
+  one CTA on the GPU, and decodes the recorded addresses. Ground truth —
+  used by the visualizer (``scripts/visualize_bank_conflicts.py``).
 """
