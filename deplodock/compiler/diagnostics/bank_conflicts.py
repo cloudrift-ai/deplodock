@@ -428,9 +428,7 @@ def _compile_and_run(graph: Graph) -> dict[str, np.ndarray]:
     return result.outputs
 
 
-def _build_result(
-    binding: StageBinding, sidecar: dict, debug_int: np.ndarray, *, k_iter: int, warp_id: int
-) -> BankConflictResult | None:
+def _build_result(binding: StageBinding, sidecar: dict, debug_int: np.ndarray, *, k_iter: int, warp_id: int) -> BankConflictResult | None:
     stage, load = binding.stage, binding.load
     if not stage.axes:
         return None
