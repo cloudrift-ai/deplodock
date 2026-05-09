@@ -1,11 +1,10 @@
-"""Instrument smem-Load addresses to ``_debug_buf`` for the dynamic
-bank-conflict simulator.
+"""Instrument smem-Load addresses to ``_debug_buf`` for the bank-conflict
+GPU trace.
 
 Off by default. Gated by ``DEPLODOCK_BANK_TRACE=1`` (matches the
 ``DEPLODOCK_DISABLE_*`` / ``DEPLODOCK_TMA`` convention used by sibling
-rules). The dynamic bank-conflict driver
-(:mod:`deplodock.compiler.diagnostics.bank_conflicts_dynamic`) sets the
-env var around its ``backend.compile()`` call.
+rules). :func:`deplodock.compiler.diagnostics.bank_conflicts.simulate_graph`
+sets the env var around its ``backend.compile()`` call.
 
 When enabled, walks each ``KernelOp`` body, finds every body ``Load``
 whose ``input`` matches a sibling ``Smem`` decl, and inserts an
@@ -128,7 +127,7 @@ def _ensure_debug_buf(graph: Graph, name: str) -> None:
 @dataclass
 class LoadRecord:
     """Per-smem-Load metadata stashed on ``OPTIONS.sidecar`` for the
-    dynamic driver to decode the trace buffer."""
+    GPU-trace driver to decode the trace buffer."""
 
     load_id: int
     smem_name: str
