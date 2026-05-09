@@ -43,9 +43,6 @@ PATTERN = [Pattern("root", LoopOp)]
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    desired = root.output.name or root.id
-    if desired != root.id and desired not in graph.nodes:
-        graph.rename_node(root.id, desired)
     kname = _kernel_name_for(root.op, root.id)
     root.op = tileify(root.op, kname)
     return None

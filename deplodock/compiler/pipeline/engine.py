@@ -578,6 +578,13 @@ def _apply_replacement(graph: Graph, match: Match, fragment: Graph) -> Graph:
     if old_output in g.nodes:
         g.remove_node(old_output)
 
+    # Promote the new node's id to its friendly output.name once consumed
+    # nodes are gone — keeps kernel buf names (which embed the node id)
+    # readable. Falls back silently if the friendly name is taken.
+    desired = g.nodes[new_output].output.name
+    if desired and desired != new_output and desired not in g.nodes:
+        g.rename_node(new_output, desired)
+
     _remove_orphans(g)
     return g
 
