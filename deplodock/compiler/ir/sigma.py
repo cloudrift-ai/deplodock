@@ -12,10 +12,9 @@ Lives at the top of ``ir/`` rather than under any one IR package because
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx
+from deplodock.compiler.ir.expr import Expr, SimplifyCtx
 
 
 @dataclass(frozen=True, eq=False)
@@ -41,24 +40,12 @@ class Sigma:
     def apply(self, e: Expr) -> Expr:
         return e.substitute(self.mapping)
 
-    def eval(self, e: Expr, ctx: SimplifyCtx) -> Expr:
+    def reduce(self, e: Expr, ctx: SimplifyCtx) -> Expr:
         """Substitute then simplify under ``ctx``. Use when the substitution
-        is expected to expose constant folding (e.g. anchor / coefficient
-        probes that pin axes to literals)."""
+        is expected to expose constant folding — e.g. anchor / coefficient
+        probes that pin axes to literals. Distinct from ``Expr.eval`` which
+        evaluates a fully-bound expression to a concrete int/float."""
         return e.substitute(self.mapping).simplify(ctx)
-
-    @classmethod
-    def zero(cls, names: Iterable[str]) -> Sigma:
-        """All ``names`` → ``0``. The per-CTA "anchor" substitution used to
-        evaluate an index with cache axes pinned out."""
-        return cls({n: Literal(0, "int") for n in names})
-
-    @classmethod
-    def unit(cls, target: str, names: Iterable[str]) -> Sigma:
-        """Coefficient probe for ``target``: ``target`` → ``1`` and every
-        other name in ``names`` → ``0``. Used to read off the affine
-        coefficient of one variable in an index."""
-        return cls({n: Literal(1 if n == target else 0, "int") for n in names})
 
     def extend(self, name: str, expr: Expr) -> Sigma:
         return Sigma({**self.mapping, name: expr})

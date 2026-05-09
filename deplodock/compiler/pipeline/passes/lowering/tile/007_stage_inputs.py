@@ -249,8 +249,8 @@ def _classify(
     ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
     candidate_names = tuple(ax.name for ax in candidates)
 
-    zero_sigma = Sigma.zero(candidate_names)
-    origin = tuple(zero_sigma.eval(e, ctx) for e in load.index)
+    zero_sigma = Sigma({n: Literal(0, "int") for n in candidate_names})
+    origin = tuple(zero_sigma.reduce(e, ctx) for e in load.index)
 
     var_to_dim: dict[str, int] = {}
     for ax in candidates:
@@ -287,8 +287,8 @@ def _classify(
     needs_template = False
     for ax in cache_axes:
         d = var_to_dim[ax.name]
-        sigma_one = Sigma.unit(ax.name, candidate_names)
-        actual = sorted(t.pretty() for t in _flatten_add(sigma_one.eval(load.index[d], ctx)))
+        unit_sigma = Sigma({n: Literal(1 if n == ax.name else 0, "int") for n in candidate_names})
+        actual = sorted(t.pretty() for t in _flatten_add(unit_sigma.reduce(load.index[d], ctx)))
         expected = sorted(t.pretty() for t in _flatten_add((origin[d] + Literal(1, "int")).simplify(ctx)))
         if actual != expected:
             needs_template = True
