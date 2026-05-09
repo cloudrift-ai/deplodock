@@ -103,10 +103,8 @@ class BankConflictResult:
     lds128_events: int = 0  # sum(max(0, distinct_addrs[b] - vec_width)); vec_width=1 if standalone, up to 4 if vectorized
     vec_group_size: int = 1  # number of Loads that fuse into one LDS.(N×32) (1 = scalar LDS.32)
     avg_way: float = 0.0
-    enclosing_axes: tuple[str, ...] = ()
     # Populated by ``simulate_graph`` only (visualizer-facing).
     full_sweep_touched: dict[tuple[int, int], list[tuple[int, int]]] = field(default_factory=dict)
-    full_sweep_subst_idx: dict[tuple[int, int], tuple[str, ...]] = field(default_factory=dict)
     full_sweep_conflict_cells: set[tuple[int, int]] = field(default_factory=set)
 
 
@@ -175,7 +173,7 @@ def _walk_loads(body, axes: tuple[Axis, ...]):
 # ---------------------------------------------------------------------------
 
 
-def thread_axis_env(thread_axes: tuple[Axis, ...], tid: int) -> dict[str, int]:
+def _thread_axis_env(thread_axes: tuple[Axis, ...], tid: int) -> dict[str, int]:
     """Reproduce the runtime decode of ``threadIdx.x`` into per-axis ints.
 
     Identical to ``_render_thread_axis_decode`` in ``ir/stmt/blocks.py``:
@@ -208,10 +206,9 @@ def thread_axis_env(thread_axes: tuple[Axis, ...], tid: int) -> dict[str, int]:
 class BankDistribution:
     """Per-lane bank allocation for one warp evaluating one Load index.
 
-    Pure layout output — no Stage / Load / Tile identifiers. ``simulate``
-    composes this with names and provenance into a ``BankConflictResult``;
-    the lowering rules in ``compiler/pipeline/passes/lowering/tile``
-    consume the raw fields directly to score candidate smem layouts.
+    Pure layout output — no Stage / Load / Tile identifiers. The lowering
+    rules in ``compiler/pipeline/passes/lowering/tile`` consume the raw
+    fields directly to score candidate smem layouts.
     """
 
     lane_addrs: list[int]  # length WARP_SIZE — pre-mod linear smem address
@@ -247,11 +244,8 @@ def lane_bank_distribution(
     index — uniform across the warp at one moment, doesn't shift the
     bank pattern). Free vars in ``cache_index`` not in ``thread_axes``
     and not in ``extra_env`` are zero-bound; bank distribution is
-    invariant to additive warp-uniform offsets, so this matches the
-    "drop ``warp_const``" simplification of the affine analyzer that
-    used to live in ``passes/lowering/tile/_helpers.py``. Pass
-    ``extra_env`` to pin a specific loop iter or block coord (e.g.
-    ``{k_loop: 5}``).
+    invariant to additive warp-uniform offsets. Pass ``extra_env`` to
+    pin a specific loop iter or block coord (e.g. ``{k_loop: 5}``).
 
     Returns ``None`` if ``len(cache_index) != len(cache_extents)`` or
     if ``Expr.eval`` raises (KeyError / TypeError) for any lane.
@@ -273,7 +267,7 @@ def lane_bank_distribution(
     lane_banks: list[int] = []
     for lane in range(WARP_SIZE):
         env: dict[str, object] = dict(base_env)
-        env.update(thread_axis_env(thread_axes, warp_id * WARP_SIZE + lane))
+        env.update(_thread_axis_env(thread_axes, warp_id * WARP_SIZE + lane))
         try:
             coords = [int(idx.eval(env)) for idx in cache_index]
         except (KeyError, TypeError):
@@ -487,7 +481,7 @@ def _build_result(
     avg = sum(nz) / len(nz) if nz else 0.0
 
     # Full-sweep cell maps — fold all k_iter records.
-    full_sweep_touched, full_sweep_subst, full_sweep_conflict = _full_sweep_from_trace(region, stage=stage, warp_id=warp_id)
+    full_sweep_touched, full_sweep_conflict = _full_sweep_from_trace(region, stage=stage, warp_id=warp_id)
 
     return BankConflictResult(
         stage_name=stage.name,
@@ -510,34 +504,24 @@ def _build_result(
         lds128_events=conflict_events,  # annotate_lds128 may rewrite later
         vec_group_size=1,
         avg_way=avg,
-        enclosing_axes=tuple(ax.name for ax in binding.enclosing_loop_axes),
         full_sweep_touched=full_sweep_touched,
-        full_sweep_subst_idx=full_sweep_subst,
         full_sweep_conflict_cells=full_sweep_conflict,
     )
 
 
 def _full_sweep_from_trace(
     region: np.ndarray, stage: Stage, warp_id: int
-) -> tuple[
-    dict[tuple[int, int], list[tuple[int, int]]],
-    dict[tuple[int, int], tuple[str, ...]],
-    set[tuple[int, int]],
-]:
+) -> tuple[dict[tuple[int, int], list[tuple[int, int]]], set[tuple[int, int]]]:
     """Build per-cell access maps from the recorded trace.
 
     ``region.shape == (iter_total, num_warps, 32)``; values are
     ``smem_addr_in_elements + 1`` (0 = unwritten). Cell ``(r, c)`` is
     derived from ``addr // row_stride`` / ``addr % row_stride`` over
     ``stage.alloc_extents``.
-
-    Substituted index strings (third element of the return) are always
-    empty — we don't have the symbolic Expr per cell here. Visualizer
-    tooltips degrade gracefully.
     """
     alloc = list(stage.alloc_extents)
     if not alloc:
-        return {}, {}, set()
+        return {}, set()
     strides = [1] * len(alloc)
     for i in range(len(alloc) - 2, -1, -1):
         strides[i] = strides[i + 1] * alloc[i + 1]
@@ -545,7 +529,7 @@ def _full_sweep_from_trace(
 
     iter_total, num_warps, _ = region.shape
     if warp_id >= num_warps:
-        return {}, {}, set()
+        return {}, set()
 
     touched: dict[tuple[int, int], list[tuple[int, int]]] = {}
     conflicts: set[tuple[int, int]] = set()
@@ -568,4 +552,4 @@ def _full_sweep_from_trace(
             r, c, bank = entry
             if len(lds_addrs_per_bank[bank]) > 1:
                 conflicts.add((r, c))
-    return touched, {}, conflicts
+    return touched, conflicts
