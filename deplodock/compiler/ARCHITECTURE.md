@@ -26,6 +26,18 @@ GPU
 `Graph` (`compiler/graph.py`) hosts nodes from every dialect; rewrite
 passes swap node ops in place, so there is no separate "program" type.
 
+`Graph._structural_key()` returns a Merkle-style digest used for
+candidate dedup in autotuning loops. Per node it folds in op kind,
+op body's `Body._structural_key` (or other dataclass fields for leaf
+ops, skipping `name`), `Tensor.shape` / `dtype` (skipping `Tensor.name`),
+and the recursive digests of input nodes; the top-level digest folds in
+the graph's `inputs` / `outputs` sequences. Hints and graph-internal
+node ids are excluded. Two graphs that compute the same dataflow
+through structurally-equivalent kernels hash equal regardless of
+node-id naming or inconsequential body details. Not cached — `Graph`
+is mutable; callers that dedup many candidates snapshot the digest
+themselves.
+
 ## Module layout
 
 | Path                  | Role                                    | See                          |
