@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.graph import Graph, Tensor, _fmt_op
+from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
@@ -88,7 +88,7 @@ class Pattern:
 class Match:
     """Result of matching a pattern against a graph.
 
-    ``nodes`` maps each pattern entry's name to the node id it matched.
+    ``nodes`` maps each pattern entry's name to the matched ``Node``.
     ``consumed`` and ``output`` may be overwritten by the rewrite
     function to control which nodes the rewriter removes and which node
     its edges get redirected to. ``output`` defaults to ``root_node_id``
@@ -96,7 +96,7 @@ class Match:
     """
 
     root_node_id: str
-    nodes: dict[str, str] = field(default_factory=dict)
+    nodes: dict[str, Node] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
     output: str | None = None
 
@@ -119,7 +119,7 @@ def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
 
 def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
     cursor: str | None = start
-    nodes: dict[str, str] = {}
+    nodes: dict[str, Node] = {}
     consumed: set[str] = set()
     for prod in pattern:
         if cursor is None:
@@ -129,7 +129,7 @@ def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
             return None
         if not _check_constraints(node, prod):
             return None
-        nodes[prod.name] = cursor
+        nodes[prod.name] = node
         consumed.add(cursor)
         cursor = _sole_consumer(graph, cursor)
     return Match(root_node_id=start, nodes=nodes, consumed=consumed)
@@ -244,10 +244,13 @@ def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | Non
         elif pname == "out":
             kwargs[pname] = root_node.output
         elif pname in pattern_names:
-            mid = match.nodes.get(pname)
-            if mid is None or mid not in graph.nodes:
+            n = match.nodes.get(pname)
+            # Identity check (not just id-existence): an earlier match in
+            # this batch may have removed n and a different node may now
+            # occupy the same id, leaving our cached Node ref stale.
+            if n is None or graph.nodes.get(n.id) is not n:
                 return None
-            kwargs[pname] = graph.nodes[mid]
+            kwargs[pname] = n
         else:
             if input_slot < len(root_node.inputs):
                 kwargs[pname] = graph.nodes.get(root_node.inputs[input_slot])
@@ -389,7 +392,7 @@ def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Gr
     by ``>>> name`` / ``<<< name`` markers (see ``rule_diff``). Kernel
     ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
     dedicated printers rather than dumped as a body repr."""
-    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
+    matched_ids: set[str] = set(match.consumed) | {n.id for n in match.nodes.values()}
     matched_ids.add(match.root_node_id)
     matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
     before = _format_nodes(matched_nodes, graph)
@@ -453,11 +456,11 @@ def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dic
     dicts so post-hoc scripts (and the article-side analysis) can iterate
     rule applications without re-parsing the text snapshot.
     """
-    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
+    matched_ids: set[str] = set(match.consumed) | {n.id for n in match.nodes.values()}
     matched_ids.add(match.root_node_id)
     return {
         "root": match.root_node_id,
-        "matched_pattern_nodes": dict(match.nodes),
+        "matched_pattern_nodes": {name: n.id for name, n in match.nodes.items()},
         "before": [_node_to_dict(graph.nodes[nid]) for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes],
         "after": [_node_to_dict(fragment.nodes[nid]) for nid in fragment.topological_order()],
     }

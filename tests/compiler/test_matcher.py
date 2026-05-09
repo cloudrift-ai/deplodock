@@ -55,7 +55,7 @@ def test_two_node_chain():
         ],
     )
     assert len(matches) == 1
-    assert matches[0].nodes == {"ew": "m", "red": "o"}
+    assert {k: v.id for k, v in matches[0].nodes.items()} == {"ew": "m", "red": "o"}
     assert matches[0].consumed == {"m", "o"}
 
 

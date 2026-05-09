@@ -37,8 +37,8 @@ seed; overlaps between matches are allowed (the rewriter exits after
 the first successful rewrite per iteration so overlap is just
 candidate enumeration).
 
-`Match.nodes: dict[str, str]` maps each pattern entry's name to the
-matched node id. `Match.consumed` and `Match.output` are overridable by
+`Match.nodes: dict[str, Node]` maps each pattern entry's name to the
+matched `Node`. `Match.consumed` and `Match.output` are overridable by
 the rewrite function to control which nodes the splicer removes and
 which node's edges get rewired.
 
