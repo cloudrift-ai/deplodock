@@ -12,22 +12,31 @@ Public surface:
   whose return type discriminates the rewrite flavor:
   * ``Graph`` — functional fragment, spliced in place of the match.
   * ``Op`` — in-place rebind of ``root.op`` (id, inputs, hints kept).
+  * ``list[Graph | Op]`` — autotuning fork: engine applies option 0
+    inline and pushes one ``Candidate`` per remaining option onto the
+    search queue.
   Raise ``RuleSkipped`` to decline a match.
-- ``run_pipeline(graph, passes, dump=None)`` — run each named pass
-  directory in order, dispatching ``dump.on_pass`` after each.
-"""
+- ``Candidate`` / ``Search`` / ``run_pipeline`` — the autotune driver.
+  ``run_pipeline`` yields ``Candidate``s; for deterministic rules
+  (no list returns) it yields exactly one.
+
+Rule contract: rules MUST be idempotent on their own output. The engine
+re-runs the full pipeline on every popped candidate, relying on each
+rule's "already applied" guard (often implicit via op-type change) to
+skip work that's already done."""
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import inspect
 import logging
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
@@ -98,6 +107,64 @@ class Match:
     nodes: dict[str, Node] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
     output: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Autotune surface: Candidate, TraceEntry, Search
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TraceEntry:
+    """One rule application in a candidate's history. ``choice_idx`` is
+    the option picked at fork points (0 for deterministic single-option
+    rules)."""
+
+    rule_name: str
+    choice_idx: int = 0
+
+
+@dataclass
+class Candidate:
+    """A single point in the search space. The engine pops a candidate,
+    runs the entire pipeline on its graph, and yields it (terminal). When
+    a rule yields multiple options, the engine deepcopies ``graph``,
+    applies an alt option, extends ``trace``, and pushes the fork as a
+    new ``Candidate`` onto the search queue.
+
+    ``graph`` is owned by this candidate (deep-copied at fork time).
+    ``ctx`` is shared by reference (frozen). ``trace`` is the immutable
+    history of rule applications on this branch."""
+
+    graph: Graph
+    ctx: Context
+    trace: tuple[TraceEntry, ...] = ()
+
+
+class Search(Protocol):
+    """Search-strategy hook. The engine pushes spawned candidates here
+    and pops the next one to expand. Implementations choose the
+    ordering — DFS / BFS / priority / MCTS / whatever."""
+
+    def push(self, c: Candidate) -> None: ...
+    def pop(self) -> Candidate | None: ...  # None when exhausted
+
+
+class DFSSearch:
+    """Depth-first stack. With deterministic (non-list-returning) rules,
+    no fork ever happens, so this yields exactly one candidate — same
+    observable behavior as the old single-graph pipeline driver. Used
+    as the default by ``run_pipeline``; pass an explicit ``search=`` to
+    ``run_autotune`` for any other strategy."""
+
+    def __init__(self) -> None:
+        self._stack: list[Candidate] = []
+
+    def push(self, c: Candidate) -> None:
+        self._stack.append(c)
+
+    def pop(self) -> Candidate | None:
+        return self._stack.pop() if self._stack else None
 
 
 def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
@@ -277,17 +344,35 @@ def run_pass(
     point. ``select``, if given, restricts the run to rules whose name
     (with or without the numeric ordering prefix, e.g. ``tileify`` or
     ``001_tileify``) appears in the iterable — useful for isolating a
-    single rule's behavior in tests."""
+    single rule's behavior in tests.
+
+    Single-graph helper: use ``run_pipeline`` for autotuning. Discards
+    any fork ``Candidate``s a multi-option rule might want to spawn."""
     rules = _load_rules(pass_dir)
     if select is not None:
         wanted = set(select)
         rules = [r for r in rules if r.name in wanted or _strip_rule_prefix(r.name) in wanted]
-    return _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name, ctx=ctx)
+    g, _ = _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name, ctx=ctx)
+    return g
 
 
 def run_rule(graph: Graph, rule_path: Path, ctx: Context | None = None) -> Graph:
-    """Load a single rule module and apply it to fixed point."""
-    return _apply_rules(graph, [_load_rule(rule_path)], ctx=ctx)
+    """Load a single rule module and apply it to fixed point. Discards
+    fork siblings — for autotuning use the full ``run_pipeline`` driver."""
+    g, _ = _apply_rules(graph, [_load_rule(rule_path)], ctx=ctx)
+    return g
+
+
+def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:
+    """Apply one rewrite outcome to ``graph``. ``Op`` rebinds
+    ``root.op`` in place (id, inputs, hints kept); ``Graph`` is a
+    fragment spliced via ``_apply_replacement``. Returns the (possibly
+    same, possibly new) graph."""
+    if isinstance(result, Op):
+        graph.nodes[match.root_node_id].op = result
+        return graph
+    assert isinstance(result, Graph), f"rule {rule_name} returned {type(result).__name__}; expected Graph, Op, list, or RuleSkipped"
+    return _apply_replacement(graph, match, result)
 
 
 def _apply_rules(
@@ -297,7 +382,9 @@ def _apply_rules(
     pass_idx: int | None = None,
     pass_name: str | None = None,
     ctx: Context | None = None,
-) -> Graph:
+    search: Search | None = None,
+    trace: tuple[TraceEntry, ...] = (),
+) -> tuple[Graph, tuple[TraceEntry, ...]]:
     from collections import defaultdict
 
     debug_on = logger.isEnabledFor(logging.DEBUG)
@@ -333,30 +420,49 @@ def _apply_rules(
                             emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
                         stats[2] += time.monotonic() - t1
                         continue
-                    # An ``Op`` return is shorthand for "rebind ``root.op``
-                    # in place" — wrapped in a single-node fragment so the
-                    # diff renderer and dump path are shared with the
-                    # functional case. In-place rebinds don't re-trigger
-                    # this rule (the same pattern won't match the new op),
-                    # so we don't set ``rule_changed`` / ``outer_changed``.
-                    inplace = isinstance(result, Op)
-                    if inplace:
-                        fragment = _wrap_op_as_fragment(graph, match.root_node_id, result)
-                    else:
-                        assert isinstance(result, Graph), (
-                            f"rule {rule.name} returned {type(result).__name__}; expected Graph, Op, or RuleSkipped"
-                        )
-                        fragment = result
+                    # Normalize: bare Op/Graph → 1-element list; multi-
+                    # element list = autotune fork point.
+                    options = list(result) if isinstance(result, (list, tuple)) else [result]
+                    if not options:
+                        # Empty list = "no viable option" — same as RuleSkipped.
+                        stats[2] += time.monotonic() - t1
+                        continue
+                    # Spawn one Candidate per non-chosen alt; each gets
+                    # a deep-copy of the current graph with the alt
+                    # applied. They re-enter the pipeline at pass 0
+                    # when popped — idempotent rules skip the work
+                    # already baked into the graph.
+                    if len(options) > 1 and search is not None:
+                        for alt_idx, alt in enumerate(options[1:], start=1):
+                            forked_graph = copy.deepcopy(graph)
+                            forked_match = _remap_match_to(forked_graph, match)
+                            forked_graph = _apply_one(forked_graph, forked_match, alt, rule_name=rule.name)
+                            search.push(
+                                Candidate(
+                                    graph=forked_graph,
+                                    ctx=ctx,
+                                    trace=(*trace, TraceEntry(rule.name, alt_idx)),
+                                )
+                            )
+                    chosen = options[0]
+                    # Render the diff and dump record using a unified
+                    # single-node fragment view (same path for Op-rebind
+                    # and Graph-splice).
+                    fragment = _wrap_op_as_fragment(graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
                     text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
                     if debug_on:
                         emit(text)
                     if dump_on:
                         record = _record_rule_application(graph, match, fragment)
                         dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-                    if inplace:
-                        graph.nodes[match.root_node_id].op = result
-                    else:
-                        graph = _apply_replacement(graph, match, fragment)
+                    inplace = isinstance(chosen, Op)
+                    graph = _apply_one(graph, match, chosen, rule_name=rule.name)
+                    trace = (*trace, TraceEntry(rule.name, 0))
+                    if not inplace:
+                        # Functional-rule splices change the graph
+                        # structurally; re-run the rule loop. In-place
+                        # rebinds change op only — the same pattern
+                        # won't match the new op, so don't re-fire.
                         rule_changed = True
                         outer_changed = True
                     stats[2] += time.monotonic() - t1
@@ -366,7 +472,20 @@ def _apply_rules(
     for name, (n, mt, rt) in sorted(rule_stats.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
         if n or mt > 0.01:
             logger.info("  rule %-30s applied=%4d  match=%5.2fs  rewrite=%5.2fs", name, n, mt, rt)
-    return graph
+    return graph, trace
+
+
+def _remap_match_to(forked_graph: Graph, match: Match) -> Match:
+    """Re-resolve ``match`` against ``forked_graph`` (a deep copy).
+    The original ``Match.nodes`` holds Node refs from the source graph;
+    after deepcopy those refs point into the wrong graph. Re-resolve by
+    id so dispatcher checks (identity / removal) work on the fork."""
+    return Match(
+        root_node_id=match.root_node_id,
+        nodes={name: forked_graph.nodes[n.id] for name, n in match.nodes.items() if n.id in forked_graph.nodes},
+        consumed=set(match.consumed),
+        output=match.output,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -585,20 +704,83 @@ def run_pipeline(
     ctx: Context | None = None,
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
-    after each. ``select`` is forwarded to :func:`run_pass` for every
-    pass — only rules whose name matches will run. ``ctx`` is built once
-    (probing the live device if not provided) and passed to every rule
-    that takes a ``ctx`` parameter."""
-    t_start = time.monotonic()
-    select_set = set(select) if select is not None else None
+    after each. Single-candidate convenience wrapper around
+    :func:`run_autotune` (uses ``DFSSearch``) — returns the graph of the
+    first terminal candidate. With deterministic rules that's the only
+    candidate.
+
+    ``ctx`` is built once (probing the live device if not provided)
+    and passed to every rule that takes a ``ctx`` parameter."""
+    return next(run_autotune(graph, passes, search=DFSSearch(), dump=dump, select=select, ctx=ctx)).graph
+
+
+def run_autotune(
+    graph: Graph,
+    passes: list[str],
+    *,
+    search: Search,
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+    ctx: Context | None = None,
+) -> Iterator[Candidate]:
+    """Drive the autotune search. Yields one terminal ``Candidate`` per
+    fully-explored branch. With deterministic rules (no list-returning
+    rewrites) the search yields exactly one — same shape as
+    ``run_pipeline``.
+
+    ``search`` is required: the caller picks the strategy
+    (``DFSSearch`` for plain DFS, or any custom ``Search`` impl for
+    priority / MCTS / beam). The engine pushes the initial candidate
+    and every fork-spawned sibling onto it, then pops + expands until
+    exhausted.
+
+    Each popped candidate runs the entire pipeline on its graph from
+    pass 0; rules MUST be idempotent on their own output so rerun work
+    is cheap (pattern-match scans that find nothing).
+
+    ``ctx`` is built once (probing the live device if not provided)
+    and shared by every candidate."""
     if ctx is None:
         ctx = Context.probe()
+    select_set = set(select) if select is not None else None
+    search.push(Candidate(graph=graph, ctx=ctx, trace=()))
+
+    while (cand := search.pop()) is not None:
+        yield _expand(cand, passes, ctx, search, dump, select_set)
+
+
+def _expand(
+    cand: Candidate,
+    passes: list[str],
+    ctx: Context,
+    search: Search,
+    dump: CompilerDump | None,
+    select_set: set[str] | None,
+) -> Candidate:
+    """Run the full pipeline on ``cand.graph``, accumulating into its
+    trace. Forks during execution push fresh ``Candidate``s onto
+    ``search``; this function returns the option-0 terminal."""
+    t_start = time.monotonic()
+    graph = cand.graph
+    trace = cand.trace
     for idx, name in enumerate(passes, start=1):
         t0 = time.monotonic()
         n_before = len(graph.nodes)
-        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name, select=select_set, ctx=ctx)
+        rules = _load_rules(_PASSES_DIR / name)
+        if select_set is not None:
+            rules = [r for r in rules if r.name in select_set or _strip_rule_prefix(r.name) in select_set]
+        graph, trace = _apply_rules(
+            graph,
+            rules,
+            dump=dump,
+            pass_idx=idx,
+            pass_name=name,
+            ctx=ctx,
+            search=search,
+            trace=trace,
+        )
         logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
         if dump is not None:
             dump.on_pass(idx, name, graph)
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
-    return graph
+    return Candidate(graph=graph, ctx=ctx, trace=trace)

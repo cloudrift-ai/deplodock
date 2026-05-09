@@ -48,7 +48,7 @@ Every file named `NNN_<name>.py` under a pass directory is a rule:
 
 ```python
 PATTERN = [Pattern("root", SomeOp), ...]   # required
-def rewrite(ctx: Context, graph: Graph, match: Match) -> Graph | Op:
+def rewrite(ctx: Context, graph: Graph, match: Match) -> Graph | Op | list[Graph | Op]:
     ...
 ```
 
@@ -56,6 +56,20 @@ The dispatcher binds parameters by name. Reserved names: `graph`,
 `match`, `root`, `out`, `ctx`. Pattern names from `PATTERN` bind to
 matched `Node` objects. Anything else binds positionally to
 `root.inputs[i]`. Take only what you need — `ctx` is optional.
+
+**Returning a list = autotune fork.** A rule that's unsure which
+parameter to use returns the alternatives as a list. The engine applies
+option 0 inline and pushes one `Candidate` per remaining option onto the
+search queue (deep-copying the graph at the fork point). Single-option
+returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
+
+**Idempotence requirement.** Every rule MUST be idempotent on its own
+output. The engine re-runs the entire pipeline on each popped candidate
+from pass 0; rules whose output is already in the graph must `RuleSkipped`
+or have a pattern that no longer matches. Most rules satisfy this
+implicitly via op-type changes (`LoopOp` → `TileOp`); the rest have
+explicit `raise RuleSkipped("already X")` guards. Without idempotence,
+re-runs would double-apply and corrupt graph state.
 
 The return type discriminates the rewrite flavor:
 
@@ -82,7 +96,14 @@ rules — they're shared helpers for the pass's rule modules.
 - `run_pass(graph, pass_dir)` — load every rule file in a directory,
   apply each to fixed point, then rescan the sequence until no rule
   makes further progress.
-- `run_pipeline(graph, passes, dump=None)` — run each named pass
+- `run_autotune(graph, passes, search=...) -> Iterator[Candidate]` —
+  drive the full search. Yields one terminal `Candidate` per
+  fully-explored branch. Default search is depth-first; for autotuning,
+  pass a custom `Search` implementation (priority queue, MCTS, etc.).
+  See `engine.py:Candidate`, `TraceEntry`, `Search`.
+- `run_pipeline(graph, passes, dump=None)` — single-graph convenience
+  wrapper around `run_autotune`. Returns the first terminal candidate's
+  graph; for deterministic rules that's the only one. Run each named pass
   directory in order. After each pass, dispatches `dump.on_pass(name,
   graph)` so dump hooks land at the right stage without the caller
   hard-coding which dump method belongs to which pass.

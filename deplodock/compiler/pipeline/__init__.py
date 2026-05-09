@@ -13,10 +13,15 @@
 
 from deplodock.compiler.pipeline.dump import CompilerDump
 from deplodock.compiler.pipeline.engine import (
+    Candidate,
+    DFSSearch,
     Match,
     Pattern,
     RuleSkipped,
+    Search,
+    TraceEntry,
     match_pattern,
+    run_autotune,
     run_pass,
     run_pipeline,
     run_rule,
@@ -32,15 +37,20 @@ CUDA_PASSES = [*KERNEL_PASSES, "lowering/cuda"]
 
 __all__ = [
     "CUDA_PASSES",
+    "Candidate",
     "CompilerDump",
+    "DFSSearch",
     "KERNEL_PASSES",
     "LOOP_PASSES",
     "Match",
     "Pattern",
     "RuleSkipped",
+    "Search",
     "TENSOR_PASSES",
     "TILE_PASSES",
+    "TraceEntry",
     "match_pattern",
+    "run_autotune",
     "run_pass",
     "run_pipeline",
     "run_rule",
