@@ -2,9 +2,13 @@
 
 Takes one or more IR JSON paths and renders one column per input. Each
 column contains a card per ``(Stage, body-Load)`` pair showing the warp's
-per-lane smem bank at one inner-loop iteration. Simulation lives in
-``deplodock.compiler.diagnostics.bank_conflicts``; this script is a thin
-CLI + ECharts emitter.
+per-lane smem bank at one inner-loop iteration.
+
+Simulation:
+:func:`deplodock.compiler.diagnostics.bank_conflicts.simulate_graph`
+compiles the kernel, instruments it at the kernel-lowering stage, and runs one CTA
+to record actual smem addresses per lane. This script is a thin CLI +
+ECharts emitter. **Requires CUDA** — compile and launch must succeed.
 
 Workflow — produce IRs via the compiler with whatever pass gates you
 want, then feed the dumped JSONs in::
@@ -53,9 +57,8 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
         key = (p.tile_op_name, p.stage_name)
         u = stage_union.setdefault(key, {})
         for cell, pairs in p.full_sweep_touched.items():
-            subst = p.full_sweep_subst_idx.get(cell, ())
             for k, lane in pairs:
-                u.setdefault(cell, []).append((p.load_name, k, lane, subst))
+                u.setdefault(cell, []).append((p.load_name, k, lane))
         cmap = stage_conflict_loads.setdefault(key, {})
         for cell in p.full_sweep_conflict_cells:
             cmap.setdefault(cell, set()).add(p.load_name)
@@ -91,13 +94,10 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
         # Per-Stage UNION across every body Load of the Stage.
         union = stage_union.get((p.tile_op_name, p.stage_name), {})
         sweep_per_cell: dict[tuple[int, int], list[list]] = {}
-        subst_per_cell: dict[tuple[int, int], dict[str, tuple]] = {}
         for (r, c), entries in union.items():
             if not (0 <= r < layout_rows and 0 <= c < layout_cols):
                 continue
-            sweep_per_cell[(r, c)] = [[ln, k, lane] for (ln, k, lane, _s) in entries]
-            for ln, _k, _l, s in entries:
-                subst_per_cell.setdefault((r, c), {}).setdefault(ln, tuple(s))
+            sweep_per_cell[(r, c)] = [[ln, k, lane] for (ln, k, lane) in entries]
         all_cells = sorted(set(touched_now) | set(sweep_per_cell))
         conflict_loads = stage_conflict_loads.get((p.tile_op_name, p.stage_name), {})
         touched_entries = [
@@ -107,8 +107,6 @@ def _serialize(panels: list[BankConflictResult], all_panels_for_union: list[Bank
                 "lanes_now": touched_now.get((r, c), []),
                 # sweep: list of [load_name, k_iter, lane]
                 "sweep": sweep_per_cell.get((r, c), []),
-                # subst_by_load: {load_name: [substituted_index_string, ...]}
-                "subst_by_load": {ln: list(s) for ln, s in subst_per_cell.get((r, c), {}).items()},
                 # Loads whose LDS conflicts when touching this cell.
                 "conflict_loads": sorted(conflict_loads.get((r, c), set())),
             }
@@ -403,7 +401,6 @@ PAYLOAD.columns.forEach((col, ci) => {
     // addresses = conflict for this LDS.
     const touchedNow = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.lanes_now]));
     const sweep = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.sweep]));
-    const substByLoad = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.subst_by_load]));
     const focusLoad = lay.load_name;
     const conflictLoadsByCell = new Map(lay.touched.map(t => [`${t.r},${t.c}`, t.conflict_loads || []]));
     for (let r = 0; r < lay.rows; r++) {
@@ -438,12 +435,10 @@ PAYLOAD.columns.forEach((col, ci) => {
           if (!sweepPairs.length) {
             return head + padTag + `<br/><span style="color:#6b7280">never read by warp 0 (other warps own this row)</span>`;
           }
-          // One substituted form per Load that hits this cell.
-          const substMap = substByLoad.get(k) || {};
-          const substLines = Object.entries(substMap).sort().map(
-            ([ln, subst]) => `<code style="color:#3ddc84">${ln}[${subst.join(', ')}]</code>`
-          );
-          const loadSection = substLines.length ? `<br/>${substLines.join('<br/>')}` : '';
+          const loadNames = [...new Set(sweepPairs.map(([ln, _k, _l]) => ln))].sort();
+          const loadSection = loadNames.length
+            ? `<br/>${loadNames.map(ln => `<code style="color:#3ddc84">${ln}</code>`).join('<br/>')}`
+            : '';
           const conflicts = conflictLoadsByCell.get(k) || [];
           let conflictTag = '';
           if (conflicts.length) {

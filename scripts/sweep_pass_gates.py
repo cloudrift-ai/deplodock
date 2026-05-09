@@ -22,7 +22,7 @@ from pathlib import Path
 # Make tests.perf importable when running from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from deplodock.compiler.diagnostics.bank_conflicts import find_all_bindings, simulate  # noqa: E402
+from deplodock.compiler.diagnostics.bank_conflicts import find_all_bindings, lane_bank_distribution  # noqa: E402
 from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline  # noqa: E402
 from tests.perf.cases import FUSED_CASES, PRIMITIVE_CASES, build_deplodock_graph  # noqa: E402
 
@@ -64,10 +64,17 @@ def total_events_per_kernel(graph) -> dict[str, dict[str, int]]:
         if key in seen:
             continue
         seen.add(key)
-        r = simulate(b)
-        if r is None:
+        stage, load, tile = b.stage, b.load, b.tile
+        if not stage.axes or len(load.index) < len(stage.axes):
             continue
-        out[b.tile_op_name][r.stage_name] += r.conflict_events
+        cache_idx = tuple(load.index[-len(stage.axes) :])
+        extra_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
+        for ax in b.enclosing_loop_axes:
+            extra_env.setdefault(ax.name, 0)
+        dist = lane_bank_distribution(cache_idx, stage.alloc_extents, tile.thread_axes, extra_env=extra_env)
+        if dist is None:
+            continue
+        out[b.tile_op_name][stage.name] += dist.conflict_events
     return {k: dict(v) for k, v in out.items()}
 
 

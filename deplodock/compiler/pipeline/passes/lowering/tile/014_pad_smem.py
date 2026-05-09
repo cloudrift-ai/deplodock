@@ -24,35 +24,25 @@ by one row, every higher-stride row shifts by one float, and the per-
 thread address mod 32 changes from a uniform 0 to a sequence that
 touches all 32 banks.
 
-Analysis (closed-form, no per-thread evaluator)
-================================================
+Analysis
+========
 
-For an affine Load index, decompose each dim into
-``anchor + sum_v(coeff_v * Var(v))`` over the thread-axis vars (via
-:func:`affine_form`). The flat smem address for a Load is
-``sum_d (idx[d] * stride[d])``. Substituting the decomposition:
-
-    flat(tid) = warp_const + sum_v (S_v * tid_v(tid))
-
-where ``S_v = sum_d coeff_v_d * stride[d]`` is the per-thread-axis
-contribution to the flat address. ``warp_const`` collects the anchor
-parts plus everything that doesn't reference a thread-axis Var — it
-shifts every thread's address by the same amount and so contributes a
-constant offset to *all* banks; the bank distribution it produces is
-independent of ``warp_const``.
-
-So bank conflict counting reduces to: enumerate ``tid ∈ [0, 32)``,
-decode ``(tid_v)`` per :func:`materialize_tile`'s tid-flatten scheme,
-compute ``flat_v = sum_v S_v * tid_v``, distribute by ``flat_v % 32``,
-count distinct addresses per bank. Broadcasts (multiple tids → same
-``flat_v``) don't count as conflicts.
+Per-lane bank distribution comes from the shared kernel
+:func:`deplodock.compiler.diagnostics.bank_conflicts.lane_bank_distribution`,
+which enumerates the 32 warp lanes, decodes each lane's thread-axis
+values per ``materialize_tile``'s flatten scheme, evaluates the Load
+index against the smem strides (folded with any pad), and tallies
+distinct addresses per bank. Block axes and outer loop axes are
+auto-zero-bound — bank distribution is invariant to additive
+warp-uniform offsets, so the choice of value doesn't change ``max_way``.
 
 The pass:
 
 1. For each ``Stage`` in the Tile body, find body Loads reading it.
-2. Compute per-axis ``S_v`` once per Load via :func:`affine_form`.
-3. If any Load is non-affine in the thread-axis vars, conservatively
-   skip the Stage (we can't bound its conflict without the analyzer).
+2. Compute the worst-case ``max_way`` across all body Loads at the
+   current (un-padded) extents.
+3. If any Load can't be evaluated (rank mismatch with ``Stage.axes``),
+   conservatively skip the Stage.
 4. Try ``+1`` padding combinations (1-dim, then 2-dim) within
    ``_MAX_PADDED_SLAB_BYTES``; pick the first that drives every
    Load's max-way conflict to 1. Fall back to the best partial fix.
@@ -64,15 +54,13 @@ import logging
 import os
 from dataclasses import replace as dc_replace
 
+from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis
-from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
-    load_thread_axis_coeffs,
     loads_reading,
-    max_bank_conflict,
     single_tile,
 )
 
@@ -105,17 +93,16 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 def _maybe_rewrite(body: Body) -> Body | None:
     idx, tile = single_tile(body)
 
-    thread_axes = tuple(ba.axis for ba in tile.axes if ba.bind == BIND_THREAD)
-    if not thread_axes:
+    if not tile.thread_axes:
         raise RuleSkipped("Tile has no THREAD axes — no bank-conflict layout to pad")
 
-    new_tile_body = _process_body(tile.body, thread_axes)
+    new_tile_body = _process_body(tile.body, tile)
     if new_tile_body is tile.body or new_tile_body == tile.body:
         raise RuleSkipped("no Stage has a fixable bank conflict within slab budget")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
+def _process_body(body: Body, tile: Tile) -> Body:
     """Walk body and any free-Loop scopes; pad each Stage that has a
     fixable conflict. Returns the new body (or original if no changes)."""
     new_body: list[Stmt] = list(body)
@@ -130,42 +117,50 @@ def _process_body(body: Body, thread_axes: tuple[Axis, ...]) -> Body:
             loads = loads_reading(body, s.name)
             if not loads:
                 continue
-            updated = _try_fix(s, loads, thread_axes)
+            updated = _try_fix(s, loads, tile)
             if updated is not None:
                 new_body[i] = updated
                 changed = True
         elif isinstance(s, Loop):
-            inner = _process_body(s.body, thread_axes)
+            inner = _process_body(s.body, tile)
             if inner is not s.body and inner != s.body:
                 new_body[i] = dc_replace(s, body=inner)
                 changed = True
     return tuple(new_body) if changed else body
 
 
-def _try_fix(stage: Stage, loads, thread_axes: tuple[Axis, ...]) -> Stage | None:
+def _max_conflict(loads: list[Load], extents: tuple[int, ...], leading_phase: bool, tile: Tile) -> int | None:
+    """Worst-case ``max_way`` across body ``loads`` of one Stage at the
+    given hypothetical ``extents``. Returns ``None`` if any Load can't
+    be evaluated (rank mismatch / unbound non-thread var that isn't
+    auto-zero-bindable) — caller skips conservatively."""
+    worst = 1
+    for ld in loads:
+        cache_idx = ld.index[1:] if leading_phase else ld.index
+        if len(cache_idx) != len(extents):
+            return None
+        dist = lane_bank_distribution(tuple(cache_idx), extents, tile.thread_axes)
+        if dist is None:
+            return None
+        worst = max(worst, dist.max_way)
+    return worst
+
+
+def _try_fix(stage: Stage, loads: list[Load], tile: Tile) -> Stage | None:
     n = len(stage.axes)
     base_extents = tuple(int(ax.extent) for ax in stage.axes)
+    leading_phase = isinstance(stage, BufferedStage)
 
-    # Body Loads on a ``BufferedStage`` carry an extra leading phase index
-    # added by ``010_double_buffer``; strip it for the analysis. Phase is
-    # uniform across threads, so it doesn't affect bank distribution.
-    per_load_coeffs = load_thread_axis_coeffs(
-        loads,
-        n,
-        thread_axes,
-        leading_phase_dim=isinstance(stage, BufferedStage),
-    )
-    if per_load_coeffs is None:
+    base_conflict = _max_conflict(loads, base_extents, leading_phase, tile)
+    if base_conflict is None:
         return None
-
-    no_pad = (0,) * n
-    base_conflict = max_bank_conflict(per_load_coeffs, base_extents, thread_axes)
     if base_conflict <= 1:
         return None
 
     # Try +1 padding combinations, smallest-pad-first. Single-dim pads
     # (n options) before pair-dim pads (n*(n-1)/2 options). Stop at the
     # first conflict-free configuration.
+    no_pad = (0,) * n
     candidates: list[tuple[int, ...]] = []
     # 1-dim: prefer innermost-first (likely the right granularity).
     for dim in range(n - 1, -1, -1):
@@ -189,7 +184,9 @@ def _try_fix(stage: Stage, loads, thread_axes: tuple[Axis, ...]) -> Stage | None
             slab_bytes *= e
         if slab_bytes > _MAX_PADDED_SLAB_BYTES:
             continue
-        c = max_bank_conflict(per_load_coeffs, padded, thread_axes)
+        c = _max_conflict(loads, padded, leading_phase, tile)
+        if c is None:
+            continue
         if c <= 1:
             n_pad_dims = sum(1 for p in pad if p)
             logger.info(

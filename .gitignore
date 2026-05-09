@@ -28,5 +28,8 @@ nginx.vllm.conf
 tests/perf/.results/
 _test_data
 
+# Experiment outputs
+experiments/
+
 # Claude Code per-user local settings (skills/agents under .claude/ are tracked)
 .claude/settings.local.json

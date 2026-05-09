@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.expr import Expr, SimplifyCtx
 
 
 @dataclass(frozen=True, eq=False)
@@ -39,6 +39,13 @@ class Sigma:
 
     def apply(self, e: Expr) -> Expr:
         return e.substitute(self.mapping)
+
+    def reduce(self, e: Expr, ctx: SimplifyCtx) -> Expr:
+        """Substitute then simplify under ``ctx``. Use when the substitution
+        is expected to expose constant folding — e.g. anchor / coefficient
+        probes that pin axes to literals. Distinct from ``Expr.eval`` which
+        evaluates a fully-bound expression to a concrete int/float."""
+        return e.substitute(self.mapping).simplify(ctx)
 
     def extend(self, name: str, expr: Expr) -> Sigma:
         return Sigma({**self.mapping, name: expr})
