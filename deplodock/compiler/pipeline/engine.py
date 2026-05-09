@@ -27,8 +27,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.graph import Graph, Tensor, _fmt_op
+from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
+from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -112,8 +114,6 @@ def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
 
 
 def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
-    if start not in graph.nodes:
-        return None
     cursor: str | None = start
     nodes: dict[str, str] = {}
     consumed: set[str] = set()
@@ -132,11 +132,7 @@ def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
 
 
 def _check_constraints(node, prod: Pattern) -> bool:
-    for field_name, expected in prod.constraints.items():
-        actual = getattr(node.op, field_name, None)
-        if actual is None or str(actual) != str(expected):
-            return False
-    return True
+    return all(str(getattr(node.op, k, None)) == str(v) for k, v in prod.constraints.items())
 
 
 def _sole_consumer(graph: Graph, nid: str) -> str | None:
@@ -292,37 +288,38 @@ def _apply_rules(
     pass_idx: int | None = None,
     pass_name: str | None = None,
 ) -> Graph:
+    from collections import defaultdict
+
+    debug_on = logger.isEnabledFor(logging.DEBUG)
+    dump_on = dump is not None and pass_idx is not None and pass_name is not None
+    need_text = debug_on or dump_on
+
+    # name -> [applied, match_s, rewrite_s]
+    rule_stats: dict[str, list] = defaultdict(lambda: [0, 0.0, 0.0])
+
     outer_changed = True
-    rule_stats: dict[str, tuple[int, float, float]] = {}  # name -> (applied, match_s, rewrite_s)
     while outer_changed:
         outer_changed = False
         for rule in rules:
             while True:
+                stats = rule_stats[rule.name]
                 t0 = time.monotonic()
                 matches = match_pattern(graph, rule.pattern)
-                match_time = time.monotonic() - t0
+                stats[1] += time.monotonic() - t0
                 if not matches:
-                    prev = rule_stats.get(rule.name, (0, 0.0, 0.0))
-                    rule_stats[rule.name] = (prev[0], prev[1] + match_time, prev[2])
                     break
                 rule_changed = False
-                applied = 0
-                rewrite_time = 0.0
                 for match in matches:
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
                     t1 = time.monotonic()
-                    # Snapshot matched-node ops before rewrite. Always
-                    # captured: needed for in-place change detection
-                    # (counting toward ``applied``). At -vv or when a
-                    # dump is set, the same snapshot also drives the
-                    # before/after render text.
-                    debug_on = logger.isEnabledFor(logging.DEBUG)
+                    # Snapshot matched-node ops before rewrite — needed
+                    # for in-place change detection. ``pre_names`` (output-name
+                    # → pre-rewrite id) lets the formatter follow renames
+                    # (rules like ``tileify`` mutate the op AND ``rename_node``
+                    # to a friendlier id), so it's only built when text is needed.
                     pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
-                    # Output-name → pre-rewrite node id so the formatter
-                    # can follow renames (rules like ``tileify`` mutate
-                    # the op AND ``rename_node`` to a friendlier id).
-                    pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops if nid in graph.nodes}
+                    pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops} if need_text else {}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
@@ -330,44 +327,38 @@ def _apply_rules(
                         fragment = rule.rewrite(**kwargs)
                     except RuleSkipped as exc:
                         if debug_on:
-                            from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped
-
                             emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
-                        rewrite_time += time.monotonic() - t1
+                        stats[2] += time.monotonic() - t1
                         continue
                     if fragment is None:
-                        # Detect both in-place op rebinds AND rule-driven
-                        # rename/delete (e.g. ``tileify`` calls
-                        # ``graph.rename_node``; the old id disappears
-                        # from ``graph.nodes`` even though the rule did
-                        # apply).
+                        # Detect in-place op rebinds AND rule-driven rename/delete
+                        # (e.g. ``tileify`` renames a node, so the old id
+                        # disappears from ``graph.nodes`` even though it applied).
                         if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
-                            text = _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
+                            text = (
+                                _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
+                                if need_text
+                                else None
+                            )
                             if debug_on:
-                                from deplodock.compiler.pipeline.rule_diff import emit
-
                                 emit(text)
-                            if dump is not None and pass_idx is not None and pass_name is not None:
+                            if dump_on:
                                 record = _record_inplace_application(graph, match, pre_ops)
                                 dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-                            applied += 1
-                        rewrite_time += time.monotonic() - t1
+                            stats[0] += 1
+                        stats[2] += time.monotonic() - t1
                         continue
-                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name)
+                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
                     if debug_on:
-                        from deplodock.compiler.pipeline.rule_diff import emit
-
                         emit(text)
-                    if dump is not None and pass_idx is not None and pass_name is not None:
+                    if dump_on:
                         record = _record_rule_application(graph, match, fragment)
                         dump.on_rule(pass_idx, pass_name, rule.name, record, text)
                     graph = _apply_replacement(graph, match, fragment)
-                    rewrite_time += time.monotonic() - t1
-                    applied += 1
+                    stats[2] += time.monotonic() - t1
+                    stats[0] += 1
                     rule_changed = True
                     outer_changed = True
-                prev = rule_stats.get(rule.name, (0, 0.0, 0.0))
-                rule_stats[rule.name] = (prev[0] + applied, prev[1] + match_time, prev[2] + rewrite_time)
                 if not rule_changed:
                     break
     for name, (n, mt, rt) in sorted(rule_stats.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
@@ -386,8 +377,6 @@ def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Gr
     by ``>>> name`` / ``<<< name`` markers (see ``rule_diff``). Kernel
     ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
     dedicated printers rather than dumped as a body repr."""
-    from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
-
     matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
     matched_ids.add(match.root_node_id)
     matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
@@ -416,8 +405,6 @@ def _format_inplace_application(
     lets the formatter resolve a renamed-away id to its post-rewrite
     counterpart by matching on output name, which is preserved across
     ``rename_node``."""
-    from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
-
     # Build a "current id" for each pre_ops entry, following any rename
     # that happened during the rewrite.
     name_to_post_id = {graph.nodes[nid].output.name: nid for nid in graph.nodes} if pre_names else {}
@@ -495,10 +482,6 @@ def _format_nodes(nodes: list, graph: Graph) -> str:
     emits ``<output> = TileOp(<inputs>)`` one line above, so the kernel
     header would just duplicate the same info and shift the body's
     indent by 4 spaces, ballooning the diff."""
-    from deplodock.compiler.graph import _fmt_op
-    from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-
     lines: list[str] = []
     for node in nodes:
         op = node.op
@@ -573,12 +556,12 @@ def _apply_replacement(graph: Graph, match: Match, fragment: Graph) -> Graph:
     g.replace_node(old_output, new_output)
 
     for nid in match.consumed:
-        orig = graph.nodes.get(nid)
-        if orig is not None and orig.hints:
+        orig = g.nodes.get(nid)
+        if orig is None:
+            continue
+        if orig.hints:
             g.nodes[new_output].hints.merge(orig.hints)
-
-    for nid in match.consumed:
-        if nid in g.nodes and nid != old_output:
+        if nid != old_output:
             g.remove_node(nid)
     if old_output in g.nodes:
         g.remove_node(old_output)
