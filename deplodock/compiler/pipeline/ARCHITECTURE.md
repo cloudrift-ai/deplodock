@@ -48,9 +48,14 @@ Every file named `NNN_<name>.py` under a pass directory is a rule:
 
 ```python
 PATTERN = [Pattern("root", SomeOp), ...]   # required
-def rewrite(graph: Graph, match: Match) -> Graph | Op:
+def rewrite(ctx: Context, graph: Graph, match: Match) -> Graph | Op:
     ...
 ```
+
+The dispatcher binds parameters by name. Reserved names: `graph`,
+`match`, `root`, `out`, `ctx`. Pattern names from `PATTERN` bind to
+matched `Node` objects. Anything else binds positionally to
+`root.inputs[i]`. Take only what you need — `ctx` is optional.
 
 The return type discriminates the rewrite flavor:
 

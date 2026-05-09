@@ -51,7 +51,6 @@ The pass:
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
@@ -79,10 +78,6 @@ _MAX_PADDED_SLAB_BYTES = 20 * 1024
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
-    # Diagnostic gate for visualizing pipeline behavior with this pass
-    # disabled (e.g. smem-conflict before/after diffs).
-    if os.environ.get("DEPLODOCK_DISABLE_PAD_SMEM") == "1":
-        raise RuleSkipped("disabled via DEPLODOCK_DISABLE_PAD_SMEM=1")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("no Stage benefited from padding")

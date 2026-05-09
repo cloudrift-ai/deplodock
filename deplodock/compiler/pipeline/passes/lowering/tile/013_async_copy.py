@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import logging
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AsyncBufferedStage, AsyncWait, BufferedStage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +43,9 @@ _MIN_CAPABILITY = (8, 0)
 _MIN_BYTES_PER_THREAD = 16  # 4 fp32 elems
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    if compute_capability() < _MIN_CAPABILITY:
-        raise RuleSkipped(f"cp.async requires compute capability >= {_MIN_CAPABILITY}, got {compute_capability()}")
+def rewrite(ctx: Context, root: Node) -> Graph | None:
+    if ctx.compute_capability < _MIN_CAPABILITY:
+        raise RuleSkipped(f"cp.async requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")

@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
@@ -210,13 +211,13 @@ def _load_rule(path: Path) -> _Rule:
     return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names)
 
 
-def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | None:
+def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match, ctx: Context | None = None) -> dict | None:
     """Bind each ``rewrite`` param to its source.
 
-    Reserved-name params (``graph`` / ``match`` / ``root`` / ``out``) and
-    ``PATTERN``-name params bind by name; every remaining param binds
-    positionally to ``root.inputs[i]`` (in declaration order, ``None``
-    when the position exceeds the available inputs).
+    Reserved-name params (``graph`` / ``match`` / ``root`` / ``out`` /
+    ``ctx``) and ``PATTERN``-name params bind by name; every remaining
+    param binds positionally to ``root.inputs[i]`` (in declaration
+    order, ``None`` when the position exceeds the available inputs).
 
     Returns ``None`` when a pattern-name param's matched node has been
     deleted from the graph between match enumeration and rewrite — a
@@ -239,6 +240,8 @@ def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | Non
             kwargs[pname] = root_node
         elif pname == "out":
             kwargs[pname] = root_node.output
+        elif pname == "ctx":
+            kwargs[pname] = ctx
         elif pname in pattern_names:
             n = match.nodes.get(pname)
             # Identity check (not just id-existence): an earlier match in
@@ -268,6 +271,7 @@ def run_pass(
     pass_idx: int | None = None,
     pass_name: str | None = None,
     select: Iterable[str] | None = None,
+    ctx: Context | None = None,
 ) -> Graph:
     """Load all rule modules in ``pass_dir`` and apply them to fixed
     point. ``select``, if given, restricts the run to rules whose name
@@ -278,12 +282,12 @@ def run_pass(
     if select is not None:
         wanted = set(select)
         rules = [r for r in rules if r.name in wanted or _strip_rule_prefix(r.name) in wanted]
-    return _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name)
+    return _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name, ctx=ctx)
 
 
-def run_rule(graph: Graph, rule_path: Path) -> Graph:
+def run_rule(graph: Graph, rule_path: Path, ctx: Context | None = None) -> Graph:
     """Load a single rule module and apply it to fixed point."""
-    return _apply_rules(graph, [_load_rule(rule_path)])
+    return _apply_rules(graph, [_load_rule(rule_path)], ctx=ctx)
 
 
 def _apply_rules(
@@ -292,6 +296,7 @@ def _apply_rules(
     dump: CompilerDump | None = None,
     pass_idx: int | None = None,
     pass_name: str | None = None,
+    ctx: Context | None = None,
 ) -> Graph:
     from collections import defaultdict
 
@@ -318,7 +323,7 @@ def _apply_rules(
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
                     t1 = time.monotonic()
-                    kwargs = _build_rewrite_kwargs(rule, graph, match)
+                    kwargs = _build_rewrite_kwargs(rule, graph, match, ctx)
                     if kwargs is None:
                         continue
                     try:
@@ -577,16 +582,21 @@ def run_pipeline(
     passes: list[str],
     dump: CompilerDump | None = None,
     select: Iterable[str] | None = None,
+    ctx: Context | None = None,
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
     after each. ``select`` is forwarded to :func:`run_pass` for every
-    pass — only rules whose name matches will run."""
+    pass — only rules whose name matches will run. ``ctx`` is built once
+    (probing the live device if not provided) and passed to every rule
+    that takes a ``ctx`` parameter."""
     t_start = time.monotonic()
     select_set = set(select) if select is not None else None
+    if ctx is None:
+        ctx = Context.probe()
     for idx, name in enumerate(passes, start=1):
         t0 = time.monotonic()
         n_before = len(graph.nodes)
-        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name, select=select_set)
+        graph = run_pass(graph, _PASSES_DIR / name, dump=dump, pass_idx=idx, pass_name=name, select=select_set, ctx=ctx)
         logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
         if dump is not None:
             dump.on_pass(idx, name, graph)
