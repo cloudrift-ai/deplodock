@@ -17,6 +17,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Per-block static-smem cap. Hard hardware limit since Maxwell (sm_50);
+# anything declared as ``__shared__`` at compile time must fit.
+# Universal across every arch we target.
+STATIC_SMEM_CAP = 48 * 1024
+
+# Per-block dynamic-smem opt-in cap by compute capability. NVIDIA assigns
+# different sm_XX numbers to datacenter vs consumer SKUs within the same
+# arch family (sm_80 A100 vs sm_86 RTX 30xx; sm_90 H100 vs sm_120 RTX
+# 50xx), so this is keyed on cc, not "arch generation". Values from
+# ``cudaDevAttrMaxSharedMemoryPerBlockOptin``.
+_MAX_DYNAMIC_SMEM_BY_CC: dict[tuple[int, int], int] = {
+    (7, 5): 64 * 1024,
+    (8, 0): 163 * 1024,
+    (8, 6): 99 * 1024,
+    (8, 9): 99 * 1024,
+    (9, 0): 227 * 1024,
+    (10, 0): 227 * 1024,
+    (12, 0): 99 * 1024,
+}
+
+
+def _max_dynamic_smem_for(cc: tuple[int, int]) -> int:
+    """Per-block dynamic-smem opt-in cap for ``cc``. Falls back to
+    ``STATIC_SMEM_CAP`` for unknown / no-hardware caps so callers that
+    use it as a budget naturally degrade to the static-only ceiling."""
+    return _MAX_DYNAMIC_SMEM_BY_CC.get(cc, STATIC_SMEM_CAP)
+
 
 @dataclass(frozen=True)
 class Context:
@@ -29,10 +56,12 @@ class Context:
     """
 
     compute_capability: tuple[int, int]
+    static_smem_cap: int = STATIC_SMEM_CAP
+    max_dynamic_smem: int = STATIC_SMEM_CAP  # overridden by from_target/probe
 
     @classmethod
     def from_target(cls, cap: tuple[int, int]) -> Context:
-        return cls(compute_capability=cap)
+        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap))
 
     @classmethod
     def probe(cls) -> Context:
@@ -41,4 +70,5 @@ class Context:
         support" (rules gating on capability self-skip via ``RuleSkipped``)."""
         from deplodock.compiler.target import compute_capability  # noqa: PLC0415
 
-        return cls(compute_capability=compute_capability())
+        cap = compute_capability()
+        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap))

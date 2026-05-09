@@ -26,9 +26,9 @@ Trigger:
   longer enforces this gate; ``014`` keeps it because its rewrite
   reorders smem visibility relative to the FMA chain and that
   reordering compounds fp32 drift on online-softmax-style bodies.
-- Smem budget: ``2 × sum(slab_floats) ≤ _SMEM_BUDGET`` (default 96 KB
-  to fit the per-block dynamic smem cap on Ada / Hopper consumer
-  parts).
+- Smem budget: ``2 × sum(slab_bytes) ≤ ctx.max_dynamic_smem`` — the
+  per-block dynamic-smem opt-in cap derived from compute capability
+  (99 KB on sm_86/89/120, 163 KB on sm_80, 227 KB on sm_90+).
 
 Idempotence: a Stage that's already a ``BufferedStage`` is left alone.
 """
@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from dataclasses import replace as dc_replace
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
@@ -47,26 +48,25 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_in
 PATTERN = [Pattern("root", TileOp)]
 
 _BUFFER_COUNT = 2
-_SMEM_BUDGET_BYTES = 96 * 1024  # 96 KB
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
+def rewrite(ctx: Context, root: Node) -> Graph | None:
+    new_body = _maybe_rewrite(root.op.body, ctx.max_dynamic_smem)
     if new_body is None:
         raise RuleSkipped("no K-outer matmul Loop eligible for double-buffering")
     return TileOp(body=new_body, name=root.op.name)
 
 
-def _maybe_rewrite(body: Body) -> Body | None:
+def _maybe_rewrite(body: Body, smem_budget: int) -> Body | None:
     idx, tile = single_tile(body)
 
-    new_tile_body = _process_scope(tile.body)
+    new_tile_body = _process_scope(tile.body, smem_budget)
     if new_tile_body is tile.body or new_tile_body == tile.body:
         raise RuleSkipped("no K-outer matmul Loop eligible for double-buffering within smem budget")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_scope(body: Body) -> Body:
+def _process_scope(body: Body, smem_budget: int) -> Body:
     """Walk the body looking for K-outer Loops eligible for double-buffering.
 
     Tracks ``invariant_names`` — the set of SSA names defined by
@@ -86,7 +86,7 @@ def _process_scope(body: Body) -> Body:
         if isinstance(s, Loop) and not s.is_reduce and _is_kouter_matmul(s, invariant_names):
             if not any(isinstance(st, BufferedStage) for st in s.body):
                 stages = [st for st in s.body if isinstance(st, Stage)]
-                if _BUFFER_COUNT * sum(st.smem_bytes for st in stages) <= _SMEM_BUDGET_BYTES:
+                if _BUFFER_COUNT * sum(st.smem_bytes for st in stages) <= smem_budget:
                     updated = _double_buffer(s)
                     if updated is not None:
                         new_body[i] = updated
