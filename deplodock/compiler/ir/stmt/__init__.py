@@ -54,6 +54,7 @@ from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, SelectBranch, Write
 from deplodock.compiler.ir.stmt.normalize import (
+    canonicalize_buffer_names,
     canonicalize_free_axis_order,
     dedup_loads,
     drop_size_one_free_axes,
@@ -62,6 +63,7 @@ from deplodock.compiler.ir.stmt.normalize import (
     normalize_body,
     rename_ssa_sequential,
     simplify_body,
+    sort_commutative_args,
     unify_sibling_reduce_axes,
 )
 
@@ -81,6 +83,7 @@ __all__ = [
     "StridedLoop",
     "Tile",
     "Write",
+    "canonicalize_buffer_names",
     "canonicalize_free_axis_order",
     "dedup_loads",
     "drop_size_one_free_axes",
@@ -94,5 +97,6 @@ __all__ = [
     "render_index",
     "select_to_ternary",
     "simplify_body",
+    "sort_commutative_args",
     "unify_sibling_reduce_axes",
 ]

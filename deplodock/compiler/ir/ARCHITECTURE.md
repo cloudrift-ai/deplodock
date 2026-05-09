@@ -139,6 +139,23 @@ canonicalized before validation:
   Loops.
 - `rename_ssa_sequential` — cosmetic: Assign/Select names become `v0,
   v1, …` in definition order.
+- `canonicalize_buffer_names` — rename `Load.input` / `Write.output` to
+  `b0, b1, …` in encounter order. Off by default (buffer names bind to
+  graph nodes) — opt in via `normalize_body(..., canonical_buffers=True)`.
+  Used by `Body._structural_key` for dedup queries where buffer identity
+  doesn't matter.
+- `sort_commutative_args` — sort `Assign.args` for commutative ops
+  (`add` / `multiply` / `maximum` / `minimum`) so two bodies that
+  differ only by argument order land in the same canonical form.
+  Runs last so the sort key is the post-rename canonical SSA / buffer
+  names.
+
+`Body._structural_key` re-runs `normalize_body(self, hoist=False,
+canonical_buffers=True)` and joins `pretty_body`'s line list — a
+`cached_property` returning the canonical text rendering. Two bodies
+that differ only by SSA / axis names, commutative-arg order, or
+external-buffer names produce the same key. Use it as a dict key /
+set member when deduping candidate bodies in a search.
 
 ### `loop/simplify.py` — Expr simplification
 

@@ -20,7 +20,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, Write
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -35,7 +35,7 @@ def _make_axis_renamer(old: str, new: Axis) -> Callable[[Axis], Axis]:
     return lambda a: new if a.name == old else a
 
 
-def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
+def normalize_body(stmts: Body, *, hoist: bool = True, canonical_buffers: bool = False) -> Body:
     """Apply the structural and cosmetic normalization passes in order.
 
     Used by both ``LoopOp.__post_init__`` and ``TileOp.__post_init__`` so
@@ -45,7 +45,14 @@ def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
     ``hoist=False`` skips :func:`hoist_loop_invariants`. TileOp bodies turn
     it off because a Stage binding is scoped to the Loop where it's
     declared — hoisting Loads that read from a staged buffer above the
-    Stage decl would leave the read referencing an undeclared name."""
+    Stage decl would leave the read referencing an undeclared name.
+
+    ``canonical_buffers=True`` runs :func:`canonicalize_buffer_names` after
+    SSA renaming. Off by default — buffer names bind to graph inputs /
+    outputs and are meaningful at the Op boundary. Turned on by
+    :attr:`Body._structural_key` so two bodies that read identical patterns
+    from differently-named buffers hash and compare equal.
+    """
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)
     stmts = eliminate_copy_aliases(stmts)
@@ -55,6 +62,12 @@ def normalize_body(stmts: Body, *, hoist: bool = True) -> Body:
         stmts = hoist_loop_invariants(stmts)
     stmts = simplify_body(stmts)
     stmts = rename_ssa_sequential(stmts)
+    if canonical_buffers:
+        stmts = canonicalize_buffer_names(stmts)
+    # Sort runs last so the keys it sorts by are the post-rename canonical
+    # SSA / buffer names — that way two bodies that differ only in original
+    # argument order produce identical post-normalization arg tuples.
+    stmts = sort_commutative_args(stmts)
     return stmts
 
 
@@ -505,3 +518,66 @@ def rename_ssa_sequential(stmts: Body) -> Body:
         return Axis(name=new, extent=a.extent) if new != a.name else a
 
     return tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in stmts)
+
+
+# ---------------------------------------------------------------------------
+# Pass: sort args of commutative Assigns.
+# ---------------------------------------------------------------------------
+
+
+def sort_commutative_args(stmts: Body) -> Body:
+    """Sort ``Assign.args`` for commutative ``op``s so two bodies that
+    differ only by argument order land in the same canonical form.
+
+    Acts on ``Assign`` only — Expr-level commutativity (e.g. ``a + b``
+    inside a ``Load`` index or ``Cond.cond``) is handled by
+    :func:`simplify_body` via the per-Expr ``simplify`` rules. Recurses
+    through every block-structured Stmt (``Loop`` / ``StridedLoop`` /
+    ``Tile`` / ``Cond``)."""
+    stmts = Body.coerce(stmts)
+
+    def fn(s: Stmt) -> Stmt:
+        if isinstance(s, Assign) and s.op.commutative and len(s.args) > 1:
+            sorted_args = tuple(sorted(s.args))
+            if sorted_args != s.args:
+                return replace(s, args=sorted_args)
+        return s
+
+    return stmts.map(fn)
+
+
+# ---------------------------------------------------------------------------
+# Pass: canonicalize external-buffer names (opt-in via normalize_body flag).
+# ---------------------------------------------------------------------------
+
+
+def canonicalize_buffer_names(stmts: Body) -> Body:
+    """Rename ``Load.input`` and ``Write.output`` buffer references to
+    ``b0, b1, ...`` in encounter order via :meth:`Body.iter`.
+
+    Off by default — buffer names bind to graph nodes (each ``Load.input``
+    matches the producing op's id), so renaming them in a body that's
+    still attached to an Op would break that wiring. Used by
+    :attr:`Body._structural_key` for dedup queries where buffer identity
+    doesn't matter (two bodies with identical access patterns over
+    differently-named inputs are structurally equal)."""
+    stmts = Body.coerce(stmts)
+
+    rename: dict[str, str] = {}
+    for s in stmts.iter():
+        if isinstance(s, Load) and s.input not in rename:
+            rename[s.input] = f"b{len(rename)}"
+        elif isinstance(s, Write) and s.output not in rename:
+            rename[s.output] = f"b{len(rename)}"
+
+    if all(o == n for o, n in rename.items()):
+        return stmts
+
+    def fn(s: Stmt) -> Stmt:
+        if isinstance(s, Load) and s.input in rename:
+            return replace(s, input=rename[s.input])
+        if isinstance(s, Write) and s.output in rename:
+            return replace(s, output=rename[s.output])
+        return s
+
+    return stmts.map(fn)
