@@ -8,9 +8,13 @@ Public surface:
   topo-ordered seed along fan-out-1 consumer edges.
 - ``run_rule`` / ``run_pass`` — apply one rule module / every rule
   module in a directory to fixed point. Rule modules declare
-  ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(graph, match) ->
-  Graph | None`` function. Returned fragments are spliced into the
-  graph; ``None`` means no-op / in-place mutation.
+  ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(...)`` function.
+  Two flavors:
+  * Functional (default): ``rewrite`` returns a ``Graph`` fragment that
+    gets spliced into the graph.
+  * In-place: module sets ``IN_PLACE = True`` and ``rewrite`` mutates
+    nodes/ops directly, returning ``None``.
+  Either flavor raises ``RuleSkipped`` to decline a match.
 - ``run_pipeline(graph, passes, dump=None)`` — run each named pass
   directory in order, dispatching ``dump.on_pass`` after each.
 """
@@ -177,6 +181,7 @@ class _Rule:
     pattern: list[Pattern]
     rewrite: Callable[..., Graph | None]
     param_names: tuple[str, ...]
+    in_place: bool
 
 
 def _load_rules(pass_dir: Path) -> list[_Rule]:
@@ -205,7 +210,8 @@ def _load_rule(path: Path) -> _Rule:
     if rewrite_fn is None:
         raise ValueError(f"Rule {path} missing rewrite() function")
     param_names = tuple(inspect.signature(rewrite_fn).parameters.keys())
-    return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names)
+    in_place = bool(getattr(module, "IN_PLACE", False))
+    return _Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names, in_place=in_place)
 
 
 def _build_rewrite_kwargs(rule: _Rule, graph: Graph, match: Match) -> dict | None:
@@ -313,13 +319,14 @@ def _apply_rules(
                     if any(nid not in graph.nodes for nid in match.consumed):
                         continue
                     t1 = time.monotonic()
-                    # Snapshot matched-node ops before rewrite — needed
-                    # for in-place change detection. ``pre_names`` (output-name
-                    # → pre-rewrite id) lets the formatter follow renames
-                    # (rules like ``tileify`` mutate the op AND ``rename_node``
-                    # to a friendlier id), so it's only built when text is needed.
-                    pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
-                    pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops} if need_text else {}
+                    # In-place rules need pre-rewrite snapshots so the
+                    # formatter can render the diff. ``pre_names``
+                    # (output-name → pre-rewrite id) lets the formatter
+                    # follow rule-driven renames (e.g. ``tileify`` mutates
+                    # the op AND ``rename_node`` to a friendlier id).
+                    if rule.in_place:
+                        pre_ops = {nid: graph.nodes[nid].op for nid in match.consumed if nid in graph.nodes}
+                        pre_names = {graph.nodes[nid].output.name: nid for nid in pre_ops} if need_text else {}
                     kwargs = _build_rewrite_kwargs(rule, graph, match)
                     if kwargs is None:
                         continue
@@ -330,35 +337,40 @@ def _apply_rules(
                             emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
                         stats[2] += time.monotonic() - t1
                         continue
-                    if fragment is None:
-                        # Detect in-place op rebinds AND rule-driven rename/delete
-                        # (e.g. ``tileify`` renames a node, so the old id
-                        # disappears from ``graph.nodes`` even though it applied).
-                        if any(nid not in graph.nodes or graph.nodes[nid].op is not pre_ops[nid] for nid in pre_ops):
-                            text = (
-                                _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
-                                if need_text
-                                else None
-                            )
-                            if debug_on:
-                                emit(text)
-                            if dump_on:
-                                record = _record_inplace_application(graph, match, pre_ops)
-                                dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-                            stats[0] += 1
+                    if rule.in_place:
+                        # In-place rules signal "applied" by returning
+                        # (anything not raised). Decline via RuleSkipped.
+                        # In-place mutations don't re-trigger this rule
+                        # (one batch per ``while True`` iteration); they
+                        # mutate to a state the same pattern won't match
+                        # again, and rules are ordered deliberately so
+                        # re-running prior rules isn't expected.
+                        text = (
+                            _format_inplace_application(rule.name, graph, match, pre_ops, pass_name=pass_name, pre_names=pre_names)
+                            if need_text
+                            else None
+                        )
+                        if debug_on:
+                            emit(text)
+                        if dump_on:
+                            record = _record_inplace_application(graph, match, pre_ops)
+                            dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+                        stats[0] += 1
                         stats[2] += time.monotonic() - t1
-                        continue
-                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
-                    if debug_on:
-                        emit(text)
-                    if dump_on:
-                        record = _record_rule_application(graph, match, fragment)
-                        dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-                    graph = _apply_replacement(graph, match, fragment)
-                    stats[2] += time.monotonic() - t1
-                    stats[0] += 1
-                    rule_changed = True
-                    outer_changed = True
+                    else:
+                        # Functional rule: ``rewrite`` must return a Fragment.
+                        assert fragment is not None, f"functional rule {rule.name} returned None — use RuleSkipped or set IN_PLACE = True"
+                        text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
+                        if debug_on:
+                            emit(text)
+                        if dump_on:
+                            record = _record_rule_application(graph, match, fragment)
+                            dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+                        graph = _apply_replacement(graph, match, fragment)
+                        stats[2] += time.monotonic() - t1
+                        stats[0] += 1
+                        rule_changed = True
+                        outer_changed = True
                 if not rule_changed:
                     break
     for name, (n, mt, rt) in sorted(rule_stats.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):

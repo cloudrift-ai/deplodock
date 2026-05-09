@@ -33,6 +33,7 @@ from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoo
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 

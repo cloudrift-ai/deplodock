@@ -19,6 +19,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import dedup_loads
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
+IN_PLACE = True
 PATTERN = [Pattern("root", LoopOp)]
 
 

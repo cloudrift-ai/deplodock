@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 # wider swizzle) and rewrites body Loads in one place.
 
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 _MIN_CAPABILITY = (9, 0)
@@ -93,7 +94,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
     src_shapes = {nid: tuple(int(d) for d in node.output.shape) for nid, node in graph.nodes.items()}
     new_body = _maybe_rewrite(root.op.body, src_ranks, src_shapes)
     if new_body is None:
-        return None
+        raise RuleSkipped("rewrite helper returned no change")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

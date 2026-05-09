@@ -60,6 +60,7 @@ from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
@@ -79,7 +80,7 @@ def _bk_candidates(tile) -> tuple[int, ...]:
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
+        raise RuleSkipped("rewrite helper returned no change")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

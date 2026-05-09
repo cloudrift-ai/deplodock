@@ -26,6 +26,7 @@ from deplodock.compiler.ir.stmt import Body, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 _MAX_UNROLL_TRIPS = 64

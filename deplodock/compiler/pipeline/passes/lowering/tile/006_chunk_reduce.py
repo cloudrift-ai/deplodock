@@ -58,6 +58,7 @@ from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 # Match ``007_stage_inputs._MAX_SLAB_BYTES`` exactly — that's the cap
@@ -75,7 +76,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         raise RuleSkipped("disabled via DEPLODOCK_DISABLE_CHUNK_REDUCE=1")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
+        raise RuleSkipped("rewrite helper returned no change")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

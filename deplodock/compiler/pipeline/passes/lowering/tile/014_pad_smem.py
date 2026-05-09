@@ -66,6 +66,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 
 logger = logging.getLogger(__name__)
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 # Per-Stage padded-slab budget. The static-smem cap on consumer Ada/Hopper
@@ -85,7 +86,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         raise RuleSkipped("disabled via DEPLODOCK_DISABLE_PAD_SMEM=1")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
+        raise RuleSkipped("no Stage benefited from padding")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

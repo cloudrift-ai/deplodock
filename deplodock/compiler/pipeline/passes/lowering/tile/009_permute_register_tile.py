@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 # covers exactly 32 banks.
 _LDS128_FLOATS = 4
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 
@@ -89,7 +90,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         raise RuleSkipped("disabled via DEPLODOCK_DISABLE_CHUNK_REGISTER_TILE=1")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
+        raise RuleSkipped("rewrite helper returned no change")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

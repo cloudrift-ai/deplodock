@@ -68,6 +68,7 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline.engine import Pattern
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 

@@ -20,6 +20,7 @@ from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.pipeline.engine import Pattern
 
+IN_PLACE = True
 PATTERN = [Pattern("root", KernelOp)]
 
 _BLOCK = 256

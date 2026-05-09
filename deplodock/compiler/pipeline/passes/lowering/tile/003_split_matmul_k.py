@@ -65,13 +65,14 @@ from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 from deplodock.compiler.tuning import auto_splitk
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
+        raise RuleSkipped("rewrite helper returned no change")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 

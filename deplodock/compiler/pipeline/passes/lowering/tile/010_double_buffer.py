@@ -44,6 +44,7 @@ from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_k_outer, single_tile
 
+IN_PLACE = True
 PATTERN = [Pattern("root", TileOp)]
 
 _BUFFER_COUNT = 2
@@ -53,7 +54,7 @@ _SMEM_BUDGET_BYTES = 96 * 1024  # 96 KB
 def rewrite(graph: Graph, root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
+        raise RuleSkipped("no K-outer matmul Loop eligible for double-buffering")
     root.op = TileOp(body=new_body, name=root.op.name)
     return None
 
