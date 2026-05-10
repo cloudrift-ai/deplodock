@@ -170,18 +170,33 @@ class TraceEntry:
 @dataclass
 class Candidate:
     """A single point in the search space. The engine pops a candidate,
-    runs the entire pipeline on its graph, and yields it (terminal). When
-    a rule yields multiple options, the engine deepcopies ``graph``,
-    applies an alt option, extends ``trace``, and pushes the fork as a
-    new ``Candidate`` onto the search queue.
+    advances it by one rule application attempt, pushes the resulting
+    successor(s) back onto the search queue, and yields the candidate
+    when ``_pass_idx`` reaches the end of the pipeline.
 
-    ``graph`` is owned by this candidate (deep-copied at fork time).
-    ``ctx`` is shared by reference (frozen). ``trace`` is the immutable
-    history of rule applications on this branch."""
+    ``graph`` is owned by this candidate (deep-copied on multi-option
+    forks; mutated in place on single-option steps). ``ctx`` is shared
+    by reference. ``trace`` is the immutable history of rule
+    applications on this branch.
+
+    Resume state — ``(_pass_idx, _rule_idx, _n_applied)`` — is the full
+    pipeline cursor:
+
+    * ``_pass_idx`` — index of the pass to apply next.
+    * ``_rule_idx`` — index of the rule within the current pass to try
+      next.
+    * ``_n_applied`` — number of successful rewrites in the current
+      pass scan. When ``_rule_idx`` wraps past the last rule with this
+      counter ``> 0``, the engine resets ``_rule_idx`` to 0 (re-scan
+      since changes happened); with the counter ``== 0``, the engine
+      advances to the next pass."""
 
     graph: Graph
     ctx: Context
     trace: tuple[TraceEntry, ...] = ()
+    _pass_idx: int = 0
+    _rule_idx: int = 0
+    _n_applied: int = 0
 
 
 class Search(Protocol):
@@ -387,19 +402,79 @@ def run_pass(
 
     Single-graph helper: use ``run_pipeline`` for autotuning. Discards
     any fork ``Candidate``s a multi-option rule might want to spawn."""
-    rules = _load_rules(pass_dir)
-    if select is not None:
-        wanted = set(select)
-        rules = [r for r in rules if r.name in wanted or _strip_rule_prefix(r.name) in wanted]
-    g, _ = _apply_rules(graph, rules, dump=dump, pass_idx=pass_idx, pass_name=pass_name, ctx=ctx)
-    return g
+    if ctx is None:
+        ctx = Context.probe()
+    rules = _filter_rules(_load_rules(pass_dir), set(select) if select is not None else None)
+    search = DFSSearch()
+    search.push(Candidate(graph=graph, ctx=ctx))
+    return next(_search_loop(search, [rules], [pass_name or ""], ctx, dump)).graph
 
 
 def run_rule(graph: Graph, rule_path: Path, ctx: Context | None = None) -> Graph:
     """Load a single rule module and apply it to fixed point. Discards
     fork siblings — for autotuning use the full ``run_pipeline`` driver."""
-    g, _ = _apply_rules(graph, [_load_rule(rule_path)], ctx=ctx)
-    return g
+    if ctx is None:
+        ctx = Context.probe()
+    search = DFSSearch()
+    search.push(Candidate(graph=graph, ctx=ctx))
+    return next(_search_loop(search, [[_load_rule(rule_path)]], [""], ctx, None)).graph
+
+
+def _search_loop(
+    search: Search,
+    rules_per_pass: list[list[_Rule]],
+    pass_names: list[str],
+    ctx: Context | None,
+    dump: CompilerDump | None,
+) -> Iterator[Candidate]:
+    """The unified search-driven driver. Each iteration: pop a
+    candidate, try one rule application (or end-of-pass bookkeeping),
+    push successor(s). Yields when a candidate reaches the end of the
+    pipeline (``_pass_idx >= len(pass_names)``).
+
+    Used by every engine entry point — ``run_autotune`` (full pipeline),
+    ``run_pass`` (one pass), ``run_rule`` (one rule). They differ only
+    in the rules-per-pass list and the ``Search`` instance supplied."""
+    while (cand := search.pop()) is not None:
+        if cand._pass_idx >= len(pass_names):
+            yield cand
+            continue
+        rules = rules_per_pass[cand._pass_idx]
+        # End-of-scan bookkeeping: did any rewrite fire in this scan?
+        # If yes, restart from rule 0 (something changed; earlier rules
+        # may have new opportunities). If no, advance to next pass.
+        if cand._rule_idx >= len(rules):
+            if cand._n_applied > 0:
+                cand._rule_idx = 0
+                cand._n_applied = 0
+            else:
+                name = pass_names[cand._pass_idx]
+                if name:
+                    logger.info("compile: %-18s done (%d nodes)", name, len(cand.graph.nodes))
+                if dump is not None and name:
+                    dump.on_pass(cand._pass_idx + 1, name, cand.graph)
+                cand._pass_idx += 1
+                cand._rule_idx = 0
+                cand._n_applied = 0
+            search.push(cand)
+            continue
+        # One iteration: try one rule application.
+        rule = rules[cand._rule_idx]
+        pass_idx_arg = cand._pass_idx + 1 if pass_names[cand._pass_idx] else None
+        pass_name_arg = pass_names[cand._pass_idx] or None
+        next_cands = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg)
+        if next_cands is None:
+            # Rule had nothing to do — advance _rule_idx and push back.
+            cand._rule_idx += 1
+            search.push(cand)
+        else:
+            # Rule applied (possibly with forks). _rule_idx unchanged
+            # so the next iteration re-tries the same rule (more matches
+            # may exist; idempotent rules will RuleSkipped on already-
+            # processed roots). ``_try_one_rule`` already incremented
+            # ``_n_applied`` on every successor.
+            for c in next_cands:
+                search.push(c)
 
 
 def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:
@@ -414,104 +489,113 @@ def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str
     return _apply_replacement(graph, match, result)
 
 
-def _apply_rules(
-    graph: Graph,
-    rules: list[_Rule],
-    dump: CompilerDump | None = None,
-    pass_idx: int | None = None,
-    pass_name: str | None = None,
-    ctx: Context | None = None,
-    search: Search | None = None,
-    trace: tuple[TraceEntry, ...] = (),
-) -> tuple[Graph, tuple[TraceEntry, ...]]:
-    from collections import defaultdict
+def _try_one_rule(
+    cand: Candidate,
+    rule: _Rule,
+    ctx: Context | None,
+    dump: CompilerDump | None,
+    pass_idx: int | None,
+    pass_name: str | None,
+) -> list[Candidate] | None:
+    """One iteration: enumerate ``rule``'s matches once and apply each
+    live match (with non-skipped rewrite) in batch. Match enumeration
+    happens ONCE per call — staged matches that get invalidated by an
+    earlier application in the batch are filtered via ``is_alive()``
+    rather than re-walking the graph. This matches the old engine's
+    per-rule batch semantics, which is what downstream rules (lift /
+    fusion / staging) depend on for deterministic structure.
 
+    Returns:
+    - ``None`` — no live match yielded a non-skipped rewrite; the rule
+      had nothing to do at this state.
+    - ``[c]`` — applied without forking; ``cand`` with extended trace
+      and incremented ``_n_applied``.
+    - ``[*forks, c]`` — multi-option fork(s) encountered during the
+      batch; ``c`` (inline branch) is at the *end* so a LIFO ``Search``
+      pops it first; forks carry deep-copied graphs with their alt
+      applied at the fork point.
+
+    Caller (``run_autotune``) handles the ``_rule_idx`` / ``_pass_idx``
+    bookkeeping based on whether this returns ``None`` or ``[...]``."""
     debug_on = logger.isEnabledFor(logging.DEBUG)
     dump_on = dump is not None and pass_idx is not None and pass_name is not None
     need_text = debug_on or dump_on
 
-    # name -> [applied, match_s, rewrite_s]
-    rule_stats: dict[str, list] = defaultdict(lambda: [0, 0.0, 0.0])
-
-    outer_changed = True
-    while outer_changed:
-        outer_changed = False
-        for rule in rules:
-            while True:
-                stats = rule_stats[rule.name]
-                t0 = time.monotonic()
-                matches = match_pattern(graph, rule.pattern)
-                stats[1] += time.monotonic() - t0
-                if not matches:
-                    break
-                rule_changed = False
-                for match in matches:
-                    if not match.is_alive():
-                        continue
-                    t1 = time.monotonic()
-                    kwargs = _build_rewrite_kwargs(rule, match, ctx)
-                    if kwargs is None:
-                        continue
-                    try:
-                        result = rule.rewrite(**kwargs)
-                    except RuleSkipped as exc:
-                        if debug_on:
-                            emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
-                        stats[2] += time.monotonic() - t1
-                        continue
-                    # Normalize: bare Op/Graph → 1-element list; multi-
-                    # element list = autotune fork point.
-                    options = list(result) if isinstance(result, (list, tuple)) else [result]
-                    if not options:
-                        # Empty list = "no viable option" — same as RuleSkipped.
-                        stats[2] += time.monotonic() - t1
-                        continue
-                    # Spawn one Candidate per non-chosen alt; each gets
-                    # a deep-copy of the current graph with the alt
-                    # applied. They re-enter the pipeline at pass 0
-                    # when popped — idempotent rules skip the work
-                    # already baked into the graph.
-                    if len(options) > 1 and search is not None:
-                        for alt_idx, alt in enumerate(options[1:], start=1):
-                            forked_graph = copy.deepcopy(graph)
-                            forked_match = _remap_match_to(forked_graph, match)
-                            forked_graph = _apply_one(forked_graph, forked_match, alt, rule_name=rule.name)
-                            search.push(
-                                Candidate(
-                                    graph=forked_graph,
-                                    ctx=ctx,
-                                    trace=(*trace, TraceEntry(rule.name, alt_idx)),
-                                )
-                            )
-                    chosen = options[0]
-                    # Render the diff and dump record using a unified
-                    # single-node fragment view (same path for Op-rebind
-                    # and Graph-splice).
-                    fragment = _wrap_op_as_fragment(graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
-                    text = _format_rule_application(rule.name, graph, match, fragment, pass_name=pass_name) if need_text else None
-                    if debug_on:
-                        emit(text)
-                    if dump_on:
-                        record = _record_rule_application(graph, match, fragment)
-                        dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-                    inplace = isinstance(chosen, Op)
-                    graph = _apply_one(graph, match, chosen, rule_name=rule.name)
-                    trace = (*trace, TraceEntry(rule.name, 0))
-                    if not inplace:
-                        # Functional-rule splices change the graph
-                        # structurally; re-run the rule loop. In-place
-                        # rebinds change op only — the same pattern
-                        # won't match the new op, so don't re-fire.
-                        rule_changed = True
-                        outer_changed = True
-                    stats[2] += time.monotonic() - t1
-                    stats[0] += 1
-                if not rule_changed:
-                    break
-    for name, (n, mt, rt) in sorted(rule_stats.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
-        if n or mt > 0.01:
-            logger.info("  rule %-30s applied=%4d  match=%5.2fs  rewrite=%5.2fs", name, n, mt, rt)
-    return graph, trace
+    matches = match_pattern(cand.graph, rule.pattern)
+    forks: list[Candidate] = []
+    fired = False
+    functional_fired = False
+    for match in matches:
+        if not match.is_alive():
+            continue
+        kwargs = _build_rewrite_kwargs(rule, match, ctx)
+        if kwargs is None:
+            continue
+        try:
+            result = rule.rewrite(**kwargs)
+        except RuleSkipped as exc:
+            if debug_on:
+                emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
+            continue
+        options = list(result) if isinstance(result, (list, tuple)) else [result]
+        if not options:
+            continue
+        chosen = options[0]
+        fragment = _wrap_op_as_fragment(cand.graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
+        text = _format_rule_application(rule.name, cand.graph, match, fragment, pass_name=pass_name) if need_text else None
+        if debug_on:
+            emit(text)
+        if dump_on:
+            record = _record_rule_application(cand.graph, match, fragment)
+            dump.on_rule(pass_idx, pass_name, rule.name, record, text)
+        # Fork branches: each alt gets a deep-copy of cand.graph at
+        # this point in the batch (after prior matches' option-0
+        # applications, before this match's). The fork resumes into
+        # the same rule batch from the next match — when it's popped,
+        # ``_try_one_rule`` will re-enumerate against its alt graph
+        # and process whatever matches remain there.
+        if len(options) > 1:
+            snapshot = copy.deepcopy(cand.graph)
+            for alt_idx, alt in enumerate(options[1:], start=1):
+                fg = copy.deepcopy(snapshot)
+                fm = _remap_match_to(fg, match)
+                fg = _apply_one(fg, fm, alt, rule_name=rule.name)
+                forks.append(
+                    Candidate(
+                        graph=fg,
+                        ctx=cand.ctx,
+                        trace=(*cand.trace, TraceEntry(rule.name, alt_idx)),
+                        _pass_idx=cand._pass_idx,
+                        _rule_idx=cand._rule_idx,
+                        _n_applied=cand._n_applied + (0 if isinstance(alt, Op) else 1),
+                    )
+                )
+        cand.graph = _apply_one(cand.graph, match, chosen, rule_name=rule.name)
+        cand.trace = (*cand.trace, TraceEntry(rule.name, 0))
+        # ``_n_applied`` counts only FUNCTIONAL (Graph) fires — the
+        # end-of-scan restart fires when these accumulate, matching the
+        # old engine's ``outer_changed`` semantics. In-place (Op) fires
+        # don't restart the scan: they only mutate ``root.op`` and the
+        # same pattern won't re-match the new op for most rules; rules
+        # whose op type stays the same rely on per-rule idempotence
+        # guards (and their downstream rule order is intentional).
+        if not isinstance(chosen, Op):
+            cand._n_applied += 1
+            functional_fired = True
+        fired = True
+    if not fired:
+        return None
+    # If only in-place fires happened in this batch, advance
+    # ``_rule_idx`` — re-running the same rule on the post-mutation
+    # state would either RuleSkipped (idempotent guard) or re-fire
+    # (non-idempotent in-place rule). Old engine handled this by
+    # never re-scanning after an in-place-only batch (its inner
+    # ``while True`` broke when ``rule_changed`` stayed False).
+    if not functional_fired:
+        cand._rule_idx += 1
+    # Forks first, inline branch (cand) last — LIFO ``Search`` pops
+    # cand next, driving the current branch deep before backtracking.
+    return [*forks, cand]
 
 
 def _remap_match_to(forked_graph: Graph, match: Match) -> Match:
@@ -769,59 +853,32 @@ def run_autotune(
     rewrites) the search yields exactly one — same shape as
     ``run_pipeline``.
 
-    ``search`` is required: the caller picks the strategy
-    (``DFSSearch`` for plain DFS, or any custom ``Search`` impl for
-    priority / MCTS / beam). The engine pushes the initial candidate
-    and every fork-spawned sibling onto it, then pops + expands until
-    exhausted.
+    The loop is fully search-driven: pop a candidate, advance it by one
+    rule application via :func:`_try_step`, push successor(s) back to
+    ``search``. When no rule fires in the current pass, advance the
+    candidate's ``_pass_idx`` and push it back. When ``_pass_idx``
+    reaches the end of ``passes``, the candidate is terminal and gets
+    yielded.
 
-    Each popped candidate runs the entire pipeline on its graph from
-    pass 0; rules MUST be idempotent on their own output so rerun work
-    is cheap (pattern-match scans that find nothing).
+    ``search`` chooses the order: ``DFSSearch`` for depth-first
+    (current-branch-first) traversal — the default in ``run_pipeline``;
+    any other ``Search`` implementation for priority / MCTS / beam.
 
     ``ctx`` is built once (probing the live device if not provided)
     and shared by every candidate."""
     if ctx is None:
         ctx = Context.probe()
     select_set = set(select) if select is not None else None
-    search.push(Candidate(graph=graph, ctx=ctx, trace=()))
-
-    while (cand := search.pop()) is not None:
-        yield _expand(cand, passes, ctx, search, dump, select_set)
-
-
-def _expand(
-    cand: Candidate,
-    passes: list[str],
-    ctx: Context,
-    search: Search,
-    dump: CompilerDump | None,
-    select_set: set[str] | None,
-) -> Candidate:
-    """Run the full pipeline on ``cand.graph``, accumulating into its
-    trace. Forks during execution push fresh ``Candidate``s onto
-    ``search``; this function returns the option-0 terminal."""
+    rules_per_pass = [_filter_rules(_load_rules(_PASSES_DIR / name), select_set) for name in passes]
     t_start = time.monotonic()
-    graph = cand.graph
-    trace = cand.trace
-    for idx, name in enumerate(passes, start=1):
-        t0 = time.monotonic()
-        n_before = len(graph.nodes)
-        rules = _load_rules(_PASSES_DIR / name)
-        if select_set is not None:
-            rules = [r for r in rules if r.name in select_set or _strip_rule_prefix(r.name) in select_set]
-        graph, trace = _apply_rules(
-            graph,
-            rules,
-            dump=dump,
-            pass_idx=idx,
-            pass_name=name,
-            ctx=ctx,
-            search=search,
-            trace=trace,
-        )
-        logger.info("compile: %-18s %.2fs (%d -> %d nodes)", name, time.monotonic() - t0, n_before, len(graph.nodes))
-        if dump is not None:
-            dump.on_pass(idx, name, graph)
+
+    search.push(Candidate(graph=graph, ctx=ctx))
+
+    yield from _search_loop(search, rules_per_pass, passes, ctx, dump)
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
-    return Candidate(graph=graph, ctx=ctx, trace=trace)
+
+
+def _filter_rules(rules: list[_Rule], select_set: set[str] | None) -> list[_Rule]:
+    if select_set is None:
+        return rules
+    return [r for r in rules if r.name in select_set or _strip_rule_prefix(r.name) in select_set]

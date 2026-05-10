@@ -63,10 +63,16 @@ def _place_inits_in_scope(body: tuple) -> tuple:
     names whose Init belongs HERE (= no free-Loop interposed between this
     scope and the Accum). Insert an Init for each at the start of the
     scope body. Then recurse into any nested free Loops to repeat at
-    their scope."""
+    their scope.
+
+    Idempotent on its own output: Accums whose Init already exists at
+    this scope are left alone, so repeated applications converge."""
+    existing: set[str] = {s.name for s in body if isinstance(s, Init)}
     inits_here: dict[str, Accum] = {}
     for s in body:
         for a in _accums_under_reduces_only(s):
+            if a.name in existing:
+                continue
             inits_here.setdefault(a.name, a)
 
     new_body: list[Stmt] = []
