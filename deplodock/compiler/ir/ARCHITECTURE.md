@@ -36,6 +36,16 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 - **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
   `CudaOp` carrying rendered source.
 
+`Op.source` is the rewrite-chain predecessor — the engine's
+`_apply_one` stamps it on every 1:1 in-place rebind, so a fully
+lowered `CudaOp` carries the full chain back to its originating
+`LoopOp` (`cuda.source.source.source`) without any rule needing to
+pass it explicitly. The base-class field is keyword-only and
+`compare=False`, so subclass positional construction and equality
+keep working unchanged. `source` is excluded from
+`Graph.structural_key` and from `op_cache_key` — kernels rendered
+along different lowering paths still dedup in the tuning cache.
+
 ## `base.py`
 
 Cross-cutting root. Imported by every dialect, imports nothing from

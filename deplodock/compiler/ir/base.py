@@ -12,14 +12,27 @@ avoids a frontend→tensor dependency for a single function.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 
 @dataclass
 class Op:
-    """Base class for all operations."""
+    """Base class for all operations.
+
+    ``source`` is the predecessor op in any rewrite chain — the engine
+    stamps it automatically on every 1:1 in-place rebind
+    (``_apply_one`` Op branch), so a fully-lowered ``CudaOp`` keeps the
+    full path back through ``KernelOp → TileOp → LoopOp`` (or any other
+    chain a future pipeline introduces) via repeated ``.source``
+    traversals. Keyword-only so positional construction of subclass
+    fields keeps working; excluded from :meth:`Graph.structural_key`
+    via ``_STRUCTURAL_SKIP_FIELDS`` — pure attribution metadata, not
+    part of dataflow identity.
+    """
+
+    source: Op | None = field(default=None, kw_only=True, repr=False, compare=False)
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         """Derive the output shape from input shapes. Override in subclasses."""

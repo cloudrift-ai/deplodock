@@ -584,8 +584,19 @@ def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str
     """Apply one rewrite outcome to ``graph``. ``Op`` rebinds
     ``root.op`` in place (id, inputs, hints kept); ``Graph`` is a
     fragment spliced via ``Graph.splice``. Returns the (possibly
-    same, possibly new) graph."""
+    same, possibly new) graph.
+
+    On the 1:1 ``Op`` path the engine stamps ``result.source`` with the
+    op being replaced (unless the rule already set it). This threads
+    the rewrite chain through every in-place rebind for free — lowering
+    rules don't need to repeat ``source=root.op`` in every constructor
+    call. From a fully lowered ``CudaOp``, ``cuda.source.source.source``
+    walks back to the originating ``LoopOp``.
+    """
     if isinstance(result, Op):
+        old_op = graph.nodes[match.root_node_id].op
+        if result is not old_op and result.source is None:
+            result.source = old_op
         graph.nodes[match.root_node_id].op = result
         return graph
     assert isinstance(result, Graph), f"rule {rule_name} returned {type(result).__name__}; expected Graph, Op, list, or RuleSkipped"

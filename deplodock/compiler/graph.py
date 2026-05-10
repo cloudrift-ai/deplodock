@@ -315,6 +315,13 @@ def _stmt_eval_scope() -> dict:
     return _STMT_EVAL_SCOPE
 
 
+# Op dataclass fields excluded from ``Graph.structural_key`` for ops that
+# don't carry a ``Body``. ``name`` is an instance label; ``source`` is the
+# rewrite-chain predecessor on the base ``Op`` (attribution metadata only,
+# stamped automatically by the engine — see ``Op.source``).
+_STRUCTURAL_SKIP_FIELDS = frozenset({"name", "source"})
+
+
 class Graph:
     """Directed acyclic compute graph of tensor operations.
 
@@ -589,7 +596,7 @@ class Graph:
             if isinstance(body, Body):
                 op_payload: tuple = ("body", body.structural_key())
             else:
-                attrs = tuple((f.name, repr(getattr(op, f.name))) for f in dc_fields(op) if f.name != "name")
+                attrs = tuple((f.name, repr(getattr(op, f.name))) for f in dc_fields(op) if f.name not in _STRUCTURAL_SKIP_FIELDS)
                 op_payload = ("attrs", attrs)
             out = node.output
             out_payload = (tuple(out.shape), out.dtype)
