@@ -179,8 +179,6 @@ def record_terminal(
     context_key: str,
     *,
     backend=None,
-    warmup: int = 5,
-    num_iters: int = 20,
 ) -> None:
     """Measure every ``CudaOp`` in ``graph`` and attribute the result to
     every ancestor along its ``.source`` chain.
@@ -191,9 +189,11 @@ def record_terminal(
     until real measurement is opted in.
 
     When ``backend`` is provided (typically a ``CudaBackend``): calls
-    ``backend.benchmark(graph, warmup=..., num_iters=...)`` once,
-    consuming the per-launch GPU-event timings. The i-th
-    :class:`LaunchTime` corresponds to the i-th ``CudaOp`` in
+    ``backend.benchmark(graph, num_iters="auto")`` once, consuming the
+    per-launch GPU-event timings. Auto mode adapts the iter count to
+    kernel cost (~100 ms total GPU time, clamped [10, 100k] iters), so
+    callers don't need to pre-tune warmup / iters per kernel size. The
+    i-th :class:`LaunchTime` corresponds to the i-th ``CudaOp`` in
     ``graph.topological_order()`` (the same order the backend uses
     internally — see ``backend/cuda/program.py::_launches``).
 
@@ -220,7 +220,7 @@ def record_terminal(
         return
 
     try:
-        result = backend.benchmark(graph, warmup=warmup, num_iters=num_iters)
+        result = backend.benchmark(graph, num_iters="auto")
     except Exception as exc:  # noqa: BLE001 — autotune cache must record any failure mode
         logger.warning("cache: backend.benchmark failed (%s) — pinning bench_fail for %d kernel(s)", exc, len(cuda_nodes))
         for node in cuda_nodes:

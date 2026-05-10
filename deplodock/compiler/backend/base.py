@@ -121,21 +121,43 @@ class Backend(ABC):
         *,
         input_data: dict[str, np.ndarray] | None = None,
         warmup: int = 5,
-        num_iters: int = 20,
+        num_iters: int | str = 20,
     ) -> BenchmarkResult:
         """Wall-time benchmark over repeated ``run()`` calls.
 
         Default implementation — good enough for numpy / loop interpreters.
         Backends with better timing (e.g. CUDA using GPU events inside an
         nvcc-compiled subprocess) override for device-precise measurements.
+
+        ``num_iters="auto"`` adapts the iter count to the per-call cost:
+        keep running until accumulated wall time reaches 100 ms (the
+        hardcoded auto budget), clamped to ``[10, 100_000]`` iterations.
         """
+        if isinstance(num_iters, str):
+            if num_iters != "auto":
+                raise ValueError(f"num_iters must be int or 'auto', got {num_iters!r}")
+            target_total_ms = 100.0
+            min_iters = 10
+            max_iters = 100_000
+            auto = True
+        else:
+            target_total_ms = float("inf")
+            min_iters = int(num_iters)
+            max_iters = int(num_iters)
+            auto = False
+
         for _ in range(warmup):
             self.run(compiled, input_data=input_data)
         times: list[float] = []
-        for _ in range(num_iters):
+        cumulative_ms = 0.0
+        while len(times) < max_iters:
             t0 = time.perf_counter()
             self.run(compiled, input_data=input_data)
-            times.append((time.perf_counter() - t0) * 1000)
+            dt = (time.perf_counter() - t0) * 1000
+            times.append(dt)
+            cumulative_ms += dt
+            if auto and len(times) >= min_iters and cumulative_ms >= target_total_ms:
+                break
         return BenchmarkResult(
             time_ms=sum(times) / len(times),
             min_ms=min(times),

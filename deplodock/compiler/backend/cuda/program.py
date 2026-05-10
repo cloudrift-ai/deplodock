@@ -366,14 +366,28 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
     return DebugResult(outputs=outputs, per_launch=per_launch_np)
 
 
+_AUTO_BUDGET_MS = 100.0
+_AUTO_MIN_ITERS = 10
+_AUTO_MAX_ITERS = 100_000
+
+
 def benchmark_program(
     graph: Graph,
     input_data: dict[str, np.ndarray] | None = None,
     warmup: int = 5,
-    num_iters: int = 20,
+    num_iters: int | str = 20,
     on_iter=None,
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
+
+    ``num_iters`` accepts an explicit count or the string ``"auto"``. In
+    auto mode the loop runs at least ``_AUTO_MIN_ITERS`` iterations and
+    keeps going until the accumulated *GPU* time across all launches
+    (sum of per-kernel event deltas) reaches ``_AUTO_BUDGET_MS``, capped
+    at ``_AUTO_MAX_ITERS``. This adapts the iter count to the kernel
+    cost: a 7-µs RMSNorm gets ~14k iters at 100 ms budget, a 1-ms matmul
+    gets ~100. The result's ``time_ms`` is the mean of the actually-run
+    iterations.
 
     ``on_iter``, if provided, is a no-arg callable invoked **before**
     each iteration of both the warmup and the measured loop. Used by
@@ -384,6 +398,19 @@ def benchmark_program(
     of percent on small kernels. The callable is responsible for any
     timing of its own work."""
     import cupy as cp
+
+    if isinstance(num_iters, str):
+        if num_iters != "auto":
+            raise ValueError(f"num_iters must be int or 'auto', got {num_iters!r}")
+        target_total_ms = _AUTO_BUDGET_MS
+        min_iters = _AUTO_MIN_ITERS
+        max_iters = _AUTO_MAX_ITERS
+        auto = True
+    else:
+        target_total_ms = float("inf")
+        min_iters = int(num_iters)
+        max_iters = int(num_iters)
+        auto = False
 
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
@@ -401,7 +428,9 @@ def benchmark_program(
     stops = [cp.cuda.Event() for _ in range(n)]
     acc = [0.0] * n
 
-    for _ in range(num_iters):
+    iters_run = 0
+    cumulative_gpu_ms = 0.0
+    while iters_run < max_iters:
         if on_iter is not None:
             on_iter()
         for i, launch in enumerate(compiled.launches):
@@ -418,12 +447,20 @@ def benchmark_program(
             # not what ``time_ms`` reports (which is the sum of per-
             # kernel events — pure GPU work, no sync overhead).
             stops[i].synchronize()
+        iter_total = 0.0
         for i in range(n):
-            acc[i] += cp.cuda.get_elapsed_time(starts[i], stops[i])
+            dt = cp.cuda.get_elapsed_time(starts[i], stops[i])
+            acc[i] += dt
+            iter_total += dt
+        cumulative_gpu_ms += iter_total
+        iters_run += 1
+        if auto and iters_run >= min_iters and cumulative_gpu_ms >= target_total_ms:
+            break
 
-    per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / num_iters) for i in range(n)]
+    iters = max(iters_run, 1)
+    per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / iters) for i in range(n)]
     return BenchmarkResult(
-        time_ms=sum(acc) / num_iters,
+        time_ms=sum(acc) / iters,
         num_launches=n,
         per_launch=per_launch if per_launch else None,
     )

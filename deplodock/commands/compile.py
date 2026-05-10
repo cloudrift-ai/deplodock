@@ -89,8 +89,6 @@ def register_compile_command(subparsers):
         default=None,
         help="Path to the tuning SQLite cache. Default: ~/.cache/deplodock/autotune.db when --tune is set.",
     )
-    parser.add_argument("--tune-warmup", type=int, default=5, help="Warmup launches per kernel during --tune (default: 5).")
-    parser.add_argument("--tune-iters", type=int, default=20, help="Measured iterations per kernel during --tune (default: 20).")
 
     from deplodock.compiler.target import add_target_arg
 
@@ -209,15 +207,7 @@ def handle_compile(args):
         cache = TuningCache(path=db_path)
         logger.info("Tuning cache: %s", db_path)
 
-    result = run_pipeline(
-        graph,
-        passes,
-        dump=dump,
-        backend=backend,
-        cache=cache,
-        bench_warmup=args.tune_warmup,
-        bench_iters=args.tune_iters,
-    )
+    result = run_pipeline(graph, passes, dump=dump, backend=backend, cache=cache)
 
     if cache is not None:
         _print_tune_summary(result, cache)

@@ -70,7 +70,7 @@ class CudaBackend(Backend):
         *,
         input_data: dict[str, np.ndarray] | None = None,
         warmup: int = 5,
-        num_iters: int = 20,
+        num_iters: int | str = 20,
         on_iter=None,
     ) -> BenchmarkResult:
         del input_data
