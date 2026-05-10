@@ -183,19 +183,61 @@ class Cursor:
     rule_idx: int = 0
     n_applied: int = 0
 
-    def advance_rule(self) -> None:
-        self.rule_idx += 1
+    def advance(
+        self,
+        result: RuleResult,
+        n_rules: int,
+        on_pass_finish: Callable[[int], None] | None = None,
+    ) -> None:
+        """Drive the cursor forward by one rule attempt.
 
-    def restart_scan(self) -> None:
+        First, update ``n_applied`` (functional fires drive end-of-scan
+        restart logic) and ``rule_idx`` (only advanced when no
+        functional fire happened — in-place rebinds and zero-fire
+        batches stay on the same graph state, so re-scanning the rule
+        would loop or no-op). Then, when ``rule_idx`` reaches
+        ``n_rules``, transition: restart from rule 0 if functional
+        rewrites accumulated this scan, otherwise invoke ``on_pass_end``
+        with the just-finished ``pass_idx`` and advance to the next
+        pass."""
+        self.n_applied += result.n_functional
+        if result.n_functional == 0:
+            self.rule_idx += 1
+        if self.rule_idx < n_rules:
+            return
+        finished = self.n_applied == 0
         self.rule_idx = 0
         self.n_applied = 0
+        if finished:
+            if on_pass_finish is not None:
+                on_pass_finish(self.pass_idx)
+            self.pass_idx += 1
 
-    def advance_pass(self) -> None:
-        self.pass_idx += 1
-        self.restart_scan()
+    def fork(self, n_applied_delta: int) -> Cursor:
+        """A copy at the same ``(pass_idx, rule_idx)`` with ``n_applied``
+        shifted by ``n_applied_delta`` — used when spawning autotune
+        alternatives mid-batch."""
+        return Cursor(self.pass_idx, self.rule_idx, self.n_applied + n_applied_delta)
 
-    def record_functional(self) -> None:
-        self.n_applied += 1
+
+@dataclass
+class RuleResult:
+    """Outcome of one ``_try_one_rule`` call.
+
+    * ``forks`` — alternative candidates spawned at autotune fork points
+      (empty for deterministic rules).
+    * ``n_functional`` — count of ``Graph`` (functional) rewrites applied
+      to the candidate's own graph in this batch.
+    * ``n_inplace`` — count of ``Op`` (in-place rebind) rewrites applied
+      to the candidate's own graph in this batch."""
+
+    forks: list[Candidate] = field(default_factory=list)
+    n_functional: int = 0
+    n_inplace: int = 0
+
+    @property
+    def fired(self) -> bool:
+        return (self.n_functional + self.n_inplace) > 0
 
 
 @dataclass
@@ -478,38 +520,29 @@ def _search_loop(
             yield cand
             continue
         rules = rules_per_pass[cur.pass_idx]
-        # End-of-scan bookkeeping: did any rewrite fire in this scan?
-        # If yes, restart from rule 0 (something changed; earlier rules
-        # may have new opportunities). If no, advance to next pass.
-        if cur.rule_idx >= len(rules):
-            if cur.n_applied > 0:
-                cur.restart_scan()
-            else:
-                name = pass_names[cur.pass_idx]
-                if name:
-                    logger.info("compile: %-18s done (%d nodes)", name, len(cand.graph.nodes))
-                if dump is not None and name:
-                    dump.on_pass(cur.pass_idx + 1, name, cand.graph)
-                cur.advance_pass()
+        # Empty pass (e.g. all rules filtered out): nothing to do, skip.
+        if not rules:
+            cur.pass_idx += 1
             search.push(cand)
             continue
-        # One iteration: try one rule application.
         rule = rules[cur.rule_idx]
         pass_idx_arg = cur.pass_idx + 1 if pass_names[cur.pass_idx] else None
         pass_name_arg = pass_names[cur.pass_idx] or None
-        next_cands = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg)
-        if next_cands is None:
-            # Rule had nothing to do — advance rule_idx and push back.
-            cur.advance_rule()
-            search.push(cand)
-        else:
-            # Rule applied (possibly with forks). cursor.rule_idx unchanged
-            # so the next iteration re-tries the same rule (more matches
-            # may exist; idempotent rules will RuleSkipped on already-
-            # processed roots). ``_try_one_rule`` already incremented
-            # ``cursor.n_applied`` on every successor.
-            for c in next_cands:
-                search.push(c)
+        result = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg)
+
+        def _on_pass_finish(idx: int) -> None:
+            name = pass_names[idx]
+            if name:
+                logger.info("compile: %-18s done (%d nodes)", name, len(cand.graph.nodes))
+            if dump is not None and name:
+                dump.on_pass(idx + 1, name, cand.graph)
+
+        cur.advance(result, n_rules=len(rules), on_pass_finish=_on_pass_finish)
+        # Forks first, then ``cand`` last — LIFO ``Search`` pops ``cand``
+        # next, driving the inline branch deep before backtracking.
+        for fork in result.forks:
+            search.push(fork)
+        search.push(cand)
 
 
 def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:
@@ -532,7 +565,7 @@ def _try_one_rule(
     dump: CompilerDump | None,
     pass_idx: int | None,
     pass_name: str | None,
-) -> list[Candidate] | None:
+) -> RuleResult:
     """One iteration: enumerate ``rule``'s matches once and apply each
     live match (with non-skipped rewrite) in batch. Match enumeration
     happens ONCE per call — staged matches that get invalidated by an
@@ -541,26 +574,18 @@ def _try_one_rule(
     downstream rules (lift / fusion / staging) depend on for
     deterministic structure.
 
-    Returns:
-    - ``None`` — no live match yielded a non-skipped rewrite; the rule
-      had nothing to do at this state.
-    - ``[c]`` — applied without forking; ``cand`` with extended trace
-      and incremented ``cursor.n_applied``.
-    - ``[*forks, c]`` — multi-option fork(s) encountered during the
-      batch; ``c`` (inline branch) is at the *end* so a LIFO ``Search``
-      pops it first; forks carry deep-copied graphs with their alt
-      applied at the fork point.
-
-    Caller (``run_autotune``) handles the ``cursor.rule_idx`` / ``cursor.pass_idx``
-    bookkeeping based on whether this returns ``None`` or ``[...]``."""
+    Mutates ``cand.graph`` and ``cand.trace`` in place with each match's
+    option-0 application. Does NOT touch ``cand.cursor`` — the caller
+    feeds the returned ``RuleResult`` to ``Cursor.advance`` to drive
+    the cursor transition. Each fork carries a deep-copied graph with
+    its alt applied at the fork point and a cursor at the same
+    ``(pass_idx, rule_idx)`` as ``cand``."""
     debug_on = logger.isEnabledFor(logging.DEBUG)
     dump_on = dump is not None and pass_idx is not None and pass_name is not None
     need_text = debug_on or dump_on
 
     matches = match_pattern(cand.graph, rule.pattern)
-    forks: list[Candidate] = []
-    fired = False
-    functional_fired = False
+    result = RuleResult()
     for match in matches:
         options = _try_rewrite(rule, match, ctx, debug_on=debug_on, pass_name=pass_name)
         if options is None:
@@ -575,52 +600,35 @@ def _try_one_rule(
             dump.on_rule(pass_idx, pass_name, rule.name, record, text)
         # Fork branches: each alt gets a deep-copy of cand.graph at
         # this point in the batch (after prior matches' option-0
-        # applications, before this match's). The fork resumes into
-        # the same rule batch from the next match — when it's popped,
-        # ``_try_one_rule`` will re-enumerate against its alt graph
-        # and process whatever matches remain there.
+        # applications, before this match's). Fork cursors carry the
+        # batch's running ``n_functional`` so far plus this alt's
+        # contribution — when popped, the fork re-enters the same rule
+        # batch from a fresh match enumeration on its alt graph.
         if len(options) > 1:
             snapshot = copy.deepcopy(cand.graph)
             for alt_idx, alt in enumerate(options[1:], start=1):
                 fg = copy.deepcopy(snapshot)
                 fm = _remap_match_to(fg, match)
                 fg = _apply_one(fg, fm, alt, rule_name=rule.name)
-                fork_cursor = Cursor(
-                    pass_idx=cand.cursor.pass_idx,
-                    rule_idx=cand.cursor.rule_idx,
-                    n_applied=cand.cursor.n_applied + (0 if isinstance(alt, Op) else 1),
-                )
-                forks.append(
+                alt_delta = result.n_functional + (0 if isinstance(alt, Op) else 1)
+                result.forks.append(
                     Candidate(
                         graph=fg,
                         ctx=cand.ctx,
                         trace=(*cand.trace, TraceEntry(rule.name, alt_idx)),
-                        cursor=fork_cursor,
+                        cursor=cand.cursor.fork(alt_delta),
                     )
                 )
         cand.graph = _apply_one(cand.graph, match, chosen, rule_name=rule.name)
         cand.trace = (*cand.trace, TraceEntry(rule.name, 0))
-        # ``cursor.n_applied`` counts only FUNCTIONAL (Graph) fires — the
-        # end-of-scan restart fires when these accumulate. In-place (Op)
-        # fires don't restart the scan: they only mutate ``root.op`` and
-        # the same pattern won't re-match the new op for most rules;
-        # rules whose op type stays the same rely on per-rule idempotence
-        # guards (and their downstream rule order is intentional).
-        if not isinstance(chosen, Op):
-            cand.cursor.record_functional()
-            functional_fired = True
-        fired = True
-    if not fired:
-        return None
-    # If only in-place fires happened in this batch, advance
-    # ``cursor.rule_idx`` — re-running the same rule on the post-mutation
-    # state would either RuleSkipped (idempotent guard) or re-fire
-    # (non-idempotent in-place rule), so don't re-scan it.
-    if not functional_fired:
-        cand.cursor.advance_rule()
-    # Forks first, inline branch (cand) last — LIFO ``Search`` pops
-    # cand next, driving the current branch deep before backtracking.
-    return [*forks, cand]
+        # Functional (Graph) fires drive the end-of-scan restart; in-place
+        # (Op) rebinds don't, since the same pattern won't re-match the
+        # mutated op (or the rule's idempotence guard handles it).
+        if isinstance(chosen, Op):
+            result.n_inplace += 1
+        else:
+            result.n_functional += 1
+    return result
 
 
 def _remap_match_to(forked_graph: Graph, match: Match) -> Match:
