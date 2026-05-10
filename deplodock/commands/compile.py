@@ -75,6 +75,22 @@ def register_compile_command(subparsers):
     )
     parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help=(
+            "Bench every CudaOp produced by the pipeline via CudaBackend, attribute per-kernel "
+            "latency (microseconds) to every ancestor along Op.source (CudaOp/KernelOp/TileOp/LoopOp), "
+            "and write the rows to the tuning cache. Forces --ir cuda."
+        ),
+    )
+    parser.add_argument(
+        "--tune-db",
+        default=None,
+        help="Path to the tuning SQLite cache. Default: ~/.cache/deplodock/autotune.db when --tune is set.",
+    )
+    parser.add_argument("--tune-warmup", type=int, default=5, help="Warmup launches per kernel during --tune (default: 5).")
+    parser.add_argument("--tune-iters", type=int, default=20, help="Measured iterations per kernel during --tune (default: 20).")
 
     from deplodock.compiler.target import add_target_arg
 
@@ -177,7 +193,34 @@ def handle_compile(args):
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
         dump.dump_input_graph(graph)
-    result = run_pipeline(graph, passes, dump=dump)
+
+    backend = None
+    cache = None
+    if args.tune:
+        if passes != CUDA_PASSES:
+            logger.info("--tune forces --ir cuda (overriding %r)", args.ir)
+            passes = CUDA_PASSES
+            args.ir = "cuda"
+        from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        from deplodock.compiler.cache import TuningCache  # noqa: PLC0415
+
+        backend = CudaBackend()
+        db_path = Path(args.tune_db) if args.tune_db else Path.home() / ".cache" / "deplodock" / "autotune.db"
+        cache = TuningCache(path=db_path)
+        logger.info("Tuning cache: %s", db_path)
+
+    result = run_pipeline(
+        graph,
+        passes,
+        dump=dump,
+        backend=backend,
+        cache=cache,
+        bench_warmup=args.tune_warmup,
+        bench_iters=args.tune_iters,
+    )
+
+    if cache is not None:
+        _print_tune_summary(result, cache)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
@@ -216,6 +259,39 @@ def _is_boundary(op) -> bool:
     from deplodock.compiler.ir.base import ConstantOp, InputOp
 
     return isinstance(op, (InputOp, ConstantOp))
+
+
+def _print_tune_summary(graph, cache) -> None:
+    """Print per-kernel measured latency + cumulative chain attribution."""
+    from deplodock.compiler.cache import op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+
+    ctx_key = Context.probe().structural_key()
+    cuda_nodes = [n for nid in graph.topological_order() for n in [graph.nodes[nid]] if isinstance(n.op, CudaOp)]
+    if not cuda_nodes:
+        sys.stderr.write("[tune] no CudaOp nodes — nothing to report\n")
+        return
+
+    sys.stderr.write("\n[tune] per-kernel measurements:\n")
+    sys.stderr.write(f"{'idx':>4}  {'kernel':<32}  {'latency_us':>12}  {'chain rows':>10}\n")
+    total = 0.0
+    for i, node in enumerate(cuda_nodes):
+        op = node.op
+        key = op_cache_key(op)
+        entry = cache.lookup(ctx_key, key) if key else None
+        latency = entry.latency_us if entry else float("nan")
+        total += latency if entry else 0.0
+        # Count rows landed in the cache for this kernel's source chain.
+        chain_hits = 0
+        cur = op
+        while cur is not None:
+            k = op_cache_key(cur)
+            if k and cache.has(ctx_key, k):
+                chain_hits += 1
+            cur = cur.source
+        sys.stderr.write(f"{i:>4}  {op.kernel_name[:32]:<32}  {latency:>12.2f}  {chain_hits:>10}\n")
+    sys.stderr.write(f"[tune] total kernel time: {total:.2f} us across {len(cuda_nodes)} kernel(s)\n")
 
 
 def _load_or_trace(args) -> tuple[Graph, str]:

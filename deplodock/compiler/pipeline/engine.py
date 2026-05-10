@@ -809,6 +809,10 @@ def run_pipeline(
     dump: CompilerDump | None = None,
     select: Iterable[str] | None = None,
     ctx: Context | None = None,
+    backend=None,
+    cache: TuningCache | None = None,
+    bench_warmup: int = 5,
+    bench_iters: int = 20,
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
     after each. Single-candidate convenience wrapper around
@@ -817,8 +821,28 @@ def run_pipeline(
     candidate. With deterministic rules that's the only candidate.
 
     ``ctx`` is built once (probing the live device if not provided)
-    and passed to every rule that takes a ``ctx`` parameter."""
-    return next(run_autotune(graph, passes, search=MeasurementPrioritySearch(), dump=dump, select=select, ctx=ctx)).graph
+    and passed to every rule that takes a ``ctx`` parameter.
+
+    ``backend`` (typically :class:`CudaBackend`) opts the run into real
+    GPU measurement: every terminal graph's per-kernel latency is
+    recorded to ``cache`` and attributed to every ancestor along the
+    ``Op.source`` chain. ``cache`` defaults to a fresh in-memory store;
+    pass an explicit :class:`TuningCache` to persist measurements
+    across runs."""
+    search = MeasurementPrioritySearch(cache=cache)
+    return next(
+        run_autotune(
+            graph,
+            passes,
+            search=search,
+            dump=dump,
+            select=select,
+            ctx=ctx,
+            backend=backend,
+            bench_warmup=bench_warmup,
+            bench_iters=bench_iters,
+        )
+    ).graph
 
 
 def run_autotune(
@@ -829,6 +853,9 @@ def run_autotune(
     dump: CompilerDump | None = None,
     select: Iterable[str] | None = None,
     ctx: Context | None = None,
+    backend=None,
+    bench_warmup: int = 5,
+    bench_iters: int = 20,
 ) -> Iterator[Candidate]:
     """Drive the autotune search. Yields one terminal ``Candidate`` per
     fully-explored branch. With deterministic rules (no list-returning
@@ -851,7 +878,9 @@ def run_autotune(
     :class:`MeasurementPrioritySearch` does), each yielded terminal
     candidate has its ``CudaOp`` nodes recorded to the cache via
     :func:`record_terminal` before being yielded — so subsequent
-    candidates see the updated priority signal.
+    candidates see the updated priority signal. Pass a ``Backend``
+    (typically :class:`CudaBackend`) via ``backend=`` to record real
+    GPU-event latencies; omit it to record the stub ``latency_us=1.0``.
 
     ``ctx`` is built once (probing the live device if not provided)
     and shared by every candidate."""
@@ -866,7 +895,14 @@ def run_autotune(
     cache: TuningCache | None = getattr(search, "cache", None)
     for cand in _search_loop(search, rules_per_pass, passes, ctx, dump):
         if cache is not None:
-            record_terminal(cand.graph, cache, cand.ctx.structural_key())
+            record_terminal(
+                cand.graph,
+                cache,
+                cand.ctx.structural_key(),
+                backend=backend,
+                warmup=bench_warmup,
+                num_iters=bench_iters,
+            )
         yield cand
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
 

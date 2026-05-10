@@ -10,7 +10,9 @@ kernels still dedup.
 
 from __future__ import annotations
 
-from deplodock.compiler.cache import op_cache_key
+from deplodock.compiler.backend.base import BenchmarkResult, LaunchTime
+from deplodock.compiler.cache import TuningCache, op_cache_key, record_terminal
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda.ir import CudaOp
@@ -59,3 +61,39 @@ def test_source_excluded_from_structural_key() -> None:
         source=None,  # different lowering chain
     )
     assert op_cache_key(cuda) == op_cache_key(other)
+
+
+class _StubBackend:
+    """Backend stub that yields scripted per-kernel latencies."""
+
+    def __init__(self, per_launch_ms: list[float]) -> None:
+        self.per_launch_ms = per_launch_ms
+        self.calls: int = 0
+
+    def benchmark(self, graph, *, warmup: int = 5, num_iters: int = 20) -> BenchmarkResult:
+        del graph, warmup, num_iters
+        self.calls += 1
+        per_launch = [LaunchTime(idx=i, kernel_name=f"k{i}", time_ms=t) for i, t in enumerate(self.per_launch_ms)]
+        return BenchmarkResult(time_ms=sum(self.per_launch_ms), num_launches=len(per_launch), per_launch=per_launch)
+
+
+def test_record_terminal_attributes_latency_to_every_ancestor() -> None:
+    """One bench call → entries land for CudaOp, KernelOp, TileOp, and
+    LoopOp ancestors, all carrying the measured latency (in microseconds)."""
+    g = run_pipeline(_elementwise_graph(), CUDA_PASSES)
+    cuda_node = next(n for n in g.nodes.values() if isinstance(n.op, CudaOp))
+    cuda = cuda_node.op
+    cache = TuningCache()
+    ctx_key = Context.from_target((12, 0)).structural_key()
+    backend = _StubBackend(per_launch_ms=[0.0425])  # 42.5 us
+
+    record_terminal(g, cache, ctx_key, backend=backend)
+
+    assert backend.calls == 1
+    for ancestor in (cuda, cuda.source, cuda.source.source, cuda.source.source.source):
+        key = op_cache_key(ancestor)
+        assert key is not None, f"{type(ancestor).__name__} should be cacheable"
+        entry = cache.lookup(ctx_key, key)
+        assert entry is not None, f"no cache entry for {type(ancestor).__name__}"
+        assert entry.latency_us == 42.5
+        assert entry.status == "ok"

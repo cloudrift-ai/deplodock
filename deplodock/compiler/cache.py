@@ -6,10 +6,12 @@ and codegen-affecting knobs. ``op_key`` is the structural digest of a
 fully-lowered op (today: ``CudaOp`` — :func:`op_cache_key` digests its
 rendered source + launch params).
 
-Stub measurement: until real GPU benchmarking lands, terminal
-:class:`CudaOp` nodes are recorded with ``latency_us=1.0``. The search
-policy uses cache hits to prioritize candidates whose remaining ops
-still need measurement (see :class:`MeasurementPrioritySearch`).
+Measurement: :func:`record_terminal` either stubs latency to ``1.0`` (no
+backend) or runs ``backend.benchmark`` once per terminal graph and
+attributes the per-launch GPU-event time to every ancestor along the
+``Op.source`` chain (``CudaOp → KernelOp → TileOp → LoopOp``). The
+search policy uses cache hits to prioritize candidates whose remaining
+ops still need measurement (see :class:`MeasurementPrioritySearch`).
 
 Concurrency: opened in WAL mode so parallel benches can read while one
 writes. The connection is kept open for the cache's lifetime; callers
@@ -19,12 +21,15 @@ locking).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from deplodock.compiler.structural import digest
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -92,14 +97,40 @@ class TuningCache:
 
 
 def op_cache_key(op: object) -> str | None:
-    """Cache key for a fully-lowered op, or ``None`` if the op isn't
-    terminal yet. Today only :class:`CudaOp` is terminal; we digest its
-    rendered source and launch parameters (the bits that determine
-    runtime behavior)."""
+    """Cache key for any kernel-bearing op, or ``None`` if the op isn't
+    cacheable.
+
+    Each level of the lowering chain has its own well-defined identity:
+
+    - ``CudaOp`` — digest of rendered kernel source + launch params (the
+      bits that determine runtime behavior).
+    - ``KernelOp`` / ``TileOp`` / ``LoopOp`` — digest of the dialect tag
+      plus :meth:`Body.structural_key` (already canonicalizes SSA, axis,
+      commutative-arg, and external-buffer names).
+
+    Same kernel reached via different rewrite paths produces the same
+    key — ``Op.source`` is *not* part of the digest, so a fused LoopOp
+    and the TileOp lowered from it hash differently (their structures
+    differ), but two LoopOps that are structurally identical share a
+    key regardless of which graph they live in.
+    """
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         return digest("CudaOp", op.kernel_source, op.arg_order, op.grid, op.block, op.smem_bytes)
+    if isinstance(op, (LoopOp, TileOp)):
+        return digest(type(op).__name__, op.body.structural_key())
+    if isinstance(op, KernelOp):
+        # KernelOp bodies contain hardware-primitive stmts (Smem, Sync, ...)
+        # that ``Body.structural_key``'s normalize path doesn't yet support.
+        # Fall back to ``repr``-based digest — deterministic, but doesn't
+        # canonicalize SSA / axis names so structurally-equivalent kernels
+        # may hash distinct. Register Kernel-IR stmts for ``rewrite`` to
+        # promote this to a real structural digest.
+        return digest("KernelOp", repr(op.body))
     return None
 
 
@@ -134,17 +165,89 @@ def count_unmeasured_ops(graph, cache: TuningCache, context_key: str) -> int:
     return n
 
 
-def record_terminal(graph, cache: TuningCache, context_key: str, *, latency_us: float = 1.0) -> None:
-    """Record every ``CudaOp`` node in ``graph`` to the cache. Stub
-    measurement (default ``latency_us=1.0``) until real GPU benching
-    lands — at that point this becomes ``measure_terminal`` and gets
-    the real number."""
+def _source_chain(op):
+    """Yield ``op`` and every predecessor along ``Op.source``."""
+    cur = op
+    while cur is not None:
+        yield cur
+        cur = cur.source
+
+
+def record_terminal(
+    graph,
+    cache: TuningCache,
+    context_key: str,
+    *,
+    backend=None,
+    warmup: int = 5,
+    num_iters: int = 20,
+) -> None:
+    """Measure every ``CudaOp`` in ``graph`` and attribute the result to
+    every ancestor along its ``.source`` chain.
+
+    When ``backend`` is ``None`` (default — keeps tests and CPU-only
+    environments working): records ``latency_us=1.0`` for every kernel.
+    This is the "stub" path used by the search policy as a placeholder
+    until real measurement is opted in.
+
+    When ``backend`` is provided (typically a ``CudaBackend``): calls
+    ``backend.benchmark(graph, warmup=..., num_iters=...)`` once,
+    consuming the per-launch GPU-event timings. The i-th
+    :class:`LaunchTime` corresponds to the i-th ``CudaOp`` in
+    ``graph.topological_order()`` (the same order the backend uses
+    internally — see ``backend/cuda/program.py::_launches``).
+
+    For each measured kernel the result is attributed to every ancestor
+    along ``CudaOp.source`` (``KernelOp → TileOp → LoopOp``) — the same
+    latency at every abstraction level, since they describe the same
+    kernel. A future run that sees an equivalent ``LoopOp`` body can
+    hit the cache without re-lowering.
+
+    If ``backend.benchmark`` raises (NVRTC compile error, OOM, etc.) the
+    whole graph is recorded with ``status="bench_fail"`` and the
+    exception is logged — the cache pins the failure so the search
+    doesn't re-discover the same dead end.
+    """
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
-    for node in graph.nodes.values():
-        if not isinstance(node.op, CudaOp):
-            continue
-        key = op_cache_key(node.op)
+    cuda_nodes = [graph.nodes[nid] for nid in graph.topological_order() if isinstance(graph.nodes[nid].op, CudaOp)]
+    if not cuda_nodes:
+        return
+
+    if backend is None:
+        for node in cuda_nodes:
+            _attribute(cache, context_key, node.op, latency_us=1.0, status="ok")
+        return
+
+    try:
+        result = backend.benchmark(graph, warmup=warmup, num_iters=num_iters)
+    except Exception as exc:  # noqa: BLE001 — autotune cache must record any failure mode
+        logger.warning("cache: backend.benchmark failed (%s) — pinning bench_fail for %d kernel(s)", exc, len(cuda_nodes))
+        for node in cuda_nodes:
+            _attribute(cache, context_key, node.op, latency_us=0.0, status="bench_fail")
+        return
+
+    per_launch = result.per_launch or []
+    if len(per_launch) != len(cuda_nodes):
+        logger.warning(
+            "cache: per_launch count (%d) != CudaOp node count (%d); falling back to graph time_ms / N",
+            len(per_launch),
+            len(cuda_nodes),
+        )
+        avg_us = (result.time_ms * 1000.0) / max(len(cuda_nodes), 1)
+        for node in cuda_nodes:
+            _attribute(cache, context_key, node.op, latency_us=avg_us, status="ok")
+        return
+
+    for node, lt in zip(cuda_nodes, per_launch, strict=True):
+        _attribute(cache, context_key, node.op, latency_us=lt.time_ms * 1000.0, status="ok")
+
+
+def _attribute(cache: TuningCache, context_key: str, cuda_op, *, latency_us: float, status: str) -> None:
+    """Record ``latency_us`` against every ancestor in ``cuda_op.source``."""
+    for ancestor in _source_chain(cuda_op):
+        key = op_cache_key(ancestor)
         if key is None:
             continue
-        cache.record(context_key, key, latency_us=latency_us, status="ok")
+        cache.record(context_key, key, latency_us=latency_us, status=status)
+    logger.debug("cache: %s for kernel %s @ %.2f us", status, cuda_op.kernel_name, latency_us)

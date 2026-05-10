@@ -96,16 +96,18 @@ rules — they're shared helpers for the pass's rule modules.
 - `run_pass(graph, pass_dir)` — load every rule file in a directory,
   apply each to fixed point, then rescan the sequence until no rule
   makes further progress.
-- `run_autotune(graph, passes, search=...) -> Iterator[Candidate]` —
+- `run_autotune(graph, passes, search=..., backend=None) -> Iterator[Candidate]` —
   drive the full search. Yields one terminal `Candidate` per
   fully-explored branch. Default search is `MeasurementPrioritySearch`
   (priority by remaining unmeasured ops; DFS-equivalent on a fresh
   in-memory cache); pass a custom `Search` implementation for any other
   strategy. When `search` exposes a `cache: TuningCache`, `run_autotune`
-  calls `record_terminal(cand.graph, cache, ctx.structural_key())` on
-  each yielded terminal so the priority signal updates between branches.
-  See `engine.py:Candidate`, `TraceEntry`, `Search`,
-  `MeasurementPrioritySearch`, and `cache.py:TuningCache`.
+  calls `record_terminal(cand.graph, cache, ctx.structural_key(), backend=...)`
+  on each yielded terminal. Pass a `Backend` (typically `CudaBackend`)
+  via `backend=` to record real per-kernel GPU-event latencies; omit it
+  to record the stub `latency_us=1.0`. `bench_warmup` / `bench_iters`
+  control the bench window. See `engine.py:Candidate`, `TraceEntry`,
+  `Search`, `MeasurementPrioritySearch`, and `cache.py:TuningCache`.
 - `run_pipeline(graph, passes, dump=None)` — single-graph convenience
   wrapper around `run_autotune`. Returns the first terminal candidate's
   graph; for deterministic rules that's the only one. Run each named pass
