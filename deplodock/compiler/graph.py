@@ -20,10 +20,11 @@ its only users.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.base import InputOp, Op
 
 # ---------------------------------------------------------------------------
 # Hints
@@ -445,6 +446,96 @@ class Graph:
         self.inputs = [new_id if i == old_id else i for i in self.inputs]
         self.outputs = [new_id if o == old_id else o for o in self.outputs]
 
+    def splice(self, fragment: Graph, *, consumed: Iterable[str], output: str) -> str:
+        """Splice ``fragment`` into this graph in place of ``consumed``.
+
+        Fragment ``InputOp`` nodes alias existing graph nodes by id (no
+        copy); every other fragment node is added with its original id
+        when it doesn't collide, otherwise a fresh id. Hints on removed
+        nodes are merged onto the fragment's output. Returns the id of
+        the fragment's output in this graph (post-rename).
+
+        ``consumed`` is the set of node ids the rewriter declares the
+        match owns; ``output`` is the id whose consumers get redirected
+        to the fragment output (typically the match root)."""
+        id_map: dict[str, str] = {}
+        for frag_id in fragment.topological_order():
+            frag_node = fragment.nodes[frag_id]
+            if isinstance(frag_node.op, InputOp):
+                id_map[frag_id] = frag_id  # references existing graph node
+                continue
+            mapped_inputs = [id_map.get(inp, inp) for inp in frag_node.inputs]
+            # Preserve fragment ids when they don't collide. Lifting / fusion
+            # use stable names (``lift_<nid>``, ``merged_<nid>``) that don't
+            # clash because the original is already consumed. Stable ids keep
+            # buf names inside LoopOp bodies (``Load.source``/``Write.output``,
+            # both buf names) consistent with the surrounding graph.
+            preferred_id = frag_id if frag_id not in self.nodes else None
+            new_id = self.add_node(
+                op=frag_node.op,
+                inputs=mapped_inputs,
+                output=Tensor(frag_node.output.name, frag_node.output.shape, frag_node.output.dtype),
+                node_id=preferred_id,
+            )
+            if frag_node.hints:
+                self.nodes[new_id].hints = frag_node.hints
+            id_map[frag_id] = new_id
+
+        new_output = id_map[fragment.outputs[0]]
+        self.replace_node(output, new_output)
+
+        for nid in consumed:
+            orig = self.nodes.get(nid)
+            if orig is None:
+                continue
+            if orig.hints:
+                self.nodes[new_output].hints.merge(orig.hints)
+            if nid != output:
+                self.remove_node(nid)
+        if output in self.nodes:
+            self.remove_node(output)
+
+        # Promote the new node's id to its friendly output.name once consumed
+        # nodes are gone — keeps kernel buf names (which embed the node id)
+        # readable. Falls back silently if the friendly name is taken.
+        desired = self.nodes[new_output].output.name
+        if desired and desired != new_output and desired not in self.nodes:
+            self.rename_node(new_output, desired)
+            new_output = desired
+
+        self.remove_orphans()
+        return new_output
+
+    def remove_orphans(self) -> None:
+        """Remove nodes with zero consumers that aren't graph inputs/outputs."""
+        output_set = set(self.outputs)
+        input_set = set(self.inputs)
+
+        def _is_protected(nid: str) -> bool:
+            if nid in output_set or nid in input_set:
+                return True
+            node = self.nodes.get(nid)
+            return node is not None and isinstance(node.op, InputOp)
+
+        consumer_count: dict[str, int] = dict.fromkeys(self.nodes, 0)
+        for node in self.nodes.values():
+            for inp in set(node.inputs):
+                if inp in consumer_count:
+                    consumer_count[inp] += 1
+
+        queue: list[str] = [nid for nid, c in consumer_count.items() if c == 0 and not _is_protected(nid)]
+        while queue:
+            nid = queue.pop()
+            if nid not in self.nodes:
+                continue
+            node = self.nodes[nid]
+            for inp in set(node.inputs):
+                if inp in consumer_count:
+                    consumer_count[inp] -= 1
+                    if consumer_count[inp] == 0 and not _is_protected(inp):
+                        queue.append(inp)
+            self.remove_node(nid)
+
     def users(self, node_id: str) -> set[str]:
         """Return the set of node ids that consume ``node_id``. O(1)."""
         return self._users.get(node_id, set())
@@ -452,6 +543,66 @@ class Graph:
     def consumers(self, node_id: str) -> list[str]:
         """List form of :meth:`users`, preserved for existing callers."""
         return list(self._users.get(node_id, ()))
+
+    def structural_key(self) -> str:
+        """Implements :class:`deplodock.compiler.structural.Structural`.
+
+        Merkle-style structural digest of the graph. Two graphs that
+        compute the same dataflow — same op kinds, same canonicalized op
+        bodies, same Tensor shapes / dtypes, same input wiring — produce
+        the same digest. Two graphs that differ in any of those produce
+        different digests.
+
+        Per node the key combines:
+
+        - op class name,
+        - op body's :meth:`Body.structural_key` (for body-bearing ops:
+          ``LoopOp`` / ``TileOp`` / ``KernelOp``) — already canonicalizes
+          SSA / axis / commutative-arg / buffer names,
+        - other dataclass fields of the op rendered via ``repr`` — skipping
+          ``name`` (instance identifier),
+        - ``Tensor.shape`` and ``Tensor.dtype`` of the output (skipping
+          ``Tensor.name`` — graph-internal label),
+        - the ordered tuple of input nodes' digests (recursive).
+
+        Top-level digest folds in the graph's :attr:`inputs` /
+        :attr:`outputs` sequences. ``Hints`` (advisory) and graph-internal
+        node ids are deliberately excluded.
+
+        Not cached: ``Graph`` is mutable. Callers that dedup many
+        candidates should snapshot the digest into a dict / set themselves.
+        """
+        from dataclasses import fields as dc_fields  # noqa: PLC0415
+
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+        from deplodock.compiler.structural import digest  # noqa: PLC0415
+
+        keys: dict[str, str] = {}
+
+        def node_key(nid: str) -> str:
+            cached = keys.get(nid)
+            if cached is not None:
+                return cached
+            node = self.nodes[nid]
+            op = node.op
+            body = getattr(op, "body", None)
+            if isinstance(body, Body):
+                op_payload: tuple = ("body", body.structural_key())
+            else:
+                attrs = tuple((f.name, repr(getattr(op, f.name))) for f in dc_fields(op) if f.name != "name")
+                op_payload = ("attrs", attrs)
+            out = node.output
+            out_payload = (tuple(out.shape), out.dtype)
+            input_payload = tuple(node_key(i) for i in node.inputs)
+            d = digest(type(op).__name__, op_payload, out_payload, input_payload)
+            keys[nid] = d
+            return d
+
+        # Hash from outputs back so disconnected dead nodes don't perturb the
+        # key, and from inputs forward so an input-order swap is observable.
+        out_keys = tuple(node_key(o) for o in self.outputs)
+        in_keys = tuple(node_key(i) for i in self.inputs)
+        return digest("graph", in_keys, out_keys)
 
     def topological_order(self) -> list[str]:
         """Return node ids in topological order (inputs before consumers).

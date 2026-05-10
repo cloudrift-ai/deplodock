@@ -30,6 +30,9 @@ _test_data
 
 # Experiment outputs
 experiments/
+recipes/**/benchmark*.log
+recipes/**/instances.json
+recipes/**/tasks.json
 
 # Claude Code per-user local settings (skills/agents under .claude/ are tracked)
 .claude/settings.local.json

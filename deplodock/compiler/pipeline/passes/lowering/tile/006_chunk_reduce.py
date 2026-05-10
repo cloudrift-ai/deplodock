@@ -46,7 +46,6 @@ reduce-Loop is left alone.
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
@@ -68,16 +67,11 @@ _MAX_SLAB_BYTES_HEADROOM = 8 * 1024
 _BK_CANDIDATES = (128, 64, 32, 16, 8)
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    # Diagnostic gate for visualizing pipeline behavior with this pass
-    # disabled (e.g. smem-layout before/after diffs).
-    if os.environ.get("DEPLODOCK_DISABLE_CHUNK_REDUCE") == "1":
-        raise RuleSkipped("disabled via DEPLODOCK_DISABLE_CHUNK_REDUCE=1")
+def rewrite(root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+        raise RuleSkipped("rewrite helper returned no change")
+    return TileOp(body=new_body, name=root.op.name)
 
 
 def _maybe_rewrite(body):

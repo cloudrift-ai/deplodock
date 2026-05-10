@@ -58,7 +58,6 @@ Skips when:
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
@@ -84,14 +83,11 @@ _LDS128_FLOATS = 4
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    if os.environ.get("DEPLODOCK_DISABLE_CHUNK_REGISTER_TILE") == "1":
-        raise RuleSkipped("disabled via DEPLODOCK_DISABLE_CHUNK_REGISTER_TILE=1")
+def rewrite(root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+        raise RuleSkipped("rewrite helper returned no change")
+    return TileOp(body=new_body, name=root.op.name)
 
 
 def _maybe_rewrite(body: Body) -> Body | None:

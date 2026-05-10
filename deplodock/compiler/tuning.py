@@ -361,12 +361,16 @@ def thread_budget() -> int:
     return _int_env("DEPLODOCK_TB", 256)
 
 
-def forced_bk(tile: Tile | None = None) -> int | None:
+def forced_bk(tile: Tile | None = None, static_smem_cap: int | None = None) -> int | None:
     """Force BK via env, or pick the M-adaptive default. Backs off to
-    a smaller BK when the M-adaptive choice would overflow the 48 KB
-    static-smem cap at the active tile shape — happens for small
-    matmuls where the THREAD axes stay at the full output extent and
-    BK_SMALL_M=64 produces a stage too large for two buffers."""
+    a smaller BK when the M-adaptive choice would overflow the static-
+    smem cap at the active tile shape — happens for small matmuls where
+    the THREAD axes stay at the full output extent and BK_SMALL_M=64
+    produces a stage too large for two buffers.
+
+    ``static_smem_cap`` defaults to ``Context.static_smem_cap`` (48 KB);
+    callers that have a ``Context`` should pass ``ctx.static_smem_cap``
+    so the budget tracks the target arch."""
     raw = os.environ.get("DEPLODOCK_BK")
     if raw:
         try:
@@ -376,26 +380,31 @@ def forced_bk(tile: Tile | None = None) -> int | None:
     if tile is None or not _has_matmul_reduce(tile.body):
         return None
     bk = _BK_SMALL_M if _matmul_M(tile) <= _M_THRESHOLD else (_BK_LARGE_M_TMA if _tma_enabled() else _BK_LARGE_M_DEFAULT)
-    return _bk_fits_smem(tile, bk)
+    if static_smem_cap is None:
+        from deplodock.compiler.context import STATIC_SMEM_CAP  # noqa: PLC0415
+
+        static_smem_cap = STATIC_SMEM_CAP
+    return _bk_fits_smem(tile, bk, static_smem_cap)
 
 
-# sm_120 hard cap is 48 KB static smem; 014_pad_smem adds +1
-# row of padding per stage to break 32-way bank conflicts, so reserve
-# ~4 KB of headroom for that swelling.
-_SMEM_BUDGET_BYTES = 44 * 1024
+# Reserve ~4 KB of headroom under the static-smem cap so 014_pad_smem's
+# ``+1`` per-stage padding (to break 32-way bank conflicts) doesn't
+# push the kernel over.
+_PAD_HEADROOM_BYTES = 4 * 1024
 _DTYPE_BYTES = 4
 
 
-def _bk_fits_smem(tile: Tile, bk: int) -> int:
-    """Halve BK until the (BN+BM)·BK·4·2 stage fits in 48 KB static
-    smem. Returns the largest BK ≥ 1 that fits."""
+def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
+    """Halve BK until the (BN+BM)·BK·4·2 stage fits in static smem
+    minus pad headroom. Returns the largest BK ≥ 1 that fits."""
+    budget = static_smem_cap - _PAD_HEADROOM_BYTES
     extents = _logical_output_extents(tile)
     if len(extents) < 2:
         return bk
     (def_bn, def_bm), _ = _default_tile(tile)
     bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", def_bn))
     bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", def_bm))
-    while bk > 1 and (bn_actual + bm_actual) * bk * _DTYPE_BYTES * 2 > _SMEM_BUDGET_BYTES:
+    while bk > 1 and (bn_actual + bm_actual) * bk * _DTYPE_BYTES * 2 > budget:
         bk //= 2
     return bk
 

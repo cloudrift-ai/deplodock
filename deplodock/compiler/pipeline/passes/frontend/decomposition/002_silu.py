@@ -2,13 +2,14 @@
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "silu"})]
 
 
-def rewrite(graph: Graph, inp_x: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, inp_x: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     """Replace silu(x) with x * recip(1 + exp(-x))."""
     frag = open_fragment(graph, [inp_x])
 

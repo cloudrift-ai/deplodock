@@ -3,13 +3,14 @@
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import UnsqueezeOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", UnsqueezeOp)]
 
 
-def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     out_shape = tuple(out.shape)
     in_shape = tuple(inp_x.output.shape)
     dim = root.op.dim

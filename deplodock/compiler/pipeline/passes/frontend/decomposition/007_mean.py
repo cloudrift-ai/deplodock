@@ -3,13 +3,14 @@
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
 
 PATTERN = [Pattern("root", MeanOp)]
 
 
-def rewrite(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     """Replace mean(x, axis) with sum(x, axis) / axis_size."""
     axis = root.op.axis
     x_shape = inp_x.output.shape

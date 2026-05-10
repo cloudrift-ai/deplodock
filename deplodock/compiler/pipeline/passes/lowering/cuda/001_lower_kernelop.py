@@ -18,7 +18,7 @@ from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", KernelOp)]
 
@@ -27,7 +27,8 @@ _BLOCK = 256
 _DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2}
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:
+    graph = match.graph
     shapes: dict[str, tuple[int, ...]] = {bid: tuple(graph.nodes[bid].output.shape) for bid in root.op.inputs}
     for out in root.op.outputs:
         shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(root.output.shape)
@@ -67,7 +68,7 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         if s.reduce_op is not None and s.output in output_set and s.output not in seen_atomic:
             seen_atomic.add(s.output)
             atomic_outputs.append(s.output)
-    root.op = CudaOp(
+    return CudaOp(
         kernel_source=render_kernelop(root.op, shapes=shapes, literal_constants=literal_constants),
         kernel_name=root.op.name,
         arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
@@ -77,7 +78,6 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
         tma_descriptors=tuple(descriptors),
         zero_outputs=tuple(atomic_outputs),
     )
-    return None
 
 
 def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:

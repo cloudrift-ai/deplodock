@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
@@ -65,10 +66,10 @@ PATTERN = [Pattern("root", TileOp)]
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 
 
-def _bk_candidates(tile) -> tuple[int, ...]:
+def _bk_candidates(tile, static_smem_cap: int) -> tuple[int, ...]:
     from deplodock.compiler.tuning import forced_bk
 
-    f = forced_bk(tile)
+    f = forced_bk(tile, static_smem_cap)
     if f is None:
         return _BK_CANDIDATES
     # Forced value tried first; fall back to the built-in list if it
@@ -76,23 +77,22 @@ def _bk_candidates(tile) -> tuple[int, ...]:
     return (f, *(c for c in _BK_CANDIDATES if c != f))
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
+def rewrite(ctx: Context, root: Node) -> Graph | None:
+    new_body = _maybe_rewrite(root.op.body, ctx.static_smem_cap)
     if new_body is None:
-        return None
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+        raise RuleSkipped("rewrite helper returned no change")
+    return TileOp(body=new_body, name=root.op.name)
 
 
-def _maybe_rewrite(body):
+def _maybe_rewrite(body, static_smem_cap: int):
     idx, tile = single_tile(body)
-    new_body, changed = _chunk_in_body(tile.body, tile)
+    new_body, changed = _chunk_in_body(tile.body, tile, static_smem_cap)
     if not changed:
         raise RuleSkipped("no matmul-shaped reduce Loop with K-divisor in candidates")
     return body[:idx] + (Tile(axes=tile.axes, body=new_body),) + body[idx + 1 :]
 
 
-def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
+def _chunk_in_body(stmts: tuple, tile, static_smem_cap: int) -> tuple[tuple, bool]:
     """Walk a body, chunking the first matmul-shaped reduce Loop found.
     Recurses through wrapper Loops / StridedLoops / Conds so a matmul
     nested inside an output-position free loop (fused SDPA V-projection)
@@ -106,20 +106,20 @@ def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
             out.append(s)
             continue
         if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
-            chunked = _chunk_loop(s, tile)
+            chunked = _chunk_loop(s, tile, static_smem_cap)
             if chunked is not None:
                 out.append(chunked)
                 changed = True
                 continue
         if isinstance(s, (Loop, StridedLoop)):
-            inner, inner_changed = _chunk_in_body(s.body, tile)
+            inner, inner_changed = _chunk_in_body(s.body, tile, static_smem_cap)
             if inner_changed:
                 out.append(replace(s, body=inner))
                 changed = True
                 continue
         if isinstance(s, Cond):
-            inner_b, cb = _chunk_in_body(s.body, tile)
-            inner_e, ce = _chunk_in_body(s.else_body, tile)
+            inner_b, cb = _chunk_in_body(s.body, tile, static_smem_cap)
+            inner_e, ce = _chunk_in_body(s.else_body, tile, static_smem_cap)
             if cb or ce:
                 out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
                 changed = True
@@ -128,9 +128,9 @@ def _chunk_in_body(stmts: tuple, tile) -> tuple[tuple, bool]:
     return tuple(out), changed
 
 
-def _chunk_loop(loop: Loop, tile) -> Loop | None:
+def _chunk_loop(loop: Loop, tile, static_smem_cap: int) -> Loop | None:
     K = int(loop.axis.extent)
-    BK = next((c for c in _bk_candidates(tile) if K % c == 0 and K > c), None)
+    BK = next((c for c in _bk_candidates(tile, static_smem_cap) if K % c == 0 and K > c), None)
     if BK is None:
         return None
 

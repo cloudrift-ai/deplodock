@@ -3,7 +3,7 @@
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import LinearOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     matmul_decompose,
@@ -13,7 +13,8 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
 PATTERN = [Pattern("root", LinearOp)]
 
 
-def rewrite(graph: Graph, inp_x: Node, inp_w: Node, inp_b: Node | None, out: Tensor) -> Graph | None:
+def rewrite(match: Match, inp_x: Node, inp_w: Node, inp_b: Node | None, out: Tensor) -> Graph | None:
+    graph = match.graph
     exts = [inp_x, inp_w] + ([inp_b] if inp_b else [])
     frag = open_fragment(graph, exts)
 

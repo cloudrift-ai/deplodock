@@ -22,9 +22,8 @@ from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 PATTERN = [Pattern("root", LoopOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body = dedup_loads(root.op.body)
     if new_body == root.op.body:
         raise RuleSkipped("no duplicate (input, index) Loads to dedup")
-    root.op = LoopOp(body=new_body)
-    return None
+    return LoopOp(body=new_body)

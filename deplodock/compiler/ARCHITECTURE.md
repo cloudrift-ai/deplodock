@@ -26,6 +26,29 @@ GPU
 `Graph` (`compiler/graph.py`) hosts nodes from every dialect; rewrite
 passes swap node ops in place, so there is no separate "program" type.
 
+`Graph.structural_key()` implements the `Structural` protocol
+(`compiler/structural.py`) — a Merkle-style hex sha256 digest used for
+candidate dedup in autotuning loops. Per node it folds in op kind,
+op body's `Body.structural_key()` (or other dataclass fields for leaf
+ops, skipping `name`), `Tensor.shape` / `dtype` (skipping `Tensor.name`),
+and the recursive digests of input nodes; the top-level digest folds in
+the graph's `inputs` / `outputs` sequences. Hints and graph-internal
+node ids are excluded. Two graphs that compute the same dataflow
+through structurally-equivalent kernels hash equal regardless of
+node-id naming or inconsequential body details. Not cached — `Graph`
+is mutable; callers that dedup many candidates snapshot the digest
+themselves.
+
+`Structural` is the one convention: anything we compare or cache by
+structure (`Graph`, `Body`, `Context`, future fork-option payloads and
+subgraph slices) implements `structural_key() -> str`. The `digest(...)`
+helper in `compiler/structural.py` is the canonical fold; composite
+implementers call it with child digests + their own discriminating
+fields. Each implementer's docstring documents what's deliberately
+excluded (names, hints, ambient I/O) — the contract is "include only
+bits that affect codegen output or dataflow semantics" so the
+autotuning cache doesn't bust on cosmetic edits.
+
 ## Module layout
 
 | Path                  | Role                                    | See                          |

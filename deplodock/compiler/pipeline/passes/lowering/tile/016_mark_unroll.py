@@ -1,20 +1,12 @@
 """Mark small loop nests for ``#pragma unroll``.
 
-For each ``Loop`` / ``StridedLoop`` nest inside the Tile body, compute
-the **total trip count** = product of axis extents along the chain from
-the outermost loop down to its innermost loop body. If the total is
-less than ``_MAX_UNROLL_TRIPS``, set ``unroll=True`` on every loop in
-that chain.
-
-Why a per-nest threshold rather than per-loop: a 16-iteration outer
-loop wrapping a 16-iteration inner loop has 256 unrolled iterations —
-worth marking unroll on neither alone, but marking both is a useful
-signal to the CUDA compiler when each loop in isolation is small.
-The product gauges the realized unroll cost so the threshold is the
-real "how big is the unrolled body".
-
-Idempotent: a Loop already marked ``unroll=True`` stays that way; the
-pass returns ``None`` when no Loop in the body needs flipping.
+Currently a no-op: the ``unroll`` annotation is stripped by
+``canonicalize_free_axis_order`` (which rebuilds free Loops with
+default ``unroll=False``), and re-applying it surfaces a CUDA codegen
+issue (misaligned-address errors on certain TMA / coalesced-load
+shapes). The pass stays in the pipeline as a structural placeholder so
+restoring it is just a matter of re-enabling the body — see git
+history for the original ``_walk_body`` logic.
 """
 
 from __future__ import annotations
@@ -31,12 +23,8 @@ PATTERN = [Pattern("root", TileOp)]
 _MAX_UNROLL_TRIPS = 64
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
-    new_body, changed = _walk_body(root.op.body)
-    if not changed:
-        raise RuleSkipped(f"no Loop nest with total trips <= {_MAX_UNROLL_TRIPS} found")
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+def rewrite(root: Node) -> Graph | None:
+    raise RuleSkipped("mark_unroll disabled — see module docstring")
 
 
 def _walk_body(body: Body) -> tuple[Body, bool]:

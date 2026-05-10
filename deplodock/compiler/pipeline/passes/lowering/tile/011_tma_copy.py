@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
@@ -59,8 +60,8 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     TmaBufferedStage,
 )
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability, single_tile
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,8 @@ _MAX_RANK = 5
 _TMA_ALIGN_BYTES = 16
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(ctx: Context, match: Match, root: Node) -> Graph | None:
+    graph = match.graph
     # TMA is on by default on sm_90+ (Hopper / Blackwell — the hardware
     # that has ``cp.async.bulk.tensor``). ``DEPLODOCK_TMA=0`` forces
     # the cp.async + ``+1`` padding baseline for A/B comparison.
@@ -86,16 +88,15 @@ def rewrite(graph: Graph, root: Node) -> Graph | None:
 
     if not _tma_enabled():
         raise RuleSkipped("TMA disabled (DEPLODOCK_TMA=0 or compute capability < sm_90)")
-    if compute_capability() < _MIN_CAPABILITY:
-        raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {compute_capability()}")
+    if ctx.compute_capability < _MIN_CAPABILITY:
+        raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
 
     src_ranks = {nid: len(node.output.shape) for nid, node in graph.nodes.items()}
     src_shapes = {nid: tuple(int(d) for d in node.output.shape) for nid, node in graph.nodes.items()}
     new_body = _maybe_rewrite(root.op.body, src_ranks, src_shapes)
     if new_body is None:
-        return None
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+        raise RuleSkipped("rewrite helper returned no change")
+    return TileOp(body=new_body, name=root.op.name)
 
 
 def _maybe_rewrite(

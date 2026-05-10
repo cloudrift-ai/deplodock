@@ -37,8 +37,8 @@ seed; overlaps between matches are allowed (the rewriter exits after
 the first successful rewrite per iteration so overlap is just
 candidate enumeration).
 
-`Match.nodes: dict[str, str]` maps each pattern entry's name to the
-matched node id. `Match.consumed` and `Match.output` are overridable by
+`Match.nodes: dict[str, Node]` maps each pattern entry's name to the
+matched `Node`. `Match.consumed` and `Match.output` are overridable by
 the rewrite function to control which nodes the splicer removes and
 which node's edges get rewired.
 
@@ -48,17 +48,44 @@ Every file named `NNN_<name>.py` under a pass directory is a rule:
 
 ```python
 PATTERN = [Pattern("root", SomeOp), ...]   # required
-def rewrite(graph: Graph, match: Match) -> Graph | None:
+def rewrite(ctx: Context, graph: Graph, match: Match) -> Graph | Op | list[Graph | Op]:
     ...
 ```
 
-- Returning a `Graph` fragment splices it in place of `match.output`
-  (defaults to `match.root_node_id`); fragment `InputOp` nodes reference
-  existing graph nodes by id, non-Input nodes get fresh ids.
-- Returning `None` means "no-op / already mutated in place" — used by
-  the lowering rules because `KernelOp.arg_order` / `CudaOp.arg_order`
-  embed the original node id as the output buffer name, so a fresh id
-  from splicing would break the generated kernel's buffer binding.
+The dispatcher binds parameters by name. Reserved names: `graph`,
+`match`, `root`, `out`, `ctx`. Pattern names from `PATTERN` bind to
+matched `Node` objects. Anything else binds positionally to
+`root.inputs[i]`. Take only what you need — `ctx` is optional.
+
+**Returning a list = autotune fork.** A rule that's unsure which
+parameter to use returns the alternatives as a list. The engine applies
+option 0 inline and pushes one `Candidate` per remaining option onto the
+search queue (deep-copying the graph at the fork point). Single-option
+returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
+
+**Idempotence requirement.** Every rule MUST be idempotent on its own
+output. The engine re-runs the entire pipeline on each popped candidate
+from pass 0; rules whose output is already in the graph must `RuleSkipped`
+or have a pattern that no longer matches. Most rules satisfy this
+implicitly via op-type changes (`LoopOp` → `TileOp`); the rest have
+explicit `raise RuleSkipped("already X")` guards. Without idempotence,
+re-runs would double-apply and corrupt graph state.
+
+The return type discriminates the rewrite flavor:
+
+- **Functional** — returns a `Graph` fragment, spliced in place of
+  `match.output` (defaults to `match.root_node_id`); fragment `InputOp`
+  nodes reference existing graph nodes by id, non-Input nodes get fresh
+  ids.
+- **In-place** — returns an `Op`. The engine assigns it to `root.op`
+  directly, preserving the node id, inputs list, output Tensor, and
+  hints. Used by the lowering rules because `KernelOp.arg_order` /
+  `CudaOp.arg_order` embed the original node id as the output buffer
+  name, so a fresh id from splicing would break the generated kernel's
+  buffer binding.
+
+Raise `RuleSkipped(reason)` to decline a match — the engine logs the
+reason at DEBUG and moves on.
 
 Files starting with `_` (e.g. `_broadcast.py`) are **not** loaded as
 rules — they're shared helpers for the pass's rule modules.
@@ -69,7 +96,14 @@ rules — they're shared helpers for the pass's rule modules.
 - `run_pass(graph, pass_dir)` — load every rule file in a directory,
   apply each to fixed point, then rescan the sequence until no rule
   makes further progress.
-- `run_pipeline(graph, passes, dump=None)` — run each named pass
+- `run_autotune(graph, passes, search=...) -> Iterator[Candidate]` —
+  drive the full search. Yields one terminal `Candidate` per
+  fully-explored branch. Default search is depth-first; for autotuning,
+  pass a custom `Search` implementation (priority queue, MCTS, etc.).
+  See `engine.py:Candidate`, `TraceEntry`, `Search`.
+- `run_pipeline(graph, passes, dump=None)` — single-graph convenience
+  wrapper around `run_autotune`. Returns the first terminal candidate's
+  graph; for deterministic rules that's the only one. Run each named pass
   directory in order. After each pass, dispatches `dump.on_pass(name,
   graph)` so dump hooks land at the right stage without the caller
   hard-coding which dump method belongs to which pass.

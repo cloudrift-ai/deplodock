@@ -16,12 +16,13 @@ from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Write
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import IndexMapOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline.engine import Match, Pattern
 
 PATTERN = [Pattern("root", IndexMapOp)]
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:
+    graph = match.graph
     axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(root.op.out_shape))
     mapping = {f"{PLACEHOLDER_PREFIX}{i}": Var(a.name) for i, a in enumerate(axes)}
     write_index = tuple(Var(a.name) for a in axes)

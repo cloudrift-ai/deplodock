@@ -25,13 +25,14 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, TernaryExpr, placeholder
 from deplodock.compiler.ir.frontend.ir import CatOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", CatOp)]
 
 
-def rewrite(graph: Graph, inp_a: Node, inp_b: Node, inp_dim: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, inp_a: Node, inp_b: Node, inp_dim: Node, out: Tensor) -> Graph | None:
+    graph = match.graph
     a_shape = tuple(inp_a.output.shape)
     out_shape = tuple(out.shape)
     ndim = len(out_shape)

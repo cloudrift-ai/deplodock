@@ -74,12 +74,11 @@ class _Slab(NamedTuple):
     n_bytes: int
 
 
-def rewrite(graph: Graph, root: Node) -> Graph | None:
+def rewrite(root: Node) -> Graph | None:
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
-        return None
-    root.op = TileOp(body=new_body, name=root.op.name)
-    return None
+        raise RuleSkipped("rewrite helper returned no change")
+    return TileOp(body=new_body, name=root.op.name)
 
 
 _WARP_SIZE = 32
