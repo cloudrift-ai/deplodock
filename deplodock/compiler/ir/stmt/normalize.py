@@ -50,7 +50,7 @@ def normalize_body(stmts: Body, *, hoist: bool = True, canonical_buffers: bool =
     ``canonical_buffers=True`` runs :func:`canonicalize_buffer_names` after
     SSA renaming. Off by default — buffer names bind to graph inputs /
     outputs and are meaningful at the Op boundary. Turned on by
-    :attr:`Body._structural_key` so two bodies that read identical patterns
+    :attr:`Body.structural_key()` so two bodies that read identical patterns
     from differently-named buffers hash and compare equal.
     """
     stmts = drop_size_one_free_axes(stmts)
@@ -558,7 +558,7 @@ def canonicalize_buffer_names(stmts: Body) -> Body:
     Off by default — buffer names bind to graph nodes (each ``Load.input``
     matches the producing op's id), so renaming them in a body that's
     still attached to an Op would break that wiring. Used by
-    :attr:`Body._structural_key` for dedup queries where buffer identity
+    :attr:`Body.structural_key()` for dedup queries where buffer identity
     doesn't matter (two bodies with identical access patterns over
     differently-named inputs are structurally equal)."""
     stmts = Body.coerce(stmts)

@@ -1,4 +1,4 @@
-"""Tests for ``Body._structural_key`` and the two new normalization
+"""Tests for ``Body.structural_key()`` and the two new normalization
 passes (``sort_commutative_args``, ``canonicalize_buffer_names``).
 
 The structural key is the canonical text rendering used for dedup
@@ -97,7 +97,7 @@ def test_canonicalize_buffer_names_already_canonical_returns_same() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Body._structural_key
+# Body.structural_key()
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +122,7 @@ def _matmul_body(input_x: str, input_y: str, output: str) -> Body:
 def test_structural_key_equal_for_renamed_buffers() -> None:
     a = _matmul_body("X", "Y", "O")
     b = _matmul_body("foo", "bar", "baz")
-    assert a._structural_key == b._structural_key
+    assert a.structural_key() == b.structural_key()
 
 
 def test_structural_key_equal_for_swapped_commutative_args() -> None:
@@ -153,7 +153,7 @@ def test_structural_key_equal_for_swapped_commutative_args() -> None:
             ),
         )
     )
-    assert body_xy._structural_key == body_yx._structural_key
+    assert body_xy.structural_key() == body_yx.structural_key()
 
 
 def test_structural_key_distinguishes_subtract_from_add() -> None:
@@ -174,7 +174,7 @@ def test_structural_key_distinguishes_subtract_from_add() -> None:
             )
         )
 
-    assert make("add")._structural_key != make("subtract")._structural_key
+    assert make("add").structural_key() != make("subtract").structural_key()
 
 
 def test_structural_key_distinguishes_swapped_noncommutative_args() -> None:
@@ -197,28 +197,28 @@ def test_structural_key_distinguishes_swapped_noncommutative_args() -> None:
             )
         )
 
-    assert make(("x", "y"))._structural_key != make(("y", "x"))._structural_key
+    assert make(("x", "y")).structural_key() != make(("y", "x")).structural_key()
 
 
 def test_structural_key_idempotent() -> None:
     """Round-tripping a body through ``normalize_body(canonical_buffers=True)``
     fixes its structural key — re-querying yields the same string."""
     body = _matmul_body("X", "Y", "O")
-    k1 = body._structural_key
+    k1 = body.structural_key()
     renormalized = Body(normalize_body(body, hoist=False, canonical_buffers=True))
-    assert renormalized._structural_key == k1
+    assert renormalized.structural_key() == k1
 
 
 def test_structural_key_is_string_and_hashable() -> None:
     body = _matmul_body("X", "Y", "O")
-    key = body._structural_key
+    key = body.structural_key()
     assert isinstance(key, str)
-    assert hash(key) == hash(body._structural_key)  # cached, deterministic
+    assert hash(key) == hash(body.structural_key())  # cached, deterministic
 
 
 def test_structural_key_cached_property() -> None:
     """Accessing twice returns the *same* string object (cached)."""
     body = _matmul_body("X", "Y", "O")
-    a = body._structural_key
-    b = body._structural_key
+    a = body.structural_key()
+    b = body.structural_key()
     assert a is b

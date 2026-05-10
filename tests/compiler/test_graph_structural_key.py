@@ -1,9 +1,9 @@
-"""Tests for ``Graph._structural_key`` — the Merkle-style structural
+"""Tests for ``Graph.structural_key()`` — the Merkle-style structural
 digest used for candidate dedup in autotuning loops.
 
 The digest is invariant under: graph-internal node-id renames, Tensor
 name renames, hint changes, and (transitively, via
-``Body._structural_key``) SSA / axis / commutative-arg / external-buffer
+``Body.structural_key()``) SSA / axis / commutative-arg / external-buffer
 name changes inside body-bearing ops. It is *sensitive* to: op kind,
 op body / attrs, output shape / dtype, input wiring (recursive), and
 the graph's input / output sequences.
@@ -67,7 +67,7 @@ def _add_graph(input_names: tuple[str, str], output_name: str, shape: tuple = (4
 def test_structural_key_equal_for_isomorphic_graphs() -> None:
     a = _add_graph(("x", "y"), "out")
     b = _add_graph(("x", "y"), "out")
-    assert a._structural_key() == b._structural_key()
+    assert a.structural_key() == b.structural_key()
 
 
 def test_structural_key_invariant_to_node_id_renames() -> None:
@@ -75,7 +75,7 @@ def test_structural_key_invariant_to_node_id_renames() -> None:
     The digest must not depend on user-chosen ids."""
     a = _add_graph(("x", "y"), "out")
     b = _add_graph(("alpha", "beta"), "result")
-    assert a._structural_key() == b._structural_key()
+    assert a.structural_key() == b.structural_key()
 
 
 def test_structural_key_invariant_to_tensor_name() -> None:
@@ -91,7 +91,7 @@ def test_structural_key_invariant_to_tensor_name() -> None:
     b.add_node(op=a_loop, inputs=["x", "y"], output=Tensor("ccc", (4,)), node_id="out")
     b.inputs = ["x", "y"]
     b.outputs = ["out"]
-    assert a._structural_key() == b._structural_key()
+    assert a.structural_key() == b.structural_key()
 
 
 def test_structural_key_invariant_to_hints() -> None:
@@ -99,7 +99,7 @@ def test_structural_key_invariant_to_hints() -> None:
     b = _add_graph(("x", "y"), "out")
     b.hints.set("cuda.matmul.strategy", "naive")
     b.nodes["out"].hints.set("foo", "bar")
-    assert a._structural_key() == b._structural_key()
+    assert a.structural_key() == b.structural_key()
 
 
 def test_structural_key_equal_for_swapped_commutative_body_order() -> None:
@@ -128,7 +128,7 @@ def test_structural_key_equal_for_swapped_commutative_body_order() -> None:
     g_yx.add_node(op=LoopOp(body=body), inputs=["x", "y"], output=Tensor("out", (4,)), node_id="out")
     g_yx.inputs = ["x", "y"]
     g_yx.outputs = ["out"]
-    assert g_xy._structural_key() == g_yx._structural_key()
+    assert g_xy.structural_key() == g_yx.structural_key()
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +149,13 @@ def test_structural_key_distinguishes_op_kind() -> None:
     b.inputs = ["x"]
     b.outputs = ["x"]
 
-    assert a._structural_key() != b._structural_key()
+    assert a.structural_key() != b.structural_key()
 
 
 def test_structural_key_distinguishes_shape() -> None:
     a = _add_graph(("x", "y"), "out", shape=(4,))
     b = _add_graph(("x", "y"), "out", shape=(8,))
-    assert a._structural_key() != b._structural_key()
+    assert a.structural_key() != b.structural_key()
 
 
 def test_structural_key_distinguishes_dtype() -> None:
@@ -169,7 +169,7 @@ def test_structural_key_distinguishes_dtype() -> None:
     b.inputs = ["x"]
     b.outputs = ["x"]
 
-    assert a._structural_key() != b._structural_key()
+    assert a.structural_key() != b.structural_key()
 
 
 def test_structural_key_distinguishes_input_order() -> None:
@@ -191,7 +191,7 @@ def test_structural_key_distinguishes_input_order() -> None:
     b.inputs = ["y", "x"]
     b.outputs = ["x"]
 
-    assert a._structural_key() != b._structural_key()
+    assert a.structural_key() != b.structural_key()
 
 
 def test_structural_key_distinguishes_body_op() -> None:
@@ -217,7 +217,7 @@ def test_structural_key_distinguishes_body_op() -> None:
     b.add_node(op=LoopOp(body=body), inputs=["x", "y"], output=Tensor("out", (4,)), node_id="out")
     b.inputs = ["x", "y"]
     b.outputs = ["out"]
-    assert a._structural_key() != b._structural_key()
+    assert a.structural_key() != b.structural_key()
 
 
 def test_structural_key_distinguishes_constantop_value() -> None:
@@ -233,7 +233,7 @@ def test_structural_key_distinguishes_constantop_value() -> None:
     b.inputs = []
     b.outputs = ["c"]
 
-    assert a._structural_key() != b._structural_key()
+    assert a.structural_key() != b.structural_key()
 
 
 # ---------------------------------------------------------------------------
@@ -243,22 +243,22 @@ def test_structural_key_distinguishes_constantop_value() -> None:
 
 def test_structural_key_returns_hex_digest() -> None:
     g = _add_graph(("x", "y"), "out")
-    key = g._structural_key()
+    key = g.structural_key()
     assert isinstance(key, str) and len(key) == 64
     int(key, 16)  # valid hex
 
 
 def test_structural_key_deterministic_across_calls() -> None:
     g = _add_graph(("x", "y"), "out")
-    assert g._structural_key() == g._structural_key()
+    assert g.structural_key() == g.structural_key()
 
 
 def test_structural_key_changes_after_mutation() -> None:
     """Sanity: mutation changes the digest. Confirms the method is
     actually reading current state, not a stale snapshot."""
     g = _add_graph(("x", "y"), "out")
-    k1 = g._structural_key()
+    k1 = g.structural_key()
     _input(g, "z", (4,))
     g.inputs = ["x", "y", "z"]
-    k2 = g._structural_key()
+    k2 = g.structural_key()
     assert k1 != k2

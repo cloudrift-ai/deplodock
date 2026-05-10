@@ -431,9 +431,10 @@ class Body(tuple[Stmt, ...]):
 
     # -- structural identity --------------------------------------------
 
-    @cached_property
-    def _structural_key(self) -> str:
-        """Canonical text rendering used for structural-equivalence
+    def structural_key(self) -> str:
+        """Implements :class:`deplodock.compiler.structural.Structural`.
+
+        Canonical text rendering used for structural-equivalence
         queries. Two bodies that differ only by SSA / axis names,
         commutative-arg order, or external-buffer names produce the same
         key.
@@ -444,14 +445,11 @@ class Body(tuple[Stmt, ...]):
         ``canonical_buffers=True`` (renames ``Load.input`` /
         ``Write.output`` to ``b0, b1, ...``), then joining
         :func:`pretty_body`'s line list. Cached on the instance — Body
-        is immutable.
+        is immutable."""
+        return self._cached_structural_key
 
-        Use as a dict key / set member when deduping candidate bodies in
-        a search; ``hash(body._structural_key)`` is the conventional
-        spelling. Equality of two Body instances by this key is what
-        consumers should compare on, not Python's ``==`` (the
-        tuple-inherited element-wise eq is sensitive to fresh SSA names
-        and arg order)."""
+    @cached_property
+    def _cached_structural_key(self) -> str:
         from deplodock.compiler.ir.stmt.base import pretty_body  # noqa: PLC0415
         from deplodock.compiler.ir.stmt.normalize import normalize_body  # noqa: PLC0415
 

@@ -544,18 +544,19 @@ class Graph:
         """List form of :meth:`users`, preserved for existing callers."""
         return list(self._users.get(node_id, ()))
 
-    def _structural_key(self) -> str:
-        """Merkle-style structural digest of the graph.
+    def structural_key(self) -> str:
+        """Implements :class:`deplodock.compiler.structural.Structural`.
 
-        Two graphs that compute the same dataflow — same op kinds, same
-        canonicalized op bodies, same Tensor shapes / dtypes, same input
-        wiring — produce the same digest. Two graphs that differ in any
-        of those produce different digests.
+        Merkle-style structural digest of the graph. Two graphs that
+        compute the same dataflow — same op kinds, same canonicalized op
+        bodies, same Tensor shapes / dtypes, same input wiring — produce
+        the same digest. Two graphs that differ in any of those produce
+        different digests.
 
         Per node the key combines:
 
         - op class name,
-        - op body's :attr:`Body._structural_key` (for body-bearing ops:
+        - op body's :meth:`Body.structural_key` (for body-bearing ops:
           ``LoopOp`` / ``TileOp`` / ``KernelOp``) — already canonicalizes
           SSA / axis / commutative-arg / buffer names,
         - other dataclass fields of the op rendered via ``repr`` — skipping
@@ -570,13 +571,11 @@ class Graph:
 
         Not cached: ``Graph`` is mutable. Callers that dedup many
         candidates should snapshot the digest into a dict / set themselves.
-        Mirror name to :attr:`Body._structural_key` (leading underscore
-        signals "for dedup machinery, not general API").
         """
-        import hashlib  # noqa: PLC0415
         from dataclasses import fields as dc_fields  # noqa: PLC0415
 
         from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+        from deplodock.compiler.structural import digest  # noqa: PLC0415
 
         keys: dict[str, str] = {}
 
@@ -588,22 +587,22 @@ class Graph:
             op = node.op
             body = getattr(op, "body", None)
             if isinstance(body, Body):
-                op_payload: tuple = ("body", body._structural_key)
+                op_payload: tuple = ("body", body.structural_key())
             else:
                 attrs = tuple((f.name, repr(getattr(op, f.name))) for f in dc_fields(op) if f.name != "name")
                 op_payload = ("attrs", attrs)
             out = node.output
             out_payload = (tuple(out.shape), out.dtype)
             input_payload = tuple(node_key(i) for i in node.inputs)
-            digest = hashlib.sha256(repr((type(op).__name__, op_payload, out_payload, input_payload)).encode()).hexdigest()
-            keys[nid] = digest
-            return digest
+            d = digest(type(op).__name__, op_payload, out_payload, input_payload)
+            keys[nid] = d
+            return d
 
         # Hash from outputs back so disconnected dead nodes don't perturb the
         # key, and from inputs forward so an input-order swap is observable.
         out_keys = tuple(node_key(o) for o in self.outputs)
         in_keys = tuple(node_key(i) for i in self.inputs)
-        return hashlib.sha256(repr(("graph", in_keys, out_keys)).encode()).hexdigest()
+        return digest("graph", in_keys, out_keys)
 
     def topological_order(self) -> list[str]:
         """Return node ids in topological order (inputs before consumers).

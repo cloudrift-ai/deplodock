@@ -63,6 +63,20 @@ class Context:
     def from_target(cls, cap: tuple[int, int]) -> Context:
         return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap))
 
+    def structural_key(self) -> str:
+        """Implements :class:`deplodock.compiler.structural.Structural`.
+
+        Folds in only codegen-affecting fields. ``compute_capability``
+        gates hardware-feature passes (TMA, cp.async, dynamic smem cap);
+        anything derived from it (``max_dynamic_smem``) is implied. As
+        non-derived knobs land (forced TMA on/off, splitk overrides),
+        extend this method explicitly — keep ambient I/O fields out so
+        the autotuning cache survives debug-flag flips.
+        """
+        from deplodock.compiler.structural import digest  # noqa: PLC0415
+
+        return digest("Context", self.compute_capability)
+
     @classmethod
     def probe(cls) -> Context:
         """Build by probing the live CUDA device. Falls back to (0, 0) if
