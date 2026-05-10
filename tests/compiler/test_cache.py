@@ -49,12 +49,26 @@ def test_cache_record_then_lookup() -> None:
     assert cache.has("ctx", "op")
 
 
-def test_cache_replace_updates_existing_row() -> None:
+def test_cache_record_keeps_best() -> None:
+    """Re-recording an ``ok`` entry only updates if the new latency is
+    lower — autotune attribution writes the same ancestor key multiple
+    times; we want the best variant ever seen, not the most recent."""
     cache = TuningCache()
+    cache.record("ctx", "op", latency_us=2.5)
     cache.record("ctx", "op", latency_us=1.0)
-    cache.record("ctx", "op", latency_us=2.5, status="ok")
+    assert cache.lookup("ctx", "op").latency_us == 1.0  # improved
+    cache.record("ctx", "op", latency_us=5.0)
+    assert cache.lookup("ctx", "op").latency_us == 1.0  # kept best
+
+
+def test_cache_record_status_change_overwrites() -> None:
+    """A successful measurement supersedes a prior ``bench_fail`` row
+    even if its latency would otherwise lose the keep-best check."""
+    cache = TuningCache()
+    cache.record("ctx", "op", latency_us=0.0, status="bench_fail")
+    cache.record("ctx", "op", latency_us=10.0, status="ok")
     entry = cache.lookup("ctx", "op")
-    assert entry is not None and entry.latency_us == 2.5
+    assert entry.status == "ok" and entry.latency_us == 10.0
 
 
 def test_cache_segregates_by_context() -> None:

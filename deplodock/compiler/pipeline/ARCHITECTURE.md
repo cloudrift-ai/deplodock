@@ -98,16 +98,21 @@ rules — they're shared helpers for the pass's rule modules.
   makes further progress.
 - `run_autotune(graph, passes, search=..., backend=None) -> Iterator[Candidate]` —
   drive the full search. Yields one terminal `Candidate` per
-  fully-explored branch. Default search is `MeasurementPrioritySearch`
-  (priority by remaining unmeasured ops; DFS-equivalent on a fresh
-  in-memory cache); pass a custom `Search` implementation for any other
-  strategy. When `search` exposes a `cache: TuningCache`, `run_autotune`
-  calls `record_terminal(cand.graph, cache, ctx.structural_key(), backend=...)`
+  fully-explored branch. Two built-in searches: `GreedySearch` (used by
+  `run_pipeline`; stops at the first terminal — autotune forks beyond
+  option 0 are never explored) and `TuningSearch` (used by `--tune`;
+  runs the queue dry, exploring every fork). Both rank candidates by
+  remaining unmeasured ops (DFS-equivalent on a fresh cache). The
+  greedy stop is self-detected by the search: `pop` returns `None` when
+  the previously popped candidate didn't return via `push` — i.e. when
+  the engine yielded it as terminal.
+  When `search` exposes a `cache: TuningCache`, `run_autotune` calls
+  `record_terminal(cand.graph, cache, ctx.structural_key(), backend=...)`
   on each yielded terminal. Pass a `Backend` (typically `CudaBackend`)
   via `backend=` to record real per-kernel GPU-event latencies; omit it
-  to record the stub `latency_us=1.0`. `bench_warmup` / `bench_iters`
-  control the bench window. See `engine.py:Candidate`, `TraceEntry`,
-  `Search`, `MeasurementPrioritySearch`, and `cache.py:TuningCache`.
+  to record the stub `latency_us=1.0`. See `engine.py:Candidate`,
+  `TraceEntry`, `Search`, `GreedySearch`, `TuningSearch`, and
+  `cache.py:TuningCache`.
 - `run_pipeline(graph, passes, dump=None)` — single-graph convenience
   wrapper around `run_autotune`. Returns the first terminal candidate's
   graph; for deterministic rules that's the only one. Run each named pass

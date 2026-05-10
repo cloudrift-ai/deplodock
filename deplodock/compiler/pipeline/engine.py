@@ -261,35 +261,26 @@ class Candidate:
 
 
 class Search(Protocol):
-    """Search-strategy hook. The engine pushes spawned candidates here
-    and pops the next one to expand. Implementations choose the
-    ordering — DFS / BFS / priority / MCTS / whatever."""
+    """Search-strategy hook. The engine pushes spawned candidates and
+    pops the next one to expand. ``pop`` returning ``None`` ends the
+    search. Implementations choose both the ordering (DFS / BFS /
+    priority / MCTS / whatever) and the termination condition (greedy
+    stops at first terminal; exhaustive runs the queue dry).
+
+    The engine doesn't tell the search when a candidate is terminal —
+    instead a terminal candidate is the one the engine yielded without
+    pushing it back. Searches that need to detect this can track the
+    last-popped candidate and check whether it returned via ``push``."""
 
     def push(self, c: Candidate) -> None: ...
     def pop(self) -> Candidate | None: ...  # None when exhausted
 
 
-class MeasurementPrioritySearch:
-    """Priority search keyed on remaining unmeasured ops.
-
-    Computes :func:`count_unmeasured_ops` at push time (kernel-bearing
-    nodes whose op_key isn't yet in the cache). Pops the candidate with
-    the lowest count — i.e. the one closest to being fully measurable.
-    Ties break LIFO (most recently pushed wins), so on a fresh in-memory
-    cache where every candidate has the same count, behavior is
-    identical to a DFS stack: drive the current branch to terminal,
-    then backtrack.
-
-    Why this is the right default: a candidate that's three rules from
-    terminal is more valuable to expand than a freshly forked one
-    because finishing it adds a real cache entry that future forks can
-    compare against. As real measurement lands (and a populated
-    cross-run cache appears), the same machinery promotes candidates
-    whose ops are already measured — no policy change needed.
-
-    ``context_key`` is fixed at construction (one search instance =
-    one target). Pass ``cache=None`` for a fresh in-memory cache.
-    """
+class _PriorityHeap:
+    """Shared push/pop for the two concrete search policies. Priority
+    is ``count_unmeasured_ops`` at push time; LIFO tiebreak via
+    decreasing ``_seq`` so on a fresh in-memory cache the order is the
+    same as a DFS stack."""
 
     def __init__(self, cache: TuningCache | None = None, context_key: str | None = None) -> None:
         if cache is None:
@@ -302,14 +293,12 @@ class MeasurementPrioritySearch:
     def _ckey(self, c: Candidate) -> str:
         return self._context_key if self._context_key is not None else c.ctx.structural_key()
 
-    def push(self, c: Candidate) -> None:
+    def _push(self, c: Candidate) -> None:
         n = count_unmeasured_ops(c.graph, self._cache, self._ckey(c))
-        # LIFO tiebreak via decreasing ``_seq``: with equal priorities the
-        # most recently pushed candidate pops first, matching DFS semantics.
         self._seq += 1
         heapq.heappush(self._heap, (n, -self._seq, c))
 
-    def pop(self) -> Candidate | None:
+    def _pop(self) -> Candidate | None:
         if not self._heap:
             return None
         return heapq.heappop(self._heap)[2]
@@ -317,6 +306,49 @@ class MeasurementPrioritySearch:
     @property
     def cache(self) -> TuningCache:
         return self._cache
+
+
+class GreedySearch(_PriorityHeap):
+    """Stop at the first terminal candidate.
+
+    The engine yields a terminal candidate without pushing it back. We
+    detect that by tracking the last-popped candidate: if the next
+    ``pop`` sees that nothing has been ``push``-ed since (the candidate
+    didn't return for another rule application), the previous candidate
+    must have been terminal — return ``None`` to end the search even if
+    the heap still holds unexplored forks.
+
+    Used by ``run_pipeline`` for single-shot compiles. Autotune forks
+    beyond option 0 stay in the heap unmeasured."""
+
+    def __init__(self, cache: TuningCache | None = None, context_key: str | None = None) -> None:
+        super().__init__(cache, context_key)
+        self._outstanding: Candidate | None = None
+
+    def push(self, c: Candidate) -> None:
+        if c is self._outstanding:
+            self._outstanding = None
+        self._push(c)
+
+    def pop(self) -> Candidate | None:
+        if self._outstanding is not None:
+            # Last popped never came back via ``push`` → it was terminal.
+            return None
+        c = self._pop()
+        self._outstanding = c
+        return c
+
+
+class TuningSearch(_PriorityHeap):
+    """Exhaustive priority search — runs the heap dry, exploring every
+    autotune fork. Used by ``deplodock compile --tune`` so every variant
+    is benched and its latency lands in the cache."""
+
+    def push(self, c: Candidate) -> None:
+        self._push(c)
+
+    def pop(self) -> Candidate | None:
+        return self._pop()
 
 
 def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
@@ -519,7 +551,7 @@ def run_pass(
     if ctx is None:
         ctx = Context.probe()
     rules = _filter_rules(_load_rules(pass_dir), set(select) if select is not None else None)
-    search = MeasurementPrioritySearch()
+    search = GreedySearch()
     search.push(Candidate(graph=graph, ctx=ctx))
     return next(_search_loop(search, [rules], [pass_name or ""], ctx, dump)).graph
 
@@ -529,7 +561,7 @@ def run_rule(graph: Graph, rule_path: Path, ctx: Context | None = None) -> Graph
     fork siblings — for autotuning use the full ``run_pipeline`` driver."""
     if ctx is None:
         ctx = Context.probe()
-    search = MeasurementPrioritySearch()
+    search = GreedySearch()
     search.push(Candidate(graph=graph, ctx=ctx))
     return next(_search_loop(search, [[_load_rule(rule_path)]], [""], ctx, None)).graph
 
@@ -814,9 +846,8 @@ def run_pipeline(
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
     after each. Single-candidate convenience wrapper around
-    :func:`run_autotune` (uses :class:`MeasurementPrioritySearch` with a
-    fresh in-memory cache) — returns the graph of the first terminal
-    candidate. With deterministic rules that's the only candidate.
+    :func:`run_autotune` using :class:`GreedySearch` — stops at the
+    first terminal so autotune forks beyond option 0 are never explored.
 
     ``ctx`` is built once (probing the live device if not provided)
     and passed to every rule that takes a ``ctx`` parameter.
@@ -826,8 +857,11 @@ def run_pipeline(
     recorded to ``cache`` and attributed to every ancestor along the
     ``Op.source`` chain. ``cache`` defaults to a fresh in-memory store;
     pass an explicit :class:`TuningCache` to persist measurements
-    across runs."""
-    search = MeasurementPrioritySearch(cache=cache)
+    across runs.
+
+    For exhaustive autotuning, call :func:`run_autotune` directly with
+    :class:`TuningSearch` and iterate every yielded candidate."""
+    search = GreedySearch(cache=cache)
     return next(run_autotune(graph, passes, search=search, dump=dump, select=select, ctx=ctx, backend=backend)).graph
 
 
@@ -853,18 +887,18 @@ def run_autotune(
     reaches the end of ``passes``, the candidate is terminal and gets
     yielded.
 
-    ``search`` chooses the order: :class:`MeasurementPrioritySearch` is
-    the default (priority-by-unmeasured, DFS-equivalent on a fresh
-    cache); any other ``Search`` implementation works for priority /
-    MCTS / beam strategies.
+    ``search`` chooses both the order and the stopping condition:
+    :class:`GreedySearch` for single-shot compiles (stops at the first
+    terminal); :class:`TuningSearch` for ``--tune`` (runs the queue
+    dry, exploring every fork).
 
-    When ``search`` exposes a ``cache: TuningCache`` (as
-    :class:`MeasurementPrioritySearch` does), each yielded terminal
-    candidate has its ``CudaOp`` nodes recorded to the cache via
-    :func:`record_terminal` before being yielded — so subsequent
-    candidates see the updated priority signal. Pass a ``Backend``
-    (typically :class:`CudaBackend`) via ``backend=`` to record real
-    GPU-event latencies; omit it to record the stub ``latency_us=1.0``.
+    When ``search`` exposes a ``cache: TuningCache`` (both built-in
+    searches do), each yielded terminal candidate has its ``CudaOp``
+    nodes recorded to the cache via :func:`record_terminal` before being
+    yielded — so subsequent candidates see the updated priority signal.
+    Pass a ``Backend`` (typically :class:`CudaBackend`) via ``backend=``
+    to record real GPU-event latencies; omit it to record the stub
+    ``latency_us=1.0``.
 
     ``ctx`` is built once (probing the live device if not provided)
     and shared by every candidate."""

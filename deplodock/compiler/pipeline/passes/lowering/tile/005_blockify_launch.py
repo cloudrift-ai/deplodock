@@ -1,4 +1,4 @@
-"""Launch-geometry pass.
+"""Launch-geometry pass — forks over matmul (BN, BM) for autotuning.
 
 Decides the THREAD/BLOCK partition of every parallel axis on a
 ``TileOp`` containing one ``Tile`` whose ``block_axes`` is still empty.
@@ -6,24 +6,26 @@ Output-dim free-Loop lifting happens earlier in ``001_tileify`` — by
 the time this rule runs, every parallel axis is already in
 ``Tile.axes``.
 
-**Apportion THREAD/BLOCK.** ``tuning.thread_tile_shape(tile)`` returns
-the per-axis THREAD-tile widths the launch should emit, in innermost-
-first order — typically ``(PAT, PAT)`` for matmul or
-``(thread_budget,)`` otherwise.
-
-For each of the innermost ``len(shape)`` axes ``ba`` with extent ``ext``
-and target ``shape[i]``:
+**Apportion THREAD/BLOCK.** A per-axis THREAD-tile shape
+``(BN, BM)`` (innermost-first) drives the split:
 
 - ``ext == shape[i]`` — keep whole as THREAD.
 - ``ext > shape[i]`` and ``ext % shape[i] == 0`` — split into
   ``axis_i:shape[i]`` (THREAD) + ``axis_o:ext/shape[i]`` (BLOCK), with
   body indices σ-rewritten ``axis → axis_o*shape[i] + axis_i``.
-- ``ext < shape[i]`` — keep THREAD whole (smaller-than-target axis is
-  fine; the launch loses some threads but stays correct).
-- otherwise (``ext > shape[i]`` non-divisible) — bail with
-  ``RuleSkipped``.
+- ``ext < shape[i]`` — keep THREAD whole.
+- otherwise (oversized, non-divisible) — bail with ``RuleSkipped``.
 
 Outer axes beyond ``len(shape)`` go BLOCK whole.
+
+**Matmul: autotune fork.** For matmul tiles the rule returns a *list*
+of TileOp variants — one per ``(BN, BM)`` candidate that passes the
+``register_tile_shape`` gate (THREAD extents share a value with the
+heuristic class's ``(def_bn, def_bm)`` so ``008_register_tile`` can
+apply a non-trivial F). Option 0 is the heuristic shape so deterministic
+``run_pipeline`` callers behave exactly as before; the rest only get
+explored under ``--tune`` (or when an autotune-driven ``Search`` consumes
+the queue). Non-matmul tiles return a single deterministic TileOp.
 
 PAT and the register-tile factor F are paired in ``tuning`` so
 ``PAT/F = 16``. After ``008_register_tile`` splits each PAT axis by F,
@@ -31,8 +33,8 @@ the final per-axis thread count is exactly 16 and the two output axes
 together yield ``16² = 256 = thread_budget`` — no post-hoc rebalance
 pass needed.
 
-Idempotent: if no axis was split and every axis kept its original
-bind, returns None.
+Idempotent: if option 0's partition is identical to the current Tile
+(no axis split, every bind unchanged), raises ``RuleSkipped``.
 """
 
 from __future__ import annotations
@@ -45,33 +47,85 @@ from deplodock.compiler.ir.stmt import Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
-from deplodock.compiler.tuning import thread_tile_shape
+from deplodock.compiler.tuning import _has_matmul_reduce, thread_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
-
-def rewrite(root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
-    if new_body is None:
-        raise RuleSkipped("rewrite helper returned no change")
-    return TileOp(body=new_body, name=root.op.name)
+# Candidate per-axis THREAD widths to fork over for matmul tiles.
+_TUNE_AXIS_CHOICES: tuple[int, ...] = (32, 64, 128)
 
 
-def _maybe_rewrite(body):
+def rewrite(root: Node) -> Graph | None | list[TileOp]:
+    body = root.op.body
     idx, tile = single_tile(body)
     if tile.block_axes:
         raise RuleSkipped("Tile already partitioned (block_axes non-empty)")
 
-    partitioned = _partition_threads(tile)
+    if _has_matmul_reduce(tile.body):
+        variants = _matmul_variants(body, idx, tile, root.op.name)
+        if not variants:
+            raise RuleSkipped("no viable (BN, BM) candidate")
+        if len(variants) == 1:
+            return variants[0]
+        return variants
+
+    partitioned = _partition_threads(tile, shape=thread_tile_shape(tile))
     if partitioned is None:
         raise RuleSkipped("partition already fits the requested tile shape")
-    return body[:idx] + (partitioned,) + body[idx + 1 :]
+    return TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=root.op.name)
 
 
-def _partition_threads(tile: Tile) -> Tile | None:
-    """Split the innermost axes per ``thread_tile_shape``. Outer axes →
-    BLOCK whole. Bail on non-divisible oversized axes."""
-    shape = thread_tile_shape(tile)
+def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
+    """Enumerate ``(BN, BM)`` candidates for a matmul Tile. Heuristic shape
+    is emitted first so deterministic compiles pick it. Variants are
+    filtered to those that pass the ``register_tile_shape`` gate (one
+    THREAD extent must match the heuristic class's ``(def_bn, def_bm)``)
+    so ``008_register_tile`` can apply non-trivial F."""
+    if len(tile.axes) < 2:
+        return []
+    ext_inner = int(tile.axes[-1].axis.extent)
+    ext_outer = int(tile.axes[-2].axis.extent)
+
+    heuristic = thread_tile_shape(tile)
+
+    seen: set[tuple[int, int]] = set()
+    ordered: list[tuple[int, int]] = []
+
+    def _add(shape: tuple[int, int]) -> None:
+        if shape in seen:
+            return
+        bn, bm = shape
+        # ``_partition_threads`` handles ``ext < target`` by keeping THREAD
+        # whole; only reject oversized non-divisible combos.
+        if ext_inner > bn and ext_inner % bn != 0:
+            return
+        if ext_outer > bm and ext_outer % bm != 0:
+            return
+        seen.add(shape)
+        ordered.append(shape)
+
+    # Heuristic first — deterministic-compile path unchanged.
+    if len(heuristic) >= 2:
+        _add((int(heuristic[0]), int(heuristic[1])))
+    for bn in _TUNE_AXIS_CHOICES:
+        for bm in _TUNE_AXIS_CHOICES:
+            _add((bn, bm))
+
+    variants: list[TileOp] = []
+    for shape in ordered:
+        try:
+            partitioned = _partition_threads(tile, shape=shape)
+        except RuleSkipped:
+            continue
+        if partitioned is None:
+            continue
+        variants.append(TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=name))
+    return variants
+
+
+def _partition_threads(tile: Tile, *, shape: tuple[int, ...]) -> Tile | None:
+    """Split the innermost axes per ``shape``. Outer axes → BLOCK whole.
+    Bail on non-divisible oversized axes."""
     axes = list(tile.axes)
     new_axes_inner_first: list[BoundAxis] = []
     sigma_map: dict[str, object] = {}

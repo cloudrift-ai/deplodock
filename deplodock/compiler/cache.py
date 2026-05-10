@@ -11,7 +11,7 @@ backend) or runs ``backend.benchmark`` once per terminal graph and
 attributes the per-launch GPU-event time to every ancestor along the
 ``Op.source`` chain (``CudaOp → KernelOp → TileOp → LoopOp``). The
 search policy uses cache hits to prioritize candidates whose remaining
-ops still need measurement (see :class:`MeasurementPrioritySearch`).
+ops still need measurement (see :class:`GreedySearch` / :class:`TuningSearch`).
 
 Concurrency: opened in WAL mode so parallel benches can read while one
 writes. The connection is kept open for the cache's lifetime; callers
@@ -86,7 +86,17 @@ class TuningCache:
         return row is not None
 
     def record(self, context_key: str, op_key: str, *, latency_us: float, status: str = "ok") -> None:
-        """Insert or replace one entry. ``measured_at`` is stamped now."""
+        """Record a measurement, keeping the best result.
+
+        When an ``ok`` entry already exists with a *lower* latency, keep
+        it — autotune attribution writes the same ancestor multiple
+        times as different variants land, and we want the LoopOp/TileOp
+        rows to reflect the best variant ever seen. Status transitions
+        (e.g. ``bench_fail → ok``) always overwrite so a successful
+        variant supersedes a known-failure record."""
+        existing = self.lookup(context_key, op_key)
+        if existing is not None and existing.status == "ok" and status == "ok" and latency_us >= existing.latency_us:
+            return
         self._conn.execute(
             "INSERT OR REPLACE INTO entries (context_key, op_key, status, latency_us, measured_at) VALUES (?, ?, ?, ?, ?)",
             (context_key, op_key, status, latency_us, datetime.now(UTC).isoformat()),
@@ -152,8 +162,9 @@ def count_unmeasured_ops(graph, cache: TuningCache, context_key: str) -> int:
     A node is "measured" iff its op is fully lowered (``CudaOp``) and its
     :func:`op_cache_key` is present in the cache. Pre-terminal ops
     (``LoopOp`` / ``TileOp`` / ``KernelOp``) always count as unmeasured.
-    Used as the priority key by :class:`MeasurementPrioritySearch` —
-    candidates with fewer remaining unmeasured ops pop first.
+    Used as the priority key by :class:`GreedySearch` /
+    :class:`TuningSearch` — candidates with fewer remaining unmeasured
+    ops pop first.
     """
     n = 0
     for node in graph.nodes.values():
