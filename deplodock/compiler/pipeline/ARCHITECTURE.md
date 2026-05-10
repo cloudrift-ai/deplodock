@@ -98,9 +98,14 @@ rules — they're shared helpers for the pass's rule modules.
   makes further progress.
 - `run_autotune(graph, passes, search=...) -> Iterator[Candidate]` —
   drive the full search. Yields one terminal `Candidate` per
-  fully-explored branch. Default search is depth-first; for autotuning,
-  pass a custom `Search` implementation (priority queue, MCTS, etc.).
-  See `engine.py:Candidate`, `TraceEntry`, `Search`.
+  fully-explored branch. Default search is `MeasurementPrioritySearch`
+  (priority by remaining unmeasured ops; DFS-equivalent on a fresh
+  in-memory cache); pass a custom `Search` implementation for any other
+  strategy. When `search` exposes a `cache: TuningCache`, `run_autotune`
+  calls `record_terminal(cand.graph, cache, ctx.structural_key())` on
+  each yielded terminal so the priority signal updates between branches.
+  See `engine.py:Candidate`, `TraceEntry`, `Search`,
+  `MeasurementPrioritySearch`, and `cache.py:TuningCache`.
 - `run_pipeline(graph, passes, dump=None)` — single-graph convenience
   wrapper around `run_autotune`. Returns the first terminal candidate's
   graph; for deterministic rules that's the only one. Run each named pass

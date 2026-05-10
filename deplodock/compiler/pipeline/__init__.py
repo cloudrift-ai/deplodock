@@ -14,8 +14,8 @@
 from deplodock.compiler.pipeline.dump import CompilerDump
 from deplodock.compiler.pipeline.engine import (
     Candidate,
-    DFSSearch,
     Match,
+    MeasurementPrioritySearch,
     Pattern,
     RuleSkipped,
     Search,
@@ -39,10 +39,10 @@ __all__ = [
     "CUDA_PASSES",
     "Candidate",
     "CompilerDump",
-    "DFSSearch",
     "KERNEL_PASSES",
     "LOOP_PASSES",
     "Match",
+    "MeasurementPrioritySearch",
     "Pattern",
     "RuleSkipped",
     "Search",

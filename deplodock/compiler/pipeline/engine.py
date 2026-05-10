@@ -28,6 +28,7 @@ skip work that's already done."""
 from __future__ import annotations
 
 import copy
+import heapq
 import importlib.util
 import inspect
 import logging
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from deplodock.compiler.cache import TuningCache, count_unmeasured_ops, record_terminal
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
@@ -267,21 +269,54 @@ class Search(Protocol):
     def pop(self) -> Candidate | None: ...  # None when exhausted
 
 
-class DFSSearch:
-    """Depth-first stack. With deterministic (non-list-returning) rules,
-    no fork ever happens, so this yields exactly one candidate — same
-    observable behavior as the old single-graph pipeline driver. Used
-    as the default by ``run_pipeline``; pass an explicit ``search=`` to
-    ``run_autotune`` for any other strategy."""
+class MeasurementPrioritySearch:
+    """Priority search keyed on remaining unmeasured ops.
 
-    def __init__(self) -> None:
-        self._stack: list[Candidate] = []
+    Computes :func:`count_unmeasured_ops` at push time (kernel-bearing
+    nodes whose op_key isn't yet in the cache). Pops the candidate with
+    the lowest count — i.e. the one closest to being fully measurable.
+    Ties break LIFO (most recently pushed wins), so on a fresh in-memory
+    cache where every candidate has the same count, behavior is
+    identical to a DFS stack: drive the current branch to terminal,
+    then backtrack.
+
+    Why this is the right default: a candidate that's three rules from
+    terminal is more valuable to expand than a freshly forked one
+    because finishing it adds a real cache entry that future forks can
+    compare against. As real measurement lands (and a populated
+    cross-run cache appears), the same machinery promotes candidates
+    whose ops are already measured — no policy change needed.
+
+    ``context_key`` is fixed at construction (one search instance =
+    one target). Pass ``cache=None`` for a fresh in-memory cache.
+    """
+
+    def __init__(self, cache: TuningCache | None = None, context_key: str | None = None) -> None:
+        if cache is None:
+            cache = TuningCache()
+        self._cache = cache
+        self._context_key = context_key
+        self._heap: list[tuple[int, int, Candidate]] = []
+        self._seq = 0
+
+    def _ckey(self, c: Candidate) -> str:
+        return self._context_key if self._context_key is not None else c.ctx.structural_key()
 
     def push(self, c: Candidate) -> None:
-        self._stack.append(c)
+        n = count_unmeasured_ops(c.graph, self._cache, self._ckey(c))
+        # LIFO tiebreak via decreasing ``_seq``: with equal priorities the
+        # most recently pushed candidate pops first, matching DFS semantics.
+        self._seq += 1
+        heapq.heappush(self._heap, (n, -self._seq, c))
 
     def pop(self) -> Candidate | None:
-        return self._stack.pop() if self._stack else None
+        if not self._heap:
+            return None
+        return heapq.heappop(self._heap)[2]
+
+    @property
+    def cache(self) -> TuningCache:
+        return self._cache
 
 
 def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
@@ -484,7 +519,7 @@ def run_pass(
     if ctx is None:
         ctx = Context.probe()
     rules = _filter_rules(_load_rules(pass_dir), set(select) if select is not None else None)
-    search = DFSSearch()
+    search = MeasurementPrioritySearch()
     search.push(Candidate(graph=graph, ctx=ctx))
     return next(_search_loop(search, [rules], [pass_name or ""], ctx, dump)).graph
 
@@ -494,7 +529,7 @@ def run_rule(graph: Graph, rule_path: Path, ctx: Context | None = None) -> Graph
     fork siblings — for autotuning use the full ``run_pipeline`` driver."""
     if ctx is None:
         ctx = Context.probe()
-    search = DFSSearch()
+    search = MeasurementPrioritySearch()
     search.push(Candidate(graph=graph, ctx=ctx))
     return next(_search_loop(search, [[_load_rule(rule_path)]], [""], ctx, None)).graph
 
@@ -766,13 +801,13 @@ def run_pipeline(
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
     after each. Single-candidate convenience wrapper around
-    :func:`run_autotune` (uses ``DFSSearch``) — returns the graph of the
-    first terminal candidate. With deterministic rules that's the only
-    candidate.
+    :func:`run_autotune` (uses :class:`MeasurementPrioritySearch` with a
+    fresh in-memory cache) — returns the graph of the first terminal
+    candidate. With deterministic rules that's the only candidate.
 
     ``ctx`` is built once (probing the live device if not provided)
     and passed to every rule that takes a ``ctx`` parameter."""
-    return next(run_autotune(graph, passes, search=DFSSearch(), dump=dump, select=select, ctx=ctx)).graph
+    return next(run_autotune(graph, passes, search=MeasurementPrioritySearch(), dump=dump, select=select, ctx=ctx)).graph
 
 
 def run_autotune(
@@ -796,9 +831,16 @@ def run_autotune(
     reaches the end of ``passes``, the candidate is terminal and gets
     yielded.
 
-    ``search`` chooses the order: ``DFSSearch`` for depth-first
-    (current-branch-first) traversal — the default in ``run_pipeline``;
-    any other ``Search`` implementation for priority / MCTS / beam.
+    ``search`` chooses the order: :class:`MeasurementPrioritySearch` is
+    the default (priority-by-unmeasured, DFS-equivalent on a fresh
+    cache); any other ``Search`` implementation works for priority /
+    MCTS / beam strategies.
+
+    When ``search`` exposes a ``cache: TuningCache`` (as
+    :class:`MeasurementPrioritySearch` does), each yielded terminal
+    candidate has its ``CudaOp`` nodes recorded to the cache via
+    :func:`record_terminal` before being yielded — so subsequent
+    candidates see the updated priority signal.
 
     ``ctx`` is built once (probing the live device if not provided)
     and shared by every candidate."""
@@ -810,7 +852,11 @@ def run_autotune(
 
     search.push(Candidate(graph=graph, ctx=ctx))
 
-    yield from _search_loop(search, rules_per_pass, passes, ctx, dump)
+    cache: TuningCache | None = getattr(search, "cache", None)
+    for cand in _search_loop(search, rules_per_pass, passes, ctx, dump):
+        if cache is not None:
+            record_terminal(cand.graph, cache, cand.ctx.structural_key())
+        yield cand
     logger.info("compile: total %.2fs", time.monotonic() - t_start)
 
 
