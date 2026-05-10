@@ -515,13 +515,14 @@ def _search_loop(
 def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:
     """Apply one rewrite outcome to ``graph``. ``Op`` rebinds
     ``root.op`` in place (id, inputs, hints kept); ``Graph`` is a
-    fragment spliced via ``_apply_replacement``. Returns the (possibly
+    fragment spliced via ``Graph.splice``. Returns the (possibly
     same, possibly new) graph."""
     if isinstance(result, Op):
         graph.nodes[match.root_node_id].op = result
         return graph
     assert isinstance(result, Graph), f"rule {rule_name} returned {type(result).__name__}; expected Graph, Op, list, or RuleSkipped"
-    return _apply_replacement(graph, match, result)
+    graph.splice(result, consumed=match.consumed, output=match.output or match.root_node_id)
+    return graph
 
 
 def _try_one_rule(
@@ -741,103 +742,6 @@ def _dedent(line: str, n: int) -> str:
     while i < n and i < len(line) and line[i] == " ":
         i += 1
     return line[i:]
-
-
-# ---------------------------------------------------------------------------
-# Fragment splicer
-# ---------------------------------------------------------------------------
-
-
-def _apply_replacement(graph: Graph, match: Match, fragment: Graph) -> Graph:
-    """Splice a replacement fragment into the graph.
-
-    1. Add fragment's non-InputOp nodes to the graph (with fresh IDs).
-    2. Wire the fragment's output to replace the match's output.
-    3. Remove consumed nodes and orphaned constants.
-
-    Mutates ``graph`` in place and returns the same object.
-    """
-    g = graph
-
-    id_map: dict[str, str] = {}
-    for frag_id in fragment.topological_order():
-        frag_node = fragment.nodes[frag_id]
-        if isinstance(frag_node.op, InputOp):
-            id_map[frag_id] = frag_id  # references existing graph node
-            continue
-        mapped_inputs = [id_map.get(inp, inp) for inp in frag_node.inputs]
-        # Preserve the fragment's id when it doesn't collide. Lifting / fusion
-        # fragments use stable names (``lift_<nid>``, ``merged_<nid>``) that
-        # don't clash with the surrounding graph because the original node is
-        # already consumed. Keeping the id stable means buf names inside the
-        # LoopOp body (``Load.source`` / ``Write.output``, both buf names)
-        # remain consistent with the surrounding graph.
-        preferred_id = frag_id if frag_id not in g.nodes else None
-        new_id = g.add_node(
-            op=frag_node.op,
-            inputs=mapped_inputs,
-            output=Tensor(frag_node.output.name, frag_node.output.shape, frag_node.output.dtype),
-            node_id=preferred_id,
-        )
-        if frag_node.hints:
-            g.nodes[new_id].hints = frag_node.hints
-        id_map[frag_id] = new_id
-
-    new_output = id_map[fragment.outputs[0]]
-    old_output = match.output or match.root_node_id
-    g.replace_node(old_output, new_output)
-
-    for nid in match.consumed:
-        orig = g.nodes.get(nid)
-        if orig is None:
-            continue
-        if orig.hints:
-            g.nodes[new_output].hints.merge(orig.hints)
-        if nid != old_output:
-            g.remove_node(nid)
-    if old_output in g.nodes:
-        g.remove_node(old_output)
-
-    # Promote the new node's id to its friendly output.name once consumed
-    # nodes are gone — keeps kernel buf names (which embed the node id)
-    # readable. Falls back silently if the friendly name is taken.
-    desired = g.nodes[new_output].output.name
-    if desired and desired != new_output and desired not in g.nodes:
-        g.rename_node(new_output, desired)
-
-    _remove_orphans(g)
-    return g
-
-
-def _remove_orphans(graph: Graph) -> None:
-    """Remove nodes with zero consumers that aren't graph outputs."""
-    output_set = set(graph.outputs)
-    input_set = set(graph.inputs)
-
-    def _is_protected(nid: str) -> bool:
-        if nid in output_set or nid in input_set:
-            return True
-        node = graph.nodes.get(nid)
-        return node is not None and isinstance(node.op, InputOp)
-
-    consumer_count: dict[str, int] = dict.fromkeys(graph.nodes, 0)
-    for node in graph.nodes.values():
-        for inp in set(node.inputs):
-            if inp in consumer_count:
-                consumer_count[inp] += 1
-
-    queue: list[str] = [nid for nid, c in consumer_count.items() if c == 0 and not _is_protected(nid)]
-    while queue:
-        nid = queue.pop()
-        if nid not in graph.nodes:
-            continue
-        node = graph.nodes[nid]
-        for inp in set(node.inputs):
-            if inp in consumer_count:
-                consumer_count[inp] -= 1
-                if consumer_count[inp] == 0 and not _is_protected(inp):
-                    queue.append(inp)
-        graph.remove_node(nid)
 
 
 # ---------------------------------------------------------------------------
