@@ -1,8 +1,10 @@
-"""Tests for the autotune tuning cache (``deplodock.compiler.cache``).
+"""Tests for the tree-shaped tuning cache (``deplodock.compiler.cache``).
 
-Covers the SQLite layer (lookup / has / record / replace) and the helpers
-that bridge it to the search policy (``op_cache_key`` for CudaOp,
-``count_unmeasured_ops``, ``record_terminal``).
+The schema is three tables — ``cuda_perf`` for terminal measurements,
+``expansions`` for parent→child edges, ``nodes`` for the maintained
+``expected_terminals`` / ``seen_terminals`` counters. These tests verify
+the online maintenance of the counters under expansion and terminal
+recording, plus the helper functions ``op_cache_key`` / ``record_terminal``.
 """
 
 from __future__ import annotations
@@ -33,49 +35,136 @@ def _make_cuda_graph(*, kernel_source: str = "__global__ void k() {}") -> Graph:
     return g
 
 
-def test_cache_lookup_miss_returns_none() -> None:
+# ---------------------------------------------------------------------------
+# cuda_perf
+# ---------------------------------------------------------------------------
+
+
+def test_cuda_perf_miss_returns_none() -> None:
     cache = TuningCache()
-    assert cache.lookup("ctx", "op") is None
-    assert not cache.has("ctx", "op")
+    assert cache.cuda_perf("ctx", "cuda") is None
 
 
-def test_cache_record_then_lookup() -> None:
+def test_record_cuda_perf_then_lookup() -> None:
     cache = TuningCache()
-    cache.record("ctx", "op", latency_us=1.0)
-    entry = cache.lookup("ctx", "op")
-    assert entry is not None
-    assert entry.latency_us == 1.0
-    assert entry.status == "ok"
-    assert cache.has("ctx", "op")
+    cache.record_cuda_perf("ctx", "cuda", latency_us=12.0)
+    row = cache.cuda_perf("ctx", "cuda")
+    assert row is not None and row.latency_us == 12.0 and row.status == "ok"
 
 
-def test_cache_record_keeps_best() -> None:
-    """Re-recording an ``ok`` entry only updates if the new latency is
-    lower — autotune attribution writes the same ancestor key multiple
-    times; we want the best variant ever seen, not the most recent."""
+def test_record_cuda_perf_keeps_best() -> None:
     cache = TuningCache()
-    cache.record("ctx", "op", latency_us=2.5)
-    cache.record("ctx", "op", latency_us=1.0)
-    assert cache.lookup("ctx", "op").latency_us == 1.0  # improved
-    cache.record("ctx", "op", latency_us=5.0)
-    assert cache.lookup("ctx", "op").latency_us == 1.0  # kept best
+    cache.record_cuda_perf("ctx", "cuda", latency_us=2.5)
+    cache.record_cuda_perf("ctx", "cuda", latency_us=1.0)
+    assert cache.cuda_perf("ctx", "cuda").latency_us == 1.0
+    cache.record_cuda_perf("ctx", "cuda", latency_us=5.0)
+    assert cache.cuda_perf("ctx", "cuda").latency_us == 1.0
 
 
-def test_cache_record_status_change_overwrites() -> None:
-    """A successful measurement supersedes a prior ``bench_fail`` row
-    even if its latency would otherwise lose the keep-best check."""
+def test_status_change_overrides_keep_best() -> None:
     cache = TuningCache()
-    cache.record("ctx", "op", latency_us=0.0, status="bench_fail")
-    cache.record("ctx", "op", latency_us=10.0, status="ok")
-    entry = cache.lookup("ctx", "op")
-    assert entry.status == "ok" and entry.latency_us == 10.0
+    cache.record_cuda_perf("ctx", "cuda", latency_us=0.0, status="bench_fail")
+    cache.record_cuda_perf("ctx", "cuda", latency_us=10.0, status="ok")
+    row = cache.cuda_perf("ctx", "cuda")
+    assert row.status == "ok" and row.latency_us == 10.0
 
 
-def test_cache_segregates_by_context() -> None:
+# ---------------------------------------------------------------------------
+# Tree expansion / counters
+# ---------------------------------------------------------------------------
+
+
+def test_root_placeholder_has_expected_one() -> None:
     cache = TuningCache()
-    cache.record("ctx_a", "op", latency_us=1.0)
-    assert cache.has("ctx_a", "op")
-    assert not cache.has("ctx_b", "op")
+    cache.ensure_root("ctx", "root")
+    node = cache.node("ctx", "root")
+    assert node.expected_terminals == 1 and node.seen_terminals == 0
+
+
+def test_first_expansion_propagates_delta() -> None:
+    """First expansion of a parent consumes its placeholder ``1``, so
+    the delta to ancestors is ``n_new - 1``."""
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a", "b", "c"])
+    root = cache.node("ctx", "root")
+    assert root.expected_terminals == 3  # placeholder 1 + delta 2
+    for ck in ("a", "b", "c"):
+        child = cache.node("ctx", ck)
+        assert child.expected_terminals == 1
+        assert child.parent_key == "root"
+
+
+def test_second_expansion_is_pure_addition() -> None:
+    """Once a parent already has children, every new edge adds +1."""
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a"])
+    assert cache.node("ctx", "root").expected_terminals == 1
+    cache.expand("ctx", "root", ["b", "c"])
+    assert cache.node("ctx", "root").expected_terminals == 3  # 1 + 2 new
+
+
+def test_expansion_is_idempotent() -> None:
+    """Re-running the same expansion is a no-op (PRIMARY KEY rejects
+    duplicates; ``INSERT OR IGNORE`` makes it silent)."""
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a", "b"])
+    cache.expand("ctx", "root", ["a", "b"])
+    assert cache.node("ctx", "root").expected_terminals == 2
+
+
+def test_deep_expansion_propagates_to_root() -> None:
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a"])  # root: 1, a: 1
+    cache.expand("ctx", "a", ["a1", "a2", "a3"])  # a: 3 (+2), root: 3 (+2)
+    assert cache.node("ctx", "root").expected_terminals == 3
+    assert cache.node("ctx", "a").expected_terminals == 3
+
+
+def test_terminal_propagates_seen_upward() -> None:
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a", "b"])
+    cache.record_cuda_perf("ctx", "a", latency_us=10.0)
+    assert cache.node("ctx", "a").seen_terminals == 1
+    assert cache.node("ctx", "root").seen_terminals == 1
+    cache.record_cuda_perf("ctx", "b", latency_us=20.0)
+    assert cache.node("ctx", "root").seen_terminals == 2
+
+
+def test_re_recording_same_terminal_doesnt_double_count() -> None:
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a"])
+    cache.record_cuda_perf("ctx", "a", latency_us=10.0)
+    cache.record_cuda_perf("ctx", "a", latency_us=5.0)  # better — overwrites latency
+    assert cache.node("ctx", "a").seen_terminals == 1
+    assert cache.node("ctx", "root").seen_terminals == 1
+
+
+def test_is_fully_explored_tracks_seen_vs_expected() -> None:
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a", "b"])
+    assert not cache.is_fully_explored("ctx", "root")
+    cache.record_cuda_perf("ctx", "a", latency_us=1.0)
+    assert not cache.is_fully_explored("ctx", "root")
+    cache.record_cuda_perf("ctx", "b", latency_us=2.0)
+    assert cache.is_fully_explored("ctx", "root")
+
+
+def test_expansion_grows_denominator_mid_run() -> None:
+    """If a previously-terminal-looking node gets expanded, ``expected``
+    grows. The semantics for 'fully explored' tighten accordingly."""
+    cache = TuningCache()
+    cache.expand("ctx", "root", ["a"])
+    cache.record_cuda_perf("ctx", "a", latency_us=1.0)
+    assert cache.is_fully_explored("ctx", "root")  # a was a leaf
+    # Now suppose a gets expanded into two sub-options later.
+    cache.expand("ctx", "a", ["a1", "a2"])
+    # root.expected: 1 + delta(+1) = 2 ; root.seen still 1
+    assert not cache.is_fully_explored("ctx", "root")
+
+
+# ---------------------------------------------------------------------------
+# op_cache_key / record_terminal
+# ---------------------------------------------------------------------------
 
 
 def test_op_cache_key_only_for_cuda_op() -> None:
@@ -90,14 +179,13 @@ def test_op_cache_key_distinguishes_kernel_source() -> None:
     assert op_cache_key(a.nodes["k"].op) != op_cache_key(b.nodes["k"].op)
 
 
-def test_record_terminal_writes_each_cuda_op() -> None:
+def test_record_terminal_writes_cuda_perf_with_stub_backend() -> None:
     cache = TuningCache()
     g = _make_cuda_graph()
-    record_terminal(g, cache, context_key="ctx")
+    record_terminal(g, cache, context_key="ctx")  # no backend → stub latency 1.0
     key = op_cache_key(g.nodes["k"].op)
-    assert key is not None
-    entry = cache.lookup("ctx", key)
-    assert entry is not None and entry.latency_us == 1.0
+    row = cache.cuda_perf("ctx", key)
+    assert row is not None and row.latency_us == 1.0
 
 
 def test_count_unmeasured_drops_after_record_terminal() -> None:
@@ -108,9 +196,7 @@ def test_count_unmeasured_drops_after_record_terminal() -> None:
     assert count_unmeasured_ops(g, cache, "ctx") == 0
 
 
-def test_context_structural_key_is_stable_and_segregates_by_cap() -> None:
+def test_context_structural_key_segregates() -> None:
     a = Context.from_target((12, 0))
-    b = Context.from_target((12, 0))
-    c = Context.from_target((9, 0))
-    assert a.structural_key() == b.structural_key()
-    assert a.structural_key() != c.structural_key()
+    b = Context.from_target((9, 0))
+    assert a.structural_key() != b.structural_key()

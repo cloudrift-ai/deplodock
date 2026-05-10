@@ -77,23 +77,19 @@ class _StubBackend:
         return BenchmarkResult(time_ms=sum(self.per_launch_ms), num_launches=len(per_launch), per_launch=per_launch)
 
 
-def test_record_terminal_attributes_latency_to_every_ancestor() -> None:
-    """One bench call → entries land for CudaOp, KernelOp, TileOp, and
-    LoopOp ancestors, all carrying the measured latency (in microseconds)."""
+def test_record_terminal_inserts_cuda_perf_row() -> None:
+    """A bench call inserts one ``cuda_perf`` row keyed on the CudaOp."""
     g = run_pipeline(_elementwise_graph(), CUDA_PASSES)
     cuda_node = next(n for n in g.nodes.values() if isinstance(n.op, CudaOp))
     cuda = cuda_node.op
-    cache = TuningCache()
+    cache = TuningCache()  # fresh, no prior measurements
     ctx_key = Context.from_target((12, 0)).structural_key()
     backend = _StubBackend(per_launch_ms=[0.0425])  # 42.5 us
 
     record_terminal(g, cache, ctx_key, backend=backend)
 
     assert backend.calls == 1
-    for ancestor in (cuda, cuda.source, cuda.source.source, cuda.source.source.source):
-        key = op_cache_key(ancestor)
-        assert key is not None, f"{type(ancestor).__name__} should be cacheable"
-        entry = cache.lookup(ctx_key, key)
-        assert entry is not None, f"no cache entry for {type(ancestor).__name__}"
-        assert entry.latency_us == 42.5
-        assert entry.status == "ok"
+    row = cache.cuda_perf(ctx_key, op_cache_key(cuda))
+    assert row is not None
+    assert row.latency_us == 42.5
+    assert row.status == "ok"

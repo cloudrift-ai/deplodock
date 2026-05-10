@@ -303,10 +303,10 @@ def _print_tune_summary(candidates, cache) -> None:
         shapes: list[str] = []
         for node in cuda_nodes:
             key = op_cache_key(node.op)
-            entry = cache.lookup(ctx_key, key) if key else None
-            latency = entry.latency_us if entry else float("nan")
+            row = cache.cuda_perf(ctx_key, key) if key else None
+            latency = row.latency_us if row else float("nan")
             per_kernel.append((node.op.kernel_name, latency))
-            if entry is not None and entry.status == "ok":
+            if row is not None and row.status == "ok":
                 total += latency
             bn_bm = _post_blockify_bn_bm(node.op)
             if bn_bm is not None:

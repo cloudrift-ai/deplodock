@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from deplodock.compiler.cache import TuningCache, count_unmeasured_ops, record_terminal
+from deplodock.compiler.cache import TuningCache, count_unmeasured_ops, op_cache_key, record_terminal
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
@@ -581,6 +581,7 @@ def _search_loop(
     Used by every engine entry point — ``run_autotune`` (full pipeline),
     ``run_pass`` (one pass), ``run_rule`` (one rule). They differ only
     in the rules-per-pass list and the ``Search`` instance supplied."""
+    cache: TuningCache | None = getattr(search, "cache", None)
     while (cand := search.pop()) is not None:
         cur = cand.cursor
         if cur.pass_idx >= len(pass_names):
@@ -595,7 +596,7 @@ def _search_loop(
         rule = rules[cur.rule_idx]
         pass_idx_arg = cur.pass_idx + 1 if pass_names[cur.pass_idx] else None
         pass_name_arg = pass_names[cur.pass_idx] or None
-        result = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg)
+        result = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg, cache=cache)
 
         def _on_pass_finish(idx: int) -> None:
             name = pass_names[idx]
@@ -643,6 +644,8 @@ def _try_one_rule(
     dump: CompilerDump | None,
     pass_idx: int | None,
     pass_name: str | None,
+    *,
+    cache: TuningCache | None = None,
 ) -> RuleResult:
     """One iteration: enumerate ``rule``'s matches once and apply each
     live match (with non-skipped rewrite) in batch. Match enumeration
@@ -664,11 +667,25 @@ def _try_one_rule(
 
     matches = match_pattern(cand.graph, rule.pattern)
     result = RuleResult()
+    context_key = cand.ctx.structural_key() if cache is not None else None
     for match in matches:
         options = _try_rewrite(rule, match, ctx, debug_on=debug_on, pass_name=pass_name)
         if options is None:
             continue
         chosen = options[0]
+        # Record the (parent_key → child_keys) expansion in the autotune
+        # tree before applying anything. Only fires when every option is
+        # an ``Op`` with a derivable ``op_cache_key`` — Graph-returning
+        # rewrites (decomposition / fusion) don't have a single post-op
+        # to key on, so they don't contribute tree edges. Single-option
+        # rules still record an edge (n_new=1, delta=0); the chain in
+        # the cache mirrors the source chain on the resulting kernels.
+        if cache is not None and context_key is not None:
+            parent_key = op_cache_key(cand.graph.nodes[match.root_node_id].op)
+            if parent_key is not None and all(isinstance(o, Op) for o in options):
+                child_keys = [op_cache_key(o) for o in options]
+                if all(k is not None for k in child_keys):
+                    cache.expand(context_key, parent_key, child_keys)
         fragment = _wrap_op_as_fragment(cand.graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
         text = _format_rule_application(rule.name, cand.graph, match, fragment, pass_name=pass_name) if need_text else None
         if debug_on:
