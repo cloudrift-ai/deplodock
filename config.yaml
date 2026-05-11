@@ -25,6 +25,6 @@ providers:
   cloudrift:
     # API key: defaults to $CLOUDRIFT_API_KEY env var
     # API URL: defaults to $CLOUDRIFT_API_URL env var, else https://api.cloudrift.ai
-    image_url_nvidia: "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
-    image_url_amd: "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
+    # image_url: override the OS image. By default deplodock auto-picks ROCm for
+    # mi* instance types and NVIDIA otherwise (see provisioning/cloudrift.py).
     # billing_exempt: true  # admin-only, skip billing

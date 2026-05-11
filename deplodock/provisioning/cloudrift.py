@@ -17,7 +17,6 @@ DEFAULT_IMAGE_URL_NVIDIA = (
     "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
 )
 DEFAULT_IMAGE_URL_AMD = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
-DEFAULT_IMAGE_URL = DEFAULT_IMAGE_URL_NVIDIA  # backward-compat alias
 DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
 API_VERSION = "~upcoming"
 
@@ -65,7 +64,7 @@ async def _rent_instance(
     api_key,
     instance_type,
     ssh_public_keys,
-    image_url=DEFAULT_IMAGE_URL,
+    image_url,
     cloudinit_url=DEFAULT_CLOUDINIT_URL,
     ports=None,
     api_url=DEFAULT_API_URL,
@@ -196,6 +195,7 @@ async def wait_for_status(
     fail_statuses = fail_statuses or set()
     elapsed = 0
     status = None
+    last_info = None
     while elapsed < timeout:
         info = await _get_instance_info(api_key, instance_id, api_url)
         if info is None:
@@ -203,16 +203,26 @@ async def wait_for_status(
             await asyncio.sleep(interval)
             elapsed += interval
             continue
+        last_info = info
         status = info.get("status")
+        if status == target_status and _instance_fully_ready(info):
+            return info
         if status in fail_statuses:
             logger.error(f"Instance {instance_id} reached fail status '{status}'")
             return None
-        if status == target_status and _instance_fully_ready(info):
-            return info
         await asyncio.sleep(interval)
         elapsed += interval
 
-    logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
+    if last_info is not None and last_info.get("status") == target_status:
+        vms = last_info.get("virtual_machines") or []
+        vm_ready = vms[0].get("ready") if vms else None
+        logger.error(
+            f"Timeout after {timeout}s: instance {instance_id} reached '{target_status}' but never became ready "
+            f"(host_address={last_info.get('host_address')!r}, port_mappings={last_info.get('port_mappings')!r}, "
+            f"vm_ready={vm_ready!r})"
+        )
+    else:
+        logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
     return None
 
 
@@ -333,8 +343,9 @@ async def create_instance(
     """
     if image_url is None:
         image_url = select_image_url(instance_type)
-        logger.info(f"Auto-selected image for {instance_type}: {image_url}")
-    logger.info(f"Creating CloudRift instance (type={instance_type})...")
+        logger.info(f"Creating CloudRift instance (type={instance_type}, auto-selected image={image_url})...")
+    else:
+        logger.info(f"Creating CloudRift instance (type={instance_type}, image={image_url})...")
 
     ssh_key_path = os.path.expanduser(ssh_key_path)
     if dry_run and not os.path.exists(ssh_key_path):
@@ -371,6 +382,11 @@ async def create_instance(
 
     info = await wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
     if info is None:
+        logger.warning(f"Terminating orphaned instance {instance_id} after wait_for_status failure.")
+        try:
+            await _terminate_instance(api_key, instance_id, api_url)
+        except Exception as exc:
+            logger.error(f"Failed to terminate orphaned instance {instance_id}: {exc}")
         return None
 
     logger.info("Instance is Active.")

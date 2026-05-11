@@ -147,15 +147,15 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
             logger.info(f"[dry-run] create instance type={instance_type} ssh_key={pub_key_path}")
 
         cr_config = (providers_config or {}).get("cloudrift", {})
-        is_amd = gpu_name.startswith("AMD")
-        image_url = cr_config.get("image_url_amd") if is_amd else cr_config.get("image_url_nvidia")
-        image_kwargs = {"image_url": image_url} if image_url else {}
+        # config.yaml may override the image; otherwise create_instance auto-selects from instance_type.
+        image_url = cr_config.get("image_url")
         billing_exempt = cr_config.get("billing_exempt", False)
 
         conn = await cr_provider.create_instance(
             api_key=api_key or "",
             instance_type=instance_type,
             ssh_key_path=pub_key_path,
+            image_url=image_url,
             ports=[22, 8000, 8080],
             timeout=600,
             dry_run=dry_run,
@@ -163,7 +163,6 @@ async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key,
             wait_ssh=True,
             ssh_private_key_path=ssh_key,
             billing_exempt=billing_exempt,
-            **image_kwargs,
         )
         return conn
 

@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from deplodock.provisioning.cloudrift import (
     API_VERSION,
     DEFAULT_CLOUDINIT_URL,
-    DEFAULT_IMAGE_URL,
     DEFAULT_IMAGE_URL_AMD,
     DEFAULT_IMAGE_URL_NVIDIA,
     _add_ssh_key,
@@ -20,7 +19,9 @@ from deplodock.provisioning.cloudrift import (
     _log_connection_info,
     _rent_instance,
     _terminate_instance,
+    create_instance,
     select_image_url,
+    wait_for_status,
 )
 
 API_KEY = "test-api-key"
@@ -138,14 +139,21 @@ async def test_api_request_dry_run(caplog):
 async def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    result = await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], ports=[22, 8000], api_url=API_URL)
+    result = await _rent_instance(
+        API_KEY,
+        "rtx49-7c-kn.1",
+        ["ssh-ed25519 AAAA user@host"],
+        DEFAULT_IMAGE_URL_NVIDIA,
+        ports=[22, 8000],
+        api_url=API_URL,
+    )
 
     call_data = mock_api.call_args[0][2]
     assert call_data["selector"] == {"ByInstanceTypeAndLocation": {"instance_type": "rtx49-7c-kn.1"}}
     assert call_data["config"] == {
         "VirtualMachine": {
             "ssh_key": {"PublicKeys": ["ssh-ed25519 AAAA user@host"]},
-            "image_url": DEFAULT_IMAGE_URL,
+            "image_url": DEFAULT_IMAGE_URL_NVIDIA,
             "cloudinit_url": DEFAULT_CLOUDINIT_URL,
             "ports": ["22", "8000"],
         }
@@ -158,7 +166,7 @@ async def test_rent_instance_payload(mock_api):
 async def test_rent_instance_no_ports(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], DEFAULT_IMAGE_URL_NVIDIA, api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert "ports" not in call_data
@@ -169,7 +177,14 @@ async def test_rent_instance_no_ports(mock_api):
 async def test_rent_instance_billing_exempt(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL, billing_exempt=True)
+    await _rent_instance(
+        API_KEY,
+        "rtx49-7c-kn.1",
+        ["ssh-ed25519 AAAA user@host"],
+        DEFAULT_IMAGE_URL_NVIDIA,
+        api_url=API_URL,
+        billing_exempt=True,
+    )
 
     call_data = mock_api.call_args[0][2]
     assert call_data["billing_exempt"] is True
@@ -179,7 +194,7 @@ async def test_rent_instance_billing_exempt(mock_api):
 async def test_rent_instance_no_billing_exempt_by_default(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], DEFAULT_IMAGE_URL_NVIDIA, api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert "billing_exempt" not in call_data
@@ -364,11 +379,6 @@ def test_select_image_url_nvidia_h200():
     assert select_image_url("h200-24-200-1000-generic.8") == DEFAULT_IMAGE_URL_NVIDIA
 
 
-def test_default_image_url_alias_points_to_nvidia():
-    """DEFAULT_IMAGE_URL must remain a NVIDIA alias for backward compat."""
-    assert DEFAULT_IMAGE_URL == DEFAULT_IMAGE_URL_NVIDIA
-
-
 # ── _instance_fully_ready ────────────────────────────────────────
 
 
@@ -412,3 +422,114 @@ def test_default_api_url_fallback(monkeypatch):
     monkeypatch.delenv("CLOUDRIFT_API_URL", raising=False)
     importlib.reload(cloudrift)
     assert cloudrift.DEFAULT_API_URL == "https://api.cloudrift.ai"
+
+
+# ── wait_for_status ───────────────────────────────────────────────
+
+
+def _active_response(ready=True, host="1.2.3.4", ports=None):
+    """Build a minimal instance dict for wait_for_status tests."""
+    if ports is None:
+        ports = [[22, 22222]]
+    return {
+        "id": "inst-123",
+        "status": "Active",
+        "host_address": host,
+        "port_mappings": ports,
+        "virtual_machines": [{"ready": ready}],
+    }
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_polls_until_ready(mock_get, mock_sleep):
+    """wait_for_status must keep polling while status is Active but networking is missing."""
+    mock_get.side_effect = [
+        {"id": "inst-123", "status": "Active", "host_address": None, "port_mappings": None},
+        _active_response(ready=False),
+        _active_response(ready=True),
+    ]
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+    assert info is not None
+    assert info["host_address"] == "1.2.3.4"
+    assert mock_get.await_count == 3
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_timeout_logs_readiness_components(mock_get, mock_sleep, caplog):
+    """At timeout, the log message must identify the readiness components that blocked us."""
+    mock_get.return_value = {
+        "id": "inst-123",
+        "status": "Active",
+        "host_address": None,
+        "port_mappings": None,
+        "virtual_machines": [{"ready": False}],
+    }
+    with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
+        info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=20, interval=10)
+    assert info is None
+    assert "never became ready" in caplog.text
+    assert "host_address=None" in caplog.text
+    assert "port_mappings=None" in caplog.text
+    assert "vm_ready=False" in caplog.text
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_returns_none_on_fail_status(mock_get, mock_sleep):
+    """fail_statuses must short-circuit polling."""
+    mock_get.return_value = {"id": "inst-123", "status": "Inactive"}
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, fail_statuses={"Inactive"})
+    assert info is None
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_target_wins_over_fail_for_same_string(mock_get, mock_sleep):
+    """If a status appears in both target_status and fail_statuses, success takes precedence."""
+    mock_get.return_value = _active_response(ready=True)
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, fail_statuses={"Active"})
+    assert info is not None
+    assert info["host_address"] == "1.2.3.4"
+
+
+# ── create_instance orphan termination ───────────────────────────
+
+
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_terminates_orphan_on_timeout(mock_rent, mock_wait, mock_terminate, tmp_path):
+    """When wait_for_status fails, the rented instance must be terminated before returning None."""
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
+    mock_wait.return_value = None
+
+    conn = await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+    assert conn is None
+    mock_terminate.assert_awaited_once()
+    args = mock_terminate.await_args
+    assert args.args[1] == "inst-orphan"
+
+
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait, mock_terminate, tmp_path, caplog):
+    """A failed terminate during orphan cleanup must not mask the original failure."""
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
+    mock_wait.return_value = None
+    mock_terminate.side_effect = RuntimeError("network down")
+
+    with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
+        conn = await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+    assert conn is None
+    assert "Failed to terminate orphaned instance inst-orphan" in caplog.text
