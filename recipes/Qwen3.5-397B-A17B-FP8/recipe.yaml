@@ -3,18 +3,27 @@ model:
 
 engine:
   llm:
-    tensor_parallel_size: 8
     pipeline_parallel_size: 1
-    gpu_memory_utilization: 0.8
-    max_concurrent_requests: 4
-    mem_fraction_static: 0.8
-    sglang:
-      image: "lmsysorg/sglang:dev-cu13"
-      extra_args: "--reasoning-parser qwen3 --tool-call-parser qwen3_coder"
-      extra_env:
-        SGLANG_ENABLE_JIT_DEEPGEMM: 0
 
 matrices:
-  deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-  deploy.gpu_count: 8
-  engine.llm.context_length: 262144
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    deploy.gpu_count: 8
+    engine.llm.tensor_parallel_size: 8
+    engine.llm.gpu_memory_utilization: 0.8
+    engine.llm.max_concurrent_requests: 4
+    engine.llm.context_length: 262144
+    engine.llm.sglang.image: "lmsysorg/sglang:dev-cu13"
+    engine.llm.sglang.extra_args: "--reasoning-parser qwen3 --tool-call-parser qwen3_coder"
+    engine.llm.sglang.extra_env.SGLANG_ENABLE_JIT_DEEPGEMM: 0
+
+  # Per vLLM's official Qwen3.5 recipe, 8x H200 is the verified config:
+  # https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html
+  # ~397 GB FP8 weights + ~50-80 GB overhead leaves ~650 GB across 8x 141 GB cards for KV cache.
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 8
+    engine.llm.tensor_parallel_size: 8
+    engine.llm.gpu_memory_utilization: 0.9
+    engine.llm.max_concurrent_requests: 64
+    engine.llm.context_length: 262144
+    engine.llm.vllm.image: "vllm/vllm-openai:v0.20.1"
+    engine.llm.vllm.extra_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --language-model-only"
