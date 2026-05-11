@@ -28,3 +28,15 @@ matrices:
     engine.llm.gpu_memory_utilization: 0.8
     engine.llm.max_concurrent_requests: 64
     engine.llm.context_length: 262144
+
+  - deploy.gpu: "AMD Instinct MI350X"
+    deploy.gpu_count: 1
+    engine.llm.tensor_parallel_size: 1
+    engine.llm.gpu_memory_utilization: 0.9
+    engine.llm.max_concurrent_requests: 16
+    engine.llm.context_length: 262144
+    engine.llm.vllm.image: "vllm/vllm-openai-rocm:v0.20.2"
+    engine.llm.vllm.extra_env:
+      VLLM_ROCM_USE_AITER: 1
+    benchmark.max_concurrency: 16
+    benchmark.num_prompts: 64
