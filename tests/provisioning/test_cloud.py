@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import yaml
 
-from deplodock.provisioning.cloud import _provision_once, _select_provider_entry, delete_cloud_vm, resolve_vm_spec
+from deplodock.provisioning.candidates import VmCandidate
+from deplodock.provisioning.cloud import _provision_cloudrift, delete_cloud_vm, resolve_vm_spec
 from deplodock.provisioning.types import VMConnectionInfo
 from deplodock.recipe import load_recipe
 
@@ -163,31 +164,16 @@ def test_vm_connection_info_defaults():
     assert conn.delete_info == ()
 
 
-# ── _select_provider_entry ──────────────────────────────────────
+# ── _provision_cloudrift ────────────────────────────────────────
 
 
-def test_select_provider_entry_defaults_to_first():
-    entries = [("cloudrift", "h200-24-200-1000-generic"), ("gcp", "a3-ultragpu")]
-    assert _select_provider_entry("NVIDIA H200 141GB", entries, None) == ("cloudrift", "h200-24-200-1000-generic")
-
-
-def test_select_provider_entry_override_picks_matching():
-    entries = [("cloudrift", "h200-24-200-1000-generic"), ("gcp", "a3-ultragpu")]
-    assert _select_provider_entry("NVIDIA H200 141GB", entries, "gcp") == ("gcp", "a3-ultragpu")
-
-
-def test_select_provider_entry_unavailable_provider_raises():
-    entries = [("gcp", "a2-ultragpu")]
-    with pytest.raises(ValueError, match="not available on provider 'cloudrift'"):
-        _select_provider_entry("NVIDIA A100 80GB", entries, "cloudrift")
-
-
-# ── _provision_once ─────────────────────────────────────────────
+def _cr_cand():
+    return VmCandidate(provider="cloudrift", base_type="rtx49-7c-kn", instance_type="rtx49-7c-kn.1", zone=None)
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
 @patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
-async def test_provision_once_cloudrift_billing_exempt(mock_create, tmp_path):
+async def test_provision_cloudrift_billing_exempt(mock_create, tmp_path):
     """billing_exempt in providers_config is forwarded to create_instance."""
     key_file = tmp_path / "id_ed25519"
     key_file.write_text("private-key")
@@ -198,9 +184,7 @@ async def test_provision_once_cloudrift_billing_exempt(mock_create, tmp_path):
 
     providers_config = {"cloudrift": {"billing_exempt": True}}
 
-    conn = await _provision_once(
-        "cloudrift", "rtx4090.1", "NVIDIA RTX 4090", 1, str(key_file), providers_config, "test", False, logging.getLogger()
-    )
+    conn = await _provision_cloudrift(_cr_cand(), str(key_file), providers_config, False, logging.getLogger())
 
     assert conn is not None
     assert mock_create.call_args.kwargs["billing_exempt"] is True
@@ -208,7 +192,7 @@ async def test_provision_once_cloudrift_billing_exempt(mock_create, tmp_path):
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
 @patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
-async def test_provision_once_cloudrift_no_billing_exempt(mock_create, tmp_path):
+async def test_provision_cloudrift_no_billing_exempt(mock_create, tmp_path):
     """billing_exempt defaults to False when not in providers_config."""
     key_file = tmp_path / "id_ed25519"
     key_file.write_text("private-key")
@@ -217,7 +201,7 @@ async def test_provision_once_cloudrift_no_billing_exempt(mock_create, tmp_path)
 
     mock_create.return_value = VMConnectionInfo(host="1.2.3.4", username="user", ssh_port=22222)
 
-    conn = await _provision_once("cloudrift", "rtx4090.1", "NVIDIA RTX 4090", 1, str(key_file), {}, "test", False, logging.getLogger())
+    conn = await _provision_cloudrift(_cr_cand(), str(key_file), {}, False, logging.getLogger())
 
     assert conn is not None
     assert mock_create.call_args.kwargs["billing_exempt"] is False

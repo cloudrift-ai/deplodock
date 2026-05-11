@@ -10,6 +10,7 @@ from deplodock.provisioning.cloudrift import (
     create_instance,
     delete_instance,
 )
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.redact import register_secret
 
 logger = logging.getLogger(__name__)
@@ -39,17 +40,21 @@ def handle_create(args):
 async def _handle_create(args):
     api_key = _resolve_api_key(args.api_key)
     ports = [int(p) for p in args.ports.split(",")] if args.ports else None
-    conn = await create_instance(
-        api_key=api_key,
-        instance_type=args.instance_type,
-        ssh_key_path=args.ssh_key,
-        image_url=args.image_url,
-        ports=ports,
-        timeout=args.timeout,
-        api_url=args.api_url,
-        dry_run=args.dry_run,
-        billing_exempt=args.billing_exempt,
-    )
+    try:
+        conn = await create_instance(
+            api_key=api_key,
+            instance_type=args.instance_type,
+            ssh_key_path=args.ssh_key,
+            image_url=args.image_url,
+            ports=ports,
+            timeout=args.timeout,
+            api_url=args.api_url,
+            dry_run=args.dry_run,
+            billing_exempt=args.billing_exempt,
+        )
+    except (CapacityExhausted, TerminalProvisionError) as exc:
+        logger.error(f"{exc}")
+        sys.exit(1)
     if conn is None:
         sys.exit(1)
 

@@ -234,15 +234,31 @@ deplodock teardown <run_dir> [--ssh-key ~/.ssh/id_ed25519]
 
 ### `deplodock vm create / delete`
 
-Manages cloud GPU VM lifecycles directly. Instances are ephemeral — `delete` removes them entirely. Run `deplodock vm create {gcp,cloudrift} --help` for full flag lists.
+Manages cloud GPU VM lifecycles directly. Instances are ephemeral — `delete` removes them entirely. Run `deplodock vm create {gpu,gcp,cloudrift} --help` for full flag lists.
+
+There are two `vm create` modes:
+
+* **`gpu`** (recommended) — name a GPU from the hardware table; the orchestrator picks the provider and instance type, retries transient failures, and falls back to alternative candidates on capacity errors. Same code path as `deploy cloud` and `bench`.
+* **`gcp` / `cloudrift`** — single-shot manual create. You pass the exact `--machine-type` / `--instance-type`. No retries, no fallback. Useful for debugging an exact instance shape or for instance types not yet in the hardware table.
 
 ```bash
+# GPU-based (uses orchestrator: retries, candidate fallback, orphan cleanup)
+deplodock vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 \
+  --ssh-key ~/.ssh/id_ed25519 --provider cloudrift
+
+# Manual single-shot
 deplodock vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
 deplodock vm delete gcp --instance my-vm --zone us-central1-a
 
 deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
 deplodock vm delete cloudrift --instance-id <id>
 ```
+
+#### Allocation strategy (shared by `deploy cloud`, `bench`, `vm create gpu`)
+
+All three commands go through `provision_cloud_vm()` in `deplodock/provisioning/cloud.py`. It enumerates *candidates* from `hardware.GPU_INSTANCE_TYPES` (preference-ordered) and, for GCP, fans out across the zones listed in `GPU_GCP_ZONES`. For each candidate it makes up to `SAME_CANDIDATE_RETRIES` attempts on transient failures, then advances. Providers signal "no capacity, try next" by raising `CapacityExhausted`; non-retryable errors raise `TerminalProvisionError` and abort. Fallback never silently crosses provider boundaries — `--provider` (or the first hardware-table entry) bounds the search.
+
+Capacity-class signals recognized today: CloudRift HTTP 503/429 on rent, CloudRift `Inactive` terminal status / readiness timeout, GCP `ZONE_RESOURCE_POOL_EXHAUSTED` / `QUOTA_EXCEEDED` / `STOCKOUT` in `gcloud` stderr, and GCP `RUNNING`-status timeout. Both providers terminate VMs they created but couldn't bring to readiness, so orchestrator fallback does not leak orphan instances.
 
 GCP project is inferred from `gcloud` config. CloudRift reads `CLOUDRIFT_API_KEY` and `CLOUDRIFT_API_URL` from the environment by default. **H200 on CloudRift** is only available on on-prem clusters — set `CLOUDRIFT_API_URL` to the on-prem endpoint (the public `api.cloudrift.ai` does not offer H200).
 
@@ -278,8 +294,8 @@ Only users with **write** or **admin** access can trigger benchmarks. For fork P
 
 ## Adding a New VM Provider
 
-1. Create `provisioning/<provider>.py` with `create_instance()` -> `VMConnectionInfo | None` and `delete_instance()`
-2. Add CLI handlers in `commands/vm/<provider>.py`
-3. Register CLI in `commands/vm/__init__.py`
-4. Add entries to `hardware.py` GPU_INSTANCE_TYPES table
-5. Add provider dispatch in `provisioning/cloud.py` `provision_cloud_vm()` and `delete_cloud_vm()`
+1. Create `provisioning/<provider>.py` with `create_instance()` -> `VMConnectionInfo | None` and `delete_instance()`. The function must raise `CapacityExhausted` on no-capacity errors and `TerminalProvisionError` on auth/malformed-request errors, and terminate any VM it created but couldn't bring to readiness before re-raising (see `deplodock/provisioning/errors.py`).
+2. Add CLI handlers in `commands/vm/<provider>.py` (the single-shot manual subcommand).
+3. Register CLI in `commands/vm/__init__.py`.
+4. Add entries to `hardware.py` `GPU_INSTANCE_TYPES` table. If the provider has zone-affinity, add `GPU_<provider>_ZONES` and teach `iter_candidates` in `provisioning/candidates.py` to fan out across them.
+5. Add provider dispatch in `provisioning/cloud.py` (`_provision_candidate`) and `delete_cloud_vm()`.

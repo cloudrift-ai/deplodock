@@ -7,6 +7,7 @@ import os
 
 import httpx
 
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.provisioning.ssh import wait_for_ssh
 from deplodock.provisioning.types import VMConnectionInfo
 
@@ -371,16 +372,24 @@ async def create_instance(
         with open(ssh_key_path) as f:
             public_key = f.read().strip()
 
-    result = await _rent_instance(
-        api_key,
-        instance_type,
-        [public_key],
-        image_url=image_url,
-        ports=ports,
-        api_url=api_url,
-        dry_run=dry_run,
-        billing_exempt=billing_exempt,
-    )
+    try:
+        result = await _rent_instance(
+            api_key,
+            instance_type,
+            [public_key],
+            image_url=image_url,
+            ports=ports,
+            api_url=api_url,
+            dry_run=dry_run,
+            billing_exempt=billing_exempt,
+        )
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in (429, 503):
+            raise CapacityExhausted(f"CloudRift rent returned {code} for {instance_type}") from exc
+        if 400 <= code < 500:
+            raise TerminalProvisionError(f"CloudRift rent returned {code}: {exc.response.text}") from exc
+        raise
     if dry_run:
         logger.info("[dry-run] Would wait for Active status, then print connection info.")
         return VMConnectionInfo(
@@ -392,8 +401,8 @@ async def create_instance(
 
     instance_ids = result.get("instance_ids", [])
     if not instance_ids:
-        logger.error("Error: no instance ID returned from rent API.")
-        return None
+        # Rent succeeded HTTP-wise but allocated nothing — treat as no-capacity.
+        raise CapacityExhausted(f"CloudRift rent returned no instance ID for {instance_type}")
     instance_id = instance_ids[0]
     logger.info(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
@@ -412,7 +421,11 @@ async def create_instance(
             await _terminate_instance(api_key, instance_id, api_url)
         except Exception as exc:
             logger.error(f"Failed to terminate orphaned instance {instance_id}: {exc}")
-        return None
+        # wait_for_status returns None for fail-status (e.g. Inactive) and for timeout.
+        # Either way, this candidate has effectively no usable capacity — advance.
+        raise CapacityExhausted(
+            f"CloudRift instance {instance_id} ({instance_type}) never reached Active (fail-status or timeout after {timeout}s)"
+        )
 
     logger.info("Instance is Active.")
     logger.info(f"Instance details: {json.dumps(info, indent=2)}")

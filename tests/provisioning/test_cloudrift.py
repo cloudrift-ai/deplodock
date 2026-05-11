@@ -25,6 +25,7 @@ from deplodock.provisioning.cloudrift import (
     select_image_url,
     wait_for_status,
 )
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 
 API_KEY = "test-api-key"
 API_URL = "https://api.test.cloudrift.ai"
@@ -514,16 +515,18 @@ async def test_wait_for_status_target_wins_over_fail_for_same_string(mock_get, m
 @patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
 @patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_terminates_orphan_on_timeout(mock_rent, mock_wait, mock_terminate, tmp_path):
-    """When wait_for_status fails, the rented instance must be terminated before returning None."""
+    """When wait_for_status fails, the rented instance must be terminated and CapacityExhausted raised."""
+    import pytest
+
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 AAAA test@host\n")
 
     mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
     mock_wait.return_value = None
 
-    conn = await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
-    assert conn is None
     mock_terminate.assert_awaited_once()
     args = mock_terminate.await_args
     assert args.args[1] == "inst-orphan"
@@ -533,7 +536,9 @@ async def test_create_instance_terminates_orphan_on_timeout(mock_rent, mock_wait
 @patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
 @patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait, mock_terminate, tmp_path, caplog):
-    """A failed terminate during orphan cleanup must not mask the original failure."""
+    """A failed terminate during orphan cleanup must not mask the original CapacityExhausted."""
+    import pytest
+
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 AAAA test@host\n")
 
@@ -542,9 +547,9 @@ async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait,
     mock_terminate.side_effect = RuntimeError("network down")
 
     with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
-        conn = await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+        with pytest.raises(CapacityExhausted):
+            await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
-    assert conn is None
     assert "Failed to terminate orphaned instance inst-orphan" in caplog.text
 
 
@@ -612,4 +617,62 @@ async def test_wait_for_status_retries_network_error(mock_get, mock_sleep):
     ]
     info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
     assert info is not None
-    assert mock_get.await_count == 2
+
+
+# ── create_instance HTTP-code classification ────────────────────
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_503_raises_capacity_exhausted(mock_rent, tmp_path):
+    """HTTP 503 on rent must be classified as CapacityExhausted for orchestrator fallback."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(503)
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_429_raises_capacity_exhausted(mock_rent, tmp_path):
+    """HTTP 429 (rate limit) is also capacity-class."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(429)
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_401_raises_terminal(mock_rent, tmp_path):
+    """HTTP 401/403 must surface as TerminalProvisionError so the orchestrator aborts."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(401)
+
+    with pytest.raises(TerminalProvisionError):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_empty_instance_ids_raises_capacity(mock_rent, tmp_path):
+    """Rent succeeding HTTP-wise but returning no instance is still no-capacity."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": []}
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)

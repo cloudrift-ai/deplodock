@@ -4,10 +4,30 @@ import asyncio
 import logging
 import shlex
 
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.provisioning.shell import run_shell_cmd
 from deplodock.provisioning.types import VMConnectionInfo
 
 logger = logging.getLogger(__name__)
+
+# Substrings in gcloud stderr that map to CapacityExhausted (try next candidate).
+# These are the messages GCP returns when a zone/machine type is out of capacity
+# or when the project's quota is the bottleneck — both are zone/type-specific
+# and may succeed on the next candidate.
+_CAPACITY_STDERR_MARKERS = (
+    "ZONE_RESOURCE_POOL_EXHAUSTED",
+    "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+    "QUOTA_EXCEEDED",
+    "STOCKOUT",
+    "RESOURCE_EXHAUSTED",
+)
+
+
+def _classify_create_failure(stderr: str) -> Exception:
+    """Map a gcloud-create stderr blob to the right exception class."""
+    if any(marker in stderr for marker in _CAPACITY_STDERR_MARKERS):
+        return CapacityExhausted(f"gcloud create reported capacity error: {stderr.strip()}")
+    return TerminalProvisionError(f"gcloud create failed: {stderr.strip()}")
 
 
 def _duration_to_seconds(duration: str) -> int:
@@ -227,37 +247,46 @@ async def create_instance(
     rc, stdout, stderr = await run_shell_cmd(cmd, dry_run=dry_run, timeout=timeout)
     if rc != 0:
         logger.error(f"Failed to create instance: {stderr.strip()}")
-        return None
+        # Before raising, nothing has been provisioned — no orphan to clean up.
+        raise _classify_create_failure(stderr)
 
-    logger.info(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
-    if not await wait_for_status(instance, zone, "RUNNING", timeout, dry_run=dry_run):
-        logger.warning(f"Deleting instance '{instance}' after provisioning timeout...")
-        await run_shell_cmd(_gcloud_delete_cmd(instance, zone), dry_run=dry_run)
-        return None
-    logger.info("Instance is RUNNING.")
+    # gcloud create succeeded; from here on, any failure leaks the VM unless we
+    # explicitly delete it. Mirror CloudRift's orphan-termination pattern so
+    # callers (orchestrator or direct) can rely on a uniform cleanup invariant.
+    try:
+        logger.info(f"Waiting for instance to reach RUNNING status (timeout: {timeout}s)...")
+        if not await wait_for_status(instance, zone, "RUNNING", timeout, dry_run=dry_run):
+            raise CapacityExhausted(f"GCP instance '{instance}' did not reach RUNNING within {timeout}s in zone {zone}")
+        logger.info("Instance is RUNNING.")
 
-    # Get external IP
-    rc, stdout, _ = await run_shell_cmd(_gcloud_external_ip_cmd(instance, zone), dry_run=dry_run)
-    external_ip = stdout.strip() if rc == 0 else ""
+        rc, stdout, _ = await run_shell_cmd(_gcloud_external_ip_cmd(instance, zone), dry_run=dry_run)
+        external_ip = stdout.strip() if rc == 0 else ""
 
-    if not dry_run:
-        if not external_ip:
-            logger.warning("Warning: No external IP found.")
-        else:
-            logger.info(f"External IP: {external_ip}")
+        if not dry_run:
+            if not external_ip:
+                logger.warning("Warning: No external IP found.")
+            else:
+                logger.info(f"External IP: {external_ip}")
 
-    if wait_ssh:
-        logger.info(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
-        if not await wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, ssh_gateway=ssh_gateway, dry_run=dry_run):
-            return None
-        logger.info("SSH is ready.")
+        if wait_ssh:
+            logger.info(f"Waiting for SSH connectivity (timeout: {wait_ssh_timeout}s)...")
+            if not await wait_for_ssh(instance, zone, timeout=wait_ssh_timeout, ssh_gateway=ssh_gateway, dry_run=dry_run):
+                raise RuntimeError(f"SSH never came up on GCP instance '{instance}' within {wait_ssh_timeout}s")
+            logger.info("SSH is ready.")
 
-    return VMConnectionInfo(
-        host=external_ip or "dry-run-gcp-host",
-        username="",
-        ssh_port=22,
-        delete_info=("gcp", instance, zone),
-    )
+        return VMConnectionInfo(
+            host=external_ip or "dry-run-gcp-host",
+            username="",
+            ssh_port=22,
+            delete_info=("gcp", instance, zone),
+        )
+    except Exception:
+        logger.warning(f"Terminating orphan GCP instance '{instance}' in zone '{zone}' after exception.")
+        try:
+            await run_shell_cmd(_gcloud_delete_cmd(instance, zone), dry_run=dry_run)
+        except Exception as cleanup_exc:
+            logger.error(f"Failed to delete orphan GCP instance '{instance}': {cleanup_exc}")
+        raise
 
 
 async def delete_instance(instance, zone, dry_run=False):

@@ -1,7 +1,25 @@
 """Cloud VM provisioning: resolve specs, create/delete VMs.
 
 Bridge between the deploy layer and VM providers. All VM-related logic for
-bench and deploy CLI goes through this module.
+``deploy cloud``, ``bench``, and ``vm create --gpu`` goes through this
+module so the three paths share retry, fallback, and orphan-cleanup
+semantics.
+
+Allocation model — see :mod:`deplodock.provisioning.candidates`:
+
+* The orchestrator enumerates *candidates* (provider + instance type +
+  optional zone) in preference order from the hardware table.
+* For each candidate, it makes up to :data:`SAME_CANDIDATE_RETRIES`
+  attempts on transient errors.
+* On :class:`~deplodock.provisioning.errors.CapacityExhausted`, it
+  advances to the next candidate immediately (no same-candidate retry).
+* On :class:`~deplodock.provisioning.errors.TerminalProvisionError`, it
+  aborts and propagates to the caller.
+
+Provider orphans (VMs that were created but never reached a usable
+state) are terminated inside each provider's ``create_instance`` before
+it raises — see :mod:`deplodock.provisioning.cloudrift` and
+:mod:`deplodock.provisioning.gcp`.
 """
 
 import asyncio
@@ -13,17 +31,17 @@ from datetime import datetime
 
 from deplodock.hardware import (
     DEFAULT_GCP_PROVISIONING_MODEL,
-    DEFAULT_GCP_ZONE,
     GPU_GCP_PROVISIONING_MODEL,
-    GPU_GCP_ZONES,
-    GPU_INSTANCE_TYPES,
-    resolve_instance_type,
 )
 from deplodock.provisioning import cloudrift as cr_provider
 from deplodock.provisioning import gcp as gcp_provider
+from deplodock.provisioning.candidates import VmCandidate, iter_candidates
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.redact import register_secret
 
-DEFAULT_PROVISION_RETRIES = 3
+# How many times to retry the *same* candidate on a transient (non-capacity,
+# non-terminal) error before moving on to the next candidate.
+SAME_CANDIDATE_RETRIES = 2
 PROVISION_RETRY_DELAY = 10  # seconds
 
 logger = logging.getLogger(__name__)
@@ -69,22 +87,6 @@ def resolve_vm_spec(loaded_configs, server_name=None):
     return gpu_name, max_gpu_count
 
 
-def _select_provider_entry(gpu_name, gpu_entries, provider):
-    """Pick a (provider, base_type) tuple from the hardware table.
-
-    If provider is None, use the first entry (preference order). If provider
-    is set, find the matching entry or raise ValueError with the available
-    providers for this GPU.
-    """
-    if provider is None:
-        return gpu_entries[0]
-    for entry in gpu_entries:
-        if entry[0] == provider:
-            return entry
-    available = [p for p, _ in gpu_entries]
-    raise ValueError(f"GPU '{gpu_name}' not available on provider '{provider}'. Available: {available}")
-
-
 async def provision_cloud_vm(
     gpu_name,
     gpu_count,
@@ -93,154 +95,187 @@ async def provision_cloud_vm(
     server_name=None,
     dry_run=False,
     logger=None,
-    max_retries=DEFAULT_PROVISION_RETRIES,
     provider=None,
 ):
     """Provision a cloud VM for the given GPU requirements.
 
-    Retries up to max_retries times on failure (e.g. transient provider issues).
-    Looks up the provider from the hardware table and dispatches to the
-    provider's create_instance(). If provider is set, overrides the default
-    preference order in the hardware table.
+    Iterates candidates from :func:`iter_candidates` in preference order.
+    For each candidate, makes up to :data:`SAME_CANDIDATE_RETRIES` attempts
+    on transient failures, then advances to the next candidate on capacity
+    failures or after exhausting transient retries.
+
+    Args:
+        provider: optional provider filter. When set, candidates are
+            restricted to that provider — fallback never silently crosses
+            to another provider behind the caller's back.
 
     Returns:
-        VMConnectionInfo on success, None on failure.
+        VMConnectionInfo on success, None when every candidate is exhausted.
+
+    Raises:
+        TerminalProvisionError: on non-retryable provider errors (auth,
+            malformed request). Surfaces immediately without trying further
+            candidates.
     """
     logger = logger or logging.getLogger(__name__)
 
-    gpu_entries = GPU_INSTANCE_TYPES.get(gpu_name)
-    if not gpu_entries:
-        logger.error(f"Unknown GPU '{gpu_name}' — not in hardware table")
-        return None
+    candidates = iter_candidates(gpu_name, gpu_count, provider)
+    logger.info(f"GPU: {gpu_name} x{gpu_count} -> {len(candidates)} candidate(s): " + ", ".join(c.describe() for c in candidates))
 
-    selected_provider, base_type = _select_provider_entry(gpu_name, gpu_entries, provider)
-    instance_type = resolve_instance_type(selected_provider, base_type, gpu_count)
-    logger.info(f"GPU: {gpu_name} x{gpu_count} -> {selected_provider} {instance_type}")
+    last_err: Exception | None = None
+    for cand in candidates:
+        logger.info(f"Trying candidate: {cand.describe()}")
+        for attempt in range(1, SAME_CANDIDATE_RETRIES + 1):
+            try:
+                conn = await _provision_candidate(cand, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger)
+            except CapacityExhausted as exc:
+                logger.warning(f"{cand.describe()}: capacity exhausted ({exc}); advancing to next candidate.")
+                last_err = exc
+                break
+            except TerminalProvisionError:
+                # Auth / bad request / etc. — won't change across candidates.
+                raise
+            except Exception as exc:
+                last_err = exc
+                if attempt < SAME_CANDIDATE_RETRIES:
+                    logger.warning(
+                        f"{cand.describe()}: transient failure on attempt {attempt}/{SAME_CANDIDATE_RETRIES} ({exc}); "
+                        f"retrying same candidate in {PROVISION_RETRY_DELAY}s."
+                    )
+                    await asyncio.sleep(PROVISION_RETRY_DELAY)
+                    continue
+                logger.warning(
+                    f"{cand.describe()}: exhausted {SAME_CANDIDATE_RETRIES} same-candidate retries ({exc}); advancing to next candidate."
+                )
+                break
+            else:
+                if conn is not None or dry_run:
+                    return conn
+                # Soft None — treat like capacity exhaustion, advance immediately.
+                logger.warning(f"{cand.describe()}: provider returned None; advancing to next candidate.")
+                break
 
-    for attempt in range(1, max_retries + 1):
-        conn = await _provision_once(
-            selected_provider, instance_type, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger
-        )
-        if conn is not None or dry_run:
-            return conn
-
-        if attempt < max_retries:
-            logger.warning(f"Provisioning attempt {attempt}/{max_retries} failed, retrying in {PROVISION_RETRY_DELAY}s...")
-            await asyncio.sleep(PROVISION_RETRY_DELAY)
-        else:
-            logger.error(f"Provisioning failed after {max_retries} attempts")
-
+    logger.error(f"All {len(candidates)} candidate(s) exhausted for {gpu_name} x{gpu_count}. Last error: {last_err}")
     return None
 
 
-async def _provision_once(provider, instance_type, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger):
-    """Single provisioning attempt for a cloud VM. Returns VMConnectionInfo or None."""
-    if provider == "cloudrift":
-        api_key = os.environ.get("CLOUDRIFT_API_KEY")
-        if not api_key and not dry_run:
-            raise RuntimeError("CLOUDRIFT_API_KEY env var required for CloudRift provisioning")
-        register_secret(api_key or "")
+async def _provision_candidate(
+    cand: VmCandidate,
+    gpu_name: str,
+    gpu_count: int,
+    ssh_key: str,
+    providers_config,
+    server_name,
+    dry_run: bool,
+    logger,
+):
+    """Single provisioning attempt for one resolved candidate.
 
-        pub_key_path = f"{ssh_key}.pub"
+    Returns a ``VMConnectionInfo`` on success or ``None`` on a soft failure
+    the provider couldn't classify (extremely rare; treated like
+    ``CapacityExhausted`` by the orchestrator). Capacity-class and terminal
+    failures are raised, not returned.
+    """
+    if cand.provider == "cloudrift":
+        return await _provision_cloudrift(cand, ssh_key, providers_config, dry_run, logger)
+    if cand.provider == "gcp":
+        return await _provision_gcp(cand, gpu_name, ssh_key, providers_config, server_name, dry_run, logger)
+    raise ValueError(f"Unknown provider: {cand.provider}")
 
-        if dry_run:
-            logger.info(f"[dry-run] create instance type={instance_type} ssh_key={pub_key_path}")
 
-        cr_config = (providers_config or {}).get("cloudrift", {})
-        # config.yaml may override the image; otherwise create_instance auto-selects from instance_type.
-        image_url = cr_config.get("image_url")
-        billing_exempt = cr_config.get("billing_exempt", False)
+async def _provision_cloudrift(cand: VmCandidate, ssh_key, providers_config, dry_run, logger):
+    api_key = os.environ.get("CLOUDRIFT_API_KEY")
+    if not api_key and not dry_run:
+        raise TerminalProvisionError("CLOUDRIFT_API_KEY env var required for CloudRift provisioning")
+    register_secret(api_key or "")
 
-        conn = await cr_provider.create_instance(
-            api_key=api_key or "",
-            instance_type=instance_type,
-            ssh_key_path=pub_key_path,
-            image_url=image_url,
-            ports=[22, 8000, 8080],
-            timeout=600,
-            dry_run=dry_run,
-            fail_statuses={"Inactive"},
-            wait_ssh=True,
-            ssh_private_key_path=ssh_key,
-            billing_exempt=billing_exempt,
-        )
-        return conn
+    pub_key_path = f"{ssh_key}.pub"
 
-    elif provider == "gcp":
-        gcp_config = (providers_config or {}).get("gcp", {})
-        gpu_zones = GPU_GCP_ZONES.get(gpu_name)
-        zone = gpu_zones[0] if gpu_zones else DEFAULT_GCP_ZONE
-        provisioning_model = GPU_GCP_PROVISIONING_MODEL.get(gpu_name, DEFAULT_GCP_PROVISIONING_MODEL)
-        ssh_user = gcp_config.get("ssh_user", os.environ.get("USER", "deploy"))
-        ts = datetime.now().strftime("%m%d-%H%M")
-        suffix = secrets.token_hex(2)
-        raw_name = f"bench-{server_name}-{ts}-{suffix}" if server_name else f"bench-vm-{ts}-{suffix}"
-        instance_name = raw_name.lower().replace("_", "-")
+    if dry_run:
+        logger.info(f"[dry-run] create instance type={cand.instance_type} ssh_key={pub_key_path}")
 
-        if dry_run:
-            logger.info(f"[dry-run] create instance={instance_name} zone={zone} type={instance_type}")
+    cr_config = (providers_config or {}).get("cloudrift", {})
+    image_url = cr_config.get("image_url")
+    billing_exempt = cr_config.get("billing_exempt", False)
 
-        image_family = gcp_config.get("image_family", "debian-12")
-        image_project = gcp_config.get("image_project", "debian-cloud")
+    return await cr_provider.create_instance(
+        api_key=api_key or "",
+        instance_type=cand.instance_type,
+        ssh_key_path=pub_key_path,
+        image_url=image_url,
+        ports=[22, 8000, 8080],
+        timeout=600,
+        dry_run=dry_run,
+        fail_statuses={"Inactive"},
+        wait_ssh=True,
+        ssh_private_key_path=ssh_key,
+        billing_exempt=billing_exempt,
+    )
 
-        # Build extra gcloud args from config properties and env vars
-        extra_parts = []
 
-        service_account = gcp_config.get(
-            "service_account",
-            os.environ.get("GCP_SERVICE_ACCOUNT", ""),
-        )
-        if service_account:
-            register_secret(service_account)
-            extra_parts.append(f"--service-account={service_account}")
-            extra_parts.append("--scopes=https://www.googleapis.com/auth/cloud-platform")
+async def _provision_gcp(cand: VmCandidate, gpu_name, ssh_key, providers_config, server_name, dry_run, logger):
+    gcp_config = (providers_config or {}).get("gcp", {})
+    provisioning_model = GPU_GCP_PROVISIONING_MODEL.get(gpu_name, DEFAULT_GCP_PROVISIONING_MODEL)
+    ssh_user = gcp_config.get("ssh_user", os.environ.get("USER", "deploy"))
+    ts = datetime.now().strftime("%m%d-%H%M")
+    suffix = secrets.token_hex(2)
+    raw_name = f"bench-{server_name}-{ts}-{suffix}" if server_name else f"bench-vm-{ts}-{suffix}"
+    instance_name = raw_name.lower().replace("_", "-")
 
-        boot_disk_size = gcp_config.get("boot_disk_size")
-        if boot_disk_size:
-            extra_parts.append(f"--boot-disk-size={boot_disk_size}")
+    if dry_run:
+        logger.info(f"[dry-run] create instance={instance_name} zone={cand.zone} type={cand.instance_type}")
 
-        tags = gcp_config.get("tags")
-        if tags:
-            extra_parts.append(f"--tags={tags}")
+    image_family = gcp_config.get("image_family", "debian-12")
+    image_project = gcp_config.get("image_project", "debian-cloud")
 
-        # Inject SSH public key into VM metadata for direct SSH access
-        pub_key_path = f"{ssh_key}.pub"
-        if os.path.exists(pub_key_path) and not dry_run:
-            with open(pub_key_path) as f:
-                pub_key = f.read().strip()
-            metadata_arg = f"--metadata=ssh-keys={ssh_user}:{pub_key}"
-            extra_parts.append(shlex.quote(metadata_arg))
+    extra_parts = []
 
-        # Append any raw extra_gcloud_args from config
-        raw_extra = gcp_config.get("extra_gcloud_args", "")
-        if raw_extra:
-            extra_parts.append(raw_extra)
+    service_account = gcp_config.get("service_account", os.environ.get("GCP_SERVICE_ACCOUNT", ""))
+    if service_account:
+        register_secret(service_account)
+        extra_parts.append(f"--service-account={service_account}")
+        extra_parts.append("--scopes=https://www.googleapis.com/auth/cloud-platform")
 
-        extra_gcloud_args = " ".join(extra_parts) if extra_parts else None
+    boot_disk_size = gcp_config.get("boot_disk_size")
+    if boot_disk_size:
+        extra_parts.append(f"--boot-disk-size={boot_disk_size}")
 
-        if provisioning_model == "FLEX_START":
-            create_timeout = gcp_config.get("create_timeout_flex_start", 14400)
-        else:
-            create_timeout = gcp_config.get("create_timeout_spot", 600)
+    tags = gcp_config.get("tags")
+    if tags:
+        extra_parts.append(f"--tags={tags}")
 
-        conn = await gcp_provider.create_instance(
-            instance=instance_name,
-            zone=zone,
-            machine_type=instance_type,
-            provisioning_model=provisioning_model,
-            image_family=image_family,
-            image_project=image_project,
-            extra_gcloud_args=extra_gcloud_args,
-            timeout=create_timeout,
-            wait_ssh=True,
-            dry_run=dry_run,
-        )
-        if conn and conn.username == "":
-            conn.username = ssh_user
-        return conn
+    pub_key_path = f"{ssh_key}.pub"
+    if os.path.exists(pub_key_path) and not dry_run:
+        with open(pub_key_path) as f:
+            pub_key = f.read().strip()
+        extra_parts.append(shlex.quote(f"--metadata=ssh-keys={ssh_user}:{pub_key}"))
 
+    raw_extra = gcp_config.get("extra_gcloud_args", "")
+    if raw_extra:
+        extra_parts.append(raw_extra)
+
+    extra_gcloud_args = " ".join(extra_parts) if extra_parts else None
+
+    if provisioning_model == "FLEX_START":
+        create_timeout = gcp_config.get("create_timeout_flex_start", 14400)
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        create_timeout = gcp_config.get("create_timeout_spot", 600)
+
+    conn = await gcp_provider.create_instance(
+        instance=instance_name,
+        zone=cand.zone,
+        machine_type=cand.instance_type,
+        provisioning_model=provisioning_model,
+        image_family=image_family,
+        image_project=image_project,
+        extra_gcloud_args=extra_gcloud_args,
+        timeout=create_timeout,
+        wait_ssh=True,
+        dry_run=dry_run,
+    )
+    if conn and conn.username == "":
+        conn.username = ssh_user
+    return conn
 
 
 async def delete_cloud_vm(delete_info, dry_run=False):
