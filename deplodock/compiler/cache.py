@@ -31,9 +31,10 @@ locking).
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -51,6 +52,7 @@ class CudaPerf:
     status: str
     latency_us: float
     measured_at: str
+    knobs: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ class TuningCache:
             status       TEXT NOT NULL,
             latency_us   REAL NOT NULL,
             measured_at  TEXT NOT NULL,
+            knobs        TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (context_key, cuda_key)
         )
         """,
@@ -136,10 +139,14 @@ class TuningCache:
 
     def cuda_perf(self, context_key: str, cuda_key: str) -> CudaPerf | None:
         row = self._conn.execute(
-            "SELECT context_key, cuda_key, status, latency_us, measured_at FROM cuda_perf WHERE context_key = ? AND cuda_key = ?",
+            "SELECT context_key, cuda_key, status, latency_us, measured_at, knobs "
+            "FROM cuda_perf WHERE context_key = ? AND cuda_key = ?",
             (context_key, cuda_key),
         ).fetchone()
-        return CudaPerf(*row) if row else None
+        if row is None:
+            return None
+        knobs = json.loads(row[5]) if row[5] else {}
+        return CudaPerf(row[0], row[1], row[2], row[3], row[4], knobs)
 
     def is_fully_explored(self, context_key: str, node_key: str) -> bool:
         """O(1) — true iff every known leaf below ``node_key`` has been
@@ -211,6 +218,7 @@ class TuningCache:
         *,
         latency_us: float,
         status: str = "ok",
+        knobs: dict | None = None,
     ) -> bool:
         """Record a terminal measurement and propagate ``+1`` to
         ``seen_terminals`` on every ancestor. The cache keeps the *best*
@@ -222,9 +230,11 @@ class TuningCache:
         existing = self.cuda_perf(context_key, cuda_key)
         keep_best = existing is not None and existing.status == "ok" and status == "ok" and latency_us >= existing.latency_us
         if not keep_best:
+            knobs_json = json.dumps(knobs or {}, sort_keys=True, default=str)
             self._conn.execute(
-                "INSERT OR REPLACE INTO cuda_perf (context_key, cuda_key, status, latency_us, measured_at) VALUES (?, ?, ?, ?, ?)",
-                (context_key, cuda_key, status, latency_us, datetime.now(UTC).isoformat()),
+                "INSERT OR REPLACE INTO cuda_perf (context_key, cuda_key, status, latency_us, measured_at, knobs) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (context_key, cuda_key, status, latency_us, datetime.now(UTC).isoformat(), knobs_json),
             )
 
         # Make sure the node row exists for this cuda_key (the engine
@@ -414,10 +424,11 @@ def record_terminal(
             _record_one(cache, context_key, node.op, latency_us=1.0, status="ok")
         return
 
+    logger.info("[tune] benching %d kernel(s) in graph", len(cuda_nodes))
     try:
         result = backend.benchmark(graph, num_iters="auto")
     except Exception as exc:  # noqa: BLE001 — autotune cache must record any failure mode
-        logger.warning("cache: backend.benchmark failed (%s) — pinning bench_fail for %d kernel(s)", exc, len(cuda_nodes))
+        logger.warning("[tune] backend.benchmark failed (%s) — pinning bench_fail for %d kernel(s)", exc, len(cuda_nodes))
         for node in cuda_nodes:
             _record_one(cache, context_key, node.op, latency_us=0.0, status="bench_fail")
         return
@@ -425,7 +436,7 @@ def record_terminal(
     per_launch = result.per_launch or []
     if len(per_launch) != len(cuda_nodes):
         logger.warning(
-            "cache: per_launch count (%d) != CudaOp node count (%d); falling back to graph time_ms / N",
+            "[tune] per_launch count (%d) != CudaOp node count (%d); falling back to graph time_ms / N",
             len(per_launch),
             len(cuda_nodes),
         )
@@ -441,9 +452,14 @@ def record_terminal(
 def _record_one(cache: TuningCache, context_key: str, cuda_op, *, latency_us: float, status: str) -> None:
     """Insert one ``cuda_perf`` row keyed on the CudaOp's structural
     digest; the cache walks ``parent_key`` chains internally to update
-    ``seen_terminals``."""
+    ``seen_terminals``. Knobs accumulated along the rewrite chain are
+    persisted alongside the latency so a partial sweep is still
+    self-describing without the in-memory candidate."""
     cuda_key = op_cache_key(cuda_op)
     if cuda_key is None:
         return
-    cache.record_cuda_perf(context_key, cuda_key, latency_us=latency_us, status=status)
-    logger.debug("cache: %s for kernel %s @ %.2f us", status, getattr(cuda_op, "kernel_name", "?"), latency_us)
+    knobs = getattr(cuda_op, "knobs", None) or {}
+    cache.record_cuda_perf(context_key, cuda_key, latency_us=latency_us, status=status, knobs=knobs)
+    # INFO so ``deplodock compile --tune -v`` shows per-kernel progress;
+    # at default WARNING level we stay quiet.
+    logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), latency_us, status)

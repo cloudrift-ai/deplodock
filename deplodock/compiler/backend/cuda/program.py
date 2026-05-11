@@ -367,8 +367,35 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
 
 
 _AUTO_BUDGET_MS = 100.0
-_AUTO_MIN_ITERS = 10
 _AUTO_MAX_ITERS = 100_000
+# Per-launch wall-clock cap. Any single kernel launch exceeding this is
+# considered "broken" — too many threads, infinite loop, hung GPU — and
+# the bench bails out via ``RuntimeError`` so the autotune sweep doesn't
+# stall on one bad variant.
+_KERNEL_TIMEOUT_MS = 1000.0
+
+
+def _wait_for_event(event, timeout_ms: float, label: str) -> None:
+    """Block until ``event`` completes, polling rather than calling the
+    blocking ``synchronize()``. Raises ``RuntimeError`` on timeout —
+    necessary because once a CUDA kernel is hung, ``synchronize()``
+    blocks indefinitely (the driver only resets after minutes), which
+    stalls the autotune sweep on a single bad variant.
+
+    Caveat: a hung kernel is still queued on the device after we give
+    up here, so the *next* launch queues behind it and may also be
+    slow. That's still vastly better than blocking forever in this
+    one bench."""
+    import time as _time
+
+    import cupy as _cp  # noqa: PLC0415
+
+    deadline = _time.perf_counter() + timeout_ms / 1000.0
+    while not event.done:
+        if _time.perf_counter() > deadline:
+            raise RuntimeError(f"kernel {label!r} did not complete within {timeout_ms:.0f} ms — variant marked bench_fail")
+        _time.sleep(0.001)
+    _cp.cuda.runtime.eventSynchronize(event.ptr)  # cheap post-completion sync
 
 
 def benchmark_program(
@@ -380,48 +407,35 @@ def benchmark_program(
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
 
-    ``num_iters`` accepts an explicit count or the string ``"auto"``. In
-    auto mode the loop runs at least ``_AUTO_MIN_ITERS`` iterations and
-    keeps going until the accumulated *GPU* time across all launches
-    (sum of per-kernel event deltas) reaches ``_AUTO_BUDGET_MS``, capped
-    at ``_AUTO_MAX_ITERS``. This adapts the iter count to the kernel
-    cost: a 7-µs RMSNorm gets ~14k iters at 100 ms budget, a 1-ms matmul
-    gets ~100. The result's ``time_ms`` is the mean of the actually-run
-    iterations.
+    Single loop covers warmup + measurement: the first ``warmup`` iters
+    are discarded, the rest are counted toward the result. Per-launch
+    timing is still recorded for every iteration so the
+    ``_KERNEL_TIMEOUT_MS`` watchdog can abort the bench on a bad kernel
+    even during warmup.
 
-    ``on_iter``, if provided, is a no-arg callable invoked **before**
-    each iteration of both the warmup and the measured loop. Used by
-    the perf suite to interleave a PyTorch reference run with the
-    Deplodock launches so both backends see the same warm GPU state
-    (same clocks, same caches) — comparing one-after-the-other can
-    give the second-run backend a thermal/cache advantage worth tens
-    of percent on small kernels. The callable is responsible for any
-    timing of its own work."""
+    ``num_iters`` accepts an explicit count or the string ``"auto"``. In
+    auto mode the loop accumulates measured GPU time until it reaches
+    ``_AUTO_BUDGET_MS`` (capped at ``_AUTO_MAX_ITERS`` measured iters).
+    For a 7-µs RMSNorm that's ~14k iters; a 1-ms matmul gets ~100. The
+    result's ``time_ms`` is the mean of measured iterations.
+
+    ``on_iter`` — see autotune flow note below."""
     import cupy as cp
 
     if isinstance(num_iters, str):
         if num_iters != "auto":
             raise ValueError(f"num_iters must be int or 'auto', got {num_iters!r}")
         target_total_ms = _AUTO_BUDGET_MS
-        min_iters = _AUTO_MIN_ITERS
-        max_iters = _AUTO_MAX_ITERS
+        max_measured = _AUTO_MAX_ITERS
         auto = True
     else:
         target_total_ms = float("inf")
-        min_iters = int(num_iters)
-        max_iters = int(num_iters)
+        max_measured = int(num_iters)
         auto = False
 
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
     descs = _prebuild_descriptors(compiled, arrays)
-
-    for _ in range(warmup):
-        if on_iter is not None:
-            on_iter()
-        for li, launch in enumerate(compiled.launches):
-            _launch(launch, compiled, arrays, descs.get(li))
-    cp.cuda.runtime.deviceSynchronize()
 
     n = len(compiled.launches)
     starts = [cp.cuda.Event() for _ in range(n)]
@@ -429,10 +443,12 @@ def benchmark_program(
     acc = [0.0] * n
 
     iters_run = 0
+    measured = 0
     cumulative_gpu_ms = 0.0
-    while iters_run < max_iters:
+    while True:
         if on_iter is not None:
             on_iter()
+        iter_dts = [0.0] * n
         for i, launch in enumerate(compiled.launches):
             starts[i].record()
             _launch(launch, compiled, arrays, descs.get(i))
@@ -442,22 +458,28 @@ def benchmark_program(
             # event slide into a downstream kernel's scheduling window,
             # which ends up attributing 0.5-0.8 ms of phantom time to
             # whichever sub-100µs kernel happens to land at a stream-
-            # stall position. The added sync overhead is negligible vs
-            # the kernels' work and only affects the benchmark window,
-            # not what ``time_ms`` reports (which is the sum of per-
-            # kernel events — pure GPU work, no sync overhead).
-            stops[i].synchronize()
-        iter_total = 0.0
-        for i in range(n):
+            # stall position. Polling-with-timeout instead of blocking
+            # ``synchronize()`` so the autotune sweep can abort a single
+            # hung kernel instead of stalling forever.
+            _wait_for_event(stops[i], _KERNEL_TIMEOUT_MS, launch.kernel_name)
             dt = cp.cuda.get_elapsed_time(starts[i], stops[i])
-            acc[i] += dt
-            iter_total += dt
-        cumulative_gpu_ms += iter_total
+            iter_dts[i] = dt
         iters_run += 1
-        if auto and iters_run >= min_iters and cumulative_gpu_ms >= target_total_ms:
+        # Warmup iters: discard. ``iter_dts`` is still subject to the
+        # timeout check above so a hung kernel is caught early.
+        if iters_run <= warmup:
+            continue
+        # Measured iter: accumulate.
+        for i in range(n):
+            acc[i] += iter_dts[i]
+        cumulative_gpu_ms += sum(iter_dts)
+        measured += 1
+        if measured >= max_measured:
+            break
+        if auto and cumulative_gpu_ms >= target_total_ms:
             break
 
-    iters = max(iters_run, 1)
+    iters = max(measured, 1)
     per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / iters) for i in range(n)]
     return BenchmarkResult(
         time_ms=sum(acc) / iters,

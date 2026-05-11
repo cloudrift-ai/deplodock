@@ -630,6 +630,10 @@ def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str
         old_op = graph.nodes[match.root_node_id].op
         if result is not old_op and result.source is None:
             result.source = old_op
+            # Merge predecessor knobs forward; rule-set knobs win on key
+            # collision. Build a fresh dict so we don't accidentally
+            # mutate the predecessor's metadata.
+            result.knobs = {**old_op.knobs, **result.knobs}
         graph.nodes[match.root_node_id].op = result
         return graph
     assert isinstance(result, Graph), f"rule {rule_name} returned {type(result).__name__}; expected Graph, Op, list, or RuleSkipped"
@@ -928,11 +932,25 @@ def run_autotune(
     search.push(Candidate(graph=graph, ctx=ctx))
 
     cache: TuningCache | None = getattr(search, "cache", None)
+    n_terminals = 0
     for cand in _search_loop(search, rules_per_pass, passes, ctx, dump):
+        n_terminals += 1
+        if backend is not None:
+            # Collect knobs from every terminal kernel in the graph so
+            # the log line reflects the *actual* autotune choices that
+            # produced this variant, not just the rule:choice indices.
+            knob_strs: list[str] = []
+            for nid in cand.graph.topological_order():
+                op = cand.graph.nodes[nid].op
+                k = getattr(op, "knobs", None) or {}
+                if k:
+                    knob_strs.append(", ".join(f"{kk}={vv}" for kk, vv in sorted(k.items())))
+            label = " | ".join(knob_strs) if knob_strs else "option-0"
+            logger.info("[tune] variant #%d  [%s]", n_terminals, label)
         if cache is not None:
             record_terminal(cand.graph, cache, cand.ctx.structural_key(), backend=backend)
         yield cand
-    logger.info("compile: total %.2fs", time.monotonic() - t_start)
+    logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 
 
 def _filter_rules(rules: list[_Rule], select_set: set[str] | None) -> list[_Rule]:

@@ -129,34 +129,44 @@ class Backend(ABC):
         Backends with better timing (e.g. CUDA using GPU events inside an
         nvcc-compiled subprocess) override for device-precise measurements.
 
+        Single loop covers warmup + measurement (the first ``warmup`` iters
+        are discarded). A per-call wall-time watchdog (``1000 ms``) raises
+        ``RuntimeError`` if any single ``run()`` exceeds it — autotune
+        sweeps catch this and mark the variant ``bench_fail``.
+
         ``num_iters="auto"`` adapts the iter count to the per-call cost:
-        keep running until accumulated wall time reaches 100 ms (the
-        hardcoded auto budget), clamped to ``[10, 100_000]`` iterations.
+        keep running measured iters until accumulated wall time reaches
+        100 ms, capped at ``100_000`` measured iters.
         """
         if isinstance(num_iters, str):
             if num_iters != "auto":
                 raise ValueError(f"num_iters must be int or 'auto', got {num_iters!r}")
             target_total_ms = 100.0
-            min_iters = 10
-            max_iters = 100_000
+            max_measured = 100_000
             auto = True
         else:
             target_total_ms = float("inf")
-            min_iters = int(num_iters)
-            max_iters = int(num_iters)
+            max_measured = int(num_iters)
             auto = False
 
-        for _ in range(warmup):
-            self.run(compiled, input_data=input_data)
+        kernel_timeout_ms = 1000.0
+        iters_run = 0
         times: list[float] = []
         cumulative_ms = 0.0
-        while len(times) < max_iters:
+        while True:
             t0 = time.perf_counter()
             self.run(compiled, input_data=input_data)
             dt = (time.perf_counter() - t0) * 1000
+            if dt > kernel_timeout_ms:
+                raise RuntimeError(f"run() took {dt:.1f} ms — exceeds {kernel_timeout_ms:.0f} ms timeout")
+            iters_run += 1
+            if iters_run <= warmup:
+                continue
             times.append(dt)
             cumulative_ms += dt
-            if auto and len(times) >= min_iters and cumulative_ms >= target_total_ms:
+            if len(times) >= max_measured:
+                break
+            if auto and cumulative_ms >= target_total_ms:
                 break
         return BenchmarkResult(
             time_ms=sum(times) / len(times),

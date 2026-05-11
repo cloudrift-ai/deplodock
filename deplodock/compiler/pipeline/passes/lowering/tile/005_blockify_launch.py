@@ -52,7 +52,7 @@ from deplodock.compiler.tuning import _has_matmul_reduce, thread_tile_shape
 PATTERN = [Pattern("root", TileOp)]
 
 # Candidate per-axis THREAD widths to fork over for matmul tiles.
-_TUNE_AXIS_CHOICES: tuple[int, ...] = (32, 64, 128)
+_TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 
 
 def rewrite(root: Node) -> Graph | None | list[TileOp]:
@@ -60,6 +60,12 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     idx, tile = single_tile(body)
     if tile.block_axes:
         raise RuleSkipped("Tile already partitioned (block_axes non-empty)")
+    # Explicit idempotence — same reason as 008's ``register_tile`` knob.
+    # A ``(BN, BM)`` variant where the matmul output extents are ≤ the
+    # picked widths produces post-partition axes identical to pre-, so the
+    # pattern still matches on re-entry. The ``blockify`` knob short-circuits.
+    if root.op.knobs.get("blockify"):
+        raise RuleSkipped("blockify already applied (knobs['blockify'] set)")
 
     if _has_matmul_reduce(tile.body):
         variants = _matmul_variants(body, idx, tile, root.op.name)
@@ -119,7 +125,14 @@ def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
             continue
         if partitioned is None:
             continue
-        variants.append(TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=name))
+        bn, bm = shape
+        variants.append(
+            TileOp(
+                body=body[:idx] + (partitioned,) + body[idx + 1 :],
+                name=name,
+                knobs={"BN": bn, "BM": bm, "blockify": True},
+            )
+        )
     return variants
 
 

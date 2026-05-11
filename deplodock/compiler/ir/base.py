@@ -33,6 +33,13 @@ class Op:
     """
 
     source: Op | None = field(default=None, kw_only=True, repr=False, compare=False)
+    # Free-form metadata dict for rules to stamp the knobs they used
+    # (e.g. ``{"BN": 64, "BM": 64}`` from ``005_blockify_launch``). The
+    # engine's ``_apply_one`` merges the predecessor's knobs forward on
+    # every 1:1 rebind, so a fully-lowered ``CudaOp`` carries every
+    # autotune knob picked along the chain. Excluded from structural
+    # identity and equality — pure attribution metadata.
+    knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         """Derive the output shape from input shapes. Override in subclasses."""

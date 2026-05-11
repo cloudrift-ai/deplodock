@@ -6,7 +6,9 @@ node carries a rendered CUDA kernel source plus its launch geometry.
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,6 +16,44 @@ import numpy as np
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import benchmark_program, make_runner, run_program, run_program_debug
 from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
+
+logger = logging.getLogger(__name__)
+
+# Hard wall-clock cap for ``benchmark()`` calls. Wraps the whole bench
+# in a daemon worker thread; if it doesn't return within this budget we
+# abandon and raise ``RuntimeError``. Needed because NVRTC compilation
+# inside the first kernel launch can take 30+ s on heavily-replicated
+# kernels (e.g. autotune variants with F_M*F_N=256 cells), which would
+# otherwise stall the whole sweep on one bad variant.
+_BENCH_WALL_TIMEOUT_S = 10.0
+
+
+def _benchmark_with_timeout(graph, *, warmup, num_iters, on_iter):
+    """Run ``benchmark_program`` in a daemon worker; raise on timeout.
+
+    The worker captures the return value or exception in a shared dict.
+    On timeout the worker is abandoned (still daemon, dies with the
+    process) — GPU memory it allocated leaks until the eventual NVRTC
+    compile/kernel finishes or the process exits. Acceptable for an
+    autotune sweep: a handful of timeouts cost some headroom but the
+    sweep keeps moving instead of stalling forever."""
+    box: dict[str, object] = {}
+
+    def _worker() -> None:
+        try:
+            box["value"] = benchmark_program(graph, warmup=warmup, num_iters=num_iters, on_iter=on_iter)
+        except BaseException as exc:  # noqa: BLE001 — pass everything back through the box
+            box["error"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True, name="deplodock-bench")
+    t.start()
+    t.join(timeout=_BENCH_WALL_TIMEOUT_S)
+    if t.is_alive():
+        logger.warning("benchmark exceeded %.1fs wall budget — abandoning worker thread", _BENCH_WALL_TIMEOUT_S)
+        raise RuntimeError(f"benchmark exceeded {_BENCH_WALL_TIMEOUT_S:.1f}s wall budget — variant marked bench_fail")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
@@ -74,7 +114,7 @@ class CudaBackend(Backend):
         on_iter=None,
     ) -> BenchmarkResult:
         del input_data
-        result = benchmark_program(compiled, warmup=warmup, num_iters=num_iters, on_iter=on_iter)
+        result = _benchmark_with_timeout(compiled, warmup=warmup, num_iters=num_iters, on_iter=on_iter)
         return BenchmarkResult(
             time_ms=result.time_ms,
             num_launches=result.num_launches,

@@ -256,31 +256,13 @@ def _is_boundary(op) -> bool:
     return isinstance(op, (InputOp, ConstantOp))
 
 
-def _post_blockify_bn_bm(cuda_op) -> tuple[int, int] | None:
-    """Walk ``CudaOp.source`` back to the post-005 TileOp and read the
-    chosen ``(BN, BM)`` from its THREAD axes (the largest THREAD product
-    in the chain — pre-008-register-tile state)."""
-    from deplodock.compiler.ir.axis import BIND_THREAD  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt import Tile  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
-
-    best: tuple[int, int] | None = None
-    best_prod = -1
-    cur = cuda_op
-    while cur is not None:
-        if isinstance(cur, TileOp):
-            for s in cur.body:
-                if isinstance(s, Tile) and s.block_axes:
-                    thread_axes = [ba for ba in s.axes if ba.bind == BIND_THREAD]
-                    if len(thread_axes) == 2:
-                        bn = int(thread_axes[-1].axis.extent)
-                        bm = int(thread_axes[-2].axis.extent)
-                        prod = bn * bm
-                        if prod > best_prod:
-                            best_prod = prod
-                            best = (bn, bm)
-        cur = cur.source
-    return best
+def _format_knobs(cuda_op) -> str:
+    """Render ``CudaOp.knobs`` (forwarded from every Op-rebind along the
+    rewrite chain) as a compact ``key=value`` string. Empty dict → ``-``."""
+    knobs = getattr(cuda_op, "knobs", None) or {}
+    if not knobs:
+        return "-"
+    return ", ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
 
 
 def _print_tune_summary(candidates, cache) -> None:
@@ -300,7 +282,7 @@ def _print_tune_summary(candidates, cache) -> None:
         cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
         per_kernel: list[tuple[str, float]] = []
         total = 0.0
-        shapes: list[str] = []
+        knob_strs: list[str] = []
         for node in cuda_nodes:
             key = op_cache_key(node.op)
             row = cache.cuda_perf(ctx_key, key) if key else None
@@ -308,22 +290,20 @@ def _print_tune_summary(candidates, cache) -> None:
             per_kernel.append((node.op.kernel_name, latency))
             if row is not None and row.status == "ok":
                 total += latency
-            bn_bm = _post_blockify_bn_bm(node.op)
-            if bn_bm is not None:
-                shapes.append(f"(BN={bn_bm[0]},BM={bn_bm[1]})")
-        shape_str = " ".join(shapes) if shapes else "-"
-        rows.append((total, shape_str, per_kernel))
+            knob_strs.append(_format_knobs(node.op))
+        knobs_str = " | ".join(knob_strs) if knob_strs else "-"
+        rows.append((total, knobs_str, per_kernel))
 
     rows.sort(key=lambda r: r[0])
     sys.stderr.write(f"\n[tune] explored {len(rows)} variant(s):\n")
-    sys.stderr.write(f"{'rank':>4}  {'total_us':>10}  shape per kernel\n")
-    for rank, (total, shape_str, _) in enumerate(rows):
+    sys.stderr.write(f"{'rank':>4}  {'total_us':>10}  knobs per kernel\n")
+    for rank, (total, knobs_str, _) in enumerate(rows):
         marker = "*" if rank == 0 else " "
-        sys.stderr.write(f"{rank:>4}{marker} {total:>10.2f}  {shape_str}\n")
+        sys.stderr.write(f"{rank:>4}{marker} {total:>10.2f}  {knobs_str}\n")
 
     if rows:
-        best_total, best_shape, best_kernels = rows[0]
-        sys.stderr.write(f"\n[tune] winner {best_shape}: {best_total:.2f} us total\n")
+        best_total, best_knobs, best_kernels = rows[0]
+        sys.stderr.write(f"\n[tune] winner [{best_knobs}]: {best_total:.2f} us total\n")
         for name, latency in best_kernels:
             sys.stderr.write(f"         {name:<48}  {latency:>10.2f} us\n")
 
