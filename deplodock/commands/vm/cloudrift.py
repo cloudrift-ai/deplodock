@@ -9,7 +9,6 @@ from deplodock.provisioning.cloudrift import (
     DEFAULT_API_URL,
     create_instance,
     delete_instance,
-    select_image_url,
 )
 from deplodock.redact import register_secret
 
@@ -40,14 +39,11 @@ def handle_create(args):
 async def _handle_create(args):
     api_key = _resolve_api_key(args.api_key)
     ports = [int(p) for p in args.ports.split(",")] if args.ports else None
-    image_url = args.image_url or select_image_url(args.instance_type)
-    if not args.image_url:
-        logger.info(f"Selected image for {args.instance_type}: {image_url}")
     conn = await create_instance(
         api_key=api_key,
         instance_type=args.instance_type,
         ssh_key_path=args.ssh_key,
-        image_url=image_url,
+        image_url=args.image_url,
         ports=ports,
         timeout=args.timeout,
         api_url=args.api_url,

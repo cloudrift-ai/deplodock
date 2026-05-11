@@ -15,6 +15,7 @@ from deplodock.provisioning.cloudrift import (
     _api_request,
     _ensure_ssh_key,
     _get_instance_info,
+    _instance_fully_ready,
     _list_ssh_keys,
     _log_connection_info,
     _rent_instance,
@@ -366,6 +367,40 @@ def test_select_image_url_nvidia_h200():
 def test_default_image_url_alias_points_to_nvidia():
     """DEFAULT_IMAGE_URL must remain a NVIDIA alias for backward compat."""
     assert DEFAULT_IMAGE_URL == DEFAULT_IMAGE_URL_NVIDIA
+
+
+# ── _instance_fully_ready ────────────────────────────────────────
+
+
+def test_instance_fully_ready_happy_path():
+    info = INSTANCE_ACTIVE_RESPONSE["instances"][0]
+    assert _instance_fully_ready(info) is True
+
+
+def test_instance_fully_ready_missing_host_address():
+    info = {"status": "Active", "host_address": None, "port_mappings": [[22, 22222]]}
+    assert _instance_fully_ready(info) is False
+
+
+def test_instance_fully_ready_null_port_mappings():
+    info = {"status": "Active", "host_address": "1.2.3.4", "port_mappings": None}
+    assert _instance_fully_ready(info) is False
+
+
+def test_instance_fully_ready_vm_not_ready_yet():
+    info = {
+        "status": "Active",
+        "host_address": "1.2.3.4",
+        "port_mappings": [[22, 22222]],
+        "virtual_machines": [{"ready": False}],
+    }
+    assert _instance_fully_ready(info) is False
+
+
+def test_instance_fully_ready_bare_metal_no_vms():
+    """Bare-metal instances have no virtual_machines list; networking alone suffices."""
+    info = {"status": "Active", "host_address": "1.2.3.4", "port_mappings": [[22, 22222]]}
+    assert _instance_fully_ready(info) is True
 
 
 def test_default_api_url_fallback(monkeypatch):

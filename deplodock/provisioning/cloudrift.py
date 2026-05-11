@@ -204,16 +204,31 @@ async def wait_for_status(
             elapsed += interval
             continue
         status = info.get("status")
-        if status == target_status:
-            return info
         if status in fail_statuses:
             logger.error(f"Instance {instance_id} reached fail status '{status}'")
             return None
+        if status == target_status and _instance_fully_ready(info):
+            return info
         await asyncio.sleep(interval)
         elapsed += interval
 
     logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
     return None
+
+
+def _instance_fully_ready(info):
+    """Return True if the instance has finished networking and (for VMs) is ready.
+
+    CloudRift flips ``status`` to ``Active`` before ``host_address`` / ``port_mappings``
+    are populated and before the VM's own ``ready`` flag is set. Acting on Active
+    alone gives a connection target with ``host=None`` and an empty port table.
+    """
+    if not info.get("host_address") or not info.get("port_mappings"):
+        return False
+    vms = info.get("virtual_machines") or []
+    if vms and not vms[0].get("ready"):
+        return False
+    return True
 
 
 def _extract_connection_info(instance, delete_info=()):
@@ -291,7 +306,7 @@ async def create_instance(
     api_key,
     instance_type,
     ssh_key_path,
-    image_url=DEFAULT_IMAGE_URL,
+    image_url=None,
     ports=None,
     timeout=600,
     api_url=DEFAULT_API_URL,
@@ -304,6 +319,8 @@ async def create_instance(
     """Create a CloudRift VM instance.
 
     Args:
+        image_url: VM image URL. If ``None``, auto-picks ROCm for ``mi*`` instance
+            types and NVIDIA otherwise via :func:`select_image_url`.
         ssh_key_path: path to the SSH **public** key file.
         fail_statuses: optional set of statuses that trigger immediate failure
             (e.g. {"Inactive"}).
@@ -314,6 +331,9 @@ async def create_instance(
         VMConnectionInfo on success, None on failure.
         In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
+    if image_url is None:
+        image_url = select_image_url(instance_type)
+        logger.info(f"Auto-selected image for {instance_type}: {image_url}")
     logger.info(f"Creating CloudRift instance (type={instance_type})...")
 
     ssh_key_path = os.path.expanduser(ssh_key_path)
