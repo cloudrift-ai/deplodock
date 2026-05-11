@@ -197,7 +197,20 @@ async def wait_for_status(
     status = None
     last_info = None
     while elapsed < timeout:
-        info = await _get_instance_info(api_key, instance_id, api_url)
+        try:
+            info = await _get_instance_info(api_key, instance_id, api_url)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                logger.warning(f"Transient {exc.response.status_code} from CloudRift while polling {instance_id}; retrying.")
+                await asyncio.sleep(interval)
+                elapsed += interval
+                continue
+            raise
+        except httpx.RequestError as exc:
+            logger.warning(f"Network error polling CloudRift for {instance_id}: {exc}; retrying.")
+            await asyncio.sleep(interval)
+            elapsed += interval
+            continue
         if info is None:
             logger.warning(f"Warning: instance {instance_id} not found.")
             await asyncio.sleep(interval)
@@ -380,7 +393,15 @@ async def create_instance(
     instance_id = instance_ids[0]
     logger.info(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
-    info = await wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
+    try:
+        info = await wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
+    except Exception:
+        logger.warning(f"Terminating orphaned instance {instance_id} after exception during wait_for_status.")
+        try:
+            await _terminate_instance(api_key, instance_id, api_url)
+        except Exception as exc:
+            logger.error(f"Failed to terminate orphaned instance {instance_id}: {exc}")
+        raise
     if info is None:
         logger.warning(f"Terminating orphaned instance {instance_id} after wait_for_status failure.")
         try:

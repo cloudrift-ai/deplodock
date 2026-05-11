@@ -5,6 +5,8 @@ Response fixtures are captured from real CloudRift API calls.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
 from deplodock.provisioning.cloudrift import (
     API_VERSION,
     DEFAULT_CLOUDINIT_URL,
@@ -533,3 +535,70 @@ async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait,
 
     assert conn is None
     assert "Failed to terminate orphaned instance inst-orphan" in caplog.text
+
+
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_terminates_orphan_on_exception(mock_rent, mock_wait, mock_terminate, tmp_path):
+    """When wait_for_status raises, the rented instance must be terminated and the exception re-raised."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
+    mock_wait.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+    mock_terminate.assert_awaited_once()
+    assert mock_terminate.await_args.args[1] == "inst-orphan"
+
+
+# ── wait_for_status transient-error handling ─────────────────────
+
+
+def _http_status_error(code):
+    """Construct an httpx.HTTPStatusError with a given status code."""
+    request = httpx.Request("POST", "https://api.test/instances/list")
+    response = httpx.Response(code, request=request)
+    return httpx.HTTPStatusError(f"HTTP {code}", request=request, response=response)
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_retries_transient_5xx(mock_get, mock_sleep):
+    """A transient 5xx during polling must be retried, not propagated."""
+    mock_get.side_effect = [
+        _http_status_error(502),
+        _http_status_error(503),
+        _active_response(ready=True),
+    ]
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+    assert info is not None
+    assert mock_get.await_count == 3
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_propagates_4xx(mock_get, mock_sleep):
+    """A 4xx (auth, bad request) is terminal and must propagate."""
+    import pytest
+
+    mock_get.side_effect = _http_status_error(401)
+    with pytest.raises(httpx.HTTPStatusError):
+        await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_retries_network_error(mock_get, mock_sleep):
+    """httpx network errors (timeout, connection refused, etc.) must be retried."""
+    mock_get.side_effect = [
+        httpx.ConnectError("connection refused"),
+        _active_response(ready=True),
+    ]
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+    assert info is not None
+    assert mock_get.await_count == 2
