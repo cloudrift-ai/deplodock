@@ -66,6 +66,8 @@ deplodock vm create cloudrift \
 
 The command requires the **public** key path (`.pub`), not the private key. `CLOUDRIFT_API_KEY` must be set in the environment (or pass `--api-key`). The command waits up to 600s for `Active` status and prints the SSH connection on success.
 
+**Image is auto-selected from the instance type.** Instance types starting with `mi` (AMD Instinct, e.g. `mi350x-...`) get the ROCm image; everything else gets the NVIDIA driver image. Do not pass `--image-url` unless the user explicitly wants to override — the wrong image leaves the GPU unusable because the kernel modules for the other vendor aren't on disk.
+
 **`--billing-exempt`** is an admin-only flag that skips CloudRift billing. Always confirm with the user before adding it; never set it implicitly. It is silently accepted by the API only for accounts authorized for no-cost rentals — passing it on a regular account will likely fail or be billed normally. The flag is CloudRift-specific and does not exist for GCP.
 
 **Sourcing the API key and URL from env files:** deplodock does **not** auto-load env files (no `python-dotenv` dependency). The repo root typically has a base `.env`. The user may also keep additional `.env.*` files that point at different clusters / accounts.

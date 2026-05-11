@@ -13,9 +13,26 @@ from deplodock.provisioning.types import VMConnectionInfo
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = os.environ.get("CLOUDRIFT_API_URL", "https://api.cloudrift.ai")
-DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
+DEFAULT_IMAGE_URL_NVIDIA = (
+    "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
+)
+DEFAULT_IMAGE_URL_AMD = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
+DEFAULT_IMAGE_URL = DEFAULT_IMAGE_URL_NVIDIA  # backward-compat alias
 DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
 API_VERSION = "~upcoming"
+
+
+def select_image_url(instance_type):
+    """Pick the right OS image for a CloudRift instance type.
+
+    AMD Instinct instance types start with ``mi`` (e.g. ``mi350x-15-250-1000-gv.1``)
+    and need the ROCm image; everything else gets the NVIDIA image. Mismatches
+    leave the GPU unusable because the kernel module for the wrong vendor isn't
+    on disk.
+    """
+    if instance_type.startswith("mi"):
+        return DEFAULT_IMAGE_URL_AMD
+    return DEFAULT_IMAGE_URL_NVIDIA
 
 
 # ── API helpers ───────────────────────────────────────────────────

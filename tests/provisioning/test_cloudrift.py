@@ -9,6 +9,8 @@ from deplodock.provisioning.cloudrift import (
     API_VERSION,
     DEFAULT_CLOUDINIT_URL,
     DEFAULT_IMAGE_URL,
+    DEFAULT_IMAGE_URL_AMD,
+    DEFAULT_IMAGE_URL_NVIDIA,
     _add_ssh_key,
     _api_request,
     _ensure_ssh_key,
@@ -17,6 +19,7 @@ from deplodock.provisioning.cloudrift import (
     _log_connection_info,
     _rent_instance,
     _terminate_instance,
+    select_image_url,
 )
 
 API_KEY = "test-api-key"
@@ -339,6 +342,30 @@ def test_default_api_url_env_var_override(monkeypatch):
     finally:
         monkeypatch.delenv("CLOUDRIFT_API_URL", raising=False)
         importlib.reload(cloudrift)
+
+
+# ── select_image_url ─────────────────────────────────────────────
+
+
+def test_select_image_url_amd_mi350x():
+    assert select_image_url("mi350x-15-250-1000-gv.1") == DEFAULT_IMAGE_URL_AMD
+
+
+def test_select_image_url_amd_mi300x():
+    assert select_image_url("mi300x-8-100-500-foo.4") == DEFAULT_IMAGE_URL_AMD
+
+
+def test_select_image_url_nvidia_rtx5090():
+    assert select_image_url("rtx59-7-50-400-ec.1") == DEFAULT_IMAGE_URL_NVIDIA
+
+
+def test_select_image_url_nvidia_h200():
+    assert select_image_url("h200-24-200-1000-generic.8") == DEFAULT_IMAGE_URL_NVIDIA
+
+
+def test_default_image_url_alias_points_to_nvidia():
+    """DEFAULT_IMAGE_URL must remain a NVIDIA alias for backward compat."""
+    assert DEFAULT_IMAGE_URL == DEFAULT_IMAGE_URL_NVIDIA
 
 
 def test_default_api_url_fallback(monkeypatch):
