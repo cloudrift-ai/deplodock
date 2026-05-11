@@ -340,15 +340,77 @@ class GreedySearch(_PriorityHeap):
 
 
 class TuningSearch(_PriorityHeap):
-    """Exhaustive priority search — runs the heap dry, exploring every
-    autotune fork. Used by ``deplodock compile --tune`` so every variant
-    is benched and its latency lands in the cache."""
+    """MCTS-style exhaustive priority search using UCB1 selection.
+
+    Each candidate sits at some "tip" node in the cache tree (the
+    op_cache_key of the most recently rewritten kernel-bearing op).
+    Priority for pop ordering is ``-UCB1(tip)`` where
+
+    ``UCB1 = mean_reward + c * sqrt(log(parent.visits) / tip.visits)``
+
+    Reward per measured terminal is ``1 / latency_us`` for an ``ok``
+    bench, ``0`` for ``bench_fail``. Failures stay in the visit count,
+    so a subtree with all bench_fails has ``mean_reward = 0`` and falls
+    in the rankings even as its exploration term decays.
+
+    Tips not yet in the cache (fresh frontier) get ``priority = -∞`` so
+    they're always popped first — the algorithm explores once before
+    exploiting. Used by ``deplodock compile --tune`` so the sweep
+    drifts toward promising subtrees while still covering the space."""
+
+    UCB_C = 1.41  # √2 — classic UCB1 exploration constant.
 
     def push(self, c: Candidate) -> None:
-        self._push(c)
+        ckey = self._ckey(c)
+        tip_key = self._tip_key(c.graph, ckey)
+        priority = self._ucb_priority(ckey, tip_key)
+        self._seq += 1
+        heapq.heappush(self._heap, (priority, -self._seq, c))
 
     def pop(self) -> Candidate | None:
         return self._pop()
+
+    # -- UCB plumbing --------------------------------------------------
+
+    def _ucb_priority(self, context_key: str, tip_key: str | None) -> float:
+        """Heap-min priority key. Lower = pop first; ``-UCB1`` so higher
+        UCB pops earlier. Fresh frontier (no cache row, or row with zero
+        visits) gets ``-inf`` — always pop first."""
+        if tip_key is None:
+            return 0.0
+        node = self._cache.node(context_key, tip_key)
+        if node is None or node.seen_terminals == 0:
+            return float("-inf")
+        mean = node.total_reward / node.seen_terminals
+        parent = self._cache.node(context_key, node.parent_key) if node.parent_key else None
+        parent_visits = parent.seen_terminals if parent and parent.seen_terminals > 0 else node.seen_terminals
+        import math  # noqa: PLC0415
+
+        exploration = self.UCB_C * math.sqrt(math.log(max(parent_visits, 1)) / max(node.seen_terminals, 1))
+        return -(mean + exploration)
+
+    def _tip_key(self, graph, context_key: str) -> str | None:
+        """The candidate's tip is its deepest kernel-bearing op in the
+        cache tree (most rule applications fired). For single-kernel
+        graphs that's just the one body-bearing op's key."""
+        keys = [op_cache_key(n.op) for n in graph.nodes.values() if op_cache_key(n.op) is not None]
+        if not keys:
+            return None
+        if len(keys) == 1:
+            return keys[0]
+        return max(keys, key=lambda k: self._depth(context_key, k))
+
+    def _depth(self, context_key: str, node_key: str) -> int:
+        d = 0
+        cur: str | None = node_key
+        # Hard cap on chain walk so a degenerate cycle (shouldn't happen, defensive) doesn't loop forever.
+        while cur is not None and d < 64:
+            row = self._cache.node(context_key, cur)
+            if row is None or row.parent_key is None:
+                break
+            cur = row.parent_key
+            d += 1
+        return d
 
 
 def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:

@@ -57,13 +57,22 @@ class CudaPerf:
 
 @dataclass(frozen=True)
 class NodeRow:
-    """One ``nodes`` row — autotune-tree state for an op."""
+    """One ``nodes`` row — autotune-tree state for an op.
+
+    ``seen_terminals`` counts every measured terminal under this node
+    (ok + fail). ``failed_terminals`` tracks fails only (diagnostic).
+    ``total_reward`` accumulates the MCTS-style reward (``1/latency_us``
+    for ok, ``0`` for fail) over all measured descendants. ``mean_reward
+    = total_reward / max(seen_terminals, 1)`` is the UCB exploitation
+    term; ``failed_terminals`` informs the optional penalty."""
 
     context_key: str
     node_key: str
     parent_key: str | None
     expected_terminals: int
     seen_terminals: int
+    failed_terminals: int = 0
+    total_reward: float = 0.0
 
 
 class TuningCache:
@@ -101,6 +110,8 @@ class TuningCache:
             parent_key         TEXT,
             expected_terminals INTEGER NOT NULL DEFAULT 1,
             seen_terminals     INTEGER NOT NULL DEFAULT 0,
+            failed_terminals   INTEGER NOT NULL DEFAULT 0,
+            total_reward       REAL NOT NULL DEFAULT 0.0,
             PRIMARY KEY (context_key, node_key)
         )
         """,
@@ -124,7 +135,7 @@ class TuningCache:
 
     def node(self, context_key: str, node_key: str) -> NodeRow | None:
         row = self._conn.execute(
-            "SELECT context_key, node_key, parent_key, expected_terminals, seen_terminals "
+            "SELECT context_key, node_key, parent_key, expected_terminals, seen_terminals, failed_terminals, total_reward "
             "FROM nodes WHERE context_key = ? AND node_key = ?",
             (context_key, node_key),
         ).fetchone()
@@ -251,12 +262,18 @@ class TuningCache:
         node = self.node(context_key, cuda_key)
         if node is None or node.seen_terminals >= 1:
             return False
+        # MCTS reward: ``1 / latency_us`` for ok, ``0`` for failure.
+        # Failures still count as a visit so the subtree's mean reward
+        # drops, which lowers its UCB exploitation term.
+        reward = (1.0 / latency_us) if status == "ok" and latency_us > 0 else 0.0
+        failed_delta = 0 if status == "ok" else 1
         self._conn.execute(
-            "UPDATE nodes SET seen_terminals = 1 WHERE context_key = ? AND node_key = ?",
-            (context_key, cuda_key),
+            "UPDATE nodes SET seen_terminals = 1, failed_terminals = ?, total_reward = ? "
+            "WHERE context_key = ? AND node_key = ?",
+            (failed_delta, reward, context_key, cuda_key),
         )
         if node.parent_key is not None:
-            self._propagate_seen(context_key, node.parent_key, +1)
+            self._propagate_visit(context_key, node.parent_key, seen_delta=1, failed_delta=failed_delta, reward_delta=reward)
         return True
 
     # ------------------------------------------------------------------
@@ -278,14 +295,28 @@ class TuningCache:
             ).fetchone()
             cur_key = row[0] if row else None
 
-    def _propagate_seen(self, context_key: str, node_key: str, delta: int) -> None:
-        """Add ``delta`` to ``seen_terminals`` of ``node_key`` and every
-        ancestor along ``parent_key``."""
+    def _propagate_visit(
+        self,
+        context_key: str,
+        node_key: str,
+        *,
+        seen_delta: int,
+        failed_delta: int,
+        reward_delta: float,
+    ) -> None:
+        """Bump ``seen_terminals`` / ``failed_terminals`` / ``total_reward``
+        on ``node_key`` and every ancestor along ``parent_key``. This is
+        the MCTS backpropagation: each measured terminal walks up to the
+        root, updating every ancestor's stats so UCB selection can use
+        them on the next pop."""
         cur_key: str | None = node_key
         while cur_key is not None:
             self._conn.execute(
-                "UPDATE nodes SET seen_terminals = seen_terminals + ? WHERE context_key = ? AND node_key = ?",
-                (delta, context_key, cur_key),
+                "UPDATE nodes SET seen_terminals = seen_terminals + ?, "
+                "failed_terminals = failed_terminals + ?, "
+                "total_reward = total_reward + ? "
+                "WHERE context_key = ? AND node_key = ?",
+                (seen_delta, failed_delta, reward_delta, context_key, cur_key),
             )
             row = self._conn.execute(
                 "SELECT parent_key FROM nodes WHERE context_key = ? AND node_key = ?",
