@@ -18,7 +18,7 @@ DEFAULT_IMAGE_URL_NVIDIA = (
 )
 DEFAULT_IMAGE_URL_AMD = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
 DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
-API_VERSION = "~upcoming"
+API_VERSION = "2026-02-10"
 
 
 def select_image_url(instance_type):
@@ -244,9 +244,13 @@ def _instance_fully_ready(info):
 
     CloudRift flips ``status`` to ``Active`` before ``host_address`` / ``port_mappings``
     are populated and before the VM's own ``ready`` flag is set. Acting on Active
-    alone gives a connection target with ``host=None`` and an empty port table.
+    alone gives a connection target with ``host=None`` and an unset port table.
+
+    ``port_mappings`` is ``None`` until allocation completes, and ``[]`` once
+    allocation finishes for instances that expose ports directly on the host IP
+    (no NAT forwarding). Both ``[]`` and a populated list count as ready.
     """
-    if not info.get("host_address") or not info.get("port_mappings"):
+    if not info.get("host_address") or info.get("port_mappings") is None:
         return False
     vms = info.get("virtual_machines") or []
     if vms and not vms[0].get("ready"):

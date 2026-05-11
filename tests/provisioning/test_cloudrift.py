@@ -415,6 +415,17 @@ def test_instance_fully_ready_bare_metal_no_vms():
     assert _instance_fully_ready(info) is True
 
 
+def test_instance_fully_ready_direct_host_empty_port_mappings():
+    """Some providers expose ports directly on the host IP (no NAT). port_mappings=[] is ready."""
+    info = {
+        "status": "Active",
+        "host_address": "37.206.67.141",
+        "port_mappings": [],
+        "virtual_machines": [{"ready": True, "state": "Running"}],
+    }
+    assert _instance_fully_ready(info) is True
+
+
 def test_default_api_url_fallback(monkeypatch):
     """DEFAULT_API_URL falls back to https://api.cloudrift.ai when env var unset."""
     import importlib
