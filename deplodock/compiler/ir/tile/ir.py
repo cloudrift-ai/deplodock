@@ -429,6 +429,116 @@ class TileOp(Op):
         head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
         return "\n".join([head, *pretty_body(self.body, "    ")])
 
+    def validate(self, ctx) -> bool:
+        """Reject post-register-tile variants whose THREAD-axis product
+        exceeds the hardware launch budget (``max_threads_per_cta``, 1024
+        on every CUDA capability we support). Without this, F-fork
+        candidates like ``(F_M=1, F_N=2)`` on a ``BM=64, BN=128`` tile
+        spawn a CTA of 64×64=4096 threads — the driver rejects it but the
+        engine has already burned compile + 5s wall-budget on the bench,
+        which leaks an abandoned NVRTC thread and slows every subsequent
+        variant.
+
+        Pre-register-tile TileOps (the post-blockify state, where THREAD
+        extents are ``BM, BN`` and the register-tile rule will still
+        divide by ``(F_M, F_N)``) are gated on the ``register_tile`` knob
+        — skip the check until that rule has fired, otherwise we'd reject
+        every healthy pre-tile candidate too."""
+        if not self.knobs.get("register_tile"):
+            return True
+        from math import prod  # noqa: PLC0415
+
+        tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
+        if tile is None:
+            return True
+        thread_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD]
+        if not thread_extents:
+            return True
+        threads = prod(thread_extents)
+        return threads <= ctx.max_threads_per_cta
+
+    def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
+        """Autotune prior over the failure modes we've observed:
+
+        - Sub-warp launch (threads < 32) → ``-2.0``. A 4-thread CTA wastes
+          ~7/8 of every warp instruction.
+        - Single cell per thread → ``-1.0``. No work per thread, every
+          load goes to global memory (no register reuse), memory-bound.
+        - Massive unroll (cells/thread > 64) → graduated penalty up to
+          ``-1.0``. NVRTC compile time explodes on the unrolled body.
+        - CTA count outside ``[32, 4096]`` → ``-0.5``. Too few CTAs leave
+          SMs idle; too many serialize waves.
+        - Distance from 256 threads/CTA → up to ``-1.0``.
+        - Stages (smem staging) → ``+1.0``.
+        - Register tile fired (``F_M * F_N > 1``) → ``+1.0``.
+
+        Pre-register-tile TileOps are scored on a *predicted* final thread
+        count (assuming 008 will pick F to target ~256 threads when
+        possible). Post-register-tile TileOps use the actual ``F_M``,
+        ``F_N`` from knobs.
+        """
+        from math import prod  # noqa: PLC0415
+
+        from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
+
+        target_threads = 256
+        score = 0.0
+        # ``self.body.iter()`` is recursive — by the time this TileOp
+        # is scored, ``chunk_matmul_k`` etc. may have wrapped the Tile
+        # in a K-outer ``Loop``, so the top-level iter doesn't see it.
+        tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
+        if tile is None:
+            return 0.0
+
+        thread_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD]
+        block_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_BLOCK]
+        if not thread_extents:
+            return 0.0
+
+        threads = prod(thread_extents)
+        ctas = prod(block_extents) if block_extents else 1
+
+        if self.knobs.get("register_tile"):
+            # Post-008: knobs carry the actual cell shape.
+            final_threads = threads
+            cells = max(1, int(self.knobs.get("F_M", 1)) * int(self.knobs.get("F_N", 1)))
+        elif threads >= 1024:
+            # Pre-008 but large enough that 008 will likely divide F to
+            # target ~256 threads.
+            final_threads = target_threads
+            cells = max(1, threads // target_threads)
+        else:
+            # Pre-008 small tile — 008's heuristic gate will likely skip,
+            # so the kernel emits 1 cell per thread.
+            final_threads = threads
+            cells = 1
+
+        # Thread count penalty.
+        if final_threads < 32:
+            score -= 2.0
+        elif final_threads > 1024:
+            score -= 2.0
+        else:
+            score -= min(abs(final_threads - target_threads) / target_threads, 1.0)
+
+        # Cells-per-thread penalty.
+        if cells == 1:
+            score -= 1.0
+        elif cells > 64:
+            score -= min((cells - 64) / 64.0, 1.0)
+
+        # CTA count penalty.
+        if ctas < 32 or ctas > 4096:
+            score -= 0.5
+
+        # Bonuses.
+        if any(isinstance(b, _Stage) for b in tile.body):
+            score += 1.0
+        if self.knobs.get("register_tile"):
+            score += 1.0
+
+        return score
+
     @property
     def inputs(self) -> tuple[str, ...]:
         """Distinct external-buffer names in body first-use order.

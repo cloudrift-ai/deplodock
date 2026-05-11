@@ -107,10 +107,20 @@ def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
             return
         if ext_outer > bm and ext_outer % bm != 0:
             return
+        # Reject oversized THREAD widths: ``_partition_threads`` silently
+        # clamps to the axis extent, so ``bn > ext_inner`` (or
+        # ``bm > ext_outer``) produces an identical kernel to the
+        # ``bn == ext_inner`` (or ``bm == ext_outer``) variant. Without
+        # this filter the autotuner spawns duplicate candidates and a
+        # failure on one can overwrite a good measurement on its alias.
+        if bn > ext_inner or bm > ext_outer:
+            return
         seen.add(shape)
         ordered.append(shape)
 
-    # Heuristic first — deterministic-compile path unchanged.
+    # Heuristic first — deterministic-compile path unchanged. The
+    # autotune search re-ranks unvisited candidates via ``TileOp.score``
+    # so the rule's emission order doesn't bias exploration.
     if len(heuristic) >= 2:
         _add((int(heuristic[0]), int(heuristic[1])))
     for bn in _TUNE_AXIS_CHOICES:

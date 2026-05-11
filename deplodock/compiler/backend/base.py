@@ -62,6 +62,14 @@ class BenchmarkResult:
 class Backend(ABC):
     """Abstract backend: Graph → compiled artifact → run."""
 
+    # Wall-clock cap a single ``benchmark()`` call may consume before
+    # being treated as a failure. Used by the autotune cache to assign
+    # a realistic latency to ``bench_fail`` rows (and as the reward
+    # denominator in UCB). Backends override if they enforce a
+    # different watchdog — e.g. ``CudaBackend`` sets a thread-watchdog
+    # of the same duration around its bench loop.
+    bench_wall_timeout_s: float = 5.0
+
     @abstractmethod
     def compile(self, graph: Graph) -> Any:
         """Lower a ``Graph`` to a backend-specific runnable artifact."""

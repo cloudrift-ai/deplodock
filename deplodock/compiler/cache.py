@@ -60,11 +60,12 @@ class NodeRow:
     """One ``nodes`` row — autotune-tree state for an op.
 
     ``seen_terminals`` counts every measured terminal under this node
-    (ok + fail). ``failed_terminals`` tracks fails only (diagnostic).
-    ``total_reward`` accumulates the MCTS-style reward (``1/latency_us``
-    for ok, ``0`` for fail) over all measured descendants. ``mean_reward
-    = total_reward / max(seen_terminals, 1)`` is the UCB exploitation
-    term; ``failed_terminals`` informs the optional penalty."""
+    (ok + fail; used by coverage queries). ``failed_terminals`` tracks
+    fails only (diagnostic). ``visits`` is the MCTS denominator — it
+    increments both on each ``cache.expand`` (expansion = exploration)
+    and on each terminal measurement (measurement = visit). ``total_reward``
+    accumulates the MCTS-style reward (``1/latency_us`` for ok, ``0``
+    for fail). UCB exploitation uses ``total_reward / visits``."""
 
     context_key: str
     node_key: str
@@ -72,6 +73,7 @@ class NodeRow:
     expected_terminals: int
     seen_terminals: int
     failed_terminals: int = 0
+    visits: int = 0
     total_reward: float = 0.0
 
 
@@ -111,6 +113,7 @@ class TuningCache:
             expected_terminals INTEGER NOT NULL DEFAULT 1,
             seen_terminals     INTEGER NOT NULL DEFAULT 0,
             failed_terminals   INTEGER NOT NULL DEFAULT 0,
+            visits             INTEGER NOT NULL DEFAULT 0,
             total_reward       REAL NOT NULL DEFAULT 0.0,
             PRIMARY KEY (context_key, node_key)
         )
@@ -135,7 +138,7 @@ class TuningCache:
 
     def node(self, context_key: str, node_key: str) -> NodeRow | None:
         row = self._conn.execute(
-            "SELECT context_key, node_key, parent_key, expected_terminals, seen_terminals, failed_terminals, total_reward "
+            "SELECT context_key, node_key, parent_key, expected_terminals, seen_terminals, failed_terminals, visits, total_reward "
             "FROM nodes WHERE context_key = ? AND node_key = ?",
             (context_key, node_key),
         ).fetchone()
@@ -164,6 +167,18 @@ class TuningCache:
         measured. Reads the maintained counters; no tree walk."""
         n = self.node(context_key, node_key)
         return n is not None and n.seen_terminals >= n.expected_terminals
+
+    def root_coverage(self, context_key: str) -> tuple[int, int]:
+        """``(seen_terminals, expected_terminals)`` summed over every
+        root node (``parent_key IS NULL``) for this context. Used by
+        the CLI stopping policy to know how much of the autotune tree
+        has been explored so far."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(seen_terminals), 0), COALESCE(SUM(expected_terminals), 0) "
+            "FROM nodes WHERE context_key = ? AND parent_key IS NULL",
+            (context_key,),
+        ).fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
 
     # ------------------------------------------------------------------
     # Mutations
@@ -222,6 +237,16 @@ class TuningCache:
         if delta != 0:
             self._propagate_expected(context_key, parent_key, delta)
 
+        # Treat the expansion event itself as one "visit" of the parent
+        # for MCTS-style UCB selection (separate ``visits`` column;
+        # doesn't disturb ``seen_terminals`` which counts measured
+        # leaves). Without this, every sibling at a fork has
+        # ``visits = 0`` and indistinguishable ``-inf`` UCB priorities,
+        # so the selector can't differentiate. With it, a node that's
+        # been popped and rule-fired accumulates visits along the way;
+        # un-expanded siblings stay at ``visits = 0`` and pop first.
+        self._propagate_mcts_visit(context_key, parent_key, visits_delta=1, reward_delta=0.0)
+
     def record_cuda_perf(
         self,
         context_key: str,
@@ -239,8 +264,14 @@ class TuningCache:
         the corresponding node row), so the caller knows propagation
         ran."""
         existing = self.cuda_perf(context_key, cuda_key)
+        # Never let a bench_fail overwrite a prior ``ok`` row. Distinct
+        # autotune variants can render to the same ``cuda_key`` (e.g. a
+        # BM > input-dim variant clamps down to the same kernel as the
+        # exact-fit one); without this guard the bench_fail's wall-budget
+        # row would clobber a known-good measurement.
+        keep_existing_ok = existing is not None and existing.status == "ok" and status != "ok"
         keep_best = existing is not None and existing.status == "ok" and status == "ok" and latency_us >= existing.latency_us
-        if not keep_best:
+        if not keep_best and not keep_existing_ok:
             knobs_json = json.dumps(knobs or {}, sort_keys=True, default=str)
             self._conn.execute(
                 "INSERT OR REPLACE INTO cuda_perf (context_key, cuda_key, status, latency_us, measured_at, knobs) "
@@ -268,7 +299,7 @@ class TuningCache:
         reward = (1.0 / latency_us) if status == "ok" and latency_us > 0 else 0.0
         failed_delta = 0 if status == "ok" else 1
         self._conn.execute(
-            "UPDATE nodes SET seen_terminals = 1, failed_terminals = ?, total_reward = ? "
+            "UPDATE nodes SET seen_terminals = 1, failed_terminals = ?, visits = visits + 1, total_reward = ? "
             "WHERE context_key = ? AND node_key = ?",
             (failed_delta, reward, context_key, cuda_key),
         )
@@ -304,19 +335,36 @@ class TuningCache:
         failed_delta: int,
         reward_delta: float,
     ) -> None:
-        """Bump ``seen_terminals`` / ``failed_terminals`` / ``total_reward``
-        on ``node_key`` and every ancestor along ``parent_key``. This is
-        the MCTS backpropagation: each measured terminal walks up to the
-        root, updating every ancestor's stats so UCB selection can use
-        them on the next pop."""
+        """Terminal-measurement backprop: bump ``seen_terminals`` /
+        ``failed_terminals`` / ``visits`` / ``total_reward`` on
+        ``node_key`` and every ancestor along ``parent_key``."""
         cur_key: str | None = node_key
         while cur_key is not None:
             self._conn.execute(
                 "UPDATE nodes SET seen_terminals = seen_terminals + ?, "
                 "failed_terminals = failed_terminals + ?, "
+                "visits = visits + ?, "
                 "total_reward = total_reward + ? "
                 "WHERE context_key = ? AND node_key = ?",
-                (seen_delta, failed_delta, reward_delta, context_key, cur_key),
+                (seen_delta, failed_delta, seen_delta, reward_delta, context_key, cur_key),
+            )
+            row = self._conn.execute(
+                "SELECT parent_key FROM nodes WHERE context_key = ? AND node_key = ?",
+                (context_key, cur_key),
+            ).fetchone()
+            cur_key = row[0] if row else None
+
+    def _propagate_mcts_visit(self, context_key: str, node_key: str, *, visits_delta: int, reward_delta: float) -> None:
+        """Expansion-event backprop: bump ``visits`` (and optionally
+        ``total_reward``) only — used by ``expand`` to treat each rule
+        firing as a soft visit for UCB selection, without disturbing
+        ``seen_terminals`` (which still means "measured leaves")."""
+        cur_key: str | None = node_key
+        while cur_key is not None:
+            self._conn.execute(
+                "UPDATE nodes SET visits = visits + ?, total_reward = total_reward + ? "
+                "WHERE context_key = ? AND node_key = ?",
+                (visits_delta, reward_delta, context_key, cur_key),
             )
             row = self._conn.execute(
                 "SELECT parent_key FROM nodes WHERE context_key = ? AND node_key = ?",
@@ -459,9 +507,21 @@ def record_terminal(
     try:
         result = backend.benchmark(graph, num_iters="auto")
     except Exception as exc:  # noqa: BLE001 — autotune cache must record any failure mode
-        logger.warning("[tune] backend.benchmark failed (%s) — pinning bench_fail for %d kernel(s)", exc, len(cuda_nodes))
+        # Treat the failure's "latency" as the wall-time budget that was
+        # exhausted. Makes the cuda_perf row honest (these kernels DID
+        # consume that much wall time, even if uselessly) and gives MCTS
+        # UCB a small but non-zero reward (``1 / bench_wall_timeout``)
+        # instead of zero. Still way below an ``ok`` kernel's reward,
+        # so failures stay deprioritized.
+        fail_latency_us = float(backend.bench_wall_timeout_s) * 1_000_000.0
+        logger.warning(
+            "[tune] backend.benchmark failed (%s) — pinning bench_fail @ %.1f us for %d kernel(s)",
+            exc,
+            fail_latency_us,
+            len(cuda_nodes),
+        )
         for node in cuda_nodes:
-            _record_one(cache, context_key, node.op, latency_us=0.0, status="bench_fail")
+            _record_one(cache, context_key, node.op, latency_us=fail_latency_us, status="bench_fail")
         return
 
     per_launch = result.per_launch or []

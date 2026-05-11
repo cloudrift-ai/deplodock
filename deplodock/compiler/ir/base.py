@@ -63,6 +63,16 @@ class Op:
         """
         return True
 
+    def score(self, ctx) -> float:  # noqa: ARG002 — ``ctx`` consumed by subclass overrides
+        """Heuristic "promisingness" prior for autotune candidate
+        ordering. Higher = explore first. Returned without bounds; the
+        search uses it only as a tiebreaker among unvisited siblings.
+        Default: ``0.0``. Override in subclasses with domain knowledge
+        (``TileOp.score`` prefers CTAs near the target thread count
+        that stage their inputs and register-tile, for example).
+        """
+        return 0.0
+
 
 @dataclass
 class InputOp(Op):

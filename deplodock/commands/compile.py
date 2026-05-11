@@ -89,6 +89,30 @@ def register_compile_command(subparsers):
         default=None,
         help="Path to the tuning SQLite cache. Default: ~/.cache/deplodock/autotune.db when --tune is set.",
     )
+    parser.add_argument(
+        "--tune-budget",
+        type=float,
+        default=60.0,
+        help="Wall-clock budget for --tune in seconds (default: 60). Set to inf for unbounded.",
+    )
+    parser.add_argument(
+        "--tune-patience",
+        type=int,
+        default=20,
+        help=(
+            "Stop after this many consecutive measured variants haven't beaten the current "
+            "best latency. Honored only after --tune-min-coverage is reached. Default: 20."
+        ),
+    )
+    parser.add_argument(
+        "--tune-min-coverage",
+        type=float,
+        default=0.3,
+        help=(
+            "Patience-based early stop is suppressed until this fraction of the autotune "
+            "tree is explored. Default: 0.3 (30%%). Set to 1.0 to disable patience."
+        ),
+    )
 
     from deplodock.compiler.target import add_target_arg
 
@@ -208,11 +232,22 @@ def handle_compile(args):
         logger.info("Tuning cache: %s", db_path)
 
     if args.tune:
+        import time as _time  # noqa: PLC0415
+
         from deplodock.compiler.pipeline import TuningSearch, run_autotune  # noqa: PLC0415
 
-        search = TuningSearch(cache=cache)
+        search = TuningSearch(
+            cache=cache,
+            budget_s=args.tune_budget,
+            patience=args.tune_patience,
+            min_coverage=args.tune_min_coverage,
+        )
+        t0 = _time.monotonic()
         candidates = list(run_autotune(graph, passes, search=search, dump=dump, backend=backend))
-        result = candidates[0].graph
+        elapsed = _time.monotonic() - t0
+        reason = search.stop_reason or "tree exhausted"
+        sys.stderr.write(f"\n[tune] stopped: {reason} after {len(candidates)} variant(s) in {elapsed:.1f}s\n")
+        result = _pick_best_candidate(candidates, cache).graph
         _print_tune_summary(candidates, cache)
     else:
         result = run_pipeline(graph, passes, dump=dump)
@@ -227,6 +262,20 @@ def handle_compile(args):
         sys.stdout.write(content)
         if not content.endswith("\n"):
             sys.stdout.write("\n")
+
+    # Under --tune, a bench-timeout abandons its NVRTC worker thread
+    # (see ``_benchmark_with_timeout``) which is still holding the CUDA
+    # context. Python finalization (cupy memory-pool teardown, CUDA
+    # context release) deadlocks against that live worker, so the
+    # process hangs after all output has been written. Skip Python's
+    # cleanup with ``os._exit`` once we know output is flushed — there
+    # is nothing left to do and the daemon thread dies with the process.
+    if args.tune:
+        import os as _os  # noqa: PLC0415
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _os._exit(0)
 
 
 def _resolve_passes(args) -> list[str]:
@@ -265,6 +314,36 @@ def _format_knobs(cuda_op) -> str:
     return ", ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
 
 
+def _pick_best_candidate(candidates, cache):
+    """Pick the autotune candidate whose CudaOps all measured ``ok`` and
+    whose summed latency is lowest. Falls back to ``candidates[0]`` when
+    nothing has a clean measurement (e.g. every variant timed out)."""
+    from deplodock.compiler.cache import op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+
+    ctx_key = Context.probe().structural_key()
+    best = None
+    best_total = float("inf")
+    for cand in candidates:
+        cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
+        if not cuda_nodes:
+            continue
+        total = 0.0
+        all_ok = True
+        for node in cuda_nodes:
+            key = op_cache_key(node.op)
+            row = cache.cuda_perf(ctx_key, key) if key else None
+            if row is None or row.status != "ok":
+                all_ok = False
+                break
+            total += row.latency_us
+        if all_ok and total < best_total:
+            best_total = total
+            best = cand
+    return best if best is not None else candidates[0]
+
+
 def _print_tune_summary(candidates, cache) -> None:
     """Print all variants explored by the autotuner, sorted by total
     GPU latency. Each ``Candidate`` is one terminal pipeline run (one
@@ -277,11 +356,12 @@ def _print_tune_summary(candidates, cache) -> None:
 
     ctx_key = Context.probe().structural_key()
 
-    rows: list[tuple[float, str, list[tuple[str, float]]]] = []
+    rows: list[tuple[bool, float, str, list[tuple[str, float]]]] = []
     for cand in candidates:
         cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
         per_kernel: list[tuple[str, float]] = []
         total = 0.0
+        all_ok = bool(cuda_nodes)
         knob_strs: list[str] = []
         for node in cuda_nodes:
             key = op_cache_key(node.op)
@@ -290,19 +370,26 @@ def _print_tune_summary(candidates, cache) -> None:
             per_kernel.append((node.op.kernel_name, latency))
             if row is not None and row.status == "ok":
                 total += latency
+            else:
+                all_ok = False
             knob_strs.append(_format_knobs(node.op))
         knobs_str = " | ".join(knob_strs) if knob_strs else "-"
-        rows.append((total, knobs_str, per_kernel))
+        rows.append((all_ok, total, knobs_str, per_kernel))
 
-    rows.sort(key=lambda r: r[0])
+    # Sort ok variants by ascending latency first, then any with a
+    # bench_fail / unmeasured kernel at the bottom (status tiebreaker
+    # before latency so 0.00 placeholders don't masquerade as the winner).
+    rows.sort(key=lambda r: (not r[0], r[1]))
     sys.stderr.write(f"\n[tune] explored {len(rows)} variant(s):\n")
-    sys.stderr.write(f"{'rank':>4}  {'total_us':>10}  knobs per kernel\n")
-    for rank, (total, knobs_str, _) in enumerate(rows):
-        marker = "*" if rank == 0 else " "
-        sys.stderr.write(f"{rank:>4}{marker} {total:>10.2f}  {knobs_str}\n")
+    sys.stderr.write(f"{'rank':>4}  {'status':>7}  {'total_us':>10}  knobs per kernel\n")
+    for rank, (all_ok, total, knobs_str, _) in enumerate(rows):
+        marker = "*" if rank == 0 and all_ok else " "
+        status = "ok" if all_ok else "fail"
+        sys.stderr.write(f"{rank:>4}{marker} {status:>7}  {total:>10.2f}  {knobs_str}\n")
 
-    if rows:
-        best_total, best_knobs, best_kernels = rows[0]
+    ok_rows = [r for r in rows if r[0]]
+    if ok_rows:
+        _, best_total, best_knobs, best_kernels = ok_rows[0]
         sys.stderr.write(f"\n[tune] winner [{best_knobs}]: {best_total:.2f} us total\n")
         for name, latency in best_kernels:
             sys.stderr.write(f"         {name:<48}  {latency:>10.2f} us\n")

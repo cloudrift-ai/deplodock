@@ -156,7 +156,9 @@ def _variants(
 
     # Heuristic first — non-tune compiles pick option 0. Exempt from the
     # cell-count cap so class-tuned defaults like ``(F_M=8, F_N=8)`` keep
-    # working; the cap only narrows the *autotune* alternatives.
+    # working; the cap only narrows the *autotune* alternatives. Search
+    # re-ranks unvisited variants via ``TileOp.score`` so rule emission
+    # order doesn't determine MCTS bootstrap order.
     _add((int(heuristic[0]), int(heuristic[1])), cap_cells=False)
     for f_m in _TUNE_F_CHOICES:
         for f_n in _TUNE_F_CHOICES:

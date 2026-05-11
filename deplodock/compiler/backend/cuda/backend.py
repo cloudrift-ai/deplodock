@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 # abandon and raise ``RuntimeError``. Needed because NVRTC compilation
 # inside the first kernel launch can take 30+ s on heavily-replicated
 # kernels (e.g. autotune variants with F_M*F_N=256 cells), which would
-# otherwise stall the whole sweep on one bad variant.
-_BENCH_WALL_TIMEOUT_S = 5.0
+# otherwise stall the whole sweep on one bad variant. Exposed via the
+# inherited ``Backend.bench_wall_timeout_s`` attribute for callers
+# (autotune cache reads it to set fail-row latencies).
 
 
-def _benchmark_with_timeout(graph, *, warmup, num_iters, on_iter):
+def _benchmark_with_timeout(graph, *, warmup, num_iters, on_iter, wall_timeout_s):
     """Run ``benchmark_program`` in a daemon worker; raise on timeout.
 
     The worker captures the return value or exception in a shared dict.
@@ -47,10 +48,10 @@ def _benchmark_with_timeout(graph, *, warmup, num_iters, on_iter):
 
     t = threading.Thread(target=_worker, daemon=True, name="deplodock-bench")
     t.start()
-    t.join(timeout=_BENCH_WALL_TIMEOUT_S)
+    t.join(timeout=wall_timeout_s)
     if t.is_alive():
-        logger.warning("benchmark exceeded %.1fs wall budget — abandoning worker thread", _BENCH_WALL_TIMEOUT_S)
-        raise RuntimeError(f"benchmark exceeded {_BENCH_WALL_TIMEOUT_S:.1f}s wall budget — variant marked bench_fail")
+        logger.warning("benchmark exceeded %.1fs wall budget — abandoning worker thread", wall_timeout_s)
+        raise RuntimeError(f"benchmark exceeded {wall_timeout_s:.1f}s wall budget — variant marked bench_fail")
     if "error" in box:
         raise box["error"]
     return box["value"]
@@ -114,7 +115,7 @@ class CudaBackend(Backend):
         on_iter=None,
     ) -> BenchmarkResult:
         del input_data
-        result = _benchmark_with_timeout(compiled, warmup=warmup, num_iters=num_iters, on_iter=on_iter)
+        result = _benchmark_with_timeout(compiled, warmup=warmup, num_iters=num_iters, on_iter=on_iter, wall_timeout_s=self.bench_wall_timeout_s)
         return BenchmarkResult(
             time_ms=result.time_ms,
             num_launches=result.num_launches,
