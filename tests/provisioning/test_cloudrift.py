@@ -5,19 +5,27 @@ Response fixtures are captured from real CloudRift API calls.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
 from deplodock.provisioning.cloudrift import (
     API_VERSION,
     DEFAULT_CLOUDINIT_URL,
-    DEFAULT_IMAGE_URL,
+    DEFAULT_IMAGE_URL_AMD,
+    DEFAULT_IMAGE_URL_NVIDIA,
     _add_ssh_key,
     _api_request,
     _ensure_ssh_key,
     _get_instance_info,
+    _instance_fully_ready,
     _list_ssh_keys,
     _log_connection_info,
     _rent_instance,
     _terminate_instance,
+    create_instance,
+    select_image_url,
+    wait_for_status,
 )
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 
 API_KEY = "test-api-key"
 API_URL = "https://api.test.cloudrift.ai"
@@ -134,14 +142,21 @@ async def test_api_request_dry_run(caplog):
 async def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    result = await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], ports=[22, 8000], api_url=API_URL)
+    result = await _rent_instance(
+        API_KEY,
+        "rtx49-7c-kn.1",
+        ["ssh-ed25519 AAAA user@host"],
+        DEFAULT_IMAGE_URL_NVIDIA,
+        ports=[22, 8000],
+        api_url=API_URL,
+    )
 
     call_data = mock_api.call_args[0][2]
     assert call_data["selector"] == {"ByInstanceTypeAndLocation": {"instance_type": "rtx49-7c-kn.1"}}
     assert call_data["config"] == {
         "VirtualMachine": {
             "ssh_key": {"PublicKeys": ["ssh-ed25519 AAAA user@host"]},
-            "image_url": DEFAULT_IMAGE_URL,
+            "image_url": DEFAULT_IMAGE_URL_NVIDIA,
             "cloudinit_url": DEFAULT_CLOUDINIT_URL,
             "ports": ["22", "8000"],
         }
@@ -154,7 +169,7 @@ async def test_rent_instance_payload(mock_api):
 async def test_rent_instance_no_ports(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], DEFAULT_IMAGE_URL_NVIDIA, api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert "ports" not in call_data
@@ -165,7 +180,14 @@ async def test_rent_instance_no_ports(mock_api):
 async def test_rent_instance_billing_exempt(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL, billing_exempt=True)
+    await _rent_instance(
+        API_KEY,
+        "rtx49-7c-kn.1",
+        ["ssh-ed25519 AAAA user@host"],
+        DEFAULT_IMAGE_URL_NVIDIA,
+        api_url=API_URL,
+        billing_exempt=True,
+    )
 
     call_data = mock_api.call_args[0][2]
     assert call_data["billing_exempt"] is True
@@ -175,7 +197,7 @@ async def test_rent_instance_billing_exempt(mock_api):
 async def test_rent_instance_no_billing_exempt_by_default(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
-    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], api_url=API_URL)
+    await _rent_instance(API_KEY, "rtx49-7c-kn.1", ["ssh-ed25519 AAAA user@host"], DEFAULT_IMAGE_URL_NVIDIA, api_url=API_URL)
 
     call_data = mock_api.call_args[0][2]
     assert "billing_exempt" not in call_data
@@ -341,6 +363,70 @@ def test_default_api_url_env_var_override(monkeypatch):
         importlib.reload(cloudrift)
 
 
+# ── select_image_url ─────────────────────────────────────────────
+
+
+def test_select_image_url_amd_mi350x():
+    assert select_image_url("mi350x-15-250-1000-gv.1") == DEFAULT_IMAGE_URL_AMD
+
+
+def test_select_image_url_amd_mi300x():
+    assert select_image_url("mi300x-8-100-500-foo.4") == DEFAULT_IMAGE_URL_AMD
+
+
+def test_select_image_url_nvidia_rtx5090():
+    assert select_image_url("rtx59-7-50-400-ec.1") == DEFAULT_IMAGE_URL_NVIDIA
+
+
+def test_select_image_url_nvidia_h200():
+    assert select_image_url("h200-24-200-1000-generic.8") == DEFAULT_IMAGE_URL_NVIDIA
+
+
+# ── _instance_fully_ready ────────────────────────────────────────
+
+
+def test_instance_fully_ready_happy_path():
+    info = INSTANCE_ACTIVE_RESPONSE["instances"][0]
+    assert _instance_fully_ready(info) is True
+
+
+def test_instance_fully_ready_missing_host_address():
+    info = {"status": "Active", "host_address": None, "port_mappings": [[22, 22222]]}
+    assert _instance_fully_ready(info) is False
+
+
+def test_instance_fully_ready_null_port_mappings():
+    info = {"status": "Active", "host_address": "1.2.3.4", "port_mappings": None}
+    assert _instance_fully_ready(info) is False
+
+
+def test_instance_fully_ready_vm_not_ready_yet():
+    info = {
+        "status": "Active",
+        "host_address": "1.2.3.4",
+        "port_mappings": [[22, 22222]],
+        "virtual_machines": [{"ready": False}],
+    }
+    assert _instance_fully_ready(info) is False
+
+
+def test_instance_fully_ready_bare_metal_no_vms():
+    """Bare-metal instances have no virtual_machines list; networking alone suffices."""
+    info = {"status": "Active", "host_address": "1.2.3.4", "port_mappings": [[22, 22222]]}
+    assert _instance_fully_ready(info) is True
+
+
+def test_instance_fully_ready_direct_host_empty_port_mappings():
+    """Some providers expose ports directly on the host IP (no NAT). port_mappings=[] is ready."""
+    info = {
+        "status": "Active",
+        "host_address": "37.206.67.141",
+        "port_mappings": [],
+        "virtual_machines": [{"ready": True, "state": "Running"}],
+    }
+    assert _instance_fully_ready(info) is True
+
+
 def test_default_api_url_fallback(monkeypatch):
     """DEFAULT_API_URL falls back to https://api.cloudrift.ai when env var unset."""
     import importlib
@@ -350,3 +436,243 @@ def test_default_api_url_fallback(monkeypatch):
     monkeypatch.delenv("CLOUDRIFT_API_URL", raising=False)
     importlib.reload(cloudrift)
     assert cloudrift.DEFAULT_API_URL == "https://api.cloudrift.ai"
+
+
+# ── wait_for_status ───────────────────────────────────────────────
+
+
+def _active_response(ready=True, host="1.2.3.4", ports=None):
+    """Build a minimal instance dict for wait_for_status tests."""
+    if ports is None:
+        ports = [[22, 22222]]
+    return {
+        "id": "inst-123",
+        "status": "Active",
+        "host_address": host,
+        "port_mappings": ports,
+        "virtual_machines": [{"ready": ready}],
+    }
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_polls_until_ready(mock_get, mock_sleep):
+    """wait_for_status must keep polling while status is Active but networking is missing."""
+    mock_get.side_effect = [
+        {"id": "inst-123", "status": "Active", "host_address": None, "port_mappings": None},
+        _active_response(ready=False),
+        _active_response(ready=True),
+    ]
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+    assert info is not None
+    assert info["host_address"] == "1.2.3.4"
+    assert mock_get.await_count == 3
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_timeout_logs_readiness_components(mock_get, mock_sleep, caplog):
+    """At timeout, the log message must identify the readiness components that blocked us."""
+    mock_get.return_value = {
+        "id": "inst-123",
+        "status": "Active",
+        "host_address": None,
+        "port_mappings": None,
+        "virtual_machines": [{"ready": False}],
+    }
+    with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
+        info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=20, interval=10)
+    assert info is None
+    assert "never became ready" in caplog.text
+    assert "host_address=None" in caplog.text
+    assert "port_mappings=None" in caplog.text
+    assert "vm_ready=False" in caplog.text
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_returns_none_on_fail_status(mock_get, mock_sleep):
+    """fail_statuses must short-circuit polling."""
+    mock_get.return_value = {"id": "inst-123", "status": "Inactive"}
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, fail_statuses={"Inactive"})
+    assert info is None
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_target_wins_over_fail_for_same_string(mock_get, mock_sleep):
+    """If a status appears in both target_status and fail_statuses, success takes precedence."""
+    mock_get.return_value = _active_response(ready=True)
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, fail_statuses={"Active"})
+    assert info is not None
+    assert info["host_address"] == "1.2.3.4"
+
+
+# ── create_instance orphan termination ───────────────────────────
+
+
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_terminates_orphan_on_timeout(mock_rent, mock_wait, mock_terminate, tmp_path):
+    """When wait_for_status fails, the rented instance must be terminated and CapacityExhausted raised."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
+    mock_wait.return_value = None
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+    mock_terminate.assert_awaited_once()
+    args = mock_terminate.await_args
+    assert args.args[1] == "inst-orphan"
+
+
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait, mock_terminate, tmp_path, caplog):
+    """A failed terminate during orphan cleanup must not mask the original CapacityExhausted."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
+    mock_wait.return_value = None
+    mock_terminate.side_effect = RuntimeError("network down")
+
+    with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
+        with pytest.raises(CapacityExhausted):
+            await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+    assert "Failed to terminate orphaned instance inst-orphan" in caplog.text
+
+
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_terminates_orphan_on_exception(mock_rent, mock_wait, mock_terminate, tmp_path):
+    """When wait_for_status raises, the rented instance must be terminated and the exception re-raised."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-orphan"]}
+    mock_wait.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+    mock_terminate.assert_awaited_once()
+    assert mock_terminate.await_args.args[1] == "inst-orphan"
+
+
+# ── wait_for_status transient-error handling ─────────────────────
+
+
+def _http_status_error(code):
+    """Construct an httpx.HTTPStatusError with a given status code."""
+    request = httpx.Request("POST", "https://api.test/instances/list")
+    response = httpx.Response(code, request=request)
+    return httpx.HTTPStatusError(f"HTTP {code}", request=request, response=response)
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_retries_transient_5xx(mock_get, mock_sleep):
+    """A transient 5xx during polling must be retried, not propagated."""
+    mock_get.side_effect = [
+        _http_status_error(502),
+        _http_status_error(503),
+        _active_response(ready=True),
+    ]
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+    assert info is not None
+    assert mock_get.await_count == 3
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_propagates_4xx(mock_get, mock_sleep):
+    """A 4xx (auth, bad request) is terminal and must propagate."""
+    import pytest
+
+    mock_get.side_effect = _http_status_error(401)
+    with pytest.raises(httpx.HTTPStatusError):
+        await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_retries_network_error(mock_get, mock_sleep):
+    """httpx network errors (timeout, connection refused, etc.) must be retried."""
+    mock_get.side_effect = [
+        httpx.ConnectError("connection refused"),
+        _active_response(ready=True),
+    ]
+    info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
+    assert info is not None
+
+
+# ── create_instance HTTP-code classification ────────────────────
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_503_raises_capacity_exhausted(mock_rent, tmp_path):
+    """HTTP 503 on rent must be classified as CapacityExhausted for orchestrator fallback."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(503)
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_429_raises_capacity_exhausted(mock_rent, tmp_path):
+    """HTTP 429 (rate limit) is also capacity-class."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(429)
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_401_raises_terminal(mock_rent, tmp_path):
+    """HTTP 401/403 must surface as TerminalProvisionError so the orchestrator aborts."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(401)
+
+    with pytest.raises(TerminalProvisionError):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_empty_instance_ids_raises_capacity(mock_rent, tmp_path):
+    """Rent succeeding HTTP-wise but returning no instance is still no-capacity."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.return_value = {"instance_ids": []}
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)

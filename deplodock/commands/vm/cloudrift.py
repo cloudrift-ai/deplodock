@@ -7,10 +7,10 @@ import sys
 
 from deplodock.provisioning.cloudrift import (
     DEFAULT_API_URL,
-    DEFAULT_IMAGE_URL,
     create_instance,
     delete_instance,
 )
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.redact import register_secret
 
 logger = logging.getLogger(__name__)
@@ -40,17 +40,21 @@ def handle_create(args):
 async def _handle_create(args):
     api_key = _resolve_api_key(args.api_key)
     ports = [int(p) for p in args.ports.split(",")] if args.ports else None
-    conn = await create_instance(
-        api_key=api_key,
-        instance_type=args.instance_type,
-        ssh_key_path=args.ssh_key,
-        image_url=args.image_url,
-        ports=ports,
-        timeout=args.timeout,
-        api_url=args.api_url,
-        dry_run=args.dry_run,
-        billing_exempt=args.billing_exempt,
-    )
+    try:
+        conn = await create_instance(
+            api_key=api_key,
+            instance_type=args.instance_type,
+            ssh_key_path=args.ssh_key,
+            image_url=args.image_url,
+            ports=ports,
+            timeout=args.timeout,
+            api_url=args.api_url,
+            dry_run=args.dry_run,
+            billing_exempt=args.billing_exempt,
+        )
+    except (CapacityExhausted, TerminalProvisionError) as exc:
+        logger.error(f"{exc}")
+        sys.exit(1)
     if conn is None:
         sys.exit(1)
 
@@ -81,7 +85,11 @@ def register_create_target(subparsers):
     parser.add_argument("--instance-type", required=True, help="Instance type (e.g. rtx4090.1)")
     parser.add_argument("--ssh-key", required=True, help="Path to SSH public key file")
     parser.add_argument("--api-key", default=None, help="CloudRift API key (fallback: CLOUDRIFT_API_KEY env var)")
-    parser.add_argument("--image-url", default=DEFAULT_IMAGE_URL, help="VM image URL (default: Ubuntu 24.04)")
+    parser.add_argument(
+        "--image-url",
+        default=None,
+        help="VM image URL (default: auto-pick ROCm for mi* instance types, NVIDIA otherwise)",
+    )
     parser.add_argument("--ports", default="22,8000", help="Comma-separated ports to open (default: 22,8000)")
     parser.add_argument(
         "--api-url",

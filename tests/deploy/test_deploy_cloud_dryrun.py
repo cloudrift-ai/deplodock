@@ -115,7 +115,9 @@ def test_deploy_cloud_provider_flag_override_dry_run(run_cli, tmp_path):
         "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
-    assert "-> gcp a3-ultragpu-1g" in stdout
+    # --provider gcp must restrict candidates to GCP only (no cloudrift entry).
+    assert "Trying candidate: gcp a3-ultragpu-1g" in stdout
+    assert "Trying candidate: cloudrift" not in stdout
 
 
 def test_deploy_cloud_provider_default_is_cloudrift_for_h200(run_cli, tmp_path):
@@ -150,7 +152,9 @@ def test_deploy_cloud_provider_default_is_cloudrift_for_h200(run_cli, tmp_path):
         "--dry-run",
     )
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
-    assert "-> cloudrift h200-24-200-1000-generic.1" in stdout
+    # Without --provider, CloudRift is the first hardware-table entry for H200,
+    # so the orchestrator must try it first.
+    assert "Trying candidate: cloudrift h200-24-200-1000-generic.1" in stdout
 
 
 def test_deploy_cloud_missing_gpu_flag_fails(run_cli, recipes_dir):

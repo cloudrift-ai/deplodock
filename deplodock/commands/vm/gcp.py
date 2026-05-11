@@ -1,12 +1,16 @@
 """GCP provider CLI handlers."""
 
 import asyncio
+import logging
 import sys
 
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.provisioning.gcp import (
     create_instance,
     delete_instance,
 )
+
+logger = logging.getLogger(__name__)
 
 # ── CLI handlers ───────────────────────────────────────────────────
 
@@ -17,23 +21,27 @@ def handle_create(args):
 
 
 async def _handle_create(args):
-    conn = await create_instance(
-        instance=args.instance,
-        zone=args.zone,
-        machine_type=args.machine_type,
-        provisioning_model=args.provisioning_model,
-        max_run_duration=args.max_run_duration,
-        request_valid_for_duration=args.request_valid_for_duration,
-        termination_action=args.termination_action,
-        image_family=args.image_family,
-        image_project=args.image_project,
-        extra_gcloud_args=args.gcloud_args,
-        timeout=args.timeout,
-        wait_ssh=args.wait_ssh,
-        wait_ssh_timeout=args.wait_ssh_timeout,
-        ssh_gateway=args.ssh_gateway,
-        dry_run=args.dry_run,
-    )
+    try:
+        conn = await create_instance(
+            instance=args.instance,
+            zone=args.zone,
+            machine_type=args.machine_type,
+            provisioning_model=args.provisioning_model,
+            max_run_duration=args.max_run_duration,
+            request_valid_for_duration=args.request_valid_for_duration,
+            termination_action=args.termination_action,
+            image_family=args.image_family,
+            image_project=args.image_project,
+            extra_gcloud_args=args.gcloud_args,
+            timeout=args.timeout,
+            wait_ssh=args.wait_ssh,
+            wait_ssh_timeout=args.wait_ssh_timeout,
+            ssh_gateway=args.ssh_gateway,
+            dry_run=args.dry_run,
+        )
+    except (CapacityExhausted, TerminalProvisionError) as exc:
+        logger.error(f"{exc}")
+        sys.exit(1)
     if conn is None:
         sys.exit(1)
 

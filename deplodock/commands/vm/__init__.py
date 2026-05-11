@@ -10,14 +10,17 @@ def register_vm_command(subparsers):
         register_delete_target as register_cloudrift_delete,
     )
     from deplodock.commands.vm.gcp import register_create_target, register_delete_target
+    from deplodock.commands.vm.gpu import register_create_target as register_gpu_create
 
     vm_parser = subparsers.add_parser("vm", help="Manage cloud VM instances")
 
     action_subparsers = vm_parser.add_subparsers(dest="action", required=True)
 
-    # create action
+    # create action: 'gpu' (orchestrator-backed, GPU-name-driven) and the
+    # provider-specific single-shot manual targets 'gcp' and 'cloudrift'.
     create_parser = action_subparsers.add_parser("create", help="Create a VM instance")
     create_subparsers = create_parser.add_subparsers(dest="provider", required=True)
+    register_gpu_create(create_subparsers)
     register_create_target(create_subparsers)
     register_cloudrift_create(create_subparsers)
 

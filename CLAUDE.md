@@ -52,8 +52,9 @@ same worker.
 - `deplodock bench recipes/* --filter "KEY=PATTERN"` — run only variants matching the filter (fnmatch glob, repeatable, AND logic)
 - `deplodock bench experiments/...` — run an experiment (results stored in the experiment dir)
 - `deplodock teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
-- `deplodock vm create gcp ...` — create a GCP GPU VM
-- `deplodock vm create cloudrift ...` — create a CloudRift GPU VM
+- `deplodock vm create gpu --gpu NAME --gpu-count N [--provider X]` — create a VM by GPU name (orchestrator: retries, candidate fallback, orphan cleanup)
+- `deplodock vm create gcp ...` — create a specific GCP GPU VM (single-shot manual)
+- `deplodock vm create cloudrift ...` — create a specific CloudRift GPU VM (single-shot manual)
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
 - `deplodock pull <model>` — download a HuggingFace model to local cache

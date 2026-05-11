@@ -7,15 +7,32 @@ import os
 
 import httpx
 
+from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 from deplodock.provisioning.ssh import wait_for_ssh
 from deplodock.provisioning.types import VMConnectionInfo
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = os.environ.get("CLOUDRIFT_API_URL", "https://api.cloudrift.ai")
-DEFAULT_IMAGE_URL = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
+DEFAULT_IMAGE_URL_NVIDIA = (
+    "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-gpu-580-129-20251015-183936.img"
+)
+DEFAULT_IMAGE_URL_AMD = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
 DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
-API_VERSION = "~upcoming"
+API_VERSION = "2026-02-10"
+
+
+def select_image_url(instance_type):
+    """Pick the right OS image for a CloudRift instance type.
+
+    AMD Instinct instance types start with ``mi`` (e.g. ``mi350x-15-250-1000-gv.1``)
+    and need the ROCm image; everything else gets the NVIDIA image. Mismatches
+    leave the GPU unusable because the kernel module for the wrong vendor isn't
+    on disk.
+    """
+    if instance_type.startswith("mi"):
+        return DEFAULT_IMAGE_URL_AMD
+    return DEFAULT_IMAGE_URL_NVIDIA
 
 
 # ── API helpers ───────────────────────────────────────────────────
@@ -48,7 +65,7 @@ async def _rent_instance(
     api_key,
     instance_type,
     ssh_public_keys,
-    image_url=DEFAULT_IMAGE_URL,
+    image_url,
     cloudinit_url=DEFAULT_CLOUDINIT_URL,
     ports=None,
     api_url=DEFAULT_API_URL,
@@ -179,15 +196,30 @@ async def wait_for_status(
     fail_statuses = fail_statuses or set()
     elapsed = 0
     status = None
+    last_info = None
     while elapsed < timeout:
-        info = await _get_instance_info(api_key, instance_id, api_url)
+        try:
+            info = await _get_instance_info(api_key, instance_id, api_url)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                logger.warning(f"Transient {exc.response.status_code} from CloudRift while polling {instance_id}; retrying.")
+                await asyncio.sleep(interval)
+                elapsed += interval
+                continue
+            raise
+        except httpx.RequestError as exc:
+            logger.warning(f"Network error polling CloudRift for {instance_id}: {exc}; retrying.")
+            await asyncio.sleep(interval)
+            elapsed += interval
+            continue
         if info is None:
             logger.warning(f"Warning: instance {instance_id} not found.")
             await asyncio.sleep(interval)
             elapsed += interval
             continue
+        last_info = info
         status = info.get("status")
-        if status == target_status:
+        if status == target_status and _instance_fully_ready(info):
             return info
         if status in fail_statuses:
             logger.error(f"Instance {instance_id} reached fail status '{status}'")
@@ -195,8 +227,36 @@ async def wait_for_status(
         await asyncio.sleep(interval)
         elapsed += interval
 
-    logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
+    if last_info is not None and last_info.get("status") == target_status:
+        vms = last_info.get("virtual_machines") or []
+        vm_ready = vms[0].get("ready") if vms else None
+        logger.error(
+            f"Timeout after {timeout}s: instance {instance_id} reached '{target_status}' but never became ready "
+            f"(host_address={last_info.get('host_address')!r}, port_mappings={last_info.get('port_mappings')!r}, "
+            f"vm_ready={vm_ready!r})"
+        )
+    else:
+        logger.error(f"Timeout after {timeout}s waiting for status '{target_status}' (last: '{status}')")
     return None
+
+
+def _instance_fully_ready(info):
+    """Return True if the instance has finished networking and (for VMs) is ready.
+
+    CloudRift flips ``status`` to ``Active`` before ``host_address`` / ``port_mappings``
+    are populated and before the VM's own ``ready`` flag is set. Acting on Active
+    alone gives a connection target with ``host=None`` and an unset port table.
+
+    ``port_mappings`` is ``None`` until allocation completes, and ``[]`` once
+    allocation finishes for instances that expose ports directly on the host IP
+    (no NAT forwarding). Both ``[]`` and a populated list count as ready.
+    """
+    if not info.get("host_address") or info.get("port_mappings") is None:
+        return False
+    vms = info.get("virtual_machines") or []
+    if vms and not vms[0].get("ready"):
+        return False
+    return True
 
 
 def _extract_connection_info(instance, delete_info=()):
@@ -274,7 +334,7 @@ async def create_instance(
     api_key,
     instance_type,
     ssh_key_path,
-    image_url=DEFAULT_IMAGE_URL,
+    image_url=None,
     ports=None,
     timeout=600,
     api_url=DEFAULT_API_URL,
@@ -287,6 +347,8 @@ async def create_instance(
     """Create a CloudRift VM instance.
 
     Args:
+        image_url: VM image URL. If ``None``, auto-picks ROCm for ``mi*`` instance
+            types and NVIDIA otherwise via :func:`select_image_url`.
         ssh_key_path: path to the SSH **public** key file.
         fail_statuses: optional set of statuses that trigger immediate failure
             (e.g. {"Inactive"}).
@@ -297,7 +359,11 @@ async def create_instance(
         VMConnectionInfo on success, None on failure.
         In dry-run mode, returns a VMConnectionInfo with placeholder values.
     """
-    logger.info(f"Creating CloudRift instance (type={instance_type})...")
+    if image_url is None:
+        image_url = select_image_url(instance_type)
+        logger.info(f"Creating CloudRift instance (type={instance_type}, auto-selected image={image_url})...")
+    else:
+        logger.info(f"Creating CloudRift instance (type={instance_type}, image={image_url})...")
 
     ssh_key_path = os.path.expanduser(ssh_key_path)
     if dry_run and not os.path.exists(ssh_key_path):
@@ -306,16 +372,24 @@ async def create_instance(
         with open(ssh_key_path) as f:
             public_key = f.read().strip()
 
-    result = await _rent_instance(
-        api_key,
-        instance_type,
-        [public_key],
-        image_url=image_url,
-        ports=ports,
-        api_url=api_url,
-        dry_run=dry_run,
-        billing_exempt=billing_exempt,
-    )
+    try:
+        result = await _rent_instance(
+            api_key,
+            instance_type,
+            [public_key],
+            image_url=image_url,
+            ports=ports,
+            api_url=api_url,
+            dry_run=dry_run,
+            billing_exempt=billing_exempt,
+        )
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        if code in (429, 503):
+            raise CapacityExhausted(f"CloudRift rent returned {code} for {instance_type}") from exc
+        if 400 <= code < 500:
+            raise TerminalProvisionError(f"CloudRift rent returned {code}: {exc.response.text}") from exc
+        raise
     if dry_run:
         logger.info("[dry-run] Would wait for Active status, then print connection info.")
         return VMConnectionInfo(
@@ -327,14 +401,31 @@ async def create_instance(
 
     instance_ids = result.get("instance_ids", [])
     if not instance_ids:
-        logger.error("Error: no instance ID returned from rent API.")
-        return None
+        # Rent succeeded HTTP-wise but allocated nothing — treat as no-capacity.
+        raise CapacityExhausted(f"CloudRift rent returned no instance ID for {instance_type}")
     instance_id = instance_ids[0]
     logger.info(f"Instance rented (id={instance_id}). Waiting for Active status (timeout: {timeout}s)...")
 
-    info = await wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
+    try:
+        info = await wait_for_status(api_key, instance_id, "Active", timeout, api_url, fail_statuses=fail_statuses)
+    except Exception:
+        logger.warning(f"Terminating orphaned instance {instance_id} after exception during wait_for_status.")
+        try:
+            await _terminate_instance(api_key, instance_id, api_url)
+        except Exception as exc:
+            logger.error(f"Failed to terminate orphaned instance {instance_id}: {exc}")
+        raise
     if info is None:
-        return None
+        logger.warning(f"Terminating orphaned instance {instance_id} after wait_for_status failure.")
+        try:
+            await _terminate_instance(api_key, instance_id, api_url)
+        except Exception as exc:
+            logger.error(f"Failed to terminate orphaned instance {instance_id}: {exc}")
+        # wait_for_status returns None for fail-status (e.g. Inactive) and for timeout.
+        # Either way, this candidate has effectively no usable capacity — advance.
+        raise CapacityExhausted(
+            f"CloudRift instance {instance_id} ({instance_type}) never reached Active (fail-status or timeout after {timeout}s)"
+        )
 
     logger.info("Instance is Active.")
     logger.info(f"Instance details: {json.dumps(info, indent=2)}")
