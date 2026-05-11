@@ -43,6 +43,14 @@ from deplodock.compiler.structural import digest
 logger = logging.getLogger(__name__)
 
 
+class TuneAborted(RuntimeError):
+    """Raised by :func:`record_terminal` when a bench failure leaves the
+    CUDA stream in a state where subsequent benches would block in
+    ``_allocate`` (waiting for the still-running timed-out kernel to
+    drain). Callers catch this to stop the autotune sweep with whatever
+    measurements have been recorded so far."""
+
+
 @dataclass(frozen=True)
 class CudaPerf:
     """One ``cuda_perf`` row."""
@@ -505,6 +513,13 @@ def record_terminal(
 
     logger.info("[tune] benching %d kernel(s) in graph", len(cuda_nodes))
     try:
+        # ``num_iters="auto"`` adapts the iter count to per-call latency
+        # (target 100 ms of GPU time, capped at ``_AUTO_MAX_ITERS``) so
+        # tiny kernels get many samples for variance reduction and heavy
+        # ones don't oversample. GPU time is what we actually want to
+        # bound, not wall time — Python/cupy framing overhead is fixed
+        # per iter and would otherwise force us into low sample counts
+        # on small kernels.
         result = backend.benchmark(graph, num_iters="auto")
     except Exception as exc:  # noqa: BLE001 — autotune cache must record any failure mode
         # Treat the failure's "latency" as the wall-time budget that was
@@ -513,7 +528,7 @@ def record_terminal(
         # UCB a small but non-zero reward (``1 / bench_wall_timeout``)
         # instead of zero. Still way below an ``ok`` kernel's reward,
         # so failures stay deprioritized.
-        fail_latency_us = float(backend.bench_wall_timeout_s) * 1_000_000.0
+        fail_latency_us = float(backend.bench_run_timeout_s) * 1_000_000.0
         logger.warning(
             "[tune] backend.benchmark failed (%s) — pinning bench_fail @ %.1f us for %d kernel(s)",
             exc,
@@ -522,7 +537,14 @@ def record_terminal(
         )
         for node in cuda_nodes:
             _record_one(cache, context_key, node.op, latency_us=fail_latency_us, status="bench_fail")
-        return
+        # The kernel that timed out is still queued on the CUDA stream
+        # and will keep executing for an unbounded time. Subsequent
+        # ``backend.benchmark`` calls in this process hit cupy's
+        # ``_allocate`` which serializes on the stream — that's why an
+        # autotune sweep tends to "hang on the variant *after* a
+        # bench_fail" instead of on the failing one itself. Re-raise so
+        # the engine can abort the sweep before that happens.
+        raise TuneAborted(f"autotune aborted after bench_fail; the dirty CUDA stream would hang the next variant") from exc
 
     per_launch = result.per_launch or []
     if len(per_launch) != len(cuda_nodes):
@@ -538,6 +560,21 @@ def record_terminal(
 
     for node, lt in zip(cuda_nodes, per_launch, strict=True):
         _record_one(cache, context_key, node.op, latency_us=lt.time_ms * 1000.0, status="ok")
+
+    # Between successful variants: drain any pending GPU work and let
+    # cupy release its memory-pool blocks back to the driver. Drain
+    # is microseconds when the stream is clean (the bench loop's own
+    # ``_wait_for_event`` already synced every launch), so we don't
+    # pay anything in the healthy path. The mempool free prevents
+    # cross-variant fragmentation — each variant's compiled buffers
+    # come from a fresh allocation rather than a stale pool slab.
+    try:
+        import cupy as _cp  # noqa: PLC0415
+
+        _cp.cuda.runtime.deviceSynchronize()
+        _cp.get_default_memory_pool().free_all_blocks()
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
 
 
 def _record_one(cache: TuningCache, context_key: str, cuda_op, *, latency_us: float, status: str) -> None:

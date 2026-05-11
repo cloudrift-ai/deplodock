@@ -137,6 +137,20 @@ def bench_pair(request):
     return _run
 
 
+def _tune_budget_s() -> float | None:
+    """``DEPLODOCK_TUNE_BUDGET`` (seconds) enables autotuning for every
+    ``bench_pair`` case. ``None`` (the default) skips ``--tune`` so the
+    suite measures the deterministic-compile baseline."""
+    raw = os.environ.get("DEPLODOCK_TUNE_BUDGET", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
 def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool) -> PerfRow:
     """Spawn ``deplodock run --bench`` for one case and harvest the dumps."""
     with tempfile.TemporaryDirectory(prefix=f"deplodock_bench_{case.name}_") as tmp:
@@ -155,11 +169,19 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
         ]
         if profile:
             cmd.append("--profile")
+        tune_budget = _tune_budget_s()
+        if tune_budget is not None:
+            cmd += ["--tune", "--tune-budget", str(tune_budget)]
         env = dict(os.environ)
         env["DEPLODOCK_DUMP_DIR"] = tmp
         env.pop("DEPLODOCK_NCU_CHILD", None)
 
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
+        # Each tuning sweep adds ``tune_budget`` per case. The default
+        # 900s ceiling covers the deterministic-compile path; bump it
+        # when tuning so the subprocess timeout doesn't kill a healthy
+        # sweep mid-run.
+        timeout_s = 900.0 + (tune_budget or 0.0) * 1.5
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
         if res.returncode != 0:
             # Surface stderr so flaky-bench cases are diagnosable, but
             # synthesize a minimal row so the suite doesn't abort.

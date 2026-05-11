@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -29,32 +28,6 @@ logger = logging.getLogger(__name__)
 # (autotune cache reads it to set fail-row latencies).
 
 
-def _benchmark_with_timeout(graph, *, warmup, num_iters, on_iter, wall_timeout_s):
-    """Run ``benchmark_program`` in a daemon worker; raise on timeout.
-
-    The worker captures the return value or exception in a shared dict.
-    On timeout the worker is abandoned (still daemon, dies with the
-    process) — GPU memory it allocated leaks until the eventual NVRTC
-    compile/kernel finishes or the process exits. Acceptable for an
-    autotune sweep: a handful of timeouts cost some headroom but the
-    sweep keeps moving instead of stalling forever."""
-    box: dict[str, object] = {}
-
-    def _worker() -> None:
-        try:
-            box["value"] = benchmark_program(graph, warmup=warmup, num_iters=num_iters, on_iter=on_iter)
-        except BaseException as exc:  # noqa: BLE001 — pass everything back through the box
-            box["error"] = exc
-
-    t = threading.Thread(target=_worker, daemon=True, name="deplodock-bench")
-    t.start()
-    t.join(timeout=wall_timeout_s)
-    if t.is_alive():
-        logger.warning("benchmark exceeded %.1fs wall budget — abandoning worker thread", wall_timeout_s)
-        raise RuntimeError(f"benchmark exceeded {wall_timeout_s:.1f}s wall budget — variant marked bench_fail")
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
@@ -89,6 +62,11 @@ class CudaBackend(Backend):
         return run_pipeline(graph, CUDA_PASSES, dump=self.dump)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
+        # GPU serialization happens inside ``run_program`` /
+        # ``run_program_debug`` / ``benchmark_program`` — they grab
+        # ``gpu_lock()`` only around the launches + sync so parallel
+        # workers can NVRTC-compile in parallel and only contend for
+        # the device when it's time to time.
         if self.debug:
             debug_result = run_program_debug(compiled, input_data=input_data)
             self.last_debug_result = debug_result
@@ -115,7 +93,22 @@ class CudaBackend(Backend):
         on_iter=None,
     ) -> BenchmarkResult:
         del input_data
-        result = _benchmark_with_timeout(compiled, warmup=warmup, num_iters=num_iters, on_iter=on_iter, wall_timeout_s=self.bench_wall_timeout_s)
+        # GPU serialization is held inside ``benchmark_program`` (only
+        # around the iter loop, not NVRTC compile + alloc). The compile
+        # stage is bounded by ``bench_compile_timeout_s``; the iter loop
+        # is bounded both by ``num_iters="auto"``'s 100 ms GPU-time
+        # target *and* the cumulative ``bench_run_timeout_s`` budget,
+        # which catches pathological variants where every launch fits
+        # under the per-launch ``_KERNEL_TIMEOUT_MS`` watchdog but they
+        # accumulate over many iters.
+        result = benchmark_program(
+            compiled,
+            warmup=warmup,
+            num_iters=num_iters,
+            on_iter=on_iter,
+            compile_timeout_s=self.bench_compile_timeout_s,
+            run_timeout_s=self.bench_run_timeout_s,
+        )
         return BenchmarkResult(
             time_ms=result.time_ms,
             num_launches=result.num_launches,
@@ -125,5 +118,10 @@ class CudaBackend(Backend):
     def make_runner(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None):
         """Return a zero-arg ``run_once()`` callable that issues one full
         kernel-sequence pass on the same pre-allocated buffers. Used for
-        interleaved benchmarking against PyTorch."""
+        interleaved benchmarking against PyTorch.
+
+        Per-call locking is intentionally omitted: callers that need
+        process-level serialization should hold ``gpu_lock()`` around
+        their entire iter loop instead of acquiring/releasing on every
+        kernel launch."""
         return make_runner(compiled, input_data=input_data)

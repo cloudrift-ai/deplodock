@@ -62,13 +62,20 @@ class BenchmarkResult:
 class Backend(ABC):
     """Abstract backend: Graph → compiled artifact → run."""
 
-    # Wall-clock cap a single ``benchmark()`` call may consume before
-    # being treated as a failure. Used by the autotune cache to assign
-    # a realistic latency to ``bench_fail`` rows (and as the reward
-    # denominator in UCB). Backends override if they enforce a
-    # different watchdog — e.g. ``CudaBackend`` sets a thread-watchdog
-    # of the same duration around its bench loop.
-    bench_wall_timeout_s: float = 5.0
+    # Wall-clock cap on the NVRTC-compile stage of a single
+    # ``benchmark()`` call. Enforced at the C-call boundary after compile
+    # finishes so the worker raises cleanly and no daemon thread is ever
+    # left holding the CUDA context. Autotune cache pins ``bench_fail``
+    # latency to (this + ``bench_run_timeout_s``).
+    bench_compile_timeout_s: float = 2.0
+    # Cumulative GPU-time cap on the iter loop. Enforced *after* each
+    # iter completes — checked against the running sum of per-launch
+    # event-measured ms. Catches the case where every iter is just
+    # under the per-launch ``_KERNEL_TIMEOUT_MS`` watchdog (e.g. 999 ms
+    # × 20 iters = 20 s of GPU time) which the watchdog by design lets
+    # through. Distinct from a wall-clock cap so Python/cupy framing
+    # overhead doesn't artificially shrink the budget for tiny ops.
+    bench_run_timeout_s: float = 2.0
 
     @abstractmethod
     def compile(self, graph: Graph) -> Any:

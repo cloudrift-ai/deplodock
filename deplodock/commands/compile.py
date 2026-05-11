@@ -232,6 +232,7 @@ def handle_compile(args):
         logger.info("Tuning cache: %s", db_path)
 
     if args.tune:
+        import os as _os  # noqa: PLC0415
         import time as _time  # noqa: PLC0415
 
         from deplodock.compiler.pipeline import TuningSearch, run_autotune  # noqa: PLC0415
@@ -243,7 +244,17 @@ def handle_compile(args):
             min_coverage=args.tune_min_coverage,
         )
         t0 = _time.monotonic()
-        candidates = list(run_autotune(graph, passes, search=search, dump=dump, backend=backend))
+        try:
+            candidates = list(run_autotune(graph, passes, search=search, dump=dump, backend=backend))
+        except RuntimeError as exc:
+            # An autotune-internal raise (bench watchdog couldn't bail
+            # in time because the GPU queue is saturated). The CUDA
+            # stream is dirty — bypass Python cleanup so cupy's atexit
+            # doesn't deadlock on the still-running launch.
+            sys.stderr.write(f"\n[tune] aborted: {exc}\n")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            _os._exit(1)
         elapsed = _time.monotonic() - t0
         reason = search.stop_reason or "tree exhausted"
         sys.stderr.write(f"\n[tune] stopped: {reason} after {len(candidates)} variant(s) in {elapsed:.1f}s\n")

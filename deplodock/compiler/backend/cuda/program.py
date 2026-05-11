@@ -315,18 +315,34 @@ def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -
     """Run the lowered graph once, return output ndarrays + total time."""
     import cupy as cp
 
+    from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
+
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
     descs = _prebuild_descriptors(compiled, arrays)
 
-    start = cp.cuda.Event()
-    stop = cp.cuda.Event()
-    start.record()
-    for li, launch in enumerate(compiled.launches):
-        _launch(launch, compiled, arrays, descs.get(li))
-    stop.record()
-    stop.synchronize()
-    time_ms = cp.cuda.get_elapsed_time(start, stop)
+    # Acquire the cross-process GPU lock only around the actual kernel
+    # launches + synchronize, not the NVRTC compile / cupy alloc above.
+    # That lets parallel workers compile in parallel and serialize only
+    # on the device, which is the part where contention skews timings.
+    with gpu_lock():
+        start = cp.cuda.Event()
+        stop = cp.cuda.Event()
+        start.record()
+        for li, launch in enumerate(compiled.launches):
+            _launch(launch, compiled, arrays, descs.get(li))
+            # Per-launch watchdog: queue an event after each launch and
+            # wait for it before the next one. Mirrors what
+            # ``benchmark_program`` does, so a single hung kernel raises
+            # cleanly instead of letting downstream callers (e.g. the
+            # ``--bench`` step right after this accuracy check) queue
+            # their work behind the stuck launch.
+            barrier = cp.cuda.Event()
+            barrier.record()
+            _wait_for_event(barrier, _KERNEL_TIMEOUT_MS, launch.kernel_name)
+        stop.record()
+        _wait_for_event(stop, _KERNEL_TIMEOUT_MS, "run_program.stop")
+        time_ms = cp.cuda.get_elapsed_time(start, stop)
 
     outputs: dict[str, np.ndarray] = {}
     for buf in compiled.bufs:
@@ -343,6 +359,8 @@ class DebugResult:
 
 def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> DebugResult:
     """Run the graph once, snapshotting every non-input buffer after each launch."""
+    from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
+
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
     descs = _prebuild_descriptors(compiled, arrays)
@@ -350,14 +368,15 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
     input_names = {b.name for b in compiled.bufs if b.role == "input"}
     per_launch_np: dict[int, dict[str, np.ndarray]] = {}
 
-    for li, launch in enumerate(compiled.launches):
-        _launch(launch, compiled, arrays, descs.get(li))
-        snap: dict[str, np.ndarray] = {}
-        for name, arr in arrays.items():
-            if name in input_names:
-                continue
-            snap[name] = arr.get().astype(np.float32, copy=False)
-        per_launch_np[li] = snap
+    with gpu_lock():
+        for li, launch in enumerate(compiled.launches):
+            _launch(launch, compiled, arrays, descs.get(li))
+            snap: dict[str, np.ndarray] = {}
+            for name, arr in arrays.items():
+                if name in input_names:
+                    continue
+                snap[name] = arr.get().astype(np.float32, copy=False)
+            per_launch_np[li] = snap
 
     outputs: dict[str, np.ndarray] = {}
     for buf in compiled.bufs:
@@ -367,7 +386,21 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
 
 
 _AUTO_BUDGET_MS = 100.0
-_AUTO_MAX_ITERS = 100_000
+# Defensive cap for ``num_iters="auto"``. The 100 ms GPU-time target
+# normally short-circuits the loop well before this — at 10 µs/launch
+# (about as fast as a real kernel gets) it'd take 10 k iters. The cap
+# only bites the broken-kernel case where ``iter_dts`` stays at 0
+# (kernel returns instantly so the GPU-time accumulator never advances);
+# at ~100 µs of Python/cupy overhead per iter, 10 k iters caps the
+# wall time at roughly the run-stage budget.
+_AUTO_MAX_ITERS = 100
+# Target per-kernel-position timing window. Sub-millisecond kernels are
+# dominated by per-iter Python/cupy framing overhead (~100 µs); we
+# amortize it by repeating each launch ``batch_size`` times inside one
+# CUDA event window, where ``batch_size = ceil(_BATCH_TARGET_MS /
+# per_launch_ms)``. Calibrated after warmup from the last-warmup iter's
+# per-launch timings, then held fixed during measurement.
+_BATCH_TARGET_MS = 1.0
 # Per-launch wall-clock cap. Any single kernel launch exceeding this is
 # considered "broken" — too many threads, infinite loop, hung GPU — and
 # the bench bails out via ``RuntimeError`` so the autotune sweep doesn't
@@ -404,6 +437,8 @@ def benchmark_program(
     warmup: int = 5,
     num_iters: int | str = 20,
     on_iter=None,
+    compile_timeout_s: float | None = None,
+    run_timeout_s: float | None = None,
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
 
@@ -419,8 +454,26 @@ def benchmark_program(
     For a 7-µs RMSNorm that's ~14k iters; a 1-ms matmul gets ~100. The
     result's ``time_ms`` is the mean of measured iterations.
 
-    ``on_iter`` — see autotune flow note below."""
+    ``on_iter`` — see autotune flow note below.
+
+    ``compile_timeout_s`` bounds the NVRTC-compile + alloc + descriptor
+    setup stage at a C-call boundary: if that pre-loop work overruns,
+    the function raises ``RuntimeError`` before entering the bench loop
+    so no daemon thread is left holding the CUDA context.
+
+    ``run_timeout_s`` bounds the iter loop on **accumulated GPU time**
+    (sum of per-launch CUDA-event measurements), not wall-clock — so
+    Python/cupy framing overhead doesn't shrink the budget for tiny
+    ops. Catches the gap left by the per-launch ``_KERNEL_TIMEOUT_MS``
+    watchdog: a variant where every launch fits under the watchdog but
+    summed across iters exceeds the budget (e.g. 999 ms × N iters).
+    Checked between iters so no in-flight launch is mid-kernel when
+    the function raises."""
+    import time as _time  # noqa: PLC0415
+
     import cupy as cp
+
+    from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     if isinstance(num_iters, str):
         if num_iters != "auto":
@@ -433,51 +486,96 @@ def benchmark_program(
         max_measured = int(num_iters)
         auto = False
 
+    t_compile_start = _time.monotonic()
     compiled = _compile(graph)
     arrays = _allocate(compiled, input_data)
     descs = _prebuild_descriptors(compiled, arrays)
+    compile_elapsed = _time.monotonic() - t_compile_start
+    if compile_timeout_s is not None and compile_elapsed > compile_timeout_s:
+        raise RuntimeError(f"benchmark compile stage exceeded {compile_timeout_s:.1f}s budget ({compile_elapsed:.2f}s) — variant marked bench_fail")
 
     n = len(compiled.launches)
     starts = [cp.cuda.Event() for _ in range(n)]
     stops = [cp.cuda.Event() for _ in range(n)]
     acc = [0.0] * n
+    # Per-position batch size — how many times to invoke each launch
+    # back-to-back inside one CUDA event window. Calibrated from the
+    # last warmup iter's per-launch ms; until then we run B=1.
+    batch_sizes = [1] * n
 
     iters_run = 0
     measured = 0
-    cumulative_gpu_ms = 0.0
-    while True:
-        if on_iter is not None:
-            on_iter()
-        iter_dts = [0.0] * n
-        for i, launch in enumerate(compiled.launches):
-            starts[i].record()
-            _launch(launch, compiled, arrays, descs.get(i))
-            stops[i].record()
-            # Per-kernel sync to make per-launch attribution accurate.
-            # Without it, back-to-back launches let one kernel's stop
-            # event slide into a downstream kernel's scheduling window,
-            # which ends up attributing 0.5-0.8 ms of phantom time to
-            # whichever sub-100µs kernel happens to land at a stream-
-            # stall position. Polling-with-timeout instead of blocking
-            # ``synchronize()`` so the autotune sweep can abort a single
-            # hung kernel instead of stalling forever.
-            _wait_for_event(stops[i], _KERNEL_TIMEOUT_MS, launch.kernel_name)
-            dt = cp.cuda.get_elapsed_time(starts[i], stops[i])
-            iter_dts[i] = dt
-        iters_run += 1
-        # Warmup iters: discard. ``iter_dts`` is still subject to the
-        # timeout check above so a hung kernel is caught early.
-        if iters_run <= warmup:
-            continue
-        # Measured iter: accumulate.
-        for i in range(n):
-            acc[i] += iter_dts[i]
-        cumulative_gpu_ms += sum(iter_dts)
-        measured += 1
-        if measured >= max_measured:
-            break
-        if auto and cumulative_gpu_ms >= target_total_ms:
-            break
+    cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
+    total_gpu_ms = 0.0       # all-iter GPU time (incl. warmup), for the run-stage budget
+    # Hold the cross-process GPU lock for the whole warmup+measure
+    # window. Compile and allocate above stay outside, so parallel
+    # workers can NVRTC-compile their candidates concurrently and only
+    # serialize on the device when it's time to time.
+    with gpu_lock():
+        while True:
+            if on_iter is not None:
+                # Pass the current per-iter batch size so peer backends
+                # (e.g. torch eager in ``_bench_interleaved``) can run
+                # the same number of back-to-back calls per CUDA event
+                # window — keeps the comparison apples-to-apples on
+                # warm/sustained perf instead of letting torch see a
+                # partially-cold GPU between iters while deplodock
+                # measures from a steady state. ``max`` across launch
+                # positions so torch is at least as warmed as our
+                # slowest position.
+                on_iter(max(batch_sizes))
+            iter_dts = [0.0] * n
+            for i, launch in enumerate(compiled.launches):
+                b = batch_sizes[i]
+                starts[i].record()
+                for _ in range(b):
+                    _launch(launch, compiled, arrays, descs.get(i))
+                stops[i].record()
+                # Per-kernel sync to make per-launch attribution accurate.
+                # Without it, back-to-back launches let one kernel's stop
+                # event slide into a downstream kernel's scheduling window,
+                # which ends up attributing 0.5-0.8 ms of phantom time to
+                # whichever sub-100µs kernel happens to land at a stream-
+                # stall position. Polling-with-timeout instead of blocking
+                # ``synchronize()`` so the autotune sweep can abort a single
+                # hung kernel instead of stalling forever.
+                _wait_for_event(stops[i], _KERNEL_TIMEOUT_MS * b, launch.kernel_name)
+                dt = cp.cuda.get_elapsed_time(starts[i], stops[i]) / b
+                iter_dts[i] = dt
+            iters_run += 1
+            total_gpu_ms += sum(iter_dts[i] * batch_sizes[i] for i in range(n))
+            # GPU-time run budget: bail if the cumulative GPU time across
+            # all iters (warmup + measured) exceeds ``run_timeout_s``.
+            # Catches the "every iter is just under the per-launch
+            # watchdog" pathology. Counts warmup iters too so a slow
+            # kernel can't hide behind warmup discards.
+            if run_timeout_s is not None and total_gpu_ms > run_timeout_s * 1000.0:
+                raise RuntimeError(f"benchmark run stage exceeded {run_timeout_s:.1f}s of GPU time — variant marked bench_fail")
+            # Last warmup iter: calibrate per-position batch sizes so each
+            # CUDA event window covers ~``_BATCH_TARGET_MS`` of GPU time.
+            # Amortizes the ~100 µs per-iter Python/cupy framing overhead
+            # across many launches when the kernel itself is faster than
+            # the framing — without batching, a 9 µs kernel measured one
+            # iter at a time is mostly framing noise.
+            if iters_run == warmup:
+                for i in range(n):
+                    if iter_dts[i] > 0 and iter_dts[i] < _BATCH_TARGET_MS:
+                        batch_sizes[i] = max(1, int(round(_BATCH_TARGET_MS / iter_dts[i])))
+            # Warmup iters: discard. ``iter_dts`` is still subject to the
+            # ``_KERNEL_TIMEOUT_MS`` watchdog above, which bounds any
+            # single hung launch.
+            if iters_run <= warmup:
+                continue
+            # Measured iter: accumulate per-launch (already normalized
+            # to per-launch ms inside the inner loop).
+            for i in range(n):
+                acc[i] += iter_dts[i]
+            cumulative_gpu_ms += sum(iter_dts[i] * batch_sizes[i] for i in range(n))
+            measured += 1
+            if measured >= max_measured:
+                break
+            if auto and cumulative_gpu_ms >= target_total_ms:
+                break
 
     iters = max(measured, 1)
     per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / iters) for i in range(n)]

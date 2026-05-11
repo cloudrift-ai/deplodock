@@ -434,6 +434,18 @@ def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Hard ceiling on the launch grid for ``KernelOp.validate``. The CUDA driver
+# allows ~2^31 CTAs per dim; the cap here is sized to allow any realistic
+# matmul launch (including K-split fan-in, which multiplies CTA count by
+# the split factor — e.g. (M=32, K=18944, N=3584) with BM=BN=16 and
+# auto-splitK=37 produces 2 × 224 × 37 ≈ 17 k CTAs of heavy per-CTA work),
+# while still rejecting truly degenerate launches that would saturate
+# the GPU command processor with light per-CTA work. The autotune-side
+# guard against pathological tiny-CTA × huge-grid variants is the
+# graduated penalty in ``TileOp.score``, not this cap.
+_MAX_CTAS = 65536
+
+
 @dataclass
 class KernelOp(Op):
     """One ``__global__`` GPU kernel as a Kernel IR program.
@@ -488,11 +500,16 @@ class KernelOp(Op):
         ``validate`` on each op rebind, but only at the ``KernelOp``
         stage are the THREAD axes guaranteed to reflect the final
         per-CTA launch geometry — earlier ``TileOp`` rewrites may still
-        split or coalesce them). Two checks:
+        split or coalesce them). Three checks:
 
         - threads ≤ ``ctx.max_threads_per_cta`` (driver-side launch cap),
         - smem ≤ ``ctx.max_dynamic_smem`` (per-block ``cudaFuncSetAttribute``
-          opt-in cap; smaller for older / consumer cards)."""
+          opt-in cap; smaller for older / consumer cards),
+        - CTAs ≤ ``_MAX_CTAS`` (a hard cap on the launch grid — empirically
+          variants with tens of thousands of light CTAs slot into the
+          GPU command processor so slowly that the per-launch
+          ``_KERNEL_TIMEOUT_MS`` watchdog stops being a useful escape
+          hatch; better to drop them at the rule level before benching)."""
         from math import prod  # noqa: PLC0415
         from deplodock.compiler.ir.stmt import Tile  # noqa: PLC0415
 
@@ -500,6 +517,9 @@ class KernelOp(Op):
             if isinstance(s, Tile):
                 threads = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_THREAD)
                 if threads > ctx.max_threads_per_cta:
+                    return False
+                ctas = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_BLOCK)
+                if ctas > _MAX_CTAS:
                     return False
         if self.smem_bytes() > ctx.max_dynamic_smem:
             return False

@@ -47,6 +47,24 @@ def register_run_command(subparsers):
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
     parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="Autotune the compile pipeline (search BM/BN/F/... knobs and pick the lowest-latency variant) "
+        "before running. The picked graph is what gets benched/checked. Uses the same persistent cache "
+        "as ``deplodock compile --tune`` (``~/.cache/deplodock/autotune.db``).",
+    )
+    parser.add_argument(
+        "--tune-budget",
+        type=float,
+        default=60.0,
+        help="Wall-clock budget for --tune in seconds (default: 60).",
+    )
+    parser.add_argument(
+        "--tune-db",
+        default=None,
+        help="Path to the tuning SQLite cache. Default: ~/.cache/deplodock/autotune.db.",
+    )
+    parser.add_argument(
         "--bench-backends",
         default=None,
         help=(
@@ -121,7 +139,28 @@ def handle_run(args):
         dump.dump_input_graph(graph)
 
     backend = CudaBackend(debug=args.debug or None, dump=dump)
-    compiled = backend.compile(graph)
+    if getattr(args, "tune", False):
+        try:
+            compiled, best_us = _compile_tuned(graph, backend, dump, args)
+        except RuntimeError as exc:
+            # An autotune-internal raise (e.g. bench watchdog couldn't
+            # bail in time because of queue buildup). The CUDA stream
+            # is dirty — bypass cleanup so cupy's atexit doesn't block.
+            sys.stderr.write(f"run --tune: {exc}\n")
+            _write_tune_bench_json(dump, best_total_us=0.0, warmup=args.warmup, iters=args.iters)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+        if compiled is None:
+            logger.warning("run --tune: no ok candidate after autotune — skipping post-tune --bench")
+            _write_tune_bench_json(dump, best_total_us=0.0, warmup=args.warmup, iters=args.iters)
+            # ``os._exit`` skips Python's cleanup so cupy's atexit handlers
+            # don't block on draining the CUDA queue of timed-out kernels.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+    else:
+        compiled = backend.compile(graph)
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
@@ -134,17 +173,29 @@ def handle_run(args):
     # launch the deplodock kernels so ncu can sample our metrics.
     skip_accuracy = os.environ.get(_NCU_RECURSE_GUARD) == "1"
 
-    if not skip_accuracy:
-        run_result = backend.run(compiled, input_data=input_data)
-        if dump and backend.last_debug_result is not None:
-            dump.dump_per_launch_values(backend.last_debug_result.per_launch)
+    try:
+        if not skip_accuracy:
+            run_result = backend.run(compiled, input_data=input_data)
+            if dump and backend.last_debug_result is not None:
+                dump.dump_per_launch_values(backend.last_debug_result.per_launch)
 
-        eager_out = _eager_output(module, example_args, example_kwargs)
-        _check_accuracy(run_result.outputs, eager_out)
-    else:
-        # ncu child needs at least one deplodock launch for metrics
-        # to populate; skip the eager comparison.
-        backend.run(compiled, input_data=input_data)
+            eager_out = _eager_output(module, example_args, example_kwargs)
+            _check_accuracy(run_result.outputs, eager_out)
+        else:
+            # ncu child needs at least one deplodock launch for metrics
+            # to populate; skip the eager comparison.
+            backend.run(compiled, input_data=input_data)
+    except RuntimeError as exc:
+        # Per-launch watchdog fired in ``run_program`` (kernel >1 s, or
+        # queue buildup from a prior failed autotune variant). The CUDA
+        # context is dirty — bypass Python cleanup so cupy's atexit
+        # doesn't block on the still-running kernel.
+        sys.stderr.write(f"accuracy check failed: {exc}\n")
+        if getattr(args, "tune", False):
+            _write_tune_bench_json(dump, best_total_us=0.0, warmup=args.warmup, iters=args.iters)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
     if not args.bench:
         return
@@ -162,48 +213,130 @@ def handle_run(args):
     backends = _resolve_backends(args.bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup, backends=backends)
 
-    with _gpu_lock():
+    # GPU serialization is handled inside ``CudaBackend.benchmark`` (and
+    # every other GPU entry point) via ``gpu_lock()`` — no need to wrap
+    # the whole bench block here. Print/dump are pure CPU work.
+    try:
         results, bench = _bench_interleaved(
             cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
         )
+    except RuntimeError as exc:
+        # Bench watchdog fired (slow kernel, hung launch). The kernel
+        # that timed out is still queued on the CUDA stream, so Python's
+        # normal shutdown would block in cupy's atexit memory-pool
+        # drain. Report the failure and ``os._exit`` so the process
+        # actually exits.
+        sys.stderr.write(f"benchmark failed: {exc}\n")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
-        if dump:
-            dump.dump_benchmark(bench)
-            _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
+    if dump:
+        dump.dump_benchmark(bench)
+        _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
-        _print_table(results)
-        _print_kernel_stats(compiled, bench)
-        if args.profile:
-            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+    _print_table(results)
+    _print_kernel_stats(compiled, bench)
+    if args.profile:
+        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+    # Under ``--tune`` the autotune sweep may have left slow / timed-out
+    # kernels queued on the CUDA stream — they're still executing in the
+    # driver even though we bailed on waiting for their stop events.
+    # Python's normal shutdown runs cupy's atexit handlers, which try
+    # to free the memory pool and consequently block until the queue
+    # drains. Bypass cleanup once output is flushed: the OS reclaims
+    # GPU resources when the process exits.
+    if getattr(args, "tune", False):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
-def _gpu_lock():
-    """Cross-process advisory lock on a single GPU. Activated when
-    ``DEPLODOCK_GPU_LOCK`` is set (path of the lock file); a no-op
-    otherwise so ad-hoc ``deplodock run`` invocations don't pay any
-    coordination overhead. The path holds an ``flock`` (via
-    ``filelock.FileLock``) for the duration of the ``with`` block —
-    other waiters block, avoiding interleaved kernel launches that
-    would corrupt iter timings.
+def _write_tune_bench_json(dump, *, best_total_us: float, warmup: int, iters: int) -> None:
+    """Synthesize the ``60_bench_compare.json`` the perf-suite conftest
+    parses. Used by the ``--tune`` path when the sweep didn't yield an
+    ok variant (every bench overran its compile/run budget): the
+    perf-suite test still expects a row, so we write zeros and let
+    downstream tooling flag the case."""
+    if dump is None:
+        return
+    import json as _json  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    payload = {
+        "warmup": warmup,
+        "iters": iters,
+        "backends": {
+            "Eager PyTorch": {"latency_us": 0.0},
+            "Deplodock": {"latency_us": best_total_us, "speedup_vs_eager": 0.0},
+        },
+        "tune_failed": best_total_us == 0.0,
+    }
+    (_Path(dump.dir) / "60_bench_compare.json").write_text(_json.dumps(payload, indent=2))
+
+
+def _compile_tuned(graph, backend, dump, args):
+    """Autotune the lowering pipeline and return the best variant's
+    compiled graph. Mirrors ``deplodock compile --tune``: shared persistent
+    cache, same MCTS-driven search, same wall-budget knob. The picked
+    candidate is the lowest summed CudaOp latency that measured ``ok``.
+
+    Holds the cross-process ``DEPLODOCK_GPU_LOCK`` for the whole tune —
+    parallel ``deplodock run --tune`` workers under ``make bench-kernels``
+    must serialize on the live GPU or their benches contaminate each
+    other's timings.
     """
-    import contextlib
-    import os as _os
+    from pathlib import Path as _Path  # noqa: PLC0415
 
-    path = _os.environ.get("DEPLODOCK_GPU_LOCK")
-    if not path:
+    from deplodock.compiler.cache import TuningCache, op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch, run_autotune  # noqa: PLC0415
 
-        @contextlib.contextmanager
-        def _noop():
-            yield
+    db_path = _Path(args.tune_db) if args.tune_db else _Path.home() / ".cache" / "deplodock" / "autotune.db"
+    cache = TuningCache(path=db_path)
+    logger.info("run --tune: cache=%s budget=%.1fs", db_path, args.tune_budget)
+    search = TuningSearch(cache=cache, budget_s=args.tune_budget)
 
-        return _noop()
+    # ``run_autotune`` drives ``backend.benchmark`` once per terminal
+    # candidate; the backend acquires the GPU lock per call, so parallel
+    # ``deplodock run --tune`` workers are already serialized at the
+    # kernel-launch granularity without wrapping the whole sweep.
+    candidates = list(run_autotune(graph, CUDA_PASSES, search=search, dump=dump, backend=backend))
 
-    from pathlib import Path as _Path
-
-    from filelock import FileLock
-
-    _Path(path).parent.mkdir(parents=True, exist_ok=True)
-    return FileLock(path)
+    ctx_key = Context.probe().structural_key()
+    best = None
+    best_total = float("inf")
+    for cand in candidates:
+        cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
+        if not cuda_nodes:
+            continue
+        total = 0.0
+        all_ok = True
+        for node in cuda_nodes:
+            key = op_cache_key(node.op)
+            row = cache.cuda_perf(ctx_key, key) if key else None
+            if row is None or row.status != "ok":
+                all_ok = False
+                break
+            total += row.latency_us
+        if all_ok and total < best_total:
+            best_total = total
+            best = cand
+    if best is None:
+        # Every candidate either bench_failed or produced no CudaOp.
+        # Falling back to the deterministic compile gives us back the
+        # heuristic variant that the sweep already proved doesn't
+        # complete within the wall budget — running it through the
+        # accuracy check (no timeout) or the bench loop just hangs.
+        # Signal "no measurement" via ``best_total=inf`` so the caller
+        # writes a zero-result bench JSON and force-exits cleanly
+        # rather than hanging on a broken kernel.
+        logger.warning("run --tune: no ok candidate after %d variant(s); every bench timed out", len(candidates))
+        return None, float("inf")
+    logger.info("run --tune: best variant %.2f us across %d kernel(s)", best_total, sum(1 for n in best.graph.nodes.values() if isinstance(n.op, CudaOp)))
+    return best.graph, best_total
 
 
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
@@ -600,18 +733,17 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
-    with _gpu_lock():
-        if args.bench:
-            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-            print()
-            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-            print("-" * 38)
-            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-            if dump:
-                dump.dump_benchmark(bench)
-            _print_kernel_stats(graph, bench)
-        if args.profile:
-            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+    if args.bench:
+        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+        print()
+        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+        print("-" * 38)
+        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+        if dump:
+            dump.dump_benchmark(bench)
+        _print_kernel_stats(graph, bench)
+    if args.profile:
+        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):
@@ -822,17 +954,23 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     """
     import torch
 
-    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
+    # Each entry: (start_event, stop_event, batch_size_used). The
+    # batch size is propagated by ``benchmark_program``'s ``on_iter``
+    # so peer torch backends time the same number of back-to-back
+    # calls deplodock does per CUDA event window — both sides then
+    # measure sustained per-call latency, no warm-vs-cold asymmetry.
+    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, int]]] = {name: [] for name in torch_fns}
 
-    def on_iter() -> None:
+    def on_iter(batch_size: int = 1) -> None:
         for name, fn in torch_fns.items():
             start = torch.cuda.Event(enable_timing=True)
             stop = torch.cuda.Event(enable_timing=True)
             with torch.no_grad():
                 start.record()
-                fn()
+                for _ in range(batch_size):
+                    fn()
                 stop.record()
-            torch_events[name].append((start, stop))
+            torch_events[name].append((start, stop, batch_size))
 
     bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
@@ -841,7 +979,9 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
-            results[name] = (sum(s.elapsed_time(e) for s, e in measured) / len(measured)) * 1000
+            # ``elapsed_time`` is in ms across the whole batch; divide
+            # by the batch size and multiply by 1000 to get per-call us.
+            results[name] = sum(s.elapsed_time(e) * 1000.0 / b for s, e, b in measured) / len(measured)
     results["Deplodock"] = bench.time_ms * 1000
     return results, bench
 

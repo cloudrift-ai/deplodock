@@ -1262,7 +1262,19 @@ def run_autotune(
             label = " | ".join(knob_strs) if knob_strs else "option-0"
             logger.info("[tune] variant #%d  [%s]", n_terminals, label)
         if cache is not None:
-            record_terminal(cand.graph, cache, cand.ctx.structural_key(), backend=backend)
+            from deplodock.compiler.cache import TuneAborted  # noqa: PLC0415
+
+            try:
+                record_terminal(cand.graph, cache, cand.ctx.structural_key(), backend=backend)
+            except TuneAborted as exc:
+                # A bench failure left GPU work queued; running another
+                # variant would block in cupy's ``_allocate``. Yield
+                # this terminal (its measurements are already recorded
+                # as bench_fail) and stop the sweep so the caller can
+                # pick a winner from whatever ok variants we've got.
+                logger.warning("[tune] %s — stopping after %d terminal(s)", exc, n_terminals)
+                yield cand
+                break
         yield cand
     logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 

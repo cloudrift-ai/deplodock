@@ -466,8 +466,15 @@ class TileOp(Op):
           load goes to global memory (no register reuse), memory-bound.
         - Massive unroll (cells/thread > 64) → graduated penalty up to
           ``-1.0``. NVRTC compile time explodes on the unrolled body.
-        - CTA count outside ``[32, 4096]`` → ``-0.5``. Too few CTAs leave
-          SMs idle; too many serialize waves.
+        - CTA count below 32 → ``-0.5``. Too few CTAs to fill the SMs.
+        - CTA count above ``2048`` → graduated penalty up to ``-2.5``.
+          A typical sm_120-class GPU has ~150 SMs running ~2 concurrent
+          CTAs each, so ~300 in flight; 2 k CTAs is ~7 waves, beyond
+          which we burn time in the command processor scheduling waves
+          of light per-CTA work, and atomic-fanin on output writebacks
+          starts dominating (see the ``BM=16, BN=16`` failure on
+          ``(M=32, K=3584, N=18944)`` — 2 k+ CTAs, 1 cell/thread, kernel
+          runs >3 s).
         - Distance from 256 threads/CTA → up to ``-1.0``.
         - Stages (smem staging) → ``+1.0``.
         - Register tile fired (``F_M * F_N > 1``) → ``+1.0``.
@@ -527,9 +534,14 @@ class TileOp(Op):
         elif cells > 64:
             score -= min((cells - 64) / 64.0, 1.0)
 
-        # CTA count penalty.
-        if ctas < 32 or ctas > 4096:
+        # CTA count penalty — flat for under-fill, graduated for huge launches.
+        # Above ~2 k CTAs the command processor spends most of its time
+        # scheduling tiny waves and atomic fan-in on output writebacks
+        # serializes hard, so the penalty grows linearly past the limit.
+        if ctas < 32:
             score -= 0.5
+        elif ctas > 2048:
+            score -= min(0.5 + (ctas - 2048) / 4096.0, 2.5)
 
         # Bonuses.
         if any(isinstance(b, _Stage) for b in tile.body):
