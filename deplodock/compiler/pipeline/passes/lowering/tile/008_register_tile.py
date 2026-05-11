@@ -71,7 +71,13 @@ PATTERN = [Pattern("root", TileOp)]
 # Candidate per-thread cell factors to fork over. Cell shape is
 # ``(F_M, F_N)`` with each F dividing its corresponding THREAD axis
 # extent.
-_TUNE_F_CHOICES: tuple[int, ...] = (2, 4, 8)
+_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+# Cap on per-thread output cells. F_M × F_N replicates the matmul reduce
+# body that many times per thread; beyond this NVRTC compile time
+# explodes on the unrolled body. ``TileOp.validate`` is the second-line
+# filter (post-register-tile thread count); this is the first-line cap
+# in the rule itself.
+_MAX_CELLS_PER_THREAD = 128
 
 
 def rewrite(root: Node) -> Graph | None | list[TileOp]:
@@ -135,19 +141,23 @@ def _variants(
     seen: set[tuple[int, int]] = set()
     ordered: list[tuple[int, int]] = []
 
-    def _add(shape: tuple[int, int]) -> None:
+    def _add(shape: tuple[int, int], *, cap_cells: bool = True) -> None:
         f_m, f_n = shape
         if shape in seen:
             return
         if f_m <= 1 and f_n <= 1:
             return  # both ≤ 1 means no register tile — handled by the skip path
+        if cap_cells and f_m * f_n > _MAX_CELLS_PER_THREAD:
+            return  # too many per-thread cells; NVRTC compile bombs
         if m_ext % f_m != 0 or n_ext % f_n != 0:
             return
         seen.add(shape)
         ordered.append(shape)
 
-    # Heuristic first — non-tune compiles pick option 0.
-    _add((int(heuristic[0]), int(heuristic[1])))
+    # Heuristic first — non-tune compiles pick option 0. Exempt from the
+    # cell-count cap so class-tuned defaults like ``(F_M=8, F_N=8)`` keep
+    # working; the cap only narrows the *autotune* alternatives.
+    _add((int(heuristic[0]), int(heuristic[1])), cap_cells=False)
     for f_m in _TUNE_F_CHOICES:
         for f_n in _TUNE_F_CHOICES:
             _add((f_m, f_n))

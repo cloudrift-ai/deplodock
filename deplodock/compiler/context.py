@@ -58,6 +58,10 @@ class Context:
     compute_capability: tuple[int, int]
     static_smem_cap: int = STATIC_SMEM_CAP
     max_dynamic_smem: int = STATIC_SMEM_CAP  # overridden by from_target/probe
+    # Hardware-universal per-CTA thread cap (CUDA compute capability ≥ 2.0).
+    # Used by ``KernelOp.validate`` to filter autotune variants whose launch
+    # geometry would be rejected by the driver before the kernel ever runs.
+    max_threads_per_cta: int = 1024
 
     @classmethod
     def from_target(cls, cap: tuple[int, int]) -> Context:

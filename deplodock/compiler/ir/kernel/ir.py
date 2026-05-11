@@ -465,6 +465,46 @@ class KernelOp(Op):
         head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
         return "\n".join([head, *pretty_body(self.body, "    ")])
 
+    def smem_bytes(self) -> int:
+        """Total static + dynamic ``__shared__`` bytes declared in the
+        body — sum of ``prod(Smem.extents) * sizeof(Smem.dtype)`` over
+        every ``Smem`` decl. Used by both ``CudaOp`` codegen (to set the
+        launch ``smem_bytes`` arg) and ``validate`` (to gate against the
+        target's smem cap)."""
+        from math import prod  # noqa: PLC0415
+
+        # Mirror cuda/001_lower_kernelop's _DTYPE_BYTES for the smem sizing.
+        dtype_bytes = {"float": 4, "double": 8, "int": 4, "half": 2, "bfloat16": 2}
+        total = 0
+        for s in self.body:
+            if isinstance(s, Smem):
+                elements = prod(int(e) for e in s.extents) if s.extents else 1
+                total += elements * dtype_bytes.get(s.dtype, 4)
+        return total
+
+    def validate(self, ctx) -> bool:
+        """Drop kernels whose launch wouldn't fit the hardware. Runs
+        after every tile-level rewrite has settled (the engine calls
+        ``validate`` on each op rebind, but only at the ``KernelOp``
+        stage are the THREAD axes guaranteed to reflect the final
+        per-CTA launch geometry — earlier ``TileOp`` rewrites may still
+        split or coalesce them). Two checks:
+
+        - threads ≤ ``ctx.max_threads_per_cta`` (driver-side launch cap),
+        - smem ≤ ``ctx.max_dynamic_smem`` (per-block ``cudaFuncSetAttribute``
+          opt-in cap; smaller for older / consumer cards)."""
+        from math import prod  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt import Tile  # noqa: PLC0415
+
+        for s in self.body:
+            if isinstance(s, Tile):
+                threads = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_THREAD)
+                if threads > ctx.max_threads_per_cta:
+                    return False
+        if self.smem_bytes() > ctx.max_dynamic_smem:
+            return False
+        return True
+
     @property
     def loads(self) -> tuple[Load, ...]:
         return self.body.iter_of_type(Load)

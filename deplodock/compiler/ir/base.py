@@ -53,6 +53,16 @@ class Op:
         """Render this op's body for kernel dumps. Default: None (skip)."""
         return None
 
+    def validate(self, ctx) -> bool:  # noqa: ARG002 — ``ctx`` consumed by subclass overrides
+        """Sanity-check this op against the compilation context. Return
+        ``False`` to signal that the engine should *drop* this op (e.g.
+        skip a fork variant that would produce an unrunnable kernel).
+        Default: always valid. Override in subclasses to enforce per-op
+        invariants — ``TileOp.validate`` for instance checks that the
+        post-register-tile thread count fits the hardware launch budget.
+        """
+        return True
+
 
 @dataclass
 class InputOp(Op):

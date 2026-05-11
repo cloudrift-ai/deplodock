@@ -57,13 +57,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 PATTERN = [Pattern("root", TileOp)]
 
-_MAX_SLAB_BYTES = 16 * 1024  # 16 KB hard cap per Stage
-# Per-scope budget across all admitted Stages. Consumer hardware static-
-# smem cap is 48 KB; downstream pad + double-buffer can ~2× this, so the
-# pre-pad/db budget is ``48 KB / 2 = 24 KB``.
-_PER_SCOPE_BYTES_BUDGET = 24 * 1024
-
-
 class _Slab(NamedTuple):
     """Slab geometry derived from one Load's index."""
 
@@ -74,8 +67,14 @@ class _Slab(NamedTuple):
     n_bytes: int
 
 
-def rewrite(root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
+def rewrite(root: Node, ctx) -> Graph | None:
+    # Per-Stage and per-scope smem budgets come from the hardware target:
+    # admit any slab as long as cumulative smem stays under
+    # ``ctx.max_dynamic_smem``. ``KernelOp.validate`` is the second-line
+    # gate that drops variants whose final smem (post pad + double-buffer)
+    # still overflows the cap.
+    budget = ctx.max_dynamic_smem
+    new_body = _maybe_rewrite(root.op.body, slab_cap=budget, scope_budget=budget)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")
     return TileOp(body=new_body, name=root.op.name)
@@ -84,7 +83,7 @@ def rewrite(root: Node) -> Graph | None:
 _WARP_SIZE = 32
 
 
-def _maybe_rewrite(body: Body) -> Body | None:
+def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int) -> Body | None:
     idx, tile = single_tile(body)
     if any(isinstance(s, Stage) for s in tile.body.iter()):
         raise RuleSkipped("Tile body already has Stage stmts (idempotence)")
@@ -104,7 +103,9 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
     used_names: set[str] = set()
     block_axis_names = frozenset(ax.name for ax in tile.block_axes)
-    new_tile_body = _process_scope(tile, tile.thread_axes, tile.all_axes, block_axis_names, used_names)
+    new_tile_body = _process_scope(
+        tile, tile.thread_axes, tile.all_axes, block_axis_names, used_names, slab_cap=slab_cap, scope_budget=scope_budget
+    )
     if new_tile_body == tile.body:
         raise RuleSkipped("no Load qualifies for staging")
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
@@ -116,6 +117,9 @@ def _process_scope(
     in_scope_axes: tuple[Axis, ...],
     block_axis_names: frozenset[str],
     used_names: set[str],
+    *,
+    slab_cap: int,
+    scope_budget: int,
 ) -> Body:
     """Free Loops recurse; reduce loops contribute Loads to this scope's
     per-buffer bucket. Per buffer, derive one slab if all Loads agree;
@@ -126,7 +130,18 @@ def _process_scope(
     for s in scope.body:
         if isinstance(s, Loop) and not s.is_reduce:
             rewritten_inner.append(
-                Loop(axis=s.axis, body=_process_scope(s, thread_axes, (*in_scope_axes, s.axis), block_axis_names, used_names))
+                Loop(
+                    axis=s.axis,
+                    body=_process_scope(
+                        s,
+                        thread_axes,
+                        (*in_scope_axes, s.axis),
+                        block_axis_names,
+                        used_names,
+                        slab_cap=slab_cap,
+                        scope_budget=scope_budget,
+                    ),
+                )
             )
             continue
         if isinstance(s, (Loop, StridedLoop)):
@@ -136,7 +151,7 @@ def _process_scope(
                     loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes))
         rewritten_inner.append(s)
 
-    stages, name_rewrites = _build_stages(loads_by_buf, thread_axes, block_axis_names, used_names)
+    stages, name_rewrites = _build_stages(loads_by_buf, thread_axes, block_axis_names, used_names, slab_cap=slab_cap, scope_budget=scope_budget)
     if not stages:
         return tuple(rewritten_inner)
 
@@ -149,6 +164,9 @@ def _build_stages(
     thread_axes: tuple[Axis, ...],
     block_axis_names: frozenset[str],
     used_names: set[str],
+    *,
+    slab_cap: int,
+    scope_budget: int,
 ) -> tuple[list[Stage], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by structural index equality (within a
     loop they collapse only when textually identical — Python-scope
@@ -186,10 +204,10 @@ def _build_stages(
                 partitions.append((load, reduce_axis, scope_axes, [load]))
 
         for rep_load, rep_reduce, rep_scope, members in partitions:
-            slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope)
+            slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope, slab_cap=slab_cap)
             if slab is None:
                 continue
-            if used_bytes + slab.n_bytes > _PER_SCOPE_BYTES_BUDGET:
+            if used_bytes + slab.n_bytes > scope_budget:
                 continue
             smem_name = _gen_name(buf, used_names)
             addressing: AffineAddressing | TemplateAddressing = (
@@ -229,6 +247,8 @@ def _classify(
     thread_axes: tuple[Axis, ...],
     reduce_axis: Axis,
     scope_axes: tuple[Axis, ...],
+    *,
+    slab_cap: int,
 ) -> _Slab | None:
     """Derive the slab for ``load`` by evaluating ``load.index`` over
     the cache vars (thread axes + this loop's reduce axis):
@@ -280,7 +300,7 @@ def _classify(
     n_bytes = BYTES_PER_ELEM
     for ax in cache_axes:
         n_bytes *= int(ax.extent)
-    if n_bytes > _MAX_SLAB_BYTES:
+    if n_bytes > slab_cap:
         return None
 
     needs_template = False

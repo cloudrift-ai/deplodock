@@ -676,6 +676,15 @@ def _try_one_rule(
         options = _try_rewrite(rule, match, ctx, debug_on=debug_on, pass_name=pass_name)
         if options is None:
             continue
+        # Drop options that fail their own validity check (e.g. TileOp
+        # variants whose post-register-tile launch would exceed 1024
+        # threads). Saves the engine from deep-copying and pushing a
+        # candidate that the backend will only fail on. Non-Op options
+        # (Graph fragments) skip the check; their structure is opaque
+        # at this layer.
+        options = [o for o in options if not isinstance(o, Op) or o.validate(ctx)]
+        if not options:
+            continue
         chosen = options[0]
         # Record the (parent_key → child_keys) expansion in the autotune
         # tree before applying anything. Only fires when every option is

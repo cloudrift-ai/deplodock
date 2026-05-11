@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # inside the first kernel launch can take 30+ s on heavily-replicated
 # kernels (e.g. autotune variants with F_M*F_N=256 cells), which would
 # otherwise stall the whole sweep on one bad variant.
-_BENCH_WALL_TIMEOUT_S = 10.0
+_BENCH_WALL_TIMEOUT_S = 5.0
 
 
 def _benchmark_with_timeout(graph, *, warmup, num_iters, on_iter):
