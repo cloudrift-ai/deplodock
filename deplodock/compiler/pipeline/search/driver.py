@@ -1,0 +1,190 @@
+"""Autotune driver — the search-loop that walks the rewrite tree.
+
+``_search_loop`` is the unified driver: pop a candidate, advance it by
+one rule application (via ``engine._try_one_rule``), push successor(s)
+back. ``run_autotune`` wraps it with backend measurement / cache
+recording per terminal; ``run_pipeline`` is the single-shot greedy
+convenience wrapper used by ``deplodock compile`` without ``--tune``."""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Iterable, Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from deplodock.compiler.context import Context
+from deplodock.compiler.graph import Graph
+from deplodock.compiler.pipeline.search.cache import TuningCache, record_terminal
+from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.policy import GreedySearch, Search
+
+if TYPE_CHECKING:
+    from deplodock.compiler.pipeline.dump import CompilerDump
+
+_PASSES_DIR = Path(__file__).resolve().parent.parent / "passes"
+
+logger = logging.getLogger(__name__)
+
+
+def _search_loop(
+    search: Search,
+    rules_per_pass: list,
+    pass_names: list[str],
+    ctx: Context | None,
+    dump: CompilerDump | None,
+) -> Iterator[Candidate]:
+    """The unified search-driven driver. Each iteration: pop a
+    candidate, try one rule application (or end-of-pass bookkeeping),
+    push successor(s). Yields when a candidate reaches the end of the
+    pipeline (``cursor.pass_idx >= len(pass_names)``).
+
+    Used by every engine entry point — ``run_autotune`` (full pipeline),
+    ``run_pass`` (one pass), ``run_rule`` (one rule). They differ only
+    in the rules-per-pass list and the ``Search`` instance supplied."""
+    # Local import to break the engine ↔ driver cycle (engine.run_pass
+    # / run_rule call _search_loop, and _try_one_rule lives in engine).
+    from deplodock.compiler.pipeline.engine import _try_one_rule  # noqa: PLC0415
+
+    cache: TuningCache | None = getattr(search, "cache", None)
+    while (cand := search.pop()) is not None:
+        cur = cand.cursor
+        if cur.pass_idx >= len(pass_names):
+            yield cand
+            continue
+        rules = rules_per_pass[cur.pass_idx]
+        # Empty pass (e.g. all rules filtered out): nothing to do, skip.
+        if not rules:
+            cur.pass_idx += 1
+            search.push(cand)
+            continue
+        rule = rules[cur.rule_idx]
+        pass_idx_arg = cur.pass_idx + 1 if pass_names[cur.pass_idx] else None
+        pass_name_arg = pass_names[cur.pass_idx] or None
+        result = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg, cache=cache)
+
+        def _on_pass_finish(idx: int) -> None:
+            name = pass_names[idx]
+            if name:
+                logger.info("compile: %-18s done (%d nodes)", name, len(cand.graph.nodes))
+            if dump is not None and name:
+                dump.on_pass(idx + 1, name, cand.graph)
+
+        cur.advance(result, n_rules=len(rules), on_pass_finish=_on_pass_finish)
+        # Forks first, then ``cand`` last — LIFO ``Search`` pops ``cand``
+        # next, driving the inline branch deep before backtracking.
+        for fork in result.forks:
+            search.push(fork)
+        search.push(cand)
+
+
+def run_pipeline(
+    graph: Graph,
+    passes: list[str],
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+    ctx: Context | None = None,
+    backend=None,
+    cache: TuningCache | None = None,
+) -> Graph:
+    """Run each named pass directory in order; dispatch ``dump.on_pass``
+    after each. Single-candidate convenience wrapper around
+    :func:`run_autotune` using :class:`GreedySearch` — stops at the
+    first terminal so autotune forks beyond option 0 are never explored.
+
+    ``ctx`` is built once (probing the live device if not provided)
+    and passed to every rule that takes a ``ctx`` parameter.
+
+    ``backend`` (typically :class:`CudaBackend`) opts the run into real
+    GPU measurement: every terminal graph's per-kernel latency is
+    recorded to ``cache`` and attributed to every ancestor along the
+    ``Op.source`` chain. ``cache`` defaults to a fresh in-memory store;
+    pass an explicit :class:`TuningCache` to persist measurements
+    across runs.
+
+    For exhaustive autotuning, call :func:`run_autotune` directly with
+    :class:`TuningSearch` and iterate every yielded candidate."""
+    search = GreedySearch(cache=cache)
+    return next(run_autotune(graph, passes, search=search, dump=dump, select=select, ctx=ctx, backend=backend)).graph
+
+
+def run_autotune(
+    graph: Graph,
+    passes: list[str],
+    *,
+    search: Search,
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+    ctx: Context | None = None,
+    backend=None,
+) -> Iterator[Candidate]:
+    """Drive the autotune search. Yields one terminal ``Candidate`` per
+    fully-explored branch. With deterministic rules (no list-returning
+    rewrites) the search yields exactly one — same shape as
+    ``run_pipeline``.
+
+    The loop is fully search-driven: pop a candidate, advance it by one
+    rule application via :func:`_try_step`, push successor(s) back to
+    ``search``. When no rule fires in the current pass, advance the
+    candidate's ``cursor.pass_idx`` and push it back. When ``cursor.pass_idx``
+    reaches the end of ``passes``, the candidate is terminal and gets
+    yielded.
+
+    ``search`` chooses both the order and the stopping condition:
+    :class:`GreedySearch` for single-shot compiles (stops at the first
+    terminal); :class:`TuningSearch` for ``--tune`` (runs the queue
+    dry, exploring every fork).
+
+    When ``search`` exposes a ``cache: TuningCache`` (both built-in
+    searches do), each yielded terminal candidate has its ``CudaOp``
+    nodes recorded to the cache via :func:`record_terminal` before being
+    yielded — so subsequent candidates see the updated priority signal.
+    Pass a ``Backend`` (typically :class:`CudaBackend`) via ``backend=``
+    to record real GPU-event latencies; omit it to record the stub
+    ``latency_us=1.0``.
+
+    ``ctx`` is built once (probing the live device if not provided)
+    and shared by every candidate."""
+    from deplodock.compiler.pipeline.engine import _filter_rules, _load_rules  # noqa: PLC0415
+
+    if ctx is None:
+        ctx = Context.probe()
+    select_set = set(select) if select is not None else None
+    rules_per_pass = [_filter_rules(_load_rules(_PASSES_DIR / name), select_set) for name in passes]
+    t_start = time.monotonic()
+
+    search.push(Candidate(graph=graph, ctx=ctx))
+
+    cache: TuningCache | None = getattr(search, "cache", None)
+    n_terminals = 0
+    for cand in _search_loop(search, rules_per_pass, passes, ctx, dump):
+        n_terminals += 1
+        if backend is not None:
+            # Collect knobs from every terminal kernel in the graph so
+            # the log line reflects the *actual* autotune choices that
+            # produced this variant, not just the rule:choice indices.
+            knob_strs: list[str] = []
+            for nid in cand.graph.topological_order():
+                op = cand.graph.nodes[nid].op
+                k = getattr(op, "knobs", None) or {}
+                if k:
+                    knob_strs.append(", ".join(f"{kk}={vv}" for kk, vv in sorted(k.items())))
+            label = " | ".join(knob_strs) if knob_strs else "option-0"
+            logger.info("[tune] variant #%d  [%s]", n_terminals, label)
+        if cache is not None:
+            from deplodock.compiler.pipeline.search.cache import TuneAborted  # noqa: PLC0415
+
+            try:
+                record_terminal(cand.graph, cache, cand.ctx.structural_key(), backend=backend)
+            except TuneAborted as exc:
+                # A bench failure left GPU work queued; running another
+                # variant would block in cupy's ``_allocate``. Yield
+                # this terminal (its measurements are already recorded
+                # as bench_fail) and stop the sweep so the caller can
+                # pick a winner from whatever ok variants we've got.
+                logger.warning("[tune] %s — stopping after %d terminal(s)", exc, n_terminals)
+                yield cand
+                break
+        yield cand
+    logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)

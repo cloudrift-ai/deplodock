@@ -1,4 +1,4 @@
-"""Tests for the tree-shaped tuning cache (``deplodock.compiler.cache``).
+"""Tests for the tree-shaped tuning cache (``deplodock.compiler.pipeline.search.cache``).
 
 The schema is three tables — ``cuda_perf`` for terminal measurements,
 ``expansions`` for parent→child edges, ``nodes`` for the maintained
@@ -9,16 +9,16 @@ recording, plus the helper functions ``op_cache_key`` / ``record_terminal``.
 
 from __future__ import annotations
 
-from deplodock.compiler.cache import (
+from deplodock.compiler.context import Context
+from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.cuda.ir import CudaOp
+from deplodock.compiler.pipeline.search.cache import (
     TuningCache,
     count_unmeasured_ops,
     op_cache_key,
     record_terminal,
 )
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda.ir import CudaOp
 
 
 def _make_cuda_graph(*, kernel_source: str = "__global__ void k() {}") -> Graph:

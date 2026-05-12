@@ -1,8 +1,9 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
-- :mod:`.engine` — pattern matcher + rule runner + ``run_pipeline``
-  entry point. Exports ``Pattern``, ``Match``, ``match_pattern``,
-  ``run_rule``, ``run_pass``, ``run_pipeline``.
+- :mod:`.engine` — pattern matcher + rule runner. Exports ``Pattern``,
+  ``Match``, ``match_pattern``, ``run_rule``, ``run_pass``.
+- :mod:`.search` — autotune driver (``Candidate`` / ``Search`` /
+  ``run_pipeline`` / ``run_autotune``) and persistent measurement cache.
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
   dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories grouped by IR level:
@@ -13,19 +14,21 @@
 
 from deplodock.compiler.pipeline.dump import CompilerDump
 from deplodock.compiler.pipeline.engine import (
-    Candidate,
-    GreedySearch,
     Match,
     Pattern,
     RuleSkipped,
+    match_pattern,
+    run_pass,
+    run_rule,
+)
+from deplodock.compiler.pipeline.search import (
+    Candidate,
+    GreedySearch,
     Search,
     TraceEntry,
     TuningSearch,
-    match_pattern,
     run_autotune,
-    run_pass,
     run_pipeline,
-    run_rule,
 )
 
 # Canonical pass lists, indexed by the --ir stage they produce. Backends

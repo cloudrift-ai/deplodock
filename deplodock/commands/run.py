@@ -298,7 +298,7 @@ def _compile_tuned(graph, backend, dump, args):
     import os as _os  # noqa: PLC0415
     from pathlib import Path as _Path  # noqa: PLC0415
 
-    from deplodock.compiler.cache import TuningCache, op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.cache import TuningCache, op_cache_key  # noqa: PLC0415
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch, run_autotune  # noqa: PLC0415

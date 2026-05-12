@@ -10,8 +10,8 @@ measurements and asserts the walk picks the expected frontier.
 
 from __future__ import annotations
 
-from deplodock.compiler.cache import TuningCache
-from deplodock.compiler.pipeline.engine import TuningSearch
+from deplodock.compiler.pipeline.search import TuningSearch
+from deplodock.compiler.pipeline.search.cache import TuningCache
 
 
 def _make_search(cache: TuningCache, context_key: str = "ctx") -> TuningSearch:

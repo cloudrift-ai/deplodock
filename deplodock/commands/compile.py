@@ -228,7 +228,7 @@ def handle_compile(args):
             passes = CUDA_PASSES
             args.ir = "cuda"
         from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-        from deplodock.compiler.cache import TuningCache  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.cache import TuningCache  # noqa: PLC0415
 
         # 10 s wall budget on each variant's bench. Backstops the
         # in-process per-launch/per-iter watchdogs: if a kernel keeps
@@ -340,7 +340,7 @@ def _pick_best_candidate(candidates, cache):
     """Pick the autotune candidate whose CudaOps all measured ``ok`` and
     whose summed latency is lowest. Falls back to ``candidates[0]`` when
     nothing has a clean measurement (e.g. every variant timed out)."""
-    from deplodock.compiler.cache import op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.cache import op_cache_key  # noqa: PLC0415
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
@@ -372,7 +372,7 @@ def _print_tune_summary(candidates, cache) -> None:
     set of autotune choices); each carries a ``trace`` of ``TraceEntry``
     (rule_name, choice_idx) and a graph with measured ``CudaOp`` nodes.
     """
-    from deplodock.compiler.cache import op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.cache import op_cache_key  # noqa: PLC0415
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 

@@ -161,8 +161,7 @@ class TuningCache:
 
     def cuda_perf(self, context_key: str, cuda_key: str) -> CudaPerf | None:
         row = self._conn.execute(
-            "SELECT context_key, cuda_key, status, latency_us, measured_at, knobs "
-            "FROM cuda_perf WHERE context_key = ? AND cuda_key = ?",
+            "SELECT context_key, cuda_key, status, latency_us, measured_at, knobs FROM cuda_perf WHERE context_key = ? AND cuda_key = ?",
             (context_key, cuda_key),
         ).fetchone()
         if row is None:
@@ -370,8 +369,7 @@ class TuningCache:
         cur_key: str | None = node_key
         while cur_key is not None:
             self._conn.execute(
-                "UPDATE nodes SET visits = visits + ?, total_reward = total_reward + ? "
-                "WHERE context_key = ? AND node_key = ?",
+                "UPDATE nodes SET visits = visits + ?, total_reward = total_reward + ? WHERE context_key = ? AND node_key = ?",
                 (visits_delta, reward_delta, context_key, cur_key),
             )
             row = self._conn.execute(

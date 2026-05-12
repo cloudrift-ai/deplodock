@@ -11,7 +11,6 @@ kernels still dedup.
 from __future__ import annotations
 
 from deplodock.compiler.backend.base import BenchmarkResult, LaunchTime
-from deplodock.compiler.cache import TuningCache, op_cache_key, record_terminal
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
@@ -21,6 +20,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
+from deplodock.compiler.pipeline.search.cache import TuningCache, op_cache_key, record_terminal
 
 
 def _elementwise_graph() -> Graph:

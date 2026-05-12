@@ -6,7 +6,12 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 
 ```
 pipeline/
-├── engine.py      # Pattern, Match, match_pattern, run_rule, run_pass, run_pipeline, splice
+├── engine.py      # Pattern, Match, match_pattern, run_rule, run_pass, splice
+├── search/        # Autotune driver: Candidate, Search policies, run_pipeline / run_autotune, TuningCache
+│   ├── candidate.py  # Candidate / Cursor / TraceEntry / RuleResult data classes
+│   ├── policy.py     # Search protocol, GreedySearch, TuningSearch (MCTS/UCB1)
+│   ├── driver.py     # _search_loop + run_pipeline / run_autotune entry points
+│   └── cache.py      # TuningCache SQLite store + op_cache_key / record_terminal
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
 └── passes/
@@ -110,9 +115,9 @@ rules — they're shared helpers for the pass's rule modules.
   `record_terminal(cand.graph, cache, ctx.structural_key(), backend=...)`
   on each yielded terminal. Pass a `Backend` (typically `CudaBackend`)
   via `backend=` to record real per-kernel GPU-event latencies; omit it
-  to record the stub `latency_us=1.0`. See `engine.py:Candidate`,
-  `TraceEntry`, `Search`, `GreedySearch`, `TuningSearch`, and
-  `cache.py:TuningCache`.
+  to record the stub `latency_us=1.0`. See `search/candidate.py:Candidate`,
+  `search/candidate.py:TraceEntry`, `search/policy.py:{Search,GreedySearch,TuningSearch}`,
+  and `search/cache.py:TuningCache`.
 - `run_pipeline(graph, passes, dump=None)` — single-graph convenience
   wrapper around `run_autotune`. Returns the first terminal candidate's
   graph; for deterministic rules that's the only one. Run each named pass
