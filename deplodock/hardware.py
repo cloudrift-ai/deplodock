@@ -37,6 +37,7 @@ GPU_INSTANCE_TYPES = {
         ("gcp", "a3-highgpu"),
     ],
     "NVIDIA H200 141GB": [
+        ("cloudrift", "h200-8-generic"),
         ("cloudrift", "h200-24-200-1000-generic"),
         ("gcp", "a3-ultragpu"),
     ],
