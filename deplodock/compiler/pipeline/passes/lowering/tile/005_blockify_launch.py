@@ -98,22 +98,22 @@ def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
     ordered: list[tuple[int, int]] = []
 
     def _add(shape: tuple[int, int]) -> None:
-        if shape in seen:
-            return
         bn, bm = shape
-        # ``_partition_threads`` handles ``ext < target`` by keeping THREAD
-        # whole; only reject oversized non-divisible combos.
+        # Clamp oversized THREAD widths to the axis extent. ``_partition_threads``
+        # silently clamps anyway, so ``bn > ext_inner`` would yield a kernel
+        # identical to ``bn == ext_inner``; dedup via ``seen`` after clamping
+        # so the autotuner doesn't spawn aliased variants. Clamping (vs the
+        # old reject) gives tiny matmuls (both ext ≤ smallest _TUNE_AXIS_CHOICE)
+        # at least one valid variant — e.g. SDPA's per-head 8×8 QK·V where
+        # rejecting every choice left no candidate at all.
+        bn = min(bn, ext_inner)
+        bm = min(bm, ext_outer)
         if ext_inner > bn and ext_inner % bn != 0:
             return
         if ext_outer > bm and ext_outer % bm != 0:
             return
-        # Reject oversized THREAD widths: ``_partition_threads`` silently
-        # clamps to the axis extent, so ``bn > ext_inner`` (or
-        # ``bm > ext_outer``) produces an identical kernel to the
-        # ``bn == ext_inner`` (or ``bm == ext_outer``) variant. Without
-        # this filter the autotuner spawns duplicate candidates and a
-        # failure on one can overwrite a good measurement on its alias.
-        if bn > ext_inner or bm > ext_outer:
+        shape = (bn, bm)
+        if shape in seen:
             return
         seen.add(shape)
         ordered.append(shape)
