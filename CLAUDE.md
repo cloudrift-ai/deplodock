@@ -21,6 +21,7 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
 - `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging
+- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`); `--tune-db` on `deplodock compile` / `deplodock run` takes precedence
 
 ## Running Tests
 

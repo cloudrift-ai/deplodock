@@ -475,7 +475,17 @@ class TileOp(Op):
           starts dominating (see the ``BM=16, BN=16`` failure on
           ``(M=32, K=3584, N=18944)`` — 2 k+ CTAs, 1 cell/thread, kernel
           runs >3 s).
-        - Distance from 256 threads/CTA → up to ``-1.0``.
+        - Distance from 256 threads/CTA → up to ``-1.0`` baseline,
+          doubled to ``-2.0`` when post-register-tile ``cells < 16``
+          (thin per-thread compute can't amortize the launch + atomic
+          overhead at a wide launch).
+        - Total global atomic writes (cross-CTA split-K ``atomicAdd``)
+          above ~256 k → graduated penalty up to ``-2.0``. Each split-K
+          CTA contributes one ``atomicAdd`` per output cell; total ops
+          scale as ``threads × ctas × atomic_writes_per_thread`` and
+          contention through L2 dominates the kernel once the count is
+          in the millions (observed on ``BM=64, BN=16`` matmul where
+          2 M FP atomics blew the bench timeout).
         - Stages (smem staging) → ``+1.0``.
         - Register tile fired (``F_M * F_N > 1``) → ``+1.0``.
 
@@ -520,13 +530,21 @@ class TileOp(Op):
             final_threads = threads
             cells = 1
 
-        # Thread count penalty.
+        # Thread count penalty. Slope is gentle by default (``/target``),
+        # but doubles when ``cells < 16`` post-register-tile — a wide
+        # launch with thin per-thread compute can't amortize the launch
+        # + atomic-fanin overhead. Observed on
+        # ``matmul_add (1,128,2048)x(2048,2048)+r``: (threads=512,
+        # cells=32) ran in 37 us while (threads=512, cells=8) hung the
+        # bench. The conjunctive penalty distinguishes them.
         if final_threads < 32:
             score -= 2.0
         elif final_threads > 1024:
             score -= 2.0
         else:
-            score -= min(abs(final_threads - target_threads) / target_threads, 1.0)
+            distance = abs(final_threads - target_threads)
+            multiplier = 2.0 if (cells < 16 and self.knobs.get("register_tile")) else 1.0
+            score -= min(distance / target_threads * multiplier, 2.0)
 
         # Cells-per-thread penalty.
         if cells == 1:
@@ -542,6 +560,17 @@ class TileOp(Op):
             score -= 0.5
         elif ctas > 2048:
             score -= min(0.5 + (ctas - 2048) / 4096.0, 2.5)
+
+        # Atomic-fanin penalty. Cross-CTA split-K emits one ``atomicAdd``
+        # per output cell per CTA; total ops scale as
+        # ``ctas × threads × atomic_writes_per_thread`` (pre-reg-tile has
+        # 1 write per thread; post-reg-tile has F_M*F_N writes per
+        # thread but proportionally fewer threads — the product matches).
+        atomic_writes = sum(1 for s in self.body.iter() if isinstance(s, Write) and s.reduce_op is not None)
+        if atomic_writes:
+            total_atomics = atomic_writes * threads * ctas
+            if total_atomics > 256_000:
+                score -= min((total_atomics - 256_000) / 1_000_000, 2.0)
 
         # Bonuses.
         if any(isinstance(b, _Stage) for b in tile.body):

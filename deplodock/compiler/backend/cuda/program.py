@@ -14,6 +14,11 @@ scratch. Launch order is ``graph.topological_order()``.
 from __future__ import annotations
 
 import logging
+import os as _os
+import pickle
+import select
+import subprocess
+import time as _time_module
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -130,6 +135,8 @@ class _Compiled:
 
 
 def _compile(graph: Graph) -> _Compiled:
+    import time as _time  # noqa: PLC0415
+
     import cupy as cp
 
     bufs = _buffers(graph)
@@ -386,13 +393,13 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
 
 
 _AUTO_BUDGET_MS = 100.0
-# Defensive cap for ``num_iters="auto"``. The 100 ms GPU-time target
-# normally short-circuits the loop well before this — at 10 µs/launch
-# (about as fast as a real kernel gets) it'd take 10 k iters. The cap
-# only bites the broken-kernel case where ``iter_dts`` stays at 0
-# (kernel returns instantly so the GPU-time accumulator never advances);
-# at ~100 µs of Python/cupy overhead per iter, 10 k iters caps the
-# wall time at roughly the run-stage budget.
+# Iter-count cap on ``num_iters="auto"``. Combined with the GPU-time
+# target above: whichever fires first wins. The cap is the binding
+# constraint for fast kernels (sub-ms / launch, where 100 ms target
+# would otherwise mean 100s of iters and the corresponding atomic /
+# clock-state pressure on heavy-fanout K-split kernels); the GPU-time
+# target is the binding constraint for slow kernels (>= 1 ms / launch,
+# where 100 iters would over-measure relative to confidence needs).
 _AUTO_MAX_ITERS = 100
 # Target per-kernel-position timing window. Sub-millisecond kernels are
 # dominated by per-iter Python/cupy framing overhead (~100 µs); we
@@ -423,11 +430,22 @@ def _wait_for_event(event, timeout_ms: float, label: str) -> None:
 
     import cupy as _cp  # noqa: PLC0415
 
-    deadline = _time.perf_counter() + timeout_ms / 1000.0
+    start = _time.perf_counter()
+    deadline = start + timeout_ms / 1000.0
+    next_warn = start + 0.2  # surface kernels stuck >200ms even if they eventually finish
+    warned = False
     while not event.done:
-        if _time.perf_counter() > deadline:
+        now = _time.perf_counter()
+        if now > deadline:
             raise RuntimeError(f"kernel {label!r} did not complete within {timeout_ms:.0f} ms — variant marked bench_fail")
+        if now > next_warn:
+            logger.warning("[cuda] kernel %r still pending after %.2fs (timeout %.1fs)", label, now - start, timeout_ms / 1000.0)
+            warned = True
+            next_warn = now + 1.0  # subsequent log every 1s while still stuck
         _time.sleep(0.001)
+    elapsed = _time.perf_counter() - start
+    if warned:
+        logger.warning("[cuda] kernel %r completed after %.2fs of waiting", label, elapsed)
     _cp.cuda.runtime.eventSynchronize(event.ptr)  # cheap post-completion sync
 
 
@@ -452,7 +470,12 @@ def benchmark_program(
     auto mode the loop accumulates measured GPU time until it reaches
     ``_AUTO_BUDGET_MS`` (capped at ``_AUTO_MAX_ITERS`` measured iters).
     For a 7-µs RMSNorm that's ~14k iters; a 1-ms matmul gets ~100. The
-    result's ``time_ms`` is the mean of measured iterations.
+    result's per-launch ``time_ms`` is the *median* of measured iters
+    (mean was sensitive to single-iter outliers from thermal blips and
+    GPU-lock-contention spikes — the autotune ``_pick_best_candidate``
+    selects on the lowest summed latency, so noise-driven dips made it
+    pick variants whose post-tune bench was slower than the heuristic).
+    Total ``time_ms`` is the sum of per-launch medians.
 
     ``on_iter`` — see autotune flow note below.
 
@@ -491,13 +514,24 @@ def benchmark_program(
     arrays = _allocate(compiled, input_data)
     descs = _prebuild_descriptors(compiled, arrays)
     compile_elapsed = _time.monotonic() - t_compile_start
+    logger.info(
+        "[bench] enter benchmark_program: %d launch(es) compile+alloc=%.2fs kernels=[%s]",
+        len(compiled.launches),
+        compile_elapsed,
+        ", ".join(f"{li}:{l.kernel_name}" for li, l in enumerate(compiled.launches)),
+    )
     if compile_timeout_s is not None and compile_elapsed > compile_timeout_s:
         raise RuntimeError(f"benchmark compile stage exceeded {compile_timeout_s:.1f}s budget ({compile_elapsed:.2f}s) — variant marked bench_fail")
 
     n = len(compiled.launches)
     starts = [cp.cuda.Event() for _ in range(n)]
     stops = [cp.cuda.Event() for _ in range(n)]
-    acc = [0.0] * n
+    # Per-launch sample list — kept around to compute the median across
+    # measured iters (more robust than the arithmetic mean against
+    # thermal blips, GPU-lock-contention spikes, and other one-off
+    # outliers that the autotune's variant ranking previously got
+    # confused by; see ``project_..._noise`` write-ups).
+    samples: list[list[float]] = [[] for _ in range(n)]
     # Per-position batch size — how many times to invoke each launch
     # back-to-back inside one CUDA event window. Calibrated from the
     # last warmup iter's per-launch ms; until then we run B=1.
@@ -566,10 +600,11 @@ def benchmark_program(
             # single hung launch.
             if iters_run <= warmup:
                 continue
-            # Measured iter: accumulate per-launch (already normalized
-            # to per-launch ms inside the inner loop).
+            # Measured iter: store per-launch sample (already normalized
+            # to per-launch ms inside the inner loop). Reduced via median
+            # at the end so a single outlier iter can't shift the result.
             for i in range(n):
-                acc[i] += iter_dts[i]
+                samples[i].append(iter_dts[i])
             cumulative_gpu_ms += sum(iter_dts[i] * batch_sizes[i] for i in range(n))
             measured += 1
             if measured >= max_measured:
@@ -577,12 +612,182 @@ def benchmark_program(
             if auto and cumulative_gpu_ms >= target_total_ms:
                 break
 
-    iters = max(measured, 1)
-    per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=acc[i] / iters) for i in range(n)]
+    import statistics as _stats  # noqa: PLC0415
+
+    medians = [(_stats.median(samples[i]) if samples[i] else 0.0) for i in range(n)]
+    per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=medians[i]) for i in range(n)]
     return BenchmarkResult(
-        time_ms=sum(acc) / iters,
+        time_ms=sum(medians),
         num_launches=n,
         per_launch=per_launch if per_launch else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-isolated benchmark worker
+# ---------------------------------------------------------------------------
+
+
+class _BenchWorker:
+    """Long-lived ``deplodock.compiler.backend.cuda._bench_worker`` subprocess.
+
+    Lets the parent enforce a hard wall-clock cap on a bench: if the worker
+    doesn't respond within ``wall_timeout_s``, the parent SIGKILLs it. The
+    dirty CUDA stream (and any kernels still queued behind a hung launch)
+    dies with the process, so the *next* bench starts on a clean device —
+    fixes the "autotune hangs on the variant AFTER a bench_fail" pathology
+    documented in ``cache.py``.
+
+    Lifecycle: one worker per ``CudaBackend`` instance, lazily spawned on
+    the first ``bench`` call and respawned on timeout / EOF / error. The
+    worker imports cupy lazily on its first request — until then no CUDA
+    context is initialized in the worker, so the spawn cost is just Python
+    startup (~0.2 s).
+    """
+
+    _WORKER_MODULE = "deplodock.compiler.backend.cuda._bench_worker"
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None  # noqa: UP007 — lazy-init sentinel
+
+    def _spawn(self) -> None:
+        import sys as _sys  # noqa: PLC0415
+
+        self._proc = subprocess.Popen(  # noqa: S603
+            [_sys.executable, "-m", self._WORKER_MODULE],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(_os.environ),
+            bufsize=0,
+        )
+        logger.info("[bench-worker] spawned pid=%s", self._proc.pid)
+
+    def _kill(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            self._proc.kill()
+            try:
+                self._proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+        except ProcessLookupError:
+            pass
+        self._proc = None
+
+    def __del__(self) -> None:
+        self._kill()
+
+    def bench(self, graph: Graph, *, wall_timeout_s: float, **kwargs) -> BenchmarkResult:
+        if self._proc is None or self._proc.poll() is not None:
+            self._spawn()
+        assert self._proc is not None  # for type narrowing
+        proc = self._proc
+
+        request = pickle.dumps({"graph": graph, "kwargs": kwargs}, protocol=pickle.HIGHEST_PROTOCOL)
+        try:
+            proc.stdin.write(len(request).to_bytes(8, "little"))
+            proc.stdin.write(request)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            self._kill()
+            raise RuntimeError(f"bench worker died during request send: {exc}") from exc
+
+        deadline = _time_module.perf_counter() + wall_timeout_s
+        out_fd = proc.stdout.fileno()
+
+        def _read_with_deadline(n: int) -> bytes:
+            buf = bytearray()
+            while len(buf) < n:
+                remaining = deadline - _time_module.perf_counter()
+                if remaining <= 0:
+                    raise _BenchTimeout()
+                r, _, _ = select.select([out_fd], [], [], remaining)
+                if not r:
+                    raise _BenchTimeout()
+                chunk = _os.read(out_fd, n - len(buf))
+                if not chunk:
+                    raise _BenchWorkerEOF()
+                buf.extend(chunk)
+            return bytes(buf)
+
+        try:
+            header = _read_with_deadline(8)
+            n = int.from_bytes(header, "little")
+            body = _read_with_deadline(n)
+        except _BenchTimeout:
+            self._kill()
+            raise RuntimeError(f"bench worker exceeded {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned")
+        except _BenchWorkerEOF:
+            stderr_tail = b""
+            try:
+                stderr_tail = proc.stderr.read() or b""
+            except Exception:  # noqa: BLE001 — stderr drain is best-effort
+                pass
+            self._kill()
+            raise RuntimeError(f"bench worker EOF before response; stderr tail: {stderr_tail.decode(errors='replace')[-500:]}")
+
+        resp = pickle.loads(body)
+        if not resp.get("ok"):
+            # Surface the worker-side exception verbatim. ``cache.py`` already
+            # treats this as a generic bench failure and pins ``bench_fail``.
+            raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
+        return resp["result"]
+
+
+class _BenchTimeout(Exception):
+    """Internal sentinel — converted to RuntimeError at the API boundary."""
+
+
+class _BenchWorkerEOF(Exception):
+    """Internal sentinel — worker died without writing a response."""
+
+
+# Module-level singleton. Reused across ``benchmark_program_isolated`` calls
+# in the same process so we pay the worker startup cost once.
+_bench_worker_singleton: _BenchWorker | None = None
+
+
+def _bench_worker() -> _BenchWorker:
+    global _bench_worker_singleton
+    if _bench_worker_singleton is None:
+        _bench_worker_singleton = _BenchWorker()
+    return _bench_worker_singleton
+
+
+def benchmark_program_isolated(
+    graph: Graph,
+    *,
+    wall_timeout_s: float,
+    warmup: int = 5,
+    num_iters: int | str = 20,
+    compile_timeout_s: float | None = None,
+    run_timeout_s: float | None = None,
+) -> BenchmarkResult:
+    """Wall-time-bounded ``benchmark_program``. Runs the bench in a
+    persistent subprocess; on ``wall_timeout_s`` overrun the worker is
+    SIGKILLed and the next call respawns it on a clean device.
+
+    The in-process ``compile_timeout_s`` / ``run_timeout_s`` budgets are
+    still enforced inside the worker (they're cheaper and give better
+    error messages than a SIGKILL). ``wall_timeout_s`` is the backstop
+    for the failure mode they don't cover: a kernel that keeps the GPU
+    busy past any per-launch / per-iter budget, which on cupy makes the
+    next ``deviceSynchronize`` block indefinitely.
+
+    ``on_iter`` is not supported here — interleaved benchmarking (the
+    ``deplodock run --bench`` path that alternates torch eager / compile
+    / deplodock) needs the bench to share a Python process with torch
+    and must use ``benchmark_program`` directly instead.
+    """
+    return _bench_worker().bench(
+        graph,
+        wall_timeout_s=wall_timeout_s,
+        warmup=warmup,
+        num_iters=num_iters,
+        compile_timeout_s=compile_timeout_s,
+        run_timeout_s=run_timeout_s,
     )
 
 

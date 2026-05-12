@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -87,7 +88,10 @@ def register_compile_command(subparsers):
     parser.add_argument(
         "--tune-db",
         default=None,
-        help="Path to the tuning SQLite cache. Default: ~/.cache/deplodock/autotune.db when --tune is set.",
+        help=(
+            "Path to the tuning SQLite cache. Falls back to ``DEPLODOCK_TUNE_DB`` env var, "
+            "then to ~/.cache/deplodock/autotune.db when --tune is set."
+        ),
     )
     parser.add_argument(
         "--tune-budget",
@@ -226,8 +230,15 @@ def handle_compile(args):
         from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
         from deplodock.compiler.cache import TuningCache  # noqa: PLC0415
 
-        backend = CudaBackend()
-        db_path = Path(args.tune_db) if args.tune_db else Path.home() / ".cache" / "deplodock" / "autotune.db"
+        # 10 s wall budget on each variant's bench. Backstops the
+        # in-process per-launch/per-iter watchdogs: if a kernel keeps
+        # the GPU busy past those, the subprocess worker is SIGKILLed
+        # and the dirty stream dies with it — the next bench respawns
+        # cleanly. Without this the autotune sweep wedges on the
+        # variant after a bench_fail (see ``benchmark_program_isolated``).
+        backend = CudaBackend(bench_wall_timeout_s=10.0)
+        db_override = args.tune_db or os.environ.get("DEPLODOCK_TUNE_DB")
+        db_path = Path(db_override) if db_override else Path.home() / ".cache" / "deplodock" / "autotune.db"
         cache = TuningCache(path=db_path)
         logger.info("Tuning cache: %s", db_path)
 

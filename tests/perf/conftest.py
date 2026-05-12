@@ -171,7 +171,10 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
             cmd.append("--profile")
         tune_budget = _tune_budget_s()
         if tune_budget is not None:
-            cmd += ["--tune", "--tune-budget", str(tune_budget)]
+            # ``-v`` raises the bench subprocess to INFO so the kernel
+            # compile / launch / wait logs (program.py) are emitted —
+            # essential for diagnosing variants that wedge mid-sweep.
+            cmd += ["--tune", "--tune-budget", str(tune_budget), "-v"]
         env = dict(os.environ)
         env["DEPLODOCK_DUMP_DIR"] = tmp
         env.pop("DEPLODOCK_NCU_CHILD", None)
@@ -181,11 +184,21 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
         # when tuning so the subprocess timeout doesn't kill a healthy
         # sweep mid-run.
         timeout_s = 900.0 + (tune_budget or 0.0) * 1.5
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
+        # During tuning, stream stderr live so a wedged kernel is
+        # diagnosable in real time (capture_output buffers everything
+        # until exit, which is useless for a hung subprocess).
+        if tune_budget is not None:
+            sys.stderr.write(f"[bench {case.name}] launching: {' '.join(cmd)}\n")
+            sys.stderr.flush()
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True, env=env, timeout=timeout_s)
+            res_stderr = ""
+        else:
+            res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
+            res_stderr = res.stderr
         if res.returncode != 0:
             # Surface stderr so flaky-bench cases are diagnosable, but
             # synthesize a minimal row so the suite doesn't abort.
-            sys.stderr.write(f"[bench {case.name}] exit={res.returncode}\n{res.stderr[-2000:]}\n")
+            sys.stderr.write(f"[bench {case.name}] exit={res.returncode}\n{res_stderr[-2000:]}\n")
             return PerfRow(
                 name=case.name,
                 op=case.op,

@@ -41,23 +41,16 @@ bench-kernels: setup
 	@rm -f /tmp/deplodock-gpu.lock
 	./venv/bin/pytest tests/perf/ -m perf -n auto --dist=loadgroup -v -p no:randomly --no-header
 
-# Autotune each case before benching. ``DEPLODOCK_TUNE_BUDGET`` (override
-# via ``make bench-kernels-tune TUNE_BUDGET=120``) caps the per-case
-# autotune sweep. The persistent cache at ``~/.cache/deplodock/autotune.db``
-# is shared across cases, so re-runs reuse prior measurements.
-#
-# Both targets run sequentially (no ``-n auto``). The GPU lock inside
-# ``benchmark_program`` would serialize the bench window anyway, but
-# concurrent xdist workers still poison each other's measurements via
-# cupy mempool fragmentation, L2 residue from neighbor kernels, and
-# clock-state transitions between high-perf and idle — tiny ops show
-# 5-10× variance under ``-n auto``. The compile phase (NVRTC, lowering)
-# is the only thing that benefits from parallelism, and it's a small
-# fraction of total time; sequential keeps numbers reliable.
-TUNE_BUDGET ?= 30
-bench-kernels-tune: setup
+TUNE_BUDGET ?= 90
+tune-kernels: setup
 	@rm -f /tmp/deplodock-gpu.lock
-	DEPLODOCK_TUNE_BUDGET=$(TUNE_BUDGET) ./venv/bin/pytest tests/perf/ -m perf -v -p no:randomly --no-header
+	@rm -f ~/.cache/deplodock/tune-kernels.db
+	DEPLODOCK_TUNE_BUDGET=$(TUNE_BUDGET) DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
+
+bench-kernels-tuned: setup
+	@rm -f /tmp/deplodock-gpu.lock
+	@test -f ~/.cache/deplodock/tune-kernels.db || (echo "The kernel tuning DB not foud; run make tune-kernels"; exit 1)
+	DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n auto --dist=loadgroup -v -p no:randomly --no-header
 
 bench: setup
 	@echo "Running benchmarks..."

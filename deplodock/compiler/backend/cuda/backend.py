@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
-from deplodock.compiler.backend.cuda.program import benchmark_program, make_runner, run_program, run_program_debug
+from deplodock.compiler.backend.cuda.program import (
+    benchmark_program,
+    benchmark_program_isolated,
+    make_runner,
+    run_program,
+    run_program_debug,
+)
 from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
 
 logger = logging.getLogger(__name__)
@@ -46,7 +52,13 @@ class CudaBackend(Backend):
     populated with the per-launch snapshots for the last ``run()`` call.
     """
 
-    def __init__(self, *, debug: bool | None = None, dump: CompilerDump | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        debug: bool | None = None,
+        dump: CompilerDump | None = None,
+        bench_wall_timeout_s: float | None = None,
+    ) -> None:
         if debug is None:
             debug = os.environ.get(_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
         if dump is None:
@@ -56,6 +68,10 @@ class CudaBackend(Backend):
         self.debug = debug
         self.dump = dump
         self.last_debug_result = None
+        # When set, ``benchmark()`` runs in a subprocess so the parent
+        # can SIGKILL a wedged worker. Defaults to ``None`` (in-process,
+        # required when ``on_iter`` callbacks are supplied).
+        self.bench_wall_timeout_s = bench_wall_timeout_s
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
@@ -93,22 +109,38 @@ class CudaBackend(Backend):
         on_iter=None,
     ) -> BenchmarkResult:
         del input_data
-        # GPU serialization is held inside ``benchmark_program`` (only
-        # around the iter loop, not NVRTC compile + alloc). The compile
-        # stage is bounded by ``bench_compile_timeout_s``; the iter loop
-        # is bounded both by ``num_iters="auto"``'s 100 ms GPU-time
-        # target *and* the cumulative ``bench_run_timeout_s`` budget,
-        # which catches pathological variants where every launch fits
-        # under the per-launch ``_KERNEL_TIMEOUT_MS`` watchdog but they
-        # accumulate over many iters.
-        result = benchmark_program(
-            compiled,
-            warmup=warmup,
-            num_iters=num_iters,
-            on_iter=on_iter,
-            compile_timeout_s=self.bench_compile_timeout_s,
-            run_timeout_s=self.bench_run_timeout_s,
-        )
+        # ``bench_wall_timeout_s`` selects between two paths:
+        # - Set (autotune sweep): run in a subprocess-isolated worker so
+        #   a wedged kernel can be SIGKILLed without leaving the
+        #   parent's CUDA stream dirty. Wall-clock backstop on top of the
+        #   in-worker ``bench_compile_timeout_s`` / ``bench_run_timeout_s``.
+        # - ``None`` (interactive ``deplodock run --bench``): run in-process.
+        #   Required when ``on_iter`` callbacks are supplied — they can't
+        #   cross the subprocess boundary.
+        # ``on_iter`` forces the in-process path even when
+        # ``bench_wall_timeout_s`` is set — interleaved benches need to
+        # share torch state with the parent and can't cross the
+        # subprocess boundary. The autotune sweep never passes
+        # ``on_iter``, so this fallback only fires for ``--tune --bench``
+        # where the post-tune interleaved bench reuses the same backend.
+        if self.bench_wall_timeout_s is not None and on_iter is None:
+            result = benchmark_program_isolated(
+                compiled,
+                wall_timeout_s=self.bench_wall_timeout_s,
+                warmup=warmup,
+                num_iters=num_iters,
+                compile_timeout_s=self.bench_compile_timeout_s,
+                run_timeout_s=self.bench_run_timeout_s,
+            )
+        else:
+            result = benchmark_program(
+                compiled,
+                warmup=warmup,
+                num_iters=num_iters,
+                on_iter=on_iter,
+                compile_timeout_s=self.bench_compile_timeout_s,
+                run_timeout_s=self.bench_run_timeout_s,
+            )
         return BenchmarkResult(
             time_ms=result.time_ms,
             num_launches=result.num_launches,

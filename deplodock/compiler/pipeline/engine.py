@@ -627,13 +627,16 @@ class TuningSearch(_PriorityHeap):
 
     def _candidate_score(self, tip_key: str) -> float:
         """Highest ``Op.score`` among queued candidates whose tip matches
-        ``tip_key``. Falls back to ``0.0`` if no candidate is in
-        ``_by_tip`` for this node (e.g. it's a non-frontier interior
-        node that doesn't have a pending candidate sitting at it)."""
-        cands = self._by_tip.get(tip_key, [])
-        if not cands:
-            return 0.0
+        ``tip_key``. Falls back to ``-inf`` if no candidate is in
+        ``_by_tip`` for this node — the prior cutoff filter compares
+        unvisited siblings against the best score among them, so a
+        defaulted ``0.0`` would silently outrank legitimately-priored
+        negative scores (e.g. an `atomic-fanin -5.0` matmul variant
+        would survive the cutoff because a popped-from-queue sibling
+        appears as "0.0" and raises the cutoff floor).
+        """
         best = float("-inf")
+        cands = self._by_tip.get(tip_key, [])
         for c in cands:
             for n in c.graph.nodes.values():
                 if op_cache_key(n.op) == tip_key:
@@ -641,7 +644,7 @@ class TuningSearch(_PriorityHeap):
                     if s > best:
                         best = s
                     break
-        return best if best != float("-inf") else 0.0
+        return best
 
     def _depth(self, context_key: str, node_key: str) -> int:
         d = 0

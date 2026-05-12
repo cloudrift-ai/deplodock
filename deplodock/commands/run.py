@@ -62,7 +62,10 @@ def register_run_command(subparsers):
     parser.add_argument(
         "--tune-db",
         default=None,
-        help="Path to the tuning SQLite cache. Default: ~/.cache/deplodock/autotune.db.",
+        help=(
+            "Path to the tuning SQLite cache. Falls back to ``DEPLODOCK_TUNE_DB`` env var, "
+            "then to ~/.cache/deplodock/autotune.db."
+        ),
     )
     parser.add_argument(
         "--bench-backends",
@@ -138,7 +141,12 @@ def handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    backend = CudaBackend(debug=args.debug or None, dump=dump)
+    # Under ``--tune``, each variant's bench runs in a subprocess worker
+    # so a wedged kernel can be SIGKILLed without leaving the stream
+    # dirty. Without ``--tune`` the bench stays in-process (needed for
+    # the interleaved ``--bench`` path that shares torch state).
+    _wall_to = 10.0 if getattr(args, "tune", False) else None
+    backend = CudaBackend(debug=args.debug or None, dump=dump, bench_wall_timeout_s=_wall_to)
     if getattr(args, "tune", False):
         try:
             compiled, best_us = _compile_tuned(graph, backend, dump, args)
@@ -287,6 +295,7 @@ def _compile_tuned(graph, backend, dump, args):
     must serialize on the live GPU or their benches contaminate each
     other's timings.
     """
+    import os as _os  # noqa: PLC0415
     from pathlib import Path as _Path  # noqa: PLC0415
 
     from deplodock.compiler.cache import TuningCache, op_cache_key  # noqa: PLC0415
@@ -294,7 +303,8 @@ def _compile_tuned(graph, backend, dump, args):
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch, run_autotune  # noqa: PLC0415
 
-    db_path = _Path(args.tune_db) if args.tune_db else _Path.home() / ".cache" / "deplodock" / "autotune.db"
+    _db_override = args.tune_db or _os.environ.get("DEPLODOCK_TUNE_DB")
+    db_path = _Path(_db_override) if _db_override else _Path.home() / ".cache" / "deplodock" / "autotune.db"
     cache = TuningCache(path=db_path)
     logger.info("run --tune: cache=%s budget=%.1fs", db_path, args.tune_budget)
     search = TuningSearch(cache=cache, budget_s=args.tune_budget)

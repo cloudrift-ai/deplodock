@@ -76,6 +76,15 @@ class Backend(ABC):
     # through. Distinct from a wall-clock cap so Python/cupy framing
     # overhead doesn't artificially shrink the budget for tiny ops.
     bench_run_timeout_s: float = 2.0
+    # Optional hard wall-clock cap on a single ``benchmark()`` call.
+    # When set, the call runs in a subprocess-isolated worker so the
+    # parent can SIGKILL the GPU process if a kernel keeps the device
+    # busy past the in-process per-launch / per-iter budgets (those
+    # budgets rely on ``cupy.cuda.Event.done`` which never trips on
+    # some hangs). Set this for autotune sweeps; leave ``None`` for
+    # interactive ``deplodock run`` so on-iter callbacks and the
+    # parent's torch instance can be shared in-process.
+    bench_wall_timeout_s: float | None = None
 
     @abstractmethod
     def compile(self, graph: Graph) -> Any:

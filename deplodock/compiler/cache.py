@@ -537,14 +537,14 @@ def record_terminal(
         )
         for node in cuda_nodes:
             _record_one(cache, context_key, node.op, latency_us=fail_latency_us, status="bench_fail")
-        # The kernel that timed out is still queued on the CUDA stream
-        # and will keep executing for an unbounded time. Subsequent
-        # ``backend.benchmark`` calls in this process hit cupy's
-        # ``_allocate`` which serializes on the stream — that's why an
-        # autotune sweep tends to "hang on the variant *after* a
-        # bench_fail" instead of on the failing one itself. Re-raise so
-        # the engine can abort the sweep before that happens.
-        raise TuneAborted(f"autotune aborted after bench_fail; the dirty CUDA stream would hang the next variant") from exc
+        # Bench worker runs in a subprocess (see
+        # ``benchmark_program_isolated``); on wall-timeout the worker is
+        # SIGKILL'd, taking the dirty CUDA stream with it. The next
+        # bench respawns the worker on a clean device, so the historical
+        # "autotune hangs on the variant *after* a bench_fail" failure
+        # mode no longer applies. Record the failure and return —
+        # MCTS UCB will deprioritize this subtree.
+        return
 
     per_launch = result.per_launch or []
     if len(per_launch) != len(cuda_nodes):
