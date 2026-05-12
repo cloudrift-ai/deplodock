@@ -3,8 +3,8 @@ driver loop, and the persistent measurement cache.
 
 - :mod:`.candidate` — ``Candidate`` / ``Cursor`` / ``TraceEntry`` /
   ``RuleResult`` data classes.
-- :mod:`.policy` — ``Search`` protocol plus :class:`GreedySearch` /
-  :class:`TuningSearch` concrete strategies.
+- :mod:`.policy` — ``Search`` protocol (``base``) plus :class:`GreedySearch`
+  (``greedy``) / :class:`TuningSearch` (``mcts``) concrete strategies.
 - :mod:`.driver` — ``run_pipeline`` / ``run_autotune`` entry points and
   the unified ``_search_loop`` driver.
 - :mod:`.cache` — :class:`TuningCache` SQLite store + ``op_cache_key`` /
