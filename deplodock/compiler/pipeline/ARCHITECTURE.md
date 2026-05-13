@@ -7,11 +7,14 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 ```
 pipeline/
 ├── engine.py      # Pattern, Match, match_pattern, run_rule, run_pass, splice
-├── search/        # Autotune driver: Candidate, Search policies, run_pipeline / run_autotune, TuningCache
+├── search/        # Autotune driver: Candidate, Search policies, run_pipeline / run_autotune, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / Cursor / TraceEntry / RuleResult data classes
 │   ├── policy/       # Search protocol (base.py) + GreedySearch (greedy.py) / TuningSearch (mcts.py)
 │   ├── driver.py     # _search_loop + run_pipeline / run_autotune entry points
-│   └── cache.py      # TuningCache SQLite store + op_cache_key / record_terminal
+│   ├── db.py         # SearchDB SQLite store: loop/tile/kernel/cuda op inventory + lowering edges + perf
+│   ├── tree.py       # SearchTree in-memory MCTS state (rebuilt per process)
+│   ├── recorder.py   # record_terminal: bench → DB persist → tree bump; op-JSON helpers
+│   └── keys.py       # op_cache_key / dialect_of / source_chain (shared by db/tree/recorder)
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
 └── passes/
@@ -107,17 +110,47 @@ rules — they're shared helpers for the pass's rule modules.
   `run_pipeline`; stops at the first terminal — autotune forks beyond
   option 0 are never explored) and `TuningSearch` (used by `--tune`;
   runs the queue dry, exploring every fork). Both rank candidates by
-  remaining unmeasured ops (DFS-equivalent on a fresh cache). The
-  greedy stop is self-detected by the search: `pop` returns `None` when
-  the previously popped candidate didn't return via `push` — i.e. when
-  the engine yielded it as terminal.
-  When `search` exposes a `cache: TuningCache`, `run_autotune` calls
-  `record_terminal(cand.graph, cache, ctx.structural_key(), backend=...)`
+  remaining unmeasured ops (DFS-equivalent on a fresh DB). The greedy
+  stop is self-detected by the search: `pop` returns `None` when the
+  previously popped candidate didn't return via `push` — i.e. when the
+  engine yielded it as terminal.
+  When `search` exposes a `tree: SearchTree`, `run_autotune` calls
+  `record_terminal(cand.graph, db, tree, ctx.structural_key(), backend=...)`
   on each yielded terminal. Pass a `Backend` (typically `CudaBackend`)
-  via `backend=` to record real per-kernel GPU-event latencies; omit it
-  to record the stub `latency_us=1.0`. See `search/candidate.py:Candidate`,
-  `search/candidate.py:TraceEntry`, `search/policy/{base,greedy,mcts}.py:{Search,GreedySearch,TuningSearch}`,
-  and `search/cache.py:TuningCache`.
+  via `backend=` to record real per-kernel GPU-event statistics
+  (median + min/max/mean/variance over the per-iter samples carried on
+  `LaunchTime.samples`); omit it to record the stub `latency_us=1.0`.
+  See `search/candidate.py:Candidate`, `search/candidate.py:TraceEntry`,
+  `search/policy/{base,greedy,mcts}.py:{Search,GreedySearch,TuningSearch}`,
+  `search/db.py:SearchDB`, `search/tree.py:SearchTree`, and
+  `search/recorder.py:record_terminal`.
+
+### Search persistence: on-disk inventory vs in-memory MCTS
+
+The autotune state is split across two cooperating modules:
+
+- **`SearchDB`** (`search/db.py`) — SQLite store partitioned into six
+  tables: `loop_op`, `tile_op`, `kernel_op`, `cuda_op` (one row per op
+  encountered along any lowering chain, keyed by `op_cache_key`), a
+  `lowering` edge table (best-known child per parent — deterministic
+  for Tile→Kernel and Kernel→Cuda; best-median upsert for Loop→Tile
+  where autotune explores many TileOp variants per LoopOp), and a
+  backend-partitioned `perf` table carrying full stats
+  (`latency_us_{median,min,max,mean,variance}`, `n_samples`,
+  `backend`, `status`, `knobs`). Selection statistic is the median.
+- **`SearchTree`** (`search/tree.py`) — pure-Python in-memory MCTS
+  state. Tracks `expected_terminals` / `seen_terminals` /
+  `failed_terminals` / `visits` / `total_reward` per node and the
+  three upward propagation walks. Rebuilt fresh each process: the
+  engine re-fires every rule on warm starts (see `engine.py:_try_one_rule`
+  → `tree.expand(...)`), which re-creates the tree topology; cached
+  `perf` rows ensure no re-bench. UCB priors don't survive across runs.
+
+`search/recorder.py:record_terminal` is the only module that knows
+about all four parts (graph, DB, tree, backend). It does one
+`backend.benchmark(...)` call per terminal graph, then walks
+`Op.source` once to record op inventory + lowering edges + the `perf`
+row, then bumps the tree.
 - `run_pipeline(graph, passes, dump=None)` — single-graph convenience
   wrapper around `run_autotune`. Returns the first terminal candidate's
   graph; for deterministic rules that's the only one. Run each named pass

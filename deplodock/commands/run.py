@@ -62,10 +62,7 @@ def register_run_command(subparsers):
     parser.add_argument(
         "--tune-db",
         default=None,
-        help=(
-            "Path to the tuning SQLite cache. Falls back to ``DEPLODOCK_TUNE_DB`` env var, "
-            "then to ~/.cache/deplodock/autotune.db."
-        ),
+        help=("Path to the tuning SQLite cache. Falls back to ``DEPLODOCK_TUNE_DB`` env var, then to ~/.cache/deplodock/autotune.db."),
     )
     parser.add_argument(
         "--bench-backends",
@@ -298,22 +295,23 @@ def _compile_tuned(graph, backend, dump, args):
     import os as _os  # noqa: PLC0415
     from pathlib import Path as _Path  # noqa: PLC0415
 
-    from deplodock.compiler.pipeline.search.cache import TuningCache, op_cache_key  # noqa: PLC0415
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch, run_autotune  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search import SearchDB, SearchTree, op_cache_key  # noqa: PLC0415
 
     _db_override = args.tune_db or _os.environ.get("DEPLODOCK_TUNE_DB")
     db_path = _Path(_db_override) if _db_override else _Path.home() / ".cache" / "deplodock" / "autotune.db"
-    cache = TuningCache(path=db_path)
-    logger.info("run --tune: cache=%s budget=%.1fs", db_path, args.tune_budget)
-    search = TuningSearch(cache=cache, budget_s=args.tune_budget)
+    db = SearchDB(path=db_path)
+    tree = SearchTree()
+    logger.info("run --tune: db=%s budget=%.1fs", db_path, args.tune_budget)
+    search = TuningSearch(tree=tree, db=db, budget_s=args.tune_budget)
 
     # ``run_autotune`` drives ``backend.benchmark`` once per terminal
     # candidate; the backend acquires the GPU lock per call, so parallel
     # ``deplodock run --tune`` workers are already serialized at the
     # kernel-launch granularity without wrapping the whole sweep.
-    candidates = list(run_autotune(graph, CUDA_PASSES, search=search, dump=dump, backend=backend))
+    candidates = list(run_autotune(graph, CUDA_PASSES, search=search, dump=dump, backend=backend, db=db))
 
     ctx_key = Context.probe().structural_key()
     best = None
@@ -326,11 +324,11 @@ def _compile_tuned(graph, backend, dump, args):
         all_ok = True
         for node in cuda_nodes:
             key = op_cache_key(node.op)
-            row = cache.cuda_perf(ctx_key, key) if key else None
+            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
             if row is None or row.status != "ok":
                 all_ok = False
                 break
-            total += row.latency_us
+            total += row.stats.median
         if all_ok and total < best_total:
             best_total = total
             best = cand
@@ -345,7 +343,11 @@ def _compile_tuned(graph, backend, dump, args):
         # rather than hanging on a broken kernel.
         logger.warning("run --tune: no ok candidate after %d variant(s); every bench timed out", len(candidates))
         return None, float("inf")
-    logger.info("run --tune: best variant %.2f us across %d kernel(s)", best_total, sum(1 for n in best.graph.nodes.values() if isinstance(n.op, CudaOp)))
+    logger.info(
+        "run --tune: best variant %.2f us across %d kernel(s)",
+        best_total,
+        sum(1 for n in best.graph.nodes.values() if isinstance(n.op, CudaOp)),
+    )
     return best.graph, best_total
 
 

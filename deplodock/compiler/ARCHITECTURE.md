@@ -59,7 +59,7 @@ autotuning cache doesn't bust on cosmetic edits.
 | `pipeline/`           | Rewrite engine, passes, dump hooks      | `pipeline/ARCHITECTURE.md`   |
 | `backend/`            | Execution (numpy / loop / cuda)         | `backend/ARCHITECTURE.md`    |
 | `loader/`             | Bind constants (safetensors / `nn.Module` → `input_data`) | —              |
-| `cache.py`            | SQLite tuning cache (`TuningCache`)     | —                            |
+| `pipeline/search/`    | Autotune DB + MCTS tree (see below)     | `pipeline/ARCHITECTURE.md`   |
 | `structural.py`       | `Structural` protocol + `digest()` fold | —                            |
 
 ## Per-layer rules

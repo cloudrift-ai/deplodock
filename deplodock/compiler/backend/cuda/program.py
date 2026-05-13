@@ -135,7 +135,6 @@ class _Compiled:
 
 
 def _compile(graph: Graph) -> _Compiled:
-    import time as _time  # noqa: PLC0415
 
     import cupy as cp
 
@@ -518,10 +517,12 @@ def benchmark_program(
         "[bench] enter benchmark_program: %d launch(es) compile+alloc=%.2fs kernels=[%s]",
         len(compiled.launches),
         compile_elapsed,
-        ", ".join(f"{li}:{l.kernel_name}" for li, l in enumerate(compiled.launches)),
+        ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
     )
     if compile_timeout_s is not None and compile_elapsed > compile_timeout_s:
-        raise RuntimeError(f"benchmark compile stage exceeded {compile_timeout_s:.1f}s budget ({compile_elapsed:.2f}s) — variant marked bench_fail")
+        raise RuntimeError(
+            f"benchmark compile stage exceeded {compile_timeout_s:.1f}s budget ({compile_elapsed:.2f}s) — variant marked bench_fail"
+        )
 
     n = len(compiled.launches)
     starts = [cp.cuda.Event() for _ in range(n)]
@@ -540,7 +541,7 @@ def benchmark_program(
     iters_run = 0
     measured = 0
     cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
-    total_gpu_ms = 0.0       # all-iter GPU time (incl. warmup), for the run-stage budget
+    total_gpu_ms = 0.0  # all-iter GPU time (incl. warmup), for the run-stage budget
     # Hold the cross-process GPU lock for the whole warmup+measure
     # window. Compile and allocate above stay outside, so parallel
     # workers can NVRTC-compile their candidates concurrently and only
@@ -615,7 +616,15 @@ def benchmark_program(
     import statistics as _stats  # noqa: PLC0415
 
     medians = [(_stats.median(samples[i]) if samples[i] else 0.0) for i in range(n)]
-    per_launch = [LaunchTime(idx=i, kernel_name=compiled.launches[i].kernel_name, time_ms=medians[i]) for i in range(n)]
+    per_launch = [
+        LaunchTime(
+            idx=i,
+            kernel_name=compiled.launches[i].kernel_name,
+            time_ms=medians[i],
+            samples=tuple(samples[i]) if samples[i] else None,
+        )
+        for i in range(n)
+    ]
     return BenchmarkResult(
         time_ms=sum(medians),
         num_launches=n,
@@ -636,7 +645,7 @@ class _BenchWorker:
     dirty CUDA stream (and any kernels still queued behind a hung launch)
     dies with the process, so the *next* bench starts on a clean device —
     fixes the "autotune hangs on the variant AFTER a bench_fail" pathology
-    documented in ``cache.py``.
+    documented in ``recorder.py``.
 
     Lifecycle: one worker per ``CudaBackend`` instance, lazily spawned on
     the first ``bench`` call and respawned on timeout / EOF / error. The
@@ -716,22 +725,23 @@ class _BenchWorker:
             header = _read_with_deadline(8)
             n = int.from_bytes(header, "little")
             body = _read_with_deadline(n)
-        except _BenchTimeout:
+        except _BenchTimeout as exc:
             self._kill()
-            raise RuntimeError(f"bench worker exceeded {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned")
-        except _BenchWorkerEOF:
+            raise RuntimeError(f"bench worker exceeded {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned") from exc
+        except _BenchWorkerEOF as exc:
             stderr_tail = b""
             try:
                 stderr_tail = proc.stderr.read() or b""
             except Exception:  # noqa: BLE001 — stderr drain is best-effort
                 pass
             self._kill()
-            raise RuntimeError(f"bench worker EOF before response; stderr tail: {stderr_tail.decode(errors='replace')[-500:]}")
+            raise RuntimeError(f"bench worker EOF before response; stderr tail: {stderr_tail.decode(errors='replace')[-500:]}") from exc
 
         resp = pickle.loads(body)
         if not resp.get("ok"):
-            # Surface the worker-side exception verbatim. ``cache.py`` already
-            # treats this as a generic bench failure and pins ``bench_fail``.
+            # Surface the worker-side exception verbatim. ``recorder.py``
+            # already treats this as a generic bench failure and pins
+            # ``bench_fail``.
             raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
         return resp["result"]
 

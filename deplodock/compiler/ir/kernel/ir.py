@@ -511,6 +511,7 @@ class KernelOp(Op):
           ``_KERNEL_TIMEOUT_MS`` watchdog stops being a useful escape
           hatch; better to drop them at the rule level before benching)."""
         from math import prod  # noqa: PLC0415
+
         from deplodock.compiler.ir.stmt import Tile  # noqa: PLC0415
 
         for s in self.body:

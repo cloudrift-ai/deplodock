@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.pipeline.search.cache import TuningCache
 from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.policy.base import _PriorityHeap
+from deplodock.compiler.pipeline.search.tree import SearchTree
 
 
 class GreedySearch(_PriorityHeap):
@@ -20,8 +21,14 @@ class GreedySearch(_PriorityHeap):
     Used by ``run_pipeline`` for single-shot compiles. Autotune forks
     beyond option 0 stay in the heap unmeasured."""
 
-    def __init__(self, cache: TuningCache | None = None, context_key: str | None = None) -> None:
-        super().__init__(cache, context_key)
+    def __init__(
+        self,
+        tree: SearchTree | None = None,
+        context_key: str | None = None,
+        *,
+        db: SearchDB | None = None,
+    ) -> None:
+        super().__init__(tree, context_key, db=db)
         self._outstanding: Candidate | None = None
 
     def push(self, c: Candidate) -> None:

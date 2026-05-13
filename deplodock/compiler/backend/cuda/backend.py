@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 # (autotune cache reads it to set fail-row latencies).
 
 
-
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -51,6 +50,8 @@ class CudaBackend(Backend):
     buffer after each kernel launch. ``last_debug_result`` is then
     populated with the per-launch snapshots for the last ``run()`` call.
     """
+
+    name = "cuda"
 
     def __init__(
         self,

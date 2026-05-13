@@ -1,11 +1,11 @@
 """MCTS-style exhaustive priority search using UCB1 selection.
 
 Used by ``deplodock compile --tune``. Each candidate sits at some
-"tip" node in the cache tree (the ``op_cache_key`` of the most
+"tip" node in the search tree (the ``op_cache_key`` of the most
 recently rewritten kernel-bearing op); pop ordering is driven by a
-UCB1 walk over the cache tree rooted at the first ``parent_key IS
-NULL`` row, with the score-based prior breaking ties among unvisited
-siblings.
+UCB1 walk over the in-memory :class:`SearchTree` rooted at the first
+root inserted, with the score-based prior breaking ties among
+unvisited siblings.
 
 Stopping policy: wall-clock budget, or ``patience`` measured terminals
 without a new best latency once coverage clears ``min_coverage``."""
@@ -15,26 +15,28 @@ from __future__ import annotations
 import heapq
 import time
 
-from deplodock.compiler.pipeline.search.cache import TuningCache, op_cache_key
 from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.db import SearchDB
+from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.policy.base import _PriorityHeap
+from deplodock.compiler.pipeline.search.tree import SearchTree
 
 
 class TuningSearch(_PriorityHeap):
     """MCTS-style exhaustive priority search using UCB1 selection.
 
-    Each candidate sits at some "tip" node in the cache tree (the
+    Each candidate sits at some "tip" node in the search tree (the
     op_cache_key of the most recently rewritten kernel-bearing op).
     Priority for pop ordering is ``-UCB1(tip)`` where
 
     ``UCB1 = mean_reward + c * sqrt(log(parent.visits) / tip.visits)``
 
-    Reward per measured terminal is ``1 / latency_us`` for an ``ok``
-    bench, ``0`` for ``bench_fail``. Failures stay in the visit count,
-    so a subtree with all bench_fails has ``mean_reward = 0`` and falls
-    in the rankings even as its exploration term decays.
+    Reward per measured terminal is ``1 / latency_us_median`` for an
+    ``ok`` bench, ``0`` for ``bench_fail``. Failures stay in the visit
+    count, so a subtree with all bench_fails has ``mean_reward = 0``
+    and falls in the rankings even as its exploration term decays.
 
-    Tips not yet in the cache (fresh frontier) get ``priority = -∞`` so
+    Tips not yet in the tree (fresh frontier) get ``priority = -∞`` so
     they're always popped first — the algorithm explores once before
     exploiting. Used by ``deplodock compile --tune`` so the sweep
     drifts toward promising subtrees while still covering the space.
@@ -59,14 +61,15 @@ class TuningSearch(_PriorityHeap):
 
     def __init__(
         self,
-        cache: TuningCache | None = None,
+        tree: SearchTree | None = None,
         context_key: str | None = None,
         *,
+        db: SearchDB | None = None,
         budget_s: float = 60.0,
         patience: int = 20,
         min_coverage: float = 0.3,
     ) -> None:
-        super().__init__(cache, context_key)
+        super().__init__(tree, context_key, db=db)
         self._budget_s = budget_s
         self._patience = patience
         self._min_coverage = min_coverage
@@ -82,7 +85,7 @@ class TuningSearch(_PriorityHeap):
         self._current: Candidate | None = None
         self._just_popped: Candidate | None = None
         self._by_tip: dict[str, list[Candidate]] = {}
-        # Root of the cache tree, latched on first push so the per-pop
+        # Root of the search tree, latched on first push so the per-pop
         # UCB walk starts at the right place.
         self._root_key: str | None = None
 
@@ -108,9 +111,9 @@ class TuningSearch(_PriorityHeap):
             heapq.heappush(self._heap, (0.0, -self._seq, c))
             return
         self._by_tip.setdefault(tip_key, []).append(c)
-        # Latch the cache tree's root the first time we see one.
+        # Latch the search tree's root the first time we see one.
         if self._root_key is None:
-            self._root_key = self._find_root(ckey)
+            self._root_key = self._tree.find_root(ckey)
 
     def pop(self) -> Candidate | None:
         if self._should_stop():
@@ -122,13 +125,13 @@ class TuningSearch(_PriorityHeap):
             self._just_popped = c
             return c
         # Previous rollout terminated (engine yielded without push-back).
-        # Start a new iteration: walk the cache tree from root via UCB
+        # Start a new iteration: walk the search tree from root via UCB
         # and pick a candidate whose tip matches the selected frontier.
         ckey = self._context_key
         if ckey is None:
             return self._fallback_pop()
         if self._root_key is None:
-            self._root_key = self._find_root(ckey)
+            self._root_key = self._tree.find_root(ckey)
         if self._root_key is None:
             return self._fallback_pop()
         target = self._ucb_walk(ckey, self._root_key)
@@ -166,18 +169,16 @@ class TuningSearch(_PriorityHeap):
             return True
         if self._context_key is None:
             return False
-        # Poll the cache for newly-measured terminals since the last
+        # Poll the tree for newly-measured terminals since the last
         # pop check. Reset stagnant on any improvement; otherwise
         # count fresh measurements toward patience.
-        seen, expected = self._cache.root_coverage(self._context_key)
+        seen, expected = self._tree.root_coverage(self._context_key)
         new_measurements = seen - self._last_seen
         self._last_seen = seen
         if new_measurements > 0:
-            row = self._cache._conn.execute(  # noqa: SLF001
-                "SELECT MIN(latency_us) FROM cuda_perf WHERE context_key = ? AND status = 'ok'",
-                (self._context_key,),
-            ).fetchone()
-            cur_best = row[0] if row and row[0] is not None else float("inf")
+            cur_best = self._db.min_latency_for_context(self._context_key, backend="cuda")
+            if cur_best is None:
+                cur_best = float("inf")
             if cur_best < self._best_latency:
                 self._best_latency = cur_best
                 self._stagnant = 0
@@ -193,7 +194,7 @@ class TuningSearch(_PriorityHeap):
 
     def _ucb_priority(self, context_key: str, tip_key: str | None) -> float:
         """Heap-min priority key. Lower = pop first; ``-UCB1`` so higher
-        UCB pops earlier. Fresh frontier (no cache row, or row with zero
+        UCB pops earlier. Fresh frontier (no tree row, or row with zero
         ``visits``) gets ``-inf`` — always pop first.
 
         ``visits`` is the MCTS denominator (expansions + measurements),
@@ -202,11 +203,11 @@ class TuningSearch(_PriorityHeap):
         sibling, still totally fresh"."""
         if tip_key is None:
             return 0.0
-        node = self._cache.node(context_key, tip_key)
+        node = self._tree.node(context_key, tip_key)
         if node is None or node.visits == 0:
             return float("-inf")
         mean = node.total_reward / node.visits
-        parent = self._cache.node(context_key, node.parent_key) if node.parent_key else None
+        parent = self._tree.node(context_key, node.parent_key) if node.parent_key else None
         parent_visits = parent.visits if parent and parent.visits > 0 else node.visits
         import math  # noqa: PLC0415
 
@@ -215,7 +216,7 @@ class TuningSearch(_PriorityHeap):
 
     def _tip_key(self, graph, context_key: str) -> str | None:
         """The candidate's tip is its deepest kernel-bearing op in the
-        cache tree (most rule applications fired). For single-kernel
+        search tree (most rule applications fired). For single-kernel
         graphs that's just the one body-bearing op's key."""
         keys = [op_cache_key(n.op) for n in graph.nodes.values() if op_cache_key(n.op) is not None]
         if not keys:
@@ -224,19 +225,8 @@ class TuningSearch(_PriorityHeap):
             return keys[0]
         return max(keys, key=lambda k: self._depth(context_key, k))
 
-    def _find_root(self, context_key: str) -> str | None:
-        """Return the node_key of the cache tree's root for this context
-        — the first ``parent_key IS NULL`` row inserted (typically the
-        post-fusion LoopOp). Latched on first call; subsequent calls
-        return the same key even if more roots get inserted later."""
-        row = self._cache._conn.execute(  # noqa: SLF001
-            "SELECT node_key FROM nodes WHERE context_key = ? AND parent_key IS NULL ORDER BY rowid LIMIT 1",
-            (context_key,),
-        ).fetchone()
-        return row[0] if row else None
-
     def _ucb_walk(self, context_key: str, root_key: str) -> str | None:
-        """Walk the cache tree from ``root_key`` via UCB selection at
+        """Walk the search tree from ``root_key`` via UCB selection at
         each node. Stops at the first node with at least one unvisited
         child (returning that child) or with no children at all
         (returning that node itself). Among unvisited siblings, the
@@ -248,10 +238,10 @@ class TuningSearch(_PriorityHeap):
         # Cap to defend against a hypothetical cycle in the parent_key
         # graph. Real trees here are tens of levels deep at most.
         for _ in range(256):
-            children = self._cache.children(context_key, cur)
+            children = self._tree.children(context_key, cur)
             if not children:
-                return cur  # frontier: leaf of the cache tree
-            cur_node = self._cache.node(context_key, cur)
+                return cur  # frontier: leaf of the search tree
+            cur_node = self._tree.node(context_key, cur)
             parent_visits = cur_node.visits if cur_node else 1
             # Find unvisited children; if any, pick the one whose
             # candidate has the highest ``score`` (heuristic prior).
@@ -265,7 +255,7 @@ class TuningSearch(_PriorityHeap):
             unvisited: list[tuple[str, float]] = []
             best_score = float("-inf")
             for ck in children:
-                child = self._cache.node(context_key, ck)
+                child = self._tree.node(context_key, ck)
                 s = self._candidate_score(ck)
                 if s > best_score:
                     best_score = s
@@ -292,7 +282,7 @@ class TuningSearch(_PriorityHeap):
             best_key = None
             best_ucb = float("-inf")
             for ck in children:
-                child = self._cache.node(context_key, ck)
+                child = self._tree.node(context_key, ck)
                 if child is None or child.visits == 0:
                     continue
                 mean = child.total_reward / child.visits
@@ -332,7 +322,7 @@ class TuningSearch(_PriorityHeap):
         cur: str | None = node_key
         # Hard cap on chain walk so a degenerate cycle (shouldn't happen, defensive) doesn't loop forever.
         while cur is not None and d < 64:
-            row = self._cache.node(context_key, cur)
+            row = self._tree.node(context_key, cur)
             if row is None or row.parent_key is None:
                 break
             cur = row.parent_key

@@ -41,11 +41,18 @@ class RunResult:
 
 @dataclass
 class LaunchTime:
-    """Per-launch GPU-event timing inside a benchmark run."""
+    """Per-launch GPU-event timing inside a benchmark run.
+
+    ``time_ms`` is the median over ``samples`` (the canonical selection
+    statistic — robust to single-iter outliers from cupy framing
+    jitter). ``samples`` carries every measured per-iter latency in
+    ms so callers downstream (e.g. the tuning DB recorder) can compute
+    min/max/mean/variance without re-running the bench."""
 
     idx: int
     kernel_name: str
     time_ms: float
+    samples: tuple[float, ...] | None = None
 
 
 @dataclass
@@ -61,6 +68,12 @@ class BenchmarkResult:
 
 class Backend(ABC):
     """Abstract backend: Graph → compiled artifact → run."""
+
+    # Short identifier used by the autotune ``perf`` table to partition
+    # measurements by which backend produced them (so e.g. the CUDA
+    # backend and the loop interpreter can share a DB without clobber).
+    # Subclasses override.
+    name: str = "stub"
 
     # Wall-clock cap on the NVRTC-compile stage of a single
     # ``benchmark()`` call. Enforced at the C-call boundary after compile

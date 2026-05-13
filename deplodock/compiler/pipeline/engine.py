@@ -41,8 +41,9 @@ from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
-from deplodock.compiler.pipeline.search.cache import TuningCache, op_cache_key
 from deplodock.compiler.pipeline.search.candidate import Candidate, RuleResult, TraceEntry
+from deplodock.compiler.pipeline.search.keys import op_cache_key
+from deplodock.compiler.pipeline.search.tree import SearchTree
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -408,7 +409,7 @@ def _try_one_rule(
     pass_idx: int | None,
     pass_name: str | None,
     *,
-    cache: TuningCache | None = None,
+    tree: SearchTree | None = None,
 ) -> RuleResult:
     """One iteration: enumerate ``rule``'s matches once and apply each
     live match (with non-skipped rewrite) in batch. Match enumeration
@@ -430,7 +431,7 @@ def _try_one_rule(
 
     matches = match_pattern(cand.graph, rule.pattern)
     result = RuleResult()
-    context_key = cand.ctx.structural_key() if cache is not None else None
+    context_key = cand.ctx.structural_key() if tree is not None else None
     for match in matches:
         options = _try_rewrite(rule, match, ctx, debug_on=debug_on, pass_name=pass_name)
         if options is None:
@@ -451,13 +452,13 @@ def _try_one_rule(
         # rewrites (decomposition / fusion) don't have a single post-op
         # to key on, so they don't contribute tree edges. Single-option
         # rules still record an edge (n_new=1, delta=0); the chain in
-        # the cache mirrors the source chain on the resulting kernels.
-        if cache is not None and context_key is not None:
+        # the tree mirrors the source chain on the resulting kernels.
+        if tree is not None and context_key is not None:
             parent_key = op_cache_key(cand.graph.nodes[match.root_node_id].op)
             if parent_key is not None and all(isinstance(o, Op) for o in options):
                 child_keys = [op_cache_key(o) for o in options]
                 if all(k is not None for k in child_keys):
-                    cache.expand(context_key, parent_key, child_keys)
+                    tree.expand(context_key, parent_key, child_keys)
         fragment = _wrap_op_as_fragment(cand.graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
         text = _format_rule_application(rule.name, cand.graph, match, fragment, pass_name=pass_name) if need_text else None
         if debug_on:

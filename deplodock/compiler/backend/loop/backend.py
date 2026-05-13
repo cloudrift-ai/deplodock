@@ -26,5 +26,7 @@ if TYPE_CHECKING:
 class LoopBackend(Backend):
     """Execute a fused ``Graph[LoopOp]`` via the default topo-walk; LoopOps are JIT'd by ``LoopOp.forward``."""
 
+    name = "loop"
+
     def compile(self, graph: Graph) -> Graph:
         return run_pipeline(graph, LOOP_PASSES)

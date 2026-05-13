@@ -10,8 +10,10 @@ from __future__ import annotations
 import heapq
 from typing import Protocol
 
-from deplodock.compiler.pipeline.search.cache import TuningCache, count_unmeasured_ops
 from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.db import SearchDB
+from deplodock.compiler.pipeline.search.recorder import count_unmeasured_ops
+from deplodock.compiler.pipeline.search.tree import SearchTree
 
 
 class Search(Protocol):
@@ -33,13 +35,27 @@ class Search(Protocol):
 class _PriorityHeap:
     """Shared push/pop for the two concrete search policies. Priority
     is ``count_unmeasured_ops`` at push time; LIFO tiebreak via
-    decreasing ``_seq`` so on a fresh in-memory cache the order is the
-    same as a DFS stack."""
+    decreasing ``_seq`` so on a fresh in-memory store the order is the
+    same as a DFS stack.
 
-    def __init__(self, cache: TuningCache | None = None, context_key: str | None = None) -> None:
-        if cache is None:
-            cache = TuningCache()
-        self._cache = cache
+    ``tree`` is the in-memory MCTS state (rebuilt per process); ``db``
+    is the on-disk inventory + perf store (cross-run cache hits).
+    Both default to fresh instances so callers can construct a search
+    without wiring persistence."""
+
+    def __init__(
+        self,
+        tree: SearchTree | None = None,
+        context_key: str | None = None,
+        *,
+        db: SearchDB | None = None,
+    ) -> None:
+        if tree is None:
+            tree = SearchTree()
+        if db is None:
+            db = SearchDB()
+        self._tree = tree
+        self._db = db
         self._context_key = context_key
         self._heap: list[tuple[int, int, Candidate]] = []
         self._seq = 0
@@ -48,7 +64,7 @@ class _PriorityHeap:
         return self._context_key if self._context_key is not None else c.ctx.structural_key()
 
     def _push(self, c: Candidate) -> None:
-        n = count_unmeasured_ops(c.graph, self._cache, self._ckey(c))
+        n = count_unmeasured_ops(c.graph, self._db, self._ckey(c))
         self._seq += 1
         heapq.heappush(self._heap, (n, -self._seq, c))
 
@@ -58,5 +74,9 @@ class _PriorityHeap:
         return heapq.heappop(self._heap)[2]
 
     @property
-    def cache(self) -> TuningCache:
-        return self._cache
+    def tree(self) -> SearchTree:
+        return self._tree
+
+    @property
+    def db(self) -> SearchDB:
+        return self._db

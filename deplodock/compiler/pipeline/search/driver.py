@@ -2,9 +2,9 @@
 
 ``_search_loop`` is the unified driver: pop a candidate, advance it by
 one rule application (via ``engine._try_one_rule``), push successor(s)
-back. ``run_autotune`` wraps it with backend measurement / cache
-recording per terminal; ``run_pipeline`` is the single-shot greedy
-convenience wrapper used by ``deplodock compile`` without ``--tune``."""
+back. ``run_autotune`` wraps it with backend measurement / DB recording
+per terminal; ``run_pipeline`` is the single-shot greedy convenience
+wrapper used by ``deplodock compile`` without ``--tune``."""
 
 from __future__ import annotations
 
@@ -16,9 +16,11 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.pipeline.search.cache import TuningCache, record_terminal
 from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.policy import GreedySearch, Search
+from deplodock.compiler.pipeline.search.recorder import TuneAborted, record_terminal
+from deplodock.compiler.pipeline.search.tree import SearchTree
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -47,7 +49,7 @@ def _search_loop(
     # / run_rule call _search_loop, and _try_one_rule lives in engine).
     from deplodock.compiler.pipeline.engine import _try_one_rule  # noqa: PLC0415
 
-    cache: TuningCache | None = getattr(search, "cache", None)
+    tree: SearchTree | None = getattr(search, "tree", None)
     while (cand := search.pop()) is not None:
         cur = cand.cursor
         if cur.pass_idx >= len(pass_names):
@@ -62,7 +64,7 @@ def _search_loop(
         rule = rules[cur.rule_idx]
         pass_idx_arg = cur.pass_idx + 1 if pass_names[cur.pass_idx] else None
         pass_name_arg = pass_names[cur.pass_idx] or None
-        result = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg, cache=cache)
+        result = _try_one_rule(cand, rule, ctx, dump, pass_idx_arg, pass_name_arg, tree=tree)
 
         def _on_pass_finish(idx: int) -> None:
             name = pass_names[idx]
@@ -86,7 +88,8 @@ def run_pipeline(
     select: Iterable[str] | None = None,
     ctx: Context | None = None,
     backend=None,
-    cache: TuningCache | None = None,
+    db: SearchDB | None = None,
+    tree: SearchTree | None = None,
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
     after each. Single-candidate convenience wrapper around
@@ -98,15 +101,15 @@ def run_pipeline(
 
     ``backend`` (typically :class:`CudaBackend`) opts the run into real
     GPU measurement: every terminal graph's per-kernel latency is
-    recorded to ``cache`` and attributed to every ancestor along the
-    ``Op.source`` chain. ``cache`` defaults to a fresh in-memory store;
-    pass an explicit :class:`TuningCache` to persist measurements
-    across runs.
+    recorded to ``db`` and attributed to every ancestor along the
+    ``Op.source`` chain. ``db`` defaults to a fresh in-memory store;
+    pass an explicit :class:`SearchDB` to persist measurements
+    across runs. ``tree`` defaults to a fresh :class:`SearchTree`.
 
     For exhaustive autotuning, call :func:`run_autotune` directly with
     :class:`TuningSearch` and iterate every yielded candidate."""
-    search = GreedySearch(cache=cache)
-    return next(run_autotune(graph, passes, search=search, dump=dump, select=select, ctx=ctx, backend=backend)).graph
+    search = GreedySearch(tree=tree)
+    return next(run_autotune(graph, passes, search=search, dump=dump, select=select, ctx=ctx, backend=backend, db=db)).graph
 
 
 def run_autotune(
@@ -118,6 +121,7 @@ def run_autotune(
     select: Iterable[str] | None = None,
     ctx: Context | None = None,
     backend=None,
+    db: SearchDB | None = None,
 ) -> Iterator[Candidate]:
     """Drive the autotune search. Yields one terminal ``Candidate`` per
     fully-explored branch. With deterministic rules (no list-returning
@@ -136,13 +140,13 @@ def run_autotune(
     terminal); :class:`TuningSearch` for ``--tune`` (runs the queue
     dry, exploring every fork).
 
-    When ``search`` exposes a ``cache: TuningCache`` (both built-in
+    When ``search`` exposes a ``tree: SearchTree`` (both built-in
     searches do), each yielded terminal candidate has its ``CudaOp``
-    nodes recorded to the cache via :func:`record_terminal` before being
-    yielded — so subsequent candidates see the updated priority signal.
-    Pass a ``Backend`` (typically :class:`CudaBackend`) via ``backend=``
-    to record real GPU-event latencies; omit it to record the stub
-    ``latency_us=1.0``.
+    nodes recorded to ``db`` and the tree via :func:`record_terminal`
+    before being yielded — so subsequent candidates see the updated
+    priority signal. Pass a ``Backend`` (typically
+    :class:`CudaBackend`) via ``backend=`` to record real GPU-event
+    latencies; omit it to record the stub ``latency_us=1.0``.
 
     ``ctx`` is built once (probing the live device if not provided)
     and shared by every candidate."""
@@ -156,7 +160,9 @@ def run_autotune(
 
     search.push(Candidate(graph=graph, ctx=ctx))
 
-    cache: TuningCache | None = getattr(search, "cache", None)
+    tree: SearchTree | None = getattr(search, "tree", None)
+    if db is None:
+        db = SearchDB()
     n_terminals = 0
     for cand in _search_loop(search, rules_per_pass, passes, ctx, dump):
         n_terminals += 1
@@ -172,11 +178,9 @@ def run_autotune(
                     knob_strs.append(", ".join(f"{kk}={vv}" for kk, vv in sorted(k.items())))
             label = " | ".join(knob_strs) if knob_strs else "option-0"
             logger.info("[tune] variant #%d  [%s]", n_terminals, label)
-        if cache is not None:
-            from deplodock.compiler.pipeline.search.cache import TuneAborted  # noqa: PLC0415
-
+        if tree is not None:
             try:
-                record_terminal(cand.graph, cache, cand.ctx.structural_key(), backend=backend)
+                record_terminal(cand.graph, db, tree, cand.ctx.structural_key(), backend=backend)
             except TuneAborted as exc:
                 # A bench failure left GPU work queued; running another
                 # variant would block in cupy's ``_allocate``. Yield

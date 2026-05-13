@@ -221,14 +221,13 @@ def handle_compile(args):
         dump.dump_input_graph(graph)
 
     backend = None
-    cache = None
     if args.tune:
         if passes != CUDA_PASSES:
             logger.info("--tune forces --ir cuda (overriding %r)", args.ir)
             passes = CUDA_PASSES
             args.ir = "cuda"
         from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.cache import TuningCache  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search import SearchDB, SearchTree  # noqa: PLC0415
 
         # 10 s wall budget on each variant's bench. Backstops the
         # in-process per-launch/per-iter watchdogs: if a kernel keeps
@@ -239,8 +238,9 @@ def handle_compile(args):
         backend = CudaBackend(bench_wall_timeout_s=10.0)
         db_override = args.tune_db or os.environ.get("DEPLODOCK_TUNE_DB")
         db_path = Path(db_override) if db_override else Path.home() / ".cache" / "deplodock" / "autotune.db"
-        cache = TuningCache(path=db_path)
-        logger.info("Tuning cache: %s", db_path)
+        db = SearchDB(path=db_path)
+        tree = SearchTree()
+        logger.info("Tuning DB: %s", db_path)
 
     if args.tune:
         import os as _os  # noqa: PLC0415
@@ -249,14 +249,15 @@ def handle_compile(args):
         from deplodock.compiler.pipeline import TuningSearch, run_autotune  # noqa: PLC0415
 
         search = TuningSearch(
-            cache=cache,
+            tree=tree,
+            db=db,
             budget_s=args.tune_budget,
             patience=args.tune_patience,
             min_coverage=args.tune_min_coverage,
         )
         t0 = _time.monotonic()
         try:
-            candidates = list(run_autotune(graph, passes, search=search, dump=dump, backend=backend))
+            candidates = list(run_autotune(graph, passes, search=search, dump=dump, backend=backend, db=db))
         except RuntimeError as exc:
             # An autotune-internal raise (bench watchdog couldn't bail
             # in time because the GPU queue is saturated). The CUDA
@@ -269,8 +270,8 @@ def handle_compile(args):
         elapsed = _time.monotonic() - t0
         reason = search.stop_reason or "tree exhausted"
         sys.stderr.write(f"\n[tune] stopped: {reason} after {len(candidates)} variant(s) in {elapsed:.1f}s\n")
-        result = _pick_best_candidate(candidates, cache).graph
-        _print_tune_summary(candidates, cache)
+        result = _pick_best_candidate(candidates, db).graph
+        _print_tune_summary(candidates, db)
     else:
         result = run_pipeline(graph, passes, dump=dump)
 
@@ -336,13 +337,13 @@ def _format_knobs(cuda_op) -> str:
     return ", ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
 
 
-def _pick_best_candidate(candidates, cache):
+def _pick_best_candidate(candidates, db):
     """Pick the autotune candidate whose CudaOps all measured ``ok`` and
     whose summed latency is lowest. Falls back to ``candidates[0]`` when
     nothing has a clean measurement (e.g. every variant timed out)."""
-    from deplodock.compiler.pipeline.search.cache import op_cache_key  # noqa: PLC0415
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search import op_cache_key  # noqa: PLC0415
 
     ctx_key = Context.probe().structural_key()
     best = None
@@ -355,26 +356,26 @@ def _pick_best_candidate(candidates, cache):
         all_ok = True
         for node in cuda_nodes:
             key = op_cache_key(node.op)
-            row = cache.cuda_perf(ctx_key, key) if key else None
+            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
             if row is None or row.status != "ok":
                 all_ok = False
                 break
-            total += row.latency_us
+            total += row.stats.median
         if all_ok and total < best_total:
             best_total = total
             best = cand
     return best if best is not None else candidates[0]
 
 
-def _print_tune_summary(candidates, cache) -> None:
+def _print_tune_summary(candidates, db) -> None:
     """Print all variants explored by the autotuner, sorted by total
     GPU latency. Each ``Candidate`` is one terminal pipeline run (one
     set of autotune choices); each carries a ``trace`` of ``TraceEntry``
     (rule_name, choice_idx) and a graph with measured ``CudaOp`` nodes.
     """
-    from deplodock.compiler.pipeline.search.cache import op_cache_key  # noqa: PLC0415
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search import op_cache_key  # noqa: PLC0415
 
     ctx_key = Context.probe().structural_key()
 
@@ -387,8 +388,8 @@ def _print_tune_summary(candidates, cache) -> None:
         knob_strs: list[str] = []
         for node in cuda_nodes:
             key = op_cache_key(node.op)
-            row = cache.cuda_perf(ctx_key, key) if key else None
-            latency = row.latency_us if row else float("nan")
+            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
+            latency = row.stats.median if row else float("nan")
             per_kernel.append((node.op.kernel_name, latency))
             if row is not None and row.status == "ok":
                 total += latency

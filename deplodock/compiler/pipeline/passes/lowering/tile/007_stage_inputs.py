@@ -57,6 +57,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 PATTERN = [Pattern("root", TileOp)]
 
+
 class _Slab(NamedTuple):
     """Slab geometry derived from one Load's index."""
 
@@ -151,7 +152,9 @@ def _process_scope(
                     loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes))
         rewritten_inner.append(s)
 
-    stages, name_rewrites = _build_stages(loads_by_buf, thread_axes, block_axis_names, used_names, slab_cap=slab_cap, scope_budget=scope_budget)
+    stages, name_rewrites = _build_stages(
+        loads_by_buf, thread_axes, block_axis_names, used_names, slab_cap=slab_cap, scope_budget=scope_budget
+    )
     if not stages:
         return tuple(rewritten_inner)
 
