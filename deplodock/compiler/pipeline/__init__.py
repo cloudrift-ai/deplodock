@@ -1,8 +1,10 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
-- :mod:`.engine` — pattern matcher + rule runner. Exports ``Pattern``,
-  ``Match``, ``match_pattern``, ``run_pass``. To run a single rule
-  module, call ``run_pass(rules_dir, select=[<rule_stem>])``.
+- :mod:`.engine` — pattern matcher + rule plumbing. Exports
+  ``Pattern``, ``Match``, ``match_pattern``, ``RuleSkipped``. Compilation
+  drives through ``run_pipeline`` / ``run_autotune`` for every caller —
+  including tests — so the pass list is always explicit (``[name, ...]``)
+  and the same greedy / autotune semantics apply everywhere.
 - :mod:`.search` — autotune driver (``Candidate`` / ``Search`` /
   ``run_pipeline`` / ``run_autotune``) and persistent measurement cache.
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
@@ -10,7 +12,7 @@
 - :mod:`.passes` — pass directories grouped by IR level:
   ``frontend/{decomposition,optimization}``, ``loop/{lifting,fusion}``,
   ``lowering/{tile,kernel,cuda}``. Each leaf contains ``NNN_<name>.py``
-  rule modules picked up by ``run_pass``.
+  rule modules picked up by ``run_pipeline``.
 """
 
 from deplodock.compiler.pipeline.dump import CompilerDump
@@ -19,7 +21,6 @@ from deplodock.compiler.pipeline.engine import (
     Pattern,
     RuleSkipped,
     match_pattern,
-    run_pass,
 )
 from deplodock.compiler.pipeline.search import (
     Candidate,
@@ -56,6 +57,5 @@ __all__ = [
     "TuningSearch",
     "match_pattern",
     "run_autotune",
-    "run_pass",
     "run_pipeline",
 ]

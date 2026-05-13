@@ -9,8 +9,6 @@ both pre- and post-fusion, and the outputs must match. ``LoopOp.forward``
 makes the post-fusion run possible without a GPU.
 """
 
-from pathlib import Path
-
 import numpy as np
 
 from deplodock.compiler.backend.numpy import NumpyBackend
@@ -18,19 +16,14 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.engine import run_pass
-
-_PASSES_ROOT = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
-LIFTING_DIR = _PASSES_ROOT / "loop" / "lifting"
-RULES_DIR = _PASSES_ROOT / "loop" / "fusion"
+from deplodock.compiler.pipeline import run_pipeline
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()
 
 
 def _fuse(graph: Graph) -> Graph:
-    graph = run_pass(graph, LIFTING_DIR)
-    return run_pass(graph, RULES_DIR)
+    return run_pipeline(graph, ["loop/lifting", "loop/fusion"])
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

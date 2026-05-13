@@ -6,8 +6,7 @@ Public surface:
   ``Pattern`` matches one node by ``op_type`` + field constraints;
   ``match_pattern(graph, pattern)`` walks forward from every
   topo-ordered seed along fan-out-1 consumer edges.
-- ``run_pass`` — apply every rule
-  module in a directory to fixed point. Rule modules declare
+- Rule modules under ``passes/`` declare
   ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(...)`` function
   whose return type discriminates the rewrite flavor:
   * ``Graph`` — functional fragment, spliced in place of the match.
@@ -31,7 +30,7 @@ import importlib.util
 import inspect
 import logging
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -330,33 +329,6 @@ def _try_rewrite(
 # ---------------------------------------------------------------------------
 # Rewrite loop
 # ---------------------------------------------------------------------------
-
-
-def run_pass(
-    graph: Graph,
-    pass_dir: Path,
-    dump: CompilerDump | None = None,
-    pass_name: str | None = None,
-    select: Iterable[str] | None = None,
-    ctx: Context | None = None,
-) -> Graph:
-    """Load all rule modules in ``pass_dir`` and apply them to fixed
-    point. ``select``, if given, restricts the run to rules whose name
-    (with or without the numeric ordering prefix, e.g. ``tileify`` or
-    ``001_tileify``) appears in the iterable — useful for isolating a
-    single rule's behavior in tests.
-
-    Single-graph helper: use ``run_pipeline`` for autotuning. Discards
-    any fork ``Candidate``s a multi-option rule might want to spawn."""
-    from deplodock.compiler.pipeline.search.driver import _search_loop  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
-
-    if ctx is None:
-        ctx = Context.probe()
-    rules = _filter_rules(_load_rules(pass_dir), set(select) if select is not None else None)
-    search = GreedySearch()
-    search.push(Candidate(graph=graph, ctx=ctx))
-    return next(_search_loop(search, [rules], [pass_name or ""], ctx, dump)).graph
 
 
 def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:
