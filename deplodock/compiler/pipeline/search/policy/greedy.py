@@ -50,7 +50,14 @@ class GreedySearch(_PriorityHeap):
             row = self._db.lookup_lowering(parent_key)
             if row is None:
                 return c
-            perf = self._db.lookup_perf_any(row.child_key)
+            # Look up the winning child's measured perf row under *this*
+            # compile's context + backend. The DB partitions perf by
+            # both, so a cross-target row (e.g. measured on sm_90 while
+            # we compile for sm_80) won't return knobs here — we still
+            # use the lowering edge for selection but skip the knob
+            # carry-over since it wouldn't apply. Backend identity rides
+            # on ``ctx.backend_name`` (stamped by ``run_autotune``).
+            perf = self._db.lookup_perf(self._ckey(c), row.child_key, backend=c.ctx.backend_name)
             self._choices[parent_key] = (row.child_key, perf.knobs if perf else {})
         child_key, _knobs = self._choices[parent_key]
         # Identify the fork whose newly-introduced op points back to the

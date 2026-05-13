@@ -309,18 +309,6 @@ class SearchDB:
             best_median_us=row[4],
         )
 
-    def lookup_perf_any(self, op_key: str) -> PerfRow | None:
-        """First ``ok`` row for ``op_key`` across any context/backend —
-        used to recover the knobs of a stored winner for telemetry. Falls
-        back to any-status row if no ``ok`` row exists."""
-        row = self._conn.execute(
-            "SELECT context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
-            "latency_us_mean, latency_us_variance, n_samples, measured_at, knobs "
-            "FROM perf WHERE op_key = ? ORDER BY (status = 'ok') DESC, latency_us_median ASC LIMIT 1",
-            (op_key,),
-        ).fetchone()
-        return _row_to_perf(row) if row else None
-
     def lookup_perf(self, context_key: str, op_key: str, *, backend: str) -> PerfRow | None:
         row = self._conn.execute(
             "SELECT context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "

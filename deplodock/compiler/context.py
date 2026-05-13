@@ -62,6 +62,12 @@ class Context:
     # Used by ``KernelOp.validate`` to filter autotune variants whose launch
     # geometry would be rejected by the driver before the kernel ever runs.
     max_threads_per_cta: int = 1024
+    # Identifies which backend's perf rows this compile should consult
+    # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
+    # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the
+    # canonical autotune target. ``run_autotune`` replaces this when a
+    # live :class:`Backend` is supplied.
+    backend_name: str = "cuda"
 
     @classmethod
     def from_target(cls, cap: tuple[int, int]) -> Context:

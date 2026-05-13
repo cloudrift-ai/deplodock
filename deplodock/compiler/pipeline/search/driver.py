@@ -156,6 +156,15 @@ def run_autotune(
 
     if ctx is None:
         ctx = Context.probe()
+    # Stamp the backend identifier so DB lookups (``GreedySearch._select``)
+    # pull perf rows from the matching backend. ``"cuda"`` is the
+    # canonical autotune target — keep it when no live backend is
+    # supplied so a previously-tuned DB still drives the choice.
+    backend_name = getattr(backend, "name", "cuda")
+    if ctx.backend_name != backend_name:
+        from dataclasses import replace as _replace  # noqa: PLC0415
+
+        ctx = _replace(ctx, backend_name=backend_name)
     select_set = set(select) if select is not None else None
     rules_per_pass = [_filter_rules(_load_rules(_PASSES_DIR / name), select_set) for name in passes]
     t_start = time.monotonic()
