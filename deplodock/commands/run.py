@@ -298,14 +298,13 @@ def _compile_tuned(graph, backend, dump, args):
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch, run_autotune  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search import SearchDB, SearchTree, op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search import SearchDB, op_cache_key  # noqa: PLC0415
 
     _db_override = args.tune_db or _os.environ.get("DEPLODOCK_TUNE_DB")
     db_path = _Path(_db_override) if _db_override else _Path.home() / ".cache" / "deplodock" / "autotune.db"
     db = SearchDB(path=db_path)
-    tree = SearchTree()
     logger.info("run --tune: db=%s budget=%.1fs", db_path, args.tune_budget)
-    search = TuningSearch(tree=tree, db=db, budget_s=args.tune_budget)
+    search = TuningSearch(db=db, budget_s=args.tune_budget)
 
     # ``run_autotune`` drives ``backend.benchmark`` once per terminal
     # candidate; the backend acquires the GPU lock per call, so parallel

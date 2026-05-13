@@ -227,7 +227,7 @@ def handle_compile(args):
             passes = CUDA_PASSES
             args.ir = "cuda"
         from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search import SearchDB, SearchTree  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search import SearchDB  # noqa: PLC0415
 
         # 10 s wall budget on each variant's bench. Backstops the
         # in-process per-launch/per-iter watchdogs: if a kernel keeps
@@ -239,7 +239,6 @@ def handle_compile(args):
         db_override = args.tune_db or os.environ.get("DEPLODOCK_TUNE_DB")
         db_path = Path(db_override) if db_override else Path.home() / ".cache" / "deplodock" / "autotune.db"
         db = SearchDB(path=db_path)
-        tree = SearchTree()
         logger.info("Tuning DB: %s", db_path)
 
     if args.tune:
@@ -249,7 +248,6 @@ def handle_compile(args):
         from deplodock.compiler.pipeline import TuningSearch, run_autotune  # noqa: PLC0415
 
         search = TuningSearch(
-            tree=tree,
             db=db,
             budget_s=args.tune_budget,
             patience=args.tune_patience,
