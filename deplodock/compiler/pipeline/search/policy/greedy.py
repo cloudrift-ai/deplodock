@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.base import Op
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
@@ -27,6 +26,10 @@ class GreedySearch(_PriorityHeap):
     compile doesn't hit the DB again. Without a DB hit we fall back to
     option-0 (the rule's heuristic ordering) — same behavior as before.
 
+    The rewrite site rides on ``Candidate.last_rewritten`` (set by the
+    engine after every rule application), so the policy reads the new
+    child op and its source parent directly without scanning the graph.
+
     No ``tree`` attribute — greedy never participates in the MCTS
     accounting, so :func:`record_terminal` skips the tree bump when it
     sees ``getattr(search, "tree", None) is None``."""
@@ -36,13 +39,24 @@ class GreedySearch(_PriorityHeap):
         # parent_key → (child_key, knobs) for this compile session.
         self._choices: dict[str, tuple[str, dict]] = {}
 
-    def push(self, c: Candidate, *forks: Candidate, parent: Op | None = None) -> None:
-        if not forks or parent is None:
+    def push(self, c: Candidate, *forks: Candidate) -> None:
+        if not forks:
             self._push(c)
             return
-        self._push(self._select(c, forks, parent))
+        self._push(self._select(c, forks))
 
-    def _select(self, c: Candidate, forks: tuple[Candidate, ...], parent: Op) -> Candidate:
+    def _select(self, c: Candidate, forks: tuple[Candidate, ...]) -> Candidate:
+        # Forks deep-copy the graph but preserve node IDs, so every
+        # candidate in the group exposes the rule's new op at the same
+        # ``last_rewritten`` node. Read it off ``c`` to recover the
+        # parent (via ``op.source``) for the DB lookup.
+        if not c.last_rewritten:
+            return c
+        nid = c.last_rewritten[0]
+        new_op = c.graph.nodes[nid].op
+        parent = new_op.source
+        if parent is None:
+            return c
         parent_key = op_cache_key(parent)
         if parent_key is None:
             return c
@@ -60,19 +74,9 @@ class GreedySearch(_PriorityHeap):
             perf = self._db.lookup_perf(self._ckey(c), row.child_key, backend=c.ctx.backend_name)
             self._choices[parent_key] = (row.child_key, perf.knobs if perf else {})
         child_key, _knobs = self._choices[parent_key]
-        # Identify the fork whose newly-introduced op points back to the
-        # rewritten parent (by ``op_cache_key`` since forks deep-copy the
-        # graph, so a Python ``is`` against ``parent`` only matches the
-        # primary candidate) and matches the DB-preferred child key.
-        # ``_apply_one`` stamps ``op.source`` on every rebind so the
-        # structural lookup is reliable.
         for cand in (c, *forks):
-            for node in cand.graph.nodes.values():
-                src = node.op.source
-                if src is None:
-                    continue
-                if op_cache_key(src) == parent_key and op_cache_key(node.op) == child_key:
-                    return cand
+            if op_cache_key(cand.graph.nodes[nid].op) == child_key:
+                return cand
         # DB winner not present in this fork group (structural-key
         # collision, stale DB after a rule change, etc.) — fall back to
         # option-0 rather than failing.

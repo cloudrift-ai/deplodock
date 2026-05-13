@@ -23,7 +23,6 @@ import heapq
 import time
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.base import Op
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
@@ -347,13 +346,10 @@ class TuningSearch(_PriorityHeap):
     def stop_reason(self) -> str | None:
         return self._stop_reason
 
-    def push(self, c: Candidate, *forks: Candidate, parent: Op | None = None) -> None:
+    def push(self, c: Candidate, *forks: Candidate) -> None:
         # Tuning registers every candidate. Order matches the previous
         # driver behavior — forks first, primary last — so the
         # ``_just_popped`` check below still fires on the right one.
-        # ``parent`` is unused here (MCTS tracks parents via the
-        # ``SearchTree``); accepted for protocol compatibility.
-        del parent
         for fork in forks:
             self._push_one(fork)
         self._push_one(c)

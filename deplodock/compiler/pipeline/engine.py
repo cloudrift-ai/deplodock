@@ -431,12 +431,6 @@ def _try_one_rule(
         # contribution — when popped, the fork re-enters the same rule
         # batch from a fresh match enumeration on its alt graph.
         if len(options) > 1:
-            # Stash the pre-rewrite op so the search policy can key DB
-            # lookups on its ``op_cache_key`` without diffing graphs.
-            # Multiple fork-spawning matches in one batch overwrite;
-            # only the last one's siblings are visible in ``forks`` after
-            # this iteration so keeping that match's parent is correct.
-            result.parent = cand.graph.nodes[match.root_node_id].op
             snapshot = copy.deepcopy(cand.graph)
             for alt_idx, alt in enumerate(options[1:], start=1):
                 fg = copy.deepcopy(snapshot)
@@ -449,10 +443,15 @@ def _try_one_rule(
                         ctx=cand.ctx,
                         trace=(*cand.trace, TraceEntry(rule.name, alt_idx)),
                         cursor=cand.cursor.fork(alt_delta),
+                        last_rewritten=(match.root_node_id,),
                     )
                 )
         cand.graph = _apply_one(cand.graph, match, chosen, rule_name=rule.name)
         cand.trace = (*cand.trace, TraceEntry(rule.name, 0))
+        # Record the rewrite site so the search policy can read the
+        # new op without scanning the graph. Forks inherit the same
+        # node ID (deep-copy preserves keys).
+        cand.last_rewritten = (match.root_node_id,)
         # Functional (Graph) fires drive the end-of-scan restart; in-place
         # (Op) rebinds don't, since the same pattern won't re-match the
         # mutated op (or the rule's idempotence guard handles it).
