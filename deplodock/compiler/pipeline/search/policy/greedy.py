@@ -12,15 +12,15 @@ from deplodock.compiler.pipeline.search.policy.base import _PriorityHeap
 class GreedySearch(_PriorityHeap):
     """Stop at the first terminal candidate.
 
-    The engine yields a terminal candidate without pushing it back. We
-    detect that by tracking the last-popped candidate: if the next
-    ``pop`` sees that nothing has been ``push``-ed since (the candidate
-    didn't return for another rule application), the previous candidate
-    must have been terminal — return ``None`` to end the search even if
-    the heap still holds unexplored forks.
+    ``push`` always enqueues exactly one candidate (either the primary
+    ``c`` or the DB-preferred fork) and drops the rest, so the heap
+    holds at most one item at any time. When the engine yields a
+    terminal without pushing it back, the next ``pop`` finds the heap
+    empty and returns ``None``, ending the search — no explicit
+    "last-popped" tracking needed.
 
-    Used by ``run_pipeline`` for single-shot compiles. At every
-    fork point we consult the search DB's ``lowering`` table: if a
+    Used by ``run_pipeline`` for single-shot compiles. At every fork
+    point we consult the search DB's ``lowering`` table: if a
     previously-tuned winner exists for the parent op's structural key,
     we push that fork instead of option-0. Decisions are memoized in
     ``_choices`` so the same parent key encountered repeatedly in one
@@ -33,18 +33,14 @@ class GreedySearch(_PriorityHeap):
 
     def __init__(self, context_key: str | None = None, *, db: SearchDB | None = None) -> None:
         super().__init__(context_key, db=db)
-        self._outstanding: Candidate | None = None
         # parent_key → (child_key, knobs) for this compile session.
         self._choices: dict[str, tuple[str, dict]] = {}
 
     def push(self, c: Candidate, *forks: Candidate, parent: Op | None = None) -> None:
-        if c is self._outstanding:
-            self._outstanding = None
         if not forks or parent is None:
             self._push(c)
             return
-        winner = self._select(c, forks, parent)
-        self._push(winner)
+        self._push(self._select(c, forks, parent))
 
     def _select(self, c: Candidate, forks: tuple[Candidate, ...], parent: Op) -> Candidate:
         parent_key = op_cache_key(parent)
@@ -76,9 +72,4 @@ class GreedySearch(_PriorityHeap):
         return c
 
     def pop(self) -> Candidate | None:
-        if self._outstanding is not None:
-            # Last popped never came back via ``push`` → it was terminal.
-            return None
-        c = self._pop()
-        self._outstanding = c
-        return c
+        return self._pop()
