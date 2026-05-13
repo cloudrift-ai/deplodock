@@ -204,7 +204,7 @@ async def _provision_cloudrift(cand: VmCandidate, ssh_key, providers_config, dry
         ssh_key_path=pub_key_path,
         image_url=image_url,
         ports=[22, 8000, 8080],
-        timeout=600,
+        timeout=1800,
         dry_run=dry_run,
         fail_statuses={"Inactive"},
         wait_ssh=True,
