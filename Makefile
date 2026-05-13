@@ -37,20 +37,20 @@ format: setup
 test: setup
 	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
 
-bench-kernels: setup
+bench-kernels-clean: setup
 	@rm -f /tmp/deplodock-gpu.lock
 	./venv/bin/pytest tests/perf/ -m perf -n auto --dist=loadgroup -v -p no:randomly --no-header
+
+bench-kernels-tuned: setup
+	@rm -f /tmp/deplodock-gpu.lock
+	@test -f ~/.cache/deplodock/tune-kernels.db || (echo "The kernel tuning DB not foud; run make tune-kernels"; exit 1)
+	DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n auto --dist=loadgroup -v -p no:randomly --no-header
 
 TUNE_BUDGET ?= 90
 tune-kernels: setup
 	@rm -f /tmp/deplodock-gpu.lock
 	@rm -f ~/.cache/deplodock/tune-kernels.db
 	DEPLODOCK_TUNE_BUDGET=$(TUNE_BUDGET) DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
-
-bench-kernels-tuned: setup
-	@rm -f /tmp/deplodock-gpu.lock
-	@test -f ~/.cache/deplodock/tune-kernels.db || (echo "The kernel tuning DB not foud; run make tune-kernels"; exit 1)
-	DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n auto --dist=loadgroup -v -p no:randomly --no-header
 
 bench: setup
 	@echo "Running benchmarks..."
