@@ -17,7 +17,6 @@ from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 def _make_search(tree: SearchTree) -> TuningSearch:
     return TuningSearch(
         tree=tree,
-        budget_s=float("inf"),
         patience=10**9,
         min_coverage=1.1,
     )

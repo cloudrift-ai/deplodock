@@ -127,13 +127,13 @@ def bench_pair(request):
     """
 
     def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow | None:
-        tune_budget = _tune_budget_s()
-        if tune_budget is not None:
+        if _tune_enabled():
             # Tune-only path: run ``deplodock compile --tune`` per case to
-            # populate the autotune DB. Measurement is skipped entirely so
-            # the tuning budget isn't eaten by a post-tune bench step —
-            # run ``make bench-kernels-tuned`` afterwards to measure.
-            _tune_via_subprocess(case, tune_budget=tune_budget)
+            # populate the autotune DB. Measurement is skipped entirely —
+            # run ``make bench-kernels-tuned`` afterwards to measure with
+            # the tuned knobs. Search runs until patience or tree
+            # exhaustion (no wall budget).
+            _tune_via_subprocess(case)
             return None
 
         if iters is None:
@@ -145,27 +145,18 @@ def bench_pair(request):
     return _run
 
 
-def _tune_budget_s() -> float | None:
-    """``DEPLODOCK_TUNE_BUDGET`` (seconds) enables the tune-only path: each
-    case spawns ``deplodock compile --tune`` to populate the autotune DB
+def _tune_enabled() -> bool:
+    """``DEPLODOCK_TUNE=1`` enables the tune-only path: each case spawns
+    ``deplodock compile --tune`` to populate the autotune DB
     (``DEPLODOCK_TUNE_DB``). The bench step is skipped — re-run the suite
-    without ``DEPLODOCK_TUNE_BUDGET`` (e.g. ``make bench-kernels-tuned``)
-    to measure with the tuned knobs. ``None`` (default) skips tuning."""
-    raw = os.environ.get("DEPLODOCK_TUNE_BUDGET", "").strip()
-    if not raw:
-        return None
-    try:
-        v = float(raw)
-    except ValueError:
-        return None
-    return v if v > 0 else None
+    without ``DEPLODOCK_TUNE`` (e.g. ``make bench-kernels-tuned``) to
+    measure with the tuned knobs."""
+    return os.environ.get("DEPLODOCK_TUNE", "").strip().lower() in ("1", "true", "yes")
 
 
-def _tune_via_subprocess(case: Case, *, tune_budget: float) -> None:
+def _tune_via_subprocess(case: Case) -> None:
     """Spawn ``deplodock compile --tune`` for one case. Writes knob
-    measurements to ``DEPLODOCK_TUNE_DB`` and exits — no bench is run,
-    so the wall budget per case stays close to ``tune_budget`` instead
-    of also paying for a post-tune ``--bench`` step."""
+    measurements to ``DEPLODOCK_TUNE_DB`` and exits — no bench is run."""
     cmd = [
         sys.executable,
         "-m",
@@ -174,17 +165,13 @@ def _tune_via_subprocess(case: Case, *, tune_budget: float) -> None:
         "--code",
         case.code,
         "--tune",
-        "--tune-budget",
-        str(tune_budget),
         "-v",
     ]
     env = dict(os.environ)
-    # Discard compile's stdout (the rendered CUDA IR) — we only care
-    # about the side effect of writing to the tuning DB.
-    timeout_s = 900.0 + tune_budget * 1.5
+    # No timeout — search exits on patience or tree exhaustion.
     sys.stderr.write(f"[tune {case.name}] launching: {' '.join(cmd)}\n")
     sys.stderr.flush()
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=None, env=env, timeout=timeout_s)
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=None, env=env)
     if res.returncode != 0:
         sys.stderr.write(f"[tune {case.name}] exit={res.returncode}\n")
 

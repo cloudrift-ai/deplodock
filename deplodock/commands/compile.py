@@ -94,12 +94,6 @@ def register_compile_command(subparsers):
         ),
     )
     parser.add_argument(
-        "--tune-budget",
-        type=float,
-        default=60.0,
-        help="Wall-clock budget for --tune in seconds (default: 60). Set to inf for unbounded.",
-    )
-    parser.add_argument(
         "--tune-patience",
         type=int,
         default=20,
@@ -249,13 +243,18 @@ def handle_compile(args):
 
         search = TuningSearch(
             db=db,
-            budget_s=args.tune_budget,
             patience=args.tune_patience,
             min_coverage=args.tune_min_coverage,
         )
         t0 = _time.monotonic()
+        candidates: list = []
         try:
-            candidates = list(run_autotune(graph, passes, search=search, dump=dump, backend=backend, db=db))
+            for cand in run_autotune(graph, passes, search=search, dump=dump, backend=backend, db=db):
+                candidates.append(cand)
+        except KeyboardInterrupt:
+            # Manual abort: cut the sweep, fall through to summary + best-pick.
+            search.stop("interrupted (Ctrl-C)")
+            sys.stderr.write("\n[tune] interrupted (Ctrl-C) — printing partial results\n")
         except RuntimeError as exc:
             # An autotune-internal raise (bench watchdog couldn't bail
             # in time because the GPU queue is saturated). The CUDA
@@ -268,6 +267,11 @@ def handle_compile(args):
         elapsed = _time.monotonic() - t0
         reason = search.stop_reason or "tree exhausted"
         sys.stderr.write(f"\n[tune] stopped: {reason} after {len(candidates)} variant(s) in {elapsed:.1f}s\n")
+        if not candidates:
+            sys.stderr.write("[tune] no candidates produced — exiting without output\n")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            _os._exit(0)
         result = _pick_best_candidate(candidates, db).graph
         _print_tune_summary(candidates, db)
     else:

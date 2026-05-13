@@ -68,7 +68,7 @@ def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
     All matmul-graph terminal candidates share the same parent op for
     blockify (the pre-blockify matmul TileOp), so deduping on
     ``child_key`` is enough."""
-    search = TuningSearch(db=SearchDB(), budget_s=float("inf"), patience=10**6, min_coverage=0.0)
+    search = TuningSearch(db=SearchDB(), patience=10**6, min_coverage=0.0)
     candidates = list(run_autotune(_make_matmul(), TILE_PASSES, search=search, db=SearchDB()))
     out: dict[str, tuple[str, str, dict]] = {}
     for cand in candidates:

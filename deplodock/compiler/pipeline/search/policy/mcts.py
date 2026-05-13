@@ -20,7 +20,6 @@ without a new best latency once coverage clears ``min_coverage``."""
 from __future__ import annotations
 
 import math
-import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -253,15 +252,17 @@ class TuningSearch:
     exploiting. Used by ``deplodock compile --tune`` so the sweep
     drifts toward promising subtrees while still covering the space.
 
-    Stopping policy. ``pop()`` returns ``None`` when any of:
+    Stopping policy. ``pop()`` returns ``None`` when:
 
-    - wall-clock budget ``budget_s`` (from first push) elapsed,
     - ``patience`` measured terminals in a row without a new best
       latency, *and* coverage ``seen / expected ≥ min_coverage`` so the
-      patience clock doesn't fire on a slow start.
+      patience clock doesn't fire on a slow start, or
+    - the tree is fully drained (no candidate queued, fallback empty).
 
-    Disable a knob by passing ``float("inf")`` (budget / coverage) or
-    a very large int (patience)."""
+    There is no wall-clock budget — under parallel workers a wall
+    budget chops off promising branches mid-exploration; rely on
+    patience + tree exhaustion instead. For manual runs, send Ctrl-C
+    and the caller catches ``KeyboardInterrupt`` to print stats."""
 
     UCB_C = math.sqrt(2)  # canonical UCB1 exploration constant.
     # Score-gap below which an unvisited sibling is dropped from the
@@ -276,7 +277,6 @@ class TuningSearch:
         tree: SearchTree | None = None,
         *,
         db: SearchDB | None = None,
-        budget_s: float = 60.0,
         patience: int = 20,
         min_coverage: float = 0.3,
     ) -> None:
@@ -285,10 +285,8 @@ class TuningSearch:
         # Latched lazily on the first ``push`` — the engine never spawns
         # a tuning sweep across mixed contexts so one key per process is fine.
         self._context_key: str | None = None
-        self._budget_s = budget_s
         self._patience = patience
         self._min_coverage = min_coverage
-        self._t_start = time.monotonic()
         self._last_seen = 0
         self._best_latency = float("inf")
         self._stagnant = 0
@@ -361,10 +359,14 @@ class TuningSearch:
             return self._fallback.popleft()
         return None
 
+    def stop(self, reason: str) -> None:
+        """Externally signal early termination (e.g. ``KeyboardInterrupt``
+        from the CLI). The next ``pop`` will return ``None`` and the
+        caller can read ``stop_reason``."""
+        self._stop_reason = reason
+
     def _should_stop(self) -> bool:
-        elapsed = time.monotonic() - self._t_start
-        if elapsed >= self._budget_s:
-            self._stop_reason = f"wall budget ({self._budget_s:.1f}s, elapsed {elapsed:.1f}s)"
+        if self._stop_reason is not None:
             return True
         if self._context_key is None:
             return False
