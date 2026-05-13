@@ -126,10 +126,18 @@ def bench_pair(request):
     doesn't gate on it.
     """
 
-    def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow:
+    def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow | None:
+        tune_budget = _tune_budget_s()
+        if tune_budget is not None:
+            # Tune-only path: run ``deplodock compile --tune`` per case to
+            # populate the autotune DB. Measurement is skipped entirely so
+            # the tuning budget isn't eaten by a post-tune bench step —
+            # run ``make bench-kernels-tuned`` afterwards to measure.
+            _tune_via_subprocess(case, tune_budget=tune_budget)
+            return None
+
         if iters is None:
             iters = case.iters
-
         row = _bench_via_subprocess(case, warmup=warmup, iters=iters, profile=_ncu_enabled())
         _collector(request.config).append(row)
         return row
@@ -138,9 +146,11 @@ def bench_pair(request):
 
 
 def _tune_budget_s() -> float | None:
-    """``DEPLODOCK_TUNE_BUDGET`` (seconds) enables autotuning for every
-    ``bench_pair`` case. ``None`` (the default) skips ``--tune`` so the
-    suite measures the deterministic-compile baseline."""
+    """``DEPLODOCK_TUNE_BUDGET`` (seconds) enables the tune-only path: each
+    case spawns ``deplodock compile --tune`` to populate the autotune DB
+    (``DEPLODOCK_TUNE_DB``). The bench step is skipped — re-run the suite
+    without ``DEPLODOCK_TUNE_BUDGET`` (e.g. ``make bench-kernels-tuned``)
+    to measure with the tuned knobs. ``None`` (default) skips tuning."""
     raw = os.environ.get("DEPLODOCK_TUNE_BUDGET", "").strip()
     if not raw:
         return None
@@ -149,6 +159,34 @@ def _tune_budget_s() -> float | None:
     except ValueError:
         return None
     return v if v > 0 else None
+
+
+def _tune_via_subprocess(case: Case, *, tune_budget: float) -> None:
+    """Spawn ``deplodock compile --tune`` for one case. Writes knob
+    measurements to ``DEPLODOCK_TUNE_DB`` and exits — no bench is run,
+    so the wall budget per case stays close to ``tune_budget`` instead
+    of also paying for a post-tune ``--bench`` step."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "deplodock.deplodock",
+        "compile",
+        "--code",
+        case.code,
+        "--tune",
+        "--tune-budget",
+        str(tune_budget),
+        "-v",
+    ]
+    env = dict(os.environ)
+    # Discard compile's stdout (the rendered CUDA IR) — we only care
+    # about the side effect of writing to the tuning DB.
+    timeout_s = 900.0 + tune_budget * 1.5
+    sys.stderr.write(f"[tune {case.name}] launching: {' '.join(cmd)}\n")
+    sys.stderr.flush()
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=None, env=env, timeout=timeout_s)
+    if res.returncode != 0:
+        sys.stderr.write(f"[tune {case.name}] exit={res.returncode}\n")
 
 
 def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool) -> PerfRow:
@@ -169,32 +207,13 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
         ]
         if profile:
             cmd.append("--profile")
-        tune_budget = _tune_budget_s()
-        if tune_budget is not None:
-            # ``-v`` raises the bench subprocess to INFO so the kernel
-            # compile / launch / wait logs (program.py) are emitted —
-            # essential for diagnosing variants that wedge mid-sweep.
-            cmd += ["--tune", "--tune-budget", str(tune_budget), "-v"]
         env = dict(os.environ)
         env["DEPLODOCK_DUMP_DIR"] = tmp
         env.pop("DEPLODOCK_NCU_CHILD", None)
 
-        # Each tuning sweep adds ``tune_budget`` per case. The default
-        # 900s ceiling covers the deterministic-compile path; bump it
-        # when tuning so the subprocess timeout doesn't kill a healthy
-        # sweep mid-run.
-        timeout_s = 900.0 + (tune_budget or 0.0) * 1.5
-        # During tuning, stream stderr live so a wedged kernel is
-        # diagnosable in real time (capture_output buffers everything
-        # until exit, which is useless for a hung subprocess).
-        if tune_budget is not None:
-            sys.stderr.write(f"[bench {case.name}] launching: {' '.join(cmd)}\n")
-            sys.stderr.flush()
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True, env=env, timeout=timeout_s)
-            res_stderr = ""
-        else:
-            res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
-            res_stderr = res.stderr
+        timeout_s = 900.0
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
+        res_stderr = res.stderr
         if res.returncode != 0:
             # Surface stderr so flaky-bench cases are diagnosable, but
             # synthesize a minimal row so the suite doesn't abort.
