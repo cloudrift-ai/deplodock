@@ -170,7 +170,7 @@ def run_autotune(
     rules_per_pass = [_filter_rules(_load_rules(_PASSES_DIR / name), select_set) for name in passes]
     t_start = time.monotonic()
 
-    search.push(Candidate(graph=graph, ctx=ctx))
+    search.push(Candidate(ctx=ctx, _graph=graph))
 
     tree: SearchTree | None = getattr(search, "tree", None)
     if db is None:

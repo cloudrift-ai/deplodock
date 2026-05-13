@@ -25,7 +25,6 @@ skip work that's already done."""
 
 from __future__ import annotations
 
-import copy
 import importlib.util
 import inspect
 import logging
@@ -40,7 +39,7 @@ from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
-from deplodock.compiler.pipeline.search.candidate import Candidate, RuleResult, TraceEntry
+from deplodock.compiler.pipeline.search.candidate import Candidate, ForkOrigin, RuleResult
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 
 if TYPE_CHECKING:
@@ -149,6 +148,23 @@ class Match:
             if n is None or id(n) != self._identities.get(nid):
                 return False
         return True
+
+    def remap(self, graph: Graph) -> Match:
+        """Build a fresh ``Match`` against ``graph`` (a copy of the
+        original) that mirrors this match's ids. Re-snapshots
+        ``_identities`` against the new graph's nodes so ``is_alive``
+        still works after the copy. Used when materializing a lazy
+        fork — the fork copies the parent's snapshot, then needs a
+        match anchored on the copy."""
+        identities = {nid: id(graph.nodes[nid]) for nid in self.consumed if nid in graph.nodes}
+        return Match(
+            graph=graph,
+            root_node_id=self.root_node_id,
+            nodes=dict(self.nodes),
+            consumed=set(self.consumed),
+            output=self.output,
+            _identities=identities,
+        )
 
 
 def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
@@ -331,34 +347,6 @@ def _try_rewrite(
 # ---------------------------------------------------------------------------
 
 
-def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:
-    """Apply one rewrite outcome to ``graph``. ``Op`` rebinds
-    ``root.op`` in place (id, inputs, hints kept); ``Graph`` is a
-    fragment spliced via ``Graph.splice``. Returns the (possibly
-    same, possibly new) graph.
-
-    On the 1:1 ``Op`` path the engine stamps ``result.source`` with the
-    op being replaced (unless the rule already set it). This threads
-    the rewrite chain through every in-place rebind for free — lowering
-    rules don't need to repeat ``source=root.op`` in every constructor
-    call. From a fully lowered ``CudaOp``, ``cuda.source.source.source``
-    walks back to the originating ``LoopOp``.
-    """
-    if isinstance(result, Op):
-        old_op = graph.nodes[match.root_node_id].op
-        if result is not old_op and result.source is None:
-            result.source = old_op
-            # Merge predecessor knobs forward; rule-set knobs win on key
-            # collision. Build a fresh dict so we don't accidentally
-            # mutate the predecessor's metadata.
-            result.knobs = {**old_op.knobs, **result.knobs}
-        graph.nodes[match.root_node_id].op = result
-        return graph
-    assert isinstance(result, Graph), f"rule {rule_name} returned {type(result).__name__}; expected Graph, Op, list, or RuleSkipped"
-    graph.splice(result, consumed=match.consumed, output=match.output or match.root_node_id)
-    return graph
-
-
 def _try_one_rule(
     cand: Candidate,
     rule: _Rule,
@@ -424,34 +412,41 @@ def _try_one_rule(
         if dump_on:
             record = _record_rule_application(cand.graph, match, fragment)
             dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-        # Fork branches: each alt gets a deep-copy of cand.graph at
-        # this point in the batch (after prior matches' option-0
-        # applications, before this match's). Fork cursors carry the
-        # batch's running ``n_functional`` so far plus this alt's
-        # contribution — when popped, the fork re-enters the same rule
-        # batch from a fresh match enumeration on its alt graph.
+        # Fork branches: each alt becomes a **lazy** Candidate sharing
+        # a single deep-copied ``snapshot`` of the parent's graph at
+        # this fork point. The fork's ``.graph`` is materialized on
+        # first access (deepcopy + apply); the snapshot is freed by
+        # refcount once every sibling has materialized or been dropped
+        # from the search queue. Cuts fork-time memory from
+        # O(K·sizeof(graph)) to O(sizeof(graph)) per fork point.
+        #
+        # ``tip_key`` is precomputed for ``Op`` options so the search
+        # can bucket the fork without materializing; ``Graph``-returning
+        # options have ``tip_key=None`` and route to the fallback queue.
         if len(options) > 1:
-            snapshot = copy.deepcopy(cand.graph)
+            snapshot = cand.graph.copy()
             for alt_idx, alt in enumerate(options[1:], start=1):
-                fg = copy.deepcopy(snapshot)
-                fm = _remap_match_to(fg, match)
-                fg = _apply_one(fg, fm, alt, rule_name=rule.name)
                 alt_delta = result.n_functional + (0 if isinstance(alt, Op) else 1)
+                tip_key = op_cache_key(alt) if isinstance(alt, Op) else None
+                # The fork inherits the parent's trace; ``Candidate.apply``
+                # appends the fork's ``TraceEntry`` when the fork is
+                # materialized via the ``.graph`` property.
                 result.forks.append(
                     Candidate(
-                        graph=fg,
                         ctx=cand.ctx,
-                        trace=(*cand.trace, TraceEntry(rule.name, alt_idx)),
+                        trace=cand.trace,
                         cursor=cand.cursor.fork(alt_delta),
-                        last_rewritten=(match.root_node_id,),
+                        _origin=ForkOrigin(
+                            parent_snapshot=snapshot,
+                            rule_name=rule.name,
+                            match=match,
+                            option=alt,
+                            choice_idx=alt_idx,
+                            tip_key=tip_key,
+                        ),
                     )
                 )
-        cand.graph = _apply_one(cand.graph, match, chosen, rule_name=rule.name)
-        cand.trace = (*cand.trace, TraceEntry(rule.name, 0))
-        # Record the rewrite site so the search policy can read the
-        # new op without scanning the graph. Forks inherit the same
-        # node ID (deep-copy preserves keys).
-        cand.last_rewritten = (match.root_node_id,)
+        cand.apply(rule.name, match, chosen)
         # Functional (Graph) fires drive the end-of-scan restart; in-place
         # (Op) rebinds don't, since the same pattern won't re-match the
         # mutated op (or the rule's idempotence guard handles it).
@@ -460,21 +455,6 @@ def _try_one_rule(
         else:
             result.n_functional += 1
     return result
-
-
-def _remap_match_to(forked_graph: Graph, match: Match) -> Match:
-    """Build a fresh ``Match`` against ``forked_graph`` (a deep copy)
-    that mirrors ``match``'s ids. Re-snapshot ``_identities`` against
-    the forked nodes so the new match's ``is_alive`` check works."""
-    identities = {nid: id(forked_graph.nodes[nid]) for nid in match.consumed if nid in forked_graph.nodes}
-    return Match(
-        graph=forked_graph,
-        root_node_id=match.root_node_id,
-        nodes=dict(match.nodes),
-        consumed=set(match.consumed),
-        output=match.output,
-        _identities=identities,
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -66,7 +66,7 @@ def test_compile_code_functional_softmax_bakes_kwargs(run_cli):
 def test_compile_passes_shorthand(run_cli, tmp_path):
     """'dolft' should expand to decomposition/optimization/lifting/fusion/lowering/tile."""
     out = tmp_path / "out.txt"
-    rc, stdout, stderr = run_cli("compile", "-c", "F.relu(torch.randn(8))", "--passes", "dolft", "-o", str(out), "-v")
+    rc, stdout, stderr = run_cli("compile", "-c", "F.relu(torch.randn(8))", "--passes", "dolft", "-o", str(out), "-vv")
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     for name in ("frontend/decomposition", "frontend/optimization", "loop/lifting", "loop/fusion", "lowering/tile"):

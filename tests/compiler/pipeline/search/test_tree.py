@@ -115,7 +115,8 @@ def test_find_root_returns_first_inserted() -> None:
     tree = SearchTree()
     tree.ensure_root("first")
     tree.expand("first", ["c"])
-    assert tree.root is not None and tree.root.key == "first"
+    # tree.root is the super-root; "first" is its only subtree root.
+    assert tree.subtree_roots[0].key == "first"
 
 
 def test_root_coverage_sums_over_roots() -> None:

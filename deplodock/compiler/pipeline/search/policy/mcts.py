@@ -20,6 +20,7 @@ without a new best latency once coverage clears ``min_coverage``."""
 from __future__ import annotations
 
 import math
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -100,8 +101,18 @@ class SearchTree:
     cached ``perf`` rows on disk ensure no re-bench, but the UCB
     counters (visits / reward / coverage) start from zero each run.
 
+    **Forest as a single tree.** Multi-kernel graphs produce several
+    independent rewrite chains, each starting from its own ``op_cache_key``.
+    To keep the search rooted at one node (so the UCB walk and coverage
+    queries don't have to special-case multiple roots), the tree owns
+    a synthetic **super-root** sentinel. Every kernel root inserted via
+    :meth:`ensure_root` becomes a child of the super-root; propagation
+    walks then aggregate per-kernel statistics into one place. The
+    super-root's ``children`` are the per-kernel roots, accessible via
+    :meth:`SearchTree.subtree_roots`.
+
     Three counters are maintained online via upward propagation along
-    ``parent_key``:
+    ``SearchNode.parent``:
 
     - ``expected_terminals`` — each *new* expansion of a parent that
       had no children adds ``n_new - 1`` to every ancestor (the
@@ -122,6 +133,8 @@ class SearchTree:
     semantics ("we just discovered there's more to explore").
     """
 
+    SUPER_ROOT_KEY = "<super_root>"
+
     def __init__(self) -> None:
         # The in-memory tree is single-context per process — the on-disk
         # DB carries context_key for cross-machine partitioning, but the
@@ -129,11 +142,12 @@ class SearchTree:
         # ``_nodes`` is the by-key index used for O(1) lookup from
         # ``record_terminal`` / ``expand`` callers that hold an
         # ``op_cache_key``. Parent/child structure lives on the
-        # :class:`NodeRow` objects themselves.
+        # :class:`SearchNode` objects themselves.
         self._nodes: dict[str, SearchNode] = {}
-        # First root inserted; latched on first ``ensure_root`` so the
-        # UCB walk can start there without scanning the dict.
-        self._root: SearchNode | None = None
+        # Synthetic super-root sentinel. ``expected_terminals=0`` so it
+        # doesn't itself count toward coverage; each kernel root's
+        # ``+1`` placeholder propagates up on insertion.
+        self._root = SearchNode(key=self.SUPER_ROOT_KEY, expected_terminals=0)
 
     # ------------------------------------------------------------------
     # Reads
@@ -147,17 +161,29 @@ class SearchTree:
         return [c.key for c in parent.children] if parent else []
 
     @property
-    def root(self) -> SearchNode | None:
-        """First root :class:`NodeRow` inserted, or ``None`` if nothing
-        has been expanded yet."""
+    def root(self) -> SearchNode:
+        """Synthetic super-root. Its children are the per-kernel
+        subtree roots (see :meth:`subtree_roots`)."""
         return self._root
 
+    @property
+    def subtree_roots(self) -> list[SearchNode]:
+        """Per-kernel roots — children of the super-root, in insertion
+        order. Each one heads an independent rewrite chain."""
+        return list(self._root.children)
+
     def root_coverage(self) -> tuple[int, int]:
-        """``(seen, expected)`` for the latched root. ``(0, 0)`` if no
-        root has been inserted."""
-        if self._root is None:
-            return 0, 0
+        """``(seen, expected)`` summed across every kernel subtree
+        (i.e. read off the super-root)."""
         return self._root.seen_terminals, self._root.expected_terminals
+
+    def min_subtree_seen(self) -> int:
+        """Minimum ``seen_terminals`` across the kernel roots. ``0``
+        when no roots are inserted yet. Used by the bootstrap phase to
+        enforce per-subtree coverage."""
+        if not self._root.children:
+            return 0
+        return min(c.seen_terminals for c in self._root.children)
 
     def is_fully_explored(self, node_key: str) -> bool:
         n = self.node(node_key)
@@ -168,13 +194,18 @@ class SearchTree:
     # ------------------------------------------------------------------
 
     def ensure_root(self, node_key: str) -> SearchNode:
-        """Insert a root node if not present and return it."""
+        """Insert a kernel root (child of the super-root) if not
+        present and return it. The new root's ``+1`` placeholder
+        propagates up to the super-root."""
         row = self._nodes.get(node_key)
-        if row is None:
-            row = SearchNode(key=node_key)
-            self._nodes[node_key] = row
-        if self._root is None:
-            self._root = row
+        if row is not None:
+            return row
+        row = SearchNode(key=node_key, parent=self._root)
+        self._nodes[node_key] = row
+        self._root.children.append(row)
+        # New kernel root contributes its placeholder ``expected=1`` to
+        # the super-root's aggregate.
+        self._root.expected_terminals += 1
         return row
 
     def expand(self, parent_key: str, child_keys: list[str], *, child_scores: list[float] | None = None) -> None:
@@ -231,14 +262,20 @@ class SearchTree:
 
     def record_terminal(self, leaf_key: str, *, reward: float, status: str) -> bool:
         """Bump ``seen_terminals = 1`` on the leaf (if not already
-        seen), propagate ``+1`` to every ancestor, and add the reward.
+        seen), propagate ``+1`` to every ancestor (up to the
+        super-root), and add the reward.
 
         Returns ``True`` iff this was a newly-measured terminal (so the
         caller knows propagation ran)."""
         node = self._nodes.get(leaf_key)
         if node is None:
-            node = SearchNode(key=leaf_key)
+            # Leaf measured before any rule expanded it (rare; test
+            # fixtures). Parent it under the super-root so propagation
+            # still reaches a known anchor.
+            node = SearchNode(key=leaf_key, parent=self._root)
             self._nodes[leaf_key] = node
+            self._root.children.append(node)
+            self._root.expected_terminals += 1
         if node.seen_terminals >= 1:
             return False
         failed_delta = 0 if status == "ok" else 1
@@ -389,9 +426,18 @@ class TuningSearch:
     def _push_one(self, c: Candidate) -> None:
         if self._context_key is None:
             self._context_key = c.ctx.structural_key()
-        tip_key = self._tip_key(c.graph)
+        # Lazy forks expose a precomputed ``tip_key`` so we don't have
+        # to materialize their graph just to bucket them. A lazy fork
+        # whose option is a Graph-returning rewrite has no precomputable
+        # tip and falls through to the fallback queue without
+        # materializing — those are rare (functional fusion /
+        # decomposition rarely fork). Concrete candidates compute the
+        # tip from their materialized graph as before.
+        if c._origin is not None:
+            tip_key = c._origin.tip_key
+        else:
+            tip_key = self._tip_key(c.graph)
         if tip_key is None:
-            # No tip — keep on the FIFO fallback queue (rare).
             self._fallback.append(c)
             return
         self._by_tip.setdefault(tip_key, []).append(c)
@@ -399,13 +445,14 @@ class TuningSearch:
     def pop(self) -> Candidate | None:
         if self._should_stop():
             return None
-        root = self._tree.root
-        if root is None:
-            return self._fallback_pop()
-        seen, _ = self._tree.root_coverage()
-        if seen < self.N_BOOTSTRAP:
+        # Bootstrap: keep drilling rollouts to terminal until *every*
+        # kernel subtree has at least ``N_BOOTSTRAP`` measurements. A
+        # graph with K kernels then gets at least K * N_BOOTSTRAP
+        # terminals before UCB takes over — otherwise UCB would commit
+        # to whichever subtree got measured first and starve the rest.
+        if self._tree.min_subtree_seen() < self.N_BOOTSTRAP:
             return self._bootstrap_pop()
-        target = self._ucb_walk(root)
+        target = self._ucb_walk(self._tree.root)
         if target is None or target.key not in self._by_tip:
             return self._fallback_pop()
         cands = self._by_tip[target.key]
@@ -485,22 +532,27 @@ class TuningSearch:
         return d
 
     def _bootstrap_pop(self) -> Candidate | None:
-        """Bootstrap selection: pop the candidate furthest along in the
-        pipeline (highest ``cursor.pass_idx`` then ``rule_idx``), tied
-        on ``Op.score``. Tree-depth doesn't track pipeline progress —
-        Graph-rewrite passes (decomposition / fusion) advance the cursor
-        without adding tree edges, so a tree-shallow candidate can be
-        closer to terminal than a tree-deep one. Cursor-progress is the
-        right "drill toward terminal" signal."""
+        """Bootstrap selection. Sort key (minimized) per queued candidate:
+
+        - ``subtree_seen`` — pick from the kernel subtree with the
+          fewest measured terminals, so every subtree gets balanced
+          coverage before UCB starts.
+        - ``-cursor.pass_idx, -cursor.rule_idx`` — within the chosen
+          subtree, drill the candidate that's furthest along the
+          pipeline. Tree-depth doesn't track pipeline progress (Graph
+          rewrites advance the cursor without growing the tree), so
+          cursor-progress is the right "drill toward terminal" signal.
+        - ``-score`` — ``Op.score`` breaks the remaining ties."""
         best_tip: str | None = None
         best_idx = 0
-        best_key: tuple[int, int, float] = (-1, -1, float("-inf"))
+        best_key: tuple[int, int, int, float] = (sys.maxsize, 0, 0, 0.0)
         for tip_key, cands in self._by_tip.items():
             node = self._tree.node(tip_key)
             score = node.score if node is not None else float("-inf")
+            subtree_seen = self._subtree_seen(node)
             for i, c in enumerate(cands):
-                key = (c.cursor.pass_idx, c.cursor.rule_idx, score)
-                if key > best_key:
+                key = (subtree_seen, -c.cursor.pass_idx, -c.cursor.rule_idx, -score)
+                if key < best_key:
                     best_key = key
                     best_tip = tip_key
                     best_idx = i
@@ -511,6 +563,25 @@ class TuningSearch:
         if not self._by_tip[best_tip]:
             del self._by_tip[best_tip]
         return c
+
+    def _subtree_seen(self, node: SearchNode | None) -> int:
+        """Walk ``node.parent`` up to the kernel root (child of the
+        super-root) and return its ``seen_terminals``. ``sys.maxsize``
+        when ``node`` is ``None`` or unreachable — caller treats those
+        as "lowest priority for bootstrap" since they aren't in any
+        kernel subtree."""
+        if node is None:
+            return sys.maxsize
+        super_root = self._tree.root
+        cur: SearchNode | None = node
+        # Walk up to the child-of-super-root (the kernel root).
+        for _ in range(256):
+            if cur is None or cur.parent is None or cur.parent is super_root:
+                break
+            cur = cur.parent
+        if cur is None or cur.parent is not super_root:
+            return sys.maxsize
+        return cur.seen_terminals
 
     def _ucb_walk(self, root: SearchNode) -> SearchNode | None:
         """Walk the search tree via UCB selection. Stops at the first
