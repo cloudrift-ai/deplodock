@@ -25,7 +25,7 @@ def test_first_expansion_propagates_delta() -> None:
     for ck in ("a", "b", "c"):
         child = tree.node(ck)
         assert child.expected_terminals == 1
-        assert child.parent_key == "root"
+        assert child.parent is root
 
 
 def test_second_expansion_is_pure_addition() -> None:
@@ -115,7 +115,7 @@ def test_find_root_returns_first_inserted() -> None:
     tree = SearchTree()
     tree.ensure_root("first")
     tree.expand("first", ["c"])
-    assert tree.root == "first"
+    assert tree.root is not None and tree.root.key == "first"
 
 
 def test_root_coverage_sums_over_roots() -> None:

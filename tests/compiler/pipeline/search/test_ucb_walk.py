@@ -35,8 +35,8 @@ def test_walk_returns_unvisited_child_at_root() -> None:
     tree = SearchTree()
     tree.ensure_root("root")
     tree.expand("root", ["A", "B", "C"])
-    target = _make_search(tree)._ucb_walk("root")
-    assert target in {"A", "B", "C"}
+    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    assert target.key in {"A", "B", "C"}
 
 
 def test_walk_prefers_unvisited_over_visited_with_low_mean() -> None:
@@ -44,20 +44,23 @@ def test_walk_prefers_unvisited_over_visited_with_low_mean() -> None:
     tree.ensure_root("root")
     tree.expand("root", ["A", "B", "C"])
     tree.record_terminal("A", reward=1.0 / 76.0, status="ok")
-    target = _make_search(tree)._ucb_walk("root")
-    assert target in {"B", "C"}, f"expected unvisited child, got {target}"
+    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    assert target.key in {"B", "C"}, f"expected unvisited child, got {target}"
 
 
-def test_walk_descends_into_only_visited_child_when_others_drained() -> None:
+def test_walk_returns_root_when_no_live_descent_path() -> None:
+    """All children are measured leaves (no expansion under them) →
+    the walk has no live frontier to descend into and returns the
+    current node. In production this state is transient: the next
+    rollout completes (or the search terminates)."""
     tree = SearchTree()
     tree.ensure_root("root")
     tree.expand("root", ["A", "B", "C"])
     tree.record_terminal("A", reward=1.0 / 50.0, status="ok")
     tree.record_terminal("B", reward=1.0 / 200.0, status="ok")
     tree.record_terminal("C", reward=1.0 / 200.0, status="ok")
-    target = _make_search(tree)._ucb_walk("root")
-    # A has no expanded children, so the walk stops at A (frontier).
-    assert target == "A", f"expected best leaf 'A', got {target}"
+    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    assert target.key == "root"
 
 
 def test_walk_descends_then_returns_unvisited_grandchild() -> None:
@@ -70,21 +73,27 @@ def test_walk_descends_then_returns_unvisited_grandchild() -> None:
     _set_node(tree, "root", visits=100, seen=100, reward=1.25)
     tree.expand("A", ["A1", "A2"])
     tree.record_terminal("A1", reward=1.0 / 60.0, status="ok")
-    target = _make_search(tree)._ucb_walk("root")
-    assert target == "A2"
+    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    assert target.key == "A2"
 
 
 def test_walk_revisits_underexplored_sibling_when_exploration_dominates() -> None:
     """A measured many times with low mean; B measured once. The
-    exploration term should let B win on the next walk."""
+    exploration term should let B win descent. Both arms are expanded
+    so the walk has live descendants to drill into; the returned node
+    is the under-explored arm's frontier."""
     tree = SearchTree()
     tree.ensure_root("root")
     tree.expand("root", ["A", "B"])
+    tree.expand("A", ["A1"])
+    tree.expand("B", ["B1"])
     # 25 synthetic ok measurements of A at ~76us each.
     _set_node(tree, "A", visits=25, seen=25, reward=25 * (1.0 / 76.0))
     _set_node(tree, "root", visits=26, seen=26, reward=25 * (1.0 / 76.0) + 1.0 / 83.0)
     # B measured once at 83us → high exploration bonus.
-    tree.record_terminal("B", reward=1.0 / 83.0, status="ok")
-    target = _make_search(tree)._ucb_walk("root")
-    # B's exploration term ≈ √(log(26)/1) ≈ 1.8 dominates A's 0.0005 + 0.36.
-    assert target == "B", f"under-explored arm should win, got {target}"
+    tree.record_terminal("B1", reward=1.0 / 83.0, status="ok")
+    # Re-expand B so B1 is no longer the frontier (it's measured); B2 is.
+    tree.expand("B", ["B1", "B2"])
+    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    # B has higher UCB (low visits + exploration term dominates A's mean).
+    assert target.key == "B2", f"under-explored arm should win, got {target}"

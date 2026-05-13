@@ -415,7 +415,8 @@ def _try_one_rule(
             if parent_key is not None and all(isinstance(o, Op) for o in options):
                 child_keys = [op_cache_key(o) for o in options]
                 if all(k is not None for k in child_keys):
-                    tree.expand(parent_key, child_keys)
+                    child_scores = [o.score(ctx) for o in options]
+                    tree.expand(parent_key, child_keys, child_scores=child_scores)
         fragment = _wrap_op_as_fragment(cand.graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
         text = _format_rule_application(rule.name, cand.graph, match, fragment, pass_name=pass_name) if need_text else None
         if debug_on:

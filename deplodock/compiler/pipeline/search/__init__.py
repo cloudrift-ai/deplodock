@@ -23,14 +23,14 @@ from deplodock.compiler.pipeline.search.db import PerfRow, PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.driver import run_autotune, run_pipeline
 from deplodock.compiler.pipeline.search.keys import dialect_of, op_cache_key, source_chain
 from deplodock.compiler.pipeline.search.policy import GreedySearch, Search, TuningSearch
-from deplodock.compiler.pipeline.search.policy.mcts import NodeRow, SearchTree
+from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree
 from deplodock.compiler.pipeline.search.recorder import TuneAborted, count_unmeasured_ops, record_terminal
 
 __all__ = [
     "Candidate",
     "Cursor",
     "GreedySearch",
-    "NodeRow",
+    "SearchNode",
     "PerfRow",
     "PerfStats",
     "RuleResult",

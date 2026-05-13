@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
@@ -32,8 +32,8 @@ from deplodock.compiler.pipeline.search.keys import op_cache_key
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class NodeRow:
+@dataclass(repr=False)
+class SearchNode:
     """One tree node — autotune-state for an op.
 
     ``seen_terminals`` counts every measured terminal under this node
@@ -43,14 +43,53 @@ class NodeRow:
     nothing else (expansion alone never bumps it). ``total_reward``
     accumulates the MCTS reward (``1/latency_us`` for ok, ``0`` for
     fail). UCB1 exploitation uses ``total_reward / visits``.
+
+    The node carries its own ``key`` plus direct ``parent`` / ``children``
+    references, so tree walks are plain attribute access rather than
+    ``dict[key]`` round-trips on the parent :class:`SearchTree`.
     """
 
-    parent_key: str | None
+    key: str
+    parent: SearchNode | None = field(default=None, repr=False)
+    children: list[SearchNode] = field(default_factory=list, repr=False)
     expected_terminals: int = 1
     seen_terminals: int = 0
     failed_terminals: int = 0
     visits: int = 0
     total_reward: float = 0.0
+    # Prior heuristic ``op.score(ctx)`` of the op this node represents.
+    # Stashed by :meth:`SearchTree.expand` so the search policy can read
+    # it without scanning queued candidates' graphs after the candidate
+    # has moved on. ``-inf`` for the root and for nodes inserted without
+    # a score (e.g. test fixtures).
+    score: float = float("-inf")
+
+    def is_expanded(self) -> bool:
+        return bool(self.children)
+
+    def is_measured(self) -> bool:
+        return self.visits > 0
+
+    def is_frontier(self) -> bool:
+        """Unexpanded and unmeasured — a pop-able rollout target."""
+        return not self.children and self.visits == 0
+
+    def is_fully_explored(self) -> bool:
+        return self.seen_terminals >= self.expected_terminals
+
+    def mean_reward(self) -> float:
+        return self.total_reward / self.visits if self.visits else 0.0
+
+    def ucb(self, c: float) -> float:
+        """Canonical UCB1; ``+inf`` when unmeasured (so unvisited
+        children get descent priority over any measured sibling)."""
+        if self.visits == 0:
+            return float("inf")
+        parent_visits = self.parent.visits if self.parent and self.parent.visits > 0 else 1
+        return self.mean_reward() + c * math.sqrt(math.log(max(parent_visits, 1)) / self.visits)
+
+    def __repr__(self) -> str:  # avoid parent/children recursion
+        return f"NodeRow(key={self.key!r}, visits={self.visits}, reward={self.total_reward:.4f}, score={self.score})"
 
 
 class SearchTree:
@@ -87,59 +126,66 @@ class SearchTree:
         # The in-memory tree is single-context per process — the on-disk
         # DB carries context_key for cross-machine partitioning, but the
         # search policy here only ever operates within one context.
-        self._nodes: dict[str, NodeRow] = {}
-        # Ordered list (dedup on insert) so iteration order is
-        # deterministic for tests and tie-breaks in the policy.
-        self._expansions: dict[str, list[str]] = {}
+        # ``_nodes`` is the by-key index used for O(1) lookup from
+        # ``record_terminal`` / ``expand`` callers that hold an
+        # ``op_cache_key``. Parent/child structure lives on the
+        # :class:`NodeRow` objects themselves.
+        self._nodes: dict[str, SearchNode] = {}
         # First root inserted; latched on first ``ensure_root`` so the
         # UCB walk can start there without scanning the dict.
-        self._root_key: str | None = None
+        self._root: SearchNode | None = None
 
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
 
-    def node(self, node_key: str) -> NodeRow | None:
+    def node(self, node_key: str) -> SearchNode | None:
         return self._nodes.get(node_key)
 
     def children(self, parent_key: str) -> list[str]:
-        return list(self._expansions.get(parent_key, ()))
+        parent = self._nodes.get(parent_key)
+        return [c.key for c in parent.children] if parent else []
 
     @property
-    def root(self) -> str | None:
-        """The first ``parent_key is None`` node inserted, or ``None``
-        if nothing has been expanded yet."""
-        return self._root_key
+    def root(self) -> SearchNode | None:
+        """First root :class:`NodeRow` inserted, or ``None`` if nothing
+        has been expanded yet."""
+        return self._root
 
     def root_coverage(self) -> tuple[int, int]:
-        """``(sum_seen, sum_expected)`` over every root in the tree."""
-        seen = 0
-        expected = 0
-        for row in self._nodes.values():
-            if row.parent_key is not None:
-                continue
-            seen += row.seen_terminals
-            expected += row.expected_terminals
-        return seen, expected
+        """``(seen, expected)`` for the latched root. ``(0, 0)`` if no
+        root has been inserted."""
+        if self._root is None:
+            return 0, 0
+        return self._root.seen_terminals, self._root.expected_terminals
 
     def is_fully_explored(self, node_key: str) -> bool:
         n = self.node(node_key)
-        return n is not None and n.seen_terminals >= n.expected_terminals
+        return n is not None and n.is_fully_explored()
 
     # ------------------------------------------------------------------
     # Mutations
     # ------------------------------------------------------------------
 
-    def ensure_root(self, node_key: str) -> None:
-        """Insert a root node (``parent_key = None``) if not present."""
-        if node_key not in self._nodes:
-            self._nodes[node_key] = NodeRow(parent_key=None)
-        if self._root_key is None:
-            self._root_key = node_key
+    def ensure_root(self, node_key: str) -> SearchNode:
+        """Insert a root node if not present and return it."""
+        row = self._nodes.get(node_key)
+        if row is None:
+            row = SearchNode(key=node_key)
+            self._nodes[node_key] = row
+        if self._root is None:
+            self._root = row
+        return row
 
-    def expand(self, parent_key: str, child_keys: list[str]) -> None:
+    def expand(self, parent_key: str, child_keys: list[str], *, child_scores: list[float] | None = None) -> None:
         """Record ``parent_key → child_keys`` edges and maintain
         ``expected_terminals`` on every ancestor.
+
+        ``child_scores`` (optional, aligned with ``child_keys``) stashes
+        each child's ``op.score(ctx)`` on its :class:`NodeRow` so the
+        search policy can read the prior in O(1) without rescanning
+        queued candidates' graphs. Re-expansions don't overwrite an
+        already-set score.
 
         Idempotent — re-firing a rule with the same children adds no
         new edges. When the rule's option set has grown, only the
@@ -147,30 +193,41 @@ class SearchTree:
         """
         if not child_keys:
             return
-        self.ensure_root(parent_key)
-
-        existing = self._expansions.setdefault(parent_key, [])
-        pre = len(existing)
+        parent = self.ensure_root(parent_key)
+        pre = len(parent.children)
+        existing_keys = {c.key for c in parent.children}
+        scores = child_scores if child_scores is not None else [float("-inf")] * len(child_keys)
         n_new = 0
-        for ck in child_keys:
-            if ck in existing:
+        for ck, s in zip(child_keys, scores, strict=True):
+            if ck in existing_keys:
+                # Backfill score on a re-expansion if it wasn't set originally.
+                row = self._nodes[ck]
+                if row.score == float("-inf") and s != float("-inf"):
+                    row.score = s
                 continue
-            existing.append(ck)
+            row = self._nodes.get(ck)
+            if row is None:
+                row = SearchNode(key=ck, parent=parent, score=s)
+                self._nodes[ck] = row
+            else:
+                # Pre-existing orphan (e.g. from a record_terminal that
+                # ran before its parent was known) — adopt it.
+                row.parent = parent
+                if row.score == float("-inf") and s != float("-inf"):
+                    row.score = s
+            parent.children.append(row)
+            existing_keys.add(ck)
             n_new += 1
 
         if n_new == 0:
             return
-
-        # Insert child node rows (placeholders) for the new edges.
-        for ck in child_keys:
-            self._nodes.setdefault(ck, NodeRow(parent_key=parent_key))
 
         # First-ever expansion of this parent consumes its placeholder "1",
         # so the delta is one less than n_new. Later expansions are pure
         # additions (the parent was already accounting for its children).
         delta = n_new - 1 if pre == 0 else n_new
         if delta != 0:
-            self._propagate_expected(parent_key, delta)
+            self._propagate_expected(parent, delta)
 
     def record_terminal(self, leaf_key: str, *, reward: float, status: str) -> bool:
         """Bump ``seen_terminals = 1`` on the leaf (if not already
@@ -178,7 +235,10 @@ class SearchTree:
 
         Returns ``True`` iff this was a newly-measured terminal (so the
         caller knows propagation ran)."""
-        node = self._nodes.setdefault(leaf_key, NodeRow(parent_key=None))
+        node = self._nodes.get(leaf_key)
+        if node is None:
+            node = SearchNode(key=leaf_key)
+            self._nodes[leaf_key] = node
         if node.seen_terminals >= 1:
             return False
         failed_delta = 0 if status == "ok" else 1
@@ -186,9 +246,9 @@ class SearchTree:
         node.failed_terminals = failed_delta
         node.visits += 1
         node.total_reward += reward
-        if node.parent_key is not None:
+        if node.parent is not None:
             self._propagate_visit(
-                node.parent_key,
+                node.parent,
                 seen_delta=1,
                 failed_delta=failed_delta,
                 reward_delta=reward,
@@ -199,33 +259,27 @@ class SearchTree:
     # Internal propagation walks
     # ------------------------------------------------------------------
 
-    def _propagate_expected(self, node_key: str, delta: int) -> None:
-        cur: str | None = node_key
+    def _propagate_expected(self, node: SearchNode, delta: int) -> None:
+        cur: SearchNode | None = node
         while cur is not None:
-            row = self._nodes.get(cur)
-            if row is None:
-                return
-            row.expected_terminals += delta
-            cur = row.parent_key
+            cur.expected_terminals += delta
+            cur = cur.parent
 
     def _propagate_visit(
         self,
-        node_key: str,
+        node: SearchNode,
         *,
         seen_delta: int,
         failed_delta: int,
         reward_delta: float,
     ) -> None:
-        cur: str | None = node_key
+        cur: SearchNode | None = node
         while cur is not None:
-            row = self._nodes.get(cur)
-            if row is None:
-                return
-            row.seen_terminals += seen_delta
-            row.failed_terminals += failed_delta
-            row.visits += seen_delta
-            row.total_reward += reward_delta
-            cur = row.parent_key
+            cur.seen_terminals += seen_delta
+            cur.failed_terminals += failed_delta
+            cur.visits += seen_delta
+            cur.total_reward += reward_delta
+            cur = cur.parent
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +331,7 @@ class TuningSearch:
     # switching to UCB. UCB needs some measured rewards to be meaningful;
     # before that it's just "pick any unvisited" which doesn't drill
     # down through expanded subtrees.
-    N_BOOTSTRAP = 20
+    N_BOOTSTRAP = 10
     # Score-gap below which an unvisited sibling is dropped from the
     # expansion frontier (see ``_ucb_walk``). 1.0 spans roughly one of the
     # graduated penalties in ``TileOp.score`` — e.g. CTA-count or
@@ -345,19 +399,19 @@ class TuningSearch:
     def pop(self) -> Candidate | None:
         if self._should_stop():
             return None
-        root_key = self._tree.root
-        if root_key is None:
+        root = self._tree.root
+        if root is None:
             return self._fallback_pop()
         seen, _ = self._tree.root_coverage()
         if seen < self.N_BOOTSTRAP:
             return self._bootstrap_pop()
-        target = self._ucb_walk(root_key)
-        if target is None or target not in self._by_tip:
+        target = self._ucb_walk(root)
+        if target is None or target.key not in self._by_tip:
             return self._fallback_pop()
-        cands = self._by_tip[target]
+        cands = self._by_tip[target.key]
         c = cands.pop(0)
         if not cands:
-            del self._by_tip[target]
+            del self._by_tip[target.key]
         return c
 
     def _fallback_pop(self) -> Candidate | None:
@@ -418,7 +472,17 @@ class TuningSearch:
             return None
         if len(keys) == 1:
             return keys[0]
-        return max(keys, key=self._depth)
+        return max(keys, key=self._tree_depth)
+
+    def _tree_depth(self, node_key: str) -> int:
+        """Hops from ``node_key`` up to the root via ``NodeRow.parent``.
+        Capped at 64 as a defensive measure against a hypothetical cycle."""
+        node = self._tree.node(node_key)
+        d = 0
+        while node is not None and node.parent is not None and d < 64:
+            node = node.parent
+            d += 1
+        return d
 
     def _bootstrap_pop(self) -> Candidate | None:
         """Bootstrap selection: pop the candidate furthest along in the
@@ -432,7 +496,8 @@ class TuningSearch:
         best_idx = 0
         best_key: tuple[int, int, float] = (-1, -1, float("-inf"))
         for tip_key, cands in self._by_tip.items():
-            score = self._candidate_score(tip_key)
+            node = self._tree.node(tip_key)
+            score = node.score if node is not None else float("-inf")
             for i, c in enumerate(cands):
                 key = (c.cursor.pass_idx, c.cursor.rule_idx, score)
                 if key > best_key:
@@ -447,112 +512,48 @@ class TuningSearch:
             del self._by_tip[best_tip]
         return c
 
-    def _ucb_walk(self, root_key: str) -> str | None:
-        """Walk the search tree from ``root_key`` via UCB selection at
-        each node. Stops at the first node with at least one *unexpanded*
-        child (no grandchildren yet — the true frontier) and returns
-        that child. Expanded-but-unmeasured nodes (``visits == 0`` but
-        ``children != []``) are descended through via UCB: their
-        infinite exploration bonus (``log/0``) gives them automatic
-        descent priority over measured siblings, which is the canonical
-        MCTS handling of unvisited children.
+    def _ucb_walk(self, root: SearchNode) -> SearchNode | None:
+        """Walk the search tree via UCB selection. Stops at the first
+        :class:`NodeRow` with an unexpanded + unmeasured child (the true
+        frontier) and returns it. Expanded-but-unmeasured nodes are
+        descended through — :meth:`NodeRow.ucb` returns ``+inf`` when
+        ``visits == 0`` so canonical UCB1 picks them ahead of measured
+        siblings automatically; ``score`` breaks ``+inf`` ties.
 
-        Among unexpanded siblings, ``Op.score`` breaks ties and a
-        ``SCORE_CUTOFF`` purge drops priors that are too far below the
-        local best — keeps the budget on well-shaped variants instead
-        of burning it on a hopeless one."""
-        cur = root_key
-        # Cap to defend against a hypothetical cycle in the parent_key
-        # graph. Real trees here are tens of levels deep at most.
+        Measured leaves (terminal, no children, ``visits > 0``) are
+        skipped during descent — they contribute their visits to the
+        parent's UCB but have no candidate left to pop.
+
+        Among unexpanded siblings, ``score`` ranks priors and a
+        ``SCORE_CUTOFF`` purge drops priors too far below the local
+        best, freeing the budget for promising variants."""
+        cur = root
+        # Cap to defend against a hypothetical cycle. Real trees here
+        # are tens of levels deep at most.
         for _ in range(256):
-            children = self._tree.children(cur)
-            if not children:
+            if not cur.children:
                 return cur  # frontier: leaf of the search tree
-            cur_node = self._tree.node(cur)
-            parent_visits = cur_node.visits if cur_node else 1
 
-            # Identify the true frontier among children: unexpanded
-            # (no grandchildren) AND unmeasured (no terminal recorded).
-            # Expanded children get descended into via UCB; measured-leaf
-            # children are done terminals (no candidate left to pop) and
-            # contribute their visits to the parent's UCB descent only.
-            unexpanded: list[tuple[str, float]] = []
-            best_score = float("-inf")
-            for ck in children:
-                if self._tree.children(ck):
-                    continue  # expanded — handle in descent branch
-                child = self._tree.node(ck)
-                if child is not None and child.visits > 0:
-                    continue  # measured leaf — already a terminal
-                s = self._candidate_score(ck)
-                if s > best_score:
-                    best_score = s
-                unexpanded.append((ck, s))
-            if unexpanded and best_score != float("-inf"):
-                cutoff = best_score - self.SCORE_CUTOFF
-                kept, dropped = [], []
-                for ck, s in unexpanded:
-                    (kept if s >= cutoff else dropped).append((ck, s))
-                # Purge cutoff-dropped candidates from the queue so the
-                # ``_fallback_pop`` drain (used when the walk lands on a
-                # key that isn't queued) can't resurrect them later.
-                for ck, _ in dropped:
-                    self._by_tip.pop(ck, None)
-                unexpanded = kept
-            if unexpanded:
-                return max(unexpanded, key=lambda kv: kv[1])[0]
+            # True frontier: children that are both unexpanded and unmeasured.
+            frontier = [c for c in cur.children if c.is_frontier()]
+            if frontier:
+                best_score = max(c.score for c in frontier)
+                if best_score != float("-inf"):
+                    cutoff = best_score - self.SCORE_CUTOFF
+                    # Purge cutoff-dropped candidates from the queue so the
+                    # ``_fallback_pop`` drain (used when the walk lands on a
+                    # node that isn't queued) can't resurrect them later.
+                    for c in frontier:
+                        if c.score < cutoff:
+                            self._by_tip.pop(c.key, None)
+                    frontier = [c for c in frontier if c.score >= cutoff]
+                if frontier:
+                    return max(frontier, key=lambda n: n.score)
 
-            # All children are expanded → descend via UCB. ``visits == 0``
-            # children get +inf exploration (log/0) so canonical MCTS
-            # picks them ahead of measured siblings automatically.
-            best_key = None
-            best_ucb = float("-inf")
-            for ck in children:
-                child = self._tree.node(ck)
-                if child is None:
-                    continue
-                if child.visits == 0:
-                    ucb = float("inf")
-                else:
-                    mean = child.total_reward / child.visits
-                    ucb = mean + self.UCB_C * math.sqrt(math.log(max(parent_visits, 1)) / child.visits)
-                if ucb > best_ucb:
-                    best_ucb = ucb
-                    best_key = ck
-            if best_key is None:
+            # Descend into expanded children only. ``visits == 0`` gets
+            # +inf via ``NodeRow.ucb``; score breaks ties.
+            expanded = [c for c in cur.children if c.is_expanded()]
+            if not expanded:
                 return cur
-            cur = best_key
+            cur = max(expanded, key=lambda c: (c.ucb(self.UCB_C), c.score))
         return cur
-
-    def _candidate_score(self, tip_key: str) -> float:
-        """Highest ``Op.score`` among queued candidates whose tip matches
-        ``tip_key``. Falls back to ``-inf`` if no candidate is in
-        ``_by_tip`` for this node — the prior cutoff filter compares
-        unvisited siblings against the best score among them, so a
-        defaulted ``0.0`` would silently outrank legitimately-priored
-        negative scores (e.g. an `atomic-fanin -5.0` matmul variant
-        would survive the cutoff because a popped-from-queue sibling
-        appears as "0.0" and raises the cutoff floor).
-        """
-        best = float("-inf")
-        cands = self._by_tip.get(tip_key, [])
-        for c in cands:
-            for n in c.graph.nodes.values():
-                if op_cache_key(n.op) == tip_key:
-                    s = n.op.score(c.ctx)
-                    if s > best:
-                        best = s
-                    break
-        return best
-
-    def _depth(self, node_key: str) -> int:
-        d = 0
-        cur: str | None = node_key
-        # Hard cap on chain walk so a degenerate cycle (shouldn't happen, defensive) doesn't loop forever.
-        while cur is not None and d < 64:
-            row = self._tree.node(cur)
-            if row is None or row.parent_key is None:
-                break
-            cur = row.parent_key
-            d += 1
-        return d
