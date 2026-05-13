@@ -121,7 +121,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
     chunk_stride = _LDS128_FLOATS * lane_ext
     new_tile = Tile(axes=tile.axes, body=_rewrite_body(tile.body, lane.name, F, chunk_stride))
-    logger.info(
+    logger.debug(
         "chunk N register-tile on lane=%s F=%d -> stride=%d, chunks=%d (chunk_stride=%d, BN=%d)",
         lane.name,
         F,

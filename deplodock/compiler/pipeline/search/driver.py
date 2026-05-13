@@ -70,7 +70,7 @@ def _search_loop(
         def _on_pass_finish(idx: int) -> None:
             name = pass_names[idx]
             if name:
-                logger.info("compile: %-18s done (%d nodes)", name, len(cand.graph.nodes))
+                logger.debug("compile: %-18s done (%d nodes)", name, len(cand.graph.nodes))
             if dump is not None and name:
                 dump.on_pass(idx + 1, name, cand.graph)
 

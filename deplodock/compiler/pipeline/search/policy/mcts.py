@@ -252,6 +252,14 @@ class TuningSearch:
     exploiting. Used by ``deplodock compile --tune`` so the sweep
     drifts toward promising subtrees while still covering the space.
 
+    Two-phase selection. The first ``N_BOOTSTRAP`` rollouts skip UCB
+    and drill straight down to terminal: pick the deepest unexpanded
+    frontier in the tree, tie-breaking on ``Op.score``. This seeds the
+    UCB statistics with a handful of measured terminals before
+    canonical UCB1 kicks in (which without measurements would just
+    re-pick the same level-1 unvisited child forever). After bootstrap,
+    selection uses :meth:`_ucb_walk`.
+
     Stopping policy. ``pop()`` returns ``None`` when:
 
     - ``patience`` measured terminals in a row without a new best
@@ -265,6 +273,11 @@ class TuningSearch:
     and the caller catches ``KeyboardInterrupt`` to print stats."""
 
     UCB_C = math.sqrt(2)  # canonical UCB1 exploration constant.
+    # Measure this many terminals via greedy depth-first descent before
+    # switching to UCB. UCB needs some measured rewards to be meaningful;
+    # before that it's just "pick any unvisited" which doesn't drill
+    # down through expanded subtrees.
+    N_BOOTSTRAP = 20
     # Score-gap below which an unvisited sibling is dropped from the
     # expansion frontier (see ``_ucb_walk``). 1.0 spans roughly one of the
     # graduated penalties in ``TileOp.score`` — e.g. CTA-count or
@@ -335,6 +348,9 @@ class TuningSearch:
         root_key = self._tree.root
         if root_key is None:
             return self._fallback_pop()
+        seen, _ = self._tree.root_coverage()
+        if seen < self.N_BOOTSTRAP:
+            return self._bootstrap_pop()
         target = self._ucb_walk(root_key)
         if target is None or target not in self._by_tip:
             return self._fallback_pop()
@@ -404,13 +420,47 @@ class TuningSearch:
             return keys[0]
         return max(keys, key=self._depth)
 
+    def _bootstrap_pop(self) -> Candidate | None:
+        """Bootstrap selection: pop the candidate furthest along in the
+        pipeline (highest ``cursor.pass_idx`` then ``rule_idx``), tied
+        on ``Op.score``. Tree-depth doesn't track pipeline progress —
+        Graph-rewrite passes (decomposition / fusion) advance the cursor
+        without adding tree edges, so a tree-shallow candidate can be
+        closer to terminal than a tree-deep one. Cursor-progress is the
+        right "drill toward terminal" signal."""
+        best_tip: str | None = None
+        best_idx = 0
+        best_key: tuple[int, int, float] = (-1, -1, float("-inf"))
+        for tip_key, cands in self._by_tip.items():
+            score = self._candidate_score(tip_key)
+            for i, c in enumerate(cands):
+                key = (c.cursor.pass_idx, c.cursor.rule_idx, score)
+                if key > best_key:
+                    best_key = key
+                    best_tip = tip_key
+                    best_idx = i
+        if best_tip is None:
+            # Fall through to fallback (drains by_tip arbitrarily + _fallback).
+            return self._fallback_pop()
+        c = self._by_tip[best_tip].pop(best_idx)
+        if not self._by_tip[best_tip]:
+            del self._by_tip[best_tip]
+        return c
+
     def _ucb_walk(self, root_key: str) -> str | None:
         """Walk the search tree from ``root_key`` via UCB selection at
-        each node. Stops at the first node with at least one unvisited
-        child (returning that child) or with no children at all
-        (returning that node itself). Among unvisited siblings, the
-        ``Op.score`` heuristic breaks the otherwise-arbitrary order so
-        the MCTS bootstrap visits "well-shaped" candidates first."""
+        each node. Stops at the first node with at least one *unexpanded*
+        child (no grandchildren yet — the true frontier) and returns
+        that child. Expanded-but-unmeasured nodes (``visits == 0`` but
+        ``children != []``) are descended through via UCB: their
+        infinite exploration bonus (``log/0``) gives them automatic
+        descent priority over measured siblings, which is the canonical
+        MCTS handling of unvisited children.
+
+        Among unexpanded siblings, ``Op.score`` breaks ties and a
+        ``SCORE_CUTOFF`` purge drops priors that are too far below the
+        local best — keeps the budget on well-shaped variants instead
+        of burning it on a hopeless one."""
         cur = root_key
         # Cap to defend against a hypothetical cycle in the parent_key
         # graph. Real trees here are tens of levels deep at most.
@@ -420,51 +470,52 @@ class TuningSearch:
                 return cur  # frontier: leaf of the search tree
             cur_node = self._tree.node(cur)
             parent_visits = cur_node.visits if cur_node else 1
-            # Find unvisited children; if any, pick the one whose
-            # candidate has the highest ``score`` (heuristic prior).
-            # Score cutoff: suppress unvisited candidates whose prior is
-            # far below the best score seen at this level. When every
-            # unvisited sibling is below the cutoff we *don't* fall
-            # through to the worst-of-the-worst — instead we descend via
-            # UCB so the budget keeps re-exploring known-good subtrees
-            # rather than burning a wall-budget bench on a hopeless
-            # variant.
-            unvisited: list[tuple[str, float]] = []
+
+            # Identify the true frontier among children: unexpanded
+            # (no grandchildren) AND unmeasured (no terminal recorded).
+            # Expanded children get descended into via UCB; measured-leaf
+            # children are done terminals (no candidate left to pop) and
+            # contribute their visits to the parent's UCB descent only.
+            unexpanded: list[tuple[str, float]] = []
             best_score = float("-inf")
             for ck in children:
+                if self._tree.children(ck):
+                    continue  # expanded — handle in descent branch
                 child = self._tree.node(ck)
+                if child is not None and child.visits > 0:
+                    continue  # measured leaf — already a terminal
                 s = self._candidate_score(ck)
                 if s > best_score:
                     best_score = s
-                if child is None or child.visits == 0:
-                    unvisited.append((ck, s))
-            if unvisited and best_score != float("-inf"):
+                unexpanded.append((ck, s))
+            if unexpanded and best_score != float("-inf"):
                 cutoff = best_score - self.SCORE_CUTOFF
                 kept, dropped = [], []
-                for ck, s in unvisited:
+                for ck, s in unexpanded:
                     (kept if s >= cutoff else dropped).append((ck, s))
                 # Purge cutoff-dropped candidates from the queue so the
                 # ``_fallback_pop`` drain (used when the walk lands on a
                 # key that isn't queued) can't resurrect them later.
                 for ck, _ in dropped:
                     self._by_tip.pop(ck, None)
-                unvisited = kept
-            if unvisited:
-                return max(unvisited, key=lambda kv: kv[1])[0]
-            # All worth-exploring children visited (the unvisited got
-            # cut off by the score filter, or every child has a
-            # measurement). Descend into the UCB-best of the visited
-            # ones; skip zero-visit children so the score-cut variants
-            # don't cause a divide-by-zero here.
+                unexpanded = kept
+            if unexpanded:
+                return max(unexpanded, key=lambda kv: kv[1])[0]
+
+            # All children are expanded → descend via UCB. ``visits == 0``
+            # children get +inf exploration (log/0) so canonical MCTS
+            # picks them ahead of measured siblings automatically.
             best_key = None
             best_ucb = float("-inf")
             for ck in children:
                 child = self._tree.node(ck)
-                if child is None or child.visits == 0:
+                if child is None:
                     continue
-                mean = child.total_reward / child.visits
-                exploration = self.UCB_C * math.sqrt(math.log(max(parent_visits, 1)) / child.visits)
-                ucb = mean + exploration
+                if child.visits == 0:
+                    ucb = float("inf")
+                else:
+                    mean = child.total_reward / child.visits
+                    ucb = mean + self.UCB_C * math.sqrt(math.log(max(parent_visits, 1)) / child.visits)
                 if ucb > best_ucb:
                     best_ucb = ucb
                     best_key = ck
