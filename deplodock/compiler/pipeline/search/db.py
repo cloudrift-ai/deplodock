@@ -58,6 +58,17 @@ class PerfRow:
     knobs: dict
 
 
+@dataclass(frozen=True)
+class LoweringRow:
+    """One ``lowering`` row — best-known child for a parent op."""
+
+    parent_key: str
+    parent_dialect: str
+    child_key: str
+    child_dialect: str
+    best_median_us: float | None
+
+
 class SearchDB:
     """Persistent inventory of compiled ops + their measured perf.
 
@@ -279,6 +290,36 @@ class SearchDB:
     # ------------------------------------------------------------------
     # Perf — read
     # ------------------------------------------------------------------
+
+    def lookup_lowering(self, parent_key: str) -> LoweringRow | None:
+        """Return the best-known child for ``parent_key``, or ``None``
+        when no row exists. Used by :class:`GreedySearch` to pick the
+        DB-preferred fork at each fork point."""
+        row = self._conn.execute(
+            "SELECT parent_key, parent_dialect, child_key, child_dialect, best_median_us FROM lowering WHERE parent_key = ?",
+            (parent_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return LoweringRow(
+            parent_key=row[0],
+            parent_dialect=row[1],
+            child_key=row[2],
+            child_dialect=row[3],
+            best_median_us=row[4],
+        )
+
+    def lookup_perf_any(self, op_key: str) -> PerfRow | None:
+        """First ``ok`` row for ``op_key`` across any context/backend —
+        used to recover the knobs of a stored winner for telemetry. Falls
+        back to any-status row if no ``ok`` row exists."""
+        row = self._conn.execute(
+            "SELECT context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
+            "latency_us_mean, latency_us_variance, n_samples, measured_at, knobs "
+            "FROM perf WHERE op_key = ? ORDER BY (status = 'ok') DESC, latency_us_median ASC LIMIT 1",
+            (op_key,),
+        ).fetchone()
+        return _row_to_perf(row) if row else None
 
     def lookup_perf(self, context_key: str, op_key: str, *, backend: str) -> PerfRow | None:
         row = self._conn.execute(

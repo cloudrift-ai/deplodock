@@ -14,6 +14,7 @@ from __future__ import annotations
 import heapq
 from typing import Protocol
 
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.recorder import count_unmeasured_ops
@@ -31,12 +32,15 @@ class Search(Protocol):
     pushing it back. Searches that need to detect this can track the
     last-popped candidate and check whether it returned via ``push``.
 
-    ``push(c, *forks)`` carries the primary candidate ``c`` plus every
-    sibling alternative the engine spawned at the same rewrite point.
+    ``push(c, *forks, parent=...)`` carries the primary candidate ``c``
+    plus every sibling alternative the engine spawned at the same
+    rewrite point. ``parent`` is the pre-rewrite op shared by the
+    group, or ``None`` when forks weren't spawned (deterministic step).
     Exhaustive policies register all of them; greedy policies can
-    discard the forks once they pick the most promising primary."""
+    discard the forks once they pick the most promising primary
+    (optionally consulting the DB via ``parent``'s ``op_cache_key``)."""
 
-    def push(self, c: Candidate, *forks: Candidate) -> None: ...
+    def push(self, c: Candidate, *forks: Candidate, parent: Op | None = None) -> None: ...
     def pop(self) -> Candidate | None: ...  # None when exhausted
 
 

@@ -107,9 +107,13 @@ rules — they're shared helpers for the pass's rule modules.
 - `run_autotune(graph, passes, search=..., backend=None) -> Iterator[Candidate]` —
   drive the full search. Yields one terminal `Candidate` per
   fully-explored branch. Two built-in searches: `GreedySearch` (used by
-  `run_pipeline`; stops at the first terminal — autotune forks beyond
-  option 0 are never explored) and `TuningSearch` (used by `--tune`;
-  runs the queue dry, exploring every fork). Both rank candidates by
+  `run_pipeline`; stops at the first terminal. At every fork point it
+  consults `SearchDB.lowering` keyed by the rewritten parent op's
+  `op_cache_key`: a previously-measured winner gets picked over option
+  0; otherwise option 0 — the rule's heuristic-first ordering — wins.
+  Decisions are memoized per compile so repeated parent keys don't
+  hit the DB) and `TuningSearch` (used by `--tune`; runs the queue
+  dry, exploring every fork). Both rank candidates by
   remaining unmeasured ops (DFS-equivalent on a fresh DB). The greedy
   stop is self-detected by the search: `pop` returns `None` when the
   previously popped candidate didn't return via `push` — i.e. when the

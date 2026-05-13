@@ -431,6 +431,12 @@ def _try_one_rule(
         # contribution — when popped, the fork re-enters the same rule
         # batch from a fresh match enumeration on its alt graph.
         if len(options) > 1:
+            # Stash the pre-rewrite op so the search policy can key DB
+            # lookups on its ``op_cache_key`` without diffing graphs.
+            # Multiple fork-spawning matches in one batch overwrite;
+            # only the last one's siblings are visible in ``forks`` after
+            # this iteration so keeping that match's parent is correct.
+            result.parent = cand.graph.nodes[match.root_node_id].op
             snapshot = copy.deepcopy(cand.graph)
             for alt_idx, alt in enumerate(options[1:], start=1):
                 fg = copy.deepcopy(snapshot)

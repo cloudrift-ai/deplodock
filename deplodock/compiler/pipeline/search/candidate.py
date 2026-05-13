@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph
+from deplodock.compiler.ir.base import Op
 
 
 @dataclass(frozen=True)
@@ -84,12 +85,17 @@ class RuleResult:
 
     * ``forks`` — alternative candidates spawned at autotune fork points
       (empty for deterministic rules).
+    * ``parent`` — pre-rewrite op at the fork point. Only set when forks
+      were spawned (``len(options) > 1``); ``None`` for deterministic
+      rules or in-place rebinds. Lets the search policy key DB lookups
+      on the parent's ``op_cache_key`` without scanning the graph.
     * ``n_functional`` — count of ``Graph`` (functional) rewrites applied
       to the candidate's own graph in this batch.
     * ``n_inplace`` — count of ``Op`` (in-place rebind) rewrites applied
       to the candidate's own graph in this batch."""
 
     forks: list[Candidate] = field(default_factory=list)
+    parent: Op | None = None
     n_functional: int = 0
     n_inplace: int = 0
 

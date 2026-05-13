@@ -77,10 +77,11 @@ def _search_loop(
         cur.advance(result, n_rules=len(rules), on_pass_finish=_on_pass_finish)
         # Push ``cand`` and its sibling forks together so the policy
         # sees them as one fork-point group. ``GreedySearch`` discards
-        # the forks; ``TuningSearch`` registers all of them (forks
-        # first internally so the ``_just_popped`` check still fires
-        # on ``cand``, preserving the rollout semantics).
-        search.push(cand, *result.forks)
+        # the forks (or picks a DB-preferred one via ``parent``);
+        # ``TuningSearch`` registers all of them (forks first
+        # internally so the ``_just_popped`` check still fires on
+        # ``cand``, preserving the rollout semantics).
+        search.push(cand, *result.forks, parent=result.parent)
 
 
 def run_pipeline(
