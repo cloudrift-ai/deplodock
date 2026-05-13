@@ -117,6 +117,36 @@ def test_count_unmeasured_drops_after_record_terminal() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_kernel_op_cache_key_is_structural() -> None:
+    """KernelOp keys come from ``Body.structural_key()`` (not ``repr``)
+    so two KernelOps whose bodies differ only in SSA names or hardware
+    primitives hash equal. Build two bodies with the same shape but
+    different SSA / axis names + a Sync; they should hash identical."""
+    from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+    from deplodock.compiler.ir.expr import Var
+    from deplodock.compiler.ir.kernel.ir import KernelOp, Sync
+    from deplodock.compiler.ir.stmt import Body, Load, Tile, Write
+
+    def _body(axis_name: str, ssa: str) -> Body:
+        a = Axis(name=axis_name, extent=8)
+        return Body(
+            (
+                Tile(
+                    axes=(BoundAxis(axis=a, bind=BIND_THREAD),),
+                    body=(
+                        Load(name=ssa, input="b0", index=(Var(axis_name),)),
+                        Sync(),
+                        Write(output="b1", index=(Var(axis_name),), value=ssa),
+                    ),
+                ),
+            )
+        )
+
+    k1 = KernelOp(body=_body("a0", "x"), name="k")
+    k2 = KernelOp(body=_body("z9", "tmp"), name="k")
+    assert op_cache_key(k1) == op_cache_key(k2)
+
+
 def test_record_terminal_persists_full_op_chain() -> None:
     """A fully-lowered CudaOp has a ``source`` chain back through
     KernelOp → TileOp → LoopOp. ``record_terminal`` must persist one row

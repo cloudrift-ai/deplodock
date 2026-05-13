@@ -623,3 +623,106 @@ __all__ = [
 
 
 _ = field  # silence ruff
+
+
+# ---------------------------------------------------------------------------
+# rewrite-dispatch handlers for Kernel-IR stmts
+# ---------------------------------------------------------------------------
+#
+# ``Body.structural_key()`` runs ``normalize_body``, which dispatches
+# :func:`deplodock.compiler.ir.stmt.passes.rewrite` over every stmt. The
+# default dispatch raises ``NotImplementedError``, so we register a handler
+# per Kernel-IR stmt here. Buffer names (``Smem.name``, mbarriers, TMA
+# descriptors, etc.) are *not* SSA — the ``rename`` callback only canon-
+# icalizes SSA tokens — so they pass through unchanged. ``Expr`` fields go
+# through ``sigma.apply``; the leaf-only stmts (``Sync`` / ``CpAsyncCommit``
+# / ``CpAsyncWait``) are stateless and return themselves.
+
+
+from deplodock.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
+
+
+@_rewrite.register
+def _(s: Smem, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: Sync, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: CpAsyncCommit, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: CpAsyncWait, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: CpAsyncCopy, rename, sigma, axis_fn):
+    return CpAsyncCopy(
+        smem=s.smem,
+        smem_index=tuple(sigma.apply(e) for e in s.smem_index),
+        src=s.src,
+        src_index=tuple(sigma.apply(e) for e in s.src_index),
+    )
+
+
+@_rewrite.register
+def _(s: TmaDescriptor, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: TmaLoad, rename, sigma, axis_fn):
+    return TmaLoad(
+        smem=s.smem,
+        smem_index=tuple(sigma.apply(e) for e in s.smem_index),
+        desc=s.desc,
+        coords=tuple(sigma.apply(e) for e in s.coords),
+        mbar=s.mbar,
+        mbar_slot=sigma.apply(s.mbar_slot) if s.mbar_slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: MbarrierInit, rename, sigma, axis_fn):
+    return MbarrierInit(
+        mbar=s.mbar,
+        count=s.count,
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: MbarrierArriveExpectTx, rename, sigma, axis_fn):
+    return MbarrierArriveExpectTx(
+        mbar=s.mbar,
+        bytes_=s.bytes_,
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: MbarrierWait, rename, sigma, axis_fn):
+    return MbarrierWait(
+        mbar=s.mbar,
+        phase=sigma.apply(s.phase),
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: TreeHalve, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: WarpShuffle, rename, sigma, axis_fn):
+    # ``name`` is the SSA output; ``value`` is the SSA input — both pass
+    # through ``rename`` so the SSA canonicalizer can renumber them.
+    return WarpShuffle(name=rename(s.name), value=rename(s.value), op=s.op, length=s.length)

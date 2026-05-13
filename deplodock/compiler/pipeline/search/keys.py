@@ -8,12 +8,12 @@ parent module.
 
 - ``CudaOp`` — digest of rendered kernel source + launch params (the
   bits that determine runtime behavior).
-- ``LoopOp`` / ``TileOp`` — digest of the dialect tag plus
-  :meth:`Body.structural_key` (canonicalizes SSA, axis, commutative-arg,
-  and external-buffer names).
-- ``KernelOp`` — falls back to ``repr``-based digest because Kernel-IR
-  bodies contain hardware-primitive stmts (Smem, Sync, ...) that
-  ``Body.structural_key``'s normalize path doesn't yet support.
+- ``LoopOp`` / ``TileOp`` / ``KernelOp`` — digest of the dialect tag
+  plus :meth:`Body.structural_key` (canonicalizes SSA, axis,
+  commutative-arg, and external-buffer names). KernelOp works because
+  ``kernel/ir.py`` registers ``rewrite`` handlers for every Kernel-IR
+  stmt (Smem, Sync, CpAsync*, Tma*, Mbarrier*, TreeHalve, WarpShuffle),
+  letting ``normalize_body`` walk the body without bailing.
 
 Same kernel reached via different rewrite paths produces the same key
 — ``Op.source`` is not part of the digest.
@@ -38,10 +38,8 @@ def op_cache_key(op: object) -> str | None:
 
     if isinstance(op, CudaOp):
         return digest("CudaOp", op.kernel_source, op.arg_order, op.grid, op.block, op.smem_bytes)
-    if isinstance(op, (LoopOp, TileOp)):
+    if isinstance(op, (LoopOp, TileOp, KernelOp)):
         return digest(type(op).__name__, op.body.structural_key())
-    if isinstance(op, KernelOp):
-        return digest("KernelOp", repr(op.body))
     return None
 
 
