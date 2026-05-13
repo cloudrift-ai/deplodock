@@ -85,60 +85,60 @@ class SearchTree:
     """
 
     def __init__(self) -> None:
-        # Keyed by (context_key, node_key) so multiple compile contexts
-        # can share one tree without cross-pollution. Today the autotune
-        # loop only ever uses one context per process, but the keying
-        # mirrors the previous SQLite schema for minimal churn at call
-        # sites.
-        self._nodes: dict[tuple[str, str], NodeRow] = {}
+        # The in-memory tree is single-context per process — the on-disk
+        # DB carries context_key for cross-machine partitioning, but the
+        # search policy here only ever operates within one context.
+        self._nodes: dict[str, NodeRow] = {}
         # Ordered list (dedup on insert) so iteration order is
         # deterministic for tests and tie-breaks in the policy.
-        self._expansions: dict[tuple[str, str], list[str]] = {}
+        self._expansions: dict[str, list[str]] = {}
+        # First root inserted; latched on first ``ensure_root`` so the
+        # UCB walk can start there without scanning the dict.
+        self._root_key: str | None = None
 
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
 
-    def node(self, context_key: str, node_key: str) -> NodeRow | None:
-        return self._nodes.get((context_key, node_key))
+    def node(self, node_key: str) -> NodeRow | None:
+        return self._nodes.get(node_key)
 
-    def children(self, context_key: str, parent_key: str) -> list[str]:
-        return list(self._expansions.get((context_key, parent_key), ()))
+    def children(self, parent_key: str) -> list[str]:
+        return list(self._expansions.get(parent_key, ()))
 
-    def find_root(self, context_key: str) -> str | None:
-        """Return the first ``parent_key is None`` node inserted for
-        this context (insertion order is preserved by ``dict``)."""
-        for (ctx, key), row in self._nodes.items():
-            if ctx == context_key and row.parent_key is None:
-                return key
-        return None
+    @property
+    def root(self) -> str | None:
+        """The first ``parent_key is None`` node inserted, or ``None``
+        if nothing has been expanded yet."""
+        return self._root_key
 
-    def root_coverage(self, context_key: str) -> tuple[int, int]:
-        """``(sum_seen, sum_expected)`` over every root for this context."""
+    def root_coverage(self) -> tuple[int, int]:
+        """``(sum_seen, sum_expected)`` over every root in the tree."""
         seen = 0
         expected = 0
-        for (ctx, _), row in self._nodes.items():
-            if ctx != context_key or row.parent_key is not None:
+        for row in self._nodes.values():
+            if row.parent_key is not None:
                 continue
             seen += row.seen_terminals
             expected += row.expected_terminals
         return seen, expected
 
-    def is_fully_explored(self, context_key: str, node_key: str) -> bool:
-        n = self.node(context_key, node_key)
+    def is_fully_explored(self, node_key: str) -> bool:
+        n = self.node(node_key)
         return n is not None and n.seen_terminals >= n.expected_terminals
 
     # ------------------------------------------------------------------
     # Mutations
     # ------------------------------------------------------------------
 
-    def ensure_root(self, context_key: str, node_key: str) -> None:
+    def ensure_root(self, node_key: str) -> None:
         """Insert a root node (``parent_key = None``) if not present."""
-        key = (context_key, node_key)
-        if key not in self._nodes:
-            self._nodes[key] = NodeRow(parent_key=None)
+        if node_key not in self._nodes:
+            self._nodes[node_key] = NodeRow(parent_key=None)
+        if self._root_key is None:
+            self._root_key = node_key
 
-    def expand(self, context_key: str, parent_key: str, child_keys: list[str]) -> None:
+    def expand(self, parent_key: str, child_keys: list[str]) -> None:
         """Record ``parent_key → child_keys`` edges and maintain
         ``expected_terminals`` on every ancestor.
 
@@ -148,9 +148,9 @@ class SearchTree:
         """
         if not child_keys:
             return
-        self.ensure_root(context_key, parent_key)
+        self.ensure_root(parent_key)
 
-        existing = self._expansions.setdefault((context_key, parent_key), [])
+        existing = self._expansions.setdefault(parent_key, [])
         pre = len(existing)
         n_new = 0
         for ck in child_keys:
@@ -164,30 +164,22 @@ class SearchTree:
 
         # Insert child node rows (placeholders) for the new edges.
         for ck in child_keys:
-            self._nodes.setdefault((context_key, ck), NodeRow(parent_key=parent_key))
+            self._nodes.setdefault(ck, NodeRow(parent_key=parent_key))
 
         # First-ever expansion of this parent consumes its placeholder "1",
         # so the delta is one less than n_new. Later expansions are pure
         # additions (the parent was already accounting for its children).
         delta = n_new - 1 if pre == 0 else n_new
         if delta != 0:
-            self._propagate_expected(context_key, parent_key, delta)
+            self._propagate_expected(parent_key, delta)
 
-    def record_terminal(
-        self,
-        context_key: str,
-        leaf_key: str,
-        *,
-        reward: float,
-        status: str,
-    ) -> bool:
+    def record_terminal(self, leaf_key: str, *, reward: float, status: str) -> bool:
         """Bump ``seen_terminals = 1`` on the leaf (if not already
         seen), propagate ``+1`` to every ancestor, and add the reward.
 
         Returns ``True`` iff this was a newly-measured terminal (so the
         caller knows propagation ran)."""
-        key = (context_key, leaf_key)
-        node = self._nodes.setdefault(key, NodeRow(parent_key=None))
+        node = self._nodes.setdefault(leaf_key, NodeRow(parent_key=None))
         if node.seen_terminals >= 1:
             return False
         failed_delta = 0 if status == "ok" else 1
@@ -197,7 +189,6 @@ class SearchTree:
         node.total_reward += reward
         if node.parent_key is not None:
             self._propagate_visit(
-                context_key,
                 node.parent_key,
                 seen_delta=1,
                 failed_delta=failed_delta,
@@ -209,10 +200,10 @@ class SearchTree:
     # Internal propagation walks
     # ------------------------------------------------------------------
 
-    def _propagate_expected(self, context_key: str, node_key: str, delta: int) -> None:
+    def _propagate_expected(self, node_key: str, delta: int) -> None:
         cur: str | None = node_key
         while cur is not None:
-            row = self._nodes.get((context_key, cur))
+            row = self._nodes.get(cur)
             if row is None:
                 return
             row.expected_terminals += delta
@@ -220,7 +211,6 @@ class SearchTree:
 
     def _propagate_visit(
         self,
-        context_key: str,
         node_key: str,
         *,
         seen_delta: int,
@@ -229,7 +219,7 @@ class SearchTree:
     ) -> None:
         cur: str | None = node_key
         while cur is not None:
-            row = self._nodes.get((context_key, cur))
+            row = self._nodes.get(cur)
             if row is None:
                 return
             row.seen_terminals += seen_delta
@@ -303,16 +293,10 @@ class TuningSearch:
         self._best_latency = float("inf")
         self._stagnant = 0
         self._stop_reason: str | None = None
-        # MCTS rollout state: candidates grouped by their tip op_cache_key.
-        # ``_current`` is the candidate being drilled to terminal right
-        # now — pop returns it on every call until the engine yields it
-        # (i.e. doesn't push it back).
-        self._current: Candidate | None = None
-        self._just_popped: Candidate | None = None
+        # Candidates grouped by their tip op_cache_key. Every push lands
+        # here (or in ``_fallback`` if no tip); every pop runs a UCB walk
+        # from the root and pulls one from the selected tip's bucket.
         self._by_tip: dict[str, list[Candidate]] = {}
-        # Root of the search tree, latched on first push so the per-pop
-        # UCB walk starts at the right place.
-        self._root_key: str | None = None
         # FIFO fallback queue for candidates whose tip op_cache_key is
         # missing (no kernel-bearing op in the graph yet) and for the
         # final drain when ``_by_tip`` is empty.
@@ -333,61 +317,33 @@ class TuningSearch:
         return self._stop_reason
 
     def push(self, c: Candidate, *forks: Candidate) -> None:
-        # Tuning registers every candidate. Order matches the previous
-        # driver behavior — forks first, primary last — so the
-        # ``_just_popped`` check below still fires on the right one.
+        self._push_one(c)
         for fork in forks:
             self._push_one(fork)
-        self._push_one(c)
 
     def _push_one(self, c: Candidate) -> None:
-        ckey = c.ctx.structural_key()
         if self._context_key is None:
-            self._context_key = ckey
-        # If this is the candidate we just popped being pushed back
-        # mid-rollout (engine advanced it by one rule), keep it as the
-        # outstanding rollout. Otherwise it's a fork sibling — file it
-        # under its tip for later UCB-walk selection.
-        if c is self._just_popped:
-            self._current = c
-            return
-        tip_key = self._tip_key(c.graph, ckey)
+            self._context_key = c.ctx.structural_key()
+        tip_key = self._tip_key(c.graph)
         if tip_key is None:
             # No tip — keep on the FIFO fallback queue (rare).
             self._fallback.append(c)
             return
         self._by_tip.setdefault(tip_key, []).append(c)
-        # Latch the search tree's root the first time we see one.
-        if self._root_key is None:
-            self._root_key = self._tree.find_root(ckey)
 
     def pop(self) -> Candidate | None:
         if self._should_stop():
             return None
-        # Mid-rollout: keep returning the same candidate.
-        if self._current is not None:
-            c = self._current
-            self._current = None
-            self._just_popped = c
-            return c
-        # Previous rollout terminated (engine yielded without push-back).
-        # Start a new iteration: walk the search tree from root via UCB
-        # and pick a candidate whose tip matches the selected frontier.
-        ckey = self._context_key
-        if ckey is None:
+        root_key = self._tree.root
+        if root_key is None:
             return self._fallback_pop()
-        if self._root_key is None:
-            self._root_key = self._tree.find_root(ckey)
-        if self._root_key is None:
-            return self._fallback_pop()
-        target = self._ucb_walk(ckey, self._root_key)
+        target = self._ucb_walk(root_key)
         if target is None or target not in self._by_tip:
             return self._fallback_pop()
         cands = self._by_tip[target]
         c = cands.pop(0)
         if not cands:
             del self._by_tip[target]
-        self._just_popped = c
         return c
 
     def _fallback_pop(self) -> Candidate | None:
@@ -400,12 +356,9 @@ class TuningSearch:
                 c = cands.pop(0)
                 if not cands:
                     del self._by_tip[tip]
-                self._just_popped = c
                 return c
         if self._fallback:
-            c = self._fallback.popleft()
-            self._just_popped = c
-            return c
+            return self._fallback.popleft()
         return None
 
     def _should_stop(self) -> bool:
@@ -418,7 +371,7 @@ class TuningSearch:
         # Poll the tree for newly-measured terminals since the last
         # pop check. Reset stagnant on any improvement; otherwise
         # count fresh measurements toward patience.
-        seen, expected = self._tree.root_coverage(self._context_key)
+        seen, expected = self._tree.root_coverage()
         new_measurements = seen - self._last_seen
         self._last_seen = seen
         if new_measurements > 0:
@@ -438,7 +391,7 @@ class TuningSearch:
 
     # -- UCB plumbing --------------------------------------------------
 
-    def _tip_key(self, graph, context_key: str) -> str | None:
+    def _tip_key(self, graph) -> str | None:
         """The candidate's tip is its deepest kernel-bearing op in the
         search tree (most rule applications fired). For single-kernel
         graphs that's just the one body-bearing op's key."""
@@ -447,9 +400,9 @@ class TuningSearch:
             return None
         if len(keys) == 1:
             return keys[0]
-        return max(keys, key=lambda k: self._depth(context_key, k))
+        return max(keys, key=self._depth)
 
-    def _ucb_walk(self, context_key: str, root_key: str) -> str | None:
+    def _ucb_walk(self, root_key: str) -> str | None:
         """Walk the search tree from ``root_key`` via UCB selection at
         each node. Stops at the first node with at least one unvisited
         child (returning that child) or with no children at all
@@ -460,10 +413,10 @@ class TuningSearch:
         # Cap to defend against a hypothetical cycle in the parent_key
         # graph. Real trees here are tens of levels deep at most.
         for _ in range(256):
-            children = self._tree.children(context_key, cur)
+            children = self._tree.children(cur)
             if not children:
                 return cur  # frontier: leaf of the search tree
-            cur_node = self._tree.node(context_key, cur)
+            cur_node = self._tree.node(cur)
             parent_visits = cur_node.visits if cur_node else 1
             # Find unvisited children; if any, pick the one whose
             # candidate has the highest ``score`` (heuristic prior).
@@ -477,7 +430,7 @@ class TuningSearch:
             unvisited: list[tuple[str, float]] = []
             best_score = float("-inf")
             for ck in children:
-                child = self._tree.node(context_key, ck)
+                child = self._tree.node(ck)
                 s = self._candidate_score(ck)
                 if s > best_score:
                     best_score = s
@@ -504,7 +457,7 @@ class TuningSearch:
             best_key = None
             best_ucb = float("-inf")
             for ck in children:
-                child = self._tree.node(context_key, ck)
+                child = self._tree.node(ck)
                 if child is None or child.visits == 0:
                     continue
                 mean = child.total_reward / child.visits
@@ -539,12 +492,12 @@ class TuningSearch:
                     break
         return best
 
-    def _depth(self, context_key: str, node_key: str) -> int:
+    def _depth(self, node_key: str) -> int:
         d = 0
         cur: str | None = node_key
         # Hard cap on chain walk so a degenerate cycle (shouldn't happen, defensive) doesn't loop forever.
         while cur is not None and d < 64:
-            row = self._tree.node(context_key, cur)
+            row = self._tree.node(cur)
             if row is None or row.parent_key is None:
                 break
             cur = row.parent_key

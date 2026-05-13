@@ -389,7 +389,6 @@ def _try_one_rule(
 
     matches = match_pattern(cand.graph, rule.pattern)
     result = RuleResult()
-    context_key = cand.ctx.structural_key() if tree is not None else None
     for match in matches:
         options = _try_rewrite(rule, match, ctx, debug_on=debug_on, pass_name=pass_name)
         if options is None:
@@ -411,12 +410,12 @@ def _try_one_rule(
         # to key on, so they don't contribute tree edges. Single-option
         # rules still record an edge (n_new=1, delta=0); the chain in
         # the tree mirrors the source chain on the resulting kernels.
-        if tree is not None and context_key is not None:
+        if tree is not None:
             parent_key = op_cache_key(cand.graph.nodes[match.root_node_id].op)
             if parent_key is not None and all(isinstance(o, Op) for o in options):
                 child_keys = [op_cache_key(o) for o in options]
                 if all(k is not None for k in child_keys):
-                    tree.expand(context_key, parent_key, child_keys)
+                    tree.expand(parent_key, child_keys)
         fragment = _wrap_op_as_fragment(cand.graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
         text = _format_rule_application(rule.name, cand.graph, match, fragment, pass_name=pass_name) if need_text else None
         if debug_on:

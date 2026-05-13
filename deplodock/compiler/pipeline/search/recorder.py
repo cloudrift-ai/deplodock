@@ -203,7 +203,7 @@ def _persist(
     )
     if tree is not None:
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
-        tree.record_terminal(context_key, cuda_key, reward=reward, status=status)
+        tree.record_terminal(cuda_key, reward=reward, status=status)
 
     logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), stats.median, status)
 
