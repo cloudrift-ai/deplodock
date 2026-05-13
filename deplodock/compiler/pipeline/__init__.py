@@ -1,7 +1,8 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
 - :mod:`.engine` — pattern matcher + rule runner. Exports ``Pattern``,
-  ``Match``, ``match_pattern``, ``run_rule``, ``run_pass``.
+  ``Match``, ``match_pattern``, ``run_pass``. To run a single rule
+  module, call ``run_pass(rules_dir, select=[<rule_stem>])``.
 - :mod:`.search` — autotune driver (``Candidate`` / ``Search`` /
   ``run_pipeline`` / ``run_autotune``) and persistent measurement cache.
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
@@ -19,7 +20,6 @@ from deplodock.compiler.pipeline.engine import (
     RuleSkipped,
     match_pattern,
     run_pass,
-    run_rule,
 )
 from deplodock.compiler.pipeline.search import (
     Candidate,
@@ -58,5 +58,4 @@ __all__ = [
     "run_autotune",
     "run_pass",
     "run_pipeline",
-    "run_rule",
 ]

@@ -6,7 +6,7 @@ Public surface:
   ``Pattern`` matches one node by ``op_type`` + field constraints;
   ``match_pattern(graph, pattern)`` walks forward from every
   topo-ordered seed along fan-out-1 consumer edges.
-- ``run_rule`` / ``run_pass`` — apply one rule module / every rule
+- ``run_pass`` — apply every rule
   module in a directory to fixed point. Rule modules declare
   ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(...)`` function
   whose return type discriminates the rewrite flavor:
@@ -336,7 +336,6 @@ def run_pass(
     graph: Graph,
     pass_dir: Path,
     dump: CompilerDump | None = None,
-    pass_idx: int | None = None,
     pass_name: str | None = None,
     select: Iterable[str] | None = None,
     ctx: Context | None = None,
@@ -358,19 +357,6 @@ def run_pass(
     search = GreedySearch()
     search.push(Candidate(graph=graph, ctx=ctx))
     return next(_search_loop(search, [rules], [pass_name or ""], ctx, dump)).graph
-
-
-def run_rule(graph: Graph, rule_path: Path, ctx: Context | None = None) -> Graph:
-    """Load a single rule module and apply it to fixed point. Discards
-    fork siblings — for autotuning use the full ``run_pipeline`` driver."""
-    from deplodock.compiler.pipeline.search.driver import _search_loop  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
-
-    if ctx is None:
-        ctx = Context.probe()
-    search = GreedySearch()
-    search.push(Candidate(graph=graph, ctx=ctx))
-    return next(_search_loop(search, [[_load_rule(rule_path)]], [""], ctx, None)).graph
 
 
 def _apply_one(graph: Graph, match: Match, result: Graph | Op, *, rule_name: str) -> Graph:

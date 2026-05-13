@@ -42,11 +42,12 @@ def _search_loop(
     push successor(s). Yields when a candidate reaches the end of the
     pipeline (``cursor.pass_idx >= len(pass_names)``).
 
-    Used by every engine entry point — ``run_autotune`` (full pipeline),
-    ``run_pass`` (one pass), ``run_rule`` (one rule). They differ only
-    in the rules-per-pass list and the ``Search`` instance supplied."""
+    Used by every engine entry point — ``run_autotune`` (full pipeline)
+    and ``run_pass`` (one pass; pass ``select=[stem]`` to run a single
+    rule). They differ only in the rules-per-pass list and the
+    ``Search`` instance supplied."""
     # Local import to break the engine ↔ driver cycle (engine.run_pass
-    # / run_rule call _search_loop, and _try_one_rule lives in engine).
+    # calls _search_loop, and _try_one_rule lives in engine).
     from deplodock.compiler.pipeline.engine import _try_one_rule  # noqa: PLC0415
 
     tree: SearchTree | None = getattr(search, "tree", None)

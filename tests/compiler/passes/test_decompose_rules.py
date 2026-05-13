@@ -25,7 +25,7 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.engine import run_rule
+from deplodock.compiler.pipeline.engine import run_pass
 
 RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "frontend" / "decomposition"
 
@@ -46,7 +46,9 @@ def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-6):
 
 
 def _apply(graph: Graph, rule_name: str) -> Graph:
-    return run_rule(graph, RULES_DIR / rule_name)
+    # Run a single rule out of the decomposition pass by selecting on
+    # its filename stem (e.g. ``"003_pow.py"`` → ``"003_pow"``).
+    return run_pass(graph, RULES_DIR, select=[Path(rule_name).stem])
 
 
 # ===================================================================
