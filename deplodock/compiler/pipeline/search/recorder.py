@@ -157,7 +157,10 @@ def _persist(
         return
 
     # Record every op in the chain into its dialect's inventory table
-    # AND record each dialect-changing edge in the lowering table.
+    # AND record every adjacent rewrite hop in the lowering table —
+    # including intra-dialect autotune hops (blockify_launch,
+    # register_tile, ...) so greedy replay can reconstruct the full
+    # decision chain by walking lowering rows hop-by-hop.
     chain = [op for op in source_chain(cuda_op) if _is_kernel_bearing(op)]
     for op in chain:
         _record_op_inventory(db, op)
@@ -167,17 +170,25 @@ def _persist(
     for parent_op, child_op in zip(chain[1:], chain[:-1], strict=False):
         p_dialect = dialect_of(parent_op)
         c_dialect = dialect_of(child_op)
-        if p_dialect == c_dialect or p_dialect is None or c_dialect is None:
+        if p_dialect is None or c_dialect is None:
             continue
         p_key = op_cache_key(parent_op)
         c_key = op_cache_key(child_op)
         if p_key is None or c_key is None:
             continue
+        # Knob delta = entries new or changed at this hop. Engine merges
+        # ``{**old.knobs, **new.knobs}`` on every rebind so ``child``
+        # carries the cumulative set; subtract ``parent`` to recover
+        # just this step's contribution.
+        p_knobs = getattr(parent_op, "knobs", None) or {}
+        c_knobs = getattr(child_op, "knobs", None) or {}
+        knobs_delta = {k: v for k, v in c_knobs.items() if p_knobs.get(k) != v}
         db.record_lowering(
             p_key,
             p_dialect,
             c_key,
             c_dialect,
+            knobs=knobs_delta,
             measured_median_us=stats.median if status == "ok" else None,
         )
 

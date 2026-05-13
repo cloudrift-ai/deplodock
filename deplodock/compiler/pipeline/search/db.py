@@ -6,12 +6,16 @@ Pure persistence layer — no MCTS state, no propagation walks. Tables:
   op encountered along a lowering chain. Keyed by ``op_cache_key``.
   Each row stores the JSON form (for programmatic inspection) and the
   pretty-printed form (for human inspection).
-- ``lowering`` — best-known child for each parent op. For Tile→Kernel
-  and Kernel→Cuda the rewrite is deterministic so the first write wins.
-  For Loop→Tile autotune explores multiple TileOp variants; the row
-  tracks the one whose downstream CudaOp has the lowest measured
-  ``best_median_us``, and ``record_lowering`` replaces it whenever a
-  faster variant gets measured.
+- ``lowering`` — best-known child for each parent op, one row per
+  rewrite hop along the lowering chain (Loop→Tile, every intra-Tile
+  autotune step, Tile→Kernel, Kernel→Cuda). Each row carries the knob
+  delta the rule stamped at that hop, so :class:`GreedySearch` can
+  replay the full chain by matching forks against the recorded delta
+  at every fork point. ``record_lowering`` upserts uniformly across
+  dialects: a strictly better measured median replaces the row; a
+  None measurement (bench_fail terminal) never overwrites a
+  known-good row. Deterministic rewrites (single option) trivially
+  win their own slot via the same path.
 - ``perf`` — backend-agnostic measurement store. ``op_key`` is whichever
   terminal op the backend measured (today: a CudaOp; tomorrow whatever
   other backends lower to). ``backend`` partitions the table so the
@@ -60,12 +64,18 @@ class PerfRow:
 
 @dataclass(frozen=True)
 class LoweringRow:
-    """One ``lowering`` row — best-known child for a parent op."""
+    """One ``lowering`` row — best-known child for a parent op.
+
+    ``knobs`` is the delta added at this rewrite step (e.g.
+    ``005_blockify_launch`` adds ``{"BN": 64, "BM": 64}``). Greedy
+    replay picks the fork whose newly-stamped knobs agree with this
+    delta — no need to compare structural keys per fork."""
 
     parent_key: str
     parent_dialect: str
     child_key: str
     child_dialect: str
+    knobs: dict
     best_median_us: float | None
 
 
@@ -116,6 +126,7 @@ class SearchDB:
             parent_dialect  TEXT NOT NULL,
             child_key       TEXT NOT NULL,
             child_dialect   TEXT NOT NULL,
+            knobs           TEXT NOT NULL DEFAULT '{}',
             best_median_us  REAL
         )
         """,
@@ -205,42 +216,46 @@ class SearchDB:
         child_key: str,
         child_dialect: str,
         *,
+        knobs: dict | None = None,
         measured_median_us: float | None,
     ) -> None:
         """Upsert one ``parent_key`` → ``child_key`` lowering edge.
 
-        Tile→Kernel and Kernel→Cuda are deterministic (the rewrite has
-        no variants), so the first write wins and ``best_median_us``
-        stays NULL for those rows. Loop→Tile is the autotuned step —
-        passing the measured median lets this routine swap the row to
-        the faster variant whenever one shows up.
+        ``knobs`` is the delta this rewrite step stamps onto the child
+        (e.g. blockify_launch adds ``{"BN": 64, "BM": 64}``; tileify
+        adds nothing). Greedy replay picks forks by knob-subset match
+        against this delta, so the row is enough to reconstruct the
+        chain without re-querying ``perf``.
+
+        Best-of upsert across every dialect — autotune fork rules live
+        at Tile→Tile (blockify, register_tile) and used to be excluded
+        here; recording every hop is how the chain stays replayable.
+        Rows where the rewrite is genuinely deterministic (a single
+        option) still trivially win their own slot, just via the same
+        upsert path.
         """
+        knobs_json = json.dumps(knobs or {}, sort_keys=True, default=str)
         existing = self._conn.execute(
             "SELECT child_key, best_median_us FROM lowering WHERE parent_key = ?",
             (parent_key,),
         ).fetchone()
         if existing is None:
             self._conn.execute(
-                "INSERT INTO lowering (parent_key, parent_dialect, child_key, child_dialect, best_median_us) VALUES (?, ?, ?, ?, ?)",
-                (parent_key, parent_dialect, child_key, child_dialect, measured_median_us),
+                "INSERT INTO lowering (parent_key, parent_dialect, child_key, child_dialect, knobs, best_median_us) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (parent_key, parent_dialect, child_key, child_dialect, knobs_json, measured_median_us),
             )
             return
-        # Deterministic dialects: don't touch a row that's already correct.
-        # If the existing row points at a different child we leave it alone —
-        # within a process the rewrite is single-valued; cross-process
-        # divergence would point at a structural-key collision, which is
-        # the digest's problem to solve, not ours.
-        if parent_dialect in ("tile", "kernel"):
-            return
-        # Loop→Tile: replace the row iff the new measurement is strictly
-        # better than the stored best (or the stored best is NULL).
+        # Replace iff the new measurement is strictly better than the
+        # stored best (or the stored best is NULL). A None measurement
+        # never overwrites a known-good row.
         cur_best = existing[1]
         if measured_median_us is None:
             return
         if cur_best is None or measured_median_us < cur_best:
             self._conn.execute(
-                "UPDATE lowering SET child_key = ?, child_dialect = ?, best_median_us = ? WHERE parent_key = ?",
-                (child_key, child_dialect, measured_median_us, parent_key),
+                "UPDATE lowering SET child_key = ?, child_dialect = ?, knobs = ?, best_median_us = ? WHERE parent_key = ?",
+                (child_key, child_dialect, knobs_json, measured_median_us, parent_key),
             )
 
     # ------------------------------------------------------------------
@@ -296,7 +311,7 @@ class SearchDB:
         when no row exists. Used by :class:`GreedySearch` to pick the
         DB-preferred fork at each fork point."""
         row = self._conn.execute(
-            "SELECT parent_key, parent_dialect, child_key, child_dialect, best_median_us FROM lowering WHERE parent_key = ?",
+            "SELECT parent_key, parent_dialect, child_key, child_dialect, knobs, best_median_us FROM lowering WHERE parent_key = ?",
             (parent_key,),
         ).fetchone()
         if row is None:
@@ -306,7 +321,8 @@ class SearchDB:
             parent_dialect=row[1],
             child_key=row[2],
             child_dialect=row[3],
-            best_median_us=row[4],
+            knobs=json.loads(row[4]) if row[4] else {},
+            best_median_us=row[5],
         )
 
     def lookup_perf(self, context_key: str, op_key: str, *, backend: str) -> PerfRow | None:

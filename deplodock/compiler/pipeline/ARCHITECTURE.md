@@ -136,10 +136,13 @@ The autotune state is split across two cooperating modules:
 - **`SearchDB`** (`search/db.py`) — SQLite store partitioned into six
   tables: `loop_op`, `tile_op`, `kernel_op`, `cuda_op` (one row per op
   encountered along any lowering chain, keyed by `op_cache_key`), a
-  `lowering` edge table (best-known child per parent — deterministic
-  for Tile→Kernel and Kernel→Cuda; best-median upsert for Loop→Tile
-  where autotune explores many TileOp variants per LoopOp), and a
-  backend-partitioned `perf` table carrying full stats
+  `lowering` edge table (one row per rewrite hop along the chain —
+  Loop→Tile, every intra-Tile autotune step, Tile→Kernel, Kernel→Cuda
+  — carrying the knob delta the rule stamped at that hop and a
+  best-median upsert across every dialect, so `GreedySearch` can
+  replay the full chain by matching forks against the delta at each
+  fork point), and a backend-partitioned `perf` table carrying full
+  stats
   (`latency_us_{median,min,max,mean,variance}`, `n_samples`,
   `backend`, `status`, `knobs`). Selection statistic is the median.
 - **`SearchTree`** (`search/policy/mcts.py`) — pure-Python in-memory

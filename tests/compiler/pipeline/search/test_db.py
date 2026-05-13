@@ -112,21 +112,24 @@ def test_record_cuda_op_persists_launch_params() -> None:
 
 
 # ---------------------------------------------------------------------------
-# lowering — deterministic vs Loop→Tile best-of
+# lowering — uniform best-of across every dialect
 # ---------------------------------------------------------------------------
 
 
-def test_lowering_tile_to_kernel_is_first_write_wins() -> None:
+def test_lowering_best_of_applies_across_dialects() -> None:
+    """Every hop replays via the same best-median upsert — including
+    Tile→Kernel and Kernel→Cuda, which used to be first-write-wins.
+    The chain-replay design needs uniform semantics so intra-Tile
+    autotune hops (blockify, register_tile) get the same treatment as
+    Loop→Tile."""
     db = SearchDB()
     db.record_lowering("tile-A", "tile", "kernel-A", "kernel", measured_median_us=10.0)
-    # A second call with a different child is ignored — deterministic
-    # dialects can't legitimately remap.
     db.record_lowering("tile-A", "tile", "kernel-B", "kernel", measured_median_us=5.0)
     row = db._conn.execute(
         "SELECT child_key, best_median_us FROM lowering WHERE parent_key = ?",
         ("tile-A",),
     ).fetchone()
-    assert row[0] == "kernel-A"
+    assert row[0] == "kernel-B" and row[1] == 5.0
 
 
 def test_lowering_loop_to_tile_keeps_best() -> None:

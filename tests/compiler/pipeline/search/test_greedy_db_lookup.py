@@ -109,12 +109,16 @@ def test_greedy_picks_db_winner() -> None:
     assert option_zero[2] != winner_knobs
 
     db = SearchDB()
-    # ``record_lowering`` early-returns for tile→tile (first-write-wins),
-    # so write directly. ``best_median_us`` only needs to be non-NULL for
-    # the policy to consider the row.
-    db._conn.execute(
-        "INSERT INTO lowering (parent_key, parent_dialect, child_key, child_dialect, best_median_us) VALUES (?, 'tile', ?, 'tile', ?)",
-        (parent_key, winner_key, 1.0),
+    # ``record_lowering`` writes the knob delta — that's what greedy
+    # matches forks against. blockify_launch stamps ``blockify=True``
+    # alongside ``(BN, BM)``, so include it for a faithful delta.
+    db.record_lowering(
+        parent_key,
+        "tile",
+        winner_key,
+        "tile",
+        knobs={**winner_knobs, "blockify": True},
+        measured_median_us=1.0,
     )
 
     out = run_pipeline(_make_matmul(), TILE_PASSES, db=db)
@@ -129,9 +133,13 @@ def test_irrelevant_seed_is_ignored() -> None:
     option_zero_knobs = variants[0][2]
 
     db = SearchDB()
-    db._conn.execute(
-        "INSERT INTO lowering (parent_key, parent_dialect, child_key, child_dialect, best_median_us) "
-        "VALUES ('unrelated-parent', 'tile', 'unrelated-child', 'tile', 1.0)",
+    db.record_lowering(
+        "unrelated-parent",
+        "tile",
+        "unrelated-child",
+        "tile",
+        knobs={"BN": 999, "BM": 999, "blockify": True},
+        measured_median_us=1.0,
     )
 
     out = run_pipeline(_make_matmul(), TILE_PASSES, db=db)
