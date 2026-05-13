@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import statistics
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import (
@@ -29,7 +30,14 @@ from deplodock.compiler.pipeline.search.keys import (
     op_cache_key,
     source_chain,
 )
-from deplodock.compiler.pipeline.search.tree import SearchTree
+
+if TYPE_CHECKING:
+    # SearchTree lives next to TuningSearch in policy/mcts.py. We can't
+    # import it eagerly here because policy/base.py imports recorder
+    # (for ``count_unmeasured_ops``) and policy/mcts.py imports
+    # policy/base.py — a runtime import would close the cycle. The
+    # annotation is the only use, so TYPE_CHECKING is enough.
+    from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +51,7 @@ class TuneAborted(RuntimeError):
 def record_terminal(
     graph,
     db: SearchDB,
-    tree: SearchTree,
+    tree: SearchTree | None,
     context_key: str,
     *,
     backend,
@@ -134,7 +142,7 @@ def record_terminal(
 
 def _persist(
     db: SearchDB,
-    tree: SearchTree,
+    tree: SearchTree | None,
     context_key: str,
     cuda_op,
     *,
@@ -182,8 +190,9 @@ def _persist(
         stats=stats,
         knobs=knobs,
     )
-    reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
-    tree.record_terminal(context_key, cuda_key, reward=reward, status=status)
+    if tree is not None:
+        reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
+        tree.record_terminal(context_key, cuda_key, reward=reward, status=status)
 
     logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), stats.median, status)
 

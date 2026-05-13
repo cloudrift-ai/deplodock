@@ -10,9 +10,11 @@ MCTS tree.
   the unified ``_search_loop`` driver.
 - :mod:`.db` — :class:`SearchDB` SQLite store (op inventory, lowering
   edges, generic ``perf`` table).
-- :mod:`.tree` — :class:`SearchTree` in-memory MCTS state.
+- :mod:`.policy.mcts` — :class:`TuningSearch` + the in-memory
+  :class:`SearchTree` / :class:`NodeRow` (MCTS-only — no other policy
+  reads or writes the tree).
 - :mod:`.recorder` — top-level :func:`record_terminal` orchestrating
-  bench → DB writes → tree updates.
+  bench → DB writes → optional tree updates.
 - :mod:`.keys` — ``op_cache_key`` / ``dialect_of`` / ``source_chain``.
 """
 
@@ -21,8 +23,8 @@ from deplodock.compiler.pipeline.search.db import PerfRow, PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.driver import run_autotune, run_pipeline
 from deplodock.compiler.pipeline.search.keys import dialect_of, op_cache_key, source_chain
 from deplodock.compiler.pipeline.search.policy import GreedySearch, Search, TuningSearch
+from deplodock.compiler.pipeline.search.policy.mcts import NodeRow, SearchTree
 from deplodock.compiler.pipeline.search.recorder import TuneAborted, count_unmeasured_ops, record_terminal
-from deplodock.compiler.pipeline.search.tree import NodeRow, SearchTree
 
 __all__ = [
     "Candidate",

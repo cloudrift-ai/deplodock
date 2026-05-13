@@ -43,10 +43,10 @@ from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_const
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
 from deplodock.compiler.pipeline.search.candidate import Candidate, RuleResult, TraceEntry
 from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.tree import SearchTree
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
+    from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 _RULE_PREFIX_RE = re.compile(r"^\d+[a-z]?_")
 

@@ -5,7 +5,7 @@ No DB, no I/O — just pure-Python expand / propagation invariants.
 
 from __future__ import annotations
 
-from deplodock.compiler.pipeline.search.tree import SearchTree
+from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 
 def test_root_placeholder_has_expected_one() -> None:

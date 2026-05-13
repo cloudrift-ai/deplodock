@@ -31,8 +31,7 @@ class Cursor:
     """Pipeline resume state for a ``Candidate``.
 
     * ``pass_idx`` — index of the pass to apply next.
-    * ``rule_idx`` — index of the rule within the current pass to try
-      next.
+    * ``rule_idx`` — index of the rule within the current pass to try next.
     * ``n_applied`` — number of functional rewrites in the current
       pass scan. When ``rule_idx`` wraps past the last rule with this
       counter ``> 0``, the engine restarts the scan (changes happened);

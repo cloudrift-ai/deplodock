@@ -11,7 +11,7 @@ measurements and asserts the walk picks the expected frontier.
 from __future__ import annotations
 
 from deplodock.compiler.pipeline.search import TuningSearch
-from deplodock.compiler.pipeline.search.tree import SearchTree
+from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 
 def _make_search(tree: SearchTree, context_key: str = "ctx") -> TuningSearch:

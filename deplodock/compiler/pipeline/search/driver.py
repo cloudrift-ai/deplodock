@@ -20,10 +20,10 @@ from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.policy import GreedySearch, Search
 from deplodock.compiler.pipeline.search.recorder import TuneAborted, record_terminal
-from deplodock.compiler.pipeline.search.tree import SearchTree
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
+    from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 _PASSES_DIR = Path(__file__).resolve().parent.parent / "passes"
 
@@ -89,7 +89,6 @@ def run_pipeline(
     ctx: Context | None = None,
     backend=None,
     db: SearchDB | None = None,
-    tree: SearchTree | None = None,
 ) -> Graph:
     """Run each named pass directory in order; dispatch ``dump.on_pass``
     after each. Single-candidate convenience wrapper around
@@ -104,11 +103,11 @@ def run_pipeline(
     recorded to ``db`` and attributed to every ancestor along the
     ``Op.source`` chain. ``db`` defaults to a fresh in-memory store;
     pass an explicit :class:`SearchDB` to persist measurements
-    across runs. ``tree`` defaults to a fresh :class:`SearchTree`.
+    across runs.
 
     For exhaustive autotuning, call :func:`run_autotune` directly with
     :class:`TuningSearch` and iterate every yielded candidate."""
-    search = GreedySearch(tree=tree)
+    search = GreedySearch(db=db)
     return next(run_autotune(graph, passes, search=search, dump=dump, select=select, ctx=ctx, backend=backend, db=db)).graph
 
 
@@ -178,17 +177,21 @@ def run_autotune(
                     knob_strs.append(", ".join(f"{kk}={vv}" for kk, vv in sorted(k.items())))
             label = " | ".join(knob_strs) if knob_strs else "option-0"
             logger.info("[tune] variant #%d  [%s]", n_terminals, label)
-        if tree is not None:
-            try:
-                record_terminal(cand.graph, db, tree, cand.ctx.structural_key(), backend=backend)
-            except TuneAborted as exc:
-                # A bench failure left GPU work queued; running another
-                # variant would block in cupy's ``_allocate``. Yield
-                # this terminal (its measurements are already recorded
-                # as bench_fail) and stop the sweep so the caller can
-                # pick a winner from whatever ok variants we've got.
-                logger.warning("[tune] %s — stopping after %d terminal(s)", exc, n_terminals)
-                yield cand
-                break
+        try:
+            # ``recorder.record_terminal`` is a no-op when backend is
+            # ``None`` (or writes 1.0us stubs to the in-memory DB) and
+            # gracefully handles ``tree is None`` (greedy search). The
+            # call is unconditional so any backend-driven measurement
+            # always lands in the perf / inventory tables.
+            record_terminal(cand.graph, db, tree, cand.ctx.structural_key(), backend=backend)
+        except TuneAborted as exc:
+            # A bench failure left GPU work queued; running another
+            # variant would block in cupy's ``_allocate``. Yield
+            # this terminal (its measurements are already recorded
+            # as bench_fail) and stop the sweep so the caller can
+            # pick a winner from whatever ok variants we've got.
+            logger.warning("[tune] %s — stopping after %d terminal(s)", exc, n_terminals)
+            yield cand
+            break
         yield cand
     logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
