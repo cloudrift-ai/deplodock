@@ -436,16 +436,19 @@ class Body(tuple[Stmt, ...]):
 
         Canonical text rendering used for structural-equivalence
         queries. Two bodies that differ only by SSA / axis names,
-        commutative-arg order, or external-buffer names produce the same
-        key.
+        commutative-arg order, external-buffer names, or the specific
+        op within a compute-unit cluster (``add`` vs ``sub``, ``div``
+        vs ``mod``) produce the same key.
 
         Built by re-running :func:`normalize_body` with ``hoist=False``
         (safe for both Loop-IR and Tile-IR bodies — hoisting can move
-        Loads above Stage decls in Tile bodies) and
+        Loads above Stage decls in Tile bodies),
         ``canonical_buffers=True`` (renames ``Load.input`` /
-        ``Write.output`` to ``b0, b1, ...``), then joining
-        :func:`pretty_body`'s line list. Cached on the instance — Body
-        is immutable."""
+        ``Write.output`` to ``b0, b1, ...``), and ``cluster_ops=True``
+        (collapses each op to its compute-unit cluster representative
+        — see :func:`deplodock.compiler.ir.elementwise.cluster_representative`),
+        then joining :func:`pretty_body`'s line list. Cached on the
+        instance — Body is immutable."""
         return self._cached_structural_key
 
     @cached_property
@@ -453,5 +456,5 @@ class Body(tuple[Stmt, ...]):
         from deplodock.compiler.ir.stmt.base import pretty_body  # noqa: PLC0415
         from deplodock.compiler.ir.stmt.normalize import normalize_body  # noqa: PLC0415
 
-        normalized = normalize_body(self, hoist=False, canonical_buffers=True)
+        normalized = normalize_body(self, hoist=False, canonical_buffers=True, cluster_ops=True)
         return "\n".join(pretty_body(normalized))

@@ -35,7 +35,13 @@ def _make_axis_renamer(old: str, new: Axis) -> Callable[[Axis], Axis]:
     return lambda a: new if a.name == old else a
 
 
-def normalize_body(stmts: Body, *, hoist: bool = True, canonical_buffers: bool = False) -> Body:
+def normalize_body(
+    stmts: Body,
+    *,
+    hoist: bool = True,
+    canonical_buffers: bool = False,
+    cluster_ops: bool = False,
+) -> Body:
     """Apply the structural and cosmetic normalization passes in order.
 
     Used by both ``LoopOp.__post_init__`` and ``TileOp.__post_init__`` so
@@ -52,6 +58,13 @@ def normalize_body(stmts: Body, *, hoist: bool = True, canonical_buffers: bool =
     outputs and are meaningful at the Op boundary. Turned on by
     :attr:`Body.structural_key()` so two bodies that read identical patterns
     from differently-named buffers hash and compare equal.
+
+    ``cluster_ops=True`` runs :func:`canonicalize_op_clusters` after
+    buffer renaming. Off by default — collapsing ``sub`` to ``add`` (or
+    ``mod`` to ``divide``) destroys semantics, so this is only safe
+    when the output is a hash key, never a runnable body. Turned on by
+    :attr:`Body.structural_key()` so two bodies that differ only in the
+    *kind* of FMA / compare / SFU op at the same position hash equal.
     """
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)
@@ -64,6 +77,8 @@ def normalize_body(stmts: Body, *, hoist: bool = True, canonical_buffers: bool =
     stmts = rename_ssa_sequential(stmts)
     if canonical_buffers:
         stmts = canonicalize_buffer_names(stmts)
+    if cluster_ops:
+        stmts = canonicalize_op_clusters(stmts)
     # Sort runs last so the keys it sorts by are the post-rename canonical
     # SSA / buffer names — that way two bodies that differ only in original
     # argument order produce identical post-normalization arg tuples.
@@ -579,5 +594,44 @@ def canonicalize_buffer_names(stmts: Body) -> Body:
         if isinstance(s, Write) and s.output in rename:
             return replace(s, output=rename[s.output])
         return s
+
+    return stmts.map(fn)
+
+
+# ---------------------------------------------------------------------------
+# Pass: collapse ops to their compute-unit cluster representative
+# (opt-in via normalize_body's ``cluster_ops`` flag).
+# ---------------------------------------------------------------------------
+
+
+def canonicalize_op_clusters(stmts: Body) -> Body:
+    """Replace every ``ElementwiseImpl`` field on every stmt with its
+    cluster representative from :func:`cluster_representative`.
+
+    The pass walks ``stmts`` with :meth:`Body.map` and uses
+    ``dataclasses.fields`` to locate any field currently holding an
+    ``ElementwiseImpl`` (covers ``Init.op`` / ``Assign.op`` /
+    ``Accum.op`` / ``Write.reduce_op`` / Kernel-IR's ``TreeHalve.op`` /
+    ``WarpShuffle.op`` without coupling this module to those IR
+    dialects). The replacement is destructive — the resulting body is
+    only safe to consume from :attr:`Body.structural_key()`.
+    """
+    from dataclasses import fields, is_dataclass  # noqa: PLC0415
+
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl, cluster_representative  # noqa: PLC0415
+
+    def fn(s: Stmt) -> Stmt:
+        if not is_dataclass(s):
+            return s
+        changes: dict[str, ElementwiseImpl] = {}
+        for f in fields(s):
+            val = getattr(s, f.name)
+            if isinstance(val, ElementwiseImpl):
+                rep = cluster_representative(val)
+                if rep != val:
+                    changes[f.name] = rep
+        if not changes:
+            return s
+        return replace(s, **changes)
 
     return stmts.map(fn)
