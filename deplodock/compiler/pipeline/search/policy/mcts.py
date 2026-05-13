@@ -346,7 +346,15 @@ class TuningSearch(_PriorityHeap):
     def stop_reason(self) -> str | None:
         return self._stop_reason
 
-    def push(self, c: Candidate) -> None:
+    def push(self, c: Candidate, *forks: Candidate) -> None:
+        # Tuning registers every candidate. Order matches the previous
+        # driver behavior — forks first, primary last — so the
+        # ``_just_popped`` check below still fires on the right one.
+        for fork in forks:
+            self._push_one(fork)
+        self._push_one(c)
+
+    def _push_one(self, c: Candidate) -> None:
         if self._context_key is None:
             self._context_key = c.ctx.structural_key()
         ckey = self._ckey(c)

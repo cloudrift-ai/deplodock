@@ -29,9 +29,14 @@ class Search(Protocol):
     The engine doesn't tell the search when a candidate is terminal —
     instead a terminal candidate is the one the engine yielded without
     pushing it back. Searches that need to detect this can track the
-    last-popped candidate and check whether it returned via ``push``."""
+    last-popped candidate and check whether it returned via ``push``.
 
-    def push(self, c: Candidate) -> None: ...
+    ``push(c, *forks)`` carries the primary candidate ``c`` plus every
+    sibling alternative the engine spawned at the same rewrite point.
+    Exhaustive policies register all of them; greedy policies can
+    discard the forks once they pick the most promising primary."""
+
+    def push(self, c: Candidate, *forks: Candidate) -> None: ...
     def pop(self) -> Candidate | None: ...  # None when exhausted
 
 

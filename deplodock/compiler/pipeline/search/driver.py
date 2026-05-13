@@ -74,11 +74,12 @@ def _search_loop(
                 dump.on_pass(idx + 1, name, cand.graph)
 
         cur.advance(result, n_rules=len(rules), on_pass_finish=_on_pass_finish)
-        # Forks first, then ``cand`` last — LIFO ``Search`` pops ``cand``
-        # next, driving the inline branch deep before backtracking.
-        for fork in result.forks:
-            search.push(fork)
-        search.push(cand)
+        # Push ``cand`` and its sibling forks together so the policy
+        # sees them as one fork-point group. ``GreedySearch`` discards
+        # the forks; ``TuningSearch`` registers all of them (forks
+        # first internally so the ``_just_popped`` check still fires
+        # on ``cand``, preserving the rollout semantics).
+        search.push(cand, *result.forks)
 
 
 def run_pipeline(

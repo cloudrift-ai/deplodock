@@ -28,7 +28,14 @@ class GreedySearch(_PriorityHeap):
         super().__init__(context_key, db=db)
         self._outstanding: Candidate | None = None
 
-    def push(self, c: Candidate) -> None:
+    def push(self, c: Candidate, *forks: Candidate) -> None:
+        # Greedy stops at the first terminal, so the only candidate
+        # that ever pops again is ``c``. Forks (fork-point siblings of
+        # ``c``) would never be reached — drop them now to keep the
+        # heap small and the intent explicit. A future ``--warm-start``
+        # path can override this to pick the DB-best variant from
+        # ``(c, *forks)`` instead of always keeping ``c``.
+        del forks
         if c is self._outstanding:
             self._outstanding = None
         self._push(c)
