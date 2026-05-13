@@ -19,14 +19,14 @@ without a new best latency once coverage clears ``min_coverage``."""
 
 from __future__ import annotations
 
-import heapq
+import math
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.policy.base import _PriorityHeap
 
 # ---------------------------------------------------------------------------
 # In-memory MCTS tree
@@ -39,12 +39,11 @@ class NodeRow:
 
     ``seen_terminals`` counts every measured terminal under this node
     (ok + fail; used by coverage queries). ``failed_terminals`` tracks
-    fails only (diagnostic). ``visits`` is the MCTS denominator — it
-    increments both on each :meth:`SearchTree.expand` (expansion =
-    exploration) and on each terminal measurement (measurement =
-    visit). ``total_reward`` accumulates the MCTS reward
-    (``1/latency_us`` for ok, ``0`` for fail). UCB exploitation uses
-    ``total_reward / visits``.
+    fails only (diagnostic). ``visits`` is the canonical-MCTS
+    denominator — it counts measured terminals under this node and
+    nothing else (expansion alone never bumps it). ``total_reward``
+    accumulates the MCTS reward (``1/latency_us`` for ok, ``0`` for
+    fail). UCB1 exploitation uses ``total_reward / visits``.
     """
 
     parent_key: str | None
@@ -74,10 +73,10 @@ class SearchTree:
       terminal bumps every ancestor by ``+1`` (and ``+1`` for
       ``failed`` on failure).
     - ``visits`` / ``total_reward`` — UCB1 numerator + denominator.
-      Bumped both on expansion (treats a rule firing as a soft visit
-      so unvisited siblings stay distinguishable in UCB selection) and
-      on terminal measurement (``reward = 1/median_us`` for ok, ``0``
-      for fail).
+      Bumped only on terminal measurement (``reward = 1/median_us``
+      for ok, ``0`` for fail). Canonical MCTS: an expansion alone is
+      not a visit — unvisited siblings are handled by the "pick any
+      unvisited child first" branch in :meth:`_ucb_walk`.
 
     A node is fully explored when ``seen_terminals == expected_terminals``.
     The value can move *down* mid-run when expansion grows the
@@ -174,12 +173,6 @@ class SearchTree:
         if delta != 0:
             self._propagate_expected(context_key, parent_key, delta)
 
-        # Treat the expansion event itself as one "visit" of the parent
-        # for MCTS-style UCB selection — without this, every sibling at
-        # a fork has ``visits = 0`` and indistinguishable ``-inf`` UCB
-        # priorities, so the selector can't differentiate.
-        self._propagate_mcts_visit(context_key, parent_key, visits_delta=1, reward_delta=0.0)
-
     def record_terminal(
         self,
         context_key: str,
@@ -245,30 +238,13 @@ class SearchTree:
             row.total_reward += reward_delta
             cur = row.parent_key
 
-    def _propagate_mcts_visit(
-        self,
-        context_key: str,
-        node_key: str,
-        *,
-        visits_delta: int,
-        reward_delta: float,
-    ) -> None:
-        cur: str | None = node_key
-        while cur is not None:
-            row = self._nodes.get((context_key, cur))
-            if row is None:
-                return
-            row.visits += visits_delta
-            row.total_reward += reward_delta
-            cur = row.parent_key
-
 
 # ---------------------------------------------------------------------------
 # MCTS search policy
 # ---------------------------------------------------------------------------
 
 
-class TuningSearch(_PriorityHeap):
+class TuningSearch:
     """MCTS-style exhaustive priority search using UCB1 selection.
 
     Each candidate sits at some "tip" node in the search tree (the
@@ -297,7 +273,7 @@ class TuningSearch(_PriorityHeap):
     Disable a knob by passing ``float("inf")`` (budget / coverage) or
     a very large int (patience)."""
 
-    UCB_C = 1.0  # exploration constant; lower than √2 because we already count expansions as visits.
+    UCB_C = math.sqrt(2)  # canonical UCB1 exploration constant.
     # Score-gap below which an unvisited sibling is dropped from the
     # expansion frontier (see ``_ucb_walk``). 1.0 spans roughly one of the
     # graduated penalties in ``TileOp.score`` — e.g. CTA-count or
@@ -308,15 +284,17 @@ class TuningSearch(_PriorityHeap):
     def __init__(
         self,
         tree: SearchTree | None = None,
-        context_key: str | None = None,
         *,
         db: SearchDB | None = None,
         budget_s: float = 60.0,
         patience: int = 20,
         min_coverage: float = 0.3,
     ) -> None:
-        super().__init__(context_key, db=db)
+        self._db = db if db is not None else SearchDB()
         self._tree = tree if tree is not None else SearchTree()
+        # Latched lazily on the first ``push`` — the engine never spawns
+        # a tuning sweep across mixed contexts so one key per process is fine.
+        self._context_key: str | None = None
         self._budget_s = budget_s
         self._patience = patience
         self._min_coverage = min_coverage
@@ -335,6 +313,14 @@ class TuningSearch(_PriorityHeap):
         # Root of the search tree, latched on first push so the per-pop
         # UCB walk starts at the right place.
         self._root_key: str | None = None
+        # FIFO fallback queue for candidates whose tip op_cache_key is
+        # missing (no kernel-bearing op in the graph yet) and for the
+        # final drain when ``_by_tip`` is empty.
+        self._fallback: deque[Candidate] = deque()
+
+    @property
+    def db(self) -> SearchDB:
+        return self._db
 
     @property
     def tree(self) -> SearchTree:
@@ -355,9 +341,9 @@ class TuningSearch(_PriorityHeap):
         self._push_one(c)
 
     def _push_one(self, c: Candidate) -> None:
+        ckey = c.ctx.structural_key()
         if self._context_key is None:
-            self._context_key = c.ctx.structural_key()
-        ckey = self._ckey(c)
+            self._context_key = ckey
         # If this is the candidate we just popped being pushed back
         # mid-rollout (engine advanced it by one rule), keep it as the
         # outstanding rollout. Otherwise it's a fork sibling — file it
@@ -367,9 +353,8 @@ class TuningSearch(_PriorityHeap):
             return
         tip_key = self._tip_key(c.graph, ckey)
         if tip_key is None:
-            # No tip — keep on the legacy heap as a fallback (rare).
-            self._seq += 1
-            heapq.heappush(self._heap, (0.0, -self._seq, c))
+            # No tip — keep on the FIFO fallback queue (rare).
+            self._fallback.append(c)
             return
         self._by_tip.setdefault(tip_key, []).append(c)
         # Latch the search tree's root the first time we see one.
@@ -408,8 +393,8 @@ class TuningSearch(_PriorityHeap):
     def _fallback_pop(self) -> Candidate | None:
         """When the UCB walk has nothing to match (root unknown, all
         frontiers exhausted, etc.), drain the by-tip dict in arbitrary
-        order, then the legacy heap. Keeps the search complete even when
-        the tree-walk selector can't find a target."""
+        order, then the FIFO fallback queue. Keeps the search complete
+        even when the tree-walk selector can't find a target."""
         for tip, cands in list(self._by_tip.items()):
             if cands:
                 c = cands.pop(0)
@@ -417,8 +402,8 @@ class TuningSearch(_PriorityHeap):
                     del self._by_tip[tip]
                 self._just_popped = c
                 return c
-        if self._heap:
-            c = heapq.heappop(self._heap)[2]
+        if self._fallback:
+            c = self._fallback.popleft()
             self._just_popped = c
             return c
         return None
@@ -453,28 +438,6 @@ class TuningSearch(_PriorityHeap):
 
     # -- UCB plumbing --------------------------------------------------
 
-    def _ucb_priority(self, context_key: str, tip_key: str | None) -> float:
-        """Heap-min priority key. Lower = pop first; ``-UCB1`` so higher
-        UCB pops earlier. Fresh frontier (no tree row, or row with zero
-        ``visits``) gets ``-inf`` — always pop first.
-
-        ``visits`` is the MCTS denominator (expansions + measurements),
-        not just measured leaves. That lets the search differentiate
-        "rule fired here, accumulating exploration" vs "untouched
-        sibling, still totally fresh"."""
-        if tip_key is None:
-            return 0.0
-        node = self._tree.node(context_key, tip_key)
-        if node is None or node.visits == 0:
-            return float("-inf")
-        mean = node.total_reward / node.visits
-        parent = self._tree.node(context_key, node.parent_key) if node.parent_key else None
-        parent_visits = parent.visits if parent and parent.visits > 0 else node.visits
-        import math  # noqa: PLC0415
-
-        exploration = self.UCB_C * math.sqrt(math.log(max(parent_visits, 1)) / max(node.visits, 1))
-        return -(mean + exploration)
-
     def _tip_key(self, graph, context_key: str) -> str | None:
         """The candidate's tip is its deepest kernel-bearing op in the
         search tree (most rule applications fired). For single-kernel
@@ -493,8 +456,6 @@ class TuningSearch(_PriorityHeap):
         (returning that node itself). Among unvisited siblings, the
         ``Op.score`` heuristic breaks the otherwise-arbitrary order so
         the MCTS bootstrap visits "well-shaped" candidates first."""
-        import math  # noqa: PLC0415
-
         cur = root_key
         # Cap to defend against a hypothetical cycle in the parent_key
         # graph. Real trees here are tens of levels deep at most.

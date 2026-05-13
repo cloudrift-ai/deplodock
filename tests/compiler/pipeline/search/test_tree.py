@@ -67,10 +67,11 @@ def test_record_terminal_bumps_visits_and_reward() -> None:
     tree.record_terminal("ctx", "a", reward=0.2, status="ok")
     a = tree.node("ctx", "a")
     root = tree.node("ctx", "root")
-    assert a.visits >= 1 and a.total_reward == 0.2
-    # Root saw +1 expansion (visits=1) + 1 terminal (visits=2).
-    assert root.visits >= 2
-    assert root.total_reward >= 0.2
+    assert a.visits == 1 and a.total_reward == 0.2
+    # Canonical MCTS: only terminals count as visits — expansion alone
+    # does not bump visits. Root has one terminal under it.
+    assert root.visits == 1
+    assert root.total_reward == 0.2
 
 
 def test_record_terminal_idempotent_for_same_leaf() -> None:

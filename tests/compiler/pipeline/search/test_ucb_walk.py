@@ -14,10 +14,9 @@ from deplodock.compiler.pipeline.search import TuningSearch
 from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 
-def _make_search(tree: SearchTree, context_key: str = "ctx") -> TuningSearch:
+def _make_search(tree: SearchTree) -> TuningSearch:
     return TuningSearch(
         tree=tree,
-        context_key=context_key,
         budget_s=float("inf"),
         patience=10**9,
         min_coverage=1.1,

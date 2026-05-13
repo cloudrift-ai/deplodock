@@ -5,16 +5,15 @@ from __future__ import annotations
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.policy.base import _PriorityHeap
 
 
-class GreedySearch(_PriorityHeap):
+class GreedySearch:
     """Stop at the first terminal candidate.
 
     ``push`` always enqueues exactly one candidate (either the primary
-    ``c`` or the DB-preferred fork) and drops the rest, so the heap
-    holds at most one item at any time. When the engine yields a
-    terminal without pushing it back, the next ``pop`` finds the heap
+    ``c`` or the DB-preferred fork) and drops the rest, so only a
+    single pending slot is ever needed. When the engine yields a
+    terminal without pushing it back, the next ``pop`` finds the slot
     empty and returns ``None``, ending the search.
 
     Used by ``run_pipeline`` for single-shot compiles. At every fork
@@ -35,16 +34,18 @@ class GreedySearch(_PriorityHeap):
     accounting, so :func:`record_terminal` skips the tree bump when it
     sees ``getattr(search, "tree", None) is None``."""
 
-    def __init__(self, context_key: str | None = None, *, db: SearchDB | None = None) -> None:
-        super().__init__(context_key, db=db)
+    def __init__(self, *, db: SearchDB | None = None) -> None:
+        self._db = db if db is not None else SearchDB()
         # parent_key → winning knob delta for this compile session.
         self._choices: dict[str, dict] = {}
+        self._pending: Candidate | None = None
+
+    @property
+    def db(self) -> SearchDB:
+        return self._db
 
     def push(self, c: Candidate, *forks: Candidate) -> None:
-        if not forks:
-            self._push(c)
-            return
-        self._push(self._select(c, forks))
+        self._pending = self._select(c, forks) if forks else c
 
     def _select(self, c: Candidate, forks: tuple[Candidate, ...]) -> Candidate:
         # Forks deep-copy the graph but preserve node IDs, so every
@@ -83,4 +84,5 @@ class GreedySearch(_PriorityHeap):
         return c
 
     def pop(self) -> Candidate | None:
-        return self._pop()
+        c, self._pending = self._pending, None
+        return c
