@@ -39,9 +39,9 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.pattern import Match, Pattern, Pipeline
+from deplodock.compiler.pipeline.pattern import Match, Pass, Pattern, Pipeline  # noqa: F401  (Pattern re-exported)
 from deplodock.compiler.pipeline.rule import Rule
-from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
+from deplodock.compiler.pipeline.rule_diff import display_name, emit, render_rule_diff
 from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.policy import GreedySearch, Search
@@ -272,22 +272,23 @@ def _make_apply_logger(
     """Build the ``Candidate.on_apply`` callback that renders a rule
     application's diff at debug / writes its dump record. Returns
     ``None`` when neither sink is active so ``Candidate.apply`` can
-    skip the hook entirely. ``rule_name`` comes from
-    ``Candidate.apply``; pipeline location comes from
-    ``match.pass_idx`` / ``match.pass_name`` (stamped by the search
-    loop after ``match_pattern``). One logger instance serves every
-    rule batch in the pipeline."""
+    skip the hook entirely. Rule + pass metadata is read off
+    ``match.rule`` (stamped by ``Pipeline.match``). One logger instance
+    serves every rule batch in the pipeline."""
     if not (debug_on or dump is not None):
         return None
 
-    def _on_apply(graph_before: Graph, rule_name: str, match: Match, option: Op | Graph) -> None:
+    def _on_apply(graph_before: Graph, match: Match, option: Op | Graph) -> None:
         fragment = _wrap_op_as_fragment(graph_before, match.root_node_id, option) if isinstance(option, Op) else option
+        rule = match.rule
+        pass_ = match.pass_
+        rule_name = rule.name if rule is not None else ""
         text = _format_rule_application(rule_name, graph_before, match, fragment, pass_name=match.pass_name)
         if debug_on:
             emit(text)
-        if dump is not None and match.pass_idx is not None and match.pass_name is not None:
+        if dump is not None and rule is not None and pass_ is not None and pass_.name:
             record = _record_rule_application(graph_before, match, fragment)
-            dump.on_rule(match.pass_idx, match.pass_name, rule_name, record, text)
+            dump.on_rule(pass_, rule, record, text)
 
     return _on_apply
 
@@ -303,15 +304,14 @@ def _search_loop(
     successor(s). Yields when a candidate reaches the end of the
     pipeline (``cursor.pass_idx >= pipeline.n_passes()``).
 
-    Per-rule batch semantics: enumerate matches via :func:`match_pattern`
-    (which stamps ``pipeline`` / ``pass_idx`` / ``rule_idx`` on each
-    Match plus ``is_last`` on the last live one), call
-    ``Candidate.try_rewrite`` for each. Single-option matches apply
-    inline; the first multi-option match spawns one ``LazyCandidate``
-    per option and breaks the loop. Cursor advance for the rule batch
-    is owned by ``Candidate.apply`` / ``_advance_batch``, fired on
-    ``match.is_last`` even when the rewrite skipped or yielded no
-    valid options."""
+    Per-rule batch semantics: enumerate matches via
+    :meth:`Pipeline.match` (which stamps ``rule`` on each Match plus
+    ``is_last`` on the last live one), call ``Candidate.try_rewrite``
+    for each. Single-option matches apply inline; the first multi-
+    option match spawns one ``LazyCandidate`` per option and breaks
+    the loop. Cursor advance for the rule batch is owned by
+    ``Candidate.apply`` / ``_advance_batch``, fired on ``match.is_last``
+    even when the rewrite skipped or yielded no valid options."""
     while (popped := search.pop()) is not None:
         cand = popped.resolve()
         cur = cand.cursor
@@ -324,20 +324,14 @@ def _search_loop(
             cur.pass_idx += 1
             search.push(cand.lazy())
             continue
-        matches = pipeline.match(cand.graph, cur.pass_idx, cur.rule_idx)
+        rule = pipeline.rule_at(cur.pass_idx, cur.rule_idx)
+        matches = pipeline.match(cand.graph, rule)
         if not matches:
             # No live matches → no apply will fire → advance the cursor
             # ourselves with a synthetic last-match sentinel so the
             # transition still flows through ``Candidate.apply`` /
             # ``_advance_batch``.
-            sentinel = Match(
-                graph=cand.graph,
-                root_node_id="",
-                pipeline=pipeline,
-                pass_idx=cur.pass_idx,
-                rule_idx=cur.rule_idx,
-                is_last=True,
-            )
+            sentinel = Match(graph=cand.graph, root_node_id="", rule=rule, is_last=True)
             cand._advance_if_last(sentinel)
             search.push(cand.lazy())
             continue
@@ -353,10 +347,7 @@ def _search_loop(
             # snapshot. The fork's apply on resolve advances the
             # cursor when ``match.is_last`` (the cursor advance the
             # eager loop didn't do here, since we deferred to forks).
-            forks = [
-                LazyCandidate(inner=cand, cursor=replace(cur), chain=[(match, opt)])
-                for opt in options
-            ]
+            forks = [LazyCandidate(inner=cand, cursor=replace(cur), chain=[(match, opt)]) for opt in options]
             break
 
         if forks is not None:
@@ -432,8 +423,10 @@ def run_autotune(
     if ctx.backend_name != backend_name:
         ctx = replace(ctx, backend_name=backend_name)
     select_set = set(select) if select is not None else None
-    rules_per_pass = [_filter_rules(_load_rules(_PASSES_DIR / name), select_set) for name in passes]
-    pipeline = Pipeline(passes=list(passes), rules_per_pass=rules_per_pass)
+    pass_list = [
+        Pass(name=name, rules=_filter_rules(_load_rules(_PASSES_DIR / name), select_set), index=i) for i, name in enumerate(passes)
+    ]
+    pipeline = Pipeline(passes=pass_list)
     t_start = time.monotonic()
 
     # The on_apply hook (debug diff + dump.on_rule) propagates from the
@@ -442,10 +435,10 @@ def run_autotune(
     # loop never has to (re)install it.
     on_apply = _make_apply_logger(debug_on=logger.isEnabledFor(logging.DEBUG), dump=dump)
 
-    def on_pass_finish(pass_idx: int, pass_name: str, graph_after: Graph) -> None:
-        logger.debug("compile: %-18s done (%d nodes)", pass_name, len(graph_after.nodes))
+    def on_pass_finish(pass_: Pass, graph_after: Graph) -> None:
+        logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(graph_after.nodes))
         if dump is not None:
-            dump.on_pass(pass_idx, pass_name, graph_after)
+            dump.on_pass(pass_, graph_after)
 
     search.push(Candidate(ctx=ctx, graph=graph, on_apply=on_apply, on_pass_finish=on_pass_finish).lazy())
 

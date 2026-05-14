@@ -1,5 +1,6 @@
-"""Pattern matcher value types — ``Pattern``, ``Match``, ``match_pattern``,
-plus :class:`Pipeline`, the per-run description of pass + rule layout.
+"""Pattern matcher value types — ``Pattern``, ``Match``, plus
+:class:`Pass` and :class:`Pipeline`, the per-run description of pass +
+rule layout.
 
 Lives in its own module so the engine *and* the search policies can
 both import these without cycling. ``engine.py`` owns the rule-loader
@@ -29,53 +30,65 @@ class Pattern:
     constraints: dict = field(default_factory=dict)
 
 
+@dataclass
+class Pass:
+    """One pipeline pass: a named, indexed list of rules.
+
+    * ``name`` — pass directory name (e.g. ``"frontend/decomposition"``),
+      or ``""`` for empty / nameless pass slots (early-exit stubs).
+    * ``rules`` — the rules in this pass, in load order.
+    * ``index`` — 0-based position in the pipeline.
+
+    Stamps each rule's ``pass_`` backref on construction so a ``Match``
+    that carries a ``Rule`` can resolve pass metadata without holding a
+    separate index.
+    """
+
+    name: str
+    rules: list[Rule]
+    index: int = 0
+
+    def __post_init__(self) -> None:
+        for r in self.rules:
+            r.pass_ = self
+
+
 @dataclass(frozen=True)
 class Pipeline:
-    """Frozen per-run layout of the rewrite pipeline: pass directory
-    names and the rules in each pass. Constructed once per
-    ``run_autotune`` call and threaded onto every :class:`Match` so
-    rule / pass metadata has a single source of truth instead of
-    being re-stamped on each match.
-
-    ``passes`` may include ``""`` placeholders for empty / nameless
-    pass slots (e.g. early-exit stubs); :meth:`pass_name` returns
-    ``None`` for those so dump bookkeeping skips them.
+    """Frozen per-run layout of the rewrite pipeline. Constructed once
+    per ``run_autotune`` call and reached from every :class:`Match` via
+    ``match.rule.pass_``.
 
     :meth:`match` is the only entry point for pattern matching: it
-    locates the rule via ``(pass_idx, rule_idx)``, walks the graph,
-    and stamps every Match with this Pipeline + indices so callers
-    can derive rule / pass metadata. Tests / standalone callers that
-    just want pattern matching can build a one-rule Pipeline via
-    :meth:`from_pattern`."""
+    walks the graph for one rule and stamps the rule onto every Match.
+    Tests / standalone callers that just want pattern matching can
+    build a one-rule Pipeline via :meth:`from_pattern`."""
 
-    passes: list[str]
-    rules_per_pass: list[list[Rule]]
+    passes: list[Pass]
 
-    def rule(self, pass_idx: int, rule_idx: int) -> Rule:
-        return self.rules_per_pass[pass_idx][rule_idx]
+    def rule_at(self, pass_idx: int, rule_idx: int) -> Rule:
+        return self.passes[pass_idx].rules[rule_idx]
 
-    def pass_name(self, pass_idx: int) -> str | None:
-        return self.passes[pass_idx] or None
+    def pass_at(self, pass_idx: int) -> Pass:
+        return self.passes[pass_idx]
 
     def n_rules(self, pass_idx: int) -> int:
-        return len(self.rules_per_pass[pass_idx])
+        return len(self.passes[pass_idx].rules)
 
     def n_passes(self) -> int:
         return len(self.passes)
 
-    def match(self, graph: Graph, pass_idx: int, rule_idx: int) -> list[Match]:
-        """Enumerate every live pattern match for the rule at
-        ``(pass_idx, rule_idx)`` against ``graph``. Stamps
-        ``is_last=True`` on the last surviving match so the rewriter
-        knows which apply closes out the rule batch (cursor advance
-        flows through ``Candidate.try_rewrite`` /
+    def match(self, graph: Graph, rule: Rule) -> list[Match]:
+        """Enumerate every live pattern match for ``rule`` against
+        ``graph``. Stamps ``is_last=True`` on the last surviving match
+        so the rewriter knows which apply closes out the rule batch
+        (cursor advance flows through ``Candidate.try_rewrite`` /
         ``Candidate.apply``). Drops matches that fail
         :meth:`Match.is_alive` — an earlier match in the same batch
         may have removed a consumed node."""
-        pattern = self.rule(pass_idx, rule_idx).pattern
         results: list[Match] = []
         for nid in graph.topological_order():
-            m = _match_at(graph, nid, pattern, self, pass_idx, rule_idx)
+            m = _match_at(graph, nid, rule)
             if m is not None and m.is_alive():
                 results.append(m)
         if results:
@@ -88,7 +101,8 @@ class Pipeline:
         Pipeline whose only rule wraps ``pattern`` (no ``rewrite``).
         Lets pattern-matching tests drive :meth:`match` without
         setting up the full engine pipeline."""
-        return cls(passes=["__test__"], rules_per_pass=[[Rule(name="__test__", pattern=pattern)]])
+        rule = Rule(name="__test__", pattern=pattern)
+        return cls(passes=[Pass(name="__test__", rules=[rule], index=0)])
 
 
 @dataclass
@@ -103,14 +117,13 @@ class Match:
     redirected to. ``output`` defaults to ``root_node_id`` when left
     as ``None``.
 
-    ``pipeline`` + ``pass_idx`` + ``rule_idx`` locate this match in
-    the run's pipeline so the rewriter can derive ``rule`` /
-    ``rule_name`` / ``pass_name`` / ``n_rules`` from one source.
-    Set by :meth:`Pipeline.match` at construction time (use
-    :meth:`Pipeline.from_pattern` to build a one-rule Pipeline for
-    standalone / test callers). ``is_last`` is stamped on the last
-    live match returned by :meth:`Pipeline.match` so
-    ``Candidate.try_rewrite`` knows when to advance the cursor.
+    ``rule`` locates this match in the run's pipeline so the rewriter
+    can derive ``rule_name`` / ``pass_name`` / ``n_rules`` /
+    ``pass_idx`` from one source. Set by :meth:`Pipeline.match` at
+    construction time (use :meth:`Pipeline.from_pattern` to build a
+    one-rule Pipeline for standalone / test callers). ``is_last`` is
+    stamped on the last live match returned by :meth:`Pipeline.match`
+    so ``Candidate.try_rewrite`` knows when to advance the cursor.
 
     Use the helpers (``root``, ``node()``, ``input()``, ``is_alive()``)
     to resolve ids to ``Node`` objects through ``graph`` — they're the
@@ -119,9 +132,7 @@ class Match:
 
     graph: Graph
     root_node_id: str
-    pipeline: Pipeline | None = None
-    pass_idx: int = 0
-    rule_idx: int = 0
+    rule: Rule | None = None
     nodes: dict[str, str] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
     output: str | None = None
@@ -134,27 +145,27 @@ class Match:
     _identities: dict[str, int] = field(default_factory=dict, repr=False)
 
     @property
-    def rule(self) -> Rule | None:
-        if self.pipeline is None:
-            return None
-        return self.pipeline.rule(self.pass_idx, self.rule_idx)
+    def rule_name(self) -> str | None:
+        return self.rule.name if self.rule is not None else None
 
     @property
-    def rule_name(self) -> str | None:
-        rule = self.rule
-        return rule.name if rule is not None else None
+    def pass_(self) -> Pass | None:
+        return self.rule.pass_ if self.rule is not None else None
 
     @property
     def pass_name(self) -> str | None:
-        if self.pipeline is None:
-            return None
-        return self.pipeline.pass_name(self.pass_idx)
+        p = self.pass_
+        return (p.name or None) if p is not None else None
+
+    @property
+    def pass_idx(self) -> int | None:
+        p = self.pass_
+        return p.index if p is not None else None
 
     @property
     def n_rules(self) -> int:
-        if self.pipeline is None:
-            return 0
-        return self.pipeline.n_rules(self.pass_idx)
+        p = self.pass_
+        return len(p.rules) if p is not None else 0
 
     @property
     def root(self) -> Node:
@@ -197,9 +208,7 @@ class Match:
         return Match(
             graph=graph,
             root_node_id=self.root_node_id,
-            pipeline=self.pipeline,
-            pass_idx=self.pass_idx,
-            rule_idx=self.rule_idx,
+            rule=self.rule,
             nodes=dict(self.nodes),
             consumed=set(self.consumed),
             output=self.output,
@@ -208,19 +217,12 @@ class Match:
         )
 
 
-def _match_at(
-    graph: Graph,
-    start: str,
-    pattern: list[Pattern],
-    pipeline: Pipeline | None,
-    pass_idx: int,
-    rule_idx: int,
-) -> Match | None:
+def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
     cursor: str | None = start
     nodes: dict[str, str] = {}
     consumed: set[str] = set()
     identities: dict[str, int] = {}
-    for prod in pattern:
+    for prod in rule.pattern:
         if cursor is None:
             return None
         node = graph.nodes.get(cursor)
@@ -235,9 +237,7 @@ def _match_at(
     return Match(
         graph=graph,
         root_node_id=start,
-        pipeline=pipeline,
-        pass_idx=pass_idx,
-        rule_idx=rule_idx,
+        rule=rule,
         nodes=nodes,
         consumed=consumed,
         _identities=identities,
@@ -253,4 +253,4 @@ def _sole_consumer(graph: Graph, nid: str) -> str | None:
     return consumers[0] if len(consumers) == 1 else None
 
 
-__all__ = ["Match", "Pattern", "Pipeline", "Rule"]
+__all__ = ["Match", "Pass", "Pattern", "Pipeline", "Rule"]

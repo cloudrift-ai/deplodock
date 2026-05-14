@@ -2,9 +2,8 @@
 
 - :mod:`.engine` — pattern matcher + rule plumbing. Exports
   ``Pattern``, ``Match``, ``Pipeline``, ``RuleSkipped``.
-  Pattern matching goes through ``Pipeline.match(graph, pass_idx,
-  rule_idx)``; tests can use ``Pipeline.from_pattern(...)`` for a
-  one-rule shim. Compilation drives through ``run_pipeline`` /
+  Pattern matching goes through ``Pipeline.match(graph, rule)``;
+  tests can use ``Pipeline.from_pattern(...)`` for a one-rule shim. Compilation drives through ``run_pipeline`` /
   ``run_autotune`` for every caller — including tests — so the pass
   list is always explicit (``[name, ...]``) and the same greedy /
   autotune semantics apply everywhere.

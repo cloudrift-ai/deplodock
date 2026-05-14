@@ -27,7 +27,7 @@ _logger = logging.getLogger("deplodock.compiler.pipeline.engine")
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.base import Op
-    from deplodock.compiler.pipeline.pattern import Match
+    from deplodock.compiler.pipeline.pattern import Match, Pass
 
 
 @dataclass
@@ -51,7 +51,7 @@ class Cursor:
 
 
 ApplyCallback = Callable[["Graph", "Match", "Op | Graph"], None]
-PassFinishCallback = Callable[[int, str, Graph], None]
+PassFinishCallback = Callable[["Pass", Graph], None]
 
 
 @dataclass
@@ -153,7 +153,7 @@ class Candidate:
         from deplodock.compiler.ir.base import Op as _Op  # noqa: PLC0415
 
         if self.on_apply is not None:
-            self.on_apply(self.graph, match.rule_name or "", match, option)
+            self.on_apply(self.graph, match, option)
         if isinstance(option, _Op):
             old_op = self.graph.nodes[match.root_node_id].op
             if option is not old_op and option.source is None:
@@ -168,23 +168,24 @@ class Candidate:
 
     def _advance_if_last(self, match: Match) -> None:
         if match.is_last:
-            self._advance_batch(match.n_rules, match.pass_idx, match.pass_name)
+            self._advance_batch(match.pass_)
 
-    def _advance_batch(self, n_rules: int, pass_idx: int | None, pass_name: str | None) -> None:
+    def _advance_batch(self, pass_: Pass | None) -> None:
         """Move ``cursor.rule_idx`` past the just-finished rule batch.
         Wraps to the next pass (firing ``on_pass_finish``) when the
         scan completes with no functional rewrites; otherwise restarts
         the scan from rule 0 to apply newly-spawned matches."""
         cur = self.cursor
         cur.rule_idx += 1
+        n_rules = len(pass_.rules) if pass_ is not None else 0
         if cur.rule_idx < n_rules:
             return
         finished = cur.n_applied == 0
         cur.rule_idx = 0
         cur.n_applied = 0
         if finished:
-            if self.on_pass_finish is not None and pass_idx is not None and pass_name is not None:
-                self.on_pass_finish(pass_idx, pass_name, self.graph)
+            if self.on_pass_finish is not None and pass_ is not None and pass_.name:
+                self.on_pass_finish(pass_, self.graph)
             cur.pass_idx += 1
 
 

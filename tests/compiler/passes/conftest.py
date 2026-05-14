@@ -18,18 +18,18 @@ from deplodock.compiler.pipeline.engine import _strip_rule_prefix as strip_rule_
 class RecordingDump:
     """Minimal ``CompilerDump`` substitute that records fired rule names.
 
-    The engine calls ``on_rule(pass_idx, pass_name, rule_name, record, text)``
-    once per applied rewrite and ``on_pass(idx, name, graph)`` after each
-    pass. Only ``on_rule`` is interesting here; ``on_pass`` is a no-op.
+    The engine calls ``on_rule(pass_, rule, record, text)`` once per
+    applied rewrite and ``on_pass(pass_, graph)`` after each pass. Only
+    ``on_rule`` is interesting here; ``on_pass`` is a no-op.
     """
 
     def __init__(self) -> None:
         self.fired: list[tuple[str, str]] = []  # (pass_name, stripped_rule_name)
 
-    def on_rule(self, pass_idx, pass_name, rule_name, record, text) -> None:
-        self.fired.append((pass_name, strip_rule_prefix(rule_name)))
+    def on_rule(self, pass_, rule, record, text) -> None:
+        self.fired.append((pass_.name, strip_rule_prefix(rule.name)))
 
-    def on_pass(self, idx, pass_name, graph) -> None:
+    def on_pass(self, pass_, graph) -> None:
         pass
 
     def fired_rules(self, pass_name: str | None = None) -> set[str]:

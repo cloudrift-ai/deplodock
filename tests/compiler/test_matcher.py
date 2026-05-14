@@ -10,7 +10,8 @@ def _match(g: Graph, pattern: list[Pattern]):
     """Pattern-only matcher: build a one-rule ``Pipeline`` and ask it
     to match. Mirrors what the engine does without the rest of the
     rewrite plumbing."""
-    return Pipeline.from_pattern(pattern).match(g, 0, 0)
+    pipeline = Pipeline.from_pattern(pattern)
+    return pipeline.match(g, pipeline.rule_at(0, 0))
 
 
 def _simple_graph() -> Graph:

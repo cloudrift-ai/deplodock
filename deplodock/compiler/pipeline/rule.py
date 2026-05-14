@@ -2,12 +2,13 @@
 binding metadata for the engine's signature dispatcher.
 
 Lives in its own module so :mod:`pipeline.pattern` (which holds
-``Pipeline``, the engine-wide rule layout) and :mod:`pipeline.engine`
-(which loads rules off disk and runs their rewrites) share one
-definition without cycling through each other. Rules are loaded by
-``engine._load_rule`` from the ``passes/`` directory tree; tests can
-construct a one-rule ``Pipeline`` via :meth:`Pipeline.from_pattern`
-which uses a no-rewrite ``Rule`` to drive pure pattern matching.
+``Pass`` / ``Pipeline``, the engine-wide rule layout) and
+:mod:`pipeline.engine` (which loads rules off disk and runs their
+rewrites) share one definition without cycling through each other.
+Rules are loaded by ``engine._load_rule`` from the ``passes/`` directory
+tree; tests can construct a one-rule ``Pipeline`` via
+:meth:`Pipeline.from_pattern` which uses a no-rewrite ``Rule`` to drive
+pure pattern matching.
 """
 
 from __future__ import annotations
@@ -19,10 +20,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.ir.base import Op
-    from deplodock.compiler.pipeline.pattern import Pattern
+    from deplodock.compiler.pipeline.pattern import Pass, Pattern
 
 
-@dataclass(frozen=True)
+@dataclass
 class Rule:
     """One rewrite rule loaded from a ``passes/<dir>/NNN_<name>.py``
     module.
@@ -46,12 +47,17 @@ class Rule:
       - anything else — bound positionally to the input ``Node`` at
         slot ``i``, ``None`` past the input count or for deleted
         source nodes.
+
+    * ``pass_`` — backref to the owning ``Pass``. Stamped by ``Pass``
+      at construction time; ``None`` only on stray ``Rule`` instances
+      built outside a pipeline (none exist in production paths).
     """
 
     name: str
     pattern: list[Pattern]
     rewrite: Callable[..., Graph | Op | None] | None = None
     param_names: tuple[str, ...] = field(default_factory=tuple)
+    pass_: Pass | None = field(default=None, repr=False, compare=False)
 
 
 __all__ = ["Rule"]
