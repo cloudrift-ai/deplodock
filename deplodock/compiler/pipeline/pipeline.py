@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.search.db import SearchDB
     from deplodock.compiler.pipeline.search.policy import Search
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("deplodock.compiler.pipeline")
 
 
 _PASSES_DIR = Path(__file__).resolve().parent / "passes"
@@ -259,6 +259,68 @@ class Match:
         )
 
 
+@dataclass
+class Cursor:
+    """Pipeline resume state for a candidate. Owns the entire advance
+    logic: ``advance(graph)`` moves past the current rule batch,
+    wrapping to the next pass — logging "compile: <pass> done" and
+    flushing ``pipeline.dump.on_pass`` — when the scan completes with
+    no functional rewrites.
+
+    * ``pipeline`` — the pipeline being driven; needed to look up the
+      current pass / rule by index.
+    * ``pass_idx`` — index of the pass to apply next.
+    * ``rule_idx`` — index of the rule within the current pass to try
+      next.
+    * ``n_applied`` — number of functional rewrites in the current
+      pass scan. When ``rule_idx`` wraps past the last rule with this
+      counter ``> 0``, the engine restarts the scan (changes happened);
+      with the counter ``== 0``, the engine advances to the next pass.
+    """
+
+    pipeline: Pipeline
+    pass_idx: int = 0
+    rule_idx: int = 0
+    n_applied: int = 0
+
+    @property
+    def is_done(self) -> bool:
+        return self.pass_idx >= len(self.pipeline.passes)
+
+    @property
+    def current_pass(self) -> Pass:
+        assert not self.is_done, f"cursor is done (pass_idx={self.pass_idx} >= {len(self.pipeline.passes)})"
+        return self.pipeline.passes[self.pass_idx]
+
+    @property
+    def current_rule(self) -> Rule:
+        pass_ = self.current_pass
+        assert self.rule_idx < len(pass_.rules), f"rule_idx={self.rule_idx} out of range for pass {pass_.name!r} ({len(pass_.rules)} rules)"
+        return pass_.rules[self.rule_idx]
+
+    def advance(self, graph: Graph) -> None:
+        """Move past the just-finished rule batch. Wraps to the next
+        pass (logging done + flushing ``pipeline.dump.on_pass``) when
+        the scan completes with no functional rewrites; otherwise
+        restarts the scan from rule 0 to apply newly-spawned matches.
+        ``graph`` is the candidate's current graph — passed in so the
+        on-pass dump and node-count debug line have something to
+        report. Raises if the cursor is already done."""
+        pass_ = self.current_pass  # asserts not is_done
+        self.rule_idx += 1
+        if self.rule_idx < len(pass_.rules):
+            return
+        finished = self.n_applied == 0
+        self.rule_idx = 0
+        self.n_applied = 0
+        if finished:
+            if pass_.name:
+                logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(graph.nodes))
+                if self.pipeline.dump is not None:
+                    self.pipeline.dump.on_pass(pass_, graph)
+            self.pass_idx += 1
+
+
 @dataclass(frozen=True)
 class Pipeline:
     """Frozen per-run layout of the rewrite pipeline.
@@ -332,24 +394,21 @@ class Pipeline:
         while (popped := search.pop()) is not None:
             cand = popped.resolve()
             cur = cand.cursor
-            if cur.pass_idx >= len(self.passes):
+            if cur.is_done:
                 yield cand
                 continue
-            pass_ = self.passes[cur.pass_idx]
+            pass_ = cur.current_pass
             # Empty pass (e.g. all rules filtered out): nothing to do, skip.
             if not pass_.rules:
                 cur.pass_idx += 1
                 search.push(cand.lazy())
                 continue
-            rule = pass_.rules[cur.rule_idx]
-            matches = self.match(cand.graph, rule)
+            matches = self.match(cand.graph, cur.current_rule)
             if not matches:
-                # No live matches → no apply will fire → advance the cursor
-                # ourselves with a synthetic last-match sentinel so the
-                # transition still flows through ``Candidate.apply`` /
-                # ``_advance_batch``.
-                sentinel = Match(graph=cand.graph, root_node_id="", pipeline=self, rule=rule, is_last=True)
-                cand._advance_if_last(sentinel)
+                # No live matches → no apply fires → advance the cursor
+                # directly so the search loop doesn't re-pop the same
+                # rule batch forever.
+                cur.advance(cand.graph)
                 search.push(cand.lazy())
                 continue
 
@@ -436,7 +495,7 @@ class Pipeline:
             ctx = dc_replace(ctx, backend_name=backend_name)
         t_start = time.monotonic()
 
-        search.push(_Candidate(ctx=ctx, graph=graph).lazy())
+        search.push(_Candidate(ctx=ctx, graph=graph, cursor=Cursor(pipeline=self)).lazy())
 
         tree = getattr(search, "tree", None)
         if db is None:

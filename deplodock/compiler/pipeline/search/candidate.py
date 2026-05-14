@@ -13,13 +13,14 @@ once, replay the chain of ``(match, option)`` pairs through
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
+from deplodock.compiler.pipeline.pipeline import Cursor
 from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-
@@ -29,26 +30,6 @@ _logger = logging.getLogger("deplodock.compiler.pipeline")
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.pipeline import Match
-
-
-@dataclass
-class Cursor:
-    """Pipeline resume state for a candidate.
-
-    * ``pass_idx`` — index of the pass to apply next.
-    * ``rule_idx`` — index of the rule within the current pass to try next.
-    * ``n_applied`` — number of functional rewrites in the current
-      pass scan. When ``rule_idx`` wraps past the last rule with this
-      counter ``> 0``, the engine restarts the scan (changes happened);
-      with the counter ``== 0``, the engine advances to the next pass.
-
-    The advance/wrap/pass-step logic lives in :meth:`Candidate.apply`
-    (driven by ``match.is_last``) so eager and lazy candidates
-    transition through the cursor states the same way."""
-
-    pass_idx: int = 0
-    rule_idx: int = 0
-    n_applied: int = 0
 
 
 @dataclass
@@ -67,7 +48,7 @@ class Candidate:
 
     ctx: Context
     graph: Graph
-    cursor: Cursor = field(default_factory=Cursor)
+    cursor: Cursor
 
     def resolve(self) -> Candidate:
         """Identity — already concrete. Provided so callers can resolve
@@ -183,29 +164,7 @@ class Candidate:
 
     def _advance_if_last(self, match: Match) -> None:
         if match.is_last:
-            self._advance_batch(match)
-
-    def _advance_batch(self, match: Match) -> None:
-        """Move ``cursor.rule_idx`` past the just-finished rule batch.
-        Wraps to the next pass (logging done + flushing ``pipeline.dump.on_pass``)
-        when the scan completes with no functional rewrites; otherwise
-        restarts the scan from rule 0 to apply newly-spawned matches."""
-        pass_ = match.rule.pass_ if match.rule is not None else None
-        cur = self.cursor
-        cur.rule_idx += 1
-        n_rules = len(pass_.rules) if pass_ is not None else 0
-        if cur.rule_idx < n_rules:
-            return
-        finished = cur.n_applied == 0
-        cur.rule_idx = 0
-        cur.n_applied = 0
-        if finished:
-            if pass_ is not None and pass_.name:
-                _logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(self.graph.nodes))
-                pipeline = match.pipeline
-                if pipeline is not None and pipeline.dump is not None:
-                    pipeline.dump.on_pass(pass_, self.graph)
-            cur.pass_idx += 1
+            self.cursor.advance(self.graph)
 
 
 @dataclass
