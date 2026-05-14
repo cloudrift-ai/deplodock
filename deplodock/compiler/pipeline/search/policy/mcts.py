@@ -1,6 +1,6 @@
 """MCTS-style exhaustive priority search using UCB1 selection.
 
-Used by ``deplodock compile --tune``. Each candidate sits at some
+Used by ``deplodock tune``. Each candidate sits at some
 "tip" node in the search tree (the ``op_cache_key`` of the most
 recently rewritten kernel-bearing op); pop ordering is driven by a
 UCB1 walk over the in-memory :class:`SearchTree` rooted at the first
@@ -37,6 +37,7 @@ def _lazy_tip(c: LazyCandidate) -> tuple[Match, object] | None:
     rewrite that defines the fork's tip. Returns ``None`` when the
     chain is empty (the fork has already been resolved)."""
     return c.chain[-1] if c.chain else None
+
 
 # ---------------------------------------------------------------------------
 # In-memory MCTS tree
@@ -359,7 +360,7 @@ class TuningSearch(Search):
 
     Tips not yet in the tree (fresh frontier) get ``priority = -∞`` so
     they're always popped first — the algorithm explores once before
-    exploiting. Used by ``deplodock compile --tune`` so the sweep
+    exploiting. Used by ``deplodock tune`` so the sweep
     drifts toward promising subtrees while still covering the space.
 
     Two-phase selection. The first ``N_BOOTSTRAP`` rollouts skip UCB

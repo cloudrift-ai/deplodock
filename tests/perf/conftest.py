@@ -128,7 +128,7 @@ def bench_pair(request):
 
     def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow | None:
         if _tune_enabled():
-            # Tune-only path: run ``deplodock compile --tune`` per case to
+            # Tune-only path: run ``deplodock tune`` per case to
             # populate the autotune DB. Measurement is skipped entirely —
             # run ``make bench-kernels-tuned`` afterwards to measure with
             # the tuned knobs. Search runs until patience or tree
@@ -147,7 +147,7 @@ def bench_pair(request):
 
 def _tune_enabled() -> bool:
     """``DEPLODOCK_TUNE=1`` enables the tune-only path: each case spawns
-    ``deplodock compile --tune`` to populate the autotune DB
+    ``deplodock tune`` to populate the autotune DB
     (``DEPLODOCK_TUNE_DB``). The bench step is skipped — re-run the suite
     without ``DEPLODOCK_TUNE`` (e.g. ``make bench-kernels-tuned``) to
     measure with the tuned knobs."""
@@ -155,16 +155,15 @@ def _tune_enabled() -> bool:
 
 
 def _tune_via_subprocess(case: Case) -> None:
-    """Spawn ``deplodock compile --tune`` for one case. Writes knob
+    """Spawn ``deplodock tune`` for one case. Writes knob
     measurements to ``DEPLODOCK_TUNE_DB`` and exits — no bench is run."""
     cmd = [
         sys.executable,
         "-m",
         "deplodock.deplodock",
-        "compile",
+        "tune",
         "--code",
         case.code,
-        "--tune",
         "-v",
     ]
     env = dict(os.environ)

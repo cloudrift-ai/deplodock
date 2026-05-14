@@ -17,8 +17,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import Pipeline, TILE_PASSES, TuningSearch
-from deplodock.compiler.ir.base import Op
+from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 

@@ -112,7 +112,7 @@ rules — they're shared helpers for the pass's rule modules.
   `op_cache_key`: a previously-measured winner gets picked over option
   0; otherwise option 0 — the rule's heuristic-first ordering — wins.
   Decisions are memoized per compile so repeated parent keys don't
-  hit the DB) and `TuningSearch` (used by `--tune`; runs the queue
+  hit the DB) and `TuningSearch` (used by `deplodock tune`; runs the queue
   dry, exploring every fork). Both rank candidates by
   remaining unmeasured ops (DFS-equivalent on a fresh DB). The greedy
   stop is self-detected by the search: `pop` returns `None` when the

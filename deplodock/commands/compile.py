@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,8 +48,8 @@ _DEFAULT_PASSES = LOOP_PASSES
 _PASS_SHORTCUTS = {short: full for full, short in PASS_SHORTHAND.items()}
 
 
-def register_compile_command(subparsers):
-    parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
+def add_input_args(parser) -> None:
+    """Register the model/IR input arguments shared by ``compile`` and ``tune``."""
     parser.add_argument("input", nargs="?", help="HuggingFace model ID or .json IR file. Mutually exclusive with --code.")
     parser.add_argument(
         "--code",
@@ -74,67 +73,15 @@ def register_compile_command(subparsers):
         default=32,
         help="Sequence length for full-model tracing (default: 32).",
     )
-    parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
-    parser.add_argument(
-        "--tune",
-        action="store_true",
-        help=(
-            "Bench every CudaOp produced by the pipeline via CudaBackend, attribute per-kernel "
-            "latency (microseconds) to every ancestor along Op.source (CudaOp/KernelOp/TileOp/LoopOp), "
-            "and write the rows to the tuning cache. Forces --ir cuda."
-        ),
-    )
-    parser.add_argument(
-        "--tune-db",
-        default=None,
-        help=(
-            "Path to the tuning SQLite cache. Falls back to ``DEPLODOCK_TUNE_DB`` env var, "
-            "then to ~/.cache/deplodock/autotune.db when --tune is set."
-        ),
-    )
-    parser.add_argument(
-        "--tune-patience",
-        type=int,
-        default=20,
-        help=(
-            "Stop after this many consecutive measured variants haven't beaten the current "
-            "best latency. Honored only after --tune-min-coverage is reached. Default: 20."
-        ),
-    )
-    parser.add_argument(
-        "--tune-min-coverage",
-        type=float,
-        default=0.3,
-        help=(
-            "Patience-based early stop is suppressed until this fraction of the autotune "
-            "tree is explored. Default: 0.3 (30%%). Set to 1.0 to disable patience."
-        ),
-    )
 
     from deplodock.compiler.target import add_target_arg
 
     add_target_arg(parser)
-    parser.add_argument(
-        "--ir",
-        choices=list(_IR_STAGES),
-        default="cuda",
-        help=(
-            "IR stage to print to stdout (or ``--output``) — defaults to "
-            "``cuda`` (the final lowered stage). Use a lower stage like "
-            "``loop`` / ``tile`` / ``kernel`` to inspect intermediate IRs."
-        ),
-    )
-    parser.add_argument(
-        "--passes",
-        default=None,
-        help=(
-            "Pass list to override the default. Accepts either a comma-separated list "
-            "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
-            "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
-            "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
-        ),
-    )
+
+
+def add_diagnostics_args(parser) -> None:
+    """Register the ``-v`` / diff-rendering args shared by ``compile`` and ``tune``."""
     parser.add_argument(
         "-v",
         "--verbose",
@@ -169,6 +116,57 @@ def register_compile_command(subparsers):
         default=200,
         help="If a single rule's -vv diff exceeds N lines, fall back to full before/after (default: 200).",
     )
+
+
+def setup_pipeline_runtime(args) -> None:
+    """Apply verbosity, diff-render config, and target overrides from parsed args."""
+    from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
+    from deplodock.compiler.target import apply_target_arg
+
+    verbose = getattr(args, "verbose", 0)
+    if verbose == 0:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif verbose == 1:
+        logging.getLogger().setLevel(logging.INFO)
+    else:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    set_config(
+        RuleRenderConfig(
+            color=should_use_color(sys.stdout, args.color),
+            context=args.diff_context,
+            max_lines=args.diff_max_lines,
+        )
+    )
+
+    apply_target_arg(args)
+
+
+def register_compile_command(subparsers):
+    parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
+    add_input_args(parser)
+    parser.add_argument("--output", "-o", help="Output path for compiled IR")
+    parser.add_argument(
+        "--ir",
+        choices=list(_IR_STAGES),
+        default="cuda",
+        help=(
+            "IR stage to print to stdout (or ``--output``) — defaults to "
+            "``cuda`` (the final lowered stage). Use a lower stage like "
+            "``loop`` / ``tile`` / ``kernel`` to inspect intermediate IRs."
+        ),
+    )
+    parser.add_argument(
+        "--passes",
+        default=None,
+        help=(
+            "Pass list to override the default. Accepts either a comma-separated list "
+            "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
+            "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
+            "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
+        ),
+    )
+    add_diagnostics_args(parser)
     parser.set_defaults(func=handle_compile)
 
 
@@ -180,106 +178,23 @@ def handle_compile(args):
         logger.error("either a positional model ID / IR file or --code is required")
         sys.exit(2)
 
-    # Map -v / -vv to root log level. Default: WARNING (only the requested
-    # IR is printed; pass / rule timings emitted at INFO are suppressed).
-    # -v → INFO (today's pass + rule timings). -vv → DEBUG (per-rule
-    # snapshot emission in `_apply_rules`).
-    verbose = getattr(args, "verbose", 0)
-    if verbose == 0:
-        logging.getLogger().setLevel(logging.WARNING)
-    elif verbose == 1:
-        logging.getLogger().setLevel(logging.INFO)
-    else:
-        logging.getLogger().setLevel(logging.DEBUG)
-
     from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
-    from deplodock.compiler.target import apply_target_arg
 
-    set_config(
-        RuleRenderConfig(
-            color=should_use_color(sys.stdout, args.color),
-            context=args.diff_context,
-            max_lines=args.diff_max_lines,
-        )
-    )
-
-    apply_target_arg(args)
-    passes = _resolve_passes(args)
-    graph, base_name = _load_or_trace(args)
+    setup_pipeline_runtime(args)
+    passes = resolve_passes(args)
+    graph, _ = load_or_trace(args)
     initial_count = len(graph.nodes)
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
         dump.dump_input_graph(graph)
 
-    backend = None
-    if args.tune:
-        if passes != CUDA_PASSES:
-            logger.info("--tune forces --ir cuda (overriding %r)", args.ir)
-            passes = CUDA_PASSES
-            args.ir = "cuda"
-        from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search import SearchDB  # noqa: PLC0415
-
-        # 10 s wall budget on each variant's bench. Backstops the
-        # in-process per-launch/per-iter watchdogs: if a kernel keeps
-        # the GPU busy past those, the subprocess worker is SIGKILLed
-        # and the dirty stream dies with it — the next bench respawns
-        # cleanly. Without this the autotune sweep wedges on the
-        # variant after a bench_fail (see ``benchmark_program_isolated``).
-        backend = CudaBackend(bench_wall_timeout_s=10.0)
-        db_override = args.tune_db or os.environ.get("DEPLODOCK_TUNE_DB")
-        db_path = Path(db_override) if db_override else Path.home() / ".cache" / "deplodock" / "autotune.db"
-        db = SearchDB(path=db_path)
-        logger.info("Tuning DB: %s", db_path)
-
-    if args.tune:
-        import os as _os  # noqa: PLC0415
-        import time as _time  # noqa: PLC0415
-
-        from deplodock.compiler.pipeline import Pipeline, TuningSearch  # noqa: PLC0415
-
-        search = TuningSearch(
-            db=db,
-            patience=args.tune_patience,
-            min_coverage=args.tune_min_coverage,
-        )
-        t0 = _time.monotonic()
-        candidates: list = []
-        try:
-            for cand in Pipeline.build(passes, dump=dump).tune(graph, search=search, backend=backend, db=db):
-                candidates.append(cand)
-        except KeyboardInterrupt:
-            # Manual abort: cut the sweep, fall through to summary + best-pick.
-            search.stop("interrupted (Ctrl-C)")
-            sys.stderr.write("\n[tune] interrupted (Ctrl-C) — printing partial results\n")
-        except RuntimeError as exc:
-            # An autotune-internal raise (bench watchdog couldn't bail
-            # in time because the GPU queue is saturated). The CUDA
-            # stream is dirty — bypass Python cleanup so cupy's atexit
-            # doesn't deadlock on the still-running launch.
-            sys.stderr.write(f"\n[tune] aborted: {exc}\n")
-            sys.stdout.flush()
-            sys.stderr.flush()
-            _os._exit(1)
-        elapsed = _time.monotonic() - t0
-        reason = search.stop_reason or "tree exhausted"
-        sys.stderr.write(f"\n[tune] stopped: {reason} after {len(candidates)} variant(s) in {elapsed:.1f}s\n")
-        if not candidates:
-            sys.stderr.write("[tune] no candidates produced — exiting without output\n")
-            sys.stdout.flush()
-            sys.stderr.flush()
-            _os._exit(0)
-        result = _pick_best_candidate(candidates, db).graph
-        _print_tune_summary(candidates, db)
-    else:
-        result = Pipeline.build(passes, dump=dump).run(graph)
+    result = Pipeline.build(passes, dump=dump).run(graph)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
-    content = _format_stage(result, args.ir)
+    content = format_stage(result, args.ir)
     if args.output:
         Path(args.output).write_text(content)
         logger.info("Saved %s IR: %s", args.ir, args.output)
@@ -288,22 +203,8 @@ def handle_compile(args):
         if not content.endswith("\n"):
             sys.stdout.write("\n")
 
-    # Under --tune, a bench-timeout abandons its NVRTC worker thread
-    # (see ``_benchmark_with_timeout``) which is still holding the CUDA
-    # context. Python finalization (cupy memory-pool teardown, CUDA
-    # context release) deadlocks against that live worker, so the
-    # process hangs after all output has been written. Skip Python's
-    # cleanup with ``os._exit`` once we know output is flushed — there
-    # is nothing left to do and the daemon thread dies with the process.
-    if args.tune:
-        import os as _os  # noqa: PLC0415
 
-        sys.stdout.flush()
-        sys.stderr.flush()
-        _os._exit(0)
-
-
-def _resolve_passes(args) -> list[str]:
+def resolve_passes(args) -> list[str]:
     if args.passes is not None:
         raw = args.passes.strip()
         # Shorthand: no commas AND every character is a known pass letter.
@@ -315,7 +216,7 @@ def _resolve_passes(args) -> list[str]:
     return _DEFAULT_PASSES
 
 
-def _format_stage(graph, stage: str) -> str:
+def format_stage(graph, stage: str) -> str:
     from deplodock.compiler.pipeline.dump import format_kernels
 
     formatter = _IR_STAGES[stage][1]
@@ -330,97 +231,7 @@ def _is_boundary(op) -> bool:
     return isinstance(op, (InputOp, ConstantOp))
 
 
-def _format_knobs(cuda_op) -> str:
-    """Render ``CudaOp.knobs`` (forwarded from every Op-rebind along the
-    rewrite chain) as a compact ``key=value`` string. Empty dict → ``-``."""
-    knobs = getattr(cuda_op, "knobs", None) or {}
-    if not knobs:
-        return "-"
-    return ", ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
-
-
-def _pick_best_candidate(candidates, db):
-    """Pick the autotune candidate whose CudaOps all measured ``ok`` and
-    whose summed latency is lowest. Falls back to ``candidates[0]`` when
-    nothing has a clean measurement (e.g. every variant timed out)."""
-    from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search import op_cache_key  # noqa: PLC0415
-
-    ctx_key = Context.probe().structural_key()
-    best = None
-    best_total = float("inf")
-    for cand in candidates:
-        cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
-        if not cuda_nodes:
-            continue
-        total = 0.0
-        all_ok = True
-        for node in cuda_nodes:
-            key = op_cache_key(node.op)
-            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
-            if row is None or row.status != "ok":
-                all_ok = False
-                break
-            total += row.stats.median
-        if all_ok and total < best_total:
-            best_total = total
-            best = cand
-    return best if best is not None else candidates[0]
-
-
-def _print_tune_summary(candidates, db) -> None:
-    """Print all variants explored by the autotuner, sorted by total
-    GPU latency. Each ``Candidate`` is one terminal pipeline run (one
-    set of autotune choices); per-kernel latencies come from looking up
-    each ``CudaOp`` in ``CandidateGraph`` against the measurement
-    ``SearchDB``."""
-    from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search import op_cache_key  # noqa: PLC0415
-
-    ctx_key = Context.probe().structural_key()
-
-    rows: list[tuple[bool, float, str, list[tuple[str, float]]]] = []
-    for cand in candidates:
-        cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
-        per_kernel: list[tuple[str, float]] = []
-        total = 0.0
-        all_ok = bool(cuda_nodes)
-        knob_strs: list[str] = []
-        for node in cuda_nodes:
-            key = op_cache_key(node.op)
-            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
-            latency = row.stats.median if row else float("nan")
-            per_kernel.append((node.op.kernel_name, latency))
-            if row is not None and row.status == "ok":
-                total += latency
-            else:
-                all_ok = False
-            knob_strs.append(_format_knobs(node.op))
-        knobs_str = " | ".join(knob_strs) if knob_strs else "-"
-        rows.append((all_ok, total, knobs_str, per_kernel))
-
-    # Sort ok variants by ascending latency first, then any with a
-    # bench_fail / unmeasured kernel at the bottom (status tiebreaker
-    # before latency so 0.00 placeholders don't masquerade as the winner).
-    rows.sort(key=lambda r: (not r[0], r[1]))
-    sys.stderr.write(f"\n[tune] explored {len(rows)} variant(s):\n")
-    sys.stderr.write(f"{'rank':>4}  {'status':>7}  {'total_us':>10}  knobs per kernel\n")
-    for rank, (all_ok, total, knobs_str, _) in enumerate(rows):
-        marker = "*" if rank == 0 and all_ok else " "
-        status = "ok" if all_ok else "fail"
-        sys.stderr.write(f"{rank:>4}{marker} {status:>7}  {total:>10.2f}  {knobs_str}\n")
-
-    ok_rows = [r for r in rows if r[0]]
-    if ok_rows:
-        _, best_total, best_knobs, best_kernels = ok_rows[0]
-        sys.stderr.write(f"\n[tune] winner [{best_knobs}]: {best_total:.2f} us total\n")
-        for name, latency in best_kernels:
-            sys.stderr.write(f"         {name:<48}  {latency:>10.2f} us\n")
-
-
-def _load_or_trace(args) -> tuple[Graph, str]:
+def load_or_trace(args) -> tuple[Graph, str]:
     if args.code:
         from deplodock.commands.trace import graph_from_code
 

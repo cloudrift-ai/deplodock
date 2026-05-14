@@ -47,7 +47,7 @@ from __future__ import annotations
 import os
 from typing import NamedTuple
 
-from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma

@@ -477,7 +477,7 @@ class Pipeline:
 
         ``search`` chooses both the order and the stopping condition:
         :class:`GreedySearch` for single-shot compiles (stops at the
-        first terminal); :class:`TuningSearch` for ``--tune`` (runs the
+        first terminal); :class:`TuningSearch` for ``deplodock tune`` (runs the
         queue dry, exploring every fork).
 
         When ``search`` exposes a ``tree: SearchTree``

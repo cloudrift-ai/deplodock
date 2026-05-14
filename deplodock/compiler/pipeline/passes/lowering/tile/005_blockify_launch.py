@@ -24,7 +24,7 @@ of TileOp variants — one per ``(BN, BM)`` candidate that passes the
 heuristic class's ``(def_bn, def_bm)`` so ``008_register_tile`` can
 apply a non-trivial F). Option 0 is the heuristic shape so deterministic
 ``run_pipeline`` callers behave exactly as before; the rest only get
-explored under ``--tune`` (or when an autotune-driven ``Search`` consumes
+explored under ``deplodock tune`` (or when an autotune-driven ``Search`` consumes
 the queue). Non-matmul tiles return a single deterministic TileOp.
 
 PAT and the register-tile factor F are paired in ``tuning`` so
