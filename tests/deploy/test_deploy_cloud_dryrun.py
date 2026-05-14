@@ -154,7 +154,7 @@ def test_deploy_cloud_provider_default_is_cloudrift_for_h200(run_cli, tmp_path):
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
     # Without --provider, CloudRift is the first hardware-table entry for H200,
     # so the orchestrator must try it first.
-    assert "Trying candidate: cloudrift h200-24-200-1000-generic.1" in stdout
+    assert "Trying candidate: cloudrift h200-8-generic.1" in stdout
 
 
 def test_deploy_cloud_missing_gpu_flag_fails(run_cli, recipes_dir):

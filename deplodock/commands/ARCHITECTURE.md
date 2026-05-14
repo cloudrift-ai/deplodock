@@ -254,6 +254,8 @@ deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25
 deplodock vm delete cloudrift --instance-id <id>
 ```
 
+CloudRift attach to a specific network with `--network <name>` (on both `vm create cloudrift` and `vm create gpu`). The name must exist in the target datacenter; omit to let CloudRift pick a public network.
+
 #### Allocation strategy (shared by `deploy cloud`, `bench`, `vm create gpu`)
 
 All three commands go through `provision_cloud_vm()` in `deplodock/provisioning/cloud.py`. It enumerates *candidates* from `hardware.GPU_INSTANCE_TYPES` (preference-ordered) and, for GCP, fans out across the zones listed in `GPU_GCP_ZONES`. For each candidate it makes up to `SAME_CANDIDATE_RETRIES` attempts on transient failures, then advances. Providers signal "no capacity, try next" by raising `CapacityExhausted`; non-retryable errors raise `TerminalProvisionError` and abort. Fallback never silently crosses provider boundaries — `--provider` (or the first hardware-table entry) bounds the search.

@@ -205,3 +205,39 @@ async def test_provision_cloudrift_no_billing_exempt(mock_create, tmp_path):
 
     assert conn is not None
     assert mock_create.call_args.kwargs["billing_exempt"] is False
+
+
+@patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
+@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+async def test_provision_cloudrift_network(mock_create, tmp_path):
+    """network in providers_config is forwarded to create_instance."""
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("private-key")
+    pub_file = tmp_path / "id_ed25519.pub"
+    pub_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_create.return_value = VMConnectionInfo(host="1.2.3.4", username="user", ssh_port=22222)
+
+    providers_config = {"cloudrift": {"network": "public"}}
+
+    conn = await _provision_cloudrift(_cr_cand(), str(key_file), providers_config, False, logging.getLogger())
+
+    assert conn is not None
+    assert mock_create.call_args.kwargs["network"] == "public"
+
+
+@patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
+@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+async def test_provision_cloudrift_no_network(mock_create, tmp_path):
+    """network defaults to None when not in providers_config."""
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("private-key")
+    pub_file = tmp_path / "id_ed25519.pub"
+    pub_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_create.return_value = VMConnectionInfo(host="1.2.3.4", username="user", ssh_port=22222)
+
+    conn = await _provision_cloudrift(_cr_cand(), str(key_file), {}, False, logging.getLogger())
+
+    assert conn is not None
+    assert mock_create.call_args.kwargs["network"] is None

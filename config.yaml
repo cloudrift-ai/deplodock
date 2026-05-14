@@ -28,3 +28,4 @@ providers:
     # image_url: override the OS image. By default deplodock auto-picks ROCm for
     # mi* instance types and NVIDIA otherwise (see provisioning/cloudrift.py).
     # billing_exempt: true  # admin-only, skip billing
+    # network: public  # CloudRift network name (must exist in the target datacenter)
