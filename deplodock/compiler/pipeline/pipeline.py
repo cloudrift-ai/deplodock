@@ -1,16 +1,17 @@
-"""Pipeline value types: ``Pattern``, ``Match``, ``Rule``,
-``RuleSkipped``, ``Pass``, ``Pipeline``.
+"""Pipeline value types and compile driver: ``Pattern``, ``Match``,
+``Rule``, ``RuleSkipped``, ``Pass``, ``Cursor``, ``Pipeline``.
 
 Bundled together because they form a tight chain — ``Pattern`` defines
-what a rule matches, ``Rule`` carries the pattern + rewrite,
-``Pass`` groups rules, ``Pipeline`` holds passes and drives matching,
-and ``Match`` carries ``Rule`` (which backref-resolves to ``Pass``) so
-the driver can read pass / rule metadata off one field. Splitting them
-across modules forced ``TYPE_CHECKING`` shuffles for backrefs without
-buying anything; one module keeps the cycle visible.
+what a rule matches, ``Rule`` carries the pattern + rewrite, ``Pass``
+groups rules, ``Pipeline`` holds passes and drives matching, ``Cursor``
+tracks per-candidate resume state, and ``Match`` carries ``Rule`` (which
+backref-resolves to ``Pass``) + ``Pipeline`` so callers can read all
+pass / rule / dump metadata off one field.
 
-The driver (rule loader, rewrite dispatcher, search loop, public
-``run_pipeline`` / ``run_autotune``) lives in :mod:`.driver`.
+``Pipeline`` also owns the compile entry points — :meth:`build`,
+:meth:`run`, :meth:`tune`, :meth:`search`. The per-rule logging,
+rewrite-kwarg dispatch, and snapshot rendering live on
+:class:`Candidate` (see :mod:`..search.candidate`).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field, replace as dc_replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -195,8 +196,8 @@ class Match:
 
     graph: Graph
     root_node_id: str
-    pipeline: Pipeline | None = None
-    rule: Rule | None = None
+    pipeline: Pipeline
+    rule: Rule
     nodes: dict[str, str] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
     output: str | None = None
@@ -330,10 +331,14 @@ class Pipeline:
     Tests / standalone callers that just want pattern matching can
     build a one-rule Pipeline via :meth:`from_pattern`.
 
-    ``dump`` is the optional artifact collector — when set, the driver
-    routes per-rule diffs and post-pass graph dumps through it. Living
-    on Pipeline lets the driver read it off one shared reference
-    instead of threading it through every helper.
+    ``dump`` is the optional artifact collector — when set,
+    :class:`Candidate` routes per-rule diffs through ``dump.on_rule``
+    inside :meth:`Candidate._log_apply` and :class:`Cursor` routes
+    post-pass graph dumps through ``dump.on_pass`` inside
+    :meth:`Cursor.advance`. Living on Pipeline lets both read it off
+    one shared reference (reached via ``match.pipeline.dump`` and
+    ``cursor.pipeline.dump``) instead of threading it through every
+    helper.
     """
 
     passes: list[Pass]
@@ -386,8 +391,9 @@ class Pipeline:
         Single-option matches apply inline; the first multi-option
         match spawns one ``LazyCandidate`` per option and breaks the
         loop. Cursor advance for the rule batch is owned by
-        ``Candidate.apply`` / ``_advance_batch``, fired on
-        ``match.is_last`` even when the rewrite skipped or yielded no
+        :meth:`Cursor.advance`, fired from ``Candidate.apply`` on
+        ``match.is_last`` (and directly here for batches that produced
+        no live matches) even when the rewrite skipped or yielded no
         valid options."""
         from deplodock.compiler.pipeline.search.candidate import LazyCandidate  # noqa: PLC0415
 
@@ -398,16 +404,18 @@ class Pipeline:
                 yield cand
                 continue
             pass_ = cur.current_pass
-            # Empty pass (e.g. all rules filtered out): nothing to do, skip.
+            # Empty pass (e.g. all rules filtered out) OR no live
+            # matches → no apply fires → advance the cursor directly
+            # so the search loop doesn't re-pop the same rule batch
+            # forever. ``advance`` handles both cases uniformly: with
+            # ``n_applied == 0`` it wraps to the next pass and fires
+            # the post-pass log + dump.
             if not pass_.rules:
-                cur.pass_idx += 1
+                cur.advance(cand.graph)
                 search.push(cand.lazy())
                 continue
             matches = self.match(cand.graph, cur.current_rule)
             if not matches:
-                # No live matches → no apply fires → advance the cursor
-                # directly so the search loop doesn't re-pop the same
-                # rule batch forever.
                 cur.advance(cand.graph)
                 search.push(cand.lazy())
                 continue
@@ -423,7 +431,7 @@ class Pipeline:
                 # snapshot. The fork's apply on resolve advances the
                 # cursor when ``match.is_last`` (the cursor advance the
                 # eager loop didn't do here, since we deferred to forks).
-                forks = [LazyCandidate(inner=cand, cursor=dc_replace(cur), chain=[(match, opt)]) for opt in options]
+                forks = [LazyCandidate(inner=cand, cursor=replace(cur), chain=[(match, opt)]) for opt in options]
                 break
 
             if forks is not None:
@@ -492,7 +500,7 @@ class Pipeline:
             ctx = _Context.probe()
         backend_name = getattr(backend, "name", "cuda")
         if ctx.backend_name != backend_name:
-            ctx = dc_replace(ctx, backend_name=backend_name)
+            ctx = replace(ctx, backend_name=backend_name)
         t_start = time.monotonic()
 
         search.push(_Candidate(ctx=ctx, graph=graph, cursor=Cursor(pipeline=self)).lazy())
@@ -528,22 +536,23 @@ class Pipeline:
 
 
 def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match | None:
-    cursor: str | None = start
+    nid: str | None = start
     nodes: dict[str, str] = {}
     consumed: set[str] = set()
     identities: dict[str, int] = {}
     for prod in rule.pattern:
-        if cursor is None:
+        if nid is None:
             return None
-        node = graph.nodes.get(cursor)
+        node = graph.nodes.get(nid)
         if node is None or not isinstance(node.op, prod.op_type):
             return None
-        if not _check_constraints(node, prod):
+        if not all(str(getattr(node.op, k, None)) == str(v) for k, v in prod.constraints.items()):
             return None
-        nodes[prod.name] = cursor
-        consumed.add(cursor)
-        identities[cursor] = id(node)
-        cursor = _sole_consumer(graph, cursor)
+        nodes[prod.name] = nid
+        consumed.add(nid)
+        identities[nid] = id(node)
+        consumers = graph.consumers(nid)
+        nid = consumers[0] if len(consumers) == 1 else None
     return Match(
         graph=graph,
         root_node_id=start,
@@ -553,15 +562,6 @@ def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match
         consumed=consumed,
         _identities=identities,
     )
-
-
-def _check_constraints(node: Node, prod: Pattern) -> bool:
-    return all(str(getattr(node.op, k, None)) == str(v) for k, v in prod.constraints.items())
-
-
-def _sole_consumer(graph: Graph, nid: str) -> str | None:
-    consumers = graph.consumers(nid)
-    return consumers[0] if len(consumers) == 1 else None
 
 
 __all__ = ["Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]

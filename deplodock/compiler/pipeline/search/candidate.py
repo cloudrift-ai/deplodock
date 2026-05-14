@@ -89,7 +89,6 @@ class Candidate:
             self._advance_if_last(match)
             return None
         rule = match.rule
-        assert rule is not None, "Match.rule must be set before try_rewrite"
         try:
             result = rule.rewrite(**_build_rewrite_kwargs(rule, match, self.ctx))
         except RuleSkipped as exc:
@@ -146,19 +145,17 @@ class Candidate:
         from deplodock.compiler.pipeline.rule_diff import emit  # noqa: PLC0415
 
         rule = match.rule
-        pass_ = rule.pass_ if rule is not None else None
-        pipeline = match.pipeline
-        dump = pipeline.dump if pipeline is not None else None
+        pass_ = rule.pass_
+        dump = match.pipeline.dump
         debug_on = _logger.isEnabledFor(logging.DEBUG)
         if not (debug_on or dump is not None):
             return
         fragment = _wrap_op_as_fragment(self.graph, match.root_node_id, option) if isinstance(option, Op) else option
-        rule_name = rule.name if rule is not None else ""
         pass_name = pass_.name if pass_ is not None else None
-        text = _format_rule_application(rule_name, self.graph, match, fragment, pass_name=pass_name)
+        text = _format_rule_application(rule.name, self.graph, match, fragment, pass_name=pass_name)
         if debug_on:
             emit(text)
-        if dump is not None and rule is not None and pass_ is not None and pass_.name:
+        if dump is not None and pass_ is not None and pass_.name:
             record = _record_rule_application(self.graph, match, fragment)
             dump.on_rule(pass_, rule, record, text)
 
