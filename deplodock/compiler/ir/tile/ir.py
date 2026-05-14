@@ -430,24 +430,42 @@ class TileOp(Op):
         return "\n".join([head, *pretty_body(self.body, "    ")])
 
     def validate(self, ctx) -> bool:
-        """Reject post-register-tile variants whose THREAD-axis product
-        exceeds the hardware launch budget (``max_threads_per_cta``, 1024
-        on every CUDA capability we support). Without this, F-fork
-        candidates like ``(F_M=1, F_N=2)`` on a ``BM=64, BN=128`` tile
-        spawn a CTA of 64×64=4096 threads — the driver rejects it but the
-        engine has already burned compile + 5s wall-budget on the bench,
-        which leaks an abandoned NVRTC thread and slows every subsequent
-        variant.
+        """Reject post-register-tile variants whose launch geometry would
+        exceed device limits. Two checks:
+
+        - **threads ≤ ``ctx.max_threads_per_cta``** (1024 on every CUDA
+          capability we support). Without this, F-fork candidates like
+          ``(F_M=1, F_N=2)`` on a ``BM=64, BN=128`` tile spawn a CTA of
+          64×64=4096 threads — the driver rejects it but the engine has
+          already burned compile + bench wall-budget on it.
+        - **staged smem footprint ≤ ``ctx.max_dynamic_smem``**.
+          Sums every ``Stage.smem_bytes`` in the body (including nested
+          Stages inside reduce loops). The check uses raw stage bytes —
+          no upfront slack for the upcoming ``010_double_buffer`` /
+          ``014_pad_smem`` overhead. Those passes' decisions are part of
+          the autotune surface; when their multipliers push a variant
+          over the cap, ``KernelOp.validate`` is the second-line gate.
+          Without this tile-stage check, three-pass naive softmax +
+          ``@V`` at large head_dim/seq stages mul+mask in three separate
+          smem regions whose total exceeds the device cap and crashes
+          the launch with ``CUDA_ERROR_INVALID_VALUE``.
 
         Pre-register-tile TileOps (the post-blockify state, where THREAD
         extents are ``BM, BN`` and the register-tile rule will still
-        divide by ``(F_M, F_N)``) are gated on the ``register_tile`` knob
-        — skip the check until that rule has fired, otherwise we'd reject
-        every healthy pre-tile candidate too."""
-        if not self.knobs.get("register_tile"):
-            return True
+        divide by ``(F_M, F_N)``) skip the THREAD check — otherwise we'd
+        reject every healthy pre-tile candidate. The smem check runs at
+        every stage where Stages are present."""
         from math import prod  # noqa: PLC0415
 
+        # Staged-smem check — runs whether or not register_tile fired,
+        # since 007_stage_inputs can add Stages independently.
+        staged = sum(s.smem_bytes for s in self.body.iter() if isinstance(s, Stage))
+        if staged > ctx.max_dynamic_smem:
+            return False
+
+        # THREAD-count check — only after register_tile committed.
+        if not self.knobs.get("register_tile"):
+            return True
         tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
         if tile is None:
             return True

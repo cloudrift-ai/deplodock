@@ -21,15 +21,14 @@ from deplodock.compiler.pipeline.engine import (
     Pattern,
     RuleSkipped,
     match_pattern,
+    run_autotune,
+    run_pipeline,
 )
 from deplodock.compiler.pipeline.search import (
     Candidate,
     GreedySearch,
     Search,
-    TraceEntry,
     TuningSearch,
-    run_autotune,
-    run_pipeline,
 )
 
 # Canonical pass lists, indexed by the --ir stage they produce. Backends
@@ -53,7 +52,6 @@ __all__ = [
     "Search",
     "TENSOR_PASSES",
     "TILE_PASSES",
-    "TraceEntry",
     "TuningSearch",
     "match_pattern",
     "run_autotune",

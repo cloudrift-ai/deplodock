@@ -81,7 +81,10 @@ class CompilerDump:
         The text snapshot comes from ``_format_rule_application`` (or the
         in-place variant); the structured ``record`` mirrors it for
         post-hoc analysis. Both are written to
-        ``{idx:02d}_{pass}__{rule}.rules.{txt,json}`` when the pass ends.
+        ``{idx+1:02d}_{pass}__{rule}.rules.{txt,json}`` when the pass
+        ends — ``pass_idx`` is the engine's 0-based index; the dump
+        adds ``+1`` for filename display so the on-disk layout matches
+        the human-readable pass ordering.
         """
         key = (pass_idx, pass_name, rule_name)
         self._rule_records.setdefault(key, []).append(record)
@@ -92,12 +95,14 @@ class CompilerDump:
 
         Every pass is treated uniformly: no per-pass special cases, so
         adding a new pass automatically gets dumped. File names are
-        ``{idx:02d}_{pass_name}.{ext}`` with slashes in ``pass_name``
-        flattened to underscores. Also flushes any per-rule application
-        snapshots accumulated during this pass to ``.rules.{txt,json}``
-        files alongside the post-pass graph dump.
+        ``{idx+1:02d}_{pass_name}.{ext}`` with slashes in ``pass_name``
+        flattened to underscores — ``idx`` is the engine's 0-based pass
+        index; the dump bumps it to 1-based for display. Also flushes
+        any per-rule application snapshots accumulated during this pass
+        to ``.rules.{txt,json}`` files alongside the post-pass graph
+        dump.
         """
-        self._dump_graph(f"{idx:02d}_{pass_name.replace('/', '_')}", graph)
+        self._dump_graph(f"{idx + 1:02d}_{pass_name.replace('/', '_')}", graph)
         self._flush_rule_dumps(idx, pass_name)
 
     def _flush_rule_dumps(self, idx: int, pass_name: str) -> None:
@@ -105,7 +110,7 @@ class CompilerDump:
         for (pass_idx, pname, rule_name), records in list(self._rule_records.items()):
             if pass_idx != idx or pname != pass_name:
                 continue
-            prefix = f"{idx:02d}_{flat_pass}__{rule_name}.rules"
+            prefix = f"{idx + 1:02d}_{flat_pass}__{rule_name}.rules"
             self._write_text(f"{prefix}.txt", "\n\n".join(self._rule_texts.pop((pass_idx, pname, rule_name))) + "\n")
             self._write_json(f"{prefix}.json", records)
             del self._rule_records[(pass_idx, pname, rule_name)]

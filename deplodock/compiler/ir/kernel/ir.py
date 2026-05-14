@@ -480,15 +480,19 @@ class KernelOp(Op):
     def smem_bytes(self) -> int:
         """Total static + dynamic ``__shared__`` bytes declared in the
         body — sum of ``prod(Smem.extents) * sizeof(Smem.dtype)`` over
-        every ``Smem`` decl. Used by both ``CudaOp`` codegen (to set the
-        launch ``smem_bytes`` arg) and ``validate`` (to gate against the
-        target's smem cap)."""
+        every ``Smem`` decl, **at any nesting depth**. ``Smem`` stmts
+        sit inside ``Tile`` / ``Loop`` bodies post-lowering, so the
+        top-level-only iterator the engine used to use under-counted by
+        the entire footprint and lets oversize kernels slip past
+        :meth:`validate`. Use the deep iterator (``for s in self``) to
+        match :meth:`smem_names` and the renderer's
+        ``_compute_dynamic_smem_offsets``."""
         from math import prod  # noqa: PLC0415
 
         # Mirror cuda/001_lower_kernelop's _DTYPE_BYTES for the smem sizing.
         dtype_bytes = {"float": 4, "double": 8, "int": 4, "half": 2, "bfloat16": 2}
         total = 0
-        for s in self.body:
+        for s in self:
             if isinstance(s, Smem):
                 elements = prod(int(e) for e in s.extents) if s.extents else 1
                 total += elements * dtype_bytes.get(s.dtype, 4)

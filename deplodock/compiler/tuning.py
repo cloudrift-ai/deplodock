@@ -395,8 +395,18 @@ _DTYPE_BYTES = 4
 
 
 def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
-    """Halve BK until the (BN+BM)·BK·4·2 stage fits in static smem
-    minus pad headroom. Returns the largest BK ≥ 1 that fits."""
+    """Halve BK until the per-stage smem fits in ``static_smem_cap``
+    minus pad headroom. Returns the largest BK ≥ 1 that fits.
+
+    Stage footprint = ``n_inputs · max(BN, BM) · BK · 4 · 2``: each
+    external input gets staged at roughly ``tile × BK`` floats, with
+    two buffers for double-buffering. ``n_inputs`` is read from the
+    tile body — a plain ``matmul`` has 2 inputs (A, B); fused-prologue
+    matmuls (``silu_mul_matmul``, naive attention's ``softmax·mask @ V``)
+    have ≥3 and need a tighter BK to leave room for the extra stage.
+    The previous 2-input fixed assumption let naive_attn at head_dim=128
+    pick a BK that overflowed the dynamic-smem cap at launch.
+    """
     budget = static_smem_cap - _PAD_HEADROOM_BYTES
     extents = _logical_output_extents(tile)
     if len(extents) < 2:
@@ -404,7 +414,9 @@ def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
     (def_bn, def_bm), _ = _default_tile(tile)
     bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", def_bn))
     bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", def_bm))
-    while bk > 1 and (bn_actual + bm_actual) * bk * _DTYPE_BYTES * 2 > budget:
+    n_inputs = max(_external_input_count(tile.body), 2)
+    stage_footprint = n_inputs * max(bn_actual, bm_actual) * _DTYPE_BYTES * 2
+    while bk > 1 and stage_footprint * bk > budget:
         bk //= 2
     return bk
 

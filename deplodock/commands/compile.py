@@ -372,9 +372,9 @@ def _pick_best_candidate(candidates, db):
 def _print_tune_summary(candidates, db) -> None:
     """Print all variants explored by the autotuner, sorted by total
     GPU latency. Each ``Candidate`` is one terminal pipeline run (one
-    set of autotune choices); each carries a ``trace`` of ``TraceEntry``
-    (rule_name, choice_idx) and a graph with measured ``CudaOp`` nodes.
-    """
+    set of autotune choices); per-kernel latencies come from looking up
+    each ``CudaOp`` in ``CandidateGraph`` against the measurement
+    ``SearchDB``."""
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.pipeline.search import op_cache_key  # noqa: PLC0415

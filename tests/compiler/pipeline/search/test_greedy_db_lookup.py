@@ -1,22 +1,24 @@
-"""GreedySearch consults the DB at fork points.
+"""GreedySearch always picks option-0 at fork points.
 
 Drives a real fork point (``005_blockify_launch`` on a matmul) through
 ``run_pipeline`` and asserts:
 
-1. **Baseline**: fresh DB → greedy picks option 0 (heuristic order).
-2. **Seeded DB**: write a ``lowering`` row pointing at a non-option-0
-   variant → greedy picks that variant instead.
-3. **No seed for an unrelated parent key**: the seed is ignored when
-   ``op_cache_key`` doesn't match, so option 0 is still chosen.
+1. **Baseline**: fresh DB → greedy picks option 0 (rule's heuristic
+   ordering).
+2. **DB seeded with an unrelated row**: greedy still picks option 0
+   (DB lookup was removed; greedy is purely option-0).
 """
 
 from __future__ import annotations
+
+import pytest
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, TuningSearch, run_autotune, run_pipeline
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 
@@ -24,6 +26,18 @@ from deplodock.compiler.pipeline.search.keys import op_cache_key
 # enough that ``005_blockify_launch`` actually forks over multiple
 # ``(BN, BM)`` variants.
 _M, _K, _N = 256, 64, 256
+
+
+@pytest.fixture(autouse=True)
+def _shrink_autotune_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cap the autotune search space so the exhaustive walk in
+    ``_enumerate_blockify_variants`` stays tractable. Pins everything
+    that this test doesn't care about (only blockify ``(BN, BM)`` needs
+    to fork) via ``DEPLODOCK_*`` env knobs and disables the per-buffer
+    staging power-set so ``007_stage_inputs`` emits a single variant
+    (its pre-knob behavior)."""
+    monkeypatch.setenv("DEPLODOCK_STAGE_INPUTS", "0xFFFF")
+    monkeypatch.setenv("DEPLODOCK_TMA", "0")
 
 
 def _make_matmul() -> Graph:
@@ -60,28 +74,34 @@ def _blockify_pair(op: Op) -> tuple[Op, Op] | None:
     return None
 
 
+def _record_pair(out: dict[str, tuple[str, str, dict]], op: Op) -> None:
+    pair = _blockify_pair(op)
+    if pair is None:
+        return
+    parent, child = pair
+    pk = op_cache_key(parent)
+    ck = op_cache_key(child)
+    if pk is None or ck is None or ck in out:
+        return
+    out[ck] = (pk, ck, {k: v for k, v in child.knobs.items() if k in ("BN", "BM")})
+
+
 def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
-    """Sweep the autotune space (no backend → stub latencies) and
-    collect every distinct ``(parent_key, child_key, knobs)`` produced
+    """Collect every distinct ``(parent_key, child_key, knobs)`` produced
     at the blockify_launch fork point.
 
-    All matmul-graph terminal candidates share the same parent op for
-    blockify (the pre-blockify matmul TileOp), so deduping on
-    ``child_key`` is enough."""
+    Index 0 is anchored on the greedy/heuristic variant (what option-0
+    in the rule emits) by recording the greedy ``run_pipeline`` result
+    first; the autotune sweep then appends alternatives. This is stable
+    across changes to the MCTS walk order, which can shift if e.g.
+    ``op_cache_key`` partitions the search frontier differently."""
+    out: dict[str, tuple[str, str, dict]] = {}
+    greedy = run_pipeline(_make_matmul(), TILE_PASSES, db=SearchDB())
+    _record_pair(out, _final_tile_op(greedy))
     search = TuningSearch(db=SearchDB(), patience=10**6, min_coverage=0.0)
     candidates = list(run_autotune(_make_matmul(), TILE_PASSES, search=search, db=SearchDB()))
-    out: dict[str, tuple[str, str, dict]] = {}
     for cand in candidates:
-        op = _final_tile_op(cand.graph)
-        pair = _blockify_pair(op)
-        if pair is None:
-            continue
-        parent, child = pair
-        pk = op_cache_key(parent)
-        ck = op_cache_key(child)
-        if pk is None or ck is None or ck in out:
-            continue
-        out[ck] = (pk, ck, {k: v for k, v in child.knobs.items() if k in ("BN", "BM")})
+        _record_pair(out, _final_tile_op(cand.graph))
     return list(out.values())
 
 
@@ -95,35 +115,6 @@ def test_baseline_picks_option_zero() -> None:
     out = run_pipeline(_make_matmul(), TILE_PASSES, db=SearchDB())
     bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
     assert bn_bm == option_zero_knobs
-
-
-def test_greedy_picks_db_winner() -> None:
-    """Seed the lowering table with a non-option-0 child. Greedy should
-    pick that variant instead of option-0."""
-    variants = _enumerate_blockify_variants()
-    assert len(variants) >= 2
-    option_zero = variants[0]
-    winner = variants[1]
-    parent_key, winner_key, winner_knobs = winner
-    # Sanity: knobs really do differ.
-    assert option_zero[2] != winner_knobs
-
-    db = SearchDB()
-    # ``record_lowering`` writes the knob delta — that's what greedy
-    # matches forks against. blockify_launch stamps ``blockify=True``
-    # alongside ``(BN, BM)``, so include it for a faithful delta.
-    db.record_lowering(
-        parent_key,
-        "tile",
-        winner_key,
-        "tile",
-        knobs={**winner_knobs, "blockify": True},
-        measured_median_us=1.0,
-    )
-
-    out = run_pipeline(_make_matmul(), TILE_PASSES, db=db)
-    bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
-    assert bn_bm == winner_knobs
 
 
 def test_irrelevant_seed_is_ignored() -> None:

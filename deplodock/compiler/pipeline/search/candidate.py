@@ -1,5 +1,5 @@
 """Search-tree data classes — one ``Candidate`` per point in the
-autotune space, plus its cursor / trace / per-step result records.
+autotune space, plus its cursor / per-step result records.
 
 A ``Candidate`` is what the engine pops, advances by one rule
 application, and pushes back. Forks at multi-option rewrite points
@@ -21,16 +21,6 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.pattern import Match
 
 
-@dataclass(frozen=True)
-class TraceEntry:
-    """One rule application in a candidate's history. ``choice_idx`` is
-    the option picked at fork points (0 for deterministic single-option
-    rules)."""
-
-    rule_name: str
-    choice_idx: int = 0
-
-
 @dataclass
 class Cursor:
     """Pipeline resume state for a ``Candidate``.
@@ -40,68 +30,15 @@ class Cursor:
     * ``n_applied`` — number of functional rewrites in the current
       pass scan. When ``rule_idx`` wraps past the last rule with this
       counter ``> 0``, the engine restarts the scan (changes happened);
-      with the counter ``== 0``, the engine advances to the next pass."""
+      with the counter ``== 0``, the engine advances to the next pass.
+
+    The advance/wrap/pass-step logic lives in :meth:`Candidate.apply`
+    (driven by ``match.is_last``) so eager and lazy candidates
+    transition through the cursor states the same way."""
 
     pass_idx: int = 0
     rule_idx: int = 0
     n_applied: int = 0
-
-    def advance(
-        self,
-        result: RuleResult,
-        n_rules: int,
-        on_pass_finish: Callable[[int], None] | None = None,
-    ) -> None:
-        """Drive the cursor forward by one rule attempt.
-
-        First, update ``n_applied`` (functional fires drive end-of-scan
-        restart logic) and ``rule_idx`` (only advanced when no
-        functional fire happened — in-place rebinds and zero-fire
-        batches stay on the same graph state, so re-scanning the rule
-        would loop or no-op). Then, when ``rule_idx`` reaches
-        ``n_rules``, transition: restart from rule 0 if functional
-        rewrites accumulated this scan, otherwise invoke ``on_pass_end``
-        with the just-finished ``pass_idx`` and advance to the next
-        pass."""
-        self.n_applied += result.n_functional
-        if result.n_functional == 0:
-            self.rule_idx += 1
-        if self.rule_idx < n_rules:
-            return
-        finished = self.n_applied == 0
-        self.rule_idx = 0
-        self.n_applied = 0
-        if finished:
-            if on_pass_finish is not None:
-                on_pass_finish(self.pass_idx)
-            self.pass_idx += 1
-
-    def fork(self, n_applied_delta: int) -> Cursor:
-        """A copy at the same ``(pass_idx, rule_idx)`` with ``n_applied``
-        shifted by ``n_applied_delta`` — used when spawning autotune
-        alternatives mid-batch."""
-        return Cursor(self.pass_idx, self.rule_idx, self.n_applied + n_applied_delta)
-
-
-@dataclass
-class RuleResult:
-    """Outcome of one rule-application iteration.
-
-    * ``forks`` — alternative candidates spawned at autotune fork points
-      (empty for deterministic rules).
-    * ``n_functional`` — count of ``Graph`` (functional) rewrites applied
-      to the candidate's own graph in this batch.
-    * ``n_inplace`` — count of ``Op`` (in-place rebind) rewrites applied
-      to the candidate's own graph in this batch."""
-
-    forks: list[Candidate] = field(default_factory=list)
-    n_functional: int = 0
-    n_inplace: int = 0
-
-    @property
-    def fired(self) -> bool:
-        return (self.n_functional + self.n_inplace) > 0
-
 
 @dataclass(frozen=True)
 class ForkOrigin:
@@ -111,24 +48,22 @@ class ForkOrigin:
 
     Multiple sibling forks share the same ``parent_snapshot`` via Python
     references — refcount frees it when the last lazy sibling has been
-    materialized or dropped from the search queue.
-
-    ``tip_key`` is precomputed as ``op_cache_key(option)`` so the search
-    can file the fork into its ``_by_tip`` bucket without materializing
-    the graph.
-    """
+    materialized or dropped from the search queue. ``match`` carries
+    everything the rule application needs: the rewrite site (read by
+    ``TuningSearch`` to derive its tip key) and the pipeline location
+    (``pass_idx`` / ``pass_name``, replayed back to ``on_apply`` when
+    the fork materializes so the diff/dump rendering reports the
+    *producer's* pass, not whichever pass the consumer is on by the
+    time it pops the fork)."""
 
     parent_snapshot: Graph
     rule_name: str
     match: Match
     option: Op | Graph
-    choice_idx: int  # option index picked at the fork point; ``Candidate.apply`` records it on the trace
-    # ``op_cache_key(option)`` when the option is an Op (the autotune
-    # knob case); ``None`` for Graph-returning rewrites whose tip can't
-    # be computed without materializing. ``None`` tips route to the
-    # search's FIFO fallback queue, bypassing UCB selection — fine for
-    # the rare functional fork point.
-    tip_key: str | None
+
+
+ApplyCallback = Callable[["Graph", str, "Match", "Op | Graph"], None]
+PassFinishCallback = Callable[[int, str, Graph], None]
 
 
 @dataclass
@@ -143,17 +78,19 @@ class Candidate:
     rewrite points are *lazy* — they hold an ``_origin`` (see
     :class:`ForkOrigin`) and materialize on first ``.graph`` access.
 
-    ``ctx`` is shared by reference. ``trace`` is the immutable history
-    of rule applications on this branch. ``cursor`` is the pipeline
-    cursor.
+    ``ctx`` is shared by reference. ``cursor`` is the pipeline cursor.
 
-    ``last_rewritten`` lists the node IDs whose op was replaced by the
-    most recent rule application — empty until the first rule fires."""
+    ``on_apply`` is a per-batch hook fired from inside :meth:`apply`
+    just before the rewrite mutates ``graph``. The engine sets it once
+    per rule batch (shared by ``cand`` and its sibling forks) so the
+    debug/dump rendering of "this rewrite happened" lives next to the
+    apply itself — the search loop doesn't have to log a fork's apply
+    that hasn't materialized yet."""
 
     ctx: Context
-    trace: tuple[TraceEntry, ...] = ()
     cursor: Cursor = field(default_factory=Cursor)
-    last_rewritten: tuple[str, ...] = ()
+    on_apply: ApplyCallback | None = None
+    on_pass_finish: PassFinishCallback | None = None
     _graph: Graph | None = field(default=None, repr=False)
     _origin: ForkOrigin | None = field(default=None, repr=False)
 
@@ -170,7 +107,7 @@ class Candidate:
             assert origin is not None  # invariant enforced by __post_init__
             self._graph = origin.parent_snapshot.copy()
             self._origin = None  # drop the shared snapshot reference; refcount-GC kicks in
-            self.apply(origin.rule_name, origin.match.remap(self._graph), origin.option, choice_idx=origin.choice_idx)
+            self.apply(origin.rule_name, origin.match.remap(self._graph), origin.option)
         return self._graph
 
     @graph.setter
@@ -178,33 +115,70 @@ class Candidate:
         self._graph = g
         self._origin = None
 
-    def apply(self, rule_name: str, match: Match, option: Op | Graph, *, choice_idx: int = 0) -> None:
-        """Apply one rewrite outcome to ``self.graph`` in place and
-        update ``trace`` + ``last_rewritten``. ``Op`` rebinds
-        ``root.op`` (id, inputs, hints kept); ``Graph`` is a fragment
-        spliced via ``Graph.splice``.
+    def apply(self, rule_name: str, match: Match, option: Op | Graph | None) -> None:
+        """Apply one rewrite outcome to ``self.graph`` in place, then
+        update ``cursor`` for the rewrite kind and (when
+        ``match.is_last``) for the rule-batch boundary.
 
-        On the ``Op`` path the chain ``Op.source`` is stamped with the
-        op being replaced (unless the rule already set it) and the
-        predecessor's ``knobs`` are merged forward — so the rewrite
-        chain threads through every in-place rebind for free.
+        Per-rewrite cursor accounting: functional ``Graph`` splices
+        bump ``n_applied`` so the end-of-pass logic knows the scan must
+        restart; in-place ``Op`` rebinds bump nothing (the rule's
+        idempotence guard handles re-firing).
 
-        ``choice_idx`` is the option index picked at this fork point
-        (0 for the primary path, ``>0`` for the recorded fork that this
-        Candidate descended from).
-        """
+        Per-batch cursor accounting (only when ``match.is_last``):
+        advance ``rule_idx`` by 1, and when it reaches
+        ``match.n_rules`` either restart the scan (if any functional
+        rewrites accumulated) or fire ``on_pass_finish`` and step to
+        the next pass. Owning the advance here keeps eager driver
+        applies and lazy fork-materialization applies on the same code
+        path — a fork's cursor moves forward identically to the
+        cand's, regardless of when the materialization happens.
+
+        ``Op`` rebinds ``root.op`` (id, inputs, hints kept); ``Graph``
+        is a fragment spliced via ``Graph.splice``. On the ``Op`` path
+        the chain ``Op.source`` is stamped with the op being replaced
+        (unless the rule already set it) and the predecessor's
+        ``knobs`` are merged forward — so the rewrite chain threads
+        through every in-place rebind for free.
+
+        Fires ``on_apply(graph_before, rule_name, match, option)``
+        first when set, so the engine's debug/dump rendering sees the
+        pre-rewrite graph. ``match.pass_idx`` / ``match.pass_name``
+        carry the producer's pass location (which may differ from
+        ``self.cursor.pass_idx`` for a lazily-materialized fork)."""
         # Local imports to break the cycle with ``compiler.ir.base``.
         from deplodock.compiler.ir.base import Op as _Op  # noqa: PLC0415
 
-        graph = self.graph
-        if isinstance(option, _Op):
-            old_op = graph.nodes[match.root_node_id].op
-            if option is not old_op and option.source is None:
-                option.source = old_op
-                option.knobs = {**old_op.knobs, **option.knobs}
-            graph.nodes[match.root_node_id].op = option
-        else:
-            assert isinstance(option, Graph), f"rule {rule_name} returned {type(option).__name__}; expected Graph, Op, list, or RuleSkipped"
-            graph.splice(option, consumed=match.consumed, output=match.output or match.root_node_id)
-        self.trace = (*self.trace, TraceEntry(rule_name, choice_idx))
-        self.last_rewritten = (match.root_node_id,)
+        if option is not None:
+            graph = self.graph
+            if self.on_apply is not None:
+                self.on_apply(graph, rule_name, match, option)
+            if isinstance(option, _Op):
+                old_op = graph.nodes[match.root_node_id].op
+                if option is not old_op and option.source is None:
+                    option.source = old_op
+                    option.knobs = {**old_op.knobs, **option.knobs}
+                graph.nodes[match.root_node_id].op = option
+            else:
+                assert isinstance(option, Graph), f"expected Graph, Op, list, or RuleSkipped; got {type(option).__name__}"
+                graph.splice(option, consumed=match.consumed, output=match.output or match.root_node_id)
+                self.cursor.n_applied += 1
+        if match.is_last:
+            self._advance_batch(match.n_rules, match.pass_idx, match.pass_name)
+
+    def _advance_batch(self, n_rules: int, pass_idx: int | None, pass_name: str | None) -> None:
+        """Move ``cursor.rule_idx`` past the just-finished rule batch.
+        Wraps to the next pass (firing ``on_pass_finish``) when the
+        scan completes with no functional rewrites; otherwise restarts
+        the scan from rule 0 to apply newly-spawned matches."""
+        cur = self.cursor
+        cur.rule_idx += 1
+        if cur.rule_idx < n_rules:
+            return
+        finished = cur.n_applied == 0
+        cur.rule_idx = 0
+        cur.n_applied = 0
+        if finished:
+            if self.on_pass_finish is not None and pass_idx is not None and pass_name is not None:
+                self.on_pass_finish(pass_idx, pass_name, self.graph)
+            cur.pass_idx += 1

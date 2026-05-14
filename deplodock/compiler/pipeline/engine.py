@@ -29,8 +29,9 @@ import importlib.util
 import inspect
 import logging
 import re
-from collections.abc import Callable
-from dataclasses import dataclass, field
+import time
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,9 +39,12 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
+from deplodock.compiler.pipeline.pattern import Match, Pattern, match_pattern
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped, render_rule_diff
-from deplodock.compiler.pipeline.search.candidate import Candidate, ForkOrigin, RuleResult
-from deplodock.compiler.pipeline.search.keys import op_cache_key
+from deplodock.compiler.pipeline.search.candidate import Candidate, ForkOrigin
+from deplodock.compiler.pipeline.search.db import SearchDB
+from deplodock.compiler.pipeline.search.policy import GreedySearch, Search
+from deplodock.compiler.pipeline.search.recorder import TuneAborted, record_terminal
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
@@ -70,146 +74,6 @@ class RuleSkipped(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
-
-
-# ---------------------------------------------------------------------------
-# Chain matcher
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Pattern:
-    """One node in a chain-match pattern.
-
-    ``constraints`` is a dict of ``field_name → expected_value`` checks
-    applied to ``node.op`` (e.g. ``{"fn": "softmax"}``).
-    """
-
-    name: str
-    op_type: type
-    constraints: dict = field(default_factory=dict)
-
-
-@dataclass
-class Match:
-    """Result of matching a pattern against a graph.
-
-    ``graph`` is the graph this match was built against (rules access
-    it via ``match.graph`` for ad-hoc lookups). ``nodes`` maps each
-    pattern entry's name to the matched node id. ``consumed`` and
-    ``output`` may be overwritten by the rewrite function to control
-    which nodes the rewriter removes and which node its edges get
-    redirected to. ``output`` defaults to ``root_node_id`` when left
-    as ``None``.
-
-    Use the helpers (``root``, ``node()``, ``input()``, ``is_alive()``)
-    to resolve ids to ``Node`` objects through ``graph`` — they're the
-    intended access pattern for rules that need graph-wide lookups.
-    """
-
-    graph: Graph
-    root_node_id: str
-    nodes: dict[str, str] = field(default_factory=dict)
-    consumed: set[str] = field(default_factory=set)
-    output: str | None = None
-    # Snapshot of id(Node) at match time for every consumed node. The
-    # ``is_alive`` check uses this to detect the case where an earlier
-    # match in the same batch removed a consumed node and a different
-    # node was added at the same id (e.g. splicer auto-rename hitting
-    # a recently-freed name). Pure id-existence wouldn't catch that.
-    _identities: dict[str, int] = field(default_factory=dict, repr=False)
-
-    @property
-    def root(self) -> Node:
-        """The root ``Node`` (matched by the first ``Pattern`` entry)."""
-        return self.graph.nodes[self.root_node_id]
-
-    def node(self, name_or_id: str) -> Node:
-        """Resolve a pattern name (e.g. ``"producer"``) OR a raw node id
-        to the current ``Node`` in ``graph``. Raises ``KeyError`` if the
-        node has been removed."""
-        nid = self.nodes.get(name_or_id, name_or_id)
-        return self.graph.nodes[nid]
-
-    def input(self, i: int) -> Node | None:
-        """Root's ``i``-th input as a ``Node``, or ``None`` when ``i``
-        exceeds the input count or the input node was removed."""
-        root = self.root
-        if i >= len(root.inputs):
-            return None
-        return self.graph.nodes.get(root.inputs[i])
-
-    def is_alive(self) -> bool:
-        """``True`` when every consumed node still resolves to the same
-        ``Node`` object captured at match time. Catches both removal and
-        the "removed-then-re-added under same id" case."""
-        for nid in self.consumed:
-            n = self.graph.nodes.get(nid)
-            if n is None or id(n) != self._identities.get(nid):
-                return False
-        return True
-
-    def remap(self, graph: Graph) -> Match:
-        """Build a fresh ``Match`` against ``graph`` (a copy of the
-        original) that mirrors this match's ids. Re-snapshots
-        ``_identities`` against the new graph's nodes so ``is_alive``
-        still works after the copy. Used when materializing a lazy
-        fork — the fork copies the parent's snapshot, then needs a
-        match anchored on the copy."""
-        identities = {nid: id(graph.nodes[nid]) for nid in self.consumed if nid in graph.nodes}
-        return Match(
-            graph=graph,
-            root_node_id=self.root_node_id,
-            nodes=dict(self.nodes),
-            consumed=set(self.consumed),
-            output=self.output,
-            _identities=identities,
-        )
-
-
-def match_pattern(graph: Graph, pattern: list[Pattern]) -> list[Match]:
-    """Return every pattern match rooted at a topo-ordered node.
-
-    Matches may overlap — e.g. both ``{A, B}`` and ``{B, C}`` for a
-    two-node pattern. The rewriter breaks after the first successful
-    ``rewrite`` per pass iteration, so overlap is only a candidate-
-    enumeration concern.
-    """
-    results: list[Match] = []
-    for nid in graph.topological_order():
-        m = _match_at(graph, nid, pattern)
-        if m is not None:
-            results.append(m)
-    return results
-
-
-def _match_at(graph: Graph, start: str, pattern: list[Pattern]) -> Match | None:
-    cursor: str | None = start
-    nodes: dict[str, str] = {}
-    consumed: set[str] = set()
-    identities: dict[str, int] = {}
-    for prod in pattern:
-        if cursor is None:
-            return None
-        node = graph.nodes.get(cursor)
-        if node is None or not isinstance(node.op, prod.op_type):
-            return None
-        if not _check_constraints(node, prod):
-            return None
-        nodes[prod.name] = cursor
-        consumed.add(cursor)
-        identities[cursor] = id(node)
-        cursor = _sole_consumer(graph, cursor)
-    return Match(graph=graph, root_node_id=start, nodes=nodes, consumed=consumed, _identities=identities)
-
-
-def _check_constraints(node, prod: Pattern) -> bool:
-    return all(str(getattr(node.op, k, None)) == str(v) for k, v in prod.constraints.items())
-
-
-def _sole_consumer(graph: Graph, nid: str) -> str | None:
-    consumers = graph.consumers(nid)
-    return consumers[0] if len(consumers) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -314,147 +178,6 @@ def _build_rewrite_kwargs(rule: _Rule, match: Match, ctx: Context | None) -> dic
                 kwargs[pname] = None
             input_slot += 1
     return kwargs
-
-
-def _try_rewrite(
-    rule: _Rule,
-    match: Match,
-    ctx: Context | None,
-    *,
-    debug_on: bool,
-    pass_name: str | None,
-) -> list | None:
-    """Run ``rule.rewrite`` against ``match`` and return its options.
-
-    Returns ``None`` (caller should ``continue``) when the match is
-    stale, the rule raises ``RuleSkipped``, or it returns no options.
-    Otherwise returns a non-empty list of ``Op``/``Graph`` options."""
-    if not match.is_alive():
-        return None
-    kwargs = _build_rewrite_kwargs(rule, match, ctx)
-    try:
-        result = rule.rewrite(**kwargs)
-    except RuleSkipped as exc:
-        if debug_on:
-            emit(format_skipped(display_name(pass_name, rule.name), match.root_node_id, exc.reason))
-        return None
-    options = list(result) if isinstance(result, (list, tuple)) else [result]
-    return options or None
-
-
-# ---------------------------------------------------------------------------
-# Rewrite loop
-# ---------------------------------------------------------------------------
-
-
-def _try_one_rule(
-    cand: Candidate,
-    rule: _Rule,
-    ctx: Context | None,
-    dump: CompilerDump | None,
-    pass_idx: int | None,
-    pass_name: str | None,
-    *,
-    tree: SearchTree | None = None,
-) -> RuleResult:
-    """One iteration: enumerate ``rule``'s matches once and apply each
-    live match (with non-skipped rewrite) in batch. Match enumeration
-    happens ONCE per call — staged matches that get invalidated by an
-    earlier application in the batch are filtered via ``is_alive()``
-    rather than re-walking the graph. Per-rule batch semantics are what
-    downstream rules (lift / fusion / staging) depend on for
-    deterministic structure.
-
-    Mutates ``cand.graph`` and ``cand.trace`` in place with each match's
-    option-0 application. Does NOT touch ``cand.cursor`` — the caller
-    feeds the returned ``RuleResult`` to ``Cursor.advance`` to drive
-    the cursor transition. Each fork carries a deep-copied graph with
-    its alt applied at the fork point and a cursor at the same
-    ``(pass_idx, rule_idx)`` as ``cand``."""
-    debug_on = logger.isEnabledFor(logging.DEBUG)
-    dump_on = dump is not None and pass_idx is not None and pass_name is not None
-    need_text = debug_on or dump_on
-
-    matches = match_pattern(cand.graph, rule.pattern)
-    result = RuleResult()
-    for match in matches:
-        options = _try_rewrite(rule, match, ctx, debug_on=debug_on, pass_name=pass_name)
-        if options is None:
-            continue
-        # Drop options that fail their own validity check (e.g. TileOp
-        # variants whose post-register-tile launch would exceed 1024
-        # threads). Saves the engine from deep-copying and pushing a
-        # candidate that the backend will only fail on. Non-Op options
-        # (Graph fragments) skip the check; their structure is opaque
-        # at this layer.
-        options = [o for o in options if not isinstance(o, Op) or o.validate(ctx)]
-        if not options:
-            continue
-        chosen = options[0]
-        # Record the (parent_key → child_keys) expansion in the autotune
-        # tree before applying anything. Only fires when every option is
-        # an ``Op`` with a derivable ``op_cache_key`` — Graph-returning
-        # rewrites (decomposition / fusion) don't have a single post-op
-        # to key on, so they don't contribute tree edges. Single-option
-        # rules still record an edge (n_new=1, delta=0); the chain in
-        # the tree mirrors the source chain on the resulting kernels.
-        if tree is not None:
-            parent_key = op_cache_key(cand.graph.nodes[match.root_node_id].op)
-            if parent_key is not None and all(isinstance(o, Op) for o in options):
-                child_keys = [op_cache_key(o) for o in options]
-                if all(k is not None for k in child_keys):
-                    child_scores = [o.score(ctx) for o in options]
-                    tree.expand(parent_key, child_keys, child_scores=child_scores)
-        fragment = _wrap_op_as_fragment(cand.graph, match.root_node_id, chosen) if isinstance(chosen, Op) else chosen
-        text = _format_rule_application(rule.name, cand.graph, match, fragment, pass_name=pass_name) if need_text else None
-        if debug_on:
-            emit(text)
-        if dump_on:
-            record = _record_rule_application(cand.graph, match, fragment)
-            dump.on_rule(pass_idx, pass_name, rule.name, record, text)
-        # Fork branches: each alt becomes a **lazy** Candidate sharing
-        # a single deep-copied ``snapshot`` of the parent's graph at
-        # this fork point. The fork's ``.graph`` is materialized on
-        # first access (deepcopy + apply); the snapshot is freed by
-        # refcount once every sibling has materialized or been dropped
-        # from the search queue. Cuts fork-time memory from
-        # O(K·sizeof(graph)) to O(sizeof(graph)) per fork point.
-        #
-        # ``tip_key`` is precomputed for ``Op`` options so the search
-        # can bucket the fork without materializing; ``Graph``-returning
-        # options have ``tip_key=None`` and route to the fallback queue.
-        if len(options) > 1:
-            snapshot = cand.graph.copy()
-            for alt_idx, alt in enumerate(options[1:], start=1):
-                alt_delta = result.n_functional + (0 if isinstance(alt, Op) else 1)
-                tip_key = op_cache_key(alt) if isinstance(alt, Op) else None
-                # The fork inherits the parent's trace; ``Candidate.apply``
-                # appends the fork's ``TraceEntry`` when the fork is
-                # materialized via the ``.graph`` property.
-                result.forks.append(
-                    Candidate(
-                        ctx=cand.ctx,
-                        trace=cand.trace,
-                        cursor=cand.cursor.fork(alt_delta),
-                        _origin=ForkOrigin(
-                            parent_snapshot=snapshot,
-                            rule_name=rule.name,
-                            match=match,
-                            option=alt,
-                            choice_idx=alt_idx,
-                            tip_key=tip_key,
-                        ),
-                    )
-                )
-        cand.apply(rule.name, match, chosen)
-        # Functional (Graph) fires drive the end-of-scan restart; in-place
-        # (Op) rebinds don't, since the same pattern won't re-match the
-        # mutated op (or the rule's idempotence guard handles it).
-        if isinstance(chosen, Op):
-            result.n_inplace += 1
-        else:
-            result.n_functional += 1
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -567,3 +290,276 @@ def _filter_rules(rules: list[_Rule], select_set: set[str] | None) -> list[_Rule
     if select_set is None:
         return rules
     return [r for r in rules if r.name in select_set or _strip_rule_prefix(r.name) in select_set]
+
+
+# ---------------------------------------------------------------------------
+# Search driver — pop a candidate, run one rule's batch, push successors.
+# ``run_pipeline`` / ``run_autotune`` are the public entry points.
+# ---------------------------------------------------------------------------
+
+
+_PASSES_DIR = Path(__file__).resolve().parent / "passes"
+
+
+def _make_apply_logger(
+    *,
+    debug_on: bool,
+    dump: CompilerDump | None,
+) -> Callable[[Graph, str, Match, Op | Graph], None] | None:
+    """Build the ``Candidate.on_apply`` callback that renders a rule
+    application's diff at debug / writes its dump record. Returns
+    ``None`` when neither sink is active so ``Candidate.apply`` can
+    skip the hook entirely. ``rule_name`` comes from
+    ``Candidate.apply``; pipeline location comes from
+    ``match.pass_idx`` / ``match.pass_name`` (stamped by the search
+    loop after ``match_pattern``). One logger instance serves every
+    rule batch in the pipeline."""
+    if not (debug_on or dump is not None):
+        return None
+
+    def _on_apply(graph_before: Graph, rule_name: str, match: Match, option: Op | Graph) -> None:
+        fragment = _wrap_op_as_fragment(graph_before, match.root_node_id, option) if isinstance(option, Op) else option
+        text = _format_rule_application(rule_name, graph_before, match, fragment, pass_name=match.pass_name)
+        if debug_on:
+            emit(text)
+        if dump is not None and match.pass_idx is not None and match.pass_name is not None:
+            record = _record_rule_application(graph_before, match, fragment)
+            dump.on_rule(match.pass_idx, match.pass_name, rule_name, record, text)
+
+    return _on_apply
+
+
+def _search_loop(
+    search: Search,
+    rules_per_pass: list,
+    pass_names: list[str],
+    ctx: Context | None,
+    dump: CompilerDump | None,
+) -> Iterator[Candidate]:
+    """The unified search-driven driver. Each iteration: pop a
+    candidate, run one rule's batch of matches against its graph, push
+    successor(s). Yields when a candidate reaches the end of the
+    pipeline (``cursor.pass_idx >= len(pass_names)``).
+
+    Per-rule batch semantics: enumerate matches once, apply each live
+    one's option-0 to ``cand``, spawn lazy forks for every alt option.
+    ``Candidate.apply`` bumps ``cursor.n_applied`` for functional fires;
+    ``advance_rule`` moves ``rule_idx`` forward exactly once per batch
+    and restarts the scan when the pass collected any functional rewrite.
+    """
+    debug_on = logger.isEnabledFor(logging.DEBUG)
+
+    while (cand := search.pop()) is not None:
+        cur = cand.cursor
+        if cur.pass_idx >= len(pass_names):
+            yield cand
+            continue
+        rules = rules_per_pass[cur.pass_idx]
+        # Empty pass (e.g. all rules filtered out): nothing to do, skip.
+        if not rules:
+            cur.pass_idx += 1
+            search.push(cand)
+            continue
+        rule = rules[cur.rule_idx]
+        pass_name_arg = pass_names[cur.pass_idx] or None
+        pass_idx_arg = cur.pass_idx if pass_name_arg else None
+        n_rules = len(rules)
+
+        forks: list[Candidate] = []
+        # Defer the final apply via a single-slot ``pending``: each new
+        # iteration first applies the previous pending (with default
+        # ``is_last=False`` — just bumps ``n_applied`` for functional
+        # fires), then runs the current match's rewrite against the now
+        # up-to-date graph. After the loop the final pending gets
+        # applied with ``is_last=True`` so its ``apply`` advances the
+        # cursor. This way every cursor transition flows through
+        # ``Candidate.apply`` — eager driver and lazy fork
+        # materialization share one transition implementation.
+        pending: tuple[Match, Op | Graph] | None = None
+        for match in match_pattern(cand.graph, rule.pattern):
+            if pending is not None:
+                prev_match, prev_opt = pending
+                pending = None
+                if prev_match.is_alive():
+                    cand.apply(rule.name, prev_match, prev_opt)
+            if not match.is_alive():
+                continue
+            match.pass_idx = pass_idx_arg
+            match.pass_name = pass_name_arg
+            match.n_rules = n_rules
+            try:
+                result = rule.rewrite(**_build_rewrite_kwargs(rule, match, ctx))
+            except RuleSkipped as exc:
+                if debug_on:
+                    emit(format_skipped(display_name(pass_name_arg, rule.name), match.root_node_id, exc.reason))
+                continue
+            options = list(result) if isinstance(result, (list, tuple)) else [result]
+            # Drop options that fail their own validity check (e.g. TileOp
+            # variants whose post-register-tile launch would exceed 1024
+            # threads). Saves the engine from deep-copying and pushing a
+            # candidate that the backend will only fail on. Non-Op options
+            # (Graph fragments) skip the check; their structure is opaque
+            # at this layer.
+            options = [o for o in options if not isinstance(o, Op) or o.validate(ctx)]
+            if not options:
+                continue
+            if len(options) > 1:
+                snapshot = cand.graph.copy()
+                # Each fork is a one-apply lineage: when its lazy
+                # materialization runs ``apply``, that single apply is
+                # the end of the rule batch for the fork — so its
+                # stored match carries ``is_last=True``. Clone via
+                # ``replace`` so we don't bleed ``is_last`` onto the
+                # cand's copy of the same match.
+                fork_match = replace(match, is_last=True)
+                for alt in options[1:]:
+                    forks.append(
+                        Candidate(
+                            ctx=cand.ctx,
+                            cursor=replace(cand.cursor),
+                            on_apply=cand.on_apply,
+                            on_pass_finish=cand.on_pass_finish,
+                            _origin=ForkOrigin(
+                                parent_snapshot=snapshot,
+                                rule_name=rule.name,
+                                match=fork_match,
+                                option=alt,
+                            ),
+                        )
+                    )
+            pending = (match, options[0])
+
+        # Final apply for cand: stamp ``is_last`` on the last live
+        # pending so its ``apply`` advances the cursor. For empty
+        # batches (no rewrite landed) synthesize a no-op apply so the
+        # advance still goes through ``Candidate.apply``.
+        if pending is not None and pending[0].is_alive():
+            pending[0].is_last = True
+            cand.apply(rule.name, pending[0], pending[1])
+        else:
+            sentinel = Match(
+                graph=cand.graph,
+                root_node_id="",
+                pass_idx=pass_idx_arg,
+                pass_name=pass_name_arg,
+                n_rules=n_rules,
+                is_last=True,
+            )
+            cand.apply(rule.name, sentinel, None)
+        # Push ``cand`` and its sibling forks together so the policy
+        # sees them as one fork-point group. ``GreedySearch`` keeps
+        # only ``cand`` (option-0); ``TuningSearch`` registers each
+        # fork group as a tree edge before bucketing.
+        search.push(cand, *forks)
+
+
+def run_pipeline(
+    graph: Graph,
+    passes: list[str],
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+    ctx: Context | None = None,
+    backend=None,
+    db: SearchDB | None = None,
+) -> Graph:
+    """Single-shot greedy compile — run each named pass directory in
+    order, picking option 0 at every fork point. Convenience wrapper
+    around :func:`run_autotune` that yields the first terminal.
+
+    ``ctx`` is built once (probing the live device if not provided)
+    and passed to every rule that takes a ``ctx`` parameter.
+
+    ``backend`` (typically :class:`CudaBackend`) opts the run into real
+    GPU measurement: every terminal graph's per-kernel latency is
+    recorded to ``db`` and attributed to every ancestor along the
+    ``Op.source`` chain. ``db`` defaults to a fresh in-memory store;
+    pass an explicit :class:`SearchDB` to persist measurements
+    across runs.
+
+    For exhaustive autotuning, call :func:`run_autotune` directly with
+    :class:`TuningSearch` and iterate every yielded candidate."""
+    search = GreedySearch(db=db)
+    return next(run_autotune(graph, passes, search=search, dump=dump, select=select, ctx=ctx, backend=backend, db=db)).graph
+
+
+def run_autotune(
+    graph: Graph,
+    passes: list[str],
+    *,
+    search: Search,
+    dump: CompilerDump | None = None,
+    select: Iterable[str] | None = None,
+    ctx: Context | None = None,
+    backend=None,
+    db: SearchDB | None = None,
+) -> Iterator[Candidate]:
+    """Drive the autotune search. Yields one terminal ``Candidate`` per
+    fully-explored branch. With deterministic rules (no list-returning
+    rewrites) the search yields exactly one — same shape as
+    ``run_pipeline``.
+
+    ``search`` chooses both the order and the stopping condition:
+    :class:`GreedySearch` for single-shot compiles (stops at the first
+    terminal); :class:`TuningSearch` for ``--tune`` (runs the queue dry,
+    exploring every fork).
+
+    When ``search`` exposes a ``tree: SearchTree`` (``TuningSearch``
+    does), each yielded terminal candidate has its ``CudaOp`` nodes
+    recorded to ``db`` and the tree via :func:`record_terminal` before
+    being yielded — so subsequent candidates see the updated priority
+    signal. Pass a ``Backend`` (typically :class:`CudaBackend`) via
+    ``backend=`` to record real GPU-event latencies; omit it to record
+    the stub ``latency_us=1.0``.
+
+    ``ctx`` is built once (probing the live device if not provided) and
+    shared by every candidate."""
+    if ctx is None:
+        ctx = Context.probe()
+    backend_name = getattr(backend, "name", "cuda")
+    if ctx.backend_name != backend_name:
+        ctx = replace(ctx, backend_name=backend_name)
+    select_set = set(select) if select is not None else None
+    rules_per_pass = [_filter_rules(_load_rules(_PASSES_DIR / name), select_set) for name in passes]
+    t_start = time.monotonic()
+
+    # The on_apply hook (debug diff + dump.on_rule) propagates from the
+    # root Candidate to every fork via ``cand.on_apply`` in the loop, so
+    # one logger built here serves the whole pipeline run — the search
+    # loop never has to (re)install it.
+    on_apply = _make_apply_logger(debug_on=logger.isEnabledFor(logging.DEBUG), dump=dump)
+
+    def on_pass_finish(pass_idx: int, pass_name: str, graph_after: Graph) -> None:
+        logger.debug("compile: %-18s done (%d nodes)", pass_name, len(graph_after.nodes))
+        if dump is not None:
+            dump.on_pass(pass_idx, pass_name, graph_after)
+
+    search.push(Candidate(ctx=ctx, on_apply=on_apply, on_pass_finish=on_pass_finish, _graph=graph))
+
+    tree: SearchTree | None = getattr(search, "tree", None)
+    if db is None:
+        db = SearchDB()
+    n_terminals = 0
+    for cand in _search_loop(search, rules_per_pass, passes, ctx, dump):
+        n_terminals += 1
+        if backend is not None:
+            knob_strs: list[str] = []
+            for nid in cand.graph.topological_order():
+                op = cand.graph.nodes[nid].op
+                k = getattr(op, "knobs", None) or {}
+                if k:
+                    knob_strs.append(", ".join(f"{kk}={vv}" for kk, vv in sorted(k.items())))
+            label = " | ".join(knob_strs) if knob_strs else "option-0"
+            logger.info("[tune] variant #%d  [%s]", n_terminals, label)
+        try:
+            record_terminal(cand.graph, db, tree, cand.ctx.structural_key(), backend=backend)
+        except TuneAborted as exc:
+            # A bench failure left GPU work queued; running another
+            # variant would block in cupy's ``_allocate``. Yield this
+            # terminal (its measurements are already recorded as
+            # bench_fail) and stop the sweep so the caller can pick a
+            # winner from whatever ok variants we've got.
+            logger.warning("[tune] %s — stopping after %d terminal(s)", exc, n_terminals)
+            yield cand
+            break
+        yield cand
+    logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)

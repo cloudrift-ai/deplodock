@@ -24,9 +24,11 @@ import sys
 from collections import deque
 from dataclasses import dataclass, field
 
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
+from deplodock.compiler.pipeline.search.policy.base import Search
 
 # ---------------------------------------------------------------------------
 # In-memory MCTS tree
@@ -230,6 +232,15 @@ class SearchTree:
         scores = child_scores if child_scores is not None else [float("-inf")] * len(child_keys)
         n_new = 0
         for ck, s in zip(child_keys, scores, strict=True):
+            # A child equal to its parent is always a cycle (the rule
+            # produced a variant whose ``op_cache_key`` matches the
+            # input). Adopting it would set ``parent.parent = parent``
+            # and ``_propagate_expected`` would loop forever. Caller is
+            # expected to derive distinct keys (e.g. via ``op.knobs``);
+            # guard here so a missed key contribution can't deadlock the
+            # autotune driver.
+            if ck == parent_key:
+                continue
             if ck in existing_keys:
                 # Backfill score on a re-expansion if it wasn't set originally.
                 row = self._nodes[ck]
@@ -324,7 +335,7 @@ class SearchTree:
 # ---------------------------------------------------------------------------
 
 
-class TuningSearch:
+class TuningSearch(Search):
     """MCTS-style exhaustive priority search using UCB1 selection.
 
     Each candidate sits at some "tip" node in the search tree (the
@@ -419,22 +430,65 @@ class TuningSearch:
         return self._stop_reason
 
     def push(self, c: Candidate, *forks: Candidate) -> None:
+        # Group forks by rewrite site (every fork from the same
+        # ``_try_one_rule`` match shares ``_origin.match.root_node_id``)
+        # so each multi-option fork point produces one ``tree.expand``
+        # edge — the engine no longer reaches into the tree itself.
+        sites: dict[str, list[Candidate]] = {}
+        for fork in forks:
+            origin = fork._origin
+            if origin is None:
+                continue
+            sites.setdefault(origin.match.root_node_id, []).append(fork)
+        for site, group in sites.items():
+            self._record_fork(c, site, group)
         self._push_one(c)
         for fork in forks:
             self._push_one(fork)
 
+    def _record_fork(self, primary: Candidate, site: str, forks: list[Candidate]) -> None:
+        """Register one ``parent_key → child_keys`` edge in the MCTS
+        tree, derived from the fork group at ``site``. ``primary`` is
+        option-0 (already applied to its graph); ``forks`` are the alt
+        options whose ``ForkOrigin.option`` carries the post-rule op.
+        Skips when the site isn't in ``primary.graph`` (Graph splices
+        that removed the node) or any key is uncomputable."""
+        primary_node = primary.graph.nodes.get(site)
+        if primary_node is None:
+            return
+        parent_op = primary_node.op.source
+        if parent_op is None:
+            return
+        parent_key = op_cache_key(parent_op)
+        if parent_key is None:
+            return
+        members: list[tuple[Op, Candidate]] = [(primary_node.op, primary)]
+        for fork in forks:
+            opt = fork._origin.option if fork._origin is not None else None
+            if not isinstance(opt, Op):
+                return  # mixed-shape fork group — keep the tree honest, skip
+            members.append((opt, fork))
+        child_keys: list[str] = []
+        for op, _ in members:
+            ck = op_cache_key(op)
+            if ck is None:
+                return
+            child_keys.append(ck)
+        scores = [op.score(cand.ctx) for op, cand in members]
+        self._tree.expand(parent_key, child_keys, child_scores=scores)
+
     def _push_one(self, c: Candidate) -> None:
         if self._context_key is None:
             self._context_key = c.ctx.structural_key()
-        # Lazy forks expose a precomputed ``tip_key`` so we don't have
-        # to materialize their graph just to bucket them. A lazy fork
-        # whose option is a Graph-returning rewrite has no precomputable
-        # tip and falls through to the fallback queue without
-        # materializing — those are rare (functional fusion /
-        # decomposition rarely fork). Concrete candidates compute the
-        # tip from their materialized graph as before.
+        # Lazy forks know their post-rule op via ``_origin.option`` so
+        # we can bucket them without materializing the graph. Forks
+        # whose option is a Graph splice have no single tip op and fall
+        # through to the fallback queue (rare — functional rewrites
+        # rarely fork at autotune points). Concrete candidates compute
+        # the tip from their materialized graph.
         if c._origin is not None:
-            tip_key = c._origin.tip_key
+            opt = c._origin.option
+            tip_key = op_cache_key(opt) if isinstance(opt, Op) else None
         else:
             tip_key = self._tip_key(c.graph)
         if tip_key is None:

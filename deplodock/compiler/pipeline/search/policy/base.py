@@ -1,13 +1,13 @@
-"""``Search`` protocol shared by the concrete policies."""
+"""``Search`` ABC shared by the concrete policies."""
 
 from __future__ import annotations
 
-from typing import Protocol
+from abc import ABC, abstractmethod
 
 from deplodock.compiler.pipeline.search.candidate import Candidate
 
 
-class Search(Protocol):
+class Search(ABC):
     """Search-strategy hook. The engine pushes spawned candidates and
     pops the next one to expand. ``pop`` returning ``None`` ends the
     search. Implementations choose both the ordering (DFS / BFS /
@@ -21,9 +21,12 @@ class Search(Protocol):
 
     ``push(c, *forks)`` carries the primary candidate ``c`` plus every
     sibling alternative the engine spawned at the same rewrite point.
-    Exhaustive policies register all of them; greedy policies can
-    discard the forks once they pick the most promising primary
-    (optionally consulting the DB via ``c.last_rewritten``)."""
+    Exhaustive policies register all of them; greedy policies discard
+    the forks and keep only ``c`` (option-0)."""
 
+    @abstractmethod
     def push(self, c: Candidate, *forks: Candidate) -> None: ...
-    def pop(self) -> Candidate | None: ...  # None when exhausted
+
+    @abstractmethod
+    def pop(self) -> Candidate | None:  # None when exhausted
+        ...
