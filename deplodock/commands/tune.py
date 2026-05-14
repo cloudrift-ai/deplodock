@@ -147,14 +147,13 @@ def handle_tune(args):
     result = _pick_best_candidate(candidates, db).graph
     _print_tune_summary(candidates, db)
 
-    content = format_stage(result, "cuda")
+    # Only write the winner's CUDA source when ``--output`` is given.
+    # Dumping a multi-kB kernel to stdout after a 40s tune is noise —
+    # callers that want it can pass ``-o`` (or re-run ``deplodock compile``
+    # with the winning knobs to reproduce).
     if args.output:
-        Path(args.output).write_text(content)
+        Path(args.output).write_text(format_stage(result, "cuda"))
         logger.info("Saved cuda IR: %s", args.output)
-    else:
-        sys.stdout.write(content)
-        if not content.endswith("\n"):
-            sys.stdout.write("\n")
 
     # A bench-timeout abandons its NVRTC worker thread (see
     # ``_benchmark_with_timeout``) which is still holding the CUDA
@@ -245,14 +244,22 @@ def _print_tune_summary(candidates, db) -> None:
     rows.sort(key=lambda r: (not r[0], r[1]))
     sys.stderr.write(f"\n[tune] explored {len(rows)} variant(s):\n")
     sys.stderr.write(f"{'rank':>4}  {'status':>7}  {'total_us':>10}  knobs per kernel\n")
-    for rank, (all_ok, total, knobs_str, _) in enumerate(rows):
+
+    def _emit(rank: int, row: tuple[bool, float, str, list[tuple[str, float]]]) -> None:
+        all_ok, total, knobs_str, _ = row
         marker = "*" if rank == 0 and all_ok else " "
         status = "ok" if all_ok else "fail"
         sys.stderr.write(f"{rank:>4}{marker} {status:>7}  {total:>10.2f}  {knobs_str}\n")
 
-    ok_rows = [r for r in rows if r[0]]
-    if ok_rows:
-        _, best_total, best_knobs, best_kernels = ok_rows[0]
-        sys.stderr.write(f"\n[tune] winner [{best_knobs}]: {best_total:.2f} us total\n")
-        for name, latency in best_kernels:
-            sys.stderr.write(f"         {name:<48}  {latency:>10.2f} us\n")
+    # Collapse the middle of long tables: head 10 + ellipsis + tail 5.
+    # 20 is the threshold below which the full table fits on one screen
+    # and the elision would hide more than it saves.
+    if len(rows) > 20:
+        for rank, row in enumerate(rows[:10]):
+            _emit(rank, row)
+        sys.stderr.write(f"{'...':>4}   {'...':>7}  {'...':>10}  ({len(rows) - 15} variant(s) elided)\n")
+        for offset, row in enumerate(rows[-5:]):
+            _emit(len(rows) - 5 + offset, row)
+    else:
+        for rank, row in enumerate(rows):
+            _emit(rank, row)
