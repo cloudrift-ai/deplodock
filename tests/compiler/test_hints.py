@@ -166,13 +166,13 @@ def test_hints_flow_through_lower():
     After fusion, the matmul pair (mul + sum) becomes one LoopOp graph
     node whose ``.hints`` carries the merged hints from all consumed nodes.
     """
-    from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
     g = _matmul_graph()
     ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))
     g.nodes[ew_id].hints.set("cuda.matmul.strategy", "tma_db")
 
-    fused = run_pipeline(g, LOOP_PASSES)
+    fused = Pipeline.build(LOOP_PASSES).run(g)
 
     from deplodock.compiler.ir.loop import LoopOp
 

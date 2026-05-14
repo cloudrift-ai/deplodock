@@ -2,7 +2,7 @@
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import SoftmaxOp
-from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, softmax_decompose
 
 PATTERN = [Pattern("root", SoftmaxOp)]

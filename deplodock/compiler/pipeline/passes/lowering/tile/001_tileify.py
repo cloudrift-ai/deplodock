@@ -36,7 +36,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Cond, Loop, StridedLoop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", LoopOp)]
 

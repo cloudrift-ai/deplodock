@@ -25,7 +25,7 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, TernaryExpr, placeholder
 from deplodock.compiler.ir.frontend.ir import CatOp
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", CatOp)]

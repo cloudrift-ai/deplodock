@@ -16,7 +16,7 @@ from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Select, SelectBranch, Write
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import IndexMapOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline import Match, Pattern
 
 PATTERN = [Pattern("root", IndexMapOp)]
 

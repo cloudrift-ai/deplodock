@@ -20,7 +20,7 @@ from deplodock.compiler.backend.cuda.program import (
     run_program,
     run_program_debug,
 )
-from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
+from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class CudaBackend(Backend):
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
-        return run_pipeline(graph, CUDA_PASSES, dump=self.dump)
+        return Pipeline.build(CUDA_PASSES, dump=self.dump).run(graph)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         # GPU serialization happens inside ``run_program`` /

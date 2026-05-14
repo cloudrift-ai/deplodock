@@ -16,14 +16,14 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import run_pipeline
+from deplodock.compiler.pipeline import Pipeline
 
 rng = np.random.default_rng(0)
 _backend = NumpyBackend()
 
 
 def _fuse(graph: Graph) -> Graph:
-    return run_pipeline(graph, ["loop/lifting", "loop/fusion"])
+    return Pipeline.build(["loop/lifting", "loop/fusion"]).run(graph)
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

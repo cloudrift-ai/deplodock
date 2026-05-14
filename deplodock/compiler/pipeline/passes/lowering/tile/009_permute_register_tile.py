@@ -66,7 +66,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Tile, Write
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     single_tile,

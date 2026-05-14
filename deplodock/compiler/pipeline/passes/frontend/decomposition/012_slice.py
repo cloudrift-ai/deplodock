@@ -9,7 +9,7 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SliceOp
-from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", SliceOp)]

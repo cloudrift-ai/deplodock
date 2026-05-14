@@ -3,7 +3,7 @@
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import run_pipeline
+from deplodock.compiler.pipeline import Pipeline
 
 _DECOMP_PASS = "frontend/decomposition"
 
@@ -20,7 +20,7 @@ def _make_silu_graph() -> Graph:
 def test_decompose_silu():
     """Running the decomposition pass replaces silu with primitive ops."""
     g = _make_silu_graph()
-    result = run_pipeline(g, [_DECOMP_PASS])
+    result = Pipeline.build([_DECOMP_PASS]).run(g)
     fns = [n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
     assert "silu" not in fns
     assert "negative" in fns
@@ -30,7 +30,7 @@ def test_decompose_silu():
 def test_decomposed_output_preserved():
     """Graph outputs still point at an ElementwiseOp after decomposition."""
     g = _make_silu_graph()
-    result = run_pipeline(g, [_DECOMP_PASS])
+    result = Pipeline.build([_DECOMP_PASS]).run(g)
     assert len(result.outputs) == 1
     assert isinstance(result.nodes[result.outputs[0]].op, ElementwiseOp)
 
@@ -38,6 +38,6 @@ def test_decomposed_output_preserved():
 def test_fixed_point_is_idempotent():
     """Applying a pass to its own output is a no-op."""
     g = _make_silu_graph()
-    once = run_pipeline(g, [_DECOMP_PASS])
-    twice = run_pipeline(once, [_DECOMP_PASS])
+    once = Pipeline.build([_DECOMP_PASS]).run(g)
+    twice = Pipeline.build([_DECOMP_PASS]).run(once)
     assert len(twice.nodes) == len(once.nodes)

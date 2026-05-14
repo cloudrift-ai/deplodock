@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.engine import _strip_rule_prefix as strip_rule_prefix
+from deplodock.compiler.pipeline import _strip_rule_prefix as strip_rule_prefix
 
 
 class RecordingDump:

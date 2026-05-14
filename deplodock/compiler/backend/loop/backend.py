@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.backend import Backend
-from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
+from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
@@ -29,4 +29,4 @@ class LoopBackend(Backend):
     name = "loop"
 
     def compile(self, graph: Graph) -> Graph:
-        return run_pipeline(graph, LOOP_PASSES)
+        return Pipeline.build(LOOP_PASSES).run(graph)

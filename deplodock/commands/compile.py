@@ -192,7 +192,7 @@ def handle_compile(args):
     else:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
     from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
     from deplodock.compiler.target import apply_target_arg
@@ -239,7 +239,7 @@ def handle_compile(args):
         import os as _os  # noqa: PLC0415
         import time as _time  # noqa: PLC0415
 
-        from deplodock.compiler.pipeline import TuningSearch, run_autotune  # noqa: PLC0415
+        from deplodock.compiler.pipeline import Pipeline, TuningSearch  # noqa: PLC0415
 
         search = TuningSearch(
             db=db,
@@ -249,7 +249,7 @@ def handle_compile(args):
         t0 = _time.monotonic()
         candidates: list = []
         try:
-            for cand in run_autotune(graph, passes, search=search, dump=dump, backend=backend, db=db):
+            for cand in Pipeline.build(passes, dump=dump).tune(graph, search=search, backend=backend, db=db):
                 candidates.append(cand)
         except KeyboardInterrupt:
             # Manual abort: cut the sweep, fall through to summary + best-pick.
@@ -275,7 +275,7 @@ def handle_compile(args):
         result = _pick_best_candidate(candidates, db).graph
         _print_tune_summary(candidates, db)
     else:
-        result = run_pipeline(graph, passes, dump=dump)
+        result = Pipeline.build(passes, dump=dump).run(graph)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)

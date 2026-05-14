@@ -7,7 +7,7 @@ full permutation of length ``ndim`` (``aten.permute``).
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.frontend.ir import TransposeOp
-from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", TransposeOp)]

@@ -13,21 +13,22 @@ once, replay the chain of ``(match, option)`` pairs through
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph
+from deplodock.compiler.graph import Graph, Tensor, _fmt_op
+from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
+from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
+from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-
 # skipped lines under ``compile -vv``) keep working without callers
 # having to also bump this module's level.
-_logger = logging.getLogger("deplodock.compiler.pipeline.engine")
+_logger = logging.getLogger("deplodock.compiler.pipeline")
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.base import Op
-    from deplodock.compiler.pipeline.engine import Match, Pass
+    from deplodock.compiler.pipeline.pipeline import Match
 
 
 @dataclass
@@ -50,20 +51,15 @@ class Cursor:
     n_applied: int = 0
 
 
-ApplyCallback = Callable[["Graph", "Match", "Op | Graph"], None]
-PassFinishCallback = Callable[["Pass", Graph], None]
-
-
 @dataclass
 class Candidate:
     """A concrete point in the search space — owns a real ``graph``.
 
     ``ctx`` is shared by reference across siblings. ``cursor`` tracks
-    pipeline resume state. ``on_apply`` is fired from inside
-    :meth:`apply` just before each rewrite mutates ``graph`` (the
-    engine installs it on the root candidate; forks inherit).
-    ``on_pass_finish`` fires from inside :meth:`apply` when the rule
-    batch ending the pass is applied.
+    pipeline resume state. The candidate reads any logging / dump sink
+    off ``match.pipeline.dump`` inside :meth:`apply` and the
+    end-of-pass hook inside :meth:`_advance_batch` — no separate
+    callback wiring is needed.
 
     :class:`LazyCandidate` is the deferred-apply counterpart used for
     autotune fork siblings; both expose :meth:`resolve` so the search
@@ -72,8 +68,6 @@ class Candidate:
     ctx: Context
     graph: Graph
     cursor: Cursor = field(default_factory=Cursor)
-    on_apply: ApplyCallback | None = None
-    on_pass_finish: PassFinishCallback | None = None
 
     def resolve(self) -> Candidate:
         """Identity — already concrete. Provided so callers can resolve
@@ -103,10 +97,8 @@ class Candidate:
         is skipped by the rule's own idempotence guard. The
         multi-option return path is the one exception: the cursor
         advance is left to the eventual fork's apply on resolve."""
-        from deplodock.compiler.ir.base import Op as _Op  # noqa: PLC0415
-        from deplodock.compiler.pipeline.engine.driver import _build_rewrite_kwargs  # noqa: PLC0415
-        from deplodock.compiler.pipeline.engine.pipeline import RuleSkipped  # noqa: PLC0415
-        from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped  # noqa: PLC0415
+        from deplodock.compiler.pipeline.pipeline import RuleSkipped  # noqa: PLC0415
+        from deplodock.compiler.pipeline.rule_diff import emit, format_skipped  # noqa: PLC0415
 
         if not match.is_alive():
             # Earlier applies in this batch invalidated the match's
@@ -121,11 +113,11 @@ class Candidate:
             result = rule.rewrite(**_build_rewrite_kwargs(rule, match, self.ctx))
         except RuleSkipped as exc:
             if _logger.isEnabledFor(logging.DEBUG):
-                emit(format_skipped(display_name(match.pass_name, match.rule_name or ""), match.root_node_id, exc.reason))
+                emit(format_skipped(display_name(rule.pass_.name if rule.pass_ else None, rule.name), match.root_node_id, exc.reason))
             self._advance_if_last(match)
             return None
         options = list(result) if isinstance(result, (list, tuple)) else [result]
-        options = [o for o in options if not isinstance(o, _Op) or o.validate(self.ctx)]
+        options = [o for o in options if not isinstance(o, Op) or o.validate(self.ctx)]
         if not options:
             self._advance_if_last(match)
             return None
@@ -141,9 +133,11 @@ class Candidate:
         """Lazy mode (called by ``LazyCandidate.resolve`` and
         internally by :meth:`try_rewrite` for single-option matches):
         apply the specific ``option`` to this candidate's graph.
-        Mutates the graph, fires ``on_apply``, bumps cursor
-        ``n_applied`` for functional splices, and advances the rule-
-        batch cursor when ``match.is_last``.
+        Mutates the graph, logs the rewrite (debug diff +
+        ``pipeline.dump.on_rule`` snapshot, both read off
+        ``match.pipeline``), bumps cursor ``n_applied`` for functional
+        splices, and advances the rule-batch cursor when
+        ``match.is_last``.
 
         ``Op`` rebinds ``root.op`` (id / inputs / hints kept);
         ``Graph`` is a fragment spliced via ``Graph.splice``. On the
@@ -151,11 +145,8 @@ class Candidate:
         being replaced (unless the rule already set it) and the
         predecessor's ``knobs`` are merged forward — so the rewrite
         chain threads through every in-place rebind for free."""
-        from deplodock.compiler.ir.base import Op as _Op  # noqa: PLC0415
-
-        if self.on_apply is not None:
-            self.on_apply(self.graph, match, option)
-        if isinstance(option, _Op):
+        self._log_apply(match, option)
+        if isinstance(option, Op):
             old_op = self.graph.nodes[match.root_node_id].op
             if option is not old_op and option.source is None:
                 option.source = old_op
@@ -167,15 +158,39 @@ class Candidate:
             self.cursor.n_applied += 1
         self._advance_if_last(match)
 
+    def _log_apply(self, match: Match, option: Op | Graph) -> None:
+        """Render a per-rule diff at DEBUG and route a structured
+        record to ``match.pipeline.dump`` when set. Returns early when
+        neither sink is active."""
+        from deplodock.compiler.pipeline.rule_diff import emit  # noqa: PLC0415
+
+        rule = match.rule
+        pass_ = rule.pass_ if rule is not None else None
+        pipeline = match.pipeline
+        dump = pipeline.dump if pipeline is not None else None
+        debug_on = _logger.isEnabledFor(logging.DEBUG)
+        if not (debug_on or dump is not None):
+            return
+        fragment = _wrap_op_as_fragment(self.graph, match.root_node_id, option) if isinstance(option, Op) else option
+        rule_name = rule.name if rule is not None else ""
+        pass_name = pass_.name if pass_ is not None else None
+        text = _format_rule_application(rule_name, self.graph, match, fragment, pass_name=pass_name)
+        if debug_on:
+            emit(text)
+        if dump is not None and rule is not None and pass_ is not None and pass_.name:
+            record = _record_rule_application(self.graph, match, fragment)
+            dump.on_rule(pass_, rule, record, text)
+
     def _advance_if_last(self, match: Match) -> None:
         if match.is_last:
-            self._advance_batch(match.pass_)
+            self._advance_batch(match)
 
-    def _advance_batch(self, pass_: Pass | None) -> None:
+    def _advance_batch(self, match: Match) -> None:
         """Move ``cursor.rule_idx`` past the just-finished rule batch.
-        Wraps to the next pass (firing ``on_pass_finish``) when the
-        scan completes with no functional rewrites; otherwise restarts
-        the scan from rule 0 to apply newly-spawned matches."""
+        Wraps to the next pass (logging done + flushing ``pipeline.dump.on_pass``)
+        when the scan completes with no functional rewrites; otherwise
+        restarts the scan from rule 0 to apply newly-spawned matches."""
+        pass_ = match.rule.pass_ if match.rule is not None else None
         cur = self.cursor
         cur.rule_idx += 1
         n_rules = len(pass_.rules) if pass_ is not None else 0
@@ -185,8 +200,11 @@ class Candidate:
         cur.rule_idx = 0
         cur.n_applied = 0
         if finished:
-            if self.on_pass_finish is not None and pass_ is not None and pass_.name:
-                self.on_pass_finish(pass_, self.graph)
+            if pass_ is not None and pass_.name:
+                _logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(self.graph.nodes))
+                pipeline = match.pipeline
+                if pipeline is not None and pipeline.dump is not None:
+                    pipeline.dump.on_pass(pass_, self.graph)
             cur.pass_idx += 1
 
 
@@ -194,9 +212,8 @@ class Candidate:
 class LazyCandidate:
     """Deferred-apply counterpart of :class:`Candidate`. Holds a parent
     ``inner`` Candidate (whose ``graph`` is the snapshot to clone from
-    and whose ``ctx`` / ``on_apply`` / ``on_pass_finish`` propagate
-    onto the resolved Candidate) and a ``chain`` of ``(match, option)``
-    pairs to replay on resolve.
+    and whose ``ctx`` propagates onto the resolved Candidate) and a
+    ``chain`` of ``(match, option)`` pairs to replay on resolve.
 
     Sibling forks at the same rewrite point share ``inner`` by
     reference — only one snapshot is ever held in memory per fork
@@ -212,23 +229,157 @@ class LazyCandidate:
 
     def resolve(self) -> Candidate:
         """Materialize: copy ``inner.graph``, build a fresh Candidate
-        carrying our cursor and the inner's callbacks, replay the
-        chain through its ``apply``, drop the chain so a second resolve
-        is a no-op (returns the cached resolved Candidate). Multiple
-        sibling ``LazyCandidate`` instances pointing at the same
-        ``inner`` each get their own copy — the snapshot is shared
-        only across siblings, not across resolve calls."""
+        carrying our cursor, replay the chain through its ``apply``,
+        drop the chain so a second resolve is a no-op (returns the
+        cached resolved Candidate). Multiple sibling ``LazyCandidate``
+        instances pointing at the same ``inner`` each get their own
+        copy — the snapshot is shared only across siblings, not across
+        resolve calls."""
         if not self.chain:
             return self.inner
-        resolved = Candidate(
-            ctx=self.inner.ctx,
-            graph=self.inner.graph.copy(),
-            cursor=self.cursor,
-            on_apply=self.inner.on_apply,
-            on_pass_finish=self.inner.on_pass_finish,
-        )
+        resolved = Candidate(ctx=self.inner.ctx, graph=self.inner.graph.copy(), cursor=self.cursor)
         for match, option in self.chain:
             resolved.apply(match.remap(resolved.graph), option)
         self.chain = []
         self.inner = resolved
         return resolved
+
+
+# ---------------------------------------------------------------------------
+# Per-rule snapshot rendering (used at DEBUG, i.e. ``compile -vv``, and
+# routed to ``pipeline.dump.on_rule`` when a dump sink is set).
+# Module-private helpers used only by :meth:`Candidate._log_apply`.
+# ---------------------------------------------------------------------------
+
+
+def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph, *, pass_name: str | None = None) -> str:
+    """Render a one-rule-application snapshot as a unified diff bracketed
+    by ``>>> name`` / ``<<< name`` markers (see ``rule_diff``). Kernel
+    ops (LoopOp/TileOp/KernelOp/CudaOp) are pretty-printed via their
+    dedicated printers rather than dumped as a body repr."""
+    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
+    matched_ids.add(match.root_node_id)
+    matched_nodes = [graph.nodes[nid] for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes]
+    before = _format_nodes(matched_nodes, graph)
+    frag_nodes = [fragment.nodes[nid] for nid in fragment.topological_order()]
+    after = _format_nodes(frag_nodes, fragment)
+    return render_rule_diff(display_name(pass_name, name), before, after, header=f"matched at {match.root_node_id}")
+
+
+def _wrap_op_as_fragment(graph: Graph, root_id: str, new_op: Op) -> Graph:
+    """Build a single-node fragment that mirrors ``graph.nodes[root_id]``
+    with ``new_op`` substituted. Lets the engine render an in-place op
+    rebind through the same diff/dump path as a functional fragment splice
+    (the engine then assigns ``root.op = new_op`` directly, bypassing the
+    splicer — node id, inputs list, hints, and output Tensor are kept)."""
+    root = graph.nodes[root_id]
+    frag = Graph()
+    for inp_id in root.inputs:
+        if inp_id in frag.nodes:
+            continue
+        inp = graph.nodes.get(inp_id)
+        shape = inp.output.shape if inp is not None else ()
+        dtype = inp.output.dtype if inp is not None else "f32"
+        frag.add_node(InputOp(), [], Tensor(inp_id, shape, dtype), node_id=inp_id)
+    out_id = frag.add_node(new_op, list(root.inputs), root.output, node_id=root.id)
+    frag.outputs = [out_id]
+    return frag
+
+
+def _record_rule_application(graph: Graph, match: Match, fragment: Graph) -> dict:
+    """Structured analog of ``_format_rule_application`` for JSON dumps.
+
+    Captures the matched-subgraph nodes and the fragment's nodes as plain
+    dicts so post-hoc scripts (and the article-side analysis) can iterate
+    rule applications without re-parsing the text snapshot.
+    """
+    matched_ids: set[str] = set(match.consumed) | set(match.nodes.values())
+    matched_ids.add(match.root_node_id)
+    return {
+        "root": match.root_node_id,
+        "matched_pattern_nodes": dict(match.nodes),
+        "before": [_node_to_dict(graph.nodes[nid]) for nid in graph.topological_order() if nid in matched_ids and nid in graph.nodes],
+        "after": [_node_to_dict(fragment.nodes[nid]) for nid in fragment.topological_order()],
+    }
+
+
+def _node_to_dict(node) -> dict:
+    return {
+        "id": node.output.name,
+        "op_class": type(node.op).__name__,
+        "inputs": list(node.inputs),
+        "output_shape": list(node.output.shape),
+        "output_dtype": node.output.dtype,
+    }
+
+
+def _format_nodes(nodes: list, graph: Graph) -> str:
+    """Render a list of nodes as readable text. Kernel-IR ops use their
+    own ``pretty_body``; everything else falls back to a ``name: ClsName(args)``
+    one-liner. Scalar ``ConstantOp`` inputs are inlined as literals (same
+    treatment as ``format_kernels`` — see ``_inline_scalar_loads``).
+
+    The leading ``kernel <name>  inputs: ...  outputs: ...`` header that
+    ``TileOp.pretty_body`` prepends is stripped here: this path already
+    emits ``<output> = TileOp(<inputs>)`` one line above, so the kernel
+    header would just duplicate the same info and shift the body's
+    indent by 4 spaces, ballooning the diff."""
+    lines: list[str] = []
+    for node in nodes:
+        op = node.op
+        if isinstance(op, (InputOp, ConstantOp)):
+            continue
+        body = op.pretty_body()
+        if body is None:
+            lines.append(f"{node.output.name} = {_fmt_op(node, graph)}")
+            continue
+        arg_names = [graph.nodes[inp].output.name for inp in node.inputs if inp in graph.nodes]
+        lines.append(f"{node.output.name} = {type(op).__name__}({', '.join(arg_names)})")
+        scalar_inputs = _scalar_constant_inputs(graph, node, ConstantOp)
+        if scalar_inputs:
+            body = _inline_scalar_loads(body, scalar_inputs)
+        body_lines = body.splitlines()
+        if body_lines and body_lines[0].lstrip().startswith("kernel ") and " inputs: " in body_lines[0] and " outputs: " in body_lines[0]:
+            body_lines = [_dedent(ln, 4) for ln in body_lines[1:]]
+        lines.extend(f"  {line}" for line in body_lines)
+    return "\n".join(lines)
+
+
+def _dedent(line: str, n: int) -> str:
+    """Strip up to ``n`` leading spaces from ``line``."""
+    i = 0
+    while i < n and i < len(line) and line[i] == " ":
+        i += 1
+    return line[i:]
+
+
+def _build_rewrite_kwargs(rule, match: Match, ctx: Context | None) -> dict:
+    """Bind each ``rewrite`` param to its source.
+
+    Reserved-name params (``match`` / ``root`` / ``out`` / ``ctx``) and
+    ``PATTERN``-name params bind by name; every remaining param binds
+    positionally to ``root.inputs[i]`` (in declaration order, ``None``
+    when the position exceeds the available inputs)."""
+    pattern_names = {p.name for p in rule.pattern}
+    root_node = match.root
+    graph = match.graph
+    kwargs: dict = {}
+    input_slot = 0
+    for pname in rule.param_names:
+        if pname == "match":
+            kwargs[pname] = match
+        elif pname == "root":
+            kwargs[pname] = root_node
+        elif pname == "out":
+            kwargs[pname] = root_node.output
+        elif pname == "ctx":
+            kwargs[pname] = ctx
+        elif pname in pattern_names:
+            kwargs[pname] = match.node(pname)
+        else:
+            if input_slot < len(root_node.inputs):
+                kwargs[pname] = graph.nodes.get(root_node.inputs[input_slot])
+            else:
+                kwargs[pname] = None
+            input_slot += 1
+    return kwargs

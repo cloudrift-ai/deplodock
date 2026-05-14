@@ -16,7 +16,7 @@ from dataclasses import replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

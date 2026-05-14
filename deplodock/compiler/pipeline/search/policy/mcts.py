@@ -25,7 +25,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.pipeline.engine.pipeline import Match
+from deplodock.compiler.pipeline.pipeline import Match
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key

@@ -1,30 +1,32 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
-- :mod:`.engine` — pattern matcher + rule plumbing. Exports
-  ``Pattern``, ``Match``, ``Pipeline``, ``RuleSkipped``.
-  Pattern matching goes through ``Pipeline.match(graph, rule)``;
-  tests can use ``Pipeline.from_pattern(...)`` for a one-rule shim. Compilation drives through ``run_pipeline`` /
-  ``run_autotune`` for every caller — including tests — so the pass
-  list is always explicit (``[name, ...]``) and the same greedy /
-  autotune semantics apply everywhere.
-- :mod:`.search` — autotune driver (``Candidate`` / ``Search`` /
-  ``run_pipeline`` / ``run_autotune``) and persistent measurement cache.
+- :mod:`.pipeline` — value types (``Pattern``, ``Match``, ``Rule``,
+  ``RuleSkipped``, ``Pass``, ``Pipeline``) and the compile entry
+  points (``Pipeline.build``, ``.run``, ``.tune``, ``.search``).
+  Pattern matching goes through ``pipeline.match(graph, rule)``; tests
+  can use ``Pipeline.from_pattern(...)`` for a one-rule shim. The same
+  greedy / autotune semantics apply to every caller.
+- :mod:`.search` — search policies (``Candidate`` / ``Search`` /
+  ``GreedySearch`` / ``TuningSearch``) and persistent measurement
+  cache. ``Candidate.apply`` owns the per-rule logging + dump hooks
+  (reads ``match.pipeline.dump``).
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
   dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories grouped by IR level:
   ``frontend/{decomposition,optimization}``, ``loop/{lifting,fusion}``,
   ``lowering/{tile,kernel,cuda}``. Each leaf contains ``NNN_<name>.py``
-  rule modules picked up by ``run_pipeline``.
+  rule modules picked up by ``Pass.load``.
 """
 
 from deplodock.compiler.pipeline.dump import CompilerDump
-from deplodock.compiler.pipeline.engine import (
+from deplodock.compiler.pipeline.pipeline import (
     Match,
+    Pass,
     Pattern,
     Pipeline,
+    Rule,
     RuleSkipped,
-    run_autotune,
-    run_pipeline,
+    _strip_rule_prefix,
 )
 from deplodock.compiler.pipeline.search import (
     Candidate,
@@ -49,13 +51,14 @@ __all__ = [
     "KERNEL_PASSES",
     "LOOP_PASSES",
     "Match",
+    "Pass",
     "Pattern",
     "Pipeline",
+    "Rule",
     "RuleSkipped",
     "Search",
     "TENSOR_PASSES",
     "TILE_PASSES",
     "TuningSearch",
-    "run_autotune",
-    "run_pipeline",
+    "_strip_rule_prefix",
 ]

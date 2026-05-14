@@ -25,7 +25,7 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import run_pipeline
+from deplodock.compiler.pipeline import Pipeline
 
 _DECOMP_PASS = "frontend/decomposition"
 
@@ -48,7 +48,7 @@ def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-6):
 def _apply(graph: Graph, rule_name: str) -> Graph:
     # Run a single rule out of the decomposition pass by selecting on
     # its filename stem (e.g. ``"003_pow.py"`` → ``"003_pow"``).
-    return run_pipeline(graph, [_DECOMP_PASS], select=[Path(rule_name).stem])
+    return Pipeline.build([_DECOMP_PASS], select=[Path(rule_name).stem]).run(graph)
 
 
 # ===================================================================
@@ -205,7 +205,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     from deplodock.compiler.trace.torch import trace_module
 
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
-    decomposed = run_pipeline(graph, ["frontend/decomposition", "frontend/optimization"])
+    decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
     for n in decomposed.nodes.values():
         assert not isinstance(n.op, RmsNormOp), f"rms_norm survived decomposition at {n.output.name}"
 
@@ -261,7 +261,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     from deplodock.compiler.trace.torch import trace_module
 
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
-    decomposed = run_pipeline(graph, ["frontend/decomposition", "frontend/optimization"])
+    decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
     for n in decomposed.nodes.values():
         assert not isinstance(n.op, SoftmaxOp), f"softmax survived decomposition at {n.output.name}"
 

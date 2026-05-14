@@ -17,7 +17,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import TILE_PASSES, TuningSearch, run_autotune, run_pipeline
+from deplodock.compiler.pipeline import Pipeline, TILE_PASSES, TuningSearch
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
@@ -96,10 +96,10 @@ def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
     across changes to the MCTS walk order, which can shift if e.g.
     ``op_cache_key`` partitions the search frontier differently."""
     out: dict[str, tuple[str, str, dict]] = {}
-    greedy = run_pipeline(_make_matmul(), TILE_PASSES, db=SearchDB())
+    greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     _record_pair(out, _final_tile_op(greedy))
     search = TuningSearch(db=SearchDB(), patience=10**6, min_coverage=0.0)
-    candidates = list(run_autotune(_make_matmul(), TILE_PASSES, search=search, db=SearchDB()))
+    candidates = list(Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()))
     for cand in candidates:
         _record_pair(out, _final_tile_op(cand.graph))
     return list(out.values())
@@ -112,7 +112,7 @@ def test_baseline_picks_option_zero() -> None:
     assert len(variants) >= 2, f"need ≥2 variants to test; got {len(variants)}"
     option_zero_knobs = variants[0][2]
 
-    out = run_pipeline(_make_matmul(), TILE_PASSES, db=SearchDB())
+    out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
     assert bn_bm == option_zero_knobs
 
@@ -133,6 +133,6 @@ def test_irrelevant_seed_is_ignored() -> None:
         measured_median_us=1.0,
     )
 
-    out = run_pipeline(_make_matmul(), TILE_PASSES, db=db)
+    out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=db)
     bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
     assert bn_bm == option_zero_knobs

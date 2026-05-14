@@ -62,7 +62,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import register_tile_shape
 

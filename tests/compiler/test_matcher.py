@@ -3,7 +3,7 @@
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.engine import Pattern, Pipeline
+from deplodock.compiler.pipeline import Pattern, Pipeline
 
 
 def _match(g: Graph, pattern: list[Pattern]):
@@ -11,7 +11,7 @@ def _match(g: Graph, pattern: list[Pattern]):
     to match. Mirrors what the engine does without the rest of the
     rewrite plumbing."""
     pipeline = Pipeline.from_pattern(pattern)
-    return pipeline.match(g, pipeline.rule_at(0, 0))
+    return pipeline.match(g, pipeline.passes[0].rules[0])
 
 
 def _simple_graph() -> Graph:

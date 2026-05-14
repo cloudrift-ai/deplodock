@@ -53,7 +53,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, Simp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AffineAddressing, Stage, TemplateAddressing, TileOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]

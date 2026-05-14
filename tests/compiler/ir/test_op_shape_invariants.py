@@ -51,7 +51,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
     """
     import torch
 
-    from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.trace.torch import trace_module
 
     # Exercise each decomp rule: RMSNorm hits decompose_rms_norm + decompose_mean.
@@ -66,7 +66,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
 
     for name, module, inputs in modules:
         graph = trace_module(module, inputs)
-        decomposed = run_pipeline(graph, ["frontend/decomposition"])
+        decomposed = Pipeline.build(["frontend/decomposition"]).run(graph)
         for n in decomposed.nodes.values():
             if not isinstance(n.op, ElementwiseOp):
                 continue

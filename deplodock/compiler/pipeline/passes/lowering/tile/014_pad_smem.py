@@ -57,7 +57,7 @@ from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp, TmaBufferedStage
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     single_tile,

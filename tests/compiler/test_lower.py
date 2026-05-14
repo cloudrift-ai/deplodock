@@ -18,14 +18,14 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
+from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
 _backend = NumpyBackend()
 rng = np.random.default_rng(0)
 
 
 def _compile(graph: Graph) -> Graph:
-    return run_pipeline(graph, LOOP_PASSES)
+    return Pipeline.build(LOOP_PASSES).run(graph)
 
 
 def _fully_rewrite(graph: Graph) -> Graph:

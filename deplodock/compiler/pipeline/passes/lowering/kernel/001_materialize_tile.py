@@ -66,7 +66,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     TmaBufferedStage,
 )
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 

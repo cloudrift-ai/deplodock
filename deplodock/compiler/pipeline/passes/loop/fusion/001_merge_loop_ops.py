@@ -41,7 +41,7 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, splice_graph
 from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.pipeline.engine import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 _BLOWUP_FACTOR = 8
 

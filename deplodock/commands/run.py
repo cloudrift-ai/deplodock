@@ -556,7 +556,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
 
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline import Pipeline
 
     path = Path(args.ir)
     with open(path) as f:
@@ -572,7 +572,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         dump.dump_input_graph(graph)
 
     if tail:
-        graph = run_pipeline(graph, tail, dump=dump)
+        graph = Pipeline.build(tail, dump=dump).run(graph)
 
     rng = np.random.default_rng(args.seed)
     input_data: dict[str, list[float]] = {}

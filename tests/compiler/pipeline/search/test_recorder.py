@@ -16,7 +16,7 @@ from deplodock.compiler.ir.kernel.ir import KernelOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import CUDA_PASSES, run_pipeline
+from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 from deplodock.compiler.pipeline.search import (
     SearchDB,
     SearchTree,
@@ -151,7 +151,7 @@ def test_record_terminal_persists_full_op_chain() -> None:
     """A fully-lowered CudaOp has a ``source`` chain back through
     KernelOp → TileOp → LoopOp. ``record_terminal`` must persist one row
     per dialect and three lowering edges."""
-    g = run_pipeline(_elementwise_graph(), CUDA_PASSES)
+    g = Pipeline.build(CUDA_PASSES).run(_elementwise_graph())
     cuda = next(n.op for n in g.nodes.values() if isinstance(n.op, CudaOp))
     # Sanity: the chain we expect is present.
     assert isinstance(cuda.source, KernelOp)
@@ -182,7 +182,7 @@ def test_loop_to_tile_lowering_keeps_best_variant() -> None:
     """Second recording with a faster median replaces the row; a slower
     one leaves it alone. (Deterministic Tile→Kernel and Kernel→Cuda
     stay pinned to their first child either way.)"""
-    g = run_pipeline(_elementwise_graph(), CUDA_PASSES)
+    g = Pipeline.build(CUDA_PASSES).run(_elementwise_graph())
     cuda = next(n.op for n in g.nodes.values() if isinstance(n.op, CudaOp))
     loop_op = cuda.source.source.source
     loop_key = op_cache_key(loop_op)

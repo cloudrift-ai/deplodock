@@ -18,7 +18,7 @@ from deplodock.compiler.ir.expr import CastExpr, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import GatherOp
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", GatherOp)]
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.pipeline.engine import RuleSkipped
+from deplodock.compiler.pipeline import RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 from deplodock.compiler.tuning import _tma_enabled
 

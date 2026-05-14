@@ -10,13 +10,13 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.loop import Accum, LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import LOOP_PASSES, run_pipeline
+from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
 from .conftest import requires_cuda
 
 
 def _compile(graph: Graph) -> Graph:
-    return run_pipeline(graph, LOOP_PASSES)
+    return Pipeline.build(LOOP_PASSES).run(graph)
 
 
 def _pointwise_chain_graph() -> Graph:

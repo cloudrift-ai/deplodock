@@ -31,7 +31,7 @@ import logging
 from collections.abc import Callable
 
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Tile
-from deplodock.compiler.pipeline.engine import RuleSkipped
+from deplodock.compiler.pipeline import RuleSkipped
 
 _logger = logging.getLogger(__name__)
 

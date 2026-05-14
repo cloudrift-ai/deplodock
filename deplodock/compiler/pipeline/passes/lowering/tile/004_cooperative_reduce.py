@@ -72,7 +72,7 @@ from deplodock.compiler.ir.tile.ir import (
     Tile,
     TileOp,
 )
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 _WARP_SIZE = 32

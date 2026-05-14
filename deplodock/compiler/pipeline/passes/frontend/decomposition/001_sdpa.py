@@ -12,7 +12,7 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     const_bc,
     gqa_broadcast,

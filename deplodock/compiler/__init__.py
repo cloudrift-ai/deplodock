@@ -5,7 +5,7 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.ir.frontend.ir import ReshapeOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp, ScanOp, ScatterOp
 from deplodock.compiler.pipeline.dump import CompilerDump
-from deplodock.compiler.pipeline.engine import Match, Pattern, Pipeline
+from deplodock.compiler.pipeline import Match, Pattern, Pipeline
 
 __all__ = [
     "CompilerDump",

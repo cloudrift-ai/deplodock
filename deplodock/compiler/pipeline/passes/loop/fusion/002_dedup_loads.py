@@ -17,7 +17,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import dedup_loads
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", LoopOp)]
 

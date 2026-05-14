@@ -364,9 +364,9 @@ def simulate_graph(
     selects the warp within the CTA.
     """
     from deplodock.compiler.ir.kernel.ir import KernelOp, Smem
-    from deplodock.compiler.pipeline import KERNEL_PASSES, run_pipeline
+    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
-    g = run_pipeline(graph.copy(), KERNEL_PASSES)
+    g = Pipeline.build(KERNEL_PASSES).run(graph.copy())
 
     out: list[BankConflictResult] = []
     for node in g.nodes.values():
