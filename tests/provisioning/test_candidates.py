@@ -29,7 +29,7 @@ def test_iter_candidates_h200_default_picks_cloudrift_first():
     cands = iter_candidates("NVIDIA H200 141GB", 8, provider=None)
     # Cloudrift entry, then GCP entries (one per zone)
     assert cands[0].provider == "cloudrift"
-    assert cands[0].instance_type == "h200-24-200-1000-generic.8"
+    assert cands[0].instance_type == "h200-8-generic.8"
     gcp_cands = [c for c in cands if c.provider == "gcp"]
     assert len(gcp_cands) == 2
     assert {c.zone for c in gcp_cands} == {"europe-west1-b", "europe-west4-a"}

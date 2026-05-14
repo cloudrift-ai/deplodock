@@ -17,7 +17,7 @@ providers:
   gcp:
     create_timeout_spot: 600
     create_timeout_flex_start: 14400
-    image_family: "common-cu128-ubuntu-2204-nvidia-570"
+    image_family: "common-cu129-ubuntu-2404-nvidia-580"
     image_project: "deeplearning-platform-release"
     boot_disk_size: "2000GB"
     tags: "ssh"
@@ -28,3 +28,4 @@ providers:
     # image_url: override the OS image. By default deplodock auto-picks ROCm for
     # mi* instance types and NVIDIA otherwise (see provisioning/cloudrift.py).
     # billing_exempt: true  # admin-only, skip billing
+    # network: public  # CloudRift network name (must exist in the target datacenter)

@@ -194,9 +194,10 @@ async def _provision_cloudrift(cand: VmCandidate, ssh_key, providers_config, dry
     if dry_run:
         logger.info(f"[dry-run] create instance type={cand.instance_type} ssh_key={pub_key_path}")
 
-    cr_config = (providers_config or {}).get("cloudrift", {})
+    cr_config = (providers_config or {}).get("cloudrift") or {}
     image_url = cr_config.get("image_url")
     billing_exempt = cr_config.get("billing_exempt", False)
+    network = cr_config.get("network")
 
     return await cr_provider.create_instance(
         api_key=api_key or "",
@@ -210,6 +211,7 @@ async def _provision_cloudrift(cand: VmCandidate, ssh_key, providers_config, dry
         wait_ssh=True,
         ssh_private_key_path=ssh_key,
         billing_exempt=billing_exempt,
+        network=network,
     )
 
 

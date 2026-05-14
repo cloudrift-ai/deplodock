@@ -71,6 +71,7 @@ async def _rent_instance(
     api_url=DEFAULT_API_URL,
     dry_run=False,
     billing_exempt=False,
+    network=None,
 ):
     """Rent a new CloudRift VM instance.
 
@@ -99,6 +100,8 @@ async def _rent_instance(
     }
     if billing_exempt:
         data["billing_exempt"] = True
+    if network is not None:
+        data["network"] = network
     return await _api_request("POST", "/api/v1/instances/rent", data, api_key, api_url, dry_run)
 
 
@@ -343,6 +346,7 @@ async def create_instance(
     wait_ssh=False,
     ssh_private_key_path=None,
     billing_exempt=False,
+    network=None,
 ):
     """Create a CloudRift VM instance.
 
@@ -382,6 +386,7 @@ async def create_instance(
             api_url=api_url,
             dry_run=dry_run,
             billing_exempt=billing_exempt,
+            network=network,
         )
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code

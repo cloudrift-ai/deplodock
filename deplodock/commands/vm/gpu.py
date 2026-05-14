@@ -35,9 +35,15 @@ async def _handle_create(args):
     if args.config and os.path.exists(args.config):
         config = load_config(args.config)
         providers_config = config.get("providers")
-    if args.billing_exempt:
+    if args.billing_exempt or args.network:
         providers_config = providers_config or {}
-        providers_config.setdefault("cloudrift", {})["billing_exempt"] = True
+        # `cloudrift:` in config.yaml can parse to None when it has only commented children.
+        if providers_config.get("cloudrift") is None:
+            providers_config["cloudrift"] = {}
+        if args.billing_exempt:
+            providers_config["cloudrift"]["billing_exempt"] = True
+        if args.network:
+            providers_config["cloudrift"]["network"] = args.network
 
     try:
         conn = await provision_cloud_vm(
@@ -82,5 +88,10 @@ def register_create_target(subparsers):
         help="Path to config.yaml for provider-specific defaults (default: config.yaml)",
     )
     parser.add_argument("--billing-exempt", action="store_true", help="Skip billing for CloudRift (admin-only)")
+    parser.add_argument(
+        "--network",
+        default=None,
+        help="CloudRift network name (must exist in target datacenter; default: provider picks a public network)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without executing")
     parser.set_defaults(func=handle_create)

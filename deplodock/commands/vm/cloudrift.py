@@ -51,6 +51,7 @@ async def _handle_create(args):
             api_url=args.api_url,
             dry_run=args.dry_run,
             billing_exempt=args.billing_exempt,
+            network=args.network,
         )
     except (CapacityExhausted, TerminalProvisionError) as exc:
         logger.error(f"{exc}")
@@ -99,6 +100,11 @@ def register_create_target(subparsers):
     parser.add_argument("--timeout", type=int, default=600, help="Seconds to wait for Active status (default: 600)")
     parser.add_argument("--dry-run", action="store_true", help="Print requests without executing")
     parser.add_argument("--billing-exempt", action="store_true", help="Skip billing (admin-only)")
+    parser.add_argument(
+        "--network",
+        default=None,
+        help="Network name to attach the instance to (must exist in the target datacenter; default: provider picks a public network)",
+    )
     parser.set_defaults(func=handle_create)
 
 
