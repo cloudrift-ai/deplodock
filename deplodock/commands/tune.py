@@ -14,7 +14,7 @@ from deplodock.commands.compile import (
     load_or_trace,
     setup_pipeline_runtime,
 )
-from deplodock.compiler.pipeline import CUDA_PASSES
+from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,34 @@ def register_tune_command(subparsers):
         help=(
             "Stop after this many consecutive measured variants haven't beaten the current "
             "best latency. Honored only after the bootstrap phase has seeded every kernel "
-            "subtree with at least N_BOOTSTRAP measurements. Default: 20."
+            "subtree with at least --n-bootstrap measurements. Default: 20."
+        ),
+    )
+    parser.add_argument(
+        "--ucb-c",
+        type=float,
+        default=TuningSearch.DEFAULT_UCB_C,
+        help=(
+            "UCB1 exploration constant. The canonical value is sqrt(2) ≈ 1.414; larger values "
+            f"shift the walk toward exploration. Default: {TuningSearch.DEFAULT_UCB_C:.4f}."
+        ),
+    )
+    parser.add_argument(
+        "--n-bootstrap",
+        type=int,
+        default=TuningSearch.DEFAULT_N_BOOTSTRAP,
+        help=(
+            "Measure this many terminals per kernel subtree via greedy depth-first descent "
+            "before switching to UCB1 selection. Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--score-cutoff",
+        type=float,
+        default=TuningSearch.DEFAULT_SCORE_CUTOFF,
+        help=(
+            "Score gap below the local best at which an unvisited sibling is dropped from the "
+            "expansion frontier (see ``_ucb_walk``). Default: %(default)s."
         ),
     )
     add_diagnostics_args(parser)
@@ -59,7 +86,7 @@ def handle_tune(args):
     import time
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import Pipeline, TuningSearch
+    from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
     from deplodock.compiler.pipeline.search import SearchDB
 
@@ -82,7 +109,13 @@ def handle_tune(args):
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
-    search = TuningSearch(db=db, patience=args.patience)
+    search = TuningSearch(
+        db=db,
+        patience=args.patience,
+        ucb_c=args.ucb_c,
+        n_bootstrap=args.n_bootstrap,
+        score_cutoff=args.score_cutoff,
+    )
     t0 = time.monotonic()
     candidates: list = []
     try:

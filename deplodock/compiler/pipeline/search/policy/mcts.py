@@ -335,18 +335,26 @@ class TuningSearch(Search):
     patience + tree exhaustion instead. For manual runs, send Ctrl-C
     and the caller catches ``KeyboardInterrupt`` to print stats."""
 
-    UCB_C = math.sqrt(2)  # canonical UCB1 exploration constant.
-    # Measure this many terminals via greedy depth-first descent before
-    # switching to UCB. UCB needs some measured rewards to be meaningful;
-    # before that it's just "pick any unvisited" which doesn't drill
-    # down through expanded subtrees.
-    N_BOOTSTRAP = 10
-    # Score-gap below which an unvisited sibling is dropped from the
-    # expansion frontier (see ``_ucb_walk``). 1.0 spans roughly one of the
-    # graduated penalties in ``TileOp.score`` — e.g. CTA-count or
-    # thread-distance — so a sibling with one extra failure mode beyond the
-    # current best is dropped rather than benched.
-    SCORE_CUTOFF = 1.0
+    # Default knobs. Exposed as constructor arguments so callers (and the
+    # ``deplodock tune`` CLI) can sweep them.
+    #
+    # ``ucb_c`` — canonical UCB1 exploration constant. ``sqrt(2)`` is the
+    # classical value; larger values shift the walk toward exploration.
+    #
+    # ``n_bootstrap`` — measure this many terminals via greedy
+    # depth-first descent per kernel subtree before switching to UCB.
+    # UCB needs some measured rewards to be meaningful; before that it's
+    # just "pick any unvisited" which doesn't drill down through
+    # expanded subtrees.
+    #
+    # ``score_cutoff`` — score-gap below which an unvisited sibling is
+    # dropped from the expansion frontier (see ``_ucb_walk``). ``1.0``
+    # spans roughly one of the graduated penalties in ``TileOp.score``
+    # — e.g. CTA-count or thread-distance — so a sibling with one extra
+    # failure mode beyond the current best is dropped rather than benched.
+    DEFAULT_UCB_C = math.sqrt(2)
+    DEFAULT_N_BOOTSTRAP = 10
+    DEFAULT_SCORE_CUTOFF = 1.0
 
     def __init__(
         self,
@@ -354,6 +362,9 @@ class TuningSearch(Search):
         *,
         db: SearchDB | None = None,
         patience: int = 20,
+        ucb_c: float = DEFAULT_UCB_C,
+        n_bootstrap: int = DEFAULT_N_BOOTSTRAP,
+        score_cutoff: float = DEFAULT_SCORE_CUTOFF,
     ) -> None:
         self._db = db if db is not None else SearchDB()
         self._tree = tree if tree is not None else SearchTree()
@@ -361,6 +372,9 @@ class TuningSearch(Search):
         # a tuning sweep across mixed contexts so one key per process is fine.
         self._context_key: str | None = None
         self._patience = patience
+        self._ucb_c = ucb_c
+        self._n_bootstrap = n_bootstrap
+        self._score_cutoff = score_cutoff
         self._last_seen = 0
         self._best_latency = float("inf")
         self._stagnant = 0
@@ -466,7 +480,7 @@ class TuningSearch(Search):
         # graph with K kernels then gets at least K * N_BOOTSTRAP
         # terminals before UCB takes over — otherwise UCB would commit
         # to whichever subtree got measured first and starve the rest.
-        if self._tree.min_subtree_seen() < self.N_BOOTSTRAP:
+        if self._tree.min_subtree_seen() < self._n_bootstrap:
             return self._bootstrap_pop()
         target = self._ucb_walk(self._tree.root)
         if target is None or target.key not in self._by_tip:
@@ -521,7 +535,7 @@ class TuningSearch(Search):
         # Patience is only honored after bootstrap has seeded every
         # kernel subtree with at least ``N_BOOTSTRAP`` measurements —
         # otherwise patience could fire before UCB ever runs.
-        if self._tree.min_subtree_seen() < self.N_BOOTSTRAP:
+        if self._tree.min_subtree_seen() < self._n_bootstrap:
             return False
         if self._stagnant >= self._patience:
             self._stop_reason = f"patience ({self._stagnant} stagnant, best {self._best_latency:.2f} us)"
@@ -630,7 +644,7 @@ class TuningSearch(Search):
             if frontier:
                 best_score = max(c.score for c in frontier)
                 if best_score != float("-inf"):
-                    cutoff = best_score - self.SCORE_CUTOFF
+                    cutoff = best_score - self._score_cutoff
                     # Purge cutoff-dropped candidates from the queue so the
                     # ``_fallback_pop`` drain (used when the walk lands on a
                     # node that isn't queued) can't resurrect them later.
@@ -646,5 +660,5 @@ class TuningSearch(Search):
             expanded = [c for c in cur.children if c.is_expanded()]
             if not expanded:
                 return cur
-            cur = max(expanded, key=lambda c: (c.ucb(self.UCB_C), c.score))
+            cur = max(expanded, key=lambda c: (c.ucb(self._ucb_c), c.score))
         return cur
