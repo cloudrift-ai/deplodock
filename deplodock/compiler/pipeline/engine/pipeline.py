@@ -1,20 +1,28 @@
-"""Pattern matcher value types — ``Pattern``, ``Match``, plus
-:class:`Pass` and :class:`Pipeline`, the per-run description of pass +
-rule layout.
+"""Pipeline value types: ``Pattern``, ``Match``, ``Rule``,
+``RuleSkipped``, ``Pass``, ``Pipeline``.
 
-Lives in its own module so the engine *and* the search policies can
-both import these without cycling. ``engine.py`` owns the rule-loader
-and rewrite dispatcher (which depend on ``Match``); ``Search.push``
-takes a ``Match`` so policies that care about the rewrite site can
-read it off the engine hand-off.
+Bundled together because they form a tight chain — ``Pattern`` defines
+what a rule matches, ``Rule`` carries the pattern + rewrite,
+``Pass`` groups rules, ``Pipeline`` holds passes and drives matching,
+and ``Match`` carries ``Rule`` (which backref-resolves to ``Pass``) so
+the driver can read pass / rule metadata off one field. Splitting them
+across modules forced ``TYPE_CHECKING`` shuffles for backrefs without
+buying anything; one module keeps the cycle visible.
+
+The driver (rule loader, rewrite dispatcher, search loop, public
+``run_pipeline`` / ``run_autotune``) lives in :mod:`.driver`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.pipeline.rule import Rule
+
+if TYPE_CHECKING:
+    from deplodock.compiler.ir.base import Op
 
 
 @dataclass
@@ -28,6 +36,57 @@ class Pattern:
     name: str
     op_type: type
     constraints: dict = field(default_factory=dict)
+
+
+@dataclass
+class Rule:
+    """One rewrite rule loaded from a ``passes/<dir>/NNN_<name>.py``
+    module.
+
+    * ``name`` — the file stem (engine display + dump filenames).
+    * ``pattern`` — the chain-match pattern the rule fires on.
+    * ``rewrite`` — the rule's ``rewrite`` function. ``None`` for the
+      no-rewrite stubs :meth:`Pipeline.from_pattern` builds for
+      pattern-matching-only callers.
+    * ``param_names`` — captured at load time so the dispatcher can
+      bind each rewrite param via signature inspection. The binding
+      rules (kept here so docstring + dataclass live together):
+
+      - ``graph`` — the current ``Graph``
+      - ``match`` — the full ``Match`` (escape hatch)
+      - ``root`` — ``graph.nodes[match.root_node_id]``
+      - ``out`` — ``root.output``
+      - ``ctx`` — the engine's ``Context``
+      - any ``Pattern.name`` declared in ``pattern`` — that pattern
+        entry's matched ``Node``
+      - anything else — bound positionally to the input ``Node`` at
+        slot ``i``, ``None`` past the input count or for deleted
+        source nodes.
+
+    * ``pass_`` — backref to the owning ``Pass``. Stamped by ``Pass``
+      at construction time; ``None`` only on stray ``Rule`` instances
+      built outside a pipeline (none exist in production paths).
+    """
+
+    name: str
+    pattern: list[Pattern]
+    rewrite: Callable[..., Graph | Op | None] | None = None
+    param_names: tuple[str, ...] = field(default_factory=tuple)
+    pass_: Pass | None = field(default=None, repr=False, compare=False)
+
+
+class RuleSkipped(Exception):
+    """Raised by a rule's ``rewrite()`` to signal that the match was
+    considered but skipped, with a human-readable reason for why no
+    rewrite was applied. The engine catches it, logs the reason at
+    DEBUG (visible at ``compile -vv``), and treats the result the same
+    as ``return None`` with no in-place mutation. Use this in place of
+    a bare ``return None`` whenever the skip reason would help debug
+    why a rule didn't fire on a given match."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass
@@ -51,58 +110,6 @@ class Pass:
     def __post_init__(self) -> None:
         for r in self.rules:
             r.pass_ = self
-
-
-@dataclass(frozen=True)
-class Pipeline:
-    """Frozen per-run layout of the rewrite pipeline. Constructed once
-    per ``run_autotune`` call and reached from every :class:`Match` via
-    ``match.rule.pass_``.
-
-    :meth:`match` is the only entry point for pattern matching: it
-    walks the graph for one rule and stamps the rule onto every Match.
-    Tests / standalone callers that just want pattern matching can
-    build a one-rule Pipeline via :meth:`from_pattern`."""
-
-    passes: list[Pass]
-
-    def rule_at(self, pass_idx: int, rule_idx: int) -> Rule:
-        return self.passes[pass_idx].rules[rule_idx]
-
-    def pass_at(self, pass_idx: int) -> Pass:
-        return self.passes[pass_idx]
-
-    def n_rules(self, pass_idx: int) -> int:
-        return len(self.passes[pass_idx].rules)
-
-    def n_passes(self) -> int:
-        return len(self.passes)
-
-    def match(self, graph: Graph, rule: Rule) -> list[Match]:
-        """Enumerate every live pattern match for ``rule`` against
-        ``graph``. Stamps ``is_last=True`` on the last surviving match
-        so the rewriter knows which apply closes out the rule batch
-        (cursor advance flows through ``Candidate.try_rewrite`` /
-        ``Candidate.apply``). Drops matches that fail
-        :meth:`Match.is_alive` — an earlier match in the same batch
-        may have removed a consumed node."""
-        results: list[Match] = []
-        for nid in graph.topological_order():
-            m = _match_at(graph, nid, rule)
-            if m is not None and m.is_alive():
-                results.append(m)
-        if results:
-            results[-1].is_last = True
-        return results
-
-    @classmethod
-    def from_pattern(cls, pattern: list[Pattern]) -> Pipeline:
-        """Test/standalone helper: build a single-pass, single-rule
-        Pipeline whose only rule wraps ``pattern`` (no ``rewrite``).
-        Lets pattern-matching tests drive :meth:`match` without
-        setting up the full engine pipeline."""
-        rule = Rule(name="__test__", pattern=pattern)
-        return cls(passes=[Pass(name="__test__", rules=[rule], index=0)])
 
 
 @dataclass
@@ -217,6 +224,57 @@ class Match:
         )
 
 
+@dataclass(frozen=True)
+class Pipeline:
+    """Frozen per-run layout of the rewrite pipeline.
+
+    :meth:`match` is the only entry point for pattern matching: it
+    walks the graph for one rule and stamps the rule onto every Match.
+    Tests / standalone callers that just want pattern matching can
+    build a one-rule Pipeline via :meth:`from_pattern`.
+    """
+
+    passes: list[Pass]
+
+    def rule_at(self, pass_idx: int, rule_idx: int) -> Rule:
+        return self.passes[pass_idx].rules[rule_idx]
+
+    def pass_at(self, pass_idx: int) -> Pass:
+        return self.passes[pass_idx]
+
+    def n_rules(self, pass_idx: int) -> int:
+        return len(self.passes[pass_idx].rules)
+
+    def n_passes(self) -> int:
+        return len(self.passes)
+
+    def match(self, graph: Graph, rule: Rule) -> list[Match]:
+        """Enumerate every live pattern match for ``rule`` against
+        ``graph``. Stamps ``is_last=True`` on the last surviving match
+        so the rewriter knows which apply closes out the rule batch
+        (cursor advance flows through ``Candidate.try_rewrite`` /
+        ``Candidate.apply``). Drops matches that fail
+        :meth:`Match.is_alive` — an earlier match in the same batch
+        may have removed a consumed node."""
+        results: list[Match] = []
+        for nid in graph.topological_order():
+            m = _match_at(graph, nid, rule)
+            if m is not None and m.is_alive():
+                results.append(m)
+        if results:
+            results[-1].is_last = True
+        return results
+
+    @classmethod
+    def from_pattern(cls, pattern: list[Pattern]) -> Pipeline:
+        """Test/standalone helper: build a single-pass, single-rule
+        Pipeline whose only rule wraps ``pattern`` (no ``rewrite``).
+        Lets pattern-matching tests drive :meth:`match` without
+        setting up the full engine pipeline."""
+        rule = Rule(name="__test__", pattern=pattern)
+        return cls(passes=[Pass(name="__test__", rules=[rule], index=0)])
+
+
 def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
     cursor: str | None = start
     nodes: dict[str, str] = {}
@@ -253,4 +311,4 @@ def _sole_consumer(graph: Graph, nid: str) -> str | None:
     return consumers[0] if len(consumers) == 1 else None
 
 
-__all__ = ["Match", "Pass", "Pattern", "Pipeline", "Rule"]
+__all__ = ["Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]

@@ -27,7 +27,7 @@ _logger = logging.getLogger("deplodock.compiler.pipeline.engine")
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.base import Op
-    from deplodock.compiler.pipeline.pattern import Match, Pass
+    from deplodock.compiler.pipeline.engine import Match, Pass
 
 
 @dataclass
@@ -104,7 +104,8 @@ class Candidate:
         multi-option return path is the one exception: the cursor
         advance is left to the eventual fork's apply on resolve."""
         from deplodock.compiler.ir.base import Op as _Op  # noqa: PLC0415
-        from deplodock.compiler.pipeline.engine import RuleSkipped, _build_rewrite_kwargs  # noqa: PLC0415
+        from deplodock.compiler.pipeline.engine.driver import _build_rewrite_kwargs  # noqa: PLC0415
+        from deplodock.compiler.pipeline.engine.pipeline import RuleSkipped  # noqa: PLC0415
         from deplodock.compiler.pipeline.rule_diff import display_name, emit, format_skipped  # noqa: PLC0415
 
         if not match.is_alive():

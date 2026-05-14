@@ -21,8 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult
     from deplodock.compiler.graph import Graph
-    from deplodock.compiler.pipeline.pattern import Pass
-    from deplodock.compiler.pipeline.rule import Rule
+    from deplodock.compiler.pipeline.engine import Pass, Rule
 
 logger = logging.getLogger(__name__)
 

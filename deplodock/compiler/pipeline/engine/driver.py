@@ -1,22 +1,11 @@
-"""Pattern-based rewrite engine and compile-pipeline entry point.
+"""Compile-pipeline driver — rule loading, rewrite dispatch, search loop,
+and the public ``run_pipeline`` / ``run_autotune`` entry points.
 
-Public surface:
-
-- ``Pattern`` / ``Match`` / ``match_pattern`` — chain matcher: each
-  ``Pattern`` matches one node by ``op_type`` + field constraints;
-  ``match_pattern(graph, pattern)`` walks forward from every
-  topo-ordered seed along fan-out-1 consumer edges.
-- Rule modules under ``passes/`` declare
-  ``PATTERN = [Pattern(...), ...]`` and a ``rewrite(...)`` function
-  whose return type discriminates the rewrite flavor:
-  * ``Graph`` — functional fragment, spliced in place of the match.
-  * ``Op`` — in-place rebind of ``root.op`` (id, inputs, hints kept).
-  * ``list[Graph | Op]`` — autotuning fork: engine applies option 0
-    inline and pushes one ``Candidate`` per remaining option onto the
-    search queue.
-  Raise ``RuleSkipped`` to decline a match.
-- The autotune driver (``Candidate``, ``Search``, ``run_pipeline``,
-  ``run_autotune``) lives in :mod:`deplodock.compiler.pipeline.search`.
+The matcher value types (``Pattern`` / ``Match``) live in
+:mod:`.match`; ``Pass`` / ``Rule`` / ``Pipeline`` live in their own
+sibling modules. This module wires them together: loads rules off disk
+into a :class:`Pipeline`, runs the search loop one rule batch at a
+time, fires per-rule diff / dump hooks, and records terminal candidates.
 
 Rule contract: rules MUST be idempotent on their own output. The engine
 re-runs the full pipeline on every popped candidate, relying on each
@@ -36,11 +25,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Node, Tensor, _fmt_op
+from deplodock.compiler.graph import Graph, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.pattern import Match, Pass, Pattern, Pipeline  # noqa: F401  (Pattern re-exported)
-from deplodock.compiler.pipeline.rule import Rule
+from deplodock.compiler.pipeline.engine.pipeline import Match, Pass, Pipeline, Rule
 from deplodock.compiler.pipeline.rule_diff import display_name, emit, render_rule_diff
 from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate
 from deplodock.compiler.pipeline.search.db import SearchDB
@@ -61,20 +49,6 @@ def _strip_rule_prefix(name: str) -> str:
 
 
 logger = logging.getLogger(__name__)
-
-
-class RuleSkipped(Exception):
-    """Raised by a rule's ``rewrite()`` to signal that the match was
-    considered but skipped, with a human-readable reason for why no
-    rewrite was applied. The engine catches it, logs the reason at
-    DEBUG (visible at ``compile -vv``), and treats the result the same
-    as ``return None`` with no in-place mutation. Use this in place of
-    a bare ``return None`` whenever the skip reason would help debug
-    why a rule didn't fire on a given match."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -261,14 +235,14 @@ def _filter_rules(rules: list[Rule], select_set: set[str] | None) -> list[Rule]:
 # ---------------------------------------------------------------------------
 
 
-_PASSES_DIR = Path(__file__).resolve().parent / "passes"
+_PASSES_DIR = Path(__file__).resolve().parent.parent / "passes"
 
 
 def _make_apply_logger(
     *,
     debug_on: bool,
     dump: CompilerDump | None,
-) -> Callable[[Graph, str, Match, Op | Graph], None] | None:
+) -> Callable[[Graph, Match, Op | Graph], None] | None:
     """Build the ``Candidate.on_apply`` callback that renders a rule
     application's diff at debug / writes its dump record. Returns
     ``None`` when neither sink is active so ``Candidate.apply`` can
@@ -470,3 +444,6 @@ def run_autotune(
             break
         yield cand
     logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
+
+
+__all__ = ["run_autotune", "run_pipeline"]
