@@ -8,47 +8,28 @@ from __future__ import annotations
 from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 
-def test_root_placeholder_has_expected_one() -> None:
+def test_root_starts_unseen() -> None:
     tree = SearchTree()
     tree.ensure_root("root")
     node = tree.node("root")
-    assert node.expected_terminals == 1 and node.seen_terminals == 0
+    assert node.seen_terminals == 0 and node.visits == 0
 
 
-def test_first_expansion_propagates_delta() -> None:
-    """First expansion of a parent consumes its placeholder ``1``, so
-    the delta to ancestors is ``n_new - 1``."""
+def test_first_expansion_links_children_to_parent() -> None:
     tree = SearchTree()
     tree.expand("root", ["a", "b", "c"])
     root = tree.node("root")
-    assert root.expected_terminals == 3
+    assert [c.key for c in root.children] == ["a", "b", "c"]
     for ck in ("a", "b", "c"):
         child = tree.node(ck)
-        assert child.expected_terminals == 1
         assert child.parent is root
-
-
-def test_second_expansion_is_pure_addition() -> None:
-    tree = SearchTree()
-    tree.expand("root", ["a"])
-    assert tree.node("root").expected_terminals == 1
-    tree.expand("root", ["b", "c"])
-    assert tree.node("root").expected_terminals == 3
 
 
 def test_expansion_is_idempotent() -> None:
     tree = SearchTree()
     tree.expand("root", ["a", "b"])
     tree.expand("root", ["a", "b"])
-    assert tree.node("root").expected_terminals == 2
-
-
-def test_deep_expansion_propagates_to_root() -> None:
-    tree = SearchTree()
-    tree.expand("root", ["a"])
-    tree.expand("a", ["a1", "a2", "a3"])
-    assert tree.node("root").expected_terminals == 3
-    assert tree.node("a").expected_terminals == 3
+    assert [c.key for c in tree.node("root").children] == ["a", "b"]
 
 
 def test_record_terminal_propagates_seen_upward() -> None:
@@ -92,25 +73,6 @@ def test_record_terminal_failed_counts_separately() -> None:
     assert tree.node("a").seen_terminals == 1
 
 
-def test_is_fully_explored_tracks_seen_vs_expected() -> None:
-    tree = SearchTree()
-    tree.expand("root", ["a", "b"])
-    assert not tree.is_fully_explored("root")
-    tree.record_terminal("a", reward=0.1, status="ok")
-    assert not tree.is_fully_explored("root")
-    tree.record_terminal("b", reward=0.1, status="ok")
-    assert tree.is_fully_explored("root")
-
-
-def test_expansion_grows_denominator_mid_run() -> None:
-    tree = SearchTree()
-    tree.expand("root", ["a"])
-    tree.record_terminal("a", reward=0.1, status="ok")
-    assert tree.is_fully_explored("root")
-    tree.expand("a", ["a1", "a2"])
-    assert not tree.is_fully_explored("root")
-
-
 def test_find_root_returns_first_inserted() -> None:
     tree = SearchTree()
     tree.ensure_root("first")
@@ -119,12 +81,15 @@ def test_find_root_returns_first_inserted() -> None:
     assert tree.subtree_roots[0].key == "first"
 
 
-def test_root_coverage_sums_over_roots() -> None:
+def test_min_subtree_seen_balances_across_kernel_roots() -> None:
     tree = SearchTree()
-    tree.expand("root", ["a", "b"])
+    tree.expand("k1", ["a"])
+    tree.expand("k2", ["b"])
     tree.record_terminal("a", reward=0.1, status="ok")
-    seen, expected = tree.root_coverage()
-    assert seen == 1 and expected == 2
+    # k1 has 1 seen terminal under it, k2 has 0 — min is 0.
+    assert tree.min_subtree_seen() == 0
+    tree.record_terminal("b", reward=0.1, status="ok")
+    assert tree.min_subtree_seen() == 1
 
 
 def test_children_preserves_insertion_order() -> None:

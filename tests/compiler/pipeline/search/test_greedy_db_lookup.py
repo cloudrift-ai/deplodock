@@ -97,7 +97,7 @@ def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
     out: dict[str, tuple[str, str, dict]] = {}
     greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     _record_pair(out, _final_tile_op(greedy))
-    search = TuningSearch(db=SearchDB(), patience=10**6, min_coverage=0.0)
+    search = TuningSearch(db=SearchDB(), patience=10**6)
     candidates = list(Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()))
     for cand in candidates:
         _record_pair(out, _final_tile_op(cand.graph))

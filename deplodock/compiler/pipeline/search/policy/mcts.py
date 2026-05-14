@@ -14,8 +14,9 @@ writes them. Engine + recorder feed the tree (via ``expand`` and
 ``getattr(search, "tree", None)``; nobody outside this file consumes
 the counters.
 
-Stopping policy: wall-clock budget, or ``patience`` measured terminals
-without a new best latency once coverage clears ``min_coverage``."""
+Stopping policy: ``patience`` measured terminals without a new best
+latency, applied only after the bootstrap phase has seeded every
+kernel subtree with ``N_BOOTSTRAP`` measurements."""
 
 from __future__ import annotations
 
@@ -49,8 +50,8 @@ class SearchNode:
     """One tree node — autotune-state for an op.
 
     ``seen_terminals`` counts every measured terminal under this node
-    (ok + fail; used by coverage queries). ``failed_terminals`` tracks
-    fails only (diagnostic). ``visits`` is the canonical-MCTS
+    (ok + fail; used by the bootstrap balancer). ``failed_terminals``
+    tracks fails only (diagnostic). ``visits`` is the canonical-MCTS
     denominator — it counts measured terminals under this node and
     nothing else (expansion alone never bumps it). ``total_reward``
     accumulates the MCTS reward (``1/latency_us`` for ok, ``0`` for
@@ -64,7 +65,6 @@ class SearchNode:
     key: str
     parent: SearchNode | None = field(default=None, repr=False)
     children: list[SearchNode] = field(default_factory=list, repr=False)
-    expected_terminals: int = 1
     seen_terminals: int = 0
     failed_terminals: int = 0
     visits: int = 0
@@ -85,9 +85,6 @@ class SearchNode:
     def is_frontier(self) -> bool:
         """Unexpanded and unmeasured — a pop-able rollout target."""
         return not self.children and self.visits == 0
-
-    def is_fully_explored(self) -> bool:
-        return self.seen_terminals >= self.expected_terminals
 
     def mean_reward(self) -> float:
         return self.total_reward / self.visits if self.visits else 0.0
@@ -114,21 +111,17 @@ class SearchTree:
 
     **Forest as a single tree.** Multi-kernel graphs produce several
     independent rewrite chains, each starting from its own ``op_cache_key``.
-    To keep the search rooted at one node (so the UCB walk and coverage
-    queries don't have to special-case multiple roots), the tree owns
-    a synthetic **super-root** sentinel. Every kernel root inserted via
+    To keep the search rooted at one node (so the UCB walk doesn't
+    have to special-case multiple roots), the tree owns a synthetic
+    **super-root** sentinel. Every kernel root inserted via
     :meth:`ensure_root` becomes a child of the super-root; propagation
     walks then aggregate per-kernel statistics into one place. The
     super-root's ``children`` are the per-kernel roots, accessible via
     :meth:`SearchTree.subtree_roots`.
 
-    Three counters are maintained online via upward propagation along
+    Two counters are maintained online via upward propagation along
     ``SearchNode.parent``:
 
-    - ``expected_terminals`` — each *new* expansion of a parent that
-      had no children adds ``n_new - 1`` to every ancestor (the
-      parent's placeholder "1" is consumed by the first child);
-      subsequent expansions of the same parent add ``n_new``.
     - ``seen_terminals`` / ``failed_terminals`` — each measured
       terminal bumps every ancestor by ``+1`` (and ``+1`` for
       ``failed`` on failure).
@@ -137,11 +130,6 @@ class SearchTree:
       for ok, ``0`` for fail). Canonical MCTS: an expansion alone is
       not a visit — unvisited siblings are handled by the "pick any
       unvisited child first" branch in :meth:`_ucb_walk`.
-
-    A node is fully explored when ``seen_terminals == expected_terminals``.
-    The value can move *down* mid-run when expansion grows the
-    denominator faster than the numerator — that's the correct
-    semantics ("we just discovered there's more to explore").
     """
 
     SUPER_ROOT_KEY = "<super_root>"
@@ -155,10 +143,8 @@ class SearchTree:
         # ``op_cache_key``. Parent/child structure lives on the
         # :class:`SearchNode` objects themselves.
         self._nodes: dict[str, SearchNode] = {}
-        # Synthetic super-root sentinel. ``expected_terminals=0`` so it
-        # doesn't itself count toward coverage; each kernel root's
-        # ``+1`` placeholder propagates up on insertion.
-        self._root = SearchNode(key=self.SUPER_ROOT_KEY, expected_terminals=0)
+        # Synthetic super-root sentinel.
+        self._root = SearchNode(key=self.SUPER_ROOT_KEY)
 
     # ------------------------------------------------------------------
     # Reads
@@ -183,22 +169,13 @@ class SearchTree:
         order. Each one heads an independent rewrite chain."""
         return list(self._root.children)
 
-    def root_coverage(self) -> tuple[int, int]:
-        """``(seen, expected)`` summed across every kernel subtree
-        (i.e. read off the super-root)."""
-        return self._root.seen_terminals, self._root.expected_terminals
-
     def min_subtree_seen(self) -> int:
         """Minimum ``seen_terminals`` across the kernel roots. ``0``
         when no roots are inserted yet. Used by the bootstrap phase to
-        enforce per-subtree coverage."""
+        balance measurements across kernels."""
         if not self._root.children:
             return 0
         return min(c.seen_terminals for c in self._root.children)
-
-    def is_fully_explored(self, node_key: str) -> bool:
-        n = self.node(node_key)
-        return n is not None and n.is_fully_explored()
 
     # ------------------------------------------------------------------
     # Mutations
@@ -206,22 +183,17 @@ class SearchTree:
 
     def ensure_root(self, node_key: str) -> SearchNode:
         """Insert a kernel root (child of the super-root) if not
-        present and return it. The new root's ``+1`` placeholder
-        propagates up to the super-root."""
+        present and return it."""
         row = self._nodes.get(node_key)
         if row is not None:
             return row
         row = SearchNode(key=node_key, parent=self._root)
         self._nodes[node_key] = row
         self._root.children.append(row)
-        # New kernel root contributes its placeholder ``expected=1`` to
-        # the super-root's aggregate.
-        self._root.expected_terminals += 1
         return row
 
     def expand(self, parent_key: str, child_keys: list[str], *, child_scores: list[float] | None = None) -> None:
-        """Record ``parent_key → child_keys`` edges and maintain
-        ``expected_terminals`` on every ancestor.
+        """Record ``parent_key → child_keys`` edges.
 
         ``child_scores`` (optional, aligned with ``child_keys``) stashes
         each child's ``op.score(ctx)`` on its :class:`NodeRow` so the
@@ -230,23 +202,20 @@ class SearchTree:
         already-set score.
 
         Idempotent — re-firing a rule with the same children adds no
-        new edges. When the rule's option set has grown, only the
-        genuinely-new edges propagate.
+        new edges.
         """
         if not child_keys:
             return
         parent = self.ensure_root(parent_key)
-        pre = len(parent.children)
         existing_keys = {c.key for c in parent.children}
         scores = child_scores if child_scores is not None else [float("-inf")] * len(child_keys)
-        n_new = 0
         for ck, s in zip(child_keys, scores, strict=True):
             # A child equal to its parent is always a cycle (the rule
             # produced a variant whose ``op_cache_key`` matches the
             # input). Adopting it would set ``parent.parent = parent``
-            # and ``_propagate_expected`` would loop forever. Caller is
-            # expected to derive distinct keys (e.g. via ``op.knobs``);
-            # guard here so a missed key contribution can't deadlock the
+            # and parent walks would loop forever. Caller is expected
+            # to derive distinct keys (e.g. via ``op.knobs``); guard
+            # here so a missed key contribution can't deadlock the
             # autotune driver.
             if ck == parent_key:
                 continue
@@ -268,17 +237,6 @@ class SearchTree:
                     row.score = s
             parent.children.append(row)
             existing_keys.add(ck)
-            n_new += 1
-
-        if n_new == 0:
-            return
-
-        # First-ever expansion of this parent consumes its placeholder "1",
-        # so the delta is one less than n_new. Later expansions are pure
-        # additions (the parent was already accounting for its children).
-        delta = n_new - 1 if pre == 0 else n_new
-        if delta != 0:
-            self._propagate_expected(parent, delta)
 
     def record_terminal(self, leaf_key: str, *, reward: float, status: str) -> bool:
         """Bump ``seen_terminals = 1`` on the leaf (if not already
@@ -295,7 +253,6 @@ class SearchTree:
             node = SearchNode(key=leaf_key, parent=self._root)
             self._nodes[leaf_key] = node
             self._root.children.append(node)
-            self._root.expected_terminals += 1
         if node.seen_terminals >= 1:
             return False
         failed_delta = 0 if status == "ok" else 1
@@ -315,12 +272,6 @@ class SearchTree:
     # ------------------------------------------------------------------
     # Internal propagation walks
     # ------------------------------------------------------------------
-
-    def _propagate_expected(self, node: SearchNode, delta: int) -> None:
-        cur: SearchNode | None = node
-        while cur is not None:
-            cur.expected_terminals += delta
-            cur = cur.parent
 
     def _propagate_visit(
         self,
@@ -374,8 +325,9 @@ class TuningSearch(Search):
     Stopping policy. ``pop()`` returns ``None`` when:
 
     - ``patience`` measured terminals in a row without a new best
-      latency, *and* coverage ``seen / expected ≥ min_coverage`` so the
-      patience clock doesn't fire on a slow start, or
+      latency — *only* enforced after bootstrap completes (every
+      kernel subtree has at least ``N_BOOTSTRAP`` measurements), so
+      the patience clock can't fire on a slow start, or
     - the tree is fully drained (no candidate queued, fallback empty).
 
     There is no wall-clock budget — under parallel workers a wall
@@ -402,7 +354,6 @@ class TuningSearch(Search):
         *,
         db: SearchDB | None = None,
         patience: int = 20,
-        min_coverage: float = 0.3,
     ) -> None:
         self._db = db if db is not None else SearchDB()
         self._tree = tree if tree is not None else SearchTree()
@@ -410,7 +361,6 @@ class TuningSearch(Search):
         # a tuning sweep across mixed contexts so one key per process is fine.
         self._context_key: str | None = None
         self._patience = patience
-        self._min_coverage = min_coverage
         self._last_seen = 0
         self._best_latency = float("inf")
         self._stagnant = 0
@@ -556,7 +506,7 @@ class TuningSearch(Search):
         # Poll the tree for newly-measured terminals since the last
         # pop check. Reset stagnant on any improvement; otherwise
         # count fresh measurements toward patience.
-        seen, expected = self._tree.root_coverage()
+        seen = sum(c.seen_terminals for c in self._tree.root.children)
         new_measurements = seen - self._last_seen
         self._last_seen = seen
         if new_measurements > 0:
@@ -568,9 +518,13 @@ class TuningSearch(Search):
                 self._stagnant = 0
             else:
                 self._stagnant += new_measurements
-        coverage = (seen / expected) if expected else 0.0
-        if coverage >= self._min_coverage and self._stagnant >= self._patience:
-            self._stop_reason = f"patience ({self._stagnant} stagnant @ {100 * coverage:.0f}% coverage, best {self._best_latency:.2f} us)"
+        # Patience is only honored after bootstrap has seeded every
+        # kernel subtree with at least ``N_BOOTSTRAP`` measurements —
+        # otherwise patience could fire before UCB ever runs.
+        if self._tree.min_subtree_seen() < self.N_BOOTSTRAP:
+            return False
+        if self._stagnant >= self._patience:
+            self._stop_reason = f"patience ({self._stagnant} stagnant, best {self._best_latency:.2f} us)"
             return True
         return False
 

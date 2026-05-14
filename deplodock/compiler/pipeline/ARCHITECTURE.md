@@ -147,15 +147,14 @@ The autotune state is split across two cooperating modules:
   `backend`, `status`, `knobs`). Selection statistic is the median.
 - **`SearchTree`** (`search/policy/mcts.py`) — pure-Python in-memory
   MCTS state, colocated with `TuningSearch` because MCTS is the only
-  policy that reads it. Tracks `expected_terminals` /
-  `seen_terminals` / `failed_terminals` / `visits` / `total_reward`
-  per node and the three upward propagation walks. Rebuilt fresh each
-  process: the engine re-fires every rule on warm starts (see
-  `engine.py:_try_one_rule` → `tree.expand(...)`), which re-creates
-  the tree topology; cached `perf` rows ensure no re-bench. UCB
-  priors don't survive across runs. `GreedySearch` has no tree and
-  `recorder.record_terminal` short-circuits the tree bump when it
-  receives `tree=None`.
+  policy that reads it. Tracks `seen_terminals` / `failed_terminals`
+  / `visits` / `total_reward` per node, propagated upward on every
+  recorded terminal. Rebuilt fresh each process: the engine re-fires
+  every rule on warm starts (see `engine.py:_try_one_rule` →
+  `tree.expand(...)`), which re-creates the tree topology; cached
+  `perf` rows ensure no re-bench. UCB priors don't survive across
+  runs. `GreedySearch` has no tree and `recorder.record_terminal`
+  short-circuits the tree bump when it receives `tree=None`.
 
 `search/recorder.py:record_terminal` is the only module that knows
 about all four parts (graph, DB, tree, backend). It does one

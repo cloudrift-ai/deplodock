@@ -18,7 +18,6 @@ def _make_search(tree: SearchTree) -> TuningSearch:
     return TuningSearch(
         tree=tree,
         patience=10**9,
-        min_coverage=1.1,
     )
 
 

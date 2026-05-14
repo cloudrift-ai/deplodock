@@ -40,16 +40,8 @@ def register_tune_command(subparsers):
         default=20,
         help=(
             "Stop after this many consecutive measured variants haven't beaten the current "
-            "best latency. Honored only after --min-coverage is reached. Default: 20."
-        ),
-    )
-    parser.add_argument(
-        "--min-coverage",
-        type=float,
-        default=0.3,
-        help=(
-            "Patience-based early stop is suppressed until this fraction of the autotune "
-            "tree is explored. Default: 0.3 (30%%). Set to 1.0 to disable patience."
+            "best latency. Honored only after the bootstrap phase has seeded every kernel "
+            "subtree with at least N_BOOTSTRAP measurements. Default: 20."
         ),
     )
     add_diagnostics_args(parser)
@@ -90,7 +82,7 @@ def handle_tune(args):
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
-    search = TuningSearch(db=db, patience=args.patience, min_coverage=args.min_coverage)
+    search = TuningSearch(db=db, patience=args.patience)
     t0 = time.monotonic()
     candidates: list = []
     try:
