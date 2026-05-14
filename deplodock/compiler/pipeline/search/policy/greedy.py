@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.policy.base import Search
 
@@ -29,16 +29,16 @@ class GreedySearch(Search):
 
     def __init__(self, *, db: SearchDB | None = None) -> None:
         self._db = db if db is not None else SearchDB()
-        self._pending: Candidate | None = None
+        self._pending: LazyCandidate | None = None
 
     @property
     def db(self) -> SearchDB:
         return self._db
 
-    def push(self, c: Candidate, *forks: Candidate) -> None:
-        del forks  # greedy always picks option-0 (``c``)
-        self._pending = c
+    def push(self, primary: LazyCandidate, *forks: LazyCandidate) -> None:
+        del forks  # greedy always picks option-0 (``primary``)
+        self._pending = primary
 
-    def pop(self) -> Candidate | None:
+    def pop(self) -> LazyCandidate | None:
         c, self._pending = self._pending, None
         return c

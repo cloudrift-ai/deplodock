@@ -18,7 +18,7 @@ The ``run_pipeline`` / ``run_autotune`` entry points and the
 from :mod:`pipeline`).
 """
 
-from deplodock.compiler.pipeline.search.candidate import Candidate, Cursor
+from deplodock.compiler.pipeline.search.candidate import Candidate, Cursor, LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfRow, PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import dialect_of, op_cache_key, source_chain
 from deplodock.compiler.pipeline.search.policy import GreedySearch, Search, TuningSearch
@@ -29,6 +29,7 @@ __all__ = [
     "Candidate",
     "Cursor",
     "GreedySearch",
+    "LazyCandidate",
     "SearchNode",
     "PerfRow",
     "PerfStats",

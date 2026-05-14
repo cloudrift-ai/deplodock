@@ -25,10 +25,18 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.pattern import Match
+from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.policy.base import Search
+
+
+def _lazy_tip(c: LazyCandidate) -> tuple[Match, object] | None:
+    """Last ``(match, option)`` in a lazy fork's apply chain — the
+    rewrite that defines the fork's tip. Returns ``None`` when the
+    chain is empty (the fork has already been resolved)."""
+    return c.chain[-1] if c.chain else None
 
 # ---------------------------------------------------------------------------
 # In-memory MCTS tree
@@ -409,11 +417,11 @@ class TuningSearch(Search):
         # Candidates grouped by their tip op_cache_key. Every push lands
         # here (or in ``_fallback`` if no tip); every pop runs a UCB walk
         # from the root and pulls one from the selected tip's bucket.
-        self._by_tip: dict[str, list[Candidate]] = {}
+        self._by_tip: dict[str, list[LazyCandidate]] = {}
         # FIFO fallback queue for candidates whose tip op_cache_key is
         # missing (no kernel-bearing op in the graph yet) and for the
         # final drain when ``_by_tip`` is empty.
-        self._fallback: deque[Candidate] = deque()
+        self._fallback: deque[LazyCandidate] = deque()
 
     @property
     def db(self) -> SearchDB:
@@ -429,31 +437,32 @@ class TuningSearch(Search):
     def stop_reason(self) -> str | None:
         return self._stop_reason
 
-    def push(self, c: Candidate, *forks: Candidate) -> None:
-        # Group forks by rewrite site (every fork from the same
-        # ``_try_one_rule`` match shares ``_origin.match.root_node_id``)
-        # so each multi-option fork point produces one ``tree.expand``
-        # edge — the engine no longer reaches into the tree itself.
-        sites: dict[str, list[Candidate]] = {}
+    def push(self, primary: LazyCandidate, *forks: LazyCandidate) -> None:
+        # Group forks by rewrite site (every fork from the same rule
+        # batch shares its match's ``root_node_id``) so each multi-
+        # option fork point produces one ``tree.expand`` edge — the
+        # engine no longer reaches into the tree itself.
+        sites: dict[str, list[LazyCandidate]] = {}
         for fork in forks:
-            origin = fork._origin
-            if origin is None:
+            tip = _lazy_tip(fork)
+            if tip is None:
                 continue
-            sites.setdefault(origin.match.root_node_id, []).append(fork)
+            sites.setdefault(tip[0].root_node_id, []).append(fork)
         for site, group in sites.items():
-            self._record_fork(c, site, group)
-        self._push_one(c)
+            self._record_fork(primary, site, group)
+        self._push_one(primary)
         for fork in forks:
             self._push_one(fork)
 
-    def _record_fork(self, primary: Candidate, site: str, forks: list[Candidate]) -> None:
+    def _record_fork(self, primary: LazyCandidate, site: str, forks: list[LazyCandidate]) -> None:
         """Register one ``parent_key → child_keys`` edge in the MCTS
-        tree, derived from the fork group at ``site``. ``primary`` is
-        option-0 (already applied to its graph); ``forks`` are the alt
-        options whose ``ForkOrigin.option`` carries the post-rule op.
-        Skips when the site isn't in ``primary.graph`` (Graph splices
-        that removed the node) or any key is uncomputable."""
-        primary_node = primary.graph.nodes.get(site)
+        tree, derived from the fork group at ``site``. ``primary``
+        wraps option-0 (already applied to its inner Candidate's
+        graph; chain is empty); ``forks`` are siblings whose chain
+        tail carries the post-rule op. Skips when the site isn't in
+        ``primary.inner.graph`` (Graph splices that removed the node)
+        or any key is uncomputable."""
+        primary_node = primary.inner.graph.nodes.get(site)
         if primary_node is None:
             return
         parent_op = primary_node.op.source
@@ -462,9 +471,10 @@ class TuningSearch(Search):
         parent_key = op_cache_key(parent_op)
         if parent_key is None:
             return
-        members: list[tuple[Op, Candidate]] = [(primary_node.op, primary)]
+        members: list[tuple[Op, LazyCandidate]] = [(primary_node.op, primary)]
         for fork in forks:
-            opt = fork._origin.option if fork._origin is not None else None
+            tip = _lazy_tip(fork)
+            opt = tip[1] if tip is not None else None
             if not isinstance(opt, Op):
                 return  # mixed-shape fork group — keep the tree honest, skip
             members.append((opt, fork))
@@ -474,29 +484,30 @@ class TuningSearch(Search):
             if ck is None:
                 return
             child_keys.append(ck)
-        scores = [op.score(cand.ctx) for op, cand in members]
+        scores = [op.score(cand.inner.ctx) for op, cand in members]
         self._tree.expand(parent_key, child_keys, child_scores=scores)
 
-    def _push_one(self, c: Candidate) -> None:
+    def _push_one(self, c: LazyCandidate) -> None:
         if self._context_key is None:
-            self._context_key = c.ctx.structural_key()
-        # Lazy forks know their post-rule op via ``_origin.option`` so
-        # we can bucket them without materializing the graph. Forks
-        # whose option is a Graph splice have no single tip op and fall
-        # through to the fallback queue (rare — functional rewrites
-        # rarely fork at autotune points). Concrete candidates compute
-        # the tip from their materialized graph.
-        if c._origin is not None:
-            opt = c._origin.option
+            self._context_key = c.inner.ctx.structural_key()
+        # Bucket by the tip op's ``op_cache_key``: lazy siblings with a
+        # pending chain expose the tip via the chain tail; an already-
+        # resolved (or zero-chain) lazy reads its inner graph. Tip ops
+        # that are Graph splices have no single key and fall through to
+        # the fallback FIFO (rare — functional rewrites rarely fork at
+        # autotune points).
+        tip = _lazy_tip(c)
+        if tip is not None:
+            opt = tip[1]
             tip_key = op_cache_key(opt) if isinstance(opt, Op) else None
         else:
-            tip_key = self._tip_key(c.graph)
+            tip_key = self._tip_key(c.inner.graph)
         if tip_key is None:
             self._fallback.append(c)
             return
         self._by_tip.setdefault(tip_key, []).append(c)
 
-    def pop(self) -> Candidate | None:
+    def pop(self) -> LazyCandidate | None:
         if self._should_stop():
             return None
         # Bootstrap: keep drilling rollouts to terminal until *every*
@@ -515,7 +526,7 @@ class TuningSearch(Search):
             del self._by_tip[target.key]
         return c
 
-    def _fallback_pop(self) -> Candidate | None:
+    def _fallback_pop(self) -> LazyCandidate | None:
         """When the UCB walk has nothing to match (root unknown, all
         frontiers exhausted, etc.), drain the by-tip dict in arbitrary
         order, then the FIFO fallback queue. Keeps the search complete
@@ -585,7 +596,7 @@ class TuningSearch(Search):
             d += 1
         return d
 
-    def _bootstrap_pop(self) -> Candidate | None:
+    def _bootstrap_pop(self) -> LazyCandidate | None:
         """Bootstrap selection. Sort key (minimized) per queued candidate:
 
         - ``subtree_seen`` — pick from the kernel subtree with the

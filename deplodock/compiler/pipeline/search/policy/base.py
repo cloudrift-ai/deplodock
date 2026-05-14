@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from deplodock.compiler.pipeline.search.candidate import Candidate
+from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 
 
 class Search(ABC):
@@ -14,19 +14,20 @@ class Search(ABC):
     priority / MCTS / whatever) and the termination condition (greedy
     stops at first terminal; exhaustive runs the queue dry).
 
-    The engine doesn't tell the search when a candidate is terminal —
-    instead a terminal candidate is the one the engine yielded without
-    pushing it back. Searches that need to detect this can track the
-    last-popped candidate and check whether it returned via ``push``.
+    Everything in the search layer is :class:`LazyCandidate` —
+    concrete candidates from the engine arrive wrapped in a
+    zero-chain ``LazyCandidate`` (``resolve`` returns the inner
+    Candidate unchanged) so push/pop stays uniform across "the
+    rollout's current cand" and "an autotune fork that hasn't been
+    materialized yet".
 
-    ``push(c, *forks)`` carries the primary candidate ``c`` plus every
-    sibling alternative the engine spawned at the same rewrite point.
-    Exhaustive policies register all of them; greedy policies discard
-    the forks and keep only ``c`` (option-0)."""
-
-    @abstractmethod
-    def push(self, c: Candidate, *forks: Candidate) -> None: ...
+    ``push(primary, *forks)`` carries the primary candidate plus
+    every sibling spawned at the same rewrite point. Exhaustive
+    policies register all of them; greedy keeps only ``primary``."""
 
     @abstractmethod
-    def pop(self) -> Candidate | None:  # None when exhausted
+    def push(self, primary: LazyCandidate, *forks: LazyCandidate) -> None: ...
+
+    @abstractmethod
+    def pop(self) -> LazyCandidate | None:  # None when exhausted
         ...

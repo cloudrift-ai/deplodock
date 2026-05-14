@@ -1,10 +1,13 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
 - :mod:`.engine` — pattern matcher + rule plumbing. Exports
-  ``Pattern``, ``Match``, ``match_pattern``, ``RuleSkipped``. Compilation
-  drives through ``run_pipeline`` / ``run_autotune`` for every caller —
-  including tests — so the pass list is always explicit (``[name, ...]``)
-  and the same greedy / autotune semantics apply everywhere.
+  ``Pattern``, ``Match``, ``Pipeline``, ``RuleSkipped``.
+  Pattern matching goes through ``Pipeline.match(graph, pass_idx,
+  rule_idx)``; tests can use ``Pipeline.from_pattern(...)`` for a
+  one-rule shim. Compilation drives through ``run_pipeline`` /
+  ``run_autotune`` for every caller — including tests — so the pass
+  list is always explicit (``[name, ...]``) and the same greedy /
+  autotune semantics apply everywhere.
 - :mod:`.search` — autotune driver (``Candidate`` / ``Search`` /
   ``run_pipeline`` / ``run_autotune``) and persistent measurement cache.
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
@@ -19,8 +22,8 @@ from deplodock.compiler.pipeline.dump import CompilerDump
 from deplodock.compiler.pipeline.engine import (
     Match,
     Pattern,
+    Pipeline,
     RuleSkipped,
-    match_pattern,
     run_autotune,
     run_pipeline,
 )
@@ -48,12 +51,12 @@ __all__ = [
     "LOOP_PASSES",
     "Match",
     "Pattern",
+    "Pipeline",
     "RuleSkipped",
     "Search",
     "TENSOR_PASSES",
     "TILE_PASSES",
     "TuningSearch",
-    "match_pattern",
     "run_autotune",
     "run_pipeline",
 ]
