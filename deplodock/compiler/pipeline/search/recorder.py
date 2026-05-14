@@ -202,6 +202,28 @@ def _persist(
         knobs=knobs,
     )
     if tree is not None:
+        # Splice the source chain into the search tree before recording
+        # the terminal. Without this the leaf cuda_key is unknown to the
+        # tree (no fork ever emitted it as a child option — final-lower
+        # rules are single-option), so ``record_terminal`` falls into its
+        # orphan path and parents the leaf directly under the super-root.
+        # Each measured terminal then becomes its own subtree root with
+        # ``seen_terminals=1`` and the real root never accumulates
+        # propagated visits — ``min_subtree_seen()`` stays 0 forever,
+        # bootstrap never completes, and the patience clock never fires.
+        #
+        # Walk top-down (deepest source first) so each ``expand`` sees
+        # its parent already registered in the tree from the previous
+        # iteration; ``expand`` is a no-op for already-known parent-child
+        # edges. Bottom-up would orphan every intermediate op as its own
+        # super-root child because ``expand`` doesn't re-parent existing
+        # nodes — that path was tried and made the problem worse.
+        for parent_op, child_op in zip(reversed(chain[1:]), reversed(chain[:-1]), strict=False):
+            p_key = op_cache_key(parent_op)
+            c_key = op_cache_key(child_op)
+            if p_key is None or c_key is None or p_key == c_key:
+                continue
+            tree.expand(p_key, [c_key])
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
         tree.record_terminal(cuda_key, reward=reward, status=status)
 

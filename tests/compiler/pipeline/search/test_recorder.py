@@ -147,6 +147,33 @@ def test_kernel_op_cache_key_is_structural() -> None:
     assert op_cache_key(k1) == op_cache_key(k2)
 
 
+def test_record_terminal_propagates_through_source_chain() -> None:
+    """The terminal CudaOp is typically not introduced via a fork (the
+    final-lower rules are single-option), so the tree has no prior
+    record of its ``op_cache_key``. ``record_terminal`` must splice the
+    chain (LoopOp → TileOp → KernelOp → CudaOp) into the tree before
+    bumping the leaf, otherwise propagation parents the leaf under the
+    super-root and ``min_subtree_seen()`` stays at 0 forever — which
+    gates the MCTS bootstrap phase and prevents patience from firing.
+    """
+    g = Pipeline.build(CUDA_PASSES).run(_elementwise_graph())
+
+    db = SearchDB()
+    tree = SearchTree()
+    ctx_key = Context.from_target((12, 0)).structural_key()
+    record_terminal(g, db, tree, ctx_key, backend=_StubBackend(per_launch_ms=[0.05]))
+
+    # The kernel root (deepest source op) should accumulate the visit;
+    # the leaf should NOT have been parented directly under super-root.
+    assert tree.min_subtree_seen() == 1, (
+        "min_subtree_seen=0 indicates the leaf orphan-rooted itself instead "
+        "of propagating through the chain — bootstrap will never complete"
+    )
+    assert len(tree.root.children) == 1, (
+        f"expected one kernel root, got {len(tree.root.children)} — each terminal is creating its own super-root child"
+    )
+
+
 def test_record_terminal_persists_full_op_chain() -> None:
     """A fully-lowered CudaOp has a ``source`` chain back through
     KernelOp → TileOp → LoopOp. ``record_terminal`` must persist one row
