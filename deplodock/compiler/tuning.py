@@ -334,10 +334,17 @@ def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     """Per-thread output tile ``(F_M, F_N)``. ``(1, 1)`` to skip
-    register tiling on non-matmul bodies and on matmuls whose post-
-    blockify THREAD axes are too small to host the F-tile (tiny matmul
-    fallback — blockify kept the original output extents whole because
-    they were already < tile width)."""
+    register tiling on non-matmul bodies and on tiny matmuls whose
+    post-blockify THREAD product is already at-or-below one warp.
+
+    For tiles whose THREAD extents match the class's default (BN, BM),
+    return the class-tuned ``(F_M, F_N)``. For *off-default* (BN, BM)
+    — the autotune sweep over ``005_blockify_launch``'s ``_TUNE_AXIS_CHOICES``
+    — derive a heuristic F from the actual thread extents that targets
+    ~256 post-split threads, so 008 still forks (and the autotuner can
+    explore its F neighborhood) instead of bailing to ``(1, 1)`` and
+    leaving small-tile variants register-tile-less.
+    """
     if tile is None or not _has_matmul_reduce(tile.body):
         return (1, 1)
     (def_bn, def_bm), (def_fm, def_fn) = _default_tile(tile)
@@ -345,16 +352,30 @@ def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     f_n = _int_env("DEPLODOCK_FN", def_fn)
     bn = _int_env("DEPLODOCK_BN", def_bn)
     bm = _int_env("DEPLODOCK_BM", def_bm)
-    # Post-blockify: each output's THREAD axis should equal the per-axis
-    # tile width (BN, BM). If neither matches, blockify kept the axes
-    # whole — register-tiling would just rename them, no parallelism.
     from deplodock.compiler.ir.axis import BIND_THREAD
 
-    if any(ba.bind == BIND_THREAD for ba in tile.axes):
-        thread_extents = {int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD}
-        if not (thread_extents & {bn, bm}):
-            return (1, 1)
-    return (f_m, f_n)
+    thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
+    if not thread_axes:
+        return (f_m, f_n)
+    thread_extents = {int(ba.axis.extent) for ba in thread_axes}
+    if thread_extents & {bn, bm}:
+        return (f_m, f_n)
+
+    # Off-default (BN, BM) — pick the largest symmetric F (power of 2)
+    # that divides both extents and leaves at least one warp's worth of
+    # threads post-split. The autotune fork over ``_TUNE_F_CHOICES``
+    # then explores neighbours; this just has to be non-(1, 1) so 008
+    # fires and emits the fork.
+    sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
+    m_ext = int(sorted_ba[0].axis.extent)
+    n_ext = int(sorted_ba[-1].axis.extent)
+    cur_threads = m_ext * n_ext
+    if cur_threads <= 32:
+        return (1, 1)
+    for f in (8, 4, 2):
+        if m_ext % f == 0 and n_ext % f == 0 and (m_ext // f) * (n_ext // f) >= 32:
+            return (f, f)
+    return (1, 1)
 
 
 def thread_budget() -> int:
@@ -395,8 +416,18 @@ _DTYPE_BYTES = 4
 
 
 def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
-    """Halve BK until the (BN+BM)·BK·4·2 stage fits in static smem
-    minus pad headroom. Returns the largest BK ≥ 1 that fits."""
+    """Halve BK until the per-stage smem fits in ``static_smem_cap``
+    minus pad headroom. Returns the largest BK ≥ 1 that fits.
+
+    Stage footprint = ``n_inputs · max(BN, BM) · BK · 4 · 2``: each
+    external input gets staged at roughly ``tile × BK`` floats, with
+    two buffers for double-buffering. ``n_inputs`` is read from the
+    tile body — a plain ``matmul`` has 2 inputs (A, B); fused-prologue
+    matmuls (``silu_mul_matmul``, naive attention's ``softmax·mask @ V``)
+    have ≥3 and need a tighter BK to leave room for the extra stage.
+    The previous 2-input fixed assumption let naive_attn at head_dim=128
+    pick a BK that overflowed the dynamic-smem cap at launch.
+    """
     budget = static_smem_cap - _PAD_HEADROOM_BYTES
     extents = _logical_output_extents(tile)
     if len(extents) < 2:
@@ -404,7 +435,9 @@ def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
     (def_bn, def_bm), _ = _default_tile(tile)
     bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", def_bn))
     bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", def_bm))
-    while bk > 1 and (bn_actual + bm_actual) * bk * _DTYPE_BYTES * 2 > budget:
+    n_inputs = max(_external_input_count(tile.body), 2)
+    stage_footprint = n_inputs * max(bn_actual, bm_actual) * _DTYPE_BYTES * 2
+    while bk > 1 and stage_footprint * bk > budget:
         bk //= 2
     return bk
 

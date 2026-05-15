@@ -8,7 +8,7 @@ Two halves:
 2. **Behavior tests** — build a ``LoopOp`` graph that exercises a
    specific tileify branch (outer-chain stripping for reduction /
    pointwise, sibling output-Loop lifting), then run only the
-   ``tileify`` rule via ``run_pipeline(..., select={"tileify"})`` so
+   ``tileify`` rule via ``Pipeline.build(select={"tileify"}).run(...)`` so
    the resulting ``Tile.axes`` reflects tileify alone — no subsequent
    ``blockify_launch`` partition or ``cooperative_reduce`` rewrite to
    obscure the assertion.
@@ -23,7 +23,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.ir.tile.ir import BIND_THREAD, Tile, TileOp
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -40,7 +40,7 @@ def test_tileify_fires_on_pointwise(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "tileify" in recording_dump.fired_rules("lowering/tile")
 
 
@@ -51,7 +51,7 @@ def test_tileify_fires_on_reduction(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "tileify" in recording_dump.fired_rules("lowering/tile")
 
 
@@ -79,7 +79,7 @@ def _wrap_loopop(loop_op: LoopOp, *, output_id: str = "o", output_shape: tuple =
 def _run_only_tileify(g: Graph) -> TileOp:
     """Run the full pipeline with only the ``tileify`` rule enabled and
     return the (single) resulting ``TileOp``."""
-    out = run_pipeline(g, TILE_PASSES, select={"tileify"})
+    out = Pipeline.build(TILE_PASSES, select={"tileify"}).run(g)
     tile_ops = [n.op for n in out.nodes.values() if isinstance(n.op, TileOp)]
     assert len(tile_ops) == 1
     return tile_ops[0]

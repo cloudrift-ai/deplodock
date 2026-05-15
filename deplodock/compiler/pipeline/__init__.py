@@ -1,30 +1,38 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
-- :mod:`.engine` — pattern matcher + rule runner + ``run_pipeline``
-  entry point. Exports ``Pattern``, ``Match``, ``match_pattern``,
-  ``run_rule``, ``run_pass``, ``run_pipeline``.
+- :mod:`.pipeline` — value types (``Pattern``, ``Match``, ``Rule``,
+  ``RuleSkipped``, ``Pass``, ``Pipeline``) and the compile entry
+  points (``Pipeline.build``, ``.run``, ``.tune``, ``.search``).
+  Pattern matching goes through ``pipeline.match(graph, rule)``; tests
+  can use ``Pipeline.from_pattern(...)`` for a one-rule shim. The same
+  greedy / autotune semantics apply to every caller.
+- :mod:`.search` — search policies (``Candidate`` / ``Search`` /
+  ``GreedySearch`` / ``TuningSearch``) and persistent measurement
+  cache. ``Candidate.apply`` owns the per-rule logging + dump hooks
+  (reads ``match.pipeline.dump``).
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
   dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories grouped by IR level:
   ``frontend/{decomposition,optimization}``, ``loop/{lifting,fusion}``,
   ``lowering/{tile,kernel,cuda}``. Each leaf contains ``NNN_<name>.py``
-  rule modules picked up by ``run_pass``.
+  rule modules picked up by ``Pass.load``.
 """
 
 from deplodock.compiler.pipeline.dump import CompilerDump
-from deplodock.compiler.pipeline.engine import (
-    Candidate,
-    DFSSearch,
+from deplodock.compiler.pipeline.pipeline import (
     Match,
+    Pass,
     Pattern,
+    Pipeline,
+    Rule,
     RuleSkipped,
+    _strip_rule_prefix,
+)
+from deplodock.compiler.pipeline.search import (
+    Candidate,
+    GreedySearch,
     Search,
-    TraceEntry,
-    match_pattern,
-    run_autotune,
-    run_pass,
-    run_pipeline,
-    run_rule,
+    TuningSearch,
 )
 
 # Canonical pass lists, indexed by the --ir stage they produce. Backends
@@ -39,19 +47,18 @@ __all__ = [
     "CUDA_PASSES",
     "Candidate",
     "CompilerDump",
-    "DFSSearch",
+    "GreedySearch",
     "KERNEL_PASSES",
     "LOOP_PASSES",
     "Match",
+    "Pass",
     "Pattern",
+    "Pipeline",
+    "Rule",
     "RuleSkipped",
     "Search",
     "TENSOR_PASSES",
     "TILE_PASSES",
-    "TraceEntry",
-    "match_pattern",
-    "run_autotune",
-    "run_pass",
-    "run_pipeline",
-    "run_rule",
+    "TuningSearch",
+    "_strip_rule_prefix",
 ]

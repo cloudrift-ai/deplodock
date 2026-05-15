@@ -194,8 +194,11 @@ def test_structural_key_distinguishes_input_order() -> None:
     assert a.structural_key() != b.structural_key()
 
 
-def test_structural_key_distinguishes_body_op() -> None:
-    """Same wiring + shapes; one body adds, the other multiplies."""
+def test_structural_key_distinguishes_cross_cluster_body_op() -> None:
+    """Same wiring + shapes; ``add`` and ``divide`` live in different
+    compute-unit clusters (FMA vs SFU-div) so the bodies hash distinct.
+    Within-cluster ops (e.g. add vs multiply) collapse — see
+    ``tests/compiler/ir/stmt/test_structural_key.py``."""
     a = _add_graph(("x", "y"), "out")
     b = Graph()
     _input(b, "x", (4,))
@@ -208,7 +211,7 @@ def test_structural_key_distinguishes_body_op() -> None:
                 body=(
                     Load(name="lx", input="x", index=(Var("a"),)),
                     Load(name="ly", input="y", index=(Var("a"),)),
-                    Assign(name="z", op="multiply", args=("lx", "ly")),
+                    Assign(name="z", op="divide", args=("lx", "ly")),
                     Write(output="out", index=(Var("a"),), value="z"),
                 ),
             ),

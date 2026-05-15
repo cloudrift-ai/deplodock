@@ -57,7 +57,7 @@ from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp, TmaBufferedStage
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     single_tile,
@@ -183,7 +183,7 @@ def _try_fix(stage: Stage, loads: list[Load], tile: Tile) -> Stage | None:
             continue
         if c <= 1:
             n_pad_dims = sum(1 for p in pad if p)
-            logger.info(
+            logger.debug(
                 "Stage %s: %d-way bank conflict → 1-way after %d-dim pad %s",
                 stage.name,
                 base_conflict,
@@ -196,7 +196,7 @@ def _try_fix(stage: Stage, loads: list[Load], tile: Tile) -> Stage | None:
             best_pad = pad
 
     if best_c < base_conflict:
-        logger.warning(
+        logger.debug(
             "Stage %s: %d-way bank conflict; partial fix → %d-way with pad %s (no perfect fix found)",
             stage.name,
             base_conflict,
@@ -204,5 +204,5 @@ def _try_fix(stage: Stage, loads: list[Load], tile: Tile) -> Stage | None:
             best_pad,
         )
         return dc_replace(stage, pad=best_pad)
-    logger.warning("Stage %s: %d-way bank conflict; no padding fix found", stage.name, base_conflict)
+    logger.debug("Stage %s: %d-way bank conflict; no padding fix found", stage.name, base_conflict)
     return None

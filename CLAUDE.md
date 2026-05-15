@@ -21,6 +21,7 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
 - `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging
+- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`); `--tune-db` on `deplodock tune` / `deplodock run` takes precedence
 
 ## Running Tests
 
@@ -63,6 +64,7 @@ same worker.
 - `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR] [--target sm_NN]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model). `--target sm_NN` (e.g. `sm_80`, `sm_90`, `sm_120`) overrides the live device's compute capability so passes that gate on hardware features (TMA, cp.async) take the target's path.
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
 - `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
+- `deplodock tune <model_or_ir|--code EXPR> [--tune-db PATH] [--patience N] [--ucb-c C]` — autotune via SP-MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior). Pops candidates by UCB1, benches every CudaOp variant, persists `perf` / `lowering` / inventory rows to the SQLite cache, and stops on patience (N consecutive measured terminals without a new best). Prints the winning CUDA IR to stdout and a ranked variant summary to stderr.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
@@ -81,7 +83,12 @@ same worker.
 
 ## Documentation Conventions
 
-- Target ~120 characters for `ARCHITECTURE.md`, `README.md`, and other docs (ASCII diagrams, tables, prose). Wider is fine if a table or diagram reads better that way — some overflow is acceptable. Python code stays under 140 chars (Ruff-enforced).
+**Wrap every `.md` file in the repo to ~120 characters.** This includes `README.md`, every `ARCHITECTURE.md`, every file
+under `plans/`, every file under `docs/`, and any other markdown anywhere in the tree. Do NOT wrap at 70–80 characters —
+that is the default markdown habit, and it is wrong for this repo. Aim for lines in the 90–120 range.
+
+Table rows, ASCII diagrams, and long URLs may overflow past 120 if wrapping would hurt readability — that's the only
+acceptable reason to go wider. Python code stays under 140 chars (Ruff-enforced).
 
 ## Contribution Instructions
 

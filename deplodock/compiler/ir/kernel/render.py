@@ -49,7 +49,7 @@ static __device__ __forceinline__ bool mbarrier_try_wait_parity(unsigned long lo
     unsigned int addr = __cvta_generic_to_shared(mbar);
     int ready;
     asm volatile("{.reg .pred P; mbarrier.try_wait.parity.shared.b64 P, [%1], %2; selp.b32 %0, 1, 0, P;}\\n"
-                 : "=r"(ready) : "r"(addr), "r"(phase));
+                 : "=r"(ready) : "r"(addr), "r"(phase) : "memory");
     return ready != 0;
 }
 
@@ -60,9 +60,16 @@ static __device__ __forceinline__ void mbarrier_wait_parity(unsigned long long* 
     // is required (try_wait can return early); the suspend hint prevents
     // hot-spinning across all 256 CTA threads (~3-4× kernel speedup on
     // small matmuls where the wait-vs-compute ratio is high).
+    //
+    // The ``"memory"`` clobber prevents the compiler from reordering
+    // smem loads across this asm. The primary correctness anchor is
+    // the trailing ``__syncthreads()`` materialize emits after each
+    // MbarrierWait (see ``001_materialize_tile.py``); the clobber is
+    // defensive belt-and-braces so the asm itself reads as a fence
+    // even if a future caller forgets the surrounding Sync.
     unsigned int addr = __cvta_generic_to_shared(mbar);
     asm volatile("{.reg .pred P; bw: mbarrier.try_wait.parity.shared.b64 P, [%0], %1; @!P bra bw;}\\n"
-                 :: "r"(addr), "r"(phase));
+                 :: "r"(addr), "r"(phase) : "memory");
 }
 
 static __device__ __forceinline__ void cp_async_bulk_tensor_2d(

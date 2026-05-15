@@ -49,7 +49,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     TmaBufferedStage,
 )
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 logger = logging.getLogger(__name__)

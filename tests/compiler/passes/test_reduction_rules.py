@@ -18,7 +18,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, run_pipeline
+from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
 _accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.004_cooperative_reduce")._accums_independent
 
@@ -47,7 +47,7 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" in fired
     assert "chunk_matmul_k" not in fired
@@ -62,7 +62,7 @@ def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" not in fired
 
@@ -78,7 +78,7 @@ def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" in fired
 
@@ -93,7 +93,7 @@ def test_warp_cooperative_skips_stage_inputs(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" in fired
     assert "stage_inputs" not in fired
@@ -119,7 +119,7 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = run_pipeline(g, KERNEL_PASSES, dump=recording_dump)
+    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
     stmts = _kernel_body_stmts(out)
     assert any(isinstance(s, WarpShuffle) for s in stmts)
     assert not any(isinstance(s, TreeHalve) for s in stmts)
@@ -137,7 +137,7 @@ def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = run_pipeline(g, KERNEL_PASSES, dump=recording_dump)
+    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
     stmts = _kernel_body_stmts(out)
     warp_shuffles = [s for s in stmts if isinstance(s, WarpShuffle)]
     tree_halves = [s for s in stmts if isinstance(s, TreeHalve)]
@@ -157,7 +157,7 @@ def test_block_cooperative_still_uses_stage_inputs(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" in fired
     assert "stage_inputs" in fired
@@ -174,7 +174,7 @@ def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "cooperative_reduce" not in fired
 

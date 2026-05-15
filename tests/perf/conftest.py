@@ -126,15 +126,56 @@ def bench_pair(request):
     doesn't gate on it.
     """
 
-    def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow:
+    def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow | None:
+        if _tune_enabled():
+            # Tune-only path: run ``deplodock tune`` per case to
+            # populate the autotune DB. Measurement is skipped entirely —
+            # run ``make bench-kernels-tuned`` afterwards to measure with
+            # the tuned knobs. Search runs until patience or tree
+            # exhaustion (no wall budget).
+            _tune_via_subprocess(case)
+            return None
+
         if iters is None:
             iters = case.iters
-
         row = _bench_via_subprocess(case, warmup=warmup, iters=iters, profile=_ncu_enabled())
         _collector(request.config).append(row)
         return row
 
     return _run
+
+
+def _tune_enabled() -> bool:
+    """``DEPLODOCK_TUNE=1`` enables the tune-only path: each case spawns
+    ``deplodock tune`` to populate the autotune DB
+    (``DEPLODOCK_TUNE_DB``). The bench step is skipped — re-run the suite
+    without ``DEPLODOCK_TUNE`` (e.g. ``make bench-kernels-tuned``) to
+    measure with the tuned knobs."""
+    return os.environ.get("DEPLODOCK_TUNE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _tune_via_subprocess(case: Case) -> None:
+    """Spawn ``deplodock tune`` for one case. Writes knob
+    measurements to ``DEPLODOCK_TUNE_DB`` and exits — no bench is run."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "deplodock.deplodock",
+        "tune",
+        "--code",
+        case.code,
+        "-v",
+    ]
+    env = dict(os.environ)
+    sys.stderr.write(f"[tune {case.name}] launching: {' '.join(cmd)}\n")
+    sys.stderr.flush()
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=None, env=env, timeout=180.0)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"[tune {case.name}] TIMEOUT after 180s\n")
+        return
+    if res.returncode != 0:
+        sys.stderr.write(f"[tune {case.name}] exit={res.returncode}\n")
 
 
 def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool) -> PerfRow:
@@ -159,11 +200,13 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
         env["DEPLODOCK_DUMP_DIR"] = tmp
         env.pop("DEPLODOCK_NCU_CHILD", None)
 
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
+        timeout_s = 900.0
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
+        res_stderr = res.stderr
         if res.returncode != 0:
             # Surface stderr so flaky-bench cases are diagnosable, but
             # synthesize a minimal row so the suite doesn't abort.
-            sys.stderr.write(f"[bench {case.name}] exit={res.returncode}\n{res.stderr[-2000:]}\n")
+            sys.stderr.write(f"[bench {case.name}] exit={res.returncode}\n{res_stderr[-2000:]}\n")
             return PerfRow(
                 name=case.name,
                 op=case.op,

@@ -434,6 +434,18 @@ def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Hard ceiling on the launch grid for ``KernelOp.validate``. The CUDA driver
+# allows ~2^31 CTAs per dim; the cap here is sized to allow any realistic
+# matmul launch (including K-split fan-in, which multiplies CTA count by
+# the split factor — e.g. (M=32, K=18944, N=3584) with BM=BN=16 and
+# auto-splitK=37 produces 2 × 224 × 37 ≈ 17 k CTAs of heavy per-CTA work),
+# while still rejecting truly degenerate launches that would saturate
+# the GPU command processor with light per-CTA work. The autotune-side
+# guard against pathological tiny-CTA × huge-grid variants is the
+# graduated penalty in ``TileOp.score``, not this cap.
+_MAX_CTAS = 65536
+
+
 @dataclass
 class KernelOp(Op):
     """One ``__global__`` GPU kernel as a Kernel IR program.
@@ -464,6 +476,59 @@ class KernelOp(Op):
         sig_out = ", ".join(self.outputs) or "-"
         head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
         return "\n".join([head, *pretty_body(self.body, "    ")])
+
+    def smem_bytes(self) -> int:
+        """Total static + dynamic ``__shared__`` bytes declared in the
+        body — sum of ``prod(Smem.extents) * sizeof(Smem.dtype)`` over
+        every ``Smem`` decl, **at any nesting depth**. ``Smem`` stmts
+        sit inside ``Tile`` / ``Loop`` bodies post-lowering, so the
+        top-level-only iterator the engine used to use under-counted by
+        the entire footprint and lets oversize kernels slip past
+        :meth:`validate`. Use the deep iterator (``for s in self``) to
+        match :meth:`smem_names` and the renderer's
+        ``_compute_dynamic_smem_offsets``."""
+        from math import prod  # noqa: PLC0415
+
+        # Mirror cuda/001_lower_kernelop's _DTYPE_BYTES for the smem sizing.
+        dtype_bytes = {"float": 4, "double": 8, "int": 4, "half": 2, "bfloat16": 2}
+        total = 0
+        for s in self:
+            if isinstance(s, Smem):
+                elements = prod(int(e) for e in s.extents) if s.extents else 1
+                total += elements * dtype_bytes.get(s.dtype, 4)
+        return total
+
+    def validate(self, ctx) -> bool:
+        """Drop kernels whose launch wouldn't fit the hardware. Runs
+        after every tile-level rewrite has settled (the engine calls
+        ``validate`` on each op rebind, but only at the ``KernelOp``
+        stage are the THREAD axes guaranteed to reflect the final
+        per-CTA launch geometry — earlier ``TileOp`` rewrites may still
+        split or coalesce them). Three checks:
+
+        - threads ≤ ``ctx.max_threads_per_cta`` (driver-side launch cap),
+        - smem ≤ ``ctx.max_dynamic_smem`` (per-block ``cudaFuncSetAttribute``
+          opt-in cap; smaller for older / consumer cards),
+        - CTAs ≤ ``_MAX_CTAS`` (a hard cap on the launch grid — empirically
+          variants with tens of thousands of light CTAs slot into the
+          GPU command processor so slowly that the per-launch
+          ``_KERNEL_TIMEOUT_MS`` watchdog stops being a useful escape
+          hatch; better to drop them at the rule level before benching)."""
+        from math import prod  # noqa: PLC0415
+
+        from deplodock.compiler.ir.stmt import Tile  # noqa: PLC0415
+
+        for s in self.body:
+            if isinstance(s, Tile):
+                threads = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_THREAD)
+                if threads > ctx.max_threads_per_cta:
+                    return False
+                ctas = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_BLOCK)
+                if ctas > _MAX_CTAS:
+                    return False
+        if self.smem_bytes() > ctx.max_dynamic_smem:
+            return False
+        return True
 
     @property
     def loads(self) -> tuple[Load, ...]:
@@ -562,3 +627,106 @@ __all__ = [
 
 
 _ = field  # silence ruff
+
+
+# ---------------------------------------------------------------------------
+# rewrite-dispatch handlers for Kernel-IR stmts
+# ---------------------------------------------------------------------------
+#
+# ``Body.structural_key()`` runs ``normalize_body``, which dispatches
+# :func:`deplodock.compiler.ir.stmt.passes.rewrite` over every stmt. The
+# default dispatch raises ``NotImplementedError``, so we register a handler
+# per Kernel-IR stmt here. Buffer names (``Smem.name``, mbarriers, TMA
+# descriptors, etc.) are *not* SSA — the ``rename`` callback only canon-
+# icalizes SSA tokens — so they pass through unchanged. ``Expr`` fields go
+# through ``sigma.apply``; the leaf-only stmts (``Sync`` / ``CpAsyncCommit``
+# / ``CpAsyncWait``) are stateless and return themselves.
+
+
+from deplodock.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
+
+
+@_rewrite.register
+def _(s: Smem, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: Sync, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: CpAsyncCommit, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: CpAsyncWait, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: CpAsyncCopy, rename, sigma, axis_fn):
+    return CpAsyncCopy(
+        smem=s.smem,
+        smem_index=tuple(sigma.apply(e) for e in s.smem_index),
+        src=s.src,
+        src_index=tuple(sigma.apply(e) for e in s.src_index),
+    )
+
+
+@_rewrite.register
+def _(s: TmaDescriptor, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: TmaLoad, rename, sigma, axis_fn):
+    return TmaLoad(
+        smem=s.smem,
+        smem_index=tuple(sigma.apply(e) for e in s.smem_index),
+        desc=s.desc,
+        coords=tuple(sigma.apply(e) for e in s.coords),
+        mbar=s.mbar,
+        mbar_slot=sigma.apply(s.mbar_slot) if s.mbar_slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: MbarrierInit, rename, sigma, axis_fn):
+    return MbarrierInit(
+        mbar=s.mbar,
+        count=s.count,
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: MbarrierArriveExpectTx, rename, sigma, axis_fn):
+    return MbarrierArriveExpectTx(
+        mbar=s.mbar,
+        bytes_=s.bytes_,
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: MbarrierWait, rename, sigma, axis_fn):
+    return MbarrierWait(
+        mbar=s.mbar,
+        phase=sigma.apply(s.phase),
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
+def _(s: TreeHalve, rename, sigma, axis_fn):
+    return s
+
+
+@_rewrite.register
+def _(s: WarpShuffle, rename, sigma, axis_fn):
+    # ``name`` is the SSA output; ``value`` is the SSA input — both pass
+    # through ``rename`` so the SSA canonicalizer can renumber them.
+    return WarpShuffle(name=rename(s.name), value=rename(s.value), op=s.op, length=s.length)

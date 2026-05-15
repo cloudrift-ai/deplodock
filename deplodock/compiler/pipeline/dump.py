@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult
     from deplodock.compiler.graph import Graph
+    from deplodock.compiler.pipeline.pipeline import Pass, Rule
 
 logger = logging.getLogger(__name__)
 
@@ -68,36 +69,35 @@ class CompilerDump:
 
     # --- Dump methods ---
 
-    def on_rule(
-        self,
-        pass_idx: int,
-        pass_name: str,
-        rule_name: str,
-        record: dict,
-        text: str,
-    ) -> None:
+    def on_rule(self, pass_: Pass, rule: Rule, record: dict, text: str) -> None:
         """Buffer one rule-application record for later flush in ``on_pass``.
 
         The text snapshot comes from ``_format_rule_application`` (or the
         in-place variant); the structured ``record`` mirrors it for
         post-hoc analysis. Both are written to
-        ``{idx:02d}_{pass}__{rule}.rules.{txt,json}`` when the pass ends.
+        ``{idx+1:02d}_{pass}__{rule}.rules.{txt,json}`` when the pass
+        ends — ``pass_.index`` is the engine's 0-based pass index; the
+        dump adds ``+1`` for filename display so the on-disk layout
+        matches the human-readable pass ordering.
         """
-        key = (pass_idx, pass_name, rule_name)
+        key = (pass_.index, pass_.name, rule.name)
         self._rule_records.setdefault(key, []).append(record)
         self._rule_texts.setdefault(key, []).append(text)
 
-    def on_pass(self, idx: int, pass_name: str, graph: Graph) -> None:
+    def on_pass(self, pass_: Pass, graph: Graph) -> None:
         """Dump the graph after a pass as json / txt / dot (+ kernels.txt if any).
 
         Every pass is treated uniformly: no per-pass special cases, so
         adding a new pass automatically gets dumped. File names are
-        ``{idx:02d}_{pass_name}.{ext}`` with slashes in ``pass_name``
-        flattened to underscores. Also flushes any per-rule application
-        snapshots accumulated during this pass to ``.rules.{txt,json}``
-        files alongside the post-pass graph dump.
+        ``{idx+1:02d}_{pass_name}.{ext}`` with slashes in ``pass_name``
+        flattened to underscores — ``pass_.index`` is the engine's
+        0-based pass index; the dump bumps it to 1-based for display.
+        Also flushes any per-rule application snapshots accumulated
+        during this pass to ``.rules.{txt,json}`` files alongside the
+        post-pass graph dump.
         """
-        self._dump_graph(f"{idx:02d}_{pass_name.replace('/', '_')}", graph)
+        idx, pass_name = pass_.index, pass_.name
+        self._dump_graph(f"{idx + 1:02d}_{pass_name.replace('/', '_')}", graph)
         self._flush_rule_dumps(idx, pass_name)
 
     def _flush_rule_dumps(self, idx: int, pass_name: str) -> None:
@@ -105,7 +105,7 @@ class CompilerDump:
         for (pass_idx, pname, rule_name), records in list(self._rule_records.items()):
             if pass_idx != idx or pname != pass_name:
                 continue
-            prefix = f"{idx:02d}_{flat_pass}__{rule_name}.rules"
+            prefix = f"{idx + 1:02d}_{flat_pass}__{rule_name}.rules"
             self._write_text(f"{prefix}.txt", "\n\n".join(self._rule_texts.pop((pass_idx, pname, rule_name))) + "\n")
             self._write_json(f"{prefix}.json", records)
             del self._rule_records[(pass_idx, pname, rule_name)]

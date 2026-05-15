@@ -17,7 +17,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp, SdpaOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -38,7 +38,7 @@ def test_plain_matmul_fires_register_tile(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "register_tile" in recording_dump.fired_rules("lowering/tile")
 
 
@@ -50,7 +50,7 @@ def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "register_tile" not in recording_dump.fired_rules("lowering/tile")
 
 
@@ -63,7 +63,7 @@ def test_single_buffer_reduce_does_not_fire_register_tile(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "register_tile" not in recording_dump.fired_rules("lowering/tile")
 
 
@@ -77,7 +77,7 @@ def test_small_matmul_does_not_fire_register_tile(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "register_tile" not in recording_dump.fired_rules("lowering/tile")
 
 
@@ -97,7 +97,7 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "register_tile" in fired, fired
 
@@ -115,5 +115,5 @@ def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     assert "register_tile" in recording_dump.fired_rules("lowering/tile")

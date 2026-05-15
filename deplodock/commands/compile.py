@@ -48,8 +48,8 @@ _DEFAULT_PASSES = LOOP_PASSES
 _PASS_SHORTCUTS = {short: full for full, short in PASS_SHORTHAND.items()}
 
 
-def register_compile_command(subparsers):
-    parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
+def add_input_args(parser) -> None:
+    """Register the model/IR input arguments shared by ``compile`` and ``tune``."""
     parser.add_argument("input", nargs="?", help="HuggingFace model ID or .json IR file. Mutually exclusive with --code.")
     parser.add_argument(
         "--code",
@@ -73,32 +73,15 @@ def register_compile_command(subparsers):
         default=32,
         help="Sequence length for full-model tracing (default: 32).",
     )
-    parser.add_argument("--output", "-o", help="Output path for compiled IR")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
 
     from deplodock.compiler.target import add_target_arg
 
     add_target_arg(parser)
-    parser.add_argument(
-        "--ir",
-        choices=list(_IR_STAGES),
-        default="cuda",
-        help=(
-            "IR stage to print to stdout (or ``--output``) — defaults to "
-            "``cuda`` (the final lowered stage). Use a lower stage like "
-            "``loop`` / ``tile`` / ``kernel`` to inspect intermediate IRs."
-        ),
-    )
-    parser.add_argument(
-        "--passes",
-        default=None,
-        help=(
-            "Pass list to override the default. Accepts either a comma-separated list "
-            "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
-            "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
-            "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
-        ),
-    )
+
+
+def add_diagnostics_args(parser) -> None:
+    """Register the ``-v`` / diff-rendering args shared by ``compile`` and ``tune``."""
     parser.add_argument(
         "-v",
         "--verbose",
@@ -133,6 +116,57 @@ def register_compile_command(subparsers):
         default=200,
         help="If a single rule's -vv diff exceeds N lines, fall back to full before/after (default: 200).",
     )
+
+
+def setup_pipeline_runtime(args) -> None:
+    """Apply verbosity, diff-render config, and target overrides from parsed args."""
+    from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
+    from deplodock.compiler.target import apply_target_arg
+
+    verbose = getattr(args, "verbose", 0)
+    if verbose == 0:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif verbose == 1:
+        logging.getLogger().setLevel(logging.INFO)
+    else:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    set_config(
+        RuleRenderConfig(
+            color=should_use_color(sys.stdout, args.color),
+            context=args.diff_context,
+            max_lines=args.diff_max_lines,
+        )
+    )
+
+    apply_target_arg(args)
+
+
+def register_compile_command(subparsers):
+    parser = subparsers.add_parser("compile", help="Compile a model or IR through structural lowering")
+    add_input_args(parser)
+    parser.add_argument("--output", "-o", help="Output path for compiled IR")
+    parser.add_argument(
+        "--ir",
+        choices=list(_IR_STAGES),
+        default="cuda",
+        help=(
+            "IR stage to print to stdout (or ``--output``) — defaults to "
+            "``cuda`` (the final lowered stage). Use a lower stage like "
+            "``loop`` / ``tile`` / ``kernel`` to inspect intermediate IRs."
+        ),
+    )
+    parser.add_argument(
+        "--passes",
+        default=None,
+        help=(
+            "Pass list to override the default. Accepts either a comma-separated list "
+            "(e.g. 'decomposition,optimization,fusion') or a contiguous string of "
+            "single-letter shortcuts: d=decomposition, o=optimization, l=lifting, "
+            "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
+        ),
+    )
+    add_diagnostics_args(parser)
     parser.set_defaults(func=handle_compile)
 
 
@@ -144,44 +178,23 @@ def handle_compile(args):
         logger.error("either a positional model ID / IR file or --code is required")
         sys.exit(2)
 
-    # Map -v / -vv to root log level. Default: WARNING (only the requested
-    # IR is printed; pass / rule timings emitted at INFO are suppressed).
-    # -v → INFO (today's pass + rule timings). -vv → DEBUG (per-rule
-    # snapshot emission in `_apply_rules`).
-    verbose = getattr(args, "verbose", 0)
-    if verbose == 0:
-        logging.getLogger().setLevel(logging.WARNING)
-    elif verbose == 1:
-        logging.getLogger().setLevel(logging.INFO)
-    else:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
-    from deplodock.compiler.target import apply_target_arg
 
-    set_config(
-        RuleRenderConfig(
-            color=should_use_color(sys.stdout, args.color),
-            context=args.diff_context,
-            max_lines=args.diff_max_lines,
-        )
-    )
-
-    apply_target_arg(args)
-    passes = _resolve_passes(args)
-    graph, base_name = _load_or_trace(args)
+    setup_pipeline_runtime(args)
+    passes = resolve_passes(args)
+    graph, _ = load_or_trace(args)
     initial_count = len(graph.nodes)
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
         dump.dump_input_graph(graph)
-    result = run_pipeline(graph, passes, dump=dump)
+
+    result = Pipeline.build(passes, dump=dump).run(graph)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
-    content = _format_stage(result, args.ir)
+    content = format_stage(result, args.ir)
     if args.output:
         Path(args.output).write_text(content)
         logger.info("Saved %s IR: %s", args.ir, args.output)
@@ -191,7 +204,7 @@ def handle_compile(args):
             sys.stdout.write("\n")
 
 
-def _resolve_passes(args) -> list[str]:
+def resolve_passes(args) -> list[str]:
     if args.passes is not None:
         raw = args.passes.strip()
         # Shorthand: no commas AND every character is a known pass letter.
@@ -203,7 +216,7 @@ def _resolve_passes(args) -> list[str]:
     return _DEFAULT_PASSES
 
 
-def _format_stage(graph, stage: str) -> str:
+def format_stage(graph, stage: str) -> str:
     from deplodock.compiler.pipeline.dump import format_kernels
 
     formatter = _IR_STAGES[stage][1]
@@ -218,7 +231,7 @@ def _is_boundary(op) -> bool:
     return isinstance(op, (InputOp, ConstantOp))
 
 
-def _load_or_trace(args) -> tuple[Graph, str]:
+def load_or_trace(args) -> tuple[Graph, str]:
     if args.code:
         from deplodock.commands.trace import graph_from_code
 

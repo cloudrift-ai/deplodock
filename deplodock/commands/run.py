@@ -134,17 +134,26 @@ def handle_run(args):
     # launch the deplodock kernels so ncu can sample our metrics.
     skip_accuracy = os.environ.get(_NCU_RECURSE_GUARD) == "1"
 
-    if not skip_accuracy:
-        run_result = backend.run(compiled, input_data=input_data)
-        if dump and backend.last_debug_result is not None:
-            dump.dump_per_launch_values(backend.last_debug_result.per_launch)
+    try:
+        if not skip_accuracy:
+            run_result = backend.run(compiled, input_data=input_data)
+            if dump and backend.last_debug_result is not None:
+                dump.dump_per_launch_values(backend.last_debug_result.per_launch)
 
-        eager_out = _eager_output(module, example_args, example_kwargs)
-        _check_accuracy(run_result.outputs, eager_out)
-    else:
-        # ncu child needs at least one deplodock launch for metrics
-        # to populate; skip the eager comparison.
-        backend.run(compiled, input_data=input_data)
+            eager_out = _eager_output(module, example_args, example_kwargs)
+            _check_accuracy(run_result.outputs, eager_out)
+        else:
+            # ncu child needs at least one deplodock launch for metrics
+            # to populate; skip the eager comparison.
+            backend.run(compiled, input_data=input_data)
+    except RuntimeError as exc:
+        # Per-launch watchdog fired in ``run_program`` (kernel >1 s).
+        # The CUDA context is dirty — bypass Python cleanup so cupy's
+        # atexit doesn't block on the still-running kernel.
+        sys.stderr.write(f"accuracy check failed: {exc}\n")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
     if not args.bench:
         return
@@ -162,48 +171,32 @@ def handle_run(args):
     backends = _resolve_backends(args.bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup, backends=backends)
 
-    with _gpu_lock():
+    # GPU serialization is handled inside ``CudaBackend.benchmark`` (and
+    # every other GPU entry point) via ``gpu_lock()`` — no need to wrap
+    # the whole bench block here. Print/dump are pure CPU work.
+    try:
         results, bench = _bench_interleaved(
             cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
         )
+    except RuntimeError as exc:
+        # Bench watchdog fired (slow kernel, hung launch). The kernel
+        # that timed out is still queued on the CUDA stream, so Python's
+        # normal shutdown would block in cupy's atexit memory-pool
+        # drain. Report the failure and ``os._exit`` so the process
+        # actually exits.
+        sys.stderr.write(f"benchmark failed: {exc}\n")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
-        if dump:
-            dump.dump_benchmark(bench)
-            _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
+    if dump:
+        dump.dump_benchmark(bench)
+        _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
-        _print_table(results)
-        _print_kernel_stats(compiled, bench)
-        if args.profile:
-            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
-
-
-def _gpu_lock():
-    """Cross-process advisory lock on a single GPU. Activated when
-    ``DEPLODOCK_GPU_LOCK`` is set (path of the lock file); a no-op
-    otherwise so ad-hoc ``deplodock run`` invocations don't pay any
-    coordination overhead. The path holds an ``flock`` (via
-    ``filelock.FileLock``) for the duration of the ``with`` block —
-    other waiters block, avoiding interleaved kernel launches that
-    would corrupt iter timings.
-    """
-    import contextlib
-    import os as _os
-
-    path = _os.environ.get("DEPLODOCK_GPU_LOCK")
-    if not path:
-
-        @contextlib.contextmanager
-        def _noop():
-            yield
-
-        return _noop()
-
-    from pathlib import Path as _Path
-
-    from filelock import FileLock
-
-    _Path(path).parent.mkdir(parents=True, exist_ok=True)
-    return FileLock(path)
+    _print_table(results)
+    _print_kernel_stats(compiled, bench)
+    if args.profile:
+        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
@@ -563,7 +556,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
 
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.pipeline import run_pipeline
+    from deplodock.compiler.pipeline import Pipeline
 
     path = Path(args.ir)
     with open(path) as f:
@@ -579,7 +572,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         dump.dump_input_graph(graph)
 
     if tail:
-        graph = run_pipeline(graph, tail, dump=dump)
+        graph = Pipeline.build(tail, dump=dump).run(graph)
 
     rng = np.random.default_rng(args.seed)
     input_data: dict[str, list[float]] = {}
@@ -600,18 +593,17 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
-    with _gpu_lock():
-        if args.bench:
-            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-            print()
-            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-            print("-" * 38)
-            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-            if dump:
-                dump.dump_benchmark(bench)
-            _print_kernel_stats(graph, bench)
-        if args.profile:
-            _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+    if args.bench:
+        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+        print()
+        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+        print("-" * 38)
+        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+        if dump:
+            dump.dump_benchmark(bench)
+        _print_kernel_stats(graph, bench)
+    if args.profile:
+        _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):
@@ -822,26 +814,41 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     """
     import torch
 
-    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
+    # Each entry: (start_event, stop_event, batch_size_used). The
+    # batch size is propagated by ``benchmark_program``'s ``on_iter``
+    # so peer torch backends time the same number of back-to-back
+    # calls deplodock does per CUDA event window — both sides then
+    # measure sustained per-call latency, no warm-vs-cold asymmetry.
+    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, int]]] = {name: [] for name in torch_fns}
 
-    def on_iter() -> None:
+    def on_iter(batch_size: int = 1) -> None:
         for name, fn in torch_fns.items():
             start = torch.cuda.Event(enable_timing=True)
             stop = torch.cuda.Event(enable_timing=True)
             with torch.no_grad():
                 start.record()
-                fn()
+                for _ in range(batch_size):
+                    fn()
                 stop.record()
-            torch_events[name].append((start, stop))
+            torch_events[name].append((start, stop, batch_size))
 
     bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
+
+    import statistics as _stats  # noqa: PLC0415
 
     results: dict[str, float] = {}
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
-            results[name] = (sum(s.elapsed_time(e) for s, e in measured) / len(measured)) * 1000
+            # ``elapsed_time`` is in ms across the whole batch; divide
+            # by the batch size and multiply by 1000 to get per-call us.
+            # Median (not mean) for symmetry with deplodock's reduction
+            # in ``benchmark_program`` — keeps a single thermal-blip or
+            # lock-contention outlier from dragging eager's reported
+            # latency up.
+            per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
+            results[name] = _stats.median(per_iter_us)
     results["Deplodock"] = bench.time_ms * 1000
     return results, bench
 

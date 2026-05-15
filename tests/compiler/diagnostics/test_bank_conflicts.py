@@ -20,7 +20,7 @@ def test_oracle_matches_kernel_analyzer_on_small_matmul():
     from deplodock.compiler.graph import Graph, Tensor
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
-    from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (256, 64)), node_id="a")
@@ -29,7 +29,7 @@ def test_oracle_matches_kernel_analyzer_on_small_matmul():
     g.inputs = ["a", "b"]
     g.outputs = ["c"]
 
-    tile_graph = run_pipeline(g, TILE_PASSES)
+    tile_graph = Pipeline.build(TILE_PASSES).run(g)
 
     oracle_by_key: dict[tuple[str, str, str], tuple[list[int], list[int]]] = {}
     for binding in find_all_bindings(tile_graph):

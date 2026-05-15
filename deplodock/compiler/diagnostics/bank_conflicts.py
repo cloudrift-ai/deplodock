@@ -363,12 +363,10 @@ def simulate_graph(
     the full-sweep cell maps fold every iteration regardless. ``warp_id``
     selects the warp within the CTA.
     """
-    from copy import deepcopy
-
     from deplodock.compiler.ir.kernel.ir import KernelOp, Smem
-    from deplodock.compiler.pipeline import KERNEL_PASSES, run_pipeline
+    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
-    g = run_pipeline(deepcopy(graph), KERNEL_PASSES)
+    g = Pipeline.build(KERNEL_PASSES).run(graph.copy())
 
     out: list[BankConflictResult] = []
     for node in g.nodes.values():

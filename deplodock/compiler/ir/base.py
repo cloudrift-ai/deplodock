@@ -12,14 +12,34 @@ avoids a frontend→tensor dependency for a single function.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 
 @dataclass
 class Op:
-    """Base class for all operations."""
+    """Base class for all operations.
+
+    ``source`` is the predecessor op in any rewrite chain — the engine
+    stamps it automatically on every 1:1 in-place rebind
+    (``_apply_one`` Op branch), so a fully-lowered ``CudaOp`` keeps the
+    full path back through ``KernelOp → TileOp → LoopOp`` (or any other
+    chain a future pipeline introduces) via repeated ``.source``
+    traversals. Keyword-only so positional construction of subclass
+    fields keeps working; excluded from :meth:`Graph.structural_key`
+    via ``_STRUCTURAL_SKIP_FIELDS`` — pure attribution metadata, not
+    part of dataflow identity.
+    """
+
+    source: Op | None = field(default=None, kw_only=True, repr=False, compare=False)
+    # Free-form metadata dict for rules to stamp the knobs they used
+    # (e.g. ``{"BN": 64, "BM": 64}`` from ``005_blockify_launch``). The
+    # engine's ``_apply_one`` merges the predecessor's knobs forward on
+    # every 1:1 rebind, so a fully-lowered ``CudaOp`` carries every
+    # autotune knob picked along the chain. Excluded from structural
+    # identity and equality — pure attribution metadata.
+    knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         """Derive the output shape from input shapes. Override in subclasses."""
@@ -31,6 +51,28 @@ class Op:
 
     def pretty_body(self) -> str | None:
         """Render this op's body for kernel dumps. Default: None (skip)."""
+        return None
+
+    def validate(self, ctx) -> bool:  # noqa: ARG002 — ``ctx`` consumed by subclass overrides
+        """Sanity-check this op against the compilation context. Return
+        ``False`` to signal that the engine should *drop* this op (e.g.
+        skip a fork variant that would produce an unrunnable kernel).
+        Default: always valid. Override in subclasses to enforce per-op
+        invariants — ``TileOp.validate`` for instance checks that the
+        post-register-tile thread count fits the hardware launch budget.
+        """
+        return True
+
+    def score(self, ctx) -> float | None:  # noqa: ARG002 — ``ctx`` consumed by subclass overrides
+        """Heuristic "promisingness" prior for autotune candidate
+        ordering. Higher = explore first. Returned without bounds; the
+        search uses it only as a tiebreaker among unvisited siblings.
+        Default: ``None`` (no prior available — the op does not
+        contribute to the candidate's mean score). Override in
+        subclasses with domain knowledge (``TileOp.score`` prefers CTAs
+        near the target thread count that stage their inputs and
+        register-tile, for example).
+        """
         return None
 
 

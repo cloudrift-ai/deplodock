@@ -79,6 +79,12 @@ class ElementwiseImpl:
     def __call__(self, *args):
         return self._fn(*args)
 
+    def __reduce__(self):
+        # The resolved ``_fn`` is a numpy ufunc or one of the lambdas in
+        # ``_NAME_TO_FN`` — neither pickles cleanly. Serialize the name
+        # and re-resolve on unpickle by going through ``__init__``.
+        return (self.__class__, (self.name,))
+
     @property
     def commutative(self) -> bool:
         return self.name in self._COMMUTATIVE
@@ -95,3 +101,91 @@ class ElementwiseImpl:
 
     def __repr__(self) -> str:
         return f"ElementwiseImpl({self.name!r})"
+
+
+# ---------------------------------------------------------------------------
+# Op clustering — used by ``Body.structural_key()`` (opt-in) to collapse
+# ops that share a GPU functional unit so two kernels that differ only by
+# the *kind* of cheap-FMA op (or expensive-SFU op) at the same position
+# hash equal. The cluster representative is just one ``ElementwiseImpl``
+# name per group — the choice is arbitrary, only equality matters.
+# ---------------------------------------------------------------------------
+
+
+# Maps each known op name → its cluster representative.
+#
+# Clusters are picked by the GPU compute unit that issues the op:
+#
+# - **fma** (rep ``add``) — cheap ALU (~1-2 cycle): add / sub / multiply /
+#   negative / abs / fma. ``sum`` and ``prod`` are reduce aliases of
+#   add / multiply and land here too.
+# - **compare** (rep ``maximum``) — predicate / select ALU: min / max /
+#   amax / sign.
+# - **sfu_div** (rep ``divide``) — integer / float division SFU path:
+#   divide / true_divide / floor_divide / remainder / mod / reciprocal.
+# - **sfu_trans** (rep ``exp``) — MUFU transcendental path (~10-30x cycle
+#   cost): sqrt / rsqrt / exp / log / sin / cos / tanh / sigmoid /
+#   silu / erf / gelu* / pow / relu. (relu joins the SFU bucket only
+#   because composite activations live here and a position that *might*
+#   carry one of them dominates the perf signal; bucketing the cheap
+#   max(0, x) implementation alongside doesn't lose meaningful
+#   information for the search.)
+# - **copy** (rep ``copy``) — passthrough; its own bucket so a no-op
+#   doesn't get collapsed with arithmetic.
+_OP_CLUSTERS: dict[str, str] = {
+    # fma
+    "add": "add",
+    "sum": "add",
+    "subtract": "add",
+    "sub": "add",
+    "negative": "add",
+    "multiply": "add",
+    "prod": "add",
+    "abs": "add",
+    "fma": "add",
+    # compare
+    "maximum": "maximum",
+    "minimum": "maximum",
+    "amax": "maximum",
+    "sign": "maximum",
+    # sfu_div
+    "divide": "divide",
+    "true_divide": "divide",
+    "floor_divide": "divide",
+    "remainder": "divide",
+    "mod": "divide",
+    "reciprocal": "divide",
+    # sfu_trans
+    "sqrt": "exp",
+    "rsqrt": "exp",
+    "exp": "exp",
+    "log": "exp",
+    "log2": "exp",
+    "log10": "exp",
+    "sin": "exp",
+    "cos": "exp",
+    "tan": "exp",
+    "tanh": "exp",
+    "sigmoid": "exp",
+    "silu": "exp",
+    "erf": "exp",
+    "gelu": "exp",
+    "gelu_tanh": "exp",
+    "pow": "exp",
+    "relu": "exp",
+    # passthrough
+    "copy": "copy",
+}
+
+
+def cluster_representative(op: ElementwiseImpl) -> ElementwiseImpl:
+    """Return the canonical op for ``op``'s compute-unit cluster.
+
+    Unknown op names pass through unchanged — the mapping is best-effort
+    and a missing entry is treated as "stand-alone cluster". Callers
+    that want to detect coverage gaps can ``assert op.name in
+    _OP_CLUSTERS``."""
+    rep = _OP_CLUSTERS.get(op.name)
+    if rep is None or rep == op.name:
+        return op
+    return ElementwiseImpl(rep)

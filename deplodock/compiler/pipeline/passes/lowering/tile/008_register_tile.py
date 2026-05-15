@@ -62,50 +62,121 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
+# Candidate per-thread cell factors to fork over. Cell shape is
+# ``(F_M, F_N)`` with each F dividing its corresponding THREAD axis
+# extent.
+_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+# Cap on per-thread output cells. F_M × F_N replicates the matmul reduce
+# body that many times per thread; beyond this NVRTC compile time
+# explodes on the unrolled body. ``TileOp.validate`` is the second-line
+# filter (post-register-tile thread count); this is the first-line cap
+# in the rule itself.
+_MAX_CELLS_PER_THREAD = 128
 
-def rewrite(root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
-    if new_body is None:
-        raise RuleSkipped("rewrite helper returned no change")
-    return TileOp(body=new_body, name=root.op.name)
 
-
-def _maybe_rewrite(body: Body) -> Body | None:
+def rewrite(root: Node) -> Graph | None | list[TileOp]:
+    body = root.op.body
     idx, tile = single_tile(body)
 
-    # Profitability gate first — register tiling only helps matmul-shape
+    # Explicit idempotence: once we've register-tiled this op, don't
+    # re-fork. Without this, ``F=1`` in one axis leaves that THREAD
+    # extent unchanged so ``register_tile_shape``'s gate still passes,
+    # and 008 cascades into nested forks across every subsequent rule
+    # pass. The ``register_tile`` knob is stamped by ``_variants`` on
+    # every emitted variant.
+    if root.op.knobs.get("register_tile"):
+        raise RuleSkipped("register-tile already applied (knobs['register_tile'] set)")
+
+    # Profitability gate — register tiling only helps matmul-shape
     # bodies (≥2 reduce-Loops sharing operand Loads across M / N).
     if not any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
         raise RuleSkipped("no matmul-shaped reduce in the Tile body — register tiling unprofitable")
 
-    f_m, f_n = register_tile_shape(tile)
-    if f_m <= 1 and f_n <= 1:
-        raise RuleSkipped(f"register-tile factor ({f_m}, {f_n}) disabled (both <= 1)")
+    # Heuristic says "don't bother" → don't fork. Keeps the small-matmul
+    # path (BN, BM < 16) emitting one un-tiled kernel and avoids burning
+    # autotune cycles on tiles where the heuristic's own ``(1, 1)`` reflects
+    # a real profitability gate (e.g., post-blockify extents too small to
+    # divide cleanly by F).
+    heuristic = register_tile_shape(tile)
+    if heuristic[0] <= 1 and heuristic[1] <= 1:
+        raise RuleSkipped(f"heuristic register-tile factor {heuristic} disabled — skipping fork")
 
-    # Identify the M and N THREAD axes by sorting by extent: smaller is
-    # M, larger is N. For the symmetric default ``(BN=BM=PAT)`` either
-    # ordering works (``_register_tile`` is symmetric in axis names
-    # when factors are equal); for the asymmetric cuBLAS layout
-    # ``(BN=128, BM=64)`` the sort picks M=64 thread axis to pair with
-    # ``F_M`` and N=128 thread axis to pair with ``F_N``.
+    # Identify M / N THREAD axes by sorting by extent (smaller = M).
     thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
     if len(thread_axes) != 2:
         raise RuleSkipped(f"register-tile needs exactly 2 THREAD axes, found {len(thread_axes)}")
     sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
     m_axis_name, n_axis_name = sorted_ba[0].axis.name, sorted_ba[1].axis.name
     m_ext, n_ext = int(sorted_ba[0].axis.extent), int(sorted_ba[1].axis.extent)
-    if m_ext % f_m != 0 or n_ext % f_n != 0:
-        raise RuleSkipped(f"register-tile F=({f_m},{f_n}) must divide THREAD extents ({m_ext},{n_ext})")
-    rewritten = _register_tile(tile, m_axis_name, n_axis_name, f_m, f_n)
-    if rewritten is None:
-        raise RuleSkipped("_register_tile bailed (unsupported shape)")
-    return body[:idx] + (rewritten,) + body[idx + 1 :]
+
+    variants = _variants(body, idx, tile, root.op.name, m_axis_name, n_axis_name, m_ext, n_ext, heuristic)
+    if not variants:
+        raise RuleSkipped("no viable (F_M, F_N) candidate")
+    if len(variants) == 1:
+        return variants[0]
+    return variants
+
+
+def _variants(
+    body: Body,
+    idx: int,
+    tile: Tile,
+    name: str,
+    m_axis_name: str,
+    n_axis_name: str,
+    m_ext: int,
+    n_ext: int,
+    heuristic: tuple[int, int],
+) -> list[TileOp]:
+    """Enumerate viable ``(F_M, F_N)`` cell shapes. Heuristic shape goes
+    first so deterministic compiles pick it; alternative shapes are
+    appended in a fixed order so the trace's ``choice_idx`` is stable
+    across runs."""
+    seen: set[tuple[int, int]] = set()
+    ordered: list[tuple[int, int]] = []
+
+    def _add(shape: tuple[int, int], *, cap_cells: bool = True) -> None:
+        f_m, f_n = shape
+        if shape in seen:
+            return
+        if f_m <= 1 and f_n <= 1:
+            return  # both ≤ 1 means no register tile — handled by the skip path
+        if cap_cells and f_m * f_n > _MAX_CELLS_PER_THREAD:
+            return  # too many per-thread cells; NVRTC compile bombs
+        if m_ext % f_m != 0 or n_ext % f_n != 0:
+            return
+        seen.add(shape)
+        ordered.append(shape)
+
+    # Heuristic first — non-tune compiles pick option 0. Exempt from the
+    # cell-count cap so class-tuned defaults like ``(F_M=8, F_N=8)`` keep
+    # working; the cap only narrows the *autotune* alternatives. Search
+    # re-ranks unvisited variants via ``TileOp.score`` so rule emission
+    # order doesn't determine MCTS bootstrap order.
+    _add((int(heuristic[0]), int(heuristic[1])), cap_cells=False)
+    for f_m in _TUNE_F_CHOICES:
+        for f_n in _TUNE_F_CHOICES:
+            _add((f_m, f_n))
+
+    variants: list[TileOp] = []
+    for f_m, f_n in ordered:
+        rewritten = _register_tile(tile, m_axis_name, n_axis_name, f_m, f_n)
+        if rewritten is None:
+            continue
+        variants.append(
+            TileOp(
+                body=body[:idx] + (rewritten,) + body[idx + 1 :],
+                name=name,
+                knobs={"F_M": f_m, "F_N": f_n, "register_tile": True},
+            )
+        )
+    return variants
 
 
 def _split_axis(axes: tuple[BoundAxis, ...], target: str, factor: int) -> tuple[tuple[BoundAxis, ...], Axis]:

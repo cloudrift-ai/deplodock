@@ -156,6 +156,9 @@ class Combine(Stmt):
     name: str
     op: ElementwiseImpl
 
+    def deps(self) -> tuple[str, ...]:
+        return (self.name,)
+
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
 
@@ -428,6 +431,179 @@ class TileOp(Op):
         sig_out = ", ".join(self.outputs) or "-"
         head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
         return "\n".join([head, *pretty_body(self.body, "    ")])
+
+    def validate(self, ctx) -> bool:
+        """Reject post-register-tile variants whose launch geometry would
+        exceed device limits. Two checks:
+
+        - **threads ≤ ``ctx.max_threads_per_cta``** (1024 on every CUDA
+          capability we support). Without this, F-fork candidates like
+          ``(F_M=1, F_N=2)`` on a ``BM=64, BN=128`` tile spawn a CTA of
+          64×64=4096 threads — the driver rejects it but the engine has
+          already burned compile + bench wall-budget on it.
+        - **staged smem footprint ≤ ``ctx.max_dynamic_smem``**.
+          Sums every ``Stage.smem_bytes`` in the body (including nested
+          Stages inside reduce loops). The check uses raw stage bytes —
+          no upfront slack for the upcoming ``010_double_buffer`` /
+          ``014_pad_smem`` overhead. Those passes' decisions are part of
+          the autotune surface; when their multipliers push a variant
+          over the cap, ``KernelOp.validate`` is the second-line gate.
+          Without this tile-stage check, three-pass naive softmax +
+          ``@V`` at large head_dim/seq stages mul+mask in three separate
+          smem regions whose total exceeds the device cap and crashes
+          the launch with ``CUDA_ERROR_INVALID_VALUE``.
+
+        Pre-register-tile TileOps (the post-blockify state, where THREAD
+        extents are ``BM, BN`` and the register-tile rule will still
+        divide by ``(F_M, F_N)``) skip the THREAD check — otherwise we'd
+        reject every healthy pre-tile candidate. The smem check runs at
+        every stage where Stages are present."""
+        from math import prod  # noqa: PLC0415
+
+        # Staged-smem check — runs whether or not register_tile fired,
+        # since 007_stage_inputs can add Stages independently.
+        staged = sum(s.smem_bytes for s in self.body.iter() if isinstance(s, Stage))
+        if staged > ctx.max_dynamic_smem:
+            return False
+
+        # THREAD-count check — only after register_tile committed.
+        if not self.knobs.get("register_tile"):
+            return True
+        tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
+        if tile is None:
+            return True
+        thread_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD]
+        if not thread_extents:
+            return True
+        threads = prod(thread_extents)
+        return threads <= ctx.max_threads_per_cta
+
+    def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
+        """Autotune prior over the failure modes we've observed:
+
+        - Sub-warp launch (threads < 32) → ``-2.0``. A 4-thread CTA wastes
+          ~7/8 of every warp instruction.
+        - Single cell per thread → ``-1.0``. No work per thread, every
+          load goes to global memory (no register reuse), memory-bound.
+        - Massive unroll (cells/thread > 64) → graduated penalty up to
+          ``-1.0``. NVRTC compile time explodes on the unrolled body.
+        - CTA count below 32 → ``-0.5``. Too few CTAs to fill the SMs.
+        - CTA count above ``2048`` → graduated penalty up to ``-2.5``.
+          A typical sm_120-class GPU has ~150 SMs running ~2 concurrent
+          CTAs each, so ~300 in flight; 2 k CTAs is ~7 waves, beyond
+          which we burn time in the command processor scheduling waves
+          of light per-CTA work, and atomic-fanin on output writebacks
+          starts dominating (see the ``BM=16, BN=16`` failure on
+          ``(M=32, K=3584, N=18944)`` — 2 k+ CTAs, 1 cell/thread, kernel
+          runs >3 s).
+        - Distance from 256 threads/CTA → up to ``-1.0`` baseline,
+          doubled to ``-2.0`` when post-register-tile ``cells < 16``
+          (thin per-thread compute can't amortize the launch + atomic
+          overhead at a wide launch).
+        - Total global atomic writes (cross-CTA split-K ``atomicAdd``)
+          above ~256 k → graduated penalty up to ``-2.0``. Each split-K
+          CTA contributes one ``atomicAdd`` per output cell; total ops
+          scale as ``threads × ctas × atomic_writes_per_thread`` and
+          contention through L2 dominates the kernel once the count is
+          in the millions (observed on ``BM=64, BN=16`` matmul where
+          2 M FP atomics blew the bench timeout).
+        - Stages (smem staging) → ``+1.0``.
+        - Register tile fired (``F_M * F_N > 1``) → ``+1.0``.
+
+        Pre-register-tile TileOps are scored on a *predicted* final thread
+        count (assuming 008 will pick F to target ~256 threads when
+        possible). Post-register-tile TileOps use the actual ``F_M``,
+        ``F_N`` from knobs.
+        """
+        from math import prod  # noqa: PLC0415
+
+        from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
+
+        target_threads = 256
+        score = 0.0
+        # ``self.body.iter()`` is recursive — by the time this TileOp
+        # is scored, ``chunk_matmul_k`` etc. may have wrapped the Tile
+        # in a K-outer ``Loop``, so the top-level iter doesn't see it.
+        tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
+        if tile is None:
+            return 0.0
+
+        thread_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD]
+        block_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_BLOCK]
+        if not thread_extents:
+            return 0.0
+
+        threads = prod(thread_extents)
+        ctas = prod(block_extents) if block_extents else 1
+
+        if self.knobs.get("register_tile"):
+            # Post-008: knobs carry the actual cell shape.
+            final_threads = threads
+            cells = max(1, int(self.knobs.get("F_M", 1)) * int(self.knobs.get("F_N", 1)))
+        elif threads >= 1024:
+            # Pre-008 but large enough that 008 will likely divide F to
+            # target ~256 threads.
+            final_threads = target_threads
+            cells = max(1, threads // target_threads)
+        else:
+            # Pre-008 small tile — 008's heuristic gate will likely skip,
+            # so the kernel emits 1 cell per thread.
+            final_threads = threads
+            cells = 1
+
+        # Thread count penalty. Slope is gentle by default (``/target``),
+        # but doubles when ``cells < 16`` post-register-tile — a wide
+        # launch with thin per-thread compute can't amortize the launch
+        # + atomic-fanin overhead. Observed on
+        # ``matmul_add (1,128,2048)x(2048,2048)+r``: (threads=512,
+        # cells=32) ran in 37 us while (threads=512, cells=8) hung the
+        # bench. The conjunctive penalty distinguishes them.
+        if final_threads < 32:
+            score -= 2.0
+        elif final_threads > 1024:
+            score -= 2.0
+        else:
+            distance = abs(final_threads - target_threads)
+            multiplier = 2.0 if (cells < 16 and self.knobs.get("register_tile")) else 1.0
+            score -= min(distance / target_threads * multiplier, 2.0)
+
+        # Cells-per-thread penalty.
+        if cells == 1:
+            score -= 1.0
+        elif cells > 64:
+            score -= min((cells - 64) / 64.0, 1.0)
+
+        # CTA count penalty — flat for under-fill, graduated for huge launches.
+        # Above ~2 k CTAs the command processor spends most of its time
+        # scheduling tiny waves and atomic fan-in on output writebacks
+        # serializes hard, so the penalty grows linearly past the limit.
+        if ctas < 32:
+            score -= 0.5
+        elif ctas > 2048:
+            score -= min(0.5 + (ctas - 2048) / 4096.0, 2.5)
+
+        # Atomic-fanin penalty. Cross-CTA split-K emits one ``atomicAdd``
+        # per output cell per CTA. Score on ``final_threads × ctas`` —
+        # the predicted post-register-tile launch geometry — so pre-008
+        # variants are compared on what their *kernel* will look like,
+        # not their intermediate IR shape. The earlier ``threads × ctas``
+        # formula penalised the heuristic (BN=128, BM=64) tile with its
+        # raw 8 192 thread extent even though 008 was about to divide it
+        # down to ~256, making small (BN, BM) tiles score artificially
+        # higher and dominate bootstrap exploration.
+        atomic_writes = sum(1 for s in self.body.iter() if isinstance(s, Write) and s.reduce_op is not None)
+        if atomic_writes:
+            total_atomics = atomic_writes * final_threads * ctas
+            if total_atomics > 256_000:
+                score -= min((total_atomics - 256_000) / 1_000_000, 2.0)
+
+        # Bonuses.
+        if any(isinstance(b, _Stage) for b in tile.body):
+            score += 1.0
+        if self.knobs.get("register_tile"):
+            score += 1.0
+
+        return score
 
     @property
     def inputs(self) -> tuple[str, ...]:

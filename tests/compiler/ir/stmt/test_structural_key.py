@@ -156,48 +156,56 @@ def test_structural_key_equal_for_swapped_commutative_args() -> None:
     assert body_xy.structural_key() == body_yx.structural_key()
 
 
-def test_structural_key_distinguishes_subtract_from_add() -> None:
+def _binary_body(op: str, args: tuple[str, str] = ("x", "y")) -> Body:
+    """Two-operand body builder used by the op-clustering tests below."""
     a = Axis("a", 4)
-
-    def make(op: str) -> Body:
-        return Body(
-            (
-                Loop(
-                    axis=a,
-                    body=(
-                        Load(name="x", input="X", index=(Var("a"),)),
-                        Load(name="y", input="Y", index=(Var("a"),)),
-                        Assign(name="z", op=op, args=("x", "y")),
-                        Write(output="O", index=(Var("a"),), value="z"),
-                    ),
+    return Body(
+        (
+            Loop(
+                axis=a,
+                body=(
+                    Load(name="x", input="X", index=(Var("a"),)),
+                    Load(name="y", input="Y", index=(Var("a"),)),
+                    Assign(name="z", op=op, args=args),
+                    Write(output="O", index=(Var("a"),), value="z"),
                 ),
-            )
+            ),
         )
+    )
 
-    assert make("add").structural_key() != make("subtract").structural_key()
+
+def test_structural_key_clusters_fma_ops() -> None:
+    """add / subtract / multiply share the FMA cluster — all hash equal.
+
+    The cluster representative is ``add``; two bodies that differ only
+    in *which* FMA-issued op sits at the same position are
+    structurally equivalent for autotune search purposes."""
+    keys = {_binary_body(op).structural_key() for op in ("add", "subtract", "multiply", "negative")}
+    assert len(keys) == 1, f"expected 1 cluster key for FMA ops, got {len(keys)}"
 
 
-def test_structural_key_distinguishes_swapped_noncommutative_args() -> None:
-    """``subtract(x, y)`` and ``subtract(y, x)`` are NOT structurally
-    equal — the sort pass must skip non-commutative ops."""
-    a = Axis("a", 4)
+def test_structural_key_clusters_sfu_div_ops() -> None:
+    """divide / mod / reciprocal share the SFU-div cluster."""
+    keys = {_binary_body(op).structural_key() for op in ("divide", "true_divide", "floor_divide", "remainder", "mod")}
+    assert len(keys) == 1
 
-    def make(args: tuple[str, str]) -> Body:
-        return Body(
-            (
-                Loop(
-                    axis=a,
-                    body=(
-                        Load(name="x", input="X", index=(Var("a"),)),
-                        Load(name="y", input="Y", index=(Var("a"),)),
-                        Assign(name="z", op="subtract", args=args),
-                        Write(output="O", index=(Var("a"),), value="z"),
-                    ),
-                ),
-            )
-        )
 
-    assert make(("x", "y")).structural_key() != make(("y", "x")).structural_key()
+def test_structural_key_distinguishes_across_clusters() -> None:
+    """Cross-cluster ops still hash distinct — clustering doesn't
+    collapse FMA into SFU."""
+    fma = _binary_body("add").structural_key()
+    sfu_div = _binary_body("divide").structural_key()
+    sfu_trans = _binary_body("exp").structural_key()
+    compare = _binary_body("maximum").structural_key()
+    assert len({fma, sfu_div, sfu_trans, compare}) == 4
+
+
+def test_structural_key_clusters_collapse_noncommutative_to_commutative() -> None:
+    """Side effect of clustering: ``subtract`` (non-commutative) folds
+    to ``add`` (commutative), so swapped args sort to the same form.
+    Document the consequence explicitly — autotune treats ``x - y`` and
+    ``y - x`` as the same kernel shape."""
+    assert _binary_body("subtract", ("x", "y")).structural_key() == _binary_body("subtract", ("y", "x")).structural_key()
 
 
 def test_structural_key_idempotent() -> None:

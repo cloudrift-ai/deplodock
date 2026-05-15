@@ -66,7 +66,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     TmaBufferedStage,
 )
-from deplodock.compiler.pipeline.engine import Pattern
+from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -177,11 +177,19 @@ def _materialize(blk: Tile) -> Stmt:
         # TMA path: wait carries the explicit consumer-side phase + slot
         # set by 015_pipeline_k_outer. The wait targets its pipeline-unit
         # group's mbar (each group has its own mbar with arrive count
-        # == num distinct stages in that group).
+        # == num distinct stages in that group). A trailing ``Sync()``
+        # backs up the mbarrier's CTA-wide visibility guarantee — nvcc
+        # treats the wait's inline-PTX asm as opaque, so without an
+        # explicit ``__syncthreads()`` the compiler is free to reorder
+        # smem Loads across iterations of the K loop, reading stale
+        # bytes from the previous iter's slot. Surfaces on small tiles
+        # (BM=16, BN=16 + stage) where the inner-loop schedule makes
+        # the reorder profitable; on larger tiles the schedule is
+        # dense enough that no useful hoist is possible.
         if stmt.phase is not None and has_tma:
             gid = wait_group.get(id(stmt))
             if gid is not None:
-                return [MbarrierWait(mbar=_mbar_name(gid), phase=stmt.phase, slot=stmt.slot)]
+                return [MbarrierWait(mbar=_mbar_name(gid), phase=stmt.phase, slot=stmt.slot), Sync()]
         # cp.async fallback (or pre-pipelining synchronous-style wait,
         # or AsyncWait whose pipeline group couldn't be inferred).
         return [CpAsyncWait(group=stmt.keep), Sync()]

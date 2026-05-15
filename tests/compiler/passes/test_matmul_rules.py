@@ -11,7 +11,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from tests.compiler.passes.conftest import strip_rule_prefix
 
 
@@ -74,28 +74,28 @@ def _make_matmul_then_elwise() -> Graph:
 
 
 def test_plain_matmul_fires_split_k_and_blockify(recording_dump):
-    run_pipeline(_make_plain_matmul(), TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_plain_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
-    run_pipeline(_make_elwise_lhs_matmul(), TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_elwise_lhs_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
-    run_pipeline(_make_two_elwise_lhs_matmul(), TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_two_elwise_lhs_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
 
 
 def test_matmul_then_elwise_fires_split_k_and_blockify(recording_dump):
-    run_pipeline(_make_matmul_then_elwise(), TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_matmul_then_elwise())
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" in fired
     assert "blockify_launch" in fired
@@ -110,7 +110,7 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" not in fired
     assert "blockify_launch" in fired
@@ -137,11 +137,11 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
     # reduce) and cooperative_reduce raises (no reduce Loop). The engine's
     # ``debug_on`` gate keys off the engine logger's level — bump that to
     # DEBUG so ``emit`` actually fires.
-    logging.getLogger("deplodock.compiler.pipeline.engine").setLevel(logging.DEBUG)
+    logging.getLogger("deplodock.compiler.pipeline").setLevel(logging.DEBUG)
     try:
-        run_pipeline(g, TILE_PASSES)
+        Pipeline.build(TILE_PASSES).run(g)
     finally:
-        logging.getLogger("deplodock.compiler.pipeline.engine").setLevel(logging.NOTSET)
+        logging.getLogger("deplodock.compiler.pipeline").setLevel(logging.NOTSET)
 
     out = capsys.readouterr().out
     skip_messages = [ln for ln in out.splitlines() if ln.startswith("--- ") and "skipped" in ln]

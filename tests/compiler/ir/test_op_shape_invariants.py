@@ -13,8 +13,6 @@ Three invariants, one test each:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -53,10 +51,8 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
     """
     import torch
 
-    from deplodock.compiler.pipeline.engine import run_pass
+    from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.trace.torch import trace_module
-
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
 
     # Exercise each decomp rule: RMSNorm hits decompose_rms_norm + decompose_mean.
     # Softmax hits decompose_softmax. Linear(x) hits decompose_linear +
@@ -70,7 +66,7 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
 
     for name, module, inputs in modules:
         graph = trace_module(module, inputs)
-        decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
+        decomposed = Pipeline.build(["frontend/decomposition"]).run(graph)
         for n in decomposed.nodes.values():
             if not isinstance(n.op, ElementwiseOp):
                 continue

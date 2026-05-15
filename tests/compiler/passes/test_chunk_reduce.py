@@ -21,7 +21,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.frontend.ir import SdpaOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline
+from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 _mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.006_chunk_reduce")
 _qualifies = _mod._qualifies
@@ -49,7 +49,7 @@ def test_sdpa_seq512_fires_chunk_reduce(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_reduce" in fired, fired
     # And staging should now fire on the chunked kernel.
@@ -68,7 +68,7 @@ def test_sdpa_seq128_does_not_need_chunk_reduce(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    run_pipeline(g, TILE_PASSES, dump=recording_dump)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     # Staging should fire (slab fits without chunking).
     assert "stage_inputs" in fired, fired

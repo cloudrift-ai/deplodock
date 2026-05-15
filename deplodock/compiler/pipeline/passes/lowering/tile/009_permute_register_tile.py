@@ -66,7 +66,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Tile, Write
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
-from deplodock.compiler.pipeline.engine import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     single_tile,
@@ -121,7 +121,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
     chunk_stride = _LDS128_FLOATS * lane_ext
     new_tile = Tile(axes=tile.axes, body=_rewrite_body(tile.body, lane.name, F, chunk_stride))
-    logger.info(
+    logger.debug(
         "chunk N register-tile on lane=%s F=%d -> stride=%d, chunks=%d (chunk_stride=%d, BN=%d)",
         lane.name,
         F,

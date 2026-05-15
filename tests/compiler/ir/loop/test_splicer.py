@@ -491,6 +491,63 @@ def test_multi_output_splice_target():
     assert len(merged.inputs) == 1
 
 
+def test_shared_load_dedup_into_reduce():
+    """Producer body has a Load reused across a long expression chain
+    (mirrors silu: ``in = load x; v0 = neg(in); v1 = exp(v0); v2 = add(1, v1);
+    v3 = recip(v2); v4 = mul(in, v3)``). The first and last uses of ``in`` sit
+    at opposite ends of the chain. Splicing into a consumer that reads the
+    producer's output inside a reduce loop exercises the dedup + emit-ordering
+    path: when the late ``v4 = mul(in, v3)`` lands, ``in`` dedups to the
+    existing binding emitted earlier for ``v0``; if the splicer prepends naïvely
+    the new stmt lands above its own dep. The merged body must keep SSA in
+    topological order across the reduce boundary."""
+    producer = LoopOp(
+        body=(
+            Loop(
+                axis=A0,
+                body=(
+                    Load(name="in_", input="src_0", index=(Var("a0"),)),
+                    Assign(name="v0", op="negative", args=("in_",)),
+                    Assign(name="v1", op="exp", args=("v0",)),
+                    Assign(name="v2", op="add", args=("v1", "v1")),
+                    Assign(name="v3", op="reciprocal", args=("v2",)),
+                    Assign(name="v4", op="multiply", args=("in_", "v3")),
+                    Write(output="out_0", index=(Var("a0"),), value="v4"),
+                ),
+            ),
+        ),
+    )
+    # Consumer: matmul-style reduce over a1. The producer's output is loaded
+    # inside the reduce loop, so the spliced chain has to be ordered correctly
+    # within the (a0, a1) reduce scope.
+    consumer = LoopOp(
+        body=(
+            Loop(
+                axis=A0,
+                body=(
+                    Loop(
+                        axis=A1,
+                        body=(
+                            Load(name="pv", input="src_0", index=(Var("a1"),)),
+                            Load(name="w", input="src_1", index=(Var("a1"), Var("a0"))),
+                            Assign(name="prod", op="multiply", args=("pv", "w")),
+                            Accum(name="acc", value="prod", op="add"),
+                        ),
+                    ),
+                    Write(output="out_0", index=(Var("a0"),), value="acc"),
+                ),
+            ),
+        ),
+    )
+    merged = splice_loop_ops(producer, consumer, source="src_0")
+    assert merged is not None  # would have failed pre-fix with SSA validation error
+    # Reduce + full silu chain + final multiply should all materialize once.
+    assert _count_kind(merged, Accum) == 1
+    fns = _elementwise_fns(merged)
+    for op in ("negative", "exp", "add", "reciprocal", "multiply"):
+        assert op in fns, f"missing {op} in merged body: {fns}"
+
+
 def test_literal_producer_write_index():
     """Producer writes at (a0, 0); consumer reads at (a0, 0). The Literal dim
     contributes no σ binding and shouldn't block splicing."""

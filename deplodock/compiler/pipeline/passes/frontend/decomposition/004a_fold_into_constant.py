@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import TransposeOp
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._fold_constant import fold_into_constant
 
 PATTERN = [Pattern("root", TransposeOp)]

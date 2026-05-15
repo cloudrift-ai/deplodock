@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from deplodock.compiler.diagnostics.bank_conflicts import find_all_bindings, lane_bank_distribution  # noqa: E402
-from deplodock.compiler.pipeline import TILE_PASSES, run_pipeline  # noqa: E402
+from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: E402
 from tests.perf.cases import FUSED_CASES, PRIMITIVE_CASES, build_deplodock_graph  # noqa: E402
 
 CONFIGS = [
@@ -85,7 +85,7 @@ def run_case(case, configs=CONFIGS) -> dict:
         try:
             with with_env(env):
                 g = build_deplodock_graph(case)
-                run_pipeline(g, TILE_PASSES)
+                Pipeline.build(TILE_PASSES).run(g)
                 kernels = total_events_per_kernel(g)
                 total = sum(sum(s.values()) for s in kernels.values())
                 record[cfg_name] = {"total": total, "per_kernel": kernels}

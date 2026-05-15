@@ -18,7 +18,7 @@ from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.pipeline.engine import Match, Pattern
+from deplodock.compiler.pipeline import Match, Pattern
 
 PATTERN = [Pattern("root", KernelOp)]
 

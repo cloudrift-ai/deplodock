@@ -25,9 +25,9 @@ from deplodock.compiler.ir.frontend.ir import (
     UnsqueezeOp,
 )
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline.engine import run_rule
+from deplodock.compiler.pipeline import Pipeline
 
-RULES_DIR = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes" / "frontend" / "decomposition"
+_DECOMP_PASS = "frontend/decomposition"
 
 rng = np.random.default_rng(42)
 _backend = NumpyBackend()
@@ -46,7 +46,9 @@ def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-6):
 
 
 def _apply(graph: Graph, rule_name: str) -> Graph:
-    return run_rule(graph, RULES_DIR / rule_name)
+    # Run a single rule out of the decomposition pass by selecting on
+    # its filename stem (e.g. ``"003_pow.py"`` → ``"003_pow"``).
+    return Pipeline.build([_DECOMP_PASS], select=[Path(rule_name).stem]).run(graph)
 
 
 # ===================================================================
@@ -200,13 +202,10 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     """
     import torch
 
-    from deplodock.compiler.pipeline.engine import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
-    decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
-    decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
+    decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
     for n in decomposed.nodes.values():
         assert not isinstance(n.op, RmsNormOp), f"rms_norm survived decomposition at {n.output.name}"
 
@@ -259,13 +258,10 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     """End-to-end: torch.nn.Softmax → trace → decomposition yields primitives only."""
     import torch
 
-    from deplodock.compiler.pipeline.engine import run_pass
     from deplodock.compiler.trace.torch import trace_module
 
-    rules_dir = Path(__file__).parent.parent.parent.parent / "deplodock" / "compiler" / "pipeline" / "passes"
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
-    decomposed = run_pass(graph, rules_dir / "frontend" / "decomposition")
-    decomposed = run_pass(decomposed, rules_dir / "frontend" / "optimization")
+    decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
     for n in decomposed.nodes.values():
         assert not isinstance(n.op, SoftmaxOp), f"softmax survived decomposition at {n.output.name}"
 
