@@ -14,11 +14,18 @@ from deplodock.compiler.pipeline.search import TuningSearch
 from deplodock.compiler.pipeline.search.policy.mcts import SearchTree
 
 
-def _make_search(tree: SearchTree) -> TuningSearch:
-    return TuningSearch(
+def _make_search(tree: SearchTree, *, live_keys: list[str] | None = None) -> TuningSearch:
+    """Build a TuningSearch with ``live_keys`` registered as having a
+    queued lazy. The walk's frontier filter requires ``key in _by_tip``
+    so dead tree nodes don't block descent — tests have to opt in to
+    that liveness for any node they expect the walk to return."""
+    search = TuningSearch(
         tree=tree,
         patience=10**9,
     )
+    for k in live_keys or []:
+        search._by_tip.setdefault(k, []).append(object())  # type: ignore[arg-type]
+    return search
 
 
 def _set_node(tree: SearchTree, key: str, *, visits: int, seen: int, reward: float) -> None:
@@ -34,7 +41,7 @@ def test_walk_returns_unvisited_child_at_root() -> None:
     tree = SearchTree()
     tree.ensure_root("root")
     tree.expand("root", ["A", "B", "C"])
-    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    target = _make_search(tree, live_keys=["A", "B", "C"])._ucb_walk(tree.node("root"))
     assert target.key in {"A", "B", "C"}
 
 
@@ -43,7 +50,7 @@ def test_walk_prefers_unvisited_over_visited_with_low_mean() -> None:
     tree.ensure_root("root")
     tree.expand("root", ["A", "B", "C"])
     tree.record_terminal("A", reward=1.0 / 76.0, status="ok")
-    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    target = _make_search(tree, live_keys=["B", "C"])._ucb_walk(tree.node("root"))
     assert target.key in {"B", "C"}, f"expected unvisited child, got {target}"
 
 
@@ -72,7 +79,7 @@ def test_walk_descends_then_returns_unvisited_grandchild() -> None:
     _set_node(tree, "root", visits=100, seen=100, reward=1.25)
     tree.expand("A", ["A1", "A2"])
     tree.record_terminal("A1", reward=1.0 / 60.0, status="ok")
-    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    target = _make_search(tree, live_keys=["A2"])._ucb_walk(tree.node("root"))
     assert target.key == "A2"
 
 
@@ -93,6 +100,6 @@ def test_walk_revisits_underexplored_sibling_when_exploration_dominates() -> Non
     tree.record_terminal("B1", reward=1.0 / 83.0, status="ok")
     # Re-expand B so B1 is no longer the frontier (it's measured); B2 is.
     tree.expand("B", ["B1", "B2"])
-    target = _make_search(tree)._ucb_walk(tree.node("root"))
+    target = _make_search(tree, live_keys=["B2"])._ucb_walk(tree.node("root"))
     # B has higher UCB (low visits + exploration term dominates A's mean).
     assert target.key == "B2", f"under-explored arm should win, got {target}"

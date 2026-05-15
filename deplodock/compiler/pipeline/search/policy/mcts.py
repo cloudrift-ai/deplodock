@@ -15,8 +15,7 @@ writes them. Engine + recorder feed the tree (via ``expand`` and
 the counters.
 
 Stopping policy: ``patience`` measured terminals without a new best
-latency, applied only after the bootstrap phase has seeded every
-kernel subtree with ``N_BOOTSTRAP`` measurements."""
+latency, gated only on having seen at least one terminal."""
 
 from __future__ import annotations
 
@@ -230,8 +229,16 @@ class SearchTree:
                 row = SearchNode(key=ck, parent=parent, score=s)
                 self._nodes[ck] = row
             else:
-                # Pre-existing orphan (e.g. from a record_terminal that
-                # ran before its parent was known) — adopt it.
+                # Pre-existing orphan — see comment on the original
+                # introduction of this re-parent path: a node previously
+                # added under the super-root (or another parent) gets
+                # adopted into its real lineage when the chain walk
+                # discovers it. Unlink from the old parent's children
+                # list first; otherwise propagation would walk through
+                # both the stale parent edge and the lineage parent
+                # edge, double-counting every terminal.
+                if row.parent is not None and row in row.parent.children:
+                    row.parent.children.remove(row)
                 row.parent = parent
                 if row.score == float("-inf") and s != float("-inf"):
                     row.score = s
@@ -421,28 +428,34 @@ class TuningSearch(Search):
 
     def _record_fork(self, primary: LazyCandidate, site: str, forks: list[LazyCandidate]) -> None:
         """Register one ``parent_key → child_keys`` edge in the MCTS
-        tree, derived from the fork group at ``site``. ``primary``
-        wraps option-0 (already applied to its inner Candidate's
-        graph; chain is empty); ``forks`` are siblings whose chain
-        tail carries the post-rule op. Skips when the site isn't in
-        ``primary.inner.graph`` (Graph splices that removed the node)
-        or any key is uncomputable."""
+        tree, derived from the fork group at ``site``. ``primary`` and
+        ``forks`` all carry a single-step chain ``[(match, opt)]``
+        with their post-rule op as the chain tail. The parent op is
+        the candidate's op at ``site`` *before* the rule fired (i.e.
+        ``primary.inner.graph.nodes[site].op``), which is identical for
+        primary and all forks since none have been applied yet.
+
+        Skips when the site isn't in ``primary.inner.graph`` (Graph
+        splices that removed the node) or any key is uncomputable."""
         primary_node = primary.inner.graph.nodes.get(site)
         if primary_node is None:
             return
-        parent_op = primary_node.op.source
-        if parent_op is None:
-            return
+        # ``primary_node.op`` is the pre-fork op (unchanged across forks
+        # because multi-option ``try_rewrite`` doesn't apply). That op
+        # IS the parent; its op_cache_key is the tree parent key.
+        parent_op = primary_node.op
         parent_key = op_cache_key(parent_op)
         if parent_key is None:
             return
-        members: list[tuple[Op, LazyCandidate]] = [(primary_node.op, primary)]
-        for fork in forks:
-            tip = _lazy_tip(fork)
+        # Read each fork's option from its single-element chain
+        # (primary and siblings alike — both carry ``chain=[(match, opt)]``).
+        members: list[tuple[Op, LazyCandidate]] = []
+        for cand in (primary, *forks):
+            tip = _lazy_tip(cand)
             opt = tip[1] if tip is not None else None
             if not isinstance(opt, Op):
                 return  # mixed-shape fork group — keep the tree honest, skip
-            members.append((opt, fork))
+            members.append((opt, cand))
         child_keys: list[str] = []
         for op, _ in members:
             ck = op_cache_key(op)
@@ -470,26 +483,82 @@ class TuningSearch(Search):
         if tip_key is None:
             self._fallback.append(c)
             return
+        # Keep the tree topology in sync with chain-empty re-pushes
+        # (``cand.lazy()`` after a single-option ``apply``). The apply
+        # advances the graph's tip op to a new key but doesn't fire
+        # ``_record_fork`` — the new tip has no tree edge from its
+        # predecessor. Without registering one here, the lazy lives in
+        # ``_by_tip`` under a key that ``_ucb_walk`` can't reach by
+        # descending from any tree-known ancestor, so it ends up as
+        # an orphan that only the global FIFO fallback can reach.
+        # Add a parent→tip edge from the tip op's source so UCB walks
+        # can discover it. Idempotent via ``tree.expand``'s existing-key
+        # short-circuit when the edge is already known.
+        if tip is None and tip_key not in self._by_tip:
+            source = getattr(c.inner.graph.nodes[self._tip_node_id(c.inner.graph, tip_key)].op, "source", None)
+            parent_key = op_cache_key(source) if source is not None else None
+            if parent_key is not None and parent_key != tip_key:
+                self._tree.expand(parent_key, [tip_key])
         self._by_tip.setdefault(tip_key, []).append(c)
+
+    def _tip_node_id(self, graph, tip_key: str) -> str | None:
+        """Locate the node in ``graph`` whose op matches ``tip_key``."""
+        for nid, node in graph.nodes.items():
+            if op_cache_key(node.op) == tip_key:
+                return nid
+        return None
 
     def pop(self) -> LazyCandidate | None:
         if self._should_stop():
             return None
-        # Bootstrap: keep drilling rollouts to terminal until *every*
-        # kernel subtree has at least ``N_BOOTSTRAP`` measurements. A
-        # graph with K kernels then gets at least K * N_BOOTSTRAP
-        # terminals before UCB takes over — otherwise UCB would commit
-        # to whichever subtree got measured first and starve the rest.
-        if self._tree.min_subtree_seen() < self._n_bootstrap:
-            return self._bootstrap_pop()
+        # Canonical MCTS: every pop walks the tree via UCB. Unvisited
+        # children get ``+inf`` from ``NodeRow.ucb``, which naturally
+        # produces breadth-first exploration at each level until each
+        # sibling has at least one rollout — no separate "bootstrap"
+        # phase is needed. The previous bootstrap path picked the
+        # queued lazy with highest ``pass_idx``, which on single-kernel
+        # graphs drilled every 008 F-fork sibling before backtracking
+        # to a 005 (BN, BM) sibling and biased the search toward
+        # whichever rule-pipeline branch happened to fork latest.
         target = self._ucb_walk(self._tree.root)
-        if target is None or target.key not in self._by_tip:
-            return self._fallback_pop()
-        cands = self._by_tip[target.key]
-        c = cands.pop(0)
-        if not cands:
-            del self._by_tip[target.key]
-        return c
+        if target is not None and target.key in self._by_tip:
+            cands = self._by_tip[target.key]
+            c = cands.pop(0)
+            if not cands:
+                del self._by_tip[target.key]
+            return c
+        # UCB landed on a node with no queued candidate. Instead of
+        # ``_fallback_pop``'s arbitrary global drain (which always
+        # returns whichever lazy was inserted earliest — invariably a
+        # descendant of the FIRST drilled branch), walk the target's
+        # subtree and pop any descendant that *does* have a queued
+        # candidate. That respects UCB's choice of which branch to
+        # explore while routing around the lookup mismatch caused by
+        # single-option ``apply`` advancing a lazy's tip key without
+        # bumping the tree node it used to live under.
+        if target is not None:
+            from_subtree = self._subtree_pop(target)
+            if from_subtree is not None:
+                return from_subtree
+        return self._fallback_pop()
+
+    def _subtree_pop(self, root: SearchNode) -> LazyCandidate | None:
+        """BFS ``root``'s subtree, return the first node with a queued
+        candidate. Used when UCB picks a target whose own ``_by_tip``
+        entry was consumed by an earlier drill — descendants further
+        down often still have live lazies queued."""
+        stack: list[SearchNode] = list(root.children)
+        while stack:
+            node = stack.pop()
+            if node.key in self._by_tip:
+                cands = self._by_tip[node.key]
+                if cands:
+                    c = cands.pop(0)
+                    if not cands:
+                        del self._by_tip[node.key]
+                    return c
+            stack.extend(node.children)
+        return None
 
     def _fallback_pop(self) -> LazyCandidate | None:
         """When the UCB walk has nothing to match (root unknown, all
@@ -532,10 +601,12 @@ class TuningSearch(Search):
                 self._stagnant = 0
             else:
                 self._stagnant += new_measurements
-        # Patience is only honored after bootstrap has seeded every
-        # kernel subtree with at least ``N_BOOTSTRAP`` measurements —
-        # otherwise patience could fire before UCB ever runs.
-        if self._tree.min_subtree_seen() < self._n_bootstrap:
+        # Don't fire patience before any terminal has measured — use
+        # the cumulative ``seen`` (not ``min_subtree_seen``), because
+        # the push-edge bookkeeping registers per-tip parent edges
+        # which can put intermediate ops directly under the super-root
+        # as siblings, pinning ``min_subtree_seen`` at 0 forever.
+        if seen < 1:
             return False
         if self._stagnant >= self._patience:
             self._stop_reason = f"patience ({self._stagnant} stagnant, best {self._best_latency:.2f} us)"
@@ -625,9 +696,16 @@ class TuningSearch(Search):
         ``visits == 0`` so canonical UCB1 picks them ahead of measured
         siblings automatically; ``score`` breaks ``+inf`` ties.
 
-        Measured leaves (terminal, no children, ``visits > 0``) are
-        skipped during descent — they contribute their visits to the
-        parent's UCB but have no candidate left to pop.
+        Children are filtered to ones with a live queued candidate
+        somewhere in their subtree (``_has_live_descendant``). Without
+        this, UCB happily descends into a tree branch whose ``_by_tip``
+        bucket has been drained — the search loop's single-option
+        ``apply`` advances a lazy's tip key without updating the tree
+        edge it used to live under, so a node may have ``children`` but
+        no popable candidate anywhere beneath it. Without filtering,
+        ``pop`` would land on a dead target and fall back to the global
+        FIFO drain, which always favors the first-drilled branch and
+        starves real exploration.
 
         Among unexpanded siblings, ``score`` ranks priors and a
         ``SCORE_CUTOFF`` purge drops priors too far below the local
@@ -652,13 +730,27 @@ class TuningSearch(Search):
                         if c.score < cutoff:
                             self._by_tip.pop(c.key, None)
                     frontier = [c for c in frontier if c.score >= cutoff]
+                # Frontier nodes must have a queued candidate to be a
+                # pop target — see method docstring for the why.
+                frontier = [c for c in frontier if c.key in self._by_tip]
                 if frontier:
                     return max(frontier, key=lambda n: n.score)
 
-            # Descend into expanded children only. ``visits == 0`` gets
-            # +inf via ``NodeRow.ucb``; score breaks ties.
-            expanded = [c for c in cur.children if c.is_expanded()]
+            # Descend into expanded children with live descendants only.
+            expanded = [c for c in cur.children if c.is_expanded() and self._has_live_descendant(c)]
             if not expanded:
                 return cur
             cur = max(expanded, key=lambda c: (c.ucb(self._ucb_c), c.score))
         return cur
+
+    def _has_live_descendant(self, node: SearchNode) -> bool:
+        """True if ``node`` itself or any descendant has a queued
+        candidate in ``_by_tip``. Used by ``_ucb_walk`` to skip
+        descent into branches whose entire subtree's been drained."""
+        stack: list[SearchNode] = [node]
+        while stack:
+            n = stack.pop()
+            if n.key in self._by_tip and self._by_tip[n.key]:
+                return True
+            stack.extend(n.children)
+        return False
