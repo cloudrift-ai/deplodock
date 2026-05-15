@@ -22,12 +22,18 @@ from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, Stage
 
 @rewrite.register
 def _(s: Stage, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return type(s)(**_stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn))
+    # _stage_kwargs walks Expr/Axis fields but stops at Stmt boundaries — body
+    # stmts need explicit recursion (parallel to Loop / StridedLoop handlers).
+    kwargs = _stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn)
+    kwargs["body"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
+    return type(s)(**kwargs)
 
 
 @simplify.register
 def _(s: Stage, ctx: SimplifyCtx) -> Stmt:
-    return type(s)(**_stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a))
+    kwargs = _stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a)
+    kwargs["body"] = tuple(simplify(c, ctx) for c in s.body)
+    return type(s)(**kwargs)
 
 
 @rewrite.register

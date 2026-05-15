@@ -250,6 +250,50 @@ class Stage(Stmt):
     # 32-way bank conflicts that arise when adjacent threads stride through
     # power-of-2 multiples of bank width.
     pad: tuple[int, ...] = ()
+    # Cooperative-load program: the per-CTA logical compute that produces
+    # the staged slab. Trivial form (auto-synthesized when not provided) is
+    # ``Load(input=buf, index=origin+cache_vars); Write(output=name,
+    # index=cache_vars, value=loaded)`` — equivalent to today's
+    # synthesized-from-(buf, origin, axes, addressing) materializer path.
+    # Non-trivial bodies (fused producer compute) are reserved for the
+    # follow-up stage-epilogue fusion pass; the materializer trip-wire
+    # rejects them until phase 2.
+    body: Body = field(default_factory=Body)
+
+    def __post_init__(self) -> None:
+        # Coerce tuple inputs (e.g. from rewrite/with_bodies that build a
+        # plain tuple comprehension) into the Body subclass so downstream
+        # walkers can call ``.map`` / ``.iter`` on Stage's nested body.
+        if not isinstance(self.body, Body):
+            self.body = Body.coerce(self.body)
+        if not self.body:
+            self.body = self._synthesize_trivial_body()
+
+    def _synthesize_trivial_body(self) -> Body:
+        cache_index = tuple(Var(ax.name) for ax in self.axes)
+        if isinstance(self.addressing, AffineAddressing):
+            decoded: dict[int, Expr] = dict(zip(self.addressing.dims, cache_index, strict=True))
+            src_index = tuple(o if d not in decoded else o + decoded[d] for d, o in enumerate(self.origin))
+        else:
+            src_index = self.addressing.exprs
+        load_name = f"{self.name}__src"
+        return Body(
+            (
+                Load(name=load_name, input=self.buf, index=src_index),
+                Write(output=self.name, index=cache_index, value=load_name),
+            )
+        )
+
+    # Phase 1: ``body`` is auxiliary metadata. The materializer still reads
+    # legacy ``(buf, origin, addressing)`` fields, and several tile passes
+    # (notably ``008_register_tile``) rely on ``Stage`` being opaque to
+    # generic body walkers — exposing the body via ``nested()`` would let
+    # F-axis replication descend into the cooperative-load Loads and
+    # corrupt their semantics. So we keep the leaf-stmt protocol here;
+    # σ-substitution through the body is handled explicitly by the
+    # Stage-specific ``rewrite`` / ``simplify`` handlers in
+    # ``deplodock/compiler/ir/tile/passes.py``. Phase 2 (when materializer
+    # walks ``body`` directly) revisits this.
 
     def deps(self) -> tuple[str, ...]:
         return ()
@@ -316,6 +360,7 @@ class BufferedStage(Stage):
     phase: Expr = field(kw_only=True)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.buffer_count < 2:
             raise ValueError(f"BufferedStage {self.name!r}: buffer_count must be >= 2, got {self.buffer_count}")
 

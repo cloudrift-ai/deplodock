@@ -162,6 +162,7 @@ def _double_buffer(loop: Loop) -> Loop | None:
                     axes=s.axes,
                     addressing=s.addressing,
                     pad=s.pad,
+                    body=s.body,
                     buffer_count=_BUFFER_COUNT,
                     phase=phase,
                 )

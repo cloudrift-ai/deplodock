@@ -83,6 +83,7 @@ def _process(body: Body, n_threads: int) -> Body:
                     axes=s.axes,
                     addressing=s.addressing,
                     pad=s.pad,
+                    body=s.body,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
                 )

@@ -195,6 +195,7 @@ def _materialize(blk: Tile) -> Stmt:
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
+        _assert_trivial_stage_body(stage)
         desc_name = f"{stage.name}_desc"
         gid = stage_group[id(stage)]
         mbar_name = _mbar_name(gid)
@@ -645,6 +646,25 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
 # ---------------------------------------------------------------------------
 
 
+def _assert_trivial_stage_body(stage: Stage) -> None:
+    """Phase-1 trip-wire: materializer still reads legacy (buf, origin,
+    addressing) fields, so the Stage body must be the auto-synthesized
+    trivial pair ``Load(input=buf, ...) ; Write(output=name, ...)``.
+    Anything richer (fused producer compute) requires phase 2.
+    """
+    if len(stage.body) != 2:
+        raise AssertionError(
+            f"Stage {stage.name!r}: expected trivial 2-stmt body (Load, Write), "
+            f"got {len(stage.body)} stmts — fused stage bodies are not yet supported "
+            f"by the materializer (phase 2 required)."
+        )
+    load, write = stage.body
+    if not isinstance(load, Load) or load.input != stage.buf:
+        raise AssertionError(f"Stage {stage.name!r}: body[0] must be Load(input={stage.buf!r}), got {load!r}")
+    if not isinstance(write, Write) or write.output != stage.name:
+        raise AssertionError(f"Stage {stage.name!r}: body[1] must be Write(output={stage.name!r}), got {write!r}")
+
+
 def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
 
@@ -669,6 +689,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     1's leading Sync is harmless (no prior state)."""
     if not stage.axes:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
+    _assert_trivial_stage_body(stage)
     extents = tuple(int(ax.extent) for ax in stage.axes)
     padded_extents = stage.alloc_extents
 

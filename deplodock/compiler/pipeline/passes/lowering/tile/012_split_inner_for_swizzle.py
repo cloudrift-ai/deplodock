@@ -179,7 +179,13 @@ def _split_stage(stage: TmaBufferedStage, mode: SwizzleMode, ips: int) -> TmaBuf
         inner_axis.extent,
         mode.value,
     )
-    return dc_replace(stage, axes=new_axes, addressing=new_addressing, swizzle=mode)
+    # Body's Load index references the pre-split axis Var(orig.name); axes
+    # rewrite breaks that. Clear the body so Stage.__post_init__ re-synthesizes
+    # the trivial form from the new (axes, addressing). Phase-1 invariant:
+    # 012 only runs on trivial-body TMA stages.
+    if len(stage.body) != 2:
+        raise RuleSkipped(f"stage {stage.name!r}: split requires trivial body, got {len(stage.body)} stmts")
+    return dc_replace(stage, axes=new_axes, addressing=new_addressing, swizzle=mode, body=Body())
 
 
 def _swizzle_decode_load(load: Load, mode: SwizzleMode, ips: int, factor: int) -> Load:

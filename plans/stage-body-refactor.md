@@ -83,6 +83,19 @@ indistinguishable from today's behavior.
   `stage.rewrite(σ)`. Make sure `Stage.rewrite` threads σ through `body`
   so K-outer Vars inside body Loads get substituted along with `origin`.
 
+### Stage rewrite/simplify handlers (must change)
+
+Stage's handlers in `deplodock/compiler/ir/tile/passes.py:23-30` lean on
+`_stage_kwargs` → `_walk`, which recurses through tuples and dataclasses
+but **stops at `Stmt`** (`stmt/passes.py:42` — `not isinstance(value, Stmt)`).
+Body is a tuple of Stmts, so the introspection path would leave body stmts
+untouched. Update both handlers to mirror the `Loop` / `StridedLoop`
+pattern: build kwargs via `_stage_kwargs` for the non-body fields, then
+override `body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)`
+(and analogously `simplify(c, ctx)` in the simplify handler). Without this
+change, σ-substitution inside body Loads silently no-ops and phase-1's
+trivial-body invariant breaks under `015_pipeline_k_outer`.
+
 ### Materializer change (`pipeline/passes/lowering/kernel/001_materialize_tile.py`)
 
 - `_emit_stage` (line 648) and `emit_tma_stage` (line 197) keep their
@@ -151,7 +164,13 @@ text-level change at most call sites is zero. Exceptions:
   positionally: `Load`s become per-thread gmem reads, elementwise
   `Assign`s become per-thread compute, the terminal `Write` becomes
   the smem store. Cooperative-loop scaffolding (the `StridedLoop` over
-  cache axes) stays identical.
+  cache axes) stays identical. Note: `_emit_stage` and surrounding code
+  also reads `stage.origin` at lines 228, 245, 249, 252, 266, 708 (box-size
+  derivation, literal-origin detection, split-dim coord, σ-substitution in
+  index reconstruction), and `stage.addressing` at lines 201, 215, 692,
+  704, 706-707. All become property accesses, no source change required.
+  CpAsync/Load emissions at 001:287, 730, 740 also read `stage.buf` —
+  same story.
 - `pipeline/passes/lowering/kernel/001_materialize_tile.py:197`
   (`emit_tma_stage`) — TMA materialization requires a single `Load` with
   `AffineAddressing` and no compute between Load and Write. Add an
@@ -173,6 +192,13 @@ text-level change at most call sites is zero. Exceptions:
 - `compiler/diagnostics/bank_conflicts.py:118` — reads `Stage` + `Load`
   pairs from the tile body; uses `stage.name`, `stage.axes`, `stage.pad`.
   No legacy field used. No change.
+- `deplodock/compiler/tuning.py:212` (`bufs.add(s.buf)`) and
+  `deplodock/compiler/ir/tile/ir.py:621` (`bufs.setdefault(s.buf, None)` in
+  the external-inputs property) read `stage.buf`. After phase 2 these
+  continue to work as property accesses; for multi-source bodies, the
+  `buf` property raises (single-source only), which is correct — these
+  call sites assume a single source slab and should fail loudly if that
+  invariant breaks. Audit only, no edit.
 
 ### Tests
 
