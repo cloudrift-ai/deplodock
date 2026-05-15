@@ -1,0 +1,24 @@
+model:
+  huggingface: "google/gemma-4-31B-it"
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    # Native max is 262144; BF16 weights ~62 GB leave ~73 GB on 1xH200 (141 GB) for KV cache.
+    context_length: 131072
+    max_concurrent_requests: 16
+    vllm:
+      image: "vllm/vllm-openai:gemma4-0505-cu129"
+      extra_args: "--enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template examples/tool_chat_template_gemma4.jinja --limit-mm-per-prompt '{\"image\": 0, \"audio\": 0}'"
+
+benchmark:
+  max_concurrency: 16
+  num_prompts: 64
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA H200 141GB"
+  deploy.gpu_count: 1
