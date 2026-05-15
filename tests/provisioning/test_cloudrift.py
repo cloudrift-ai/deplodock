@@ -602,10 +602,10 @@ async def test_create_instance_terminates_orphan_on_exception(mock_rent, mock_wa
 # ── wait_for_status transient-error handling ─────────────────────
 
 
-def _http_status_error(code):
-    """Construct an httpx.HTTPStatusError with a given status code."""
+def _http_status_error(code, body=""):
+    """Construct an httpx.HTTPStatusError with a given status code and optional body."""
     request = httpx.Request("POST", "https://api.test/instances/list")
-    response = httpx.Response(code, request=request)
+    response = httpx.Response(code, request=request, text=body)
     return httpx.HTTPStatusError(f"HTTP {code}", request=request, response=response)
 
 
@@ -674,6 +674,34 @@ async def test_create_instance_429_raises_capacity_exhausted(mock_rent, tmp_path
     mock_rent.side_effect = _http_status_error(429)
 
     with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_400_instance_not_found_raises_capacity(mock_rent, tmp_path):
+    """400 'Instance X not found' is a per-datacenter availability signal; advance candidates."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(400, body="Instance h200-8-generic.1 not found")
+
+    with pytest.raises(CapacityExhausted):
+        await create_instance(API_KEY, "h200-8-generic.1", str(key_file), api_url=API_URL)
+
+
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_400_other_raises_terminal(mock_rent, tmp_path):
+    """A 400 whose body is not a not-found signal must stay terminal (e.g. malformed body)."""
+    import pytest
+
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_rent.side_effect = _http_status_error(400, body="malformed request: missing field 'selector'")
+
+    with pytest.raises(TerminalProvisionError):
         await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
 
