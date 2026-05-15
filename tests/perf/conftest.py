@@ -167,10 +167,13 @@ def _tune_via_subprocess(case: Case) -> None:
         "-v",
     ]
     env = dict(os.environ)
-    # No timeout — search exits on patience or tree exhaustion.
     sys.stderr.write(f"[tune {case.name}] launching: {' '.join(cmd)}\n")
     sys.stderr.flush()
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=None, env=env)
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=None, env=env, timeout=180.0)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"[tune {case.name}] TIMEOUT after 180s\n")
+        return
     if res.returncode != 0:
         sys.stderr.write(f"[tune {case.name}] exit={res.returncode}\n")
 

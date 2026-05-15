@@ -835,13 +835,20 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
 
+    import statistics as _stats  # noqa: PLC0415
+
     results: dict[str, float] = {}
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
             # ``elapsed_time`` is in ms across the whole batch; divide
             # by the batch size and multiply by 1000 to get per-call us.
-            results[name] = sum(s.elapsed_time(e) * 1000.0 / b for s, e, b in measured) / len(measured)
+            # Median (not mean) for symmetry with deplodock's reduction
+            # in ``benchmark_program`` — keeps a single thermal-blip or
+            # lock-contention outlier from dragging eager's reported
+            # latency up.
+            per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
+            results[name] = _stats.median(per_iter_us)
     results["Deplodock"] = bench.time_ms * 1000
     return results, bench
 

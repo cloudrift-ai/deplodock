@@ -14,6 +14,7 @@ scratch. Launch order is ``graph.topological_order()``.
 from __future__ import annotations
 
 import logging
+import math
 import os as _os
 import pickle
 import select
@@ -407,6 +408,14 @@ _AUTO_MAX_ITERS = 100
 # per_launch_ms)``. Calibrated after warmup from the last-warmup iter's
 # per-launch timings, then held fixed during measurement.
 _BATCH_TARGET_MS = 1.0
+# Minimum total GPU time the warmup window should cover. sm_120 (and
+# other consumer GPUs with auto-boost) take several ms to ramp clocks
+# from idle. For tiny kernels the requested ``warmup`` iters may sum
+# to << 1 ms — the first measured iters then see mid-ramp clocks and
+# the median jitters across runs. After the post-warmup batch-size
+# calibration we extend ``warmup`` so total warmup GPU time clears
+# this threshold.
+_WARMUP_TARGET_MS = 10.0
 # Per-launch wall-clock cap. Any single kernel launch exceeding this is
 # considered "broken" — too many threads, infinite loop, hung GPU — and
 # the bench bails out via ``RuntimeError`` so the autotune sweep doesn't
@@ -508,45 +517,45 @@ def benchmark_program(
         max_measured = int(num_iters)
         auto = False
 
-    t_compile_start = _time.monotonic()
-    compiled = _compile(graph)
-    arrays = _allocate(compiled, input_data)
-    descs = _prebuild_descriptors(compiled, arrays)
-    compile_elapsed = _time.monotonic() - t_compile_start
-    logger.info(
-        "[bench] enter benchmark_program: %d launch(es) compile+alloc=%.2fs kernels=[%s]",
-        len(compiled.launches),
-        compile_elapsed,
-        ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
-    )
-    if compile_timeout_s is not None and compile_elapsed > compile_timeout_s:
-        raise RuntimeError(
-            f"benchmark compile stage exceeded {compile_timeout_s:.1f}s budget ({compile_elapsed:.2f}s) — variant marked bench_fail"
-        )
-
-    n = len(compiled.launches)
-    starts = [cp.cuda.Event() for _ in range(n)]
-    stops = [cp.cuda.Event() for _ in range(n)]
-    # Per-launch sample list — kept around to compute the median across
-    # measured iters (more robust than the arithmetic mean against
-    # thermal blips, GPU-lock-contention spikes, and other one-off
-    # outliers that the autotune's variant ranking previously got
-    # confused by; see ``project_..._noise`` write-ups).
-    samples: list[list[float]] = [[] for _ in range(n)]
-    # Per-position batch size — how many times to invoke each launch
-    # back-to-back inside one CUDA event window. Calibrated from the
-    # last warmup iter's per-launch ms; until then we run B=1.
-    batch_sizes = [1] * n
-
-    iters_run = 0
-    measured = 0
-    cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
-    total_gpu_ms = 0.0  # all-iter GPU time (incl. warmup), for the run-stage budget
-    # Hold the cross-process GPU lock for the whole warmup+measure
-    # window. Compile and allocate above stay outside, so parallel
-    # workers can NVRTC-compile their candidates concurrently and only
-    # serialize on the device when it's time to time.
+    # Hold the GPU lock across the entire compile+allocate+warmup+measure
+    # block. Peer workers running NVRTC / cudaMalloc concurrently steal
+    # driver/PCIe cycles and inflate measurement noise even when the
+    # measurement loop itself is locked, so serialize the whole window.
     with gpu_lock():
+        t_compile_start = _time.monotonic()
+        compiled = _compile(graph)
+        arrays = _allocate(compiled, input_data)
+        descs = _prebuild_descriptors(compiled, arrays)
+        compile_elapsed = _time.monotonic() - t_compile_start
+        logger.info(
+            "[bench] enter benchmark_program: %d launch(es) compile+alloc=%.2fs kernels=[%s]",
+            len(compiled.launches),
+            compile_elapsed,
+            ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
+        )
+        if compile_timeout_s is not None and compile_elapsed > compile_timeout_s:
+            raise RuntimeError(
+                f"benchmark compile stage exceeded {compile_timeout_s:.1f}s budget ({compile_elapsed:.2f}s) — variant marked bench_fail"
+            )
+
+        n = len(compiled.launches)
+        starts = [cp.cuda.Event() for _ in range(n)]
+        stops = [cp.cuda.Event() for _ in range(n)]
+        # Per-launch sample list — kept around to compute the median across
+        # measured iters (more robust than the arithmetic mean against
+        # thermal blips, GPU-lock-contention spikes, and other one-off
+        # outliers that the autotune's variant ranking previously got
+        # confused by; see ``project_..._noise`` write-ups).
+        samples: list[list[float]] = [[] for _ in range(n)]
+        # Per-position batch size — how many times to invoke each launch
+        # back-to-back inside one CUDA event window. Calibrated from the
+        # last warmup iter's per-launch ms; until then we run B=1.
+        batch_sizes = [1] * n
+
+        iters_run = 0
+        measured = 0
+        cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
+        total_gpu_ms = 0.0  # all-iter GPU time (incl. warmup), for the run-stage budget
         while True:
             if on_iter is not None:
                 # Pass the current per-iter batch size so peer backends
@@ -596,6 +605,16 @@ def benchmark_program(
                 for i in range(n):
                     if iter_dts[i] > 0 and iter_dts[i] < _BATCH_TARGET_MS:
                         batch_sizes[i] = max(1, int(round(_BATCH_TARGET_MS / iter_dts[i])))
+                # Extend warmup until total warmup GPU time clears the
+                # clock-ramp floor. Post-batching, each subsequent warmup
+                # iter spends roughly ``sum(iter_dts[i] * batch_sizes[i])``
+                # of GPU time — use the just-measured per-launch dts to
+                # estimate how many extra iters are needed.
+                if total_gpu_ms < _WARMUP_TARGET_MS:
+                    per_iter_ms = sum(iter_dts[i] * batch_sizes[i] for i in range(n))
+                    if per_iter_ms > 0:
+                        extra = int(math.ceil((_WARMUP_TARGET_MS - total_gpu_ms) / per_iter_ms))
+                        warmup += extra
             # Warmup iters: discard. ``iter_dts`` is still subject to the
             # ``_KERNEL_TIMEOUT_MS`` watchdog above, which bounds any
             # single hung launch.
