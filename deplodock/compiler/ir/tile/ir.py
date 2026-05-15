@@ -156,6 +156,9 @@ class Combine(Stmt):
     name: str
     op: ElementwiseImpl
 
+    def deps(self) -> tuple[str, ...]:
+        return (self.name,)
+
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
 

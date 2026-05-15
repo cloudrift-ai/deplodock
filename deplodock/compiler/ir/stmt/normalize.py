@@ -66,6 +66,7 @@ def normalize_body(
     :attr:`Body.structural_key()` so two bodies that differ only in the
     *kind* of FMA / compare / SFU op at the same position hash equal.
     """
+    stmts = topo_sort_siblings(stmts)
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)
     stmts = eliminate_copy_aliases(stmts)
@@ -465,6 +466,138 @@ def dedup_loads(stmts: Body) -> Body:
         return tuple(out)
 
     return walk(stmts, {}, {})
+
+
+# ---------------------------------------------------------------------------
+# Pass: topologically sort siblings so SSA defs precede their uses.
+# ---------------------------------------------------------------------------
+
+
+def topo_sort_siblings(stmts: Body) -> Body:
+    """Reorder stmts within each Body so SSA defs precede their uses.
+
+    Recurses into every child body via the Stmt protocol
+    (:meth:`Stmt.nested` / :meth:`Stmt.with_bodies`), then runs a stable
+    Kahn ordering over the current sibling list. A block stmt
+    (``Loop`` / ``StridedLoop`` / ``Tile`` / ``Cond``) is opaque at the
+    parent level: it ``defs`` any Accum names that escape its body
+    (visible to siblings via Loop's cross-boundary Accum semantics) and
+    ``uses`` its wrapper-level deps plus any free SSA names referenced
+    inside (names referenced inside but not defined inside).
+
+    Splicer worklists (and any future producer that emits stmts with
+    sibling-dedup) can land a consumer above an already-emitted producer
+    when the producer was reused from an earlier emission. Sorting at
+    normalize time decouples final body order from producer subtleties
+    and guarantees every constructed ``LoopOp`` / ``TileOp`` lands with
+    defs above uses, which downstream passes (validator, renamer,
+    codegen) rely on.
+
+    Stable: when the dep edges leave a free choice, the original sibling
+    order is preserved (heap-based Kahn with index tiebreak). Idempotent:
+    bodies already in topo order round-trip unchanged.
+    """
+    return _topo(Body.coerce(stmts))
+
+
+def _topo(body: Body) -> Body:
+    import heapq
+
+    items: list[Stmt] = []
+    for s in body:
+        nested = s.nested()
+        if nested:
+            items.append(s.with_bodies(tuple(_topo(b) for b in nested)))
+        else:
+            items.append(s)
+
+    n = len(items)
+    if n <= 1:
+        return Body(tuple(items))
+
+    defs_uses = [_sibling_defs_uses(s) for s in items]
+    # First-writer wins: handles repeated Accum decls (idempotent at the
+    # same name) and the rare aliasing edge case without crashing.
+    def_idx: dict[str, int] = {}
+    for i, (defs, _) in enumerate(defs_uses):
+        for name in defs:
+            def_idx.setdefault(name, i)
+
+    incoming: list[set[int]] = [set() for _ in range(n)]
+    outgoing: list[list[int]] = [[] for _ in range(n)]
+    for i, (_, uses) in enumerate(defs_uses):
+        for name in uses:
+            j = def_idx.get(name)
+            if j is not None and j != i and j not in incoming[i]:
+                incoming[i].add(j)
+                outgoing[j].append(i)
+
+    ready: list[int] = [i for i in range(n) if not incoming[i]]
+    heapq.heapify(ready)
+    order: list[int] = []
+    while ready:
+        i = heapq.heappop(ready)
+        order.append(i)
+        for k in outgoing[i]:
+            incoming[k].discard(i)
+            if not incoming[k]:
+                heapq.heappush(ready, k)
+
+    if len(order) != n:
+        # Cycle through SSA names — leave order untouched so the validator
+        # rejects it with a precise message instead of silently shuffling.
+        return Body(tuple(items))
+    return Body(tuple(items[i] for i in order))
+
+
+def _sibling_defs_uses(stmt: Stmt) -> tuple[frozenset[str], frozenset[str]]:
+    """Names ``stmt`` makes visible to siblings, and names it depends on
+    from siblings.
+
+    Leaves: ``defs = stmt.defines()``, ``uses = stmt.deps()``.
+    Block stmts: ``defs`` = Accum names escaping the body (recursive);
+    ``uses`` = wrapper's own deps ∪ ((all inner uses) − (all inner SSA
+    defs)).
+    """
+    nested = stmt.nested()
+    if not nested:
+        return frozenset(stmt.defines()), frozenset(stmt.deps())
+    defs: set[str] = set()
+    all_uses: set[str] = set(stmt.deps())
+    all_inner_defs: set[str] = set()
+    for b in nested:
+        defs |= _exported_accs(b)
+        all_uses |= _all_ssa_uses(b)
+        all_inner_defs |= _all_ssa_defs(b)
+    return frozenset(defs), frozenset(all_uses - all_inner_defs)
+
+
+def _exported_accs(body: Body) -> frozenset[str]:
+    out: set[str] = set()
+    for s in body:
+        if isinstance(s, Accum):
+            out.add(s.name)
+        for b in s.nested():
+            out |= _exported_accs(b)
+    return frozenset(out)
+
+
+def _all_ssa_defs(body: Body) -> frozenset[str]:
+    out: set[str] = set()
+    for s in body:
+        out.update(s.defines())
+        for b in s.nested():
+            out |= _all_ssa_defs(b)
+    return frozenset(out)
+
+
+def _all_ssa_uses(body: Body) -> frozenset[str]:
+    out: set[str] = set()
+    for s in body:
+        out.update(s.deps())
+        for b in s.nested():
+            out |= _all_ssa_uses(b)
+    return frozenset(out)
 
 
 # ---------------------------------------------------------------------------

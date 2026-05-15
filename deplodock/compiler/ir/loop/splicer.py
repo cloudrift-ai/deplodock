@@ -39,13 +39,20 @@ multi-output splice targets uniformly.
 
 ``LoopBuilder.insert`` is pure tree-splicing: descend the body along
 the enclosure path, creating ``Loop`` nodes if missing, prepend at the
-leaf. Always-prepend yields defined-before-use ordering naturally,
-because the worklist resolves deps in reverse-topological order —
-consumers demand before producers.
+leaf. The worklist resolves deps in reverse-topological order so
+consumers demand before producers — that *usually* yields defined-
+before-use. The exception is the dedup case: when a stmt's operand
+hits an existing binding emitted earlier in the worklist, the new stmt
+still prepends above the existing one — landing above its own dep.
+That sibling inversion is fixed up by the generic
+``topo_sort_siblings`` pass in :mod:`deplodock.compiler.ir.stmt.normalize`,
+which runs inside ``LoopOp.__post_init__`` — so the splicer doesn't
+need its own ordering pass; constructing the ``LoopOp`` is enough.
 """
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 
@@ -65,6 +72,8 @@ from deplodock.compiler.ir.loop.ir import (
     Write,
 )
 from deplodock.compiler.ir.sigma import Sigma
+
+logger = logging.getLogger(__name__)
 
 
 class _NotSupported(Exception):
@@ -150,7 +159,12 @@ def splice_loops(
             splice_edges=splice_edges,
             root=root,
         ).run()
-    except (_NotSupported, ValueError):
+    except (_NotSupported, ValueError) as exc:
+        # _NotSupported = splicer hit an unsupported pattern (σ-solve, scope).
+        # ValueError = LoopOp construction validation rejected the emitted body.
+        # Both surface to callers as None; debug log preserves which one for
+        # future investigation without polluting normal output.
+        logger.debug("splice_loops rejected pattern: %s: %s", type(exc).__name__, exc)
         return None
 
 
@@ -249,6 +263,10 @@ class _Splicer(LoopBuilder):
         self._seed()
         while self._pending:
             self._resolve(self._pending.popleft())
+        # Topological reordering of siblings runs inside LoopOp.__post_init__
+        # (normalize_body → topo_sort_siblings), so the dedup case where a
+        # consumer prepends above its already-emitted producer is fixed up
+        # at construction time, not here.
         return LoopOp(body=self.finish())
 
     # -- Seed: every root Write, with its value queued ----------------------

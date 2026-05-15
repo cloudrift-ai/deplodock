@@ -183,8 +183,13 @@ class Stmt:
     """
 
     def deps(self) -> tuple[str, ...]:
-        """SSA names this stmt reads — its 'requirements'."""
-        raise NotImplementedError
+        """SSA names this stmt reads — its 'requirements'.
+
+        Default: ``()`` (no SSA deps). Mirrors :meth:`defines` so stmts
+        with no SSA inputs (kernel-IR primitives like ``Sync`` /
+        ``CpAsyncCommit`` / ``MbarrierInit``) don't need to override.
+        """
+        return ()
 
     def defines(self) -> tuple[str, ...]:
         """SSA names this stmt produces — its 'bindings'.

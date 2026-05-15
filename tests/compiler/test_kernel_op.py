@@ -407,18 +407,25 @@ def test_ssa_rejects_duplicate_name():
         )
 
 
-def test_ssa_rejects_forward_reference():
+def test_ssa_topo_sorts_forward_reference():
+    """A body with a forward SSA reference is silently reordered by
+    ``topo_sort_siblings`` in ``normalize_body`` so the def precedes its
+    use. Validation only rejects truly undefined names / cycles."""
     axes = _pointwise_axes(1)
     p = Port(index=(Var("a0"),))
-    with pytest.raises(ValueError, match="not defined"):
-        _loop(
-            axes=axes,
-            inputs=(p,),
-            body=(
-                Assign("a", ElementwiseOp("add"), args=("$0", "b")),
-                Assign("b", ElementwiseOp("exp"), args=("$0",)),
-            ),
-        )
+    k = _loop(
+        axes=axes,
+        inputs=(p,),
+        body=(
+            Assign("a", ElementwiseOp("add"), args=("$0", "b")),
+            Assign("b", ElementwiseOp("exp"), args=("$0",)),
+            Write(output="out_0", index=(Var("a0"),), value="a"),
+        ),
+    )
+    # After normalization the rename pass canonicalizes to v0, v1; the
+    # exp-Assign (originally "b") must precede the add-Assign that uses it.
+    fns = [s.op.name for s in k.body[0].body if isinstance(s, Assign)]
+    assert fns == ["exp", "add"], fns
 
 
 def test_ssa_allows_input_name_reuse_in_multiple_args():

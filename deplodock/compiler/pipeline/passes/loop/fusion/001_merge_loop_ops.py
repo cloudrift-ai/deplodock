@@ -179,7 +179,11 @@ def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
 
     result = splice_graph(sub)
     if result is None:
-        raise RuleSkipped("splice_graph could not align producer/consumer iteration spaces")
+        # ``splice_graph`` returns None on any unsupported pattern: σ-solve failure
+        # (writer/reader index forms incompatible), missing axis in consumer scope,
+        # or splicer-internal validity issues. The rule treats them uniformly —
+        # the producer/consumer pair stays separate.
+        raise RuleSkipped(f"splice_graph rejected pattern: {producer.id!r} -> {consumer.id!r}")
     merged, merged_inputs = result
     new_node_id = f"merged_{consumer.id}"
     merged = _rename_write_output(merged, old=consumer.id, new=new_node_id)
