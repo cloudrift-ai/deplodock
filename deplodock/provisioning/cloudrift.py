@@ -390,10 +390,15 @@ async def create_instance(
         )
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
+        body = exc.response.text
         if code in (429, 503):
             raise CapacityExhausted(f"CloudRift rent returned {code} for {instance_type}") from exc
+        # 400 "Instance X not found" means this rift-server doesn't carry this instance type
+        # (per-datacenter availability). Treat as capacity so the orchestrator advances candidates.
+        if code == 400 and "not found" in body.lower():
+            raise CapacityExhausted(f"CloudRift rent returned 400 for {instance_type}: {body}") from exc
         if 400 <= code < 500:
-            raise TerminalProvisionError(f"CloudRift rent returned {code}: {exc.response.text}") from exc
+            raise TerminalProvisionError(f"CloudRift rent returned {code}: {body}") from exc
         raise
     if dry_run:
         logger.info("[dry-run] Would wait for Active status, then print connection info.")
