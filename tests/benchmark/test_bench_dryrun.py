@@ -64,6 +64,52 @@ def test_bench_multiple_recipes(run_cli, make_bench_config, recipes_dir, tmp_pat
     assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
 
 
+def test_bench_network_flag_dry_run(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """--network propagates into the CloudRift rent payload."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--config",
+        config_path,
+        "--network",
+        "public",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert '"network": "public"' in stdout
+
+
+def test_bench_network_flag_with_null_cloudrift_config(run_cli, recipes_dir, tmp_path):
+    """`providers.cloudrift: null` (commented children only) must not crash with --network."""
+    import yaml
+
+    config = {
+        "benchmark": {
+            "local_results_dir": os.path.join(str(tmp_path), "results"),
+            "model_dir": "/hf_models",
+        },
+        "providers": {"cloudrift": None},
+    }
+    config_path = os.path.join(str(tmp_path), "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.dump(config, f)
+
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--config",
+        config_path,
+        "--network",
+        "public",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert '"network": "public"' in stdout
+
+
 def test_bench_no_teardown_dry_run(run_cli, make_bench_config, recipes_dir, tmp_path):
     config_path = make_bench_config(tmp_path)
     recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")

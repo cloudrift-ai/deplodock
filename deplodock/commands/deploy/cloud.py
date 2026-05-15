@@ -36,8 +36,12 @@ async def _handle_cloud(args):
     register_secret(hf_token)
 
     providers_config = None
-    if args.billing_exempt:
-        providers_config = {"cloudrift": {"billing_exempt": True}}
+    if args.billing_exempt or args.network:
+        providers_config = {"cloudrift": {}}
+        if args.billing_exempt:
+            providers_config["cloudrift"]["billing_exempt"] = True
+        if args.network:
+            providers_config["cloudrift"]["network"] = args.network
 
     conn = await provision_cloud_vm(
         gpu_name=recipe.deploy.gpu,
@@ -83,6 +87,11 @@ def register_cloud_target(subparsers):
     parser.add_argument("--model-dir", default="/hf_models", help="Model cache directory")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument("--billing-exempt", action="store_true", help="Skip billing for CloudRift (admin-only)")
+    parser.add_argument(
+        "--network",
+        default=None,
+        help="CloudRift network name (must exist in target datacenter; default: provider picks a public network)",
+    )
     parser.add_argument("--gpu", required=True, help="GPU name (selects matching matrix entry)")
     parser.add_argument("--gpu-count", type=int, required=True, help="GPU count (selects matching matrix entry)")
     parser.add_argument(
