@@ -254,7 +254,7 @@ deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25
 deplodock vm delete cloudrift --instance-id <id>
 ```
 
-CloudRift attach to a specific network with `--network <name>` (on both `vm create cloudrift` and `vm create gpu`). The name must exist in the target datacenter; omit to let CloudRift pick a public network.
+CloudRift attach to a specific network with `--network <name>` (on `vm create cloudrift`, `vm create gpu`, `deploy cloud`, and `bench`). The name must exist in the target datacenter; omit to let CloudRift pick a public network.
 
 #### Allocation strategy (shared by `deploy cloud`, `bench`, `vm create gpu`)
 

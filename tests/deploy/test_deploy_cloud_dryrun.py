@@ -120,6 +120,43 @@ def test_deploy_cloud_provider_flag_override_dry_run(run_cli, tmp_path):
     assert "Trying candidate: cloudrift" not in stdout
 
 
+def test_deploy_cloud_network_flag_dry_run(run_cli, tmp_path):
+    """--network propagates into the CloudRift rent payload."""
+    recipe = {
+        "model": {"huggingface": "test-org/test-model"},
+        "engine": {
+            "llm": {
+                "tensor_parallel_size": 1,
+                "vllm": {"image": "vllm/vllm-openai:v0.17.0"},
+            }
+        },
+        "matrices": [
+            {
+                "deploy.gpu": "NVIDIA GeForce RTX 5090",
+                "deploy.gpu_count": 1,
+            },
+        ],
+    }
+    with open(tmp_path / "recipe.yaml", "w") as f:
+        yaml.dump(recipe, f)
+
+    rc, stdout, stderr = run_cli(
+        "deploy",
+        "cloud",
+        "--recipe",
+        str(tmp_path),
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
+        "--network",
+        "public",
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert '"network": "public"' in stdout
+
+
 def test_deploy_cloud_provider_default_is_cloudrift_for_h200(run_cli, tmp_path):
     """Without --provider, H200 defaults to CloudRift (first entry in hardware table)."""
     recipe = {

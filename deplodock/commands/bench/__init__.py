@@ -38,8 +38,15 @@ def handle_bench(args):
     config = load_config(args.config)
     validate_config(config)
 
-    if args.billing_exempt:
-        config.setdefault("providers", {}).setdefault("cloudrift", {})["billing_exempt"] = True
+    if args.billing_exempt or args.network:
+        providers = config.setdefault("providers", {})
+        # `cloudrift:` in config.yaml can parse to None when it has only commented children.
+        if providers.get("cloudrift") is None:
+            providers["cloudrift"] = {}
+        if args.billing_exempt:
+            providers["cloudrift"]["billing_exempt"] = True
+        if args.network:
+            providers["cloudrift"]["network"] = args.network
 
     ssh_key = _expand_path(args.ssh_key)
     dry_run = args.dry_run
@@ -282,6 +289,11 @@ def register_bench_command(subparsers):
         "--billing-exempt",
         action="store_true",
         help="Skip billing for CloudRift instances (admin-only)",
+    )
+    parser.add_argument(
+        "--network",
+        default=None,
+        help="CloudRift network name (must exist in target datacenter; default: provider picks a public network)",
     )
     parser.add_argument(
         "--filter",
