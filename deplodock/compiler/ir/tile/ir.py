@@ -580,13 +580,17 @@ class TileOp(Op):
             score -= min(0.5 + (ctas - 2048) / 4096.0, 2.5)
 
         # Atomic-fanin penalty. Cross-CTA split-K emits one ``atomicAdd``
-        # per output cell per CTA; total ops scale as
-        # ``ctas × threads × atomic_writes_per_thread`` (pre-reg-tile has
-        # 1 write per thread; post-reg-tile has F_M*F_N writes per
-        # thread but proportionally fewer threads — the product matches).
+        # per output cell per CTA. Score on ``final_threads × ctas`` —
+        # the predicted post-register-tile launch geometry — so pre-008
+        # variants are compared on what their *kernel* will look like,
+        # not their intermediate IR shape. The earlier ``threads × ctas``
+        # formula penalised the heuristic (BN=128, BM=64) tile with its
+        # raw 8 192 thread extent even though 008 was about to divide it
+        # down to ~256, making small (BN, BM) tiles score artificially
+        # higher and dominate bootstrap exploration.
         atomic_writes = sum(1 for s in self.body.iter() if isinstance(s, Write) and s.reduce_op is not None)
         if atomic_writes:
-            total_atomics = atomic_writes * threads * ctas
+            total_atomics = atomic_writes * final_threads * ctas
             if total_atomics > 256_000:
                 score -= min((total_atomics - 256_000) / 1_000_000, 2.0)
 
