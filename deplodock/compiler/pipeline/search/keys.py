@@ -1,8 +1,7 @@
 """Op-key derivation + source-chain walking for the search package.
 
-Extracted from the old ``cache.py`` so :mod:`.db`, :mod:`.tree`, and
-:mod:`.recorder` can all import without creating a cycle through a
-parent module.
+Shared by :mod:`.db`, :mod:`.policy`, and the bench-terminal helper
+in :mod:`deplodock.compiler.pipeline.pipeline`.
 
 ``op_cache_key`` keys any kernel-bearing op:
 

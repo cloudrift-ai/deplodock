@@ -1,13 +1,13 @@
 """Search-tree data classes — :class:`Candidate` (concrete graph state)
-and :class:`LazyCandidate` (a parent + a chain of pending applications
+and :class:`LazyCandidate` (a parent + an optional pending rewrite
 that materializes via :meth:`resolve`).
 
 Sibling forks at multi-option rewrite points share a single ``inner``
-``Candidate`` (the parent's snapshot) by reference; each fork holds its
-own one-element chain. ``resolve()`` is the single entry point that
-turns a lazy candidate into a concrete one — copy the inner's graph
-once, replay the chain of ``(match, option)`` pairs through
-``Candidate.apply``, drop the chain.
+``Candidate`` (the parent's snapshot) by reference; each fork holds
+its own ``pending = (match, option)`` pair. ``resolve()`` is the
+single entry point that turns a lazy candidate into a concrete one —
+copy the inner's graph once, replay ``pending`` through
+``Candidate.apply``, then drop ``pending``.
 """
 
 from __future__ import annotations
@@ -55,12 +55,20 @@ class Candidate:
         any candidate uniformly."""
         return self
 
+    def score(self) -> float:
+        """Mean of every node's ``op.score(ctx)`` over the ops that
+        return a non-``None`` score. Used as the MCTS prior for
+        ordering unmeasured siblings. Returns ``0.0`` when no op in
+        the graph provides a score."""
+        scores = [s for n in self.graph.nodes.values() if (s := n.op.score(self.ctx)) is not None]
+        return sum(scores) / len(scores) if scores else 0.0
+
     def lazy(self) -> LazyCandidate:
-        """Wrap in a zero-chain :class:`LazyCandidate`. The search
+        """Wrap in a no-op :class:`LazyCandidate` (``pending=None``). The search
         layer always handles ``LazyCandidate``; this helper lifts a
         concrete cand back into that interface (e.g. before pushing
         the rollout's current cand back to ``Search.push``)."""
-        return LazyCandidate(inner=self, cursor=self.cursor, chain=[])
+        return LazyCandidate(inner=self, cursor=self.cursor, pending=None)
 
     def try_rewrite(self, match: Match) -> list[Op | Graph] | None:
         """Eager mode (called by the search loop): invoke
@@ -168,37 +176,59 @@ class Candidate:
 class LazyCandidate:
     """Deferred-apply counterpart of :class:`Candidate`. Holds a parent
     ``inner`` Candidate (whose ``graph`` is the snapshot to clone from
-    and whose ``ctx`` propagates onto the resolved Candidate) and a
-    ``chain`` of ``(match, option)`` pairs to replay on resolve.
+    and whose ``ctx`` propagates onto the resolved Candidate) and an
+    optional ``pending`` ``(match, option)`` pair to replay on resolve.
 
     Sibling forks at the same rewrite point share ``inner`` by
     reference — only one snapshot is ever held in memory per fork
-    point. Each fork's chain is its own short list (typically a single
-    pair carrying the alt option for that fork's match site).
+    point. Each fork's ``pending`` carries the alt option for that
+    fork's match site.
 
     ``cursor`` is the lazy candidate's own pipeline cursor (typically a
     copy of the parent's cursor at fork-creation time)."""
 
     inner: Candidate
     cursor: Cursor
-    chain: list[tuple[Match, Op | Graph | None]]
+    pending: tuple[Match, Op | Graph | None] | None
 
     def resolve(self) -> Candidate:
         """Materialize: copy ``inner.graph``, build a fresh Candidate
-        carrying our cursor, replay the chain through its ``apply``,
-        drop the chain so a second resolve is a no-op (returns the
+        carrying our cursor, replay ``pending`` through its ``apply``,
+        drop ``pending`` so a second resolve is a no-op (returns the
         cached resolved Candidate). Multiple sibling ``LazyCandidate``
         instances pointing at the same ``inner`` each get their own
         copy — the snapshot is shared only across siblings, not across
         resolve calls."""
-        if not self.chain:
+        if self.pending is None:
             return self.inner
         resolved = Candidate(ctx=self.inner.ctx, graph=self.inner.graph.copy(), cursor=self.cursor)
-        for match, option in self.chain:
-            resolved.apply(match.remap(resolved.graph), option)
-        self.chain = []
+        match, option = self.pending
+        resolved.apply(match.remap(resolved.graph), option)
+        self.pending = None
         self.inner = resolved
         return resolved
+
+    def score(self) -> float:
+        """Mean of every node's ``op.score(ctx)`` in the candidate's
+        graph. When ``pending`` carries a single replacement ``Op``,
+        substitute it for the op at the match's root in-place during
+        scoring (no graph copy). When ``pending`` is a ``Graph`` splice,
+        resolve fully and score the resolved graph."""
+        from deplodock.compiler.ir.base import Op  # noqa: PLC0415
+
+        if self.pending is None:
+            return self.inner.score()
+        match, option = self.pending
+        if not isinstance(option, Op):
+            return self.resolve().score()
+        ctx = self.inner.ctx
+        scores: list[float] = []
+        for n in self.inner.graph.nodes.values():
+            op = option if n.id == match.root_node_id else n.op
+            s = op.score(ctx)
+            if s is not None:
+                scores.append(s)
+        return sum(scores) / len(scores) if scores else 0.0
 
 
 # ---------------------------------------------------------------------------

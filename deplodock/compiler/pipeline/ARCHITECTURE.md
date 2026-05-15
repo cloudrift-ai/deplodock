@@ -6,14 +6,13 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 
 ```
 pipeline/
-├── engine.py      # Pattern, Match, match_pattern, run_rule, run_pass, splice
-├── search/        # Autotune driver: Candidate, Search policies, run_pipeline / run_autotune, SearchDB + SearchTree
-│   ├── candidate.py  # Candidate / Cursor / TraceEntry / RuleResult data classes
-│   ├── policy/       # Search protocol (base.py) + GreedySearch (greedy.py) / TuningSearch (mcts.py)
-│   ├── driver.py     # _search_loop + run_pipeline / run_autotune entry points
-│   ├── db.py         # SearchDB SQLite store: loop/tile/kernel/cuda op inventory + lowering edges + perf
-│   ├── recorder.py   # record_terminal: bench → DB persist → optional tree bump; op-JSON helpers
-│   └── keys.py       # op_cache_key / dialect_of / source_chain (shared by db/policy/recorder)
+├── pipeline.py    # Pattern, Match, Rule, Pass, Pipeline; engine + Pipeline.run / Pipeline.tune / Pipeline.search
+├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
+├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
+│   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
+│   ├── policy/       # Search ABC (base.py) + GreedySearch (greedy.py) / TuningSearch (mcts.py)
+│   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf
+│   └── keys.py       # op_cache_key / dialect_of / source_chain
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
@@ -100,34 +99,25 @@ rules — they're shared helpers for the pass's rule modules.
 
 ### Drivers
 
-- `run_rule(graph, rule_path)` — load one rule file, apply to fixed point.
-- `run_pass(graph, pass_dir)` — load every rule file in a directory,
-  apply each to fixed point, then rescan the sequence until no rule
-  makes further progress.
-- `run_autotune(graph, passes, search=..., backend=None) -> Iterator[Candidate]` —
-  drive the full search. Yields one terminal `Candidate` per
-  fully-explored branch. Two built-in searches: `GreedySearch` (used by
-  `run_pipeline`; stops at the first terminal. At every fork point it
-  consults `SearchDB.lowering` keyed by the rewritten parent op's
-  `op_cache_key`: a previously-measured winner gets picked over option
-  0; otherwise option 0 — the rule's heuristic-first ordering — wins.
-  Decisions are memoized per compile so repeated parent keys don't
-  hit the DB) and `TuningSearch` (used by `deplodock tune`; runs the queue
-  dry, exploring every fork). Both rank candidates by
-  remaining unmeasured ops (DFS-equivalent on a fresh DB). The greedy
-  stop is self-detected by the search: `pop` returns `None` when the
-  previously popped candidate didn't return via `push` — i.e. when the
-  engine yielded it as terminal.
-  When `search` exposes a `tree: SearchTree`, `run_autotune` calls
-  `record_terminal(cand.graph, db, tree, ctx.structural_key(), backend=...)`
-  on each yielded terminal. Pass a `Backend` (typically `CudaBackend`)
-  via `backend=` to record real per-kernel GPU-event statistics
-  (median + min/max/mean/variance over the per-iter samples carried on
-  `LaunchTime.samples`); omit it to record the stub `latency_us=1.0`.
-  See `search/candidate.py:Candidate`, `search/candidate.py:TraceEntry`,
-  `search/policy/{base,greedy,mcts}.py:{Search,GreedySearch,TuningSearch}`,
-  `search/db.py:SearchDB`, `search/tree.py:SearchTree`, and
-  `search/recorder.py:record_terminal`.
+`Pipeline.build(passes)` wraps a pass list; the resulting object exposes
+three entry points:
+
+- `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
+  compile via `GreedySearch`. Stops at the first terminal candidate.
+- `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
+  autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
+  yields one terminal `Candidate` per fully-explored rollout.
+  `Pipeline.tune` benches each terminal via `_bench_terminal` (writes
+  per-kernel `perf` / `lowering` / inventory rows, returns the aggregate
+  `PerfStats`), then calls `search.observe(stats, status)`. With
+  `backend=None` the bench is stubbed to `latency_us=1.0`.
+- `Pipeline.search(search, ctx, *, db=None) -> Iterator[Candidate]` — the
+  inner engine loop both wrappers drive. Pops a `LazyCandidate`,
+  resolves it, runs one rule batch, pushes successors. At fork points,
+  if `db` is provided, looks up the best-known child for the parent
+  op's `op_cache_key` in `lowering` and passes the matching fork via
+  `search.push(..., best=...)`. Greedy uses `best` when present;
+  tuning ignores it.
 
 ### Search persistence: on-disk inventory vs in-memory MCTS
 
@@ -136,37 +126,32 @@ The autotune state is split across two cooperating modules:
 - **`SearchDB`** (`search/db.py`) — SQLite store partitioned into six
   tables: `loop_op`, `tile_op`, `kernel_op`, `cuda_op` (one row per op
   encountered along any lowering chain, keyed by `op_cache_key`), a
-  `lowering` edge table (one row per rewrite hop along the chain —
-  Loop→Tile, every intra-Tile autotune step, Tile→Kernel, Kernel→Cuda
-  — carrying the knob delta the rule stamped at that hop and a
-  best-median upsert across every dialect, so `GreedySearch` can
-  replay the full chain by matching forks against the delta at each
-  fork point), and a backend-partitioned `perf` table carrying full
-  stats
-  (`latency_us_{median,min,max,mean,variance}`, `n_samples`,
-  `backend`, `status`, `knobs`). Selection statistic is the median.
+  `lowering` edge table (one row per rewrite hop carrying the knob
+  delta the rule stamped at that hop plus a best-median upsert, so
+  `GreedySearch` can replay the chain by matching forks against the
+  delta at each step), and a backend-partitioned `perf` table carrying
+  full stats (`latency_us_{median,min,max,mean,variance}`,
+  `n_samples`, `backend`, `status`, `knobs`). Selection statistic is
+  the median.
 - **`SearchTree`** (`search/policy/mcts.py`) — pure-Python in-memory
   MCTS state, colocated with `TuningSearch` because MCTS is the only
-  policy that reads it. Tracks `seen_terminals` / `failed_terminals`
-  / `visits` / `total_reward` per node, propagated upward on every
-  recorded terminal. Rebuilt fresh each process: the engine re-fires
-  every rule on warm starts (see `engine.py:_try_one_rule` →
-  `tree.expand(...)`), which re-creates the tree topology; cached
-  `perf` rows ensure no re-bench. UCB priors don't survive across
-  runs. `GreedySearch` has no tree and `recorder.record_terminal`
-  short-circuits the tree bump when it receives `tree=None`.
+  policy that reads it. Each tree node wraps a `LazyCandidate`; nodes
+  carry `visits` and `best_reward` (max reward over the subtree's
+  measured leaves), plus a `live` counter that filters out subtrees
+  whose frontier has been fully drained. Tree built from push lineage
+  (parent of a pushed node = the most recently popped node). Rebuilt
+  fresh each process; cached `perf` rows in the DB ensure no re-bench
+  on warm starts. `GreedySearch` has no tree.
 
-`search/recorder.py:record_terminal` is the only module that knows
-about all four parts (graph, DB, tree, backend). It does one
-`backend.benchmark(...)` call per terminal graph, then walks
-`Op.source` once to record op inventory + lowering edges + the `perf`
-row, then bumps the tree.
-- `run_pipeline(graph, passes, dump=None)` — single-graph convenience
-  wrapper around `run_autotune`. Returns the first terminal candidate's
-  graph; for deterministic rules that's the only one. Run each named pass
-  directory in order. After each pass, dispatches `dump.on_pass(name,
-  graph)` so dump hooks land at the right stage without the caller
-  hard-coding which dump method belongs to which pass.
+`Pipeline._bench_terminal` is the only function that knows about all
+four parts (graph, DB, tree-through-`search.observe`, backend). It
+short-circuits when every `CudaOp` in the graph already has a `perf`
+row for the current `(context_key, backend)` — no GPU bench, stats
+reconstructed from the DB. Otherwise it does one
+`backend.benchmark(...)` call, walks `Op.source` once to record op
+inventory + lowering edges + the `perf` row per kernel, and returns
+the aggregate `PerfStats` (summed across kernels) for the search to
+score.
 
 ## Pass directories
 

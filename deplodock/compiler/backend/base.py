@@ -46,8 +46,8 @@ class LaunchTime:
     ``time_ms`` is the median over ``samples`` (the canonical selection
     statistic — robust to single-iter outliers from cupy framing
     jitter). ``samples`` carries every measured per-iter latency in
-    ms so callers downstream (e.g. the tuning DB recorder) can compute
-    min/max/mean/variance without re-running the bench."""
+    ms so callers downstream (e.g. ``Pipeline._bench_terminal``) can
+    compute min/max/mean/variance without re-running the bench."""
 
     idx: int
     kernel_name: str

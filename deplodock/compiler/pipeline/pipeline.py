@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.pipeline.knobs import format_tuning_knobs
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -379,7 +380,7 @@ class Pipeline:
         select_set = set(select) if select is not None else None
         return cls(passes=[Pass.load(name, i, select_set) for i, name in enumerate(passes)], dump=dump)
 
-    def search(self, search: Search, ctx: Context | None) -> Iterator[Candidate]:
+    def search(self, search: Search, ctx: Context | None, *, db: SearchDB | None = None) -> Iterator[Candidate]:
         """The unified search-driven driver. Each iteration: pop a
         candidate, run one rule's batch of matches against its graph,
         push successor(s). Yields when a candidate reaches the end of
@@ -431,11 +432,12 @@ class Pipeline:
                 # snapshot. The fork's apply on resolve advances the
                 # cursor when ``match.is_last`` (the cursor advance the
                 # eager loop didn't do here, since we deferred to forks).
-                forks = [LazyCandidate(inner=cand, cursor=replace(cur), chain=[(match, opt)]) for opt in options]
+                forks = [LazyCandidate(inner=cand, cursor=replace(cur), pending=(match, opt)) for opt in options]
                 break
 
             if forks is not None:
-                search.push(forks[0], *forks[1:])
+                best = _best_fork(forks, cand, db) if db is not None else None
+                search.push(forks[0], *forks[1:], best=best)
                 continue
 
             search.push(cand.lazy())
@@ -494,7 +496,6 @@ class Pipeline:
         from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.candidate import Candidate as _Candidate  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.recorder import TuneAborted, record_terminal  # noqa: PLC0415
 
         if ctx is None:
             ctx = _Context.probe()
@@ -505,32 +506,21 @@ class Pipeline:
 
         search.push(_Candidate(ctx=ctx, graph=graph, cursor=Cursor(pipeline=self)).lazy())
 
-        tree = getattr(search, "tree", None)
         if db is None:
             db = _SearchDB()
         n_terminals = 0
-        for cand in self.search(search, ctx):
+        for cand in self.search(search, ctx, db=db):
             n_terminals += 1
             if backend is not None:
-                knob_strs: list[str] = []
-                for nid in cand.graph.topological_order():
-                    op = cand.graph.nodes[nid].op
-                    k = getattr(op, "knobs", None) or {}
-                    if k:
-                        knob_strs.append(", ".join(f"{kk}={vv}" for kk, vv in sorted(k.items())))
+                knob_strs = [
+                    s
+                    for nid in cand.graph.topological_order()
+                    if (k := getattr(cand.graph.nodes[nid].op, "knobs", None)) and (s := format_tuning_knobs(k)) != "-"
+                ]
                 label = " | ".join(knob_strs) if knob_strs else "option-0"
                 logger.info("[tune] variant #%d  [%s]", n_terminals, label)
-            try:
-                record_terminal(cand.graph, db, tree, cand.ctx.structural_key(), backend=backend)
-            except TuneAborted as exc:
-                # A bench failure left GPU work queued; running another
-                # variant would block in cupy's ``_allocate``. Yield this
-                # terminal (its measurements are already recorded as
-                # bench_fail) and stop the sweep so the caller can pick a
-                # winner from whatever ok variants we've got.
-                logger.warning("[tune] %s — stopping after %d terminal(s)", exc, n_terminals)
-                yield cand
-                break
+            stats, status = _bench_terminal(cand, backend=backend, db=db)
+            search.observe(stats, status)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 
@@ -562,6 +552,236 @@ def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match
         consumed=consumed,
         _identities=identities,
     )
+
+
+# ---------------------------------------------------------------------------
+# Bench + DB persistence for autotune terminals (used by Pipeline.tune)
+# ---------------------------------------------------------------------------
+
+
+def _best_fork(forks, parent_cand, db):
+    """Pick the fork whose pending option matches the lowering DB's
+    best-known child for the parent op. Returns ``None`` when no row
+    exists (untuned site), the parent op has no cache key, or no fork
+    matches the recorded child key (variant drifted)."""
+    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+
+    first = forks[0]
+    if first.pending is None:
+        return None
+    match, _ = first.pending
+    parent_node = parent_cand.graph.nodes.get(match.root_node_id)
+    if parent_node is None:
+        return None
+    parent_key = op_cache_key(parent_node.op)
+    if parent_key is None:
+        return None
+    row = db.lookup_lowering(parent_key)
+    if row is None:
+        return None
+    for f in forks:
+        if f.pending is None:
+            continue
+        _, opt = f.pending
+        if op_cache_key(opt) == row.child_key:
+            return f
+    return None
+
+
+def _bench_terminal(cand, *, backend, db):
+    """Bench every ``CudaOp`` in ``cand.graph``, persist per-kernel
+    ``perf`` / inventory / lowering rows, and return ``(stats, status)``
+    where ``stats`` is the per-kernel ``PerfStats`` summed across the
+    graph (total terminal latency)."""
+    import json as _json  # noqa: PLC0415
+    import statistics as _statistics  # noqa: PLC0415
+
+    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.keys import (  # noqa: PLC0415
+        _is_kernel_bearing,
+        dialect_of,
+        op_cache_key,
+        source_chain,
+    )
+
+    def _point_stats(us: float) -> PerfStats:
+        return PerfStats(median=us, min=us, max=us, mean=us, variance=0.0, n_samples=0)
+
+    def _stats_from_launch(lt) -> PerfStats:
+        if lt.samples and len(lt.samples) >= 1:
+            us = [s * 1000.0 for s in lt.samples]
+            return PerfStats(
+                median=_statistics.median(us),
+                min=min(us),
+                max=max(us),
+                mean=_statistics.fmean(us),
+                variance=_statistics.pvariance(us) if len(us) > 1 else 0.0,
+                n_samples=len(us),
+            )
+        return _point_stats(lt.time_ms * 1000.0)
+
+    def _body_json(op, dialect: str) -> str:
+        return _json.dumps(
+            {
+                "dialect": dialect,
+                "name": getattr(op, "name", None) or getattr(op, "kernel_name", None) or "?",
+                "body_repr": repr(op.body),
+            },
+            default=str,
+        )
+
+    def _record_op_inventory(op) -> None:
+        from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+        from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+        from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+
+        key = op_cache_key(op)
+        if key is None:
+            return
+        if isinstance(op, CudaOp):
+            db.record_cuda_op(
+                key,
+                kernel_source=op.kernel_source,
+                arg_order=list(op.arg_order),
+                grid=list(op.grid),
+                block=list(op.block),
+                smem_bytes=op.smem_bytes,
+                pretty=op.kernel_source,
+            )
+        elif isinstance(op, KernelOp):
+            db.record_kernel_op(key, _body_json(op, "kernel"), op.pretty_body())
+        elif isinstance(op, TileOp):
+            db.record_tile_op(key, _body_json(op, "tile"), op.pretty_body())
+        elif isinstance(op, LoopOp):
+            db.record_loop_op(key, _body_json(op, "loop"), op.pretty_body())
+
+    def _persist(cuda_op, *, stats: PerfStats, status: str, backend_name: str) -> None:
+        cuda_key = op_cache_key(cuda_op)
+        if cuda_key is None:
+            return
+        chain = [op for op in source_chain(cuda_op) if _is_kernel_bearing(op)]
+        for op in chain:
+            _record_op_inventory(op)
+        for parent_op, child_op in zip(chain[1:], chain[:-1], strict=False):
+            p_dialect = dialect_of(parent_op)
+            c_dialect = dialect_of(child_op)
+            if p_dialect is None or c_dialect is None:
+                continue
+            p_key = op_cache_key(parent_op)
+            c_key = op_cache_key(child_op)
+            if p_key is None or c_key is None:
+                continue
+            p_knobs = getattr(parent_op, "knobs", None) or {}
+            c_knobs = getattr(child_op, "knobs", None) or {}
+            knobs_delta = {k: v for k, v in c_knobs.items() if p_knobs.get(k) != v}
+            db.record_lowering(
+                p_key,
+                p_dialect,
+                c_key,
+                c_dialect,
+                knobs=knobs_delta,
+                measured_median_us=stats.median if status == "ok" else None,
+            )
+        knobs = getattr(cuda_op, "knobs", None) or {}
+        db.record_perf(context_key, cuda_key, backend=backend_name, status=status, stats=stats, knobs=knobs)
+        logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), stats.median, status)
+
+    def _accumulate(acc: PerfStats | None, s: PerfStats) -> PerfStats:
+        if acc is None:
+            return s
+        return PerfStats(
+            median=acc.median + s.median,
+            min=acc.min + s.min,
+            max=acc.max + s.max,
+            mean=acc.mean + s.mean,
+            variance=acc.variance + s.variance,
+            n_samples=min(acc.n_samples, s.n_samples) if acc.n_samples and s.n_samples else (acc.n_samples or s.n_samples),
+        )
+
+    graph = cand.graph
+    context_key = cand.ctx.structural_key()
+    cuda_nodes = [graph.nodes[nid] for nid in graph.topological_order() if isinstance(graph.nodes[nid].op, CudaOp)]
+    if not cuda_nodes:
+        return _point_stats(0.0), "ok"
+
+    backend_name = getattr(backend, "name", "stub")
+
+    # Cache lookup: if every CudaOp already has a perf row for this
+    # (context, backend), skip the benchmark entirely and rebuild the
+    # aggregate stats from the DB. Per-kernel partial caching isn't
+    # useful here because ``backend.benchmark`` runs the whole graph.
+    cached_rows = []
+    for node in cuda_nodes:
+        key = op_cache_key(node.op)
+        row = db.lookup_perf(context_key, key, backend=backend_name) if key is not None else None
+        if row is None:
+            cached_rows = None
+            break
+        cached_rows.append(row)
+    if cached_rows is not None:
+        logger.info("[tune] cache hit for %d kernel(s) — skipping bench", len(cuda_nodes))
+        agg: PerfStats | None = None
+        status = "ok"
+        for row in cached_rows:
+            if row.status != "ok":
+                status = row.status
+            agg = _accumulate(agg, row.stats)
+            logger.info("[tune]   %s @ %.2f us  (%s, cached)", row.op_key[:12], row.stats.median, row.status)
+        return agg or _point_stats(0.0), status
+
+    status = "ok"
+    agg = None
+
+    if backend is None:
+        for node in cuda_nodes:
+            s = _point_stats(1.0)
+            _persist(node.op, stats=s, status="ok", backend_name=backend_name)
+            agg = _accumulate(agg, s)
+    else:
+        logger.info("[tune] benching %d kernel(s) in graph", len(cuda_nodes))
+        try:
+            result = backend.benchmark(graph, num_iters="auto")
+        except Exception as exc:  # noqa: BLE001
+            fail_us = float(backend.bench_run_timeout_s) * 1_000_000.0
+            logger.warning(
+                "[tune] backend.benchmark failed (%s) — pinning bench_fail @ %.1f us for %d kernel(s)",
+                exc,
+                fail_us,
+                len(cuda_nodes),
+            )
+            s = _point_stats(fail_us)
+            for node in cuda_nodes:
+                _persist(node.op, stats=s, status="bench_fail", backend_name=backend_name)
+                agg = _accumulate(agg, s)
+            status = "bench_fail"
+        else:
+            per_launch = result.per_launch or []
+            if len(per_launch) != len(cuda_nodes):
+                logger.warning(
+                    "[tune] per_launch count (%d) != CudaOp node count (%d); falling back to graph time_ms / N",
+                    len(per_launch),
+                    len(cuda_nodes),
+                )
+                avg_us = (result.time_ms * 1000.0) / max(len(cuda_nodes), 1)
+                s = _point_stats(avg_us)
+                for node in cuda_nodes:
+                    _persist(node.op, stats=s, status="ok", backend_name=backend_name)
+                    agg = _accumulate(agg, s)
+            else:
+                for node, lt in zip(cuda_nodes, per_launch, strict=True):
+                    s = _stats_from_launch(lt)
+                    _persist(node.op, stats=s, status="ok", backend_name=backend_name)
+                    agg = _accumulate(agg, s)
+            try:
+                import cupy as _cp  # noqa: PLC0415
+
+                _cp.cuda.runtime.deviceSynchronize()
+                _cp.get_default_memory_pool().free_all_blocks()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+
+    return agg or _point_stats(0.0), status
 
 
 __all__ = ["Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]

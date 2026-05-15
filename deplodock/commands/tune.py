@@ -15,6 +15,7 @@ from deplodock.commands.compile import (
     setup_pipeline_runtime,
 )
 from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch
+from deplodock.compiler.pipeline.knobs import format_tuning_knobs
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,7 @@ def register_tune_command(subparsers):
         "--patience",
         type=int,
         default=20,
-        help=(
-            "Stop after this many consecutive measured variants haven't beaten the current "
-            "best latency. Honored only after the bootstrap phase has seeded every kernel "
-            "subtree with at least --n-bootstrap measurements. Default: 20."
-        ),
+        help=("Stop after this many consecutive measured variants haven't beaten the current best latency. Default: 20."),
     )
     parser.add_argument(
         "--ucb-c",
@@ -51,24 +48,6 @@ def register_tune_command(subparsers):
         help=(
             "UCB1 exploration constant. The canonical value is sqrt(2) ≈ 1.414; larger values "
             f"shift the walk toward exploration. Default: {TuningSearch.DEFAULT_UCB_C:.4f}."
-        ),
-    )
-    parser.add_argument(
-        "--n-bootstrap",
-        type=int,
-        default=TuningSearch.DEFAULT_N_BOOTSTRAP,
-        help=(
-            "Measure this many terminals per kernel subtree via greedy depth-first descent "
-            "before switching to UCB1 selection. Default: %(default)s."
-        ),
-    )
-    parser.add_argument(
-        "--score-cutoff",
-        type=float,
-        default=TuningSearch.DEFAULT_SCORE_CUTOFF,
-        help=(
-            "Score gap below the local best at which an unvisited sibling is dropped from the "
-            "expansion frontier (see ``_ucb_walk``). Default: %(default)s."
         ),
     )
     add_diagnostics_args(parser)
@@ -109,13 +88,7 @@ def handle_tune(args):
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
-    search = TuningSearch(
-        db=db,
-        patience=args.patience,
-        ucb_c=args.ucb_c,
-        n_bootstrap=args.n_bootstrap,
-        score_cutoff=args.score_cutoff,
-    )
+    search = TuningSearch(patience=args.patience, ucb_c=args.ucb_c)
     t0 = time.monotonic()
     candidates: list = []
     try:
@@ -168,12 +141,7 @@ def handle_tune(args):
 
 
 def _format_knobs(cuda_op) -> str:
-    """Render ``CudaOp.knobs`` (forwarded from every Op-rebind along the
-    rewrite chain) as a compact ``key=value`` string. Empty dict → ``-``."""
-    knobs = getattr(cuda_op, "knobs", None) or {}
-    if not knobs:
-        return "-"
-    return ", ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
+    return format_tuning_knobs(getattr(cuda_op, "knobs", None) or {})
 
 
 def _pick_best_candidate(candidates, db):

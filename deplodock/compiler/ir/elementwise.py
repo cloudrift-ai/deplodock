@@ -79,6 +79,12 @@ class ElementwiseImpl:
     def __call__(self, *args):
         return self._fn(*args)
 
+    def __reduce__(self):
+        # The resolved ``_fn`` is a numpy ufunc or one of the lambdas in
+        # ``_NAME_TO_FN`` — neither pickles cleanly. Serialize the name
+        # and re-resolve on unpickle by going through ``__init__``.
+        return (self.__class__, (self.name,))
+
     @property
     def commutative(self) -> bool:
         return self.name in self._COMMUTATIVE

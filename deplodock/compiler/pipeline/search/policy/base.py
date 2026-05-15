@@ -1,33 +1,37 @@
-"""``Search`` ABC shared by the concrete policies."""
+"""``Search`` ABC shared by the concrete policies.
+
+- ``push`` enqueues spawned candidates (primary + forks);
+- ``pop`` returns the next candidate to explore (``None`` ends the run);
+- ``observe`` is called by :meth:`Pipeline.tune` once per yielded
+  terminal, with the aggregated ``reward`` (``1/total_us``) and
+  ``status`` from the bench. Default is a no-op; :class:`TuningSearch`
+  overrides it to backprop on its MCTS tree.
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
+from deplodock.compiler.pipeline.search.db import PerfStats
 
 
 class Search(ABC):
-    """Search-strategy hook. The engine pushes spawned candidates and
-    pops the next one to expand. ``pop`` returning ``None`` ends the
-    search. Implementations choose both the ordering (DFS / BFS /
-    priority / MCTS / whatever) and the termination condition (greedy
-    stops at first terminal; exhaustive runs the queue dry).
+    @abstractmethod
+    def push(self, primary: LazyCandidate, *forks: LazyCandidate, best: LazyCandidate | None = None) -> None:
+        """Enqueue ``primary`` and the rest of the fork siblings.
 
-    Everything in the search layer is :class:`LazyCandidate` —
-    concrete candidates from the engine arrive wrapped in a
-    zero-chain ``LazyCandidate`` (``resolve`` returns the inner
-    Candidate unchanged) so push/pop stays uniform across "the
-    rollout's current cand" and "an autotune fork that hasn't been
-    materialized yet".
-
-    ``push(primary, *forks)`` carries the primary candidate plus
-    every sibling spawned at the same rewrite point. Exhaustive
-    policies register all of them; greedy keeps only ``primary``."""
+        ``best`` (optional) carries the fork that matches the
+        DB's best-known lowering for the rewrite site. Greedy uses it
+        to prefer the post-tuning winner over the rule's default
+        option-0; tuning ignores it (it explores every fork)."""
 
     @abstractmethod
-    def push(self, primary: LazyCandidate, *forks: LazyCandidate) -> None: ...
+    def pop(self) -> LazyCandidate | None: ...
 
-    @abstractmethod
-    def pop(self) -> LazyCandidate | None:  # None when exhausted
-        ...
+    def observe(self, stats: PerfStats, status: str) -> None:  # noqa: B027
+        """Hook for the policy to consume the terminal's measurement.
+        ``stats`` aggregates the terminal's per-iter latencies in
+        microseconds (median / mean / variance / etc.); ``status`` is
+        ``"ok"`` or ``"bench_fail"``. Default no-op (greedy doesn't
+        use it)."""

@@ -16,16 +16,11 @@ class GreedySearch(Search):
     without pushing it back, the next ``pop`` finds the slot empty and
     returns ``None``, ending the search.
 
-    Used by ``run_pipeline`` for single-shot compiles. The DB is held
-    only so callers (and ``record_terminal``) have a place to write
-    measurements through; greedy itself never reads it — every fork
-    point picks option 0 unconditionally. Hop-by-hop DB replay can be
-    layered on later as a dedicated policy if/when the autotuner needs
-    deterministic resume from prior runs.
-
-    No ``tree`` attribute — greedy never participates in the MCTS
-    accounting, so :func:`record_terminal` skips the tree bump when it
-    sees ``getattr(search, "tree", None) is None``."""
+    Used by ``run_pipeline`` for single-shot compiles. At fork points
+    the engine looks up the lowering table and passes the DB-best fork
+    via ``push(..., best=...)``; greedy prefers it over the rule's
+    default option-0. When no DB entry exists (untuned site), greedy
+    falls back to ``primary``."""
 
     def __init__(self, *, db: SearchDB | None = None) -> None:
         self._db = db if db is not None else SearchDB()
@@ -35,9 +30,9 @@ class GreedySearch(Search):
     def db(self) -> SearchDB:
         return self._db
 
-    def push(self, primary: LazyCandidate, *forks: LazyCandidate) -> None:
-        del forks  # greedy always picks option-0 (``primary``)
-        self._pending = primary
+    def push(self, primary: LazyCandidate, *forks: LazyCandidate, best: LazyCandidate | None = None) -> None:
+        del forks  # greedy keeps a single candidate per fork point
+        self._pending = best if best is not None else primary
 
     def pop(self) -> LazyCandidate | None:
         c, self._pending = self._pending, None

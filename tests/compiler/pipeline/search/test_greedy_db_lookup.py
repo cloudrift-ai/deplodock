@@ -1,12 +1,16 @@
-"""GreedySearch always picks option-0 at fork points.
+"""GreedySearch prefers the DB-best lowering when one is available.
 
 Drives a real fork point (``005_blockify_launch`` on a matmul) through
 ``run_pipeline`` and asserts:
 
-1. **Baseline**: fresh DB → greedy picks option 0 (rule's heuristic
-   ordering).
-2. **DB seeded with an unrelated row**: greedy still picks option 0
-   (DB lookup was removed; greedy is purely option-0).
+1. **Baseline**: fresh DB → no lookup hit → greedy falls back to
+   option 0 (rule's heuristic ordering).
+2. **Irrelevant seed**: a ``lowering`` row keyed on an op we never see
+   doesn't match the fork's parent → greedy still falls back to
+   option 0.
+3. **Relevant seed**: a ``lowering`` row keyed on the fork's actual
+   parent and pointing at a non-option-0 child overrides the rule's
+   default; greedy resolves the seeded variant.
 """
 
 from __future__ import annotations
@@ -97,7 +101,7 @@ def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
     out: dict[str, tuple[str, str, dict]] = {}
     greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     _record_pair(out, _final_tile_op(greedy))
-    search = TuningSearch(db=SearchDB(), patience=10**6)
+    search = TuningSearch(patience=10**6)
     candidates = list(Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()))
     for cand in candidates:
         _record_pair(out, _final_tile_op(cand.graph))
@@ -135,3 +139,19 @@ def test_irrelevant_seed_is_ignored() -> None:
     out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=db)
     bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
     assert bn_bm == option_zero_knobs
+
+
+def test_seeded_lowering_overrides_option_zero() -> None:
+    """A ``lowering`` row keyed on the fork's real parent steers greedy
+    to the seeded child instead of the rule's option-0."""
+    variants = _enumerate_blockify_variants()
+    assert len(variants) >= 2, f"need ≥2 variants to test; got {len(variants)}"
+    option_zero_knobs = variants[0][2]
+    parent_key, child_key, alt_knobs = next(v for v in variants[1:] if v[2] != option_zero_knobs)
+
+    db = SearchDB()
+    db.record_lowering(parent_key, "tile", child_key, "tile", knobs=alt_knobs, measured_median_us=1.0)
+
+    out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=db)
+    bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
+    assert bn_bm == alt_knobs

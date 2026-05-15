@@ -645,7 +645,7 @@ class _BenchWorker:
     dirty CUDA stream (and any kernels still queued behind a hung launch)
     dies with the process, so the *next* bench starts on a clean device —
     fixes the "autotune hangs on the variant AFTER a bench_fail" pathology
-    documented in ``recorder.py``.
+    (see ``Pipeline._bench_terminal``).
 
     Lifecycle: one worker per ``CudaBackend`` instance, lazily spawned on
     the first ``bench`` call and respawned on timeout / EOF / error. The
@@ -739,9 +739,9 @@ class _BenchWorker:
 
         resp = pickle.loads(body)
         if not resp.get("ok"):
-            # Surface the worker-side exception verbatim. ``recorder.py``
-            # already treats this as a generic bench failure and pins
-            # ``bench_fail``.
+            # Surface the worker-side exception verbatim.
+            # ``Pipeline._bench_terminal`` treats this as a generic bench
+            # failure and pins ``bench_fail``.
             raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
         return resp["result"]
 
