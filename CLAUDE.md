@@ -82,7 +82,12 @@ same worker.
 
 ## Documentation Conventions
 
-- Target ~120 characters for `ARCHITECTURE.md`, `README.md`, and other docs (ASCII diagrams, tables, prose). Wider is fine if a table or diagram reads better that way — some overflow is acceptable. Python code stays under 140 chars (Ruff-enforced).
+**Wrap every `.md` file in the repo to ~120 characters.** This includes `README.md`, every `ARCHITECTURE.md`, every file
+under `plans/`, every file under `docs/`, and any other markdown anywhere in the tree. Do NOT wrap at 70–80 characters —
+that is the default markdown habit, and it is wrong for this repo. Aim for lines in the 90–120 range.
+
+Table rows, ASCII diagrams, and long URLs may overflow past 120 if wrapping would hurt readability — that's the only
+acceptable reason to go wider. Python code stays under 140 chars (Ruff-enforced).
 
 ## Contribution Instructions
 
