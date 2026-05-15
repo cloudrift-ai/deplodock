@@ -20,5 +20,11 @@ benchmark:
   random_output_len: 2000
 
 matrices:
-  deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-  deploy.gpu_count: 1
+  - deploy.gpu: "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    deploy.gpu_count: 1
+
+  - deploy.gpu: "NVIDIA H200 141GB"
+    deploy.gpu_count: 1
+    engine.llm.max_concurrent_requests: 32
+    engine.llm.vllm.extra_args: "--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --language-model-only --speculative-config '{\"method\":\"qwen3_next_mtp\",\"num_speculative_tokens\":2}'"
+    benchmark.max_concurrency: 32
