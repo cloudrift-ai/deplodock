@@ -166,7 +166,7 @@ def _tune_via_subprocess(case: Case) -> None:
         case.code,
         "-v",
     ]
-    if (patience := os.environ.get("DEPLODOCK_TUNE_PATIENCE")):
+    if patience := os.environ.get("DEPLODOCK_TUNE_PATIENCE"):
         cmd += ["--patience", patience]
     env = dict(os.environ)
     sys.stderr.write(f"[tune {case.name}] launching: {' '.join(cmd)}\n")
