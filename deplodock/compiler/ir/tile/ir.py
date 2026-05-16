@@ -55,6 +55,7 @@ from deplodock.compiler.ir.expr import (
     Var,
 )
 from deplodock.compiler.ir.stmt import (
+    INDENT,
     Accum,
     Assign,
     Body,
@@ -415,7 +416,8 @@ class Stage(Stmt):
             srcs = ", ".join(src.input for src in self.source_loads)
             cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes)
             pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
-            return [f"{indent}{self.name} = {type(self).__name__}(fuse[{srcs}], cache=({cache})){pad}{self._pretty_extra()}"]
+            head = f"{indent}{self.name} = {type(self).__name__}(fuse[{srcs}], cache=({cache})){pad}{self._pretty_extra()}:"
+            return [head, *pretty_body(self.body, indent + INDENT)]
         origin = ", ".join(e.pretty() for e in self.origin)
         if isinstance(self.addressing, AffineAddressing):
             slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.addressing.dims, strict=True))
