@@ -157,12 +157,9 @@ def _double_buffer(loop: Loop) -> Loop | None:
             new_body.append(
                 BufferedStage(
                     name=s.name,
-                    buf=s.buf,
-                    origin=s.origin,
                     axes=s.axes,
-                    addressing=s.addressing,
-                    pad=s.pad,
                     body=s.body,
+                    pad=s.pad,
                     buffer_count=_BUFFER_COUNT,
                     phase=phase,
                 )

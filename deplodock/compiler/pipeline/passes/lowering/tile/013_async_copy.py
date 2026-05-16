@@ -78,12 +78,9 @@ def _process(body: Body, n_threads: int) -> Body:
             new_body.append(
                 AsyncBufferedStage(
                     name=s.name,
-                    buf=s.buf,
-                    origin=s.origin,
                     axes=s.axes,
-                    addressing=s.addressing,
-                    pad=s.pad,
                     body=s.body,
+                    pad=s.pad,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
                 )

@@ -159,12 +159,9 @@ def _process(
             new_body.append(
                 TmaBufferedStage(
                     name=s.name,
-                    buf=s.buf,
-                    origin=s.origin,
                     axes=s.axes,
-                    addressing=s.addressing,
-                    pad=s.pad,
                     body=s.body,
+                    pad=s.pad,
                     buffer_count=s.buffer_count,
                     phase=s.phase,
                     swizzle=SwizzleMode.NONE,

@@ -197,9 +197,40 @@ class TemplateAddressing:
     exprs: tuple[Expr, ...]
 
 
+def trivial_stage_body(
+    name: str,
+    buf: str,
+    origin: tuple[Expr, ...],
+    axes: tuple[Axis, ...],
+    addressing: AffineAddressing | TemplateAddressing,
+) -> Body:
+    """Build the canonical ``Load + Write`` body for a cooperative-load
+    Stage. Source-side index is reconstructed from ``origin + cache_var``
+    pairs (affine) or kept verbatim (template); the Write target is the
+    Stage's smem name with cache-local Var coords.
+
+    Single source of truth for body synthesis: ``Stage`` callers that don't
+    fuse anything into the producer use this helper directly; the
+    ``primary_load`` / ``origin`` / ``addressing`` properties round-trip
+    through it."""
+    cache_index = tuple(Var(ax.name) for ax in axes)
+    if isinstance(addressing, AffineAddressing):
+        decoded: dict[int, Expr] = dict(zip(addressing.dims, cache_index, strict=True))
+        src_index = tuple(o if d not in decoded else o + decoded[d] for d, o in enumerate(origin))
+    else:
+        src_index = addressing.exprs
+    load_name = f"{name}__src"
+    return Body(
+        (
+            Load(name=load_name, input=buf, index=src_index),
+            Write(output=name, index=cache_index, value=load_name),
+        )
+    )
+
+
 @dataclass
 class Stage(Stmt):
-    """Operand-cache declaration — stage a contiguous slab of ``buf``
+    """Operand-cache declaration — stage a contiguous slab of a gmem buffer
     into a named local buffer for reuse across the surrounding ``Tile``
     body.
 
@@ -209,25 +240,25 @@ class Stage(Stmt):
     trailing ``Sync`` so the freshly-loaded smem is visible to all
     threads in the CTA.
 
-    Slab geometry:
+    Carried state:
 
-    - ``origin`` — per-source-dim CTA-uniform anchor (length == source
-      buffer rank). Each entry is an Expr that's constant across the
-      threads of a CTA — typically ``BIND_BLOCK`` Vars and Literals.
+    - ``name`` — staged buffer's SSA-like identifier. Subsequent
+      ``Load(input=name, index=cache-local)`` reads in the surrounding
+      Tile body refer to it directly.
     - ``axes`` — cache axes (smem layout, in this order).
-    - ``addressing`` — discriminated union of ``AffineAddressing``
-      (fast path, ``origin + decoded``) and ``TemplateAddressing``
-      (escape hatch carrying the original symbolic Load index).
+    - ``body`` — cooperative-load program. Today this is the trivial
+      ``Load(input=src_buf, index=...); Write(output=name, ...)`` pair
+      built by :func:`trivial_stage_body`; future producer-side fusion
+      will inline elementwise compute between the Load and Write.
+    - ``pad`` — bank-conflict-breaking padding (per cache axis).
 
-    SSA-like: ``name`` is the staged buffer's identifier; subsequent
-    ``Load(input=name, index=cache-local)`` reads in the body refer to
-    it directly. The strategy that inserts the Stage is also responsible
-    for rewriting body Loads to target ``name`` with cache-local Vars
-    (matching ``axes`` in order).
+    The legacy slab-geometry fields (``buf``, ``origin``, ``addressing``)
+    are now derived from ``body``'s primary Load via properties:
 
-    The slab form maps directly to TMA / ``cp.async.bulk`` tensor-
-    descriptor copies: ``origin`` is the box-origin and ``axes``
-    extents are the box-extents.
+    - ``buf = body[0].input``
+    - ``origin = body[0].index`` with cache-axis Vars substituted to 0
+    - ``addressing`` = ``AffineAddressing`` iff every cache axis appears
+      coef-1 in exactly one source dim, else ``TemplateAddressing``
 
     Transport is encoded structurally via subclass:
 
@@ -239,10 +270,8 @@ class Stage(Stmt):
     """
 
     name: str
-    buf: str
-    origin: tuple[Expr, ...]
     axes: tuple[Axis, ...]
-    addressing: AffineAddressing | TemplateAddressing
+    body: Body
     # Per-cache-axis extra extent added to the smem allocation (not to the
     # cooperative-load extent). Empty tuple = no padding. Used by the bank-
     # conflict pass to break stride-aliased smem layouts: padding dim ``d``
@@ -250,15 +279,6 @@ class Stage(Stmt):
     # 32-way bank conflicts that arise when adjacent threads stride through
     # power-of-2 multiples of bank width.
     pad: tuple[int, ...] = ()
-    # Cooperative-load program: the per-CTA logical compute that produces
-    # the staged slab. Trivial form (auto-synthesized when not provided) is
-    # ``Load(input=buf, index=origin+cache_vars); Write(output=name,
-    # index=cache_vars, value=loaded)`` — equivalent to today's
-    # synthesized-from-(buf, origin, axes, addressing) materializer path.
-    # Non-trivial bodies (fused producer compute) are reserved for the
-    # follow-up stage-epilogue fusion pass; the materializer trip-wire
-    # rejects them until phase 2.
-    body: Body = field(default_factory=Body)
 
     def __post_init__(self) -> None:
         # Coerce tuple inputs (e.g. from rewrite/with_bodies that build a
@@ -266,37 +286,92 @@ class Stage(Stmt):
         # walkers can call ``.map`` / ``.iter`` on Stage's nested body.
         if not isinstance(self.body, Body):
             self.body = Body.coerce(self.body)
-        if not self.body:
-            self.body = self._synthesize_trivial_body()
+        if len(self.body) < 2:
+            raise ValueError(f"Stage {self.name!r}: body must contain at least one Load and one Write, got {len(self.body)} stmts")
 
-    def _synthesize_trivial_body(self) -> Body:
-        cache_index = tuple(Var(ax.name) for ax in self.axes)
-        if isinstance(self.addressing, AffineAddressing):
-            decoded: dict[int, Expr] = dict(zip(self.addressing.dims, cache_index, strict=True))
-            src_index = tuple(o if d not in decoded else o + decoded[d] for d, o in enumerate(self.origin))
-        else:
-            src_index = self.addressing.exprs
-        load_name = f"{self.name}__src"
-        return Body(
-            (
-                Load(name=load_name, input=self.buf, index=src_index),
-                Write(output=self.name, index=cache_index, value=load_name),
-            )
-        )
-
-    # Phase 1: ``body`` is auxiliary metadata. The materializer still reads
-    # legacy ``(buf, origin, addressing)`` fields, and several tile passes
-    # (notably ``008_register_tile``) rely on ``Stage`` being opaque to
-    # generic body walkers — exposing the body via ``nested()`` would let
-    # F-axis replication descend into the cooperative-load Loads and
-    # corrupt their semantics. So we keep the leaf-stmt protocol here;
+    # Stage stays opaque to generic body walkers (no ``nested()`` /
+    # ``with_bodies()`` override). Exposing the cooperative-load Loads to
+    # ``008_register_tile``'s ``Body.map``-based F-axis replication would
+    # corrupt their semantics — cache-axis Vars in the body are
+    # smem-local, not values that participate in F-axis register tiling.
     # σ-substitution through the body is handled explicitly by the
     # Stage-specific ``rewrite`` / ``simplify`` handlers in
-    # ``deplodock/compiler/ir/tile/passes.py``. Phase 2 (when materializer
-    # walks ``body`` directly) revisits this.
+    # ``deplodock/compiler/ir/tile/passes.py``.
 
     def deps(self) -> tuple[str, ...]:
         return ()
+
+    # ------------------------------------------------------------------
+    # Derived slab-geometry views (legacy ``buf`` / ``origin`` /
+    # ``addressing`` field accessors, re-expressed as body-driven
+    # properties so the body is the single source of truth).
+    # ------------------------------------------------------------------
+
+    @property
+    def primary_load(self) -> Load:
+        """The producer-side Load that anchors this Stage's slab.
+
+        Today every Stage body has exactly one Load (trivial cooperative
+        load); raises if a future fused body has more than one source
+        Load. Callers needing all source Loads should use
+        :attr:`source_loads`."""
+        loads = tuple(s for s in self.body if isinstance(s, Load))
+        if len(loads) != 1:
+            raise ValueError(
+                f"Stage {self.name!r}: primary_load undefined — body has {len(loads)} Loads "
+                "(multi-source fused stages must use ``source_loads``)."
+            )
+        return loads[0]
+
+    @property
+    def source_loads(self) -> tuple[Load, ...]:
+        """Every Load in ``body``, in body order. Trivial body returns a
+        1-tuple; fused bodies (future) may return more."""
+        return tuple(s for s in self.body if isinstance(s, Load))
+
+    @property
+    def buf(self) -> str:
+        """Source gmem buffer name. ``body[0].input`` for the trivial /
+        single-source case."""
+        return self.primary_load.input
+
+    @property
+    def origin(self) -> tuple[Expr, ...]:
+        """Per-source-dim CTA-uniform anchor: ``primary_load.index`` with
+        every cache-axis Var substituted to 0 and simplified."""
+        from deplodock.compiler.ir.expr import SimplifyCtx  # noqa: PLC0415
+        from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+
+        sigma = Sigma({ax.name: Literal(0, "int") for ax in self.axes})
+        ctx = SimplifyCtx.empty()
+        return tuple(sigma.reduce(e, ctx) for e in self.primary_load.index)
+
+    @property
+    def addressing(self) -> AffineAddressing | TemplateAddressing:
+        """Affine if every cache axis appears coef-1 in exactly one source
+        dim of ``primary_load.index``, else template (verbatim index)."""
+        from deplodock.compiler.ir.expr import SimplifyCtx  # noqa: PLC0415
+        from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+
+        index = self.primary_load.index
+        var_to_dim: dict[str, int] = {}
+        for ax in self.axes:
+            dims = [d for d, e in enumerate(index) if ax.name in e.free_vars()]
+            if len(dims) != 1:
+                return TemplateAddressing(exprs=index)
+            var_to_dim[ax.name] = dims[0]
+
+        ctx = SimplifyCtx.empty()
+        origin = self.origin
+        for ax in self.axes:
+            d = var_to_dim[ax.name]
+            one_sigma = Sigma({a.name: (Literal(1, "int") if a.name == ax.name else Literal(0, "int")) for a in self.axes})
+            actual = one_sigma.reduce(index[d], ctx)
+            expected = (origin[d] + Literal(1, "int")).simplify(ctx)
+            if actual.pretty() != expected.pretty():
+                return TemplateAddressing(exprs=index)
+
+        return AffineAddressing(dims=tuple(var_to_dim[ax.name] for ax in self.axes))
 
     @property
     def alloc_extents(self) -> tuple[int, ...]:
