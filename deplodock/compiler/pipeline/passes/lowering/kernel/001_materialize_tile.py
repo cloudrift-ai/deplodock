@@ -150,6 +150,22 @@ def _materialize(blk: Tile) -> Stmt:
     mbar_prologue: list[Stmt] = []
     declared_mbar: set[str] = set()
 
+    # Compute-Stage Smem hoist: a multi-source Stage (produced by 007b
+    # split) emits its body inside the K-outer loop body — Smem decls
+    # inside a loop don't reach kernel scope in CUDA. Walk the body once,
+    # pre-emit Smem decls for every multi-source Stage at kernel scope,
+    # and mark them ``declared_smem`` so ``_emit_stage``'s in-loop emit
+    # is dedup'd. Single-source stages are hoisted to prologue naturally
+    # by 015 (their first emission is σ_first above the K-outer loop).
+    compute_stage_prologue: list[Stmt] = []
+    for stmt in body.iter():
+        if isinstance(stmt, Stage) and len(stmt.source_loads) > 1:
+            if stmt.name in declared_smem:
+                continue
+            extents = stmt.alloc_extents  # padded cache extents (no buffer_count — compute Stage isn't buffered)
+            compute_stage_prologue.append(Smem(name=stmt.name, extents=extents))
+            declared_smem.add(stmt.name)
+
     stage_group, wait_group, group_stage_names, group_buffer_count = _partition_tma_groups(body)
     has_tma = bool(group_stage_names)
     # Per-stage issuer thread = position of stage name within its group
@@ -394,6 +410,8 @@ def _materialize(blk: Tile) -> Stmt:
             prologue.append(Cond(cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")), body=tuple(mbar_inits)))
             prologue.append(Sync())
         new_body = prologue + new_body
+    if compute_stage_prologue:
+        new_body = compute_stage_prologue + new_body
     return Tile(axes=axes, body=_drop_redundant_syncs(new_body))
 
 

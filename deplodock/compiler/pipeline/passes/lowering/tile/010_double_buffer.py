@@ -170,6 +170,13 @@ def _double_buffer(loop: Loop) -> Loop | None:
             )
         elif isinstance(s, Loop) and s.is_reduce:
             new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
+        elif isinstance(s, Stage) and len(s.source_loads) > 1:
+            # Multi-source compute Stage (produced by 007b_split). Its
+            # body reads from sibling transport stages' smem buffers,
+            # which we just promoted to BufferedStage. Prepend the same
+            # phase index to those body Loads so the compute consumes
+            # the slot the producer just wrote.
+            new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
         else:
             new_body.append(s)
     return dc_replace(loop, body=new_body)
