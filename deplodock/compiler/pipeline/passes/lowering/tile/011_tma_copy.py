@@ -154,6 +154,7 @@ def _process(
         if (
             isinstance(s, BufferedStage)
             and not isinstance(s, (AsyncBufferedStage, TmaBufferedStage))
+            and len(s.source_loads) == 1
             and _eligible(s, src_ranks, src_shapes)
         ):
             new_body.append(

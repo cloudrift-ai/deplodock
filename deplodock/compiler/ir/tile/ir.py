@@ -401,10 +401,21 @@ class Stage(Stmt):
         return n
 
     def exprs(self) -> tuple[Expr, ...]:
-        template = self.addressing.exprs if isinstance(self.addressing, TemplateAddressing) else ()
-        return (*self.origin, *template)
+        # Exprs visible to generic Expr walkers (axis-dep analysis in 008,
+        # σ-substitution targets in 015). Iterate every source Load's index
+        # so fused stages expose all gmem references; trivial stages
+        # reduce to ``(*origin,)`` (one Load, AffineAddressing).
+        out: tuple[Expr, ...] = ()
+        for src in self.source_loads:
+            out = (*out, *src.index)
+        return out
 
     def pretty(self, indent: str = "") -> list[str]:
+        if len(self.source_loads) > 1:
+            srcs = ", ".join(src.input for src in self.source_loads)
+            cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes)
+            pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
+            return [f"{indent}{self.name} = {type(self).__name__}(fuse[{srcs}], cache=({cache})){pad}{self._pretty_extra()}"]
         origin = ", ".join(e.pretty() for e in self.origin)
         if isinstance(self.addressing, AffineAddressing):
             slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.addressing.dims, strict=True))
@@ -738,7 +749,8 @@ class TileOp(Op):
         bufs: dict[str, None] = {}
         for s in self:
             if isinstance(s, Stage):
-                bufs.setdefault(s.buf, None)
+                for src in s.source_loads:
+                    bufs.setdefault(src.input, None)
             elif isinstance(s, Load) and s.input not in stage_names:
                 bufs.setdefault(s.input, None)
         return tuple(bufs)

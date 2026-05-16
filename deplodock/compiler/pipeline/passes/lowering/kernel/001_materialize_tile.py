@@ -52,7 +52,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TreeHalve,
     WarpShuffle,
 )
-from deplodock.compiler.ir.stmt import Accum, Cond, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -195,7 +195,7 @@ def _materialize(blk: Tile) -> Stmt:
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
-        _assert_trivial_stage_body(stage)
+        _assert_stage_body_shape(stage)
         desc_name = f"{stage.name}_desc"
         gid = stage_group[id(stage)]
         mbar_name = _mbar_name(gid)
@@ -646,23 +646,24 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
 # ---------------------------------------------------------------------------
 
 
-def _assert_trivial_stage_body(stage: Stage) -> None:
-    """Phase-1 trip-wire: materializer still reads legacy (buf, origin,
-    addressing) fields, so the Stage body must be the auto-synthesized
-    trivial pair ``Load(input=buf, ...) ; Write(output=name, ...)``.
-    Anything richer (fused producer compute) requires phase 2.
+def _assert_stage_body_shape(stage: Stage) -> None:
+    """Materializer body precondition. Accepted bodies are a linear chain
+    of ``Load`` / ``Assign`` followed by exactly one terminal ``Write``
+    whose output is ``stage.name``. Single-source (trivial) and
+    multi-source (post-fusion) bodies both pass; anything richer (nested
+    Loops / Conds / extra Writes) is rejected so the materializer's flat
+    cooperative-load template stays meaningful.
     """
-    if len(stage.body) != 2:
-        raise AssertionError(
-            f"Stage {stage.name!r}: expected trivial 2-stmt body (Load, Write), "
-            f"got {len(stage.body)} stmts — fused stage bodies are not yet supported "
-            f"by the materializer (phase 2 required)."
-        )
-    load, write = stage.body
-    if not isinstance(load, Load) or load.input != stage.buf:
-        raise AssertionError(f"Stage {stage.name!r}: body[0] must be Load(input={stage.buf!r}), got {load!r}")
-    if not isinstance(write, Write) or write.output != stage.name:
-        raise AssertionError(f"Stage {stage.name!r}: body[1] must be Write(output={stage.name!r}), got {write!r}")
+    if len(stage.body) < 2:
+        raise AssertionError(f"Stage {stage.name!r}: body must contain ≥ 1 Load and a trailing Write, got {len(stage.body)} stmts")
+    if not any(isinstance(s, Load) for s in stage.body):
+        raise AssertionError(f"Stage {stage.name!r}: body must contain at least one Load")
+    last = stage.body[-1]
+    if not isinstance(last, Write) or last.output != stage.name:
+        raise AssertionError(f"Stage {stage.name!r}: body must end with Write(output={stage.name!r}), got {last!r}")
+    for s in stage.body[:-1]:
+        if not isinstance(s, (Load, Assign)):
+            raise AssertionError(f"Stage {stage.name!r}: body may only contain Load / Assign / final Write, got {type(s).__name__}")
 
 
 def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
@@ -689,7 +690,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     1's leading Sync is harmless (no prior state)."""
     if not stage.axes:
         raise ValueError(f"Stage {stage.name!r} has no cache axes")
-    _assert_trivial_stage_body(stage)
+    _assert_stage_body_shape(stage)
     extents = tuple(int(ax.extent) for ax in stage.axes)
     padded_extents = stage.alloc_extents
 
@@ -710,23 +711,32 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         coord_for = _flat_decode(stage.axes, iter_axis.name)
 
     smem_index = tuple(coord_for[ax.name] for ax in stage.axes)
-    if isinstance(stage.addressing, TemplateAddressing):
-        # Non-affine path (``/``, ``%`` from collapsed-reshape views).
-        # Cache extent equals the raw axis extent (no F-scale baked in),
-        # so substituting cache-axis Vars with their iter coords into
-        # the original Load index gives the right source address per
-        # cache position. Affine cases stay on the additive
-        # ``origin + decoded`` path because their cache extent IS scaled
-        # by F, so iter coord directly equals the cache-relative source
-        # position — no need to re-multiply via F.
-        from deplodock.compiler.ir.sigma import Sigma as _Sigma
+    # Source-index reconstruction is only used by the trivial-body /
+    # cp.async paths below. For fused (multi-source) bodies we walk the
+    # body's Loads directly and σ-rewrite their indices, so ``stage.addressing``
+    # is never consulted (it raises on multi-Load bodies). Single-Load
+    # bodies always have a well-defined addressing.
+    trivial = len(stage.source_loads) == 1 and len(stage.body) == 2
+    if trivial:
+        if isinstance(stage.addressing, TemplateAddressing):
+            # Non-affine path (``/``, ``%`` from collapsed-reshape views).
+            # Cache extent equals the raw axis extent (no F-scale baked in),
+            # so substituting cache-axis Vars with their iter coords into
+            # the original Load index gives the right source address per
+            # cache position. Affine cases stay on the additive
+            # ``origin + decoded`` path because their cache extent IS scaled
+            # by F, so iter coord directly equals the cache-relative source
+            # position — no need to re-multiply via F.
+            from deplodock.compiler.ir.sigma import Sigma as _Sigma
 
-        cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
-        source_index = tuple(cache_sigma.apply(e) for e in stage.addressing.exprs)
+            cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
+            source_index = tuple(cache_sigma.apply(e) for e in stage.addressing.exprs)
+        else:
+            assert isinstance(stage.addressing, AffineAddressing)
+            decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.addressing.dims, stage.axes, strict=True)}
+            source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
     else:
-        assert isinstance(stage.addressing, AffineAddressing)
-        decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.addressing.dims, stage.axes, strict=True)}
-        source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
+        source_index = ()  # unused on the fused path
 
     # Buffered stages prepend a phase dim to the smem allocation and to
     # both the cooperative-load write index and (downstream) every body
@@ -752,15 +762,39 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         )
         return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
 
-    load_name = f"{stage.name}_v"
+    if trivial:
+        # Trivial body fast path — preserves byte-identical Kernel IR for
+        # every non-fused stage (matches the legacy ``Load + Write`` shape
+        # the rest of the compiler / golden tests expect).
+        load_name = f"{stage.name}_v"
+        cooperative_load = StridedLoop(
+            axis=iter_axis,
+            start=tid_expr,
+            step=Literal(n_threads, "int"),
+            body=(
+                Load(name=load_name, input=stage.buf, index=source_index),
+                Write(output=stage.name, index=smem_index, value=load_name),
+            ),
+        )
+        return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
+
+    # Fused-body path: the Stage body carries the full producer program
+    # (Loads from multiple gmem buffers + elementwise compute + final
+    # Write to smem). σ-rewrite cache-axis Vars to per-thread flat-iter
+    # coords and emit the whole body inside the cooperative StridedLoop.
+    from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
+
+    cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
+
+    def _identity(name: str) -> str:
+        return name
+
+    walked_body = tuple(s.rewrite(_identity, cache_sigma) for s in stage.body)
     cooperative_load = StridedLoop(
         axis=iter_axis,
         start=tid_expr,
         step=Literal(n_threads, "int"),
-        body=(
-            Load(name=load_name, input=stage.buf, index=source_index),
-            Write(output=stage.name, index=smem_index, value=load_name),
-        ),
+        body=walked_body,
     )
     return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
 

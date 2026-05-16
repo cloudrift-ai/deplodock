@@ -152,7 +152,11 @@ def _double_buffer(loop: Loop) -> Loop | None:
     staged_names: set[str] = set()
     new_body: list[Stmt] = []
     for s in loop.body:
-        if isinstance(s, Stage):
+        # Fused stages (multi-source body) keep sync transport — the
+        # double-buffer pass only handles single-source slabs because
+        # the body-Load-rewrite below (phase prefix on smem reads) assumes
+        # one cooperative load per stage.
+        if isinstance(s, Stage) and len(s.source_loads) == 1:
             staged_names.add(s.name)
             new_body.append(
                 BufferedStage(

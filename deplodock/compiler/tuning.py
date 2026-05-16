@@ -209,7 +209,10 @@ def _external_input_count(stmts) -> int:
     bufs: set[str] = set()
     for s in body.iter():
         if isinstance(s, Stage):
-            bufs.add(s.buf)
+            # Fused stages load from multiple gmem buffers (silu-mul → gate, up);
+            # count each unique source so the heuristic sees the right input count.
+            for src_load in s.source_loads:
+                bufs.add(src_load.input)
         elif isinstance(s, Load) and s.input not in stage_names:
             bufs.add(s.input)
     return len(bufs)
