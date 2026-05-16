@@ -117,7 +117,7 @@ def _maybe_rewrite(
     for s in tile.body.iter():
         if isinstance(s, (AsyncBufferedStage, TmaBufferedStage)):
             continue
-        if isinstance(s, BufferedStage) and not _eligible(s, src_ranks, src_shapes):
+        if isinstance(s, BufferedStage) and len(s.source_loads) == 1 and not _eligible(s, src_ranks, src_shapes):
             raise RuleSkipped(
                 f"stage {s.name!r} (buf={s.buf!r}) not TMA-eligible; "
                 "leaving every stage in this tile to cp.async (avoids mixed-mode pipeline deadlock)"

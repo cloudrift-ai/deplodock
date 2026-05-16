@@ -162,7 +162,11 @@ def _materialize(blk: Tile) -> Stmt:
         if isinstance(stmt, Stage) and len(stmt.source_loads) > 1:
             if stmt.name in declared_smem:
                 continue
-            extents = stmt.alloc_extents  # padded cache extents (no buffer_count — compute Stage isn't buffered)
+            # When the compute Stage was promoted to BufferedStage (DEPLODOCK_BUFFER_COMPUTE),
+            # include buffer_count in the leading dim of the smem alloc.
+            extents = stmt.alloc_extents
+            if isinstance(stmt, BufferedStage):
+                extents = (stmt.buffer_count, *extents)
             compute_stage_prologue.append(Smem(name=stmt.name, extents=extents))
             declared_smem.add(stmt.name)
 
@@ -808,6 +812,16 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         return name
 
     walked_body = tuple(s.rewrite(_identity, cache_sigma) for s in stage.body)
+    # Buffered fused stages: the trivial-path prepends ``stage.phase`` to
+    # ``smem_index`` so the cooperative Write lands in the current ring
+    # slot. The fused path's terminal Write comes from the body's own
+    # Write stmt (with cache-local index) — apply the same prepend.
+    if isinstance(stage, BufferedStage):
+        *prefix, final = walked_body
+        assert isinstance(final, Write) and final.output == stage.name, (
+            f"Stage {stage.name!r}: buffered fused body must end with Write(output={stage.name!r}), got {final!r}"
+        )
+        walked_body = (*prefix, Write(output=final.output, index=(stage.phase, *final.index), value=final.value, reduce_op=final.reduce_op))
     cooperative_load = StridedLoop(
         axis=iter_axis,
         start=tid_expr,
