@@ -38,8 +38,11 @@ def register_tune_command(subparsers):
     parser.add_argument(
         "--patience",
         type=int,
-        default=20,
-        help=("Stop after this many consecutive measured variants haven't beaten the current best latency. Default: 20."),
+        default=None,
+        help=(
+            "Stop after this many consecutive measured variants haven't beaten the current best latency. "
+            "Falls back to ``DEPLODOCK_TUNE_PATIENCE`` env var, then to 60."
+        ),
     )
     parser.add_argument(
         "--ucb-c",
@@ -88,7 +91,8 @@ def handle_tune(args):
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
-    search = TuningSearch(patience=args.patience, ucb_c=args.ucb_c)
+    patience = args.patience if args.patience is not None else int(os.environ.get("DEPLODOCK_TUNE_PATIENCE", 60))
+    search = TuningSearch(patience=patience, ucb_c=args.ucb_c)
     t0 = time.monotonic()
     candidates: list = []
     try:

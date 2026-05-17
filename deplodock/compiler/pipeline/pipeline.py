@@ -488,8 +488,9 @@ class Pipeline:
         :func:`record_terminal` before being yielded — so subsequent
         candidates see the updated priority signal. Pass a ``Backend``
         (typically :class:`CudaBackend`) via ``backend=`` to record
-        real GPU-event latencies; omit it to record the stub
-        ``latency_us=1.0``.
+        real GPU-event latencies; omit it to skip persistence entirely
+        (terminals yield a stub ``latency_us=1.0`` but nothing is
+        written to ``db``).
 
         ``ctx`` is built once (probing the live device if not provided)
         and shared by every candidate."""
@@ -563,7 +564,18 @@ def _best_fork(forks, parent_cand, db):
     """Pick the fork whose pending option matches the lowering DB's
     best-known child for the parent op. Returns ``None`` when no row
     exists (untuned site), the parent op has no cache key, or no fork
-    matches the recorded child key (variant drifted)."""
+    matches the recorded child key (variant drifted).
+
+    The comparison is on ``op_cache_key`` of the post-apply option:
+    :meth:`Candidate.apply` merges ``parent.knobs`` into ``option.knobs``
+    on resolve so the source-chain child carries the cumulative knob
+    set, and the recorded ``child_key`` was hashed against that merged
+    set. Pre-apply (here) the option only has the rule's local delta,
+    so we replicate the merge before hashing — otherwise the cache key
+    of a freshly-emitted option never matches what tune recorded for
+    the same fork."""
+    from dataclasses import replace  # noqa: PLC0415
+
     from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
     first = forks[0]
@@ -579,11 +591,15 @@ def _best_fork(forks, parent_cand, db):
     row = db.lookup_lowering(parent_key)
     if row is None:
         return None
+    parent_knobs = getattr(parent_node.op, "knobs", None) or {}
     for f in forks:
         if f.pending is None:
             continue
         _, opt = f.pending
-        if op_cache_key(opt) == row.child_key:
+        opt_knobs = getattr(opt, "knobs", None) or {}
+        merged = {**parent_knobs, **opt_knobs}
+        probe = replace(opt, knobs=merged) if merged != opt_knobs else opt
+        if op_cache_key(probe) == row.child_key:
             return f
     return None
 
@@ -734,9 +750,15 @@ def _bench_terminal(cand, *, backend, db):
     agg = None
 
     if backend is None:
+        # No real measurement → do NOT persist. Writing the 1.0us stub
+        # to a shared DB used to clobber tuned ``best_median_us`` values
+        # (record_lowering / record_perf keep the minimum), so any plain
+        # ``deplodock run`` (which routes through ``Pipeline.run`` without
+        # a backend) was overwriting real autotune rows with 1.0us stubs.
+        # Tests that need lowering edges in stub mode should pass an
+        # explicit stub backend.
         for node in cuda_nodes:
             s = _point_stats(1.0)
-            _persist(node.op, stats=s, status="ok", backend_name=backend_name)
             agg = _accumulate(agg, s)
     else:
         logger.info("[tune] benching %d kernel(s) in graph", len(cuda_nodes))

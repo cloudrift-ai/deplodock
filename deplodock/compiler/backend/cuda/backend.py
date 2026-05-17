@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -59,6 +60,7 @@ class CudaBackend(Backend):
         debug: bool | None = None,
         dump: CompilerDump | None = None,
         bench_wall_timeout_s: float | None = None,
+        tune_db: Path | str | None = None,
     ) -> None:
         if debug is None:
             debug = os.environ.get(_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
@@ -73,10 +75,19 @@ class CudaBackend(Backend):
         # can SIGKILL a wedged worker. Defaults to ``None`` (in-process,
         # required when ``on_iter`` callbacks are supplied).
         self.bench_wall_timeout_s = bench_wall_timeout_s
+        # Persistent autotune cache. When provided, ``compile()`` opens
+        # this SearchDB so ``GreedySearch`` can pick tuned forks via
+        # ``best=``; otherwise it falls back to rule option-0.
+        self.tune_db = Path(tune_db) if tune_db is not None else None
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
-        return Pipeline.build(CUDA_PASSES, dump=self.dump).run(graph)
+        db = None
+        if self.tune_db is not None:
+            from deplodock.compiler.pipeline.search.db import SearchDB
+
+            db = SearchDB(path=self.tune_db)
+        return Pipeline.build(CUDA_PASSES, dump=self.dump).run(graph, db=db)
 
     def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
         # GPU serialization happens inside ``run_program`` /
