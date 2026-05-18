@@ -26,6 +26,7 @@ GPU_INSTANCE_TYPES = {
     ],
     "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": [
         ("cloudrift", "rtxpro6000-11-50-500-1l"),
+        ("cloudrift", "rtxpro6000mq-11-56-850-1lg"),
     ],
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": [
         ("gcp", "g4-standard"),
