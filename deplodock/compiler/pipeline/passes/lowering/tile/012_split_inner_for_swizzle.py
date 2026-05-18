@@ -48,6 +48,7 @@ from deplodock.compiler.ir.tile.ir import (
     SwizzleMode,
     TileOp,
     TmaBufferedStage,
+    trivial_stage_body,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -179,7 +180,14 @@ def _split_stage(stage: TmaBufferedStage, mode: SwizzleMode, ips: int) -> TmaBuf
         inner_axis.extent,
         mode.value,
     )
-    return dc_replace(stage, axes=new_axes, addressing=new_addressing, swizzle=mode)
+    # Body's Load index references the pre-split axis Var(orig.name); axes
+    # rewrite breaks that. Rebuild the trivial body from the new (axes,
+    # addressing) — origin doesn't change under the split. Precondition:
+    # 012 only runs on trivial-body TMA stages.
+    if len(stage.body) != 2:
+        raise RuleSkipped(f"stage {stage.name!r}: split requires trivial body, got {len(stage.body)} stmts")
+    new_body = trivial_stage_body(stage.name, stage.buf, stage.origin, new_axes, new_addressing)
+    return dc_replace(stage, axes=new_axes, body=new_body, swizzle=mode)
 
 
 def _swizzle_decode_load(load: Load, mode: SwizzleMode, ips: int, factor: int) -> Load:

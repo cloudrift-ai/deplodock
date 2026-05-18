@@ -52,7 +52,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AffineAddressing, Stage, TemplateAddressing, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AffineAddressing, Stage, TemplateAddressing, TileOp, trivial_stage_body
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
@@ -378,10 +378,8 @@ def _build_stages(
             stages.append(
                 Stage(
                     name=smem_name,
-                    buf=buf,
-                    origin=slab.origin,
                     axes=slab.cache_axes,
-                    addressing=addressing,
+                    body=trivial_stage_body(smem_name, buf, slab.origin, slab.cache_axes, addressing),
                 )
             )
             used_bytes += slab.n_bytes

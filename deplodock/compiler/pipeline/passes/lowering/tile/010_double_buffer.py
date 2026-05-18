@@ -148,19 +148,28 @@ def _double_buffer(loop: Loop) -> Loop | None:
     ``buffer_count=2`` and a shared phase expression, and rewrite each
     body Load that reads from a staged buffer to prepend the phase
     index."""
+    import os  # noqa: PLC0415
+
+    buffer_compute = os.environ.get("DEPLODOCK_BUFFER_COMPUTE", "0") in ("1", "true", "True")
+
     phase = Var(loop.axis.name) % Literal(_BUFFER_COUNT, "int")
     staged_names: set[str] = set()
+    # Collect existing stage names so we can identify compute stages
+    # (multi-source bodies whose sources are sibling stages, not gmem).
+    sibling_stage_names = {s.name for s in loop.body if isinstance(s, Stage)}
+
     new_body: list[Stmt] = []
     for s in loop.body:
-        if isinstance(s, Stage):
+        # Single-source transport stages — the standard double-buffer
+        # promotion (ring smem + phase prefix on body Load + reduce-body
+        # Load rewrite).
+        if isinstance(s, Stage) and len(s.source_loads) == 1:
             staged_names.add(s.name)
             new_body.append(
                 BufferedStage(
                     name=s.name,
-                    buf=s.buf,
-                    origin=s.origin,
                     axes=s.axes,
-                    addressing=s.addressing,
+                    body=s.body,
                     pad=s.pad,
                     buffer_count=_BUFFER_COUNT,
                     phase=phase,
@@ -168,6 +177,31 @@ def _double_buffer(loop: Loop) -> Loop | None:
             )
         elif isinstance(s, Loop) and s.is_reduce:
             new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
+        elif isinstance(s, Stage) and len(s.source_loads) > 1:
+            # Multi-source compute Stage (produced by 007b_split). Its
+            # body reads from sibling transport stages' smem buffers.
+            # Always prepend phase to those body Loads so the compute
+            # consumes the slot the producer just wrote. Additionally,
+            # when DEPLODOCK_BUFFER_COMPUTE is set, promote the compute
+            # stage itself to BufferedStage so its output (fused_smem) is
+            # ring-buffered — experimental, lets a downstream pass try to
+            # overlap compute and reduce across K_outer iterations.
+            sources_are_siblings = all(src.input in sibling_stage_names for src in s.source_loads)
+            new_inner_body = s.body.map(_make_load_rewriter(staged_names, phase))
+            if buffer_compute and sources_are_siblings:
+                staged_names.add(s.name)
+                new_body.append(
+                    BufferedStage(
+                        name=s.name,
+                        axes=s.axes,
+                        body=new_inner_body,
+                        pad=s.pad,
+                        buffer_count=_BUFFER_COUNT,
+                        phase=phase,
+                    )
+                )
+            else:
+                new_body.append(dc_replace(s, body=new_inner_body))
         else:
             new_body.append(s)
     return dc_replace(loop, body=new_body)
