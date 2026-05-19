@@ -21,6 +21,7 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, Write
+from deplodock.compiler.ir.tile.ir import Stage
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -650,6 +651,9 @@ def rename_ssa_sequential(stmts: Body) -> Body:
         elif isinstance(stmt, Tile):
             for ba in stmt.axes:
                 _record_axis(ba.axis.name)
+        elif isinstance(stmt, Stage):
+            for ax in stmt.axes:
+                _record_axis(ax.name)
         elif isinstance(stmt, (Loop, StridedLoop)):
             _record_axis(stmt.axis.name)
 

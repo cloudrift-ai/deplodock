@@ -110,7 +110,9 @@ three entry points:
   `Pipeline.tune` benches each terminal via `_bench_terminal` (writes
   per-kernel `perf` / `lowering` / inventory rows, returns the aggregate
   `PerfStats`), then calls `search.observe(stats, status)`. With
-  `backend=None` the bench is stubbed to `latency_us=1.0`.
+  `backend=None` the bench is stubbed to `latency_us=1.0` and nothing
+  is persisted — otherwise `Pipeline.run` (also routed through `tune`)
+  would overwrite tuned `best_median_us` rows with the stub.
 - `Pipeline.search(search, ctx, *, db=None) -> Iterator[Candidate]` — the
   inner engine loop both wrappers drive. Pops a `LazyCandidate`,
   resolves it, runs one rule batch, pushes successors. At fork points,
