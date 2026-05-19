@@ -2,10 +2,10 @@
 
 Knobs are forwarded along the rewrite chain via every Op-rebind and
 end up on the final ``CudaOp``. Some are real tuning parameters
-(``BM``, ``BN``, ``FM``, ``FN``, ...); others are pass-marker
-booleans (``register_tile``, ``stage:*``, ``stage_inputs``) that
-just record "this pass ran". The marker booleans are noise in tune
-output, so we drop them when rendering.
+(``BM``, ``BN``, ``FM``, ``FN``, ``stage``, ...); others are
+pass-marker booleans (``register_tile``) that just record "this pass
+ran". The marker booleans are noise in tune output, so we drop them
+when rendering.
 """
 
 from __future__ import annotations

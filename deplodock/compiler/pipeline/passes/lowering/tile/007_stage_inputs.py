@@ -79,13 +79,12 @@ def rewrite(root: Node, ctx) -> list[TileOp] | None:
     surviving variant — greedy gets the highest-perf one that fits;
     the autotuner explores them all.
 
-    Idempotence is gated on the ``stage_inputs`` knob (stamped on every
-    emitted variant) rather than on body structure, so the no-staging
-    variant — whose body matches the parent — still has a distinct
-    ``op_cache_key`` from the unstaged input and the rule doesn't
-    re-fire on it."""
-    if root.op.knobs.get("stage_inputs"):
-        raise RuleSkipped("stage_inputs already applied (idempotence via knob)")
+    Idempotence is gated on the ``stage`` knob (stamped on every emitted
+    variant) rather than on body structure, so the no-staging variant —
+    whose body matches the parent — still has a distinct ``op_cache_key``
+    from the unstaged input and the rule doesn't re-fire on it."""
+    if "stage" in root.op.knobs:
+        raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
     variants = _enumerate_variants(root.op.body, slab_cap=budget, scope_budget=budget, parent_op=root.op)
     if not variants:
@@ -97,13 +96,35 @@ _WARP_SIZE = 32
 
 
 def _forced_stage_mask(n: int) -> int | None:
-    """Parse ``DEPLODOCK_STAGE_INPUTS`` as an int (decimal or ``0x``-hex)
-    and clamp to ``n`` bits. ``None`` when unset, so the rule falls back
-    to enumerating every subset."""
-    raw = os.environ.get("DEPLODOCK_STAGE_INPUTS")
+    """Parse ``DEPLODOCK_STAGE`` and clamp to ``n`` bits. Accepts a
+    binary string ``"101"`` (char ``i`` selects ranked-buffer ``i``,
+    length must match ``n``); the keywords ``"all"`` / ``"none"`` for
+    "stage everything / nothing that qualifies"; or a decimal / ``0x``-hex
+    int for back-compat. ``None`` when unset, so the rule falls back to
+    enumerating every subset."""
+    raw = os.environ.get("DEPLODOCK_STAGE")
     if raw is None or raw == "":
         return None
+    raw = raw.strip()
+    if raw == "all":
+        return (1 << n) - 1
+    if raw == "none":
+        return 0
+    if len(raw) == n and all(c in "01" for c in raw):
+        return _binary_to_mask(raw)
     return int(raw, 0) & ((1 << n) - 1)
+
+
+def _binary_to_mask(s: str) -> int:
+    """``"101"`` → ``0b101 = 5``. Char ``i`` is bit ``i`` — left-to-right
+    reads as ranked-buffer 0, 1, 2, …, so the string position maps to
+    buffer rank directly."""
+    return sum(int(c) << i for i, c in enumerate(s))
+
+
+def _mask_to_binary(mask: int, n: int) -> str:
+    """Inverse of ``_binary_to_mask``."""
+    return "".join("1" if (mask >> i) & 1 else "0" for i in range(n))
 
 
 def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_op: TileOp) -> list[TileOp]:
@@ -113,19 +134,18 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     population count; the empty-subset variant comes last and is the
     "stage nothing" fallback whose body matches the parent.
 
-    Each variant carries a ``stage_inputs=True`` knob plus a per-buffer
-    ``stage:<buf>=True|False`` knob, giving each variant a distinct
-    ``op_cache_key`` even when bodies collide. The knob is the rule's
-    idempotence anchor so re-firing on the no-staging variant doesn't
-    loop.
+    Each variant carries a single ``stage="<binary_mask>"`` knob (e.g.
+    ``"101"`` with N=3 means stage ranked-buffers 0 and 2) — giving each
+    variant a distinct ``op_cache_key`` even when bodies collide and
+    serving as the rule's idempotence anchor so re-firing on the
+    no-staging variant doesn't loop.
 
-    ``DEPLODOCK_STAGE_INPUTS`` overrides the enumeration with a single
-    fixed mask over the ranked buffer list (bit ``i`` selects the i-th
-    buffer): ``0`` stages nothing, ``0xFFFF`` (any all-bits-set value)
-    stages everything that qualifies, and a specific bitmask stages
-    exactly that subset. Used by exhaustive autotune tests to mimic the
-    legacy single-variant behavior and avoid the ``2^N`` blow-up
-    multiplying with every other fork point.
+    ``DEPLODOCK_STAGE`` overrides the enumeration with a single fixed
+    mask over the ranked buffer list. Accepts the binary-string form,
+    ``"all"`` / ``"none"`` keywords, or a decimal / ``0x``-hex int.
+    Used by exhaustive autotune tests to mimic the legacy single-variant
+    behavior and avoid the ``2^N`` blow-up multiplying with every other
+    fork point.
 
     Returns ``[]`` when no buffer qualifies for staging (no fan-in)."""
     candidates = _candidate_buffers(body)
@@ -139,9 +159,9 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     n = len(bufs_ranked)
     # All 2^N subsets, ordered by descending popcount (most-staged first),
     # then by ascending mask within each popcount bucket so the same
-    # population stays grouped. ``DEPLODOCK_STAGE_INPUTS=<mask>`` pins
-    # the enumeration to a single mask (clamped to ``n`` bits), matching
-    # legacy single-variant behavior when set to ``0xFFFF`` (all-on).
+    # population stays grouped. ``DEPLODOCK_STAGE=<mask>`` pins the
+    # enumeration to a single mask, matching legacy single-variant
+    # behavior when set to ``"all"``.
     forced = _forced_stage_mask(n)
     if forced is not None:
         masks = [forced]
@@ -153,9 +173,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
         new_body = _maybe_rewrite(body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow)
         if new_body is None:
             continue
-        knobs = {**parent_op.knobs, "stage_inputs": True}
-        for b in bufs_ranked:
-            knobs[f"stage:{b}"] = b in allow
+        knobs = {**parent_op.knobs, "stage": _mask_to_binary(mask, n)}
         variants.append(TileOp(body=new_body, name=parent_op.name, knobs=knobs))
     return variants
 
@@ -224,7 +242,7 @@ def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs
     this allow-set" and tries the next subset.
     """
     idx, tile = single_tile(body)
-    # Idempotence is now gated on the ``stage_inputs`` knob in ``rewrite``;
+    # Idempotence is now gated on the ``stage`` knob in ``rewrite``;
     # the structural ``any(Stage)`` check would block legitimate re-firing
     # of the partial-staging variants where some Stages are present.
     if not tile.thread_axes:

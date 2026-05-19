@@ -39,8 +39,8 @@ def op_cache_key(op: object) -> str | None:
         return digest("CudaOp", op.kernel_source, op.arg_order, op.grid, op.block, op.smem_bytes)
     if isinstance(op, (LoopOp, TileOp, KernelOp)):
         # Knobs are part of the key: same-body / different-knobs variants
-        # (e.g. ``007_stage_inputs`` emits a no-op TileOp with extra
-        # ``stage:<buf>`` knobs to mark "considered, declined" decisions)
+        # (e.g. ``007_stage_inputs`` emits a no-op TileOp with a
+        # ``stage="0..0"`` knob to mark "considered, declined" decisions)
         # must not collide with their parent in the search tree, or
         # ``SearchTree.expand`` self-parents the node and
         # ``_propagate_expected`` walks the parent chain forever.
