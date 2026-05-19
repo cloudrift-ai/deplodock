@@ -57,6 +57,7 @@ from deplodock.compiler.ir.stmt import (
     _pad,
     pretty_body,
 )
+from deplodock.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -460,27 +461,33 @@ class KernelOp(Op):
     params, distinct ``Write.output`` names become writeable output
     params, ordered by first appearance. ``Smem`` buffers are excluded.
 
-    ``input_dtypes`` / ``output_dtypes`` map a global-buffer name to the
-    :class:`DataType` of that buffer. Populated by the CUDA-lowering
-    pass from the graph's tensor dtypes; missing entries default to
-    :data:`F32` so legacy tests that build KernelOps directly keep
-    working.
+    ``input_tensors`` / ``output_tensors`` map a global-buffer name to a
+    :class:`Tensor` describing that buffer (its shape + dtype). Populated
+    by the CUDA-lowering pass from the surrounding graph; missing entries
+    fall back to a unit-shape :data:`F32` tensor so legacy tests that
+    build KernelOps directly keep working.
     """
 
     body: Body = field(default_factory=Body)
     name: str = ""
-    input_dtypes: dict[str, DataType] = field(default_factory=dict)
-    output_dtypes: dict[str, DataType] = field(default_factory=dict)
+    input_tensors: dict[str, Tensor] = field(default_factory=dict)
+    output_tensors: dict[str, Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             self.body = Body.coerce(self.body)
 
+    def input_tensor(self, name: str) -> Tensor:
+        return self.input_tensors.get(name) or Tensor(name, (), F32)
+
+    def output_tensor(self, name: str) -> Tensor:
+        return self.output_tensors.get(name) or Tensor(name, (), F32)
+
     def input_dtype(self, name: str) -> DataType:
-        return self.input_dtypes.get(name, F32)
+        return self.input_tensor(name).dtype
 
     def output_dtype(self, name: str) -> DataType:
-        return self.output_dtypes.get(name, F32)
+        return self.output_tensor(name).dtype
 
     def __iter__(self) -> Iterator[Stmt]:
         return self.body.iter()

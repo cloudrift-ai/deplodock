@@ -27,6 +27,9 @@ class DataType:
     np: np.dtype
     nbytes: int
 
+    def __str__(self) -> str:
+        return self.name
+
 
 F32 = DataType("f32", np.dtype(np.float32), 4)
 F16 = DataType("f16", np.dtype(np.float16), 2)

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from deplodock.compiler.ir.base import InputOp, Op
+from deplodock.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
 # Hints
@@ -98,15 +99,6 @@ def resolve_hints(graph: Graph, node_id: str) -> Hints:
 # ---------------------------------------------------------------------------
 # Tensor + Node + Graph
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Tensor:
-    """Multidimensional array descriptor."""
-
-    name: str
-    shape: tuple[int | str, ...]  # concrete ints or symbolic dim names
-    dtype: str = "f32"
 
 
 @dataclass
@@ -754,7 +746,7 @@ class Graph:
                 "output": {
                     "name": node.output.name,
                     "shape": list(node.output.shape),
-                    "dtype": node.output.dtype,
+                    "dtype": node.output.dtype.name,
                 },
             }
             if node.hints:

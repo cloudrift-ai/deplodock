@@ -13,7 +13,6 @@ from __future__ import annotations
 from math import prod
 
 from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
-from deplodock.compiler.dtype import get as _get_dtype
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
@@ -21,6 +20,7 @@ from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.pipeline import Match, Pattern
+from deplodock.compiler.tensor import Tensor
 
 PATTERN = [Pattern("root", KernelOp)]
 
@@ -29,9 +29,19 @@ _BLOCK = 256
 
 def rewrite(match: Match, root: Node) -> Graph | None:
     graph = match.graph
-    shapes: dict[str, tuple[int, ...]] = {bid: tuple(graph.nodes[bid].output.shape) for bid in root.op.inputs}
-    for out in root.op.outputs:
-        shapes[out] = tuple(graph.nodes[out].output.shape) if out in graph.nodes else tuple(root.output.shape)
+
+    # Per-buffer Tensor descriptors (shape + dtype) for the kernel
+    # signature and the renderer's index flattening. Read from the
+    # surrounding graph; the renderer falls back to F32 / shape () for
+    # any missing entry (e.g. legacy KernelOps constructed bare in tests).
+    input_tensors: dict[str, Tensor] = {bid: graph.nodes[bid].output for bid in root.op.inputs if bid in graph.nodes}
+    output_tensors: dict[str, Tensor] = {
+        out: (graph.nodes[out].output if out in graph.nodes else Tensor(out, tuple(root.output.shape), root.output.dtype))
+        for out in root.op.outputs
+    }
+    root.op.input_tensors = input_tensors
+    root.op.output_tensors = output_tensors
+    tensors: dict[str, Tensor] = {**input_tensors, **output_tensors}
 
     # Scalar ConstantOp inputs get embedded as float literals in the kernel
     # body — no kernel parameter, no buffer load.
@@ -42,14 +52,6 @@ def rewrite(match: Match, root: Node) -> Graph | None:
             literal_constants[bid] = float(node.op.value)
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
-
-    # Per-buffer dtypes for kernel-signature rendering. Read from the
-    # graph's tensor dtypes; the renderer falls back to F32 for any
-    # missing entry (e.g. legacy KernelOps constructed bare in tests).
-    root.op.input_dtypes = {bid: _get_dtype(graph.nodes[bid].output.dtype) for bid in root.op.inputs if bid in graph.nodes}
-    root.op.output_dtypes = {
-        out: _get_dtype(graph.nodes[out].output.dtype if out in graph.nodes else root.output.dtype) for out in root.op.outputs
-    }
 
     grid, block = _launch_geometry(root.op)
     # TMA descriptors are kernel parameters that come *after* the buffer
@@ -78,7 +80,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
             seen_atomic.add(s.output)
             atomic_outputs.append(s.output)
     return CudaOp(
-        kernel_source=render_kernelop(root.op, shapes=shapes, literal_constants=literal_constants),
+        kernel_source=render_kernelop(root.op, tensors=tensors, literal_constants=literal_constants),
         kernel_name=root.op.name,
         arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
         grid=grid,
