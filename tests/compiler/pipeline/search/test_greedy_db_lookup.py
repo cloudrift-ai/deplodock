@@ -132,7 +132,7 @@ def test_irrelevant_seed_is_ignored() -> None:
         "tile",
         "unrelated-child",
         "tile",
-        knobs={"BN": 999, "BM": 999, "blockify": True},
+        knobs={"BN": 999, "BM": 999},
         measured_median_us=1.0,
     )
 

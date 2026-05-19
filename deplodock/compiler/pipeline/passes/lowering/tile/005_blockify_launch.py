@@ -58,14 +58,13 @@ _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 def rewrite(root: Node) -> Graph | None | list[TileOp]:
     body = root.op.body
     idx, tile = single_tile(body)
+    # ``block_axes`` non-empty means either (a) this rule already
+    # partitioned the tile, or (b) a prior pass (e.g. cooperative_reduce)
+    # established a BLOCK layout we must not re-classify. Either way,
+    # bail before ``_plan_partition`` rebinds existing BLOCK axes.
     if tile.block_axes:
-        raise RuleSkipped("Tile already partitioned (block_axes non-empty)")
-    # Explicit idempotence — same reason as 008's ``register_tile`` knob.
-    # A ``(BN, BM)`` variant where the matmul output extents are ≤ the
-    # picked widths produces post-partition axes identical to pre-, so the
-    # pattern still matches on re-entry. The ``blockify`` knob short-circuits.
-    if root.op.knobs.get("blockify"):
-        raise RuleSkipped("blockify already applied (knobs['blockify'] set)")
+        raise RuleSkipped("Tile already has block_axes — partition is owned by a prior pass")
+    shape = thread_tile_shape(tile)
 
     if _has_matmul_reduce(tile.body):
         variants = _matmul_variants(body, idx, tile, root.op.name)
@@ -75,9 +74,10 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
             return variants[0]
         return variants
 
-    partitioned = _partition_threads(tile, shape=thread_tile_shape(tile))
-    if partitioned is None:
-        raise RuleSkipped("partition already fits the requested tile shape")
+    new_axes, sigma_map = _plan_partition(tile, shape)
+    if _is_noop_plan(tile, new_axes, sigma_map):
+        raise RuleSkipped("partition is a no-op — tile already fits one CTA")
+    partitioned = _apply_partition(tile, new_axes, sigma_map)
     return TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=root.op.name)
 
 
@@ -99,7 +99,7 @@ def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
 
     def _add(shape: tuple[int, int]) -> None:
         bn, bm = shape
-        # Clamp oversized THREAD widths to the axis extent. ``_partition_threads``
+        # Clamp oversized THREAD widths to the axis extent. ``_plan_partition``
         # silently clamps anyway, so ``bn > ext_inner`` would yield a kernel
         # identical to ``bn == ext_inner``; dedup via ``seen`` after clamping
         # so the autotuner doesn't spawn aliased variants. Clamping (vs the
@@ -130,30 +130,31 @@ def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
     variants: list[TileOp] = []
     for shape in ordered:
         try:
-            partitioned = _partition_threads(tile, shape=shape)
+            new_axes, sigma_map = _plan_partition(tile, shape)
         except RuleSkipped:
             continue
-        if partitioned is None:
+        if _is_noop_plan(tile, new_axes, sigma_map):
             continue
+        partitioned = _apply_partition(tile, new_axes, sigma_map)
         bn, bm = shape
         variants.append(
             TileOp(
                 body=body[:idx] + (partitioned,) + body[idx + 1 :],
                 name=name,
-                knobs={"BN": bn, "BM": bm, "blockify": True},
+                knobs={"BN": bn, "BM": bm},
             )
         )
     return variants
 
 
-def _partition_threads(tile: Tile, *, shape: tuple[int, ...]) -> Tile | None:
-    """Split the innermost axes per ``shape``. Outer axes → BLOCK whole.
-    Bail on non-divisible oversized axes."""
-    axes = list(tile.axes)
+def _plan_partition(tile: Tile, shape: tuple[int, ...]) -> tuple[tuple[BoundAxis, ...], dict[str, object]]:
+    """Compute the new axis layout and σ-map for partitioning ``tile``
+    under ``shape`` (innermost-first). Raises ``RuleSkipped`` if any
+    axis is oversized and non-divisible. Pure: does not build a Tile."""
     new_axes_inner_first: list[BoundAxis] = []
     sigma_map: dict[str, object] = {}
 
-    for i, ba in enumerate(reversed(axes)):
+    for i, ba in enumerate(reversed(tile.axes)):
         if i >= len(shape):
             new_axes_inner_first.append(BoundAxis(axis=ba.axis, bind=BIND_BLOCK))
             continue
@@ -171,17 +172,28 @@ def _partition_threads(tile: Tile, *, shape: tuple[int, ...]) -> Tile | None:
             raise RuleSkipped(f"axis {ba.axis.name}:{ext} not divisible by tile-shape target {target}")
 
     new_axes_inner_first.reverse()
-    new_axes = new_axes_inner_first
+    return tuple(new_axes_inner_first), sigma_map
 
-    # No-op short-circuit: identical axes, no split.
-    if not sigma_map and len(new_axes) == len(axes):
-        same = all(a.axis is b.axis and a.bind == b.bind for a, b in zip(new_axes, axes, strict=True))
-        if same:
-            return None
 
+def _is_noop_plan(tile: Tile, new_axes: tuple[BoundAxis, ...], sigma_map: dict[str, object]) -> bool:
+    """True iff applying ``new_axes`` / ``sigma_map`` to ``tile`` would
+    leave it structurally unchanged — no axis split and every bind /
+    axis identity preserved. Used both as the post-plan idempotence
+    check on the deterministic path and the per-variant filter on the
+    matmul fork."""
+    if sigma_map:
+        return False
+    if len(new_axes) != len(tile.axes):
+        return False
+    return all(a.axis is b.axis and a.bind == b.bind for a, b in zip(new_axes, tile.axes, strict=True))
+
+
+def _apply_partition(tile: Tile, new_axes: tuple[BoundAxis, ...], sigma_map: dict[str, object]) -> Tile:
+    """Build the partitioned ``Tile`` from a plan produced by
+    ``_plan_partition``. σ-rewrites the body when any axis was split."""
     sigma = Sigma(sigma_map) if sigma_map else Sigma.IDENTITY
     new_body = tuple(s.rewrite(_id, sigma) for s in tile.body) if sigma_map else tile.body
-    return Tile(axes=tuple(new_axes), body=new_body)
+    return Tile(axes=new_axes, body=new_body)
 
 
 def _id(name: str) -> str:
