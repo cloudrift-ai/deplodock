@@ -489,13 +489,13 @@ class KernelOp(Op):
         ``_compute_dynamic_smem_offsets``."""
         from math import prod  # noqa: PLC0415
 
-        # Mirror cuda/001_lower_kernelop's _DTYPE_BYTES for the smem sizing.
-        dtype_bytes = {"float": 4, "double": 8, "int": 4, "half": 2, "bfloat16": 2}
+        from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
+
         total = 0
         for s in self:
             if isinstance(s, Smem):
                 elements = prod(int(e) for e in s.extents) if s.extents else 1
-                total += elements * dtype_bytes.get(s.dtype, 4)
+                total += elements * nbytes_of(s.dtype)
         return total
 
     def validate(self, ctx) -> bool:

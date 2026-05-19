@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from math import prod
 
+from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
@@ -23,8 +24,6 @@ from deplodock.compiler.pipeline import Match, Pattern
 PATTERN = [Pattern("root", KernelOp)]
 
 _BLOCK = 256
-
-_DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2}
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -100,5 +99,5 @@ def _smem_bytes(kernel_op: KernelOp) -> int:
     for s in kernel_op:
         if isinstance(s, Smem):
             elements = prod(int(e) for e in s.extents) if s.extents else 1
-            total += elements * _DTYPE_BYTES.get(s.dtype, 4)
+            total += elements * _nbytes_of(s.dtype)
     return total

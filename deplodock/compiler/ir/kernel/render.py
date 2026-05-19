@@ -8,6 +8,7 @@ method does the per-line emission.
 
 from __future__ import annotations
 
+from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
 
@@ -18,8 +19,6 @@ from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
 # total Smem footprint exceeds this, ``render_kernelop`` switches to a
 # single dynamic pool with per-buffer offsets.
 STATIC_SMEM_CAP = 48 * 1024
-
-_DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2, "unsigned long long": 8}
 
 # TMA / mbarrier prelude. NVRTC doesn't ship ``<cuda.h>`` /
 # ``<cuda/ptx>`` / ``<cuda/barrier>``, so we can't ``#include`` the
@@ -233,7 +232,7 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
         elements = 1
         for e in s.extents:
             elements *= int(e)
-        n_bytes = elements * _DTYPE_BYTES.get(s.dtype, 4)
+        n_bytes = elements * _nbytes_of(s.dtype)
         total += n_bytes
         sizes.append((s, n_bytes))
     if total <= STATIC_SMEM_CAP:
@@ -242,7 +241,7 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
     offsets: dict[str, int] = {}
     cursor = 0
     for s, n_bytes in sizes:
-        natural = _DTYPE_BYTES.get(s.dtype, 4)
+        natural = _nbytes_of(s.dtype)
         align = max(natural, int(s.align) if s.align else 0)
         cursor = (cursor + align - 1) // align * align
         offsets[s.name] = cursor

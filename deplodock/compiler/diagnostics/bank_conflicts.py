@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr
@@ -346,8 +347,6 @@ def annotate_lds128(results: list[BankConflictResult]) -> None:
 # Kernel-IR static analyzer (visualizer + cross-validation)
 # ---------------------------------------------------------------------------
 
-_DTYPE_BYTES = {"float": 4, "f32": 4, "half": 2, "f16": 2, "bf16": 2, "int": 4, "i32": 4, "i64": 8, "f64": 8}
-
 
 def simulate_graph(
     graph: Graph,
@@ -441,7 +440,7 @@ def _build_kernel_result(
 
     full_sweep_touched, full_sweep_conflict = _full_sweep_static(cache_idx, smem.extents, tile, encl, warp_id)
 
-    smem_bytes = _DTYPE_BYTES.get(smem.dtype, 4)
+    smem_bytes = _nbytes_of(smem.dtype)
     for e in smem.extents:
         smem_bytes *= int(e)
 
