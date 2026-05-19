@@ -773,7 +773,8 @@ class TileOp(Op):
 # layer because cooperative strategies (cooperative-reduce, blockify)
 # already commit to "this many threads cooperate" when they choose axis
 # binds and tile sizes; materialization just consumes the choice.
-# Overridable via ``DEPLODOCK_COOP_BLOCK`` for sweeps.
+# Overridable via ``DEPLODOCK_BN`` for sweeps (shared with the matmul
+# path — mutually exclusive per kernel).
 from deplodock.compiler.tuning import cooperative_block_size as _coop_block_size  # noqa: E402
 
 BLOCK_SIZE = _coop_block_size()

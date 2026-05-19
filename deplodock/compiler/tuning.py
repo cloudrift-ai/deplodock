@@ -31,7 +31,6 @@ Env vars:
 - ``DEPLODOCK_BK`` — K-split size for ``002_chunk_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
-- ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
   weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
   (Hopper / Blackwell), default-off below. ``=1`` forces on, ``=0``
@@ -321,19 +320,24 @@ def _tma_swizzle_enabled() -> bool:
     return os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") in ("1", "true", "True")
 
 
-_NON_MATMUL_THREAD_BUDGET = 256
+# CTA inner-axis width default for paths that produce a single THREAD
+# axis (non-matmul ``005_blockify_launch`` deterministic branch and
+# ``004_cooperative_reduce``'s synthetic ``t`` axis). Mutually exclusive
+# with the matmul path, so it shares the ``DEPLODOCK_BN`` env namespace
+# — at most one path applies per kernel.
+_NON_MATMUL_BN_DEFAULT = 256
 
 
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit,
-    innermost-first. ``(BN, BM)`` for matmul, ``(256,)`` for non-matmul
-    kernels."""
+    innermost-first. ``(BN, BM)`` for matmul, ``(BN,)`` for non-matmul
+    kernels (single THREAD axis; same env namespace as the matmul case)."""
     if tile is not None and _has_matmul_reduce(tile.body):
         (def_bn, def_bm), _ = _default_tile(tile)
         bn = _int_env("DEPLODOCK_BN", def_bn)
         bm = _int_env("DEPLODOCK_BM", def_bm)
         return (bn, bm)
-    return (_NON_MATMUL_THREAD_BUDGET,)
+    return (_int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT),)
 
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
@@ -443,7 +447,11 @@ def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
 
 
 def cooperative_block_size() -> int:
-    return _int_env("DEPLODOCK_COOP_BLOCK", 256)
+    """Threads/CTA for the synthetic cooperative ``t`` axis. Shares the
+    matmul ``DEPLODOCK_BN`` env namespace — cooperative-reduce and
+    matmul paths are mutually exclusive per kernel, so one env knob
+    suffices for both."""
+    return _int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT)
 
 
 # Cross-CTA split-K target. Class-adaptive: small-tile matmuls (narrow N
