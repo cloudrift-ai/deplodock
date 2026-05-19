@@ -288,13 +288,19 @@ def _find_slots(tile: Tile) -> list[_Slot]:
     # hidden dims like 3584 give per-thread iters = 14, whose only useful
     # factors are {2, 7, 14}; restricting to powers of two would leave
     # only FN=2 on the table.
+    #
+    # ``heuristic`` = the largest valid factor (most aggressive unroll —
+    # best ILP for the accumulator chain) so deterministic compiles pick
+    # FN=14 over FN=2 on rmsnorm.qwen.s32 (saves ~33%). Autotune sweeps
+    # the smaller factors after.
+    divisors = _divisors(slot_extent, _MAX_CELLS_PER_THREAD)
     return [
         _Slot(
             knob=FN.name,
             label="reduce",
             extent=slot_extent,
-            choices=_divisors(slot_extent, _MAX_CELLS_PER_THREAD),
-            heuristic=None,
+            choices=divisors,
+            heuristic=max(divisors),
             make_sites=(lambda f, axis_names=axis_names: [_reduce_unroll_site(a, f) for a in axis_names]),
         )
     ]

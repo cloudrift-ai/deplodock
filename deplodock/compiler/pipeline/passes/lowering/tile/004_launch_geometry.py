@@ -61,7 +61,10 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
         return variants
 
     if _cooperative_viable(tile):
-        return _emit_cooperative_launch(body, idx, tile, root.op.name)
+        result = _emit_cooperative_launch(body, idx, tile, root.op.name)
+        if isinstance(result, list) and not result:
+            raise RuleSkipped("no viable BN candidate for cooperative reduce")
+        return result
 
     # Pointwise / non-matmul / non-cooperative: deterministic partition.
     new_axes, sigma_map = _plan_partition(tile, thread_tile_shape(tile))
@@ -118,20 +121,42 @@ def _cooperative_viable(tile: Tile) -> bool:
     return True
 
 
-def _emit_cooperative_launch(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str) -> TileOp:
+def _emit_cooperative_launch(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str) -> list[TileOp] | TileOp:
     """Add a synthetic ``t=THREAD`` axis and rebind every existing output
     axis to ``BIND_BLOCK``. The body is left untouched —
     ``005_cooperative_reduce`` performs the StridedLoop rewrite and the
-    naked-axis epilogue wrap."""
+    naked-axis epilogue wrap.
+
+    Forks over ``BN`` (cooperative thread count) so autotune can search
+    the threads-per-CTA × per-thread-iter-count trade-off jointly with
+    ``008_register_tile``'s ``FN``. Heuristic = the historical
+    ``_effective_block_size`` so deterministic compiles pick option 0
+    with no behavior change; smaller BN values follow."""
     reduce_loops = [loop for loop in tile.body.of_type(Loop) if loop.is_reduce]
-    eff_block = _effective_block_size(int(reduce_loops[0].axis.extent))
-    t_axis = Axis("t", eff_block)
-    new_axes = (
-        BoundAxis(axis=t_axis, bind=BIND_THREAD),
-        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in tile.axes),
-    )
-    new_tile = Tile(axes=new_axes, body=tile.body)
-    return TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=name)
+    reduce_extent = int(reduce_loops[0].axis.extent)
+    heuristic_bn = _effective_block_size(reduce_extent)
+    # BN candidates: in _TUNE_AXIS_CHOICES, ≥ WARP_SIZE, ≤ heuristic_bn.
+    # Capping at heuristic_bn keeps BN ≤ next_pow2(extent), so threads
+    # never outnumber elements; otherwise we'd waste threads idle on
+    # short rows.
+    bn_candidates = sorted({bn for bn in _TUNE_AXIS_CHOICES if _WARP_SIZE <= bn <= heuristic_bn}, reverse=True)
+    if heuristic_bn not in bn_candidates:
+        bn_candidates.insert(0, heuristic_bn)
+    # Move heuristic to the front so deterministic compiles pick it.
+    bn_candidates = [heuristic_bn] + [bn for bn in bn_candidates if bn != heuristic_bn]
+
+    variants: list[TileOp] = []
+    for bn in bn_candidates:
+        t_axis = Axis("t", bn)
+        new_axes = (
+            BoundAxis(axis=t_axis, bind=BIND_THREAD),
+            *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in tile.axes),
+        )
+        new_tile = Tile(axes=new_axes, body=tile.body)
+        variants.append(TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=name, knobs={BN.name: bn}))
+    if len(variants) == 1:
+        return variants[0]
+    return variants
 
 
 # ---------------------------------------------------------------------------
