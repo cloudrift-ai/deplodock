@@ -56,6 +56,11 @@ class Load(Stmt):
         if lit is not None:
             return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(lit)};"]
         flat = render_index(self.input, self.index, ctx)
+        # When the source buffer is fp16, convert at the load boundary so
+        # all SSA locals stay in ``float`` (CUDA's ``__half`` is a struct
+        # with no implicit conversion to ``float``).
+        if ctx.buffer_dtypes.get(self.input) == "f16":
+            return [f"{_pad(ctx.indent)}float {self.name} = __half2float({self.input}[{flat}]);"]
         return [f"{_pad(ctx.indent)}float {self.name} = {self.input}[{flat}];"]
 
 
@@ -242,6 +247,10 @@ class Write(Stmt):
         flat = render_index(self.output, self.index, ctx)
         if self.reduce_op is not None:
             return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {self.value});"]
+        # When the destination buffer is fp16, cast the local float SSA
+        # value back to ``__half`` at the store boundary.
+        if ctx.buffer_dtypes.get(self.output) == "f16":
+            return [f"{_pad(ctx.indent)}{self.output}[{flat}] = __float2half({self.value});"]
         return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {self.value};"]
 
 

@@ -54,6 +54,13 @@ class RenderCtx:
     # alias into the pool instead of a stand-alone ``__shared__`` array
     # — the only way to exceed the 48 KB static-smem cap.
     smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
+    # Per-buffer canonical dtype tokens (``"f32"`` / ``"f16"``) for every
+    # global-buffer name (kernel inputs + outputs). ``Load`` / ``Write``
+    # consult this to insert ``__half2float`` / ``__float2half`` casts at
+    # the load/store boundary when the buffer's element type isn't f32 —
+    # local SSA values stay in ``float``. Missing entries default to
+    # ``"f32"`` so legacy bodies render unchanged.
+    buffer_dtypes: dict[str, str] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -66,6 +73,7 @@ class RenderCtx:
             literal_constants=self.literal_constants,
             literal_ssa=self.literal_ssa,
             smem_dynamic_offsets=self.smem_dynamic_offsets,
+            buffer_dtypes=self.buffer_dtypes,
         )
 
 

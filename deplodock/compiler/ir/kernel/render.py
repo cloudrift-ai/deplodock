@@ -190,6 +190,7 @@ def render_kernelop(
         builtins=_BUILTIN_TO_CUDA,
         literal_constants=literals,
         smem_dynamic_offsets=smem_offsets,
+        buffer_dtypes={n: t.dtype.name for n, t in tmap.items()},
     )
 
     def _dtype_for(name: str, fallback: object) -> object:
