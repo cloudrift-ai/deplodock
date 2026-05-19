@@ -138,8 +138,21 @@ canonicalized before validation:
 - `drop_size_one_free_axes` — inline extent-1 free Loops.
 - `canonicalize_free_axis_order` — sort outer free Loops by axis name.
 - `eliminate_copy_aliases` — drop `y = copy(x)` Assigns.
-- `unify_sibling_reduce_axes` — collapse sibling reduce Loops sharing
-  an input dim (softmax's max + sum sweeps become one reduce axis).
+- `unify_sibling_reduce_axes` — rename sibling reduce Loops whose
+  reduce-axis Load positions overlap on any `(source, dim)` pair so
+  they share one canonical axis name (softmax's max + sum sweeps; the
+  two matmul reductions in `silu(x@Wg) * (x@Wu)` that both index `x`
+  at the same K slot). Union-find groups all transitively-overlapping
+  Loops at one scope.
+- `merge_sibling_reduce_loops` — concatenate sibling reduce Loops that
+  share `axis.name` / `extent` into one Loop body. Gated on disjoint
+  SSA defs across the two halves, the second body not reading any name
+  the first body defines (blocks softmax-style sequential reduces
+  where sum-exp reads `acc_max`), and no between-stmt def consumed by
+  the second loop. Eliminates the duplicate K traversal in patterns
+  like `silu(x@Wg) * (x@Wu)`; downstream `dedup_loads` then collapses
+  the duplicate `x` loads, and the lowering passes stage both weight
+  tensors symmetrically.
 - `split_invariant_divides` — rewrite `divide(x, y)` into
   `reciprocal(y) + multiply(x, recip)` when `y` is loop-invariant
   w.r.t. some axis `x` depends on, so the rcp can hoist out of the
