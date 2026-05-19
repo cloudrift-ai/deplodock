@@ -1,38 +1,38 @@
-"""Chunk the N register-tile into ``LDS.128``-sized strips when ``F_N > 4``.
+"""Chunk the N register-tile into ``LDS.128``-sized strips when ``FN > 4``.
 
 After ``008_register_tile`` commits the canonical ``(THREAD-outer | RF-inner)``
 ordering on the N axis, body Loads on the B operand stage read column
-``Var(lane) * F_N + c`` for ``c=0..F_N-1``. Two regimes:
+``Var(lane) * FN + c`` for ``c=0..FN-1``. Two regimes:
 
-* ``F_N <= 4`` (canonical default): lane ``l`` reads the contiguous strip
-  ``[F_N*l, F_N*l+F_N-1]``. nvcc auto-vectorizes the unrolled scalar reads
+* ``FN <= 4`` (canonical default): lane ``l`` reads the contiguous strip
+  ``[FN*l, FN*l+FN-1]``. nvcc auto-vectorizes the unrolled scalar reads
   into a single ``ld.shared.v4`` per K-iter — and within each LDS.128
   phase (8 lanes × 4 fp32) the warp covers 32 distinct banks, so no
   conflicts. **No transform needed; pass skips.**
 
-* ``F_N > 4`` (e.g. F_N=8): lane ``l`` reads ``[8l..8l+7]``. Each LDS.128
-  carries 4 fp32, so the per-thread N-strip splits into ``F_N/4``
+* ``FN > 4`` (e.g. FN=8): lane ``l`` reads ``[8l..8l+7]``. Each LDS.128
+  carries 4 fp32, so the per-thread N-strip splits into ``FN/4``
   successive LDS.128. *Within* one LDS.128 phase, the 8 lanes are
-  stride-``F_N`` apart (lane 0 → cols 0-3, lane 1 → 8-11, …, lane 4
+  stride-``FN`` apart (lane 0 → cols 0-3, lane 1 → 8-11, …, lane 4
   wraps). 8 lanes × 4 fp32 = 32 fp32 of accesses, but with that stride
   they land on only 16 banks → 2-way conflict per phase, 8-way per
   LDS.128. ncu confirms 25 M+ conflicts on this shape.
 
 Fix: keep each LDS.128 reading 4 *contiguous* fp32 (so the phase covers
-32 distinct banks), but spread the ``F_N/4`` LDS.128's *across the
-N-tile* instead of stacking them at lane-stride F_N. Lane ``l`` now owns
-``F_N/4`` chunks of 4 cols each, the chunks spaced ``4 * lane_ext``
-apart inside the BN-wide tile (which is exactly ``F_N/4`` chunks ×
-``4 * lane_ext`` cols since ``BN = F_N * lane_ext``). For the canonical
-``F_N=8, lane_ext=16`` (``BN=128``) shape, the chunk stride is 64.
+32 distinct banks), but spread the ``FN/4`` LDS.128's *across the
+N-tile* instead of stacking them at lane-stride FN. Lane ``l`` now owns
+``FN/4`` chunks of 4 cols each, the chunks spaced ``4 * lane_ext``
+apart inside the BN-wide tile (which is exactly ``FN/4`` chunks ×
+``4 * lane_ext`` cols since ``BN = FN * lane_ext``). For the canonical
+``FN=8, lane_ext=16`` (``BN=128``) shape, the chunk stride is 64.
 
 Rewrite (applied to every Load + Write index expression containing
-``Var(lane) * F_N + Literal(c)``):
+``Var(lane) * FN + Literal(c)``):
 
-    Var(lane) * F_N + Literal(c)
+    Var(lane) * FN + Literal(c)
         →   4 * Var(lane) + Literal((c // 4) * (4 * lane_ext) + (c % 4))
 
-For ``F_N=8, lane_ext=16``:
+For ``FN=8, lane_ext=16``:
 
     c=0..3 → ``4*lane + c``           (chunk 0, cols 0..63 of the tile)
     c=4..7 → ``4*lane + 64 + (c-4)``  (chunk 1, cols 64..127 of the tile)
@@ -40,17 +40,17 @@ For ``F_N=8, lane_ext=16``:
 Per LDS.128 phase: 8 lanes read 32 contiguous fp32 (one chunk), 32
 distinct banks, **0 conflicts**. The Write to global memory follows
 the same per-thread mapping, so each chunk's lane-to-output assignment
-is also stride-1 (improved coalescing vs the F_N-stride default).
+is also stride-1 (improved coalescing vs the FN-stride default).
 
 Lane axis: the larger-extent THREAD axis (the N axis post-008; the M
-axis sits at extent ``BM/F_M``, N at ``BN/F_N``, and ``BN >= BM`` by
+axis sits at extent ``BM/FM``, N at ``BN/FN``, and ``BN >= BM`` by
 convention). M-axis register tile is left alone — M loads broadcast
 within a warp at this point and don't carry a fixable conflict.
 
 Skips when:
 
 * The picked axis has no body Load with stride F > 4 divisible by 4.
-  Captures the ``F_N <= 4`` no-op case and any non-canonical shape.
+  Captures the ``FN <= 4`` no-op case and any non-canonical shape.
 * Bank-conflict analysis (reusing ``014_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
 """
@@ -99,7 +99,7 @@ def _maybe_rewrite(body: Body) -> Body | None:
 
     # Pick the lane axis: the THREAD axis tied to the *N dim of B*. In
     # the canonical post-008 layout that's the larger-extent THREAD axis
-    # (the M axis sits at extent BM/F_M, the N axis at BN/F_N, with BN
+    # (the M axis sits at extent BM/FM, the N axis at BN/FN, with BN
     # >= BM by convention). We confirm via the access pattern that the
     # picked axis appears in some Stage Load with stride F divisible by
     # ``_LDS128_FLOATS`` and > _LDS128_FLOATS — otherwise the chunked

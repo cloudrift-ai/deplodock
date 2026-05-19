@@ -571,7 +571,7 @@ class TileOp(Op):
 
         - **threads ≤ ``ctx.max_threads_per_cta``** (1024 on every CUDA
           capability we support). Without this, F-fork candidates like
-          ``(F_M=1, F_N=2)`` on a ``BM=64, BN=128`` tile spawn a CTA of
+          ``(FM=1, FN=2)`` on a ``BM=64, BN=128`` tile spawn a CTA of
           64×64=4096 threads — the driver rejects it but the engine has
           already burned compile + bench wall-budget on it.
         - **staged smem footprint ≤ ``ctx.max_dynamic_smem``**.
@@ -588,7 +588,7 @@ class TileOp(Op):
 
         Pre-register-tile TileOps (the post-blockify state, where THREAD
         extents are ``BM, BN`` and the register-tile rule will still
-        divide by ``(F_M, F_N)``) skip the THREAD check — otherwise we'd
+        divide by ``(FM, FN)``) skip the THREAD check — otherwise we'd
         reject every healthy pre-tile candidate. The smem check runs at
         every stage where Stages are present."""
         from math import prod  # noqa: PLC0415
@@ -641,12 +641,12 @@ class TileOp(Op):
           in the millions (observed on ``BM=64, BN=16`` matmul where
           2 M FP atomics blew the bench timeout).
         - Stages (smem staging) → ``+1.0``.
-        - Register tile fired (``F_M * F_N > 1``) → ``+1.0``.
+        - Register tile fired (``FM * FN > 1``) → ``+1.0``.
 
         Pre-register-tile TileOps are scored on a *predicted* final thread
         count (assuming 008 will pick F to target ~256 threads when
-        possible). Post-register-tile TileOps use the actual ``F_M``,
-        ``F_N`` from knobs.
+        possible). Post-register-tile TileOps use the actual ``FM``,
+        ``FN`` from knobs.
         """
         from math import prod  # noqa: PLC0415
 
@@ -672,7 +672,7 @@ class TileOp(Op):
         if self.knobs.get("register_tile"):
             # Post-008: knobs carry the actual cell shape.
             final_threads = threads
-            cells = max(1, int(self.knobs.get("F_M", 1)) * int(self.knobs.get("F_N", 1)))
+            cells = max(1, int(self.knobs.get("FM", 1)) * int(self.knobs.get("FN", 1)))
         elif threads >= 1024:
             # Pre-008 but large enough that 008 will likely divide F to
             # target ~256 threads.
