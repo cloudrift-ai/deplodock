@@ -388,10 +388,14 @@ def _materialize(blk: Tile) -> Stmt:
         elif isinstance(stmt, Combine):
             if pending_reduce is None:
                 raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce loop")
-            if pending_reduce.name != stmt.name:
-                raise ValueError(f"Combine({stmt.name!r}) does not match preceding Accum({pending_reduce.name!r})")
-            new_body.extend(_emit_combine(pending_reduce, _single_thread_var(thread_axes), n_threads))
-            rename[pending_reduce.name] = f"{pending_reduce.name}_b"
+            # ``Combine.name`` is the per-thread SSA value to combine across
+            # threads. It usually matches the preceding Accum's name, but the
+            # reduce-axis register-tile pass (008 RF path) introduces an
+            # Assign fold between the multi-Accum StridedLoop and the
+            # Combine — so Combine.name may instead reference that fold's
+            # output. The combine emission only needs (name, op).
+            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads))
+            rename[stmt.name] = f"{stmt.name}_b"
             pending_reduce = None
         else:
             new_body.append(transform(stmt))
@@ -606,8 +610,8 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
 _WARP_SIZE = 32
 
 
-def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
-    """Emit the cross-thread combine producing ``<accum>_b``.
+def _emit_combine(name: str, op, t: str, n_threads: int) -> list[Stmt]:
+    """Emit the cross-thread combine producing ``<name>_b``.
 
     Three paths, picked by ``n_threads``:
 
@@ -633,31 +637,31 @@ def _emit_combine(accum: Accum, t: str, n_threads: int) -> list[Stmt]:
     ``n_threads > WARP_SIZE`` so the hierarchical path's ``Var("lane")``
     / ``Var("warp")`` references resolve.
     """
-    broadcast_name = f"{accum.name}_b"
+    broadcast_name = f"{name}_b"
     if n_threads <= _WARP_SIZE and (n_threads & (n_threads - 1)) == 0:
-        return [WarpShuffle(name=broadcast_name, value=accum.name, op=accum.op, length=n_threads)]
+        return [WarpShuffle(name=broadcast_name, value=name, op=op, length=n_threads)]
     if n_threads % _WARP_SIZE == 0 and (n_threads & (n_threads - 1)) == 0:
         n_warps = n_threads // _WARP_SIZE
-        smem_name = f"{accum.name}_smem"
-        warp_w = f"{accum.name}_w"
+        smem_name = f"{name}_smem"
+        warp_w = f"{name}_w"
         return [
-            WarpShuffle(name=warp_w, value=accum.name, op=accum.op, length=_WARP_SIZE),
+            WarpShuffle(name=warp_w, value=name, op=op, length=_WARP_SIZE),
             Smem(name=smem_name, extents=(n_warps,)),
             Cond(
                 cond=BinaryExpr("==", Var("lane"), Literal(0, "int")), body=(Write(output=smem_name, index=(Var("warp"),), value=warp_w),)
             ),
             Sync(),
-            TreeHalve(buf=smem_name, op=accum.op, length=n_warps, tid_var="warp"),
+            TreeHalve(buf=smem_name, op=op, length=n_warps, tid_var="warp"),
             # TreeHalve's render ends each loop iter with __syncthreads(), so a
             # trailing Sync here would be a no-op pair with the loop's last sync.
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
         ]
-    smem_name = f"{accum.name}_smem"
+    smem_name = f"{name}_smem"
     return [
         Smem(name=smem_name, extents=(n_threads,)),
-        Write(output=smem_name, index=(Var(t),), value=accum.name),
+        Write(output=smem_name, index=(Var(t),), value=name),
         Sync(),
-        TreeHalve(buf=smem_name, op=accum.op, length=n_threads, tid_var=t),
+        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t),
         # See note above on TreeHalve's trailing sync.
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]

@@ -1,6 +1,6 @@
 """GreedySearch prefers the DB-best lowering when one is available.
 
-Drives a real fork point (``005_blockify_launch`` on a matmul) through
+Drives a real fork point (``005_launch_geometry`` on a matmul) through
 ``run_pipeline`` and asserts:
 
 1. **Baseline**: fresh DB → no lookup hit → greedy falls back to
@@ -26,7 +26,7 @@ from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 
 # Same shape as ``tests/compiler/passes/test_matmul_rules.py`` — large
-# enough that ``005_blockify_launch`` actually forks over multiple
+# enough that ``005_launch_geometry`` actually forks over multiple
 # ``(BN, BM)`` variants.
 _M, _K, _N = 256, 64, 256
 
@@ -63,7 +63,7 @@ def _final_tile_op(g: Graph) -> TileOp:
 def _blockify_pair(op: Op) -> tuple[Op, Op] | None:
     """Walk ``op.source`` chain and return ``(parent, child)`` at the
     transition where ``BN`` first appears in knobs — that's the
-    ``005_blockify_launch`` rewrite point. ``parent`` is the pre-blockify
+    ``005_launch_geometry`` rewrite point. ``parent`` is the pre-blockify
     TileOp, ``child`` is the one introduced by the rule. Knobs propagate
     forward via ``_apply_one`` so anything later in the chain inherits
     ``BN``; only the deepest such transition is the actual rewrite."""
@@ -91,7 +91,7 @@ def _record_pair(out: dict[str, tuple[str, str, dict]], op: Op) -> None:
 
 def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
     """Collect every distinct ``(parent_key, child_key, knobs)`` produced
-    at the blockify_launch fork point.
+    at the launch_geometry fork point.
 
     Index 0 is anchored on the greedy/heuristic variant (what option-0
     in the rule emits) by recording the greedy ``run_pipeline`` result
