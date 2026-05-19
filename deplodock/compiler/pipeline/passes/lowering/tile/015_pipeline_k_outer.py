@@ -132,6 +132,21 @@ def _eligible(loop: Loop, invariant_names: set[str]) -> bool:
             return False
         if len({s.buffer_count for s in stages}) != 1:
             return False
+        # Reject when a plain (sync) ``BufferedStage`` lives alongside
+        # async/TMA Stages. The pipelining schedule hoists async/TMA
+        # Stage decls + their first-iter loads to the prologue and peels
+        # the last iter to the epilogue — both outside the K-outer loop
+        # body. A sync ``BufferedStage`` left inside the loop declares
+        # its ``Smem`` at loop scope, and the epilogue's reduce body
+        # references that name from outside the scope ("identifier
+        # x_smem is undefined" at nvcc time). The cleanest fix is to
+        # skip pipelining here; ``async_copy`` either promotes every
+        # Stage to async (and this gate accepts), or some Stage stays
+        # sync and we keep the unpipelined-but-correct schedule.
+        async_kinds = (AsyncBufferedStage, TmaBufferedStage)
+        sync_stages = [s for s in k_outer.body if isinstance(s, BufferedStage) and not isinstance(s, async_kinds)]
+        if sync_stages:
+            return False
         # Cross-loop-deps gate, relaxed: reject only when an unresolved
         # dep is *not* in ``invariant_names``.
         for c in k_inner.body:
