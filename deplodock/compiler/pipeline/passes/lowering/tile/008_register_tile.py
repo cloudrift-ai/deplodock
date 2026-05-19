@@ -77,9 +77,8 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     if not slots:
         raise RuleSkipped("no tilable slots in Tile body")
 
-    axes_for_enum = [(s.label, s.extent) for s in slots]
     heuristic = tuple(s.heuristic for s in slots) if all(s.heuristic is not None for s in slots) else None
-    combos = _enumerate_combos(axes_for_enum, _TUNE_F_CHOICES, heuristic=heuristic, max_product=_MAX_CELLS_PER_THREAD)
+    combos = _enumerate_combos(slots, heuristic=heuristic, max_product=_MAX_CELLS_PER_THREAD)
     if not combos:
         raise RuleSkipped("no viable factor combo")
 
@@ -112,13 +111,15 @@ class _Slot:
     Sibling loops at the same level share this slot (one ``knob``, one
     factor across them); each level is a distinct slot.
 
-    ``label`` / ``extent`` drive divisibility; ``heuristic`` is an
-    optional cap-exempt pre-pick. ``make_sites(f)`` returns one
-    ``_Site`` per loop at this level."""
+    ``label`` / ``extent`` drive divisibility; ``choices`` is the
+    per-slot factor search space (every choice must divide ``extent``);
+    ``heuristic`` is an optional cap-exempt pre-pick. ``make_sites(f)``
+    returns one ``_Site`` per loop at this level."""
 
     knob: str
     label: str
     extent: int
+    choices: tuple[int, ...]
     heuristic: int | None
     make_sites: Callable[[int], list[_Site]]
 
@@ -184,20 +185,24 @@ def _reduce_unroll_site(axis_name: str, factor: int) -> _Site:
     return _Site(axis=axis_name, factor=factor, apply=apply)
 
 
+def _divisors(n: int, cap: int) -> tuple[int, ...]:
+    """All divisors of ``n`` up to ``cap``, ascending."""
+    return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
+
+
 def _enumerate_combos(
-    axes: list[tuple[str, int]],
-    choices: tuple[int, ...],
+    slots: list[_Slot],
     *,
     heuristic: tuple[int, ...] | None = None,
     max_product: int | None = None,
 ) -> list[tuple[int, ...]]:
-    """Cross-product of ``choices`` per axis, filtered by divisibility
-    (``ext % f == 0``) and an optional cap on ∏factors. ``heuristic``
-    (when given) is emitted first cap-exempt so deterministic compiles
-    pick option 0; the rest follow in fixed iteration order. All-1
-    combos are dropped as no-ops.
+    """Cross-product of per-slot ``choices``, filtered by divisibility
+    (``slot.extent % f == 0``) and an optional cap on ∏factors.
+    ``heuristic`` (when given) is emitted first cap-exempt so
+    deterministic compiles pick option 0; the rest follow in fixed
+    iteration order. All-1 combos are dropped as no-ops.
     """
-    n = len(axes)
+    n = len(slots)
     seen: set[tuple[int, ...]] = set()
     ordered: list[tuple[int, ...]] = []
 
@@ -212,8 +217,8 @@ def _enumerate_combos(
                 prod *= f
             if prod > max_product:
                 return
-        for (_, ext), f in zip(axes, combo, strict=True):
-            if ext % f != 0:
+        for slot, f in zip(slots, combo, strict=True):
+            if slot.extent % f != 0:
                 return
         seen.add(combo)
         ordered.append(combo)
@@ -225,7 +230,7 @@ def _enumerate_combos(
         if len(prefix) == n:
             _add(prefix)
             return
-        for f in choices:
+        for f in slots[len(prefix)].choices:
             rec(prefix + (f,))
 
     rec(())
@@ -253,6 +258,7 @@ def _find_slots(tile: Tile) -> list[_Slot]:
                 knob=knob_names[i],
                 label=ba.axis.name,
                 extent=int(ba.axis.extent),
+                choices=_TUNE_F_CHOICES,
                 heuristic=int(h),
                 make_sites=(lambda f, name=ba.axis.name: [_thread_split_site(name, f)]),
             )
@@ -278,11 +284,16 @@ def _find_slots(tile: Tile) -> list[_Slot]:
     if slot_extent < 2:
         return []
     axis_names = tuple(sl.axis.name for sl in reduce_loops)
+    # All divisors of ``slot_extent`` (not just powers of two) — Qwen-style
+    # hidden dims like 3584 give per-thread iters = 14, whose only useful
+    # factors are {2, 7, 14}; restricting to powers of two would leave
+    # only FN=2 on the table.
     return [
         _Slot(
             knob=FN.name,
             label="reduce",
             extent=slot_extent,
+            choices=_divisors(slot_extent, _MAX_CELLS_PER_THREAD),
             heuristic=None,
             make_sites=(lambda f, axis_names=axis_names: [_reduce_unroll_site(a, f) for a in axis_names]),
         )
