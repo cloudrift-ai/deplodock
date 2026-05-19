@@ -62,10 +62,15 @@ from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Tile, Write
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 from deplodock.compiler.tuning import auto_splitk
 
 PATTERN = [Pattern("root", TileOp)]
+
+_SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
+
+SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 
 
 def rewrite(root: Node) -> Graph | None:

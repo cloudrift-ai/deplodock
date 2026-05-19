@@ -59,11 +59,14 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
+
+BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 
 
 def _bk_candidates(tile, static_smem_cap: int) -> tuple[int, ...]:
