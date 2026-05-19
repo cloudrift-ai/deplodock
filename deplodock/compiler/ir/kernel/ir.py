@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -455,17 +456,31 @@ class KernelOp(Op):
 
     Buffer shapes are *not* baked in — the surrounding graph supplies
     them at render time, same as ``TileOp``. Kernel signature is derived
-    from the body: distinct ``Load.input`` names become ``const float*``
-    params, distinct ``Write.output`` names become ``float*`` params,
-    ordered by first appearance. ``Smem`` buffers are excluded.
+    from the body: distinct ``Load.input`` names become kernel input
+    params, distinct ``Write.output`` names become writeable output
+    params, ordered by first appearance. ``Smem`` buffers are excluded.
+
+    ``input_dtypes`` / ``output_dtypes`` map a global-buffer name to the
+    :class:`DataType` of that buffer. Populated by the CUDA-lowering
+    pass from the graph's tensor dtypes; missing entries default to
+    :data:`F32` so legacy tests that build KernelOps directly keep
+    working.
     """
 
     body: Body = field(default_factory=Body)
     name: str = ""
+    input_dtypes: dict[str, DataType] = field(default_factory=dict)
+    output_dtypes: dict[str, DataType] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             self.body = Body.coerce(self.body)
+
+    def input_dtype(self, name: str) -> DataType:
+        return self.input_dtypes.get(name, F32)
+
+    def output_dtype(self, name: str) -> DataType:
+        return self.output_dtypes.get(name, F32)
 
     def __iter__(self) -> Iterator[Stmt]:
         return self.body.iter()

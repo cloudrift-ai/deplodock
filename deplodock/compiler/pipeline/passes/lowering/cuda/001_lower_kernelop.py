@@ -13,6 +13,7 @@ from __future__ import annotations
 from math import prod
 
 from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
+from deplodock.compiler.dtype import get as _get_dtype
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
@@ -41,6 +42,15 @@ def rewrite(match: Match, root: Node) -> Graph | None:
             literal_constants[bid] = float(node.op.value)
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
+
+    # Per-buffer dtypes for kernel-signature rendering. Read from the
+    # graph's tensor dtypes; the renderer falls back to F32 for any
+    # missing entry (e.g. legacy KernelOps constructed bare in tests).
+    root.op.input_dtypes = {bid: _get_dtype(graph.nodes[bid].output.dtype) for bid in root.op.inputs if bid in graph.nodes}
+    root.op.output_dtypes = {
+        out: _get_dtype(graph.nodes[out].output.dtype if out in graph.nodes else root.output.dtype) for out in root.op.outputs
+    }
+
     grid, block = _launch_geometry(root.op)
     # TMA descriptors are kernel parameters that come *after* the buffer
     # args (matching the signature emitted by ``render_kernelop``).

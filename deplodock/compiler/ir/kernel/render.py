@@ -8,6 +8,7 @@ method does the per-line emission.
 
 from __future__ import annotations
 
+from deplodock.compiler.backend.cuda.dtype import cuda_includes, cuda_name
 from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
@@ -178,8 +179,8 @@ def render_kernelop(
         smem_dynamic_offsets=smem_offsets,
     )
 
-    sig_parts = [f"const float* {n}" for n in kernel_op.inputs if n not in literals]
-    sig_parts.extend(f"float* {n}" for n in kernel_op.outputs)
+    sig_parts = [f"const {cuda_name(kernel_op.input_dtype(n))}* {n}" for n in kernel_op.inputs if n not in literals]
+    sig_parts.extend(f"{cuda_name(kernel_op.output_dtype(n))}* {n}" for n in kernel_op.outputs)
     # TMA descriptors are passed as ``__grid_constant__`` value parameters.
     # The kernel only takes their address (``&desc``) for inline asm, so
     # the opaque ``CUtensorMap`` forward decl above suffices.
@@ -206,7 +207,10 @@ def render_kernelop(
         pool_decl = f"    extern __shared__ __align__(16) unsigned char _smem_pool[];  // {smem_total} bytes\n"
         body_text = pool_decl + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
-    return f'{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
+    sig_dtypes = [kernel_op.input_dtype(n) for n in kernel_op.inputs if n not in literals]
+    sig_dtypes.extend(kernel_op.output_dtype(n) for n in kernel_op.outputs)
+    includes = "".join(f"#include {h}\n" for h in cuda_includes(sig_dtypes))
+    return f'{includes}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 
 
 def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], int]:
