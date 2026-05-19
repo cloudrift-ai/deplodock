@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import Knob, KnobType, apply_knobs_env
 
 
 def test_int_parse():
@@ -78,3 +78,72 @@ def test_binmask_requires_width():
 def test_env_property():
     assert Knob("BN", KnobType.INT).env == "DEPLODOCK_BN"
     assert Knob("STAGE", KnobType.BINMASK).env == "DEPLODOCK_STAGE"
+
+
+# ---------------------------------------------------------------------------
+# DEPLODOCK_KNOBS aggregate env var
+# ---------------------------------------------------------------------------
+
+
+def test_apply_knobs_env_splats_into_individual_keys(monkeypatch):
+    """Aggregate env var sets ``DEPLODOCK_<K>`` per entry."""
+    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    monkeypatch.delenv("DEPLODOCK_BN", raising=False)
+    applied = apply_knobs_env("BK=2,BM=16,BN=128")
+    assert applied == {"DEPLODOCK_BK": "2", "DEPLODOCK_BM": "16", "DEPLODOCK_BN": "128"}
+
+
+def test_apply_knobs_env_individual_takes_precedence(monkeypatch):
+    """An explicit ``DEPLODOCK_<K>`` wins over the aggregate."""
+    monkeypatch.setenv("DEPLODOCK_BK", "4")
+    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    applied = apply_knobs_env("BK=2,BM=16")
+    assert "DEPLODOCK_BK" not in applied  # not clobbered
+    assert applied == {"DEPLODOCK_BM": "16"}
+    import os
+
+    assert os.environ["DEPLODOCK_BK"] == "4"
+    assert os.environ["DEPLODOCK_BM"] == "16"
+
+
+def test_apply_knobs_env_tolerates_whitespace(monkeypatch):
+    """Whitespace around keys / values / separators is stripped."""
+    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    applied = apply_knobs_env(" BK = 2 ,  BM=16 ")
+    assert applied == {"DEPLODOCK_BK": "2", "DEPLODOCK_BM": "16"}
+
+
+def test_apply_knobs_env_skips_empty_entries(monkeypatch):
+    """Empty entries (trailing comma, double comma) are skipped."""
+    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    applied = apply_knobs_env("BK=2,,")
+    assert applied == {"DEPLODOCK_BK": "2"}
+
+
+def test_apply_knobs_env_rejects_missing_equals():
+    """An entry without ``=`` is malformed and surfaces an error."""
+    with pytest.raises(ValueError, match="missing '='"):
+        apply_knobs_env("BK=2,BMnoequals")
+
+
+def test_apply_knobs_env_rejects_empty_key():
+    """An entry like ``=4`` has an empty KEY and is rejected."""
+    with pytest.raises(ValueError, match="empty KEY"):
+        apply_knobs_env("=4")
+
+
+def test_apply_knobs_env_uppercases_key(monkeypatch):
+    """Lowercased keys round-trip to the upper-case env-var convention."""
+    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    applied = apply_knobs_env("bk=2")
+    assert applied == {"DEPLODOCK_BK": "2"}
+
+
+def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
+    """With no ``raw`` argument, the function reads ``DEPLODOCK_KNOBS``."""
+    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.setenv("DEPLODOCK_KNOBS", "BK=8")
+    applied = apply_knobs_env()
+    assert applied == {"DEPLODOCK_BK": "8"}

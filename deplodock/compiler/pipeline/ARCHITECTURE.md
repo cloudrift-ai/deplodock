@@ -155,6 +155,82 @@ inventory + lowering edges + the `perf` row per kernel, and returns
 the aggregate `PerfStats` (summed across kernels) for the search to
 score.
 
+## Tuning workflow
+
+The autotune loop selects one tile-lowering variant per CudaOp by repeatedly running the full pipeline with different knob
+choices at each fork point, benching the produced kernels, and steering subsequent rollouts toward the configurations that
+produced the lowest measured latency.
+
+**Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` constructs a `TuningSearch(patience=N, ucb_c=C)`,
+hands it to `Pipeline.tune(graph, search=...)`, and iterates terminals until the search's `stop_reason` fires. Each
+terminal is one fully-lowered `Graph[CudaOp]` whose every kernel got `_bench_terminal`'d. The tuning database (default
+`~/.cache/deplodock/autotune.db`, overridable with `--tune-db PATH` or `DEPLODOCK_TUNE_DB`) accumulates rows across runs;
+calling `tune` again on the same expression resumes from the cached state instead of re-benching.
+
+**Search dynamics.** SP-MCTS over the fork DAG with max-Q normalized UCB1 (see `search/policy/mcts.py`):
+
+- **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
+  where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
+  `child.score` is a rank-only structural prior the rule stamped via `TileOp.score` (no magnitude — only relative ordering).
+- **Expansion** is implicit: `Pipeline.search` pops a node and runs one rule batch; every fork pushes one new child per
+  alternative. The tree mirrors the graph's fork lineage.
+- **Simulation** is the actual `backend.benchmark(...)` call on the terminal — one real GPU run per leaf.
+- **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
+  UCB1 calls see the new max-Q.
+- **Patience** counts terminals visited *since the last new global best*; when it exceeds `--patience N` (default 20),
+  `TuningSearch.stop_reason` is set and `Pipeline.tune` exits.
+
+**Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
+`op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped. A subsequent
+`deplodock run --tune-db PATH ...` (or `make bench-kernels-tuned`) replays the cached forks via `GreedySearch`, which
+walks the parent op's `op_cache_key` in `lowering` and follows the best-known child at each step. No GPU bench is
+required on the replay path when every kernel already has a `perf` row.
+
+**Stub backend.** With `backend=None`, `_bench_terminal` short-circuits to `latency_us=1.0` and persists nothing — used by
+test fixtures so `Pipeline.run`'s greedy replay doesn't clobber tuned rows with a stub when no GPU is available.
+
+## Tunable knobs
+
+A **`Knob`** (`knob.py`) is the canonical schema for one tuning dimension: name, type (`INT` / `BOOL` / `BINMASK`),
+candidate `hints` (advisory — the rule still validates structural fit), and a short help string. Rules declare them as
+module-level constants and stamp values into `TileOp.knobs` dicts; the autotuner reads those dicts back as the per-hop
+knob delta in the `lowering` table. The registry (`knob.registry()`) auto-collects every `Knob` instance in every loaded
+rule module — no manual registration.
+
+**Pinning knobs from the environment.** Two equivalent forms:
+
+- **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_BK=32`). Read directly by the rule that owns the knob.
+- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="BK=2,BM=16,BN=128,FM=8,FN=8,STAGE=111"`).
+  Parsed once at `knob.py` import via `apply_knobs_env()`, which splats each entry into the corresponding
+  `DEPLODOCK_<K>` env var so all the per-knob readers pick it up uniformly. An explicit per-knob var wins over the
+  aggregate (so `DEPLODOCK_BK=4 DEPLODOCK_KNOBS="BK=2,BM=16"` ends up with BK=4, BM=16).
+
+Pinning replaces tuner choice: the rule sees the env value and emits exactly that variant instead of forking. Useful for
+reproducing a tune-time variant from CI logs, A/B-comparing two configs, or pinning a known-good config in a Makefile
+recipe.
+
+**Registered knobs.** All knobs in `passes/lowering/tile/*.py`:
+
+| Knob          | Type     | Owning rule                  | What it controls                                                                                  |
+|---------------|----------|------------------------------|---------------------------------------------------------------------------------------------------|
+| `BK`          | INT      | `002_chunk_matmul_k`         | Per-stage K-chunk size for matmul reductions; intra-CTA K-loop trip count = `K / BK`.             |
+| `SPLITK`      | INT      | `003_split_matmul_k`         | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
+| `BN`          | INT      | `004_launch_geometry`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
+| `BM`          | INT      | `004_launch_geometry`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
+| `STAGE`       | BINMASK  | `007_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. `"111"` stages all three.    |
+| `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
+| `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
+| `TMA`         | BOOL     | `011_tma_copy`               | Use `cp.async.bulk.tensor` staging (sm_90+ only); default tracks arch.                            |
+| `TMA_SWIZZLE` | BOOL     | `011_tma_copy`               | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
+
+`BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
+or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
+`knobs=` line — they're treated as pass-presence markers, not values.
+
+Two non-`Knob` env toggles also affect tile lowering: `DEPLODOCK_FUSED_PIPELINE=1` (`007b_split_fused_for_pipeline`)
+and `DEPLODOCK_BUFFER_COMPUTE=1` (`010_double_buffer`). These don't participate in the autotune fork lattice — they're
+binary opt-ins for experimental features that don't yet have enough signal to be candidate-driven.
+
 ## Pass directories
 
 Pass files are numerically prefixed so `sorted()` pickup is
