@@ -59,7 +59,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 PATTERN = [Pattern("root", TileOp)]
 
-STAGE = Knob("stage", KnobType.BINMASK, help="Bitmask over ranked candidate buffers (char i = buffer i)")
+STAGE = Knob("STAGE", KnobType.BINMASK, help="Bitmask over ranked candidate buffers (char i = buffer i)")
 
 
 class _Slab(NamedTuple):
@@ -82,7 +82,7 @@ def rewrite(root: Node, ctx) -> list[TileOp] | None:
     surviving variant — greedy gets the highest-perf one that fits;
     the autotuner explores them all.
 
-    Idempotence is gated on the ``stage`` knob (stamped on every emitted
+    Idempotence is gated on the ``STAGE`` knob (stamped on every emitted
     variant) rather than on body structure, so the no-staging variant —
     whose body matches the parent — still has a distinct ``op_cache_key``
     from the unstaged input and the rule doesn't re-fire on it."""
@@ -115,7 +115,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     population count; the empty-subset variant comes last and is the
     "stage nothing" fallback whose body matches the parent.
 
-    Each variant carries a single ``stage="<binary_mask>"`` knob (e.g.
+    Each variant carries a single ``STAGE="<binary_mask>"`` knob (e.g.
     ``"101"`` with N=3 means stage ranked-buffers 0 and 2) — giving each
     variant a distinct ``op_cache_key`` even when bodies collide and
     serving as the rule's idempotence anchor so re-firing on the
@@ -223,7 +223,7 @@ def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs
     this allow-set" and tries the next subset.
     """
     idx, tile = single_tile(body)
-    # Idempotence is now gated on the ``stage`` knob in ``rewrite``;
+    # Idempotence is now gated on the ``STAGE`` knob in ``rewrite``;
     # the structural ``any(Stage)`` check would block legitimate re-firing
     # of the partial-staging variants where some Stages are present.
     if not tile.thread_axes:

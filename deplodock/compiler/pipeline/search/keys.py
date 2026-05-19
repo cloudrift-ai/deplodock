@@ -40,7 +40,7 @@ def op_cache_key(op: object) -> str | None:
     if isinstance(op, (LoopOp, TileOp, KernelOp)):
         # Knobs are part of the key: same-body / different-knobs variants
         # (e.g. ``007_stage_inputs`` emits a no-op TileOp with a
-        # ``stage="0..0"`` knob to mark "considered, declined" decisions)
+        # ``STAGE="0..0"`` knob to mark "considered, declined" decisions)
         # must not collide with their parent in the search tree, or
         # ``SearchTree.expand`` self-parents the node and
         # ``_propagate_expected`` walks the parent chain forever.

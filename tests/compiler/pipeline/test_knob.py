@@ -34,7 +34,7 @@ def test_bool_pretty():
 
 
 def test_binmask_parse_binary_string():
-    k = Knob("stage", KnobType.BINMASK)
+    k = Knob("STAGE", KnobType.BINMASK)
     # char i = bit i (left-to-right reads as buffer rank 0..n-1)
     assert k.parse("101", width=3) == 0b101
     assert k.parse("000", width=3) == 0
@@ -42,33 +42,33 @@ def test_binmask_parse_binary_string():
 
 
 def test_binmask_parse_keywords():
-    k = Knob("stage", KnobType.BINMASK)
+    k = Knob("STAGE", KnobType.BINMASK)
     assert k.parse("all", width=3) == 0b111
     assert k.parse("all", width=5) == 0b11111
     assert k.parse("none", width=3) == 0
 
 
 def test_binmask_parse_int_clamps_to_width():
-    k = Knob("stage", KnobType.BINMASK)
+    k = Knob("STAGE", KnobType.BINMASK)
     assert k.parse("0xFFFF", width=3) == 0b111
     assert k.parse("5", width=3) == 0b101
 
 
 def test_binmask_pretty():
-    k = Knob("stage", KnobType.BINMASK)
+    k = Knob("STAGE", KnobType.BINMASK)
     assert k.pretty(0b101, width=3) == "101"
     assert k.pretty(0, width=3) == "000"
     assert k.pretty(0b111, width=3) == "111"
 
 
 def test_binmask_roundtrip():
-    k = Knob("stage", KnobType.BINMASK)
+    k = Knob("STAGE", KnobType.BINMASK)
     for mask in range(16):
         assert k.parse(k.pretty(mask, width=4), width=4) == mask
 
 
 def test_binmask_requires_width():
-    k = Knob("stage", KnobType.BINMASK)
+    k = Knob("STAGE", KnobType.BINMASK)
     with pytest.raises(ValueError, match="width"):
         k.parse("101")
     with pytest.raises(ValueError, match="width"):
@@ -77,6 +77,6 @@ def test_binmask_requires_width():
 
 def test_env_property():
     assert Knob("BN", KnobType.INT).env == "DEPLODOCK_BN"
-    assert Knob("stage", KnobType.BINMASK).env == "DEPLODOCK_STAGE"
+    assert Knob("STAGE", KnobType.BINMASK).env == "DEPLODOCK_STAGE"
 
 
