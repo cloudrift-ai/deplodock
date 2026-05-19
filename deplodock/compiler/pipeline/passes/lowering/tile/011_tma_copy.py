@@ -61,9 +61,22 @@ from deplodock.compiler.ir.tile.ir import (
     TmaBufferedStage,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 logger = logging.getLogger(__name__)
+
+TMA = Knob(
+    "TMA",
+    KnobType.BOOL,
+    hints=(True, False),
+    help="Use cp.async.bulk.tensor staging (sm_90+ only); default tracks arch",
+)
+TMA_SWIZZLE = Knob(
+    "TMA_SWIZZLE",
+    KnobType.BOOL,
+    help="Enable TMA hardware-swizzle modes (B128/B64/B32); default off",
+)
 
 
 # Swizzle picking moved entirely to ``012_split_inner_for_swizzle``.

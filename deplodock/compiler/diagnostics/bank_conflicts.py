@@ -288,7 +288,7 @@ def lane_bank_distribution(
 # addresses per bank are "absorbed" into the natural drain (no extra
 # replay cycle). Mirrors the cost model in ``compiler/autotune.py``
 # (``effective_b_conflict_cost``, empirically validated on
-# ``k_add_5_reduce``: 4-way @ F_N=4 ≈ 1-way @ F_N=1 wall-clock).
+# ``k_add_5_reduce``: 4-way @ FN=4 ≈ 1-way @ FN=1 wall-clock).
 #
 # Per-bank events under LDS.(N×32):
 #     events_at_bank = max(0, distinct_addrs_at_bank - vec_width)

@@ -3,13 +3,13 @@
 Three-class matmul tile, picked from the logical output extents:
 
 - **huge** (``M ≥ 256 AND N ≥ 8192``) — Qwen gate/up_proj.s512-class
-  GEMMs. ``(BN=128, BM=128, F_M=16, F_N=4)`` → 32 outputs / thread,
+  GEMMs. ``(BN=128, BM=128, FM=16, FN=4)`` → 32 outputs / thread,
   256 threads / CTA. Splitk waves target = 8.
 - **compact** (``N ≤ 1024``) — kv_proj-class and SDPA-shaped matmuls
-  (small head_dim K, M=seq). ``(BN=64, BM=64, F_M=8, F_N=4)`` → 16
+  (small head_dim K, M=seq). ``(BN=64, BM=64, FM=8, FN=4)`` → 16
   outputs / thread, 128 threads / CTA. Splitk waves target = 2.
 - **default** (everything else) — Q/O/down/MLP-up proj-class. Original
-  asymmetric cuBLAS-style ``(BN=128, BM=64, F_M=8, F_N=4)`` validated
+  asymmetric cuBLAS-style ``(BN=128, BM=64, FM=8, FN=4)`` validated
   at 105% of cuBLAS on 2048² fp32 RTX 5090. Splitk waves target = 8.
 
 Orthogonal splitk-waves overrides (tile shape unchanged):
@@ -31,9 +31,6 @@ Env vars:
 - ``DEPLODOCK_BK`` — K-split size for ``002_chunk_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
-- ``DEPLODOCK_SPLITK_WAVES`` — override the auto-splitk waves target.
-- ``DEPLODOCK_TB`` — total thread budget per CTA for non-matmul kernels.
-- ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
   weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
   (Hopper / Blackwell), default-off below. ``=1`` forces on, ``=0``
@@ -64,20 +61,20 @@ if TYPE_CHECKING:
 #
 # - "huge" (``M ≥ _HUGE_M_MIN AND N ≥ _HUGE_N_MIN``): big GEMMs like
 #   ``M=512, N=18944`` (Qwen gate/up_proj.s512). ``(BN=128, BM=128,
-#   F_M=16, F_N=4) → 32 outputs/thread, 256 threads/CTA`` beats the
+#   FM=16, FN=4) → 32 outputs/thread, 256 threads/CTA`` beats the
 #   default tile by ~8%.
 #
 # - "compact" (``N ≤ _COMPACT_N_MAX``): kv_proj-class (narrow N) and
 #   SDPA-shaped matmuls (small head_dim K, M=seq). ``(BN=64, BM=64,
-#   F_M=8, F_N=4)`` + ``waves=2`` raises grid count and tames atomic-add
+#   FM=8, FN=4)`` + ``waves=2`` raises grid count and tames atomic-add
 #   contention. Cuts kv_proj.s512 ~48µs → ~20µs and sdpa.tinyllama.s512
 #   ~456µs → ~178µs.
 #
 # - "default" (everything else): proj-class GEMMs (Q/O/down/MLP up). The
-#   original cuBLAS-style asymmetric ``(BN=128, BM=64, F_M=8, F_N=4)``
+#   original cuBLAS-style asymmetric ``(BN=128, BM=64, FM=8, FN=4)``
 #   tile, validated at ~105% of cuBLAS on 2048² fp32.
 _TILE_SHAPE_DEFAULT = (128, 64)  # (BN, BM)
-_F_PER_AXIS_DEFAULT = (8, 4)  # (F_M, F_N)
+_F_PER_AXIS_DEFAULT = (8, 4)  # (FM, FN)
 _TILE_SHAPE_HUGE = (128, 128)
 _F_PER_AXIS_HUGE = (16, 4)
 _TILE_SHAPE_COMPACT = (64, 64)
@@ -94,8 +91,8 @@ _TILE_SHAPE_FUSED = (64, 64)
 _F_PER_AXIS_FUSED = (4, 4)
 # "Default-large" class: default-class shapes with enough M to fill
 # the grid benefit from doubling the per-thread N register tile from
-# F_N=4 → F_N=8. The chunk pass (``009``) keeps LDS.128 vectorized
-# and prevents the F_N=8 bank-conflict cliff. Sweep on RTX 5090 fp32:
+# FN=4 → FN=8. The chunk pass (``009``) keeps LDS.128 vectorized
+# and prevents the FN=8 bank-conflict cliff. Sweep on RTX 5090 fp32:
 # qwen.q_proj.s512 0.87× → 0.92× (286 → 266µs), qwen.down_proj.s512
 # 0.79× → 0.86× (1434 → 1331µs), tl.gate_proj.s512 0.95× → 0.99×.
 # Small-M cases (s32) regress because the grid is too small to
@@ -259,7 +256,7 @@ def _tile_class(tile: Tile | None) -> str:
     occupancy.
 
     ``"default-large"`` is the default-class subclass for M ≥ 128 +
-    N > _COMPACT_N_MAX + N < _HUGE_N_MIN. F_N=8 (vs F_N=4) doubles
+    N > _COMPACT_N_MAX + N < _HUGE_N_MIN. FN=8 (vs FN=4) doubles
     arithmetic intensity per thread; the chunk pass (``009``) keeps
     LDS.128 vectorized.
     """
@@ -281,7 +278,7 @@ def _tile_class(tile: Tile | None) -> str:
 
 
 def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
-    """``((BN, BM), (F_M, F_N))`` defaults for the matmul tile, picked
+    """``((BN, BM), (FM, FN))`` defaults for the matmul tile, picked
     by ``_tile_class``."""
     cls = _tile_class(tile)
     if cls == "fused":
@@ -301,7 +298,13 @@ def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
 def _tma_enabled() -> bool:
     """TMA staging gate. Default-on for sm_90+ (Hopper / Blackwell) which
     have ``cp.async.bulk.tensor``; default-off below sm_90. ``DEPLODOCK_TMA``
-    overrides either way: ``=1`` forces on, ``=0`` forces off."""
+    overrides either way: ``=1`` forces on, ``=0`` forces off.
+
+    The ``TMA`` ``Knob`` itself lives in ``011_tma_copy``; this function
+    duplicates a 3-line env read instead of importing it because
+    ``011_tma_copy``'s numeric-prefix filename can only be loaded via
+    ``importlib`` and ``_fold_constant`` (a frontend pass) calls this
+    before tile passes are loaded."""
     raw = os.environ.get("DEPLODOCK_TMA")
     if raw == "1":
         return True
@@ -323,25 +326,33 @@ def _tma_swizzle_enabled() -> bool:
     return os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") in ("1", "true", "True")
 
 
+# CTA inner-axis width default for paths that produce a single THREAD
+# axis (non-matmul ``005_blockify_launch`` deterministic branch and
+# ``004_cooperative_reduce``'s synthetic ``t`` axis). Mutually exclusive
+# with the matmul path, so it shares the ``DEPLODOCK_BN`` env namespace
+# — at most one path applies per kernel.
+_NON_MATMUL_BN_DEFAULT = 256
+
+
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit,
-    innermost-first. ``(BN, BM)`` for matmul, ``(thread_budget,)`` for
-    non-matmul kernels."""
+    innermost-first. ``(BN, BM)`` for matmul, ``(BN,)`` for non-matmul
+    kernels (single THREAD axis; same env namespace as the matmul case)."""
     if tile is not None and _has_matmul_reduce(tile.body):
         (def_bn, def_bm), _ = _default_tile(tile)
         bn = _int_env("DEPLODOCK_BN", def_bn)
         bm = _int_env("DEPLODOCK_BM", def_bm)
         return (bn, bm)
-    return (thread_budget(),)
+    return (_int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT),)
 
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
-    """Per-thread output tile ``(F_M, F_N)``. ``(1, 1)`` to skip
+    """Per-thread output tile ``(FM, FN)``. ``(1, 1)`` to skip
     register tiling on non-matmul bodies and on tiny matmuls whose
     post-blockify THREAD product is already at-or-below one warp.
 
     For tiles whose THREAD extents match the class's default (BN, BM),
-    return the class-tuned ``(F_M, F_N)``. For *off-default* (BN, BM)
+    return the class-tuned ``(FM, FN)``. For *off-default* (BN, BM)
     — the autotune sweep over ``005_blockify_launch``'s ``_TUNE_AXIS_CHOICES``
     — derive a heuristic F from the actual thread extents that targets
     ~256 post-split threads, so 008 still forks (and the autotuner can
@@ -379,10 +390,6 @@ def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
         if m_ext % f == 0 and n_ext % f == 0 and (m_ext // f) * (n_ext // f) >= 32:
             return (f, f)
     return (1, 1)
-
-
-def thread_budget() -> int:
-    return _int_env("DEPLODOCK_TB", 256)
 
 
 def forced_bk(tile: Tile | None = None, static_smem_cap: int | None = None) -> int | None:
@@ -446,7 +453,11 @@ def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
 
 
 def cooperative_block_size() -> int:
-    return _int_env("DEPLODOCK_COOP_BLOCK", 256)
+    """Threads/CTA for the synthetic cooperative ``t`` axis. Shares the
+    matmul ``DEPLODOCK_BN`` env namespace — cooperative-reduce and
+    matmul paths are mutually exclusive per kernel, so one env knob
+    suffices for both."""
+    return _int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT)
 
 
 # Cross-CTA split-K target. Class-adaptive: small-tile matmuls (narrow N
@@ -471,14 +482,12 @@ def _splitk_target_waves(tile: Tile | None) -> int:
     else:
         n = m = 0
     if 0 < m <= _LOW_GRID_M_MAX and 0 < n <= _LOW_GRID_N_MAX:
-        default = _SPLITK_TARGET_WAVES_SMALL
-    elif cls == "compact":
-        default = _SPLITK_TARGET_WAVES_SMALL
-    elif cls == "default" and m >= _WIDE_GRID_M_MIN and n >= _WIDE_GRID_N_MIN:
-        default = _SPLITK_TARGET_WAVES_HIGH
-    else:
-        default = _SPLITK_TARGET_WAVES_LARGE
-    return _int_env("DEPLODOCK_SPLITK_WAVES", default)
+        return _SPLITK_TARGET_WAVES_SMALL
+    if cls == "compact":
+        return _SPLITK_TARGET_WAVES_SMALL
+    if cls == "default" and m >= _WIDE_GRID_M_MIN and n >= _WIDE_GRID_N_MIN:
+        return _SPLITK_TARGET_WAVES_HIGH
+    return _SPLITK_TARGET_WAVES_LARGE
 
 
 def auto_splitk(tile: Tile, k_o_extent: int) -> int:

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.pipeline.knobs import format_tuning_knobs
+from deplodock.compiler.pipeline.knob import format_tuning_knobs
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context

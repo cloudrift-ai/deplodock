@@ -39,7 +39,7 @@ def _shrink_autotune_search(monkeypatch: pytest.MonkeyPatch) -> None:
     to fork) via ``DEPLODOCK_*`` env knobs and disables the per-buffer
     staging power-set so ``007_stage_inputs`` emits a single variant
     (its pre-knob behavior)."""
-    monkeypatch.setenv("DEPLODOCK_STAGE_INPUTS", "0xFFFF")
+    monkeypatch.setenv("DEPLODOCK_STAGE", "all")
     monkeypatch.setenv("DEPLODOCK_TMA", "0")
 
 
@@ -132,7 +132,7 @@ def test_irrelevant_seed_is_ignored() -> None:
         "tile",
         "unrelated-child",
         "tile",
-        knobs={"BN": 999, "BM": 999, "blockify": True},
+        knobs={"BN": 999, "BM": 999},
         measured_median_us=1.0,
     )
 

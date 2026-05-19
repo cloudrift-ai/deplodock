@@ -15,7 +15,7 @@ schedule than the pure matmul:
 | Regs / thread | 80 | 80 (after fused-class fix; was 145) |
 | Occupancy | 50 % | 50 % |
 | FMA% | ~65 % | ~46 % |
-| SiLU pipeline ↔ FMA dependency chain inside K-loop | n/a | 5 stages × F_M live values |
+| SiLU pipeline ↔ FMA dependency chain inside K-loop | n/a | 5 stages × FM live values |
 
 The wall isn't bank conflicts (~5 % overhead) and it isn't pure
 register pressure once we drop to `F=4×4`. The wall is that **every

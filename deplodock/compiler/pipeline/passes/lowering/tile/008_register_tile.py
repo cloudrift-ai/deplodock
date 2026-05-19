@@ -2,7 +2,7 @@
 
 Each thread in the post-blockify state owns one output element of the
 CTA's M×N tile. ``tuning.register_tile_shape`` returns the per-thread
-``(F_M, F_N)`` cell shape — currently fixed at ``(8, 4)`` for matmul
+``(FM, FN)`` cell shape — currently fixed at ``(8, 4)`` for matmul
 (paired with the ``005_blockify_launch`` ``(BN=128, BM=64)`` thread
 tile), or ``(1, 1)`` to skip register tiling (small matmul or
 non-matmul body).
@@ -10,21 +10,21 @@ non-matmul body).
 This pass splits each ``BIND_THREAD`` axis by its factor and
 replicates the matmul reduce body + epilogue per ``(a_i, a_j)`` cell.
 Each replicated cell carries its own SSA accumulator
-(``acc0_<i>_<j>``), giving ``F_M × F_N`` independent partial sums per
+(``acc0_<i>_<j>``), giving ``FM × FN`` independent partial sums per
 thread that nvcc can schedule in parallel registers.
 
 **Axis-aware replication.** Each stmt's value transitively depends on
 some subset of {m_axis, n_axis}; the stmt is replicated
-``F_M^|{m_axis}∩deps| × F_N^|{n_axis}∩deps|`` times with σ-substituted
+``FM^|{m_axis}∩deps| × FN^|{n_axis}∩deps|`` times with σ-substituted
 indices and SSA names suffixed by the cell coordinate(s):
 
 ==============================  =====================  =============================
 Stmt's thread-axis dependence   Replicas               Per-cell name suffix
 ==============================  =====================  =============================
 ``∅`` (constant / batch only)   1                      ``""``  (shared across cells)
-``{m_axis}`` (per-row)          ``F_M``                ``"_<i>"``
-``{n_axis}`` (per-col)          ``F_N``                ``"_<j>"``
-``{m_axis, n_axis}``            ``F_M × F_N``          ``"_<i>_<j>"``
+``{m_axis}`` (per-row)          ``FM``                ``"_<i>"``
+``{n_axis}`` (per-col)          ``FN``                ``"_<j>"``
+``{m_axis, n_axis}``            ``FM × FN``          ``"_<i>_<j>"``
 ==============================  =====================  =============================
 
 Computed via :meth:`Body.fold` over the def-use DAG with a bound-axis
@@ -63,16 +63,20 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
 # Candidate per-thread cell factors to fork over. Cell shape is
-# ``(F_M, F_N)`` with each F dividing its corresponding THREAD axis
+# ``(FM, FN)`` with each F dividing its corresponding THREAD axis
 # extent.
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
-# Cap on per-thread output cells. F_M × F_N replicates the matmul reduce
+
+FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread output cells along M axis")
+FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread output cells along N axis")
+# Cap on per-thread output cells. FM × FN replicates the matmul reduce
 # body that many times per thread; beyond this NVRTC compile time
 # explodes on the unrolled body. ``TileOp.validate`` is the second-line
 # filter (post-register-tile thread count); this is the first-line cap
@@ -88,10 +92,9 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     # re-fork. Without this, ``F=1`` in one axis leaves that THREAD
     # extent unchanged so ``register_tile_shape``'s gate still passes,
     # and 008 cascades into nested forks across every subsequent rule
-    # pass. The ``register_tile`` knob is stamped by ``_variants`` on
-    # every emitted variant.
-    if root.op.knobs.get("register_tile"):
-        raise RuleSkipped("register-tile already applied (knobs['register_tile'] set)")
+    # pass. ``FM`` is stamped by ``_variants`` on every emitted variant.
+    if FM.name in root.op.knobs:
+        raise RuleSkipped("register-tile already applied (FM set in knobs)")
 
     # Profitability gate — register tiling only helps matmul-shape
     # bodies (≥2 reduce-Loops sharing operand Loads across M / N).
@@ -117,7 +120,7 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
 
     variants = _variants(body, idx, tile, root.op.name, m_axis_name, n_axis_name, m_ext, n_ext, heuristic)
     if not variants:
-        raise RuleSkipped("no viable (F_M, F_N) candidate")
+        raise RuleSkipped("no viable (FM, FN) candidate")
     if len(variants) == 1:
         return variants[0]
     return variants
@@ -134,7 +137,7 @@ def _variants(
     n_ext: int,
     heuristic: tuple[int, int],
 ) -> list[TileOp]:
-    """Enumerate viable ``(F_M, F_N)`` cell shapes. Heuristic shape goes
+    """Enumerate viable ``(FM, FN)`` cell shapes. Heuristic shape goes
     first so deterministic compiles pick it; alternative shapes are
     appended in a fixed order so the trace's ``choice_idx`` is stable
     across runs."""
@@ -155,7 +158,7 @@ def _variants(
         ordered.append(shape)
 
     # Heuristic first — non-tune compiles pick option 0. Exempt from the
-    # cell-count cap so class-tuned defaults like ``(F_M=8, F_N=8)`` keep
+    # cell-count cap so class-tuned defaults like ``(FM=8, FN=8)`` keep
     # working; the cap only narrows the *autotune* alternatives. Search
     # re-ranks unvisited variants via ``TileOp.score`` so rule emission
     # order doesn't determine MCTS bootstrap order.
@@ -173,7 +176,7 @@ def _variants(
             TileOp(
                 body=body[:idx] + (rewritten,) + body[idx + 1 :],
                 name=name,
-                knobs={"F_M": f_m, "F_N": f_n, "register_tile": True},
+                knobs={FM.name: f_m, FN.name: f_n},
             )
         )
     return variants
@@ -199,7 +202,7 @@ def _register_tile(tile: Tile, m_axis: str, n_axis: str, factor_m: int, factor_n
     """Register-tile by composing two per-axis replications, ``factor_m``
     on the M-axis and ``factor_n`` on the N-axis. Symmetric mode passes
     ``factor_m == factor_n``; asymmetric (cuBLAS-style) passes them
-    independently (e.g. ``F_M=8, F_N=4``)."""
+    independently (e.g. ``FM=8, FN=4``)."""
     new_axes, m_o = _split_axis(tile.axes, m_axis, factor_m)
     new_axes, n_o = _split_axis(new_axes, n_axis, factor_n)
 
