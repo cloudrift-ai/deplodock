@@ -31,8 +31,6 @@ Env vars:
 - ``DEPLODOCK_BK`` — K-split size for ``002_chunk_matmul_k`` (subject
   to ``K % BK == 0 and K > BK``). Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
-- ``DEPLODOCK_SPLITK_WAVES`` — override the auto-splitk waves target.
-- ``DEPLODOCK_TB`` — total thread budget per CTA for non-matmul kernels.
 - ``DEPLODOCK_COOP_BLOCK`` — cooperative-reduce thread count.
 - ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
   weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
@@ -323,16 +321,19 @@ def _tma_swizzle_enabled() -> bool:
     return os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") in ("1", "true", "True")
 
 
+_NON_MATMUL_THREAD_BUDGET = 256
+
+
 def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
     """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit,
-    innermost-first. ``(BN, BM)`` for matmul, ``(thread_budget,)`` for
-    non-matmul kernels."""
+    innermost-first. ``(BN, BM)`` for matmul, ``(256,)`` for non-matmul
+    kernels."""
     if tile is not None and _has_matmul_reduce(tile.body):
         (def_bn, def_bm), _ = _default_tile(tile)
         bn = _int_env("DEPLODOCK_BN", def_bn)
         bm = _int_env("DEPLODOCK_BM", def_bm)
         return (bn, bm)
-    return (thread_budget(),)
+    return (_NON_MATMUL_THREAD_BUDGET,)
 
 
 def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
@@ -379,10 +380,6 @@ def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
         if m_ext % f == 0 and n_ext % f == 0 and (m_ext // f) * (n_ext // f) >= 32:
             return (f, f)
     return (1, 1)
-
-
-def thread_budget() -> int:
-    return _int_env("DEPLODOCK_TB", 256)
 
 
 def forced_bk(tile: Tile | None = None, static_smem_cap: int | None = None) -> int | None:
@@ -471,14 +468,12 @@ def _splitk_target_waves(tile: Tile | None) -> int:
     else:
         n = m = 0
     if 0 < m <= _LOW_GRID_M_MAX and 0 < n <= _LOW_GRID_N_MAX:
-        default = _SPLITK_TARGET_WAVES_SMALL
-    elif cls == "compact":
-        default = _SPLITK_TARGET_WAVES_SMALL
-    elif cls == "default" and m >= _WIDE_GRID_M_MIN and n >= _WIDE_GRID_N_MIN:
-        default = _SPLITK_TARGET_WAVES_HIGH
-    else:
-        default = _SPLITK_TARGET_WAVES_LARGE
-    return _int_env("DEPLODOCK_SPLITK_WAVES", default)
+        return _SPLITK_TARGET_WAVES_SMALL
+    if cls == "compact":
+        return _SPLITK_TARGET_WAVES_SMALL
+    if cls == "default" and m >= _WIDE_GRID_M_MIN and n >= _WIDE_GRID_N_MIN:
+        return _SPLITK_TARGET_WAVES_HIGH
+    return _SPLITK_TARGET_WAVES_LARGE
 
 
 def auto_splitk(tile: Tile, k_o_extent: int) -> int:

@@ -30,7 +30,7 @@ the queue). Non-matmul tiles return a single deterministic TileOp.
 PAT and the register-tile factor F are paired in ``tuning`` so
 ``PAT/F = 16``. After ``008_register_tile`` splits each PAT axis by F,
 the final per-axis thread count is exactly 16 and the two output axes
-together yield ``16² = 256 = thread_budget`` — no post-hoc rebalance
+together yield ``16² = 256`` threads/CTA — no post-hoc rebalance
 pass needed.
 
 Idempotent: if option 0's partition is identical to the current Tile
