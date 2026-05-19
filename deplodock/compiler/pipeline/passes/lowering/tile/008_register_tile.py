@@ -168,9 +168,7 @@ def _reduce_unroll_site(axis_name: str, factor: int) -> _Site:
                     continue
                 accums = [(a.name, a.op) for a in s.body if isinstance(a, Accum)]
                 inner = replicate_along_axis(s.body, axis_name, factor, _sigma_offset(axis_name, step))
-                new_body.append(
-                    StridedLoop(axis=s.axis, start=s.start, step=Literal(step * factor, "int"), body=inner, unroll=s.unroll)
-                )
+                new_body.append(StridedLoop(axis=s.axis, start=s.start, step=Literal(step * factor, "int"), body=inner, unroll=s.unroll))
                 for orig_name, op in accums:
                     # Chain binary folds: acc_0 op acc_1 → t1; t1 op acc_2 → t2; … last → orig_name.
                     cur = f"{orig_name}_0"
@@ -360,6 +358,7 @@ def replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callable
 
 def _sigma_split(axis: str, axis_o: str, factor: int) -> Callable[[int], Sigma]:
     """σ for THREAD-axis split: ``axis → axis_o * factor + i``."""
+
     def _f(i: int) -> Sigma:
         return Sigma({axis: Var(axis_o) * Literal(factor, "int") + Literal(i, "int")})
 
@@ -368,6 +367,7 @@ def _sigma_split(axis: str, axis_o: str, factor: int) -> Callable[[int], Sigma]:
 
 def _sigma_offset(axis: str, step: int) -> Callable[[int], Sigma]:
     """σ for reduction-axis unroll: ``axis → axis + i * step`` (identity for i=0)."""
+
     def _f(i: int) -> Sigma:
         if i == 0:
             return Sigma.IDENTITY
