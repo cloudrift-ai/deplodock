@@ -3,7 +3,7 @@
 Exposes the ``recording_dump`` fixture: a duck-typed ``CompilerDump``
 that records the names of every rule that produced a rewrite, with the
 numeric ordering prefix stripped (``002_chunk_matmul_k`` →
-``chunk_matmul_k``, ``004_cooperative_reduce`` →
+``chunk_matmul_k``, ``005_cooperative_reduce`` →
 ``cooperative_reduce``). Pass it into ``run_pipeline`` / ``run_pass``
 to assert which rules fired without coupling tests to file ordering.
 """

@@ -84,7 +84,7 @@ def _t_axes(*names_and_extents) -> tuple[Axis, ...]:
 def _softmax_max_reduce(K: int = 512) -> Loop:
     """``Loop(K, body=(Load attn[a0, a1_i, K], Accum(max)))`` — ``a1_i``
     is the post-blockify thread-tile var so the slab includes a 16-wide
-    cache axis (matches what ``005_blockify_launch`` produces)."""
+    cache axis (matches what ``005_launch_geometry`` produces)."""
     return Loop(
         axis=Axis("k", K),
         body=(

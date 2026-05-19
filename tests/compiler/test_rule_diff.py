@@ -15,10 +15,10 @@ from deplodock.compiler.pipeline.rule_diff import (
 
 
 def test_render_rule_diff_brackets_with_markers():
-    out = render_rule_diff("005_blockify", "a\nb\nc\n", "a\nB\nc\n", cfg=RuleRenderConfig(color=False))
+    out = render_rule_diff("004_launch", "a\nb\nc\n", "a\nB\nc\n", cfg=RuleRenderConfig(color=False))
     lines = out.splitlines()
-    assert lines[0] == ">>> 005_blockify"
-    assert lines[-1] == "<<< 005_blockify"
+    assert lines[0] == ">>> 004_launch"
+    assert lines[-1] == "<<< 004_launch"
     assert any(ln.startswith("-b") for ln in lines)
     assert any(ln.startswith("+B") for ln in lines)
     # No file-header noise from unified_diff.
@@ -58,7 +58,7 @@ def test_format_skipped_uses_dashed_marker():
 
 
 def test_display_name_prefixes_known_pass():
-    assert display_name("lowering/tile", "005_blockify_launch") == "t:005_blockify_launch"
+    assert display_name("lowering/tile", "005_launch_geometry") == "t:005_launch_geometry"
     assert display_name("loop/fusion", "001_merge_loop_ops") == "f:001_merge_loop_ops"
     # Unknown / missing pass falls back to the bare rule name.
     assert display_name(None, "001_x") == "001_x"

@@ -20,7 +20,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
-_accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.004_cooperative_reduce")._accums_independent
+_accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.004_launch_geometry")._accums_independent
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:

@@ -10,7 +10,7 @@ Two halves:
    pointwise, sibling output-Loop lifting), then run only the
    ``tileify`` rule via ``Pipeline.build(select={"tileify"}).run(...)`` so
    the resulting ``Tile.axes`` reflects tileify alone — no subsequent
-   ``blockify_launch`` partition or ``cooperative_reduce`` rewrite to
+   ``launch_geometry`` partition or ``cooperative_reduce`` rewrite to
    obscure the assertion.
 """
 
