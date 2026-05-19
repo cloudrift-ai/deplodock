@@ -72,6 +72,7 @@ def normalize_body(
     stmts = canonicalize_free_axis_order(stmts)
     stmts = eliminate_copy_aliases(stmts)
     stmts = unify_sibling_reduce_axes(stmts)
+    stmts = merge_sibling_reduce_loops(stmts)
     if hoist:
         stmts = split_invariant_divides(stmts)
         stmts = hoist_loop_invariants(stmts)
@@ -185,10 +186,11 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
 
 
 def unify_sibling_reduce_axes(stmts: Body) -> Body:
-    """At every scope, find sibling reduce ``Loop``s whose reduce axes index
-    the same ``(Load.source, dim)`` position and rename them to a single
-    canonical axis name. Recurses through every block-structured Stmt
-    (Loop / StridedLoop / Tile / Cond) to find nested scopes."""
+    """At every scope, find sibling reduce ``Loop``s whose reduce axes
+    index overlapping ``(Load.source, dim)`` positions and rename them
+    to a single canonical axis name. Recurses through every block-
+    structured Stmt (Loop / StridedLoop / Tile / Cond) to find nested
+    scopes."""
     stmts = Body.coerce(stmts)
 
     def walk(body: Body) -> Body:
@@ -210,33 +212,63 @@ def unify_sibling_reduce_axes(stmts: Body) -> Body:
 
 def _unify_siblings(body: Body) -> Body:
     """Single-scope sibling grouping: rename reduce-axis vars across
-    sibling reduce Loops that index the same ``(source, dim)`` positions
-    so they share one canonical axis name."""
+    sibling reduce Loops whose bare-Var Load positions overlap on any
+    ``(source, dim)`` pair so they share one canonical axis name.
+
+    Two reduce Loops that bind different axis names but both index the
+    same input slot (e.g. ``x[..., a2]`` and ``x[..., a3]`` for the
+    same ``x``) are semantically the same reduction dimension. Union-
+    find on the overlap relation merges all transitively-connected
+    Loops into one group. Within a group, the first Loop's axis name
+    wins; later Loops are rewritten to use it.
+
+    Pairing on overlap rather than exact-set equality lets matmul-
+    siblings that bring in distinct weight tensors (e.g.
+    ``silu(x@Wg) * (x@Wu)`` — both reduce over K and index x, but only
+    one indexes Wg and the other Wu) unify on the shared x position;
+    the downstream :func:`merge_sibling_reduce_loops` pass then
+    concatenates their bodies.
+    """
     stmts = list(body)
-    groups: dict[frozenset[tuple[str, int]], list[int]] = {}
+
+    entries: list[tuple[int, str, int, frozenset[tuple[str, int]]]] = []
     for i, s in enumerate(stmts):
         if isinstance(s, Loop) and s.is_reduce:
             positions = _reduce_axis_source_positions(s.body, s.axis.name)
             if positions:
-                groups.setdefault(frozenset(positions), []).append(i)
+                entries.append((i, s.axis.name, int(s.axis.extent), frozenset(positions)))
 
-    for indices in groups.values():
-        if len(indices) < 2:
-            continue
-        first = stmts[indices[0]]
-        assert isinstance(first, Loop)
-        canonical = first.axis.name
-        canonical_extent = int(first.axis.extent)
-        for idx in indices[1:]:
-            loop = stmts[idx]
-            assert isinstance(loop, Loop)
-            if int(loop.axis.extent) != canonical_extent or loop.axis.name == canonical:
+    if len(entries) < 2:
+        return Body(stmts)
+
+    parent = list(range(len(entries)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a in range(len(entries)):
+        for b in range(a + 1, len(entries)):
+            if entries[a][2] != entries[b][2]:
                 continue
-            new_axis = Axis(name=canonical, extent=canonical_extent)
-            sub = Sigma({loop.axis.name: Var(canonical)})
-            rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
-            renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
-            stmts[idx] = replace(loop, axis=new_axis, body=renamed)
+            if entries[a][3] & entries[b][3]:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+
+    for k, (idx, axis_name, extent, _) in enumerate(entries):
+        canonical = entries[find(k)][1]
+        if canonical == axis_name:
+            continue
+        loop = stmts[idx]
+        assert isinstance(loop, Loop)
+        new_axis = Axis(name=canonical, extent=extent)
+        sub = Sigma({loop.axis.name: Var(canonical)})
+        rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
+        renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
+        stmts[idx] = replace(loop, axis=new_axis, body=renamed)
 
     return Body(stmts)
 
@@ -252,6 +284,116 @@ def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tupl
         for dim, e in enumerate(s.index)
         if isinstance(e, Var) and e.name == reduce_axis_name
     }
+
+
+# ---------------------------------------------------------------------------
+# Pass 4b: merge sibling reduce Loops with matching axis into one Loop.
+# ---------------------------------------------------------------------------
+#
+# After :func:`unify_sibling_reduce_axes` renames sibling reduce axes
+# that index overlapping ``(source, dim)`` positions to one canonical
+# name, adjacent reduce Loops with the same axis name/extent become
+# structurally identical iteration scopes. Merging concatenates their
+# bodies into one Loop so the reduce axis is traversed once instead of
+# twice. Downstream ``dedup_loads`` then collapses the duplicate Loads
+# both halves share — e.g. ``load x[0, a0, k]`` in the gated-MLP
+# pattern ``silu(x@Wg) * (x@Wu)`` where both matmuls reduce over the
+# same K and share x as a Load source. Symmetric staging follows: once
+# wu lives in the same K-loop as wg, ``stage_inputs`` / ``tma_copy`` /
+# ``double_buffer`` apply uniformly.
+# ---------------------------------------------------------------------------
+
+
+def merge_sibling_reduce_loops(stmts: Body) -> Body:
+    """Merge sibling reduce ``Loop``s with matching ``axis.name`` and
+    ``axis.extent`` into one Loop whose body is the concatenation.
+
+    Gates a merge on three conditions:
+
+    1. The two bodies have disjoint SSA defs — no name collision and
+       no inner-scope shadowing once they share one Loop.
+    2. The second Loop's body does not read any SSA name the first
+       Loop's body defines (including ``Accum`` exports). When it
+       does, the two reductions are sequentially dependent — e.g.
+       softmax's sum-exp loop reads ``acc_max`` from the preceding
+       max loop. Merging would replace that read of the *finalized*
+       max with a read of the in-flight per-iter value, changing
+       semantics.
+    3. No statement that sits between the two Loops defines an SSA
+       name the second Loop's body reads — otherwise the merge would
+       move that read above its def.
+
+    Statements that sit between the two original Loops stay in their
+    original positions in the parent Body. References to the first
+    Loop's ``Accum`` remain valid (Accum names cross the Loop
+    boundary). References to the second Loop's ``Accum`` from
+    statements that originally followed it now resolve to the merged
+    Loop above them — still defs-before-uses.
+
+    Recurses through every block-structured Stmt to find nested scopes.
+    """
+    stmts = Body.coerce(stmts)
+
+    def walk(body: Body) -> Body:
+        recursed: list[Stmt] = []
+        for s in body:
+            nested = s.nested()
+            if nested:
+                recursed.append(s.with_bodies(tuple(walk(b) for b in nested)))
+            else:
+                recursed.append(s)
+        return _merge_sibling_reduce_loops(Body(recursed))
+
+    return walk(stmts)
+
+
+def _merge_sibling_reduce_loops(body: Body) -> Body:
+    items = list(body)
+    if len(items) < 2:
+        return body
+
+    out: list[Stmt] = []
+    consumed: set[int] = set()
+    for i, s in enumerate(items):
+        if i in consumed:
+            continue
+        if not (isinstance(s, Loop) and s.is_reduce):
+            out.append(s)
+            continue
+        merged = s
+        for j in range(i + 1, len(items)):
+            if j in consumed:
+                continue
+            t = items[j]
+            if not (
+                isinstance(t, Loop)
+                and t.is_reduce
+                and t.axis.name == merged.axis.name
+                and int(t.axis.extent) == int(merged.axis.extent)
+                and t.unroll == merged.unroll
+            ):
+                continue
+            merged_defs = _all_ssa_defs(merged.body)
+            if merged_defs & _all_ssa_defs(t.body):
+                continue
+            if merged_defs & _all_ssa_uses(t.body):
+                continue
+            between_defs: set[str] = set()
+            for k in range(i + 1, j):
+                if k in consumed:
+                    continue
+                between_defs |= _all_ssa_defs(Body((items[k],)))
+            if between_defs & _all_ssa_uses(t.body):
+                continue
+            merged = Loop(
+                axis=merged.axis,
+                body=Body(tuple(merged.body) + tuple(t.body)),
+                unroll=merged.unroll,
+            )
+            consumed.add(j)
+        out.append(merged)
+
+    return Body(out)
 
 
 # ---------------------------------------------------------------------------

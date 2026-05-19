@@ -16,6 +16,7 @@ instance — no ``register(...)`` wrapper, no manual bookkeeping.
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -133,6 +134,60 @@ def reset_registry() -> None:
     monkeypatch ``sys.modules`` use this to force a rebuild."""
     global _REGISTRY
     _REGISTRY = None
+
+
+# --- Aggregate env var ------------------------------------------------------
+
+
+def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
+    """Splat ``DEPLODOCK_KNOBS="K1=V1,K2=V2,..."`` into individual
+    ``DEPLODOCK_<K>=V`` env vars.
+
+    Convenience for setting many knobs from one place (CLI invocation,
+    Makefile recipe, pytest ``monkeypatch.setenv``). Individual
+    ``DEPLODOCK_<K>`` vars take precedence: this only writes a key when
+    the per-knob env var is unset, so callers can pin one knob from
+    the command line and supply the rest via ``DEPLODOCK_KNOBS``
+    without surprise.
+
+    Whitespace is tolerant; empty entries are skipped. A malformed
+    entry (no ``=``) raises ``ValueError``. Returns the dict of keys
+    actually applied (for tests / diagnostics).
+
+    Runs at module import time on the live process environment. Pass
+    ``raw`` explicitly to apply a different aggregate without touching
+    ``DEPLODOCK_KNOBS`` (useful in tests).
+    """
+    if raw is None:
+        raw = os.environ.get("DEPLODOCK_KNOBS", "")
+    applied: dict[str, str] = {}
+    if not raw:
+        return applied
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} is missing '=' (expected KEY=VALUE)")
+        key, _, value = entry.partition("=")
+        key = key.strip().upper()
+        value = value.strip()
+        if not key:
+            raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} has empty KEY")
+        env_name = f"DEPLODOCK_{key}"
+        # Individual per-knob env vars win — don't clobber an explicit
+        # ``DEPLODOCK_BK=4`` with whatever the aggregate says.
+        if env_name in os.environ:
+            continue
+        os.environ[env_name] = value
+        applied[env_name] = value
+    return applied
+
+
+# Splat ``DEPLODOCK_KNOBS`` once at import so every later
+# ``os.environ.get("DEPLODOCK_<NAME>")`` reader (knob.py is imported
+# transitively by every pipeline pass) sees the per-knob keys.
+apply_knobs_env()
 
 
 # --- Rendering -------------------------------------------------------------
