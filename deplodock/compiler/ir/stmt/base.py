@@ -55,12 +55,31 @@ class RenderCtx:
     # — the only way to exceed the 48 KB static-smem cap.
     smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
     # Per-buffer canonical dtype tokens (``"f32"`` / ``"f16"``) for every
-    # global-buffer name (kernel inputs + outputs). ``Load`` / ``Write``
-    # consult this to insert ``__half2float`` / ``__float2half`` casts at
-    # the load/store boundary when the buffer's element type isn't f32 —
-    # local SSA values stay in ``float``. Missing entries default to
-    # ``"f32"`` so legacy bodies render unchanged.
+    # global-buffer name (kernel inputs + outputs). ``Load`` declares its
+    # SSA-name local in the source buffer's C type so values flow as
+    # ``__half`` end-to-end where possible; ``Write`` inserts
+    # ``__float2half`` / ``__half2float`` only when the value's dtype
+    # disagrees with the destination buffer's dtype. Missing entries
+    # default to ``"f32"`` so legacy bodies render unchanged.
     buffer_dtypes: dict[str, str] = field(default_factory=dict)
+    # Per-SSA-name canonical dtype tokens, populated as ``render_body``
+    # walks. ``Load`` writes the source buffer's dtype; ``Assign`` writes
+    # ``promote(args)``. Consumed by downstream ``Assign`` / ``Write`` to
+    # decide native-fp16-vs-promote-fallback and to insert conversions.
+    ssa_dtypes: dict[str, str] = field(default_factory=dict)
+    # Per-op CUDA spelling for the fp16 native form (e.g. ``"exp" → "hexp"``).
+    # Populated by the kernel renderer from the CUDA backend's
+    # ``INTRINSICS_FP16`` table.
+    intrinsics_fp16: dict[str, str] = field(default_factory=dict)
+    # Abstract op-names (``ElementwiseImpl.name``) for which a native fp16
+    # path exists end-to-end. ``Assign.render`` consults this to pick
+    # native vs promote-and-demote.
+    native_fp16_ops: frozenset[str] = field(default_factory=frozenset)
+    # Render-time hint to ``Literal.render``: when set to ``"f16"``,
+    # float literals render wrapped in ``__float2half(...)`` so the
+    # surrounding ``__half`` expression compiles. Set transiently by
+    # ``Assign.render`` around the fp16-native expression render.
+    literal_default_dtype: str | None = None
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -74,6 +93,10 @@ class RenderCtx:
             literal_ssa=self.literal_ssa,
             smem_dynamic_offsets=self.smem_dynamic_offsets,
             buffer_dtypes=self.buffer_dtypes,
+            ssa_dtypes=self.ssa_dtypes,
+            intrinsics_fp16=self.intrinsics_fp16,
+            native_fp16_ops=self.native_fp16_ops,
+            literal_default_dtype=self.literal_default_dtype,
         )
 
 

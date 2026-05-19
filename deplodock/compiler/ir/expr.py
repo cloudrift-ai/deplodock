@@ -234,7 +234,14 @@ class Literal(_ExprOps):
 
     def render(self, ctx, parent_prec: int = 0) -> str:
         if isinstance(self.value, float) or self.dtype == "float":
-            return _float_lit(float(self.value))
+            txt = _float_lit(float(self.value))
+            # Float literals embedded in an fp16-typed expression must
+            # compose with ``__half`` operands; wrap them so NVRTC folds
+            # the call to a half constant at compile time. Int literals
+            # (loop bounds / shape coords) are unaffected.
+            if ctx is not None and getattr(ctx, "literal_default_dtype", None) == "f16":
+                return f"__float2half({txt})"
+            return txt
         v = int(self.value)
         return f"{v}LL" if abs(v) > 32768 else str(v)
 

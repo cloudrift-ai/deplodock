@@ -52,15 +52,22 @@ class Load(Stmt):
         return [f"{indent}{self.name} = load {self.input}[{idx}]"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
+        # Inlined scalar constants stay as ``float`` locals — the
+        # consumer's ``Assign.render`` will demote / convert if needed.
         lit = ctx.literal_constants.get(self.input) if ctx.literal_constants else None
         if lit is not None:
+            ctx.ssa_dtypes[self.name] = "f32"
             return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(lit)};"]
         flat = render_index(self.input, self.index, ctx)
-        # When the source buffer is fp16, convert at the load boundary so
-        # all SSA locals stay in ``float`` (CUDA's ``__half`` is a struct
-        # with no implicit conversion to ``float``).
-        if ctx.buffer_dtypes.get(self.input) == "f16":
-            return [f"{_pad(ctx.indent)}float {self.name} = __half2float({self.input}[{flat}]);"]
+        # Declare the local in the source buffer's element type so
+        # downstream ``Assign``s can pick native fp16 ops without an
+        # immediate promote-back-to-float. Conversion at load is only
+        # needed when the source is fp16 and the chain decides to
+        # promote — handled at the use site, not here.
+        src_dt = ctx.buffer_dtypes.get(self.input, "f32")
+        ctx.ssa_dtypes[self.name] = src_dt
+        if src_dt == "f16":
+            return [f"{_pad(ctx.indent)}__half {self.name} = {self.input}[{flat}];"]
         return [f"{_pad(ctx.indent)}float {self.name} = {self.input}[{flat}];"]
 
 
@@ -92,9 +99,51 @@ class Assign(Stmt):
         return [f"{indent}{self.name} = {self.op.name}({', '.join(self.args)})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        args: list[Expr] = [Var(a) for a in self.args]
-        expr = op_to_expr(self.op.name, args)
-        return [f"{_pad(ctx.indent)}float {self.name} = {expr.render(ctx)};"]
+        from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+
+        pad = _pad(ctx.indent)
+        op_name = self.op.name
+        arg_dtypes = [ctx.ssa_dtypes.get(a, "f32") for a in self.args]
+        # Promotion rule for the elementwise scope: result is fp16 only
+        # when every input is fp16; any fp32 input promotes the whole
+        # expression to fp32 (with __half2float at the use site).
+        result_dt = "f16" if arg_dtypes and all(d == "f16" for d in arg_dtypes) else "f32"
+
+        if result_dt == "f16" and op_name in ctx.native_fp16_ops:
+            # Native fp16: pick fp16 intrinsic spellings (via a temporary
+            # ctx.intrinsics swap) and wrap float literals in
+            # ``__float2half`` so they compose with __half operands.
+            args: list[Expr] = [Var(a) for a in self.args]
+            expr = op_to_expr(op_name, args)
+            saved_intr = ctx.intrinsics
+            saved_lit = ctx.literal_default_dtype
+            ctx.intrinsics = {**saved_intr, **ctx.intrinsics_fp16}
+            ctx.literal_default_dtype = "f16"
+            try:
+                body = expr.render(ctx)
+            finally:
+                ctx.intrinsics = saved_intr
+                ctx.literal_default_dtype = saved_lit
+            ctx.ssa_dtypes[self.name] = "f16"
+            return [f"{pad}__half {self.name} = {body};"]
+
+        if result_dt == "f16":
+            # Fallback: no native fp16 form for this op (or mixed dtypes).
+            # Promote each fp16 arg to float at use, render in f32, demote
+            # the result back to fp16.
+            promoted: list[Expr] = [
+                FuncCallExpr("__half2float", [Var(a)]) if dt == "f16" else Var(a) for a, dt in zip(self.args, arg_dtypes, strict=True)
+            ]
+            expr = op_to_expr(op_name, promoted)
+            ctx.ssa_dtypes[self.name] = "f16"
+            return [f"{pad}__half {self.name} = __float2half({expr.render(ctx)});"]
+
+        # f32 result: any fp16 inputs get a per-arg ``__half2float`` wrap;
+        # everything else stays as today.
+        args = [FuncCallExpr("__half2float", [Var(a)]) if dt == "f16" else Var(a) for a, dt in zip(self.args, arg_dtypes, strict=True)]
+        expr = op_to_expr(op_name, args)
+        ctx.ssa_dtypes[self.name] = "f32"
+        return [f"{pad}float {self.name} = {expr.render(ctx)};"]
 
 
 @dataclass(frozen=True)
@@ -247,11 +296,18 @@ class Write(Stmt):
         flat = render_index(self.output, self.index, ctx)
         if self.reduce_op is not None:
             return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {self.value});"]
-        # When the destination buffer is fp16, cast the local float SSA
-        # value back to ``__half`` at the store boundary.
-        if ctx.buffer_dtypes.get(self.output) == "f16":
-            return [f"{_pad(ctx.indent)}{self.output}[{flat}] = __float2half({self.value});"]
-        return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {self.value};"]
+        # Convert at the store boundary only when the value's SSA dtype
+        # disagrees with the destination buffer's dtype — native fp16
+        # chains write through with no conversion at all.
+        value_dt = ctx.ssa_dtypes.get(self.value, "f32")
+        out_dt = ctx.buffer_dtypes.get(self.output, "f32")
+        rhs = self.value
+        if value_dt != out_dt:
+            if out_dt == "f16":
+                rhs = f"__float2half({self.value})"
+            elif out_dt == "f32" and value_dt == "f16":
+                rhs = f"__half2float({self.value})"
+        return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {rhs};"]
 
 
 @dataclass(frozen=True)
