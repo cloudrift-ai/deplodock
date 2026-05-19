@@ -76,7 +76,6 @@ _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread output cells along M axis")
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread output cells along N axis")
-REGISTER_TILE = Knob("register_tile", KnobType.BOOL, help="Marker: rule 008 has fired (idempotence guard)")
 # Cap on per-thread output cells. FM × FN replicates the matmul reduce
 # body that many times per thread; beyond this NVRTC compile time
 # explodes on the unrolled body. ``TileOp.validate`` is the second-line
@@ -93,10 +92,9 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     # re-fork. Without this, ``F=1`` in one axis leaves that THREAD
     # extent unchanged so ``register_tile_shape``'s gate still passes,
     # and 008 cascades into nested forks across every subsequent rule
-    # pass. The ``register_tile`` knob is stamped by ``_variants`` on
-    # every emitted variant.
-    if root.op.knobs.get(REGISTER_TILE.name):
-        raise RuleSkipped("register-tile already applied (knobs['register_tile'] set)")
+    # pass. ``FM`` is stamped by ``_variants`` on every emitted variant.
+    if FM.name in root.op.knobs:
+        raise RuleSkipped("register-tile already applied (FM set in knobs)")
 
     # Profitability gate — register tiling only helps matmul-shape
     # bodies (≥2 reduce-Loops sharing operand Loads across M / N).
@@ -178,7 +176,7 @@ def _variants(
             TileOp(
                 body=body[:idx] + (rewritten,) + body[idx + 1 :],
                 name=name,
-                knobs={FM.name: f_m, FN.name: f_n, REGISTER_TILE.name: True},
+                knobs={FM.name: f_m, FN.name: f_n},
             )
         )
     return variants

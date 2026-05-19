@@ -600,7 +600,8 @@ class TileOp(Op):
             return False
 
         # THREAD-count check — only after register_tile committed.
-        if not self.knobs.get("register_tile"):
+        # ``FM`` presence in knobs is the post-008 marker.
+        if "FM" not in self.knobs:
             return True
         tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
         if tile is None:
@@ -669,7 +670,7 @@ class TileOp(Op):
         threads = prod(thread_extents)
         ctas = prod(block_extents) if block_extents else 1
 
-        if self.knobs.get("register_tile"):
+        if "FM" in self.knobs:
             # Post-008: knobs carry the actual cell shape.
             final_threads = threads
             cells = max(1, int(self.knobs.get("FM", 1)) * int(self.knobs.get("FN", 1)))
@@ -697,7 +698,7 @@ class TileOp(Op):
             score -= 2.0
         else:
             distance = abs(final_threads - target_threads)
-            multiplier = 2.0 if (cells < 16 and self.knobs.get("register_tile")) else 1.0
+            multiplier = 2.0 if (cells < 16 and "FM" in self.knobs) else 1.0
             score -= min(distance / target_threads * multiplier, 2.0)
 
         # Cells-per-thread penalty.
@@ -733,7 +734,7 @@ class TileOp(Op):
         # Bonuses.
         if any(isinstance(b, _Stage) for b in tile.body):
             score += 1.0
-        if self.knobs.get("register_tile"):
+        if "FM" in self.knobs:
             score += 1.0
 
         return score

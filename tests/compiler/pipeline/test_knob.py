@@ -20,7 +20,7 @@ def test_int_pretty():
 
 
 def test_bool_parse():
-    k = Knob("register_tile", KnobType.BOOL)
+    k = Knob("FLAG", KnobType.BOOL)
     for truthy in ("1", "true", "True", "yes", "on", " TRUE "):
         assert k.parse(truthy) is True
     for falsy in ("0", "false", "no", "off", ""):
@@ -28,7 +28,7 @@ def test_bool_parse():
 
 
 def test_bool_pretty():
-    k = Knob("register_tile", KnobType.BOOL)
+    k = Knob("FLAG", KnobType.BOOL)
     assert k.pretty(True) == "True"
     assert k.pretty(False) == "False"
 
