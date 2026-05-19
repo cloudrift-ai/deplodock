@@ -78,5 +78,3 @@ def test_binmask_requires_width():
 def test_env_property():
     assert Knob("BN", KnobType.INT).env == "DEPLODOCK_BN"
     assert Knob("STAGE", KnobType.BINMASK).env == "DEPLODOCK_STAGE"
-
-
