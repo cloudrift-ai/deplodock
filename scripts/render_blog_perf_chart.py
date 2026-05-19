@@ -142,15 +142,14 @@ def _render_chart(rows: list[dict], out_dir: Path) -> None:
         value_name="speedup vs eager (×)",
         title="Per-kernel speedup vs PyTorch eager — clean vs tuned",
         subtitle=(
-            "FP32 on RTX 5090. Ratio = eager_us / backend_us (higher is faster). "
-            "Eager is the baseline at 1.0 (dashed line). Sorted by tuned ratio: "
-            "wins at top, losses at bottom."
+            "FP32 on RTX 5090. Ratio = eager_us / backend_us; higher is faster. "
+            "Sorted by tuned ratio."
         ),
         baseline=1.0,
         baseline_label="1.0× (eager)",
         tooltip_rows=tooltip_rows,
         orientation="horizontal",
-        margin={"left": 280, "right": 50, "top": 140, "bottom": 60},
+        margin={"left": 280, "right": 50, "top": 120, "bottom": 60},
     )
 
     option = _option(chart, theme_name="dark")
@@ -158,7 +157,7 @@ def _render_chart(rows: list[dict], out_dir: Path) -> None:
     option["title"]["textStyle"]["fontWeight"] = "bold"
     option["title"]["subtextStyle"]["fontSize"] = 14
     option["title"]["subtextStyle"]["lineHeight"] = 20
-    option["legend"]["top"] = 100
+    option["legend"]["top"] = 80
     option["legend"]["textStyle"]["fontSize"] = 13
 
     payload = {
