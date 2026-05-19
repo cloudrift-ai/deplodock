@@ -42,16 +42,16 @@ in ``kernel/000_place_inits`` recognises it as a reduce-passthrough and
 keeps the Init at the surrounding scope so ``acc`` accumulates across
 ``K_o`` iterations.
 
-**Autotune fork (opt-in via ``DEPLODOCK_TUNE=1``).** Under the tune
-path, the rule returns a *list* of TileOp variants — one per ``BK``
-candidate (from ``_BK_CANDIDATES``) that divides ``K`` with
-``K > BK``. Option 0 is the largest valid divisor so the heuristic
-matches the pre-fork behavior; each variant stamps
-``knobs={"BK": bk}`` for greedy-replay routing.
+**Autotune fork.** The rule returns a *list* of TileOp variants —
+one per ``BK`` candidate (from ``_BK_CANDIDATES``) that divides ``K``
+with ``K > BK``. Option 0 is the largest valid divisor so
+deterministic ``run_pipeline`` callers (greedy policy) behave exactly
+as before; the rest only get explored under ``deplodock tune``. Each
+variant stamps ``knobs={"BK": bk}`` for greedy-replay routing.
 
-Without ``DEPLODOCK_TUNE``, the rule emits the single heuristic
-variant with no knob stamping — preserves the legacy lowering-DB
-shape so existing test baselines and greedy compiles are unaffected.
+To pin BK for a specific test or sweep, set ``DEPLODOCK_BK=<int>``
+(handled in ``tuning.forced_bk``) — that value is emitted as option 0
+so greedy compiles use it and tune walks variants in the same order.
 
 Idempotence: a reduce whose immediate body already contains a
 reduce-Loop is left alone.
@@ -59,7 +59,6 @@ reduce-Loop is left alone.
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 
 from deplodock.compiler.context import Context
@@ -108,30 +107,18 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | list[TileOp]:
     if not cands:
         raise RuleSkipped("no BK candidate divides K with K > BK")
 
-    # Locked outside autotune: emit only the heuristic option (BK = first
-    # valid candidate) with no knob stamping — preserves pre-fork
-    # lowering rows / greedy behavior for the regular test suite. The
-    # MCTS-driven ``deplodock tune`` path (``DEPLODOCK_TUNE=1``) opts in.
-    if not _fork_enabled():
-        cands = cands[:1]
-
     variants: list[TileOp] = []
     for bk in cands:
         new_inner_body, changed = _chunk_in_body(tile.body, bk)
         if not changed:
             continue
         new_body = body[:idx] + (Tile(axes=tile.axes, body=new_inner_body),) + body[idx + 1 :]
-        knobs = {BK.name: bk} if _fork_enabled() else {}
-        variants.append(TileOp(body=new_body, name=root.op.name, knobs=knobs))
+        variants.append(TileOp(body=new_body, name=root.op.name, knobs={BK.name: bk}))
     if not variants:
         raise RuleSkipped("no BK variant produced a rewrite")
     if len(variants) == 1:
         return variants[0]
     return variants
-
-
-def _fork_enabled() -> bool:
-    return os.environ.get("DEPLODOCK_TUNE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _find_first_matmul_reduce(stmts: tuple) -> Loop | None:
