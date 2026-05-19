@@ -88,17 +88,20 @@ class Knob:
 
 # --- Registry --------------------------------------------------------------
 
-_RULE_MODULE_PREFIX = "deplodock.compiler.pipeline.passes."
 _REGISTRY: dict[str, Knob] | None = None
 
 
-def _walk_rule_modules() -> list[ModuleType]:
-    return [m for name, m in sys.modules.items() if name.startswith(_RULE_MODULE_PREFIX) and m is not None]
+def _walk_modules() -> list[ModuleType]:
+    # Rule modules are loaded via ``importlib.util.spec_from_file_location``
+    # and registered under their bare file stem (e.g. ``005_blockify_launch``),
+    # not the full ``deplodock.compiler.pipeline.passes.…`` path. Walk every
+    # loaded module instead of prefix-filtering.
+    return [m for m in sys.modules.values() if m is not None]
 
 
 def registry() -> dict[str, Knob]:
     """``{name: Knob}`` table, built lazily on first access by walking
-    every loaded rule module for module-level ``Knob`` attributes.
+    every loaded module for module-level ``Knob`` attributes.
 
     Rule modules are imported at pipeline-startup (to collect their
     ``PATTERN`` / ``rewrite``), so by the time anyone asks for knobs
@@ -108,8 +111,12 @@ def registry() -> dict[str, Knob]:
     global _REGISTRY
     if _REGISTRY is None:
         _REGISTRY = {}
-        for mod in _walk_rule_modules():
-            for attr in vars(mod).values():
+        for mod in _walk_modules():
+            try:
+                attrs = vars(mod).values()
+            except TypeError:
+                continue  # some built-in modules don't expose __dict__
+            for attr in attrs:
                 if isinstance(attr, Knob) and attr.name not in _REGISTRY:
                     _REGISTRY[attr.name] = attr
     return _REGISTRY
@@ -126,3 +133,29 @@ def reset_registry() -> None:
     monkeypatch ``sys.modules`` use this to force a rebuild."""
     global _REGISTRY
     _REGISTRY = None
+
+
+# --- Rendering -------------------------------------------------------------
+
+
+def format_tuning_knobs(knobs: dict) -> str:
+    """Render ``knobs`` as a compact ``key=value`` string, dropping
+    pass-marker booleans. Empty after filtering → ``-``.
+
+    A registered ``Knob`` of type ``BOOL`` is treated as a marker and
+    dropped; unregistered boolean values are also dropped (forward-compat).
+    ``BINMASK`` values are already stored as binary strings in
+    ``op.knobs`` (rules stamp via ``Knob.pretty``), so ``str(v)`` here
+    round-trips correctly.
+    """
+    rendered: list[tuple[str, str]] = []
+    for k, v in knobs.items():
+        knob = get(k)
+        if knob is not None and knob.type is KnobType.BOOL:
+            continue
+        if knob is None and isinstance(v, bool):
+            continue
+        rendered.append((k, str(v)))
+    if not rendered:
+        return "-"
+    return ", ".join(f"{k}={v}" for k, v in sorted(rendered))

@@ -54,9 +54,12 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, AffineAddressing, Stage, TemplateAddressing, TileOp, trivial_stage_body
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]
+
+STAGE = Knob("stage", KnobType.BINMASK, help="Bitmask over ranked candidate buffers (char i = buffer i)")
 
 
 class _Slab(NamedTuple):
@@ -83,7 +86,7 @@ def rewrite(root: Node, ctx) -> list[TileOp] | None:
     variant) rather than on body structure, so the no-staging variant —
     whose body matches the parent — still has a distinct ``op_cache_key``
     from the unstaged input and the rule doesn't re-fire on it."""
-    if "stage" in root.op.knobs:
+    if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
     variants = _enumerate_variants(root.op.body, slab_cap=budget, scope_budget=budget, parent_op=root.op)
@@ -96,35 +99,13 @@ _WARP_SIZE = 32
 
 
 def _forced_stage_mask(n: int) -> int | None:
-    """Parse ``DEPLODOCK_STAGE`` and clamp to ``n`` bits. Accepts a
-    binary string ``"101"`` (char ``i`` selects ranked-buffer ``i``,
-    length must match ``n``); the keywords ``"all"`` / ``"none"`` for
-    "stage everything / nothing that qualifies"; or a decimal / ``0x``-hex
-    int for back-compat. ``None`` when unset, so the rule falls back to
-    enumerating every subset."""
-    raw = os.environ.get("DEPLODOCK_STAGE")
+    """Parse the ``DEPLODOCK_STAGE`` env override via ``STAGE.parse``.
+    ``None`` when unset, so the rule falls back to enumerating every
+    subset."""
+    raw = os.environ.get(STAGE.env)
     if raw is None or raw == "":
         return None
-    raw = raw.strip()
-    if raw == "all":
-        return (1 << n) - 1
-    if raw == "none":
-        return 0
-    if len(raw) == n and all(c in "01" for c in raw):
-        return _binary_to_mask(raw)
-    return int(raw, 0) & ((1 << n) - 1)
-
-
-def _binary_to_mask(s: str) -> int:
-    """``"101"`` → ``0b101 = 5``. Char ``i`` is bit ``i`` — left-to-right
-    reads as ranked-buffer 0, 1, 2, …, so the string position maps to
-    buffer rank directly."""
-    return sum(int(c) << i for i, c in enumerate(s))
-
-
-def _mask_to_binary(mask: int, n: int) -> str:
-    """Inverse of ``_binary_to_mask``."""
-    return "".join("1" if (mask >> i) & 1 else "0" for i in range(n))
+    return STAGE.parse(raw, width=n)
 
 
 def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_op: TileOp) -> list[TileOp]:
@@ -173,7 +154,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
         new_body = _maybe_rewrite(body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow)
         if new_body is None:
             continue
-        knobs = {**parent_op.knobs, "stage": _mask_to_binary(mask, n)}
+        knobs = {**parent_op.knobs, STAGE.name: STAGE.pretty(mask, width=n)}
         variants.append(TileOp(body=new_body, name=parent_op.name, knobs=knobs))
     return variants
 

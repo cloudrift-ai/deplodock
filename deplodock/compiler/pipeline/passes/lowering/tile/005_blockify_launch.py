@@ -46,6 +46,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 from deplodock.compiler.tuning import _has_matmul_reduce, thread_tile_shape
 
@@ -53,6 +54,9 @@ PATTERN = [Pattern("root", TileOp)]
 
 # Candidate per-axis THREAD widths to fork over for matmul tiles.
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
+
+BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width")
+BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul only)")
 
 
 def rewrite(root: Node) -> Graph | None | list[TileOp]:
@@ -141,7 +145,7 @@ def _matmul_variants(body, idx: int, tile: Tile, name: str) -> list[TileOp]:
             TileOp(
                 body=body[:idx] + (partitioned,) + body[idx + 1 :],
                 name=name,
-                knobs={"BN": bn, "BM": bm},
+                knobs={BN.name: bn, BM.name: bm},
             )
         )
     return variants

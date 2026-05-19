@@ -15,7 +15,7 @@ from deplodock.commands.compile import (
     setup_pipeline_runtime,
 )
 from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch
-from deplodock.compiler.pipeline.knobs import format_tuning_knobs
+from deplodock.compiler.pipeline.knob import format_tuning_knobs
 
 logger = logging.getLogger(__name__)
 

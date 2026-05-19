@@ -63,6 +63,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import register_tile_shape
 
@@ -72,6 +73,10 @@ PATTERN = [Pattern("root", TileOp)]
 # ``(FM, FN)`` with each F dividing its corresponding THREAD axis
 # extent.
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+
+FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread output cells along M axis")
+FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread output cells along N axis")
+REGISTER_TILE = Knob("register_tile", KnobType.BOOL, help="Marker: rule 008 has fired (idempotence guard)")
 # Cap on per-thread output cells. FM × FN replicates the matmul reduce
 # body that many times per thread; beyond this NVRTC compile time
 # explodes on the unrolled body. ``TileOp.validate`` is the second-line
@@ -90,7 +95,7 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     # and 008 cascades into nested forks across every subsequent rule
     # pass. The ``register_tile`` knob is stamped by ``_variants`` on
     # every emitted variant.
-    if root.op.knobs.get("register_tile"):
+    if root.op.knobs.get(REGISTER_TILE.name):
         raise RuleSkipped("register-tile already applied (knobs['register_tile'] set)")
 
     # Profitability gate — register tiling only helps matmul-shape
@@ -173,7 +178,7 @@ def _variants(
             TileOp(
                 body=body[:idx] + (rewritten,) + body[idx + 1 :],
                 name=name,
-                knobs={"FM": f_m, "FN": f_n, "register_tile": True},
+                knobs={FM.name: f_m, FN.name: f_n, REGISTER_TILE.name: True},
             )
         )
     return variants
