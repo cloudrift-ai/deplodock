@@ -123,17 +123,19 @@ class Backend(ABC):
             node = compiled.nodes[nid]
             shape = tuple(int(d) for d in node.output.shape if isinstance(d, int))
 
+            dtype_np = node.output.dtype.np
+
             if nid in input_set:
                 if nid not in input_data:
                     raise KeyError(f"Missing input for node {nid!r}")
-                values[nid] = _coerce(input_data[nid], shape)
+                values[nid] = _coerce(input_data[nid], shape, dtype_np)
                 continue
 
             if isinstance(node.op, ConstantOp):
                 if nid in input_data:
-                    values[nid] = _coerce(input_data[nid], shape)
+                    values[nid] = _coerce(input_data[nid], shape, dtype_np)
                 elif node.op.value is not None:
-                    values[nid] = np.array([node.op.value], dtype=np.float32)
+                    values[nid] = np.array([node.op.value], dtype=dtype_np)
                 else:
                     raise KeyError(f"ConstantOp {nid!r} has no value and was not supplied in input_data")
                 continue
@@ -143,7 +145,7 @@ class Backend(ABC):
 
             args = [values[inp] for inp in node.inputs]
             result = node.op.forward(*args)
-            arr = np.asarray(result, dtype=np.float32)
+            arr = np.asarray(result, dtype=dtype_np)
             if shape and arr.shape != shape:
                 arr = arr.reshape(shape)
             values[nid] = arr
@@ -212,8 +214,8 @@ class Backend(ABC):
         )
 
 
-def _coerce(data, shape: tuple[int, ...]) -> np.ndarray:
-    arr = np.asarray(data, dtype=np.float32)
+def _coerce(data, shape: tuple[int, ...], dtype: np.dtype | None = None) -> np.ndarray:
+    arr = np.asarray(data, dtype=dtype if dtype is not None else np.float32)
     if shape and arr.shape != shape:
         arr = arr.reshape(shape)
     return arr

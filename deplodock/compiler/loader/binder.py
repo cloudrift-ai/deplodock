@@ -28,14 +28,15 @@ def apply_load_ops(source: np.ndarray, load_ops: tuple) -> np.ndarray:
         return np.ascontiguousarray(source)
 
     g = Graph()
-    in_id = g.add_node(op=InputOp(), inputs=[], output=Tensor("src", tuple(source.shape), str(source.dtype)))
+    src_dtype = str(source.dtype)
+    in_id = g.add_node(op=InputOp(), inputs=[], output=Tensor("src", tuple(source.shape), src_dtype))
     g.inputs.append(in_id)
 
     cur = in_id
     cur_shape = tuple(source.shape)
     for i, op in enumerate(load_ops):
         cur_shape = op.infer_output_shape([cur_shape])
-        nid = g.add_node(op=op, inputs=[cur], output=Tensor(f"step_{i}", cur_shape, "f32"))
+        nid = g.add_node(op=op, inputs=[cur], output=Tensor(f"step_{i}", cur_shape, src_dtype))
         cur = nid
     g.outputs.append(cur)
 
@@ -45,7 +46,7 @@ def apply_load_ops(source: np.ndarray, load_ops: tuple) -> np.ndarray:
         def compile(self, graph):
             return graph
 
-    result = _NumpyInterp().run(g, input_data={in_id: source.astype(np.float32, copy=False)})
+    result = _NumpyInterp().run(g, input_data={in_id: np.ascontiguousarray(source)})
     return np.ascontiguousarray(result.outputs[cur])
 
 
