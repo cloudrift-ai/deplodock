@@ -332,16 +332,22 @@ def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
     import torch
 
     backend, compiled = dd_state
-    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {name: [] for name in torch_fns}
+    torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, int]]] = {name: [] for name in torch_fns}
 
-    def on_iter() -> None:
+    def on_iter(batch_size: int) -> None:
+        # ``benchmark_program`` passes the per-iter batch size so peer
+        # backends run the same number of back-to-back calls per CUDA
+        # event window — keeps the comparison apples-to-apples on
+        # warm/sustained perf. We divide elapsed_time by batch_size
+        # downstream so the reported number stays per-call.
         for name, fn in torch_fns.items():
             start = torch.cuda.Event(enable_timing=True)
             stop = torch.cuda.Event(enable_timing=True)
             start.record()
-            fn()
+            for _ in range(batch_size):
+                fn()
             stop.record()
-            torch_events[name].append((start, stop))
+            torch_events[name].append((start, stop, batch_size))
 
     bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
@@ -350,7 +356,8 @@ def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
-            results[name] = (sum(s.elapsed_time(e) for s, e in measured) / len(measured)) * 1000
+            per_iter_us = [s.elapsed_time(e) / b * 1000 for s, e, b in measured]
+            results[name] = sum(per_iter_us) / len(per_iter_us)
     results["Deplodock (naive attn)"] = bench.time_ms * 1000
 
     # Per-kernel timings: log the top offenders and (if dumping) persist
