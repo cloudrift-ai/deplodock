@@ -298,7 +298,13 @@ def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
 def _tma_enabled() -> bool:
     """TMA staging gate. Default-on for sm_90+ (Hopper / Blackwell) which
     have ``cp.async.bulk.tensor``; default-off below sm_90. ``DEPLODOCK_TMA``
-    overrides either way: ``=1`` forces on, ``=0`` forces off."""
+    overrides either way: ``=1`` forces on, ``=0`` forces off.
+
+    The ``TMA`` ``Knob`` itself lives in ``011_tma_copy``; this function
+    duplicates a 3-line env read instead of importing it because
+    ``011_tma_copy``'s numeric-prefix filename can only be loaded via
+    ``importlib`` and ``_fold_constant`` (a frontend pass) calls this
+    before tile passes are loaded."""
     raw = os.environ.get("DEPLODOCK_TMA")
     if raw == "1":
         return True
