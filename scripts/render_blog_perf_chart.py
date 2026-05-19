@@ -52,19 +52,21 @@ def _merge_rows(clean: dict, tuned: dict) -> list[dict]:
         tcompile = (c or t).get("torch_compile_us")
         clean_us = c["deplodock_us"] if c else None
         tuned_us = t["deplodock_us"] if t else None
-        merged.append({
-            "name": name,
-            "op": (c or t)["op"],
-            "shape": (c or t)["shape"],
-            "tags": (c or t).get("tags", []),
-            "launches": (c or t).get("launches"),
-            "eager_us": eager_us,
-            "torch_compile_us": tcompile,
-            "deplodock_clean_us": clean_us,
-            "deplodock_tuned_us": tuned_us,
-            "ratio_clean": (eager_us / clean_us) if clean_us else None,
-            "ratio_tuned": (eager_us / tuned_us) if tuned_us else None,
-        })
+        merged.append(
+            {
+                "name": name,
+                "op": (c or t)["op"],
+                "shape": (c or t)["shape"],
+                "tags": (c or t).get("tags", []),
+                "launches": (c or t).get("launches"),
+                "eager_us": eager_us,
+                "torch_compile_us": tcompile,
+                "deplodock_clean_us": clean_us,
+                "deplodock_tuned_us": tuned_us,
+                "ratio_clean": (eager_us / clean_us) if clean_us else None,
+                "ratio_tuned": (eager_us / tuned_us) if tuned_us else None,
+            }
+        )
     return merged
 
 
@@ -82,17 +84,35 @@ def _write_data_files(rows: list[dict], clean: dict, tuned: dict, out_dir: Path)
     (out_dir / "per_kernel_data.json").write_text(json.dumps(payload, indent=2))
     with (out_dir / "per_kernel_data.csv").open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow([
-            "name", "op", "shape", "launches",
-            "eager_us", "torch_compile_us", "deplodock_clean_us", "deplodock_tuned_us",
-            "ratio_clean", "ratio_tuned",
-        ])
+        w.writerow(
+            [
+                "name",
+                "op",
+                "shape",
+                "launches",
+                "eager_us",
+                "torch_compile_us",
+                "deplodock_clean_us",
+                "deplodock_tuned_us",
+                "ratio_clean",
+                "ratio_tuned",
+            ]
+        )
         for r in rows:
-            w.writerow([
-                r["name"], r["op"], r["shape"], r["launches"],
-                r["eager_us"], r["torch_compile_us"], r["deplodock_clean_us"], r["deplodock_tuned_us"],
-                r["ratio_clean"], r["ratio_tuned"],
-            ])
+            w.writerow(
+                [
+                    r["name"],
+                    r["op"],
+                    r["shape"],
+                    r["launches"],
+                    r["eager_us"],
+                    r["torch_compile_us"],
+                    r["deplodock_clean_us"],
+                    r["deplodock_tuned_us"],
+                    r["ratio_clean"],
+                    r["ratio_tuned"],
+                ]
+            )
 
 
 def _tcomp_ratio(r: dict) -> float | None:
@@ -123,28 +143,27 @@ def _tooltip(r: dict) -> str:
 
 
 def _render_chart(rows: list[dict], out_dir: Path) -> None:
-    rows = sorted(rows, key=lambda r: (r["ratio_tuned"] or 0), reverse=True)
+    rows = sorted(rows, key=lambda r: r["ratio_tuned"] or 0, reverse=True)
     tooltip_rows = [_tooltip(r) for r in rows]
 
     chart = BarChart(
         categories=[r["name"] for r in rows],
         bars=[
-            Bar(name="deplodock tuned / eager",
+            Bar(
+                name="deplodock tuned / eager",
                 values=[round(r["ratio_tuned"], 3) if r["ratio_tuned"] else None for r in rows],
-                color=TUNED_COLOR),
-            Bar(name="deplodock clean / eager",
+                color=TUNED_COLOR,
+            ),
+            Bar(
+                name="deplodock clean / eager",
                 values=[round(r["ratio_clean"], 3) if r["ratio_clean"] else None for r in rows],
-                color=CLEAN_COLOR),
-            Bar(name="torch.compile / eager",
-                values=[_tcomp_ratio(r) for r in rows],
-                color=TCOMP_COLOR),
+                color=CLEAN_COLOR,
+            ),
+            Bar(name="torch.compile / eager", values=[_tcomp_ratio(r) for r in rows], color=TCOMP_COLOR),
         ],
         value_name="speedup vs eager (×)",
         title="Per-kernel speedup vs PyTorch eager — clean vs tuned",
-        subtitle=(
-            "FP32 on RTX 5090. Ratio = eager_us / backend_us; higher is faster. "
-            "Sorted by tuned ratio."
-        ),
+        subtitle=("FP32 on RTX 5090. Ratio = eager_us / backend_us; higher is faster. Sorted by tuned ratio."),
         baseline=1.0,
         baseline_label="1.0× (eager)",
         tooltip_rows=tooltip_rows,
@@ -180,8 +199,7 @@ def _render_chart(rows: list[dict], out_dir: Path) -> None:
         "chart.setOption(opt);\n"
         "window.addEventListener('resize', () => chart.resize());\n"
     )
-    html = render_html(body_html=body_html, scripts_js=scripts_js, theme="dark",
-                       title=chart.title, transparent=True)
+    html = render_html(body_html=body_html, scripts_js=scripts_js, theme="dark", title=chart.title, transparent=True)
     (out_dir / "per_kernel_tuned.html").write_text(html)
 
 
@@ -189,10 +207,9 @@ def _print_stats(rows: list[dict]) -> None:
     gm = statistics.geometric_mean
     rc = [r["ratio_clean"] for r in rows if r["ratio_clean"]]
     rt = [r["ratio_tuned"] for r in rows if r["ratio_tuned"]]
-    sp = [r["deplodock_clean_us"] / r["deplodock_tuned_us"]
-          for r in rows if r["deplodock_clean_us"] and r["deplodock_tuned_us"]]
-    print(f"clean: n={len(rc)}  geomean={gm(rc):.3f}  ≥1.0×: {sum(1 for r in rc if r>=1)}/{len(rc)}  max={max(rc):.2f}")
-    print(f"tuned: n={len(rt)}  geomean={gm(rt):.3f}  ≥1.0×: {sum(1 for r in rt if r>=1)}/{len(rt)}  max={max(rt):.2f}")
+    sp = [r["deplodock_clean_us"] / r["deplodock_tuned_us"] for r in rows if r["deplodock_clean_us"] and r["deplodock_tuned_us"]]
+    print(f"clean: n={len(rc)}  geomean={gm(rc):.3f}  ≥1.0×: {sum(1 for r in rc if r >= 1)}/{len(rc)}  max={max(rc):.2f}")
+    print(f"tuned: n={len(rt)}  geomean={gm(rt):.3f}  ≥1.0×: {sum(1 for r in rt if r >= 1)}/{len(rt)}  max={max(rt):.2f}")
     print(f"clean→tuned: geomean={gm(sp):.3f}  best={max(sp):.2f}×  worst={min(sp):.2f}×")
     imp = sum(1 for s in sp if s > 1.02)
     reg = sum(1 for s in sp if s < 0.98)
@@ -204,8 +221,7 @@ def main() -> None:
     p.add_argument("clean_json", type=Path)
     p.add_argument("tuned_json", type=Path)
     p.add_argument("out_dir", type=Path, help="blog public asset directory")
-    p.add_argument("--copy-raw", action="store_true",
-                   help="also copy the two input JSONs as raw_bench_untuned.json / raw_bench_tuned.json")
+    p.add_argument("--copy-raw", action="store_true", help="also copy the two input JSONs as raw_bench_untuned.json / raw_bench_tuned.json")
     args = p.parse_args()
 
     clean = json.loads(args.clean_json.read_text())

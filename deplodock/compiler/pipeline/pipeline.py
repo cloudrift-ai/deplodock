@@ -757,7 +757,7 @@ def _bench_terminal(cand, *, backend, db):
         # a backend) was overwriting real autotune rows with 1.0us stubs.
         # Tests that need lowering edges in stub mode should pass an
         # explicit stub backend.
-        for node in cuda_nodes:
+        for _node in cuda_nodes:
             s = _point_stats(1.0)
             agg = _accumulate(agg, s)
     else:
