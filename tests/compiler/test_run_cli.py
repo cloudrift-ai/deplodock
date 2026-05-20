@@ -14,6 +14,19 @@ import torch
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 
+def _randn(shape: str, dtype, scale: float | None = None) -> str:
+    """Build a ``torch.randn(...)`` snippet for the given dtype.
+
+    ``shape`` is a comma-joined dim list as it would appear inside the
+    parens. fp16 inputs are scaled down (default 0.1) so reductions
+    stay in fp16's representable range; fp32 inputs use the raw value.
+    """
+    if dtype.name == "f16":
+        s = 0.1 if scale is None else scale
+        return f"(torch.randn({shape}, dtype=torch.float16) * {s})"
+    return f"torch.randn({shape})"
+
+
 def test_run_no_code_errors(run_cli):
     rc, stdout, stderr = run_cli("run")
     assert rc != 0
@@ -30,35 +43,35 @@ def test_run_code_and_ir_mutually_exclusive(run_cli, tmp_path):
 
 
 @requires_cuda
-def test_run_code_rmsnorm_accuracy(run_cli):
-    rc, _, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))")
+def test_run_code_rmsnorm_accuracy(run_cli, dtype):
+    rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(64)({_randn('1,8,64', dtype)})")
     assert rc == 0, f"stderr: {stderr}"
 
 
 @requires_cuda
-def test_run_code_matmul_accuracy(run_cli):
-    rc, _, stderr = run_cli("run", "--code", "torch.matmul(torch.randn(16,32), torch.randn(32,16))")
+def test_run_code_matmul_accuracy(run_cli, dtype):
+    rc, _, stderr = run_cli("run", "--code", f"torch.matmul({_randn('16,32', dtype)}, {_randn('32,16', dtype)})")
     assert rc == 0, f"stderr: {stderr}"
 
 
 @requires_cuda
-def test_run_code_rmsnorm_blockify(run_cli):
+def test_run_code_rmsnorm_blockify(run_cli, dtype):
     """Wide hidden + ≥16 rows triggers blockify on the row axis. Regression
     test: cooperative load step must match the actual thread count, not
     BLOCK_SIZE=256, or staged-weight indices get skipped."""
-    rc, _, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))")
+    rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(2048)({_randn('1,32,2048', dtype)})")
     assert rc == 0, f"stderr: {stderr}"
 
 
 @requires_cuda
-def test_run_code_softmax_blockify(run_cli):
-    rc, _, stderr = run_cli("run", "--code", "torch.nn.functional.softmax(torch.randn(32,2048), dim=-1)")
+def test_run_code_softmax_blockify(run_cli, dtype):
+    rc, _, stderr = run_cli("run", "--code", f"torch.nn.functional.softmax({_randn('32,2048', dtype)}, dim=-1)")
     assert rc == 0, f"stderr: {stderr}"
 
 
 @requires_cuda
-def test_run_code_matmul_blockify(run_cli):
-    rc, _, stderr = run_cli("run", "--code", "torch.matmul(torch.randn(64,128), torch.randn(128,64))")
+def test_run_code_matmul_blockify(run_cli, dtype):
+    rc, _, stderr = run_cli("run", "--code", f"torch.matmul({_randn('64,128', dtype)}, {_randn('128,64', dtype)})")
     assert rc == 0, f"stderr: {stderr}"
 
 
