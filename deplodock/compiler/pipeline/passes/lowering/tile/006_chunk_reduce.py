@@ -49,7 +49,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Load, Loop, Stmt, StridedLoop, Tile
@@ -131,8 +131,11 @@ def _qualifies(loop: Loop, thread_axes: tuple[Axis, ...]) -> bool:
     """
     if is_matmul_reduce(loop):
         return False
-    # Idempotence: reduce immediately wrapping another reduce was
-    # already chunked.
+    # Idempotence: planner-driven path tags chunked K_inner with
+    # ``Role.STAGE_INNER``. Skip both that and the legacy "reduce
+    # wrapping another reduce" shape so the rule doesn't double-chunk.
+    if loop.role is Role.STAGE_INNER:
+        return False
     if any(inner.is_reduce for inner in loop.body.of_type(Loop)):
         return False
     has_fanin, max_in_ext, k_indexed_count = _slab_geometry(loop, thread_axes)
