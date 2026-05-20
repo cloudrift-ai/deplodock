@@ -438,16 +438,18 @@ def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] |
     inputs = {s.input for s in loads}
     if len(inputs) != 1:
         return None
-    # Vectorization emits ``float<n>`` reinterpret-casts that only fit
-    # fp32-element buffers. For fp16 (and any non-f32 future dtype) the
-    # cast would (a) read N halves as ``float<n>`` and produce nonsense,
-    # and (b) hit ``cudaErrorMisalignedAddress`` whenever the per-thread
-    # smem offset isn't 16-byte aligned (likely for ``__half[stride * k]``
-    # patterns). Fall back to scalar Load rendering — a dtype-aware
-    # vectorizer that emits ``__half2`` / ``uint4-of-8-halves`` is a
-    # follow-up.
     (input_name,) = inputs
-    if ctx.buffer_dtypes.get(input_name, "f32") != "f32":
+    src_dt = ctx.buffer_dtypes.get(input_name, "f32")
+    if src_dt not in ("f32", "f16"):
+        return None
+    # fp16 vectorization only at n=2 (a single ``__half2`` read — 4 bytes,
+    # always safe since smem ``__half[N]`` is at least 4-byte aligned and
+    # consecutive Loads k=0,1 land on even/odd halves of one ``__half2``).
+    # Wider vectors (n=4 → 8 bytes, n=8 → 16 bytes) require 4-element /
+    # 8-element alignment which we can't statically prove without an
+    # affine-form alignment analysis. For n>2 fp16 the (4, 2) retry in
+    # ``render_body`` falls through to n=2.
+    if src_dt == "f16" and n != 2:
         return None
     rank = len(loads[0].index)
     if rank == 0 or any(len(s.index) != rank for s in loads[1:]):
@@ -487,6 +489,17 @@ def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] |
     pad = _pad(ctx.indent)
     vname = f"_v_{loads[0].name}"
     components = ("x", "y", "z", "w")[:n]
+    if src_dt == "f16":
+        # ``__half2`` carries two halves with .x / .y accessors. The SSA
+        # locals are declared ``__half`` (not float) so subsequent
+        # ``Assign``s see fp16 args via ``ctx.ssa_dtypes``.
+        out = [f"{pad}__half2 {vname} = *reinterpret_cast<const __half2*>(&{loads[0].input}[{flat}]);"]
+        out.extend(f"{pad}__half {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
+        for s in loads:
+            ctx.ssa_dtypes[s.name] = "f16"
+        return out
     out = [f"{pad}float{n} {vname} = *reinterpret_cast<const float{n}*>(&{loads[0].input}[{flat}]);"]
     out.extend(f"{pad}float {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
+    for s in loads:
+        ctx.ssa_dtypes[s.name] = "f32"
     return out

@@ -794,7 +794,20 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
         full_extents = padded_extents
         prelude = [Sync()]
 
-    if isinstance(stage, AsyncBufferedStage):
+    # ``cp.async.ca [smem], [gmem], 4`` requires the smem destination to
+    # be 4-byte aligned. For fp32 smem that's automatic (sizeof(float)=4
+    # so every ``float[k]`` is 4-byte aligned). For fp16 smem, only
+    # ``__half[even]`` is 4-byte aligned — the per-thread stride-1
+    # cooperative pattern lands odd-thread writes on 2-byte-aligned
+    # destinations and hits ``cudaErrorMisalignedAddress``.
+    #
+    # PTX ``cp.async`` doesn't support a 2-byte size, so the right
+    # fp16 path is to vectorize 4 halves per thread (8-byte cp.async)
+    # — that needs a stride change in the cooperative load too. Until
+    # that's wired up, fall through to the synchronous Load+Write
+    # path for fp16-staged buffers. The variant is still buffered
+    # (BufferedStage parent class), just not async.
+    if isinstance(stage, AsyncBufferedStage) and stage_smem_dtype == "float":
         # Async transport: emit cooperative cp.async + commit only. The
         # sibling ``AsyncWait`` Stmt that dominates every consumer
         # lowers to ``CpAsyncWait + Sync``; no implicit wait here.
