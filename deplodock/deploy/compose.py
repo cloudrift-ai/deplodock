@@ -97,7 +97,8 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
     ports:
       - "{port}:8000"
     shm_size: '16gb'
-    ipc: host{docker_options_lines}
+    ipc: host
+    restart: unless-stopped{docker_options_lines}
     command: >
       {command_str}
     healthcheck:
@@ -118,6 +119,7 @@ def generate_compose(recipe: Recipe, model_dir, hf_token, num_instances=1, gpu_d
       - "8080:8080"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
     depends_on:
 {depends}
 """

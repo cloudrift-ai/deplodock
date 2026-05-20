@@ -228,7 +228,9 @@ engine:
 
 Each key-value pair is rendered as a top-level service key in the generated Docker Compose file, inserted after `ipc: host` and before `command:`. Values are serialized via `yaml.dump()` to handle nested structures (lists, dicts, scalars) correctly.
 
-Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `deploy`, `devices`, `group_add`, `volumes`, `environment`, `ports`, `shm_size`, `ipc`, `command`, `healthcheck`) are rejected at validation time via `validate_docker_options()`, following the same pattern as `validate_extra_args()`.
+Keys managed by the compose template (`image`, `container_name`, `entrypoint`, `deploy`, `devices`, `group_add`, `volumes`, `environment`, `ports`, `shm_size`, `ipc`, `command`, `healthcheck`, `restart`) are rejected at validation time via `validate_docker_options()`, following the same pattern as `validate_extra_args()`.
+
+The compose template hard-codes `restart: unless-stopped` on every engine service (and the nginx load balancer in multi-instance deployments). Containers therefore come back automatically after a host reboot or after a process crash, but a manual `docker stop` / `docker compose down` is still honored — which is what the bench teardown path relies on.
 
 Matrix overrides work naturally via deep merge:
 ```yaml
