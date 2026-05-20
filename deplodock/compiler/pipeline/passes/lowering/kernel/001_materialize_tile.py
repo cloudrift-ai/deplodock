@@ -722,6 +722,14 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
     # the default — the fused body's terminal Write produces a value of
     # the same dtype as the surrounding compute chain.
     stage_smem_dtype = (buf_cuda or {}).get(stage.buf, "float")
+    # Cooperative-reduce + VW permutation (``009b_permute_cooperative_reduce``)
+    # produces ``__half`` accesses up to 16 bytes wide; the LDS.128
+    # reinterpret-cast needs the smem buffer base to be 16-byte aligned.
+    # The default natural alignment of ``__half[N]`` is 2 bytes, so
+    # explicitly align fp16 staged smem to the widest LDS instruction
+    # (16 bytes). fp32 smem (``float[N]``) is already 4-byte aligned
+    # naturally and the existing LDS.128 path is fine.
+    stage_smem_align = 16 if stage_smem_dtype == "__half" else 0
     """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
 
     The cooperative load reads a contiguous slab of ``stage.buf``
@@ -828,7 +836,11 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
             step=Literal(n_threads, "int"),
             body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
         )
-        return [Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype), cooperative_load, CpAsyncCommit()]
+        return [
+            Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align),
+            cooperative_load,
+            CpAsyncCommit(),
+        ]
 
     if trivial:
         # Trivial body fast path — preserves byte-identical Kernel IR for
@@ -844,7 +856,12 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
                 Write(output=stage.name, index=smem_index, value=load_name),
             ),
         )
-        return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype), cooperative_load, Sync()]
+        return [
+            *prelude,
+            Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align),
+            cooperative_load,
+            Sync(),
+        ]
 
     # Fused-body path: the Stage body carries the full producer program
     # (Loads from multiple gmem buffers + elementwise compute + final
@@ -874,7 +891,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
         step=Literal(n_threads, "int"),
         body=walked_body,
     )
-    return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype), cooperative_load, Sync()]
+    return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align), cooperative_load, Sync()]
 
 
 def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:

@@ -136,7 +136,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: 
     i = 0
     while i < len(descended):
         replaced = False
-        for run_n in (4, 2):
+        for run_n in (8, 4, 2):
             vec = _try_vec_load(descended, i, run_n, buf_dtypes, literal_const_bufs)
             if vec is not None:
                 out.append(vec)
@@ -209,6 +209,19 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[st
             return None
         diff = BinaryExpr("-", anchor_k, anchor_0).simplify(SimplifyCtx.empty())
         if not (isinstance(diff, Literal) and isinstance(diff.value, int) and diff.value == k):
+            return None
+
+    # For widths above the natural 4-byte (one __half2 / one float)
+    # boundary, the reinterpret-cast destination must be aligned to
+    # ``n * elem_bytes``. Prove statically from the affine form: every
+    # free-var coefficient on the last dim must be a multiple of n,
+    # and the literal anchor must also be a multiple of n. (n=2 fp16
+    # = 4 bytes always works since __half2 is 4-byte aligned in cuda_fp16.h.)
+    if n > 2 or (n == 2 and src_dt == "f32"):
+        if not all(c % n == 0 for c in coeffs_0.values()):
+            return None
+        anchor_simplified = anchor_0.simplify(SimplifyCtx.empty())
+        if not isinstance(anchor_simplified, Literal) or anchor_simplified.value % n != 0:
             return None
 
     return VecLoad(

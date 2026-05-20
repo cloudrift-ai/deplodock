@@ -281,9 +281,23 @@ class VecLoad(Stmt):
         vec_type, elem_type = vec_pair
         flat = render_index(self.input, self.base_index, ctx)
         vname = f"_v_{self.names[0]}"
-        components = ("x", "y", "z", "w")[:n]
+        # ``.x/.y/.z/.w`` accessors only work when ``vec_type``'s native
+        # components match ``elem_type`` 1:1 (``float2``→``float``,
+        # ``__half2``→``__half``). For wider packed vectors that
+        # reinterpret a multi-element pack (``uint2``→4 halves,
+        # ``uint4``→8 halves), each ``.x``/``.y`` slot holds multiple
+        # elements, so we fall back to array-style indexing through a
+        # reinterpret-cast.
+        native_n = {"float2": 2, "float4": 4, "__half2": 2}.get(vec_type)
+        use_array_index = native_n != n
         out = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]);"]
-        out.extend(f"{pad}{elem_type} {nm} = {vname}.{c};" for nm, c in zip(self.names, components, strict=True))
+        if use_array_index:
+            arr_name = f"{vname}_h"
+            out.append(f"{pad}const {elem_type}* {arr_name} = reinterpret_cast<const {elem_type}*>(&{vname});")
+            out.extend(f"{pad}{elem_type} {nm} = {arr_name}[{k}];" for k, nm in enumerate(self.names))
+        else:
+            components = ("x", "y", "z", "w")[:n]
+            out.extend(f"{pad}{elem_type} {nm} = {vname}.{c};" for nm, c in zip(self.names, components, strict=True))
         for nm in self.names:
             ctx.ssa_dtypes[nm] = self.elem_dtype
         return out

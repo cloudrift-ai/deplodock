@@ -145,11 +145,19 @@ class CudaRenderTarget:
                 return (f"float{n}", "float")
             return None
         if dtype == "f16":
-            # Wider fp16 vectors (n=4 → 8 B, n=8 → 16 B) need 4-element /
-            # 8-element alignment which we can't statically prove; the
-            # ``(4, 2)`` retry in ``render_body`` falls through to n=2.
+            # n=2 → 4 B (LDS.32) via ``__half2`` (4-byte alignment).
+            # n=4 → 8 B (LDS.64) via ``uint2`` punned to 4 ``__half``.
+            # n=8 → 16 B (LDS.128) via ``uint4`` punned to 8 ``__half``.
+            # The 009b cooperative-reduce permutation guarantees the
+            # base address is 16-byte aligned when n=8 (and 8-byte
+            # aligned for n=4); for matmul / other shapes the
+            # vectorize pass independently checks the affine form.
             if n == 2:
                 return ("__half2", "__half")
+            if n == 4:
+                return ("uint2", "__half")
+            if n == 8:
+                return ("uint4", "__half")
             return None
         return None
 
