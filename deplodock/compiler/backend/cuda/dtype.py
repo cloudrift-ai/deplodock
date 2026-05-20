@@ -22,6 +22,21 @@ _CUDA_NAME: dict[DataType, str] = {
     _dtype.F16: "__half",
 }
 
+# Inverse of _CUDA_NAME for the kernel-internal C-name -> canonical
+# lookup. Used by Smem.render to populate ``ctx.buffer_dtypes`` so a
+# subsequent Load on the same smem buffer picks the right local C type.
+# Unknown C names (e.g. ``"unsigned long long"`` for mbarriers) map to
+# None and the caller treats the smem buffer as "not a tensor".
+_CANONICAL_FROM_CUDA_NAME: dict[str, str | None] = {v: k.name for k, v in _CUDA_NAME.items()}
+
+
+def canonical_from_cuda_name(name: str) -> str | None:
+    """Inverse of :func:`cuda_name` over the dtypes we model on the graph.
+    Returns ``None`` for CUDA C type names that don't correspond to a
+    :class:`DataType` (mbarrier slots, alignment helpers, etc.)."""
+    return _CANONICAL_FROM_CUDA_NAME.get(name)
+
+
 _CUDA_INCLUDE: dict[DataType, str | None] = {
     _dtype.F32: None,
     _dtype.F16: "<cuda_fp16.h>",
@@ -80,6 +95,8 @@ _C_NAME_BYTES: dict[str, int] = {
     "double": 8,
     "int": 4,
     "half": _dtype.F16.nbytes,
+    "__half": _dtype.F16.nbytes,
+    "__nv_bfloat16": 2,
     "bfloat16": 2,
     "bf16": 2,
     "i32": 4,

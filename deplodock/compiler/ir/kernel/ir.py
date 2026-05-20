@@ -100,10 +100,19 @@ class Smem(Stmt):
         renderer falls back to the dynamic path when total per-CTA smem
         would exceed the 48 KB static cap.
         """
+        from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name  # noqa: PLC0415
+
         total = 1
         for e in self.extents:
             total *= int(e)
         ctx.shapes[self.name] = tuple(int(e) for e in self.extents)
+        # Register the smem buffer's canonical dtype so Load/Write
+        # against this name pick the right local C type. Mbarrier slabs
+        # (``"unsigned long long"``) map to None and stay out of the
+        # dtype-aware path.
+        smem_canonical = canonical_from_cuda_name(self.dtype)
+        if smem_canonical is not None:
+            ctx.buffer_dtypes[self.name] = smem_canonical
         if self.name in ctx.smem_dynamic_offsets:
             offset = ctx.smem_dynamic_offsets[self.name]
             return [f"{_pad(ctx.indent)}{self.dtype}* {self.name} = reinterpret_cast<{self.dtype}*>(_smem_pool + {offset});"]

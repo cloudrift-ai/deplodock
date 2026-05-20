@@ -77,11 +77,22 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
-def rewrite(root: Node) -> Graph | None:
+def rewrite(match, root: Node) -> Graph | None:
+    # Per-graph-buffer CUDA C type names (e.g. ``"__half"``) so Stage
+    # materialization can stamp the matching ``Smem.dtype`` instead of
+    # the legacy ``"float"`` default. Covers anything reachable as a
+    # ``Stage.buf`` — the TileOp's input nodes are the natural set.
+    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+    buf_cuda: dict[str, str] = {}
+    for bid in root.inputs:
+        node = match.graph.nodes.get(bid)
+        if node is not None:
+            buf_cuda[bid] = cuda_name(node.output.dtype)
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, Tile):
-            new_body.append(_materialize(s))
+            new_body.append(_materialize(s, buf_cuda))
         else:
             new_body.append(s)
 
@@ -93,7 +104,8 @@ def rewrite(root: Node) -> Graph | None:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: Tile) -> Stmt:
+def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
+    buf_cuda = buf_cuda or {}
     """Materialize a Tile. ``Tile.axes`` carries the launch geometry
     (THREAD + optional BLOCK axes); strategies set this up — this pass
     commits no axis decisions of its own. The body is walked uniformly
@@ -368,13 +380,13 @@ def _materialize(blk: Tile) -> Stmt:
             new_body.extend(filter_emit(emit_tma_stage(stmt)))
             pending_reduce = None
         elif isinstance(stmt, Stage):
-            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
+            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads, buf_cuda)))
             pending_reduce = None
         elif isinstance(stmt, AsyncWait):
             new_body.extend(emit_async_wait(stmt))
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
+            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
             if stmt.is_reduce:
                 # Combine matching needs the Accum at the immediate-body
                 # level (single-loop reduce). For nested-reduce shapes
@@ -465,7 +477,7 @@ def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
     return out
 
 
-def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda) -> Stmt:
     """Translate a body Loop or StridedLoop. Recurses so nested staging
     / loops / writes inside the body get the same uniform treatment.
     The wrapper type (Loop vs StridedLoop) is preserved — strategies
@@ -483,11 +495,11 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
         if isinstance(s, TmaBufferedStage):
             inner.extend(filter_emit(emit_tma_stage(s)))
         elif isinstance(s, Stage):
-            inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
+            inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads, buf_cuda)))
         elif isinstance(s, AsyncWait):
             inner.extend(emit_async_wait(s))
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
+            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
         else:
             inner.append(transform(s))
     return replace(loop, body=inner)
@@ -692,7 +704,13 @@ def _assert_stage_body_shape(stage: Stage) -> None:
             raise AssertionError(f"Stage {stage.name!r}: body may only contain Load / Assign / final Write, got {type(s).__name__}")
 
 
-def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
+def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str] | None = None) -> list[Stmt]:
+    # ``Smem.dtype`` for a staged gmem buffer matches the gmem source's
+    # CUDA C type (so fp16 inputs stage into ``__half`` smem rather than
+    # promoting to ``float`` mid-load). Multi-source fused stages keep
+    # the default — the fused body's terminal Write produces a value of
+    # the same dtype as the surrounding compute chain.
+    stage_smem_dtype = (buf_cuda or {}).get(stage.buf, "float")
     """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
 
     The cooperative load reads a contiguous slab of ``stage.buf``
@@ -786,7 +804,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
             step=Literal(n_threads, "int"),
             body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
         )
-        return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
+        return [Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype), cooperative_load, CpAsyncCommit()]
 
     if trivial:
         # Trivial body fast path — preserves byte-identical Kernel IR for
@@ -802,7 +820,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
                 Write(output=stage.name, index=smem_index, value=load_name),
             ),
         )
-        return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
+        return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype), cooperative_load, Sync()]
 
     # Fused-body path: the Stage body carries the full producer program
     # (Loads from multiple gmem buffers + elementwise compute + final
@@ -832,7 +850,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         step=Literal(n_threads, "int"),
         body=walked_body,
     )
-    return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
+    return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype), cooperative_load, Sync()]
 
 
 def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:
