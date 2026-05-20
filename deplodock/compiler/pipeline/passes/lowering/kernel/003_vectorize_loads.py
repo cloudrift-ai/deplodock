@@ -66,15 +66,6 @@ _TARGET = CudaRenderTarget()
 def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
 
-    # Per-buffer dtype map: graph dtypes via ``kop.inputs`` / ``kop.outputs``
-    # (matcher-populated Tensor dicts), then Smem dtypes from the body.
-    buf_dtypes: dict[str, str] = {n: t.dtype.name for n, t in {**kop.inputs, **kop.outputs}.items()}
-    for s in kop.body.iter():
-        if isinstance(s, Smem):
-            canonical = canonical_from_cuda_name(s.dtype)
-            if canonical is not None:
-                buf_dtypes[s.name] = canonical
-
     # Loads from scalar ``ConstantOp`` inputs get inlined as float
     # literals at CUDA lowering (``001_lower_kernelop`` populates
     # ``literal_constants`` and the surrounding kernel doesn't even
@@ -87,32 +78,48 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         if node is not None and isinstance(node.op, ConstantOp) and node.op.value is not None:
             literal_const_bufs.add(bid)
 
-    new_body = _vectorize_body(kop.body, buf_dtypes, literal_const_bufs)
+    new_body = _vectorize_body(kop, kop.body, literal_const_bufs)
     if new_body == kop.body:
         raise RuleSkipped("no vectorizable Load runs found")
 
     return KernelOp(body=new_body, name=kop.name)
 
 
-def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: set[str]) -> Body:
+def _buf_dtype(kop: KernelOp, name: str) -> str:
+    """Resolve a buffer's canonical dtype: matcher-populated ``kop.inputs``
+    / ``kop.outputs`` for graph buffers, falling back to ``Smem`` decls
+    in the body for smem-local names, then ``f32``."""
+    t = kop.inputs.get(name) or kop.outputs.get(name)
+    if t is not None:
+        return t.dtype.name
+    for s in kop.body.iter():
+        if isinstance(s, Smem) and s.name == name:
+            canonical = canonical_from_cuda_name(s.dtype)
+            if canonical is not None:
+                return canonical
+    return "f32"
+
+
+def _vectorize_body(kop: KernelOp, body: Body, literal_const_bufs: set[str]) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
-    scan this scope for consecutive-Load runs."""
+    scan this scope for consecutive-Load runs. Threads ``kop`` through so
+    ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
     descended: list[Stmt] = []
     for s in body:
         if isinstance(s, Loop):
-            descended.append(_replace(s, body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs)))
+            descended.append(_replace(s, body=_vectorize_body(kop, s.body, literal_const_bufs)))
         elif isinstance(s, StridedLoop):
-            descended.append(_replace(s, body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs)))
+            descended.append(_replace(s, body=_vectorize_body(kop, s.body, literal_const_bufs)))
         elif isinstance(s, Cond):
             descended.append(
                 Cond(
                     cond=s.cond,
-                    body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs),
-                    else_body=_vectorize_body(s.else_body, buf_dtypes, literal_const_bufs),
+                    body=_vectorize_body(kop, s.body, literal_const_bufs),
+                    else_body=_vectorize_body(kop, s.else_body, literal_const_bufs),
                 )
             )
         elif isinstance(s, Tile):
-            descended.append(Tile(axes=s.axes, body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs)))
+            descended.append(Tile(axes=s.axes, body=_vectorize_body(kop, s.body, literal_const_bufs)))
         else:
             descended.append(s)
 
@@ -121,7 +128,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: 
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_load(descended, i, run_n, buf_dtypes, literal_const_bufs)
+            vec = _try_vec_load(descended, i, run_n, kop, literal_const_bufs)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -133,7 +140,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: 
     return Body(tuple(out))
 
 
-def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str], literal_const_bufs: set[str]) -> Load | None:
+def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp, literal_const_bufs: set[str]) -> Load | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Load pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     source buffer's dtype, return the widened :class:`Load`. Otherwise
@@ -161,7 +168,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[st
         # so a vectorized reinterpret_cast would reference an undefined
         # symbol.
         return None
-    src_dt = buf_dtypes.get(input_name, "f32")
+    src_dt = _buf_dtype(kop, input_name)
     if _TARGET.vector_type(src_dt, n) is None:
         return None
 

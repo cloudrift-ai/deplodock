@@ -52,44 +52,48 @@ _TARGET = CudaRenderTarget()
 
 def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
-
-    # Per-buffer dtype map: graph dtypes via ``kop.inputs`` / ``kop.outputs``
-    # (matcher-populated Tensor dicts), then Smem dtypes from the body.
-    # Mirrors ``003_vectorize_loads`` so we cover smem writebacks too even
-    # though the common case is the kernel's output buffer.
-    buf_dtypes: dict[str, str] = {n: t.dtype.name for n, t in {**kop.inputs, **kop.outputs}.items()}
-    for s in kop.body.iter():
-        if isinstance(s, Smem):
-            canonical = canonical_from_cuda_name(s.dtype)
-            if canonical is not None:
-                buf_dtypes[s.name] = canonical
-
-    new_body = _vectorize_body(kop.body, buf_dtypes)
+    new_body = _vectorize_body(kop, kop.body)
     if new_body == kop.body:
         raise RuleSkipped("no vectorizable Write runs found")
-
     return KernelOp(body=new_body, name=kop.name)
 
 
-def _vectorize_body(body: Body, buf_dtypes: dict[str, str]) -> Body:
+def _buf_dtype(kop: KernelOp, name: str) -> str:
+    """Resolve a buffer's canonical dtype: matcher-populated ``kop.inputs``
+    / ``kop.outputs`` for graph buffers, falling back to ``Smem`` decls
+    in the body for smem-local names, then ``f32``. Mirrors the helper
+    in ``003_vectorize_loads``."""
+    t = kop.inputs.get(name) or kop.outputs.get(name)
+    if t is not None:
+        return t.dtype.name
+    for s in kop.body.iter():
+        if isinstance(s, Smem) and s.name == name:
+            canonical = canonical_from_cuda_name(s.dtype)
+            if canonical is not None:
+                return canonical
+    return "f32"
+
+
+def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
-    scan this scope for consecutive-Write runs."""
+    scan this scope for consecutive-Write runs. Threads ``kop`` through so
+    ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
     descended: list[Stmt] = []
     for s in body:
         if isinstance(s, Loop):
-            descended.append(_replace(s, body=_vectorize_body(s.body, buf_dtypes)))
+            descended.append(_replace(s, body=_vectorize_body(kop, s.body)))
         elif isinstance(s, StridedLoop):
-            descended.append(_replace(s, body=_vectorize_body(s.body, buf_dtypes)))
+            descended.append(_replace(s, body=_vectorize_body(kop, s.body)))
         elif isinstance(s, Cond):
             descended.append(
                 Cond(
                     cond=s.cond,
-                    body=_vectorize_body(s.body, buf_dtypes),
-                    else_body=_vectorize_body(s.else_body, buf_dtypes),
+                    body=_vectorize_body(kop, s.body),
+                    else_body=_vectorize_body(kop, s.else_body),
                 )
             )
         elif isinstance(s, Tile):
-            descended.append(Tile(axes=s.axes, body=_vectorize_body(s.body, buf_dtypes)))
+            descended.append(Tile(axes=s.axes, body=_vectorize_body(kop, s.body)))
         else:
             descended.append(s)
 
@@ -98,7 +102,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str]) -> Body:
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_store(descended, i, run_n, buf_dtypes)
+            vec = _try_vec_store(descended, i, run_n, kop)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -110,7 +114,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str]) -> Body:
     return Body(tuple(out))
 
 
-def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str]) -> Write | None:
+def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> Write | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Write pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     destination buffer's dtype, return the widened :class:`Write`.
@@ -135,7 +139,7 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[s
     if any(s.reduce_op is not None for s in writes):
         return None
 
-    dst_dt = buf_dtypes.get(output_name, "f32")
+    dst_dt = _buf_dtype(kop, output_name)
     if _TARGET.vector_type(dst_dt, n) is None:
         return None
 
