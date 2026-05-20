@@ -15,6 +15,29 @@ from deplodock.compiler.ir.expr import Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, op_to_expr, render_index, select_to_ternary
 
 
+def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt: str) -> list[Expr]:
+    """Convert each SSA arg to ``dst_dt`` via ``target.convert``, returning
+    Exprs ready to drop into ``op_to_expr``. Args already at ``dst_dt``
+    pass through as bare ``Var``s. Mismatched args are wrapped in the
+    target's conversion intrinsic (e.g. ``__half2float(name)``) by
+    parsing ``target.convert``'s output back into a ``FuncCallExpr`` so
+    it composes with the Expr renderer."""
+    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+
+    out: list[Expr] = []
+    for a, dt in zip(args, arg_dtypes, strict=True):
+        if dt == dst_dt:
+            out.append(Var(a))
+            continue
+        converted = target.convert(a, dt, dst_dt)
+        paren = converted.index("(") if "(" in converted else -1
+        if paren > 0 and converted.endswith(")"):
+            out.append(FuncCallExpr(converted[:paren], [Var(a)]))
+        else:
+            out.append(Var(a))
+    return out
+
+
 def _promote_args_to_f32(target, args: tuple[str, ...], arg_dtypes: list[str]) -> list[Expr]:
     """Wrap each non-f32 SSA name with ``target.convert(name, dt, "f32")``
     so the resulting Expr tree composes in fp32. Used by ``Assign.render``
@@ -138,11 +161,18 @@ class Assign(Stmt):
     mul / exp / ...). Reductions live in ``Accum``. ``args`` reference
     ``$N`` ports, an ``Accum.name`` (reads current / finalized acc
     value), or prior SSA names.
+
+    ``dtype`` is optional and overrides the default ``promote(args)``
+    rule when set. The ``demote_to_write_dtype`` Kernel-IR pass stamps
+    it on Assigns whose results only feed dtype-narrower consumers, so
+    a softmax / RMSNorm epilogue feeding an ``__half*`` Write computes
+    in ``__half`` end to end without spurious promotions.
     """
 
     name: str
     op: ElementwiseImpl
     args: tuple[str, ...]
+    dtype: DataType | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.op, str):
@@ -155,25 +185,34 @@ class Assign(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{self.name} = {self.op.name}({', '.join(self.args)})"]
+        prefix = f"{self.dtype.name} " if self.dtype is not None else ""
+        return [f"{indent}{prefix}{self.name} = {self.op.name}({', '.join(self.args)})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         op_name = self.op.name
         arg_dtypes = [ctx.ssa_dtypes.get(a, "f32") for a in self.args]
-        # Promotion rule for the elementwise scope: result matches the
-        # input dtype when all inputs agree; any non-default fp32 input
-        # promotes the whole expression to fp32 (with conversion at the
-        # use site).
-        result_dt = "f16" if arg_dtypes and all(d == "f16" for d in arg_dtypes) else "f32"
+        # Default rule: result matches the input dtype when all inputs
+        # agree; any fp32 input promotes the whole expression to fp32.
+        # Explicit ``self.dtype`` overrides — the demote pass uses this
+        # to force a narrower dtype on the result.
+        if self.dtype is not None:
+            result_dt = self.dtype.name
+        else:
+            result_dt = "f16" if arg_dtypes and all(d == "f16" for d in arg_dtypes) else "f32"
 
-        if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt):
-            # Native non-f32 path: swap the f32 intrinsic table for the
-            # target's dtype-specific table around this render, and tell
-            # ``Literal.render`` to wrap embedded float literals in the
-            # target's dtype-cast intrinsic so they compose with the
-            # non-default-dtype operands.
-            args: list[Expr] = [Var(a) for a in self.args]
+        all_args_at_result = bool(arg_dtypes) and all(d == result_dt for d in arg_dtypes)
+        if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt) and all_args_at_result:
+            # Native non-f32 path: all args already at ``result_dt`` so
+            # no per-arg conversion is needed. Render with the target's
+            # dtype-specific intrinsics. ``Literal.render`` wraps embedded
+            # float literals via the target so they compose with the
+            # non-default-dtype operands. When args are *not* all at
+            # ``result_dt`` (mixed dtypes from an explicit ``self.dtype``
+            # demotion), fall through to the promote-then-demote path
+            # below — computing in fp32 and converting once preserves
+            # precision better than converting each arg to fp16 first.
+            args = _args_at_dtype(ctx.target, self.args, arg_dtypes, result_dt)
             expr = op_to_expr(op_name, args)
             saved_intr = ctx.intrinsics
             saved_lit = ctx.literal_default_dtype
@@ -187,21 +226,15 @@ class Assign(Stmt):
             ctx.ssa_dtypes[self.name] = result_dt
             return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body};"]
 
+        # f32 / no-native path: promote args to f32, render in f32, then
+        # convert the result back to ``result_dt`` when narrower.
+        promoted = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
+        expr = op_to_expr(op_name, promoted)
+        body_str = expr.render(ctx)
         if result_dt != "f32":
-            # Fallback: no native form for this op at result_dt.
-            # Promote each non-f32 arg to f32 at use, render in f32, then
-            # convert the result back to the declared dtype.
-            promoted = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
-            expr = op_to_expr(op_name, promoted)
-            ctx.ssa_dtypes[self.name] = result_dt
-            body = ctx.target.convert(expr.render(ctx), "f32", result_dt)
-            return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body};"]
-
-        # f32 result: any non-f32 inputs get a per-arg conversion wrap.
-        args = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
-        expr = op_to_expr(op_name, args)
-        ctx.ssa_dtypes[self.name] = "f32"
-        return [f"{pad}{ctx.type_name('f32')} {self.name} = {expr.render(ctx)};"]
+            body_str = ctx.target.convert(body_str, "f32", result_dt)
+        ctx.ssa_dtypes[self.name] = result_dt
+        return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body_str};"]
 
 
 @dataclass(frozen=True)
@@ -252,8 +285,8 @@ class Accum(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        dt = f" :{self.dtype.name}" if self.dtype is not None else ""
-        return [f"{indent}{self.name}{dt} <- {self.op.name}({self.name}, {self.value})"]
+        prefix = f"{self.dtype.name} " if self.dtype is not None else ""
+        return [f"{indent}{prefix}{self.name} <- {self.op.name}({self.name}, {self.value})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
@@ -317,7 +350,7 @@ class Init(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}Init({self.name} :{self.dtype.name}, op={self.op.name})"]
+        return [f"{indent}Init({self.dtype.name} {self.name}, op={self.op.name})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         identity = self.op.identity

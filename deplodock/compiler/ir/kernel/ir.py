@@ -88,7 +88,7 @@ class Smem(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         ext = ", ".join(str(e) for e in self.extents) or "-"
         ali = f" align={self.align}" if self.align else ""
-        return [f"{indent}Smem {self.name}[{ext}] ({self.dtype}){ali}"]
+        return [f"{indent}Smem {self.dtype} {self.name}[{ext}]{ali}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """``__shared__ <dtype> <name>[<prod(extents)>];`` and register the
@@ -366,14 +366,16 @@ class TreeHalve(Stmt):
     dtype: DataType = F32
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}TreeHalve({self.buf} :{self.dtype.name}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
+        return [f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
         pad = _pad(ctx.indent)
         inner_pad = _pad(ctx.indent + 1)
         halve_pad = _pad(ctx.indent + 2)
-        op_expr = _binary_combine_expr(self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name)
+        op_expr = _binary_combine_expr(
+            self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name
+        )
         half = int(self.length) // 2
         return [
             f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
@@ -414,7 +416,7 @@ class WarpShuffle(Stmt):
     dtype: DataType = F32
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}WarpShuffle({self.name} :{self.dtype.name} <- {self.value}, op={self.op.name}, length={self.length})"]
+        return [f"{indent}WarpShuffle({self.dtype.name} {self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
