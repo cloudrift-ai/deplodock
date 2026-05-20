@@ -37,8 +37,8 @@ class BodyOp(Op):
       override (``KernelOp`` to include ``CpAsyncCopy.src`` /
       ``TmaDescriptor.src_buf`` and exclude smem buffers; ``TileOp`` to
       include ``Stage.buf`` and exclude staged names),
-    - a unified ``pretty_body`` printing a ``kernel <name>  inputs: ...
-      outputs: ...`` header above the indented body listing.
+    - a unified ``pretty_body`` returning the indented body listing
+      (the surrounding dump emits the kernel name / I/O label).
 
     The matcher's :meth:`Op.populate_io` hook is overridden here so the
     ``inputs`` / ``outputs`` Tensor dicts the matcher snaps onto the op
@@ -97,9 +97,8 @@ class BodyOp(Op):
         self.outputs = new_out
 
     def pretty_body(self) -> str:
-        """``kernel <name>  inputs: ...  outputs: ...`` header above the
-        indented body listing."""
-        sig_in = ", ".join(self.body_inputs) or "-"
-        sig_out = ", ".join(self.body_outputs) or "-"
-        head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
-        return "\n".join([head, *_pretty_body_stmts(self.body, "    ")])
+        """Indented body listing — one stmt per line via per-stmt
+        ``pretty``. Callers (``format_kernels`` /
+        ``Candidate._format_nodes``) emit the surrounding name / I/O
+        label themselves; duplicating it here would just rot."""
+        return "\n".join(_pretty_body_stmts(self.body, "    "))

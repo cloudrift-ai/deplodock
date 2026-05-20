@@ -720,8 +720,13 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
     # CUDA C type (so fp16 inputs stage into ``__half`` smem rather than
     # promoting to ``float`` mid-load). Multi-source fused stages keep
     # the default — the fused body's terminal Write produces a value of
-    # the same dtype as the surrounding compute chain.
-    stage_smem_dtype = (buf_cuda or {}).get(stage.buf, "float")
+    # the same dtype as the surrounding compute chain, and ``stage.buf``
+    # is undefined for them (the property raises on multi-Load bodies).
+    source_loads = stage.source_loads
+    if len(source_loads) == 1:
+        stage_smem_dtype = (buf_cuda or {}).get(source_loads[0].input, "float")
+    else:
+        stage_smem_dtype = "float"
     # Cooperative-reduce + VW permutation (``009b_permute_cooperative_reduce``)
     # produces ``__half`` accesses up to 16 bytes wide; the LDS.128
     # reinterpret-cast needs the smem buffer base to be 16-byte aligned.
