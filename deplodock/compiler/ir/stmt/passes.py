@@ -19,7 +19,7 @@ from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, VecLoad, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, VecLoad, VecStore, Write
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
@@ -114,6 +114,16 @@ def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
+def _(s: VecStore, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return VecStore(
+        names=tuple(rename(n) for n in s.names),
+        output=s.output,
+        base_index=tuple(sigma.apply(e) for e in s.base_index),
+        elem_dtype=s.elem_dtype,
+    )
+
+
+@rewrite.register
 def _(s: Select, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Select(
         name=rename(s.name),
@@ -176,6 +186,11 @@ def _(s: Load, ctx: SimplifyCtx) -> Stmt:
 @simplify.register
 def _(s: Write, ctx: SimplifyCtx) -> Stmt:
     return Write(output=s.output, index=tuple(e.simplify(ctx) for e in s.index), value=s.value, reduce_op=s.reduce_op)
+
+
+@simplify.register
+def _(s: VecStore, ctx: SimplifyCtx) -> Stmt:
+    return VecStore(names=s.names, output=s.output, base_index=tuple(e.simplify(ctx) for e in s.base_index), elem_dtype=s.elem_dtype)
 
 
 @simplify.register

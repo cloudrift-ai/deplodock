@@ -56,6 +56,7 @@ from deplodock.compiler.ir.stmt import (
     Tile,
     Unpack,
     VecLoad,
+    VecStore,
     Write,
     _pad,
     pretty_body,
@@ -624,10 +625,17 @@ class KernelOp(Op):
 
     @property
     def outputs(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` buf names in body first-use order —
-        the kernel's writeable output parameters. Smem buffers are excluded."""
+        """Distinct ``Write.output`` / ``VecStore.output`` buf names in
+        body first-use order — the kernel's writeable output
+        parameters. Smem buffers are excluded."""
         smem = self.smem_names
-        return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
+        names: dict[str, None] = {}
+        for s in self:
+            if isinstance(s, Write) and s.output not in smem:
+                names.setdefault(s.output, None)
+            elif isinstance(s, VecStore) and s.output not in smem:
+                names.setdefault(s.output, None)
+        return tuple(names)
 
 
 # ---------------------------------------------------------------------------

@@ -304,6 +304,99 @@ class VecLoad(Stmt):
 
 
 @dataclass(frozen=True)
+class VecStore(Stmt):
+    """N consecutive ``Write``s packed into a single vector store.
+
+    Symmetric to :class:`VecLoad`. Emits one ``make_<vec_type>(...)``
+    (or ``__halves2half2``) constructor followed by a single
+    ``*reinterpret_cast<<vec_type>*>(&output[<flat>]) = packed;``. The
+    vector + element C type names come from
+    :meth:`RenderTarget.vector_type` for ``(elem_dtype, n)``.
+
+    ``base_index`` is the index of lane 0; lane k's destination is
+    ``base_index[:-1] + (base_index[-1] + k,)``. ``names`` are the SSA
+    values being stored (one per lane). The pass that introduces
+    ``VecStore`` (``005_vectorize_stores``) verifies the consecutive-
+    Write pattern structurally and the alignment / dtype constraints;
+    ``VecStore.render`` only needs to format the output.
+    """
+
+    names: tuple[str, ...]
+    output: str
+    base_index: tuple[Expr, ...]
+    elem_dtype: str  # canonical token: "f32" / "f16"
+
+    def deps(self) -> tuple[str, ...]:
+        return self.names
+
+    def defines(self) -> tuple[str, ...]:
+        return ()
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return self.base_index
+
+    def has_side_effects(self) -> bool:
+        return True
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(e.pretty() for e in self.base_index)
+        names = ", ".join(self.names)
+        return [f"{indent}vec_store[{len(self.names)}] {self.output}[{idx}] = ({names})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        n = len(self.names)
+        vec_pair = ctx.target.vector_type(self.elem_dtype, n)
+        pad = _pad(ctx.indent)
+        out_dt = ctx.buffer_dtypes.get(self.output, self.elem_dtype)
+        # Per-value dtype conversion: every SSA arg must be at ``out_dt``
+        # before packing. Mirror ``Write.render`` so an f32 chain feeding
+        # an f16 output still works correctly.
+        converted = []
+        for nm in self.names:
+            src_dt = ctx.ssa_dtypes.get(nm, "f32")
+            converted.append(nm if src_dt == out_dt else ctx.target.convert(nm, src_dt, out_dt))
+        if vec_pair is None:
+            # Target doesn't support this width — fall back to scalar
+            # Writes. The vectorize pass should have avoided this, but
+            # render's job is to always produce valid code.
+            lines: list[str] = []
+            for k in range(n):
+                idx_k = tuple(self.base_index[:-1]) + (BinaryExpr("+", self.base_index[-1], Literal(k, "int")),)
+                flat = render_index(self.output, idx_k, ctx)
+                lines.append(f"{pad}{self.output}[{flat}] = {converted[k]};")
+            return lines
+        vec_type, _elem_type = vec_pair
+        flat = render_index(self.output, self.base_index, ctx)
+        # Native-width vectors (``float2`` / ``float4`` / ``__half2``) take
+        # a positional constructor — ``make_float2(a, b)`` for fp32 paths,
+        # ``__halves2half2(a, b)`` for the fp16 pair. Wider packed vectors
+        # (``uint2`` / ``uint4``) re-interpret arrays of elements — we
+        # stage the elements into a local array, then store the array's
+        # uint{2,4} view in one transaction.
+        if vec_type == "__half2":
+            return [
+                f"{pad}{vec_type} _vs_{self.names[0]} = __halves2half2({converted[0]}, {converted[1]});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.names[0]};",
+            ]
+        if vec_type in ("float2", "float4"):
+            args = ", ".join(converted)
+            return [
+                f"{pad}{vec_type} _vs_{self.names[0]} = make_{vec_type}({args});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.names[0]};",
+            ]
+        # Packed widths (uint2 / uint4) over fp16: stage through a local
+        # array of ``__half`` so we never need to construct a uint{2,4}
+        # literal directly.
+        elem_type = ctx.type_name(self.elem_dtype)
+        arr = f"_vs_{self.names[0]}"
+        init = ", ".join(converted)
+        return [
+            f"{pad}{elem_type} {arr}[{n}] = {{ {init} }};",
+            f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = *reinterpret_cast<const {vec_type}*>({arr});",
+        ]
+
+
+@dataclass(frozen=True)
 class Assign(Stmt):
     """Pure SSA body statement: ``name = op(args)``.
 
