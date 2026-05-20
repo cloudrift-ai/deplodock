@@ -8,8 +8,9 @@ method does the per-line emission.
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.cuda.dtype import INTRINSICS_FP16, NATIVE_FP16_OPS, cuda_includes, cuda_name
+from deplodock.compiler.backend.cuda.dtype import cuda_includes, cuda_name
 from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
+from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
 from deplodock.compiler.tensor import Tensor
@@ -190,6 +191,7 @@ def render_kernelop(
         tmap.setdefault(n, t)
     smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
     ctx = RenderCtx(
+        target=CudaRenderTarget(),
         shapes={n: tuple(t.shape) for n, t in tmap.items()},
         indent=1,
         intrinsics=_INTRINSIC_TO_CUDA,
@@ -197,8 +199,6 @@ def render_kernelop(
         literal_constants=literals,
         smem_dynamic_offsets=smem_offsets,
         buffer_dtypes={n: t.dtype.name for n, t in tmap.items()},
-        intrinsics_fp16=INTRINSICS_FP16,
-        native_fp16_ops=NATIVE_FP16_OPS,
     )
 
     def _dtype_for(name: str, fallback: object) -> object:

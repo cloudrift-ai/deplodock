@@ -42,49 +42,12 @@ _CUDA_INCLUDE: dict[DataType, str | None] = {
     _dtype.F16: "<cuda_fp16.h>",
 }
 
-# Intrinsic spellings for the abstract op-names emitted by ``op_to_expr``
-# when the result type is fp16. Entries here are consulted by the Kernel
-# IR renderer instead of the default f32 table (``expf`` / ``fmaxf`` /
-# ``fabsf`` / ...). Operators ``+ - * /`` are not in this table — cuda_fp16.h
-# provides ``__half operator+(...)`` etc., so ``BinaryExpr`` renders
-# natively when both operands are ``__half``.
-INTRINSICS_FP16: dict[str, str] = {
-    "exp": "hexp",
-    "log": "hlog",
-    "sqrt": "hsqrt",
-    "rsqrt": "hrsqrt",
-    "tanh": "htanh",
-    "fmax": "__hmax",
-    "fmin": "__hmin",
-    "fabs": "__habs",
-}
-
-# Abstract op-names (the ``ElementwiseImpl.name`` consumed by ``op_to_expr``)
-# for which a native fp16 path exists end-to-end. Ops outside this set fall
-# back to "promote args to float, run f32 form, ``__float2half`` the result"
-# at render time so the IR stays target-agnostic.
-NATIVE_FP16_OPS: frozenset[str] = frozenset(
-    {
-        "add",
-        "subtract",
-        "multiply",
-        "divide",
-        "maximum",
-        "minimum",
-        "exp",
-        "log",
-        "sqrt",
-        "rsqrt",
-        "tanh",
-        "fabs",
-        "abs",
-        "negative",
-        "copy",
-        "reciprocal",
-        "relu",
-        "sigmoid",
-    }
-)
+# Per-op intrinsic spellings and the native-op set used to live here as
+# ``INTRINSICS_FP16`` / ``NATIVE_FP16_OPS`` for the Kernel-IR renderer
+# to consult on the ``RenderCtx``. They moved to
+# :class:`CudaRenderTarget` (``backend/cuda/render_target.py``) — the
+# render layer now talks to the target via the :class:`RenderTarget`
+# protocol instead of pulling tables from this module.
 
 # Bytes for raw CUDA C type names that appear in Kernel IR today (``Smem.dtype``,
 # ``Local.dtype``, ``Literal.dtype`` are ``str`` for now — step 2 of the dtype

@@ -18,6 +18,19 @@ from deplodock.compiler.ir.sigma import Sigma
 if TYPE_CHECKING:
     from deplodock.compiler.ir.stmt.body import Body
     from deplodock.compiler.ir.stmt.leaves import Select
+    from deplodock.compiler.render_target import RenderTarget
+
+
+def _default_render_target():
+    """Lazy default: a :class:`CudaRenderTarget` instance. Used when
+    ``RenderCtx`` is constructed without an explicit target — keeps the
+    legacy "everything is CUDA" behavior for tests / golden output.
+
+    Lazy to avoid importing the backend at IR-module load time."""
+    from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget  # noqa: PLC0415
+
+    return CudaRenderTarget()
+
 
 INDENT = "    "
 
@@ -29,15 +42,25 @@ INDENT = "    "
 
 @dataclass
 class RenderCtx:
-    """Per-render state. Targets pre-fill ``intrinsics`` / ``builtins`` with
-    target-specific spellings (``"exp" → "expf"``, ``"thread_idx.x" →
-    "threadIdx.x"``, ...). ``shapes`` maps every buffer to its declared
-    shape so multi-dim ``Load`` / ``Write`` indices can be flattened
-    row-major. ``explicit_inits`` carries the set of accumulator names
-    whose init has been emitted by an enclosing ``Init`` Stmt — Loop's
-    default per-Loop init is suppressed for those names.
+    """Per-render state. ``target`` is the :class:`RenderTarget` that
+    owns every target-specific C spelling decision (type names,
+    conversion intrinsics, per-dtype op spellings, native-op coverage,
+    vector load shapes). Everything else here is generic walk state.
+
+    ``intrinsics`` / ``builtins`` keep the legacy abstract→spelling
+    indirection used by ``FuncCallExpr.render`` / ``Builtin.render``
+    for symbols that don't vary by dtype (``thread_idx.x`` →
+    ``threadIdx.x``, etc.). Dtype-aware lookups go through
+    ``ctx.target.intrinsic(...)`` instead.
+
+    ``shapes`` maps every buffer to its declared shape so multi-dim
+    ``Load`` / ``Write`` indices can be flattened row-major.
+    ``explicit_inits`` carries the set of accumulator names whose init
+    has been emitted by an enclosing ``Init`` Stmt — Loop's default
+    per-Loop init is suppressed for those names.
     """
 
+    target: RenderTarget = field(default_factory=_default_render_target)
     shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
     indent: int = 1
     intrinsics: dict[str, str] = field(default_factory=dict)
@@ -56,34 +79,27 @@ class RenderCtx:
     smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
     # Per-buffer canonical dtype tokens (``"f32"`` / ``"f16"``) for every
     # global-buffer name (kernel inputs + outputs). ``Load`` declares its
-    # SSA-name local in the source buffer's C type so values flow as
-    # ``__half`` end-to-end where possible; ``Write`` inserts
-    # ``__float2half`` / ``__half2float`` only when the value's dtype
-    # disagrees with the destination buffer's dtype. Missing entries
-    # default to ``"f32"`` so legacy bodies render unchanged.
+    # SSA-name local in the source buffer's C type so values flow at
+    # buffer dtype end-to-end where possible; ``Write`` inserts the
+    # target's conversion intrinsic only when the value's dtype disagrees
+    # with the destination buffer's dtype. Missing entries default to
+    # ``"f32"`` so legacy bodies render unchanged.
     buffer_dtypes: dict[str, str] = field(default_factory=dict)
     # Per-SSA-name canonical dtype tokens, populated as ``render_body``
     # walks. ``Load`` writes the source buffer's dtype; ``Assign`` writes
     # ``promote(args)``. Consumed by downstream ``Assign`` / ``Write`` to
-    # decide native-fp16-vs-promote-fallback and to insert conversions.
+    # decide native-vs-promote-fallback and to insert conversions.
     ssa_dtypes: dict[str, str] = field(default_factory=dict)
-    # Per-op CUDA spelling for the fp16 native form (e.g. ``"exp" → "hexp"``).
-    # Populated by the kernel renderer from the CUDA backend's
-    # ``INTRINSICS_FP16`` table.
-    intrinsics_fp16: dict[str, str] = field(default_factory=dict)
-    # Abstract op-names (``ElementwiseImpl.name``) for which a native fp16
-    # path exists end-to-end. ``Assign.render`` consults this to pick
-    # native vs promote-and-demote.
-    native_fp16_ops: frozenset[str] = field(default_factory=frozenset)
-    # Render-time hint to ``Literal.render``: when set to ``"f16"``,
-    # float literals render wrapped in ``__float2half(...)`` so the
-    # surrounding ``__half`` expression compiles. Set transiently by
-    # ``Assign.render`` around the fp16-native expression render.
+    # Render-time hint to ``Literal.render``: when set to a non-default
+    # dtype, float literals render via ``target.literal(text, dtype)``
+    # so they compose with non-default-dtype operands. Set transiently
+    # by ``Assign.render`` around the native expression render.
     literal_default_dtype: str | None = None
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
         return RenderCtx(
+            target=self.target,
             shapes=self.shapes,
             indent=self.indent + 1,
             intrinsics=self.intrinsics,
@@ -94,10 +110,37 @@ class RenderCtx:
             smem_dynamic_offsets=self.smem_dynamic_offsets,
             buffer_dtypes=self.buffer_dtypes,
             ssa_dtypes=self.ssa_dtypes,
-            intrinsics_fp16=self.intrinsics_fp16,
-            native_fp16_ops=self.native_fp16_ops,
             literal_default_dtype=self.literal_default_dtype,
         )
+
+    # ---- Convenience wrappers over ``self.target``. These exist so the
+    # render methods read ``ctx.type_name(dt)`` instead of pulling the
+    # target out by hand; they also default ``None`` dtype to F32 so the
+    # call sites don't repeat that boilerplate.
+
+    def type_name(self, dtype) -> str:
+        """C type spelling for a local declaration. Accepts a
+        :class:`DataType`, a canonical-name string, or ``None`` (treated
+        as F32)."""
+        return self.target.type_name(_canonical_dtype_name(dtype))
+
+    def identity_literal(self, identity: float, dtype) -> str:
+        """Render an accumulator's identity (0, 1, -inf, ...) as a C
+        literal in ``dtype``, wrapping with the target's dtype cast if
+        needed (e.g. ``__float2half(0.0f)`` for fp16). Accepts a
+        :class:`DataType`, a canonical-name string, or ``None`` (F32)."""
+        from deplodock.compiler.ir.expr import _float_lit  # noqa: PLC0415
+
+        return self.target.literal(_float_lit(float(identity)), _canonical_dtype_name(dtype))
+
+
+def _canonical_dtype_name(dtype) -> str:
+    """Normalize ``DataType | str | None`` to the canonical dtype token."""
+    if dtype is None:
+        return "f32"
+    if isinstance(dtype, str):
+        return dtype
+    return dtype.name
 
 
 def _pad(n: int) -> str:
@@ -440,16 +483,8 @@ def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] |
         return None
     (input_name,) = inputs
     src_dt = ctx.buffer_dtypes.get(input_name, "f32")
-    if src_dt not in ("f32", "f16"):
-        return None
-    # fp16 vectorization only at n=2 (a single ``__half2`` read — 4 bytes,
-    # always safe since smem ``__half[N]`` is at least 4-byte aligned and
-    # consecutive Loads k=0,1 land on even/odd halves of one ``__half2``).
-    # Wider vectors (n=4 → 8 bytes, n=8 → 16 bytes) require 4-element /
-    # 8-element alignment which we can't statically prove without an
-    # affine-form alignment analysis. For n>2 fp16 the (4, 2) retry in
-    # ``render_body`` falls through to n=2.
-    if src_dt == "f16" and n != 2:
+    vec_pair = ctx.target.vector_type(src_dt, n)
+    if vec_pair is None:
         return None
     rank = len(loads[0].index)
     if rank == 0 or any(len(s.index) != rank for s in loads[1:]):
@@ -489,17 +524,9 @@ def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] |
     pad = _pad(ctx.indent)
     vname = f"_v_{loads[0].name}"
     components = ("x", "y", "z", "w")[:n]
-    if src_dt == "f16":
-        # ``__half2`` carries two halves with .x / .y accessors. The SSA
-        # locals are declared ``__half`` (not float) so subsequent
-        # ``Assign``s see fp16 args via ``ctx.ssa_dtypes``.
-        out = [f"{pad}__half2 {vname} = *reinterpret_cast<const __half2*>(&{loads[0].input}[{flat}]);"]
-        out.extend(f"{pad}__half {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
-        for s in loads:
-            ctx.ssa_dtypes[s.name] = "f16"
-        return out
-    out = [f"{pad}float{n} {vname} = *reinterpret_cast<const float{n}*>(&{loads[0].input}[{flat}]);"]
-    out.extend(f"{pad}float {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
+    vec_type, elem_type = vec_pair
+    out = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{loads[0].input}[{flat}]);"]
+    out.extend(f"{pad}{elem_type} {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
     for s in loads:
-        ctx.ssa_dtypes[s.name] = "f32"
+        ctx.ssa_dtypes[s.name] = src_dt
     return out

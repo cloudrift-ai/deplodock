@@ -14,33 +14,66 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, op_to_expr, render_index, select_to_ternary
 
-_CUDA_TYPE_BY_DTYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half"}
+
+def _promote_args_to_f32(target, args: tuple[str, ...], arg_dtypes: list[str]) -> list[Expr]:
+    """Wrap each non-f32 SSA name with ``target.convert(name, dt, "f32")``
+    so the resulting Expr tree composes in fp32. Used by ``Assign.render``
+    for the f32 result path and the f16-fallback path.
+
+    Returns an ``Expr`` list, with conversions threaded through a
+    ``FuncCallExpr``-style ``Cast``: we synthesize a no-op
+    :class:`Var` for f32 args and an inline-rendered cast for others."""
+    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+
+    out: list[Expr] = []
+    for a, dt in zip(args, arg_dtypes, strict=True):
+        if dt == "f32":
+            out.append(Var(a))
+        else:
+            # ``target.convert`` returns a fully-rendered string; wrap as
+            # a synthetic FuncCallExpr so it slots into ``op_to_expr``'s
+            # Expr-tree output without round-tripping through Var lookups.
+            converted = target.convert(a, dt, "f32")
+            # Strip the synthesized prefix to reuse FuncCallExpr's
+            # "name(args)" rendering. ``target.convert("x", "f16", "f32")``
+            # returns ``"__half2float(x)"`` — we split on the open paren.
+            paren = converted.index("(") if "(" in converted else -1
+            if paren > 0 and converted.endswith(")"):
+                out.append(FuncCallExpr(converted[:paren], [Var(a)]))
+            else:
+                out.append(Var(a))
+    return out
 
 
-def _cuda_type(dtype: DataType | None) -> str:
-    """C type spelling for an accumulator local. Falls back to ``float``."""
-    return _CUDA_TYPE_BY_DTYPE_NAME.get((dtype or F32).name, "float")
+def _dtype_intrinsics(target, result_dt: str, expr: Expr) -> dict[str, str]:
+    """Per-dtype intrinsic overrides for the abstract op names that
+    appear inside ``expr``. The Expr renderer reads ``ctx.intrinsics``
+    when resolving ``FuncCallExpr.name`` to a target spelling; we patch
+    in the dtype-specific spellings while rendering the fp16-native
+    path."""
+    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
 
+    overrides: dict[str, str] = {}
 
-def _identity_literal(identity: float, dtype: DataType | None) -> str:
-    """Render the per-op identity (0, 1, -inf, ...) as a C literal in ``dtype``.
-    Wraps in ``__float2half`` for fp16 so the declaration compiles."""
-    txt = _float_lit(float(identity))
-    if dtype is not None and dtype.name == "f16":
-        return f"__float2half({txt})"
-    return txt
+    def collect(node):
+        if isinstance(node, FuncCallExpr):
+            overrides[node.name] = target.intrinsic(node.name, result_dt)
+            for a in node.args:
+                collect(a)
+        else:
+            # Generic Expr walker — the public API is limited; rely on
+            # the common subclasses' field names.
+            for field_name in ("left", "right", "cond", "if_true", "if_false", "expr"):
+                child = getattr(node, field_name, None)
+                if child is not None:
+                    collect(child)
+            args = getattr(node, "args", None)
+            if isinstance(args, list):
+                for a in args:
+                    collect(a)
 
-
-def _convert_to(value: str, src_dt: str, dst_dt: str) -> str:
-    """Insert a fp16/f32 conversion intrinsic when ``src_dt`` differs from
-    ``dst_dt``; bare value otherwise."""
-    if src_dt == dst_dt:
-        return value
-    if dst_dt == "f16" and src_dt == "f32":
-        return f"__float2half({value})"
-    if dst_dt == "f32" and src_dt == "f16":
-        return f"__half2float({value})"
-    return value
+    collect(expr)
+    return overrides
 
 
 @dataclass(frozen=True)
@@ -86,18 +119,15 @@ class Load(Stmt):
         lit = ctx.literal_constants.get(self.input) if ctx.literal_constants else None
         if lit is not None:
             ctx.ssa_dtypes[self.name] = "f32"
-            return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(lit)};"]
+            return [f"{_pad(ctx.indent)}{ctx.type_name('f32')} {self.name} = {_float_lit(lit)};"]
         flat = render_index(self.input, self.index, ctx)
         # Declare the local in the source buffer's element type so
-        # downstream ``Assign``s can pick native fp16 ops without an
-        # immediate promote-back-to-float. Conversion at load is only
-        # needed when the source is fp16 and the chain decides to
-        # promote — handled at the use site, not here.
+        # downstream ``Assign``s can pick native ops without an
+        # immediate promote. Conversion is handled at the use site
+        # when an Assign / Write needs a different dtype.
         src_dt = ctx.buffer_dtypes.get(self.input, "f32")
         ctx.ssa_dtypes[self.name] = src_dt
-        if src_dt == "f16":
-            return [f"{_pad(ctx.indent)}__half {self.name} = {self.input}[{flat}];"]
-        return [f"{_pad(ctx.indent)}float {self.name} = {self.input}[{flat}];"]
+        return [f"{_pad(ctx.indent)}{ctx.type_name(src_dt)} {self.name} = {self.input}[{flat}];"]
 
 
 @dataclass(frozen=True)
@@ -128,51 +158,50 @@ class Assign(Stmt):
         return [f"{indent}{self.name} = {self.op.name}({', '.join(self.args)})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
-
         pad = _pad(ctx.indent)
         op_name = self.op.name
         arg_dtypes = [ctx.ssa_dtypes.get(a, "f32") for a in self.args]
-        # Promotion rule for the elementwise scope: result is fp16 only
-        # when every input is fp16; any fp32 input promotes the whole
-        # expression to fp32 (with __half2float at the use site).
+        # Promotion rule for the elementwise scope: result matches the
+        # input dtype when all inputs agree; any non-default fp32 input
+        # promotes the whole expression to fp32 (with conversion at the
+        # use site).
         result_dt = "f16" if arg_dtypes and all(d == "f16" for d in arg_dtypes) else "f32"
 
-        if result_dt == "f16" and op_name in ctx.native_fp16_ops:
-            # Native fp16: pick fp16 intrinsic spellings (via a temporary
-            # ctx.intrinsics swap) and wrap float literals in
-            # ``__float2half`` so they compose with __half operands.
+        if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt):
+            # Native non-f32 path: swap the f32 intrinsic table for the
+            # target's dtype-specific table around this render, and tell
+            # ``Literal.render`` to wrap embedded float literals in the
+            # target's dtype-cast intrinsic so they compose with the
+            # non-default-dtype operands.
             args: list[Expr] = [Var(a) for a in self.args]
             expr = op_to_expr(op_name, args)
             saved_intr = ctx.intrinsics
             saved_lit = ctx.literal_default_dtype
-            ctx.intrinsics = {**saved_intr, **ctx.intrinsics_fp16}
-            ctx.literal_default_dtype = "f16"
+            ctx.intrinsics = {**saved_intr, **_dtype_intrinsics(ctx.target, result_dt, expr)}
+            ctx.literal_default_dtype = result_dt
             try:
                 body = expr.render(ctx)
             finally:
                 ctx.intrinsics = saved_intr
                 ctx.literal_default_dtype = saved_lit
-            ctx.ssa_dtypes[self.name] = "f16"
-            return [f"{pad}__half {self.name} = {body};"]
+            ctx.ssa_dtypes[self.name] = result_dt
+            return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body};"]
 
-        if result_dt == "f16":
-            # Fallback: no native fp16 form for this op (or mixed dtypes).
-            # Promote each fp16 arg to float at use, render in f32, demote
-            # the result back to fp16.
-            promoted: list[Expr] = [
-                FuncCallExpr("__half2float", [Var(a)]) if dt == "f16" else Var(a) for a, dt in zip(self.args, arg_dtypes, strict=True)
-            ]
+        if result_dt != "f32":
+            # Fallback: no native form for this op at result_dt.
+            # Promote each non-f32 arg to f32 at use, render in f32, then
+            # convert the result back to the declared dtype.
+            promoted = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
             expr = op_to_expr(op_name, promoted)
-            ctx.ssa_dtypes[self.name] = "f16"
-            return [f"{pad}__half {self.name} = __float2half({expr.render(ctx)});"]
+            ctx.ssa_dtypes[self.name] = result_dt
+            body = ctx.target.convert(expr.render(ctx), "f32", result_dt)
+            return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {body};"]
 
-        # f32 result: any fp16 inputs get a per-arg ``__half2float`` wrap;
-        # everything else stays as today.
-        args = [FuncCallExpr("__half2float", [Var(a)]) if dt == "f16" else Var(a) for a, dt in zip(self.args, arg_dtypes, strict=True)]
+        # f32 result: any non-f32 inputs get a per-arg conversion wrap.
+        args = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
         expr = op_to_expr(op_name, args)
         ctx.ssa_dtypes[self.name] = "f32"
-        return [f"{pad}float {self.name} = {expr.render(ctx)};"]
+        return [f"{pad}{ctx.type_name('f32')} {self.name} = {expr.render(ctx)};"]
 
 
 @dataclass(frozen=True)
@@ -234,12 +263,12 @@ class Accum(Stmt):
         acc_dt = (self.dtype or F32).name
         ctx.ssa_dtypes[self.name] = acc_dt
         value_dt = ctx.ssa_dtypes.get(self.value, "f32")
-        rhs = _convert_to(self.value, value_dt, acc_dt)
+        rhs = ctx.target.convert(self.value, value_dt, acc_dt)
         if op_name in ("maximum", "amax"):
-            spelling = ctx.intrinsics.get("fmax", "fmax") if acc_dt == "f32" else ctx.intrinsics_fp16.get("fmax", "__hmax")
+            spelling = ctx.target.intrinsic("fmax", acc_dt)
             return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
         if op_name == "minimum":
-            spelling = ctx.intrinsics.get("fmin", "fmin") if acc_dt == "f32" else ctx.intrinsics_fp16.get("fmin", "__hmin")
+            spelling = ctx.target.intrinsic("fmin", acc_dt)
             return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
         return [f"{pad}{self.name} {op} {rhs};"]
@@ -296,7 +325,7 @@ class Init(Stmt):
             raise ValueError(f"Init {self.name!r} op {self.op.name!r} has no identity")
         ctx.explicit_inits.add(self.name)
         ctx.ssa_dtypes[self.name] = self.dtype.name
-        return [f"{_pad(ctx.indent)}{_cuda_type(self.dtype)} {self.name} = {_identity_literal(identity, self.dtype)};"]
+        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {ctx.identity_literal(identity, self.dtype)};"]
 
 
 # Map ``ElementwiseImpl`` op names to compound-assignment operator symbols
@@ -356,7 +385,7 @@ class Write(Stmt):
         # ``atomicAdd(__half*, float)`` call is silently broken).
         value_dt = ctx.ssa_dtypes.get(self.value, "f32")
         out_dt = ctx.buffer_dtypes.get(self.output, "f32")
-        rhs = _convert_to(self.value, value_dt, out_dt)
+        rhs = ctx.target.convert(self.value, value_dt, out_dt)
         if self.reduce_op is not None:
             return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {rhs});"]
         return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {rhs};"]
