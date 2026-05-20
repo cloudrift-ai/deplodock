@@ -29,7 +29,7 @@ Tile body, post-order):
 ## Why this lives at the Kernel-IR boundary
 
 The decision needs the source-buffer dtype (graph node dtypes for
-graph dtypes via ``KernelOp.body_inputs`` keys + ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
+graph dtypes via ``KernelOp.inputs`` keys + ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
 info, so ``normalize_body`` (which runs on every Body construction)
 can't make the call without external context. Running the pass here —
 after ``001_materialize_tile`` has placed the Smem decls and before

@@ -301,6 +301,12 @@ class Stage(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
+    def external_reads(self) -> tuple[str, ...]:
+        return tuple(s.input for s in self.source_loads)
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.name,)
+
     # ------------------------------------------------------------------
     # Derived slab-geometry views (legacy ``buf`` / ``origin`` /
     # ``addressing`` field accessors, re-expressed as body-driven
@@ -725,26 +731,6 @@ class TileOp(BodyOp):
             score += 1.0
 
         return score
-
-    @property
-    def body_inputs(self) -> tuple[str, ...]:
-        """Body-derived input buffer names — distinct external-buffer names
-        in first-use order.
-
-        A buffer is external if it's loaded from but not produced by a
-        ``Stage`` in this TileOp. Loads of staged names are skipped
-        (those bufs are smem-local at materialization). Stage source
-        bufs (``Stage.buf``) are included — they're the actual external
-        reads, performed by the cooperative load."""
-        stage_names = {s.name for s in self if isinstance(s, Stage)}
-        bufs: dict[str, None] = {}
-        for s in self:
-            if isinstance(s, Stage):
-                for src in s.source_loads:
-                    bufs.setdefault(src.input, None)
-            elif isinstance(s, Load) and s.input not in stage_names:
-                bufs.setdefault(s.input, None)
-        return tuple(bufs)
 
 
 # ---------------------------------------------------------------------------

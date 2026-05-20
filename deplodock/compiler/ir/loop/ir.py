@@ -91,8 +91,10 @@ class LoopOp(BodyOp):
     ``body`` is the sole stored field (inherited from :class:`BodyOp`): a
     tuple of nested ``Loop`` blocks with leaf ``Load`` / ``Assign`` /
     ``Accum`` / ``Write`` / ``Select`` statements. ``axes``, ``loads``,
-    ``accums``, ``body_inputs``, and ``body_outputs`` are computed
-    properties derived from that tree.
+    ``accums`` are computed properties derived from that tree;
+    ``inputs`` / ``outputs`` are seeded from body Loads / Writes by
+    :class:`BodyOp` and later snapped to real graph Tensors by the
+    matcher's ``populate_io``.
     """
 
     def __post_init__(self) -> None:
@@ -104,8 +106,11 @@ class LoopOp(BodyOp):
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
-        _validate(self)
+        # Seed before validating so ``_validate`` can read
+        # ``loop.outputs`` (populated from body-derived names) rather
+        # than the now-gone ``body_outputs`` property.
         self._seed_io_placeholders()
+        _validate(self)
 
     @property
     def axes(self) -> tuple[Axis, ...]:
@@ -380,7 +385,7 @@ def _validate(loop: LoopOp) -> None:
     # all assume this; check at construction so callers fail loudly.
     # Runs after SSA / Accum validation so malformed-body tests get the
     # specific error the body actually has, not a no-Write surface error.
-    if not loop.body_outputs:
+    if not loop.outputs:
         raise ValueError("LoopOp body has no Write")
 
 

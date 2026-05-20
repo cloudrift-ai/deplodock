@@ -174,7 +174,7 @@ def render_kernelop(
 
     Kernel signature is derived from the body: ``kernel_op.inputs``
     (distinct ``Load.input`` names) become input params,
-    ``kernel_op.body_outputs`` (distinct ``Write.output`` names) become
+    ``kernel_op.outputs`` (distinct ``Write.output`` names) become
     writeable output params, ordered by first appearance. Parameter
     types come from the per-buffer :class:`Tensor.dtype` (passed in via
     ``tensors=`` / ``shapes=`` — the caller supplies them); literal-constant

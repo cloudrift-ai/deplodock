@@ -34,11 +34,6 @@ class BodyOp(Op):
       tuple-bodies to :class:`Body`,
     - ``__iter__`` over the body's deep stmt iterator,
     - ``loads`` / ``writes`` typed iters,
-    - ``body_inputs`` / ``body_outputs`` — distinct global-buffer names
-      referenced by body Loads / Writes, in first-use order. Subclasses
-      override (``KernelOp`` to include ``CpAsyncCopy.src`` /
-      ``TmaDescriptor.src_buf`` and exclude smem buffers; ``TileOp`` to
-      include ``Stage.buf`` and exclude staged names),
     - a unified ``pretty_body`` returning the indented body listing
       (the surrounding dump emits the kernel name / I/O label).
 
@@ -46,10 +41,14 @@ class BodyOp(Op):
     from :class:`Op`) with body-derived names keyed to placeholder
     ``Tensor(name, (), F32)`` values, so pre-match callers (lifting /
     fusion / tests) already see the right keys + ordering without a
-    matcher run. The matcher's :meth:`populate_io` hook then overrides
-    each entry with the real graph-sourced ``Tensor`` and sanity-checks
-    that the body has no Load / Write naming a buffer the dict doesn't
-    cover."""
+    matcher run. The body walk is generic — each :class:`Stmt`
+    subclass declares its :meth:`Stmt.external_reads` /
+    :meth:`Stmt.external_writes` / :meth:`Stmt.local_decls`, and
+    ``BodyOp`` aggregates them (filtering reads / writes that name a
+    locally-declared buffer like an ``Smem`` or ``Stage``). The
+    matcher's :meth:`populate_io` hook then overrides each entry with
+    the real graph-sourced ``Tensor`` and sanity-checks that the body
+    has no Load / Write naming a buffer the dict doesn't cover."""
 
     body: Body = field(default_factory=Body)
     name: str = ""
@@ -63,10 +62,31 @@ class BodyOp(Op):
         """Populate empty ``inputs`` / ``outputs`` with body-derived names
         keyed to placeholder ``Tensor(name, (), F32)`` values. Skips
         either dict if the caller already supplied entries."""
+        in_names, out_names = self._derive_io_names()
         if not self.inputs:
-            self.inputs = {n: Tensor(n, (), F32) for n in self.body_inputs}
+            self.inputs = {n: Tensor(n, (), F32) for n in in_names}
         if not self.outputs:
-            self.outputs = {n: Tensor(n, (), F32) for n in self.body_outputs}
+            self.outputs = {n: Tensor(n, (), F32) for n in out_names}
+
+    def _derive_io_names(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Walk the body once; aggregate per-stmt
+        :meth:`Stmt.external_reads` / :meth:`Stmt.external_writes` and
+        filter out any name covered by some stmt's
+        :meth:`Stmt.local_decls` (smem / staged buffers). Returns
+        ``(input_names, output_names)`` in body first-use order."""
+        decls: set[str] = set()
+        for s in self:
+            decls.update(s.local_decls())
+        ins: dict[str, None] = {}
+        outs: dict[str, None] = {}
+        for s in self:
+            for r in s.external_reads():
+                if r not in decls:
+                    ins.setdefault(r, None)
+            for w in s.external_writes():
+                if w not in decls:
+                    outs.setdefault(w, None)
+        return tuple(ins), tuple(outs)
 
     def __iter__(self) -> Iterator[Stmt]:
         return self.body.iter()
@@ -79,34 +99,17 @@ class BodyOp(Op):
     def writes(self) -> tuple[Write, ...]:
         return self.body.iter_of_type(Write)
 
-    @property
-    def body_inputs(self) -> tuple[str, ...]:
-        """Distinct ``Load.input`` buf names in body first-use order.
-        Override when the op's body has extra global-buffer reference
-        stmts (Stage, CpAsyncCopy, TmaDescriptor) or excludes certain
-        local names (Stage names, Smem-declared bufs)."""
-        return tuple(dict.fromkeys(s.input for s in self.loads))
-
-    @property
-    def body_outputs(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` buf names in body first-use order."""
-        return tuple(dict.fromkeys(s.output for s in self.writes))
-
     def populate_io(self, graph, node) -> None:  # noqa: ANN001, ARG002 — matches Op.populate_io signature
-        """Override :meth:`Op.populate_io` to key off body-derived buf
-        names (which may differ from ``node.inputs`` ordering and may
-        include Stage / CpAsyncCopy / TmaDescriptor refs that aren't
-        separate graph predecessors). Sanity-checks that every body
-        Load / Write names a buffer already covered by ``inputs`` /
-        ``outputs`` (caught early — a rule that mutated the body without
-        re-seeding I/O surfaces here, not on a later mystery KeyError),
-        then replaces each entry's placeholder Tensor with the real
-        graph-sourced one when the buffer is a graph node."""
-        body_in = self.body_inputs
+        """Override :meth:`Op.populate_io`. Sanity-checks that every body
+        external read / write names a buffer already covered by
+        ``inputs`` / ``outputs`` (caught early — a rule that mutated the
+        body without re-seeding I/O surfaces here, not on a later mystery
+        KeyError), then replaces each entry's placeholder Tensor with the
+        real graph-sourced one when the buffer is a graph node."""
+        body_in, body_out = self._derive_io_names()
         stray_in = [n for n in body_in if n not in self.inputs]
         if stray_in:
             raise ValueError(f"{type(self).__name__}: body has Load buffers {stray_in} not covered by inputs={list(self.inputs)}")
-        body_out = self.body_outputs
         stray_out = [n for n in body_out if n not in self.outputs]
         if stray_out:
             raise ValueError(f"{type(self).__name__}: body has Write buffers {stray_out} not covered by outputs={list(self.outputs)}")

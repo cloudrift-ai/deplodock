@@ -84,6 +84,9 @@ class Smem(Stmt):
     dtype: str = "float"
     align: int = 0
 
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.name,)
+
     def pretty(self, indent: str = "") -> list[str]:
         ext = ", ".join(str(e) for e in self.extents) or "-"
         ali = f" align={self.align}" if self.align else ""
@@ -148,6 +151,9 @@ class CpAsyncCopy(Stmt):
     smem_index: tuple
     src: str  # source global buffer name
     src_index: tuple
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.src,)
 
     def pretty(self, indent: str = "") -> list[str]:
         smem_idx = ", ".join(e.pretty() for e in self.smem_index)
@@ -217,6 +223,9 @@ class TmaDescriptor(Stmt):
     box_extents: tuple[int, ...]
     swizzle: str = "NONE"
     dtype: str = "float"
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.src_buf,)
 
     def pretty(self, indent: str = "") -> list[str]:
         shape = ", ".join(str(e) for e in self.src_shape)
@@ -554,29 +563,6 @@ class KernelOp(BodyOp):
         """Names of all ``__shared__`` buffers declared in the body — these
         are render-internal and are excluded from kernel-parameter inference."""
         return frozenset(self.smem_buffers)
-
-    @property
-    def body_inputs(self) -> tuple[str, ...]:
-        """Body-derived input buffer names — distinct ``Load.input`` /
-        ``CpAsyncCopy.src`` / ``TmaDescriptor.src_buf`` in first-use order,
-        with smem-declared buffers excluded."""
-        smem = self.smem_buffers
-        names: dict[str, None] = {}
-        for s in self:
-            if isinstance(s, Load) and s.input not in smem:
-                names.setdefault(s.input, None)
-            elif isinstance(s, CpAsyncCopy) and s.src not in smem:
-                names.setdefault(s.src, None)
-            elif isinstance(s, TmaDescriptor) and s.src_buf not in smem:
-                names.setdefault(s.src_buf, None)
-        return tuple(names)
-
-    @property
-    def body_outputs(self) -> tuple[str, ...]:
-        """Body-derived output buffer names — distinct ``Write.output``
-        names in first-use order, with smem-declared buffers excluded."""
-        smem = self.smem_buffers
-        return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
 
 
 # ---------------------------------------------------------------------------
