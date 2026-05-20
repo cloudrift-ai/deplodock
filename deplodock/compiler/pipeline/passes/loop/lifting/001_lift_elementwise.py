@@ -63,7 +63,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 
     out_id = frag.add_node(
         kernel,
-        list(kernel.body_inputs),
+        list(kernel.inputs),
         Tensor(root.output.name, root.output.shape, root.output.dtype),
         node_id=f"lift_{root.id}",
     )

@@ -550,6 +550,7 @@ class TileOp(BodyOp):
         n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
         if n_tiles > 1:
             raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
+        self._seed_io_placeholders()
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would

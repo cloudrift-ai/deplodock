@@ -105,6 +105,7 @@ class LoopOp(BodyOp):
         normalized = normalize_body(coerced)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
         _validate(self)
+        self._seed_io_placeholders()
 
     @property
     def axes(self) -> tuple[Axis, ...]:
@@ -198,7 +199,7 @@ class LoopOp(BodyOp):
         from deplodock.compiler.ir.loop.runner import execute_loop_op_cpp
 
         out_shape = self._infer_write_shape()
-        bufs = self.body_inputs
+        bufs = tuple(self.inputs)
         if len(inputs) != len(bufs):
             raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
         input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}

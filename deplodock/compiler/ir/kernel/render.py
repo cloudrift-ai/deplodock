@@ -200,8 +200,8 @@ def render_kernelop(
     def _dtype_for(name: str) -> object:
         return tmap[name].dtype if name in tmap else F32
 
-    sig_parts = [f"const {cuda_name(_dtype_for(n))}* {n}" for n in kernel_op.body_inputs if n not in literals]
-    sig_parts.extend(f"{cuda_name(_dtype_for(n))}* {n}" for n in kernel_op.body_outputs)
+    sig_parts = [f"const {cuda_name(_dtype_for(n))}* {n}" for n in kernel_op.inputs if n not in literals]
+    sig_parts.extend(f"{cuda_name(_dtype_for(n))}* {n}" for n in kernel_op.outputs)
     # TMA descriptors are passed as ``__grid_constant__`` value parameters.
     # The kernel only takes their address (``&desc``) for inline asm, so
     # the opaque ``CUtensorMap`` forward decl above suffices.
@@ -228,8 +228,8 @@ def render_kernelop(
         pool_decl = f"    extern __shared__ __align__(16) unsigned char _smem_pool[];  // {smem_total} bytes\n"
         body_text = pool_decl + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
-    sig_dtypes = [_dtype_for(n) for n in kernel_op.body_inputs if n not in literals]
-    sig_dtypes.extend(_dtype_for(n) for n in kernel_op.body_outputs)
+    sig_dtypes = [_dtype_for(n) for n in kernel_op.inputs if n not in literals]
+    sig_dtypes.extend(_dtype_for(n) for n in kernel_op.outputs)
     includes = "".join(f"#include {h}\n" for h in cuda_includes(sig_dtypes))
     return f'{includes}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 

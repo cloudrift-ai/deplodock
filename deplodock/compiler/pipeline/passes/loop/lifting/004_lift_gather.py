@@ -51,6 +51,6 @@ def rewrite(root: Node, inp_data: Node, inp_idx: Node, out: Tensor) -> Graph | N
         if buf.id not in frag.nodes:
             frag.add_node(InputOp(), [], Tensor(buf.id, buf.output.shape, buf.output.dtype), node_id=buf.id)
 
-    out_id = frag.add_node(kernel, list(kernel.body_inputs), Tensor(out.name, out_shape, out.dtype), node_id=f"kernel_{root.id}")
+    out_id = frag.add_node(kernel, list(kernel.inputs), Tensor(out.name, out_shape, out.dtype), node_id=f"kernel_{root.id}")
     frag.outputs = [out_id]
     return frag
