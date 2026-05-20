@@ -49,30 +49,17 @@ _DEFAULT_PASSES = LOOP_PASSES
 _PASS_SHORTCUTS = {short: full for full, short in PASS_SHORTHAND.items()}
 
 
-def resolve_tune_db(args) -> Path:
-    """Resolve the autotune SQLite cache path. Precedence is the same
-    across ``compile`` / ``run`` / ``tune``: ``--tune-db`` flag →
-    ``DEPLODOCK_TUNE_DB`` env → ``~/.cache/deplodock/autotune.db``.
+def resolve_tune_db() -> Path:
+    """Resolve the autotune SQLite cache path: ``DEPLODOCK_TUNE_DB``
+    env var → ``~/.cache/deplodock/autotune.db``. Same resolution used
+    by every CLI command (``compile`` / ``run`` / ``tune``) and by
+    :class:`CudaBackend` when constructed with ``tune_db="auto"``.
 
     Callers should treat the path as advisory — the engine only opens
     it when the file actually exists; otherwise the compile falls back
     to rule defaults (greedy option-0)."""
-    override = getattr(args, "tune_db", None) or os.environ.get("DEPLODOCK_TUNE_DB")
+    override = os.environ.get("DEPLODOCK_TUNE_DB")
     return Path(override) if override else Path.home() / ".cache" / "deplodock" / "autotune.db"
-
-
-def add_tune_db_arg(parser) -> None:
-    """Add the ``--tune-db`` flag with shared help text."""
-    parser.add_argument(
-        "--tune-db",
-        default=None,
-        help=(
-            "Path to the autotune SQLite cache. When present, the lowering pipeline picks "
-            "tuned forks from the DB instead of rule defaults. "
-            "Falls back to ``DEPLODOCK_TUNE_DB`` env var, then to ~/.cache/deplodock/autotune.db; "
-            "compile falls back silently to rule defaults if no DB exists at the resolved path."
-        ),
-    )
 
 
 def add_input_args(parser) -> None:
@@ -193,7 +180,6 @@ def register_compile_command(subparsers):
             "f=fusion, t=lowering/tile, k=lowering/kernel, c=lowering/cuda."
         ),
     )
-    add_tune_db_arg(parser)
     add_diagnostics_args(parser)
     parser.set_defaults(func=handle_compile)
 
@@ -222,7 +208,8 @@ def handle_compile(args):
     # Pick tuned forks from the DB when one is reachable; otherwise the
     # engine falls back to rule defaults (greedy option-0). Compile never
     # errors on a missing DB — that's only a hint, not a requirement.
-    tune_db_path = resolve_tune_db(args)
+    # ``DEPLODOCK_TUNE_DB`` env var overrides the default path.
+    tune_db_path = resolve_tune_db()
     db = SearchDB(path=tune_db_path) if tune_db_path.exists() else None
     if db is not None:
         logger.info("Using tuning DB: %s", tune_db_path)

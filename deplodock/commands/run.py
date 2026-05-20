@@ -13,8 +13,6 @@ import os
 import sys
 from pathlib import Path
 
-from deplodock.commands.compile import add_tune_db_arg
-
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +60,6 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
-    add_tune_db_arg(parser)
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
     parser.add_argument(
@@ -124,11 +121,10 @@ def handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    # ``--tune-db`` takes the explicit path; otherwise let the backend
-    # auto-resolve env + ``~/.cache/deplodock/autotune.db`` (opens if
-    # the file exists, silent fall-back to rule defaults otherwise).
-    tune_db = args.tune_db or "auto"
-    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db=tune_db)
+    # Backend auto-resolves ``DEPLODOCK_TUNE_DB`` env →
+    # ``~/.cache/deplodock/autotune.db`` (opens if the file exists,
+    # silent fall-back to rule defaults otherwise).
+    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     if backend.tune_db is not None and backend.tune_db.exists():
         logger.info("Using tuning DB: %s", backend.tune_db)
     compiled = backend.compile(graph)
@@ -596,8 +592,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
                 shape = tuple(int(d) for d in node.output.shape)
                 input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
 
-    tune_db = args.tune_db or "auto"
-    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db=tune_db)
+    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     if backend.tune_db is not None and backend.tune_db.exists():
         logger.info("Using tuning DB: %s", backend.tune_db)
     result = backend.run(graph, input_data=input_data)
