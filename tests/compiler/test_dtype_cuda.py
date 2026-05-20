@@ -226,3 +226,26 @@ def test_fp16_rmsnorm_cuda():
     rms = np.sqrt((xf * xf).mean(axis=-1, keepdims=True) + 1e-6)
     expected = ((xf / rms) * w_data.astype(np.float32)).astype(np.float16)
     np.testing.assert_allclose(out, expected, rtol=1e-2, atol=1e-2)
+
+
+@requires_cuda
+def test_fp16_max_reduction_stays_in_fp16():
+    """``max`` is a selection (no magnitude accumulation), so it stays in
+    the input dtype. The kernel should declare ``__half`` for the
+    accumulator and use ``__hmax`` — not promote to float."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.ir.cuda import CudaOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1024,), dt.F16), node_id="x")
+    g.add_node(op=ReduceOp(op="maximum", axis=0), inputs=["x"], output=Tensor("m", (1,), dt.F16), node_id="m")
+    g.inputs = ["x"]
+    g.outputs = ["m"]
+
+    be = CudaBackend()
+    compiled = be.compile(g)
+    sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
+    # Accumulator declared as __half — selection ops don't need precision boost.
+    assert "__half acc" in sources, f"expected fp16 accumulator for max, got:\n{sources}"
+    # The combine uses __hmax (native fp16 max), not fmaxf.
+    assert "__hmax" in sources, f"expected __hmax intrinsic for fp16 max, got:\n{sources}"
