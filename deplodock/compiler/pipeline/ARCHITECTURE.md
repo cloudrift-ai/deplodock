@@ -164,7 +164,7 @@ produced the lowest measured latency.
 **Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` constructs a `TuningSearch(patience=N, ucb_c=C)`,
 hands it to `Pipeline.tune(graph, search=...)`, and iterates terminals until the search's `stop_reason` fires. Each
 terminal is one fully-lowered `Graph[CudaOp]` whose every kernel got `_bench_terminal`'d. The tuning database (default
-`~/.cache/deplodock/autotune.db`, overridable with `--tune-db PATH` or `DEPLODOCK_TUNE_DB`) accumulates rows across runs;
+`~/.cache/deplodock/autotune.db`, overridable via the `DEPLODOCK_TUNE_DB` env var) accumulates rows across runs;
 calling `tune` again on the same expression resumes from the cached state instead of re-benching.
 
 **Search dynamics.** SP-MCTS over the fork DAG with max-Q normalized UCB1 (see `search/policy/mcts.py`):
@@ -182,8 +182,9 @@ calling `tune` again on the same expression resumes from the cached state instea
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped. A subsequent
-`deplodock run --tune-db PATH ...` (or `make bench-kernels-tuned`) replays the cached forks via `GreedySearch`, which
-walks the parent op's `op_cache_key` in `lowering` and follows the best-known child at each step. No GPU bench is
+`deplodock compile` / `deplodock run` (or `make bench-kernels-tuned`) auto-resolves the same DB path (env or default)
+and replays the cached forks via `GreedySearch`, which walks the parent op's `op_cache_key` in `lowering` and follows
+the best-known child at each step. No GPU bench is
 required on the replay path when every kernel already has a `perf` row.
 
 **Stub backend.** With `backend=None`, `_bench_terminal` short-circuits to `latency_us=1.0` and persists nothing — used by

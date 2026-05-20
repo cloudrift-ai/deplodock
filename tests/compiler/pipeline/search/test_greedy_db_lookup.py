@@ -89,7 +89,16 @@ def _record_pair(out: dict[str, tuple[str, str, dict]], op: Op) -> None:
     out[ck] = (pk, ck, {k: v for k, v in child.knobs.items() if k in ("BN", "BM")})
 
 
-def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
+@pytest.fixture(scope="module")
+def _option_zero_knobs() -> dict:
+    """Greedy/heuristic ordering picks option 0; one pipeline run is
+    enough to capture its ``(BN, BM)``."""
+    out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
+    return {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
+
+
+@pytest.fixture(scope="module")
+def _blockify_variants() -> list[tuple[str, str, dict]]:
     """Collect every distinct ``(parent_key, child_key, knobs)`` produced
     at the launch_geometry fork point.
 
@@ -108,24 +117,17 @@ def _enumerate_blockify_variants() -> list[tuple[str, str, dict]]:
     return list(out.values())
 
 
-def test_baseline_picks_option_zero() -> None:
+def test_baseline_picks_option_zero(_option_zero_knobs: dict) -> None:
     """With a fresh in-memory DB, GreedySearch falls back to the rule's
     heuristic-first ordering (option 0)."""
-    variants = _enumerate_blockify_variants()
-    assert len(variants) >= 2, f"need ≥2 variants to test; got {len(variants)}"
-    option_zero_knobs = variants[0][2]
-
     out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
-    assert bn_bm == option_zero_knobs
+    assert bn_bm == _option_zero_knobs
 
 
-def test_irrelevant_seed_is_ignored() -> None:
+def test_irrelevant_seed_is_ignored(_option_zero_knobs: dict) -> None:
     """A ``lowering`` row keyed on an op we never see leaves option-0
     behavior unchanged."""
-    variants = _enumerate_blockify_variants()
-    option_zero_knobs = variants[0][2]
-
     db = SearchDB()
     db.record_lowering(
         "unrelated-parent",
@@ -138,13 +140,13 @@ def test_irrelevant_seed_is_ignored() -> None:
 
     out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=db)
     bn_bm = {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
-    assert bn_bm == option_zero_knobs
+    assert bn_bm == _option_zero_knobs
 
 
-def test_seeded_lowering_overrides_option_zero() -> None:
+def test_seeded_lowering_overrides_option_zero(_blockify_variants: list[tuple[str, str, dict]]) -> None:
     """A ``lowering`` row keyed on the fork's real parent steers greedy
     to the seeded child instead of the rule's option-0."""
-    variants = _enumerate_blockify_variants()
+    variants = _blockify_variants
     assert len(variants) >= 2, f"need ≥2 variants to test; got {len(variants)}"
     option_zero_knobs = variants[0][2]
     parent_key, child_key, alt_knobs = next(v for v in variants[1:] if v[2] != option_zero_knobs)

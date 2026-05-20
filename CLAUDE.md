@@ -21,7 +21,7 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
 - `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging
-- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`); `--tune-db` on `deplodock tune` / `deplodock run` takes precedence
+- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock compile` / `run` / `tune` all read from / write to this path so a tuned variant picked up by one command shows up in the next.
 
 ## Running Tests
 
@@ -64,7 +64,7 @@ same worker.
 - `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR] [--target sm_NN]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model). `--target sm_NN` (e.g. `sm_80`, `sm_90`, `sm_120`) overrides the live device's compute capability so passes that gate on hardware features (TMA, cp.async) take the target's path.
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
 - `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
-- `deplodock tune <model_or_ir|--code EXPR> [--tune-db PATH] [--patience N] [--ucb-c C]` — autotune via SP-MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior). Pops candidates by UCB1, benches every CudaOp variant, persists `perf` / `lowering` / inventory rows to the SQLite cache, and stops on patience (N consecutive measured terminals without a new best). Prints the winning CUDA IR to stdout and a ranked variant summary to stderr.
+- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C]` — autotune via SP-MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior). Pops candidates by UCB1, benches every CudaOp variant, persists `perf` / `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`), and stops on patience (N consecutive measured terminals without a new best). Prints the winning CUDA IR to stdout and a ranked variant summary to stderr.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`

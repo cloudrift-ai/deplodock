@@ -99,32 +99,81 @@ def _dtype_intrinsics(target, result_dt: str, expr: Expr) -> dict[str, str]:
     return overrides
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Load(Stmt):
-    """Read a value from an external input buffer into an SSA name.
+    """Read a value (or N consecutive values) from an external input buffer.
 
-    Each external-buffer read is an explicit body statement. ``input`` is
-    the source buffer's name (matches the producing graph node's id);
-    ``index`` is the dim-wise access pattern over the enclosing axes.
-    The produced SSA ``name`` is a regular value that downstream stmts
-    read.
+    Scalar (``width == 1``): one SSA binding ``names[0]``. Vector
+    (``width > 1``): N SSA bindings; lane k reads
+    ``index[:-1] + (index[-1] + k,)`` into ``names[k]``. The
+    ``003_vectorize_loads`` pass widens a run of consecutive scalar
+    Loads into one Load with ``len(names) > 1``. Every pass before that
+    produces scalar Loads and can keep using ``s.name`` / ``s.index``.
 
-    A Load is rendered as a literal binding (``float name = <value>;``)
-    when ``ctx.literal_constants`` carries a value for ``input`` — the
-    scalar-constant-inlining path populates that map at the cuda
-    lowering boundary so kernels can embed ``ConstantOp`` values
-    directly instead of taking them as ``float*`` parameters.
+    The constructor accepts either ``name="x"`` (scalar shorthand,
+    normalized to ``names=("x",)``) or ``names=(...)`` directly. Use
+    ``.is_vector`` / ``.is_scalar`` / ``.width`` / ``.name`` (asserts
+    scalar) / ``.names`` to test shape.
+
+    A scalar Load is rendered as a literal binding (``float name =
+    <value>;``) when ``ctx.literal_constants`` carries a value for
+    ``input`` — the scalar-constant-inlining path populates that map at
+    the cuda lowering boundary so kernels can embed ``ConstantOp``
+    values directly instead of taking them as ``float*`` parameters.
     """
 
-    name: str
+    names: tuple[str, ...]
     input: str
     index: tuple[Expr, ...]
+
+    def __init__(
+        self,
+        name: str | None = None,
+        input: str | None = None,
+        index: tuple[Expr, ...] | None = None,
+        *,
+        names: tuple[str, ...] | None = None,
+    ) -> None:
+        if names is None:
+            if name is None:
+                raise TypeError("Load requires either `name=` (scalar) or `names=` (vector)")
+            names = (name,)
+        elif name is not None:
+            raise TypeError("Load: pass `name=` xor `names=`, not both")
+        if input is None:
+            raise TypeError("Load requires `input=`")
+        if index is None:
+            raise TypeError("Load requires `index=`")
+        if not names:
+            raise ValueError("Load.names must be non-empty")
+        object.__setattr__(self, "names", tuple(names))
+        object.__setattr__(self, "input", input)
+        object.__setattr__(self, "index", tuple(index))
+
+    @property
+    def name(self) -> str:
+        """Scalar-only shorthand for ``names[0]``. Asserts ``is_scalar`` —
+        use ``.names`` (or guard with ``.is_scalar``) for vector Loads."""
+        assert self.is_scalar, f"Load has {self.width} names — use .names for vector Loads"
+        return self.names[0]
+
+    @property
+    def width(self) -> int:
+        return len(self.names)
+
+    @property
+    def is_vector(self) -> bool:
+        return len(self.names) > 1
+
+    @property
+    def is_scalar(self) -> bool:
+        return len(self.names) == 1
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
     def defines(self) -> tuple[str, ...]:
-        return (self.name,)
+        return self.names
 
     def exprs(self) -> tuple[Expr, ...]:
         return self.index
@@ -134,23 +183,65 @@ class Load(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
-        return [f"{indent}{self.name} = load {self.input}[{idx}]"]
+        names = ", ".join(self.names)
+        return [f"{indent}{names} = load {self.input}[{idx}]"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
         # Inlined scalar constants stay as ``float`` locals — the
         # consumer's ``Assign.render`` will demote / convert if needed.
+        # (Only valid for scalar Loads; the vectorize pass excludes
+        # literal-const buffers.)
         lit = ctx.literal_constants.get(self.input) if ctx.literal_constants else None
-        if lit is not None:
-            ctx.ssa_dtypes[self.name] = "f32"
-            return [f"{_pad(ctx.indent)}{ctx.type_name('f32')} {self.name} = {_float_lit(lit)};"]
-        flat = render_index(self.input, self.index, ctx)
-        # Declare the local in the source buffer's element type so
-        # downstream ``Assign``s can pick native ops without an
-        # immediate promote. Conversion is handled at the use site
-        # when an Assign / Write needs a different dtype.
+        if lit is not None and self.is_scalar:
+            ctx.ssa_dtypes[self.names[0]] = "f32"
+            return [f"{pad}{ctx.type_name('f32')} {self.names[0]} = {_float_lit(lit)};"]
         src_dt = ctx.buffer_dtypes.get(self.input, "f32")
-        ctx.ssa_dtypes[self.name] = src_dt
-        return [f"{_pad(ctx.indent)}{ctx.type_name(src_dt)} {self.name} = {self.input}[{flat}];"]
+        if self.is_scalar:
+            # Scalar path. Declare the local in the source buffer's
+            # element type so downstream ``Assign``s can pick native ops
+            # without an immediate promote.
+            flat = render_index(self.input, self.index, ctx)
+            ctx.ssa_dtypes[self.names[0]] = src_dt
+            return [f"{pad}{ctx.type_name(src_dt)} {self.names[0]} = {self.input}[{flat}];"]
+        # Vector path: one ``<vec_type>`` reinterpret-cast read + N
+        # ``.x/.y/.z/.w`` (or indexed) unpacks.
+        n = self.width
+        vec_pair = ctx.target.vector_type(src_dt, n)
+        if vec_pair is None:
+            # Target doesn't support this width — fall back to scalar
+            # Loads. The vectorize pass should have avoided this, but
+            # render's job is to always produce valid code.
+            out: list[str] = []
+            for k, nm in enumerate(self.names):
+                idx_k = tuple(self.index[:-1]) + (BinaryExpr("+", self.index[-1], Literal(k, "int")),)
+                flat = render_index(self.input, idx_k, ctx)
+                ctx.ssa_dtypes[nm] = src_dt
+                out.append(f"{pad}{ctx.type_name(src_dt)} {nm} = {self.input}[{flat}];")
+            return out
+        vec_type, elem_type = vec_pair
+        flat = render_index(self.input, self.index, ctx)
+        vname = f"_v_{self.names[0]}"
+        # ``.x/.y/.z/.w`` accessors only work when ``vec_type``'s native
+        # components match ``elem_type`` 1:1 (``float2``→``float``,
+        # ``__half2``→``__half``). For wider packed vectors that
+        # reinterpret a multi-element pack (``uint2``→4 halves,
+        # ``uint4``→8 halves), each ``.x``/``.y`` slot holds multiple
+        # elements, so we fall back to array-style indexing through a
+        # reinterpret-cast.
+        native_n = {"float2": 2, "float4": 4, "__half2": 2}.get(vec_type)
+        use_array_index = native_n != n
+        out_lines = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]);"]
+        if use_array_index:
+            arr_name = f"{vname}_h"
+            out_lines.append(f"{pad}const {elem_type}* {arr_name} = reinterpret_cast<const {elem_type}*>(&{vname});")
+            out_lines.extend(f"{pad}{elem_type} {nm} = {arr_name}[{k}];" for k, nm in enumerate(self.names))
+        else:
+            components = ("x", "y", "z", "w")[:n]
+            out_lines.extend(f"{pad}{elem_type} {nm} = {vname}.{c};" for nm, c in zip(self.names, components, strict=True))
+        for nm in self.names:
+            ctx.ssa_dtypes[nm] = src_dt
+        return out_lines
 
 
 @dataclass(frozen=True)
@@ -226,81 +317,6 @@ class Unpack(Stmt):
             f"{pad}{ty} {self.low_name} = __low2half({self.value});",
             f"{pad}{ty} {self.high_name} = __high2half({self.value});",
         ]
-
-
-@dataclass(frozen=True)
-class VecLoad(Stmt):
-    """N consecutive ``Load``s packed into a single vector read.
-
-    Emits ``<vec_type> _v_<n0> = *reinterpret_cast<const <vec_type>*>(...);``
-    followed by ``<elem_type> <name_k> = _v_<n0>.<x|y|z|w>;`` unpacks. The
-    vector + element C type names come from the target's
-    :meth:`RenderTarget.vector_type` for ``(elem_dtype, n)``.
-
-    ``base_index`` is the index of lane 0; lane k's source position is
-    ``base_index[:-1] + (base_index[-1] + k,)``. The pass that introduces
-    ``VecLoad`` (``003_vectorize_loads``) verifies the consecutive-load
-    pattern structurally; ``VecLoad.render`` only needs to format the
-    output.
-    """
-
-    names: tuple[str, ...]
-    input: str
-    base_index: tuple[Expr, ...]
-    elem_dtype: str  # canonical token: "f32" / "f16"
-
-    def deps(self) -> tuple[str, ...]:
-        return ()
-
-    def defines(self) -> tuple[str, ...]:
-        return self.names
-
-    def exprs(self) -> tuple[Expr, ...]:
-        return self.base_index
-
-    def pretty(self, indent: str = "") -> list[str]:
-        idx = ", ".join(e.pretty() for e in self.base_index)
-        names = ", ".join(self.names)
-        return [f"{indent}{self.elem_dtype} {names} = vec_load[{len(self.names)}] {self.input}[{idx}]"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        n = len(self.names)
-        vec_pair = ctx.target.vector_type(self.elem_dtype, n)
-        pad = _pad(ctx.indent)
-        if vec_pair is None:
-            # Target doesn't support this width — fall back to scalar
-            # Loads. The vectorize pass should have avoided this, but
-            # render's job is to always produce valid code.
-            out: list[str] = []
-            for k, nm in enumerate(self.names):
-                idx_k = tuple(self.base_index[:-1]) + (BinaryExpr("+", self.base_index[-1], Literal(k, "int")),)
-                flat = render_index(self.input, idx_k, ctx)
-                ctx.ssa_dtypes[nm] = self.elem_dtype
-                out.append(f"{pad}{ctx.type_name(self.elem_dtype)} {nm} = {self.input}[{flat}];")
-            return out
-        vec_type, elem_type = vec_pair
-        flat = render_index(self.input, self.base_index, ctx)
-        vname = f"_v_{self.names[0]}"
-        # ``.x/.y/.z/.w`` accessors only work when ``vec_type``'s native
-        # components match ``elem_type`` 1:1 (``float2``→``float``,
-        # ``__half2``→``__half``). For wider packed vectors that
-        # reinterpret a multi-element pack (``uint2``→4 halves,
-        # ``uint4``→8 halves), each ``.x``/``.y`` slot holds multiple
-        # elements, so we fall back to array-style indexing through a
-        # reinterpret-cast.
-        native_n = {"float2": 2, "float4": 4, "__half2": 2}.get(vec_type)
-        use_array_index = native_n != n
-        out = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]);"]
-        if use_array_index:
-            arr_name = f"{vname}_h"
-            out.append(f"{pad}const {elem_type}* {arr_name} = reinterpret_cast<const {elem_type}*>(&{vname});")
-            out.extend(f"{pad}{elem_type} {nm} = {arr_name}[{k}];" for k, nm in enumerate(self.names))
-        else:
-            components = ("x", "y", "z", "w")[:n]
-            out.extend(f"{pad}{elem_type} {nm} = {vname}.{c};" for nm, c in zip(self.names, components, strict=True))
-        for nm in self.names:
-            ctx.ssa_dtypes[nm] = self.elem_dtype
-        return out
 
 
 @dataclass(frozen=True)
@@ -516,34 +532,90 @@ class Init(Stmt):
 _REDUCE_OP_SYMBOL = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class Write(Stmt):
-    """Write an SSA value to output buffer ``output`` at position ``index``.
+    """Write an SSA value (or N consecutive values) to ``output``.
+
+    Scalar (``width == 1``): stores one SSA value at ``index``. Vector
+    (``width > 1``): stores N values; ``values[0]`` goes to ``index``,
+    ``values[k]`` goes to ``index[:-1] + (index[-1] + k,)``. The
+    ``005_vectorize_stores`` pass widens a run of consecutive scalar
+    Writes into one Write with ``len(values) > 1``. Every pass before
+    that produces scalar Writes and can keep using ``s.value`` /
+    ``s.index``.
+
+    The constructor accepts either ``value="v"`` (scalar shorthand,
+    normalized to ``values=("v",)``) or ``values=(...)`` directly. Use
+    ``.is_vector`` / ``.is_scalar`` / ``.width`` / ``.value`` (asserts
+    scalar) / ``.values`` to test shape.
 
     ``output`` is the destination buffer's name (matches the owning graph
     node's id, or — for multi-output kernels — one of its output buffer
     names). ``index`` uses axis Vars to compute the per-dim offset.
-    ``value`` references an SSA name available at this point in the body
-    (Assign, Accum, or a Load).
 
-    ``reduce_op`` (optional): when set, the write becomes an atomic
-    reduction (``atomicAdd`` for ``ElementwiseImpl('add')``) instead of
-    a plain store. Used by cross-CTA split-K so multiple CTAs can
-    contribute partial sums to the same output cell. Output buffer must
-    be zero-initialized by the caller.
+    ``reduce_op`` (optional, scalar-only): when set, the write becomes an
+    atomic reduction (``atomicAdd`` for ``ElementwiseImpl('add')``) instead
+    of a plain store. Vectorizing atomic reduce-writes is unsound (each
+    lane needs its own atomicAdd), so ``005_vectorize_stores`` excludes
+    them and ``__init__`` rejects the combination here.
     """
 
     output: str
     index: tuple[Expr, ...]
-    value: str
-    reduce_op: ElementwiseImpl | None = None
+    values: tuple[str, ...]
+    reduce_op: ElementwiseImpl | None
 
-    def __post_init__(self) -> None:
-        if self.reduce_op is not None and self.reduce_op.name != "add":
-            raise NotImplementedError(f"Write.reduce_op={self.reduce_op.name!r} not lowered yet (only 'add')")
+    def __init__(
+        self,
+        output: str | None = None,
+        index: tuple[Expr, ...] | None = None,
+        value: str | None = None,
+        reduce_op: ElementwiseImpl | None = None,
+        *,
+        values: tuple[str, ...] | None = None,
+    ) -> None:
+        if values is None:
+            if value is None:
+                raise TypeError("Write requires either `value=` (scalar) or `values=` (vector)")
+            values = (value,)
+        elif value is not None:
+            raise TypeError("Write: pass `value=` xor `values=`, not both")
+        if output is None:
+            raise TypeError("Write requires `output=`")
+        if index is None:
+            raise TypeError("Write requires `index=`")
+        if not values:
+            raise ValueError("Write.values must be non-empty")
+        if reduce_op is not None and reduce_op.name != "add":
+            raise NotImplementedError(f"Write.reduce_op={reduce_op.name!r} not lowered yet (only 'add')")
+        if reduce_op is not None and len(values) > 1:
+            raise ValueError("Write.reduce_op is incompatible with vector form (atomicAdd per lane is unsound)")
+        object.__setattr__(self, "output", output)
+        object.__setattr__(self, "index", tuple(index))
+        object.__setattr__(self, "values", tuple(values))
+        object.__setattr__(self, "reduce_op", reduce_op)
+
+    @property
+    def value(self) -> str:
+        """Scalar-only shorthand for ``values[0]``. Asserts ``is_scalar`` —
+        use ``.values`` (or guard with ``.is_scalar``) for vector Writes."""
+        assert self.is_scalar, f"Write has {self.width} values — use .values for vector Writes"
+        return self.values[0]
+
+    @property
+    def width(self) -> int:
+        return len(self.values)
+
+    @property
+    def is_vector(self) -> bool:
+        return len(self.values) > 1
+
+    @property
+    def is_scalar(self) -> bool:
+        return len(self.values) == 1
 
     def deps(self) -> tuple[str, ...]:
-        return (self.value,)
+        return self.values
 
     def exprs(self) -> tuple[Expr, ...]:
         return self.index
@@ -555,23 +627,75 @@ class Write(Stmt):
         idx = ", ".join(e.pretty() for e in self.index)
         if self.reduce_op is not None:
             op = _REDUCE_OP_SYMBOL.get(self.reduce_op.name, self.reduce_op.name)
-            return [f"{indent}{self.output}[{idx}] {op}= {self.value}"]
-        return [f"{indent}{self.output}[{idx}] = {self.value}"]
+            return [f"{indent}{self.output}[{idx}] {op}= {self.values[0]}"]
+        if self.is_vector:
+            return [f"{indent}{self.output}[{idx}] = ({', '.join(self.values)})"]
+        return [f"{indent}{self.output}[{idx}] = {self.values[0]}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        flat = render_index(self.output, self.index, ctx)
-        # Convert at the store boundary only when the value's SSA dtype
-        # disagrees with the destination buffer's dtype — native chains
-        # write through with no conversion. Applies to both plain stores
-        # and atomic reduce-writes (split-K matmul fans an f32
-        # accumulator into an f16 output; without conversion the
-        # ``atomicAdd(__half*, float)`` call is silently broken).
-        value_dt = ctx.ssa_dtypes.get(self.value, "f32")
+        pad = _pad(ctx.indent)
         out_dt = ctx.buffer_dtypes.get(self.output, "f32")
-        rhs = ctx.target.convert(self.value, value_dt, out_dt)
-        if self.reduce_op is not None:
-            return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {rhs});"]
-        return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {rhs};"]
+        if self.is_scalar:
+            # Scalar path. Convert at the store boundary only when the
+            # value's SSA dtype disagrees with the destination buffer's
+            # dtype — native chains write through with no conversion.
+            # Applies to both plain stores and atomic reduce-writes
+            # (split-K matmul fans an f32 accumulator into an f16 output;
+            # without conversion the ``atomicAdd(__half*, float)`` call
+            # is silently broken).
+            flat = render_index(self.output, self.index, ctx)
+            value_dt = ctx.ssa_dtypes.get(self.value, "f32")
+            rhs = ctx.target.convert(self.value, value_dt, out_dt)
+            if self.reduce_op is not None:
+                return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
+            return [f"{pad}{self.output}[{flat}] = {rhs};"]
+        # Vectorized path. Per-value dtype conversion: every SSA arg
+        # must be at ``out_dt`` before packing.
+        n = self.width
+        converted: list[str] = []
+        for nm in self.values:
+            src_dt = ctx.ssa_dtypes.get(nm, "f32")
+            converted.append(nm if src_dt == out_dt else ctx.target.convert(nm, src_dt, out_dt))
+        vec_pair = ctx.target.vector_type(out_dt, n)
+        if vec_pair is None:
+            # Target doesn't support this width — fall back to scalar
+            # writes. The vectorize pass should have avoided this, but
+            # render's job is to always produce valid code.
+            lines: list[str] = []
+            for k in range(n):
+                idx_k = tuple(self.index[:-1]) + (BinaryExpr("+", self.index[-1], Literal(k, "int")),)
+                flat = render_index(self.output, idx_k, ctx)
+                lines.append(f"{pad}{self.output}[{flat}] = {converted[k]};")
+            return lines
+        vec_type, _elem_type = vec_pair
+        flat = render_index(self.output, self.index, ctx)
+        # Native-width vectors (``float2`` / ``float4`` / ``__half2``) take
+        # a positional constructor — ``make_float2(a, b)`` for fp32 paths,
+        # ``__halves2half2(a, b)`` for the fp16 pair. Wider packed vectors
+        # (``uint2`` / ``uint4``) re-interpret arrays of elements — we
+        # stage the elements into a local array, then store the array's
+        # uint{2,4} view in one transaction.
+        if vec_type == "__half2":
+            return [
+                f"{pad}{vec_type} _vs_{self.values[0]} = __halves2half2({converted[0]}, {converted[1]});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.values[0]};",
+            ]
+        if vec_type in ("float2", "float4"):
+            args = ", ".join(converted)
+            return [
+                f"{pad}{vec_type} _vs_{self.values[0]} = make_{vec_type}({args});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.values[0]};",
+            ]
+        # Packed widths (uint2 / uint4) over fp16: stage through a local
+        # array of ``__half`` so we never need to construct a uint{2,4}
+        # literal directly.
+        elem_type = ctx.type_name(out_dt)
+        arr = f"_vs_{self.values[0]}"
+        init = ", ".join(converted)
+        return [
+            f"{pad}{elem_type} {arr}[{n}] = {{ {init} }};",
+            f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = *reinterpret_cast<const {vec_type}*>({arr});",
+        ]
 
 
 @dataclass(frozen=True)

@@ -12,7 +12,13 @@ share a factor (one knob). Today two shapes produce slots:
   step): one slot covering all reduce loops at the innermost level,
   shared factor ``FN``. Unrolling the strided loop by F breaks the
   serial dep chain on the running accumulator by giving each thread F
-  independent partial sums that get folded after the loop.
+  independent partial sums that get folded after the loop. The same
+  slot also unrolls the post-reduce normalize ``StridedLoop`` wrapper
+  produced by ``005_cooperative_reduce`` Phase 3 (non-reduce, same axis
+  name as a reduce loop) so the epilogue Loads / Writes pick up the
+  same per-thread register tile — without this the normalize loop
+  stays scalar and ``003_vectorize_loads`` / the upcoming vec-store
+  pass have nothing to fold.
 
 **Axis-aware replication.** For each slot, every stmt whose value
 transitively depends on the slot's axis is replicated ``factor`` times
@@ -152,6 +158,31 @@ def _thread_split_site(axis_name: str, factor: int) -> _Site:
     return _Site(axis=axis_name, factor=factor, apply=apply)
 
 
+def _normalize_unroll_site(axis_name: str, factor: int) -> _Site:
+    """Widen the post-reduce *normalize* ``StridedLoop`` (non-reduce
+    wrapper produced by ``005_cooperative_reduce`` Phase 3) on
+    ``axis_name`` by ``factor``; replicate its body with
+    ``σ: axis → axis + i * step``. No accumulator-fold chain: this
+    wrapper has no ``Accum`` — its body is Load / Assign / Write that
+    computes and emits one normalized output cell per replica."""
+
+    def apply(tile: Tile) -> Tile:
+        new_body: list[Stmt] = []
+        for s in tile.body:
+            if isinstance(s, StridedLoop) and not s.is_reduce and s.axis.name == axis_name and isinstance(s.step, Literal):
+                step = int(s.step.value)
+                if int(s.axis.extent) % (step * factor) != 0:
+                    new_body.append(s)
+                    continue
+                inner = replicate_along_axis(s.body, axis_name, factor, _sigma_offset(axis_name, step))
+                new_body.append(StridedLoop(axis=s.axis, start=s.start, step=Literal(step * factor, "int"), body=inner, unroll=s.unroll))
+            else:
+                new_body.append(s)
+        return Tile(axes=tile.axes, body=Body(new_body))
+
+    return _Site(axis=axis_name, factor=factor, apply=apply)
+
+
 def _reduce_unroll_site(axis_name: str, factor: int) -> _Site:
     """Widen the reduce ``StridedLoop`` on ``axis_name`` by ``factor``;
     replicate its body with ``σ: axis → axis + i * step``; fold
@@ -275,13 +306,32 @@ def _find_slots(tile: Tile) -> list[_Slot]:
         if step <= 0 or ext % step != 0:
             return []
         per_thread_iters.append(ext // step)
+    # The post-reduce normalize ``StridedLoop`` (005 Phase 3, non-reduce,
+    # axis name aliased to a reduce axis) participates in the same slot:
+    # unrolling it by the same F gives the epilogue Load/Write chain F
+    # consecutive copies that 009b can permute and 003_vectorize_loads /
+    # 005_vectorize_stores can fold. Include its per-thread iter count
+    # in the gcd so F always divides cleanly.
+    reduce_axis_set = {sl.axis.name for sl in reduce_loops}
+    normalize_loops = [
+        s
+        for s in tile.body
+        if isinstance(s, StridedLoop) and not s.is_reduce and isinstance(s.step, Literal) and s.axis.name in reduce_axis_set
+    ]
+    for sl in normalize_loops:
+        ext = int(sl.axis.extent)
+        step = int(sl.step.value)
+        if step <= 0 or ext % step != 0:
+            return []
+        per_thread_iters.append(ext // step)
     # gcd of per-loop iter counts → factor dividing it divides them all.
     slot_extent = per_thread_iters[0]
     for it in per_thread_iters[1:]:
         slot_extent = gcd(slot_extent, it)
     if slot_extent < 2:
         return []
-    axis_names = tuple(sl.axis.name for sl in reduce_loops)
+    reduce_axis_names = tuple(sl.axis.name for sl in reduce_loops)
+    normalize_axis_names = tuple(sl.axis.name for sl in normalize_loops)
     # All divisors of ``slot_extent`` (not just powers of two) — Qwen-style
     # hidden dims like 3584 give per-thread iters = 14, whose only useful
     # factors are {2, 7, 14}; restricting to powers of two would leave
@@ -299,7 +349,12 @@ def _find_slots(tile: Tile) -> list[_Slot]:
             extent=slot_extent,
             choices=divisors,
             heuristic=max(divisors),
-            make_sites=(lambda f, axis_names=axis_names: [_reduce_unroll_site(a, f) for a in axis_names]),
+            make_sites=(
+                lambda f, ra=reduce_axis_names, na=normalize_axis_names: [
+                    *(_reduce_unroll_site(a, f) for a in ra),
+                    *(_normalize_unroll_site(a, f) for a in na),
+                ]
+            ),
         )
     ]
 

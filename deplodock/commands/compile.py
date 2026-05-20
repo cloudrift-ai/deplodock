@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -46,6 +47,19 @@ _DEFAULT_PASSES = LOOP_PASSES
 # ``compiler/pipeline/rule_diff.PASS_SHORTHAND`` so the engine can build
 # the marker names without depending on the CLI layer.
 _PASS_SHORTCUTS = {short: full for full, short in PASS_SHORTHAND.items()}
+
+
+def resolve_tune_db() -> Path:
+    """Resolve the autotune SQLite cache path: ``DEPLODOCK_TUNE_DB``
+    env var → ``~/.cache/deplodock/autotune.db``. Same resolution used
+    by every CLI command (``compile`` / ``run`` / ``tune``) and by
+    :class:`CudaBackend` when constructed with ``tune_db="auto"``.
+
+    Callers should treat the path as advisory — the engine only opens
+    it when the file actually exists; otherwise the compile falls back
+    to rule defaults (greedy option-0)."""
+    override = os.environ.get("DEPLODOCK_TUNE_DB")
+    return Path(override) if override else Path.home() / ".cache" / "deplodock" / "autotune.db"
 
 
 def add_input_args(parser) -> None:
@@ -180,6 +194,7 @@ def handle_compile(args):
 
     from deplodock.compiler.pipeline import Pipeline
     from deplodock.compiler.pipeline.dump import CompilerDump
+    from deplodock.compiler.pipeline.search.db import SearchDB
 
     setup_pipeline_runtime(args)
     passes = resolve_passes(args)
@@ -190,7 +205,18 @@ def handle_compile(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    result = Pipeline.build(passes, dump=dump).run(graph)
+    # Pick tuned forks from the DB when one is reachable; otherwise the
+    # engine falls back to rule defaults (greedy option-0). Compile never
+    # errors on a missing DB — that's only a hint, not a requirement.
+    # ``DEPLODOCK_TUNE_DB`` env var overrides the default path.
+    tune_db_path = resolve_tune_db()
+    db = SearchDB(path=tune_db_path) if tune_db_path.exists() else None
+    if db is not None:
+        logger.info("Using tuning DB: %s", tune_db_path)
+    else:
+        logger.debug("No tuning DB at %s — using rule defaults", tune_db_path)
+
+    result = Pipeline.build(passes, dump=dump).run(graph, db=db)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)

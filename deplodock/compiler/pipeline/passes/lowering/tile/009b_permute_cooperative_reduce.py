@@ -134,15 +134,30 @@ def rewrite(match: Match, root: Node) -> Graph | None | list[TileOp]:
     if len(axis_names) != 1:
         raise RuleSkipped("cooperative reduce loops use mixed axis names — unsupported")
     t_name = next(iter(axis_names))
+    # The post-reduce normalize ``StridedLoop`` (005 Phase 3) is also
+    # 008-unrolled (it shares the FN slot with the reduce loops). Its
+    # body holds the epilogue Load/Write chain we need to permute too,
+    # so that 003_vectorize_loads + 005_vectorize_stores can fold the
+    # per-replica Loads/Writes into one LDS.128 / STG.128.
+    normalize_loops = [
+        sl
+        for sl in tile.body
+        if isinstance(sl, StridedLoop)
+        and not sl.is_reduce
+        and isinstance(sl.step, Literal)
+        and sl.axis.name == t_name
+        and any(t_axis.name in expr.free_vars() for expr in (sl.start,) if hasattr(expr, "free_vars"))
+    ]
+    permuted_loops = [*coop_loops, *normalize_loops]
     # ``BN`` = cooperative-thread stride. ``008`` widened each loop's
     # step to ``BN * FN``; recover BN by dividing back. All loops
     # should agree on BN.
-    bns = {int(sl.step.value) // fn for sl in coop_loops if int(sl.step.value) % fn == 0}
+    bns = {int(sl.step.value) // fn for sl in permuted_loops if int(sl.step.value) % fn == 0}
     if len(bns) != 1:
-        raise RuleSkipped("cooperative reduce loops disagree on BN (unexpected post-008 shape)")
+        raise RuleSkipped("cooperative loops disagree on BN (unexpected post-008 shape)")
     bn = next(iter(bns))
 
-    # The rewrite assumes the reduce loop runs exactly once (so
+    # The rewrite assumes the loop runs exactly once (so
     # ``Var(reduce_axis) == thread_id`` at runtime and multiplying it by
     # VW is the right per-thread permutation). When the loop iterates
     # (axis extent > BN*FN), the loop's iter variable also encodes the
@@ -150,8 +165,8 @@ def rewrite(match: Match, root: Node) -> Graph | None | list[TileOp]:
     # address. Skip the multi-iter case; the autotuner will rank
     # configurations where the loop fully unrolls (BN*FN == extent)
     # against those where it doesn't.
-    if any(int(sl.axis.extent) != int(sl.step.value) for sl in coop_loops):
-        raise RuleSkipped("reduce loop iterates >1× (BN*FN < extent); 009b assumes single-iter")
+    if any(int(sl.axis.extent) != int(sl.step.value) for sl in permuted_loops):
+        raise RuleSkipped("a permuted loop iterates >1× (BN*FN < extent); 009b assumes single-iter")
 
     # Fork over VW choices that satisfy the constraints:
     #  - FN % VW == 0
@@ -174,13 +189,12 @@ def rewrite(match: Match, root: Node) -> Graph | None | list[TileOp]:
 
     variants: list[TileOp] = []
     for vw in sorted(viable, reverse=True):
-        # Only permute indices inside the reduce StridedLoop's body —
-        # 008 widened *its* step to ``BN * FN`` and unrolled body
-        # σ-substituted on ``Var(reduce_loop.axis.name)``. Other Loops
-        # in the Tile body (epilogue / sum-reduce / etc.) use the same
-        # variable name but at the pre-008 step ``BN`` with no
-        # unrolling; their indices must NOT be permuted.
-        new_tile_body = _rewrite_only_in_reduce_loops(tile.body, set(map(id, coop_loops)), t_name, bn, vw, fn)
+        # Only permute indices inside the loops 008 actually unrolled
+        # — the reduce StridedLoops AND the post-reduce normalize
+        # wrapper (now also unrolled by 008's normalize-loop slot).
+        # Other Loops in the Tile body that share the axis name but
+        # weren't unrolled (pre-008 step ``BN``) must NOT be permuted.
+        new_tile_body = _rewrite_only_in_reduce_loops(tile.body, set(map(id, permuted_loops)), t_name, bn, vw, fn)
         new_tile = Tile(axes=tile.axes, body=new_tile_body)
         new_op = TileOp(
             body=body[:idx] + (new_tile,) + body[idx + 1 :],

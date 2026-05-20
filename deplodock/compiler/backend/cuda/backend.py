@@ -41,6 +41,25 @@ if TYPE_CHECKING:
 
 
 _DEBUG_ENV = "DEPLODOCK_DEBUG"
+_TUNE_DB_ENV = "DEPLODOCK_TUNE_DB"
+_DEFAULT_TUNE_DB = Path.home() / ".cache" / "deplodock" / "autotune.db"
+
+
+def _resolve_tune_db(value: Path | str | None) -> Path | None:
+    """Resolve the ``tune_db=`` constructor argument.
+
+    - ``None`` → ``None`` (no DB; test-isolation default).
+    - ``"auto"`` → ``DEPLODOCK_TUNE_DB`` env → ``~/.cache/deplodock/autotune.db``.
+      The result is returned regardless of whether the file exists;
+      ``compile()`` skips opening it when missing.
+    - Explicit ``Path`` / ``str`` → that path (no env lookup).
+    """
+    if value is None:
+        return None
+    if value == "auto":
+        override = os.environ.get(_TUNE_DB_ENV)
+        return Path(override) if override else _DEFAULT_TUNE_DB
+    return Path(value)
 
 
 class CudaBackend(Backend):
@@ -75,15 +94,18 @@ class CudaBackend(Backend):
         # can SIGKILL a wedged worker. Defaults to ``None`` (in-process,
         # required when ``on_iter`` callbacks are supplied).
         self.bench_wall_timeout_s = bench_wall_timeout_s
-        # Persistent autotune cache. When provided, ``compile()`` opens
-        # this SearchDB so ``GreedySearch`` can pick tuned forks via
-        # ``best=``; otherwise it falls back to rule option-0.
-        self.tune_db = Path(tune_db) if tune_db is not None else None
+        # Persistent autotune cache. ``None`` → no DB (test-isolation
+        # default; tests construct ``CudaBackend()`` without args and
+        # expect deterministic rule-defaults compiles). ``"auto"`` →
+        # resolve ``DEPLODOCK_TUNE_DB`` env var → ``~/.cache/deplodock/autotune.db``,
+        # open if the file exists. Explicit ``Path`` → use that file
+        # (open if it exists; silently skip otherwise).
+        self.tune_db = _resolve_tune_db(tune_db)
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
         db = None
-        if self.tune_db is not None:
+        if self.tune_db is not None and self.tune_db.exists():
             from deplodock.compiler.pipeline.search.db import SearchDB
 
             db = SearchDB(path=self.tune_db)

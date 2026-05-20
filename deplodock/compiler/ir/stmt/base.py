@@ -414,8 +414,8 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
 
     Detection of vectorizable Load runs (``LDS.128`` / ``__half2``) is
     no longer done here — the dedicated Kernel-IR pass
-    ``003_vectorize_loads`` rewrites those runs into explicit
-    :class:`VecLoad` Stmts before render. This function's only
+    ``003_vectorize_loads`` widens those runs into one :class:`Load`
+    with ``extra_names`` populated before render. This function's only
     pre-walk responsibility is registering literal-constant Loads so
     their ``Var(name)`` uses inline as float literals instead of
     materializing a named local.
@@ -431,7 +431,9 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
         new_map = dict(ctx.literal_ssa)
         changed = False
         for s in body:
-            if isinstance(s, Load) and s.is_literal(ctx.literal_constants):
+            # Literal-const Loads are always scalar (the vectorize pass
+            # excludes literal-const buffers from its widening logic).
+            if isinstance(s, Load) and s.is_scalar and s.is_literal(ctx.literal_constants):
                 new_map[s.name] = ctx.literal_constants[s.input]
                 changed = True
         if changed:
@@ -439,7 +441,7 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
 
     out: list[str] = []
     for s in body:
-        if isinstance(s, Load) and s.name in ctx.literal_ssa and s.is_literal(ctx.literal_constants):
+        if isinstance(s, Load) and s.is_scalar and s.name in ctx.literal_ssa and s.is_literal(ctx.literal_constants):
             continue
         out.extend(s.render(ctx))
     return out

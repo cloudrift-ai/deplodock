@@ -55,7 +55,6 @@ from deplodock.compiler.ir.stmt import (
     StridedLoop,
     Tile,
     Unpack,
-    VecLoad,
     Write,
     _pad,
     pretty_body,
@@ -610,8 +609,6 @@ class KernelOp(Op):
         for s in self:
             if isinstance(s, Load) and s.input not in smem:
                 names.setdefault(s.input, None)
-            elif isinstance(s, VecLoad) and s.input not in smem:
-                names.setdefault(s.input, None)
             elif isinstance(s, CpAsyncCopy) and s.src not in smem:
                 names.setdefault(s.src, None)
             elif isinstance(s, TmaDescriptor) and s.src_buf not in smem:
@@ -649,7 +646,6 @@ __all__ = [
     "Load",
     "Pack",
     "Unpack",
-    "VecLoad",
     "Assign",
     "Select",
     "SelectBranch",

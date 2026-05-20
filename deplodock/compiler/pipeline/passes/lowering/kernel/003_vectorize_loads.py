@@ -1,29 +1,29 @@
-"""Replace runs of consecutive ``Load`` Stmts with one :class:`VecLoad`.
+"""Widen runs of consecutive scalar ``Load`` Stmts into one vector ``Load``.
 
 Until this pass, the body of every Kernel-IR Tile carries scalar
-``Load`` Stmts. Some sequences of those Loads have a "vector" shape: N
-consecutive Loads from the same source buffer whose last-dim indices
-differ by 0, 1, ..., N-1. The CUDA backend can emit those as a single
-``float<N>`` / ``__half2`` reinterpret-cast read followed by N .x/.y/.z/.w
-unpacks. The fold used to live inside ``render_body`` as a string-level
-fast path; lifting it here makes the optimization visible in the IR
-(``--ir kernel`` shows a single ``VecLoad`` line where there used to be
-N Loads), keeps the renderer simple, and gives us a home for the
-upcoming ``__half2`` accumulator packing.
+``Load`` Stmts (``extra_names=()``). Some sequences of those Loads have
+a "vector" shape: N consecutive Loads from the same source buffer whose
+last-dim indices differ by 0, 1, ..., N-1. The CUDA backend can emit
+those as a single ``float<N>`` / ``__half2`` reinterpret-cast read
+followed by N ``.x/.y/.z/.w`` unpacks. Folding the run into one
+``Load(name=n0, extra_names=(n1..n_{N-1}), input, index)`` makes the
+optimization visible in the IR (``--ir kernel`` shows one Load with
+multiple LHS names) while keeping the renderer simple — ``Load.render``
+branches on ``extra_names`` to emit either the scalar or the vector
+form.
 
 ## What the pass does
 
 For each ``Body`` (Tile body and every nested Loop / StridedLoop / Cond /
 Tile body, post-order):
 
-1. Walk the stmts. At each position, try widths 4 then 2.
-2. If ``[body[i], ..., body[i+n-1]]`` are all ``Load``s from the same
-   input buffer, with matching outer indices, and last-dim indices
+1. Walk the stmts. At each position, try widths 8 then 4 then 2.
+2. If ``[body[i], ..., body[i+n-1]]`` are all scalar ``Load``s from the
+   same input buffer, with matching outer indices, and last-dim indices
    that affinely decompose to ``anchor, anchor+1, ..., anchor+n-1``
    (same coefficients on free vars), AND the target supports
    ``vector_type(elem_dtype, n)`` for the source-buffer dtype, replace
-   the run with one ``VecLoad(names=(n0..n_{n-1}), input, base_index,
-   elem_dtype)``.
+   the run with one widened ``Load``.
 3. Otherwise advance one stmt.
 
 ## Why this lives at the Kernel-IR boundary
@@ -55,7 +55,7 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import Smem
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, StridedLoop, Tile, VecLoad
+from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -149,16 +149,19 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: 
     return Body(tuple(out))
 
 
-def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str], literal_const_bufs: set[str]) -> VecLoad | None:
+def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str], literal_const_bufs: set[str]) -> Load | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Load pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
-    source buffer's dtype, return the replacement :class:`VecLoad`.
-    Otherwise return ``None``."""
+    source buffer's dtype, return the widened :class:`Load`. Otherwise
+    return ``None``."""
     stmts_list = list(stmts)
     if start + n > len(stmts_list):
         return None
     loads = stmts_list[start : start + n]
     if not all(isinstance(s, Load) for s in loads):
+        return None
+    # Already-widened Loads in the run aren't safe to re-merge — bail.
+    if any(s.is_vector for s in loads):
         return None
     # No literal-constant loads (those render as embedded scalar floats).
     if any(getattr(s, "input", None) is None for s in loads):
@@ -224,9 +227,8 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[st
         if not isinstance(anchor_simplified, Literal) or anchor_simplified.value % n != 0:
             return None
 
-    return VecLoad(
+    return Load(
         names=tuple(s.name for s in loads),
         input=input_name,
-        base_index=loads[0].index,
-        elem_dtype=src_dt,
+        index=loads[0].index,
     )

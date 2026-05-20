@@ -16,14 +16,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def _resolve_tune_db(args) -> Path:
-    """Resolve the autotune SQLite cache path. Precedence matches
-    ``deplodock tune``: ``--tune-db`` flag → ``DEPLODOCK_TUNE_DB`` env →
-    ``~/.cache/deplodock/autotune.db``."""
-    override = args.tune_db or os.environ.get("DEPLODOCK_TUNE_DB")
-    return Path(override) if override else Path.home() / ".cache" / "deplodock" / "autotune.db"
-
-
 def register_run_command(subparsers):
     parser = subparsers.add_parser("run", help="Compile + run an inline torch expression on the CUDA backend")
     parser.add_argument(
@@ -68,14 +60,6 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
-    parser.add_argument(
-        "--tune-db",
-        default=None,
-        help=(
-            "Path to the tuning SQLite cache used to pick tuned variants at fork points. "
-            "Falls back to ``DEPLODOCK_TUNE_DB`` env var, then to ~/.cache/deplodock/autotune.db."
-        ),
-    )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
     parser.add_argument(
@@ -137,13 +121,12 @@ def handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    tune_db = _resolve_tune_db(args)
-    if not tune_db.exists():
-        logger.info("No tuning DB at %s — using rule defaults", tune_db)
-        tune_db = None
-    else:
-        logger.info("Using tuning DB: %s", tune_db)
-    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db=tune_db)
+    # Backend auto-resolves ``DEPLODOCK_TUNE_DB`` env →
+    # ``~/.cache/deplodock/autotune.db`` (opens if the file exists,
+    # silent fall-back to rule defaults otherwise).
+    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
+    if backend.tune_db is not None and backend.tune_db.exists():
+        logger.info("Using tuning DB: %s", backend.tune_db)
     compiled = backend.compile(graph)
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
@@ -573,7 +556,6 @@ def _passes_after_stage(stage: str) -> list[str]:
 def _handle_run_ir(args, CudaBackend, CompilerDump):
     """Run path: load JSON IR (any stage), finish lowering, execute, bench."""
     import json
-    from pathlib import Path
 
     import numpy as np
 
@@ -610,13 +592,9 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
                 shape = tuple(int(d) for d in node.output.shape)
                 input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
 
-    tune_db = _resolve_tune_db(args)
-    if not tune_db.exists():
-        logger.info("No tuning DB at %s — using rule defaults", tune_db)
-        tune_db = None
-    else:
-        logger.info("Using tuning DB: %s", tune_db)
-    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db=tune_db)
+    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
+    if backend.tune_db is not None and backend.tune_db.exists():
+        logger.info("Using tuning DB: %s", backend.tune_db)
     result = backend.run(graph, input_data=input_data)
     for nid, arr in result.outputs.items():
         finite = np.isfinite(arr).all()

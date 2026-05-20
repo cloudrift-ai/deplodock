@@ -12,6 +12,7 @@ from deplodock.commands.compile import (
     add_input_args,
     format_stage,
     load_or_trace,
+    resolve_tune_db,
     setup_pipeline_runtime,
 )
 from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch
@@ -30,11 +31,6 @@ def register_tune_command(subparsers):
     )
     add_input_args(parser)
     parser.add_argument("--output", "-o", help="Output path for the tuned CUDA IR")
-    parser.add_argument(
-        "--tune-db",
-        default=None,
-        help=("Path to the tuning SQLite cache. Falls back to ``DEPLODOCK_TUNE_DB`` env var, then to ~/.cache/deplodock/autotune.db."),
-    )
     parser.add_argument(
         "--patience",
         type=int,
@@ -86,8 +82,8 @@ def handle_tune(args):
     # cleanly. Without this the autotune sweep wedges on the
     # variant after a bench_fail (see ``benchmark_program_isolated``).
     backend = CudaBackend(bench_wall_timeout_s=10.0)
-    db_override = args.tune_db or os.environ.get("DEPLODOCK_TUNE_DB")
-    db_path = Path(db_override) if db_override else Path.home() / ".cache" / "deplodock" / "autotune.db"
+    # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
+    db_path = resolve_tune_db()
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
