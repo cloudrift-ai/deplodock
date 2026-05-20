@@ -154,6 +154,81 @@ class Load(Stmt):
 
 
 @dataclass(frozen=True)
+class Pack(Stmt):
+    """Pack two scalar values into one ``__half2`` (or future short-vec).
+
+    ``name`` is the new packed SSA local; ``low`` / ``high`` are the
+    two source SSA names. The pack emits ``__halves2half2(low, high)``
+    via the target's ``convert``; if ``low`` and ``high`` are already
+    fp16, no conversion happens — just the pair-bundle intrinsic. If
+    they are fp32, the target inserts ``__float2half`` first.
+
+    Used by the ``__half2``-packing pass to bundle the two scalar
+    operands of a paired ``Accum`` (one per lane of the F16x2 pair)
+    into a single SSA value the paired Accum can consume.
+    """
+
+    name: str
+    low: str
+    high: str
+    dtype: DataType = field(default_factory=lambda: F32)  # F16x2 in real use
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.low, self.high)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.dtype.name} {self.name} = pack({self.low}, {self.high})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        low_dt = ctx.ssa_dtypes.get(self.low, "f32")
+        high_dt = ctx.ssa_dtypes.get(self.high, "f32")
+        # ``__halves2half2`` takes two ``__half``; convert each arg if
+        # it isn't already fp16 (the target's convert handles f32→f16).
+        low_expr = ctx.target.convert(self.low, low_dt, "f16")
+        high_expr = ctx.target.convert(self.high, high_dt, "f16")
+        ctx.ssa_dtypes[self.name] = self.dtype.name
+        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = __halves2half2({low_expr}, {high_expr});"]
+
+
+@dataclass(frozen=True)
+class Unpack(Stmt):
+    """Split one ``__half2`` SSA value into two scalar ``__half`` names.
+
+    Inverse of :class:`Pack`. Emits one decl line per lane via
+    ``__low2half`` / ``__high2half``. Used by the packing pass to
+    restore the scalar names that downstream stmts (e.g. WarpShuffle)
+    still reference.
+    """
+
+    low_name: str
+    high_name: str
+    value: str  # the f16x2 SSA name being split
+    lane_dtype: DataType = field(default_factory=lambda: F32)  # F16 in real use
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.value,)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.low_name, self.high_name)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.lane_dtype.name} {self.low_name}, {self.high_name} = unpack({self.value})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        ty = ctx.type_name(self.lane_dtype)
+        ctx.ssa_dtypes[self.low_name] = self.lane_dtype.name
+        ctx.ssa_dtypes[self.high_name] = self.lane_dtype.name
+        pad = _pad(ctx.indent)
+        return [
+            f"{pad}{ty} {self.low_name} = __low2half({self.value});",
+            f"{pad}{ty} {self.high_name} = __high2half({self.value});",
+        ]
+
+
+@dataclass(frozen=True)
 class VecLoad(Stmt):
     """N consecutive ``Load``s packed into a single vector read.
 

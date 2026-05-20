@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from deplodock.compiler import dtype as _dtype
 
-_TYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half"}
+_TYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half", "f16x2": "__half2"}
 
 # Intrinsic spellings — per dtype.  Keys are abstract op names emitted
 # by ``op_to_expr`` (``"exp"``, ``"fmax"``, ``"fabs"``, ...).
@@ -43,9 +43,26 @@ _INTRINSIC_F16: dict[str, str] = {
     "fabs": "__habs",
 }
 
+# Per-pair (2-wide vector) fp16 intrinsics. Each entry is the cuda_fp16.h
+# ``h2`` / ``__h*2`` form. Used when an Init / Accum / Assign carries
+# dtype = F16x2 (paired by the ``004_pack_fp16_register_tile`` pass).
+_INTRINSIC_F16x2: dict[str, str] = {
+    "exp": "h2exp",
+    "log": "h2log",
+    "sqrt": "h2sqrt",
+    "rsqrt": "h2rsqrt",
+    "tanh": "h2tanh",
+    "fmax": "__hmax2",
+    "fmin": "__hmin2",
+    "fabs": "__habs2",
+}
+
 # Abstract op names with a native fp16 form. Binary operators (+, -, *, /)
-# work via cuda_fp16.h's operator overloads on ``__half``, so they don't
-# need an entry in ``_INTRINSIC_F16`` but are still "native".
+# work via cuda_fp16.h's operator overloads on ``__half`` and ``__half2``,
+# so they don't need an entry in the intrinsic tables but are still
+# "native". The same set covers F16 and F16x2 — every op listed has both
+# a per-element (``__hmax``, ``hexp``) and per-pair (``__hmax2``,
+# ``h2exp``) form.
 _NATIVE_FP16_OPS: frozenset[str] = frozenset(
     {
         "add",
@@ -83,11 +100,14 @@ class CudaRenderTarget:
 
     def literal(self, text: str, dtype: str) -> str:
         # Numeric literals (``0.0f`` / ``1.0f`` / ``-1e+30f``) wrap in
-        # ``__float2half`` when the surrounding expression's result
-        # dtype is fp16, so the call composes with ``__half`` operands.
-        # NVRTC folds the call to a half constant at compile time.
+        # ``__float2half`` (scalar) or ``__float2half2_rn`` (pair-
+        # broadcast) when the surrounding expression's result dtype is
+        # fp16 / fp16x2 so the call composes with ``__half`` / ``__half2``
+        # operands. NVRTC folds the call to a constant at compile time.
         if dtype == "f16":
             return f"__float2half({text})"
+        if dtype == "f16x2":
+            return f"__float2half2_rn({text})"
         return text
 
     def convert(self, value: str, src_dt: str, dst_dt: str) -> str:
@@ -97,17 +117,27 @@ class CudaRenderTarget:
             return f"__float2half({value})"
         if dst_dt == "f32" and src_dt == "f16":
             return f"__half2float({value})"
+        if dst_dt == "f16x2" and src_dt == "f16":
+            # Broadcast scalar __half into both lanes of a __half2.
+            return f"__half2half2({value})"
+        if dst_dt == "f16x2" and src_dt == "f32":
+            return f"__float2half2_rn({value})"
         return value
 
     def intrinsic(self, op_name: str, result_dt: str) -> str:
-        table = _INTRINSIC_F16 if result_dt == "f16" else _INTRINSIC_F32
-        return table.get(op_name, op_name)
+        if result_dt == "f16":
+            return _INTRINSIC_F16.get(op_name, op_name)
+        if result_dt == "f16x2":
+            return _INTRINSIC_F16x2.get(op_name, op_name)
+        return _INTRINSIC_F32.get(op_name, op_name)
 
     def has_native_op(self, op_name: str, dtype: str) -> bool:
-        if dtype != "f16":
+        if dtype == "f32":
             # f32 has every op natively.
             return True
-        return op_name in _NATIVE_FP16_OPS
+        if dtype in ("f16", "f16x2"):
+            return op_name in _NATIVE_FP16_OPS
+        return False
 
     def vector_type(self, dtype: str, n: int) -> tuple[str, str] | None:
         if dtype == "f32":

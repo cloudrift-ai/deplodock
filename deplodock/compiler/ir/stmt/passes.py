@@ -19,7 +19,7 @@ from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, VecLoad, Write
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
@@ -61,6 +61,31 @@ def rewrite(stmt: Stmt, rename: Rename, sigma: Sigma = Sigma.IDENTITY, axis_fn: 
 @rewrite.register
 def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Load(name=rename(s.name), input=s.input, index=tuple(sigma.apply(e) for e in s.index))
+
+
+@rewrite.register
+def _(s: VecLoad, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return VecLoad(
+        names=tuple(rename(n) for n in s.names),
+        input=s.input,
+        base_index=tuple(sigma.apply(e) for e in s.base_index),
+        elem_dtype=s.elem_dtype,
+    )
+
+
+@rewrite.register
+def _(s: Pack, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return Pack(name=rename(s.name), low=rename(s.low), high=rename(s.high), dtype=s.dtype)
+
+
+@rewrite.register
+def _(s: Unpack, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return Unpack(
+        low_name=rename(s.low_name),
+        high_name=rename(s.high_name),
+        value=rename(s.value),
+        lane_dtype=s.lane_dtype,
+    )
 
 
 @rewrite.register
