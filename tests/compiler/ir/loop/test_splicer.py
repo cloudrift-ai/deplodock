@@ -281,7 +281,7 @@ def test_consumer_extra_input_source_remap():
     # Producer's Load survives at source 0; consumer's unrelated Load shifts to 1.
     assert any(ld.input == "src_0" for ld in loads.values())
     assert any(ld.input == "src_1" for ld in loads.values())
-    assert len(merged.inputs) == 2
+    assert len(tuple(merged.inputs)) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +387,7 @@ def test_chain_three_loops():
     loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 2
     assert {ld.input for ld in loads} == {"X", "BIAS"}
-    assert len(merged.inputs) == 2
+    assert len(tuple(merged.inputs)) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +488,7 @@ def test_multi_output_splice_target():
     # Only one external Load (target's x); the splice edges replaced sink's Loads.
     loads = [s for s in merged.body.iter() if isinstance(s, Load)]
     assert len(loads) == 1
-    assert len(merged.inputs) == 1
+    assert len(tuple(merged.inputs)) == 1
 
 
 def test_shared_load_dedup_into_reduce():

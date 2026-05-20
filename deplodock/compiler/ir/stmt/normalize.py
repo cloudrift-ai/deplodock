@@ -21,7 +21,6 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, Write
-from deplodock.compiler.ir.tile.ir import Stage
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -761,6 +760,8 @@ def rename_ssa_sequential(stmts: Body) -> Body:
       order.
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
+    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415 — break stmt↔tile cycle
+
     stmts = Body.coerce(stmts)
     ssa_rename: dict[str, str] = {}
     axis_rename: dict[str, str] = {}
@@ -782,10 +783,13 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             expr_sub[name] = Var(new)
 
     for stmt in stmts.iter():
-        if isinstance(stmt, Load) and stmt.name not in ssa_rename:
-            new = _rename(stmt.name, "in")
-            if stmt.name != new:
-                expr_sub[stmt.name] = Var(new)
+        if isinstance(stmt, Load):
+            for old in stmt.names:
+                if old in ssa_rename:
+                    continue
+                new = _rename(old, "in")
+                if old != new:
+                    expr_sub[old] = Var(new)
         elif isinstance(stmt, Accum) and stmt.name not in ssa_rename:
             _rename(stmt.name, "acc")
         elif isinstance(stmt, (Assign, Select)) and stmt.name not in ssa_rename:

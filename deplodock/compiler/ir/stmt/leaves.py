@@ -175,6 +175,9 @@ class Load(Stmt):
     def defines(self) -> tuple[str, ...]:
         return self.names
 
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.input,)
+
     def exprs(self) -> tuple[Expr, ...]:
         return self.index
 
@@ -616,6 +619,9 @@ class Write(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return self.values
+
+    def external_writes(self) -> tuple[str, ...]:
+        return (self.output,)
 
     def exprs(self) -> tuple[Expr, ...]:
         return self.index

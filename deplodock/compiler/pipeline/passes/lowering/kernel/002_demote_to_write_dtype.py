@@ -83,24 +83,13 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
     body = kop.body
 
-    # Output buffer dtypes. ``001_materialize_tile`` doesn't yet set
-    # ``output_tensors`` on the KernelOp (the CUDA-lowering pass does
-    # that downstream), so read directly from the surrounding graph
-    # using the KernelOp's body-derived ``outputs`` plus ``root.output``
-    # for the case where the KernelOp's own node-output is the only
-    # written buffer. Falls back to ``f32`` for anything we can't find.
-    out_dtypes: dict[str, str] = {}
-    for out_name in kop.outputs:
-        node = match.graph.nodes.get(out_name)
-        if node is not None:
-            out_dtypes[out_name] = node.output.dtype.name
+    # Output / input buffer dtypes come straight off ``kop.inputs`` /
+    # ``kop.outputs`` — the matcher has snapped them to the surrounding
+    # graph's Tensors. Fall back to ``root.output`` for the KernelOp's
+    # own node-output when not otherwise listed.
+    out_dtypes: dict[str, str] = {n: t.dtype.name for n, t in kop.outputs.items()}
     out_dtypes.setdefault(root.id, root.output.dtype.name)
-
-    in_dtypes: dict[str, str] = {}
-    for in_name in kop.inputs:
-        node = match.graph.nodes.get(in_name)
-        if node is not None:
-            in_dtypes[in_name] = node.output.dtype.name
+    in_dtypes: dict[str, str] = {n: t.dtype.name for n, t in kop.inputs.items()}
 
     # ssa-name → defining Stmt (deep traversal).
     defs: dict[str, Stmt] = {}
@@ -194,12 +183,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if new_body == body:
         raise RuleSkipped("no change after demotion (already stamped)")
 
-    return KernelOp(
-        body=new_body,
-        name=kop.name,
-        input_tensors=dict(kop.input_tensors),
-        output_tensors=dict(kop.output_tensors),
-    )
+    return KernelOp(body=new_body, name=kop.name)
 
 
 def _build_uses(body: Body) -> dict[str, list[Stmt]]:

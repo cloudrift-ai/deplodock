@@ -4,7 +4,7 @@ Renders the ``KernelOp`` body to a ``__global__`` CUDA source string
 and mutates the node's op payload in place. Grid / block geometry is
 derived from the ``Tile`` in the body; ``smem_bytes`` is summed
 over ``Smem`` decls. ``arg_order`` is ``kernel_op.inputs +
-kernel_op.outputs`` — matches the kernel signature emitted by
+kernel_op.outputs`` keys — matches the kernel signature emitted by
 ``render_kernelop``.
 """
 
@@ -12,11 +12,9 @@ from __future__ import annotations
 
 from math import prod
 
-from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
-from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
+from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.pipeline import Match, Pattern
@@ -27,29 +25,16 @@ PATTERN = [Pattern("root", KernelOp)]
 _BLOCK = 256
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
-    graph = match.graph
-
-    # Per-buffer Tensor descriptors (shape + dtype) for the kernel
-    # signature and the renderer's index flattening. Read from the
-    # surrounding graph; the renderer falls back to F32 / shape () for
-    # any missing entry (e.g. legacy KernelOps constructed bare in tests).
-    input_tensors: dict[str, Tensor] = {bid: graph.nodes[bid].output for bid in root.op.inputs if bid in graph.nodes}
-    output_tensors: dict[str, Tensor] = {
-        out: (graph.nodes[out].output if out in graph.nodes else Tensor(out, tuple(root.output.shape), root.output.dtype))
-        for out in root.op.outputs
-    }
-    root.op.input_tensors = input_tensors
-    root.op.output_tensors = output_tensors
-    tensors: dict[str, Tensor] = {**input_tensors, **output_tensors}
+def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
+    # Per-buffer Tensor descriptors (shape + dtype) come straight off
+    # ``root.op.inputs`` / ``root.op.outputs`` — the matcher snapped them
+    # to the surrounding graph's Tensors via ``populate_io``, including
+    # the ``constant`` / ``value`` flags for ConstantOp predecessors.
+    tensors: dict[str, Tensor] = {**root.op.inputs, **root.op.outputs}
 
     # Scalar ConstantOp inputs get embedded as float literals in the kernel
     # body — no kernel parameter, no buffer load.
-    literal_constants: dict[str, float] = {}
-    for bid in root.op.inputs:
-        node = graph.nodes.get(bid)
-        if node is not None and isinstance(node.op, ConstantOp) and node.op.value is not None:
-            literal_constants[bid] = float(node.op.value)
+    literal_constants: dict[str, float] = {n: float(t.value) for n, t in root.op.inputs.items() if t.constant and t.value is not None}
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
 
@@ -85,7 +70,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
         grid=grid,
         block=block,
-        smem_bytes=_smem_bytes(root.op),
+        smem_bytes=root.op.smem_bytes(),
         tma_descriptors=tuple(descriptors),
         zero_outputs=tuple(atomic_outputs),
     )
@@ -103,13 +88,3 @@ def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[i
             grid = ((n_threads + _BLOCK - 1) // _BLOCK, 1, 1)
             return grid, (_BLOCK, 1, 1)
     return (1, 1, 1), (1, 1, 1)
-
-
-def _smem_bytes(kernel_op: KernelOp) -> int:
-    """Sum ``prod(extents) * sizeof(dtype)`` across all ``Smem`` decls."""
-    total = 0
-    for s in kernel_op:
-        if isinstance(s, Smem):
-            elements = prod(int(e) for e in s.extents) if s.extents else 1
-            total += elements * _nbytes_of(s.dtype)
-    return total

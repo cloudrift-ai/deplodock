@@ -324,6 +324,12 @@ def _stmt_eval_scope() -> dict:
 # stamped automatically by the engine — see ``Op.source``).
 _STRUCTURAL_SKIP_FIELDS = frozenset({"name", "source"})
 
+# Op dataclass fields excluded from JSON serialization in :meth:`Graph.to_dict`:
+# pure runtime state (``source`` / ``knobs`` chain metadata, ``inputs`` /
+# ``outputs`` snapped by the matcher) — none of it belongs in the persisted
+# IR.
+_SERIALIZE_SKIP_FIELDS = frozenset({"source", "knobs", "inputs", "outputs"})
+
 
 class Graph:
     """Directed acyclic compute graph of tensor operations.
@@ -749,10 +755,14 @@ class Graph:
         }
         if self.hints:
             result["hints"] = self.hints.to_dict()
+        from dataclasses import fields as dc_fields  # noqa: PLC0415
+
         for nid, node in self.nodes.items():
             entry: dict = {
                 "op": type(node.op).__name__,
-                "op_fields": {k: _serialize_field(v) for k, v in node.op.__dict__.items() if not k.startswith("_")},
+                "op_fields": {
+                    f.name: _serialize_field(getattr(node.op, f.name)) for f in dc_fields(node.op) if f.name not in _SERIALIZE_SKIP_FIELDS
+                },
                 "inputs": node.inputs,
                 "output": {
                     "name": node.output.name,

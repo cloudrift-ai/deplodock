@@ -531,6 +531,7 @@ def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match
     nodes: dict[str, str] = {}
     consumed: set[str] = set()
     identities: dict[str, int] = {}
+    matched_nodes: list[Node] = []
     for prod in rule.pattern:
         if nid is None:
             return None
@@ -542,8 +543,14 @@ def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match
         nodes[prod.name] = nid
         consumed.add(nid)
         identities[nid] = id(node)
+        matched_nodes.append(node)
         consumers = graph.consumers(nid)
         nid = consumers[0] if len(consumers) == 1 else None
+    # Snap ``op.inputs`` / ``op.outputs`` to the surrounding graph for
+    # every matched node so rule rewrites can read per-buffer Tensors
+    # straight off the op without re-querying the graph.
+    for node in matched_nodes:
+        node.op.populate_io(graph, node)
     return Match(
         graph=graph,
         root_node_id=start,

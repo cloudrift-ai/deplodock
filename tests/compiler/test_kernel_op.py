@@ -187,7 +187,7 @@ def test_load_stmt_binding():
     loads = k.body.loads
     # rename_ssa_sequential canonicalizes Load names to in0, in1, ...
     assert len(loads) == 1 and loads[0].name == "in0" and loads[0].input == "src_0"
-    assert len(k.inputs) == 1
+    assert len(tuple(k.inputs)) == 1
 
 
 def test_load_stmt_multiple_sources():
@@ -206,7 +206,7 @@ def test_load_stmt_multiple_sources():
         ),
     )
     # Two distinct source buf names → two inputs.
-    assert k.inputs == ("src_0", "src_2")
+    assert tuple(k.inputs) == ("src_0", "src_2")
 
 
 def test_update_synthesizes_accum_decl():

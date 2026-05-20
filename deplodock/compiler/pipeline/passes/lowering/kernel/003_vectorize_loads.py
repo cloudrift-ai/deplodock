@@ -28,8 +28,8 @@ Tile body, post-order):
 
 ## Why this lives at the Kernel-IR boundary
 
-The decision needs the source-buffer dtype (``KernelOp.input_tensors``
-+ ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
+The decision needs the source-buffer dtype (graph node dtypes for
+graph dtypes via ``KernelOp.inputs`` keys + ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
 info, so ``normalize_body`` (which runs on every Body construction)
 can't make the call without external context. Running the pass here —
 after ``001_materialize_tile`` has placed the Smem decls and before
@@ -46,16 +46,13 @@ so order is mostly independent; this is the conservative ordering).
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace as _replace
 
 from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.kernel.ir import Smem
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -63,72 +60,38 @@ PATTERN = [Pattern("root", KernelOp)]
 _TARGET = CudaRenderTarget()
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
     kop: KernelOp = root.op
-
-    # Per-buffer dtype map: graph buffers from input_tensors /
-    # output_tensors (set by 001_lower_kernelop downstream — empty
-    # here), then graph fallback, then Smem dtypes from the body.
-    buf_dtypes: dict[str, str] = {}
-    for name, t in {**kop.input_tensors, **kop.output_tensors}.items():
-        buf_dtypes[name] = t.dtype.name
-    for nid in kop.inputs:
-        node = match.graph.nodes.get(nid)
-        if node is not None:
-            buf_dtypes.setdefault(nid, node.output.dtype.name)
-    for out in kop.outputs:
-        node = match.graph.nodes.get(out)
-        if node is not None:
-            buf_dtypes.setdefault(out, node.output.dtype.name)
-    for s in kop.body.iter():
-        if isinstance(s, Smem):
-            canonical = canonical_from_cuda_name(s.dtype)
-            if canonical is not None:
-                buf_dtypes[s.name] = canonical
-
-    # Loads from scalar ``ConstantOp`` inputs get inlined as float
-    # literals at CUDA lowering (``001_lower_kernelop`` populates
-    # ``literal_constants`` and the surrounding kernel doesn't even
-    # take that buffer as a parameter). We must not vectorize Loads
-    # from such buffers — the reinterpret_cast would reference a name
-    # that doesn't exist in the rendered kernel.
-    literal_const_bufs: set[str] = set()
-    for bid in kop.inputs:
-        node = match.graph.nodes.get(bid)
-        if node is not None and isinstance(node.op, ConstantOp) and node.op.value is not None:
-            literal_const_bufs.add(bid)
-
-    new_body = _vectorize_body(kop.body, buf_dtypes, literal_const_bufs)
+    new_body = _vectorize_body(kop, kop.body)
     if new_body == kop.body:
         raise RuleSkipped("no vectorizable Load runs found")
-
-    return KernelOp(
-        body=new_body,
-        name=kop.name,
-        input_tensors=dict(kop.input_tensors),
-        output_tensors=dict(kop.output_tensors),
-    )
+    return KernelOp(body=new_body, name=kop.name)
 
 
-def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: set[str]) -> Body:
+def _buf_dtype(kop: KernelOp, name: str) -> str:
+    """Resolve a buffer's canonical dtype: matcher-populated ``kop.inputs``
+    / ``kop.outputs`` for graph buffers, then ``kop.smem_buffers`` for
+    smem-local names, then ``f32``."""
+    t = kop.inputs.get(name) or kop.outputs.get(name)
+    if t is not None:
+        return t.dtype.name
+    smem = kop.smem_buffers.get(name)
+    if smem is not None:
+        canonical = canonical_from_cuda_name(smem.dtype)
+        if canonical is not None:
+            return canonical
+    return "f32"
+
+
+def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
-    scan this scope for consecutive-Load runs."""
+    scan this scope for consecutive-Load runs. Threads ``kop`` through so
+    ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
     descended: list[Stmt] = []
     for s in body:
-        if isinstance(s, Loop):
-            descended.append(_replace(s, body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs)))
-        elif isinstance(s, StridedLoop):
-            descended.append(_replace(s, body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs)))
-        elif isinstance(s, Cond):
-            descended.append(
-                Cond(
-                    cond=s.cond,
-                    body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs),
-                    else_body=_vectorize_body(s.else_body, buf_dtypes, literal_const_bufs),
-                )
-            )
-        elif isinstance(s, Tile):
-            descended.append(Tile(axes=s.axes, body=_vectorize_body(s.body, buf_dtypes, literal_const_bufs)))
+        nested = s.nested()
+        if nested:
+            descended.append(s.with_bodies(tuple(_vectorize_body(kop, b) for b in nested)))
         else:
             descended.append(s)
 
@@ -137,7 +100,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: 
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_load(descended, i, run_n, buf_dtypes, literal_const_bufs)
+            vec = _try_vec_load(descended, i, run_n, kop)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -149,7 +112,7 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str], literal_const_bufs: 
     return Body(tuple(out))
 
 
-def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str], literal_const_bufs: set[str]) -> Load | None:
+def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> Load | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Load pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     source buffer's dtype, return the widened :class:`Load`. Otherwise
@@ -171,13 +134,14 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[st
     if len(inputs) != 1:
         return None
     (input_name,) = inputs
-    if input_name in literal_const_bufs:
+    src_tensor = kop.inputs.get(input_name)
+    if src_tensor is not None and src_tensor.constant and src_tensor.value is not None:
         # Scalar-constant inputs get inlined at CUDA lowering — the
         # surrounding kernel doesn't take that buffer as a parameter,
         # so a vectorized reinterpret_cast would reference an undefined
         # symbol.
         return None
-    src_dt = buf_dtypes.get(input_name, "f32")
+    src_dt = _buf_dtype(kop, input_name)
     if _TARGET.vector_type(src_dt, n) is None:
         return None
 

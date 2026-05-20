@@ -188,15 +188,10 @@ def _recurse(stmt: Stmt, init_dtypes: dict[str, DataType], accumulating_dtype: D
     placed an Init for at the enclosing scope, so Init and Accum agree."""
     if isinstance(stmt, Accum) and stmt.name in init_dtypes:
         return replace(stmt, dtype=init_dtypes[stmt.name])
-    if isinstance(stmt, (Loop, StridedLoop)):
-        if _is_reduce_recursive(stmt):
-            return replace(stmt, body=tuple(_recurse(c, init_dtypes, accumulating_dtype, selecting_dtype) for c in stmt.body))
+    if isinstance(stmt, (Loop, StridedLoop)) and not _is_reduce_recursive(stmt):
         # Free loop — its body is its own scope; place Inits there.
         return replace(stmt, body=_place_inits_in_scope(stmt.body, accumulating_dtype, selecting_dtype))
-    if isinstance(stmt, Cond):
-        return Cond(
-            cond=stmt.cond,
-            body=tuple(_recurse(c, init_dtypes, accumulating_dtype, selecting_dtype) for c in stmt.body),
-            else_body=tuple(_recurse(c, init_dtypes, accumulating_dtype, selecting_dtype) for c in stmt.else_body),
-        )
-    return stmt
+    nested = stmt.nested()
+    if not nested:
+        return stmt
+    return stmt.with_bodies(tuple(tuple(_recurse(c, init_dtypes, accumulating_dtype, selecting_dtype) for c in b) for b in nested))

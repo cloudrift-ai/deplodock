@@ -282,6 +282,39 @@ class Stmt:
         """
         return ()
 
+    def external_reads(self) -> tuple[str, ...]:
+        """External-buffer names this stmt reads from. Default: ``()``.
+
+        Overrides: ``Load`` returns ``(self.input,)``; ``CpAsyncCopy``
+        returns ``(self.src,)``; ``TmaDescriptor`` returns
+        ``(self.src_buf,)``; ``Stage`` returns the source-Load inputs
+        from its body. The reads of any name covered by some stmt's
+        :meth:`local_decls` (smem / staged buffers) get filtered out at
+        :class:`BodyOp` aggregation time, so leaves don't need to know
+        about the surrounding declarations."""
+        return ()
+
+    def external_writes(self) -> tuple[str, ...]:
+        """External-buffer names this stmt writes to. Default: ``()``.
+
+        Overrides: ``Write`` returns ``(self.output,)``. Smem writes
+        (``CpAsyncCopy`` / ``TmaLoad``) are local — they target a name
+        covered by some :class:`Smem` decl's :meth:`local_decls` — and
+        get filtered out at aggregation rather than fighting to suppress
+        them at the leaf."""
+        return ()
+
+    def local_decls(self) -> tuple[str, ...]:
+        """Buffer names this stmt declares as kernel-local — the body's
+        external-buffer aggregator filters reads / writes naming these
+        names out of its inputs / outputs (they live inside the kernel,
+        not on the signature). Default: ``()``.
+
+        Overrides: ``Smem`` returns ``(self.name,)`` (kernel-IR shared
+        buffers); ``Stage`` returns ``(self.name,)`` (tile-IR staged
+        buffers — materialized into an ``Smem`` later)."""
+        return ()
+
     def rewrite(
         self,
         rename_ssa: Callable[[str], str],

@@ -23,12 +23,11 @@ Tile IR and are materialized away before reaching this layer. A
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -43,7 +42,6 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
-    Body,
     Cond,
     Load,
     Loop,
@@ -57,9 +55,8 @@ from deplodock.compiler.ir.stmt import (
     Unpack,
     Write,
     _pad,
-    pretty_body,
 )
-from deplodock.compiler.tensor import Tensor
+from deplodock.compiler.ir.stmt.ir import BodyOp
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -86,6 +83,9 @@ class Smem(Stmt):
     extents: tuple[int, ...]
     dtype: str = "float"
     align: int = 0
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
         ext = ", ".join(str(e) for e in self.extents) or "-"
@@ -151,6 +151,9 @@ class CpAsyncCopy(Stmt):
     smem_index: tuple
     src: str  # source global buffer name
     src_index: tuple
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.src,)
 
     def pretty(self, indent: str = "") -> list[str]:
         smem_idx = ", ".join(e.pretty() for e in self.smem_index)
@@ -220,6 +223,9 @@ class TmaDescriptor(Stmt):
     box_extents: tuple[int, ...]
     swizzle: str = "NONE"
     dtype: str = "float"
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.src_buf,)
 
     def pretty(self, indent: str = "") -> list[str]:
         shape = ", ".join(str(e) for e in self.src_shape)
@@ -480,75 +486,44 @@ _MAX_CTAS = 65536
 
 
 @dataclass
-class KernelOp(Op):
+class KernelOp(BodyOp):
     """One ``__global__`` GPU kernel as a Kernel IR program.
 
-    Op subclass parallel to ``TileOp`` / ``LoopOp``: lives as a graph
-    node, carries a body of Kernel IR stmts plus a kernel name.
+    :class:`BodyOp` subclass parallel to ``TileOp`` / ``LoopOp``: lives as
+    a graph node, carries a body of Kernel IR stmts plus a kernel name.
 
     Buffer shapes are *not* baked in — the surrounding graph supplies
     them at render time, same as ``TileOp``. Kernel signature is derived
     from the body: distinct ``Load.input`` names become kernel input
     params, distinct ``Write.output`` names become writeable output
     params, ordered by first appearance. ``Smem`` buffers are excluded.
+    ``CpAsyncCopy.src`` and ``TmaDescriptor.src_buf`` also name kernel
+    input parameters (the descriptor parameter itself is host-built and
+    appended by the CUDA backend's argument pipeline, not a graph
+    buffer)."""
 
-    ``input_tensors`` / ``output_tensors`` map a global-buffer name to a
-    :class:`Tensor` describing that buffer (its shape + dtype). Populated
-    by the CUDA-lowering pass from the surrounding graph; missing entries
-    fall back to a unit-shape :data:`F32` tensor so legacy tests that
-    build KernelOps directly keep working.
-    """
-
-    body: Body = field(default_factory=Body)
-    name: str = ""
-    input_tensors: dict[str, Tensor] = field(default_factory=dict)
-    output_tensors: dict[str, Tensor] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.body, Body):
-            self.body = Body.coerce(self.body)
-
-    def input_tensor(self, name: str) -> Tensor:
-        return self.input_tensors.get(name) or Tensor(name, (), F32)
-
-    def output_tensor(self, name: str) -> Tensor:
-        return self.output_tensors.get(name) or Tensor(name, (), F32)
-
-    def input_dtype(self, name: str) -> DataType:
-        return self.input_tensor(name).dtype
-
-    def output_dtype(self, name: str) -> DataType:
-        return self.output_tensor(name).dtype
-
-    def __iter__(self) -> Iterator[Stmt]:
-        return self.body.iter()
-
-    def pretty_body(self) -> str:
-        """Render as an indented structural listing via per-stmt ``pretty``."""
-        sig_in = ", ".join(self.inputs) or "-"
-        sig_out = ", ".join(self.outputs) or "-"
-        head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
-        return "\n".join([head, *pretty_body(self.body, "    ")])
+    @cached_property
+    def smem_buffers(self) -> dict[str, Smem]:
+        """Every ``Smem`` decl in the body, keyed by name. Cached — KernelOp
+        is treated as immutable post-construction (passes return new
+        instances), so the deep walk runs at most once per op. The deep
+        walk matters because ``Smem`` stmts sit inside ``Tile`` / ``Loop``
+        bodies post-lowering; a top-level-only iterator would miss them
+        and let oversize kernels slip past :meth:`validate`."""
+        return {s.name: s for s in self if isinstance(s, Smem)}
 
     def smem_bytes(self) -> int:
         """Total static + dynamic ``__shared__`` bytes declared in the
         body — sum of ``prod(Smem.extents) * sizeof(Smem.dtype)`` over
-        every ``Smem`` decl, **at any nesting depth**. ``Smem`` stmts
-        sit inside ``Tile`` / ``Loop`` bodies post-lowering, so the
-        top-level-only iterator the engine used to use under-counted by
-        the entire footprint and lets oversize kernels slip past
-        :meth:`validate`. Use the deep iterator (``for s in self``) to
-        match :meth:`smem_names` and the renderer's
-        ``_compute_dynamic_smem_offsets``."""
+        every ``Smem`` decl."""
         from math import prod  # noqa: PLC0415
 
         from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
 
         total = 0
-        for s in self:
-            if isinstance(s, Smem):
-                elements = prod(int(e) for e in s.extents) if s.extents else 1
-                total += elements * nbytes_of(s.dtype)
+        for s in self.smem_buffers.values():
+            elements = prod(int(e) for e in s.extents) if s.extents else 1
+            total += elements * nbytes_of(s.dtype)
         return total
 
     def validate(self, ctx) -> bool:
@@ -584,47 +559,10 @@ class KernelOp(Op):
         return True
 
     @property
-    def loads(self) -> tuple[Load, ...]:
-        return self.body.iter_of_type(Load)
-
-    @property
     def smem_names(self) -> frozenset[str]:
         """Names of all ``__shared__`` buffers declared in the body — these
         are render-internal and are excluded from kernel-parameter inference."""
-        return frozenset(s.name for s in self if isinstance(s, Smem))
-
-    @property
-    def inputs(self) -> tuple[str, ...]:
-        """Distinct ``Load.input`` buf names in body first-use order — the
-        kernel's input parameters. Smem buffers are excluded.
-
-        ``CpAsyncCopy`` stmts also count as global-buffer reads — their
-        ``src`` field names a kernel parameter same as ``Load.input`` does
-        for the synchronous path. ``TmaDescriptor`` reports its
-        ``src_buf`` (the global buffer the descriptor addresses); the
-        descriptor parameter itself is appended by the CUDA backend's
-        argument pipeline since it's host-built, not a graph buffer."""
-        smem = self.smem_names
-        names: dict[str, None] = {}
-        for s in self:
-            if isinstance(s, Load) and s.input not in smem:
-                names.setdefault(s.input, None)
-            elif isinstance(s, CpAsyncCopy) and s.src not in smem:
-                names.setdefault(s.src, None)
-            elif isinstance(s, TmaDescriptor) and s.src_buf not in smem:
-                names.setdefault(s.src_buf, None)
-        return tuple(names)
-
-    @property
-    def writes(self) -> tuple[Write, ...]:
-        return self.body.iter_of_type(Write)
-
-    @property
-    def outputs(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` buf names in body first-use order —
-        the kernel's writeable output parameters. Smem buffers are excluded."""
-        smem = self.smem_names
-        return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
+        return frozenset(self.smem_buffers)
 
 
 # ---------------------------------------------------------------------------

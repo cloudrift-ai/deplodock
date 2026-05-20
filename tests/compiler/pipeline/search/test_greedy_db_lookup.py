@@ -20,7 +20,7 @@ import pytest
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
@@ -111,9 +111,14 @@ def _blockify_variants() -> list[tuple[str, str, dict]]:
     greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     _record_pair(out, _final_tile_op(greedy))
     search = TuningSearch(patience=10**6)
-    candidates = list(Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()))
-    for cand in candidates:
+    option_zero = next(iter(out.values()))[2] if out else None
+    for cand in Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()):
         _record_pair(out, _final_tile_op(cand.graph))
+        # The only consumer (test_seeded_lowering_overrides_option_zero) just
+        # needs one variant whose knobs differ from option-0; stop as soon as
+        # we have it instead of draining the full autotune sweep (~3+ min).
+        if option_zero is not None and any(v[2] != option_zero for v in out.values()):
+            break
     return list(out.values())
 
 

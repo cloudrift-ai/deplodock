@@ -38,11 +38,9 @@ The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
 from __future__ import annotations
 
 import enum
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -70,6 +68,7 @@ from deplodock.compiler.ir.stmt import (
     Write,
     pretty_body,
 )
+from deplodock.compiler.ir.stmt.ir import BodyOp
 
 # ---------------------------------------------------------------------------
 # Schedule-bearing Stmts
@@ -302,6 +301,12 @@ class Stage(Stmt):
     def deps(self) -> tuple[str, ...]:
         return ()
 
+    def external_reads(self) -> tuple[str, ...]:
+        return tuple(s.input for s in self.source_loads)
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.name,)
+
     # ------------------------------------------------------------------
     # Derived slab-geometry views (legacy ``buf`` / ``origin`` /
     # ``addressing`` field accessors, re-expressed as body-driven
@@ -531,16 +536,13 @@ class TmaBufferedStage(BufferedStage):
 
 
 @dataclass
-class TileOp(Op):
+class TileOp(BodyOp):
     """One GPU kernel as a Tile IR program — pre-materialization.
 
-    Op subclass parallel to ``LoopOp``: lives as a graph node, carries a
-    body of Tile IR statements plus a kernel name. Materialization turns
-    a ``TileOp`` into a ``KernelOp``.
+    :class:`BodyOp` subclass parallel to ``LoopOp``: lives as a graph
+    node, carries a body of Tile IR statements plus a kernel name.
+    Materialization turns a ``TileOp`` into a ``KernelOp``.
     """
-
-    body: Body = field(default_factory=Body)
-    name: str = ""
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
@@ -554,16 +556,7 @@ class TileOp(Op):
         n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
         if n_tiles > 1:
             raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
-
-    def __iter__(self) -> Iterator[Stmt]:
-        return self.body.iter()
-
-    def pretty_body(self) -> str:
-        """Render as an indented structural listing via per-stmt ``pretty``."""
-        sig_in = ", ".join(self.inputs) or "-"
-        sig_out = ", ".join(self.outputs) or "-"
-        head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
-        return "\n".join([head, *pretty_body(self.body, "    ")])
+        self._seed_io_placeholders()
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would
@@ -738,30 +731,6 @@ class TileOp(Op):
             score += 1.0
 
         return score
-
-    @property
-    def inputs(self) -> tuple[str, ...]:
-        """Distinct external-buffer names in body first-use order.
-
-        A buffer is external if it's loaded from but not produced by a
-        ``Stage`` in this TileOp. Loads of staged names are skipped
-        (those bufs are smem-local at materialization). Stage source
-        bufs (``Stage.buf``) are included — they're the actual external
-        reads, performed by the cooperative load."""
-        stage_names = {s.name for s in self if isinstance(s, Stage)}
-        bufs: dict[str, None] = {}
-        for s in self:
-            if isinstance(s, Stage):
-                for src in s.source_loads:
-                    bufs.setdefault(src.input, None)
-            elif isinstance(s, Load) and s.input not in stage_names:
-                bufs.setdefault(s.input, None)
-        return tuple(bufs)
-
-    @property
-    def outputs(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` buf names in body first-use order."""
-        return tuple(dict.fromkeys(s.output for s in self.body.writes))
 
 
 # ---------------------------------------------------------------------------
