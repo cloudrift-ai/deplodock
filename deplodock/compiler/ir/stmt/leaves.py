@@ -348,19 +348,17 @@ class Write(Stmt):
 
     def render(self, ctx: RenderCtx) -> list[str]:
         flat = render_index(self.output, self.index, ctx)
-        if self.reduce_op is not None:
-            return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {self.value});"]
         # Convert at the store boundary only when the value's SSA dtype
-        # disagrees with the destination buffer's dtype — native fp16
-        # chains write through with no conversion at all.
+        # disagrees with the destination buffer's dtype — native chains
+        # write through with no conversion. Applies to both plain stores
+        # and atomic reduce-writes (split-K matmul fans an f32
+        # accumulator into an f16 output; without conversion the
+        # ``atomicAdd(__half*, float)`` call is silently broken).
         value_dt = ctx.ssa_dtypes.get(self.value, "f32")
         out_dt = ctx.buffer_dtypes.get(self.output, "f32")
-        rhs = self.value
-        if value_dt != out_dt:
-            if out_dt == "f16":
-                rhs = f"__float2half({self.value})"
-            elif out_dt == "f32" and value_dt == "f16":
-                rhs = f"__half2float({self.value})"
+        rhs = _convert_to(self.value, value_dt, out_dt)
+        if self.reduce_op is not None:
+            return [f"{_pad(ctx.indent)}atomicAdd(&{self.output}[{flat}], {rhs});"]
         return [f"{_pad(ctx.indent)}{self.output}[{flat}] = {rhs};"]
 
 
