@@ -13,7 +13,6 @@ from __future__ import annotations
 from math import prod
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
@@ -26,21 +25,16 @@ PATTERN = [Pattern("root", KernelOp)]
 _BLOCK = 256
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
-    graph = match.graph
-
+def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
     # Per-buffer Tensor descriptors (shape + dtype) come straight off
     # ``root.op.inputs`` / ``root.op.outputs`` — the matcher snapped them
-    # to the surrounding graph's Tensors via ``populate_io``.
+    # to the surrounding graph's Tensors via ``populate_io``, including
+    # the ``constant`` / ``value`` flags for ConstantOp predecessors.
     tensors: dict[str, Tensor] = {**root.op.inputs, **root.op.outputs}
 
     # Scalar ConstantOp inputs get embedded as float literals in the kernel
     # body — no kernel parameter, no buffer load.
-    literal_constants: dict[str, float] = {}
-    for bid in root.op.inputs:
-        node = graph.nodes.get(bid)
-        if node is not None and isinstance(node.op, ConstantOp) and node.op.value is not None:
-            literal_constants[bid] = float(node.op.value)
+    literal_constants: dict[str, float] = {n: float(t.value) for n, t in root.op.inputs.items() if t.constant and t.value is not None}
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
 

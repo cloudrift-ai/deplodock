@@ -51,7 +51,6 @@ from dataclasses import replace as _replace
 from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, StridedLoop, Tile
@@ -62,25 +61,11 @@ PATTERN = [Pattern("root", KernelOp)]
 _TARGET = CudaRenderTarget()
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
     kop: KernelOp = root.op
-
-    # Loads from scalar ``ConstantOp`` inputs get inlined as float
-    # literals at CUDA lowering (``001_lower_kernelop`` populates
-    # ``literal_constants`` and the surrounding kernel doesn't even
-    # take that buffer as a parameter). We must not vectorize Loads
-    # from such buffers — the reinterpret_cast would reference a name
-    # that doesn't exist in the rendered kernel.
-    literal_const_bufs: set[str] = set()
-    for bid in kop.inputs:
-        node = match.graph.nodes.get(bid)
-        if node is not None and isinstance(node.op, ConstantOp) and node.op.value is not None:
-            literal_const_bufs.add(bid)
-
-    new_body = _vectorize_body(kop, kop.body, literal_const_bufs)
+    new_body = _vectorize_body(kop, kop.body)
     if new_body == kop.body:
         raise RuleSkipped("no vectorizable Load runs found")
-
     return KernelOp(body=new_body, name=kop.name)
 
 
@@ -99,26 +84,26 @@ def _buf_dtype(kop: KernelOp, name: str) -> str:
     return "f32"
 
 
-def _vectorize_body(kop: KernelOp, body: Body, literal_const_bufs: set[str]) -> Body:
+def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
     scan this scope for consecutive-Load runs. Threads ``kop`` through so
     ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
     descended: list[Stmt] = []
     for s in body:
         if isinstance(s, Loop):
-            descended.append(_replace(s, body=_vectorize_body(kop, s.body, literal_const_bufs)))
+            descended.append(_replace(s, body=_vectorize_body(kop, s.body)))
         elif isinstance(s, StridedLoop):
-            descended.append(_replace(s, body=_vectorize_body(kop, s.body, literal_const_bufs)))
+            descended.append(_replace(s, body=_vectorize_body(kop, s.body)))
         elif isinstance(s, Cond):
             descended.append(
                 Cond(
                     cond=s.cond,
-                    body=_vectorize_body(kop, s.body, literal_const_bufs),
-                    else_body=_vectorize_body(kop, s.else_body, literal_const_bufs),
+                    body=_vectorize_body(kop, s.body),
+                    else_body=_vectorize_body(kop, s.else_body),
                 )
             )
         elif isinstance(s, Tile):
-            descended.append(Tile(axes=s.axes, body=_vectorize_body(kop, s.body, literal_const_bufs)))
+            descended.append(Tile(axes=s.axes, body=_vectorize_body(kop, s.body)))
         else:
             descended.append(s)
 
@@ -127,7 +112,7 @@ def _vectorize_body(kop: KernelOp, body: Body, literal_const_bufs: set[str]) -> 
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_load(descended, i, run_n, kop, literal_const_bufs)
+            vec = _try_vec_load(descended, i, run_n, kop)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -139,7 +124,7 @@ def _vectorize_body(kop: KernelOp, body: Body, literal_const_bufs: set[str]) -> 
     return Body(tuple(out))
 
 
-def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp, literal_const_bufs: set[str]) -> Load | None:
+def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> Load | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Load pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     source buffer's dtype, return the widened :class:`Load`. Otherwise
@@ -161,7 +146,8 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp, lite
     if len(inputs) != 1:
         return None
     (input_name,) = inputs
-    if input_name in literal_const_bufs:
+    src_tensor = kop.inputs.get(input_name)
+    if src_tensor is not None and src_tensor.constant and src_tensor.value is not None:
         # Scalar-constant inputs get inlined at CUDA lowering — the
         # surrounding kernel doesn't take that buffer as a parameter,
         # so a vectorized reinterpret_cast would reference an undefined

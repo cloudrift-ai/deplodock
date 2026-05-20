@@ -21,11 +21,22 @@ from deplodock.compiler.dtype import get as _get_dtype
 
 @dataclass
 class Tensor:
-    """Multidimensional array descriptor."""
+    """Multidimensional array descriptor.
+
+    ``constant`` marks tensors whose value is fixed at compile time
+    (``ConstantOp.output`` — weights, RoPE tables, scalar literals).
+    ``value`` carries the captured scalar when the constant is a
+    0-D float (``ConstantOp.value is not None``); otherwise ``None``.
+    Together they let downstream consumers (cuda lowering, the load
+    vectorizer) recognize a scalar-literal buffer without re-querying
+    the graph for ``ConstantOp`` predecessors.
+    """
 
     name: str
     shape: tuple[int | str, ...]  # concrete ints or symbolic dim names
     dtype: DataType = F32
+    constant: bool = False
+    value: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.dtype, DataType):

@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.base import ConstantOp, Op
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.base import pretty_body as _pretty_body_stmts
 from deplodock.compiler.ir.stmt.body import Body
@@ -113,11 +113,11 @@ class BodyOp(Op):
         for name in self.inputs:
             gnode = graph.nodes.get(name)
             if gnode is not None:
-                self.inputs[name] = gnode.output
+                self.inputs[name] = _tensor_for_node(gnode)
         for name in self.outputs:
             gnode = graph.nodes.get(name)
             if gnode is not None:
-                self.outputs[name] = gnode.output
+                self.outputs[name] = _tensor_for_node(gnode)
 
     def pretty_body(self) -> str:
         """Indented body listing — one stmt per line via per-stmt
@@ -125,3 +125,14 @@ class BodyOp(Op):
         ``Candidate._format_nodes``) emit the surrounding name / I/O
         label themselves; duplicating it here would just rot."""
         return "\n".join(_pretty_body_stmts(self.body, "    "))
+
+
+def _tensor_for_node(node) -> Tensor:  # noqa: ANN001 — Node lives in compiler.graph; would cycle to import.
+    """Return ``node.output``, but for ``ConstantOp`` predecessors stamp
+    ``constant=True`` (and ``value`` for scalar literals) onto a fresh
+    Tensor so downstream consumers can recognize literal-scalar buffers
+    without re-querying the graph for ConstantOp predecessors."""
+    t = node.output
+    if isinstance(node.op, ConstantOp):
+        return Tensor(t.name, t.shape, t.dtype, constant=True, value=node.op.value)
+    return t
