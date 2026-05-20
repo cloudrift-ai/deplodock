@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.expr import Expr, _float_lit
+from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum
@@ -73,10 +74,16 @@ class Loop(Stmt):
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt.leaves import _cuda_type, _identity_literal  # noqa: PLC0415
+
         pad = _pad(ctx.indent)
         out: list[str] = []
-        # Per-Loop ``float <acc> = identity;`` for each distinct Accum in the
-        # immediate body — suppressed when an enclosing Init already declared it.
+        # Per-Loop ``<dtype> <acc> = identity;`` for each distinct Accum in
+        # the immediate body — suppressed when an enclosing Init already
+        # declared it. dtype comes from the Accum's optional ``dtype`` field
+        # (defaults to fp32) so fp32-over-fp16 accumulators declare as
+        # ``float acc = 0.0f;`` while a fp16-typed Accum declares as
+        # ``__half acc = __float2half(0.0f);``.
         seen: set[str] = set()
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
@@ -86,7 +93,8 @@ class Loop(Stmt):
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
-                out.append(f"{pad}float {s.name} = {_float_lit(float(identity))};")
+                out.append(f"{pad}{_cuda_type(s.dtype)} {s.name} = {_identity_literal(identity, s.dtype)};")
+                ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
         extent = int(self.axis.extent)
         if self.unroll:
@@ -309,6 +317,8 @@ class StridedLoop(Stmt):
     def render(self, ctx: RenderCtx) -> list[str]:
         """``for (int axis = start; axis < extent; axis += step)`` with the
         same per-Loop accumulator-init prelude as ``Loop.render``."""
+        from deplodock.compiler.ir.stmt.leaves import _cuda_type, _identity_literal  # noqa: PLC0415
+
         pad = _pad(ctx.indent)
         out: list[str] = []
         seen: set[str] = set()
@@ -320,7 +330,8 @@ class StridedLoop(Stmt):
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
-                out.append(f"{pad}float {s.name} = {_float_lit(float(identity))};")
+                out.append(f"{pad}{_cuda_type(s.dtype)} {s.name} = {_identity_literal(identity, s.dtype)};")
+                ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)

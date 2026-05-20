@@ -182,6 +182,12 @@ def render_kernelop(
     if shapes:
         for n, s in shapes.items():
             tmap.setdefault(n, Tensor(n, tuple(s)))
+    # Fall back to the KernelOp's own per-buffer Tensor descriptors when
+    # the caller didn't pass an explicit map. The CUDA-lowering pass
+    # passes ``tensors=`` explicitly; tests that construct a bare KernelOp
+    # with ``input_tensors``/``output_tensors`` rely on this fallback.
+    for n, t in {**kernel_op.input_tensors, **kernel_op.output_tensors}.items():
+        tmap.setdefault(n, t)
     smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
     ctx = RenderCtx(
         shapes={n: tuple(t.shape) for n, t in tmap.items()},

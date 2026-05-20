@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, Var
@@ -66,8 +67,8 @@ def _silu_mul_matmul_tile() -> TileOp:
     tile = Tile(
         axes=(BoundAxis(axis=m, bind=BIND_THREAD), BoundAxis(axis=n, bind=BIND_THREAD), BoundAxis(axis=Axis("blk", 1), bind=BIND_BLOCK)),
         body=(
-            Init(name="acc", op=ElementwiseImpl("add")),
-            Init(name="one", op=ElementwiseImpl("add")),  # placeholder; tracer puts a real const here
+            Init(name="acc", op=ElementwiseImpl("add"), dtype=F32),
+            Init(name="one", op=ElementwiseImpl("add"), dtype=F32),  # placeholder; tracer puts a real const here
             gate_smem,
             up_smem,
             w_smem,

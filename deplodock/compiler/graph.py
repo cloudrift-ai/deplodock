@@ -223,6 +223,9 @@ def _stmt_eval_scope() -> dict:
     global _STMT_EVAL_SCOPE
     if _STMT_EVAL_SCOPE is not None:
         return _STMT_EVAL_SCOPE
+    import numpy as _np
+
+    from deplodock.compiler.dtype import DataType
     from deplodock.compiler.ir.axis import (
         BIND_BLOCK,
         BIND_THREAD,
@@ -302,6 +305,10 @@ def _stmt_eval_scope() -> dict:
         "TreeHalve": TreeHalve,
         "WarpShuffle": WarpShuffle,
         "ElementwiseImpl": ElementwiseImpl,
+        "DataType": DataType,
+        # ``repr(np.dtype('float32'))`` is ``dtype('float32')`` — eval needs
+        # ``dtype`` in scope to round-trip ``DataType.np``.
+        "dtype": _np.dtype,
         "__builtins__": {},
     }
     return _STMT_EVAL_SCOPE

@@ -8,6 +8,7 @@ import importlib
 import os
 from contextlib import contextmanager
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, Var
@@ -69,7 +70,7 @@ def _silu_tile_with_k_outer() -> TileOp:
 
     tile = Tile(
         axes=(BoundAxis(axis=m, bind=BIND_THREAD), BoundAxis(axis=n, bind=BIND_THREAD), BoundAxis(axis=Axis("blk", 1), bind=BIND_BLOCK)),
-        body=(Init(name="acc", op=ElementwiseImpl("add")), outer, Write(output="out", index=(Var("m"),), value="acc")),
+        body=(Init(name="acc", op=ElementwiseImpl("add"), dtype=F32), outer, Write(output="out", index=(Var("m"),), value="acc")),
     )
     return TileOp(body=(tile,), name="silu_pipeline")
 

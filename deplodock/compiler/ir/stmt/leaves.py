@@ -9,9 +9,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, op_to_expr, render_index, select_to_ternary
+
+_CUDA_TYPE_BY_DTYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half"}
+
+
+def _cuda_type(dtype: DataType | None) -> str:
+    """C type spelling for an accumulator local. Falls back to ``float``."""
+    return _CUDA_TYPE_BY_DTYPE_NAME.get((dtype or F32).name, "float")
+
+
+def _identity_literal(identity: float, dtype: DataType | None) -> str:
+    """Render the per-op identity (0, 1, -inf, ...) as a C literal in ``dtype``.
+    Wraps in ``__float2half`` for fp16 so the declaration compiles."""
+    txt = _float_lit(float(identity))
+    if dtype is not None and dtype.name == "f16":
+        return f"__float2half({txt})"
+    return txt
+
+
+def _convert_to(value: str, src_dt: str, dst_dt: str) -> str:
+    """Insert a fp16/f32 conversion intrinsic when ``src_dt`` differs from
+    ``dst_dt``; bare value otherwise."""
+    if src_dt == dst_dt:
+        return value
+    if dst_dt == "f16" and src_dt == "f32":
+        return f"__float2half({value})"
+    if dst_dt == "f32" and src_dt == "f16":
+        return f"__half2float({value})"
+    return value
 
 
 @dataclass(frozen=True)
@@ -168,6 +197,14 @@ class Accum(Stmt):
     name: str
     value: str
     op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("add"))
+    # Optional accumulator dtype. ``None`` in Loop IR — derived at lowering
+    # time. The Init-placement pass freezes this to a concrete
+    # :class:`DataType` (typically ``F32`` for fp16 reductions). When set,
+    # ``Accum.render`` declares the local in that dtype and inserts a
+    # ``__half2float`` / ``__float2half`` on ``value`` only when ``value``'s
+    # dtype disagrees with the accumulator's. ``None`` preserves the legacy
+    # f32 rendering.
+    dtype: DataType | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.op, str):
@@ -186,19 +223,26 @@ class Accum(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{self.name} <- {self.op.name}({self.name}, {self.value})"]
+        dt = f" :{self.dtype.name}" if self.dtype is not None else ""
+        return [f"{indent}{self.name}{dt} <- {self.op.name}({self.name}, {self.value})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         op_name = self.op.name
+        # Accumulator dtype — explicit on Accum once the Init-placement pass
+        # has frozen it; otherwise default to fp32 (legacy behavior).
+        acc_dt = (self.dtype or F32).name
+        ctx.ssa_dtypes[self.name] = acc_dt
+        value_dt = ctx.ssa_dtypes.get(self.value, "f32")
+        rhs = _convert_to(self.value, value_dt, acc_dt)
         if op_name in ("maximum", "amax"):
-            spelling = ctx.intrinsics.get("fmax", "fmax")
-            return [f"{pad}{self.name} = {spelling}({self.name}, {self.value});"]
+            spelling = ctx.intrinsics.get("fmax", "fmax") if acc_dt == "f32" else ctx.intrinsics_fp16.get("fmax", "__hmax")
+            return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
         if op_name == "minimum":
-            spelling = ctx.intrinsics.get("fmin", "fmin")
-            return [f"{pad}{self.name} = {spelling}({self.name}, {self.value});"]
+            spelling = ctx.intrinsics.get("fmin", "fmin") if acc_dt == "f32" else ctx.intrinsics_fp16.get("fmin", "__hmin")
+            return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
-        return [f"{pad}{self.name} {op} {self.value};"]
+        return [f"{pad}{self.name} {op} {rhs};"]
 
 
 @dataclass(frozen=True)
@@ -223,10 +267,19 @@ class Init(Stmt):
 
     name: str
     op: ElementwiseImpl
+    # Accumulator dtype — required. Placing an ``Init`` is the freeze
+    # point; the pass that emits it must commit to a concrete dtype. The
+    # same pass stamps the matching ``Accum``'s ``dtype`` to this value
+    # so the IR stays self-consistent.
+    dtype: DataType = field(kw_only=True)
 
     def __post_init__(self) -> None:
         if isinstance(self.op, str):
             object.__setattr__(self, "op", ElementwiseImpl(self.op))
+        if isinstance(self.dtype, str):
+            from deplodock.compiler.dtype import get as _get  # noqa: PLC0415
+
+            object.__setattr__(self, "dtype", _get(self.dtype))
 
     def deps(self) -> tuple[str, ...]:
         return ()
@@ -235,14 +288,15 @@ class Init(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}Init({self.name}, op={self.op.name})"]
+        return [f"{indent}Init({self.name} :{self.dtype.name}, op={self.op.name})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         identity = self.op.identity
         if identity is None:
             raise ValueError(f"Init {self.name!r} op {self.op.name!r} has no identity")
         ctx.explicit_inits.add(self.name)
-        return [f"{_pad(ctx.indent)}float {self.name} = {_float_lit(float(identity))};"]
+        ctx.ssa_dtypes[self.name] = self.dtype.name
+        return [f"{_pad(ctx.indent)}{_cuda_type(self.dtype)} {self.name} = {_identity_literal(identity, self.dtype)};"]
 
 
 # Map ``ElementwiseImpl`` op names to compound-assignment operator symbols

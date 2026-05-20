@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.ir.tile.ir import TileOp
@@ -65,6 +66,11 @@ def _place_inits_in_scope(body: tuple) -> tuple:
     scope body. Then recurse into any nested free Loops to repeat at
     their scope.
 
+    Decides accumulator dtype at placement time (the "freeze" point). For
+    now: always ``F32``. The fp16-promotion policy that picks ``F32`` for
+    reductions over fp16 values is a follow-up — once it lands here, the
+    matching ``Accum`` Stmts get stamped with the same dtype.
+
     Idempotent on its own output: Accums whose Init already exists at
     this scope are left alone, so repeated applications converge."""
     existing: set[str] = {s.name for s in body if isinstance(s, Init)}
@@ -75,12 +81,24 @@ def _place_inits_in_scope(body: tuple) -> tuple:
                 continue
             inits_here.setdefault(a.name, a)
 
+    init_dtypes: dict[str, DataType] = {n: _decide_dtype(a) for n, a in inits_here.items()}
+
     new_body: list[Stmt] = []
     for s in body:
-        new_body.append(_recurse(s))
+        new_body.append(_recurse(s, init_dtypes))
 
-    init_stmts: list[Stmt] = [Init(name=n, op=a.op) for n, a in inits_here.items()]
+    init_stmts: list[Stmt] = [Init(name=n, op=a.op, dtype=init_dtypes[n]) for n, a in inits_here.items()]
     return tuple(init_stmts + new_body)
+
+
+def _decide_dtype(accum: Accum) -> DataType:
+    """Pick the accumulator dtype at Init-placement time.
+
+    For now: ``F32`` for every reduction. fp16 promotion policy lives
+    here once we wire the inference (look at the value's SSA chain and
+    promote when inputs are fp16 — already correct since ``F32`` is the
+    desired result regardless)."""
+    return accum.dtype or F32
 
 
 def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
@@ -134,7 +152,7 @@ def _is_reduce_recursive(loop: Loop | StridedLoop) -> bool:
     return has_inner_reduce
 
 
-def _recurse(stmt: Stmt) -> Stmt:
+def _recurse(stmt: Stmt, init_dtypes: dict[str, DataType]) -> Stmt:
     """Descend into block-structured stmts so nested free Loops get their
     own Init placement at their own scope. Same recursive-reduce
     distinction as ``_accums_under_reduces_only``: a Loop that
@@ -142,16 +160,21 @@ def _recurse(stmt: Stmt) -> Stmt:
     without opening a new scope. ``StridedLoop`` is treated identically
     — SDPA's per-output free StridedLoop wraps a free Loop chain plus a
     Write, so it's not reduce-crossable and must open a scope so the
-    inner Accum's Init lands inside (resetting per-iteration)."""
+    inner Accum's Init lands inside (resetting per-iteration).
+
+    Stamps the accumulator dtype on every ``Accum`` whose name we just
+    placed an Init for at the enclosing scope, so Init and Accum agree."""
+    if isinstance(stmt, Accum) and stmt.name in init_dtypes:
+        return replace(stmt, dtype=init_dtypes[stmt.name])
     if isinstance(stmt, (Loop, StridedLoop)):
         if _is_reduce_recursive(stmt):
-            return replace(stmt, body=tuple(_recurse(c) for c in stmt.body))
+            return replace(stmt, body=tuple(_recurse(c, init_dtypes) for c in stmt.body))
         # Free loop — its body is its own scope; place Inits there.
         return replace(stmt, body=_place_inits_in_scope(stmt.body))
     if isinstance(stmt, Cond):
         return Cond(
             cond=stmt.cond,
-            body=tuple(_recurse(c) for c in stmt.body),
-            else_body=tuple(_recurse(c) for c in stmt.else_body),
+            body=tuple(_recurse(c, init_dtypes) for c in stmt.body),
+            else_body=tuple(_recurse(c, init_dtypes) for c in stmt.else_body),
         )
     return stmt

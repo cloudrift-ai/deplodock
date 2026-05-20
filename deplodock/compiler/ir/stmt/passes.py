@@ -70,12 +70,12 @@ def _(s: Assign, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Accum(name=rename(s.name), value=rename(s.value), op=s.op)
+    return Accum(name=rename(s.name), value=rename(s.value), op=s.op, dtype=s.dtype)
 
 
 @rewrite.register
 def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Init(name=rename(s.name), op=s.op)
+    return Init(name=rename(s.name), op=s.op, dtype=s.dtype)
 
 
 @rewrite.register
