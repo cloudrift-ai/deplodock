@@ -8,8 +8,12 @@ method does the per-line emission.
 
 from __future__ import annotations
 
+from deplodock.compiler.backend.cuda.dtype import cuda_includes, cuda_name
+from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
+from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
 from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
+from deplodock.compiler.tensor import Tensor
 
 # Per-CTA static-smem hard cap on every CUDA arch we target. Above this,
 # PTXAS rejects ``__shared__ T arr[N]`` decls (``uses too much shared
@@ -18,8 +22,6 @@ from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
 # total Smem footprint exceeds this, ``render_kernelop`` switches to a
 # single dynamic pool with per-buffer offsets.
 STATIC_SMEM_CAP = 48 * 1024
-
-_DTYPE_BYTES: dict[str, int] = {"float": 4, "double": 8, "int": 4, "half": 2, "unsigned long long": 8}
 
 # TMA / mbarrier prelude. NVRTC doesn't ship ``<cuda.h>`` /
 # ``<cuda/ptx>`` / ``<cuda/barrier>``, so we can't ``#include`` the
@@ -145,42 +147,65 @@ _BLOCK_SIZE = 256
 
 def render_kernelop(
     kernel_op: KernelOp,
+    tensors: dict[str, Tensor] | None = None,
     shapes: dict[str, tuple[int, ...]] | None = None,
     literal_constants: dict[str, float] | None = None,
 ) -> str:
     """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
-    ``shapes`` maps each global-buffer name (anything appearing on a
-    ``Load.input`` or ``Write.output``) to its declared shape; the
-    renderer uses it to row-major-flatten multi-dim indices. Production
-    callers typically build ``shapes`` from the surrounding graph
-    (``{nid: graph.nodes[nid].output.shape for nid in ...}``); tests pass
-    it as a literal dict.
+    ``tensors`` maps each global-buffer name (anything appearing on a
+    ``Load.input`` or ``Write.output``) to a :class:`Tensor` describing
+    its shape + dtype. The renderer uses the shape to row-major-flatten
+    multi-dim indices and the dtype for kernel-signature param types.
+    Production callers typically build this from the surrounding graph
+    (``{nid: graph.nodes[nid].output for nid in ...}``); tests pass it
+    as a literal dict.
+
+    ``shapes`` is the legacy form (shape-only, no dtype) — kept for
+    back-compat with tests that pre-date the dtype migration; dtypes
+    default to F32 in that path. New callers should prefer ``tensors``.
 
     ``literal_constants`` maps input-buffer names to scalar values that
-    should be embedded in the kernel body as float literals instead of
-    passed as ``float*`` parameters. Loads of those bufs render as
+    should be embedded in the kernel body as ``float`` literals instead
+    of passed as kernel parameters. Loads of those bufs render as
     ``float name = <value>;`` (see ``Load.render``) and the buf is
     excluded from the kernel signature.
 
-    Kernel signature is derived from the body: ``kernel_op.inputs`` (distinct
-    ``Load.input`` names) become ``const float*`` params, ``kernel_op.outputs``
-    (distinct ``Write.output`` names) become ``float*`` params, ordered
-    by first appearance. Literal-constant inputs are skipped.
+    Kernel signature is derived from the body: ``kernel_op.inputs``
+    (distinct ``Load.input`` names) become input params,
+    ``kernel_op.outputs`` (distinct ``Write.output`` names) become
+    writeable output params, ordered by first appearance. Parameter
+    types come from the per-buffer :class:`Tensor.dtype`; literal-constant
+    inputs are skipped.
     """
     literals = dict(literal_constants or {})
+    tmap: dict[str, Tensor] = dict(tensors) if tensors else {}
+    if shapes:
+        for n, s in shapes.items():
+            tmap.setdefault(n, Tensor(n, tuple(s)))
+    # Fall back to the KernelOp's own per-buffer Tensor descriptors when
+    # the caller didn't pass an explicit map. The CUDA-lowering pass
+    # passes ``tensors=`` explicitly; tests that construct a bare KernelOp
+    # with ``input_tensors``/``output_tensors`` rely on this fallback.
+    for n, t in {**kernel_op.input_tensors, **kernel_op.output_tensors}.items():
+        tmap.setdefault(n, t)
     smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
     ctx = RenderCtx(
-        shapes=dict(shapes or {}),
+        target=CudaRenderTarget(),
+        shapes={n: tuple(t.shape) for n, t in tmap.items()},
         indent=1,
         intrinsics=_INTRINSIC_TO_CUDA,
         builtins=_BUILTIN_TO_CUDA,
         literal_constants=literals,
         smem_dynamic_offsets=smem_offsets,
+        buffer_dtypes={n: t.dtype.name for n, t in tmap.items()},
     )
 
-    sig_parts = [f"const float* {n}" for n in kernel_op.inputs if n not in literals]
-    sig_parts.extend(f"float* {n}" for n in kernel_op.outputs)
+    def _dtype_for(name: str, fallback: object) -> object:
+        return tmap[name].dtype if name in tmap else fallback
+
+    sig_parts = [f"const {cuda_name(_dtype_for(n, kernel_op.input_dtype(n)))}* {n}" for n in kernel_op.inputs if n not in literals]
+    sig_parts.extend(f"{cuda_name(_dtype_for(n, kernel_op.output_dtype(n)))}* {n}" for n in kernel_op.outputs)
     # TMA descriptors are passed as ``__grid_constant__`` value parameters.
     # The kernel only takes their address (``&desc``) for inline asm, so
     # the opaque ``CUtensorMap`` forward decl above suffices.
@@ -207,7 +232,10 @@ def render_kernelop(
         pool_decl = f"    extern __shared__ __align__(16) unsigned char _smem_pool[];  // {smem_total} bytes\n"
         body_text = pool_decl + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
-    return f'{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
+    sig_dtypes = [_dtype_for(n, kernel_op.input_dtype(n)) for n in kernel_op.inputs if n not in literals]
+    sig_dtypes.extend(_dtype_for(n, kernel_op.output_dtype(n)) for n in kernel_op.outputs)
+    includes = "".join(f"#include {h}\n" for h in cuda_includes(sig_dtypes))
+    return f'{includes}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 
 
 def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], int]:
@@ -233,7 +261,7 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
         elements = 1
         for e in s.extents:
             elements *= int(e)
-        n_bytes = elements * _DTYPE_BYTES.get(s.dtype, 4)
+        n_bytes = elements * _nbytes_of(s.dtype)
         total += n_bytes
         sizes.append((s, n_bytes))
     if total <= STATIC_SMEM_CAP:
@@ -242,7 +270,7 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
     offsets: dict[str, int] = {}
     cursor = 0
     for s, n_bytes in sizes:
-        natural = _DTYPE_BYTES.get(s.dtype, 4)
+        natural = _nbytes_of(s.dtype)
         align = max(natural, int(s.align) if s.align else 0)
         cursor = (cursor + align - 1) // align * align
         offsets[s.name] = cursor

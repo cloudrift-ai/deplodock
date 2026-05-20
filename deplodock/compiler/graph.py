@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from deplodock.compiler.ir.base import InputOp, Op
+from deplodock.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
 # Hints
@@ -98,15 +99,6 @@ def resolve_hints(graph: Graph, node_id: str) -> Hints:
 # ---------------------------------------------------------------------------
 # Tensor + Node + Graph
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Tensor:
-    """Multidimensional array descriptor."""
-
-    name: str
-    shape: tuple[int | str, ...]  # concrete ints or symbolic dim names
-    dtype: str = "f32"
 
 
 @dataclass
@@ -231,6 +223,9 @@ def _stmt_eval_scope() -> dict:
     global _STMT_EVAL_SCOPE
     if _STMT_EVAL_SCOPE is not None:
         return _STMT_EVAL_SCOPE
+    import numpy as _np
+
+    from deplodock.compiler.dtype import DataType
     from deplodock.compiler.ir.axis import (
         BIND_BLOCK,
         BIND_THREAD,
@@ -255,10 +250,13 @@ def _stmt_eval_scope() -> dict:
         Init,
         Load,
         Loop,
+        Pack,
         Select,
         SelectBranch,
         StridedLoop,
         Tile,
+        Unpack,
+        VecLoad,
         Write,
     )
     from deplodock.compiler.ir.tile.ir import (
@@ -286,6 +284,9 @@ def _stmt_eval_scope() -> dict:
         "TernaryExpr": TernaryExpr,
         "CastExpr": CastExpr,
         "Load": Load,
+        "Pack": Pack,
+        "Unpack": Unpack,
+        "VecLoad": VecLoad,
         "Assign": Assign,
         "Accum": Accum,
         "Init": Init,
@@ -310,6 +311,10 @@ def _stmt_eval_scope() -> dict:
         "TreeHalve": TreeHalve,
         "WarpShuffle": WarpShuffle,
         "ElementwiseImpl": ElementwiseImpl,
+        "DataType": DataType,
+        # ``repr(np.dtype('float32'))`` is ``dtype('float32')`` — eval needs
+        # ``dtype`` in scope to round-trip ``DataType.np``.
+        "dtype": _np.dtype,
         "__builtins__": {},
     }
     return _STMT_EVAL_SCOPE
@@ -754,7 +759,7 @@ class Graph:
                 "output": {
                     "name": node.output.name,
                     "shape": list(node.output.shape),
-                    "dtype": node.output.dtype,
+                    "dtype": node.output.dtype.name,
                 },
             }
             if node.hints:

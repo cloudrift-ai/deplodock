@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
@@ -77,11 +78,22 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
-def rewrite(root: Node) -> Graph | None:
+def rewrite(match, root: Node) -> Graph | None:
+    # Per-graph-buffer CUDA C type names (e.g. ``"__half"``) so Stage
+    # materialization can stamp the matching ``Smem.dtype`` instead of
+    # the legacy ``"float"`` default. Covers anything reachable as a
+    # ``Stage.buf`` — the TileOp's input nodes are the natural set.
+    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+    buf_cuda: dict[str, str] = {}
+    for bid in root.inputs:
+        node = match.graph.nodes.get(bid)
+        if node is not None:
+            buf_cuda[bid] = cuda_name(node.output.dtype)
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, Tile):
-            new_body.append(_materialize(s))
+            new_body.append(_materialize(s, buf_cuda))
         else:
             new_body.append(s)
 
@@ -93,7 +105,8 @@ def rewrite(root: Node) -> Graph | None:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: Tile) -> Stmt:
+def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
+    buf_cuda = buf_cuda or {}
     """Materialize a Tile. ``Tile.axes`` carries the launch geometry
     (THREAD + optional BLOCK axes); strategies set this up — this pass
     commits no axis decisions of its own. The body is walked uniformly
@@ -368,13 +381,13 @@ def _materialize(blk: Tile) -> Stmt:
             new_body.extend(filter_emit(emit_tma_stage(stmt)))
             pending_reduce = None
         elif isinstance(stmt, Stage):
-            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
+            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads, buf_cuda)))
             pending_reduce = None
         elif isinstance(stmt, AsyncWait):
             new_body.extend(emit_async_wait(stmt))
             pending_reduce = None
         elif isinstance(stmt, (Loop, StridedLoop)):
-            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
+            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
             if stmt.is_reduce:
                 # Combine matching needs the Accum at the immediate-body
                 # level (single-loop reduce). For nested-reduce shapes
@@ -394,7 +407,8 @@ def _materialize(blk: Tile) -> Stmt:
             # Assign fold between the multi-Accum StridedLoop and the
             # Combine — so Combine.name may instead reference that fold's
             # output. The combine emission only needs (name, op).
-            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads))
+            accum_dtype = (pending_reduce.dtype or F32) if pending_reduce is not None else F32
+            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, accum_dtype))
             rename[stmt.name] = f"{stmt.name}_b"
             pending_reduce = None
         else:
@@ -465,7 +479,7 @@ def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
     return out
 
 
-def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda) -> Stmt:
     """Translate a body Loop or StridedLoop. Recurses so nested staging
     / loops / writes inside the body get the same uniform treatment.
     The wrapper type (Loop vs StridedLoop) is preserved — strategies
@@ -483,11 +497,11 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
         if isinstance(s, TmaBufferedStage):
             inner.extend(filter_emit(emit_tma_stage(s)))
         elif isinstance(s, Stage):
-            inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads)))
+            inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads, buf_cuda)))
         elif isinstance(s, AsyncWait):
             inner.extend(emit_async_wait(s))
         elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
+            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
         else:
             inner.append(transform(s))
     return replace(loop, body=inner)
@@ -610,7 +624,7 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
 _WARP_SIZE = 32
 
 
-def _emit_combine(name: str, op, t: str, n_threads: int) -> list[Stmt]:
+def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32) -> list[Stmt]:
     """Emit the cross-thread combine producing ``<name>_b``.
 
     Three paths, picked by ``n_threads``:
@@ -632,36 +646,45 @@ def _emit_combine(name: str, op, t: str, n_threads: int) -> list[Stmt]:
       indexed by ``t``, a single ``TreeHalve`` over ``n_threads``
       reduces in place, broadcast load.
 
+    ``dtype`` flows from the parent ``Accum.dtype`` (set by the
+    Init-placement pass) so the per-warp register, the inter-warp smem
+    slab, and the TreeHalve combine all render in the accumulator's
+    element type — fp16 reductions stay fp16 across the inter-warp
+    step instead of promoting back to fp32 in the broadcast.
+
     The Tile renderer emits ``int lane = threadIdx.x & 31;`` and
     ``int warp = threadIdx.x >> 5;`` for any cooperative Tile with
     ``n_threads > WARP_SIZE`` so the hierarchical path's ``Var("lane")``
     / ``Var("warp")`` references resolve.
     """
+    from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
+
+    smem_c_name = _cuda_name(dtype)
     broadcast_name = f"{name}_b"
     if n_threads <= _WARP_SIZE and (n_threads & (n_threads - 1)) == 0:
-        return [WarpShuffle(name=broadcast_name, value=name, op=op, length=n_threads)]
+        return [WarpShuffle(name=broadcast_name, value=name, op=op, length=n_threads, dtype=dtype)]
     if n_threads % _WARP_SIZE == 0 and (n_threads & (n_threads - 1)) == 0:
         n_warps = n_threads // _WARP_SIZE
         smem_name = f"{name}_smem"
         warp_w = f"{name}_w"
         return [
-            WarpShuffle(name=warp_w, value=name, op=op, length=_WARP_SIZE),
-            Smem(name=smem_name, extents=(n_warps,)),
+            WarpShuffle(name=warp_w, value=name, op=op, length=_WARP_SIZE, dtype=dtype),
+            Smem(name=smem_name, extents=(n_warps,), dtype=smem_c_name),
             Cond(
                 cond=BinaryExpr("==", Var("lane"), Literal(0, "int")), body=(Write(output=smem_name, index=(Var("warp"),), value=warp_w),)
             ),
             Sync(),
-            TreeHalve(buf=smem_name, op=op, length=n_warps, tid_var="warp"),
+            TreeHalve(buf=smem_name, op=op, length=n_warps, tid_var="warp", dtype=dtype),
             # TreeHalve's render ends each loop iter with __syncthreads(), so a
             # trailing Sync here would be a no-op pair with the loop's last sync.
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
         ]
     smem_name = f"{name}_smem"
     return [
-        Smem(name=smem_name, extents=(n_threads,)),
+        Smem(name=smem_name, extents=(n_threads,), dtype=smem_c_name),
         Write(output=smem_name, index=(Var(t),), value=name),
         Sync(),
-        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t),
+        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t, dtype=dtype),
         # See note above on TreeHalve's trailing sync.
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
@@ -692,7 +715,21 @@ def _assert_stage_body_shape(stage: Stage) -> None:
             raise AssertionError(f"Stage {stage.name!r}: body may only contain Load / Assign / final Write, got {type(s).__name__}")
 
 
-def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
+def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str] | None = None) -> list[Stmt]:
+    # ``Smem.dtype`` for a staged gmem buffer matches the gmem source's
+    # CUDA C type (so fp16 inputs stage into ``__half`` smem rather than
+    # promoting to ``float`` mid-load). Multi-source fused stages keep
+    # the default — the fused body's terminal Write produces a value of
+    # the same dtype as the surrounding compute chain.
+    stage_smem_dtype = (buf_cuda or {}).get(stage.buf, "float")
+    # Cooperative-reduce + VW permutation (``009b_permute_cooperative_reduce``)
+    # produces ``__half`` accesses up to 16 bytes wide; the LDS.128
+    # reinterpret-cast needs the smem buffer base to be 16-byte aligned.
+    # The default natural alignment of ``__half[N]`` is 2 bytes, so
+    # explicitly align fp16 staged smem to the widest LDS instruction
+    # (16 bytes). fp32 smem (``float[N]``) is already 4-byte aligned
+    # naturally and the existing LDS.128 path is fine.
+    stage_smem_align = 16 if stage_smem_dtype == "__half" else 0
     """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
 
     The cooperative load reads a contiguous slab of ``stage.buf``
@@ -776,7 +813,20 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         full_extents = padded_extents
         prelude = [Sync()]
 
-    if isinstance(stage, AsyncBufferedStage):
+    # ``cp.async.ca [smem], [gmem], 4`` requires the smem destination to
+    # be 4-byte aligned. For fp32 smem that's automatic (sizeof(float)=4
+    # so every ``float[k]`` is 4-byte aligned). For fp16 smem, only
+    # ``__half[even]`` is 4-byte aligned — the per-thread stride-1
+    # cooperative pattern lands odd-thread writes on 2-byte-aligned
+    # destinations and hits ``cudaErrorMisalignedAddress``.
+    #
+    # PTX ``cp.async`` doesn't support a 2-byte size, so the right
+    # fp16 path is to vectorize 4 halves per thread (8-byte cp.async)
+    # — that needs a stride change in the cooperative load too. Until
+    # that's wired up, fall through to the synchronous Load+Write
+    # path for fp16-staged buffers. The variant is still buffered
+    # (BufferedStage parent class), just not async.
+    if isinstance(stage, AsyncBufferedStage) and stage_smem_dtype == "float":
         # Async transport: emit cooperative cp.async + commit only. The
         # sibling ``AsyncWait`` Stmt that dominates every consumer
         # lowers to ``CpAsyncWait + Sync``; no implicit wait here.
@@ -786,7 +836,11 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
             step=Literal(n_threads, "int"),
             body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
         )
-        return [Smem(name=stage.name, extents=full_extents), cooperative_load, CpAsyncCommit()]
+        return [
+            Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align),
+            cooperative_load,
+            CpAsyncCommit(),
+        ]
 
     if trivial:
         # Trivial body fast path — preserves byte-identical Kernel IR for
@@ -802,7 +856,12 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
                 Write(output=stage.name, index=smem_index, value=load_name),
             ),
         )
-        return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
+        return [
+            *prelude,
+            Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align),
+            cooperative_load,
+            Sync(),
+        ]
 
     # Fused-body path: the Stage body carries the full producer program
     # (Loads from multiple gmem buffers + elementwise compute + final
@@ -832,7 +891,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         step=Literal(n_threads, "int"),
         body=walked_body,
     )
-    return [*prelude, Smem(name=stage.name, extents=full_extents), cooperative_load, Sync()]
+    return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align), cooperative_load, Sync()]
 
 
 def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:

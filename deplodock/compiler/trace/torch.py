@@ -113,9 +113,10 @@ def _get_shape(fx_node: Any) -> tuple:
 
 
 def _get_dtype(fx_node: Any) -> str:
-    meta = fx_node.meta.get("val", None)
-    if meta is not None and hasattr(meta, "dtype"):
-        return str(meta.dtype).replace("torch.", "")
+    meta = getattr(fx_node, "meta", None)
+    val = meta.get("val", None) if isinstance(meta, dict) else None
+    if val is not None and hasattr(val, "dtype"):
+        return str(val.dtype).replace("torch.", "")
     return "f32"
 
 
@@ -131,10 +132,13 @@ def _resolve_inputs(fx_node: Any, node_map: dict[str, str], g: Graph | None = No
                     result.append(node_map[item.name])
         elif isinstance(a, (int, float)) and not isinstance(a, bool) and g is not None:
             const_name = f"{fx_node.name}_c{len(result)}"
+            # Inherit dtype from the consuming op's output — scalar literals
+            # in mixed-dtype graphs (fp16 * 0.5, etc.) must stay in the
+            # consumer's dtype to avoid widening every elementwise step.
             const_id = g.add_node(
                 op=ConstantOp(name=const_name, value=float(a)),
                 inputs=[],
-                output=Tensor(const_name, (1,), "f32"),
+                output=Tensor(const_name, (1,), _get_dtype(fx_node)),
                 node_id=const_name,
             )
             node_map[const_name] = const_id

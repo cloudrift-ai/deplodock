@@ -18,6 +18,19 @@ from deplodock.compiler.ir.sigma import Sigma
 if TYPE_CHECKING:
     from deplodock.compiler.ir.stmt.body import Body
     from deplodock.compiler.ir.stmt.leaves import Select
+    from deplodock.compiler.render_target import RenderTarget
+
+
+def _default_render_target():
+    """Lazy default: a :class:`CudaRenderTarget` instance. Used when
+    ``RenderCtx`` is constructed without an explicit target — keeps the
+    legacy "everything is CUDA" behavior for tests / golden output.
+
+    Lazy to avoid importing the backend at IR-module load time."""
+    from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget  # noqa: PLC0415
+
+    return CudaRenderTarget()
+
 
 INDENT = "    "
 
@@ -29,15 +42,25 @@ INDENT = "    "
 
 @dataclass
 class RenderCtx:
-    """Per-render state. Targets pre-fill ``intrinsics`` / ``builtins`` with
-    target-specific spellings (``"exp" → "expf"``, ``"thread_idx.x" →
-    "threadIdx.x"``, ...). ``shapes`` maps every buffer to its declared
-    shape so multi-dim ``Load`` / ``Write`` indices can be flattened
-    row-major. ``explicit_inits`` carries the set of accumulator names
-    whose init has been emitted by an enclosing ``Init`` Stmt — Loop's
-    default per-Loop init is suppressed for those names.
+    """Per-render state. ``target`` is the :class:`RenderTarget` that
+    owns every target-specific C spelling decision (type names,
+    conversion intrinsics, per-dtype op spellings, native-op coverage,
+    vector load shapes). Everything else here is generic walk state.
+
+    ``intrinsics`` / ``builtins`` keep the legacy abstract→spelling
+    indirection used by ``FuncCallExpr.render`` / ``Builtin.render``
+    for symbols that don't vary by dtype (``thread_idx.x`` →
+    ``threadIdx.x``, etc.). Dtype-aware lookups go through
+    ``ctx.target.intrinsic(...)`` instead.
+
+    ``shapes`` maps every buffer to its declared shape so multi-dim
+    ``Load`` / ``Write`` indices can be flattened row-major.
+    ``explicit_inits`` carries the set of accumulator names whose init
+    has been emitted by an enclosing ``Init`` Stmt — Loop's default
+    per-Loop init is suppressed for those names.
     """
 
+    target: RenderTarget = field(default_factory=_default_render_target)
     shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
     indent: int = 1
     intrinsics: dict[str, str] = field(default_factory=dict)
@@ -54,10 +77,29 @@ class RenderCtx:
     # alias into the pool instead of a stand-alone ``__shared__`` array
     # — the only way to exceed the 48 KB static-smem cap.
     smem_dynamic_offsets: dict[str, int] = field(default_factory=dict)
+    # Per-buffer canonical dtype tokens (``"f32"`` / ``"f16"``) for every
+    # global-buffer name (kernel inputs + outputs). ``Load`` declares its
+    # SSA-name local in the source buffer's C type so values flow at
+    # buffer dtype end-to-end where possible; ``Write`` inserts the
+    # target's conversion intrinsic only when the value's dtype disagrees
+    # with the destination buffer's dtype. Missing entries default to
+    # ``"f32"`` so legacy bodies render unchanged.
+    buffer_dtypes: dict[str, str] = field(default_factory=dict)
+    # Per-SSA-name canonical dtype tokens, populated as ``render_body``
+    # walks. ``Load`` writes the source buffer's dtype; ``Assign`` writes
+    # ``promote(args)``. Consumed by downstream ``Assign`` / ``Write`` to
+    # decide native-vs-promote-fallback and to insert conversions.
+    ssa_dtypes: dict[str, str] = field(default_factory=dict)
+    # Render-time hint to ``Literal.render``: when set to a non-default
+    # dtype, float literals render via ``target.literal(text, dtype)``
+    # so they compose with non-default-dtype operands. Set transiently
+    # by ``Assign.render`` around the native expression render.
+    literal_default_dtype: str | None = None
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
         return RenderCtx(
+            target=self.target,
             shapes=self.shapes,
             indent=self.indent + 1,
             intrinsics=self.intrinsics,
@@ -66,7 +108,39 @@ class RenderCtx:
             literal_constants=self.literal_constants,
             literal_ssa=self.literal_ssa,
             smem_dynamic_offsets=self.smem_dynamic_offsets,
+            buffer_dtypes=self.buffer_dtypes,
+            ssa_dtypes=self.ssa_dtypes,
+            literal_default_dtype=self.literal_default_dtype,
         )
+
+    # ---- Convenience wrappers over ``self.target``. These exist so the
+    # render methods read ``ctx.type_name(dt)`` instead of pulling the
+    # target out by hand; they also default ``None`` dtype to F32 so the
+    # call sites don't repeat that boilerplate.
+
+    def type_name(self, dtype) -> str:
+        """C type spelling for a local declaration. Accepts a
+        :class:`DataType`, a canonical-name string, or ``None`` (treated
+        as F32)."""
+        return self.target.type_name(_canonical_dtype_name(dtype))
+
+    def identity_literal(self, identity: float, dtype) -> str:
+        """Render an accumulator's identity (0, 1, -inf, ...) as a C
+        literal in ``dtype``, wrapping with the target's dtype cast if
+        needed (e.g. ``__float2half(0.0f)`` for fp16). Accepts a
+        :class:`DataType`, a canonical-name string, or ``None`` (F32)."""
+        from deplodock.compiler.ir.expr import _float_lit  # noqa: PLC0415
+
+        return self.target.literal(_float_lit(float(identity)), _canonical_dtype_name(dtype))
+
+
+def _canonical_dtype_name(dtype) -> str:
+    """Normalize ``DataType | str | None`` to the canonical dtype token."""
+    if dtype is None:
+        return "f32"
+    if isinstance(dtype, str):
+        return dtype
+    return dtype.name
 
 
 def _pad(n: int) -> str:
@@ -338,20 +412,13 @@ def pretty_body(body: Body, indent: str = "") -> list[str]:
 def render_body(body: Body, ctx: RenderCtx) -> list[str]:
     """Flatten ``stmt.render(ctx)`` over a body sequence.
 
-    Vectorizes runs of N=4 (or N=2) consecutive ``Load`` stmts whose
-    indices match in every higher dim and form ``e0, e0+1, ...`` on the
-    last dim into a single ``ld.shared.v4`` (``LDS.128``) emit. Each lane
-    receives 4 fp32 in a single instruction, and the warp-wide phase
-    structure of an LDS.128 (4 phases of 8 lanes × 32 fp32) naturally
-    maps to 32 distinct banks per phase — eliminating the 4-way conflict
-    that plagues 4 separate scalar ``LDS.32`` reads at the same offsets.
-
-    Buffer-side prerequisites (16-byte alignment, fp32 dtype) are
-    enforced upstream — TMA-target ``Smem`` decls already get
-    ``__align__(16)``, and the renderer only emits ``float`` typed
-    Loads. The match is purely syntactic so degenerate cases (a Load
-    whose ``input`` resolves to a scalar literal constant, or a run
-    that doesn't form a contiguous index sequence) bypass cleanly.
+    Detection of vectorizable Load runs (``LDS.128`` / ``__half2``) is
+    no longer done here — the dedicated Kernel-IR pass
+    ``003_vectorize_loads`` rewrites those runs into explicit
+    :class:`VecLoad` Stmts before render. This function's only
+    pre-walk responsibility is registering literal-constant Loads so
+    their ``Var(name)`` uses inline as float literals instead of
+    materializing a named local.
     """
     from deplodock.compiler.ir.stmt.leaves import Load  # local — avoid cycle
 
@@ -371,80 +438,8 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
             ctx = replace(ctx, literal_ssa=new_map)
 
     out: list[str] = []
-    i = 0
-    n = len(body)
-    while i < n:
-        s = body[i]
+    for s in body:
         if isinstance(s, Load) and s.name in ctx.literal_ssa and s.is_literal(ctx.literal_constants):
-            i += 1
             continue
-        for run_n in (4, 2):
-            run = _vec_load_run(body, i, run_n, ctx)
-            if run is not None:
-                out.extend(run)
-                i += run_n
-                break
-        else:
-            out.extend(s.render(ctx))
-            i += 1
-    return out
-
-
-def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] | None:
-    """If ``body[start:start+n]`` matches the consecutive-Load pattern,
-    return the rendered ``float<n>`` vector load + per-lane unpacks.
-    Otherwise return ``None`` so :func:`render_body` falls back to the
-    per-stmt path."""
-    from deplodock.compiler.ir.stmt.leaves import Load  # local — avoid cycle
-
-    if start + n > len(body):
-        return None
-    loads = body[start : start + n]
-    if not all(isinstance(s, Load) for s in loads):
-        return None
-    if any(s.is_literal(ctx.literal_constants) for s in loads):
-        return None
-    inputs = {s.input for s in loads}
-    if len(inputs) != 1:
-        return None
-    rank = len(loads[0].index)
-    if rank == 0 or any(len(s.index) != rank for s in loads[1:]):
-        return None
-    higher = loads[0].index[:-1]
-    for s in loads[1:]:
-        if s.index[:-1] != higher:
-            return None
-    # Compare last-dim expressions via affine decomposition: same var
-    # coefficients, anchor differing by exactly ``k``. ``simplify`` alone
-    # doesn't fold ``(a*4 + k) - (a*4)`` to ``k`` (it only handles
-    # literal-only arithmetic), so we extract the affine form and
-    # subtract the anchors instead.
-    from deplodock.compiler.ir.expr import affine_form  # local — keep base.py minimal
-
-    inner_0 = loads[0].index[-1]
-    free = inner_0.free_vars()
-    for s in loads[1:]:
-        free = free | s.index[-1].free_vars()
-    af0 = affine_form(inner_0, free)
-    if af0 is None:
-        return None
-    anchor_0, coeffs_0 = af0
-    for k, s in enumerate(loads):
-        if k == 0:
-            continue
-        af = affine_form(s.index[-1], free)
-        if af is None:
-            return None
-        anchor_k, coeffs_k = af
-        if coeffs_k != coeffs_0:
-            return None
-        diff = BinaryExpr("-", anchor_k, anchor_0).simplify(SimplifyCtx.empty())
-        if not (isinstance(diff, Literal) and isinstance(diff.value, int) and diff.value == k):
-            return None
-    flat = render_index(loads[0].input, loads[0].index, ctx)
-    pad = _pad(ctx.indent)
-    vname = f"_v_{loads[0].name}"
-    components = ("x", "y", "z", "w")[:n]
-    out = [f"{pad}float{n} {vname} = *reinterpret_cast<const float{n}*>(&{loads[0].input}[{flat}]);"]
-    out.extend(f"{pad}float {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
+        out.extend(s.render(ctx))
     return out

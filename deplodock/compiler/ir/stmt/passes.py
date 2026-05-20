@@ -19,7 +19,7 @@ from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, VecLoad, Write
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
@@ -64,18 +64,43 @@ def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
+def _(s: VecLoad, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return VecLoad(
+        names=tuple(rename(n) for n in s.names),
+        input=s.input,
+        base_index=tuple(sigma.apply(e) for e in s.base_index),
+        elem_dtype=s.elem_dtype,
+    )
+
+
+@rewrite.register
+def _(s: Pack, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return Pack(name=rename(s.name), low=rename(s.low), high=rename(s.high), dtype=s.dtype)
+
+
+@rewrite.register
+def _(s: Unpack, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return Unpack(
+        low_name=rename(s.low_name),
+        high_name=rename(s.high_name),
+        value=rename(s.value),
+        lane_dtype=s.lane_dtype,
+    )
+
+
+@rewrite.register
 def _(s: Assign, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Assign(name=rename(s.name), op=s.op, args=tuple(rename(a) for a in s.args))
 
 
 @rewrite.register
 def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Accum(name=rename(s.name), value=rename(s.value), op=s.op)
+    return Accum(name=rename(s.name), value=rename(s.value), op=s.op, dtype=s.dtype)
 
 
 @rewrite.register
 def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Init(name=rename(s.name), op=s.op)
+    return Init(name=rename(s.name), op=s.op, dtype=s.dtype)
 
 
 @rewrite.register

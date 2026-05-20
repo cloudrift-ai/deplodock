@@ -234,7 +234,19 @@ class Literal(_ExprOps):
 
     def render(self, ctx, parent_prec: int = 0) -> str:
         if isinstance(self.value, float) or self.dtype == "float":
-            return _float_lit(float(self.value))
+            txt = _float_lit(float(self.value))
+            # Float literals embedded in a non-default-dtype expression
+            # must compose with the surrounding-typed operands; delegate
+            # the wrapping decision to the target (e.g. wrap with
+            # ``__float2half`` for fp16). Int literals (loop bounds /
+            # shape coords) are unaffected — they only go through the
+            # int branch below.
+            if ctx is not None:
+                wrap_dt = getattr(ctx, "literal_default_dtype", None)
+                target = getattr(ctx, "target", None)
+                if wrap_dt is not None and target is not None:
+                    return target.literal(txt, wrap_dt)
+            return txt
         v = int(self.value)
         return f"{v}LL" if abs(v) > 32768 else str(v)
 

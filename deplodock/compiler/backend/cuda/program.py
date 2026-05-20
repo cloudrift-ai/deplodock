@@ -27,6 +27,8 @@ import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
 from deplodock.compiler.backend.cuda import _tma
+from deplodock.compiler.backend.cuda.dtype import cupy_dtype
+from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
@@ -64,7 +66,7 @@ def _ensure_dynamic_smem_attr(kernel: cp.RawKernel, smem_bytes: int) -> None:
 class _Buffer:
     name: str
     shape: tuple[int, ...]
-    dtype: str
+    dtype: DataType
     role: str  # "input" | "constant" | "output" | "scratch"
 
     @property
@@ -89,7 +91,7 @@ def _buffers(graph: Graph) -> list[_Buffer]:
         else:
             role = "scratch"
         shape = tuple(int(d) for d in node.output.shape)
-        bufs.append(_Buffer(name=nid, shape=shape, dtype="float32", role=role))
+        bufs.append(_Buffer(name=nid, shape=shape, dtype=node.output.dtype, role=role))
     return bufs
 
 
@@ -198,18 +200,20 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     arrays: dict[str, cp.ndarray] = {}
     for buf in compiled.bufs:
         shape = buf.shape or (1,)
+        cp_dtype = cupy_dtype(buf.dtype)
+        np_dtype = buf.dtype.np
         src = input_data.get(buf.name)
         if src is not None:
-            arr = cp.asarray(np.ascontiguousarray(src, dtype=np.float32).reshape(shape))
+            arr = cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
         elif buf.role == "constant" and buf.name in compiled.constants:
-            arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp.float32)
+            arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp_dtype)
         elif buf.role == "input":
             # Pseudo-random fill for un-supplied inputs (matches old generated program).
-            idx = np.arange(buf.size, dtype=np.float32)
-            vals = 0.01 * ((idx * 7 + 13) % 101 - 50)
+            idx = np.arange(buf.size, dtype=np_dtype)
+            vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
             arr = cp.asarray(vals.reshape(shape))
         else:
-            arr = cp.zeros(shape, dtype=cp.float32)
+            arr = cp.zeros(shape, dtype=cp_dtype)
         arrays[buf.name] = arr
     return arrays
 
@@ -354,7 +358,7 @@ def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -
     outputs: dict[str, np.ndarray] = {}
     for buf in compiled.bufs:
         if buf.role == "output":
-            outputs[buf.name] = arrays[buf.name].get().astype(np.float32, copy=False)
+            outputs[buf.name] = arrays[buf.name].get()
     return RunResult(outputs=outputs, time_ms=time_ms)
 
 
@@ -382,13 +386,13 @@ def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = N
             for name, arr in arrays.items():
                 if name in input_names:
                     continue
-                snap[name] = arr.get().astype(np.float32, copy=False)
+                snap[name] = arr.get()
             per_launch_np[li] = snap
 
     outputs: dict[str, np.ndarray] = {}
     for buf in compiled.bufs:
         if buf.role == "output":
-            outputs[buf.name] = arrays[buf.name].get().astype(np.float32, copy=False)
+            outputs[buf.name] = arrays[buf.name].get()
     return DebugResult(outputs=outputs, per_launch=per_launch_np)
 
 

@@ -8,6 +8,7 @@ outer-loop iteration.
 
 from __future__ import annotations
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import BIND_THREAD, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
@@ -27,7 +28,7 @@ def _kernel_with_init_then_nested_reduce() -> KernelOp:
         Accum(name="acc", value="a", op=ElementwiseImpl("add")),
     )
     body = (
-        Init(name="acc", op=ElementwiseImpl("add")),
+        Init(name="acc", op=ElementwiseImpl("add"), dtype=F32),
         Loop(axis=k_o, body=(Loop(axis=k_i, body=inner),)),
         Write(output="C", index=(), value="acc"),
     )
@@ -51,6 +52,41 @@ def test_init_suppresses_default_accum_init():
     # Only ONE init line for acc, and acc is declared exactly once.
     init_count = src.count("float acc = 0.0f;")
     assert init_count == 1
+
+
+def _kernel_with_fp32_accum_over_fp16_load() -> KernelOp:
+    """fp16 input + f32 accumulator. Reads ``A`` as ``__half``, accumulates
+    in ``float`` with a ``__half2float`` insertion at the combine."""
+    from deplodock.compiler.tensor import Tensor  # noqa: PLC0415
+
+    k = Axis("k", 8)
+    inner = (
+        Load(name="a", input="A", index=(Var("k"),)),
+        Accum(name="acc", value="a", op=ElementwiseImpl("add"), dtype=F32),
+    )
+    body = (
+        Init(name="acc", op=ElementwiseImpl("add"), dtype=F32),
+        Loop(axis=k, body=inner),
+        Write(output="C", index=(), value="acc"),
+    )
+    encl = Tile(axes=(BoundAxis(axis=Axis("t0", 1), bind=BIND_THREAD),), body=body)
+    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
+
+    return KernelOp(
+        body=(encl,),
+        name="k_fp32_acc_fp16",
+        input_tensors={"A": Tensor("A", (8,), _dt.F16)},
+        output_tensors={"C": Tensor("C", (), _dt.F32)},
+    )
+
+
+def test_fp32_accumulator_over_fp16_loads_renders_conversion_at_combine():
+    src = render_kernelop(_kernel_with_fp32_accum_over_fp16_load())
+    # Accumulator declared as ``float`` (via Init), input loaded as
+    # ``__half``, combine wraps the value with ``__half2float``.
+    assert "float acc = 0.0f;" in src, src
+    assert "__half a =" in src, src
+    assert "acc += __half2float(a);" in src, src
 
 
 def test_no_init_falls_back_to_default_per_loop_init():

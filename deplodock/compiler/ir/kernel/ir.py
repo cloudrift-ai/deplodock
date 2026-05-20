@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -46,16 +47,20 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
+    Pack,
     RenderCtx,
     Select,
     SelectBranch,
     Stmt,
     StridedLoop,
     Tile,
+    Unpack,
+    VecLoad,
     Write,
     _pad,
     pretty_body,
 )
+from deplodock.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -86,7 +91,7 @@ class Smem(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         ext = ", ".join(str(e) for e in self.extents) or "-"
         ali = f" align={self.align}" if self.align else ""
-        return [f"{indent}Smem {self.name}[{ext}] ({self.dtype}){ali}"]
+        return [f"{indent}Smem {self.dtype} {self.name}[{ext}]{ali}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """``__shared__ <dtype> <name>[<prod(extents)>];`` and register the
@@ -98,10 +103,19 @@ class Smem(Stmt):
         renderer falls back to the dynamic path when total per-CTA smem
         would exceed the 48 KB static cap.
         """
+        from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name  # noqa: PLC0415
+
         total = 1
         for e in self.extents:
             total *= int(e)
         ctx.shapes[self.name] = tuple(int(e) for e in self.extents)
+        # Register the smem buffer's canonical dtype so Load/Write
+        # against this name pick the right local C type. Mbarrier slabs
+        # (``"unsigned long long"``) map to None and stay out of the
+        # dtype-aware path.
+        smem_canonical = canonical_from_cuda_name(self.dtype)
+        if smem_canonical is not None:
+            ctx.buffer_dtypes[self.name] = smem_canonical
         if self.name in ctx.smem_dynamic_offsets:
             offset = ctx.smem_dynamic_offsets[self.name]
             return [f"{_pad(ctx.indent)}{self.dtype}* {self.name} = reinterpret_cast<{self.dtype}*>(_smem_pool + {offset});"]
@@ -342,23 +356,29 @@ class TreeHalve(Stmt):
 
     Reduces ``buf[0..length)`` into ``buf[0]`` using ``op`` as the combine.
     ``tid_var`` names the cooperative thread axis. ``length`` must be a
-    power of two and ``≤ blockDim.x``.
+    power of two and ``≤ blockDim.x``. ``dtype`` is the element type of
+    the smem buffer and the dtype the combine operates in — the renderer
+    picks the right intrinsic spelling (``fmaxf`` vs ``__hmax``, etc.)
+    via the target.
     """
 
     buf: str
     op: ElementwiseImpl
     length: int
     tid_var: str
+    dtype: DataType = F32
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}TreeHalve({self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
+        return [f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
         pad = _pad(ctx.indent)
         inner_pad = _pad(ctx.indent + 1)
         halve_pad = _pad(ctx.indent + 2)
-        op_expr = _binary_combine_expr(self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]")
+        op_expr = _binary_combine_expr(
+            self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name
+        )
         half = int(self.length) // 2
         return [
             f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
@@ -377,7 +397,7 @@ class WarpShuffle(Stmt):
 
     Renders as a register-only butterfly (no smem, no syncthreads):
 
-        float <name> = <value>;
+        <type> <name> = <value>;
         <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/2));
         <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/4));
         ...
@@ -387,40 +407,54 @@ class WarpShuffle(Stmt):
     thread count fits in a single warp (``length ≤ 32``, power of two).
     Replaces the ``Smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + ``Load``
     sequence — kills the smem alloc, the two block barriers, and the
-    smem-staged broadcast load.
+    smem-staged broadcast load. ``dtype`` is the parent accumulator's
+    dtype; the renderer declares the local + picks the combine intrinsic
+    at that dtype via the target.
     """
 
     name: str
     value: str
     op: ElementwiseImpl
     length: int
+    dtype: DataType = F32
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}WarpShuffle({self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
+        return [f"{indent}WarpShuffle({self.dtype.name} {self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
-        out = [f"{pad}float {self.name} = {self.value};"]
+        acc_dt = self.dtype.name
+        value_dt = ctx.ssa_dtypes.get(self.value, acc_dt)
+        src_expr = ctx.target.convert(self.value, value_dt, acc_dt)
+        ctx.ssa_dtypes[self.name] = acc_dt
+        out = [f"{pad}{ctx.type_name(acc_dt)} {self.name} = {src_expr};"]
         s = int(self.length) // 2
         while s > 0:
             shfl = f"__shfl_xor_sync(0xffffffff, {self.name}, {s})"
-            combined = _binary_combine_expr(self.op, self.name, shfl)
+            combined = _binary_combine_expr(self.op, self.name, shfl, ctx.target, acc_dt)
             out.append(f"{pad}{self.name} = {combined};")
             s >>= 1
         return out
 
 
-def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str) -> str:
-    """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops."""
+def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: str = "f32") -> str:
+    """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops at ``dt``.
+
+    ``target`` (optional) provides the dtype-specific intrinsic spelling.
+    ``None`` keeps the legacy f32 spellings for callers that haven't
+    plumbed a target through yet.
+    """
     name = op.name
     if name in ("add", "sum"):
         return f"{a} + {b}"
     if name in ("multiply", "prod"):
         return f"{a} * {b}"
     if name in ("maximum", "amax"):
-        return f"fmaxf({a}, {b})"
+        spelling = target.intrinsic("fmax", dt) if target is not None else "fmaxf"
+        return f"{spelling}({a}, {b})"
     if name == "minimum":
-        return f"fminf({a}, {b})"
+        spelling = target.intrinsic("fmin", dt) if target is not None else "fminf"
+        return f"{spelling}({a}, {b})"
     raise ValueError(f"TreeHalve: unsupported op {name!r}")
 
 
@@ -455,17 +489,37 @@ class KernelOp(Op):
 
     Buffer shapes are *not* baked in — the surrounding graph supplies
     them at render time, same as ``TileOp``. Kernel signature is derived
-    from the body: distinct ``Load.input`` names become ``const float*``
-    params, distinct ``Write.output`` names become ``float*`` params,
-    ordered by first appearance. ``Smem`` buffers are excluded.
+    from the body: distinct ``Load.input`` names become kernel input
+    params, distinct ``Write.output`` names become writeable output
+    params, ordered by first appearance. ``Smem`` buffers are excluded.
+
+    ``input_tensors`` / ``output_tensors`` map a global-buffer name to a
+    :class:`Tensor` describing that buffer (its shape + dtype). Populated
+    by the CUDA-lowering pass from the surrounding graph; missing entries
+    fall back to a unit-shape :data:`F32` tensor so legacy tests that
+    build KernelOps directly keep working.
     """
 
     body: Body = field(default_factory=Body)
     name: str = ""
+    input_tensors: dict[str, Tensor] = field(default_factory=dict)
+    output_tensors: dict[str, Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             self.body = Body.coerce(self.body)
+
+    def input_tensor(self, name: str) -> Tensor:
+        return self.input_tensors.get(name) or Tensor(name, (), F32)
+
+    def output_tensor(self, name: str) -> Tensor:
+        return self.output_tensors.get(name) or Tensor(name, (), F32)
+
+    def input_dtype(self, name: str) -> DataType:
+        return self.input_tensor(name).dtype
+
+    def output_dtype(self, name: str) -> DataType:
+        return self.output_tensor(name).dtype
 
     def __iter__(self) -> Iterator[Stmt]:
         return self.body.iter()
@@ -489,13 +543,13 @@ class KernelOp(Op):
         ``_compute_dynamic_smem_offsets``."""
         from math import prod  # noqa: PLC0415
 
-        # Mirror cuda/001_lower_kernelop's _DTYPE_BYTES for the smem sizing.
-        dtype_bytes = {"float": 4, "double": 8, "int": 4, "half": 2, "bfloat16": 2}
+        from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
+
         total = 0
         for s in self:
             if isinstance(s, Smem):
                 elements = prod(int(e) for e in s.extents) if s.extents else 1
-                total += elements * dtype_bytes.get(s.dtype, 4)
+                total += elements * nbytes_of(s.dtype)
         return total
 
     def validate(self, ctx) -> bool:
@@ -556,6 +610,8 @@ class KernelOp(Op):
         for s in self:
             if isinstance(s, Load) and s.input not in smem:
                 names.setdefault(s.input, None)
+            elif isinstance(s, VecLoad) and s.input not in smem:
+                names.setdefault(s.input, None)
             elif isinstance(s, CpAsyncCopy) and s.src not in smem:
                 names.setdefault(s.src, None)
             elif isinstance(s, TmaDescriptor) and s.src_buf not in smem:
@@ -591,6 +647,9 @@ __all__ = [
     "Expr",
     # Loop-IR leaves + control flow (reused)
     "Load",
+    "Pack",
+    "Unpack",
+    "VecLoad",
     "Assign",
     "Select",
     "SelectBranch",
