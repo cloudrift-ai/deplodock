@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32 as _F32
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis, Role
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
@@ -37,11 +37,16 @@ class Loop(Stmt):
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
     time. Set by scheduling passes (``mark_unroll``); has no
     effect on the IR's iteration semantics.
+
+    ``role`` is a planner-assigned tag (see :class:`Role`) describing the
+    loop's purpose in the partition plan. Excluded from ``pretty()`` so it
+    doesn't affect ``Body.structural_key`` / autotune cache.
     """
 
     axis: Axis
     body: Body
     unroll: bool = False
+    role: Role | None = None
 
     def __post_init__(self) -> None:
         # Coerce so ``Loop(body=tuple_value)`` keeps working without
@@ -57,7 +62,7 @@ class Loop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return Loop(axis=self.axis, body=body, unroll=self.unroll)
+        return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role)
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
@@ -279,6 +284,7 @@ class StridedLoop(Stmt):
     step: Expr
     body: Body
     unroll: bool = False
+    role: Role | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -292,7 +298,7 @@ class StridedLoop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return StridedLoop(axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll)
+        return StridedLoop(axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll, role=self.role)
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})

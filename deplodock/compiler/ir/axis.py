@@ -20,6 +20,39 @@ output level) will land here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+
+
+class Role(Enum):
+    """Planner-assigned role tag on a body ``Loop`` / ``StridedLoop``.
+
+    Set by ``000_partition_planner`` to communicate axis-structure decisions
+    to downstream materialization passes. Excluded from ``Body.structural_key``
+    (not rendered by ``pretty()``) so adding a role doesn't invalidate
+    autotune cache entries.
+
+    ``GRID_BLOCK`` / ``GRID_THREAD`` are NOT here — those live as
+    ``BoundAxis.bind`` on ``Tile.axes`` (existing mechanism).
+
+    Roles assigned to body loops:
+
+    - ``REGISTER``: inner axis of a thread-axis split. ``001_tileify`` stops
+      lifting at this axis (keeps it as a body Loop instead of pulling into
+      ``Tile.axes``); ``008_register_tile`` replicates dependent stmts along it.
+    - ``STAGE_INNER``: inner reduce axis after a K split. Slab dimension for
+      ``007_stage_inputs``.
+    - ``SERIAL_OUTER``: outer serial chunk loop (e.g. K_o). Pipeline / double-
+      buffer targets.
+    - ``PIPELINE``: serial outer loop marked for pipelining by ``015_pipeline_k_outer``.
+    - ``COOPERATIVE_STRIDE``: reduce loop to be rewritten as ``StridedLoop`` by
+      ``005_cooperative_reduce``.
+    """
+
+    REGISTER = "register"
+    STAGE_INNER = "stage_inner"
+    SERIAL_OUTER = "serial_outer"
+    PIPELINE = "pipeline"
+    COOPERATIVE_STRIDE = "cooperative_stride"
 
 
 @dataclass(frozen=True)
@@ -81,4 +114,4 @@ class BoundAxis:
         return self.axis.extent
 
 
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK"]
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "Role"]

@@ -127,23 +127,26 @@ def canonicalize_free_axis_order(stmts: Body) -> Body:
     """Sort the outer chain of free ``Loop`` blocks alphabetically by axis
     name. The chain is the sequence of single-child free Loops at the top of
     ``stmts``; it terminates at a reduce Loop or a branching body. Recursion
-    continues into terminal block bodies (Loop / StridedLoop / Tile / Cond)."""
+    continues into terminal block bodies (Loop / StridedLoop / Tile / Cond).
+
+    Loop ``role`` and ``unroll`` annotations travel with their axis through
+    the sort so planner tags / unroll hints survive normalization."""
     stmts = Body.coerce(stmts)
-    chain_axes: list[Axis] = []
+    chain: list[Loop] = []
     current = stmts
     while len(current) == 1 and isinstance(current[0], Loop):
         loop = current[0]
         if loop.is_reduce:
             break
-        chain_axes.append(loop.axis)
+        chain.append(loop)
         current = loop.body
 
     terminal = tuple(_recurse_canonicalize(s) for s in current)
 
-    chain_axes_sorted = sorted(chain_axes, key=lambda a: a.name)
+    chain_sorted = sorted(chain, key=lambda lp: lp.axis.name)
     result: Body = terminal
-    for axis in reversed(chain_axes_sorted):
-        result = (Loop(axis=axis, body=result),)
+    for loop in reversed(chain_sorted):
+        result = (Loop(axis=loop.axis, body=result, unroll=loop.unroll, role=loop.role),)
     return result
 
 
@@ -370,6 +373,7 @@ def _merge_sibling_reduce_loops(body: Body) -> Body:
                 and t.axis.name == merged.axis.name
                 and int(t.axis.extent) == int(merged.axis.extent)
                 and t.unroll == merged.unroll
+                and t.role == merged.role
             ):
                 continue
             merged_defs = _all_ssa_defs(merged.body)
@@ -388,6 +392,7 @@ def _merge_sibling_reduce_loops(body: Body) -> Body:
                 axis=merged.axis,
                 body=Body(tuple(merged.body) + tuple(t.body)),
                 unroll=merged.unroll,
+                role=merged.role,
             )
             consumed.add(j)
         out.append(merged)

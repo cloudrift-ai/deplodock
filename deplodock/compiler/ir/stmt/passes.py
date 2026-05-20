@@ -121,6 +121,7 @@ def _(s: Loop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         axis=axis_fn(s.axis),
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
     )
 
 
@@ -133,6 +134,7 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         step=step,
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
     )
 
 
@@ -185,7 +187,7 @@ def _(s: Select, ctx: SimplifyCtx) -> Stmt:
 @simplify.register
 def _(s: Loop, ctx: SimplifyCtx) -> Stmt:
     inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent - 1))
-    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll)
+    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll, role=s.role)
 
 
 @simplify.register
@@ -198,6 +200,7 @@ def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
         step=step,
         body=tuple(simplify(c, inner) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
     )
 
 

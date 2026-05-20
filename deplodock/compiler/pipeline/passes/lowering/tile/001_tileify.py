@@ -31,7 +31,7 @@ changes.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis, Role
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Cond, Loop, StridedLoop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
@@ -89,12 +89,16 @@ def _lift_output_loops(tile: Tile) -> Tile:
     SDPA's head-dim free loop sits at top level (after the two softmax
     reduces) so this catches the case we care about; without lifting,
     every thread re-runs the inner reduce per head-dim element.
+
+    REGISTER-tagged Loops are skipped — the planner pre-split them as
+    the inner half of an output-axis register tile, and ``008_register_tile``
+    later replicates their bodies along the axis.
     """
     new_axes = list(tile.axes)
     new_body: list[Stmt] = []
     changed = False
     for s in tile.body:
-        if isinstance(s, Loop) and not s.is_reduce and _writes_with_axis(s.body, s.axis.name):
+        if isinstance(s, Loop) and not s.is_reduce and s.role is not Role.REGISTER and _writes_with_axis(s.body, s.axis.name):
             new_axes.append(BoundAxis(axis=s.axis, bind=BIND_THREAD))
             new_body.extend(s.body)
             changed = True
@@ -126,10 +130,14 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ..
 
     Stops when the current level has more than one stmt, isn't a Loop, or
     is a Loop whose body contains an ``Accum`` at the immediate level (a
-    reduce Loop — stripping it would lose the accumulator)."""
+    reduce Loop — stripping it would lose the accumulator).
+
+    Also stops at REGISTER-tagged Loops: those mark the inner half of a
+    planner-decided output-axis register tile and stay as body Loops so
+    ``008_register_tile`` can replicate their bodies."""
     axes: list[Axis] = []
     cur = stmts
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is not Role.REGISTER:
         axes.append(cur[0].axis)
         cur = cur[0].body
     return tuple(axes), cur
