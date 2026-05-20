@@ -285,21 +285,17 @@ def _process_scope(
 
     for s in scope.body:
         if isinstance(s, Loop) and not s.is_reduce:
-            rewritten_inner.append(
-                Loop(
-                    axis=s.axis,
-                    body=_process_scope(
-                        s,
-                        thread_axes,
-                        (*in_scope_axes, s.axis),
-                        block_axis_names,
-                        used_names,
-                        slab_cap=slab_cap,
-                        scope_budget=scope_budget,
-                        allowed_bufs=allowed_bufs,
-                    ),
-                )
+            new_body = _process_scope(
+                s,
+                thread_axes,
+                (*in_scope_axes, s.axis),
+                block_axis_names,
+                used_names,
+                slab_cap=slab_cap,
+                scope_budget=scope_budget,
+                allowed_bufs=allowed_bufs,
             )
+            rewritten_inner.append(s.with_bodies((new_body,)))
             continue
         if isinstance(s, (Loop, StridedLoop)):
             scope_axes = (*in_scope_axes, s.axis)

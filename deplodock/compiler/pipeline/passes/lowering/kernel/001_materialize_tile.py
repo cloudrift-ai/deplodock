@@ -32,8 +32,6 @@ passes can pattern-match on it.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
@@ -492,19 +490,21 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
 
     ``emit_tma_stage`` / ``emit_async_wait`` are closures that share
     TMA hoist + active-mbar state with the top-level walker."""
-    inner: list[Stmt] = []
-    for s in loop.body:
+
+    def materialize_leaf(s: Stmt):
         if isinstance(s, TmaBufferedStage):
-            inner.extend(filter_emit(emit_tma_stage(s)))
-        elif isinstance(s, Stage):
-            inner.extend(filter_emit(_emit_stage(s, tid_expr, n_threads, buf_cuda)))
-        elif isinstance(s, AsyncWait):
-            inner.extend(emit_async_wait(s))
-        elif isinstance(s, (Loop, StridedLoop)):
-            inner.append(_emit_loop(s, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
-        else:
-            inner.append(transform(s))
-    return replace(loop, body=inner)
+            return filter_emit(emit_tma_stage(s))
+        if isinstance(s, Stage):
+            return filter_emit(_emit_stage(s, tid_expr, n_threads, buf_cuda))
+        if isinstance(s, AsyncWait):
+            return emit_async_wait(s)
+        if s.nested():
+            # Block wrapper (Loop / StridedLoop / Cond / ...) — body.map
+            # has already mapped its child bodies post-order.
+            return s
+        return transform(s)
+
+    return loop.with_bodies((loop.body.map(materialize_leaf),))
 
 
 def _single_thread_var(thread_axes: tuple) -> str:
