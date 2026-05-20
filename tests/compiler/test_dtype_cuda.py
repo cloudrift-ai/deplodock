@@ -13,7 +13,7 @@ import numpy as np
 from deplodock.compiler import dtype as dt
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
 from .conftest import requires_cuda
@@ -97,3 +97,40 @@ def test_fp16_fallback_to_float_for_non_native_op():
 
     expected = np.array([math.erf(float(v)) for v in x_data.astype(np.float32)], dtype=np.float16)
     np.testing.assert_allclose(out.reshape(-1), expected, rtol=5e-3, atol=5e-3)
+
+
+def _fp16_sum_graph() -> Graph:
+    """fp16 input + sum reduction. The Init-placement pass picks F32 for
+    the accumulator (any fp16 input promotes), so the rendered kernel
+    declares ``float acc`` and combines via ``acc += __half2float(value)``."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1024,), dt.F16), node_id="x")
+    # Output dtype is fp16 to match HF reduction conventions (sum
+    # stays in input dtype downstream; the accumulator is the only
+    # f32 step).
+    g.add_node(op=ReduceOp(op="sum", axis=0), inputs=["x"], output=Tensor("s", (1,), dt.F16), node_id="s")
+    g.inputs = ["x"]
+    g.outputs = ["s"]
+    return g
+
+
+@requires_cuda
+def test_fp16_reduction_uses_fp32_accumulator_on_cuda():
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.ir.cuda import CudaOp
+
+    compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(_fp16_sum_graph()))
+    sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
+    # Accumulator declared as float (f32 promotion); value converted at
+    # the combine; final store back to __half.
+    assert "float acc" in sources or "float v" in sources or "float r" in sources, f"expected f32 accumulator local, got:\n{sources}"
+    assert "__half2float" in sources, f"expected __half2float at combine, got:\n{sources}"
+    assert "__float2half" in sources, f"expected __float2half at store, got:\n{sources}"
+
+    rng = np.random.default_rng(2)
+    x_data = (rng.standard_normal(1024) * 0.1).astype(np.float16)
+    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    out = next(iter(result.outputs.values()))
+    assert out.dtype == np.float16
+    expected = np.array([x_data.astype(np.float32).sum()], dtype=np.float16)
+    np.testing.assert_allclose(out.reshape(-1), expected, rtol=1e-2, atol=1e-2)
