@@ -213,7 +213,7 @@ def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
     # buf names appearing on body Loads in first-use order) so the
     # interpreter — which positionally zips ``node.inputs`` against
     # ``input_bufs`` — keys arrays by the right buf name.
-    merged_inputs = list(merged.inputs)
+    merged_inputs = list(merged.body_inputs)
     frag = Graph()
     for inp_id in merged_inputs:
         ext = graph.nodes.get(inp_id)

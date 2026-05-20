@@ -75,12 +75,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     new_body, did = _pack_body_recursive(kop.body)
     if not did:
         raise RuleSkipped("no f16 Accum/Init groups to pair")
-    return KernelOp(
-        body=new_body,
-        name=kop.name,
-        inputs=dict(kop.inputs),
-        outputs=dict(kop.outputs),
-    )
+    return KernelOp(body=new_body, name=kop.name)
 
 
 def _pack_body_recursive(body: Body) -> tuple[Body, bool]:

@@ -54,9 +54,10 @@ def test_init_suppresses_default_accum_init():
     assert init_count == 1
 
 
-def _kernel_with_fp32_accum_over_fp16_load() -> KernelOp:
+def _kernel_with_fp32_accum_over_fp16_load() -> tuple[KernelOp, dict]:
     """fp16 input + f32 accumulator. Reads ``A`` as ``__half``, accumulates
-    in ``float`` with a ``__half2float`` insertion at the combine."""
+    in ``float`` with a ``__half2float`` insertion at the combine. Returns
+    the kernel plus the ``tensors=`` map render needs to stamp A as F16."""
     from deplodock.compiler.tensor import Tensor  # noqa: PLC0415
 
     k = Axis("k", 8)
@@ -72,16 +73,14 @@ def _kernel_with_fp32_accum_over_fp16_load() -> KernelOp:
     encl = Tile(axes=(BoundAxis(axis=Axis("t0", 1), bind=BIND_THREAD),), body=body)
     from deplodock.compiler import dtype as _dt  # noqa: PLC0415
 
-    return KernelOp(
-        body=(encl,),
-        name="k_fp32_acc_fp16",
-        inputs={"A": Tensor("A", (8,), _dt.F16)},
-        outputs={"C": Tensor("C", (), _dt.F32)},
-    )
+    kop = KernelOp(body=(encl,), name="k_fp32_acc_fp16")
+    tensors = {"A": Tensor("A", (8,), _dt.F16), "C": Tensor("C", (), _dt.F32)}
+    return kop, tensors
 
 
 def test_fp32_accumulator_over_fp16_loads_renders_conversion_at_combine():
-    src = render_kernelop(_kernel_with_fp32_accum_over_fp16_load())
+    kop, tensors = _kernel_with_fp32_accum_over_fp16_load()
+    src = render_kernelop(kop, tensors=tensors)
     # Accumulator declared as ``float`` (via Init), input loaded as
     # ``__half``, combine wraps the value with ``__half2float``.
     assert "float acc = 0.0f;" in src, src

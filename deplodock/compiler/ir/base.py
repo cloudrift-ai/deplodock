@@ -5,6 +5,11 @@ are boundary sentinels that carry tensors into the graph without computing
 anything — they appear unchanged from the frontend stage all the way through
 to fusion, and the numpy backend supplies their values at runtime.
 
+The shared base for body-carrying ops (``LoopOp`` / ``KernelOp`` /
+``TileOp``) lives in :mod:`deplodock.compiler.ir.body_op` — split out to
+avoid a circular import with the ``ir.stmt`` package (which imports
+``Stage`` from ``ir.tile.ir`` for normalization).
+
 ``_keepdim_axis`` is a small shape helper used by both ``ReduceOp`` (minimal IR,
 ``tensor.py``) and ``MeanOp`` (frontend IR, ``frontend.py``). Keeping it here
 avoids a frontend→tensor dependency for a single function.

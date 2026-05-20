@@ -38,11 +38,10 @@ The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
 from __future__ import annotations
 
 import enum
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.body_op import BodyOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -531,16 +530,13 @@ class TmaBufferedStage(BufferedStage):
 
 
 @dataclass
-class TileOp(Op):
+class TileOp(BodyOp):
     """One GPU kernel as a Tile IR program — pre-materialization.
 
-    Op subclass parallel to ``LoopOp``: lives as a graph node, carries a
-    body of Tile IR statements plus a kernel name. Materialization turns
-    a ``TileOp`` into a ``KernelOp``.
+    :class:`BodyOp` subclass parallel to ``LoopOp``: lives as a graph
+    node, carries a body of Tile IR statements plus a kernel name.
+    Materialization turns a ``TileOp`` into a ``KernelOp``.
     """
-
-    body: Body = field(default_factory=Body)
-    name: str = ""
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
@@ -554,16 +550,6 @@ class TileOp(Op):
         n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
         if n_tiles > 1:
             raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
-
-    def __iter__(self) -> Iterator[Stmt]:
-        return self.body.iter()
-
-    def pretty_body(self) -> str:
-        """Render as an indented structural listing via per-stmt ``pretty``."""
-        sig_in = ", ".join(self.inputs) or "-"
-        sig_out = ", ".join(self.outputs) or "-"
-        head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
-        return "\n".join([head, *pretty_body(self.body, "    ")])
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would
@@ -740,8 +726,9 @@ class TileOp(Op):
         return score
 
     @property
-    def inputs(self) -> tuple[str, ...]:
-        """Distinct external-buffer names in body first-use order.
+    def body_inputs(self) -> tuple[str, ...]:
+        """Body-derived input buffer names — distinct external-buffer names
+        in first-use order.
 
         A buffer is external if it's loaded from but not produced by a
         ``Stage`` in this TileOp. Loads of staged names are skipped
@@ -757,11 +744,6 @@ class TileOp(Op):
             elif isinstance(s, Load) and s.input not in stage_names:
                 bufs.setdefault(s.input, None)
         return tuple(bufs)
-
-    @property
-    def outputs(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` buf names in body first-use order."""
-        return tuple(dict.fromkeys(s.output for s in self.body.writes))
 
 
 # ---------------------------------------------------------------------------

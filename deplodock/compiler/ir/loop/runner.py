@@ -60,14 +60,14 @@ static inline float rsqrtf_(float x) { return 1.0f / sqrtf(x); }
 def render_loopop_cpp(loop: LoopOp, fn_name: str, input_shapes: dict[str, tuple[int, ...]], output_shape: tuple[int, ...]) -> str:
     """Emit a complete ``extern "C" void <fn_name>(...)`` definition.
 
-    Inputs become ``const float*`` params in ``loop.inputs`` order; the
-    sole output (``loop.outputs[0]``) becomes a trailing ``float*`` param.
+    Inputs become ``const float*`` params in ``loop.body_inputs`` order; the
+    sole output (``loop.body_outputs[0]``) becomes a trailing ``float*`` param.
     """
-    output_name = loop.outputs[0]
+    output_name = loop.body_outputs[0]
     shapes: dict[str, tuple[int, ...]] = {**input_shapes, output_name: output_shape}
     ctx = RenderCtx(shapes=shapes, indent=1, intrinsics=_INTRINSICS_CPP)
 
-    sig_parts = [f"const float* {n}" for n in loop.inputs]
+    sig_parts = [f"const float* {n}" for n in loop.body_inputs]
     sig_parts.append(f"float* {output_name}")
     params_text = ", ".join(sig_parts)
 
@@ -104,13 +104,13 @@ def execute_loop_op_cpp(
 
     Returns a fresh ``np.ndarray`` of shape ``out_shape``. ``input_arrays``
     is keyed by the ``Load.input`` strings; the ordered list comes from
-    ``loop.inputs``.
+    ``loop.body_inputs``.
     """
     import cppyy
 
     _ensure_prelude()
 
-    bufs = loop.inputs
+    bufs = loop.body_inputs
     input_shapes = {name: tuple(int(d) for d in input_arrays[name].shape) for name in bufs}
     cache_key = (id(loop), tuple(input_shapes.items()), tuple(out_shape))
 

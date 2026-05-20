@@ -53,17 +53,16 @@ _TARGET = CudaRenderTarget()
 def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
 
-    # Per-buffer dtype map: graph buffers via ``kop.inputs`` / ``kop.outputs``
-    # keys (placeholder F32 tensor values at this pre-cuda-lowering stage —
-    # graph is the real dtype source), then Smem dtypes from the body. Mirror
-    # ``003_vectorize_loads`` so we cover smem writebacks too even though the
-    # common case is the kernel's output buffer.
+    # Per-buffer dtype map: graph dtypes via body-derived names, then Smem
+    # dtypes from the body. Mirrors ``003_vectorize_loads`` so we cover
+    # smem writebacks too even though the common case is the kernel's
+    # output buffer.
     buf_dtypes: dict[str, str] = {}
-    for nid in kop.inputs:
+    for nid in kop.body_inputs:
         node = match.graph.nodes.get(nid)
         if node is not None:
             buf_dtypes[nid] = node.output.dtype.name
-    for out in kop.outputs:
+    for out in kop.body_outputs:
         node = match.graph.nodes.get(out)
         if node is not None:
             buf_dtypes.setdefault(out, node.output.dtype.name)
@@ -77,12 +76,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if new_body == kop.body:
         raise RuleSkipped("no vectorizable Write runs found")
 
-    return KernelOp(
-        body=new_body,
-        name=kop.name,
-        inputs=dict(kop.inputs),
-        outputs=dict(kop.outputs),
-    )
+    return KernelOp(body=new_body, name=kop.name)
 
 
 def _vectorize_body(body: Body, buf_dtypes: dict[str, str]) -> Body:

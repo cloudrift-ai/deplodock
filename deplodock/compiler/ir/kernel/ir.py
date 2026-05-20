@@ -23,12 +23,11 @@ Tile IR and are materialized away before reaching this layer. A
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.body_op import BodyOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -43,7 +42,6 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
-    Body,
     Cond,
     Load,
     Loop,
@@ -57,9 +55,7 @@ from deplodock.compiler.ir.stmt import (
     Unpack,
     Write,
     _pad,
-    pretty_body,
 )
-from deplodock.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -480,50 +476,21 @@ _MAX_CTAS = 65536
 
 
 @dataclass
-class KernelOp(Op):
+class KernelOp(BodyOp):
     """One ``__global__`` GPU kernel as a Kernel IR program.
 
-    Op subclass parallel to ``TileOp`` / ``LoopOp``: lives as a graph
-    node, carries a body of Kernel IR stmts plus a kernel name.
+    :class:`BodyOp` subclass parallel to ``TileOp`` / ``LoopOp``: lives as
+    a graph node, carries a body of Kernel IR stmts plus a kernel name.
 
     Buffer shapes are *not* baked in — the surrounding graph supplies
     them at render time, same as ``TileOp``. Kernel signature is derived
     from the body: distinct ``Load.input`` names become kernel input
     params, distinct ``Write.output`` names become writeable output
     params, ordered by first appearance. ``Smem`` buffers are excluded.
-
-    ``inputs`` / ``outputs`` map a global-buffer name to a :class:`Tensor`
-    describing that buffer (its shape + dtype). When constructed empty,
-    ``__post_init__`` auto-populates them with body-derived names in
-    first-use order, using placeholder ``Tensor(name, (), F32)`` entries
-    — the CUDA-lowering pass replaces those with real graph-sourced
-    tensors before render. Tests that build a bare ``KernelOp`` get the
-    body-derived placeholders automatically, so iteration order
-    (``for n in kop.inputs``) matches first-appearance in the body.
-    """
-
-    body: Body = field(default_factory=Body)
-    name: str = ""
-    inputs: dict[str, Tensor] = field(default_factory=dict)
-    outputs: dict[str, Tensor] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.body, Body):
-            self.body = Body.coerce(self.body)
-        if not self.inputs:
-            self.inputs = {n: Tensor(n, (), F32) for n in self._body_input_names()}
-        if not self.outputs:
-            self.outputs = {n: Tensor(n, (), F32) for n in self._body_output_names()}
-
-    def __iter__(self) -> Iterator[Stmt]:
-        return self.body.iter()
-
-    def pretty_body(self) -> str:
-        """Render as an indented structural listing via per-stmt ``pretty``."""
-        sig_in = ", ".join(self.inputs) or "-"
-        sig_out = ", ".join(self.outputs) or "-"
-        head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
-        return "\n".join([head, *pretty_body(self.body, "    ")])
+    ``CpAsyncCopy.src`` and ``TmaDescriptor.src_buf`` also name kernel
+    input parameters (the descriptor parameter itself is host-built and
+    appended by the CUDA backend's argument pipeline, not a graph
+    buffer)."""
 
     def smem_bytes(self) -> int:
         """Total static + dynamic ``__shared__`` bytes declared in the
@@ -579,23 +546,16 @@ class KernelOp(Op):
         return True
 
     @property
-    def loads(self) -> tuple[Load, ...]:
-        return self.body.iter_of_type(Load)
-
-    @property
     def smem_names(self) -> frozenset[str]:
         """Names of all ``__shared__`` buffers declared in the body — these
         are render-internal and are excluded from kernel-parameter inference."""
         return frozenset(s.name for s in self if isinstance(s, Smem))
 
-    def _body_input_names(self) -> tuple[str, ...]:
-        """Distinct global-buffer read names in body first-use order — the
-        seed for ``self.inputs`` keys. Smem buffers are excluded.
-
-        ``Load.input``, ``CpAsyncCopy.src``, and ``TmaDescriptor.src_buf``
-        all name kernel input parameters. (The descriptor parameter itself
-        is host-built and appended by the CUDA backend's argument pipeline,
-        not a graph buffer.)"""
+    @property
+    def body_inputs(self) -> tuple[str, ...]:
+        """Body-derived input buffer names — distinct ``Load.input`` /
+        ``CpAsyncCopy.src`` / ``TmaDescriptor.src_buf`` in first-use order,
+        with smem-declared buffers excluded."""
         smem = self.smem_names
         names: dict[str, None] = {}
         for s in self:
@@ -608,12 +568,9 @@ class KernelOp(Op):
         return tuple(names)
 
     @property
-    def writes(self) -> tuple[Write, ...]:
-        return self.body.iter_of_type(Write)
-
-    def _body_output_names(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` buf names in body first-use order —
-        the seed for ``self.outputs`` keys. Smem buffers are excluded."""
+    def body_outputs(self) -> tuple[str, ...]:
+        """Body-derived output buffer names — distinct ``Write.output``
+        names in first-use order, with smem-declared buffers excluded."""
         smem = self.smem_names
         return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
 

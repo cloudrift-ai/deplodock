@@ -33,11 +33,10 @@ Free-function companions (used by passes that work on raw
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.body_op import BodyOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
@@ -86,20 +85,15 @@ class Scope:
 
 
 @dataclass
-class LoopOp(Op):
+class LoopOp(BodyOp):
     """One kernel's worth of computation as an SSA program over named axes.
 
-    ``body`` is the sole stored field: a tuple of nested ``Loop`` blocks
-    with leaf ``Load`` / ``Assign`` / ``Accum`` / ``Write`` / ``Select``
-    statements. ``axes``, ``loads``, ``accums``, and ``num_inputs`` are
-    computed properties derived from that tree.
+    ``body`` is the sole stored field (inherited from :class:`BodyOp`): a
+    tuple of nested ``Loop`` blocks with leaf ``Load`` / ``Assign`` /
+    ``Accum`` / ``Write`` / ``Select`` statements. ``axes``, ``loads``,
+    ``accums``, ``body_inputs``, and ``body_outputs`` are computed
+    properties derived from that tree.
     """
-
-    body: Body = field(default_factory=Body)
-
-    def pretty_body(self, indent: str = "") -> str:
-        """Render as an explicit nested-loop program via per-stmt ``pretty``."""
-        return "\n".join(pretty_body(self.body, indent))
 
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
@@ -146,28 +140,6 @@ class LoopOp(Op):
         walk(self.body, None)
         return frozenset(names)
 
-    @property
-    def inputs(self) -> tuple[str, ...]:
-        """Distinct buffer names referenced by body Loads, in first-use order.
-
-        Order matters: ``LoopOp.forward`` zips positional input arrays
-        against this tuple, and the surrounding graph node's ``inputs`` list
-        is set in the same order at lifting / fusion time. Using ``set(...)``
-        here would scramble the mapping (set order is hash-based) and
-        positional args would land on the wrong buffer names.
-        """
-        return tuple(dict.fromkeys(s.input for s in self.body.loads))
-
-    @property
-    def outputs(self) -> tuple[str, ...]:
-        """Distinct buffer names targeted by body Writes, in first-use order.
-
-        Mirrors ``KernelOp.outputs``: a LoopOp's outputs are the names of the
-        graph-level buffers it Writes to. Single-output kernels (today's
-        contract — see ``_infer_write_shape``) report exactly one entry.
-        """
-        return tuple(dict.fromkeys(s.output for s in self.body.writes))
-
     def analyze(self) -> LoopMeta:
         """One-pass summary of the body: name→def, name→scope, writes.
 
@@ -211,12 +183,6 @@ class LoopOp(Op):
             live_axes=_compute_live_axes(self.body),
         )
 
-    def __iter__(self) -> Iterator[Stmt]:
-        """Yield every ``Stmt`` in this op's body in pre-order (same as
-        :func:`iter_body`). Enables ``for s in loop_op: ...`` and
-        comprehensions like ``[s for s in loop_op if isinstance(s, Load)]``."""
-        return self.body.iter()
-
     def forward(self, *inputs):
         """Evaluate the kernel body via cppyy-JIT'd C++ — mirrors the other ``Op.forward`` methods.
 
@@ -232,7 +198,7 @@ class LoopOp(Op):
         from deplodock.compiler.ir.loop.runner import execute_loop_op_cpp
 
         out_shape = self._infer_write_shape()
-        bufs = self.inputs
+        bufs = self.body_inputs
         if len(inputs) != len(bufs):
             raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
         input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}
@@ -413,7 +379,7 @@ def _validate(loop: LoopOp) -> None:
     # all assume this; check at construction so callers fail loudly.
     # Runs after SSA / Accum validation so malformed-body tests get the
     # specific error the body actually has, not a no-Write surface error.
-    if not loop.outputs:
+    if not loop.body_outputs:
         raise ValueError("LoopOp body has no Write")
 
 

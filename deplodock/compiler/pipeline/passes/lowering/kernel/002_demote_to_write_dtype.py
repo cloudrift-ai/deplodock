@@ -83,21 +83,19 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
     body = kop.body
 
-    # Output buffer dtypes. ``001_materialize_tile`` only leaves
-    # placeholder F32 tensors in ``kop.outputs`` (the CUDA-lowering pass
-    # populates real dtypes downstream), so read directly from the
-    # surrounding graph using ``kop.outputs`` keys plus ``root.output``
-    # for the case where the KernelOp's own node-output is the only
-    # written buffer. Falls back to ``f32`` for anything we can't find.
+    # Output / input buffer dtypes read straight from the surrounding
+    # graph via the body-derived buffer names. Falls back to ``root.output``
+    # for the KernelOp's own node-output when not otherwise listed; ``f32``
+    # for anything we can't find.
     out_dtypes: dict[str, str] = {}
-    for out_name in kop.outputs:
+    for out_name in kop.body_outputs:
         node = match.graph.nodes.get(out_name)
         if node is not None:
             out_dtypes[out_name] = node.output.dtype.name
     out_dtypes.setdefault(root.id, root.output.dtype.name)
 
     in_dtypes: dict[str, str] = {}
-    for in_name in kop.inputs:
+    for in_name in kop.body_inputs:
         node = match.graph.nodes.get(in_name)
         if node is not None:
             in_dtypes[in_name] = node.output.dtype.name
@@ -194,12 +192,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if new_body == body:
         raise RuleSkipped("no change after demotion (already stamped)")
 
-    return KernelOp(
-        body=new_body,
-        name=kop.name,
-        inputs=dict(kop.inputs),
-        outputs=dict(kop.outputs),
-    )
+    return KernelOp(body=new_body, name=kop.name)
 
 
 def _build_uses(body: Body) -> dict[str, list[Stmt]]:
