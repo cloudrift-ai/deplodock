@@ -54,7 +54,6 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.kernel.ir import Smem
 from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, StridedLoop, Tile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -87,16 +86,16 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 
 def _buf_dtype(kop: KernelOp, name: str) -> str:
     """Resolve a buffer's canonical dtype: matcher-populated ``kop.inputs``
-    / ``kop.outputs`` for graph buffers, falling back to ``Smem`` decls
-    in the body for smem-local names, then ``f32``."""
+    / ``kop.outputs`` for graph buffers, then ``kop.smem_buffers`` for
+    smem-local names, then ``f32``."""
     t = kop.inputs.get(name) or kop.outputs.get(name)
     if t is not None:
         return t.dtype.name
-    for s in kop.body.iter():
-        if isinstance(s, Smem) and s.name == name:
-            canonical = canonical_from_cuda_name(s.dtype)
-            if canonical is not None:
-                return canonical
+    smem = kop.smem_buffers.get(name)
+    if smem is not None:
+        canonical = canonical_from_cuda_name(smem.dtype)
+        if canonical is not None:
+            return canonical
     return "f32"
 
 

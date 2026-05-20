@@ -41,7 +41,6 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.body_op import BodyOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -69,6 +68,7 @@ from deplodock.compiler.ir.stmt import (
     Write,
     pretty_body,
 )
+from deplodock.compiler.ir.stmt.ir import BodyOp
 
 # ---------------------------------------------------------------------------
 # Schedule-bearing Stmts

@@ -12,11 +12,10 @@ from __future__ import annotations
 
 from math import prod
 
-from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
-from deplodock.compiler.ir.kernel import KernelOp, Smem, Tile
+from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
 from deplodock.compiler.pipeline import Match, Pattern
@@ -77,7 +76,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
         grid=grid,
         block=block,
-        smem_bytes=_smem_bytes(root.op),
+        smem_bytes=root.op.smem_bytes(),
         tma_descriptors=tuple(descriptors),
         zero_outputs=tuple(atomic_outputs),
     )
@@ -95,13 +94,3 @@ def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[i
             grid = ((n_threads + _BLOCK - 1) // _BLOCK, 1, 1)
             return grid, (_BLOCK, 1, 1)
     return (1, 1, 1), (1, 1, 1)
-
-
-def _smem_bytes(kernel_op: KernelOp) -> int:
-    """Sum ``prod(extents) * sizeof(dtype)`` across all ``Smem`` decls."""
-    total = 0
-    for s in kernel_op:
-        if isinstance(s, Smem):
-            elements = prod(int(e) for e in s.extents) if s.extents else 1
-            total += elements * _nbytes_of(s.dtype)
-    return total

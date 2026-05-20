@@ -24,10 +24,10 @@ Tile IR and are materialized away before reaching this layer. A
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
-from deplodock.compiler.ir.body_op import BodyOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -56,6 +56,7 @@ from deplodock.compiler.ir.stmt import (
     Write,
     _pad,
 )
+from deplodock.compiler.ir.stmt.ir import BodyOp
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -492,25 +493,28 @@ class KernelOp(BodyOp):
     appended by the CUDA backend's argument pipeline, not a graph
     buffer)."""
 
+    @cached_property
+    def smem_buffers(self) -> dict[str, Smem]:
+        """Every ``Smem`` decl in the body, keyed by name. Cached — KernelOp
+        is treated as immutable post-construction (passes return new
+        instances), so the deep walk runs at most once per op. The deep
+        walk matters because ``Smem`` stmts sit inside ``Tile`` / ``Loop``
+        bodies post-lowering; a top-level-only iterator would miss them
+        and let oversize kernels slip past :meth:`validate`."""
+        return {s.name: s for s in self if isinstance(s, Smem)}
+
     def smem_bytes(self) -> int:
         """Total static + dynamic ``__shared__`` bytes declared in the
         body — sum of ``prod(Smem.extents) * sizeof(Smem.dtype)`` over
-        every ``Smem`` decl, **at any nesting depth**. ``Smem`` stmts
-        sit inside ``Tile`` / ``Loop`` bodies post-lowering, so the
-        top-level-only iterator the engine used to use under-counted by
-        the entire footprint and lets oversize kernels slip past
-        :meth:`validate`. Use the deep iterator (``for s in self``) to
-        match :meth:`smem_names` and the renderer's
-        ``_compute_dynamic_smem_offsets``."""
+        every ``Smem`` decl."""
         from math import prod  # noqa: PLC0415
 
         from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
 
         total = 0
-        for s in self:
-            if isinstance(s, Smem):
-                elements = prod(int(e) for e in s.extents) if s.extents else 1
-                total += elements * nbytes_of(s.dtype)
+        for s in self.smem_buffers.values():
+            elements = prod(int(e) for e in s.extents) if s.extents else 1
+            total += elements * nbytes_of(s.dtype)
         return total
 
     def validate(self, ctx) -> bool:
@@ -549,14 +553,14 @@ class KernelOp(BodyOp):
     def smem_names(self) -> frozenset[str]:
         """Names of all ``__shared__`` buffers declared in the body — these
         are render-internal and are excluded from kernel-parameter inference."""
-        return frozenset(s.name for s in self if isinstance(s, Smem))
+        return frozenset(self.smem_buffers)
 
     @property
     def body_inputs(self) -> tuple[str, ...]:
         """Body-derived input buffer names — distinct ``Load.input`` /
         ``CpAsyncCopy.src`` / ``TmaDescriptor.src_buf`` in first-use order,
         with smem-declared buffers excluded."""
-        smem = self.smem_names
+        smem = self.smem_buffers
         names: dict[str, None] = {}
         for s in self:
             if isinstance(s, Load) and s.input not in smem:
@@ -571,7 +575,7 @@ class KernelOp(BodyOp):
     def body_outputs(self) -> tuple[str, ...]:
         """Body-derived output buffer names — distinct ``Write.output``
         names in first-use order, with smem-declared buffers excluded."""
-        smem = self.smem_names
+        smem = self.smem_buffers
         return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
 
 

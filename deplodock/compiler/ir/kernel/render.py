@@ -244,10 +244,7 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
     explicit ``align`` field (TMA slabs request 16-byte). The final pool
     size is the offset right after the last buffer (no trailing padding
     required — dynamic smem is sized at launch time)."""
-    smems: list[Smem] = []
-    for s in kernel_op:
-        if isinstance(s, Smem):
-            smems.append(s)
+    smems: list[Smem] = list(kernel_op.smem_buffers.values())
     if not smems:
         return {}, 0
 

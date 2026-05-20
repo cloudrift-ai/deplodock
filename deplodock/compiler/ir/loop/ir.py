@@ -36,7 +36,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.body_op import BodyOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
@@ -51,6 +50,7 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     Write,
     pretty_body,
 )
+from deplodock.compiler.ir.stmt.ir import BodyOp
 
 # ---------------------------------------------------------------------------
 # Scope — a path of enclosing axes

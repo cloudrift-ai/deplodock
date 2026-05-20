@@ -1,32 +1,25 @@
 """Shared base class for body-carrying IR ops (``LoopOp`` / ``TileOp`` /
 ``KernelOp``).
 
-Lives in its own module to dodge a circular import: the ``ir.stmt``
-package's ``normalize`` submodule imports ``Stage`` from ``ir.tile.ir``,
-so ``ir.tile.ir`` can't import ``BodyOp`` from any module that triggers
-``ir.stmt.__init__`` at module-load time. The Body / Load / Write / Stmt
-/ pretty_body symbols ``BodyOp`` needs are imported lazily inside methods
-(and via :data:`TYPE_CHECKING` for annotations) to avoid that cycle.
+Lives inside the ``ir.stmt`` package — and imports its dependencies
+(``Body``, ``Load``, ``Write``, ``Stmt``, ``pretty_body``) from their leaf
+modules directly rather than via the package ``__init__`` — so that
+``ir.stmt.normalize`` (which loads ``Stage`` from ``ir.tile.ir``) doesn't
+re-enter ``ir.stmt.__init__`` through the back door when ``tile.ir``
+imports ``BodyOp``. The leaf-module imports load cleanly because none of
+them touches ``ir.tile``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.base import Op
-
-if TYPE_CHECKING:
-    from deplodock.compiler.ir.stmt.base import Stmt
-    from deplodock.compiler.ir.stmt.body import Body
-    from deplodock.compiler.ir.stmt.leaves import Load, Write
-
-
-def _empty_body() -> Body:
-    from deplodock.compiler.ir.stmt.body import Body as _Body
-
-    return _Body()
+from deplodock.compiler.ir.stmt.base import Stmt
+from deplodock.compiler.ir.stmt.base import pretty_body as _pretty_body_stmts
+from deplodock.compiler.ir.stmt.body import Body
+from deplodock.compiler.ir.stmt.leaves import Load, Write
 
 
 @dataclass
@@ -46,31 +39,30 @@ class BodyOp(Op):
       include ``Stage.buf`` and exclude staged names),
     - a unified ``pretty_body`` printing a ``kernel <name>  inputs: ...
       outputs: ...`` header above the indented body listing.
-    """
 
-    body: Body = field(default_factory=_empty_body)
+    The matcher's :meth:`Op.populate_io` hook is overridden here so the
+    ``inputs`` / ``outputs`` Tensor dicts the matcher snaps onto the op
+    are keyed by the body-derived buf names (which include
+    Stage / CpAsyncCopy / TmaDescriptor src bufs that aren't separate
+    graph predecessors)."""
+
+    body: Body = field(default_factory=Body)
     name: str = ""
 
     def __post_init__(self) -> None:
-        from deplodock.compiler.ir.stmt.body import Body as _Body  # noqa: PLC0415
-
-        if not isinstance(self.body, _Body):
-            self.body = _Body.coerce(self.body)
+        if not isinstance(self.body, Body):
+            self.body = Body.coerce(self.body)
 
     def __iter__(self) -> Iterator[Stmt]:
         return self.body.iter()
 
     @property
     def loads(self) -> tuple[Load, ...]:
-        from deplodock.compiler.ir.stmt.leaves import Load as _Load  # noqa: PLC0415
-
-        return self.body.iter_of_type(_Load)
+        return self.body.iter_of_type(Load)
 
     @property
     def writes(self) -> tuple[Write, ...]:
-        from deplodock.compiler.ir.stmt.leaves import Write as _Write  # noqa: PLC0415
-
-        return self.body.iter_of_type(_Write)
+        return self.body.iter_of_type(Write)
 
     @property
     def body_inputs(self) -> tuple[str, ...]:
@@ -107,8 +99,6 @@ class BodyOp(Op):
     def pretty_body(self) -> str:
         """``kernel <name>  inputs: ...  outputs: ...`` header above the
         indented body listing."""
-        from deplodock.compiler.ir.stmt.base import pretty_body as _pretty_body_stmts  # noqa: PLC0415
-
         sig_in = ", ".join(self.body_inputs) or "-"
         sig_out = ", ".join(self.body_outputs) or "-"
         head = f"kernel {self.name or '<unnamed>'}  inputs: {sig_in}  outputs: {sig_out}"
