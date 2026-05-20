@@ -256,7 +256,6 @@ def _stmt_eval_scope() -> dict:
         StridedLoop,
         Tile,
         Unpack,
-        VecLoad,
         Write,
     )
     from deplodock.compiler.ir.tile.ir import (
@@ -286,7 +285,6 @@ def _stmt_eval_scope() -> dict:
         "Load": Load,
         "Pack": Pack,
         "Unpack": Unpack,
-        "VecLoad": VecLoad,
         "Assign": Assign,
         "Accum": Accum,
         "Init": Init,

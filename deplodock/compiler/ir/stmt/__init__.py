@@ -52,7 +52,7 @@ from deplodock.compiler.ir.stmt.base import (
 )
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, VecLoad, VecStore, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, Write
 from deplodock.compiler.ir.stmt.normalize import (
     canonicalize_buffer_names,
     canonicalize_free_axis_order,
@@ -84,8 +84,6 @@ __all__ = [
     "StridedLoop",
     "Tile",
     "Unpack",
-    "VecLoad",
-    "VecStore",
     "Write",
     "canonicalize_buffer_names",
     "canonicalize_free_axis_order",

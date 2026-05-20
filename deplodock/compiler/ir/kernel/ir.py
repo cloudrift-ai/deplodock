@@ -55,8 +55,6 @@ from deplodock.compiler.ir.stmt import (
     StridedLoop,
     Tile,
     Unpack,
-    VecLoad,
-    VecStore,
     Write,
     _pad,
     pretty_body,
@@ -611,8 +609,6 @@ class KernelOp(Op):
         for s in self:
             if isinstance(s, Load) and s.input not in smem:
                 names.setdefault(s.input, None)
-            elif isinstance(s, VecLoad) and s.input not in smem:
-                names.setdefault(s.input, None)
             elif isinstance(s, CpAsyncCopy) and s.src not in smem:
                 names.setdefault(s.src, None)
             elif isinstance(s, TmaDescriptor) and s.src_buf not in smem:
@@ -625,17 +621,10 @@ class KernelOp(Op):
 
     @property
     def outputs(self) -> tuple[str, ...]:
-        """Distinct ``Write.output`` / ``VecStore.output`` buf names in
-        body first-use order — the kernel's writeable output
-        parameters. Smem buffers are excluded."""
+        """Distinct ``Write.output`` buf names in body first-use order —
+        the kernel's writeable output parameters. Smem buffers are excluded."""
         smem = self.smem_names
-        names: dict[str, None] = {}
-        for s in self:
-            if isinstance(s, Write) and s.output not in smem:
-                names.setdefault(s.output, None)
-            elif isinstance(s, VecStore) and s.output not in smem:
-                names.setdefault(s.output, None)
-        return tuple(names)
+        return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +646,6 @@ __all__ = [
     "Load",
     "Pack",
     "Unpack",
-    "VecLoad",
     "Assign",
     "Select",
     "SelectBranch",

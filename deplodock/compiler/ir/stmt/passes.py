@@ -19,7 +19,7 @@ from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, VecLoad, VecStore, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, Write
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
@@ -60,16 +60,10 @@ def rewrite(stmt: Stmt, rename: Rename, sigma: Sigma = Sigma.IDENTITY, axis_fn: 
 
 @rewrite.register
 def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Load(name=rename(s.name), input=s.input, index=tuple(sigma.apply(e) for e in s.index))
-
-
-@rewrite.register
-def _(s: VecLoad, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return VecLoad(
+    return Load(
         names=tuple(rename(n) for n in s.names),
         input=s.input,
-        base_index=tuple(sigma.apply(e) for e in s.base_index),
-        elem_dtype=s.elem_dtype,
+        index=tuple(sigma.apply(e) for e in s.index),
     )
 
 
@@ -108,18 +102,8 @@ def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Write(
         output=s.output,
         index=tuple(sigma.apply(e) for e in s.index),
-        value=rename(s.value),
+        values=tuple(rename(n) for n in s.values),
         reduce_op=s.reduce_op,
-    )
-
-
-@rewrite.register
-def _(s: VecStore, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return VecStore(
-        names=tuple(rename(n) for n in s.names),
-        output=s.output,
-        base_index=tuple(sigma.apply(e) for e in s.base_index),
-        elem_dtype=s.elem_dtype,
     )
 
 
@@ -180,17 +164,17 @@ def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
 
 @simplify.register
 def _(s: Load, ctx: SimplifyCtx) -> Stmt:
-    return Load(name=s.name, input=s.input, index=tuple(e.simplify(ctx) for e in s.index))
+    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index))
 
 
 @simplify.register
 def _(s: Write, ctx: SimplifyCtx) -> Stmt:
-    return Write(output=s.output, index=tuple(e.simplify(ctx) for e in s.index), value=s.value, reduce_op=s.reduce_op)
-
-
-@simplify.register
-def _(s: VecStore, ctx: SimplifyCtx) -> Stmt:
-    return VecStore(names=s.names, output=s.output, base_index=tuple(e.simplify(ctx) for e in s.base_index), elem_dtype=s.elem_dtype)
+    return Write(
+        output=s.output,
+        index=tuple(e.simplify(ctx) for e in s.index),
+        values=s.values,
+        reduce_op=s.reduce_op,
+    )
 
 
 @simplify.register

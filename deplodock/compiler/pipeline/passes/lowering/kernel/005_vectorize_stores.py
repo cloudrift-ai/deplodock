@@ -1,10 +1,10 @@
-"""Replace runs of consecutive ``Write`` Stmts with one :class:`VecStore`.
+"""Widen runs of consecutive scalar ``Write`` Stmts into one vector ``Write``.
 
 Symmetric to ``003_vectorize_loads``. Until this pass, the body of every
-Kernel-IR Tile carries scalar ``Write`` Stmts. Some sequences have a
-"vector" shape: N consecutive Writes to the same output buffer whose
-last-dim indices differ by 0, 1, ..., N-1. The CUDA backend can emit
-those as one ``make_<vec_type>(...)`` + one
+Kernel-IR Tile carries scalar ``Write`` Stmts (``extra_values=()``).
+Some sequences have a "vector" shape: N consecutive Writes to the same
+output buffer whose last-dim indices differ by 0, 1, ..., N-1. The CUDA
+backend can emit those as one ``make_<vec_type>(...)`` + one
 ``*reinterpret_cast<<vec_type>*>(&buf[base]) = packed;`` transaction.
 
 ## What the pass does
@@ -13,14 +13,13 @@ For each ``Body`` (Tile body and every nested Loop / StridedLoop / Cond /
 Tile body, post-order):
 
 1. Walk the stmts. At each position, try widths 8 then 4 then 2.
-2. If ``[body[i], ..., body[i+n-1]]`` are all ``Write``s to the same
-   output buffer with the same ``reduce_op`` (or none — atomic
-   reduce-writes do NOT vectorize), matching outer indices, and
-   last-dim indices that affinely decompose to
-   ``anchor, anchor+1, ..., anchor+n-1`` (same coefficients on free
-   vars), AND the target supports ``vector_type(elem_dtype, n)`` for
-   the destination-buffer dtype, replace the run with one
-   ``VecStore(names=(n0..n_{n-1}), output, base_index, elem_dtype)``.
+2. If ``[body[i], ..., body[i+n-1]]`` are all scalar ``Write``s to the
+   same output buffer with ``reduce_op is None`` (atomic reduce-writes
+   do NOT vectorize), matching outer indices, and last-dim indices that
+   affinely decompose to ``anchor, anchor+1, ..., anchor+n-1`` (same
+   coefficients on free vars), AND the target supports
+   ``vector_type(elem_dtype, n)`` for the destination-buffer dtype,
+   replace the run with one widened ``Write``.
 3. Otherwise advance one stmt.
 
 ## Why this lives at the Kernel-IR boundary
@@ -43,7 +42,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import Smem
-from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt, StridedLoop, Tile, VecStore, Write
+from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt, StridedLoop, Tile, Write
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -126,16 +125,19 @@ def _vectorize_body(body: Body, buf_dtypes: dict[str, str]) -> Body:
     return Body(tuple(out))
 
 
-def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str]) -> VecStore | None:
+def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[str, str]) -> Write | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Write pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
-    destination buffer's dtype, return the replacement :class:`VecStore`.
+    destination buffer's dtype, return the widened :class:`Write`.
     Otherwise return ``None``."""
     stmts_list = list(stmts)
     if start + n > len(stmts_list):
         return None
     writes = stmts_list[start : start + n]
     if not all(isinstance(s, Write) for s in writes):
+        return None
+    # Already-widened Writes in the run aren't safe to re-merge — bail.
+    if any(s.is_vector for s in writes):
         return None
 
     outputs = {s.output for s in writes}
@@ -197,9 +199,9 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, buf_dtypes: dict[s
         if not isinstance(anchor_simplified, Literal) or anchor_simplified.value % n != 0:
             return None
 
-    return VecStore(
-        names=tuple(s.value for s in writes),
+    return Write(
         output=output_name,
-        base_index=writes[0].index,
-        elem_dtype=dst_dt,
+        index=writes[0].index,
+        values=tuple(s.value for s in writes),
+        reduce_op=None,
     )

@@ -408,7 +408,9 @@ def _analyze_kernel(kernel_op, Smem, stage_filter, k_iter: int, warp_id: int) ->
     out: list[BankConflictResult] = []
     seen: set[tuple] = set()
     for smem, load, encl in bindings:
-        key = (kernel_op.name, smem.name, load.name)
+        # Vector Loads share lane-0 name as the identifier — the
+        # analyzer keys on Load identity, not per-lane SSA.
+        key = (kernel_op.name, smem.name, load.names[0])
         if key in seen:
             continue
         seen.add(key)
@@ -452,7 +454,7 @@ def _build_kernel_result(
         cols=int(smem.extents[1]) if len(smem.extents) > 1 else 1,
         pad=(),  # already folded into Smem.extents at materialize_tile
         smem_bytes=smem_bytes,
-        load_name=load.name,
+        load_name=load.names[0],
         tile_op_name=kernel_op.name or "",
         index_repr=tuple(e.pretty() for e in cache_idx),
         lane_banks=dist.lane_banks,
