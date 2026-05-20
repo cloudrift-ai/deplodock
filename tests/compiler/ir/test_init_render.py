@@ -75,8 +75,8 @@ def _kernel_with_fp32_accum_over_fp16_load() -> KernelOp:
     return KernelOp(
         body=(encl,),
         name="k_fp32_acc_fp16",
-        input_tensors={"A": Tensor("A", (8,), _dt.F16)},
-        output_tensors={"C": Tensor("C", (), _dt.F32)},
+        inputs={"A": Tensor("A", (8,), _dt.F16)},
+        outputs={"C": Tensor("C", (), _dt.F32)},
     )
 
 

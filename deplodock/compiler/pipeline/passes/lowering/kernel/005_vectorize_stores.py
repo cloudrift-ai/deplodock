@@ -25,7 +25,7 @@ Tile body, post-order):
 ## Why this lives at the Kernel-IR boundary
 
 Same reason as ``003_vectorize_loads``: the decision needs the
-destination-buffer dtype, which comes from ``KernelOp.output_tensors``
+destination-buffer dtype, which comes from graph node dtypes for ``KernelOp.outputs`` keys
 or the graph node's dtype. Running here keeps both pieces of context in
 one place and ensures the IR-visible form (``--ir kernel``) reflects
 the optimization.
@@ -53,17 +53,16 @@ _TARGET = CudaRenderTarget()
 def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
 
-    # Per-buffer dtype map: graph buffers from input_tensors /
-    # output_tensors, then graph fallback, then Smem dtypes from the
-    # body. Mirror ``003_vectorize_loads`` so we cover smem writebacks
-    # too even though the common case is the kernel's output buffer.
+    # Per-buffer dtype map: graph buffers via ``kop.inputs`` / ``kop.outputs``
+    # keys (placeholder F32 tensor values at this pre-cuda-lowering stage —
+    # graph is the real dtype source), then Smem dtypes from the body. Mirror
+    # ``003_vectorize_loads`` so we cover smem writebacks too even though the
+    # common case is the kernel's output buffer.
     buf_dtypes: dict[str, str] = {}
-    for name, t in {**kop.input_tensors, **kop.output_tensors}.items():
-        buf_dtypes[name] = t.dtype.name
     for nid in kop.inputs:
         node = match.graph.nodes.get(nid)
         if node is not None:
-            buf_dtypes.setdefault(nid, node.output.dtype.name)
+            buf_dtypes[nid] = node.output.dtype.name
     for out in kop.outputs:
         node = match.graph.nodes.get(out)
         if node is not None:
@@ -81,8 +80,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     return KernelOp(
         body=new_body,
         name=kop.name,
-        input_tensors=dict(kop.input_tensors),
-        output_tensors=dict(kop.output_tensors),
+        inputs=dict(kop.inputs),
+        outputs=dict(kop.outputs),
     )
 
 

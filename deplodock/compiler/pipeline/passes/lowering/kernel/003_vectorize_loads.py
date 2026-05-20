@@ -28,8 +28,8 @@ Tile body, post-order):
 
 ## Why this lives at the Kernel-IR boundary
 
-The decision needs the source-buffer dtype (``KernelOp.input_tensors``
-+ ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
+The decision needs the source-buffer dtype (graph node dtypes for
+``KernelOp.inputs`` keys + ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
 info, so ``normalize_body`` (which runs on every Body construction)
 can't make the call without external context. Running the pass here —
 after ``001_materialize_tile`` has placed the Smem decls and before
@@ -66,16 +66,15 @@ _TARGET = CudaRenderTarget()
 def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
 
-    # Per-buffer dtype map: graph buffers from input_tensors /
-    # output_tensors (set by 001_lower_kernelop downstream — empty
-    # here), then graph fallback, then Smem dtypes from the body.
+    # Per-buffer dtype map: graph buffers via ``kop.inputs`` / ``kop.outputs``
+    # keys (the dict values are placeholder F32 tensors at this pre-cuda-lowering
+    # stage, so the graph is the only real dtype source), then Smem dtypes from
+    # the body.
     buf_dtypes: dict[str, str] = {}
-    for name, t in {**kop.input_tensors, **kop.output_tensors}.items():
-        buf_dtypes[name] = t.dtype.name
     for nid in kop.inputs:
         node = match.graph.nodes.get(nid)
         if node is not None:
-            buf_dtypes.setdefault(nid, node.output.dtype.name)
+            buf_dtypes[nid] = node.output.dtype.name
     for out in kop.outputs:
         node = match.graph.nodes.get(out)
         if node is not None:
@@ -105,8 +104,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     return KernelOp(
         body=new_body,
         name=kop.name,
-        input_tensors=dict(kop.input_tensors),
-        output_tensors=dict(kop.output_tensors),
+        inputs=dict(kop.inputs),
+        outputs=dict(kop.outputs),
     )
 
 

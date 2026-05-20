@@ -186,8 +186,8 @@ def render_kernelop(
     # Fall back to the KernelOp's own per-buffer Tensor descriptors when
     # the caller didn't pass an explicit map. The CUDA-lowering pass
     # passes ``tensors=`` explicitly; tests that construct a bare KernelOp
-    # with ``input_tensors``/``output_tensors`` rely on this fallback.
-    for n, t in {**kernel_op.input_tensors, **kernel_op.output_tensors}.items():
+    # with populated ``inputs``/``outputs`` dicts rely on this fallback.
+    for n, t in {**kernel_op.inputs, **kernel_op.outputs}.items():
         tmap.setdefault(n, t)
     smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
     ctx = RenderCtx(
@@ -204,8 +204,8 @@ def render_kernelop(
     def _dtype_for(name: str, fallback: object) -> object:
         return tmap[name].dtype if name in tmap else fallback
 
-    sig_parts = [f"const {cuda_name(_dtype_for(n, kernel_op.input_dtype(n)))}* {n}" for n in kernel_op.inputs if n not in literals]
-    sig_parts.extend(f"{cuda_name(_dtype_for(n, kernel_op.output_dtype(n)))}* {n}" for n in kernel_op.outputs)
+    sig_parts = [f"const {cuda_name(_dtype_for(n, kernel_op.inputs[n].dtype))}* {n}" for n in kernel_op.inputs if n not in literals]
+    sig_parts.extend(f"{cuda_name(_dtype_for(n, kernel_op.outputs[n].dtype))}* {n}" for n in kernel_op.outputs)
     # TMA descriptors are passed as ``__grid_constant__`` value parameters.
     # The kernel only takes their address (``&desc``) for inline asm, so
     # the opaque ``CUtensorMap`` forward decl above suffices.
@@ -232,8 +232,8 @@ def render_kernelop(
         pool_decl = f"    extern __shared__ __align__(16) unsigned char _smem_pool[];  // {smem_total} bytes\n"
         body_text = pool_decl + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
-    sig_dtypes = [_dtype_for(n, kernel_op.input_dtype(n)) for n in kernel_op.inputs if n not in literals]
-    sig_dtypes.extend(_dtype_for(n, kernel_op.output_dtype(n)) for n in kernel_op.outputs)
+    sig_dtypes = [_dtype_for(n, kernel_op.inputs[n].dtype) for n in kernel_op.inputs if n not in literals]
+    sig_dtypes.extend(_dtype_for(n, kernel_op.outputs[n].dtype) for n in kernel_op.outputs)
     includes = "".join(f"#include {h}\n" for h in cuda_includes(sig_dtypes))
     return f'{includes}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
 

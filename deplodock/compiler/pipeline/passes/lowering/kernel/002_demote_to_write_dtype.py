@@ -83,10 +83,10 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
     body = kop.body
 
-    # Output buffer dtypes. ``001_materialize_tile`` doesn't yet set
-    # ``output_tensors`` on the KernelOp (the CUDA-lowering pass does
-    # that downstream), so read directly from the surrounding graph
-    # using the KernelOp's body-derived ``outputs`` plus ``root.output``
+    # Output buffer dtypes. ``001_materialize_tile`` only leaves
+    # placeholder F32 tensors in ``kop.outputs`` (the CUDA-lowering pass
+    # populates real dtypes downstream), so read directly from the
+    # surrounding graph using ``kop.outputs`` keys plus ``root.output``
     # for the case where the KernelOp's own node-output is the only
     # written buffer. Falls back to ``f32`` for anything we can't find.
     out_dtypes: dict[str, str] = {}
@@ -197,8 +197,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     return KernelOp(
         body=new_body,
         name=kop.name,
-        input_tensors=dict(kop.input_tensors),
-        output_tensors=dict(kop.output_tensors),
+        inputs=dict(kop.inputs),
+        outputs=dict(kop.outputs),
     )
 
 

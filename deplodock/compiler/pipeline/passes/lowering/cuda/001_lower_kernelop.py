@@ -32,16 +32,23 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 
     # Per-buffer Tensor descriptors (shape + dtype) for the kernel
     # signature and the renderer's index flattening. Read from the
-    # surrounding graph; the renderer falls back to F32 / shape () for
-    # any missing entry (e.g. legacy KernelOps constructed bare in tests).
-    input_tensors: dict[str, Tensor] = {bid: graph.nodes[bid].output for bid in root.op.inputs if bid in graph.nodes}
-    output_tensors: dict[str, Tensor] = {
-        out: (graph.nodes[out].output if out in graph.nodes else Tensor(out, tuple(root.output.shape), root.output.dtype))
-        for out in root.op.outputs
-    }
-    root.op.input_tensors = input_tensors
-    root.op.output_tensors = output_tensors
-    tensors: dict[str, Tensor] = {**input_tensors, **output_tensors}
+    # surrounding graph; the placeholder dict entries that
+    # ``KernelOp.__post_init__`` populated stay only for buffers the
+    # graph doesn't know about (e.g. legacy KernelOps constructed bare).
+    new_inputs: dict[str, Tensor] = {}
+    for bid in root.op.inputs:
+        node = graph.nodes.get(bid)
+        new_inputs[bid] = node.output if node is not None else root.op.inputs[bid]
+    new_outputs: dict[str, Tensor] = {}
+    for out in root.op.outputs:
+        node = graph.nodes.get(out)
+        if node is not None:
+            new_outputs[out] = node.output
+        else:
+            new_outputs[out] = Tensor(out, tuple(root.output.shape), root.output.dtype)
+    root.op.inputs = new_inputs
+    root.op.outputs = new_outputs
+    tensors: dict[str, Tensor] = {**new_inputs, **new_outputs}
 
     # Scalar ConstantOp inputs get embedded as float literals in the kernel
     # body — no kernel parameter, no buffer load.

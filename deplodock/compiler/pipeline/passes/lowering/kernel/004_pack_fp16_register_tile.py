@@ -78,8 +78,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     return KernelOp(
         body=new_body,
         name=kop.name,
-        input_tensors=dict(kop.input_tensors),
-        output_tensors=dict(kop.output_tensors),
+        inputs=dict(kop.inputs),
+        outputs=dict(kop.outputs),
     )
 
 

@@ -492,33 +492,28 @@ class KernelOp(Op):
     params, distinct ``Write.output`` names become writeable output
     params, ordered by first appearance. ``Smem`` buffers are excluded.
 
-    ``input_tensors`` / ``output_tensors`` map a global-buffer name to a
-    :class:`Tensor` describing that buffer (its shape + dtype). Populated
-    by the CUDA-lowering pass from the surrounding graph; missing entries
-    fall back to a unit-shape :data:`F32` tensor so legacy tests that
-    build KernelOps directly keep working.
+    ``inputs`` / ``outputs`` map a global-buffer name to a :class:`Tensor`
+    describing that buffer (its shape + dtype). When constructed empty,
+    ``__post_init__`` auto-populates them with body-derived names in
+    first-use order, using placeholder ``Tensor(name, (), F32)`` entries
+    — the CUDA-lowering pass replaces those with real graph-sourced
+    tensors before render. Tests that build a bare ``KernelOp`` get the
+    body-derived placeholders automatically, so iteration order
+    (``for n in kop.inputs``) matches first-appearance in the body.
     """
 
     body: Body = field(default_factory=Body)
     name: str = ""
-    input_tensors: dict[str, Tensor] = field(default_factory=dict)
-    output_tensors: dict[str, Tensor] = field(default_factory=dict)
+    inputs: dict[str, Tensor] = field(default_factory=dict)
+    outputs: dict[str, Tensor] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             self.body = Body.coerce(self.body)
-
-    def input_tensor(self, name: str) -> Tensor:
-        return self.input_tensors.get(name) or Tensor(name, (), F32)
-
-    def output_tensor(self, name: str) -> Tensor:
-        return self.output_tensors.get(name) or Tensor(name, (), F32)
-
-    def input_dtype(self, name: str) -> DataType:
-        return self.input_tensor(name).dtype
-
-    def output_dtype(self, name: str) -> DataType:
-        return self.output_tensor(name).dtype
+        if not self.inputs:
+            self.inputs = {n: Tensor(n, (), F32) for n in self._body_input_names()}
+        if not self.outputs:
+            self.outputs = {n: Tensor(n, (), F32) for n in self._body_output_names()}
 
     def __iter__(self) -> Iterator[Stmt]:
         return self.body.iter()
@@ -593,17 +588,14 @@ class KernelOp(Op):
         are render-internal and are excluded from kernel-parameter inference."""
         return frozenset(s.name for s in self if isinstance(s, Smem))
 
-    @property
-    def inputs(self) -> tuple[str, ...]:
-        """Distinct ``Load.input`` buf names in body first-use order — the
-        kernel's input parameters. Smem buffers are excluded.
+    def _body_input_names(self) -> tuple[str, ...]:
+        """Distinct global-buffer read names in body first-use order — the
+        seed for ``self.inputs`` keys. Smem buffers are excluded.
 
-        ``CpAsyncCopy`` stmts also count as global-buffer reads — their
-        ``src`` field names a kernel parameter same as ``Load.input`` does
-        for the synchronous path. ``TmaDescriptor`` reports its
-        ``src_buf`` (the global buffer the descriptor addresses); the
-        descriptor parameter itself is appended by the CUDA backend's
-        argument pipeline since it's host-built, not a graph buffer."""
+        ``Load.input``, ``CpAsyncCopy.src``, and ``TmaDescriptor.src_buf``
+        all name kernel input parameters. (The descriptor parameter itself
+        is host-built and appended by the CUDA backend's argument pipeline,
+        not a graph buffer.)"""
         smem = self.smem_names
         names: dict[str, None] = {}
         for s in self:
@@ -619,10 +611,9 @@ class KernelOp(Op):
     def writes(self) -> tuple[Write, ...]:
         return self.body.iter_of_type(Write)
 
-    @property
-    def outputs(self) -> tuple[str, ...]:
+    def _body_output_names(self) -> tuple[str, ...]:
         """Distinct ``Write.output`` buf names in body first-use order —
-        the kernel's writeable output parameters. Smem buffers are excluded."""
+        the seed for ``self.outputs`` keys. Smem buffers are excluded."""
         smem = self.smem_names
         return tuple(dict.fromkeys(s.output for s in self.writes if s.output not in smem))
 
