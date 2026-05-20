@@ -353,23 +353,27 @@ class TreeHalve(Stmt):
 
     Reduces ``buf[0..length)`` into ``buf[0]`` using ``op`` as the combine.
     ``tid_var`` names the cooperative thread axis. ``length`` must be a
-    power of two and ``≤ blockDim.x``.
+    power of two and ``≤ blockDim.x``. ``dtype`` is the element type of
+    the smem buffer and the dtype the combine operates in — the renderer
+    picks the right intrinsic spelling (``fmaxf`` vs ``__hmax``, etc.)
+    via the target.
     """
 
     buf: str
     op: ElementwiseImpl
     length: int
     tid_var: str
+    dtype: DataType = F32
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}TreeHalve({self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
+        return [f"{indent}TreeHalve({self.buf} :{self.dtype.name}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
         pad = _pad(ctx.indent)
         inner_pad = _pad(ctx.indent + 1)
         halve_pad = _pad(ctx.indent + 2)
-        op_expr = _binary_combine_expr(self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]")
+        op_expr = _binary_combine_expr(self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name)
         half = int(self.length) // 2
         return [
             f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
@@ -388,7 +392,7 @@ class WarpShuffle(Stmt):
 
     Renders as a register-only butterfly (no smem, no syncthreads):
 
-        float <name> = <value>;
+        <type> <name> = <value>;
         <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/2));
         <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/4));
         ...
@@ -398,40 +402,54 @@ class WarpShuffle(Stmt):
     thread count fits in a single warp (``length ≤ 32``, power of two).
     Replaces the ``Smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + ``Load``
     sequence — kills the smem alloc, the two block barriers, and the
-    smem-staged broadcast load.
+    smem-staged broadcast load. ``dtype`` is the parent accumulator's
+    dtype; the renderer declares the local + picks the combine intrinsic
+    at that dtype via the target.
     """
 
     name: str
     value: str
     op: ElementwiseImpl
     length: int
+    dtype: DataType = F32
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}WarpShuffle({self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
+        return [f"{indent}WarpShuffle({self.name} :{self.dtype.name} <- {self.value}, op={self.op.name}, length={self.length})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
-        out = [f"{pad}float {self.name} = {self.value};"]
+        acc_dt = self.dtype.name
+        value_dt = ctx.ssa_dtypes.get(self.value, acc_dt)
+        src_expr = ctx.target.convert(self.value, value_dt, acc_dt)
+        ctx.ssa_dtypes[self.name] = acc_dt
+        out = [f"{pad}{ctx.type_name(acc_dt)} {self.name} = {src_expr};"]
         s = int(self.length) // 2
         while s > 0:
             shfl = f"__shfl_xor_sync(0xffffffff, {self.name}, {s})"
-            combined = _binary_combine_expr(self.op, self.name, shfl)
+            combined = _binary_combine_expr(self.op, self.name, shfl, ctx.target, acc_dt)
             out.append(f"{pad}{self.name} = {combined};")
             s >>= 1
         return out
 
 
-def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str) -> str:
-    """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops."""
+def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: str = "f32") -> str:
+    """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops at ``dt``.
+
+    ``target`` (optional) provides the dtype-specific intrinsic spelling.
+    ``None`` keeps the legacy f32 spellings for callers that haven't
+    plumbed a target through yet.
+    """
     name = op.name
     if name in ("add", "sum"):
         return f"{a} + {b}"
     if name in ("multiply", "prod"):
         return f"{a} * {b}"
     if name in ("maximum", "amax"):
-        return f"fmaxf({a}, {b})"
+        spelling = target.intrinsic("fmax", dt) if target is not None else "fmaxf"
+        return f"{spelling}({a}, {b})"
     if name == "minimum":
-        return f"fminf({a}, {b})"
+        spelling = target.intrinsic("fmin", dt) if target is not None else "fminf"
+        return f"{spelling}({a}, {b})"
     raise ValueError(f"TreeHalve: unsupported op {name!r}")
 
 

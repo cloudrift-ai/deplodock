@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
@@ -406,7 +407,8 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
             # Assign fold between the multi-Accum StridedLoop and the
             # Combine — so Combine.name may instead reference that fold's
             # output. The combine emission only needs (name, op).
-            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads))
+            accum_dtype = (pending_reduce.dtype or F32) if pending_reduce is not None else F32
+            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, accum_dtype))
             rename[stmt.name] = f"{stmt.name}_b"
             pending_reduce = None
         else:
@@ -622,7 +624,7 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
 _WARP_SIZE = 32
 
 
-def _emit_combine(name: str, op, t: str, n_threads: int) -> list[Stmt]:
+def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32) -> list[Stmt]:
     """Emit the cross-thread combine producing ``<name>_b``.
 
     Three paths, picked by ``n_threads``:
@@ -644,36 +646,45 @@ def _emit_combine(name: str, op, t: str, n_threads: int) -> list[Stmt]:
       indexed by ``t``, a single ``TreeHalve`` over ``n_threads``
       reduces in place, broadcast load.
 
+    ``dtype`` flows from the parent ``Accum.dtype`` (set by the
+    Init-placement pass) so the per-warp register, the inter-warp smem
+    slab, and the TreeHalve combine all render in the accumulator's
+    element type — fp16 reductions stay fp16 across the inter-warp
+    step instead of promoting back to fp32 in the broadcast.
+
     The Tile renderer emits ``int lane = threadIdx.x & 31;`` and
     ``int warp = threadIdx.x >> 5;`` for any cooperative Tile with
     ``n_threads > WARP_SIZE`` so the hierarchical path's ``Var("lane")``
     / ``Var("warp")`` references resolve.
     """
+    from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
+
+    smem_c_name = _cuda_name(dtype)
     broadcast_name = f"{name}_b"
     if n_threads <= _WARP_SIZE and (n_threads & (n_threads - 1)) == 0:
-        return [WarpShuffle(name=broadcast_name, value=name, op=op, length=n_threads)]
+        return [WarpShuffle(name=broadcast_name, value=name, op=op, length=n_threads, dtype=dtype)]
     if n_threads % _WARP_SIZE == 0 and (n_threads & (n_threads - 1)) == 0:
         n_warps = n_threads // _WARP_SIZE
         smem_name = f"{name}_smem"
         warp_w = f"{name}_w"
         return [
-            WarpShuffle(name=warp_w, value=name, op=op, length=_WARP_SIZE),
-            Smem(name=smem_name, extents=(n_warps,)),
+            WarpShuffle(name=warp_w, value=name, op=op, length=_WARP_SIZE, dtype=dtype),
+            Smem(name=smem_name, extents=(n_warps,), dtype=smem_c_name),
             Cond(
                 cond=BinaryExpr("==", Var("lane"), Literal(0, "int")), body=(Write(output=smem_name, index=(Var("warp"),), value=warp_w),)
             ),
             Sync(),
-            TreeHalve(buf=smem_name, op=op, length=n_warps, tid_var="warp"),
+            TreeHalve(buf=smem_name, op=op, length=n_warps, tid_var="warp", dtype=dtype),
             # TreeHalve's render ends each loop iter with __syncthreads(), so a
             # trailing Sync here would be a no-op pair with the loop's last sync.
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
         ]
     smem_name = f"{name}_smem"
     return [
-        Smem(name=smem_name, extents=(n_threads,)),
+        Smem(name=smem_name, extents=(n_threads,), dtype=smem_c_name),
         Write(output=smem_name, index=(Var(t),), value=name),
         Sync(),
-        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t),
+        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t, dtype=dtype),
         # See note above on TreeHalve's trailing sync.
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
