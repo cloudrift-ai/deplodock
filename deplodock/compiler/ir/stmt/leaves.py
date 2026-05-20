@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr, Literal, Var, _float_lit
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, op_to_expr, render_index, select_to_ternary
 
 
@@ -151,6 +151,67 @@ class Load(Stmt):
         src_dt = ctx.buffer_dtypes.get(self.input, "f32")
         ctx.ssa_dtypes[self.name] = src_dt
         return [f"{_pad(ctx.indent)}{ctx.type_name(src_dt)} {self.name} = {self.input}[{flat}];"]
+
+
+@dataclass(frozen=True)
+class VecLoad(Stmt):
+    """N consecutive ``Load``s packed into a single vector read.
+
+    Emits ``<vec_type> _v_<n0> = *reinterpret_cast<const <vec_type>*>(...);``
+    followed by ``<elem_type> <name_k> = _v_<n0>.<x|y|z|w>;`` unpacks. The
+    vector + element C type names come from the target's
+    :meth:`RenderTarget.vector_type` for ``(elem_dtype, n)``.
+
+    ``base_index`` is the index of lane 0; lane k's source position is
+    ``base_index[:-1] + (base_index[-1] + k,)``. The pass that introduces
+    ``VecLoad`` (``003_vectorize_loads``) verifies the consecutive-load
+    pattern structurally; ``VecLoad.render`` only needs to format the
+    output.
+    """
+
+    names: tuple[str, ...]
+    input: str
+    base_index: tuple[Expr, ...]
+    elem_dtype: str  # canonical token: "f32" / "f16"
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    def defines(self) -> tuple[str, ...]:
+        return self.names
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return self.base_index
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(e.pretty() for e in self.base_index)
+        names = ", ".join(self.names)
+        return [f"{indent}{self.elem_dtype} {names} = vec_load[{len(self.names)}] {self.input}[{idx}]"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        n = len(self.names)
+        vec_pair = ctx.target.vector_type(self.elem_dtype, n)
+        pad = _pad(ctx.indent)
+        if vec_pair is None:
+            # Target doesn't support this width — fall back to scalar
+            # Loads. The vectorize pass should have avoided this, but
+            # render's job is to always produce valid code.
+            out: list[str] = []
+            for k, nm in enumerate(self.names):
+                idx_k = tuple(self.base_index[:-1]) + (BinaryExpr("+", self.base_index[-1], Literal(k, "int")),)
+                flat = render_index(self.input, idx_k, ctx)
+                ctx.ssa_dtypes[nm] = self.elem_dtype
+                out.append(f"{pad}{ctx.type_name(self.elem_dtype)} {nm} = {self.input}[{flat}];")
+            return out
+        vec_type, elem_type = vec_pair
+        flat = render_index(self.input, self.base_index, ctx)
+        vname = f"_v_{self.names[0]}"
+        components = ("x", "y", "z", "w")[:n]
+        out = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{self.input}[{flat}]);"]
+        out.extend(f"{pad}{elem_type} {nm} = {vname}.{c};" for nm, c in zip(self.names, components, strict=True))
+        for nm in self.names:
+            ctx.ssa_dtypes[nm] = self.elem_dtype
+        return out
 
 
 @dataclass(frozen=True)

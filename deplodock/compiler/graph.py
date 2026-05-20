@@ -254,6 +254,7 @@ def _stmt_eval_scope() -> dict:
         SelectBranch,
         StridedLoop,
         Tile,
+        VecLoad,
         Write,
     )
     from deplodock.compiler.ir.tile.ir import (
@@ -281,6 +282,7 @@ def _stmt_eval_scope() -> dict:
         "TernaryExpr": TernaryExpr,
         "CastExpr": CastExpr,
         "Load": Load,
+        "VecLoad": VecLoad,
         "Assign": Assign,
         "Accum": Accum,
         "Init": Init,

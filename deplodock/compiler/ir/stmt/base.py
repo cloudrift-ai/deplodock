@@ -412,20 +412,13 @@ def pretty_body(body: Body, indent: str = "") -> list[str]:
 def render_body(body: Body, ctx: RenderCtx) -> list[str]:
     """Flatten ``stmt.render(ctx)`` over a body sequence.
 
-    Vectorizes runs of N=4 (or N=2) consecutive ``Load`` stmts whose
-    indices match in every higher dim and form ``e0, e0+1, ...`` on the
-    last dim into a single ``ld.shared.v4`` (``LDS.128``) emit. Each lane
-    receives 4 fp32 in a single instruction, and the warp-wide phase
-    structure of an LDS.128 (4 phases of 8 lanes × 32 fp32) naturally
-    maps to 32 distinct banks per phase — eliminating the 4-way conflict
-    that plagues 4 separate scalar ``LDS.32`` reads at the same offsets.
-
-    Buffer-side prerequisites (16-byte alignment, fp32 dtype) are
-    enforced upstream — TMA-target ``Smem`` decls already get
-    ``__align__(16)``, and the renderer only emits ``float`` typed
-    Loads. The match is purely syntactic so degenerate cases (a Load
-    whose ``input`` resolves to a scalar literal constant, or a run
-    that doesn't form a contiguous index sequence) bypass cleanly.
+    Detection of vectorizable Load runs (``LDS.128`` / ``__half2``) is
+    no longer done here — the dedicated Kernel-IR pass
+    ``003_vectorize_loads`` rewrites those runs into explicit
+    :class:`VecLoad` Stmts before render. This function's only
+    pre-walk responsibility is registering literal-constant Loads so
+    their ``Var(name)`` uses inline as float literals instead of
+    materializing a named local.
     """
     from deplodock.compiler.ir.stmt.leaves import Load  # local — avoid cycle
 
@@ -445,88 +438,8 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
             ctx = replace(ctx, literal_ssa=new_map)
 
     out: list[str] = []
-    i = 0
-    n = len(body)
-    while i < n:
-        s = body[i]
+    for s in body:
         if isinstance(s, Load) and s.name in ctx.literal_ssa and s.is_literal(ctx.literal_constants):
-            i += 1
             continue
-        for run_n in (4, 2):
-            run = _vec_load_run(body, i, run_n, ctx)
-            if run is not None:
-                out.extend(run)
-                i += run_n
-                break
-        else:
-            out.extend(s.render(ctx))
-            i += 1
-    return out
-
-
-def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] | None:
-    """If ``body[start:start+n]`` matches the consecutive-Load pattern,
-    return the rendered ``float<n>`` vector load + per-lane unpacks.
-    Otherwise return ``None`` so :func:`render_body` falls back to the
-    per-stmt path."""
-    from deplodock.compiler.ir.stmt.leaves import Load  # local — avoid cycle
-
-    if start + n > len(body):
-        return None
-    loads = body[start : start + n]
-    if not all(isinstance(s, Load) for s in loads):
-        return None
-    if any(s.is_literal(ctx.literal_constants) for s in loads):
-        return None
-    inputs = {s.input for s in loads}
-    if len(inputs) != 1:
-        return None
-    (input_name,) = inputs
-    src_dt = ctx.buffer_dtypes.get(input_name, "f32")
-    vec_pair = ctx.target.vector_type(src_dt, n)
-    if vec_pair is None:
-        return None
-    rank = len(loads[0].index)
-    if rank == 0 or any(len(s.index) != rank for s in loads[1:]):
-        return None
-    higher = loads[0].index[:-1]
-    for s in loads[1:]:
-        if s.index[:-1] != higher:
-            return None
-    # Compare last-dim expressions via affine decomposition: same var
-    # coefficients, anchor differing by exactly ``k``. ``simplify`` alone
-    # doesn't fold ``(a*4 + k) - (a*4)`` to ``k`` (it only handles
-    # literal-only arithmetic), so we extract the affine form and
-    # subtract the anchors instead.
-    from deplodock.compiler.ir.expr import affine_form  # local — keep base.py minimal
-
-    inner_0 = loads[0].index[-1]
-    free = inner_0.free_vars()
-    for s in loads[1:]:
-        free = free | s.index[-1].free_vars()
-    af0 = affine_form(inner_0, free)
-    if af0 is None:
-        return None
-    anchor_0, coeffs_0 = af0
-    for k, s in enumerate(loads):
-        if k == 0:
-            continue
-        af = affine_form(s.index[-1], free)
-        if af is None:
-            return None
-        anchor_k, coeffs_k = af
-        if coeffs_k != coeffs_0:
-            return None
-        diff = BinaryExpr("-", anchor_k, anchor_0).simplify(SimplifyCtx.empty())
-        if not (isinstance(diff, Literal) and isinstance(diff.value, int) and diff.value == k):
-            return None
-    flat = render_index(loads[0].input, loads[0].index, ctx)
-    pad = _pad(ctx.indent)
-    vname = f"_v_{loads[0].name}"
-    components = ("x", "y", "z", "w")[:n]
-    vec_type, elem_type = vec_pair
-    out = [f"{pad}{vec_type} {vname} = *reinterpret_cast<const {vec_type}*>(&{loads[0].input}[{flat}]);"]
-    out.extend(f"{pad}{elem_type} {s.name} = {vname}.{c};" for s, c in zip(loads, components, strict=True))
-    for s in loads:
-        ctx.ssa_dtypes[s.name] = src_dt
+        out.extend(s.render(ctx))
     return out
