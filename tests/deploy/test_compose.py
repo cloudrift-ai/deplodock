@@ -275,3 +275,20 @@ def test_compose_docker_options_nested_values(sample_config):
     parsed = yaml.safe_load(result)
     svc = parsed["services"]["vllm_0"]
     assert svc["ulimits"] == {"memlock": {"soft": -1, "hard": -1}}
+
+
+# ── restart policy ────────────────────────────────────────────────
+
+
+def test_compose_restart_policy_on_engine_service(sample_config):
+    recipe = Recipe.from_dict(sample_config)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=1)
+    parsed = yaml.safe_load(result)
+    assert parsed["services"]["vllm_0"]["restart"] == "unless-stopped"
+
+
+def test_compose_restart_policy_on_nginx_service(sample_config_multi):
+    recipe = Recipe.from_dict(sample_config_multi)
+    result = generate_compose(recipe, "/mnt/models", "token", num_instances=2)
+    parsed = yaml.safe_load(result)
+    assert parsed["services"]["nginx"]["restart"] == "unless-stopped"

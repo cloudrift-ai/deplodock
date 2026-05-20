@@ -71,6 +71,7 @@ _MANAGED_COMPOSE_KEYS = frozenset(
         "ipc",
         "command",
         "healthcheck",
+        "restart",
     }
 )
 
