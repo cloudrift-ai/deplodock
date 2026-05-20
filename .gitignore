@@ -19,7 +19,7 @@ docker-compose.vllm.yml
 nginx.vllm.conf
 
 # PyCharm
-.idea/*.cubin
+.idea
 
 # Local environment / secrets
 .env
