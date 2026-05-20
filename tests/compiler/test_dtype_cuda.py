@@ -13,6 +13,7 @@ import numpy as np
 from deplodock.compiler import dtype as dt
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SoftmaxOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
@@ -134,3 +135,94 @@ def test_fp16_reduction_uses_fp32_accumulator_on_cuda():
     assert out.dtype == np.float16
     expected = np.array([x_data.astype(np.float32).sum()], dtype=np.float16)
     np.testing.assert_allclose(out.reshape(-1), expected, rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Real-world reduction shapes — matmul / softmax / RMSNorm
+# ---------------------------------------------------------------------------
+
+
+@requires_cuda
+def test_fp16_matmul_cuda():
+    """fp16 matmul: k-reduction with __half loads and f32 accumulator.
+    The decomposition expands to a Loop(k) > Loop(...) > Accum chain;
+    the Init-placement pass picks F32 because both inputs are fp16."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+
+    m, k, n = 8, 16, 8
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k), dt.F16), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n), dt.F16), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("c", (m, n), dt.F16), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+
+    rng = np.random.default_rng(3)
+    a_data = (rng.standard_normal((m, k)) * 0.1).astype(np.float16)
+    b_data = (rng.standard_normal((k, n)) * 0.1).astype(np.float16)
+
+    be = CudaBackend()
+    result = be.run(be.compile(g), input_data={"a": a_data, "b": b_data})
+    out = next(iter(result.outputs.values())).reshape(m, n)
+    assert out.dtype == np.float16
+
+    expected = (a_data.astype(np.float32) @ b_data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(out, expected, rtol=5e-3, atol=5e-3)
+
+
+@requires_cuda
+def test_fp16_softmax_cuda():
+    """fp16 softmax along last dim: two reductions (max + sum) on f16
+    values with f32 accumulators, then a per-element divide."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+
+    rows, cols = 4, 64
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (rows, cols), dt.F16), node_id="x")
+    g.add_node(op=SoftmaxOp(axis=-1), inputs=["x"], output=Tensor("y", (rows, cols), dt.F16), node_id="y")
+    g.inputs = ["x"]
+    g.outputs = ["y"]
+
+    rng = np.random.default_rng(4)
+    x_data = rng.standard_normal((rows, cols)).astype(np.float16)
+
+    be = CudaBackend()
+    result = be.run(be.compile(g), input_data={"x": x_data})
+    out = next(iter(result.outputs.values())).reshape(rows, cols)
+    assert out.dtype == np.float16
+
+    xf = x_data.astype(np.float32)
+    m = xf.max(axis=-1, keepdims=True)
+    e = np.exp(xf - m)
+    expected = (e / e.sum(axis=-1, keepdims=True)).astype(np.float16)
+    np.testing.assert_allclose(out, expected, rtol=5e-3, atol=5e-3)
+
+
+@requires_cuda
+def test_fp16_rmsnorm_cuda():
+    """fp16 RMSNorm: ``x * rsqrt(mean(x*x) + eps) * weight``. The
+    sum-of-squares reduction needs the f32 accumulator (x^2 in fp16
+    can overflow / underflow for typical activation magnitudes)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+
+    rows, cols = 4, 64
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (rows, cols), dt.F16), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (cols,), dt.F16), node_id="w")
+    g.add_node(op=RmsNormOp(eps=1e-6), inputs=["x", "w"], output=Tensor("y", (rows, cols), dt.F16), node_id="y")
+    g.inputs = ["x", "w"]
+    g.outputs = ["y"]
+
+    rng = np.random.default_rng(5)
+    x_data = rng.standard_normal((rows, cols)).astype(np.float16)
+    w_data = rng.standard_normal((cols,)).astype(np.float16)
+
+    be = CudaBackend()
+    result = be.run(be.compile(g), input_data={"x": x_data, "w": w_data})
+    out = next(iter(result.outputs.values())).reshape(rows, cols)
+    assert out.dtype == np.float16
+
+    xf = x_data.astype(np.float32)
+    rms = np.sqrt((xf * xf).mean(axis=-1, keepdims=True) + 1e-6)
+    expected = ((xf / rms) * w_data.astype(np.float32)).astype(np.float16)
+    np.testing.assert_allclose(out, expected, rtol=1e-2, atol=1e-2)
