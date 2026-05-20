@@ -44,7 +44,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis, Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, Stmt, StridedLoop, Tile
@@ -78,6 +78,17 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     # subsequent rule pass.
     if FN.name in root.op.knobs:
         raise RuleSkipped("register-tile already applied (FN set in knobs)")
+
+    # Planner-driven path: when ``000_partition_planner`` pre-split the
+    # output Loops, it tags the inner halves ``Role.REGISTER``. Those
+    # loops now sit in the Tile body (tileify stops at REGISTER); 008's
+    # job here is just to replicate their bodies along the tagged axis
+    # and unwrap the loop. No split, no fork — the planner already
+    # picked (FM, FN).
+    planned = _apply_planner_register_tags(tile)
+    if planned is not None:
+        new_tile, knobs = planned
+        return TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=root.op.name, knobs=knobs)
 
     slots = _find_slots(tile)
     if not slots:
@@ -128,6 +139,59 @@ class _Slot:
     choices: tuple[int, ...]
     heuristic: int | None
     make_sites: Callable[[int], list[_Site]]
+
+
+def _apply_planner_register_tags(tile: Tile) -> tuple[Tile, dict[str, int]] | None:
+    """Detect ``Role.REGISTER``-tagged body Loops (planner-driven path).
+
+    The planner pre-splits the output M/N Loops; their inner halves sit
+    nested in the tile body as ``Loop(m_i, REGISTER, body=[Loop(n_i,
+    REGISTER, body=…)])``. We unwrap inside-out: replicate the inner
+    Loop's body by its extent (σ: ``n_i → literal(i)``) first, then
+    feed that to the outer replication.
+
+    Returns ``(new_tile, knobs)`` with ``FM`` / ``FN`` stamped from
+    the tagged axes' extents, or ``None`` when no REGISTER tags are
+    present (caller falls back to legacy split-and-replicate fork)."""
+    new_body, factors = _replicate_register_loops(tile.body)
+    if not factors:
+        return None
+    knobs: dict[str, int] = {}
+    if len(factors) >= 1:
+        knobs[FM.name] = factors[0]
+    if len(factors) >= 2:
+        knobs[FN.name] = factors[1]
+    return Tile(axes=tile.axes, body=new_body), knobs
+
+
+def _replicate_register_loops(body: Body) -> tuple[Body, list[int]]:
+    """Walk body stmts; for each ``Loop`` tagged ``Role.REGISTER``,
+    unwrap nested REGISTER first (inside-out), then replicate THIS
+    layer's body by ``axis.extent`` with ``σ: axis → literal(i)``.
+    Returns ``(new_body, factors)`` with factors in outermost-first
+    order — matches the planner's M-before-N split order."""
+    out: list[Stmt] = []
+    factors: list[int] = []
+    for s in body:
+        if isinstance(s, Loop) and s.role is Role.REGISTER:
+            factor = int(s.axis.extent)
+            inner_unwrapped, inner_factors = _replicate_register_loops(s.body)
+            replicated = replicate_along_axis(inner_unwrapped, s.axis.name, factor, _sigma_to_literal(s.axis.name))
+            out.extend(replicated)
+            factors.append(factor)
+            factors.extend(inner_factors)
+        else:
+            out.append(s)
+    return Body(out), factors
+
+
+def _sigma_to_literal(axis: str):
+    """σ-factory for REGISTER replication: ``axis → Literal(i)``."""
+
+    def _f(i: int) -> Sigma:
+        return Sigma({axis: Literal(i, "int")})
+
+    return _f
 
 
 def _split_axis(axes: tuple[BoundAxis, ...], target: str, factor: int) -> tuple[tuple[BoundAxis, ...], Axis]:

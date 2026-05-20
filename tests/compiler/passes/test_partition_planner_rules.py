@@ -195,3 +195,62 @@ def loop_op_pointwise() -> LoopOp:
             ),
         ),
     )
+
+
+# --- 008 register_tile tag-driven path (M2 plumbing) ----------------
+
+
+def test_008_replicates_register_tagged_body_loop():
+    """When a TileOp body contains a ``Role.REGISTER`` Loop, 008 should
+    take its planner-driven path: replicate the body by the loop's
+    extent (σ: axis → literal(i)), unwrap the wrapper, and stamp
+    ``FM`` (or ``FN``) so the standard idempotence marker fires.
+
+    Tests the simplest synthetic case — no Stages, just one REGISTER
+    Loop wrapping a Load+Write body."""
+    from deplodock.compiler.ir.axis import BIND_THREAD, BoundAxis
+    from deplodock.compiler.ir.stmt import Tile
+    from deplodock.compiler.ir.tile.ir import TileOp
+
+    a_outer = Axis("a_outer", 8)
+    a_reg = Axis("a_reg", 4)
+    tile = Tile(
+        axes=(BoundAxis(axis=a_outer, bind=BIND_THREAD),),
+        body=(
+            Loop(
+                axis=a_reg,
+                role=Role.REGISTER,
+                body=(
+                    Load(name="x_v", input="x", index=(Var("a_outer"), Var("a_reg"))),
+                    Write(output="o", index=(Var("a_outer"), Var("a_reg")), value="x_v"),
+                ),
+            ),
+        ),
+    )
+    tile_op = TileOp(body=(tile,), name="t")
+
+    g = Graph()
+    _input(g, "x", (8, 4))
+    g.add_node(op=tile_op, inputs=["x"], output=Tensor("o", (8, 4)), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+
+    out = Pipeline.build(TILE_PASSES, select={"register_tile"}).run(g)
+    new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+
+    # The REGISTER Loop wrapper is gone; its body got replicated 4 times.
+    new_tile = next(s for s in new_tile_op.body if isinstance(s, Tile))
+    body_loops = [s for s in new_tile.body if isinstance(s, Loop)]
+    assert body_loops == [], "REGISTER Loop wrapper should have been unwrapped"
+    # 4 Loads + 4 Writes after replication.
+    body_loads = list(new_tile.body.iter_of_type(Load))
+    body_writes = [s for s in new_tile.body if isinstance(s, Write)]
+    assert len(body_loads) == 4
+    assert len(body_writes) == 4
+    # The σ should have substituted ``a_reg`` Var with the literal index
+    # in each replica — no surviving ``a_reg`` references.
+    for w in body_writes:
+        vars_in_index = {v for e in w.index for v in e.free_vars()}
+        assert "a_reg" not in vars_in_index, f"unreplicated a_reg in Write: {w.index}"
+    # FM gets stamped from the outermost (and only) REGISTER axis extent.
+    assert new_tile_op.knobs.get("FM") == 4

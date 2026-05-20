@@ -126,17 +126,19 @@ def _recurse_canonicalize(s: Stmt) -> Stmt:
 def canonicalize_free_axis_order(stmts: Body) -> Body:
     """Sort the outer chain of free ``Loop`` blocks alphabetically by axis
     name. The chain is the sequence of single-child free Loops at the top of
-    ``stmts``; it terminates at a reduce Loop or a branching body. Recursion
-    continues into terminal block bodies (Loop / StridedLoop / Tile / Cond).
+    ``stmts``; it terminates at a reduce Loop, a role-tagged Loop, or a
+    branching body. Recursion continues into terminal block bodies (Loop
+    / StridedLoop / Tile / Cond).
 
-    Loop ``role`` and ``unroll`` annotations travel with their axis through
-    the sort so planner tags / unroll hints survive normalization."""
+    Role-tagged Loops (planner output) terminate the sort window so the
+    planner's M_o/N_o → M_i/N_i nesting order survives. Loop ``unroll``
+    annotations travel with their axis through the sort."""
     stmts = Body.coerce(stmts)
     chain: list[Loop] = []
     current = stmts
     while len(current) == 1 and isinstance(current[0], Loop):
         loop = current[0]
-        if loop.is_reduce:
+        if loop.is_reduce or loop.role is not None:
             break
         chain.append(loop)
         current = loop.body

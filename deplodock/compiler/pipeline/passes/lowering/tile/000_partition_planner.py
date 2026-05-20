@@ -2,22 +2,26 @@
 
 Runs first in the Tile-IR lowering chain, **before** ``001_tileify``. The
 planner is the source of truth for launch-axis structure: it decides
-every relevant split (output partition, K chunking, register tile,
-serial-outer / pipeline / cooperative-stride marking) and communicates
-those decisions to downstream materialization passes via ``Role`` tags
-on body ``Loop`` / ``StridedLoop`` stmts (see :class:`Role`).
+splits (output partition, K chunking, register tile, etc.) and tags
+the resulting axes with ``Role`` values (see :class:`Role`). Downstream
+materialization passes (``001_tileify``, ``007_stage_inputs``,
+``008_register_tile``, …) read the tags and skip their own equivalent
+decisions, doing only the leftover rewrites (lift to ``Tile.axes``,
+build stages, replicate stmts).
 
-The downstream passes (``001_tileify``, ``007_stage_inputs``,
-``008_register_tile``, ``010_double_buffer``, ``015_pipeline_k_outer``,
-etc.) then materialize those tags into actual launch geometry, smem
-stages, replicated stmts, pipelined schedules, and so on — without
-having to re-derive what to do from the IR shape.
+**M2 scope** — infrastructure only. Adds the planner pass slot, the
+``canonicalize_free_axis_order`` role-terminator fix (so planner-tagged
+loops survive normalization), and 008's tag-driven path (exercised via
+synthetic tests). No matmul emission yet — the matmul register-tile
+slice was prototyped here and reverted: pre-tileify REGISTER splits
+collide with ``007_stage_inputs``'s cache-axis selection (Stages get
+duplicated with name collisions because N_i / M_i aren't cache axes).
+Resolving that needs the full launch-geometry + staging story moved
+together, so it lives in M4 alongside the matmul K / SPLITK migration.
 
-**M1 scope** — this file is currently a stub that always skips. The
-mechanism (role field + tileify REGISTER-stop guard) is in place; the
-matmul story moves into the planner in M3, when ``002_chunk_matmul_k``
-/ ``003_split_matmul_k`` / ``004_launch_geometry`` / ``008_register_tile``
-lose their split logic together. ``006_chunk_reduce`` moves in M2.
+Subsequent milestones populate the planner: M3 = non-matmul reduce
+chunking; M4 = matmul K + launch geometry + SPLITK + register tile;
+M5 = cooperative-reduce + pipeline.
 
 Gated by ``DEPLODOCK_PLANNER`` env var so each milestone can test the
 new path against the legacy default (=0) for structural equivalence.
@@ -38,5 +42,5 @@ _ENABLE_ENV = "DEPLODOCK_PLANNER"
 
 def rewrite(root: Node) -> Graph | None:
     if not os.environ.get(_ENABLE_ENV):
-        raise RuleSkipped("DEPLODOCK_PLANNER not set; planner is a no-op in M1")
-    raise RuleSkipped("planner emits no role tags yet — M2/M3 will populate")
+        raise RuleSkipped(f"{_ENABLE_ENV} not set")
+    raise RuleSkipped("planner emits no role tags yet — M3/M4/M5 populate")
