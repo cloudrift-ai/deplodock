@@ -18,8 +18,13 @@ avoids a frontend→tensor dependency for a single function.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from deplodock.compiler.graph import Graph, Node
+    from deplodock.compiler.tensor import Tensor
 
 
 @dataclass
@@ -35,6 +40,16 @@ class Op:
     fields keeps working; excluded from :meth:`Graph.structural_key`
     via ``_STRUCTURAL_SKIP_FIELDS`` — pure attribution metadata, not
     part of dataflow identity.
+
+    ``inputs`` / ``outputs`` are per-op-instance buffer maps populated by
+    the matcher (``_match_at``) just after a match is built — the matcher
+    calls :meth:`populate_io` on every matched node, snapping in real
+    :class:`Tensor` values from the surrounding graph so rule rewrites can
+    read shapes / dtypes off ``op.inputs[name]`` without re-querying.
+    Default: predecessor outputs by predecessor id, this node's output by
+    its own id. :class:`BodyOp` overrides to walk body-derived buf names
+    instead. Excluded from equality / repr — pure derived view of the
+    surrounding graph at match time.
     """
 
     source: Op | None = field(default=None, kw_only=True, repr=False, compare=False)
@@ -45,6 +60,16 @@ class Op:
     # autotune knob picked along the chain. Excluded from structural
     # identity and equality — pure attribution metadata.
     knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
+    inputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
+    outputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
+
+    def populate_io(self, graph: Graph, node: Node) -> None:
+        """Refresh ``inputs`` / ``outputs`` from the surrounding graph.
+        Called by the matcher after a match is built. Default mapping
+        works for non-body ops (one Tensor per predecessor / this node).
+        :class:`BodyOp` overrides to walk body-derived buf names."""
+        self.inputs = {pid: graph.nodes[pid].output for pid in node.inputs if pid in graph.nodes}
+        self.outputs = {node.id: node.output}
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         """Derive the output shape from input shapes. Override in subclasses."""

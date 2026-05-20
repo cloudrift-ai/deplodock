@@ -53,19 +53,11 @@ _TARGET = CudaRenderTarget()
 def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
 
-    # Per-buffer dtype map: graph dtypes via body-derived names, then Smem
-    # dtypes from the body. Mirrors ``003_vectorize_loads`` so we cover
-    # smem writebacks too even though the common case is the kernel's
-    # output buffer.
-    buf_dtypes: dict[str, str] = {}
-    for nid in kop.body_inputs:
-        node = match.graph.nodes.get(nid)
-        if node is not None:
-            buf_dtypes[nid] = node.output.dtype.name
-    for out in kop.body_outputs:
-        node = match.graph.nodes.get(out)
-        if node is not None:
-            buf_dtypes.setdefault(out, node.output.dtype.name)
+    # Per-buffer dtype map: graph dtypes via ``kop.inputs`` / ``kop.outputs``
+    # (matcher-populated Tensor dicts), then Smem dtypes from the body.
+    # Mirrors ``003_vectorize_loads`` so we cover smem writebacks too even
+    # though the common case is the kernel's output buffer.
+    buf_dtypes: dict[str, str] = {n: t.dtype.name for n, t in {**kop.inputs, **kop.outputs}.items()}
     for s in kop.body.iter():
         if isinstance(s, Smem):
             canonical = canonical_from_cuda_name(s.dtype)

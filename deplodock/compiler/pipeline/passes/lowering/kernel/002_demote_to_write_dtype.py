@@ -83,22 +83,13 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     kop: KernelOp = root.op
     body = kop.body
 
-    # Output / input buffer dtypes read straight from the surrounding
-    # graph via the body-derived buffer names. Falls back to ``root.output``
-    # for the KernelOp's own node-output when not otherwise listed; ``f32``
-    # for anything we can't find.
-    out_dtypes: dict[str, str] = {}
-    for out_name in kop.body_outputs:
-        node = match.graph.nodes.get(out_name)
-        if node is not None:
-            out_dtypes[out_name] = node.output.dtype.name
+    # Output / input buffer dtypes come straight off ``kop.inputs`` /
+    # ``kop.outputs`` — the matcher has snapped them to the surrounding
+    # graph's Tensors. Fall back to ``root.output`` for the KernelOp's
+    # own node-output when not otherwise listed.
+    out_dtypes: dict[str, str] = {n: t.dtype.name for n, t in kop.outputs.items()}
     out_dtypes.setdefault(root.id, root.output.dtype.name)
-
-    in_dtypes: dict[str, str] = {}
-    for in_name in kop.body_inputs:
-        node = match.graph.nodes.get(in_name)
-        if node is not None:
-            in_dtypes[in_name] = node.output.dtype.name
+    in_dtypes: dict[str, str] = {n: t.dtype.name for n, t in kop.inputs.items()}
 
     # ssa-name → defining Stmt (deep traversal).
     defs: dict[str, Stmt] = {}

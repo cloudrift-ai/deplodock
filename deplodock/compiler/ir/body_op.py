@@ -85,6 +85,25 @@ class BodyOp(Op):
         """Distinct ``Write.output`` buf names in body first-use order."""
         return tuple(dict.fromkeys(s.output for s in self.writes))
 
+    def populate_io(self, graph, node) -> None:  # noqa: ANN001 — matches Op.populate_io signature
+        """Override :meth:`Op.populate_io` to key off body-derived buf
+        names (which may differ from ``node.inputs`` ordering and may
+        include Stage/CpAsyncCopy/TmaDescriptor refs that aren't separate
+        graph predecessors). Each name resolves to its graph node's
+        output Tensor when present."""
+        new_in: dict = {}
+        for name in self.body_inputs:
+            gnode = graph.nodes.get(name)
+            if gnode is not None:
+                new_in[name] = gnode.output
+        self.inputs = new_in
+        new_out: dict = {}
+        for name in self.body_outputs:
+            gnode = graph.nodes.get(name)
+            if gnode is not None:
+                new_out[name] = gnode.output
+        self.outputs = new_out
+
     def pretty_body(self) -> str:
         """``kernel <name>  inputs: ...  outputs: ...`` header above the
         indented body listing."""
