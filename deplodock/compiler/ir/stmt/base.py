@@ -438,6 +438,17 @@ def _vec_load_run(body: Body, start: int, n: int, ctx: RenderCtx) -> list[str] |
     inputs = {s.input for s in loads}
     if len(inputs) != 1:
         return None
+    # Vectorization emits ``float<n>`` reinterpret-casts that only fit
+    # fp32-element buffers. For fp16 (and any non-f32 future dtype) the
+    # cast would (a) read N halves as ``float<n>`` and produce nonsense,
+    # and (b) hit ``cudaErrorMisalignedAddress`` whenever the per-thread
+    # smem offset isn't 16-byte aligned (likely for ``__half[stride * k]``
+    # patterns). Fall back to scalar Load rendering — a dtype-aware
+    # vectorizer that emits ``__half2`` / ``uint4-of-8-halves`` is a
+    # follow-up.
+    (input_name,) = inputs
+    if ctx.buffer_dtypes.get(input_name, "f32") != "f32":
+        return None
     rank = len(loads[0].index)
     if rank == 0 or any(len(s.index) != rank for s in loads[1:]):
         return None
