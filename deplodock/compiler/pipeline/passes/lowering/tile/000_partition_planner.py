@@ -224,6 +224,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             bk_choices=_BK_CANDIDATES,
             splitk_choices=_SPLITK_CANDIDATES,
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+            max_threads_per_cta=ctx.max_threads_per_cta,
             priority_mode="matmul",
         )
     elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
@@ -245,6 +246,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             splitk_choices=_SPLITK_CANDIDATES,
             br_choices=_BR_CANDIDATES,
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+            max_threads_per_cta=ctx.max_threads_per_cta,
             priority_mode="reduce",
         )
     else:
@@ -260,6 +262,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             bk_choices=(1,),
             splitk_choices=(1,),
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+            max_threads_per_cta=ctx.max_threads_per_cta,
             priority_mode="pointwise",
         )
 
@@ -297,6 +300,7 @@ def _enumerate_cartesian(
     splitk_choices: tuple[int, ...],
     br_choices: tuple[int, ...] = (1,),
     max_cells_per_thread: int,
+    max_threads_per_cta: int,
     priority_mode: str,
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
@@ -305,7 +309,7 @@ def _enumerate_cartesian(
     BN/BM clamped to extent + divisibility-checked. FM/FN as divisors of the
     per-thread remainder (auto-divisibility), capped by ``max_cells_per_thread``.
     BK/SPLITK divisor-checked against ``per_thread_K = E_K // BR``.
-    ``BN·BM·BR ≤ 1024`` (CTA thread budget).
+    ``BN·BM·BR ≤ max_threads_per_cta`` (typically 1024, from ``ctx``).
 
     Single-K-iter (per_thread_K == bk) is allowed for pointwise and
     cooperative-reduce, rejected for matmul (≥ 2 chunks needed to amortize
@@ -323,14 +327,14 @@ def _enumerate_cartesian(
             bm_c = min(bm, E_M)
             if bm_c < 1 or E_M % bm_c != 0:
                 continue
-            if bn_c * bm_c > 1024:
+            if bn_c * bm_c > max_threads_per_cta:
                 continue
             # v1 cooperative constraint: BR > 1 ⇒ BN = BM = 1.
             br_eligible: tuple[int, ...] = br_choices if (bn_c == 1 and bm_c == 1) else (1,)
             for br in br_eligible:
                 if br < 1 or E_K % br != 0:
                     continue
-                if bn_c * bm_c * br > 1024:
+                if bn_c * bm_c * br > max_threads_per_cta:
                     continue
                 per_thread_K = E_K // br
                 for fm in _divisors_up_to(E_M // bm_c, max_cells_per_thread):
