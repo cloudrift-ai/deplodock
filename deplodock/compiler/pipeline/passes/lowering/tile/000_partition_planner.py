@@ -33,7 +33,7 @@ contribution in ``Cond(K_s == 0, ...)`` so only one CTA per output cell
 contributes the residual.
 
 Pruning order: divisibility → thread budget (≤ 1024) → register budget
-(FM·FN ≤ ``MAX_CELLS_PER_THREAD``) → dedup after clamp. Heuristic combo
+(FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) → dedup after clamp. Heuristic combo
 (from ``thread_tile_shape`` / ``register_tile_shape`` / ``forced_bk`` /
 ``auto_splitk`` on the logical extents) is emitted as variant 0 so
 greedy callers without an autotune DB pick the heuristic.
@@ -63,11 +63,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Stmt, St
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
-    MAX_CELLS_PER_THREAD,
-    TUNE_F_CHOICES,
-    is_matmul_reduce,
-)
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.tuning import (
     BodyInfo,
     auto_splitk,
@@ -83,6 +79,11 @@ _PLANNER_KNOB = "PLANNER"
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
+# Per-axis register-tile factor choices (FM, FN candidates).
+_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+# Cap on total per-thread replication (∏ factors). NVRTC compile time
+# explodes on more-unrolled bodies.
+_MAX_CELLS_PER_THREAD: int = 128
 
 # Knob declarations. The planner is the source of truth for matmul
 # axis-structure tuning (BN/BM CTA tile, FM/FN per-thread cells, BK
@@ -91,8 +92,8 @@ _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 # ``DEPLODOCK_<NAME>`` env-var registry binding.
 BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
 BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")
-FM = Knob("FM", KnobType.INT, hints=TUNE_F_CHOICES, help="Per-thread cells along the matmul M (output) axis")
-FN = Knob("FN", KnobType.INT, hints=TUNE_F_CHOICES, help="Per-thread cells along the matmul N (output) axis")
+FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul M (output) axis")
+FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul N (output) axis")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 
@@ -224,7 +225,7 @@ def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> l
             return
         if bn_c * bm_c > 1024:
             return
-        if fm * fn > MAX_CELLS_PER_THREAD:
+        if fm * fn > _MAX_CELLS_PER_THREAD:
             return
         key = (bn_c, bm_c, fm, fn, bk, splitk)
         if key in seen:
@@ -246,13 +247,13 @@ def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> l
                 continue
             if bn_c * bm_c > 1024:
                 continue
-            for fm in TUNE_F_CHOICES:
+            for fm in _TUNE_F_CHOICES:
                 if E_M % (bm_c * fm) != 0:
                     continue
-                for fn in TUNE_F_CHOICES:
+                for fn in _TUNE_F_CHOICES:
                     if E_N % (bn_c * fn) != 0:
                         continue
-                    if fm * fn > MAX_CELLS_PER_THREAD:
+                    if fm * fn > _MAX_CELLS_PER_THREAD:
                         continue
                     for bk in _BK_CANDIDATES:
                         if E_K % bk != 0 or E_K <= bk:

@@ -26,9 +26,9 @@ from deplodock.compiler.ir.axis import Role
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt
-from deplodock.compiler.ir.tile.ir import Tile, TileOp
+from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import replicate_along_axis, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -67,7 +67,7 @@ def _replicate_register_loops(body: Body) -> tuple[Body, list[int]]:
         if isinstance(s, Loop) and s.role is Role.REGISTER:
             factor = int(s.axis.extent)
             inner_unwrapped, inner_factors = _replicate_register_loops(s.body)
-            replicated = replicate_along_axis(inner_unwrapped, s.axis.name, factor, _sigma_to_literal(s.axis.name))
+            replicated = _replicate_along_axis(inner_unwrapped, s.axis.name, factor, _sigma_to_literal(s.axis.name))
             out.extend(replicated)
             factors.append(factor)
             factors.extend(inner_factors)
@@ -83,3 +83,55 @@ def _sigma_to_literal(axis: str) -> Callable[[int], Sigma]:
         return Sigma({axis: Literal(i, "int")})
 
     return _f
+
+
+def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callable[[int], Sigma]) -> Body:
+    """F× replicate every stmt whose value transitively depends on
+    ``axis``. Each such stmt is emitted ``factor`` times with σ given
+    by ``sigma_for(i)`` and SSA names suffixed ``_<i>``. Stmts that
+    don't depend on ``axis`` pass through. Block stmts recurse into
+    their bodies and rebuild via :meth:`Stmt.with_bodies`; a wrapper
+    that shadows ``axis`` isn't itself replicated (the fold's bound-
+    axis filter keeps shadowed references local).
+
+    Dependency analysis is one :meth:`Body.fold` over the def-use DAG
+    with bound-axis filtering. ``keep[name]`` records which SSA names
+    must carry the suffix vs. pass through unchanged (Tile-input
+    buffers, constants, axis-free producers)."""
+
+    def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
+        # Stage cache-axis Vars are smem-local — they don't vary per replica.
+        # Mark them bound here so Stages aren't tagged for replication; only
+        # the consumer Loads (which σ-rewrite cache-axis Vars) multiply.
+        local_bound = bound | frozenset(ax.name for ax in s.axes) if isinstance(s, Stage) else bound
+        own: frozenset[str] = frozenset()
+        for e in s.exprs():
+            own = own | frozenset(v for v in e.free_vars() if v not in local_bound)
+        for c in child_T:
+            if c is not None:
+                own = own | c
+        return own
+
+    deps = body.fold(fn)
+    keep: dict[str, bool] = {n: axis in deps[id(s)] for s in body.iter() for n in s.defines()}
+
+    def rename_for(i: int):
+        def _rename(name: str) -> str:
+            return f"{name}_{i}" if keep.get(name, False) else name
+
+        return _rename
+
+    def go(b: Body) -> Body:
+        out: list[Stmt] = []
+        for s in b:
+            nested = s.nested()
+            if nested:
+                out.append(s.with_bodies(tuple(go(child) for child in nested)))
+            elif axis in deps.get(id(s), frozenset()):
+                for i in range(factor):
+                    out.append(s.rewrite(rename_for(i), sigma_for(i)))
+            else:
+                out.append(s)
+        return Body(out)
+
+    return go(body)
