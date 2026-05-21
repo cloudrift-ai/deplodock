@@ -87,6 +87,19 @@ class SearchDB:
     ``~/.cache/deplodock/autotune.db``).
     """
 
+    # Bumped whenever the fork-tree topology shifts in ways that change
+    # ``parent_key`` / ``child_key`` for the same physical decision —
+    # stale ``lowering`` rows from older versions won't match the new
+    # keys and would silently slow the next tune sweep. On version
+    # mismatch we drop the ``lowering`` table only; ``perf`` /
+    # ``loop_op`` / ``tile_op`` etc. survive (source-hash keyed,
+    # parent-tree-independent).
+    #
+    # Version log:
+    #   1: M9.4 — planner-hoisted FM / FN / BN / BM forks. Parent-tree
+    #       topology shifted vs. the legacy downstream forks.
+    _SCHEMA_VERSION = 1
+
     _SCHEMA = [
         """
         CREATE TABLE IF NOT EXISTS loop_op (
@@ -156,6 +169,13 @@ class SearchDB:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
+        # Drop the ``lowering`` table when an older schema is detected;
+        # everything else (op inventory, perf rows) is keyed off content
+        # hashes and remains valid across fork-tree changes.
+        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_version != self._SCHEMA_VERSION:
+            self._conn.execute("DROP TABLE IF EXISTS lowering")
+            self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
         for stmt in self._SCHEMA:
             self._conn.execute(stmt)
 
