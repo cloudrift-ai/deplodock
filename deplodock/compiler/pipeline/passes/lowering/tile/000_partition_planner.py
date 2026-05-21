@@ -46,11 +46,12 @@ Variant 0 (what greedy compiles pick) comes from a priority sort:
 highest cells/thread (capped at 32), threads closest to 256/CTA,
 larger BK, smaller SPLITK.
 
-Pointwise emits a single variant: ``BN`` from :func:`tuning.thread_tile_shape`
-clamped to E_N (rounded down to the largest divisor for a clean σ),
-``BM = FM = FN = BK = SPLITK = 1``. Register-tile enumeration for
-pointwise is a deliberate non-feature for now — expansion would be a
-follow-up after measuring compile-time / perf impact.
+Pointwise enumerates the same ``(BN, BM, FM, FN)`` cartesian with
+``BK = SPLITK = 1``. The priority key for pointwise prefers FEWER
+cells/thread (memory-bandwidth-bound — extra register tiling hurts
+SM occupancy), still targeting threads close to 256/CTA. Autotune
+can explore higher-cells variants where they help (~2.5× win
+measured on rotary-style 4D shapes via ``FM=32``).
 
 Chunk-reduce for large-K non-matmul reductions is not yet brought
 back into the planner — current tests don't depend on it.
@@ -70,7 +71,7 @@ from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
-from deplodock.compiler.tuning import BodyInfo, thread_tile_shape
+from deplodock.compiler.tuning import BodyInfo
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -173,11 +174,11 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
     Pointwise / non-matmul (no K detected): innermost chain axis is N
     (``outer_m`` is ``None`` for 1D pointwise; for ≥ 2D chains the
     second-innermost is M). E_K = 1, BK = SPLITK = 1 collapse the
-    K iteration. By default, BM is also locked to 1 so the visible
-    output matches the legacy single-variant pointwise heuristic; for
-    autotune-driven exploration of pointwise FM / FN / BM widening
-    (which the cartesian fully supports), the caller can flip the
-    ``_POINTWISE_WIDE`` flag below.
+    K iteration. The full ``(BN, BM, FM, FN)`` cartesian is enumerated;
+    the pointwise priority key (prefer low cells/thread, threads close
+    to 256/CTA) makes greedy pick a memory-bandwidth-friendly shape
+    while autotune can explore higher-cells variants — measured win
+    of ~2.5× on rotary-style 4D shapes via ``FM=32`` register tile.
 
     Returns ``None`` when the kernel doesn't match either shape (no
     outer chain, or matmul-detected but K reduce missing)."""
@@ -208,40 +209,34 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             bk_choices=_BK_CANDIDATES,
             splitk_choices=_SPLITK_CANDIDATES,
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+            has_matmul=True,
         )
     else:
         # No matmul reduce. Innermost is N; if there's a second-innermost
         # it's treated as the M axis. Any further-out axes become
-        # extra_outer BLOCK-whole.
+        # extra_outer BLOCK-whole. Pointwise locks BK / SPLITK to (1,)
+        # (no K reduction) and enumerates the full (BN, BM, FM, FN)
+        # cartesian — same machinery as matmul, just with a degenerate
+        # K dimension. The priority sort uses a pointwise-tuned key
+        # (prefer low cells/thread, threads close to 256) so greedy
+        # picks a memory-bandwidth-friendly shape rather than the
+        # matmul-style high-cells shape.
         outer_n = chain[-1]
         outer_m = chain[-2] if len(chain) >= 2 else None
         extra_outer = chain[:-2] if len(chain) >= 2 else ()
         k_loop = None
         E_M = int(outer_m.axis.extent) if outer_m is not None else 1
         E_N = int(outer_n.axis.extent)
-        # Pointwise locks BK / SPLITK to (1,) (no K reduction). Narrow
-        # mode (default) reproduces the legacy single-variant pointwise:
-        # ``BN`` clamped to the heuristic target, ``BM = FM = FN = 1``.
-        # Wide mode (``_POINTWISE_WIDE = True``) enumerates the full
-        # ``(BN, BM, FM, FN)`` cartesian for autotune-driven exploration.
-        bn_heuristic = _pointwise_bn(E_N, body_info)
-        if _POINTWISE_WIDE:
-            bn_choices = _TUNE_AXIS_CHOICES
-            bm_choices = _TUNE_AXIS_CHOICES
-            max_cells = _MAX_CELLS_PER_THREAD
-        else:
-            bn_choices = (bn_heuristic,)
-            bm_choices = (1,)
-            max_cells = 1  # forces FM = FN = 1 → single-variant
         param_combos = _enumerate_cartesian(
             E_M=E_M,
             E_N=E_N,
             E_K=1,
-            bn_choices=bn_choices,
-            bm_choices=bm_choices,
+            bn_choices=_TUNE_AXIS_CHOICES,
+            bm_choices=_TUNE_AXIS_CHOICES,
             bk_choices=(1,),
             splitk_choices=(1,),
-            max_cells_per_thread=max_cells,
+            max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+            has_matmul=False,
         )
 
     leading, _ = _split_leading_non_loops(loop_op.body)
@@ -265,16 +260,6 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
     return variants or None
 
 
-# Flip to ``True`` to let pointwise emit the full ``(BN, BM, FM, FN)``
-# cartesian — gives autotune more variants to explore at the cost of
-# more compile time per pointwise kernel. Greedy compile picks variant
-# 0 per the priority sort; with wider enumeration this may pick a
-# matmul-shaped tile (e.g. ``BN=16, BM=16, FM=8, FN=4``) instead of
-# the legacy row-major-wide (``BN=256, BM=1``). Worth measuring before
-# enabling by default.
-_POINTWISE_WIDE = False
-
-
 def _enumerate_cartesian(
     *,
     E_M: int,
@@ -285,6 +270,7 @@ def _enumerate_cartesian(
     bk_choices: tuple[int, ...],
     splitk_choices: tuple[int, ...],
     max_cells_per_thread: int,
+    has_matmul: bool,
 ) -> list[tuple[int, int, int, int, int, int]]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)``.
 
@@ -299,12 +285,13 @@ def _enumerate_cartesian(
     ``E_K=1``, ``bk_choices=(1,)``, ``splitk_choices=(1,)`` to collapse
     the K iteration. The single-K-iter case (``BK = E_K``) is allowed
     for ``E_K == 1`` (pointwise) and rejected when ``E_K > 1`` (matmul
-    wants at least 2 chunks). Setting ``max_cells_per_thread=1`` forces
-    ``FM = FN = 1`` (the narrow pointwise default — single-variant).
+    wants at least 2 chunks).
 
-    Returns survivors sorted by priority so variant 0 is the
-    heuristic-spirit shape (high cells/thread capped at 32, threads
-    closest to 256/CTA, larger BK, smaller SPLITK)."""
+    Returns survivors sorted by priority. ``has_matmul`` selects the
+    priority key — matmul wants high cells/thread (amortize K-loop
+    overhead), pointwise wants low cells/thread (memory-bandwidth-
+    bound, more CTAs help SM occupancy). Both prefer threads close to
+    256/CTA."""
     seen: set[tuple[int, int, int, int, int, int]] = set()
     ordered: list[tuple[int, int, int, int, int, int]] = []
     for bn in bn_choices:
@@ -336,7 +323,7 @@ def _enumerate_cartesian(
                             seen.add(key)
                             ordered.append(key)
 
-    def _priority(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
+    def _priority_matmul(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
         bn, bm, fm, fn, bk, splitk = combo
         threads = bn * bm
         cells = fm * fn
@@ -347,20 +334,21 @@ def _enumerate_cartesian(
             -splitk,  # smaller SPLITK (less atomic contention)
         )
 
-    ordered.sort(key=_priority, reverse=True)
+    def _priority_pointwise(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
+        bn, bm, fm, fn, bk, splitk = combo
+        threads = bn * bm
+        cells = fm * fn
+        # Pointwise is memory-bandwidth-bound: prefer FEW cells/thread
+        # (each cell = one load+op+store; no K-loop arithmetic to
+        # amortize register pressure) and threads close to 256/CTA.
+        return (
+            -cells,  # fewer cells/thread (negate → ascending preference)
+            -abs(256 - threads),  # threads close to 256
+        )
+
+    priority_fn = _priority_matmul if has_matmul else _priority_pointwise
+    ordered.sort(key=priority_fn, reverse=True)
     return ordered
-
-
-def _pointwise_bn(E_N: int, body_info: BodyInfo) -> int:
-    """Heuristic BN for a pointwise kernel: ``thread_tile_shape``'s
-    non-matmul branch returns ``(BN_default,)``; clamp to ``E_N`` and
-    round down to the largest divisor so the σ-split is clean."""
-    target_tuple = thread_tile_shape((E_N,), body_info)
-    bn = int(target_tuple[0]) if target_tuple else 256
-    bn = min(bn, E_N)
-    while bn > 1 and E_N % bn != 0:
-        bn -= 1
-    return max(bn, 1)
 
 
 def _build_split_body(
