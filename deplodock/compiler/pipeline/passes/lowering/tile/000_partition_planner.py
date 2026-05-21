@@ -32,11 +32,17 @@ atomic-add (``reduce_op=add``) and wraps any acc-independent residual
 contribution in ``Cond(K_s == 0, ...)`` so only one CTA per output cell
 contributes the residual.
 
-Pruning order: divisibility → thread budget (≤ 1024) → register budget
-(FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) → dedup after clamp. Heuristic combo
-(from ``thread_tile_shape`` / ``register_tile_shape`` / ``forced_bk`` /
-``auto_splitk`` on the logical extents) is emitted as variant 0 so
-greedy callers without an autotune DB pick the heuristic.
+Each cartesian level iterates only structurally valid candidates:
+BN/BM from a pow-2 preset (post-clamp to extent + divisibility check),
+FM/FN as divisors of the per-thread remainder, BK as divisors of E_K,
+SPLITK as divisors of K_o_total. Thread (≤ 1024) and register
+(FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) budgets gate the inner loops.
+
+Variant 0 (what greedy compiles pick) comes from a priority sort over
+the surviving cartesian: highest cells/thread (capped at 32), threads
+closest to 256/CTA, larger BK, smaller SPLITK. The literal class-tuned
+heuristic isn't emitted explicitly — its constituent values are
+already in the cartesian, and the priority captures the same intent.
 
 **Pointwise** (no matmul reduce in body) is handled by
 ``_split_pointwise_fully``: each chain axis is stamped ``Role.THREAD``
@@ -64,13 +70,7 @@ from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
-from deplodock.compiler.tuning import (
-    BodyInfo,
-    auto_splitk,
-    forced_bk,
-    register_tile_shape,
-    thread_tile_shape,
-)
+from deplodock.compiler.tuning import BodyInfo, thread_tile_shape
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -107,7 +107,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
 
     variants: list[LoopOp] | None
     if body_info.has_matmul:
-        variants = _split_matmul_fully(ctx, loop_op, body_info)
+        variants = _split_matmul_fully(loop_op, body_info)
     else:
         variants = _split_pointwise_fully(loop_op, body_info)
     if variants is None:
@@ -167,7 +167,7 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 # --- matmul: joint enumeration ---------------------------------------
 
 
-def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+def _split_matmul_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
     """Enumerate the pruned cartesian and emit one variant per
     surviving ``(BN, BM, FM, FN, BK, SPLITK)`` combination."""
     if not body_info.has_matmul:
@@ -194,59 +194,22 @@ def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> l
     K_name = k_loop.axis.name
     E_K = int(k_loop.axis.extent)
 
-    output_extents: tuple[int, ...] = tuple(sorted((E_M, E_N), reverse=True))
-
-    # Heuristic combo (variant 0).
-    h_thread = thread_tile_shape(output_extents, body_info)
-    h_bn = int(h_thread[0]) if len(h_thread) >= 1 else _TUNE_AXIS_CHOICES[2]
-    h_bm = int(h_thread[1]) if len(h_thread) >= 2 else _TUNE_AXIS_CHOICES[2]
-    h_bn_c = min(h_bn, E_N)
-    h_bm_c = min(h_bm, E_M)
-    h_thread_extents = (h_bm_c, h_bn_c)
-    h_fm, h_fn = (int(x) for x in register_tile_shape(output_extents, h_thread_extents, body_info))
-    h_bk_pick = forced_bk(output_extents, body_info, ctx.static_smem_cap)
-    h_bk = (
-        int(h_bk_pick)
-        if h_bk_pick is not None and E_K % h_bk_pick == 0 and E_K > h_bk_pick
-        else next((c for c in _BK_CANDIDATES if E_K % c == 0 and E_K > c), 0)
-    )
-    h_k_o = E_K // h_bk if h_bk > 0 else 0
-    h_splitk = int(auto_splitk(output_extents, body_info, h_k_o, h_thread_extents)) if h_k_o > 0 else 1
-    if h_splitk < 1:
-        h_splitk = 1
-
     seen: set[tuple[int, int, int, int, int, int]] = set()
     ordered: list[tuple[int, int, int, int, int, int]] = []
 
     def _add(bn: int, bm: int, fm: int, fn: int, bk: int, splitk: int) -> None:
-        # Clamp BN/BM to output extents.
-        bn_c = min(bn, E_N)
-        bm_c = min(bm, E_M)
-        if bn_c < 1 or bm_c < 1 or fm < 1 or fn < 1 or bk < 1 or splitk < 1:
-            return
-        if E_M % (bm_c * fm) != 0:
-            return
-        if E_N % (bn_c * fn) != 0:
-            return
-        # K split: BK divides K (intra-CTA chunking); SPLITK divides K_o_total.
-        if E_K % bk != 0 or E_K <= bk:
-            return
-        if (E_K // bk) % splitk != 0:
-            return
-        if bn_c * bm_c > 1024:
-            return
-        if fm * fn > _MAX_CELLS_PER_THREAD:
-            return
-        key = (bn_c, bm_c, fm, fn, bk, splitk)
+        key = (bn, bm, fm, fn, bk, splitk)
         if key in seen:
             return
         seen.add(key)
         ordered.append(key)
 
-    _add(h_bn, h_bm, h_fm, h_fn, h_bk, h_splitk)
-    # Fast-pruned cartesian. Each valid combo is appended; we sort the
-    # result by priority below so greedy gets a sensible variant 0 even
-    # when the literal heuristic combo fails divisibility.
+    # Pruned cartesian over (BN, BM, FM, FN, BK, SPLITK). Every loop
+    # iterates only over structurally valid candidates (BN/BM from the
+    # pow-2 preset, FM/FN as divisors of the per-thread remainder so
+    # divisibility is automatic, BK divides E_K, SPLITK divides K_o);
+    # ``_priority`` below sorts the survivors so variant 0 carries the
+    # heuristic-spirit shape (high cells/thread, ~256 threads/CTA).
     for bn in _TUNE_AXIS_CHOICES:
         bn_c = min(bn, E_N)
         if bn_c < 1 or E_N % bn_c != 0:
@@ -273,28 +236,24 @@ def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> l
                                 continue
                             _add(bn_c, bm_c, fm, fn, bk, splitk)
 
-    # Re-order so the highest-priority combo (closest to the heuristic
-    # intent — high cells/thread, threads close to 256, larger BK) comes
-    # first. Greedy compiles pick variant 0 = `ordered[0]`. Heuristic
-    # combo (if it survived `_add`) is already at index 0 and stays
-    # there via stable sort + matching priority key.
-    heuristic_key = (h_bn, h_bm, h_fm, h_fn, h_bk, h_splitk)
-
+    # Sort by heuristic-spirit priority so variant 0 carries the
+    # class-tuned shape (the explicit literal heuristic combo isn't
+    # needed — its constituent values are already in the cartesian, and
+    # the priority key captures the same intent the heuristic was
+    # designed around).
     def _priority(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
         bn, bm, fm, fn, bk, splitk = combo
         threads = bn * bm
         cells = fm * fn
-        # Heuristic exact match sorts first.
-        is_heuristic = 1 if combo == heuristic_key else 0
-        # Then high cells/thread (capped to 32 — beyond hurts NVRTC).
+        # High cells/thread (capped to 32 — beyond hurts NVRTC).
         cell_score = min(cells, 32)
-        # Then threads close to 256.
+        # Threads close to 256.
         thread_score = -abs(256 - threads)
-        # Then bigger BK (fewer K iters).
+        # Bigger BK (fewer K iters).
         bk_score = bk
-        # Then smaller SPLITK (less atomic contention).
+        # Smaller SPLITK (less atomic contention).
         splitk_score = -splitk
-        return (is_heuristic, cell_score, thread_score, bk_score, splitk_score)
+        return (cell_score, thread_score, bk_score, splitk_score)
 
     ordered.sort(key=_priority, reverse=True)
 
