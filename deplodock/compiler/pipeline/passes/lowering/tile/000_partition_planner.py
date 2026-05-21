@@ -44,13 +44,17 @@ join the predicted thread-axes list at full extent. This catches the
 SDPA-class kernels that previously fell through to legacy
 ``006_chunk_reduce`` post-tileify.
 
-Gated by ``DEPLODOCK_PLANNER`` env var so each milestone can test the
-new path against the legacy default (=0) for structural equivalence.
+M10: ``DEPLODOCK_PLANNER`` env flag has been dropped — the planner
+always runs. Legacy fallback passes (``002_chunk_matmul_k``,
+``006_chunk_reduce``, ``008_register_tile``'s matmul fork) carry
+idempotence guards that no-op once the planner has produced their
+output and stay reachable for the small subset of kernels the
+planner short-circuits (e.g. matmul-shaped LoopOps whose pre-
+blockify register_tile_shape heuristic returns ``(1, 1)``).
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 
 from deplodock.compiler.context import Context
@@ -71,7 +75,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 
 PATTERN = [Pattern("root", LoopOp)]
 
-_ENABLE_ENV = "DEPLODOCK_PLANNER"
 # Knob stamp signalling the planner produced output (for planner-side
 # idempotence — re-firing on a planned LoopOp is a no-op). Downstream
 # 006a uses ``Role.REGISTER`` presence + ``FN`` absence as its trigger.
@@ -91,8 +94,6 @@ _WARP_SIZE = 32
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
-    if not os.environ.get(_ENABLE_ENV):
-        raise RuleSkipped(f"{_ENABLE_ENV} not set")
     loop_op: LoopOp = root.op
     if loop_op.knobs.get(_PLANNER_KNOB):
         raise RuleSkipped("already planned")
@@ -839,6 +840,14 @@ def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
         # 004's ``_plan_partition`` produces no split. Greedy would
         # then have no launch geometry to use.
         if bn == ext_inner and bm == ext_outer:
+            return
+        # Reject candidates whose THREAD axis product exceeds the CTA
+        # limit (1024). ``TileOp.validate`` rejects them downstream once
+        # FM is stamped, and greedy has no fallback if every variant
+        # fails validate. Mirrors the post-clamp thread layout: the two
+        # innermost axes become BN × BM THREAD; outer chain axes go
+        # BLOCK (no thread contribution).
+        if bn * bm > 1024:
             return
         shape = (bn, bm)
         if shape in seen:
