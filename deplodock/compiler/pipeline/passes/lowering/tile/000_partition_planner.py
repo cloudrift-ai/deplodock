@@ -62,11 +62,10 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.stmt.body import Body
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -401,67 +400,56 @@ def _find_first_matmul_reduce(stmts) -> Loop | None:
 
 
 def _rewrite_epilogue_for_splitk(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]:
-    """Rewrite the trailing ``Write`` so every CTA atomic-adds its
-    partial. Two split-K-safe shapes are recognized:
+    """Mark the trailing ``Write`` atomic for the cases where that's
+    sufficient: plain matmul (no stmts between K_o and Write,
+    ``Write.value == acc``) and linear-multiplicative chain
+    (``Write.value`` reachable from ``acc`` only through multiplies
+    whose other operand is acc-independent — ``sum_i (c·a_i) = c·sum_i a_i``
+    distributes).
 
-    1. **Plain matmul**: trailing ``Write(out, idx, acc)`` directly →
-       ``Write(out, idx, acc, reduce_op=add)``.
-    2. **Linear-additive residual** (matmul_add): ``Assign(v, add, r, acc);
-       Write(out, idx, v)`` where ``r`` is a K-independent ``Load`` (either
-       in prelude or in epilogue position) → atomic ``Write(acc)`` +
-       ``Cond(K_s == 0, atomic Write(r))``.
-    3. **Linear-multiplicative chain**: ``Write.value`` is reachable from
-       ``acc`` only through multiplies whose other operand is acc-
-       independent → keep the chain, mark Write as atomic add.
+    The linear-additive residual case (``Assign(v, add, r, acc); Write(v)``)
+    needs a ``Cond(K_s == 0, atomic Write(r))`` wrap and is handled by
+    the follow-up rule ``000a_splitk_epilogue`` after launch_geometry.
+    For shapes we don't recognize, leave the body alone — the follow-up
+    rule (if it can't either) raises ``RuleSkipped`` and the SPLITK > 1
+    variant is just slower / wrong; the cartesian also includes
+    SPLITK = 1 variants that are always safe.
 
-    If the shape doesn't match a known pattern, raises ``_BuildSkipped``.
+    ``k_s_name`` is currently unused (the follow-up owns the
+    ``Cond(K_s == 0, …)`` rewrite) but kept on the signature for
+    parallelism with the follow-up rule's call site.
     """
+    del k_s_name
     stmts_list = list(stmts)
     k_idx = next(
         (i for i, s in enumerate(stmts_list) if isinstance(s, Loop) and s.role is Role.SERIAL_OUTER),
         None,
     )
     if k_idx is None:
-        raise _BuildSkipped("no SERIAL_OUTER K_o loop in inner stmts")
+        return tuple(stmts_list)
     write_idx = next((i for i, s in enumerate(stmts_list) if isinstance(s, Write)), None)
     if write_idx is None or write_idx <= k_idx:
-        raise _BuildSkipped("no Write found after K_o")
+        return tuple(stmts_list)
     k_outer = stmts_list[k_idx]
     write = stmts_list[write_idx]
-    prelude_stmts = stmts_list[:k_idx]
     epilogue_stmts = stmts_list[k_idx + 1 : write_idx]
     acc_name = _find_accum_name(k_outer)
     if acc_name is None:
-        raise _BuildSkipped("could not find Accum name inside K_o body")
+        return tuple(stmts_list)
 
+    # Plain matmul: no epilogue stmts, Write writes ``acc`` directly.
     if not epilogue_stmts and write.value == acc_name:
-        new_write = replace(write, reduce_op=ElementwiseImpl("add"))
-        head = list(prelude_stmts) + [k_outer, new_write]
-        return tuple(head + stmts_list[write_idx + 1 :])
+        stmts_list[write_idx] = replace(write, reduce_op=ElementwiseImpl("add"))
+        return tuple(stmts_list)
 
+    # Linear-multiplicative chain: ``v = c * acc`` style — distributes
+    # across CTAs, so just mark the Write atomic.
     if _is_linear_multiplicative_chain(epilogue_stmts, acc_name, write.value):
-        new_write = replace(write, reduce_op=ElementwiseImpl("add"))
-        head = list(prelude_stmts) + [k_outer] + list(epilogue_stmts) + [new_write]
-        return tuple(head + stmts_list[write_idx + 1 :])
+        stmts_list[write_idx] = replace(write, reduce_op=ElementwiseImpl("add"))
+        return tuple(stmts_list)
 
-    residual = _extract_simple_residual(prelude_stmts, epilogue_stmts, acc_name, write.value)
-    if residual is None:
-        raise _BuildSkipped("epilogue isn't a split-K-safe shape")
-    residual_name, residual_in_epilogue = residual
-    cond_write = Write(output=write.output, index=write.index, value=residual_name, reduce_op=ElementwiseImpl("add"))
-    always_write = Write(output=write.output, index=write.index, value=acc_name, reduce_op=ElementwiseImpl("add"))
-    if residual_in_epilogue:
-        residual_load = next(s for s in epilogue_stmts[:-1] if hasattr(s, "name") and s.name == residual_name)
-        cond_body = (residual_load, cond_write)
-    else:
-        cond_body = (cond_write,)
-    cond = Cond(
-        cond=BinaryExpr("==", Var(k_s_name), Literal(0, "int")),
-        body=Body(cond_body),
-        else_body=Body(()),
-    )
-    head = list(prelude_stmts) + [k_outer, always_write, cond]
-    return tuple(head + stmts_list[write_idx + 1 :])
+    # Residual / unrecognized shapes: let ``000a_splitk_epilogue`` handle.
+    return tuple(stmts_list)
 
 
 def _find_accum_name(k_o_loop: Loop) -> str | None:
@@ -495,32 +483,6 @@ def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_v
             return False
         acc_dep.add(s.name)
     return write_value in acc_dep
-
-
-def _extract_simple_residual(prelude_stmts, epilogue_stmts: list, acc_name: str, write_value: str):
-    """Match ``Assign(v, add, r, acc); Write(v)`` where ``r`` is a Load
-    (in prelude or epilogue position). Returns ``(residual_name, in_epilogue)``
-    or ``None`` on any deviation."""
-    if not epilogue_stmts:
-        return None
-    asn = epilogue_stmts[-1]
-    if not isinstance(asn, Assign):
-        return None
-    if asn.name != write_value:
-        return None
-    if asn.op.name != "add":
-        return None
-    if acc_name not in asn.args or len(asn.args) != 2:
-        return None
-    other = next(a for a in asn.args if a != acc_name)
-    earlier = epilogue_stmts[:-1]
-    if any(not isinstance(s, Load) for s in earlier):
-        return None
-    if any(s.name == other for s in earlier if isinstance(s, Load)):
-        return (other, True)
-    if any(isinstance(s, Load) and s.name == other for s in prelude_stmts):
-        return (other, False)
-    return None
 
 
 # --- pointwise / non-matmul reduce ----------------------------------
