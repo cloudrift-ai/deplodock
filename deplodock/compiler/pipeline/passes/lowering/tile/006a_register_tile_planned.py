@@ -40,17 +40,22 @@ PATTERN = [Pattern("root", TileOp)]
 def rewrite(root: Node) -> Graph | None:
     body = root.op.body
     idx, tile = single_tile(body)
-    if "FN" in root.op.knobs:
-        raise RuleSkipped("register-tile already applied (FN set in knobs)")
 
     new_body, factors = _replicate_register_loops(tile.body)
     if not factors:
+        # Idempotence + bail-out: once REGISTER Loops are gone (either
+        # because the planner emitted a (FM=1, FN=1) variant or because
+        # 006a already replicated), this pass is a no-op. In env=0 mode
+        # no REGISTER tags ever appear so we bail to the legacy 008.
         raise RuleSkipped("no Role.REGISTER tags in body — legacy 008 owns this kernel")
 
+    # FM/FN are stamped by the planner in env=1 mode; preserve them
+    # rather than overwriting. In env=0 the planner never fired so
+    # ``factors`` populates them on first run.
     knobs = dict(root.op.knobs)
-    if len(factors) >= 1:
+    if len(factors) >= 1 and "FM" not in knobs:
         knobs["FM"] = factors[0]
-    if len(factors) >= 2:
+    if len(factors) >= 2 and "FN" not in knobs:
         knobs["FN"] = factors[1]
     new_tile = Tile(axes=tile.axes, body=new_body)
     return TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=root.op.name, knobs=knobs)

@@ -133,3 +133,18 @@ def is_matmul_k_outer(
 def loads_reading(body: Body, stage_name: str) -> list[Load]:
     """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
     return [s for s in body.iter() if isinstance(s, Load) and s.input == stage_name]
+
+
+# ---------------------------------------------------------------------------
+# Shared knob choice constants (single source of truth)
+# ---------------------------------------------------------------------------
+
+# Per-nest-level register-tile factor choices. Used by
+# ``008_register_tile`` (legacy fork) and ``000_partition_planner``
+# (planner-driven matmul register-tile fork).
+TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+
+# Cap on total per-thread replication (∏ factors). Mirrors
+# ``008_register_tile._MAX_CELLS_PER_THREAD``: NVRTC compile time
+# explodes on more-unrolled bodies.
+MAX_CELLS_PER_THREAD: int = 128

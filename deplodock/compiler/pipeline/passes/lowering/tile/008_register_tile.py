@@ -51,21 +51,29 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, Stmt, StridedL
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+    MAX_CELLS_PER_THREAD as _MAX_CELLS_PER_THREAD_SHARED,
+)
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+    TUNE_F_CHOICES as _TUNE_F_CHOICES_SHARED,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
 from deplodock.compiler.tuning import register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
 
 # Per-nest-level factor choices. Each slot picks one; factors must
-# divide the slot's extent.
-_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+# divide the slot's extent. Single source of truth in ``_helpers.py``
+# so the planner-driven fork (``000_partition_planner``) and this
+# legacy fork stay in sync.
+_TUNE_F_CHOICES = _TUNE_F_CHOICES_SHARED
 
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Factor for the next-outer tilable nest level")
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Factor for the innermost tilable nest level")
 # Cap on total per-thread replication (∏ factors). NVRTC compile time
 # explodes on more-unrolled bodies; ``TileOp.validate`` is the
 # second-line filter on post-tile thread count.
-_MAX_CELLS_PER_THREAD = 128
+_MAX_CELLS_PER_THREAD = _MAX_CELLS_PER_THREAD_SHARED
 
 
 def rewrite(root: Node) -> Graph | None | list[TileOp]:

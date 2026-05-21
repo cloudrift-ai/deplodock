@@ -63,7 +63,11 @@ from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import Tile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+    MAX_CELLS_PER_THREAD,
+    TUNE_F_CHOICES,
+    is_matmul_reduce,
+)
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -94,15 +98,22 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     if loop_op.knobs.get(_PLANNER_KNOB):
         raise RuleSkipped("already planned")
 
-    after_reg = _try_matmul_register_tile(ctx, loop_op)
-    base = after_reg if after_reg is not None else loop_op
+    reg_variants = _try_matmul_register_tile(ctx, loop_op)
+    base_variants: list[LoopOp] = list(reg_variants) if reg_variants is not None else [loop_op]
 
-    k_variants = _try_matmul_k_chunk(ctx, base)
-    candidates: list[LoopOp] = list(k_variants) if k_variants is not None else [base]
+    after_k: list[LoopOp] = []
+    any_k_chunk = False
+    for base in base_variants:
+        k_variants = _try_matmul_k_chunk(ctx, base)
+        if k_variants is not None:
+            any_k_chunk = True
+            after_k.extend(k_variants)
+        else:
+            after_k.append(base)
 
     coop_results: list[LoopOp] = []
     any_coop = False
-    for cand in candidates:
+    for cand in after_k:
         coop_variants = _try_cooperative_reduce(cand)
         if coop_variants is not None:
             any_coop = True
@@ -126,7 +137,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
         else:
             chunked.append(cand)
 
-    fired = after_reg is not None or k_variants is not None or any_coop or any_chunk_reduce
+    fired = reg_variants is not None or any_k_chunk or any_coop or any_chunk_reduce
     if not fired:
         raise RuleSkipped("no planner branch matched")
 
@@ -144,43 +155,75 @@ def _stamp_planned(op: LoopOp) -> LoopOp:
 # --- matmul register-tile branch -------------------------------------
 
 
-def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> LoopOp | None:
-    """Detect a matmul-shape LoopOp; if eligible, pre-split the outer two
-    output Loops by ``(FM, FN)`` with ``Role.REGISTER`` on the inner
-    halves and σ-substitute the body. Returns ``None`` when no
-    transformation applies (legacy 008 then handles it post-staging)."""
-    fm, fn = _pick_register_factors(loop_op)
-    if fm <= 1 and fn <= 1:
-        return None
+def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
+    """Detect a matmul-shape LoopOp; if eligible, fork over ``(FM, FN)``
+    candidates from :data:`TUNE_F_CHOICES`. For each viable pair, emit
+    a LoopOp variant whose outer M / N output Loops are pre-split by
+    ``(FM, FN)`` with ``Role.REGISTER`` on the inner halves. Stamps
+    ``knobs={"FM": fm, "FN": fn}``.
 
+    Heuristic shape (from :func:`tuning.register_tile_shape`) is emitted
+    as variant 0 so deterministic compiles match the legacy 008
+    behavior. ``(1, 1)`` is included so the autotuner can elect the
+    no-register-tile shape too — it emits the body unchanged with
+    stamped knobs.
+
+    Returns ``None`` when the kernel isn't matmul-shaped or has fewer
+    than two outer free Loops."""
+    from deplodock.compiler.tuning import _has_matmul_reduce, register_tile_shape  # noqa: PLC0415
+
+    if not _has_matmul_reduce(loop_op.body):
+        return None
     chain = _outer_free_loop_chain(loop_op.body)
     if len(chain) < 2:
         return None
     outer_m, outer_n = chain[0], chain[1]
-    if int(outer_m.axis.extent) % fm != 0 or int(outer_n.axis.extent) % fn != 0:
-        return None
+    ext_m, ext_n = int(outer_m.axis.extent), int(outer_n.axis.extent)
 
-    new_body = _split_register_outer_two(loop_op.body, outer_m.axis.name, outer_n.axis.name, fm, fn)
-    return LoopOp(body=new_body, knobs=dict(loop_op.knobs))
-
-
-def _pick_register_factors(loop_op: LoopOp) -> tuple[int, int]:
-    """Heuristic ``(FM, FN)`` from :func:`tuning.register_tile_shape`
-    against a synthetic Tile carrying the outer-chain axes as THREAD —
-    same classification + small-tile guard 008 applies post-tileify."""
-    from deplodock.compiler.tuning import _has_matmul_reduce, register_tile_shape  # noqa: PLC0415
-
-    if not _has_matmul_reduce(loop_op.body):
-        return (1, 1)
-    chain = _outer_free_loop_chain(loop_op.body)
-    if len(chain) < 2:
-        return (1, 1)
     synthetic = Tile(
         axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
         body=chain[-1].body,
     )
-    fm, fn = register_tile_shape(synthetic)
-    return int(fm), int(fn)
+    h_fm, h_fn = (int(x) for x in register_tile_shape(synthetic))
+    if h_fm == 1 and h_fn == 1:
+        # ``register_tile_shape`` is pre-blockify here — without the
+        # (BN, BM) split (Step 4) the synthetic Tile has full extents
+        # and the heuristic is too pessimistic for small / fused matmuls
+        # (e.g. SDPA's 32×64 inner matmul). Defer to ``008_register_tile``
+        # post-staging, which sees the actual blockified shape. Once
+        # Step 4 hoists (BN, BM) into the planner, this short-circuit
+        # goes away and the full fork emits.
+        return None
+
+    seen: set[tuple[int, int]] = set()
+    ordered: list[tuple[int, int]] = []
+
+    def _add(fm: int, fn: int) -> None:
+        if (fm, fn) in seen:
+            return
+        if fm < 1 or fn < 1:
+            return
+        if ext_m % fm != 0 or ext_n % fn != 0:
+            return
+        if fm * fn > MAX_CELLS_PER_THREAD:
+            return
+        seen.add((fm, fn))
+        ordered.append((fm, fn))
+
+    _add(h_fm, h_fn)
+    for fm in TUNE_F_CHOICES:
+        for fn in TUNE_F_CHOICES:
+            _add(fm, fn)
+
+    variants: list[LoopOp] = []
+    for fm, fn in ordered:
+        knobs = {**loop_op.knobs, "FM": fm, "FN": fn}
+        if fm == 1 and fn == 1:
+            variants.append(LoopOp(body=loop_op.body, knobs=knobs))
+            continue
+        new_body = _split_register_outer_two(loop_op.body, outer_m.axis.name, outer_n.axis.name, fm, fn)
+        variants.append(LoopOp(body=new_body, knobs=knobs))
+    return variants or None
 
 
 def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
@@ -195,9 +238,18 @@ def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
 
 
 def _split_register_outer_two(body, m_name: str, n_name: str, fm: int, fn: int):
-    """``Loop(M:E) → Loop(M_o:E/FM) → Loop(N_o:E'/FN) → Loop(M_i:FM, REG)
-    → Loop(N_i:FN, REG) → σ(body)`` where σ maps M → M_o*FM+M_i and
-    N → N_o*FN+N_i in one pass over the innermost body."""
+    """Pre-split the outer M and N output Loops by ``(FM, FN)``.
+
+    For each axis with ``F > 1``: split into ``F_o`` (outer free,
+    extent ``E/F``) over ``F_i`` (inner ``Role.REGISTER``, extent ``F``)
+    with ``σ: axis → F_o*F + F_i``. When ``F == 1`` the axis is left
+    untouched (no split, no REGISTER tag) — this happens for variants
+    like ``(FM=1, FN=k)`` that only register-tile one of the two axes.
+
+    Resulting nesting (showing both >1):
+    ``Loop(M_o) → Loop(N_o) → Loop(M_i, REG) → Loop(N_i, REG) → σ(body)``.
+    ``F==1`` cases drop the corresponding ``F_o`` / ``F_i`` pair and
+    keep the original axis."""
 
     def _identity_rename(name: str) -> str:
         return name
@@ -210,35 +262,35 @@ def _split_register_outer_two(body, m_name: str, n_name: str, fm: int, fn: int):
     n_loop = m_body[0]
     inner = tuple(n_loop.body)
 
-    m_o = Axis(f"{m_name}_o", int(m_loop.axis.extent) // fm)
-    m_i = Axis(f"{m_name}_i", fm)
-    n_o = Axis(f"{n_name}_o", int(n_loop.axis.extent) // fn)
-    n_i = Axis(f"{n_name}_i", fn)
+    sigma_map: dict = {}
+    m_o = m_i = None
+    n_o = n_i = None
+    if fm > 1:
+        m_o = Axis(f"{m_name}_o", int(m_loop.axis.extent) // fm)
+        m_i = Axis(f"{m_name}_i", fm)
+        sigma_map[m_name] = Var(m_o.name) * Literal(fm, "int") + Var(m_i.name)
+    if fn > 1:
+        n_o = Axis(f"{n_name}_o", int(n_loop.axis.extent) // fn)
+        n_i = Axis(f"{n_name}_i", fn)
+        sigma_map[n_name] = Var(n_o.name) * Literal(fn, "int") + Var(n_i.name)
 
-    sigma = Sigma(
-        {
-            m_name: Var(m_o.name) * Literal(fm, "int") + Var(m_i.name),
-            n_name: Var(n_o.name) * Literal(fn, "int") + Var(n_i.name),
-        }
-    )
-    inner_rewritten = tuple(s.rewrite(_identity_rename, sigma) for s in inner)
+    if sigma_map:
+        sigma = Sigma(sigma_map)
+        inner_rewritten = tuple(s.rewrite(_identity_rename, sigma) for s in inner)
+    else:
+        inner_rewritten = inner
 
-    rebuilt = Loop(
-        axis=m_o,
-        body=(
-            Loop(
-                axis=n_o,
-                body=(
-                    Loop(
-                        axis=m_i,
-                        role=Role.REGISTER,
-                        body=(Loop(axis=n_i, role=Role.REGISTER, body=inner_rewritten),),
-                    ),
-                ),
-            ),
-        ),
-    )
-    return (rebuilt,)
+    # Build inside-out: register-tile inner halves, then outer halves.
+    current = inner_rewritten
+    if fn > 1:
+        current = (Loop(axis=n_i, role=Role.REGISTER, body=current),)
+    if fm > 1:
+        current = (Loop(axis=m_i, role=Role.REGISTER, body=current),)
+    outer_n_axis = n_o if fn > 1 else n_loop.axis
+    current = (Loop(axis=outer_n_axis, body=current),)
+    outer_m_axis = m_o if fm > 1 else m_loop.axis
+    current = (Loop(axis=outer_m_axis, body=current),)
+    return current
 
 
 # --- matmul K-chunk branch ------------------------------------------
