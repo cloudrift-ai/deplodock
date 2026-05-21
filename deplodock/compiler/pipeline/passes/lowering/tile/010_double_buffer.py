@@ -39,11 +39,12 @@ from dataclasses import replace as dc_replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.axis import Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_k_outer, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -96,51 +97,50 @@ def _process_scope(body: Body, smem_budget: int) -> Body:
 
 
 def _is_kouter_matmul(loop: Loop, invariant_names: set[str]) -> bool:
-    """K-outer-matmul predicate: extent ≥ 2, ≥ 1 Stage in body, and a
-    pure-matmul reduce body with no in-loop online-softmax-style merge
-    (no body stmt reads a local Accum target's running value).
+    """K-outer-matmul predicate keyed off planner Roles.
 
-    Cross-loop SSA reads are allowed when the referenced names are in
-    ``invariant_names`` — names defined by sibling stmts at the K-outer's
-    enclosing scope, before the K-outer Loop. Those values are
-    finalized before this K-outer starts, so 015's pipeline rewrite
-    can keep them in registers across the steady-state without the
-    synchronous-double-buffer + TMA-mbarrier deadlock the original
-    gate was designed to avoid.
+    The planner stamps ``Role.SERIAL_OUTER`` on the K_o loop and
+    ``Role.STAGE_INNER`` on the K_i reduce inside it (see
+    ``000_partition_planner._build_split_body``). Matching on those
+    tags replaces the structural ``is_matmul_k_outer`` walk — only
+    planner-recognized matmul K-loops are eligible.
 
-    Layered on the shared ``is_matmul_k_outer`` (which handles the
-    base shape — non-reduce free Loop wrapping a single reduce with
-    a pure-compute body that has at least one Accum) plus the
-    rule-specific ``extra_gate``.
+    Layered gates that aren't expressible as roles:
+
+    - ``extent ≥ 2`` (need room for ping-pong).
+    - ``≥ 1 Stage`` in the K_o body (after 007_stage_inputs picked
+      one — otherwise there's nothing to double-buffer).
+    - No in-loop online-softmax-style merge in K_i (non-Accum stmt
+      reading a local Accum's running value would compound fp32 drift
+      under double-buffering).
+    - Cross-loop SSA reads only when the referenced name is in
+      ``invariant_names`` — names defined by sibling stmts above this
+      K-outer at the enclosing scope. Those values are finalized
+      before K-outer starts, so the rewrite can read them from
+      registers without phase rotation. (015 carries the same gate.)
     """
-
-    def gate(k_outer: Loop, k_inner: Loop) -> bool:
-        if int(k_outer.axis.extent) < 2:
+    if loop.role is not Role.SERIAL_OUTER:
+        return False
+    if int(loop.axis.extent) < 2:
+        return False
+    if not any(isinstance(s, Stage) for s in loop.body):
+        return False
+    reduces = [c for c in loop.body if isinstance(c, Loop) and c.is_reduce]
+    if len(reduces) != 1:
+        return False
+    k_inner = reduces[0]
+    if k_inner.role is not Role.STAGE_INNER:
+        return False
+    for c in k_inner.body:
+        if isinstance(c, Accum):
+            continue
+        if any(isinstance(s, Accum) for s in k_inner.body.deps_of(c)):
             return False
-        if not any(isinstance(s, Stage) for s in k_outer.body):
-            return False
-        # Reject if any non-Accum stmt reads an Accum target's running
-        # value (in-loop online-softmax-style merge). Driven by
-        # ``Body.deps_of`` so the predicate is a one-liner: each stmt's
-        # deps resolve to defining stmts; flag any that resolves to an
-        # ``Accum``.
-        for c in k_inner.body:
-            if isinstance(c, Accum):
-                continue
-            if any(isinstance(s, Accum) for s in k_inner.body.deps_of(c)):
+    for c in k_inner.body:
+        for d, defstmt in zip(c.deps(), k_inner.body.deps_of(c), strict=False):
+            if defstmt is None and d not in invariant_names:
                 return False
-        # Cross-loop-deps gate, relaxed: reject only when an unresolved
-        # dep is *not* in ``invariant_names``. Names produced by sibling
-        # stmts above this K-outer (prior softmax max/sum reduces, hoisted
-        # reciprocals, etc.) are loop-invariant and safe to read from
-        # smem ring-buffered slabs without phase rotation.
-        for c in k_inner.body:
-            for d, defstmt in zip(c.deps(), k_inner.body.deps_of(c), strict=False):
-                if defstmt is None and d not in invariant_names:
-                    return False
-        return True
-
-    return is_matmul_k_outer(loop, extra_gate=gate)
+    return True
 
 
 def _double_buffer(loop: Loop) -> Loop | None:

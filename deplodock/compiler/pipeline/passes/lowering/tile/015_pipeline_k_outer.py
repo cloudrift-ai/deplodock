@@ -50,13 +50,13 @@ Trigger conditions:
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, AsyncWait, BufferedStage, TileOp, TmaBufferedStage
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_k_outer, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -94,68 +94,63 @@ def _process(body: Body) -> Body:
 
 
 def _eligible(loop: Loop, invariant_names: set[str]) -> bool:
-    """K-outer loop with all body staged loads as ``AsyncBufferedStage``
-    (and a *pure-matmul* reduce body — Load/Assign/Accum only AND no
-    read of an SSA name not defined locally inside the reduce, except
-    when that name is loop-invariant w.r.t. the K-outer).
+    """K-outer pipelining predicate keyed off planner Roles.
 
-    The cross-loop-deps gate originally rejected *all* reads of
-    non-locally-defined SSA names: kernels like SDPA's per-output
-    free loop have a reduce body that reads ``acc0`` / ``acc1`` from
-    prior softmax reduces, and pipelining was suspected to compound
-    fp32 drift in the rearranged commits.
+    The planner stamps ``Role.SERIAL_OUTER`` on K_o and
+    ``Role.STAGE_INNER`` on K_i. We require both, then layer the gates
+    that aren't expressible as roles:
 
-    The relaxation: a cross-loop name is allowed when it lives in
-    ``invariant_names`` — names defined by sibling stmts above the
-    K-outer at the same scope. Those values are finalized before the
-    K-outer starts, so the steady-state can read them from registers
-    without phase-dependent reordering. The original Accum-running-
-    value rejection (``Body.deps_of`` returning an in-body ``Accum``
-    for a non-Accum stmt) still holds via 014's ``extra_gate`` and is
-    the precise pattern the drift comment was about.
+    - ``extent ≥ 2`` (need prologue + ≥ 1 steady-state iter).
+    - ``≥ 2`` async/TMA Stages with a uniform ``buffer_count``. Single-
+      stage kernels (typically a Stage + a separate non-staged DRAM
+      Load in the reduce body, e.g. ``k_add_3`` with the SDPA-reduce
+      input) produce noticeable accuracy drift when pipelined and the
+      gain is small.
+    - No sync ``BufferedStage`` alongside async ones. The pipelining
+      schedule hoists async/TMA Stage decls + their first-iter loads
+      to the prologue and peels the last iter to the epilogue — both
+      outside the K-outer body. A sync BufferedStage left inside the
+      loop declares its Smem at loop scope, and the epilogue's reduce
+      body references that name from outside the scope (nvcc:
+      "identifier x_smem is undefined"). Skip rather than pipeline a
+      mixed-sync kernel; async_copy either promotes every Stage to
+      async (gate accepts) or some Stage stays sync (skip and keep the
+      unpipelined-but-correct schedule).
+    - Cross-loop SSA reads only when the referenced name is in
+      ``invariant_names`` (names defined by sibling stmts above the
+      K-outer at the enclosing scope, finalized before K-outer starts;
+      safe to read from registers across the steady-state without
+      phase-dependent reordering). The Accum-running-value rejection
+      that this gate originally guarded against — a non-Accum stmt
+      reading a local Accum's running value — is enforced upstream by
+      010_double_buffer (same predicate), so K_i bodies that reach
+      here are guaranteed clean.
 
-    ``010_double_buffer`` runs the same relaxed gate."""
-
-    def gate(k_outer: Loop, k_inner: Loop) -> bool:
-        if int(k_outer.axis.extent) < 2:
-            return False
-        stages = [s for s in k_outer.body if isinstance(s, (AsyncBufferedStage, TmaBufferedStage))]
-        # Restrict to ≥ 2 Stages (the matmul-shape case). Single-stage
-        # kernels — typically a Stage + a separate non-staged DRAM Load
-        # in the reduce body (e.g. ``k_add_3`` with the SDPA-reduce
-        # input) — produce noticeable accuracy drift when pipelined,
-        # likely because the unstaged DRAM Load hits memory at different
-        # times relative to the cp.async batch ordering. Empirically,
-        # the gain on these is small and the drift compounds across
-        # ~10 chained kernels in a transformer block.
-        if len(stages) < 2:
-            return False
-        if len({s.buffer_count for s in stages}) != 1:
-            return False
-        # Reject when a plain (sync) ``BufferedStage`` lives alongside
-        # async/TMA Stages. The pipelining schedule hoists async/TMA
-        # Stage decls + their first-iter loads to the prologue and peels
-        # the last iter to the epilogue — both outside the K-outer loop
-        # body. A sync ``BufferedStage`` left inside the loop declares
-        # its ``Smem`` at loop scope, and the epilogue's reduce body
-        # references that name from outside the scope ("identifier
-        # x_smem is undefined" at nvcc time). The cleanest fix is to
-        # skip pipelining here; ``async_copy`` either promotes every
-        # Stage to async (and this gate accepts), or some Stage stays
-        # sync and we keep the unpipelined-but-correct schedule.
-        async_kinds = (AsyncBufferedStage, TmaBufferedStage)
-        sync_stages = [s for s in k_outer.body if isinstance(s, BufferedStage) and not isinstance(s, async_kinds)]
-        if sync_stages:
-            return False
-        # Cross-loop-deps gate, relaxed: reject only when an unresolved
-        # dep is *not* in ``invariant_names``.
-        for c in k_inner.body:
-            for d, defstmt in zip(c.deps(), k_inner.body.deps_of(c), strict=False):
-                if defstmt is None and d not in invariant_names:
-                    return False
-        return True
-
-    return is_matmul_k_outer(loop, extra_gate=gate)
+    ``010_double_buffer`` keys off the same SERIAL_OUTER role."""
+    if loop.role is not Role.SERIAL_OUTER:
+        return False
+    if int(loop.axis.extent) < 2:
+        return False
+    reduces = [c for c in loop.body if isinstance(c, Loop) and c.is_reduce]
+    if len(reduces) != 1:
+        return False
+    k_inner = reduces[0]
+    if k_inner.role is not Role.STAGE_INNER:
+        return False
+    stages = [s for s in loop.body if isinstance(s, (AsyncBufferedStage, TmaBufferedStage))]
+    if len(stages) < 2:
+        return False
+    if len({s.buffer_count for s in stages}) != 1:
+        return False
+    async_kinds = (AsyncBufferedStage, TmaBufferedStage)
+    sync_stages = [s for s in loop.body if isinstance(s, BufferedStage) and not isinstance(s, async_kinds)]
+    if sync_stages:
+        return False
+    for c in k_inner.body:
+        for d, defstmt in zip(c.deps(), k_inner.body.deps_of(c), strict=False):
+            if defstmt is None and d not in invariant_names:
+                return False
+    return True
 
 
 def _pipeline(loop: Loop) -> list[Stmt] | None:

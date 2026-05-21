@@ -8,11 +8,11 @@
   ≥2 distinct K-indexed buffer Loads + at least one ``Accum``. The
   multiply between the two K-indexed Loads is implicit (the only way
   two distinct K-indexed buffer Loads can contribute to an Accum
-  in this IR is through a fused multiply-accumulate).
-- :func:`is_matmul_k_outer` — predicate for a top-level free ``Loop``
-  wrapping a single reduce Loop with a pure-compute body
-  (Load / Assign / Accum + at least one Accum). Rule-specific gates
-  layer on top via the ``extra_gate`` callback.
+  in this IR is through a fused multiply-accumulate). Used by
+  ``000_partition_planner`` to locate the K reduce inside an output
+  body; downstream K-outer passes (``010``, ``015``) key off the
+  planner-stamped ``Role.SERIAL_OUTER`` / ``Role.STAGE_INNER`` tags
+  instead of re-deriving the matmul shape structurally.
 - :func:`compute_capability` — re-exported from
   :mod:`deplodock.compiler.target` so passes can import it locally.
   Honors the ``--target sm_NN`` CLI override.
@@ -28,9 +28,8 @@ The file is prefixed ``_`` so the engine's rule loader skips it
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Tile
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.pipeline import RuleSkipped
 
 _logger = logging.getLogger(__name__)
@@ -104,35 +103,6 @@ def collect_invariant_names(stmt: Stmt) -> set[str]:
         for s in body.iter():
             out.update(s.defines())
     return out
-
-
-def is_matmul_k_outer(
-    loop: Stmt,
-    *,
-    extra_gate: Callable[[Loop, Loop], bool] = lambda k_outer, k_inner: True,
-) -> bool:
-    """True iff ``loop`` is a non-reduce free ``Loop`` wrapping exactly
-    one reduce Loop (the K-inner) whose body is pure compute
-    (``Load`` / ``Assign`` / ``Accum`` only, with at least one Accum).
-
-    ``extra_gate(k_outer, k_inner)`` runs as a final check after the
-    structural gates pass; rules layer their own constraints (e.g.
-    ``≥2 K-indexed buffers`` for register_tile, ``≥1 Stage in
-    k_outer.body`` for double_buffer, ``no cross-loop SSA reads`` for
-    pipeline_k_outer) via this hook so the structural part stays in one
-    place. Idempotence-style markers go in extra_gate too.
-    """
-    if not (isinstance(loop, Loop) and not loop.is_reduce):
-        return False
-    reduces = [c for c in loop.body if isinstance(c, Loop) and c.is_reduce]
-    if len(reduces) != 1:
-        return False
-    k_inner = reduces[0]
-    if not all(isinstance(c, (Load, Assign, Accum)) for c in k_inner.body):
-        return False
-    if not any(isinstance(c, Accum) for c in k_inner.body):
-        return False
-    return extra_gate(loop, k_inner)
 
 
 # ---------------------------------------------------------------------------

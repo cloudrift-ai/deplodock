@@ -22,9 +22,10 @@ outer chain is stripped, top-level body stmts may still contain free
 Loops whose iteration writes distinct output positions (e.g. fused
 SDPA's head-dim loop sits as a sibling to two softmax reduces). Each
 such Loop is lifted into ``Tile.axes`` (bind resolved from its role,
-defaulting to ``BIND_THREAD``) and replaced by its body. Detection:
-top-level body stmts only; the loop's subtree must contain a ``Write``
-whose index expression references the loop's axis.
+defaulting to ``BIND_THREAD``) and replaced by its body. Any free
+non-reduce Loop at this level is an output-dim iterator by LoopOp
+construction, so the lift gate is purely the body-resident-role
+filter — no per-Write index inspection needed.
 
 **BLOCK lifts → atomic Writes (generic).** Whenever the chain walker
 lifts a Loop into ``BIND_BLOCK``, every Write inside the lifted scope
@@ -53,7 +54,7 @@ from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis,
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
@@ -125,22 +126,25 @@ def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
 
 
 def _lift_output_loops(tile: Tile) -> Tile:
-    """Lift top-level free Loops that wrap a Write whose index varies
-    with the loop's axis into ``Tile.axes``. Tagged Loops bind via
-    :func:`_bind_for_role`; untagged Loops default to ``BIND_THREAD``.
+    """Lift top-level free Loops in ``tile.body`` into ``Tile.axes``.
 
-    REGISTER / SERIAL_OUTER / STAGE_INNER tags are skipped — they
-    belong in the body."""
+    Picks up the case where the chain walker stopped early (multi-stmt
+    level, e.g. fused SDPA's head-dim Loop sitting as a sibling to two
+    softmax reduces). Tagged Loops bind via :func:`_bind_for_role`;
+    untagged Loops default to ``BIND_THREAD``. Body-resident roles
+    (``REGISTER`` / ``SERIAL_OUTER`` / ``STAGE_INNER`` / ``PIPELINE``)
+    are skipped — they're handled in body lowering, not as launch dims.
+
+    The body-resident role check is the only filter — any free
+    non-reduce Loop reaching this point at the Tile-body top level is
+    an output-dim iterator by LoopOp construction (LoopOps come from
+    graph nodes; non-reduce Loops iterate the output's shape dims).
+    """
     new_axes = list(tile.axes)
     new_body: list[Stmt] = []
     changed = False
     for s in tile.body:
-        if (
-            isinstance(s, Loop)
-            and not s.is_reduce
-            and s.role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE)
-            and _writes_with_axis(s.body, s.axis.name)
-        ):
+        if isinstance(s, Loop) and not s.is_reduce and s.role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE):
             new_axes.append(BoundAxis(axis=s.axis, bind=_bind_for_role(s.role)))
             new_body.extend(s.body)
             changed = True
@@ -149,22 +153,6 @@ def _lift_output_loops(tile: Tile) -> Tile:
     if not changed:
         return tile
     return Tile(axes=tuple(new_axes), body=new_body)
-
-
-def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
-    for s in stmts:
-        if isinstance(s, Write):
-            free: set[str] = set()
-            for e in s.index:
-                free |= e.free_vars()
-            if axis_name in free:
-                return True
-        if isinstance(s, (Loop, StridedLoop)) and _writes_with_axis(s.body, axis_name):
-            return True
-        if isinstance(s, Cond):
-            if _writes_with_axis(s.body, axis_name) or _writes_with_axis(s.else_body, axis_name):
-                return True
-    return False
 
 
 def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[tuple[Axis, str], ...], tuple[LoopStmt, ...]]:
