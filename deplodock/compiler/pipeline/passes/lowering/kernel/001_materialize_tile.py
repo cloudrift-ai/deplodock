@@ -392,15 +392,17 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
             if stmt.is_reduce:
-                # Combine matching needs the Accum at the immediate-body
-                # level (single-loop reduce). For nested-reduce shapes
-                # (K-chunked matmul: outer reduce wraps inner reduce, no
-                # immediate Accum) there's no Combine to match anyway, so
-                # ``None`` here is safe — a stray Combine would error in
-                # the Combine branch as before.
+                # Single-loop reduce: Accum lives at the immediate-body level.
                 pending_reduce = next((a for a in stmt.body if isinstance(a, Accum)), None)
             else:
-                pending_reduce = None
+                # Non-reduce wrapper (e.g. ``Loop(K_o, SERIAL_OUTER, Loop(K_i,
+                # reduce, [Accum]))`` for cooperative-K reduce after the
+                # partition planner's σ-split). Descend into nested reduce
+                # subtrees so a sibling Combine can match the Accum's dtype.
+                # Returns ``None`` when no nested reduce-with-immediate-Accum
+                # exists — the Combine branch then raises ValueError, which
+                # preserves today's safety net against stray Combines.
+                pending_reduce = _find_nested_reduce_accum(stmt.body)
         elif isinstance(stmt, Combine):
             if pending_reduce is None:
                 raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce loop")
@@ -510,6 +512,26 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
         return transform(s)
 
     return loop.with_bodies((loop.body.map(materialize_leaf),))
+
+
+def _find_nested_reduce_accum(stmts) -> Accum | None:
+    """First ``Accum`` sitting at the immediate-body level of any nested
+    reduce ``Loop`` / ``StridedLoop`` subtree. Used by the materializer
+    when a non-reduce outer Loop wraps a deeper reduce — e.g. the
+    cooperative-K shape ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce,
+    [Accum]))`` produced by the partition planner's σ-split. Returns
+    ``None`` when no reduce-with-immediate-Accum is found, preserving
+    the existing "stray Combine raises" safety net."""
+    for s in stmts:
+        if isinstance(s, (Loop, StridedLoop)) and s.is_reduce:
+            for inner in s.body:
+                if isinstance(inner, Accum):
+                    return inner
+        if isinstance(s, (Loop, StridedLoop)):
+            found = _find_nested_reduce_accum(s.body)
+            if found is not None:
+                return found
+    return None
 
 
 def _single_thread_var(thread_axes: tuple) -> str:

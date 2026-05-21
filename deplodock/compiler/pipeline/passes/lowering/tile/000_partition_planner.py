@@ -231,10 +231,21 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             priority_mode="matmul",
         )
-    elif k_nonmatmul is not None:
+    elif k_nonmatmul is not None and _is_pure_reduce_shape(outer_n.body, k_nonmatmul):
         # Non-matmul reduce branch — cooperative-K enabled via BR.
         # Output axes M / N (M optional) go to BLOCK/THREAD as usual;
         # K splits as K_s · K_o · K_c · K_i with K_c at COOPERATIVE_STRIDE.
+        # ``bn_choices`` / ``bm_choices`` prepend 1 so the cartesian can
+        # explore (BN=1, BM=1) — the v1 BR>1 constraint requires the
+        # output thread axes to be extent-1 (sole THREAD axis is K_c).
+        #
+        # v1 gate: only the "pure reduce" shape (no post-reduce free
+        # Loop iterating a K-sized axis) goes through here. Multi-loop
+        # bodies (RMSNorm, softmax — reduce followed by a per-K
+        # post-pointwise output) fall through to the pointwise path,
+        # which today produces a correct (if non-cooperative) kernel.
+        # Lifting that limitation would require σ-rewriting the post-K
+        # iteration to share K_c — out of scope for v1.
         k_loop = k_nonmatmul
         k_is_matmul = False
         E_K = int(k_loop.axis.extent)
@@ -242,8 +253,8 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             E_M=E_M,
             E_N=E_N,
             E_K=E_K,
-            bn_choices=_TUNE_AXIS_CHOICES,
-            bm_choices=_TUNE_AXIS_CHOICES,
+            bn_choices=(1, *_TUNE_AXIS_CHOICES),
+            bm_choices=(1, *_TUNE_AXIS_CHOICES),
             bk_choices=_BK_CANDIDATES,
             splitk_choices=_SPLITK_CANDIDATES,
             br_choices=_BR_CANDIDATES,
@@ -477,19 +488,34 @@ def _build_split_body(
     sigma_outer = Sigma(sigma_map)
 
     # K axis split (optional — None for non-matmul).
-    K_s = K_o = K_i = None
+    #
+    # Cooperative-K (br > 1) introduces a K_c THREAD axis between K_o
+    # SERIAL_OUTER and K_i STAGE_INNER, distributing each K_o chunk's
+    # ``br · bk`` K-values across ``br`` threads. K_c sits innermost in
+    # the σ-stride so adjacent threads read adjacent K (coalesced
+    # cooperative loads). When br == 1, K_c is absent and the σ
+    # collapses to the existing matmul pattern ``K_o · bk + K_i``.
+    K_s = K_c = K_o = K_i = None
     sigma_k: Sigma | None = None
     if k_loop is not None:
         K_name = k_loop.axis.name
         E_K = int(k_loop.axis.extent)
-        K_o_ext = E_K // (splitk * bk)
-        K_s = Axis(f"{K_name}_s", splitk)
+        K_o_ext = E_K // (splitk * br * bk)
+        K_s = Axis(f"{K_name}_s", splitk) if splitk > 1 else None
+        K_c = Axis(f"{K_name}_c", br) if br > 1 else None
         K_o = Axis(f"{K_name}_o", K_o_ext)
         K_i = Axis(f"{K_name}_i", bk)
-        if splitk > 1:
-            sigma_k = Sigma({K_name: Var(K_s.name) * Literal(K_o_ext * bk, "int") + Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
+        # σ: K = K_s·(K_o_ext·br·bk) + K_o·(br·bk) + K_i·br + K_c
+        # K_c innermost (consecutive threads → consecutive K, coalesced).
+        # K_i·br stride keeps K_o · K_i · K_c contiguous within a stage.
+        inner_expr = Var(K_o.name) * Literal(br * bk, "int")
+        if K_c is not None:
+            inner_expr = inner_expr + Var(K_i.name) * Literal(br, "int") + Var(K_c.name)
         else:
-            sigma_k = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
+            inner_expr = inner_expr + Var(K_i.name)
+        if K_s is not None:
+            inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk, "int") + inner_expr
+        sigma_k = Sigma({K_name: inner_expr})
 
     # Step 1: apply σ_outer over all stmts inside outer_n's body. K
     # loop's body Loads pick up M/N substitutions; K iter var is
@@ -515,6 +541,13 @@ def _build_split_body(
         new_inner = inner_after_outer
 
     # Step 3: wrap inside-out with REGISTER → THREAD → BLOCK loops.
+    # K_c (cooperative-K) slots between the output THREAD layer
+    # (M_t / N_t) and the BLOCK layer; launch_geometry's
+    # _strip_outer_free_chain lifts it as BIND_THREAD. With v1's
+    # BR>1 ⇒ BN=BM=1 constraint, the M_t/N_t Loops are extent-1 and get
+    # inlined by normalize_body, leaving K_c as the sole THREAD axis in
+    # Tile.axes — which the materializer's _single_thread_var requires
+    # for Combine emission.
     current: tuple[Stmt, ...] = new_inner
     current = (Loop(axis=N_r, role=Role.REGISTER, body=current),)
     if M_r is not None:
@@ -522,11 +555,12 @@ def _build_split_body(
     current = (Loop(axis=N_t, role=Role.THREAD, body=current),)
     if M_t is not None:
         current = (Loop(axis=M_t, role=Role.THREAD, body=current),)
+    if K_c is not None:
+        current = (Loop(axis=K_c, role=Role.COOPERATIVE_STRIDE, body=current),)
     current = (Loop(axis=N_b, role=Role.BLOCK, body=current),)
     if M_b is not None:
         current = (Loop(axis=M_b, role=Role.BLOCK, body=current),)
-    if k_loop is not None and splitk > 1:
-        assert K_s is not None
+    if K_s is not None:
         current = (Loop(axis=K_s, role=Role.SPLITK_BLOCK, body=current),)
     # Extra outer chain axes (e.g. head_idx in multi-head SDPA; or any
     # axis further out than the second-innermost in pointwise) become
@@ -583,6 +617,32 @@ def _replace_inner_reduce(
                 continue
         out.append(s)
     return tuple(out), replaced
+
+
+def _is_pure_reduce_shape(stmts, k_reduce: Loop) -> bool:
+    """v1 gate for the cooperative-K branch: True iff ``stmts`` (the
+    inner body of outer_n) contains the K reduce subtree but no other
+    non-reduce free Loops iterating an axis of comparable extent.
+
+    Excludes shapes like RMSNorm (reduce followed by ``Loop(a2=K) post``)
+    and softmax (reduce + reduce + post-iter), where the post-iter axis
+    is structurally distinct from the cooperative thread axis K_c and
+    would create a second THREAD axis post-launch_geometry. Cooperative
+    Combine emission with two THREAD axes fails materializer's
+    ``_single_thread_var``; gating here keeps the v1 cooperative path
+    correct for pure sum / max / mean shapes."""
+    k_ext = int(k_reduce.axis.extent)
+    for s in stmts:
+        if s is k_reduce:
+            continue
+        if isinstance(s, Loop) and not s.is_reduce:
+            # A non-reduce free Loop at the same level whose extent matches
+            # the K reduce — the post-iter case. Reject the cooperative
+            # path. (Smaller free Loops, e.g. M_t/N_r-style, would have
+            # been part of the chain and not reached here.)
+            if int(s.axis.extent) == k_ext:
+                return False
+    return True
 
 
 def _find_first_reduce(stmts, *, match) -> Loop | None:
