@@ -74,8 +74,6 @@ from deplodock.compiler.tuning import BodyInfo, thread_tile_shape
 
 PATTERN = [Pattern("root", LoopOp)]
 
-_PLANNER_KNOB = "PLANNER"
-
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
@@ -100,28 +98,23 @@ SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     loop_op: LoopOp = root.op
-    if loop_op.knobs.get(_PLANNER_KNOB):
-        raise RuleSkipped("already planned")
-
     body_info = BodyInfo.of(loop_op.body)
 
+    # Idempotence: once the planner has stamped roles on the body's
+    # outer chain, ``_outer_free_loop_chain`` (which requires
+    # ``role is None``) returns an empty chain and the branches below
+    # return ``None``. No explicit "already planned" marker needed.
     variants: list[LoopOp] | None
     if body_info.has_matmul:
         variants = _split_matmul_fully(loop_op, body_info)
     else:
         variants = _split_pointwise_fully(loop_op, body_info)
     if variants is None:
-        raise RuleSkipped("kernel shape not handled by planner")
+        raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
     if len(variants) == 1:
-        return _stamp_planned(variants[0])
-    return [_stamp_planned(v) for v in variants]
-
-
-def _stamp_planned(op: LoopOp) -> LoopOp:
-    knobs = dict(op.knobs)
-    knobs[_PLANNER_KNOB] = True
-    return LoopOp(body=op.body, knobs=knobs)
+        return variants[0]
+    return variants
 
 
 # --- chain helpers ----------------------------------------------------
