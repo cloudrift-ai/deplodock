@@ -64,9 +64,27 @@ from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
-from deplodock.compiler.tuning import auto_splitk
+from deplodock.compiler.tuning import BodyInfo, auto_splitk
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+def _logical_output_extents(tile: Tile) -> tuple[int, ...]:
+    from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD  # noqa: PLC0415
+
+    extents: list[int] = []
+    i = 0
+    while i < len(tile.axes):
+        ba = tile.axes[i]
+        ext = int(ba.axis.extent)
+        if ba.bind == BIND_BLOCK and i + 1 < len(tile.axes) and tile.axes[i + 1].bind == BIND_THREAD:
+            extents.append(ext * int(tile.axes[i + 1].axis.extent))
+            i += 2
+            continue
+        extents.append(ext)
+        i += 1
+    return tuple(sorted(extents, reverse=True))
+
 
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 
@@ -95,7 +113,10 @@ def _maybe_rewrite(body, parent_knobs):
     if "SPLITK" in parent_knobs:
         splitk = int(parent_knobs["SPLITK"])
     else:
-        splitk = auto_splitk(tile, int(k_outer.axis.extent))
+        body_info = BodyInfo.of(tile.body)
+        output_extents = _logical_output_extents(tile)
+        thread_extents = tuple(int(ba.axis.extent) for ba in tile.axes)
+        splitk = auto_splitk(output_extents, body_info, int(k_outer.axis.extent), thread_extents)
     if splitk <= 1:
         raise RuleSkipped(f"splitK={splitk} (planner / heuristic elected no split)")
 

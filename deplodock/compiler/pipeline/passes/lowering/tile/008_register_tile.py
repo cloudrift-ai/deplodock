@@ -62,9 +62,29 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     replicate_along_axis,
     single_tile,
 )
-from deplodock.compiler.tuning import register_tile_shape
+from deplodock.compiler.tuning import BodyInfo, register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+def _logical_output_extents(tile: Tile) -> tuple[int, ...]:
+    """Walk ``tile.axes`` folding adjacent BLOCK-then-THREAD pairs into
+    a single extent. Returns sorted descending."""
+    from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD  # noqa: PLC0415
+
+    extents: list[int] = []
+    i = 0
+    while i < len(tile.axes):
+        ba = tile.axes[i]
+        ext = int(ba.axis.extent)
+        if ba.bind == BIND_BLOCK and i + 1 < len(tile.axes) and tile.axes[i + 1].bind == BIND_THREAD:
+            extents.append(ext * int(tile.axes[i + 1].axis.extent))
+            i += 2
+            continue
+        extents.append(ext)
+        i += 1
+    return tuple(sorted(extents, reverse=True))
+
 
 # Per-nest-level factor choices. Each slot picks one; factors must
 # divide the slot's extent. Single source of truth in ``_helpers.py``
@@ -240,10 +260,13 @@ def _find_slots(tile: Tile) -> list[_Slot]:
     the post-blockify register-tile split."""
     if not any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
         return []
-    heuristic = register_tile_shape(tile)
+    body_info = BodyInfo.of(tile.body)
+    output_extents = _logical_output_extents(tile)
+    thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
+    thread_extents = tuple(int(ba.axis.extent) for ba in thread_axes)
+    heuristic = register_tile_shape(output_extents, thread_extents, body_info)
     if heuristic[0] <= 1 and heuristic[1] <= 1:
         return []
-    thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
     if len(thread_axes) != 2:
         return []
     sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))

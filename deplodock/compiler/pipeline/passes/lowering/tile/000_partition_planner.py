@@ -9,48 +9,27 @@ materialization passes (``001_tileify``, ``006a_register_tile_planned``,
 decisions, doing only the leftover rewrites (lift to ``Tile.axes``,
 replicate stmts, build stages).
 
-**M4 scope** — matmul register tile. Detect matmul-shaped LoopOps,
-pre-split the outer M / N output Loops by ``(FM, FN)`` from
+**Matmul register tile** — detect matmul-shaped LoopOps, pre-split the
+outer M / N output Loops by ``(FM, FN)`` from
 :func:`tuning.register_tile_shape`, tag the inner halves
 ``Role.REGISTER``, and σ-substitute the body. ``001_tileify`` lifts
 M_o / N_o to ``Tile.axes`` and stops at the REGISTER tags;
 ``006a_register_tile_planned`` replicates the per-cell bodies *before*
 ``007_stage_inputs`` runs.
 
-**M7 scope** — matmul K chunking. After the M/N register-tile decision
-(if any), locate the matmul K reduce and pre-split it into
+**Matmul K chunking** — after the M/N register-tile decision, locate
+the matmul K reduce and pre-split it into
 ``Loop(K_o, SERIAL_OUTER) → Loop(K_i, reduce, STAGE_INNER)`` with
-σ: K → K_o*BK + K_i. The planner forks over a ``BK`` knob (same
-candidates as ``002_chunk_matmul_k``) so ``deplodock tune`` still
-walks the same variant space; greedy callers pick variant 0
-(the heuristic ``forced_bk`` value). ``002_chunk_matmul_k`` carries an
-idempotence guard that no-ops once the planner has stamped
-``Role.STAGE_INNER`` on the matmul reduce.
+σ: K → K_o*BK + K_i. The planner forks over a ``BK`` knob; greedy
+callers pick variant 0 (the heuristic ``forced_bk`` value).
 
-**M8 scope** — non-matmul chunk-reduce. For each non-matmul reduce
-whose K-indexed Loads project a thread-fanin slab over the 16 KB
+**Non-matmul chunk-reduce** — for each non-matmul reduce whose
+K-indexed Loads project a thread-fanin slab over the 16 KB
 ``007_stage_inputs`` cap, split K → ``Loop(K_o, SERIAL_OUTER) →
-Loop(K_i, reduce, STAGE_INNER)`` using the same BK picker as
-``006_chunk_reduce``. Predicts post-blockify thread extents via
-``min(extent, thread_tile_shape_target)`` against the outer free-Loop
-chain; skips cooperative-viable kernels (their synthetic ``t`` axis
-never matches a Load's index). ``006_chunk_reduce``'s M3 STAGE_INNER
-guard handles idempotence.
+Loop(K_i, reduce, STAGE_INNER)``.
 
-The predictor also mirrors ``001_tileify._lift_output_loops``: after
-the outer chain breaks, top-level free Loops in the remaining body
-whose subtree writes through their axis (SDPA's ``head_dim`` etc.)
-join the predicted thread-axes list at full extent. This catches the
-SDPA-class kernels that previously fell through to legacy
-``006_chunk_reduce`` post-tileify.
-
-M10: ``DEPLODOCK_PLANNER`` env flag has been dropped — the planner
-always runs. Legacy fallback passes (``002_chunk_matmul_k``,
-``006_chunk_reduce``, ``008_register_tile``'s matmul fork) carry
-idempotence guards that no-op once the planner has produced their
-output and stay reachable for the small subset of kernels the
-planner short-circuits (e.g. matmul-shaped LoopOps whose pre-
-blockify register_tile_shape heuristic returns ``(1, 1)``).
+**Matmul (BN, BM) stamp + SPLITK** — pure knob enumeration so
+``004_launch_geometry`` / ``003_split_matmul_k`` can run deterministic.
 """
 
 from __future__ import annotations
@@ -59,18 +38,24 @@ from dataclasses import replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis, Role
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import Tile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     MAX_CELLS_PER_THREAD,
     TUNE_F_CHOICES,
     is_matmul_reduce,
+)
+from deplodock.compiler.tuning import (
+    BodyInfo,
+    auto_splitk,
+    forced_bk,
+    register_tile_shape,
+    thread_tile_shape,
 )
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -80,17 +65,19 @@ PATTERN = [Pattern("root", LoopOp)]
 # 006a uses ``Role.REGISTER`` presence + ``FN`` absence as its trigger.
 _PLANNER_KNOB = "PLANNER"
 
-# Matches ``002_chunk_matmul_k._BK_CANDIDATES`` so the planner-driven
-# fork enumerates the same variant space as the legacy 002 fork did.
+# Matches the legacy 002_chunk_matmul_k BK candidate set.
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 
-# Mirrors ``004_launch_geometry._TUNE_AXIS_CHOICES`` and ``_WARP_SIZE``
-# so planner-driven forks (cooperative-BN, matmul BN/BM) enumerate the
-# same candidates the legacy 004 fork did.
+# Mirrors ``004_launch_geometry._TUNE_AXIS_CHOICES`` so planner-driven
+# matmul BN/BM forks enumerate the same candidate space as the legacy
+# 004 fork did.
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _WARP_SIZE = 32
+
+# Mirrors ``003_split_matmul_k._SPLITK_CANDIDATES``.
+_SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
@@ -98,13 +85,15 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     if loop_op.knobs.get(_PLANNER_KNOB):
         raise RuleSkipped("already planned")
 
-    reg_variants = _try_matmul_register_tile(ctx, loop_op)
+    body_info = BodyInfo.of(loop_op.body)
+
+    reg_variants = _try_matmul_register_tile(loop_op, body_info)
     base_variants: list[LoopOp] = list(reg_variants) if reg_variants is not None else [loop_op]
 
     after_k: list[LoopOp] = []
     any_k_chunk = False
     for base in base_variants:
-        k_variants = _try_matmul_k_chunk(ctx, base)
+        k_variants = _try_matmul_k_chunk(ctx, base, body_info)
         if k_variants is not None:
             any_k_chunk = True
             after_k.extend(k_variants)
@@ -114,7 +103,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     after_splitk: list[LoopOp] = []
     any_splitk = False
     for cand in after_k:
-        sk_variants = _try_splitk(ctx, cand)
+        sk_variants = _try_splitk(cand, body_info)
         if sk_variants is not None:
             any_splitk = True
             after_splitk.extend(sk_variants)
@@ -124,20 +113,17 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     chunked: list[LoopOp] = []
     any_chunk_reduce = False
     for cand in after_splitk:
-        after_cr = _try_chunk_reduce(cand)
+        after_cr = _try_chunk_reduce(cand, body_info)
         if after_cr is not None:
             any_chunk_reduce = True
             chunked.append(after_cr)
         else:
             chunked.append(cand)
 
-    # Matmul (BN, BM) stamp fork — pure knob enumeration, no body
-    # change. The planner is the source of truth; ``004_launch_geometry``
-    # reads BN/BM from knobs and emits one deterministic TileOp.
     bn_bm_results: list[LoopOp] = []
     any_bn_bm = False
     for cand in chunked:
-        bn_bm_variants = _try_matmul_bn_bm_fork(cand)
+        bn_bm_variants = _try_matmul_bn_bm_fork(cand, body_info)
         if bn_bm_variants is not None:
             any_bn_bm = True
             bn_bm_results.extend(bn_bm_variants)
@@ -161,10 +147,31 @@ def _stamp_planned(op: LoopOp) -> LoopOp:
     return LoopOp(body=op.body, knobs=knobs)
 
 
+# --- chain extent helpers --------------------------------------------
+
+
+def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
+    """Walk the outer single-stmt chain of untagged free Loops outermost-
+    first. Mirrors ``001_tileify._strip_outer_free_chain``."""
+    out: list[Loop] = []
+    cur = tuple(body)
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
+        out.append(cur[0])
+        cur = tuple(cur[0].body)
+    return tuple(out)
+
+
+def _chain_extents_desc(chain: tuple[Loop, ...]) -> tuple[int, ...]:
+    """Extents of the chain, sorted descending. Mirrors what
+    ``_logical_output_extents`` produced for the planner's synthetic
+    Tiles (all-THREAD axes, no folding)."""
+    return tuple(sorted((int(lp.axis.extent) for lp in chain), reverse=True))
+
+
 # --- matmul register-tile branch -------------------------------------
 
 
-def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
+def _try_matmul_register_tile(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
     """Detect a matmul-shape LoopOp; if eligible, fork over ``(FM, FN)``
     candidates from :data:`TUNE_F_CHOICES`. For each viable pair, emit
     a LoopOp variant whose outer M / N output Loops are pre-split by
@@ -172,16 +179,12 @@ def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | N
     ``knobs={"FM": fm, "FN": fn}``.
 
     Heuristic shape (from :func:`tuning.register_tile_shape`) is emitted
-    as variant 0 so deterministic compiles match the legacy 008
-    behavior. ``(1, 1)`` is included so the autotuner can elect the
-    no-register-tile shape too — it emits the body unchanged with
-    stamped knobs.
+    as variant 0. ``(1, 1)`` is included so the autotuner can elect the
+    no-register-tile shape too.
 
     Returns ``None`` when the kernel isn't matmul-shaped or has fewer
     than two outer free Loops."""
-    from deplodock.compiler.tuning import _has_matmul_reduce, register_tile_shape  # noqa: PLC0415
-
-    if not _has_matmul_reduce(loop_op.body):
+    if not body_info.has_matmul:
         return None
     chain = _outer_free_loop_chain(loop_op.body)
     if len(chain) < 2:
@@ -189,16 +192,9 @@ def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | N
     outer_m, outer_n = chain[0], chain[1]
     ext_m, ext_n = int(outer_m.axis.extent), int(outer_n.axis.extent)
 
-    synthetic = Tile(
-        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
-        body=chain[-1].body,
-    )
-    h_fm, h_fn = (int(x) for x in register_tile_shape(synthetic))
-    # Note: ``register_tile_shape`` runs against the pre-blockify
-    # synthetic, so for small / fused matmuls it tends to return
-    # ``(1, 1)``. In that case variant 0 (the heuristic) is the
-    # no-register-tile case; the tune sweep still walks the FM/FN
-    # cartesian via the loop below.
+    output_extents = _chain_extents_desc(chain)
+    thread_extents = tuple(int(lp.axis.extent) for lp in chain)
+    h_fm, h_fn = (int(x) for x in register_tile_shape(output_extents, thread_extents, body_info))
 
     seen: set[tuple[int, int]] = set()
     ordered: list[tuple[int, int]] = []
@@ -231,30 +227,13 @@ def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | N
     return variants or None
 
 
-def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
-    """Walk the outer single-stmt chain of untagged free Loops outermost-
-    first. Mirrors ``001_tileify._strip_outer_free_chain``."""
-    out: list[Loop] = []
-    cur = tuple(body)
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
-        out.append(cur[0])
-        cur = tuple(cur[0].body)
-    return tuple(out)
-
-
 def _split_register_outer_two(body, m_name: str, n_name: str, fm: int, fn: int):
     """Pre-split the outer M and N output Loops by ``(FM, FN)``.
 
     For each axis with ``F > 1``: split into ``F_o`` (outer free,
     extent ``E/F``) over ``F_i`` (inner ``Role.REGISTER``, extent ``F``)
     with ``σ: axis → F_o*F + F_i``. When ``F == 1`` the axis is left
-    untouched (no split, no REGISTER tag) — this happens for variants
-    like ``(FM=1, FN=k)`` that only register-tile one of the two axes.
-
-    Resulting nesting (showing both >1):
-    ``Loop(M_o) → Loop(N_o) → Loop(M_i, REG) → Loop(N_i, REG) → σ(body)``.
-    ``F==1`` cases drop the corresponding ``F_o`` / ``F_i`` pair and
-    keep the original axis."""
+    untouched."""
 
     def _identity_rename(name: str) -> str:
         return name
@@ -285,7 +264,6 @@ def _split_register_outer_two(body, m_name: str, n_name: str, fm: int, fn: int):
     else:
         inner_rewritten = inner
 
-    # Build inside-out: register-tile inner halves, then outer halves.
     current = inner_rewritten
     if fn > 1:
         current = (Loop(axis=n_i, role=Role.REGISTER, body=current),)
@@ -301,21 +279,16 @@ def _split_register_outer_two(body, m_name: str, n_name: str, fm: int, fn: int):
 # --- matmul K-chunk branch ------------------------------------------
 
 
-def _try_matmul_k_chunk(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
+def _try_matmul_k_chunk(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
     """Fork over BK for the matmul K reduce. Splits K → K_o
-    (``Role.SERIAL_OUTER``) × K_i (``Role.STAGE_INNER``) with
-    σ: K → K_o*BK + K_i. Returns one variant per BK candidate that
-    divides K (with K > BK); variant 0 carries the heuristic
-    ``forced_bk`` value so greedy callers (no autotune DB) reproduce
-    the legacy 002 default. Returns ``None`` when no matmul K reduce
-    is reachable or it's already chunked."""
+    (``Role.SERIAL_OUTER``) × K_i (``Role.STAGE_INNER``)."""
     site = _find_first_matmul_reduce(loop_op.body)
     if site is None:
         return None
     if site.role is Role.STAGE_INNER:
         return None  # already chunked
     K = int(site.axis.extent)
-    cands = _bk_candidates_for(ctx, loop_op, K)
+    cands = _bk_candidates_for(ctx, loop_op, body_info, K)
     if not cands:
         return None
     variants: list[LoopOp] = []
@@ -329,14 +302,17 @@ def _try_matmul_k_chunk(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
     return variants or None
 
 
-def _bk_candidates_for(ctx: Context, loop_op: LoopOp, K: int) -> tuple[int, ...]:
+def _bk_candidates_for(ctx: Context, loop_op: LoopOp, body_info: BodyInfo, K: int) -> tuple[int, ...]:
     """Filter ``_BK_CANDIDATES`` by ``K % bk == 0`` ∧ ``K > bk``, with
-    the heuristic ``forced_bk`` value first when it qualifies (so
-    variant 0 reproduces the legacy 002 default for greedy callers)."""
-    from deplodock.compiler.tuning import forced_bk
-
-    synthetic = _synthetic_tile_post_register(loop_op)
-    forced = forced_bk(synthetic, ctx.static_smem_cap)
+    the heuristic ``forced_bk`` value first when it qualifies."""
+    # Post-register-tile chain: walks ``loop_op.body`` outer free chain
+    # (chain breaks at REGISTER tags), so extents reflect the split.
+    chain = _outer_free_loop_chain(loop_op.body)
+    if chain:
+        output_extents = _chain_extents_desc(chain)
+    else:
+        output_extents = ()
+    forced = forced_bk(output_extents, body_info, ctx.static_smem_cap)
     base = [c for c in _BK_CANDIDATES if K % c == 0 and K > c]
     if forced is not None and K % forced == 0 and K > forced and forced not in base:
         base = [forced, *base]
@@ -345,29 +321,9 @@ def _bk_candidates_for(ctx: Context, loop_op: LoopOp, K: int) -> tuple[int, ...]
     return tuple(base)
 
 
-def _synthetic_tile_post_register(loop_op: LoopOp) -> Tile | None:
-    """Build a synthetic ``Tile`` reflecting the launch shape that
-    ``001_tileify`` will produce — outer free Loops above the first
-    REGISTER tag become ``Tile.axes`` (BIND_THREAD). Used to feed
-    :func:`tuning.forced_bk` so the picker sees the post-register-tile
-    extents."""
-    chain: list[Loop] = []
-    cur = tuple(loop_op.body)
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
-        chain.append(cur[0])
-        cur = tuple(cur[0].body)
-    if not chain:
-        return None
-    return Tile(
-        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
-        body=chain[-1].body,
-    )
-
-
 def _find_first_matmul_reduce(stmts) -> Loop | None:
     """Locate the first matmul-shaped reduce ``Loop`` reachable by
-    descent through Loops / StridedLoops / Conds. Mirrors 002's
-    walker so the K we measure is the K the rewrite will hit."""
+    descent through Loops / StridedLoops / Conds."""
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
             return s
@@ -385,10 +341,7 @@ def _find_first_matmul_reduce(stmts) -> Loop | None:
 def _chunk_first_matmul_k(stmts, bk: int) -> tuple[tuple, bool]:
     """Walk ``stmts``, replacing the first matmul-shaped reduce
     ``Loop(K, …)`` with ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce,
-    STAGE_INNER, σ(body)))``. Recurses through wrapper Loops /
-    StridedLoops / Conds so a matmul nested under register-tile REG
-    loops (the typical post-M4 shape) is reachable. Returns
-    ``(new_body, changed)``."""
+    STAGE_INNER, σ(body)))``."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
@@ -441,30 +394,21 @@ def _identity_rename_k(name: str) -> str:
 # --- non-matmul chunk-reduce branch ---------------------------------
 
 
-# Mirrors 006_chunk_reduce's BK candidate set + slab budgets.
 _REDUCE_BK_CANDIDATES = (128, 64, 32, 16, 8)
 _REDUCE_SLAB_CAP_BYTES = 16 * 1024
 _REDUCE_SLAB_HEADROOM_BYTES = 8 * 1024
 _BYTES_PER_ELEM = 4
 
 
-def _try_chunk_reduce(loop_op: LoopOp) -> LoopOp | None:
+def _try_chunk_reduce(loop_op: LoopOp, body_info: BodyInfo) -> LoopOp | None:
     """Chunk every non-matmul reduce Loop whose K-indexed Loads would
-    otherwise produce a smem slab over the ``007_stage_inputs`` cap.
-
-    Predicts post-blockify thread extents (``min(extent, target)``
-    where target comes from :func:`tuning.thread_tile_shape`) so the
-    slab math matches what 006 sees post-launch_geometry. Cooperative-
-    viable bodies (reduce extent ≥ 32 with independent Accums) are
-    skipped — their synthetic ``t`` axis never matches a Load's index,
-    so the slab degenerates to ``K × 4`` and never exceeds the cap.
-    """
+    otherwise produce a smem slab over the ``007_stage_inputs`` cap."""
     chain = _outer_free_loop_chain(loop_op.body)
     if not chain:
         return None
     lifted = _lifted_output_loops(tuple(chain[-1].body))
     combined = chain + lifted
-    thread_targets = _predict_thread_extents(loop_op, chain, lifted)
+    thread_targets = _predict_thread_extents(body_info, chain, lifted)
     if not thread_targets:
         return None
     new_body, changed = _chunk_reduces_in_body(loop_op.body, combined, thread_targets)
@@ -473,30 +417,15 @@ def _try_chunk_reduce(loop_op: LoopOp) -> LoopOp | None:
     return LoopOp(body=new_body, knobs=dict(loop_op.knobs))
 
 
-def _predict_thread_extents(loop_op: LoopOp, chain: tuple[Loop, ...], lifted: tuple[Loop, ...] = ()) -> tuple[int, ...] | None:
-    """Predicted (axis_name, thread_extent) for each outer-chain axis
-    followed by each lifted axis, mirroring ``004_launch_geometry.
-    _plan_partition`` for the chain (``ext ≤ target`` stays full;
-    ``ext > target`` shrinks to ``target``) and ``001_tileify.
-    _lift_output_loops`` for the lifted axes (always full extent —
-    tileify lifts but doesn't split them).
-
-    ``thread_tile_shape`` returns innermost-first targets; we reverse
-    so we can zip with ``chain``."""
-    from deplodock.compiler.tuning import thread_tile_shape
-
-    synthetic = Tile(
-        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
-        body=chain[-1].body,
-    )
-    shape = thread_tile_shape(synthetic)  # innermost-first
+def _predict_thread_extents(body_info: BodyInfo, chain: tuple[Loop, ...], lifted: tuple[Loop, ...] = ()) -> tuple[int, ...] | None:
+    """Predicted per-axis thread extent for each outer-chain axis
+    followed by each lifted axis."""
+    output_extents = _chain_extents_desc(chain)
+    shape = thread_tile_shape(output_extents, body_info)  # innermost-first
     targets_outer_first = tuple(reversed(shape))
     extents: list[int] = []
     for i, lp in enumerate(chain):
         ext = int(lp.axis.extent)
-        # Outer axes beyond ``len(shape)`` become BIND_BLOCK only — they
-        # contribute no thread fan-in. Use extent 1 so they don't enter
-        # the slab product.
         if i < len(chain) - len(targets_outer_first):
             extents.append(1)
             continue
@@ -509,11 +438,7 @@ def _predict_thread_extents(loop_op: LoopOp, chain: tuple[Loop, ...], lifted: tu
 
 
 def _lifted_output_loops(stmts: tuple) -> tuple[Loop, ...]:
-    """Mirror ``001_tileify._lift_output_loops``: collect top-level
-    free Loops in ``stmts`` (the body remaining after the outer free
-    chain is stripped) whose subtree contains a ``Write`` whose index
-    references the loop's axis. These become additional thread axes
-    once tileify runs."""
+    """Mirror ``001_tileify._lift_output_loops``."""
     out: list[Loop] = []
     for s in stmts:
         if isinstance(s, Loop) and not s.is_reduce and s.role is not Role.REGISTER and _writes_with_axis(s.body, s.axis.name):
@@ -522,8 +447,6 @@ def _lifted_output_loops(stmts: tuple) -> tuple[Loop, ...]:
 
 
 def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
-    """Mirror ``001_tileify._writes_with_axis``: any Write under
-    ``stmts`` whose index references ``axis_name``."""
     for s in stmts:
         if isinstance(s, Write):
             free: set[str] = set()
@@ -540,9 +463,7 @@ def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
 
 
 def _chunk_reduces_in_body(stmts, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> tuple[tuple, bool]:
-    """Walk the body, chunking every qualifying non-matmul reduce
-    Loop (mirroring 006's "fire on every qualifying reduce" behavior,
-    not 002's first-match-only). Returns ``(new_body, changed)``."""
+    """Walk the body, chunking every qualifying non-matmul reduce."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
@@ -570,10 +491,6 @@ def _chunk_reduces_in_body(stmts, chain: tuple[Loop, ...], thread_extents: tuple
 
 
 def _reduce_qualifies(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> bool:
-    """True iff ``loop`` is a non-matmul reduce, not already chunked
-    (by role tag or nested-reduce), with thread-axis fan-in over at
-    least one K-indexed Load whose candidate slab exceeds the
-    ``007_stage_inputs`` 16 KB cap."""
     if is_matmul_reduce(loop):
         return False
     if loop.role is Role.STAGE_INNER:
@@ -588,10 +505,6 @@ def _reduce_qualifies(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple
 
 
 def _slab_geometry(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]):
-    """Per-Load slab analysis mirroring 006's ``_slab_geometry`` but
-    against *predicted* thread extents. A thread axis derived from
-    ``chain[i]`` contributes its predicted extent to ``in_ext`` iff
-    the chain axis's original name appears in the Load's index."""
     from deplodock.compiler.ir.stmt import Load
 
     K_name = loop.axis.name
@@ -634,9 +547,6 @@ def _chunk_reduce_loop(loop: Loop, chain: tuple[Loop, ...], thread_extents: tupl
 
 
 def _pick_reduce_bk(K: int, in_extent_product: int) -> int | None:
-    """Largest BK from ``_REDUCE_BK_CANDIDATES`` that divides K (with
-    K > BK) and keeps the per-Load slab within the headroom budget.
-    Matches ``006_chunk_reduce._pick_bk``."""
     if in_extent_product < 1:
         in_extent_product = 1
     for c in _REDUCE_BK_CANDIDATES:
@@ -651,23 +561,11 @@ def _pick_reduce_bk(K: int, in_extent_product: int) -> int | None:
 # --- matmul (BN, BM) stamp fork --------------------------------------
 
 
-def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
-    """Enumerate ``(BN, BM)`` candidates for a matmul kernel and stamp
-    them as knobs (no body change). ``004_launch_geometry`` reads BN/BM
-    from knobs and does the deterministic axis split.
-
-    Mirrors ``004_launch_geometry._matmul_variants`` clamping logic:
-    candidates from ``_TUNE_AXIS_CHOICES``, clamped to the chain's
-    outer two extents, dropped on non-divisibility, deduped after
-    clamp. Heuristic shape (from :func:`tuning.thread_tile_shape`) is
-    variant 0.
-
-    Returns ``None`` for non-matmul kernels, kernels with < 2 outer
-    chain Loops, or kernels that already carry ``BN`` in knobs (e.g.
-    cooperative kernels — they stamp BN via the cooperative branch)."""
-    from deplodock.compiler.tuning import _has_matmul_reduce, thread_tile_shape  # noqa: PLC0415
-
-    if not _has_matmul_reduce(loop_op.body):
+def _try_matmul_bn_bm_fork(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+    """Enumerate ``(BN, BM)`` candidates and stamp them as knobs (no
+    body change). ``004_launch_geometry`` reads BN/BM from knobs and
+    does the deterministic axis split."""
+    if not body_info.has_matmul:
         return None
     if "BN" in loop_op.knobs:
         return None
@@ -678,11 +576,8 @@ def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
     ext_outer = int(chain[-2].axis.extent)
     ext_inner = int(chain[-1].axis.extent)
 
-    synthetic = Tile(
-        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
-        body=chain[-1].body,
-    )
-    heuristic = thread_tile_shape(synthetic)
+    output_extents = _chain_extents_desc(chain)
+    heuristic = thread_tile_shape(output_extents, body_info)
     h_bn = int(heuristic[0]) if len(heuristic) >= 1 else _TUNE_AXIS_CHOICES[2]
     h_bm = int(heuristic[1]) if len(heuristic) >= 2 else _TUNE_AXIS_CHOICES[2]
 
@@ -696,17 +591,8 @@ def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
             return
         if ext_outer > bm and ext_outer % bm != 0:
             return
-        # Skip noop partitions — both axes staying full THREAD means
-        # 004's ``_plan_partition`` produces no split. Greedy would
-        # then have no launch geometry to use.
         if bn == ext_inner and bm == ext_outer:
             return
-        # Reject candidates whose THREAD axis product exceeds the CTA
-        # limit (1024). ``TileOp.validate`` rejects them downstream once
-        # FM is stamped, and greedy has no fallback if every variant
-        # fails validate. Mirrors the post-clamp thread layout: the two
-        # innermost axes become BN × BM THREAD; outer chain axes go
-        # BLOCK (no thread contribution).
         if bn * bm > 1024:
             return
         shape = (bn, bm)
@@ -730,25 +616,9 @@ def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
 # --- SPLITK stamp fork ----------------------------------------------
 
 
-# Mirrors ``003_split_matmul_k._SPLITK_CANDIDATES``. Planner stamps one
-# SPLITK value per variant; ``003_split_matmul_k`` reads the stamp and
-# does the σ-split + epilogue rewrite deterministically.
-_SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
-
-
-def _try_splitk(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
-    """Enumerate ``SPLITK`` candidates for a K-chunked matmul kernel
-    and stamp them as knobs (no body change). The heuristic from
-    :func:`tuning.auto_splitk` against the synthetic Tile (post-register-
-    tile, post-K-chunk) becomes variant 0 — when it's ``1`` the fork
-    skips because no candidate would split the K_o loop.
-
-    Returns ``None`` when the kernel isn't matmul-shaped, hasn't been
-    K-chunked (no ``Role.SERIAL_OUTER`` K loop), or already carries
-    ``SPLITK`` in knobs."""
-    from deplodock.compiler.tuning import _has_matmul_reduce, auto_splitk  # noqa: PLC0415
-
-    if not _has_matmul_reduce(loop_op.body):
+def _try_splitk(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+    """Enumerate ``SPLITK`` candidates and stamp them as knobs."""
+    if not body_info.has_matmul:
         return None
     if "SPLITK" in loop_op.knobs:
         return None
@@ -759,23 +629,16 @@ def _try_splitk(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
         return None
     K_o_extent = int(k_o.axis.extent)
 
-    synthetic = Tile(
-        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain) if chain else (),
-        body=inner_body,
-    )
-    heuristic = int(auto_splitk(synthetic, K_o_extent))
+    output_extents = _chain_extents_desc(chain) if chain else ()
+    thread_extents = tuple(int(lp.axis.extent) for lp in chain)
+    heuristic = int(auto_splitk(output_extents, body_info, K_o_extent, thread_extents))
     if heuristic <= 1:
         return None
-    # No fork — one-shot stamp matching today's 003 behavior. The
-    # autotune layer can search SPLITK by overriding via env knobs;
-    # multi-variant SPLITK fork is out of scope for now.
     knobs = {**loop_op.knobs, "SPLITK": heuristic}
     return [LoopOp(body=loop_op.body, knobs=knobs)]
 
 
 def _find_serial_outer_k(stmts) -> Loop | None:
-    """Find the first ``Loop`` with ``Role.SERIAL_OUTER`` reachable in
-    ``stmts`` (the M7 K-chunk marker)."""
     for s in stmts:
         if isinstance(s, Loop) and s.role is Role.SERIAL_OUTER:
             return s

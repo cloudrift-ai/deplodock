@@ -31,28 +31,33 @@ class Role(Enum):
     (not rendered by ``pretty()``) so adding a role doesn't invalidate
     autotune cache entries.
 
-    ``GRID_BLOCK`` / ``GRID_THREAD`` are NOT here — those live as
-    ``BoundAxis.bind`` on ``Tile.axes`` (existing mechanism).
-
     Roles assigned to body loops:
 
+    - ``BLOCK``: output axis (or split sub-axis) that ``001_tileify`` lifts into
+      ``Tile.axes`` with ``BIND_BLOCK``. Stamped by the planner pre-tileify.
+    - ``THREAD``: output axis (or split sub-axis) that ``001_tileify`` lifts
+      into ``Tile.axes`` with ``BIND_THREAD``. Stamped by the planner pre-tileify.
+    - ``SPLITK_BLOCK``: cross-CTA split-K outer axis. Lifted by tileify into
+      ``Tile.axes`` with ``BIND_BLOCK``. Drives ``003_split_matmul_k``'s
+      epilogue rewrite.
     - ``REGISTER``: inner axis of a thread-axis split. ``001_tileify`` stops
       lifting at this axis (keeps it as a body Loop instead of pulling into
-      ``Tile.axes``); ``008_register_tile`` replicates dependent stmts along it.
+      ``Tile.axes``); ``006a_register_tile_planned`` replicates dependent
+      stmts along it.
     - ``STAGE_INNER``: inner reduce axis after a K split. Slab dimension for
       ``007_stage_inputs``.
     - ``SERIAL_OUTER``: outer serial chunk loop (e.g. K_o). Pipeline / double-
       buffer targets.
     - ``PIPELINE``: serial outer loop marked for pipelining by ``015_pipeline_k_outer``.
-    - ``COOPERATIVE_STRIDE``: reduce loop to be rewritten as ``StridedLoop`` by
-      ``005_cooperative_reduce``.
     """
 
+    BLOCK = "block"
+    THREAD = "thread"
+    SPLITK_BLOCK = "splitk_block"
     REGISTER = "register"
     STAGE_INNER = "stage_inner"
     SERIAL_OUTER = "serial_outer"
     PIPELINE = "pipeline"
-    COOPERATIVE_STRIDE = "cooperative_stride"
 
 
 @dataclass(frozen=True)

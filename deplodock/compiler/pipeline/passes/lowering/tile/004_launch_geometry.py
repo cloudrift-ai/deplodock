@@ -17,10 +17,9 @@ Pre-conditions: ``TileOp`` containing exactly one ``Tile`` with
 Idempotent: if a Tile already has ``block_axes`` set or the partition
 is a no-op (every axis fits one CTA), the pass skips.
 
-Note: the cooperative-reduce launch path (synthetic ``t=THREAD`` axis +
-``Role.COOPERATIVE_STRIDE`` tag) has been removed pending a planner-
-driven replacement. The ``_accums_independent`` helper is kept here for
-unit-test consumers (``tests/compiler/passes/test_reduction_rules.py``).
+Note: the cooperative-reduce launch path has been removed pending a
+planner-driven replacement. The ``_accums_independent`` helper is kept
+here for unit-test consumers (``tests/compiler/passes/test_reduction_rules.py``).
 """
 
 from __future__ import annotations
@@ -34,9 +33,30 @@ from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
-from deplodock.compiler.tuning import _has_matmul_reduce, thread_tile_shape
+from deplodock.compiler.tuning import BodyInfo, thread_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+def _logical_output_extents(tile: Tile) -> tuple[int, ...]:
+    """Recover the pre-blockify output extents from a (possibly
+    blockified) ``Tile``. Walks ``tile.axes`` folding adjacent
+    BLOCK-then-THREAD pairs into a single extent."""
+    from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD  # noqa: PLC0415
+
+    extents: list[int] = []
+    i = 0
+    while i < len(tile.axes):
+        ba = tile.axes[i]
+        ext = int(ba.axis.extent)
+        if ba.bind == BIND_BLOCK and i + 1 < len(tile.axes) and tile.axes[i + 1].bind == BIND_THREAD:
+            extents.append(ext * int(tile.axes[i + 1].axis.extent))
+            i += 2
+            continue
+        extents.append(ext)
+        i += 1
+    return tuple(sorted(extents, reverse=True))
+
 
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _WARP_SIZE = 32
@@ -51,12 +71,15 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     if tile.block_axes:
         raise RuleSkipped("Tile already has block_axes — launch geometry already decided")
 
-    if _has_matmul_reduce(tile.body):
+    body_info = BodyInfo.of(tile.body)
+    output_extents = _logical_output_extents(tile)
+
+    if body_info.has_matmul:
         # Planner-driven path: (BN, BM) already stamped on the parent
         # TileOp's knobs. Emit a single deterministic variant.
         if BN.name in root.op.knobs and BM.name in root.op.knobs:
             return _matmul_deterministic(body, idx, tile, root.op.name, root.op.knobs)
-        variants = _matmul_variants(body, idx, tile, root.op.name)
+        variants = _matmul_variants(body, idx, tile, root.op.name, body_info, output_extents)
         if not variants:
             raise RuleSkipped("no viable (BN, BM) candidate")
         if len(variants) == 1:
@@ -64,7 +87,7 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
         return variants
 
     # Pointwise / non-matmul: deterministic partition.
-    new_axes, sigma_map = _plan_partition(tile, thread_tile_shape(tile))
+    new_axes, sigma_map = _plan_partition(tile, thread_tile_shape(output_extents, body_info))
     if _is_noop_plan(tile, new_axes, sigma_map):
         raise RuleSkipped("partition is a no-op — tile already fits one CTA")
     partitioned = _apply_partition(tile, new_axes, sigma_map)
@@ -101,14 +124,21 @@ def _matmul_deterministic(body: tuple[Stmt, ...], idx: int, tile: Tile, name: st
     return TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=name)
 
 
-def _matmul_variants(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str) -> list[TileOp]:
+def _matmul_variants(
+    body: tuple[Stmt, ...],
+    idx: int,
+    tile: Tile,
+    name: str,
+    body_info: BodyInfo,
+    output_extents: tuple[int, ...],
+) -> list[TileOp]:
     """Enumerate viable ``(BN, BM)`` candidates. Heuristic shape is
     emitted first so deterministic compiles pick it."""
     if len(tile.axes) < 2:
         return []
     ext_inner = int(tile.axes[-1].axis.extent)
     ext_outer = int(tile.axes[-2].axis.extent)
-    heuristic = thread_tile_shape(tile)
+    heuristic = thread_tile_shape(output_extents, body_info)
 
     seen: set[tuple[int, int]] = set()
     ordered: list[tuple[int, int]] = []
