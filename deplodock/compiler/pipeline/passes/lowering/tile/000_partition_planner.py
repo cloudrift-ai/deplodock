@@ -490,27 +490,20 @@ def _build_split_body(
     # the σ-stride so adjacent threads read adjacent K (coalesced
     # cooperative loads). When br == 1, K_c is absent and the σ
     # collapses to the existing matmul pattern ``K_o · bk + K_i``.
-    K_s = K_c = K_o = K_i = None
-    sigma_k: Sigma | None = None
+    #
+    # K_s (cross-CTA) and K_c (cross-thread) are *shared* across all
+    # reduces in the kernel — single SPLITK and single cooperative
+    # thread axis. K_o and K_i are per-reduce (each reduce gets its own
+    # inner-body tower with axis names derived from its source K axis
+    # name), built lazily inside ``_replace_inner_reduce``.
+    K_s = K_c = None
+    E_K = K_o_ext = 0
     if k_loop is not None:
         K_name = k_loop.axis.name
         E_K = int(k_loop.axis.extent)
         K_o_ext = E_K // (splitk * br * bk)
         K_s = Axis(f"{K_name}_s", splitk) if splitk > 1 else None
         K_c = Axis(f"{K_name}_c", br) if br > 1 else None
-        K_o = Axis(f"{K_name}_o", K_o_ext)
-        K_i = Axis(f"{K_name}_i", bk)
-        # σ: K = K_s·(K_o_ext·br·bk) + K_o·(br·bk) + K_i·br + K_c
-        # K_c innermost (consecutive threads → consecutive K, coalesced).
-        # K_i·br stride keeps K_o · K_i · K_c contiguous within a stage.
-        inner_expr = Var(K_o.name) * Literal(br * bk, "int")
-        if K_c is not None:
-            inner_expr = inner_expr + Var(K_i.name) * Literal(br, "int") + Var(K_c.name)
-        else:
-            inner_expr = inner_expr + Var(K_i.name)
-        if K_s is not None:
-            inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk, "int") + inner_expr
-        sigma_k = Sigma({K_name: inner_expr})
 
     # Step 1: apply σ_outer over all stmts inside outer_n's body. K
     # loop's body Loads pick up M/N substitutions; K iter var is
@@ -518,19 +511,20 @@ def _build_split_body(
     inner_stmts = tuple(outer_n.body)
     inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
 
-    # Step 2: replace the K reduce Loop with K_o → K_i if K is present.
-    # The matmul branch uses ``is_matmul_reduce`` to identify the K
-    # reduce; the cooperative-reduce branch uses the complementary
-    # "reduce but not matmul-shape" predicate. Both are structural
-    # checks that survive σ-rewrite.
+    # Step 2: replace every K reduce Loop with a per-reduce K_o · K_i
+    # tower σ-rewriting its body. ``_replace_inner_reduce`` walks every
+    # match (not just the first) so multi-reduce kernels like softmax
+    # (max-reduce + sum-reduce over the same K) cooperatively split
+    # both reduces. The matmul branch uses ``is_matmul_reduce`` as the
+    # predicate; the cooperative-reduce branch uses the complementary
+    # "reduce but not matmul-shape" predicate.
     if k_loop is not None:
-        assert sigma_k is not None and K_o is not None and K_i is not None
         if k_is_matmul:
             match = is_matmul_reduce
         else:
             match = lambda lp: lp.is_reduce and not is_matmul_reduce(lp)  # noqa: E731
-        new_inner, replaced = _replace_inner_reduce(inner_after_outer, K_o, K_i, sigma_k, match=match)
-        if not replaced:
+        new_inner, n_replaced = _replace_inner_reduce(inner_after_outer, match=match, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext)
+        if n_replaced == 0:
             raise _BuildSkipped("K reduce not found in body")
 
         # Cooperative-K post-K loop rewrite: when br > 1 and the body has
@@ -541,7 +535,6 @@ def _build_split_body(
         # post-K Loop as a second BIND_THREAD axis and break the
         # materializer's single-THREAD-axis Combine assumption.
         if br > 1 and K_c is not None:
-            E_K = int(k_loop.axis.extent)
             new_inner = _replace_post_k_loops(new_inner, K_extent=E_K, K_s=K_s, K_c=K_c, br=br, bk=bk)
     else:
         new_inner = inner_after_outer
@@ -579,50 +572,84 @@ def _build_split_body(
 
 def _replace_inner_reduce(
     stmts: tuple[Stmt, ...],
-    K_o: Axis,
-    K_i: Axis,
-    sigma_k: Sigma,
     *,
     match,
-) -> tuple[tuple[Stmt, ...], bool]:
-    """Walk ``stmts`` and replace the first reduce Loop matching ``match``
-    with ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce, STAGE_INNER, σ_k(body)))``.
-    Returns ``(new_stmts, replaced_flag)``.
+    K_s: Axis | None,
+    K_c: Axis | None,
+    br: int,
+    bk: int,
+    K_o_ext: int,
+) -> tuple[tuple[Stmt, ...], int]:
+    """Walk ``stmts`` and replace *every* reduce Loop matching ``match``
+    with its own ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce, STAGE_INNER,
+    σ_k(body)))`` tower. Returns ``(new_stmts, n_replaced)``.
 
-    ``match(loop)`` is a callable applied to each reduce Loop encountered
-    during the walk: ``is_matmul_reduce`` for matmul kernels, the
+    K_o / K_i axis names derive from each reduce's source K axis name
+    (e.g. ``a1_o`` / ``a1_i`` for a reduce over ``a1``), so multi-reduce
+    kernels like softmax (max-reduce over ``a1`` + sum-reduce over
+    ``a2``) get distinct iteration spaces per reduce — the planner
+    output stays collision-free even though all reduces share the same
+    cooperative K_c and SPLITK K_s wrappers.
+
+    ``match(loop)`` is ``is_matmul_reduce`` for matmul kernels, the
     complementary "reduce but not matmul" predicate for non-matmul
     cooperative-K reduces. No Combine emission here — that lives in
-    ``002_cooperative_reduce``, which reads ``Role.COOPERATIVE_STRIDE`` off the
-    lifted ``BoundAxis``."""
+    ``001_launch_geometry._insert_combines_after_reduces``, which walks
+    the lifted Tile body for every K_o reduce subtree."""
     out: list[Stmt] = []
-    replaced = False
+    n_replaced = 0
     for s in stmts:
-        if replaced:
-            out.append(s)
-            continue
         if isinstance(s, Loop) and s.is_reduce and match(s):
+            K_name = s.axis.name
+            K_o = Axis(f"{K_name}_o", K_o_ext)
+            K_i = Axis(f"{K_name}_i", bk)
+            sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk)
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             k_i_loop = Loop(axis=K_i, role=Role.STAGE_INNER, body=new_body)
             k_o_loop = Loop(axis=K_o, role=Role.SERIAL_OUTER, body=(k_i_loop,))
             out.append(k_o_loop)
-            replaced = True
+            n_replaced += 1
             continue
         if isinstance(s, (Loop, StridedLoop)):
-            inner, r = _replace_inner_reduce(s.body, K_o, K_i, sigma_k, match=match)
+            inner, r = _replace_inner_reduce(s.body, match=match, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext)
             if r:
                 out.append(replace(s, body=inner))
-                replaced = True
+                n_replaced += r
                 continue
         if isinstance(s, Cond):
-            inner_b, rb = _replace_inner_reduce(s.body, K_o, K_i, sigma_k, match=match)
-            inner_e, re_ = _replace_inner_reduce(s.else_body, K_o, K_i, sigma_k, match=match)
+            inner_b, rb = _replace_inner_reduce(s.body, match=match, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext)
+            inner_e, re_ = _replace_inner_reduce(s.else_body, match=match, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext)
             if rb or re_:
                 out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
-                replaced = True
+                n_replaced += rb + re_
                 continue
         out.append(s)
-    return tuple(out), replaced
+    return tuple(out), n_replaced
+
+
+def _build_k_sigma(
+    K_name: str,
+    K_s: Axis | None,
+    K_o: Axis,
+    K_c: Axis | None,
+    K_i: Axis,
+    K_o_ext: int,
+    br: int,
+    bk: int,
+) -> Sigma:
+    """Build the σ for a single reduce's K-axis split:
+    ``K = K_s · (K_o_ext · br · bk) + K_o · (br · bk) + K_i · br + K_c``.
+    K_s and K_c terms collapse when those axes are None (SPLITK=1 and
+    BR=1 respectively); the K_i · br term loses the ``· br`` when K_c
+    is absent, matching the existing matmul σ shape."""
+    inner_expr = Var(K_o.name) * Literal(br * bk, "int")
+    if K_c is not None:
+        inner_expr = inner_expr + Var(K_i.name) * Literal(br, "int") + Var(K_c.name)
+    else:
+        inner_expr = inner_expr + Var(K_i.name)
+    if K_s is not None:
+        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk, "int") + inner_expr
+    return Sigma({K_name: inner_expr})
 
 
 def _replace_post_k_loops(

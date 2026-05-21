@@ -55,7 +55,6 @@ def test_run_code_matmul_accuracy(run_cli, dtype):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_rmsnorm_blockify(run_cli, dtype):
     """Wide hidden + ≥16 rows triggers blockify on the row axis. Regression
@@ -65,7 +64,6 @@ def test_run_code_rmsnorm_blockify(run_cli, dtype):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_softmax_blockify(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.nn.functional.softmax({_randn('32,2048', dtype)}, dim=-1)")
