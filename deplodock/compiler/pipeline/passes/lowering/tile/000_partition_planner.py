@@ -64,7 +64,7 @@ from dataclasses import replace
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis, Role
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop
@@ -229,25 +229,20 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             priority_mode="matmul",
         )
-    elif k_nonmatmul is not None and int(k_nonmatmul.axis.extent) >= ctx.warp_size and _is_pure_reduce_shape(outer_n.body, k_nonmatmul):
+    elif k_nonmatmul is not None and int(k_nonmatmul.axis.extent) >= ctx.warp_size:
         # Non-matmul reduce branch — cooperative-K enabled via BR.
         # Output axes M / N (M optional) go to BLOCK/THREAD as usual;
         # K splits as K_s · K_o · K_c · K_i with K_c at COOPERATIVE_STRIDE.
         # ``bn_choices`` / ``bm_choices`` prepend 1 so the cartesian can
         # explore (BN=1, BM=1) — the v1 BR>1 constraint requires the
         # output thread axes to be extent-1 (sole THREAD axis is K_c).
-        # Gates:
-        #   - ``E_K >= WARP_SIZE``: small reduces aren't worth a cross-
-        #     thread Combine (a single thread walks the row faster than
-        #     a warp-shuffle / tree-halve setup).
-        #
-        # v1 gate: only the "pure reduce" shape (no post-reduce free
-        # Loop iterating a K-sized axis) goes through here. Multi-loop
-        # bodies (RMSNorm, softmax — reduce followed by a per-K
-        # post-pointwise output) fall through to the pointwise path,
-        # which today produces a correct (if non-cooperative) kernel.
-        # Lifting that limitation would require σ-rewriting the post-K
-        # iteration to share K_c — out of scope for v1.
+        # Per-K post-pointwise loops (RMSNorm, softmax) are σ-rewritten
+        # in ``_build_split_body`` via ``_replace_post_k_loops`` so they
+        # share K_c with the reduce side — no need to gate them out.
+        # Gate:
+        #   - ``E_K >= ctx.warp_size``: small reduces aren't worth a
+        #     cross-thread Combine (a single thread walks the row
+        #     faster than a warp-shuffle / tree-halve setup).
         k_loop = k_nonmatmul
         k_is_matmul = False
         E_K = int(k_loop.axis.extent)
@@ -537,6 +532,17 @@ def _build_split_body(
         new_inner, replaced = _replace_inner_reduce(inner_after_outer, K_o, K_i, sigma_k, match=match)
         if not replaced:
             raise _BuildSkipped("K reduce not found in body")
+
+        # Cooperative-K post-K loop rewrite: when br > 1 and the body has
+        # additional non-reduce free Loops iterating the same K extent
+        # (RMSNorm's per-K post-pointwise, softmax's final divide loop),
+        # rewrite them into a K_o' · K_i' tower under the cooperative
+        # K_c axis. Without this, _lift_output_loops would lift the
+        # post-K Loop as a second BIND_THREAD axis and break the
+        # materializer's single-THREAD-axis Combine assumption.
+        if br > 1 and K_c is not None:
+            E_K = int(k_loop.axis.extent)
+            new_inner = _replace_post_k_loops(new_inner, K_extent=E_K, K_s=K_s, K_c=K_c, br=br, bk=bk)
     else:
         new_inner = inner_after_outer
 
@@ -619,30 +625,70 @@ def _replace_inner_reduce(
     return tuple(out), replaced
 
 
-def _is_pure_reduce_shape(stmts, k_reduce: Loop) -> bool:
-    """v1 gate for the cooperative-K branch: True iff ``stmts`` (the
-    inner body of outer_n) contains the K reduce subtree but no other
-    non-reduce free Loops iterating an axis of comparable extent.
+def _replace_post_k_loops(
+    stmts: tuple[Stmt, ...],
+    *,
+    K_extent: int,
+    K_s: Axis | None,
+    K_c: Axis,
+    br: int,
+    bk: int,
+) -> tuple[Stmt, ...]:
+    """Rewrite every non-reduce free Loop ``Loop(a_post=K_extent, body=...)``
+    in ``stmts`` into a K_o' · K_i' tower that σ-rewrites the post-iter
+    axis to ``K_o'·(br·bk) + K_i'·br + K_c.name``, matching the σ used
+    by the cooperative reduce side. The post Loop's iteration is now
+    distributed across the ``br`` K_c threads — each thread writes its
+    own K-slice instead of every thread redundantly iterating all K.
 
-    Excludes shapes like RMSNorm (reduce followed by ``Loop(a2=K) post``)
-    and softmax (reduce + reduce + post-iter), where the post-iter axis
-    is structurally distinct from the cooperative thread axis K_c and
-    would create a second THREAD axis post-launch_geometry. Cooperative
-    Combine emission with two THREAD axes fails materializer's
-    ``_single_thread_var``; gating here keeps the v1 cooperative path
-    correct for pure sum / max / mean shapes."""
-    k_ext = int(k_reduce.axis.extent)
+    K_o' carries ``Role.SERIAL_OUTER`` (launch_geometry won't lift it).
+    K_i' carries ``Role.STAGE_INNER``, semantically "inner slab dim,
+    regardless of reduce-status," so M11's ``007_stage_inputs`` tweak
+    can pick it up as a Load-collection site alongside the reduce K_i.
+
+    When ``K_s`` is present (SPLITK > 1), wrap the K_o' tower in
+    ``Cond(K_s == 0, body=[…])`` so only the K_s=0 CTA executes the
+    post — every K_s CTA otherwise repeats the same broadcast-value
+    write. Mirrors the existing atomic-Write Cond pattern.
+
+    Naming convention: the per-post-loop axes derive from the source
+    axis name (``a_post.name``) — ``{name}_o`` for K_o' and
+    ``{name}_i`` for K_i'. This keeps the IR readable when multiple
+    post-K loops exist (e.g. softmax) and avoids axis-name collisions
+    across siblings."""
+    out: list[Stmt] = []
     for s in stmts:
-        if s is k_reduce:
+        if isinstance(s, Loop) and not s.is_reduce and int(s.axis.extent) == K_extent:
+            a_post = s.axis
+            K_op = Axis(f"{a_post.name}_o", K_extent // (br * bk))
+            K_ip = Axis(f"{a_post.name}_i", bk)
+            # σ: a_post = K_o' · (br · bk) + K_i' · br + K_c
+            post_expr = Var(K_op.name) * Literal(br * bk, "int") + Var(K_ip.name) * Literal(br, "int") + Var(K_c.name)
+            sigma_post = Sigma({a_post.name: post_expr})
+            new_body = tuple(c.rewrite(_identity_rename, sigma_post) for c in s.body)
+            k_ip_loop = Loop(axis=K_ip, role=Role.STAGE_INNER, body=new_body)
+            k_op_loop: Stmt = Loop(axis=K_op, role=Role.SERIAL_OUTER, body=(k_ip_loop,))
+            if K_s is not None:
+                k_op_loop = Cond(
+                    cond=BinaryExpr("==", Var(K_s.name), Literal(0, "int")),
+                    body=(k_op_loop,),
+                    else_body=(),
+                )
+            out.append(k_op_loop)
             continue
-        if isinstance(s, Loop) and not s.is_reduce:
-            # A non-reduce free Loop at the same level whose extent matches
-            # the K reduce — the post-iter case. Reject the cooperative
-            # path. (Smaller free Loops, e.g. M_t/N_r-style, would have
-            # been part of the chain and not reached here.)
-            if int(s.axis.extent) == k_ext:
-                return False
-    return True
+        if isinstance(s, (Loop, StridedLoop)):
+            inner = _replace_post_k_loops(tuple(s.body), K_extent=K_extent, K_s=K_s, K_c=K_c, br=br, bk=bk)
+            if inner != tuple(s.body):
+                out.append(replace(s, body=inner))
+                continue
+        if isinstance(s, Cond):
+            b = _replace_post_k_loops(tuple(s.body), K_extent=K_extent, K_s=K_s, K_c=K_c, br=br, bk=bk)
+            e = _replace_post_k_loops(tuple(s.else_body), K_extent=K_extent, K_s=K_s, K_c=K_c, br=br, bk=bk)
+            if b != tuple(s.body) or e != tuple(s.else_body):
+                out.append(Cond(cond=s.cond, body=b, else_body=e))
+                continue
+        out.append(s)
+    return tuple(out)
 
 
 def _find_first_reduce(stmts, *, match) -> Loop | None:
