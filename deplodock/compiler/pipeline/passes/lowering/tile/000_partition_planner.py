@@ -154,6 +154,16 @@ def _identity_rename(name: str) -> str:
     return name
 
 
+def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
+    """All divisors of ``n`` ≤ ``cap``, ascending. Used as the FM / FN
+    candidate set: a divisor of ``E_M / bm_c`` automatically satisfies
+    the ``E_M % (bm_c * fm) == 0`` constraint, and for pow-2 ``n`` the
+    result is the same pow-2 set the legacy preset enumerated."""
+    if n < 1 or cap < 1:
+        return ()
+    return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
+
+
 # --- matmul: joint enumeration ---------------------------------------
 
 
@@ -247,14 +257,13 @@ def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> l
                 continue
             if bn_c * bm_c > 1024:
                 continue
-            for fm in _TUNE_F_CHOICES:
-                if E_M % (bm_c * fm) != 0:
-                    continue
-                for fn in _TUNE_F_CHOICES:
-                    if E_N % (bn_c * fn) != 0:
-                        continue
-                    if fm * fn > _MAX_CELLS_PER_THREAD:
-                        continue
+            # FM / FN iterate over divisors of the remaining per-thread
+            # cell counts. When E_M / bm_c is pow-2 (the common case)
+            # these match the legacy pow-2 preset exactly; non-pow-2
+            # extents pick up their structural divisors (e.g. E_N=192,
+            # bn_c=64 → FN ∈ {1, 3} where the preset only had {1}).
+            for fm in _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD):
+                for fn in _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm):
                     for bk in _BK_CANDIDATES:
                         if E_K % bk != 0 or E_K <= bk:
                             continue
