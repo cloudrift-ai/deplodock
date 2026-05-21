@@ -26,15 +26,19 @@ defaulting to ``BIND_THREAD``) and replaced by its body. Detection:
 top-level body stmts only; the loop's subtree must contain a ``Write``
 whose index expression references the loop's axis.
 
-**SPLITK_BLOCK → atomic Writes.** When the chain walker lifts a Loop
-with ``Role.SPLITK_BLOCK`` into ``BIND_BLOCK``, the body inside is
-now executed by multiple CTAs racing toward the same output cells.
-We rewrite every Write in that body so it commits its partial via
-atomic-add, decomposing ``add(K_s-indep, K_s-dep)`` shapes into
-``atomic(dep) + Cond(K_s == 0, atomic(indep))`` so K_s-independent
-contributions are added exactly once. The K_s-dep classification is
-a def-DAG walk: a value is K_s-dep iff its def chain reaches an
-``Accum`` inside the lifted scope.
+**BLOCK lifts → atomic Writes (generic).** Whenever the chain walker
+lifts a Loop into ``BIND_BLOCK``, every Write inside the lifted scope
+becomes potentially raced — multiple CTAs share the loop's axis.
+The test is structural: if the lifted axis name appears in
+``Write.index``, each CTA writes a different cell and there's no
+conflict (typical output-tile axes M_b / N_b). If the axis name is
+absent, the CTAs are reducing across that axis and we rewrite the
+Write to commit its partial via atomic-add, decomposing
+``add(indep, dep)`` shapes into
+``atomic(dep) + Cond(axis == 0, atomic(indep))`` so axis-independent
+contributions are added exactly once. This subsumes the special-case
+SPLITK_BLOCK handling: K_s simply happens to be the only Role today
+whose axis is reliably absent from Write.index by σ-construction.
 
 The node's id, inputs, and output tensor are preserved — only the op
 changes.
@@ -97,13 +101,18 @@ def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
         leading.append(rest[0])
         rest = rest[1:]
 
-    output_axes_with_bind, k_s_name, inner = _strip_outer_free_chain(rest)
+    output_axes_with_bind, inner = _strip_outer_free_chain(rest)
 
-    # If a SPLITK_BLOCK axis got lifted (the chain walker remembered
-    # its name), the body inside is now multi-CTA. Rewrite Writes so
-    # CTAs can safely commit their partials via atomic-add.
-    if k_s_name is not None:
-        inner = _rewrite_writes_for_splitk(inner, k_s_name)
+    # For each BIND_BLOCK axis we just lifted, rewrite Writes inside
+    # the lifted scope. The inner check ("axis in Write.index?")
+    # filters out axes whose CTAs already write distinct cells (M_b,
+    # N_b, etc.), so this loop is a no-op for them and only engages
+    # for reduction-style lifts (K_s — but the logic doesn't know or
+    # care about K_s specifically).
+    for axis, bind in output_axes_with_bind:
+        if bind != BIND_BLOCK:
+            continue
+        inner = _rewrite_writes_for_lifted_axis(inner, axis.name)
 
     body: list[Stmt] = list(leading)
     if output_axes_with_bind:
@@ -158,11 +167,9 @@ def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
     return False
 
 
-def _strip_outer_free_chain(
-    stmts: tuple[LoopStmt, ...],
-) -> tuple[tuple[tuple[Axis, str], ...], str | None, tuple[LoopStmt, ...]]:
+def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[tuple[Axis, str], ...], tuple[LoopStmt, ...]]:
     """Walk the outer free-Loop chain and return
-    ``(stripped_axes_with_bind, splitk_axis_name, remainder)``.
+    ``(stripped_axes_with_bind, remainder)``.
 
     Stops when the current level has more than one stmt, isn't a Loop, or
     is a reduce Loop, or carries a body-resident role (REGISTER /
@@ -171,13 +178,8 @@ def _strip_outer_free_chain(
     Tagged Loops (BLOCK / THREAD / SPLITK_BLOCK) bind via
     :func:`_bind_for_role`. Untagged Loops default to ``BIND_THREAD``
     — a safety net for kernels the planner currently can't partition
-    (e.g. SDPA V matmul where M/N detection from the chain is wrong).
-
-    The middle return value is the axis name of a lifted SPLITK_BLOCK
-    Loop, or ``None`` if no SPLITK was in the chain — used by the
-    caller to drive the atomic-Write rewrite for the body inside."""
+    (e.g. SDPA V matmul where M/N detection from the chain is wrong)."""
     axes_with_bind: list[tuple[Axis, str]] = []
-    splitk_name: str | None = None
     cur = stmts
     while (
         len(cur) == 1
@@ -186,33 +188,25 @@ def _strip_outer_free_chain(
         and cur[0].role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE)
     ):
         axes_with_bind.append((cur[0].axis, _bind_for_role(cur[0].role)))
-        if cur[0].role is Role.SPLITK_BLOCK:
-            splitk_name = cur[0].axis.name
         cur = cur[0].body
-    return tuple(axes_with_bind), splitk_name, cur
+    return tuple(axes_with_bind), cur
 
 
 # ---------------------------------------------------------------------------
-# Atomic-Write rewrite for SPLITK_BLOCK lifting
+# Atomic-Write rewrite for BLOCK lifts
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_writes_for_splitk(body: tuple[LoopStmt, ...], k_s_name: str) -> tuple[LoopStmt, ...]:
-    """Descend through wrapper Loops (REGISTER / etc.) until we reach
-    the level where ``Write`` stmts live, then rewrite each Write so
-    multiple CTAs can safely commit their partials via atomic-add.
+def _rewrite_writes_for_lifted_axis(body: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
+    """Descend through wrapper Loops (REGISTER / SERIAL_OUTER / etc.)
+    until we reach the level where ``Write`` stmts live, then rewrite
+    each Write whose index doesn't reference ``axis_name`` — those
+    are being raced by multiple CTAs to the same output cell now that
+    the axis is BIND_BLOCK.
 
-    The rewrite is driven by a def-DAG classification of each Write's
-    value into ``K_s-dep`` (reaches an Accum inside the K_s scope) vs
-    ``K_s-indep`` components:
-
-    - Pure ``K_s-dep`` value → mark Write atomic.
-    - ``add(K_s-indep, K_s-dep)`` immediate producer → emit
-      ``atomic(dep) + Cond(K_s == 0, atomic(indep))``.
-    - Otherwise → leave the Write alone (the kernel may produce wrong
-      output if SPLITK > 1; the planner enumerates SPLITK = 1 too so a
-      safe variant exists in the cartesian).
-    """
+    Writes whose index *does* mention ``axis_name`` write distinct
+    cells across CTAs (the regular output-tile case) and pass through
+    unchanged."""
     wrappers: list[Loop] = []
     cur: tuple[LoopStmt, ...] = tuple(body)
     while not any(isinstance(s, Write) for s in cur):
@@ -221,7 +215,7 @@ def _rewrite_writes_for_splitk(body: tuple[LoopStmt, ...], k_s_name: str) -> tup
         wrappers.append(cur[0])
         cur = tuple(cur[0].body)
 
-    new_kernel_stmts = _rewrite_kernel_writes(cur, k_s_name)
+    new_kernel_stmts = _rewrite_kernel_writes(cur, axis_name)
 
     current: tuple[LoopStmt, ...] = new_kernel_stmts
     for w in reversed(wrappers):
@@ -229,17 +223,18 @@ def _rewrite_writes_for_splitk(body: tuple[LoopStmt, ...], k_s_name: str) -> tup
     return current
 
 
-def _rewrite_kernel_writes(stmts: tuple[LoopStmt, ...], k_s_name: str) -> tuple[LoopStmt, ...]:
-    """At the kernel level (where Write and any Accum / K_o / Assign
-    siblings live), classify each Write's value via def-DAG and
-    rewrite for split-K correctness."""
+def _rewrite_kernel_writes(stmts: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
+    """At the kernel level, find every Write whose index doesn't
+    reference ``axis_name`` and classify its value via def-DAG analysis
+    for the atomic-add rewrite. Writes whose index *does* mention the
+    axis (the typical M_b / N_b output-tile case) pass through."""
     defs: dict[str, LoopStmt] = {s.name: s for s in stmts if hasattr(s, "name")}
-    k_dep = _compute_k_dep_set(stmts)
+    axis_dep = _compute_axis_dep_set(stmts)
 
     out: list[LoopStmt] = []
     for s in stmts:
-        if isinstance(s, Write):
-            rewritten = _rewrite_write_for_splitk(s, defs, k_dep, k_s_name)
+        if isinstance(s, Write) and not _write_indexed_by(s, axis_name):
+            rewritten = _rewrite_write_for_lifted_axis(s, defs, axis_dep, axis_name)
             if rewritten is not None:
                 out.extend(rewritten)
                 continue
@@ -247,30 +242,37 @@ def _rewrite_kernel_writes(stmts: tuple[LoopStmt, ...], k_s_name: str) -> tuple[
     return tuple(out)
 
 
-def _compute_k_dep_set(stmts: tuple[LoopStmt, ...]) -> set[str]:
-    """SSA names whose value transitively touches an ``Accum`` inside
-    these kernel-level stmts (Accums live inside the K_s scope, so
-    "touches Accum" ≡ "K_s-dependent")."""
-    k_dep: set[str] = set()
+def _write_indexed_by(write: Write, axis_name: str) -> bool:
+    """True iff any index expression of the Write mentions ``axis_name``."""
+    return any(axis_name in e.free_vars() for e in write.index)
+
+
+def _compute_axis_dep_set(stmts: tuple[LoopStmt, ...]) -> set[str]:
+    """SSA names whose value transitively touches an ``Accum`` at the
+    kernel level. Since the lifted axis wraps every kernel-level stmt,
+    any value that flows through an ``Accum`` is by construction
+    axis-dependent (the Accum aggregates iterations of an inner loop
+    that itself iterates inside the lifted axis's scope)."""
+    axis_dep: set[str] = set()
     for s in stmts:
         if isinstance(s, Accum):
-            k_dep.add(s.name)
+            axis_dep.add(s.name)
     changed = True
     while changed:
         changed = False
         for s in stmts:
-            if isinstance(s, Assign) and s.name not in k_dep:
-                if any(arg in k_dep for arg in s.args):
-                    k_dep.add(s.name)
+            if isinstance(s, Assign) and s.name not in axis_dep:
+                if any(arg in axis_dep for arg in s.args):
+                    axis_dep.add(s.name)
                     changed = True
-    return k_dep
+    return axis_dep
 
 
-def _rewrite_write_for_splitk(
+def _rewrite_write_for_lifted_axis(
     write: Write,
     defs: dict[str, LoopStmt],
-    k_dep: set[str],
-    k_s_name: str,
+    axis_dep: set[str],
+    axis_name: str,
 ) -> tuple[LoopStmt, ...] | None:
     """Classify ``write.value`` and emit the appropriate atomic-Write
     rewrite. Returns ``None`` to leave the Write alone."""
@@ -279,15 +281,15 @@ def _rewrite_write_for_splitk(
 
     value = write.value
 
-    # Splittable: immediate producer is ``add(K_s-indep, K_s-dep)``.
-    # Check this BEFORE the pure-dep path so ``v = add(r, acc)`` (which
-    # has v ∈ k_dep) gets decomposed instead of naively atomic-added
-    # (which would double-count the K_s-independent term).
+    # Splittable: immediate producer is ``add(indep, dep)``. Check this
+    # BEFORE the pure-dep path so ``v = add(r, acc)`` (which has
+    # v ∈ axis_dep) gets decomposed instead of naively atomic-added
+    # (which would double-count the axis-independent term).
     producer = defs.get(value)
     if isinstance(producer, Assign) and producer.op.name == "add" and len(producer.args) == 2:
         a, b = producer.args
-        a_dep = a in k_dep
-        b_dep = b in k_dep
+        a_dep = a in axis_dep
+        b_dep = b in axis_dep
         if a_dep != b_dep:
             indep_arg, dep_arg = (b, a) if a_dep else (a, b)
             atomic_dep = dc_replace(write, value=dep_arg, reduce_op=ElementwiseImpl("add"))
@@ -298,16 +300,17 @@ def _rewrite_write_for_splitk(
                 reduce_op=ElementwiseImpl("add"),
             )
             cond = Cond(
-                cond=BinaryExpr("==", Var(k_s_name), Literal(0, "int")),
+                cond=BinaryExpr("==", Var(axis_name), Literal(0, "int")),
                 body=Body((atomic_indep,)),
                 else_body=Body(()),
             )
             return (atomic_dep, cond)
 
-    # Pure K_s-dep (plain matmul ``Write(acc)`` and mult-chain ``Write(c·acc)``
-    # both end up here): mark atomic. ``sum_k (c·a_k) = c·sum_k a_k`` so
-    # marking the final Write atomic-add gives the correct result.
-    if value in k_dep:
+    # Pure axis-dep (plain matmul ``Write(acc)`` and mult-chain
+    # ``Write(c·acc)`` both end up here): mark atomic.
+    # ``sum_i (c·a_i) = c·sum_i a_i`` so atomic-add gives the correct
+    # result for any linear-in-acc chain.
+    if value in axis_dep:
         return (dc_replace(write, reduce_op=ElementwiseImpl("add")),)
 
     return None
