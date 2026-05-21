@@ -197,14 +197,15 @@ def loop_op_pointwise() -> LoopOp:
     )
 
 
-# --- 008 register_tile tag-driven path (M2 plumbing) ----------------
+# --- 006a register_tile_planned (M2 plumbing → M4 active) -----------
 
 
-def test_008_replicates_register_tagged_body_loop():
-    """When a TileOp body contains a ``Role.REGISTER`` Loop, 008 should
-    take its planner-driven path: replicate the body by the loop's
-    extent (σ: axis → literal(i)), unwrap the wrapper, and stamp
-    ``FM`` (or ``FN``) so the standard idempotence marker fires.
+def test_006a_replicates_register_tagged_body_loop():
+    """When a TileOp body contains a ``Role.REGISTER`` Loop,
+    ``006a_register_tile_planned`` replicates the body by the loop's
+    extent (σ: axis → literal(i)), unwraps the wrapper, and stamps
+    ``FM`` / ``FN`` so the legacy ``008_register_tile`` falls through
+    via its ``FN-in-knobs`` idempotence check.
 
     Tests the simplest synthetic case — no Stages, just one REGISTER
     Loop wrapping a Load+Write body."""
@@ -235,7 +236,7 @@ def test_008_replicates_register_tagged_body_loop():
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, select={"register_tile"}).run(g)
+    out = Pipeline.build(TILE_PASSES, select={"register_tile_planned"}).run(g)
     new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
 
     # The REGISTER Loop wrapper is gone; its body got replicated 4 times.
