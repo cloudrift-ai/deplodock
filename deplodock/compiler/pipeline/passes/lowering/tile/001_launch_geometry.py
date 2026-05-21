@@ -69,7 +69,7 @@ def _bind_for_role(role: Role | None) -> str:
     planner skips (currently: SDPA V matmul edge case).
 
     ``Role.COOPERATIVE_STRIDE`` (cooperative-K thread axis K_c) binds to
-    ``BIND_THREAD`` — the same as a regular thread axis. ``002_emit_combine``
+    ``BIND_THREAD`` — the same as a regular thread axis. ``002_cooperative_reduce``
     consumes the role tag on the lifted ``BoundAxis`` to emit ``Combine`` after
     the K_o reduce subtree.
     """

@@ -62,6 +62,11 @@ class Context:
     # Used by ``KernelOp.validate`` to filter autotune variants whose launch
     # geometry would be rejected by the driver before the kernel ever runs.
     max_threads_per_cta: int = 1024
+    # Hardware warp width — 32 on every NVIDIA arch we target. Carried on
+    # ``Context`` so cooperative-reduce gating (``000_partition_planner``)
+    # and warp-shuffle dispatch (``001_materialize_tile``) read a single
+    # source of truth instead of redefining the constant module-locally.
+    warp_size: int = 32
     # Identifies which backend's perf rows this compile should consult
     # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
     # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the

@@ -111,7 +111,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     # outer chain, ``_outer_free_loop_chain`` (which requires
     # ``role is None``) returns an empty chain and ``_split_kernel_fully``
     # returns ``None``. No explicit "already planned" marker needed.
-    variants = _split_kernel_fully(loop_op, body_info)
+    variants = _split_kernel_fully(loop_op, body_info, ctx)
     if variants is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
@@ -169,7 +169,7 @@ class _BuildSkipped(Exception):
     expect)."""
 
 
-def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> list[LoopOp] | None:
     """Unified σ-split for matmul, pointwise, and non-matmul-reduce
     kernels.
 
@@ -209,9 +209,7 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
     if body_info.has_matmul:
         k_matmul = _find_first_reduce(tuple(outer_n.body), match=is_matmul_reduce)
     else:
-        k_nonmatmul = _find_first_reduce(
-            tuple(outer_n.body), match=lambda lp: lp.is_reduce and not is_matmul_reduce(lp)
-        )
+        k_nonmatmul = _find_first_reduce(tuple(outer_n.body), match=lambda lp: lp.is_reduce and not is_matmul_reduce(lp))
 
     if k_matmul is not None:
         # Matmul branch — innermost two chain axes are M/N (require ≥ 2).
@@ -231,13 +229,17 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             priority_mode="matmul",
         )
-    elif k_nonmatmul is not None and _is_pure_reduce_shape(outer_n.body, k_nonmatmul):
+    elif k_nonmatmul is not None and int(k_nonmatmul.axis.extent) >= ctx.warp_size and _is_pure_reduce_shape(outer_n.body, k_nonmatmul):
         # Non-matmul reduce branch — cooperative-K enabled via BR.
         # Output axes M / N (M optional) go to BLOCK/THREAD as usual;
         # K splits as K_s · K_o · K_c · K_i with K_c at COOPERATIVE_STRIDE.
         # ``bn_choices`` / ``bm_choices`` prepend 1 so the cartesian can
         # explore (BN=1, BM=1) — the v1 BR>1 constraint requires the
         # output thread axes to be extent-1 (sole THREAD axis is K_c).
+        # Gates:
+        #   - ``E_K >= WARP_SIZE``: small reduces aren't worth a cross-
+        #     thread Combine (a single thread walks the row faster than
+        #     a warp-shuffle / tree-halve setup).
         #
         # v1 gate: only the "pure reduce" shape (no post-reduce free
         # Loop iterating a K-sized axis) goes through here. Multi-loop
@@ -281,9 +283,7 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
     variants: list[LoopOp] = []
     for bn, bm, fm, fn, bk, splitk, br in param_combos:
         try:
-            chain_body = _build_split_body(
-                extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk, br, k_is_matmul=k_is_matmul
-            )
+            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk, br, k_is_matmul=k_is_matmul)
         except _BuildSkipped:
             continue
         new_body = leading + chain_body
@@ -587,7 +587,7 @@ def _replace_inner_reduce(
     during the walk: ``is_matmul_reduce`` for matmul kernels, the
     complementary "reduce but not matmul" predicate for non-matmul
     cooperative-K reduces. No Combine emission here — that lives in
-    ``002_emit_combine``, which reads ``Role.COOPERATIVE_STRIDE`` off the
+    ``002_cooperative_reduce``, which reads ``Role.COOPERATIVE_STRIDE`` off the
     lifted ``BoundAxis``."""
     out: list[Stmt] = []
     replaced = False

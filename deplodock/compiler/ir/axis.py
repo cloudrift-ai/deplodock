@@ -51,7 +51,7 @@ class Role(Enum):
       buffer targets.
     - ``PIPELINE``: serial outer loop marked for pipelining by ``015_pipeline_k_outer``.
     - ``COOPERATIVE_STRIDE``: cooperative-K thread axis (K_c) for non-matmul reduces.
-      Lifted by ``001_launch_geometry`` to ``BIND_THREAD``; ``002_emit_combine`` inserts
+      Lifted by ``001_launch_geometry`` to ``BIND_THREAD``; ``002_cooperative_reduce`` inserts
       a ``Combine`` sibling after the K_o reduce subtree so the materializer emits the
       cross-thread tree-halve / warp-shuffle.
     """
@@ -114,7 +114,7 @@ class BoundAxis:
 
     ``role`` preserves the source Loop's planner-stamped role across the
     chain-lift in ``001_launch_geometry``. Downstream rules
-    (e.g. ``002_emit_combine``) consume it to identify
+    (e.g. ``002_cooperative_reduce``) consume it to identify
     ``COOPERATIVE_STRIDE`` axes after they've been lifted into ``Tile.axes``.
     """
 

@@ -43,7 +43,6 @@ def test_run_code_and_ir_mutually_exclusive(run_cli, tmp_path):
     assert "mutually exclusive" in (stdout + stderr).lower()
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_rmsnorm_accuracy(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(64)({_randn('1,8,64', dtype)})")
@@ -96,7 +95,6 @@ def test_run_code_matmul_k_chunked(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_sdpa_k_chunked(run_cli):
     """SDPA: the per-output free loop (head_dim) wraps a reduce loop +
@@ -129,7 +127,6 @@ def test_run_code_sdpa_tinyllama_per_head(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_sdpa_seq1024_dynamic_smem(run_cli):
     """SDPA at seq_len=1024, 32 heads: the Q·Kᵀ kernel needs ~50 KB of
@@ -147,7 +144,6 @@ def test_run_code_sdpa_seq1024_dynamic_smem(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_sdpa_tinyllama_full(run_cli):
     """Full multi-head TinyLlama-block-seq=512 SDPA (1 batch × 32 heads ×
@@ -162,7 +158,6 @@ def test_run_code_sdpa_tinyllama_full(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_bench_prints_table(run_cli):
     rc, stdout, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "--bench", "--warmup", "2", "--iters", "5")
@@ -194,7 +189,6 @@ def _dump_ir(project_root: Path, code: str, stage: str, out_dir: Path) -> Path:
     return candidates[-1]
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
     """``deplodock run --ir <loop.json>`` loads loop IR and runs the
@@ -233,7 +227,6 @@ def test_run_ir_kernel_stage(run_cli, project_root, tmp_path):
     assert "running tail passes: ['lowering/cuda']" in log
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_ir_cuda_stage_no_tail(run_cli, project_root, tmp_path):
     """Already-lowered cuda IR has no remaining passes."""

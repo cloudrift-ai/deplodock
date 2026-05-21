@@ -143,7 +143,6 @@ class _QKVAttnNoRope(torch.nn.Module):
         return self.o(out)
 
 
-@pytest.mark.xfail(reason="cooperative-reduce removed; planner-driven replacement pending", strict=False)
 @requires_cuda
 def test_qkv_attn_no_rope():
     """Q/K/V Linears + causal SDPA + O Linear, no RoPE. Confirms that
@@ -221,7 +220,6 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     _assert_close(dpd, eager, threshold=threshold)
 
 
-@pytest.mark.xfail(reason="cooperative-reduce removed; planner-driven replacement pending", strict=False)
 @requires_cuda
 def test_full_self_attn_tinyllama():
     """The real ``LlamaAttention`` from a TinyLlama config — the smallest
@@ -233,7 +231,6 @@ def test_full_self_attn_tinyllama():
     _run_self_attn_tinyllama(seq_len=32, threshold=1e-4)
 
 
-@pytest.mark.xfail(reason="cooperative-reduce removed; planner-driven replacement pending", strict=False)
 @requires_cuda
 def test_full_self_attn_tinyllama_seq512():
     """Same as ``test_full_self_attn_tinyllama`` but at seq_len=512 — the

@@ -123,12 +123,7 @@ def _find_reduce_subtree_index(stmts: tuple[Stmt, ...]) -> int | None:
     for i, s in enumerate(stmts):
         if isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER and _wraps_stage_inner_reduce(s.body):
             return i
-        if (
-            isinstance(s, Loop)
-            and s.is_reduce
-            and s.role is Role.STAGE_INNER
-            and any(isinstance(c, Accum) for c in s.body)
-        ):
+        if isinstance(s, Loop) and s.is_reduce and s.role is Role.STAGE_INNER and any(isinstance(c, Accum) for c in s.body):
             return i
     return None
 
