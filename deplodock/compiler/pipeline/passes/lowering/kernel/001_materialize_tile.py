@@ -177,11 +177,8 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
                 continue
             extents = stmt.alloc_extents
             # Ring-buffer multiplier — ComputeStage carries its own
-            # buffer_count when promoted (BUFFER_COMPUTE knob);
-            # BufferedStage covers the legacy promotion path.
+            # buffer_count when promoted by the BUFFER_COMPUTE knob.
             if isinstance(stmt, ComputeStage) and stmt.buffer_count > 1:
-                extents = (stmt.buffer_count, *extents)
-            elif isinstance(stmt, BufferedStage):
                 extents = (stmt.buffer_count, *extents)
             compute_stage_prologue.append(Smem(name=stmt.name, extents=extents))
             declared_smem.add(stmt.name)
