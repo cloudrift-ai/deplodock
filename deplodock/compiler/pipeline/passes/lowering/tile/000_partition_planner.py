@@ -84,7 +84,17 @@ _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 
+# Knob declarations. The planner is the source of truth for matmul
+# axis-structure tuning (BN/BM CTA tile, FM/FN per-thread cells, BK
+# K-chunk, SPLITK cross-CTA). Each enumerates its own candidate space
+# in ``_split_matmul_fully``; ``hints`` is autotune metadata + the
+# ``DEPLODOCK_<NAME>`` env-var registry binding.
+BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
+BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")
+FM = Knob("FM", KnobType.INT, hints=TUNE_F_CHOICES, help="Per-thread cells along the matmul M (output) axis")
+FN = Knob("FN", KnobType.INT, hints=TUNE_F_CHOICES, help="Per-thread cells along the matmul N (output) axis")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
+SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
@@ -286,7 +296,7 @@ def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> l
         except _BuildSkipped:
             continue
         new_body = leading + chain_body
-        knobs = {**loop_op.knobs, "BN": bn, "BM": bm, "FM": fm, "FN": fn, "BK": bk, "SPLITK": splitk}
+        knobs = {**loop_op.knobs, BN.name: bn, BM.name: bm, FM.name: fm, FN.name: fn, BK.name: bk, SPLITK.name: splitk}
         variants.append(LoopOp(body=new_body, knobs=knobs))
     return variants or None
 
@@ -616,4 +626,4 @@ def _split_pointwise_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp]
 
     new_body = leading + current
     bn = int(target_tuple[0]) if target_tuple else 256
-    return [LoopOp(body=new_body, knobs={**loop_op.knobs, "BN": bn})]
+    return [LoopOp(body=new_body, knobs={**loop_op.knobs, BN.name: bn})]
