@@ -140,7 +140,7 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Tile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind) for ba in s.axes)
+    new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind, role=ba.role) for ba in s.axes)
     return Tile(axes=new_axes, body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body))
 
 

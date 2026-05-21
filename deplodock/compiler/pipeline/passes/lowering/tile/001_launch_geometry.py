@@ -66,10 +66,16 @@ PATTERN = [Pattern("root", LoopOp)]
 def _bind_for_role(role: Role | None) -> str:
     """Resolve the ``BoundAxis.bind`` for a chain-lifted Loop. Untagged
     Loops default to ``BIND_THREAD`` — exercised only for kernels the
-    planner skips (currently: SDPA V matmul edge case)."""
+    planner skips (currently: SDPA V matmul edge case).
+
+    ``Role.COOPERATIVE_STRIDE`` (cooperative-K thread axis K_c) binds to
+    ``BIND_THREAD`` — the same as a regular thread axis. ``002_emit_combine``
+    consumes the role tag on the lifted ``BoundAxis`` to emit ``Combine`` after
+    the K_o reduce subtree.
+    """
     if role is Role.BLOCK or role is Role.SPLITK_BLOCK:
         return BIND_BLOCK
-    if role is Role.THREAD:
+    if role is Role.THREAD or role is Role.COOPERATIVE_STRIDE:
         return BIND_THREAD
     return BIND_THREAD
 
@@ -110,14 +116,14 @@ def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     # N_b, etc.), so this loop is a no-op for them and only engages
     # for reduction-style lifts (K_s — but the logic doesn't know or
     # care about K_s specifically).
-    for axis, bind in output_axes_with_bind:
+    for axis, bind, _role in output_axes_with_bind:
         if bind != BIND_BLOCK:
             continue
         inner = _rewrite_writes_for_lifted_axis(inner, axis.name)
 
     body: list[Stmt] = list(leading)
     if output_axes_with_bind:
-        bound = tuple(BoundAxis(axis=ax, bind=bind) for ax, bind in output_axes_with_bind)
+        bound = tuple(BoundAxis(axis=ax, bind=bind, role=role) for ax, bind, role in output_axes_with_bind)
         body.append(_lift_output_loops(Tile(axes=bound, body=inner)))
     else:
         body.extend(inner)
@@ -145,7 +151,7 @@ def _lift_output_loops(tile: Tile) -> Tile:
     changed = False
     for s in tile.body:
         if isinstance(s, Loop) and not s.is_reduce and s.role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE):
-            new_axes.append(BoundAxis(axis=s.axis, bind=_bind_for_role(s.role)))
+            new_axes.append(BoundAxis(axis=s.axis, bind=_bind_for_role(s.role), role=s.role))
             new_body.extend(s.body)
             changed = True
         else:
@@ -155,19 +161,24 @@ def _lift_output_loops(tile: Tile) -> Tile:
     return Tile(axes=tuple(new_axes), body=new_body)
 
 
-def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[tuple[Axis, str], ...], tuple[LoopStmt, ...]]:
+def _strip_outer_free_chain(
+    stmts: tuple[LoopStmt, ...],
+) -> tuple[tuple[tuple[Axis, str, Role | None], ...], tuple[LoopStmt, ...]]:
     """Walk the outer free-Loop chain and return
-    ``(stripped_axes_with_bind, remainder)``.
+    ``(stripped_axes_with_bind_and_role, remainder)``.
 
     Stops when the current level has more than one stmt, isn't a Loop, or
     is a reduce Loop, or carries a body-resident role (REGISTER /
     SERIAL_OUTER / STAGE_INNER / PIPELINE).
 
-    Tagged Loops (BLOCK / THREAD / SPLITK_BLOCK) bind via
-    :func:`_bind_for_role`. Untagged Loops default to ``BIND_THREAD``
+    Tagged Loops (BLOCK / THREAD / SPLITK_BLOCK / COOPERATIVE_STRIDE) bind
+    via :func:`_bind_for_role`. Untagged Loops default to ``BIND_THREAD``
     — a safety net for kernels the planner currently can't partition
-    (e.g. SDPA V matmul where M/N detection from the chain is wrong)."""
-    axes_with_bind: list[tuple[Axis, str]] = []
+    (e.g. SDPA V matmul where M/N detection from the chain is wrong).
+
+    The third tuple element preserves each Loop's role so the caller can
+    forward it to ``BoundAxis.role`` for downstream consumption."""
+    axes_with_bind: list[tuple[Axis, str, Role | None]] = []
     cur = stmts
     while (
         len(cur) == 1
@@ -175,7 +186,7 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[tuple[Ax
         and not cur[0].is_reduce
         and cur[0].role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE)
     ):
-        axes_with_bind.append((cur[0].axis, _bind_for_role(cur[0].role)))
+        axes_with_bind.append((cur[0].axis, _bind_for_role(cur[0].role), cur[0].role))
         cur = cur[0].body
     return tuple(axes_with_bind), cur
 
