@@ -13,6 +13,38 @@ SPLITK > 1, K_c for cooperative-K BR > 1). Resulting nesting:
         prelude → K_o SERIAL_OUTER → K_i STAGE_INNER (reduce σ(body)) →
         Combine (cross-thread, when K_c is present) → post-K tower → Write
 
+Example transformation (matmul A[M=64,K=32] @ B[K=32,N=64] with BN=BM=16,
+FM=FN=1, BK=16, SPLITK=1, BR=1):
+
+    Input LoopOp body:
+        for m in 0..64:
+            for n in 0..64:
+                Init(acc)
+                for k in 0..32 reduce:
+                    a = load A[m, k]; b = load B[k, n]
+                    Accum(acc, a*b)
+                Write(C[m, n], acc)
+
+    Output (σ_outer rewrites m, n; σ_k rewrites k; tower wraps):
+        for m_b in 0..4 BLOCK:
+            for n_b in 0..4 BLOCK:
+                for m_t in 0..16 THREAD:
+                    for n_t in 0..16 THREAD:
+                        for m_r in 0..1 REGISTER:    # inlined by normalize_body
+                            for n_r in 0..1 REGISTER:    # inlined
+                                Init(acc)
+                                for k_o in 0..2 SERIAL_OUTER:
+                                    for k_i in 0..16 STAGE_INNER reduce:
+                                        a = load A[m_b·16 + m_t, k_o·16 + k_i]
+                                        b = load B[k_o·16 + k_i, n_b·16 + n_t]
+                                        Accum(acc, a*b)
+                                Write(C[m_b·16 + m_t, n_b·16 + n_t], acc)
+
+For cooperative-K reduce (e.g. sum K=512 with BR=256, BK=2), K_c appears as
+a COOPERATIVE_STRIDE thread axis above the BLOCK level and σ_k extends to
+``k = k_o·512 + k_i·256 + k_c``; launch_geometry emits a ``Combine`` after
+the reduce subtree.
+
 Pointwise collapses to BM = FM = FN = 1; extent-1 sub-axes get inlined by
 normalize_body. SPLITK + Write atomicity is handled by launch_geometry's
 generic BLOCK-lift rewrite, not here. Cooperative-K's Combine emission lives
@@ -37,7 +69,6 @@ from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
-from deplodock.compiler.tuning import BodyInfo
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -93,10 +124,9 @@ class KernelShape:
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     loop_op: LoopOp = root.op
-    body_info = BodyInfo.of(loop_op.body)
     # Idempotence is structural: once roles are stamped, _outer_free_loop_chain
     # returns empty (it requires role=None) and _split_kernel_fully → None.
-    variants = _split_kernel_fully(loop_op, body_info, ctx)
+    variants = _split_kernel_fully(loop_op, ctx)
     if variants is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
@@ -153,7 +183,7 @@ class _BuildSkipped(Exception):
     """Raised by ``_build_split_body`` when the body's shape doesn't match."""
 
 
-def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> list[LoopOp] | None:
+def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
     """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
 
     Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
