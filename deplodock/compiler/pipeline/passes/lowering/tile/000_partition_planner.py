@@ -75,6 +75,22 @@ class TileParams:
     br: int = 1
 
 
+@dataclass(frozen=True)
+class KernelShape:
+    """Per-LoopOp shape info that stays constant across every ``TileParams``
+    variant of a single kernel: the output axis Loops (innermost-N, optional
+    M, extra outer chain), the K reduce Loop (None for pointwise), and the
+    set of axis names ``_replace_k_loops`` should rewrite (collected once
+    upfront by ``_split_kernel_fully`` instead of re-classified per variant).
+    """
+
+    outer_n: Loop
+    outer_m: Loop | None
+    extra_outer: tuple[Loop, ...]
+    k_loop: Loop | None
+    target_names: frozenset[str]
+
+
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     loop_op: LoopOp = root.op
     body_info = BodyInfo.of(loop_op.body)
@@ -140,10 +156,10 @@ class _BuildSkipped(Exception):
 def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> list[LoopOp] | None:
     """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
 
-    Detection is predicate-driven, not branch-driven: ``is_matmul_reduce``
-    (≥ 2 K-indexed Loads + Accum) picks the matmul knob set; any other reduce
-    with extent ≥ warp_size picks the cooperative-K set; no qualifying reduce
-    falls to pointwise. ``None`` only when there's no outer chain at all."""
+    Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
+    Accum) picks the matmul knob set; any other reduce with extent ≥ warp_size
+    picks the cooperative-K set; no qualifying reduce falls to pointwise.
+    ``None`` only when there's no outer chain at all."""
     chain = _outer_free_loop_chain(loop_op.body)
     if not chain:
         return None
@@ -154,20 +170,20 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
     E_N = int(outer_n.axis.extent)
     E_M = int(outer_m.axis.extent) if outer_m is not None else 1
 
-    # body_info.has_matmul is a cheap preflight — saves a body walk for
-    # pointwise / cooperative kernels.
-    k_matmul: Loop | None = None
-    k_nonmatmul: Loop | None = None
-    if body_info.has_matmul:
-        k_matmul = _find_first_reduce(tuple(outer_n.body), match=is_matmul_reduce)
-    else:
-        k_nonmatmul = _find_first_reduce(tuple(outer_n.body), match=lambda lp: lp.is_reduce and not is_matmul_reduce(lp))
+    # Single walk: classify body + collect every axis name _replace_k_loops
+    # should rewrite. ``target_names`` survives σ_outer (only axis NAMES are
+    # used downstream, not Loop identity — names don't change under σ).
+    all_loops: tuple[Loop, ...] = outer_n.body.iter_of_type(Loop)
+    matmul_reduces = [lp for lp in all_loops if lp.is_reduce and is_matmul_reduce(lp)]
+    nonmatmul_reduces = [lp for lp in all_loops if lp.is_reduce and not is_matmul_reduce(lp)]
 
-    if k_matmul is not None:
+    k_loop: Loop | None
+    target_names: frozenset[str]
+    if matmul_reduces:
         if outer_m is None:
             return None
-        k_loop: Loop | None = k_matmul
-        k_is_matmul = True
+        k_loop = matmul_reduces[0]
+        target_names = frozenset(lp.axis.name for lp in matmul_reduces)
         E_K = int(k_loop.axis.extent)
         param_combos = _enumerate_cartesian(
             E_M=E_M,
@@ -180,14 +196,15 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             priority_mode="matmul",
         )
-    elif k_nonmatmul is not None and int(k_nonmatmul.axis.extent) >= ctx.warp_size:
+    elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
-        # _single_thread_var) — so bn/bm_choices prepend 1 to enable
-        # (BN=BM=1). E_K ≥ warp_size: smaller reduces don't justify a
-        # warp-shuffle / tree-halve over sequential per-thread iteration.
-        k_loop = k_nonmatmul
-        k_is_matmul = False
+        # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
+        # E_K ≥ warp_size: smaller reduces don't justify a warp-shuffle.
+        # target_names includes both K-reduce axes AND per-K post-pointwise
+        # axes (non-reduce free Loops sharing E_K), since both get rewritten.
+        k_loop = nonmatmul_reduces[0]
         E_K = int(k_loop.axis.extent)
+        target_names = frozenset(lp.axis.name for lp in all_loops if int(lp.axis.extent) == E_K and not is_matmul_reduce(lp))
         param_combos = _enumerate_cartesian(
             E_M=E_M,
             E_N=E_N,
@@ -203,7 +220,7 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
     else:
         # Pointwise — no qualifying reduce.
         k_loop = None
-        k_is_matmul = True  # unused
+        target_names = frozenset()
         param_combos = _enumerate_cartesian(
             E_M=E_M,
             E_N=E_N,
@@ -216,11 +233,12 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
             priority_mode="pointwise",
         )
 
+    shape = KernelShape(outer_n=outer_n, outer_m=outer_m, extra_outer=extra_outer, k_loop=k_loop, target_names=target_names)
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
     for params in param_combos:
         try:
-            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, params, k_is_matmul=k_is_matmul)
+            chain_body = _build_split_body(shape, params)
         except _BuildSkipped:
             continue
         new_body = leading + chain_body
@@ -331,26 +349,18 @@ def _enumerate_cartesian(
     return ordered
 
 
-def _build_split_body(
-    extra_outer: tuple[Loop, ...],
-    outer_m: Loop | None,
-    outer_n: Loop,
-    k_loop: Loop | None,
-    params: TileParams,
-    *,
-    k_is_matmul: bool = True,
-) -> tuple[Stmt, ...]:
-    """σ-split ``outer_n``'s body and wrap in the output BLOCK/THREAD/REGISTER
-    tower. N axis is always present; ``outer_m`` / ``k_loop`` are None for 1D
-    pointwise / non-reduce kernels.
+def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...]:
+    """σ-split ``shape.outer_n``'s body and wrap in the output
+    BLOCK/THREAD/REGISTER tower. ``shape.outer_m`` / ``shape.k_loop`` are
+    None for 1D pointwise / non-reduce kernels.
 
     K_s and K_c (when present) are shared across all reduces in the kernel;
     K_o / K_i are per-K-Loop, built inside ``_replace_k_loops``. SPLITK
     atomic-Write is deferred to ``001_launch_geometry``."""
     sigma_map: dict[str, object] = {}
 
-    N_name = outer_n.axis.name
-    E_N = int(outer_n.axis.extent)
+    N_name = shape.outer_n.axis.name
+    E_N = int(shape.outer_n.axis.extent)
     N_b_ext = E_N // (params.bn * params.fn)
     N_b = Axis(f"{N_name}_b", N_b_ext)
     N_t = Axis(f"{N_name}_t", params.bn)
@@ -358,9 +368,9 @@ def _build_split_body(
     sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
 
     M_b = M_t = M_r = None
-    if outer_m is not None:
-        M_name = outer_m.axis.name
-        E_M = int(outer_m.axis.extent)
+    if shape.outer_m is not None:
+        M_name = shape.outer_m.axis.name
+        E_M = int(shape.outer_m.axis.extent)
         M_b_ext = E_M // (params.bm * params.fm)
         M_b = Axis(f"{M_name}_b", M_b_ext)
         M_t = Axis(f"{M_name}_t", params.bm)
@@ -374,10 +384,10 @@ def _build_split_body(
     # K axes: K_s / K_c are kernel-wide (single SPLITK / single cooperative
     # thread direction); K_o / K_i are per-K-Loop, built inside _replace_k_loops.
     K_s = K_c = None
-    E_K = K_o_ext = 0
-    if k_loop is not None:
-        K_name = k_loop.axis.name
-        E_K = int(k_loop.axis.extent)
+    K_o_ext = 0
+    if shape.k_loop is not None:
+        K_name = shape.k_loop.axis.name
+        E_K = int(shape.k_loop.axis.extent)
         K_o_ext = E_K // (params.splitk * params.br * params.bk)
         K_s = Axis(f"{K_name}_s", params.splitk) if params.splitk > 1 else None
         K_c = Axis(f"{K_name}_c", params.br) if params.br > 1 else None
@@ -385,19 +395,13 @@ def _build_split_body(
     # σ-rewrite outer_n's body (M/N axes), then replace every K-iter Loop with
     # a K_o · K_i tower. Both paths use shared canonical K_o / K_i names so
     # 007_stage_inputs row-cache can merge structurally-equivalent Loads.
-    inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in outer_n.body)
+    inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in shape.outer_n.body)
 
-    if k_loop is not None:
-        # Matmul: match only matmul-shape reduces. Cooperative: match every
-        # K-extent Loop — reduce K and per-K post-pointwise both rewrite.
-        if k_is_matmul:
-            match = is_matmul_reduce
-        else:
-            match = lambda lp: int(lp.axis.extent) == E_K and not is_matmul_reduce(lp)  # noqa: E731
+    if shape.k_loop is not None:
         new_inner, n_replaced = _replace_k_loops(
             inner_after_outer,
-            match=match,
-            K_canonical_name=k_loop.axis.name,
+            target_names=shape.target_names,
+            K_canonical_name=shape.k_loop.axis.name,
             K_s=K_s,
             K_c=K_c,
             br=params.br,
@@ -424,14 +428,14 @@ def _build_split_body(
         layers.append((M_b, Role.BLOCK))
     if K_s is not None:
         layers.append((K_s, Role.SPLITK_BLOCK))
-    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(extra_outer))
+    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
     return _wrap_tower(layers, new_inner)
 
 
 def _replace_k_loops(
     stmts: tuple[Stmt, ...],
     *,
-    match,
+    target_names: frozenset[str],
     K_canonical_name: str,
     K_s: Axis | None,
     K_c: Axis | None,
@@ -439,23 +443,23 @@ def _replace_k_loops(
     bk: int,
     K_o_ext: int,
 ) -> tuple[tuple[Stmt, ...], int]:
-    """Replace every matched Loop with a ``Loop(K_o, SERIAL_OUTER, Loop(K_i,
-    STAGE_INNER, σ(body)))`` tower. Returns ``(new_stmts, n_replaced)``.
+    """Replace every ``Loop`` whose axis name is in ``target_names`` with a
+    ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, σ(body)))`` tower.
+    Returns ``(new_stmts, n_replaced)``.
 
-    Handles both reduce K iterators (matmul + cooperative reduce) and per-K
-    post-pointwise iterators (RMSNorm / softmax post) — ``Loop.is_reduce`` is
-    derived from body Accum presence, so K_i inherits the right status. All
-    matches share the canonical K_o / K_i axis names, so post-σ their Loads
-    look structurally identical (key to 007_stage_inputs row-cache merging).
+    ``target_names`` is built once in ``_split_kernel_fully``: the set of
+    K-iteration axes that should be rewritten (matmul-shape reduces, or for
+    cooperative-K both the reduces AND the per-K post-pointwise loops sharing
+    the same K extent). ``Loop.is_reduce`` is derived from body Accum
+    presence, so K_i inherits the right status automatically.
 
     Non-reduce match + SPLITK > 1: wrap the K_o tower in ``Cond(K_s == 0)`` —
     every K_s CTA would otherwise re-execute the post. Reduce-K skips the
-    Cond; launch_geometry's atomic-Write rewrite handles cross-CTA SPLITK.
-    Combine emission lives in launch_geometry, keyed off STAGE_INNER + Accum."""
+    Cond; launch_geometry's atomic-Write rewrite handles cross-CTA SPLITK."""
     out: list[Stmt] = []
     n_replaced = 0
     for s in stmts:
-        if isinstance(s, Loop) and match(s):
+        if isinstance(s, Loop) and s.axis.name in target_names:
             K_name = s.axis.name
             K_o = Axis(f"{K_canonical_name}_o", K_o_ext)
             K_i = Axis(f"{K_canonical_name}_i", bk)
@@ -476,7 +480,7 @@ def _replace_k_loops(
             continue
         if isinstance(s, (Loop, StridedLoop)):
             inner, r = _replace_k_loops(
-                s.body, match=match, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
+                s.body, target_names=target_names, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
             )
             if r:
                 out.append(replace(s, body=inner))
@@ -484,11 +488,11 @@ def _replace_k_loops(
                 continue
         if isinstance(s, Cond):
             inner_b, rb = _replace_k_loops(
-                s.body, match=match, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
+                s.body, target_names=target_names, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
             )
             inner_e, re_ = _replace_k_loops(
                 s.else_body,
-                match=match,
+                target_names=target_names,
                 K_canonical_name=K_canonical_name,
                 K_s=K_s,
                 K_c=K_c,
@@ -525,19 +529,3 @@ def _build_k_sigma(
     if K_s is not None:
         inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk, "int") + inner_expr
     return Sigma({K_name: inner_expr})
-
-
-def _find_first_reduce(stmts, *, match) -> Loop | None:
-    """First reduce Loop satisfying ``match`` anywhere in the subtree."""
-    for s in stmts:
-        if isinstance(s, Loop) and s.is_reduce and match(s):
-            return s
-        if isinstance(s, (Loop, StridedLoop)):
-            found = _find_first_reduce(s.body, match=match)
-            if found is not None:
-                return found
-        if isinstance(s, Cond):
-            found = _find_first_reduce(s.body, match=match) or _find_first_reduce(s.else_body, match=match)
-            if found is not None:
-                return found
-    return None
