@@ -27,6 +27,23 @@ walks the same variant space; greedy callers pick variant 0
 idempotence guard that no-ops once the planner has stamped
 ``Role.STAGE_INNER`` on the matmul reduce.
 
+**M8 scope** — non-matmul chunk-reduce. For each non-matmul reduce
+whose K-indexed Loads project a thread-fanin slab over the 16 KB
+``007_stage_inputs`` cap, split K → ``Loop(K_o, SERIAL_OUTER) →
+Loop(K_i, reduce, STAGE_INNER)`` using the same BK picker as
+``006_chunk_reduce``. Predicts post-blockify thread extents via
+``min(extent, thread_tile_shape_target)`` against the outer free-Loop
+chain; skips cooperative-viable kernels (their synthetic ``t`` axis
+never matches a Load's index). ``006_chunk_reduce``'s M3 STAGE_INNER
+guard handles idempotence.
+
+**M8 limitation**: the predictor only covers the single-stmt outer
+free chain; it misses output-write Loops that ``001_tileify``'s
+``_lift_output_loops`` step lifts from multi-stmt bodies (SDPA's
+``head_dim`` etc.). Kernels with lifted output axes still rely on the
+legacy ``006_chunk_reduce`` post-tileify (which is correctly preserved
+through the M3 guard).
+
 Gated by ``DEPLODOCK_PLANNER`` env var so each milestone can test the
 new path against the legacy default (=0) for structural equivalence.
 """
@@ -74,12 +91,25 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     base = after_reg if after_reg is not None else loop_op
 
     k_variants = _try_matmul_k_chunk(ctx, base)
-    if k_variants is None and after_reg is None:
+    candidates: list[LoopOp] = list(k_variants) if k_variants is not None else [base]
+
+    chunked: list[LoopOp] = []
+    any_chunk_reduce = False
+    for cand in candidates:
+        after_cr = _try_chunk_reduce(cand)
+        if after_cr is not None:
+            any_chunk_reduce = True
+            chunked.append(after_cr)
+        else:
+            chunked.append(cand)
+
+    fired = after_reg is not None or k_variants is not None or any_chunk_reduce
+    if not fired:
         raise RuleSkipped("no planner branch matched")
 
-    if k_variants is None:
-        return _stamp_planned(base)
-    return [_stamp_planned(v) for v in k_variants]
+    if len(chunked) == 1:
+        return _stamp_planned(chunked[0])
+    return [_stamp_planned(v) for v in chunked]
 
 
 def _stamp_planned(op: LoopOp) -> LoopOp:
@@ -326,3 +356,215 @@ def _chunk_k_loop(loop: Loop, bk: int) -> Loop | None:
 
 def _identity_rename_k(name: str) -> str:
     return name
+
+
+# --- non-matmul chunk-reduce branch ---------------------------------
+
+
+# Mirrors 006_chunk_reduce's BK candidate set + slab budgets.
+_REDUCE_BK_CANDIDATES = (128, 64, 32, 16, 8)
+_REDUCE_SLAB_CAP_BYTES = 16 * 1024
+_REDUCE_SLAB_HEADROOM_BYTES = 8 * 1024
+_BYTES_PER_ELEM = 4
+
+
+def _try_chunk_reduce(loop_op: LoopOp) -> LoopOp | None:
+    """Chunk every non-matmul reduce Loop whose K-indexed Loads would
+    otherwise produce a smem slab over the ``007_stage_inputs`` cap.
+
+    Predicts post-blockify thread extents (``min(extent, target)``
+    where target comes from :func:`tuning.thread_tile_shape`) so the
+    slab math matches what 006 sees post-launch_geometry. Cooperative-
+    viable bodies (reduce extent ≥ 32 with independent Accums) are
+    skipped — their synthetic ``t`` axis never matches a Load's index,
+    so the slab degenerates to ``K × 4`` and never exceeds the cap.
+    """
+    chain = _outer_free_loop_chain(loop_op.body)
+    if not chain:
+        return None
+    # launch_geometry dispatches matmul-path before cooperative-path,
+    # so cooperative-shape only matters when no matmul reduce is
+    # present. With a matmul reduce, we run chunk_reduce on the
+    # non-matmul reduces alongside the matmul-path.
+    from deplodock.compiler.tuning import _has_matmul_reduce  # noqa: PLC0415
+
+    if not _has_matmul_reduce(loop_op.body) and _cooperative_shape(loop_op.body, chain):
+        return None
+    thread_targets = _predict_thread_extents(loop_op, chain)
+    if not thread_targets:
+        return None
+    new_body, changed = _chunk_reduces_in_body(loop_op.body, chain, thread_targets)
+    if not changed:
+        return None
+    return LoopOp(body=new_body, knobs=dict(loop_op.knobs))
+
+
+def _cooperative_shape(body, chain: tuple[Loop, ...]) -> bool:
+    """Mirror ``004_launch_geometry._cooperative_viable`` at the LoopOp
+    level: any reduce Loop with extent ≥ 32 + every reduce has an Accum
+    + Accums independent. The reduce sits at ``chain[-1].body`` (or
+    deeper) once the outer chain is stripped."""
+    from deplodock.compiler.ir.stmt import Accum
+
+    inner_body = chain[-1].body if chain else body
+    inner_stmts = tuple(inner_body) if not isinstance(inner_body, tuple) else inner_body
+    body_tuple = tuple(inner_stmts) if hasattr(inner_stmts, "__iter__") else ()
+    # Search the inner body for reduce Loops; cooperative path is keyed
+    # off ≥ WARP_SIZE reduce extent + Accum independence.
+    from deplodock.compiler.ir.stmt.body import Body
+
+    coerced = Body.coerce(body_tuple)
+    reduce_loops = [lp for lp in coerced.of_type(Loop) if lp.is_reduce]
+    if not reduce_loops:
+        return False
+    if int(reduce_loops[0].axis.extent) < 32:
+        return False
+    for rl in reduce_loops:
+        if not any(isinstance(s, Accum) for s in rl.body):
+            return False
+        accum_names = {s.name for s in rl.body if isinstance(s, Accum)}
+        for s in rl.body:
+            if isinstance(s, Accum) and rl.body.depends_on(s.value, accum_names - {s.name}):
+                return False
+    return True
+
+
+def _predict_thread_extents(loop_op: LoopOp, chain: tuple[Loop, ...]) -> tuple[int, ...] | None:
+    """Predicted (axis_name, thread_extent) for each outer-chain axis,
+    mirroring ``004_launch_geometry._plan_partition``: an axis with
+    ``ext ≤ target`` stays at full extent; ``ext > target`` shrinks to
+    ``target``. Returns the per-axis predicted thread extent in the
+    same order as ``chain`` (outermost-first).
+
+    ``thread_tile_shape`` returns innermost-first targets; we reverse
+    so we can zip with ``chain``."""
+    from deplodock.compiler.tuning import thread_tile_shape
+
+    synthetic = Tile(
+        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
+        body=chain[-1].body,
+    )
+    shape = thread_tile_shape(synthetic)  # innermost-first
+    targets_outer_first = tuple(reversed(shape))
+    extents: list[int] = []
+    for i, lp in enumerate(chain):
+        ext = int(lp.axis.extent)
+        # Outer axes beyond ``len(shape)`` become BIND_BLOCK only — they
+        # contribute no thread fan-in. Use extent 1 so they don't enter
+        # the slab product.
+        if i < len(chain) - len(targets_outer_first):
+            extents.append(1)
+            continue
+        j = i - (len(chain) - len(targets_outer_first))
+        target = targets_outer_first[j]
+        extents.append(min(ext, target))
+    return tuple(extents)
+
+
+def _chunk_reduces_in_body(stmts, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> tuple[tuple, bool]:
+    """Walk the body, chunking every qualifying non-matmul reduce
+    Loop (mirroring 006's "fire on every qualifying reduce" behavior,
+    not 002's first-match-only). Returns ``(new_body, changed)``."""
+    out: list[Stmt] = []
+    changed = False
+    for s in stmts:
+        if isinstance(s, Loop) and s.is_reduce and _reduce_qualifies(s, chain, thread_extents):
+            chunked = _chunk_reduce_loop(s, chain, thread_extents)
+            if chunked is not None:
+                out.append(chunked)
+                changed = True
+                continue
+        if isinstance(s, (Loop, StridedLoop)):
+            inner, inner_changed = _chunk_reduces_in_body(s.body, chain, thread_extents)
+            if inner_changed:
+                out.append(replace(s, body=inner))
+                changed = True
+                continue
+        if isinstance(s, Cond):
+            inner_b, cb = _chunk_reduces_in_body(s.body, chain, thread_extents)
+            inner_e, ce = _chunk_reduces_in_body(s.else_body, chain, thread_extents)
+            if cb or ce:
+                out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
+                changed = True
+                continue
+        out.append(s)
+    return tuple(out), changed
+
+
+def _reduce_qualifies(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> bool:
+    """True iff ``loop`` is a non-matmul reduce, not already chunked
+    (by role tag or nested-reduce), with thread-axis fan-in over at
+    least one K-indexed Load whose candidate slab exceeds the
+    ``007_stage_inputs`` 16 KB cap."""
+    if is_matmul_reduce(loop):
+        return False
+    if loop.role is Role.STAGE_INNER:
+        return False
+    if any(inner.is_reduce for inner in loop.body.of_type(Loop)):
+        return False
+    has_fanin, max_in_ext, k_indexed_count = _slab_geometry(loop, chain, thread_extents)
+    if k_indexed_count == 0:
+        return False
+    K_extent = int(loop.axis.extent)
+    return has_fanin and K_extent * max_in_ext * _BYTES_PER_ELEM > _REDUCE_SLAB_CAP_BYTES
+
+
+def _slab_geometry(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]):
+    """Per-Load slab analysis mirroring 006's ``_slab_geometry`` but
+    against *predicted* thread extents. A thread axis derived from
+    ``chain[i]`` contributes its predicted extent to ``in_ext`` iff
+    the chain axis's original name appears in the Load's index."""
+    from deplodock.compiler.ir.stmt import Load
+
+    K_name = loop.axis.name
+    has_fanin = False
+    max_in_ext = 1
+    count = 0
+    for ld in loop.body.iter_of_type(Load):
+        ld_vars = {v for e in ld.index for v in e.free_vars()}
+        if K_name not in ld_vars:
+            continue
+        count += 1
+        in_ext = 1
+        for lp, t_ext in zip(chain, thread_extents, strict=True):
+            if t_ext <= 1:
+                continue
+            if lp.axis.name in ld_vars:
+                in_ext *= t_ext
+            else:
+                has_fanin = True
+        max_in_ext = max(max_in_ext, in_ext)
+    return has_fanin, max_in_ext, count
+
+
+def _chunk_reduce_loop(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> Loop | None:
+    K = int(loop.axis.extent)
+    _, max_in_ext, _ = _slab_geometry(loop, chain, thread_extents)
+    bk = _pick_reduce_bk(K, max_in_ext)
+    if bk is None:
+        return None
+    K_name = loop.axis.name
+    K_o = Axis(f"{K_name}_o", K // bk)
+    K_i = Axis(f"{K_name}_i", bk)
+    sigma = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
+    inner = tuple(s.rewrite(_identity_rename_k, sigma) for s in loop.body)
+    return Loop(
+        axis=K_o,
+        role=Role.SERIAL_OUTER,
+        body=(Loop(axis=K_i, role=Role.STAGE_INNER, body=inner),),
+    )
+
+
+def _pick_reduce_bk(K: int, in_extent_product: int) -> int | None:
+    """Largest BK from ``_REDUCE_BK_CANDIDATES`` that divides K (with
+    K > BK) and keeps the per-Load slab within the headroom budget.
+    Matches ``006_chunk_reduce._pick_bk``."""
+    if in_extent_product < 1:
+        in_extent_product = 1
+    for c in _REDUCE_BK_CANDIDATES:
+        if K % c != 0 or K <= c:
+            continue
+        if in_extent_product * c * _BYTES_PER_ELEM > _REDUCE_SLAB_HEADROOM_BYTES:
+            continue
+        return c
+    return None
