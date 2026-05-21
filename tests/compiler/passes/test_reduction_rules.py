@@ -18,6 +18,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
+from deplodock.compiler.ir.tile.ir import Combine
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import accums_independent as _accums_independent
 
@@ -26,17 +27,35 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
 
 
-# --- cooperative_reduce firing on frontend graphs --------------------
+def _tile_has_combine(g: Graph) -> bool:
+    """True iff any TileOp body in ``g`` contains a ``Combine`` stmt.
+    The cooperative-reduce path lifts a ``Role.COOPERATIVE_STRIDE`` axis
+    in launch_geometry and emits ``Combine`` siblings to each reduce
+    subtree — Combine presence is the structural signal that
+    cross-thread reduction was materialized."""
+    for node in g.nodes.values():
+        body = getattr(node.op, "body", None)
+        if body is None:
+            continue
+        for s in body.iter():
+            if isinstance(s, Combine):
+                return True
+    return False
+
+
+# --- cooperative-reduce firing on frontend graphs -------------------
 # Triggers on single-buffer reductions whose first reduce-axis extent is
 # ≥ WARP_SIZE (32) — the threshold dropped from BLOCK_SIZE so softmax /
 # rmsnorm rows in the 32–128 range get a parallel reduce instead of
-# every thread redundantly walking the row. chunk_matmul_k skips
-# single-buffer reduces, so they reach cooperative_reduce unchanged.
+# every thread redundantly walking the row.
+#
+# Cooperative coordination today lives inside ``001_launch_geometry``
+# (folded from the deleted ``002_cooperative_reduce``). The structural
+# signal is "Tile body contains Combine"; assertions check via
+# :func:`_tile_has_combine` rather than rule-name firing.
 
 
 _M, _K, _N = 32, 32, 32
-
-_COOP_XFAIL = pytest.mark.xfail(reason="cooperative-reduce removed; planner-driven replacement pending", strict=False)
 
 
 def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
@@ -48,14 +67,14 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" in fired
+    assert _tile_has_combine(out)
     assert "chunk_matmul_k" not in fired
 
 
 def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
-    """K=16 < WARP_SIZE → cooperative_reduce does not fire (too small
+    """K=16 < WARP_SIZE → cooperative-reduce does not fire (too small
     to stage a meaningful cross-thread tree-halve)."""
     g = Graph()
     _input(g, "x", (4, 16))
@@ -63,13 +82,12 @@ def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" not in fired
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    assert not _tile_has_combine(out)
 
 
 def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
-    """K=32 ≥ WARP_SIZE → cooperative_reduce fires with a 32-thread
+    """K=32 ≥ WARP_SIZE → cooperative-reduce fires with a 32-thread
     cooperative block (the gate was lowered from BLOCK_SIZE to
     WARP_SIZE so K∈[32, BLOCK_SIZE) gets a parallel reduce instead of
     every thread redundantly walking the row sequentially)."""
@@ -79,9 +97,8 @@ def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" in fired
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    assert _tile_has_combine(out)
 
 
 def test_warp_cooperative_skips_stage_inputs(recording_dump):
@@ -94,9 +111,9 @@ def test_warp_cooperative_skips_stage_inputs(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" in fired
+    assert _tile_has_combine(out)
     assert "stage_inputs" not in fired
 
 
@@ -159,16 +176,19 @@ def test_block_cooperative_still_uses_stage_inputs(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" in fired
+    assert _tile_has_combine(out)
     assert "stage_inputs" in fired
 
 
 def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
     """Matmul-shape reduce → chunk_matmul_k handles K splitting; the
     cooperative-reduce strategy is for single-buffer reductions and
-    must not fire here."""
+    must not fire here.
+
+    The signal is the absence of ``Combine`` in the Tile body
+    (cooperative coordination would have emitted one)."""
     g = Graph()
     _input(g, "a", (_M, _K))
     _input(g, "b", (_K, _N))
@@ -176,9 +196,8 @@ def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "cooperative_reduce" not in fired
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    assert not _tile_has_combine(out)
 
 
 # --- _accums_independent: scoped unit tests --------------------------

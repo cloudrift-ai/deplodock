@@ -1,4 +1,5 @@
-"""Form a ``TileOp`` from each ``LoopOp`` — decide launch geometry.
+"""Form a ``TileOp`` from each ``LoopOp`` — decide launch geometry,
+materialize post-lift coordination primitives.
 
 Mechanical translation: outer free-Loop chain becomes ``Tile.axes``,
 leaves and inner Loops pass through unchanged. The planner
@@ -6,9 +7,9 @@ leaves and inner Loops pass through unchanged. The planner
 launch_geometry runs; this pass just reads the tags via
 :func:`_bind_for_role` and lifts tagged Loops with the appropriate
 ``BoundAxis.bind``: ``Role.BLOCK`` and ``Role.SPLITK_BLOCK`` →
-``BIND_BLOCK``; ``Role.THREAD`` → ``BIND_THREAD``; untagged Loops
-default to ``BIND_THREAD`` (safety net for kernels the planner
-currently can't partition — see ``_bind_for_role``).
+``BIND_BLOCK``; ``Role.THREAD`` and ``Role.COOPERATIVE_STRIDE`` →
+``BIND_THREAD``; untagged Loops default to ``BIND_THREAD`` (safety net
+for kernels the planner currently can't partition).
 
 **Outer free-Loop chain → ``Tile.axes``**. After stripping leading
 non-Loop stmts (scalar Loads) into the TileOp body prefix, the chain
@@ -22,24 +23,24 @@ outer chain is stripped, top-level body stmts may still contain free
 Loops whose iteration writes distinct output positions (e.g. fused
 SDPA's head-dim loop sits as a sibling to two softmax reduces). Each
 such Loop is lifted into ``Tile.axes`` (bind resolved from its role,
-defaulting to ``BIND_THREAD``) and replaced by its body. Any free
-non-reduce Loop at this level is an output-dim iterator by LoopOp
-construction, so the lift gate is purely the body-resident-role
-filter — no per-Write index inspection needed.
+defaulting to ``BIND_THREAD``) and replaced by its body.
 
-**BLOCK lifts → atomic Writes (generic).** Whenever the chain walker
-lifts a Loop into ``BIND_BLOCK``, every Write inside the lifted scope
-becomes potentially raced — multiple CTAs share the loop's axis.
-The test is structural: if the lifted axis name appears in
-``Write.index``, each CTA writes a different cell and there's no
-conflict (typical output-tile axes M_b / N_b). If the axis name is
-absent, the CTAs are reducing across that axis and we rewrite the
-Write to commit its partial via atomic-add, decomposing
-``add(indep, dep)`` shapes into
-``atomic(dep) + Cond(axis == 0, atomic(indep))`` so axis-independent
-contributions are added exactly once. This subsumes the special-case
-SPLITK_BLOCK handling: K_s simply happens to be the only Role today
-whose axis is reliably absent from Write.index by σ-construction.
+**Post-lift coordination — generic.** Whenever a Loop is lifted to a
+parallel coord (BIND_BLOCK or BIND_THREAD with COOPERATIVE_STRIDE),
+every Write inside the lifted scope whose index doesn't reference the
+lifted axis becomes potentially raced — multiple coords share an output
+cell. The trigger check (``Write.index`` doesn't reference the axis) is
+identical for both modes; the primitive that materializes the
+coordination differs:
+
+- **BIND_BLOCK** (cross-CTA): atomic-add Write, decomposing
+  ``add(indep, dep)`` into ``atomic(dep) + Cond(axis == 0, atomic(indep))``.
+  Subsumes the special-case SPLITK_BLOCK handling.
+- **COOPERATIVE_STRIDE** (cross-thread): emit ``Combine`` siblings
+  after each reduce subtree (smem tree-halve / warp-shuffle at
+  materialize time), then ``Cond(axis == 0, [Write])``-wrap the Write.
+  Post-Combine the broadcast value is uniform across the cooperative
+  group, so no per-term decomposition is needed.
 
 The node's id, inputs, and output tensor are preserved — only the op
 changes.
@@ -54,10 +55,10 @@ from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis,
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, StridedLoop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import Combine, Stmt, Tile, TileOp
 from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -69,9 +70,10 @@ def _bind_for_role(role: Role | None) -> str:
     planner skips (currently: SDPA V matmul edge case).
 
     ``Role.COOPERATIVE_STRIDE`` (cooperative-K thread axis K_c) binds to
-    ``BIND_THREAD`` — the same as a regular thread axis. ``002_cooperative_reduce``
-    consumes the role tag on the lifted ``BoundAxis`` to emit ``Combine`` after
-    the K_o reduce subtree.
+    ``BIND_THREAD`` — the same as a regular thread axis. The
+    post-lift rewrite (``_rewrite_for_lifted_axis`` with
+    ``mode="cooperative"``) reads the role off the BoundAxis to emit
+    ``Combine`` after each reduce subtree.
     """
     if role is Role.BLOCK or role is Role.SPLITK_BLOCK:
         return BIND_BLOCK
@@ -110,16 +112,20 @@ def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
 
     output_axes_with_bind, inner = _strip_outer_free_chain(rest)
 
-    # For each BIND_BLOCK axis we just lifted, rewrite Writes inside
-    # the lifted scope. The inner check ("axis in Write.index?")
-    # filters out axes whose CTAs already write distinct cells (M_b,
-    # N_b, etc.), so this loop is a no-op for them and only engages
-    # for reduction-style lifts (K_s — but the logic doesn't know or
-    # care about K_s specifically).
-    for axis, bind, _role in output_axes_with_bind:
-        if bind != BIND_BLOCK:
-            continue
-        inner = _rewrite_writes_for_lifted_axis(inner, axis.name)
+    # Post-lift coordination. The inner check ("axis in Write.index?")
+    # filters out axes whose coords already write distinct cells (M_b,
+    # N_b, etc.) — for those, this loop is a no-op. It engages when the
+    # lifted axis is absent from Write.index, meaning multiple coords
+    # share an output cell:
+    #   - BIND_BLOCK: rewrite Write to atomic-add (cross-CTA reduce).
+    #   - COOPERATIVE_STRIDE: emit Combine after each reduce subtree
+    #     and Cond(axis == 0)-wrap the scalar Write (cross-thread
+    #     reduce via smem tree-halve / warp-shuffle).
+    for axis, bind, role in output_axes_with_bind:
+        if bind == BIND_BLOCK:
+            inner = _rewrite_for_lifted_axis(inner, axis.name, mode="atomic")
+        elif role is Role.COOPERATIVE_STRIDE:
+            inner = _rewrite_for_lifted_axis(inner, axis.name, mode="cooperative")
 
     body: list[Stmt] = list(leading)
     if output_axes_with_bind:
@@ -192,11 +198,37 @@ def _strip_outer_free_chain(
 
 
 # ---------------------------------------------------------------------------
-# Atomic-Write rewrite for BLOCK lifts
+# Post-lift coordination
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_writes_for_lifted_axis(body: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
+def _rewrite_for_lifted_axis(body: tuple[LoopStmt, ...], axis_name: str, *, mode: str) -> tuple[LoopStmt, ...]:
+    """Materialize cross-coord coordination for a lifted parallel axis.
+
+    Both modes share the trigger ("Write.index doesn't reference the
+    lifted axis") and the def-DAG analysis (``_compute_axis_dep_set``).
+    They differ in the primitive that materializes the coordination:
+
+    - ``mode="atomic"`` (BIND_BLOCK lift): descend single-stmt
+      wrappers, rewrite Writes to atomic-add at the kernel level.
+    - ``mode="cooperative"`` (COOPERATIVE_STRIDE lift): walk recursively
+      to find every reduce subtree, emit ``Combine`` siblings after
+      each, then Cond-wrap every Write whose index doesn't reference
+      the cooperative axis.
+
+    Both rewrites are scoped to ``body`` (typically the ``Tile.body``
+    just after launch_geometry stripped the outer chain)."""
+    if mode == "atomic":
+        return _rewrite_for_atomic_lift(body, axis_name)
+    if mode == "cooperative":
+        return _rewrite_for_cooperative_lift(body, axis_name)
+    raise ValueError(f"unknown mode: {mode!r}")
+
+
+# --- Atomic mode (BIND_BLOCK lifts) ----------------------------------
+
+
+def _rewrite_for_atomic_lift(body: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
     """Descend through wrapper Loops (REGISTER / SERIAL_OUTER / etc.)
     until we reach the level where ``Write`` stmts live, then rewrite
     each Write whose index doesn't reference ``axis_name`` — those
@@ -214,7 +246,7 @@ def _rewrite_writes_for_lifted_axis(body: tuple[LoopStmt, ...], axis_name: str) 
         wrappers.append(cur[0])
         cur = tuple(cur[0].body)
 
-    new_kernel_stmts = _rewrite_kernel_writes(cur, axis_name)
+    new_kernel_stmts = _rewrite_kernel_writes_atomic(cur, axis_name)
 
     current: tuple[LoopStmt, ...] = new_kernel_stmts
     for w in reversed(wrappers):
@@ -222,7 +254,7 @@ def _rewrite_writes_for_lifted_axis(body: tuple[LoopStmt, ...], axis_name: str) 
     return current
 
 
-def _rewrite_kernel_writes(stmts: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
+def _rewrite_kernel_writes_atomic(stmts: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
     """At the kernel level, find every Write whose index doesn't
     reference ``axis_name`` and classify its value via def-DAG analysis
     for the atomic-add rewrite. Writes whose index *does* mention the
@@ -233,7 +265,7 @@ def _rewrite_kernel_writes(stmts: tuple[LoopStmt, ...], axis_name: str) -> tuple
     out: list[LoopStmt] = []
     for s in stmts:
         if isinstance(s, Write) and not _write_indexed_by(s, axis_name):
-            rewritten = _rewrite_write_for_lifted_axis(s, defs, axis_dep, axis_name)
+            rewritten = _rewrite_write_atomic(s, defs, axis_dep, axis_name)
             if rewritten is not None:
                 out.extend(rewritten)
                 continue
@@ -241,33 +273,7 @@ def _rewrite_kernel_writes(stmts: tuple[LoopStmt, ...], axis_name: str) -> tuple
     return tuple(out)
 
 
-def _write_indexed_by(write: Write, axis_name: str) -> bool:
-    """True iff any index expression of the Write mentions ``axis_name``."""
-    return any(axis_name in e.free_vars() for e in write.index)
-
-
-def _compute_axis_dep_set(stmts: tuple[LoopStmt, ...]) -> set[str]:
-    """SSA names whose value transitively touches an ``Accum`` at the
-    kernel level. Since the lifted axis wraps every kernel-level stmt,
-    any value that flows through an ``Accum`` is by construction
-    axis-dependent (the Accum aggregates iterations of an inner loop
-    that itself iterates inside the lifted axis's scope)."""
-    axis_dep: set[str] = set()
-    for s in stmts:
-        if isinstance(s, Accum):
-            axis_dep.add(s.name)
-    changed = True
-    while changed:
-        changed = False
-        for s in stmts:
-            if isinstance(s, Assign) and s.name not in axis_dep:
-                if any(arg in axis_dep for arg in s.args):
-                    axis_dep.add(s.name)
-                    changed = True
-    return axis_dep
-
-
-def _rewrite_write_for_lifted_axis(
+def _rewrite_write_atomic(
     write: Write,
     defs: dict[str, LoopStmt],
     axis_dep: set[str],
@@ -313,6 +319,138 @@ def _rewrite_write_for_lifted_axis(
         return (dc_replace(write, reduce_op=ElementwiseImpl("add")),)
 
     return None
+
+
+# --- Shared dataflow analysis ---------------------------------------
+
+
+def _write_indexed_by(write: Write, axis_name: str) -> bool:
+    """True iff any index expression of the Write mentions ``axis_name``."""
+    return any(axis_name in e.free_vars() for e in write.index)
+
+
+def _compute_axis_dep_set(stmts: tuple[LoopStmt, ...]) -> set[str]:
+    """SSA names whose value transitively touches an ``Accum`` at the
+    kernel level. Since the lifted axis wraps every kernel-level stmt,
+    any value that flows through an ``Accum`` is by construction
+    axis-dependent (the Accum aggregates iterations of an inner loop
+    that itself iterates inside the lifted axis's scope)."""
+    axis_dep: set[str] = set()
+    for s in stmts:
+        if isinstance(s, Accum):
+            axis_dep.add(s.name)
+    changed = True
+    while changed:
+        changed = False
+        for s in stmts:
+            if isinstance(s, Assign) and s.name not in axis_dep:
+                if any(arg in axis_dep for arg in s.args):
+                    axis_dep.add(s.name)
+                    changed = True
+    return axis_dep
+
+
+# --- Cooperative mode (COOPERATIVE_STRIDE lifts) --------------------
+
+
+def _rewrite_for_cooperative_lift(body: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
+    """Cooperative-K coordination: emit ``Combine`` after each K_o reduce
+    subtree (or bare STAGE_INNER reduce when K_o was inlined), then
+    Cond-wrap each scalar Write whose index doesn't reference the
+    cooperative axis.
+
+    Idempotence: if a ``Combine`` sibling is already present in
+    ``body``, skip — re-firing would emit duplicate tree-halves.
+    """
+    if any(isinstance(s, Combine) for s in body):
+        return tuple(body)
+
+    new_body = _insert_combines_after_reduces(tuple(body))
+    new_body = tuple(_guard_scalar_write(s, axis_name) for s in new_body)
+    return new_body
+
+
+def _insert_combines_after_reduces(stmts: tuple[LoopStmt, ...]) -> tuple[LoopStmt, ...]:
+    """Walk ``stmts`` once, emitting one ``Combine(name, op)`` sibling
+    after each cooperative-K reduce subtree. The reduce subtree shape is
+    one of:
+
+    - ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, reduce, [Accum]))``
+      — the canonical multi-chunk form.
+    - ``Loop(K_i, STAGE_INNER, reduce, [Accum])`` — same shape but K_o
+      collapsed to extent 1 and inlined by ``drop_size_one_free_axes``.
+
+    If neither shape matches at this level, descend one wrapper level
+    and try again (handles cases where an output THREAD layer didn't
+    fully collapse). Returns ``stmts`` unchanged if no reduce subtree
+    is found anywhere reachable.
+    """
+    new_stmts: list[LoopStmt] = []
+    emitted = False
+    for s in stmts:
+        new_stmts.append(s)
+        accums = _accums_under_reduce_subtree(s)
+        if accums:
+            new_stmts.extend(Combine(name=a.name, op=a.op) for a in accums)
+            emitted = True
+    if emitted:
+        return tuple(new_stmts)
+
+    # No subtree at this level. Try descending one wrapper.
+    for i, s in enumerate(stmts):
+        if isinstance(s, (Loop, StridedLoop)):
+            inner = _insert_combines_after_reduces(tuple(s.body))
+            if inner != tuple(s.body):
+                return stmts[:i] + (dc_replace(s, body=inner),) + stmts[i + 1 :]
+    return tuple(stmts)
+
+
+def _accums_under_reduce_subtree(s: LoopStmt) -> list[Accum]:
+    """If ``s`` is a cooperative-K reduce subtree (SERIAL_OUTER wrapping
+    STAGE_INNER, or bare STAGE_INNER), return the immediate Accums of
+    the STAGE_INNER. Otherwise return an empty list."""
+    if isinstance(s, Loop) and s.is_reduce and s.role is Role.STAGE_INNER:
+        return [c for c in s.body if isinstance(c, Accum)]
+    if isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
+        cur = tuple(s.body)
+        while len(cur) == 1 and isinstance(cur[0], (Loop, StridedLoop)):
+            inner = cur[0]
+            if inner.is_reduce and inner.role is Role.STAGE_INNER:
+                accums = [c for c in inner.body if isinstance(c, Accum)]
+                if accums:
+                    return accums
+            cur = tuple(inner.body)
+    return []
+
+
+def _guard_scalar_write(s: LoopStmt, coop_name: str) -> LoopStmt:
+    """Wrap ``s`` in ``Cond(coop == 0)`` when it's a Write whose index
+    doesn't reference the cooperative axis. Otherwise (per-thread Write
+    or non-Write stmt) returns ``s`` unchanged. Descends into block
+    stmts so multi-line post-reduce epilogues get guarded uniformly."""
+    if isinstance(s, Write):
+        free: set[str] = set()
+        for e in s.index:
+            free |= e.free_vars()
+        if coop_name not in free:
+            return Cond(
+                cond=BinaryExpr("==", Var(coop_name), Literal(0, "int")),
+                body=Body((s,)),
+                else_body=Body(()),
+            )
+        return s
+    if isinstance(s, (Loop, StridedLoop)):
+        inner = tuple(_guard_scalar_write(c, coop_name) for c in s.body)
+        if inner != tuple(s.body):
+            return dc_replace(s, body=inner)
+        return s
+    if isinstance(s, Cond):
+        b = tuple(_guard_scalar_write(c, coop_name) for c in s.body)
+        e = tuple(_guard_scalar_write(c, coop_name) for c in s.else_body)
+        if b != tuple(s.body) or e != tuple(s.else_body):
+            return Cond(cond=s.cond, body=Body(b), else_body=Body(e))
+        return s
+    return s
 
 
 # ---------------------------------------------------------------------------
