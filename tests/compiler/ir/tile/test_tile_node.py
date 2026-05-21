@@ -1,7 +1,7 @@
 """Tests for Tile-IR node helpers (``iter_body`` etc.).
 
-Tests for the ``tileify`` rule itself (Loop-IR ``LoopOp`` → Tile-IR
-``TileOp``) live in ``tests/compiler/passes/test_tileify_rules.py``.
+Tests for the ``launch_geometry`` rule itself (Loop-IR ``LoopOp`` → Tile-IR
+``TileOp``) live in ``tests/compiler/passes/test_launch_geometry_rules.py``.
 """
 
 from __future__ import annotations

@@ -33,14 +33,15 @@ class Role(Enum):
 
     Roles assigned to body loops:
 
-    - ``BLOCK``: output axis (or split sub-axis) that ``001_tileify`` lifts into
-      ``Tile.axes`` with ``BIND_BLOCK``. Stamped by the planner pre-tileify.
-    - ``THREAD``: output axis (or split sub-axis) that ``001_tileify`` lifts
-      into ``Tile.axes`` with ``BIND_THREAD``. Stamped by the planner pre-tileify.
-    - ``SPLITK_BLOCK``: cross-CTA split-K outer axis. Lifted by tileify into
-      ``Tile.axes`` with ``BIND_BLOCK``. Drives ``003_split_matmul_k``'s
-      epilogue rewrite.
-    - ``REGISTER``: inner axis of a thread-axis split. ``001_tileify`` stops
+    - ``BLOCK``: output axis (or split sub-axis) that ``001_launch_geometry`` lifts
+      into ``Tile.axes`` with ``BIND_BLOCK``. Stamped by the planner.
+    - ``THREAD``: output axis (or split sub-axis) that ``001_launch_geometry`` lifts
+      into ``Tile.axes`` with ``BIND_THREAD``. Stamped by the planner.
+    - ``SPLITK_BLOCK``: cross-CTA split-K outer axis. Lifted by
+      ``001_launch_geometry`` into ``Tile.axes`` with ``BIND_BLOCK``;
+      the planner also rewrites the epilogue Write to be atomic when
+      this role is present.
+    - ``REGISTER``: inner axis of a thread-axis split. ``001_launch_geometry`` stops
       lifting at this axis (keeps it as a body Loop instead of pulling into
       ``Tile.axes``); ``006a_register_tile_planned`` replicates dependent
       stmts along it.

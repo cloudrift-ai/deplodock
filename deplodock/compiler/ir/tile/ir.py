@@ -8,7 +8,7 @@ produces Kernel IR.
 
 Pipeline shape::
 
-    Loop IR ──tileify──▶ Tile IR (logical compute, default bindings)
+    Loop IR ──launch_geometry──▶ Tile IR (logical compute, default bindings)
                      ──[strategy passes]──▶ Tile IR (annotated)
                      ──materialize_tile──▶ Kernel IR
                      ──render_kernelop──▶ CUDA source

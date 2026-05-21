@@ -1,17 +1,17 @@
-"""Tests for the ``tileify`` rule (``001_tileify``).
+"""Tests for the ``launch_geometry`` rule (``001_launch_geometry``).
 
 Two halves:
 
 1. **Firing tests** — like the matmul / reduction rule-firing tests:
    build a frontend graph, run the full ``TILE_PASSES``, assert
-   ``tileify`` shows up in ``recording_dump.fired_rules``.
+   ``launch_geometry`` shows up in ``recording_dump.fired_rules``.
 2. **Behavior tests** — build a ``LoopOp`` graph that exercises a
-   specific tileify branch (outer-chain stripping for reduction /
-   pointwise, sibling output-Loop lifting), then run only the
-   ``tileify`` rule via ``Pipeline.build(select={"tileify"}).run(...)`` so
-   the resulting ``Tile.axes`` reflects tileify alone — no subsequent
-   ``launch_geometry`` partition or ``cooperative_reduce`` rewrite to
-   obscure the assertion.
+   specific launch_geometry branch (outer-chain stripping for reduction
+   / pointwise, sibling output-Loop lifting), then run only the
+   ``launch_geometry`` rule via ``Pipeline.build(select={"launch_geometry"}).run(...)``
+   so the resulting ``Tile.axes`` reflects launch_geometry alone — no
+   subsequent planner partition or downstream rewrite to obscure the
+   assertion.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 # --- firing on frontend graphs ---------------------------------------
 
 
-def test_tileify_fires_on_pointwise(recording_dump):
+def test_launch_geometry_fires_on_pointwise(recording_dump):
     g = Graph()
     _input(g, "x", (4, 8))
     g.add_node(op=ElementwiseOp("relu"), inputs=["x"], output=Tensor("o", (4, 8)), node_id="o")
@@ -41,10 +41,10 @@ def test_tileify_fires_on_pointwise(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "tileify" in recording_dump.fired_rules("lowering/tile")
+    assert "launch_geometry" in recording_dump.fired_rules("lowering/tile")
 
 
-def test_tileify_fires_on_reduction(recording_dump):
+def test_launch_geometry_fires_on_reduction(recording_dump):
     g = Graph()
     _input(g, "x", (4, 8))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -52,15 +52,15 @@ def test_tileify_fires_on_reduction(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "tileify" in recording_dump.fired_rules("lowering/tile")
+    assert "launch_geometry" in recording_dump.fired_rules("lowering/tile")
 
 
-# --- behavior tests: build LoopOp graphs, run tileify in isolation ---
+# --- behavior tests: build LoopOp graphs, run launch_geometry in isolation ---
 #
 # We construct the input as a ``LoopOp`` directly (skipping the
 # frontend / lifting / fusion stages) and run the full pipeline with
-# ``select={"tileify"}`` so only the tileify rule fires. The resulting
-# ``Tile.axes`` is exactly what tileify produced — no THREAD/BLOCK
+# ``select={"launch_geometry"}`` so only the launch_geometry rule fires. The resulting
+# ``Tile.axes`` is exactly what launch_geometry produced — no THREAD/BLOCK
 # partition, no StridedLoop conversion.
 #
 # Axis names get rewritten to ``a0/a1/...`` by ``LoopOp`` normalization,
@@ -76,10 +76,10 @@ def _wrap_loopop(loop_op: LoopOp, *, output_id: str = "o", output_shape: tuple =
     return g
 
 
-def _run_only_tileify(g: Graph) -> TileOp:
-    """Run the full pipeline with only the ``tileify`` rule enabled and
+def _run_only_launch_geometry(g: Graph) -> TileOp:
+    """Run the full pipeline with only the ``launch_geometry`` rule enabled and
     return the (single) resulting ``TileOp``."""
-    out = Pipeline.build(TILE_PASSES, select={"tileify"}).run(g)
+    out = Pipeline.build(TILE_PASSES, select={"launch_geometry"}).run(g)
     tile_ops = [n.op for n in out.nodes.values() if isinstance(n.op, TileOp)]
     assert len(tile_ops) == 1
     return tile_ops[0]
@@ -108,10 +108,10 @@ def _reduction_loopop() -> LoopOp:
     )
 
 
-def test_tileify_strips_outer_chain_for_reduction():
+def test_launch_geometry_strips_outer_chain_for_reduction():
     """Outer free-Loop chain (just ``i`` here) becomes ``Tile.axes``;
     the inner reduce ``k`` Loop survives in the body."""
-    tile_op = _run_only_tileify(_wrap_loopop(_reduction_loopop()))
+    tile_op = _run_only_launch_geometry(_wrap_loopop(_reduction_loopop()))
     tile = next(s for s in tile_op.body if isinstance(s, Tile))
     assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
     assert all(ba.bind == BIND_THREAD for ba in tile.axes)
@@ -119,7 +119,7 @@ def test_tileify_strips_outer_chain_for_reduction():
     assert len(body_loops) == 1 and body_loops[0].is_reduce
 
 
-def test_tileify_handles_pointwise():
+def test_launch_geometry_handles_pointwise():
     """No reduce — outer chain strips into thread axes; body is the
     leaf Load/Write pair."""
     i = Axis("i", 4)
@@ -134,20 +134,20 @@ def test_tileify_handles_pointwise():
             ),
         ),
     )
-    tile_op = _run_only_tileify(_wrap_loopop(pointwise))
+    tile_op = _run_only_launch_geometry(_wrap_loopop(pointwise))
     tile = next(s for s in tile_op.body if isinstance(s, Tile))
     assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
     assert not any(isinstance(s, Loop) for s in tile.body)
 
 
-def test_tileify_preserves_kernel_name():
+def test_launch_geometry_preserves_kernel_name():
     """The ``rewrite`` entry point assigns a kernel name based on the
     LoopOp shape and node id."""
-    tile_op = _run_only_tileify(_wrap_loopop(_reduction_loopop(), output_id="reduce"))
+    tile_op = _run_only_launch_geometry(_wrap_loopop(_reduction_loopop(), output_id="reduce"))
     assert tile_op.name.startswith("k_reduce_")
 
 
-def test_tileify_lifts_sibling_output_loop():
+def test_launch_geometry_lifts_sibling_output_loop():
     """SDPA-shaped tail: ``d`` Loop sits as a top-level sibling to the
     reduce; its body Writes ``out[i, d]``. Both ``i=4`` (outer chain)
     and ``d=16`` (lifted) end up in ``Tile.axes`` as THREAD; the
@@ -178,7 +178,7 @@ def test_tileify_lifts_sibling_output_loop():
             ),
         ),
     )
-    tile_op = _run_only_tileify(_wrap_loopop(loop_op, output_shape=(4, 16)))
+    tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op, output_shape=(4, 16)))
     tile = next(s for s in tile_op.body if isinstance(s, Tile))
     assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4, 16]
     assert all(ba.bind == BIND_THREAD for ba in tile.axes)

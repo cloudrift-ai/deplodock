@@ -1,30 +1,30 @@
-"""Form a ``TileOp`` from each ``LoopOp`` — "tileification".
+"""Form a ``TileOp`` from each ``LoopOp`` — decide launch geometry.
 
-Mechanical translation: outer free-Loop chain becomes
-``Tile(thread_axes=...)``, leaves and inner Loops pass through unchanged.
-The planner (``000_partition_planner``) stamps Role tags on body
-Loops before tileify runs; tileify just reads the tags via
-``_bind_for_role`` and lifts tagged Loops into ``Tile.axes`` with the
-appropriate ``BoundAxis.bind``.
+Mechanical translation: outer free-Loop chain becomes ``Tile.axes``,
+leaves and inner Loops pass through unchanged. The planner
+(``000_partition_planner``) stamps Role tags on body Loops before
+launch_geometry runs; this pass just reads the tags via
+:func:`_bind_for_role` and lifts tagged Loops with the appropriate
+``BoundAxis.bind``: ``Role.BLOCK`` and ``Role.SPLITK_BLOCK`` →
+``BIND_BLOCK``; ``Role.THREAD`` → ``BIND_THREAD``; untagged Loops
+default to ``BIND_THREAD`` (safety net for kernels the planner
+currently can't partition — see ``_bind_for_role``).
 
-**Outer free-Loop chain → ``Tile.thread_axes``**. After stripping
-leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
-lowering walks the outer free-Loop chain and strips it into a
-``Tile(thread_axes=...)`` (default: one thread per output point — the
-correct shape for pointwise kernels and for reductions the cooperative
-strategy chooses not to rewrite). The chain ends at: a level with
-multiple sibling stmts, a Loop with ``Accum`` in its immediate body
-(reduce — can't strip), or no Loop at all.
+**Outer free-Loop chain → ``Tile.axes``**. After stripping leading
+non-Loop stmts (scalar Loads) into the TileOp body prefix, the chain
+walker descends single-stmt nests and lifts every Loop whose role
+isn't body-resident (REGISTER / SERIAL_OUTER / STAGE_INNER / PIPELINE).
+The chain ends at: a level with multiple sibling stmts, a reduce
+Loop, a body-resident-role Loop, or no Loop at all.
 
-**Body free Loops over output dims → ``Tile.thread_axes``**. After the
+**Body free Loops over output dims → ``Tile.axes``**. After the
 outer chain is stripped, top-level body stmts may still contain free
 Loops whose iteration writes distinct output positions (e.g. fused
 SDPA's head-dim loop sits as a sibling to two softmax reduces). Each
-such Loop is lifted into ``Tile.axes`` (THREAD) and replaced by its
-body, so the launch can spawn one thread per iteration instead of
-serializing the writes. Detection: top-level body stmts only; the
-loop's subtree must contain a ``Write`` whose index expression
-references the loop's axis.
+such Loop is lifted into ``Tile.axes`` (bind resolved from its role,
+defaulting to ``BIND_THREAD``) and replaced by its body. Detection:
+top-level body stmts only; the loop's subtree must contain a ``Write``
+whose index expression references the loop's axis.
 
 The node's id, inputs, and output tensor are preserved — only the op
 changes.
@@ -56,24 +56,25 @@ def _bind_for_role(role: Role | None) -> str:
 
 def rewrite(root: Node) -> Graph | None:
     kname = _kernel_name_for(root.op, root.id)
-    return tileify(root.op, kname)
+    return launch_geometry(root.op, kname)
 
 
-def tileify(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
+def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     """Translate a ``LoopOp`` into a ``TileOp`` holding a logical ``Tile``.
 
     Steps:
 
     1. Pull leading non-Loop stmts (typically scalar Loads) off the LoopOp
        body — they sit at the start of ``TileOp.body``, above any Tile.
-    2. Descend the outer free-Loop chain, collecting axes until the chain
-       breaks (multi-stmt level, reduce Loop, or no more Loops).
+    2. Descend the outer free-Loop chain, collecting ``(axis, bind)`` pairs
+       (bind resolved from each Loop's role via :func:`_bind_for_role`)
+       until the chain breaks (multi-stmt level, reduce Loop, body-
+       resident role, or no more Loops).
     3. If any axes were collected, wrap the remaining inner body in a
-       ``Tile(thread_axes=..., bind=BIND_THREAD)``. Otherwise, lower the
-       inner body in place (single-thread serial — degenerate).
+       ``Tile`` with those ``BoundAxis``es. Otherwise, lower the inner
+       body in place (single-thread serial — degenerate).
 
-    Inner ``Loop``s pass through unchanged — strategy passes may
-    convert select ones to ``StridedLoop`` for cooperative iteration.
+    Inner ``Loop``s pass through unchanged.
     """
     leading: list[LoopStmt] = []
     rest: tuple[LoopStmt, ...] = loop_op.body

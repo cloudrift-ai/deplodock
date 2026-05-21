@@ -7,7 +7,7 @@ M1 establishes the role-tag infrastructure:
   autotune entries.
 - ``000_partition_planner`` exists as a stub (always skips); subsequent
   milestones populate it.
-- ``001_tileify`` honors ``Role.REGISTER`` by stopping the outer free-Loop
+- ``001_launch_geometry`` honors ``Role.REGISTER`` by stopping the outer free-Loop
   chain lift and skipping sibling-output-loop lifting for tagged loops.
 
 These tests construct synthetic IR and assert the new code paths fire
@@ -74,17 +74,17 @@ def _wrap_loopop(loop_op: LoopOp) -> Graph:
     return g
 
 
-def _run_only_tileify(g: Graph) -> TileOp:
-    out = Pipeline.build(TILE_PASSES, select={"tileify"}).run(g)
+def _run_only_launch_geometry(g: Graph) -> TileOp:
+    out = Pipeline.build(TILE_PASSES, select={"launch_geometry"}).run(g)
     tile_ops = [n.op for n in out.nodes.values() if isinstance(n.op, TileOp)]
     assert len(tile_ops) == 1
     return tile_ops[0]
 
 
-def test_tileify_stops_at_register_tagged_loop():
+def test_launch_geometry_stops_at_register_tagged_loop():
     """Outer free-Loop chain: when an inner Loop carries ``Role.REGISTER``,
-    tileify must stop lifting at the previous level. The REGISTER Loop
-    stays in the body for ``008_register_tile`` to replicate."""
+    launch_geometry must stop lifting at the previous level. The REGISTER Loop
+    stays in the body for ``006a_register_tile_planned`` to replicate."""
     outer = Axis("i", 4)
     inner = Axis("i_i", 2)
     loop_op = LoopOp(
@@ -104,7 +104,7 @@ def test_tileify_stops_at_register_tagged_loop():
             ),
         ),
     )
-    tile_op = _run_only_tileify(_wrap_loopop(loop_op))
+    tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op))
     tile = next(s for s in tile_op.body if isinstance(s, Tile))
     # Outer ``i`` lifted to Tile.axes; inner REGISTER ``i_i`` stays in body.
     assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
@@ -115,12 +115,12 @@ def test_tileify_stops_at_register_tagged_loop():
     assert int(body_loops[0].axis.extent) == 2
 
 
-def test_tileify_skips_register_sibling_output_loop():
+def test_launch_geometry_skips_register_sibling_output_loop():
     """A top-level body free Loop tagged REGISTER must NOT be lifted by
     ``_lift_output_loops`` even if its subtree writes the loop axis —
     the tag means "this is register-tile inner, not a launch dim."
     """
-    # Outer reduce so tileify's chain-strip stops before the sibling level.
+    # Outer reduce so launch_geometry's chain-strip stops before the sibling level.
     i = Axis("i", 4)
     k = Axis("k", 8)
     reg = Axis("r", 2)
@@ -148,7 +148,7 @@ def test_tileify_skips_register_sibling_output_loop():
             ),
         ),
     )
-    tile_op = _run_only_tileify(_wrap_loopop(loop_op))
+    tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op))
     tile = next(s for s in tile_op.body if isinstance(s, Tile))
     # Only ``i`` (outer chain) ends up in Tile.axes — ``r`` stays in body.
     assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]

@@ -242,10 +242,10 @@ class SearchDB:
         """Upsert one ``parent_key`` → ``child_key`` lowering edge.
 
         ``knobs`` is the delta this rewrite step stamps onto the child
-        (e.g. blockify_launch adds ``{"BN": 64, "BM": 64}``; tileify
-        adds nothing). Greedy replay picks forks by knob-subset match
-        against this delta, so the row is enough to reconstruct the
-        chain without re-querying ``perf``.
+        (e.g. partition_planner adds ``{"BN": 64, "BM": 64, ...}``;
+        launch_geometry adds nothing). Greedy replay picks forks by
+        knob-subset match against this delta, so the row is enough to
+        reconstruct the chain without re-querying ``perf``.
 
         Best-of upsert across every dialect — autotune fork rules live
         at Tile→Tile (blockify, register_tile) and used to be excluded

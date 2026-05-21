@@ -151,5 +151,5 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
 def test_strip_prefix_handles_letter_suffix():
     assert strip_rule_prefix("005_cooperative_reduce") == "cooperative_reduce"
     assert strip_rule_prefix("005b_cooperative_reduce") == "cooperative_reduce"
-    assert strip_rule_prefix("001_tileify") == "tileify"
+    assert strip_rule_prefix("001_launch_geometry") == "launch_geometry"
     assert strip_rule_prefix("chunk_matmul_k") == "chunk_matmul_k"

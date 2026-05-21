@@ -1,6 +1,6 @@
 """Partition planner — decide axis-structure splits up front.
 
-Runs first in the Tile-IR lowering chain, **before** ``001_tileify``. The
+Runs first in the Tile-IR lowering chain, **before** ``001_launch_geometry``. The
 planner is the source of truth for launch-axis structure: it decides
 splits (output partition, K chunking, register tile, split-K) and tags
 the resulting axes with ``Role`` values (see :class:`Role`). Downstream
@@ -127,7 +127,7 @@ def _stamp_planned(op: LoopOp) -> LoopOp:
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
-    """Mirror ``001_tileify``: strip leading non-Loop stmts off the body
+    """Mirror ``001_launch_geometry``: strip leading non-Loop stmts off the body
     (typically hoisted Loads / Stages). Returns ``(leading, rest)``."""
     leading: list[Stmt] = []
     rest = tuple(body)
@@ -380,7 +380,7 @@ def _build_matmul_body(
         current = (Loop(axis=K_s, role=Role.SPLITK_BLOCK, body=current),)
     # Extra outer chain axes (e.g. head_idx in multi-head SDPA) become
     # BLOCK directly — they were already iteration axes in the original
-    # body; we just re-stamp them so tileify binds BIND_BLOCK.
+    # body; we just re-stamp them so launch_geometry binds BIND_BLOCK.
     for outer_lp in reversed(extra_outer):
         current = (Loop(axis=outer_lp.axis, role=Role.BLOCK, body=current),)
     return current
@@ -590,9 +590,9 @@ def _split_pointwise_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp]
     target_tuple = thread_tile_shape(extents_desc, body_info)
 
     # Walk innermost-first; build (axis, role) entries. Every chain
-    # axis is tagged (THREAD/BLOCK) so tileify's chain walker reads
-    # the role directly — no untagged fallback needed for kernels the
-    # planner accepts.
+    # axis is tagged (THREAD/BLOCK) so launch_geometry's chain walker
+    # reads the role directly — no untagged fallback needed for kernels
+    # the planner accepts.
     chain_inner_first = list(reversed(chain))
     new_levels_inner_first: list[tuple[Axis, Role]] = []
     sigma_map: dict[str, object] = {}

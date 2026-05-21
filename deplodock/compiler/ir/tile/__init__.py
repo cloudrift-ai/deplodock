@@ -5,9 +5,9 @@
   and shared expressions.
 - :mod:`.pretty` — structural pretty-printer for ``TileOp``.
 
-Loop-IR → Tile-IR lowering (``tileify``) lives next to its rule at
-``passes/lowering/tile/001_tileify.py`` — the convention is "rules own
-their logic".
+Loop-IR → Tile-IR lowering (``launch_geometry``) lives next to its
+rule at ``passes/lowering/tile/001_launch_geometry.py`` — the
+convention is "rules own their logic".
 
 Materialization (Tile IR → Kernel IR) lives under
 ``passes/lowering/kernel``; rendering of Kernel IR to CUDA source lives

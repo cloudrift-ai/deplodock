@@ -56,7 +56,7 @@ def single_tile(body: Body) -> tuple[int, Tile]:
 
     ``TileOp.__post_init__`` enforces *at most* one Tile, so this only
     needs to handle the zero-Tile case — which happens for the
-    degenerate single-thread serial body ``001_tileify`` produces when
+    degenerate single-thread serial body ``001_launch_geometry`` produces when
     a LoopOp has no outer free-Loop chain to strip. Raises
     ``RuleSkipped`` in that case so the rule cleanly bails.
     """
