@@ -19,7 +19,7 @@ the σ-split body produced by ``_build_matmul_body``:
             <σ-substituted prelude> →
             Loop(K_o SERIAL_OUTER) →
               Loop(K_i STAGE_INNER, reduce, σ(K body)) →
-            <σ-substituted post (epilogue rewritten when SPLITK > 1)>
+            <σ-substituted post — Write is non-atomic here>
 
 σ-maps:
 
@@ -27,10 +27,11 @@ the σ-split body produced by ``_build_matmul_body``:
 - N → N_b*(BN*FN) + N_t*FN + N_r
 - K → K_s*(K_o_count*BK) + K_o*BK + K_i  (K_s omitted when SPLITK=1)
 
-When ``SPLITK > 1`` the planner rewrites the trailing Write to be an
-atomic-add (``reduce_op=add``) and wraps any acc-independent residual
-contribution in ``Cond(K_s == 0, ...)`` so only one CTA per output cell
-contributes the residual.
+When ``SPLITK > 1`` the planner just produces the σ-split structure
+with a non-atomic Write — ``001_launch_geometry`` does the generic
+"BIND_BLOCK lift → atomic Write" rewrite once it commits the binding,
+including the ``Cond(K_s == 0, …)`` decomposition for the residual
+case (where ``Write.value = add(K_s-indep, K_s-dep)``).
 
 Each cartesian level iterates only structurally valid candidates:
 BN/BM from a pow-2 preset (post-clamp to extent + divisibility check),
@@ -61,11 +62,10 @@ from dataclasses import replace
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis, Role
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -319,17 +319,15 @@ def _build_matmul_body(
     inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
 
     # Step 2: replace the matmul K Loop with K_o → K_i (σ-substituting
-    # K inside the K body).
+    # K inside the K body). The atomic-Write rewrite for SPLITK > 1
+    # happens in ``001_launch_geometry`` once it commits the BIND_BLOCK
+    # binding for K_s — at that point it can do the generic K_s-dep
+    # def-DAG analysis.
     new_inner, replaced = _replace_matmul_k(inner_after_outer, K_o, K_i, sigma_k)
     if not replaced:
         raise _BuildSkipped("matmul K reduce not found in body")
 
-    # Step 3: when SPLITK > 1, rewrite the epilogue to atomic Write +
-    # Cond(K_s == 0, residual).
-    if splitk > 1:
-        new_inner = _rewrite_epilogue_for_splitk(new_inner, K_s.name)
-
-    # Step 4: wrap with REGISTER → THREAD → BLOCK loops (inside-out).
+    # Step 3: wrap with REGISTER → THREAD → BLOCK loops (inside-out).
     current: tuple[Stmt, ...] = new_inner
     current = (Loop(axis=N_r, role=Role.REGISTER, body=current),)
     current = (Loop(axis=M_r, role=Role.REGISTER, body=current),)
@@ -394,95 +392,6 @@ def _find_first_matmul_reduce(stmts) -> Loop | None:
             if found is not None:
                 return found
     return None
-
-
-# --- split-K epilogue rewrite (planner-side) -------------------------
-
-
-def _rewrite_epilogue_for_splitk(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]:
-    """Mark the trailing ``Write`` atomic for the cases where that's
-    sufficient: plain matmul (no stmts between K_o and Write,
-    ``Write.value == acc``) and linear-multiplicative chain
-    (``Write.value`` reachable from ``acc`` only through multiplies
-    whose other operand is acc-independent — ``sum_i (c·a_i) = c·sum_i a_i``
-    distributes).
-
-    The linear-additive residual case (``Assign(v, add, r, acc); Write(v)``)
-    needs a ``Cond(K_s == 0, atomic Write(r))`` wrap and is handled by
-    the follow-up rule ``000a_splitk_epilogue`` after launch_geometry.
-    For shapes we don't recognize, leave the body alone — the follow-up
-    rule (if it can't either) raises ``RuleSkipped`` and the SPLITK > 1
-    variant is just slower / wrong; the cartesian also includes
-    SPLITK = 1 variants that are always safe.
-
-    ``k_s_name`` is currently unused (the follow-up owns the
-    ``Cond(K_s == 0, …)`` rewrite) but kept on the signature for
-    parallelism with the follow-up rule's call site.
-    """
-    del k_s_name
-    stmts_list = list(stmts)
-    k_idx = next(
-        (i for i, s in enumerate(stmts_list) if isinstance(s, Loop) and s.role is Role.SERIAL_OUTER),
-        None,
-    )
-    if k_idx is None:
-        return tuple(stmts_list)
-    write_idx = next((i for i, s in enumerate(stmts_list) if isinstance(s, Write)), None)
-    if write_idx is None or write_idx <= k_idx:
-        return tuple(stmts_list)
-    k_outer = stmts_list[k_idx]
-    write = stmts_list[write_idx]
-    epilogue_stmts = stmts_list[k_idx + 1 : write_idx]
-    acc_name = _find_accum_name(k_outer)
-    if acc_name is None:
-        return tuple(stmts_list)
-
-    # Plain matmul: no epilogue stmts, Write writes ``acc`` directly.
-    if not epilogue_stmts and write.value == acc_name:
-        stmts_list[write_idx] = replace(write, reduce_op=ElementwiseImpl("add"))
-        return tuple(stmts_list)
-
-    # Linear-multiplicative chain: ``v = c * acc`` style — distributes
-    # across CTAs, so just mark the Write atomic.
-    if _is_linear_multiplicative_chain(epilogue_stmts, acc_name, write.value):
-        stmts_list[write_idx] = replace(write, reduce_op=ElementwiseImpl("add"))
-        return tuple(stmts_list)
-
-    # Residual / unrecognized shapes: let ``000a_splitk_epilogue`` handle.
-    return tuple(stmts_list)
-
-
-def _find_accum_name(k_o_loop: Loop) -> str | None:
-    for s in k_o_loop.body.iter():
-        if isinstance(s, Accum):
-            return s.name
-    return None
-
-
-def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_value: str) -> bool:
-    """``Write.value`` is reachable from ``acc`` only through multiplies
-    whose other operand is acc-independent (e.g. ``acc * silu(gate)``).
-    Then ``sum_i (c * a_i) = c * sum_i a_i`` distributes — every CTA
-    computes its own ``v = c * partial_acc`` and atomic-adds."""
-    acc_dep = {acc_name}
-    for s in epilogue_stmts:
-        deps = set(s.deps())
-        touches_acc = bool(deps & acc_dep)
-        if not touches_acc:
-            continue
-        if not isinstance(s, Assign):
-            return False
-        if s.op.name != "multiply":
-            return False
-        if len(s.args) != 2:
-            return False
-        a, b = s.args
-        a_dep = a in acc_dep
-        b_dep = b in acc_dep
-        if a_dep == b_dep:
-            return False
-        acc_dep.add(s.name)
-    return write_value in acc_dep
 
 
 # --- pointwise / non-matmul reduce ----------------------------------
