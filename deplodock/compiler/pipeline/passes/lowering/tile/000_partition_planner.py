@@ -170,41 +170,55 @@ class _BuildSkipped(Exception):
 
 
 def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Unified σ-split for matmul + pointwise kernels.
+    """Unified σ-split for matmul, pointwise, and non-matmul-reduce
+    kernels.
 
-    Matmul (``body_info.has_matmul``): innermost two chain axes are
-    output M, N; reduce axis K is detected inside ``outer_n.body``.
-    Calls the cartesian with the full ``(BN, BM, BK, SPLITK)``
-    candidate sets — FM / FN come out of divisor enumeration.
+    Single-pass detection: extract the outer chain (innermost = N, next
+    out = M if present), then look inside the innermost body for reduce
+    Loops. Classify by predicate, not branch — ``is_matmul_reduce``
+    (≥ 2 K-indexed Loads + Accum) selects the matmul knob set;
+    any other reduce selects the cooperative-reduce knob set (BR > 1
+    allowed); no reduce at all selects the pointwise knob set
+    (degenerate K).
 
-    Pointwise / non-matmul (no K detected): innermost chain axis is N
-    (``outer_m`` is ``None`` for 1D pointwise; for ≥ 2D chains the
-    second-innermost is M). E_K = 1, BK = SPLITK = 1 collapse the
-    K iteration. The full ``(BN, BM, FM, FN)`` cartesian is enumerated;
-    the pointwise priority key (prefer low cells/thread, threads close
-    to 256/CTA) makes greedy pick a memory-bandwidth-friendly shape
-    while autotune can explore higher-cells variants — measured win
-    of ~2.5× on rotary-style 4D shapes via ``FM=32`` register tile.
+    For v1, kernels must have at most one reduce extent (multi-reduce
+    fused SDPA-class kernels are out of scope). When multiple reduces
+    are present with matching extents, the first matched reduce drives
+    the σ-split; downstream rules consume the cooperative role on the
+    lifted K_c axis to emit Combine.
 
-    Returns ``None`` when the kernel doesn't match either shape (no
-    outer chain, or matmul-detected but K reduce missing)."""
+    Returns ``None`` when the kernel has no outer chain at all."""
     chain = _outer_free_loop_chain(loop_op.body)
     if not chain:
         return None
 
+    # Output axes — innermost is N, next-out is M (when ≥ 2 chain
+    # axes), everything further out is extra_outer (BLOCK-whole).
+    outer_n: Loop = chain[-1]
+    outer_m: Loop | None = chain[-2] if len(chain) >= 2 else None
+    extra_outer: tuple[Loop, ...] = chain[:-2] if outer_m is not None else chain[:-1]
+    E_N = int(outer_n.axis.extent)
+    E_M = int(outer_m.axis.extent) if outer_m is not None else 1
+
+    # Reduce detection — predicate-driven, not branch-driven. The
+    # matmul-shape predicate uses ``is_matmul_reduce``; the cooperative
+    # path uses the negation. ``body_info.has_matmul`` is used as a
+    # fast preflight to avoid scanning the body twice.
+    k_matmul: Loop | None = None
+    k_nonmatmul: Loop | None = None
     if body_info.has_matmul:
-        if len(chain) < 2:
+        k_matmul = _find_first_reduce(tuple(outer_n.body), match=is_matmul_reduce)
+    else:
+        k_nonmatmul = _find_first_reduce(
+            tuple(outer_n.body), match=lambda lp: lp.is_reduce and not is_matmul_reduce(lp)
+        )
+
+    if k_matmul is not None:
+        # Matmul branch — innermost two chain axes are M/N (require ≥ 2).
+        if outer_m is None:
             return None
-        # Innermost two are M, N. Anything further out is extra_outer
-        # (e.g. head_idx in multi-head SDPA → BLOCK whole).
-        outer_m: Loop | None = chain[-2]
-        outer_n = chain[-1]
-        extra_outer = chain[:-2]
-        k_loop = _find_first_matmul_reduce(tuple(outer_n.body))
-        if k_loop is None:
-            return None
-        E_M = int(outer_m.axis.extent)
-        E_N = int(outer_n.axis.extent)
+        k_loop: Loop | None = k_matmul
+        k_is_matmul = True
         E_K = int(k_loop.axis.extent)
         param_combos = _enumerate_cartesian(
             E_M=E_M,
@@ -217,22 +231,29 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             priority_mode="matmul",
         )
+    elif k_nonmatmul is not None:
+        # Non-matmul reduce branch — cooperative-K enabled via BR.
+        # Output axes M / N (M optional) go to BLOCK/THREAD as usual;
+        # K splits as K_s · K_o · K_c · K_i with K_c at COOPERATIVE_STRIDE.
+        k_loop = k_nonmatmul
+        k_is_matmul = False
+        E_K = int(k_loop.axis.extent)
+        param_combos = _enumerate_cartesian(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=E_K,
+            bn_choices=_TUNE_AXIS_CHOICES,
+            bm_choices=_TUNE_AXIS_CHOICES,
+            bk_choices=_BK_CANDIDATES,
+            splitk_choices=_SPLITK_CANDIDATES,
+            br_choices=_BR_CANDIDATES,
+            max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+            priority_mode="reduce",
+        )
     else:
-        # No matmul reduce. Innermost is N; if there's a second-innermost
-        # it's treated as the M axis. Any further-out axes become
-        # extra_outer BLOCK-whole. Pointwise locks BK / SPLITK to (1,)
-        # (no K reduction) and enumerates the full (BN, BM, FM, FN)
-        # cartesian — same machinery as matmul, just with a degenerate
-        # K dimension. The priority sort uses a pointwise-tuned key
-        # (prefer low cells/thread, threads close to 256) so greedy
-        # picks a memory-bandwidth-friendly shape rather than the
-        # matmul-style high-cells shape.
-        outer_n = chain[-1]
-        outer_m = chain[-2] if len(chain) >= 2 else None
-        extra_outer = chain[:-2] if len(chain) >= 2 else ()
+        # Pointwise — no reduce in body. Degenerate K (E_K = bk = splitk = 1).
         k_loop = None
-        E_M = int(outer_m.axis.extent) if outer_m is not None else 1
-        E_N = int(outer_n.axis.extent)
+        k_is_matmul = True  # unused (no K loop), keep default
         param_combos = _enumerate_cartesian(
             E_M=E_M,
             E_N=E_N,
@@ -249,7 +270,9 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
     variants: list[LoopOp] = []
     for bn, bm, fm, fn, bk, splitk, br in param_combos:
         try:
-            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk, br)
+            chain_body = _build_split_body(
+                extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk, br, k_is_matmul=k_is_matmul
+            )
         except _BuildSkipped:
             continue
         new_body = leading + chain_body
@@ -411,6 +434,8 @@ def _build_split_body(
     bk: int,
     splitk: int,
     br: int = 1,
+    *,
+    k_is_matmul: bool = True,
 ) -> tuple[Stmt, ...]:
     """Unified σ-split body construction. The N axis is always present;
     ``outer_m`` and ``k_loop`` are ``None`` for 1D pointwise and
@@ -472,12 +497,20 @@ def _build_split_body(
     inner_stmts = tuple(outer_n.body)
     inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
 
-    # Step 2: replace the matmul K Loop with K_o → K_i if K is present.
+    # Step 2: replace the K reduce Loop with K_o → K_i if K is present.
+    # The matmul branch uses ``is_matmul_reduce`` to identify the K
+    # reduce; the cooperative-reduce branch uses the complementary
+    # "reduce but not matmul-shape" predicate. Both are structural
+    # checks that survive σ-rewrite.
     if k_loop is not None:
         assert sigma_k is not None and K_o is not None and K_i is not None
-        new_inner, replaced = _replace_matmul_k(inner_after_outer, K_o, K_i, sigma_k)
+        if k_is_matmul:
+            match = is_matmul_reduce
+        else:
+            match = lambda lp: lp.is_reduce and not is_matmul_reduce(lp)  # noqa: E731
+        new_inner, replaced = _replace_inner_reduce(inner_after_outer, K_o, K_i, sigma_k, match=match)
         if not replaced:
-            raise _BuildSkipped("matmul K reduce not found in body")
+            raise _BuildSkipped("K reduce not found in body")
     else:
         new_inner = inner_after_outer
 
@@ -504,17 +537,31 @@ def _build_split_body(
     return current
 
 
-def _replace_matmul_k(stmts: tuple[Stmt, ...], K_o: Axis, K_i: Axis, sigma_k: Sigma) -> tuple[tuple[Stmt, ...], bool]:
-    """Walk ``stmts`` and replace the first matmul-shaped reduce Loop
+def _replace_inner_reduce(
+    stmts: tuple[Stmt, ...],
+    K_o: Axis,
+    K_i: Axis,
+    sigma_k: Sigma,
+    *,
+    match,
+) -> tuple[tuple[Stmt, ...], bool]:
+    """Walk ``stmts`` and replace the first reduce Loop matching ``match``
     with ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce, STAGE_INNER, σ_k(body)))``.
-    Returns ``(new_stmts, replaced_flag)``."""
+    Returns ``(new_stmts, replaced_flag)``.
+
+    ``match(loop)`` is a callable applied to each reduce Loop encountered
+    during the walk: ``is_matmul_reduce`` for matmul kernels, the
+    complementary "reduce but not matmul" predicate for non-matmul
+    cooperative-K reduces. No Combine emission here — that lives in
+    ``002_emit_combine``, which reads ``Role.COOPERATIVE_STRIDE`` off the
+    lifted ``BoundAxis``."""
     out: list[Stmt] = []
     replaced = False
     for s in stmts:
         if replaced:
             out.append(s)
             continue
-        if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
+        if isinstance(s, Loop) and s.is_reduce and match(s):
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             k_i_loop = Loop(axis=K_i, role=Role.STAGE_INNER, body=new_body)
             k_o_loop = Loop(axis=K_o, role=Role.SERIAL_OUTER, body=(k_i_loop,))
@@ -522,14 +569,14 @@ def _replace_matmul_k(stmts: tuple[Stmt, ...], K_o: Axis, K_i: Axis, sigma_k: Si
             replaced = True
             continue
         if isinstance(s, (Loop, StridedLoop)):
-            inner, r = _replace_matmul_k(s.body, K_o, K_i, sigma_k)
+            inner, r = _replace_inner_reduce(s.body, K_o, K_i, sigma_k, match=match)
             if r:
                 out.append(replace(s, body=inner))
                 replaced = True
                 continue
         if isinstance(s, Cond):
-            inner_b, rb = _replace_matmul_k(s.body, K_o, K_i, sigma_k)
-            inner_e, re_ = _replace_matmul_k(s.else_body, K_o, K_i, sigma_k)
+            inner_b, rb = _replace_inner_reduce(s.body, K_o, K_i, sigma_k, match=match)
+            inner_e, re_ = _replace_inner_reduce(s.else_body, K_o, K_i, sigma_k, match=match)
             if rb or re_:
                 out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
                 replaced = True
@@ -538,16 +585,19 @@ def _replace_matmul_k(stmts: tuple[Stmt, ...], K_o: Axis, K_i: Axis, sigma_k: Si
     return tuple(out), replaced
 
 
-def _find_first_matmul_reduce(stmts) -> Loop | None:
+def _find_first_reduce(stmts, *, match) -> Loop | None:
+    """Find the first reduce Loop satisfying ``match`` anywhere in the
+    subtree. ``match`` is ``is_matmul_reduce`` for matmul, the negation
+    for cooperative-K reduces."""
     for s in stmts:
-        if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
+        if isinstance(s, Loop) and s.is_reduce and match(s):
             return s
         if isinstance(s, (Loop, StridedLoop)):
-            found = _find_first_matmul_reduce(s.body)
+            found = _find_first_reduce(s.body, match=match)
             if found is not None:
                 return found
         if isinstance(s, Cond):
-            found = _find_first_matmul_reduce(s.body) or _find_first_matmul_reduce(s.else_body)
+            found = _find_first_reduce(s.body, match=match) or _find_first_reduce(s.else_body, match=match)
             if found is not None:
                 return found
     return None
