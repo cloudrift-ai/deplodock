@@ -102,8 +102,8 @@ def test_matmul_then_elwise_fires_split_k_and_blockify(recording_dump):
 
 
 def test_pure_elementwise_does_not_fire_split_k(recording_dump):
-    """No matmul-shaped reduce → ``chunk_matmul_k`` must not fire, but
-    ``launch_geometry`` still does (every TileOp gets launch geometry)."""
+    """No matmul-shaped reduce → planner still partitions output axes
+    (BLOCK/THREAD split), but no chunk_matmul_k / split-K fires."""
     g = Graph()
     _input(g, "x", (_M, _N))
     g.add_node(op=ElementwiseOp("relu"), inputs=["x"], output=Tensor("o", (_M, _N)), node_id="o")
@@ -113,7 +113,8 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" not in fired
-    assert "launch_geometry" in fired
+    # M16: planner owns partition for both matmul and pointwise.
+    assert "partition_planner" in fired
 
 
 # --- engine: RuleSkipped exception path ------------------------------
@@ -133,9 +134,9 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    # Pure elementwise → partition_planner raises RuleSkipped (no matmul
-    # / chunk-reduce branch matched). The engine's ``debug_on`` gate keys
-    # off the engine logger's level — bump that to DEBUG so ``emit`` fires.
+    # Pure elementwise → ``006a_register_tile_planned`` raises RuleSkipped
+    # (no REG axes in body). The engine's ``debug_on`` gate keys off the
+    # engine logger's level — bump that to DEBUG so ``emit`` fires.
     logging.getLogger("deplodock.compiler.pipeline").setLevel(logging.DEBUG)
     try:
         Pipeline.build(TILE_PASSES).run(g)
@@ -144,7 +145,7 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
 
     out = capsys.readouterr().out
     skip_messages = [ln for ln in out.splitlines() if ln.startswith("--- ") and "skipped" in ln]
-    assert any("partition_planner" in m for m in skip_messages), skip_messages
+    assert skip_messages, "expected at least one tile rule to log a skip reason"
 
 
 def test_strip_prefix_handles_letter_suffix():

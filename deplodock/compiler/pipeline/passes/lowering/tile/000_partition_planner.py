@@ -89,9 +89,13 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
 
     body_info = BodyInfo.of(loop_op.body)
 
-    variants = _split_matmul_fully(ctx, loop_op, body_info)
+    variants: list[LoopOp] | None
+    if body_info.has_matmul:
+        variants = _split_matmul_fully(ctx, loop_op, body_info)
+    else:
+        variants = _split_pointwise_fully(loop_op, body_info)
     if variants is None:
-        raise RuleSkipped("non-matmul kernel — planner only handles matmul currently")
+        raise RuleSkipped("kernel shape not handled by planner")
 
     if len(variants) == 1:
         return _stamp_planned(variants[0])
@@ -535,3 +539,74 @@ def _extract_simple_residual(prelude_stmts, epilogue_stmts: list, acc_name: str,
     if any(isinstance(s, Load) and s.name == other for s in prelude_stmts):
         return (other, False)
     return None
+
+
+# --- pointwise / non-matmul reduce ----------------------------------
+
+
+def _split_pointwise_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+    """Stamp BLOCK/THREAD on the output axes of a non-matmul kernel.
+
+    For each chain axis (innermost-first), apply the per-axis target from
+    :func:`tuning.thread_tile_shape`:
+
+    - ``ext ≤ target`` (and within the THREAD slot): stamp ``Role.THREAD``.
+    - ``ext > target`` and ``ext % target == 0``: σ-split into
+      ``A_b`` (``Role.BLOCK``) over ``A_t`` (``Role.THREAD``), σ:
+      ``A → A_b * target + A_t``.
+    - Outer chain axes beyond the THREAD slot: stamp ``Role.BLOCK`` whole.
+
+    Returns ``None`` on no-op (every axis already fits the target with no
+    σ-split) or on non-divisible axes (the kernel falls through unhandled
+    — current pointwise tests don't hit this)."""
+    chain = _outer_free_loop_chain(loop_op.body)
+    if not chain:
+        return None
+
+    leading, _ = _split_leading_non_loops(loop_op.body)
+
+    # Heuristic target (innermost-first).
+    extents_desc = tuple(sorted((int(lp.axis.extent) for lp in chain), reverse=True))
+    target_tuple = thread_tile_shape(extents_desc, body_info)
+
+    # Walk innermost-first; build (axis, role) entries.
+    chain_inner_first = list(reversed(chain))
+    new_levels_inner_first: list[tuple[Axis, Role]] = []
+    sigma_map: dict[str, object] = {}
+    changed = False
+    for i, lp in enumerate(chain_inner_first):
+        ext = int(lp.axis.extent)
+        if i >= len(target_tuple):
+            # Outer beyond target — BLOCK whole.
+            new_levels_inner_first.append((lp.axis, Role.BLOCK))
+            changed = True
+            continue
+        target = int(target_tuple[i])
+        if ext <= target:
+            new_levels_inner_first.append((lp.axis, Role.THREAD))
+            continue
+        if ext % target != 0:
+            return None  # divisibility failure — can't σ-split cleanly
+        inner_ax = Axis(f"{lp.axis.name}_t", target)
+        outer_ax = Axis(f"{lp.axis.name}_b", ext // target)
+        new_levels_inner_first.append((inner_ax, Role.THREAD))
+        new_levels_inner_first.append((outer_ax, Role.BLOCK))
+        sigma_map[lp.axis.name] = Var(outer_ax.name) * Literal(target, "int") + Var(inner_ax.name)
+        changed = True
+
+    if not changed:
+        return None  # planner has nothing to add
+
+    inner_stmts = tuple(chain[-1].body)
+    if sigma_map:
+        sigma = Sigma(sigma_map)
+        inner_stmts = tuple(s.rewrite(_identity_rename, sigma) for s in inner_stmts)
+
+    # Build the wrapped body (outermost-first by reversing inner-first list).
+    current: tuple[Stmt, ...] = inner_stmts
+    for axis, role in new_levels_inner_first:
+        current = (Loop(axis=axis, role=role, body=current),)
+
+    new_body = leading + current
+    bn = int(target_tuple[0]) if target_tuple else 256
+    return [LoopOp(body=new_body, knobs={**loop_op.knobs, "BN": bn})]

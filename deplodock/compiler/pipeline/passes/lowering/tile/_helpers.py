@@ -38,6 +38,17 @@ from deplodock.compiler.pipeline import RuleSkipped
 _logger = logging.getLogger(__name__)
 
 
+def accums_independent(body: Body) -> bool:
+    """True iff no Accum's value transitively depends on another Accum's
+    running value. Permits multiple independent Accums; rejects online
+    algorithms (online softmax, Welford). Salvaged from the deleted
+    ``004_launch_geometry``; retained because the kernel-rule tests
+    use it as a structural predicate."""
+    body = Body.coerce(body)
+    accum_names = {s.name for s in body if isinstance(s, Accum)}
+    return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
+
+
 from deplodock.compiler.target import compute_capability  # noqa: E402,F401
 
 

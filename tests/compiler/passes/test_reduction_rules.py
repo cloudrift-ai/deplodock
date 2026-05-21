@@ -9,8 +9,6 @@ reordering rule files doesn't break these tests.
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
 from deplodock.compiler.graph import Graph, Tensor
@@ -21,8 +19,7 @@ from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
-
-_accums_independent = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.004_launch_geometry")._accums_independent
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import accums_independent as _accums_independent
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:

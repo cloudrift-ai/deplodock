@@ -162,9 +162,9 @@ def test_tileify_skips_register_sibling_output_loop():
 # --- Planner stub ----------------------------------------------------
 
 
-def test_planner_skips_without_env(recording_dump, monkeypatch):
-    """Without ``DEPLODOCK_PLANNER`` set, the planner is a no-op — it
-    should appear in the rule registry but not fire on any kernel."""
+def test_planner_fires_on_pointwise(recording_dump, monkeypatch):
+    """M16: the planner partitions pointwise kernels too (BLOCK/THREAD
+    on output axes). The old ``DEPLODOCK_PLANNER`` env gate is gone."""
     monkeypatch.delenv("DEPLODOCK_PLANNER", raising=False)
     g = Graph()
     _input(g, "x", (4, 8))
@@ -173,7 +173,7 @@ def test_planner_skips_without_env(recording_dump, monkeypatch):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "partition_planner" not in recording_dump.fired_rules("lowering/tile")
+    assert "partition_planner" in recording_dump.fired_rules("lowering/tile")
 
 
 def loop_op_pointwise() -> LoopOp:
