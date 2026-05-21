@@ -37,12 +37,12 @@ chain; skips cooperative-viable kernels (their synthetic ``t`` axis
 never matches a Load's index). ``006_chunk_reduce``'s M3 STAGE_INNER
 guard handles idempotence.
 
-**M8 limitation**: the predictor only covers the single-stmt outer
-free chain; it misses output-write Loops that ``001_tileify``'s
-``_lift_output_loops`` step lifts from multi-stmt bodies (SDPA's
-``head_dim`` etc.). Kernels with lifted output axes still rely on the
-legacy ``006_chunk_reduce`` post-tileify (which is correctly preserved
-through the M3 guard).
+The predictor also mirrors ``001_tileify._lift_output_loops``: after
+the outer chain breaks, top-level free Loops in the remaining body
+whose subtree writes through their axis (SDPA's ``head_dim`` etc.)
+join the predicted thread-axes list at full extent. This catches the
+SDPA-class kernels that previously fell through to legacy
+``006_chunk_reduce`` post-tileify.
 
 Gated by ``DEPLODOCK_PLANNER`` env var so each milestone can test the
 new path against the legacy default (=0) for structural equivalence.
@@ -59,7 +59,7 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis, Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop
+from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import Tile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -390,10 +390,12 @@ def _try_chunk_reduce(loop_op: LoopOp) -> LoopOp | None:
 
     if not _has_matmul_reduce(loop_op.body) and _cooperative_shape(loop_op.body, chain):
         return None
-    thread_targets = _predict_thread_extents(loop_op, chain)
+    lifted = _lifted_output_loops(tuple(chain[-1].body))
+    combined = chain + lifted
+    thread_targets = _predict_thread_extents(loop_op, chain, lifted)
     if not thread_targets:
         return None
-    new_body, changed = _chunk_reduces_in_body(loop_op.body, chain, thread_targets)
+    new_body, changed = _chunk_reduces_in_body(loop_op.body, combined, thread_targets)
     if not changed:
         return None
     return LoopOp(body=new_body, knobs=dict(loop_op.knobs))
@@ -429,12 +431,13 @@ def _cooperative_shape(body, chain: tuple[Loop, ...]) -> bool:
     return True
 
 
-def _predict_thread_extents(loop_op: LoopOp, chain: tuple[Loop, ...]) -> tuple[int, ...] | None:
-    """Predicted (axis_name, thread_extent) for each outer-chain axis,
-    mirroring ``004_launch_geometry._plan_partition``: an axis with
-    ``ext ≤ target`` stays at full extent; ``ext > target`` shrinks to
-    ``target``. Returns the per-axis predicted thread extent in the
-    same order as ``chain`` (outermost-first).
+def _predict_thread_extents(loop_op: LoopOp, chain: tuple[Loop, ...], lifted: tuple[Loop, ...] = ()) -> tuple[int, ...] | None:
+    """Predicted (axis_name, thread_extent) for each outer-chain axis
+    followed by each lifted axis, mirroring ``004_launch_geometry.
+    _plan_partition`` for the chain (``ext ≤ target`` stays full;
+    ``ext > target`` shrinks to ``target``) and ``001_tileify.
+    _lift_output_loops`` for the lifted axes (always full extent —
+    tileify lifts but doesn't split them).
 
     ``thread_tile_shape`` returns innermost-first targets; we reverse
     so we can zip with ``chain``."""
@@ -458,7 +461,40 @@ def _predict_thread_extents(loop_op: LoopOp, chain: tuple[Loop, ...]) -> tuple[i
         j = i - (len(chain) - len(targets_outer_first))
         target = targets_outer_first[j]
         extents.append(min(ext, target))
+    for lp in lifted:
+        extents.append(int(lp.axis.extent))
     return tuple(extents)
+
+
+def _lifted_output_loops(stmts: tuple) -> tuple[Loop, ...]:
+    """Mirror ``001_tileify._lift_output_loops``: collect top-level
+    free Loops in ``stmts`` (the body remaining after the outer free
+    chain is stripped) whose subtree contains a ``Write`` whose index
+    references the loop's axis. These become additional thread axes
+    once tileify runs."""
+    out: list[Loop] = []
+    for s in stmts:
+        if isinstance(s, Loop) and not s.is_reduce and s.role is not Role.REGISTER and _writes_with_axis(s.body, s.axis.name):
+            out.append(s)
+    return tuple(out)
+
+
+def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
+    """Mirror ``001_tileify._writes_with_axis``: any Write under
+    ``stmts`` whose index references ``axis_name``."""
+    for s in stmts:
+        if isinstance(s, Write):
+            free: set[str] = set()
+            for e in s.index:
+                free |= e.free_vars()
+            if axis_name in free:
+                return True
+        if isinstance(s, (Loop, StridedLoop)) and _writes_with_axis(s.body, axis_name):
+            return True
+        if isinstance(s, Cond):
+            if _writes_with_axis(s.body, axis_name) or _writes_with_axis(s.else_body, axis_name):
+                return True
+    return False
 
 
 def _chunk_reduces_in_body(stmts, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> tuple[tuple, bool]:
