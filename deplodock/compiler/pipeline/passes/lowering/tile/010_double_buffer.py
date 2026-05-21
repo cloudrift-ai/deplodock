@@ -44,9 +44,22 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
+
+BUFFER_COMPUTE = Knob(
+    "BUFFER_COMPUTE",
+    KnobType.BOOL,
+    hints=(True, False),
+    help=(
+        "Promote a multi-source compute Stage (produced by 007c_split) to a ring-buffered "
+        "Stage so its output is double-buffered alongside the per-source transport stages. "
+        "Experimental — lets a downstream pass try to overlap compute and reduce across "
+        "K_outer iterations. Default off."
+    ),
+)
 
 _BUFFER_COUNT = 2
 
@@ -150,7 +163,7 @@ def _double_buffer(loop: Loop) -> Loop | None:
     index."""
     import os  # noqa: PLC0415
 
-    buffer_compute = os.environ.get("DEPLODOCK_BUFFER_COMPUTE", "0") in ("1", "true", "True")
+    buffer_compute = os.environ.get(BUFFER_COMPUTE.env, "0") in ("1", "true", "True")
 
     phase = Var(loop.axis.name) % Literal(_BUFFER_COUNT, "int")
     staged_names: set[str] = set()
@@ -182,7 +195,7 @@ def _double_buffer(loop: Loop) -> Loop | None:
             # body reads from sibling transport stages' smem buffers.
             # Always prepend phase to those body Loads so the compute
             # consumes the slot the producer just wrote. Additionally,
-            # when DEPLODOCK_BUFFER_COMPUTE is set, promote the compute
+            # when the BUFFER_COMPUTE knob is set, promote the compute
             # stage itself to BufferedStage so its output (fused_smem) is
             # ring-buffered — experimental, lets a downstream pass try to
             # overlap compute and reduce across K_outer iterations.

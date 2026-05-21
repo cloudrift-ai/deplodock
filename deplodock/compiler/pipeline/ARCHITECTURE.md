@@ -221,16 +221,18 @@ recipe.
 | `STAGE`       | BINMASK  | `007_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. `"111"` stages all three.    |
 | `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
 | `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
-| `TMA`         | BOOL     | `011_tma_copy`               | Use `cp.async.bulk.tensor` staging (sm_90+ only); default tracks arch.                            |
-| `TMA_SWIZZLE` | BOOL     | `011_tma_copy`               | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
+| `TMA`             | BOOL     | `011_tma_copy`                       | Use `cp.async.bulk.tensor` staging (sm_90+ only); default tracks arch.                            |
+| `TMA_SWIZZLE`     | BOOL     | `011_tma_copy`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
+| `FUSED_PIPELINE`  | BOOL     | `007c_split_fused_for_pipeline`      | Split fused multi-source Stage into transport + compute so 015 can pipeline; sm_90+ win.          |
+| `BUFFER_COMPUTE`  | BOOL     | `010_double_buffer`                  | Ring-buffer the compute Stage output alongside transport stages; experimental.                    |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
 `knobs=` line — they're treated as pass-presence markers, not values.
 
-Two non-`Knob` env toggles also affect tile lowering: `DEPLODOCK_FUSED_PIPELINE=1` (`007c_split_fused_for_pipeline`)
-and `DEPLODOCK_BUFFER_COMPUTE=1` (`010_double_buffer`). These don't participate in the autotune fork lattice — they're
-binary opt-ins for experimental features that don't yet have enough signal to be candidate-driven.
+`FUSED_PIPELINE` and `BUFFER_COMPUTE` are read today via `DEPLODOCK_<NAME>` env vars (single-variant emission;
+the rule fires or skips based on the value). M3 of the fuse/split refactor will promote `FUSED_PIPELINE` to a
+fork point so the autotuner can pick per-recipe.
 
 ## Pass directories
 

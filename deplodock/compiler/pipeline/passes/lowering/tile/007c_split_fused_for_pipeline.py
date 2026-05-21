@@ -59,27 +59,32 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Loop, Stmt, Tile, Write
 from deplodock.compiler.ir.tile.ir import Stage, TileOp, trivial_stage_body
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
+FUSED_PIPELINE = Knob(
+    "FUSED_PIPELINE",
+    KnobType.BOOL,
+    hints=(True, False),
+    help=(
+        "Split fused multi-source Stage into per-source transport + compute stages so "
+        "015_pipeline_k_outer can overlap K+1 TMAs with K compute. Win on Hopper sm_90+ "
+        "with TMA; on sm_120 (cp.async only) the extra smem scratch buffers eat occupancy "
+        "and typically wash out the hide. Default off until per-recipe autotuning picks."
+    ),
+)
+
 
 def _enabled() -> bool:
-    """Opt-in via ``DEPLODOCK_FUSED_PIPELINE``.
-
-    On Hopper (sm_90+) with TMA, splitting the fused stage into per-source
-    transport stages lets ``015_pipeline_k_outer`` overlap K+1 TMAs with K
-    compute — meaningful win. On sm_120 (which uses cp.async instead),
-    the split adds register pressure (more live SSA across the new
-    compute slot) and bumps smem by the per-source scratch buffers,
-    typically dropping occupancy enough to wash out the latency hide.
-    Default off until per-hardware autotuning picks per-recipe."""
-    return os.environ.get("DEPLODOCK_FUSED_PIPELINE", "0") in ("1", "true", "True")
+    """Opt-in via the ``FUSED_PIPELINE`` knob (env override ``DEPLODOCK_FUSED_PIPELINE``)."""
+    return os.environ.get(FUSED_PIPELINE.env, "0") in ("1", "true", "True")
 
 
 def rewrite(root: Node) -> Graph | None:
     if not _enabled():
-        raise RuleSkipped("DEPLODOCK_FUSED_PIPELINE not set")
+        raise RuleSkipped(f"{FUSED_PIPELINE.env} not set")
     new_body = _maybe_rewrite(root.op.body)
     if new_body is None:
         raise RuleSkipped("no fused Stage to split for pipelining")
