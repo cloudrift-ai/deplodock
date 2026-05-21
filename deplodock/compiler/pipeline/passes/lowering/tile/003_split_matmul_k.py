@@ -54,7 +54,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
@@ -102,6 +102,12 @@ def _maybe_rewrite(body, parent_knobs):
     idx, tile = single_tile(body)
     if tile.block_axes:
         raise RuleSkipped("Tile already partitioned — must run before 005")
+
+    # Idempotence guard: planner stamps SPLITK_BLOCK on K_s (lifted by
+    # tileify into tile.axes with BIND_BLOCK) when it does the σ-split
+    # itself. In that case the σ-split is done; nothing left for 003.
+    if any(ba.axis.name.endswith("_s") and ba.bind == BIND_BLOCK for ba in tile.axes):
+        raise RuleSkipped("planner already did the SPLITK σ-split (K_s in tile.axes)")
 
     # Find the chunked matmul Loop to learn K_o.extent for the picker.
     k_outer = next((s for s in tile.body if isinstance(s, Loop) and _is_chunked_matmul(s)), None)

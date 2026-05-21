@@ -2,34 +2,45 @@
 
 Runs first in the Tile-IR lowering chain, **before** ``001_tileify``. The
 planner is the source of truth for launch-axis structure: it decides
-splits (output partition, K chunking, register tile, etc.) and tags
+splits (output partition, K chunking, register tile, split-K) and tags
 the resulting axes with ``Role`` values (see :class:`Role`). Downstream
-materialization passes (``001_tileify``, ``006a_register_tile_planned``,
-``007_stage_inputs``, ...) read the tags and skip their own equivalent
-decisions, doing only the leftover rewrites (lift to ``Tile.axes``,
-replicate stmts, build stages).
+materialization passes read the tags and skip their own equivalent
+decisions.
 
-**Matmul register tile** — detect matmul-shaped LoopOps, pre-split the
-outer M / N output Loops by ``(FM, FN)`` from
-:func:`tuning.register_tile_shape`, tag the inner halves
-``Role.REGISTER``, and σ-substitute the body. ``001_tileify`` lifts
-M_o / N_o to ``Tile.axes`` and stops at the REGISTER tags;
-``006a_register_tile_planned`` replicates the per-cell bodies *before*
-``007_stage_inputs`` runs.
+**Matmul — joint enumeration.** ``_split_matmul_fully`` enumerates the
+full pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)`` candidates
+and emits one variant per surviving combination. Each variant carries
+the σ-split body produced by ``_build_matmul_body``:
 
-**Matmul K chunking** — after the M/N register-tile decision, locate
-the matmul K reduce and pre-split it into
-``Loop(K_o, SERIAL_OUTER) → Loop(K_i, reduce, STAGE_INNER)`` with
-σ: K → K_o*BK + K_i. The planner forks over a ``BK`` knob; greedy
-callers pick variant 0 (the heuristic ``forced_bk`` value).
+    Loop(K_s SPLITK_BLOCK) →
+      Loop(M_b BLOCK) → Loop(N_b BLOCK) →
+        Loop(M_t THREAD) → Loop(N_t THREAD) →
+          Loop(M_r REGISTER) → Loop(N_r REGISTER) →
+            <σ-substituted prelude> →
+            Loop(K_o SERIAL_OUTER) →
+              Loop(K_i STAGE_INNER, reduce, σ(K body)) →
+            <σ-substituted post (epilogue rewritten when SPLITK > 1)>
 
-**Non-matmul chunk-reduce** — for each non-matmul reduce whose
-K-indexed Loads project a thread-fanin slab over the 16 KB
-``007_stage_inputs`` cap, split K → ``Loop(K_o, SERIAL_OUTER) →
-Loop(K_i, reduce, STAGE_INNER)``.
+σ-maps:
 
-**Matmul (BN, BM) stamp + SPLITK** — pure knob enumeration so
-``004_launch_geometry`` / ``003_split_matmul_k`` can run deterministic.
+- M → M_b*(BM*FM) + M_t*FM + M_r
+- N → N_b*(BN*FN) + N_t*FN + N_r
+- K → K_s*(K_o_count*BK) + K_o*BK + K_i  (K_s omitted when SPLITK=1)
+
+When ``SPLITK > 1`` the planner rewrites the trailing Write to be an
+atomic-add (``reduce_op=add``) and wraps any acc-independent residual
+contribution in ``Cond(K_s == 0, ...)`` so only one CTA per output cell
+contributes the residual.
+
+Pruning order: divisibility → thread budget (≤ 1024) → register budget
+(FM·FN ≤ ``MAX_CELLS_PER_THREAD``) → dedup after clamp. Heuristic combo
+(from ``thread_tile_shape`` / ``register_tile_shape`` / ``forced_bk`` /
+``auto_splitk`` on the logical extents) is emitted as variant 0 so
+greedy callers without an autotune DB pick the heuristic.
+
+Non-matmul branches (pointwise + chunk-reduce) are not handled here yet
+— they fall through to ``004_launch_geometry`` (pointwise) and stay
+chunk-less. M16 brings them into the planner.
 """
 
 from __future__ import annotations
@@ -39,10 +50,12 @@ from dataclasses import replace
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis, Role
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
@@ -60,24 +73,13 @@ from deplodock.compiler.tuning import (
 
 PATTERN = [Pattern("root", LoopOp)]
 
-# Knob stamp signalling the planner produced output (for planner-side
-# idempotence — re-firing on a planned LoopOp is a no-op). Downstream
-# 006a uses ``Role.REGISTER`` presence + ``FN`` absence as its trigger.
 _PLANNER_KNOB = "PLANNER"
 
-# Matches the legacy 002_chunk_matmul_k BK candidate set.
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
+_TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
+_SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
-
-# Mirrors ``004_launch_geometry._TUNE_AXIS_CHOICES`` so planner-driven
-# matmul BN/BM forks enumerate the same candidate space as the legacy
-# 004 fork did.
-_TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
-_WARP_SIZE = 32
-
-# Mirrors ``003_split_matmul_k._SPLITK_CANDIDATES``.
-_SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
@@ -87,58 +89,13 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
 
     body_info = BodyInfo.of(loop_op.body)
 
-    reg_variants = _try_matmul_register_tile(loop_op, body_info)
-    base_variants: list[LoopOp] = list(reg_variants) if reg_variants is not None else [loop_op]
+    variants = _split_matmul_fully(ctx, loop_op, body_info)
+    if variants is None:
+        raise RuleSkipped("non-matmul kernel — planner only handles matmul currently")
 
-    after_k: list[LoopOp] = []
-    any_k_chunk = False
-    for base in base_variants:
-        k_variants = _try_matmul_k_chunk(ctx, base, body_info)
-        if k_variants is not None:
-            any_k_chunk = True
-            after_k.extend(k_variants)
-        else:
-            after_k.append(base)
-
-    after_splitk: list[LoopOp] = []
-    any_splitk = False
-    for cand in after_k:
-        sk_variants = _try_splitk(cand, body_info)
-        if sk_variants is not None:
-            any_splitk = True
-            after_splitk.extend(sk_variants)
-        else:
-            after_splitk.append(cand)
-
-    chunked: list[LoopOp] = []
-    any_chunk_reduce = False
-    for cand in after_splitk:
-        after_cr = _try_chunk_reduce(cand, body_info)
-        if after_cr is not None:
-            any_chunk_reduce = True
-            chunked.append(after_cr)
-        else:
-            chunked.append(cand)
-
-    bn_bm_results: list[LoopOp] = []
-    any_bn_bm = False
-    for cand in chunked:
-        bn_bm_variants = _try_matmul_bn_bm_fork(cand, body_info)
-        if bn_bm_variants is not None:
-            any_bn_bm = True
-            bn_bm_results.extend(bn_bm_variants)
-        else:
-            bn_bm_results.append(cand)
-
-    fired = reg_variants is not None or any_k_chunk or any_splitk or any_chunk_reduce or any_bn_bm
-    if not fired:
-        raise RuleSkipped("no planner branch matched")
-
-    chunked = bn_bm_results
-
-    if len(chunked) == 1:
-        return _stamp_planned(chunked[0])
-    return [_stamp_planned(v) for v in chunked]
+    if len(variants) == 1:
+        return _stamp_planned(variants[0])
+    return [_stamp_planned(v) for v in variants]
 
 
 def _stamp_planned(op: LoopOp) -> LoopOp:
@@ -147,183 +104,304 @@ def _stamp_planned(op: LoopOp) -> LoopOp:
     return LoopOp(body=op.body, knobs=knobs)
 
 
-# --- chain extent helpers --------------------------------------------
+# --- chain helpers ----------------------------------------------------
+
+
+def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
+    """Mirror ``001_tileify``: strip leading non-Loop stmts off the body
+    (typically hoisted Loads / Stages). Returns ``(leading, rest)``."""
+    leading: list[Stmt] = []
+    rest = tuple(body)
+    while rest and not isinstance(rest[0], Loop):
+        leading.append(rest[0])
+        rest = rest[1:]
+    return tuple(leading), rest
 
 
 def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
     """Walk the outer single-stmt chain of untagged free Loops outermost-
-    first. Mirrors ``001_tileify._strip_outer_free_chain``."""
+    first, after skipping leading non-Loop stmts."""
+    _, rest = _split_leading_non_loops(body)
     out: list[Loop] = []
-    cur = tuple(body)
+    cur = rest
     while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
         out.append(cur[0])
         cur = tuple(cur[0].body)
     return tuple(out)
 
 
-def _chain_extents_desc(chain: tuple[Loop, ...]) -> tuple[int, ...]:
-    """Extents of the chain, sorted descending. Mirrors what
-    ``_logical_output_extents`` produced for the planner's synthetic
-    Tiles (all-THREAD axes, no folding)."""
-    return tuple(sorted((int(lp.axis.extent) for lp in chain), reverse=True))
+def _identity_rename(name: str) -> str:
+    return name
 
 
-# --- matmul register-tile branch -------------------------------------
+# --- matmul: joint enumeration ---------------------------------------
 
 
-def _try_matmul_register_tile(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Detect a matmul-shape LoopOp; if eligible, fork over ``(FM, FN)``
-    candidates from :data:`TUNE_F_CHOICES`. For each viable pair, emit
-    a LoopOp variant whose outer M / N output Loops are pre-split by
-    ``(FM, FN)`` with ``Role.REGISTER`` on the inner halves. Stamps
-    ``knobs={"FM": fm, "FN": fn}``.
-
-    Heuristic shape (from :func:`tuning.register_tile_shape`) is emitted
-    as variant 0. ``(1, 1)`` is included so the autotuner can elect the
-    no-register-tile shape too.
-
-    Returns ``None`` when the kernel isn't matmul-shaped or has fewer
-    than two outer free Loops."""
+def _split_matmul_fully(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+    """Enumerate the pruned cartesian and emit one variant per
+    surviving ``(BN, BM, FM, FN, BK, SPLITK)`` combination."""
     if not body_info.has_matmul:
         return None
     chain = _outer_free_loop_chain(loop_op.body)
     if len(chain) < 2:
         return None
-    outer_m, outer_n = chain[0], chain[1]
-    ext_m, ext_n = int(outer_m.axis.extent), int(outer_n.axis.extent)
+    # Innermost two axes are the matmul output dims (M, N). Anything
+    # further outer in the chain (e.g. head_idx in multi-head SDPA) is
+    # an extra output axis that becomes BLOCK directly.
+    m_idx = len(chain) - 2
+    outer_m = chain[m_idx]
+    outer_n = chain[m_idx + 1]
+    extra_outer = chain[:m_idx]
+    M_name = outer_m.axis.name
+    N_name = outer_n.axis.name
+    E_M = int(outer_m.axis.extent)
+    E_N = int(outer_n.axis.extent)
 
-    output_extents = _chain_extents_desc(chain)
-    thread_extents = tuple(int(lp.axis.extent) for lp in chain)
-    h_fm, h_fn = (int(x) for x in register_tile_shape(output_extents, thread_extents, body_info))
+    inner_stmts = tuple(outer_n.body)
+    k_loop = _find_first_matmul_reduce(inner_stmts)
+    if k_loop is None:
+        return None
+    K_name = k_loop.axis.name
+    E_K = int(k_loop.axis.extent)
 
-    seen: set[tuple[int, int]] = set()
-    ordered: list[tuple[int, int]] = []
+    output_extents: tuple[int, ...] = tuple(sorted((E_M, E_N), reverse=True))
 
-    def _add(fm: int, fn: int) -> None:
-        if (fm, fn) in seen:
+    # Heuristic combo (variant 0).
+    h_thread = thread_tile_shape(output_extents, body_info)
+    h_bn = int(h_thread[0]) if len(h_thread) >= 1 else _TUNE_AXIS_CHOICES[2]
+    h_bm = int(h_thread[1]) if len(h_thread) >= 2 else _TUNE_AXIS_CHOICES[2]
+    h_bn_c = min(h_bn, E_N)
+    h_bm_c = min(h_bm, E_M)
+    h_thread_extents = (h_bm_c, h_bn_c)
+    h_fm, h_fn = (int(x) for x in register_tile_shape(output_extents, h_thread_extents, body_info))
+    h_bk_pick = forced_bk(output_extents, body_info, ctx.static_smem_cap)
+    h_bk = (
+        int(h_bk_pick)
+        if h_bk_pick is not None and E_K % h_bk_pick == 0 and E_K > h_bk_pick
+        else next((c for c in _BK_CANDIDATES if E_K % c == 0 and E_K > c), 0)
+    )
+    h_k_o = E_K // h_bk if h_bk > 0 else 0
+    h_splitk = int(auto_splitk(output_extents, body_info, h_k_o, h_thread_extents)) if h_k_o > 0 else 1
+    if h_splitk < 1:
+        h_splitk = 1
+
+    seen: set[tuple[int, int, int, int, int, int]] = set()
+    ordered: list[tuple[int, int, int, int, int, int]] = []
+
+    def _add(bn: int, bm: int, fm: int, fn: int, bk: int, splitk: int) -> None:
+        # Clamp BN/BM to output extents.
+        bn_c = min(bn, E_N)
+        bm_c = min(bm, E_M)
+        if bn_c < 1 or bm_c < 1 or fm < 1 or fn < 1 or bk < 1 or splitk < 1:
             return
-        if fm < 1 or fn < 1:
+        if E_M % (bm_c * fm) != 0:
             return
-        if ext_m % fm != 0 or ext_n % fn != 0:
+        if E_N % (bn_c * fn) != 0:
+            return
+        # K split: BK divides K (intra-CTA chunking); SPLITK divides K_o_total.
+        if E_K % bk != 0 or E_K <= bk:
+            return
+        if (E_K // bk) % splitk != 0:
+            return
+        if bn_c * bm_c > 1024:
             return
         if fm * fn > MAX_CELLS_PER_THREAD:
             return
-        seen.add((fm, fn))
-        ordered.append((fm, fn))
+        key = (bn_c, bm_c, fm, fn, bk, splitk)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(key)
 
-    _add(h_fm, h_fn)
-    for fm in TUNE_F_CHOICES:
-        for fn in TUNE_F_CHOICES:
-            _add(fm, fn)
-
-    variants: list[LoopOp] = []
-    for fm, fn in ordered:
-        knobs = {**loop_op.knobs, "FM": fm, "FN": fn}
-        if fm == 1 and fn == 1:
-            variants.append(LoopOp(body=loop_op.body, knobs=knobs))
+    _add(h_bn, h_bm, h_fm, h_fn, h_bk, h_splitk)
+    # Fast-pruned cartesian. Each valid combo is appended; we sort the
+    # result by priority below so greedy gets a sensible variant 0 even
+    # when the literal heuristic combo fails divisibility.
+    for bn in _TUNE_AXIS_CHOICES:
+        bn_c = min(bn, E_N)
+        if bn_c < 1 or E_N % bn_c != 0:
             continue
-        new_body = _split_register_outer_two(loop_op.body, outer_m.axis.name, outer_n.axis.name, fm, fn)
+        for bm in _TUNE_AXIS_CHOICES:
+            bm_c = min(bm, E_M)
+            if bm_c < 1 or E_M % bm_c != 0:
+                continue
+            if bn_c * bm_c > 1024:
+                continue
+            for fm in TUNE_F_CHOICES:
+                if E_M % (bm_c * fm) != 0:
+                    continue
+                for fn in TUNE_F_CHOICES:
+                    if E_N % (bn_c * fn) != 0:
+                        continue
+                    if fm * fn > MAX_CELLS_PER_THREAD:
+                        continue
+                    for bk in _BK_CANDIDATES:
+                        if E_K % bk != 0 or E_K <= bk:
+                            continue
+                        k_o_total = E_K // bk
+                        for splitk in _SPLITK_CANDIDATES:
+                            if k_o_total % splitk != 0:
+                                continue
+                            _add(bn_c, bm_c, fm, fn, bk, splitk)
+
+    # Re-order so the highest-priority combo (closest to the heuristic
+    # intent — high cells/thread, threads close to 256, larger BK) comes
+    # first. Greedy compiles pick variant 0 = `ordered[0]`. Heuristic
+    # combo (if it survived `_add`) is already at index 0 and stays
+    # there via stable sort + matching priority key.
+    heuristic_key = (h_bn, h_bm, h_fm, h_fn, h_bk, h_splitk)
+
+    def _priority(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
+        bn, bm, fm, fn, bk, splitk = combo
+        threads = bn * bm
+        cells = fm * fn
+        # Heuristic exact match sorts first.
+        is_heuristic = 1 if combo == heuristic_key else 0
+        # Then high cells/thread (capped to 32 — beyond hurts NVRTC).
+        cell_score = min(cells, 32)
+        # Then threads close to 256.
+        thread_score = -abs(256 - threads)
+        # Then bigger BK (fewer K iters).
+        bk_score = bk
+        # Then smaller SPLITK (less atomic contention).
+        splitk_score = -splitk
+        return (is_heuristic, cell_score, thread_score, bk_score, splitk_score)
+
+    ordered.sort(key=_priority, reverse=True)
+
+    leading, _ = _split_leading_non_loops(loop_op.body)
+    variants: list[LoopOp] = []
+    for bn, bm, fm, fn, bk, splitk in ordered:
+        try:
+            chain_body = _build_matmul_body(extra_outer, outer_m, outer_n, M_name, N_name, K_name, k_loop, bn, bm, fm, fn, bk, splitk)
+        except _BuildSkipped:
+            continue
+        new_body = leading + chain_body
+        knobs = {**loop_op.knobs, "BN": bn, "BM": bm, "FM": fm, "FN": fn, "BK": bk, "SPLITK": splitk}
         variants.append(LoopOp(body=new_body, knobs=knobs))
     return variants or None
 
 
-def _split_register_outer_two(body, m_name: str, n_name: str, fm: int, fn: int):
-    """Pre-split the outer M and N output Loops by ``(FM, FN)``.
+class _BuildSkipped(Exception):
+    """Raised by ``_build_matmul_body`` when the body has a shape we
+    don't know how to rewrite (e.g. epilogue isn't a known split-K
+    pattern)."""
 
-    For each axis with ``F > 1``: split into ``F_o`` (outer free,
-    extent ``E/F``) over ``F_i`` (inner ``Role.REGISTER``, extent ``F``)
-    with ``σ: axis → F_o*F + F_i``. When ``F == 1`` the axis is left
-    untouched."""
 
-    def _identity_rename(name: str) -> str:
-        return name
+def _build_matmul_body(
+    extra_outer: tuple[Loop, ...],
+    outer_m: Loop,
+    outer_n: Loop,
+    M_name: str,
+    N_name: str,
+    K_name: str,
+    k_loop_ref: Loop,
+    bn: int,
+    bm: int,
+    fm: int,
+    fn: int,
+    bk: int,
+    splitk: int,
+) -> tuple[Stmt, ...]:
+    E_M = int(outer_m.axis.extent)
+    E_N = int(outer_n.axis.extent)
+    E_K = int(k_loop_ref.axis.extent)
 
-    stmts = tuple(body)
-    assert len(stmts) == 1 and isinstance(stmts[0], Loop) and stmts[0].axis.name == m_name
-    m_loop = stmts[0]
-    m_body = tuple(m_loop.body)
-    assert len(m_body) == 1 and isinstance(m_body[0], Loop) and m_body[0].axis.name == n_name
-    n_loop = m_body[0]
-    inner = tuple(n_loop.body)
+    M_b_ext = E_M // (bm * fm)
+    N_b_ext = E_N // (bn * fn)
+    K_o_ext = E_K // (splitk * bk)
 
-    sigma_map: dict = {}
-    m_o = m_i = None
-    n_o = n_i = None
-    if fm > 1:
-        m_o = Axis(f"{m_name}_o", int(m_loop.axis.extent) // fm)
-        m_i = Axis(f"{m_name}_i", fm)
-        sigma_map[m_name] = Var(m_o.name) * Literal(fm, "int") + Var(m_i.name)
-    if fn > 1:
-        n_o = Axis(f"{n_name}_o", int(n_loop.axis.extent) // fn)
-        n_i = Axis(f"{n_name}_i", fn)
-        sigma_map[n_name] = Var(n_o.name) * Literal(fn, "int") + Var(n_i.name)
+    M_b = Axis(f"{M_name}_b", M_b_ext)
+    M_t = Axis(f"{M_name}_t", bm)
+    M_r = Axis(f"{M_name}_r", fm)
+    N_b = Axis(f"{N_name}_b", N_b_ext)
+    N_t = Axis(f"{N_name}_t", bn)
+    N_r = Axis(f"{N_name}_r", fn)
+    K_s = Axis(f"{K_name}_s", splitk)
+    K_o = Axis(f"{K_name}_o", K_o_ext)
+    K_i = Axis(f"{K_name}_i", bk)
 
-    if sigma_map:
-        sigma = Sigma(sigma_map)
-        inner_rewritten = tuple(s.rewrite(_identity_rename, sigma) for s in inner)
+    sigma_outer = Sigma(
+        {
+            M_name: Var(M_b.name) * Literal(bm * fm, "int") + Var(M_t.name) * Literal(fm, "int") + Var(M_r.name),
+            N_name: Var(N_b.name) * Literal(bn * fn, "int") + Var(N_t.name) * Literal(fn, "int") + Var(N_r.name),
+        }
+    )
+    if splitk > 1:
+        sigma_k = Sigma({K_name: Var(K_s.name) * Literal(K_o_ext * bk, "int") + Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
     else:
-        inner_rewritten = inner
+        sigma_k = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
 
-    current = inner_rewritten
-    if fn > 1:
-        current = (Loop(axis=n_i, role=Role.REGISTER, body=current),)
-    if fm > 1:
-        current = (Loop(axis=m_i, role=Role.REGISTER, body=current),)
-    outer_n_axis = n_o if fn > 1 else n_loop.axis
-    current = (Loop(axis=outer_n_axis, body=current),)
-    outer_m_axis = m_o if fm > 1 else m_loop.axis
-    current = (Loop(axis=outer_m_axis, body=current),)
+    inner_stmts = tuple(outer_n.body)
+
+    # Step 1: apply σ_outer over all inner stmts. K loop's body Loads
+    # pick up M/N substitutions; K iter var is untouched.
+    inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
+
+    # Step 2: replace the matmul K Loop with K_o → K_i (σ-substituting
+    # K inside the K body).
+    new_inner, replaced = _replace_matmul_k(inner_after_outer, K_o, K_i, sigma_k)
+    if not replaced:
+        raise _BuildSkipped("matmul K reduce not found in body")
+
+    # Step 3: when SPLITK > 1, rewrite the epilogue to atomic Write +
+    # Cond(K_s == 0, residual).
+    if splitk > 1:
+        new_inner = _rewrite_epilogue_for_splitk(new_inner, K_s.name)
+
+    # Step 4: wrap with REGISTER → THREAD → BLOCK loops (inside-out).
+    current: tuple[Stmt, ...] = new_inner
+    current = (Loop(axis=N_r, role=Role.REGISTER, body=current),)
+    current = (Loop(axis=M_r, role=Role.REGISTER, body=current),)
+    current = (Loop(axis=N_t, role=Role.THREAD, body=current),)
+    current = (Loop(axis=M_t, role=Role.THREAD, body=current),)
+    current = (Loop(axis=N_b, role=Role.BLOCK, body=current),)
+    current = (Loop(axis=M_b, role=Role.BLOCK, body=current),)
+    if splitk > 1:
+        current = (Loop(axis=K_s, role=Role.SPLITK_BLOCK, body=current),)
+    # Extra outer chain axes (e.g. head_idx in multi-head SDPA) become
+    # BLOCK directly — they were already iteration axes in the original
+    # body; we just re-stamp them so tileify binds BIND_BLOCK.
+    for outer_lp in reversed(extra_outer):
+        current = (Loop(axis=outer_lp.axis, role=Role.BLOCK, body=current),)
     return current
 
 
-# --- matmul K-chunk branch ------------------------------------------
-
-
-def _try_matmul_k_chunk(ctx: Context, loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Fork over BK for the matmul K reduce. Splits K → K_o
-    (``Role.SERIAL_OUTER``) × K_i (``Role.STAGE_INNER``)."""
-    site = _find_first_matmul_reduce(loop_op.body)
-    if site is None:
-        return None
-    if site.role is Role.STAGE_INNER:
-        return None  # already chunked
-    K = int(site.axis.extent)
-    cands = _bk_candidates_for(ctx, loop_op, body_info, K)
-    if not cands:
-        return None
-    variants: list[LoopOp] = []
-    for bk in cands:
-        new_body, changed = _chunk_first_matmul_k(loop_op.body, bk)
-        if not changed:
+def _replace_matmul_k(stmts: tuple[Stmt, ...], K_o: Axis, K_i: Axis, sigma_k: Sigma) -> tuple[tuple[Stmt, ...], bool]:
+    """Walk ``stmts`` and replace the first matmul-shaped reduce Loop
+    with ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce, STAGE_INNER, σ_k(body)))``.
+    Returns ``(new_stmts, replaced_flag)``."""
+    out: list[Stmt] = []
+    replaced = False
+    for s in stmts:
+        if replaced:
+            out.append(s)
             continue
-        knobs = dict(loop_op.knobs)
-        knobs[BK.name] = bk
-        variants.append(LoopOp(body=new_body, knobs=knobs))
-    return variants or None
-
-
-def _bk_candidates_for(ctx: Context, loop_op: LoopOp, body_info: BodyInfo, K: int) -> tuple[int, ...]:
-    """Filter ``_BK_CANDIDATES`` by ``K % bk == 0`` ∧ ``K > bk``, with
-    the heuristic ``forced_bk`` value first when it qualifies."""
-    # Post-register-tile chain: walks ``loop_op.body`` outer free chain
-    # (chain breaks at REGISTER tags), so extents reflect the split.
-    chain = _outer_free_loop_chain(loop_op.body)
-    if chain:
-        output_extents = _chain_extents_desc(chain)
-    else:
-        output_extents = ()
-    forced = forced_bk(output_extents, body_info, ctx.static_smem_cap)
-    base = [c for c in _BK_CANDIDATES if K % c == 0 and K > c]
-    if forced is not None and K % forced == 0 and K > forced and forced not in base:
-        base = [forced, *base]
-    elif forced is not None and forced in base:
-        base = [forced, *(c for c in base if c != forced)]
-    return tuple(base)
+        if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
+            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            k_i_loop = Loop(axis=K_i, role=Role.STAGE_INNER, body=new_body)
+            k_o_loop = Loop(axis=K_o, role=Role.SERIAL_OUTER, body=(k_i_loop,))
+            out.append(k_o_loop)
+            replaced = True
+            continue
+        if isinstance(s, (Loop, StridedLoop)):
+            inner, r = _replace_matmul_k(s.body, K_o, K_i, sigma_k)
+            if r:
+                out.append(replace(s, body=inner))
+                replaced = True
+                continue
+        if isinstance(s, Cond):
+            inner_b, rb = _replace_matmul_k(s.body, K_o, K_i, sigma_k)
+            inner_e, re_ = _replace_matmul_k(s.else_body, K_o, K_i, sigma_k)
+            if rb or re_:
+                out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
+                replaced = True
+                continue
+        out.append(s)
+    return tuple(out), replaced
 
 
 def _find_first_matmul_reduce(stmts) -> Loop | None:
-    """Locate the first matmul-shaped reduce ``Loop`` reachable by
-    descent through Loops / StridedLoops / Conds."""
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
             return s
@@ -338,316 +416,122 @@ def _find_first_matmul_reduce(stmts) -> Loop | None:
     return None
 
 
-def _chunk_first_matmul_k(stmts, bk: int) -> tuple[tuple, bool]:
-    """Walk ``stmts``, replacing the first matmul-shaped reduce
-    ``Loop(K, …)`` with ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce,
-    STAGE_INNER, σ(body)))``."""
-    out: list[Stmt] = []
-    changed = False
-    for s in stmts:
-        if changed:
-            out.append(s)
-            continue
-        if isinstance(s, Loop) and s.is_reduce and is_matmul_reduce(s):
-            chunked = _chunk_k_loop(s, bk)
-            if chunked is not None:
-                out.append(chunked)
-                changed = True
-                continue
-        if isinstance(s, (Loop, StridedLoop)):
-            inner, inner_changed = _chunk_first_matmul_k(s.body, bk)
-            if inner_changed:
-                out.append(replace(s, body=inner))
-                changed = True
-                continue
-        if isinstance(s, Cond):
-            inner_b, cb = _chunk_first_matmul_k(s.body, bk)
-            inner_e, ce = _chunk_first_matmul_k(s.else_body, bk)
-            if cb or ce:
-                out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
-                changed = True
-                continue
-        out.append(s)
-    return tuple(out), changed
+# --- split-K epilogue rewrite (planner-side) -------------------------
 
 
-def _chunk_k_loop(loop: Loop, bk: int) -> Loop | None:
-    K = int(loop.axis.extent)
-    if K % bk != 0 or K <= bk:
-        return None
-    K_name = loop.axis.name
-    K_o = Axis(f"{K_name}_o", K // bk)
-    K_i = Axis(f"{K_name}_i", bk)
-    sigma = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
-    inner_body = tuple(s.rewrite(_identity_rename_k, sigma) for s in loop.body)
-    return Loop(
-        axis=K_o,
-        role=Role.SERIAL_OUTER,
-        body=(Loop(axis=K_i, role=Role.STAGE_INNER, body=inner_body),),
+def _rewrite_epilogue_for_splitk(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]:
+    """Rewrite the trailing ``Write`` so every CTA atomic-adds its
+    partial. Two split-K-safe shapes are recognized:
+
+    1. **Plain matmul**: trailing ``Write(out, idx, acc)`` directly →
+       ``Write(out, idx, acc, reduce_op=add)``.
+    2. **Linear-additive residual** (matmul_add): ``Assign(v, add, r, acc);
+       Write(out, idx, v)`` where ``r`` is a K-independent ``Load`` (either
+       in prelude or in epilogue position) → atomic ``Write(acc)`` +
+       ``Cond(K_s == 0, atomic Write(r))``.
+    3. **Linear-multiplicative chain**: ``Write.value`` is reachable from
+       ``acc`` only through multiplies whose other operand is acc-
+       independent → keep the chain, mark Write as atomic add.
+
+    If the shape doesn't match a known pattern, raises ``_BuildSkipped``.
+    """
+    stmts_list = list(stmts)
+    k_idx = next(
+        (i for i, s in enumerate(stmts_list) if isinstance(s, Loop) and s.role is Role.SERIAL_OUTER),
+        None,
     )
+    if k_idx is None:
+        raise _BuildSkipped("no SERIAL_OUTER K_o loop in inner stmts")
+    write_idx = next((i for i, s in enumerate(stmts_list) if isinstance(s, Write)), None)
+    if write_idx is None or write_idx <= k_idx:
+        raise _BuildSkipped("no Write found after K_o")
+    k_outer = stmts_list[k_idx]
+    write = stmts_list[write_idx]
+    prelude_stmts = stmts_list[:k_idx]
+    epilogue_stmts = stmts_list[k_idx + 1 : write_idx]
+    acc_name = _find_accum_name(k_outer)
+    if acc_name is None:
+        raise _BuildSkipped("could not find Accum name inside K_o body")
 
+    if not epilogue_stmts and write.value == acc_name:
+        new_write = replace(write, reduce_op=ElementwiseImpl("add"))
+        head = list(prelude_stmts) + [k_outer, new_write]
+        return tuple(head + stmts_list[write_idx + 1 :])
 
-def _identity_rename_k(name: str) -> str:
-    return name
+    if _is_linear_multiplicative_chain(epilogue_stmts, acc_name, write.value):
+        new_write = replace(write, reduce_op=ElementwiseImpl("add"))
+        head = list(prelude_stmts) + [k_outer] + list(epilogue_stmts) + [new_write]
+        return tuple(head + stmts_list[write_idx + 1 :])
 
-
-# --- non-matmul chunk-reduce branch ---------------------------------
-
-
-_REDUCE_BK_CANDIDATES = (128, 64, 32, 16, 8)
-_REDUCE_SLAB_CAP_BYTES = 16 * 1024
-_REDUCE_SLAB_HEADROOM_BYTES = 8 * 1024
-_BYTES_PER_ELEM = 4
-
-
-def _try_chunk_reduce(loop_op: LoopOp, body_info: BodyInfo) -> LoopOp | None:
-    """Chunk every non-matmul reduce Loop whose K-indexed Loads would
-    otherwise produce a smem slab over the ``007_stage_inputs`` cap."""
-    chain = _outer_free_loop_chain(loop_op.body)
-    if not chain:
-        return None
-    lifted = _lifted_output_loops(tuple(chain[-1].body))
-    combined = chain + lifted
-    thread_targets = _predict_thread_extents(body_info, chain, lifted)
-    if not thread_targets:
-        return None
-    new_body, changed = _chunk_reduces_in_body(loop_op.body, combined, thread_targets)
-    if not changed:
-        return None
-    return LoopOp(body=new_body, knobs=dict(loop_op.knobs))
-
-
-def _predict_thread_extents(body_info: BodyInfo, chain: tuple[Loop, ...], lifted: tuple[Loop, ...] = ()) -> tuple[int, ...] | None:
-    """Predicted per-axis thread extent for each outer-chain axis
-    followed by each lifted axis."""
-    output_extents = _chain_extents_desc(chain)
-    shape = thread_tile_shape(output_extents, body_info)  # innermost-first
-    targets_outer_first = tuple(reversed(shape))
-    extents: list[int] = []
-    for i, lp in enumerate(chain):
-        ext = int(lp.axis.extent)
-        if i < len(chain) - len(targets_outer_first):
-            extents.append(1)
-            continue
-        j = i - (len(chain) - len(targets_outer_first))
-        target = targets_outer_first[j]
-        extents.append(min(ext, target))
-    for lp in lifted:
-        extents.append(int(lp.axis.extent))
-    return tuple(extents)
-
-
-def _lifted_output_loops(stmts: tuple) -> tuple[Loop, ...]:
-    """Mirror ``001_tileify._lift_output_loops``."""
-    out: list[Loop] = []
-    for s in stmts:
-        if isinstance(s, Loop) and not s.is_reduce and s.role is not Role.REGISTER and _writes_with_axis(s.body, s.axis.name):
-            out.append(s)
-    return tuple(out)
-
-
-def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
-    for s in stmts:
-        if isinstance(s, Write):
-            free: set[str] = set()
-            for e in s.index:
-                free |= e.free_vars()
-            if axis_name in free:
-                return True
-        if isinstance(s, (Loop, StridedLoop)) and _writes_with_axis(s.body, axis_name):
-            return True
-        if isinstance(s, Cond):
-            if _writes_with_axis(s.body, axis_name) or _writes_with_axis(s.else_body, axis_name):
-                return True
-    return False
-
-
-def _chunk_reduces_in_body(stmts, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> tuple[tuple, bool]:
-    """Walk the body, chunking every qualifying non-matmul reduce."""
-    out: list[Stmt] = []
-    changed = False
-    for s in stmts:
-        if isinstance(s, Loop) and s.is_reduce and _reduce_qualifies(s, chain, thread_extents):
-            chunked = _chunk_reduce_loop(s, chain, thread_extents)
-            if chunked is not None:
-                out.append(chunked)
-                changed = True
-                continue
-        if isinstance(s, (Loop, StridedLoop)):
-            inner, inner_changed = _chunk_reduces_in_body(s.body, chain, thread_extents)
-            if inner_changed:
-                out.append(replace(s, body=inner))
-                changed = True
-                continue
-        if isinstance(s, Cond):
-            inner_b, cb = _chunk_reduces_in_body(s.body, chain, thread_extents)
-            inner_e, ce = _chunk_reduces_in_body(s.else_body, chain, thread_extents)
-            if cb or ce:
-                out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
-                changed = True
-                continue
-        out.append(s)
-    return tuple(out), changed
-
-
-def _reduce_qualifies(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> bool:
-    if is_matmul_reduce(loop):
-        return False
-    if loop.role is Role.STAGE_INNER:
-        return False
-    if any(inner.is_reduce for inner in loop.body.of_type(Loop)):
-        return False
-    has_fanin, max_in_ext, k_indexed_count = _slab_geometry(loop, chain, thread_extents)
-    if k_indexed_count == 0:
-        return False
-    K_extent = int(loop.axis.extent)
-    return has_fanin and K_extent * max_in_ext * _BYTES_PER_ELEM > _REDUCE_SLAB_CAP_BYTES
-
-
-def _slab_geometry(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]):
-    from deplodock.compiler.ir.stmt import Load
-
-    K_name = loop.axis.name
-    has_fanin = False
-    max_in_ext = 1
-    count = 0
-    for ld in loop.body.iter_of_type(Load):
-        ld_vars = {v for e in ld.index for v in e.free_vars()}
-        if K_name not in ld_vars:
-            continue
-        count += 1
-        in_ext = 1
-        for lp, t_ext in zip(chain, thread_extents, strict=True):
-            if t_ext <= 1:
-                continue
-            if lp.axis.name in ld_vars:
-                in_ext *= t_ext
-            else:
-                has_fanin = True
-        max_in_ext = max(max_in_ext, in_ext)
-    return has_fanin, max_in_ext, count
-
-
-def _chunk_reduce_loop(loop: Loop, chain: tuple[Loop, ...], thread_extents: tuple[int, ...]) -> Loop | None:
-    K = int(loop.axis.extent)
-    _, max_in_ext, _ = _slab_geometry(loop, chain, thread_extents)
-    bk = _pick_reduce_bk(K, max_in_ext)
-    if bk is None:
-        return None
-    K_name = loop.axis.name
-    K_o = Axis(f"{K_name}_o", K // bk)
-    K_i = Axis(f"{K_name}_i", bk)
-    sigma = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
-    inner = tuple(s.rewrite(_identity_rename_k, sigma) for s in loop.body)
-    return Loop(
-        axis=K_o,
-        role=Role.SERIAL_OUTER,
-        body=(Loop(axis=K_i, role=Role.STAGE_INNER, body=inner),),
+    residual = _extract_simple_residual(prelude_stmts, epilogue_stmts, acc_name, write.value)
+    if residual is None:
+        raise _BuildSkipped("epilogue isn't a split-K-safe shape")
+    residual_name, residual_in_epilogue = residual
+    cond_write = Write(output=write.output, index=write.index, value=residual_name, reduce_op=ElementwiseImpl("add"))
+    always_write = Write(output=write.output, index=write.index, value=acc_name, reduce_op=ElementwiseImpl("add"))
+    if residual_in_epilogue:
+        residual_load = next(s for s in epilogue_stmts[:-1] if hasattr(s, "name") and s.name == residual_name)
+        cond_body = (residual_load, cond_write)
+    else:
+        cond_body = (cond_write,)
+    cond = Cond(
+        cond=BinaryExpr("==", Var(k_s_name), Literal(0, "int")),
+        body=Body(cond_body),
+        else_body=Body(()),
     )
+    head = list(prelude_stmts) + [k_outer, always_write, cond]
+    return tuple(head + stmts_list[write_idx + 1 :])
 
 
-def _pick_reduce_bk(K: int, in_extent_product: int) -> int | None:
-    if in_extent_product < 1:
-        in_extent_product = 1
-    for c in _REDUCE_BK_CANDIDATES:
-        if K % c != 0 or K <= c:
-            continue
-        if in_extent_product * c * _BYTES_PER_ELEM > _REDUCE_SLAB_HEADROOM_BYTES:
-            continue
-        return c
+def _find_accum_name(k_o_loop: Loop) -> str | None:
+    for s in k_o_loop.body.iter():
+        if isinstance(s, Accum):
+            return s.name
     return None
 
 
-# --- matmul (BN, BM) stamp fork --------------------------------------
+def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_value: str) -> bool:
+    """See ``003_split_matmul_k._is_linear_multiplicative_chain``."""
+    acc_dep = {acc_name}
+    for s in epilogue_stmts:
+        deps = set(s.deps())
+        touches_acc = bool(deps & acc_dep)
+        if not touches_acc:
+            continue
+        if not isinstance(s, Assign):
+            return False
+        if s.op.name != "multiply":
+            return False
+        if len(s.args) != 2:
+            return False
+        a, b = s.args
+        a_dep = a in acc_dep
+        b_dep = b in acc_dep
+        if a_dep == b_dep:
+            return False
+        acc_dep.add(s.name)
+    return write_value in acc_dep
 
 
-def _try_matmul_bn_bm_fork(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Enumerate ``(BN, BM)`` candidates and stamp them as knobs (no
-    body change). ``004_launch_geometry`` reads BN/BM from knobs and
-    does the deterministic axis split."""
-    if not body_info.has_matmul:
+def _extract_simple_residual(prelude_stmts, epilogue_stmts: list, acc_name: str, write_value: str):
+    """See ``003_split_matmul_k._extract_simple_residual``."""
+    if not epilogue_stmts:
         return None
-    if "BN" in loop_op.knobs:
+    asn = epilogue_stmts[-1]
+    if not isinstance(asn, Assign):
         return None
-    chain = _outer_free_loop_chain(loop_op.body)
-    if len(chain) < 2:
+    if asn.name != write_value:
         return None
-
-    ext_outer = int(chain[-2].axis.extent)
-    ext_inner = int(chain[-1].axis.extent)
-
-    output_extents = _chain_extents_desc(chain)
-    heuristic = thread_tile_shape(output_extents, body_info)
-    h_bn = int(heuristic[0]) if len(heuristic) >= 1 else _TUNE_AXIS_CHOICES[2]
-    h_bm = int(heuristic[1]) if len(heuristic) >= 2 else _TUNE_AXIS_CHOICES[2]
-
-    seen: set[tuple[int, int]] = set()
-    ordered: list[tuple[int, int]] = []
-
-    def _add(bn: int, bm: int) -> None:
-        bn = min(bn, ext_inner)
-        bm = min(bm, ext_outer)
-        if ext_inner > bn and ext_inner % bn != 0:
-            return
-        if ext_outer > bm and ext_outer % bm != 0:
-            return
-        if bn == ext_inner and bm == ext_outer:
-            return
-        if bn * bm > 1024:
-            return
-        shape = (bn, bm)
-        if shape in seen:
-            return
-        seen.add(shape)
-        ordered.append(shape)
-
-    _add(h_bn, h_bm)
-    for bn in _TUNE_AXIS_CHOICES:
-        for bm in _TUNE_AXIS_CHOICES:
-            _add(bn, bm)
-
-    variants: list[LoopOp] = []
-    for bn, bm in ordered:
-        knobs = {**loop_op.knobs, "BN": bn, "BM": bm}
-        variants.append(LoopOp(body=loop_op.body, knobs=knobs))
-    return variants or None
-
-
-# --- SPLITK stamp fork ----------------------------------------------
-
-
-def _try_splitk(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Enumerate ``SPLITK`` candidates and stamp them as knobs."""
-    if not body_info.has_matmul:
+    if asn.op.name != "add":
         return None
-    if "SPLITK" in loop_op.knobs:
+    if acc_name not in asn.args or len(asn.args) != 2:
         return None
-    chain = _outer_free_loop_chain(loop_op.body)
-    inner_body = tuple(chain[-1].body) if chain else tuple(loop_op.body)
-    k_o = _find_serial_outer_k(inner_body)
-    if k_o is None:
+    other = next(a for a in asn.args if a != acc_name)
+    earlier = epilogue_stmts[:-1]
+    if any(not isinstance(s, Load) for s in earlier):
         return None
-    K_o_extent = int(k_o.axis.extent)
-
-    output_extents = _chain_extents_desc(chain) if chain else ()
-    thread_extents = tuple(int(lp.axis.extent) for lp in chain)
-    heuristic = int(auto_splitk(output_extents, body_info, K_o_extent, thread_extents))
-    if heuristic <= 1:
-        return None
-    knobs = {**loop_op.knobs, "SPLITK": heuristic}
-    return [LoopOp(body=loop_op.body, knobs=knobs)]
-
-
-def _find_serial_outer_k(stmts) -> Loop | None:
-    for s in stmts:
-        if isinstance(s, Loop) and s.role is Role.SERIAL_OUTER:
-            return s
-        if isinstance(s, (Loop, StridedLoop)):
-            found = _find_serial_outer_k(s.body)
-            if found is not None:
-                return found
-        if isinstance(s, Cond):
-            found = _find_serial_outer_k(s.body) or _find_serial_outer_k(s.else_body)
-            if found is not None:
-                return found
+    if any(s.name == other for s in earlier if isinstance(s, Load)):
+        return (other, True)
+    if any(isinstance(s, Load) and s.name == other for s in prelude_stmts):
+        return (other, False)
     return None

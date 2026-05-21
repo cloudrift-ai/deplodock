@@ -31,7 +31,7 @@ changes.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis, Role
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis, Role
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Cond, Loop, StridedLoop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
@@ -39,6 +39,17 @@ from deplodock.compiler.ir.tile.ir import Stmt, Tile, TileOp
 from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", LoopOp)]
+
+
+def _bind_for_role(role: Role | None) -> str:
+    """Resolve the ``BoundAxis.bind`` for a chain-lifted Loop. Untagged
+    Loops default to ``BIND_THREAD`` (legacy behavior for kernels the
+    planner hasn't fully tagged)."""
+    if role is Role.BLOCK or role is Role.SPLITK_BLOCK:
+        return BIND_BLOCK
+    if role is Role.THREAD:
+        return BIND_THREAD
+    return BIND_THREAD
 
 
 def rewrite(root: Node) -> Graph | None:
@@ -68,11 +79,11 @@ def tileify(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
         leading.append(rest[0])
         rest = rest[1:]
 
-    output_axes, inner = _strip_outer_free_chain(rest)
+    output_axes_with_bind, inner = _strip_outer_free_chain(rest)
 
     body: list[Stmt] = list(leading)
-    if output_axes:
-        bound = tuple(BoundAxis(axis=ax, bind=BIND_THREAD) for ax in output_axes)
+    if output_axes_with_bind:
+        bound = tuple(BoundAxis(axis=ax, bind=bind) for ax, bind in output_axes_with_bind)
         body.append(_lift_output_loops(Tile(axes=bound, body=inner)))
     else:
         body.extend(inner)
@@ -82,24 +93,22 @@ def tileify(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
 
 def _lift_output_loops(tile: Tile) -> Tile:
     """Lift top-level free Loops that wrap a Write whose index varies
-    with the loop's axis into ``Tile.axes`` (THREAD). Only top-level
-    body stmts are considered — nested promotions would mix loop
-    ordering decisions with reduction structure.
+    with the loop's axis into ``Tile.axes``. Tagged Loops bind via
+    :func:`_bind_for_role`; untagged Loops default to ``BIND_THREAD``.
 
-    SDPA's head-dim free loop sits at top level (after the two softmax
-    reduces) so this catches the case we care about; without lifting,
-    every thread re-runs the inner reduce per head-dim element.
-
-    REGISTER-tagged Loops are skipped — the planner pre-split them as
-    the inner half of an output-axis register tile, and ``008_register_tile``
-    later replicates their bodies along the axis.
-    """
+    REGISTER / SERIAL_OUTER / STAGE_INNER tags are skipped — they
+    belong in the body."""
     new_axes = list(tile.axes)
     new_body: list[Stmt] = []
     changed = False
     for s in tile.body:
-        if isinstance(s, Loop) and not s.is_reduce and s.role is not Role.REGISTER and _writes_with_axis(s.body, s.axis.name):
-            new_axes.append(BoundAxis(axis=s.axis, bind=BIND_THREAD))
+        if (
+            isinstance(s, Loop)
+            and not s.is_reduce
+            and s.role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE)
+            and _writes_with_axis(s.body, s.axis.name)
+        ):
+            new_axes.append(BoundAxis(axis=s.axis, bind=_bind_for_role(s.role)))
             new_body.extend(s.body)
             changed = True
         else:
@@ -125,22 +134,27 @@ def _writes_with_axis(stmts: tuple, axis_name: str) -> bool:
     return False
 
 
-def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[Axis, ...], tuple[LoopStmt, ...]]:
-    """Walk the outer free-Loop chain and return ``(stripped_axes, remainder)``.
+def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[tuple[Axis, str], ...], tuple[LoopStmt, ...]]:
+    """Walk the outer free-Loop chain and return ``(stripped_axes_with_bind, remainder)``.
 
     Stops when the current level has more than one stmt, isn't a Loop, or
-    is a Loop whose body contains an ``Accum`` at the immediate level (a
-    reduce Loop — stripping it would lose the accumulator).
+    is a reduce Loop, or carries a body-resident role (REGISTER /
+    SERIAL_OUTER / STAGE_INNER / PIPELINE).
 
-    Also stops at REGISTER-tagged Loops: those mark the inner half of a
-    planner-decided output-axis register tile and stay as body Loops so
-    ``008_register_tile`` can replicate their bodies."""
-    axes: list[Axis] = []
+    Tagged Loops (BLOCK / THREAD / SPLITK_BLOCK) bind via
+    :func:`_bind_for_role`; untagged Loops default to ``BIND_THREAD``
+    (legacy behavior for kernels the planner hasn't fully tagged)."""
+    axes_with_bind: list[tuple[Axis, str]] = []
     cur = stmts
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is not Role.REGISTER:
-        axes.append(cur[0].axis)
+    while (
+        len(cur) == 1
+        and isinstance(cur[0], Loop)
+        and not cur[0].is_reduce
+        and cur[0].role not in (Role.REGISTER, Role.SERIAL_OUTER, Role.STAGE_INNER, Role.PIPELINE)
+    ):
+        axes_with_bind.append((cur[0].axis, _bind_for_role(cur[0].role)))
         cur = cur[0].body
-    return tuple(axes), cur
+    return tuple(axes_with_bind), cur
 
 
 def _kernel_name_for(loop: LoopOp, base_name: str) -> str:
