@@ -47,7 +47,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, Stmt, StridedLoop, Tile
+from deplodock.compiler.ir.stmt import Loop, Tile
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -173,62 +173,6 @@ def _thread_split_site(axis_name: str, factor: int) -> _Site:
     return _Site(axis=axis_name, factor=factor, apply=apply)
 
 
-def _normalize_unroll_site(axis_name: str, factor: int) -> _Site:
-    """Widen the post-reduce *normalize* ``StridedLoop`` (non-reduce
-    wrapper produced by ``005_cooperative_reduce`` Phase 3) on
-    ``axis_name`` by ``factor``; replicate its body with
-    ``σ: axis → axis + i * step``. No accumulator-fold chain: this
-    wrapper has no ``Accum`` — its body is Load / Assign / Write that
-    computes and emits one normalized output cell per replica."""
-
-    def apply(tile: Tile) -> Tile:
-        new_body: list[Stmt] = []
-        for s in tile.body:
-            if isinstance(s, StridedLoop) and not s.is_reduce and s.axis.name == axis_name and isinstance(s.step, Literal):
-                step = int(s.step.value)
-                if int(s.axis.extent) % (step * factor) != 0:
-                    new_body.append(s)
-                    continue
-                inner = replicate_along_axis(s.body, axis_name, factor, _sigma_offset(axis_name, step))
-                new_body.append(StridedLoop(axis=s.axis, start=s.start, step=Literal(step * factor, "int"), body=inner, unroll=s.unroll))
-            else:
-                new_body.append(s)
-        return Tile(axes=tile.axes, body=Body(new_body))
-
-    return _Site(axis=axis_name, factor=factor, apply=apply)
-
-
-def _reduce_unroll_site(axis_name: str, factor: int) -> _Site:
-    """Widen the reduce ``StridedLoop`` on ``axis_name`` by ``factor``;
-    replicate its body with ``σ: axis → axis + i * step``; fold
-    ``acc_0..acc_{F-1}`` back into the original Accum name so the
-    downstream Combine sees a single value."""
-
-    def apply(tile: Tile) -> Tile:
-        new_body: list[Stmt] = []
-        for s in tile.body:
-            if isinstance(s, StridedLoop) and s.is_reduce and s.axis.name == axis_name and isinstance(s.step, Literal):
-                step = int(s.step.value)
-                if int(s.axis.extent) % (step * factor) != 0:
-                    new_body.append(s)
-                    continue
-                accums = [(a.name, a.op) for a in s.body if isinstance(a, Accum)]
-                inner = replicate_along_axis(s.body, axis_name, factor, _sigma_offset(axis_name, step))
-                new_body.append(StridedLoop(axis=s.axis, start=s.start, step=Literal(step * factor, "int"), body=inner, unroll=s.unroll))
-                for orig_name, op in accums:
-                    # Chain binary folds: acc_0 op acc_1 → t1; t1 op acc_2 → t2; … last → orig_name.
-                    cur = f"{orig_name}_0"
-                    for i in range(1, factor):
-                        t_name = orig_name if i == factor - 1 else f"{orig_name}_fold{i}"
-                        new_body.append(Assign(name=t_name, op=op, args=(cur, f"{orig_name}_{i}")))
-                        cur = t_name
-            else:
-                new_body.append(s)
-        return Tile(axes=tile.axes, body=Body(new_body))
-
-    return _Site(axis=axis_name, factor=factor, apply=apply)
-
-
 def _divisors(n: int, cap: int) -> tuple[int, ...]:
     """All divisors of ``n`` up to ``cap``, ascending."""
     return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
@@ -283,99 +227,37 @@ def _enumerate_combos(
 
 def _find_slots(tile: Tile) -> list[_Slot]:
     """Emit one ``_Slot`` per tilable nest level. Matmul body → two
-    slots (M-axis outer → ``FM``, N-axis inner → ``FN``), one site
-    each. Cooperative-reduce body → one slot at the innermost level
-    (``FN``), one site per reduce ``StridedLoop`` with shared factor.
-    Returns ``[]`` when neither shape matches or no factor > 1 fits.
+    slots (M-axis outer → ``FM``, N-axis inner → ``FN``), one site each.
+
+    Returns ``[]`` when the body isn't matmul-shaped or no factor > 1
+    fits. The cooperative-reduce slot (``StridedLoop`` unroll) has been
+    removed alongside the cooperative-reduce pipeline.
 
     The matmul branch is the fallback path for kernels where the
     planner's pre-blockify ``register_tile_shape`` heuristic returned
     ``(1, 1)`` (small / fused matmuls — SDPA's 32×64 inner matmul);
     those kernels arrive here without an FN stamp and this rule does
     the post-blockify register-tile split."""
-    from math import gcd  # noqa: PLC0415
-
-    if any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
-        heuristic = register_tile_shape(tile)
-        if heuristic[0] <= 1 and heuristic[1] <= 1:
-            return []
-        thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
-        if len(thread_axes) != 2:
-            return []
-        sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
-        knob_names = (FM.name, FN.name)
-        return [
-            _Slot(
-                knob=knob_names[i],
-                label=ba.axis.name,
-                extent=int(ba.axis.extent),
-                choices=_TUNE_F_CHOICES,
-                heuristic=int(h),
-                make_sites=(lambda f, name=ba.axis.name: [_thread_split_site(name, f)]),
-            )
-            for i, (ba, h) in enumerate(zip(sorted_ba, heuristic, strict=True))
-        ]
-
-    reduce_loops = [s for s in tile.body if isinstance(s, StridedLoop) and s.is_reduce and isinstance(s.step, Literal)]
-    if not reduce_loops:
+    if not any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
         return []
-    per_thread_iters = []
-    for sl in reduce_loops:
-        ext = int(sl.axis.extent)
-        step = int(sl.step.value)
-        if step <= 0 or ext % step != 0:
-            return []
-        per_thread_iters.append(ext // step)
-    # The post-reduce normalize ``StridedLoop`` (005 Phase 3, non-reduce,
-    # axis name aliased to a reduce axis) participates in the same slot:
-    # unrolling it by the same F gives the epilogue Load/Write chain F
-    # consecutive copies that 009b can permute and 003_vectorize_loads /
-    # 005_vectorize_stores can fold. Include its per-thread iter count
-    # in the gcd so F always divides cleanly.
-    reduce_axis_set = {sl.axis.name for sl in reduce_loops}
-    normalize_loops = [
-        s
-        for s in tile.body
-        if isinstance(s, StridedLoop) and not s.is_reduce and isinstance(s.step, Literal) and s.axis.name in reduce_axis_set
-    ]
-    for sl in normalize_loops:
-        ext = int(sl.axis.extent)
-        step = int(sl.step.value)
-        if step <= 0 or ext % step != 0:
-            return []
-        per_thread_iters.append(ext // step)
-    # gcd of per-loop iter counts → factor dividing it divides them all.
-    slot_extent = per_thread_iters[0]
-    for it in per_thread_iters[1:]:
-        slot_extent = gcd(slot_extent, it)
-    if slot_extent < 2:
+    heuristic = register_tile_shape(tile)
+    if heuristic[0] <= 1 and heuristic[1] <= 1:
         return []
-    reduce_axis_names = tuple(sl.axis.name for sl in reduce_loops)
-    normalize_axis_names = tuple(sl.axis.name for sl in normalize_loops)
-    # All divisors of ``slot_extent`` (not just powers of two) — Qwen-style
-    # hidden dims like 3584 give per-thread iters = 14, whose only useful
-    # factors are {2, 7, 14}; restricting to powers of two would leave
-    # only FN=2 on the table.
-    #
-    # ``heuristic`` = the largest valid factor (most aggressive unroll —
-    # best ILP for the accumulator chain) so deterministic compiles pick
-    # FN=14 over FN=2 on rmsnorm.qwen.s32 (saves ~33%). Autotune sweeps
-    # the smaller factors after.
-    divisors = _divisors(slot_extent, _MAX_CELLS_PER_THREAD)
+    thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
+    if len(thread_axes) != 2:
+        return []
+    sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
+    knob_names = (FM.name, FN.name)
     return [
         _Slot(
-            knob=FN.name,
-            label="reduce",
-            extent=slot_extent,
-            choices=divisors,
-            heuristic=max(divisors),
-            make_sites=(
-                lambda f, ra=reduce_axis_names, na=normalize_axis_names: [
-                    *(_reduce_unroll_site(a, f) for a in ra),
-                    *(_normalize_unroll_site(a, f) for a in na),
-                ]
-            ),
+            knob=knob_names[i],
+            label=ba.axis.name,
+            extent=int(ba.axis.extent),
+            choices=_TUNE_F_CHOICES,
+            heuristic=int(h),
+            make_sites=(lambda f, name=ba.axis.name: [_thread_split_site(name, f)]),
         )
+        for i, (ba, h) in enumerate(zip(sorted_ba, heuristic, strict=True))
     ]
 
 
@@ -384,16 +266,5 @@ def _sigma_split(axis: str, axis_o: str, factor: int) -> Callable[[int], Sigma]:
 
     def _f(i: int) -> Sigma:
         return Sigma({axis: Var(axis_o) * Literal(factor, "int") + Literal(i, "int")})
-
-    return _f
-
-
-def _sigma_offset(axis: str, step: int) -> Callable[[int], Sigma]:
-    """σ for reduction-axis unroll: ``axis → axis + i * step`` (identity for i=0)."""
-
-    def _f(i: int) -> Sigma:
-        if i == 0:
-            return Sigma.IDENTITY
-        return Sigma({axis: Var(axis) + Literal(i * step, "int")})
 
     return _f

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
@@ -37,7 +39,10 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 _M, _K, _N = 32, 32, 32
 
+_COOP_XFAIL = pytest.mark.xfail(reason="cooperative-reduce removed; planner-driven replacement pending", strict=False)
 
+
+@_COOP_XFAIL
 def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     """``sum(x, axis=-1)`` with K=256 → cooperative_reduce fires; matmul-
     shape rule (chunk_matmul_k) does not (single-buffer reduce)."""
@@ -67,6 +72,7 @@ def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
     assert "cooperative_reduce" not in fired
 
 
+@_COOP_XFAIL
 def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
     """K=32 ≥ WARP_SIZE → cooperative_reduce fires with a 32-thread
     cooperative block (the gate was lowered from BLOCK_SIZE to
@@ -83,6 +89,7 @@ def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
     assert "cooperative_reduce" in fired
 
 
+@_COOP_XFAIL
 def test_warp_cooperative_skips_stage_inputs(recording_dump):
     """K=32 → cooperative tile has 32 threads (one warp); stage_inputs
     must skip so the kernel stays smem-free (the WarpShuffle combine
@@ -110,6 +117,7 @@ def _kernel_body_stmts(g: Graph):
     return out
 
 
+@_COOP_XFAIL
 def test_warp_cooperative_emits_warpshuffle(recording_dump):
     """K=32 cooperative tile → ``materialize_tile._emit_combine`` picks
     the warp path: ``WarpShuffle`` Stmt appears, no ``TreeHalve``."""
@@ -125,6 +133,7 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
     assert not any(isinstance(s, TreeHalve) for s in stmts)
 
 
+@_COOP_XFAIL
 def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
     """K=256 cooperative tile → ``materialize_tile._emit_combine`` picks
     the hierarchical path: ``WarpShuffle`` reduces lanes within each
@@ -147,6 +156,7 @@ def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
     assert all(t.length < 256 for t in tree_halves), [t.length for t in tree_halves]
 
 
+@_COOP_XFAIL
 def test_block_cooperative_still_uses_stage_inputs(recording_dump):
     """K=256 → cooperative tile has BLOCK_SIZE threads; stage_inputs
     still fires (the smem stage avoids redundant DRAM reads when the

@@ -1,18 +1,12 @@
-"""Unified launch-geometry pass — decides ``Tile.axes`` shape for matmul,
-cooperative-reduce, and pointwise bodies in one place.
+"""Unified launch-geometry pass — decides ``Tile.axes`` shape for matmul
+and pointwise bodies in one place.
 
-Three paths, dispatched on body shape:
+Two paths, dispatched on body shape:
 
 - **Matmul** (body has a matmul-shape reduce ``Loop``): partition each
   output axis into ``(BLOCK_grid, THREAD_tile)`` per a ``(BN, BM)``
   candidate; emit one ``TileOp`` variant per viable candidate
   (heuristic first; autotune explores the rest).
-- **Cooperative reduce** (body has a reduce ``Loop`` with extent
-  ≥ ``WARP_SIZE`` and independent Accums): leave the body alone, but
-  rebind every output axis to ``BIND_BLOCK`` and add a synthetic
-  ``t=THREAD`` axis sized to a power-of-two threads-per-CTA. The
-  follow-up ``005_cooperative_reduce`` materializes the StridedLoop
-  body rewrite and the post-reduce epilogue wrap.
 - **Pointwise** (everything else): deterministic ``thread_tile_shape``
   partition. Same behavior as the old non-matmul branch of
   ``blockify_launch``.
@@ -22,16 +16,21 @@ Pre-conditions: ``TileOp`` containing exactly one ``Tile`` with
 
 Idempotent: if a Tile already has ``block_axes`` set or the partition
 is a no-op (every axis fits one CTA), the pass skips.
+
+Note: the cooperative-reduce launch path (synthetic ``t=THREAD`` axis +
+``Role.COOPERATIVE_STRIDE`` tag) has been removed pending a planner-
+driven replacement. The ``_accums_independent`` helper is kept here for
+unit-test consumers (``tests/compiler/passes/test_reduction_rules.py``).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis, Role
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import BLOCK_SIZE, TileOp
+from deplodock.compiler.ir.stmt import Accum, Body, Stmt, Tile
+from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
@@ -64,22 +63,7 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
             return variants[0]
         return variants
 
-    if _has_cooperative_stride_tag(tile):
-        # Planner pre-tagged the cooperative reduce(s) and stamped BN.
-        # The launch is now deterministic: read BN from the parent
-        # TileOp's knobs and emit a single variant.
-        bn = root.op.knobs.get(BN.name)
-        if bn is None:
-            raise RuleSkipped("cooperative-stride tag present but BN knob missing")
-        return _emit_cooperative_launch_deterministic(body, idx, tile, root.op.name, int(bn), root.op.knobs)
-
-    if _cooperative_viable(tile):
-        result = _emit_cooperative_launch(body, idx, tile, root.op.name)
-        if isinstance(result, list) and not result:
-            raise RuleSkipped("no viable BN candidate for cooperative reduce")
-        return result
-
-    # Pointwise / non-matmul / non-cooperative: deterministic partition.
+    # Pointwise / non-matmul: deterministic partition.
     new_axes, sigma_map = _plan_partition(tile, thread_tile_shape(tile))
     if _is_noop_plan(tile, new_axes, sigma_map):
         raise RuleSkipped("partition is a no-op — tile already fits one CTA")
@@ -87,112 +71,13 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
     return TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=root.op.name)
 
 
-# ---------------------------------------------------------------------------
-# Cooperative-reduce launch
-# ---------------------------------------------------------------------------
-
-
-def _next_pow2(n: int) -> int:
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
-
-
-def _effective_block_size(reduce_extent: int) -> int:
-    """Threads/CTA for the cooperative reduce. Capped at the configured
-    ``BLOCK_SIZE``; floored at ``WARP_SIZE`` so the cross-thread combine
-    has a full warp."""
-    return max(_WARP_SIZE, min(BLOCK_SIZE, _next_pow2(reduce_extent)))
-
-
 def _accums_independent(body: Body) -> bool:
     """True iff no Accum's value transitively depends on another Accum's
     running value. Permits multiple independent Accums; rejects online
-    algorithms (online softmax, Welford)."""
+    algorithms (online softmax, Welford). Retained for unit tests."""
     body = Body.coerce(body)
     accum_names = {s.name for s in body if isinstance(s, Accum)}
     return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
-
-
-def _has_cooperative_stride_tag(tile: Tile) -> bool:
-    """True iff any reduce Loop in ``tile.body`` carries the planner's
-    ``Role.COOPERATIVE_STRIDE`` tag — signals the planner already
-    elected cooperative launch and stamped ``BN``."""
-    return any(lp.role is Role.COOPERATIVE_STRIDE for lp in tile.body.iter_of_type(Loop))
-
-
-def _emit_cooperative_launch_deterministic(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str, bn: int, parent_knobs: dict) -> TileOp:
-    """Planner-driven cooperative launch: add ``t=THREAD`` axis sized to
-    ``bn`` and rebind every output axis to ``BLOCK``. No fork — the
-    planner already enumerated BN candidates."""
-    t_axis = Axis("t", bn)
-    new_axes = (
-        BoundAxis(axis=t_axis, bind=BIND_THREAD),
-        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in tile.axes),
-    )
-    new_tile = Tile(axes=new_axes, body=tile.body)
-    # No new knobs — BN was stamped on the parent LoopOp by the planner
-    # and propagates via ``Candidate.apply``.
-    del parent_knobs
-    return TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=name)
-
-
-def _cooperative_viable(tile: Tile) -> bool:
-    """True iff this Tile's body is a cooperative-reduce candidate:
-    has a reduce Loop with extent ≥ WARP_SIZE, every reduce Loop has at
-    least one Accum, and Accums are independent."""
-    if not tile.thread_axes:
-        return False
-    reduce_loops = [loop for loop in tile.body.of_type(Loop) if loop.is_reduce]
-    if not reduce_loops:
-        return False
-    if int(reduce_loops[0].axis.extent) < _WARP_SIZE:
-        return False
-    for rl in reduce_loops:
-        if not any(isinstance(s, Accum) for s in rl.body):
-            return False
-        if not _accums_independent(rl.body):
-            return False
-    return True
-
-
-def _emit_cooperative_launch(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str) -> list[TileOp] | TileOp:
-    """Add a synthetic ``t=THREAD`` axis and rebind every existing output
-    axis to ``BIND_BLOCK``. The body is left untouched —
-    ``005_cooperative_reduce`` performs the StridedLoop rewrite and the
-    naked-axis epilogue wrap.
-
-    Forks over ``BN`` (cooperative thread count) so autotune can search
-    the threads-per-CTA × per-thread-iter-count trade-off jointly with
-    ``008_register_tile``'s ``FN``. Heuristic = the historical
-    ``_effective_block_size`` so deterministic compiles pick option 0
-    with no behavior change; smaller BN values follow."""
-    reduce_loops = [loop for loop in tile.body.of_type(Loop) if loop.is_reduce]
-    reduce_extent = int(reduce_loops[0].axis.extent)
-    heuristic_bn = _effective_block_size(reduce_extent)
-    # BN candidates: in _TUNE_AXIS_CHOICES, ≥ WARP_SIZE, ≤ heuristic_bn.
-    # Capping at heuristic_bn keeps BN ≤ next_pow2(extent), so threads
-    # never outnumber elements; otherwise we'd waste threads idle on
-    # short rows.
-    bn_candidates = sorted({bn for bn in _TUNE_AXIS_CHOICES if _WARP_SIZE <= bn <= heuristic_bn}, reverse=True)
-    if heuristic_bn not in bn_candidates:
-        bn_candidates.insert(0, heuristic_bn)
-    # Move heuristic to the front so deterministic compiles pick it.
-    bn_candidates = [heuristic_bn] + [bn for bn in bn_candidates if bn != heuristic_bn]
-
-    variants: list[TileOp] = []
-    for bn in bn_candidates:
-        t_axis = Axis("t", bn)
-        new_axes = (
-            BoundAxis(axis=t_axis, bind=BIND_THREAD),
-            *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in tile.axes),
-        )
-        new_tile = Tile(axes=new_axes, body=tile.body)
-        variants.append(TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=name, knobs={BN.name: bn}))
-    if len(variants) == 1:
-        return variants[0]
-    return variants
 
 
 # ---------------------------------------------------------------------------
