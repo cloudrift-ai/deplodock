@@ -249,8 +249,11 @@ def _external_input_count(stmts) -> int:
     bufs: set[str] = set()
     for s in body.iter():
         if isinstance(s, Stage):
-            for src_load in s.source_loads:
-                bufs.add(src_load.input)
+            # ``Stage.external_reads`` returns the gmem buffer names; a
+            # ``ComputeStage`` overrides it to ``()`` because its body
+            # Loads read sibling Stage smem, not gmem.
+            for buf_name in s.external_reads():
+                bufs.add(buf_name)
         elif isinstance(s, Load) and s.input not in stage_names:
             bufs.add(s.input)
     return len(bufs)

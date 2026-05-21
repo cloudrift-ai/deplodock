@@ -42,7 +42,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
-from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import BufferedStage, ComputeStage, Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, single_tile
@@ -167,16 +167,24 @@ def _double_buffer(loop: Loop) -> Loop | None:
 
     phase = Var(loop.axis.name) % Literal(_BUFFER_COUNT, "int")
     staged_names: set[str] = set()
-    # Collect existing stage names so we can identify compute stages
-    # (multi-source bodies whose sources are sibling stages, not gmem).
-    sibling_stage_names = {s.name for s in loop.body if isinstance(s, Stage)}
 
     new_body: list[Stmt] = []
     for s in loop.body:
-        # Single-source transport stages — the standard double-buffer
-        # promotion (ring smem + phase prefix on body Load + reduce-body
-        # Load rewrite).
-        if isinstance(s, Stage) and len(s.source_loads) == 1:
+        if isinstance(s, ComputeStage):
+            # ComputeStage: body Loads read sibling Stage smem. Prepend
+            # phase so the compute consumes the slot the producer just
+            # wrote. When BUFFER_COMPUTE is set, ring-buffer the compute
+            # stage's own output too — experimental, lets a downstream
+            # pass try to overlap compute and reduce across K_outer
+            # iterations.
+            new_inner_body = s.body.map(_make_load_rewriter(staged_names, phase))
+            if buffer_compute:
+                staged_names.add(s.name)
+                new_body.append(dc_replace(s, body=new_inner_body, buffer_count=_BUFFER_COUNT, phase=phase))
+            else:
+                new_body.append(dc_replace(s, body=new_inner_body))
+        elif isinstance(s, Stage) and len(s.source_loads) == 1:
+            # Single-source transport — standard double-buffer promotion.
             staged_names.add(s.name)
             new_body.append(
                 BufferedStage(
@@ -190,32 +198,11 @@ def _double_buffer(loop: Loop) -> Loop | None:
             )
         elif isinstance(s, Loop) and s.is_reduce:
             new_body.append(dc_replace(s, body=s.body.map(_make_load_rewriter(staged_names, phase))))
-        elif isinstance(s, Stage) and len(s.source_loads) > 1:
-            # Multi-source compute Stage (produced by 007c_split). Its
-            # body reads from sibling transport stages' smem buffers.
-            # Always prepend phase to those body Loads so the compute
-            # consumes the slot the producer just wrote. Additionally,
-            # when the BUFFER_COMPUTE knob is set, promote the compute
-            # stage itself to BufferedStage so its output (fused_smem) is
-            # ring-buffered — experimental, lets a downstream pass try to
-            # overlap compute and reduce across K_outer iterations.
-            sources_are_siblings = all(src.input in sibling_stage_names for src in s.source_loads)
-            new_inner_body = s.body.map(_make_load_rewriter(staged_names, phase))
-            if buffer_compute and sources_are_siblings:
-                staged_names.add(s.name)
-                new_body.append(
-                    BufferedStage(
-                        name=s.name,
-                        axes=s.axes,
-                        body=new_inner_body,
-                        pad=s.pad,
-                        buffer_count=_BUFFER_COUNT,
-                        phase=phase,
-                    )
-                )
-            else:
-                new_body.append(dc_replace(s, body=new_inner_body))
         else:
+            # Multi-source inline-fuse Stage and any other stmt: pass
+            # through. The inline-fuse Stage bypasses 010/011/013 by
+            # design (gmem Loads inside the body can't be ring-buffered
+            # without rewriting the cooperative-load shape).
             new_body.append(s)
     return dc_replace(loop, body=new_body)
 

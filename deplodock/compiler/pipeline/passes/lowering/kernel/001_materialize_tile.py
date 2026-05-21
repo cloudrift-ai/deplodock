@@ -59,6 +59,7 @@ from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
     BufferedStage,
     Combine,
+    ComputeStage,
     Stage,
     SwizzleMode,
     TemplateAddressing,
@@ -161,22 +162,26 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
     mbar_prologue: list[Stmt] = []
     declared_mbar: set[str] = set()
 
-    # Compute-Stage Smem hoist: a multi-source Stage (produced by 007b
-    # split) emits its body inside the K-outer loop body — Smem decls
-    # inside a loop don't reach kernel scope in CUDA. Walk the body once,
-    # pre-emit Smem decls for every multi-source Stage at kernel scope,
-    # and mark them ``declared_smem`` so ``_emit_stage``'s in-loop emit
-    # is dedup'd. Single-source stages are hoisted to prologue naturally
-    # by 015 (their first emission is σ_first above the K-outer loop).
+    # Compute-Stage Smem hoist: a ComputeStage (produced by
+    # 007b_hoist_invariant_compute when FUSED_PIPELINE=True) and an
+    # inline-fuse multi-source Stage (FUSED_PIPELINE=False) both emit
+    # their body inside the K-outer loop body — Smem decls inside a
+    # loop don't reach kernel scope in CUDA. Walk the body once, pre-
+    # emit Smem decls at kernel scope, and mark them ``declared_smem``
+    # so ``_emit_stage``'s in-loop emit is dedup'd. Single-source
+    # transport stages are hoisted to prologue naturally by 015.
     compute_stage_prologue: list[Stmt] = []
     for stmt in body.iter():
-        if isinstance(stmt, Stage) and len(stmt.source_loads) > 1:
+        if isinstance(stmt, Stage) and (isinstance(stmt, ComputeStage) or len(stmt.source_loads) > 1):
             if stmt.name in declared_smem:
                 continue
-            # When the compute Stage was promoted to BufferedStage (DEPLODOCK_BUFFER_COMPUTE),
-            # include buffer_count in the leading dim of the smem alloc.
             extents = stmt.alloc_extents
-            if isinstance(stmt, BufferedStage):
+            # Ring-buffer multiplier — ComputeStage carries its own
+            # buffer_count when promoted (BUFFER_COMPUTE knob);
+            # BufferedStage covers the legacy promotion path.
+            if isinstance(stmt, ComputeStage) and stmt.buffer_count > 1:
+                extents = (stmt.buffer_count, *extents)
+            elif isinstance(stmt, BufferedStage):
                 extents = (stmt.buffer_count, *extents)
             compute_stage_prologue.append(Smem(name=stmt.name, extents=extents))
             declared_smem.add(stmt.name)
