@@ -59,7 +59,7 @@ back into the planner — current tests don't depend on it.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
@@ -101,6 +101,25 @@ FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells alon
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
+
+
+@dataclass(frozen=True)
+class TileParams:
+    """One concrete (BN, BM, FM, FN, BK, SPLITK, BR) variant produced by
+    ``_enumerate_cartesian``. Carries the axis-structure factors that
+    flow from the cartesian into ``_build_split_body`` (σ-split tower
+    construction) and into the per-variant knob stamps on the emitted
+    ``LoopOp``. ``frozen`` for hashability + de-dup in the cartesian's
+    ``seen`` set; default ``br=1`` keeps matmul / pointwise call sites
+    that ignore cooperative-K terse."""
+
+    bn: int
+    bm: int
+    fm: int
+    fn: int
+    bk: int
+    splitk: int
+    br: int = 1
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
@@ -276,21 +295,21 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
 
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
-    for bn, bm, fm, fn, bk, splitk, br in param_combos:
+    for params in param_combos:
         try:
-            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk, br, k_is_matmul=k_is_matmul)
+            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, params, k_is_matmul=k_is_matmul)
         except _BuildSkipped:
             continue
         new_body = leading + chain_body
         knobs = {
             **loop_op.knobs,
-            BN.name: bn,
-            BM.name: bm,
-            FM.name: fm,
-            FN.name: fn,
-            BK.name: bk,
-            SPLITK.name: splitk,
-            BR.name: br,
+            BN.name: params.bn,
+            BM.name: params.bm,
+            FM.name: params.fm,
+            FN.name: params.fn,
+            BK.name: params.bk,
+            SPLITK.name: params.splitk,
+            BR.name: params.br,
         }
         variants.append(LoopOp(body=new_body, knobs=knobs))
     return variants or None
@@ -308,7 +327,7 @@ def _enumerate_cartesian(
     br_choices: tuple[int, ...] = (1,),
     max_cells_per_thread: int,
     priority_mode: str,
-) -> list[tuple[int, int, int, int, int, int, int]]:
+) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``.
 
     BN / BM iterate the supplied candidate sets, clamped to extent and
@@ -340,8 +359,8 @@ def _enumerate_cartesian(
     pointwise wants low cells/thread (memory-bandwidth-bound, more CTAs
     help SM occupancy), reduce wants warp-sized-or-larger cooperative
     groups. All prefer threads close to 256/CTA."""
-    seen: set[tuple[int, int, int, int, int, int, int]] = set()
-    ordered: list[tuple[int, int, int, int, int, int, int]] = []
+    seen: set[TileParams] = set()
+    ordered: list[TileParams] = []
     for bn in bn_choices:
         bn_c = min(bn, E_N)
         if bn_c < 1 or E_N % bn_c != 0:
@@ -376,27 +395,25 @@ def _enumerate_cartesian(
                             for splitk in splitk_choices:
                                 if k_o_total % splitk != 0:
                                     continue
-                                key = (bn_c, bm_c, fm, fn, bk, splitk, br)
-                                if key in seen:
+                                params = TileParams(bn=bn_c, bm=bm_c, fm=fm, fn=fn, bk=bk, splitk=splitk, br=br)
+                                if params in seen:
                                     continue
-                                seen.add(key)
-                                ordered.append(key)
+                                seen.add(params)
+                                ordered.append(params)
 
-    def _priority_matmul(combo: tuple[int, int, int, int, int, int, int]) -> tuple[int, ...]:
-        bn, bm, fm, fn, bk, splitk, _br = combo
-        threads = bn * bm
-        cells = fm * fn
+    def _priority_matmul(p: TileParams) -> tuple[int, ...]:
+        threads = p.bn * p.bm
+        cells = p.fm * p.fn
         return (
             min(cells, 32),  # high cells/thread (capped — NVRTC compile time)
             -abs(256 - threads),  # threads close to 256
-            bk,  # bigger BK (fewer K iters)
-            -splitk,  # smaller SPLITK (less atomic contention)
+            p.bk,  # bigger BK (fewer K iters)
+            -p.splitk,  # smaller SPLITK (less atomic contention)
         )
 
-    def _priority_pointwise(combo: tuple[int, int, int, int, int, int, int]) -> tuple[int, ...]:
-        bn, bm, fm, fn, bk, splitk, _br = combo
-        threads = bn * bm
-        cells = fm * fn
+    def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
+        threads = p.bn * p.bm
+        cells = p.fm * p.fn
         # Pointwise is memory-bandwidth-bound: prefer FEW cells/thread
         # (each cell = one load+op+store; no K-loop arithmetic to
         # amortize register pressure) and threads close to 256/CTA.
@@ -405,18 +422,17 @@ def _enumerate_cartesian(
             -abs(256 - threads),  # threads close to 256
         )
 
-    def _priority_reduce(combo: tuple[int, int, int, int, int, int, int]) -> tuple[int, ...]:
-        bn, bm, _fm, _fn, bk, splitk, br = combo
-        threads = bn * bm * br
+    def _priority_reduce(p: TileParams) -> tuple[int, ...]:
+        threads = p.bn * p.bm * p.br
         # Cooperative reduce: prefer warp-sized-or-larger cooperative
         # groups (BR ≥ 32 lets the materializer use warp-shuffle), threads
         # close to 256/CTA, larger BK (fewer K iters), smaller SPLITK
         # (less atomic contention).
         return (
-            min(br, 256),
+            min(p.br, 256),
             -abs(256 - threads),
-            bk,
-            -splitk,
+            p.bk,
+            -p.splitk,
         )
 
     priority_fn = {
@@ -433,13 +449,7 @@ def _build_split_body(
     outer_m: Loop | None,
     outer_n: Loop,
     k_loop: Loop | None,
-    bn: int,
-    bm: int,
-    fm: int,
-    fn: int,
-    bk: int,
-    splitk: int,
-    br: int = 1,
+    params: TileParams,
     *,
     k_is_matmul: bool = True,
 ) -> tuple[Stmt, ...]:
@@ -463,22 +473,24 @@ def _build_split_body(
     # N axis split (always present).
     N_name = outer_n.axis.name
     E_N = int(outer_n.axis.extent)
-    N_b_ext = E_N // (bn * fn)
+    N_b_ext = E_N // (params.bn * params.fn)
     N_b = Axis(f"{N_name}_b", N_b_ext)
-    N_t = Axis(f"{N_name}_t", bn)
-    N_r = Axis(f"{N_name}_r", fn)
-    sigma_map[N_name] = Var(N_b.name) * Literal(bn * fn, "int") + Var(N_t.name) * Literal(fn, "int") + Var(N_r.name)
+    N_t = Axis(f"{N_name}_t", params.bn)
+    N_r = Axis(f"{N_name}_r", params.fn)
+    sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
 
     # M axis split (optional — None for 1D pointwise).
     M_b = M_t = M_r = None
     if outer_m is not None:
         M_name = outer_m.axis.name
         E_M = int(outer_m.axis.extent)
-        M_b_ext = E_M // (bm * fm)
+        M_b_ext = E_M // (params.bm * params.fm)
         M_b = Axis(f"{M_name}_b", M_b_ext)
-        M_t = Axis(f"{M_name}_t", bm)
-        M_r = Axis(f"{M_name}_r", fm)
-        sigma_map[M_name] = Var(M_b.name) * Literal(bm * fm, "int") + Var(M_t.name) * Literal(fm, "int") + Var(M_r.name)
+        M_t = Axis(f"{M_name}_t", params.bm)
+        M_r = Axis(f"{M_name}_r", params.fm)
+        sigma_map[M_name] = (
+            Var(M_b.name) * Literal(params.bm * params.fm, "int") + Var(M_t.name) * Literal(params.fm, "int") + Var(M_r.name)
+        )
 
     sigma_outer = Sigma(sigma_map)
 
@@ -495,15 +507,15 @@ def _build_split_body(
     # reduces in the kernel — single SPLITK and single cooperative
     # thread axis. K_o and K_i are per-reduce (each reduce gets its own
     # inner-body tower with axis names derived from its source K axis
-    # name), built lazily inside ``_replace_inner_reduce``.
+    # name), built lazily inside ``_replace_k_loops``.
     K_s = K_c = None
     E_K = K_o_ext = 0
     if k_loop is not None:
         K_name = k_loop.axis.name
         E_K = int(k_loop.axis.extent)
-        K_o_ext = E_K // (splitk * br * bk)
-        K_s = Axis(f"{K_name}_s", splitk) if splitk > 1 else None
-        K_c = Axis(f"{K_name}_c", br) if br > 1 else None
+        K_o_ext = E_K // (params.splitk * params.br * params.bk)
+        K_s = Axis(f"{K_name}_s", params.splitk) if params.splitk > 1 else None
+        K_c = Axis(f"{K_name}_c", params.br) if params.br > 1 else None
 
     # Step 1: apply σ_outer over all stmts inside outer_n's body. K
     # loop's body Loads pick up M/N substitutions; K iter var is
@@ -546,8 +558,8 @@ def _build_split_body(
             K_canonical_name=K_canonical_name,
             K_s=K_s,
             K_c=K_c,
-            br=br,
-            bk=bk,
+            br=params.br,
+            bk=params.bk,
             K_o_ext=K_o_ext,
         )
         if n_replaced == 0:
