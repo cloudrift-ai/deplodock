@@ -530,6 +530,92 @@ class TmaBufferedStage(BufferedStage):
         return f"{super()._pretty_extra()} tma{sw}"
 
 
+@dataclass
+class ComputeStage(Stage):
+    """Compute Stage — hoisted invariant compute sitting between transport
+    Stages and a reduce body.
+
+    Distinguished from a canonical (transport) ``Stage`` by what its body
+    Loads read: a transport Stage's body Loads target the gmem source
+    buffer; a ``ComputeStage``'s body Loads target *sibling* Stage smem
+    buffers and the body runs an elementwise chain whose result is
+    written into ``ComputeStage``'s own smem buffer.
+
+    Produced by the hoist-invariant-compute path: when a reduce-body
+    cone depends only on cache-axes of a producer-Stage group, the cone
+    Assigns are lifted into a ``ComputeStage`` that allocates its own
+    smem and reads from the sibling transports. Downstream:
+
+    - 010 keeps the canonical transport-Stage promotion path and
+      handles a ``ComputeStage`` separately (no gmem to ring-buffer; the
+      ``BUFFER_COMPUTE`` knob optionally ring-buffers the *output*
+      buffer so reduce reads pipeline across K_outer).
+    - 011 / 013 skip ``ComputeStage`` (no gmem transport to narrow).
+    - 015 places ``ComputeStage`` between the wait and the K_inner
+      reduce in the steady-state body — exactly the slot the cone needs.
+    - materialize_tile hoists the smem allocation to kernel scope and
+      emits the body as a per-thread cooperative compute (no
+      ``CpAsyncCopy`` / ``TmaLoad`` — body Loads target sibling smem).
+
+    Optional ``buffer_count`` / ``phase`` mirror ``BufferedStage`` so 010
+    can promote a ``ComputeStage`` to a ring-buffered output without a
+    separate ``BufferedComputeStage`` class. ``buffer_count = 1``
+    (default) means single-slot; ``>= 2`` requires ``phase``.
+    """
+
+    buffer_count: int = field(default=1, kw_only=True)
+    phase: Expr | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.buffer_count < 1:
+            raise ValueError(f"ComputeStage {self.name!r}: buffer_count must be >= 1, got {self.buffer_count}")
+        if self.buffer_count > 1 and self.phase is None:
+            raise ValueError(f"ComputeStage {self.name!r}: phase required when buffer_count > 1")
+
+    # Sibling-smem reads aren't external buffer dependencies — the
+    # producers live in the same Tile scope. Returning empty here keeps
+    # 015's TMA/async eligibility checks and the gmem-buffer
+    # enumeration in tuning.py from misclassifying ComputeStage's body
+    # Loads as gmem.
+    def external_reads(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def primary_load(self) -> Load:
+        raise ValueError(
+            f"ComputeStage {self.name!r}: primary_load undefined — compute stages read from "
+            "multiple sibling smem buffers. Use ``source_loads`` for the body Loads."
+        )
+
+    @property
+    def buf(self) -> str:
+        raise ValueError(f"ComputeStage {self.name!r}: buf undefined — compute stages have no single gmem source.")
+
+    @property
+    def origin(self) -> tuple[Expr, ...]:
+        raise ValueError(f"ComputeStage {self.name!r}: origin undefined — compute stages have no gmem slab anchor.")
+
+    @property
+    def addressing(self) -> AffineAddressing | TemplateAddressing:
+        raise ValueError(f"ComputeStage {self.name!r}: addressing undefined — compute stages have no gmem source dim.")
+
+    @property
+    def smem_bytes(self) -> int:
+        return super().smem_bytes * self.buffer_count
+
+    def exprs(self) -> tuple[Expr, ...]:
+        out = super().exprs()
+        if self.phase is not None:
+            out = (*out, self.phase)
+        return out
+
+    def _pretty_extra(self) -> str:
+        if self.buffer_count > 1 and self.phase is not None:
+            return f" compute buffers={self.buffer_count}@{self.phase.pretty()}"
+        return " compute"
+
+
 # ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
@@ -777,6 +863,7 @@ __all__ = [
     "BufferedStage",
     "AsyncBufferedStage",
     "TmaBufferedStage",
+    "ComputeStage",
     "SwizzleMode",
     "AffineAddressing",
     "TemplateAddressing",
