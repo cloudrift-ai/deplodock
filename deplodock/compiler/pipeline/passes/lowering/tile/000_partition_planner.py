@@ -7,10 +7,15 @@ the resulting axes with ``Role`` values (see :class:`Role`). Downstream
 materialization passes read the tags and skip their own equivalent
 decisions.
 
-**Matmul — joint enumeration.** ``_split_matmul_fully`` enumerates the
-full pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)`` candidates
-and emits one variant per surviving combination. Each variant carries
-the σ-split body produced by ``_build_matmul_body``:
+``_split_kernel_fully`` handles both matmul and pointwise via the same
+σ-split machinery. Each output axis splits into ``A → A_b·(T·R) + A_t·R + A_r``
+where ``(T, R) = (BN, FN)`` for the innermost N axis and ``(BM, FM)``
+for the second-innermost M axis (matmul; or degenerate ``(1, 1)`` for
+pointwise). Anything further out in the chain becomes ``Role.BLOCK``
+whole. For matmul, the reduce axis K splits as
+``K → K_s·(K_o_count·BK) + K_o·BK + K_i`` (K_s omitted when SPLITK=1).
+
+The resulting nesting (matmul, SPLITK > 1):
 
     Loop(K_s SPLITK_BLOCK) →
       Loop(M_b BLOCK) → Loop(N_b BLOCK) →
@@ -21,11 +26,10 @@ the σ-split body produced by ``_build_matmul_body``:
               Loop(K_i STAGE_INNER, reduce, σ(K body)) →
             <σ-substituted post — Write is non-atomic here>
 
-σ-maps:
-
-- M → M_b*(BM*FM) + M_t*FM + M_r
-- N → N_b*(BN*FN) + N_t*FN + N_r
-- K → K_s*(K_o_count*BK) + K_o*BK + K_i  (K_s omitted when SPLITK=1)
+For pointwise the same structure applies with K-related levels absent
+and ``BM = FM = FN = 1`` so the M_t / M_r / N_r sub-axes have extent
+1 and are removed by the downstream normalize pass; only ``M_b BLOCK``
+(whole-extent) and ``N_b BLOCK + N_t THREAD`` remain.
 
 When ``SPLITK > 1`` the planner just produces the σ-split structure
 with a non-atomic Write — ``001_launch_geometry`` does the generic
@@ -33,23 +37,20 @@ with a non-atomic Write — ``001_launch_geometry`` does the generic
 including the ``Cond(K_s == 0, …)`` decomposition for the residual
 case (where ``Write.value = add(K_s-indep, K_s-dep)``).
 
-Each cartesian level iterates only structurally valid candidates:
-BN/BM from a pow-2 preset (post-clamp to extent + divisibility check),
+Matmul cartesian iterates only structurally valid candidates: BN/BM
+from a pow-2 preset (post-clamp to extent + divisibility check),
 FM/FN as divisors of the per-thread remainder, BK as divisors of E_K,
 SPLITK as divisors of K_o_total. Thread (≤ 1024) and register
 (FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) budgets gate the inner loops.
+Variant 0 (what greedy compiles pick) comes from a priority sort:
+highest cells/thread (capped at 32), threads closest to 256/CTA,
+larger BK, smaller SPLITK.
 
-Variant 0 (what greedy compiles pick) comes from a priority sort over
-the surviving cartesian: highest cells/thread (capped at 32), threads
-closest to 256/CTA, larger BK, smaller SPLITK. The literal class-tuned
-heuristic isn't emitted explicitly — its constituent values are
-already in the cartesian, and the priority captures the same intent.
-
-**Pointwise** (no matmul reduce in body) is handled by
-``_split_pointwise_fully``: each chain axis is stamped ``Role.THREAD``
-(when ext ≤ target) or σ-split into ``A_b BLOCK`` over ``A_t THREAD``
-(when ext > target and divides). Outer chain axes beyond the THREAD
-slot become ``Role.BLOCK`` whole.
+Pointwise emits a single variant: ``BN`` from :func:`tuning.thread_tile_shape`
+clamped to E_N (rounded down to the largest divisor for a clean σ),
+``BM = FM = FN = BK = SPLITK = 1``. Register-tile enumeration for
+pointwise is a deliberate non-feature for now — expansion would be a
+follow-up after measuring compile-time / perf impact.
 
 Chunk-reduce for large-K non-matmul reductions is not yet brought
 back into the planner — current tests don't depend on it.
@@ -101,13 +102,9 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
 
     # Idempotence: once the planner has stamped roles on the body's
     # outer chain, ``_outer_free_loop_chain`` (which requires
-    # ``role is None``) returns an empty chain and the branches below
-    # return ``None``. No explicit "already planned" marker needed.
-    variants: list[LoopOp] | None
-    if body_info.has_matmul:
-        variants = _split_matmul_fully(loop_op, body_info)
-    else:
-        variants = _split_pointwise_fully(loop_op, body_info)
+    # ``role is None``) returns an empty chain and ``_split_kernel_fully``
+    # returns ``None``. No explicit "already planned" marker needed.
+    variants = _split_kernel_fully(loop_op, body_info)
     if variants is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
@@ -156,52 +153,97 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
     return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-# --- matmul: joint enumeration ---------------------------------------
+# --- unified kernel split ---------------------------------------------
 
 
-def _split_matmul_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Enumerate the pruned cartesian and emit one variant per
-    surviving ``(BN, BM, FM, FN, BK, SPLITK)`` combination."""
-    if not body_info.has_matmul:
-        return None
+class _BuildSkipped(Exception):
+    """Raised by ``_build_split_body`` when the body has a shape we
+    don't know how to rewrite (e.g. matmul K reduce not where we
+    expect)."""
+
+
+def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
+    """Unified σ-split for matmul + pointwise kernels.
+
+    Matmul (``body_info.has_matmul``): innermost two chain axes are
+    output M, N; reduce axis K is detected inside ``outer_n.body``.
+    Enumerates the full pruned cartesian over ``(BN, BM, FM, FN, BK,
+    SPLITK)`` and emits one variant per surviving combo, sorted by
+    priority so variant 0 is the heuristic-spirit shape.
+
+    Pointwise / non-matmul (no K detected): innermost chain axis is N
+    (``outer_m`` is ``None`` for 1D pointwise; for ≥ 2D chains the
+    second-innermost is M but with degenerate ``BM = FM = 1`` so it
+    block-only). No register tile, no K — emits a single variant with
+    ``BN`` from :func:`tuning.thread_tile_shape`.
+
+    Returns ``None`` when the kernel doesn't match either shape (no
+    outer chain, or matmul-detected but K reduce missing)."""
     chain = _outer_free_loop_chain(loop_op.body)
-    if len(chain) < 2:
+    if not chain:
         return None
-    # Innermost two axes are the matmul output dims (M, N). Anything
-    # further outer in the chain (e.g. head_idx in multi-head SDPA) is
-    # an extra output axis that becomes BLOCK directly.
-    m_idx = len(chain) - 2
-    outer_m = chain[m_idx]
-    outer_n = chain[m_idx + 1]
-    extra_outer = chain[:m_idx]
-    M_name = outer_m.axis.name
-    N_name = outer_n.axis.name
-    E_M = int(outer_m.axis.extent)
-    E_N = int(outer_n.axis.extent)
 
-    inner_stmts = tuple(outer_n.body)
-    k_loop = _find_first_matmul_reduce(inner_stmts)
-    if k_loop is None:
-        return None
-    K_name = k_loop.axis.name
-    E_K = int(k_loop.axis.extent)
+    if body_info.has_matmul:
+        if len(chain) < 2:
+            return None
+        # Innermost two are M, N. Anything further out is extra_outer
+        # (e.g. head_idx in multi-head SDPA → BLOCK whole).
+        outer_m: Loop | None = chain[-2]
+        outer_n = chain[-1]
+        extra_outer = chain[:-2]
+        k_loop = _find_first_matmul_reduce(tuple(outer_n.body))
+        if k_loop is None:
+            return None
+        E_M = int(outer_m.axis.extent)
+        E_N = int(outer_n.axis.extent)
+        E_K = int(k_loop.axis.extent)
+        param_combos = _matmul_cartesian(E_M, E_N, E_K)
+    else:
+        # No matmul reduce. Innermost is N; if there's a second-innermost
+        # it's treated as a degenerate M (BM = FM = 1 → block-only). Any
+        # further-out axes become extra_outer BLOCK-whole.
+        outer_n = chain[-1]
+        outer_m = chain[-2] if len(chain) >= 2 else None
+        extra_outer = chain[:-2] if len(chain) >= 2 else ()
+        k_loop = None
+        E_N = int(outer_n.axis.extent)
+        bn = _pointwise_bn(E_N, body_info)
+        param_combos = [(bn, 1, 1, 1, 1, 1)]
 
+    leading, _ = _split_leading_non_loops(loop_op.body)
+    variants: list[LoopOp] = []
+    for bn, bm, fm, fn, bk, splitk in param_combos:
+        try:
+            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk)
+        except _BuildSkipped:
+            continue
+        new_body = leading + chain_body
+        knobs = {
+            **loop_op.knobs,
+            BN.name: bn,
+            BM.name: bm,
+            FM.name: fm,
+            FN.name: fn,
+            BK.name: bk,
+            SPLITK.name: splitk,
+        }
+        variants.append(LoopOp(body=new_body, knobs=knobs))
+    return variants or None
+
+
+def _matmul_cartesian(E_M: int, E_N: int, E_K: int) -> list[tuple[int, int, int, int, int, int]]:
+    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)`` for a
+    matmul kernel. BN/BM from a pow-2 preset (clamped to extent +
+    divisibility check); FM/FN as divisors of the per-thread remainder
+    so divisibility is automatic; BK as divisor of E_K; SPLITK as
+    divisor of K_o_total. Thread (≤ 1024) and register
+    (FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) budgets gate the inner loops.
+
+    Returns the survivors sorted by priority so variant 0 is the
+    heuristic-spirit shape (high cells/thread capped at 32, threads
+    closest to 256/CTA, larger BK, smaller SPLITK)."""
     seen: set[tuple[int, int, int, int, int, int]] = set()
     ordered: list[tuple[int, int, int, int, int, int]] = []
-
-    def _add(bn: int, bm: int, fm: int, fn: int, bk: int, splitk: int) -> None:
-        key = (bn, bm, fm, fn, bk, splitk)
-        if key in seen:
-            return
-        seen.add(key)
-        ordered.append(key)
-
-    # Pruned cartesian over (BN, BM, FM, FN, BK, SPLITK). Every loop
-    # iterates only over structurally valid candidates (BN/BM from the
-    # pow-2 preset, FM/FN as divisors of the per-thread remainder so
-    # divisibility is automatic, BK divides E_K, SPLITK divides K_o);
-    # ``_priority`` below sorts the survivors so variant 0 carries the
-    # heuristic-spirit shape (high cells/thread, ~256 threads/CTA).
     for bn in _TUNE_AXIS_CHOICES:
         bn_c = min(bn, E_N)
         if bn_c < 1 or E_N % bn_c != 0:
@@ -212,11 +254,6 @@ def _split_matmul_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
                 continue
             if bn_c * bm_c > 1024:
                 continue
-            # FM / FN iterate over divisors of the remaining per-thread
-            # cell counts. When E_M / bm_c is pow-2 (the common case)
-            # these match the legacy pow-2 preset exactly; non-pow-2
-            # extents pick up their structural divisors (e.g. E_N=192,
-            # bn_c=64 → FN ∈ {1, 3} where the preset only had {1}).
             for fm in _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD):
                 for fn in _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm):
                     for bk in _BK_CANDIDATES:
@@ -226,56 +263,44 @@ def _split_matmul_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
                         for splitk in _SPLITK_CANDIDATES:
                             if k_o_total % splitk != 0:
                                 continue
-                            _add(bn_c, bm_c, fm, fn, bk, splitk)
+                            key = (bn_c, bm_c, fm, fn, bk, splitk)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            ordered.append(key)
 
-    # Sort by heuristic-spirit priority so variant 0 carries the
-    # class-tuned shape (the explicit literal heuristic combo isn't
-    # needed — its constituent values are already in the cartesian, and
-    # the priority key captures the same intent the heuristic was
-    # designed around).
     def _priority(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
         bn, bm, fm, fn, bk, splitk = combo
         threads = bn * bm
         cells = fm * fn
-        # High cells/thread (capped to 32 — beyond hurts NVRTC).
-        cell_score = min(cells, 32)
-        # Threads close to 256.
-        thread_score = -abs(256 - threads)
-        # Bigger BK (fewer K iters).
-        bk_score = bk
-        # Smaller SPLITK (less atomic contention).
-        splitk_score = -splitk
-        return (cell_score, thread_score, bk_score, splitk_score)
+        return (
+            min(cells, 32),  # high cells/thread (capped — NVRTC compile time)
+            -abs(256 - threads),  # threads close to 256
+            bk,  # bigger BK (fewer K iters)
+            -splitk,  # smaller SPLITK (less atomic contention)
+        )
 
     ordered.sort(key=_priority, reverse=True)
-
-    leading, _ = _split_leading_non_loops(loop_op.body)
-    variants: list[LoopOp] = []
-    for bn, bm, fm, fn, bk, splitk in ordered:
-        try:
-            chain_body = _build_matmul_body(extra_outer, outer_m, outer_n, M_name, N_name, K_name, k_loop, bn, bm, fm, fn, bk, splitk)
-        except _BuildSkipped:
-            continue
-        new_body = leading + chain_body
-        knobs = {**loop_op.knobs, BN.name: bn, BM.name: bm, FM.name: fm, FN.name: fn, BK.name: bk, SPLITK.name: splitk}
-        variants.append(LoopOp(body=new_body, knobs=knobs))
-    return variants or None
+    return ordered
 
 
-class _BuildSkipped(Exception):
-    """Raised by ``_build_matmul_body`` when the body has a shape we
-    don't know how to rewrite (e.g. epilogue isn't a known split-K
-    pattern)."""
+def _pointwise_bn(E_N: int, body_info: BodyInfo) -> int:
+    """Heuristic BN for a pointwise kernel: ``thread_tile_shape``'s
+    non-matmul branch returns ``(BN_default,)``; clamp to ``E_N`` and
+    round down to the largest divisor so the σ-split is clean."""
+    target_tuple = thread_tile_shape((E_N,), body_info)
+    bn = int(target_tuple[0]) if target_tuple else 256
+    bn = min(bn, E_N)
+    while bn > 1 and E_N % bn != 0:
+        bn -= 1
+    return max(bn, 1)
 
 
-def _build_matmul_body(
+def _build_split_body(
     extra_outer: tuple[Loop, ...],
-    outer_m: Loop,
+    outer_m: Loop | None,
     outer_n: Loop,
-    M_name: str,
-    N_name: str,
-    K_name: str,
-    k_loop_ref: Loop,
+    k_loop: Loop | None,
     bn: int,
     bm: int,
     fm: int,
@@ -283,61 +308,91 @@ def _build_matmul_body(
     bk: int,
     splitk: int,
 ) -> tuple[Stmt, ...]:
-    E_M = int(outer_m.axis.extent)
+    """Unified σ-split body construction. The N axis is always present;
+    ``outer_m`` and ``k_loop`` are ``None`` for 1D pointwise and
+    non-matmul kernels respectively, in which case the corresponding
+    σ-substitution + Loop tower levels are skipped.
+
+    Each output axis splits as ``A → A_b·(T·R) + A_t·R + A_r`` (with
+    ``T = BN | BM``, ``R = FN | FM``); the extent-1 sub-axes generated
+    when ``T = R = 1`` (pointwise M and outer slots) are removed
+    downstream by ``normalize_extent_one_loops``. K splits as
+    ``K → K_s·(K_o_count·BK) + K_o·BK + K_i`` (K_s omitted when
+    ``SPLITK == 1``).
+
+    The atomic-Write rewrite for the K_s case is deferred to
+    ``001_launch_geometry`` — it's the generic "BIND_BLOCK lift →
+    atomic Write" rewrite triggered when K_s lifts to BIND_BLOCK."""
+    sigma_map: dict[str, object] = {}
+
+    # N axis split (always present).
+    N_name = outer_n.axis.name
     E_N = int(outer_n.axis.extent)
-    E_K = int(k_loop_ref.axis.extent)
-
-    M_b_ext = E_M // (bm * fm)
     N_b_ext = E_N // (bn * fn)
-    K_o_ext = E_K // (splitk * bk)
-
-    M_b = Axis(f"{M_name}_b", M_b_ext)
-    M_t = Axis(f"{M_name}_t", bm)
-    M_r = Axis(f"{M_name}_r", fm)
     N_b = Axis(f"{N_name}_b", N_b_ext)
     N_t = Axis(f"{N_name}_t", bn)
     N_r = Axis(f"{N_name}_r", fn)
-    K_s = Axis(f"{K_name}_s", splitk)
-    K_o = Axis(f"{K_name}_o", K_o_ext)
-    K_i = Axis(f"{K_name}_i", bk)
+    sigma_map[N_name] = Var(N_b.name) * Literal(bn * fn, "int") + Var(N_t.name) * Literal(fn, "int") + Var(N_r.name)
 
-    sigma_outer = Sigma(
-        {
-            M_name: Var(M_b.name) * Literal(bm * fm, "int") + Var(M_t.name) * Literal(fm, "int") + Var(M_r.name),
-            N_name: Var(N_b.name) * Literal(bn * fn, "int") + Var(N_t.name) * Literal(fn, "int") + Var(N_r.name),
-        }
-    )
-    if splitk > 1:
-        sigma_k = Sigma({K_name: Var(K_s.name) * Literal(K_o_ext * bk, "int") + Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
-    else:
-        sigma_k = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
+    # M axis split (optional — None for 1D pointwise).
+    M_b = M_t = M_r = None
+    if outer_m is not None:
+        M_name = outer_m.axis.name
+        E_M = int(outer_m.axis.extent)
+        M_b_ext = E_M // (bm * fm)
+        M_b = Axis(f"{M_name}_b", M_b_ext)
+        M_t = Axis(f"{M_name}_t", bm)
+        M_r = Axis(f"{M_name}_r", fm)
+        sigma_map[M_name] = Var(M_b.name) * Literal(bm * fm, "int") + Var(M_t.name) * Literal(fm, "int") + Var(M_r.name)
 
+    sigma_outer = Sigma(sigma_map)
+
+    # K axis split (optional — None for non-matmul).
+    K_s = K_o = K_i = None
+    sigma_k: Sigma | None = None
+    if k_loop is not None:
+        K_name = k_loop.axis.name
+        E_K = int(k_loop.axis.extent)
+        K_o_ext = E_K // (splitk * bk)
+        K_s = Axis(f"{K_name}_s", splitk)
+        K_o = Axis(f"{K_name}_o", K_o_ext)
+        K_i = Axis(f"{K_name}_i", bk)
+        if splitk > 1:
+            sigma_k = Sigma({K_name: Var(K_s.name) * Literal(K_o_ext * bk, "int") + Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
+        else:
+            sigma_k = Sigma({K_name: Var(K_o.name) * Literal(bk, "int") + Var(K_i.name)})
+
+    # Step 1: apply σ_outer over all stmts inside outer_n's body. K
+    # loop's body Loads pick up M/N substitutions; K iter var is
+    # untouched.
     inner_stmts = tuple(outer_n.body)
-
-    # Step 1: apply σ_outer over all inner stmts. K loop's body Loads
-    # pick up M/N substitutions; K iter var is untouched.
     inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
 
-    # Step 2: replace the matmul K Loop with K_o → K_i (σ-substituting
-    # K inside the K body). The atomic-Write rewrite for SPLITK > 1
-    # happens in ``001_launch_geometry`` once it commits the BIND_BLOCK
-    # binding for K_s — at that point it can do the generic K_s-dep
-    # def-DAG analysis.
-    new_inner, replaced = _replace_matmul_k(inner_after_outer, K_o, K_i, sigma_k)
-    if not replaced:
-        raise _BuildSkipped("matmul K reduce not found in body")
+    # Step 2: replace the matmul K Loop with K_o → K_i if K is present.
+    if k_loop is not None:
+        assert sigma_k is not None and K_o is not None and K_i is not None
+        new_inner, replaced = _replace_matmul_k(inner_after_outer, K_o, K_i, sigma_k)
+        if not replaced:
+            raise _BuildSkipped("matmul K reduce not found in body")
+    else:
+        new_inner = inner_after_outer
 
-    # Step 3: wrap with REGISTER → THREAD → BLOCK loops (inside-out).
+    # Step 3: wrap inside-out with REGISTER → THREAD → BLOCK loops.
     current: tuple[Stmt, ...] = new_inner
     current = (Loop(axis=N_r, role=Role.REGISTER, body=current),)
-    current = (Loop(axis=M_r, role=Role.REGISTER, body=current),)
+    if M_r is not None:
+        current = (Loop(axis=M_r, role=Role.REGISTER, body=current),)
     current = (Loop(axis=N_t, role=Role.THREAD, body=current),)
-    current = (Loop(axis=M_t, role=Role.THREAD, body=current),)
+    if M_t is not None:
+        current = (Loop(axis=M_t, role=Role.THREAD, body=current),)
     current = (Loop(axis=N_b, role=Role.BLOCK, body=current),)
-    current = (Loop(axis=M_b, role=Role.BLOCK, body=current),)
-    if splitk > 1:
+    if M_b is not None:
+        current = (Loop(axis=M_b, role=Role.BLOCK, body=current),)
+    if k_loop is not None and splitk > 1:
+        assert K_s is not None
         current = (Loop(axis=K_s, role=Role.SPLITK_BLOCK, body=current),)
-    # Extra outer chain axes (e.g. head_idx in multi-head SDPA) become
+    # Extra outer chain axes (e.g. head_idx in multi-head SDPA; or any
+    # axis further out than the second-innermost in pointwise) become
     # BLOCK directly — they were already iteration axes in the original
     # body; we just re-stamp them so launch_geometry binds BIND_BLOCK.
     for outer_lp in reversed(extra_outer):
@@ -392,71 +447,3 @@ def _find_first_matmul_reduce(stmts) -> Loop | None:
             if found is not None:
                 return found
     return None
-
-
-# --- pointwise / non-matmul reduce ----------------------------------
-
-
-def _split_pointwise_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | None:
-    """Stamp BLOCK/THREAD on the output axes of a non-matmul kernel.
-
-    For each chain axis (innermost-first), apply the per-axis target from
-    :func:`tuning.thread_tile_shape`:
-
-    - ``ext ≤ target`` (and within the THREAD slot): stamp ``Role.THREAD``.
-    - ``ext > target`` and ``ext % target == 0``: σ-split into
-      ``A_b`` (``Role.BLOCK``) over ``A_t`` (``Role.THREAD``), σ:
-      ``A → A_b * target + A_t``.
-    - Outer chain axes beyond the THREAD slot: stamp ``Role.BLOCK`` whole.
-
-    Returns ``None`` on no-op (every axis already fits the target with no
-    σ-split) or on non-divisible axes (the kernel falls through unhandled
-    — current pointwise tests don't hit this)."""
-    chain = _outer_free_loop_chain(loop_op.body)
-    if not chain:
-        return None
-
-    leading, _ = _split_leading_non_loops(loop_op.body)
-
-    # Heuristic target (innermost-first).
-    extents_desc = tuple(sorted((int(lp.axis.extent) for lp in chain), reverse=True))
-    target_tuple = thread_tile_shape(extents_desc, body_info)
-
-    # Walk innermost-first; build (axis, role) entries. Every chain
-    # axis is tagged (THREAD/BLOCK) so launch_geometry's chain walker
-    # reads the role directly — no untagged fallback needed for kernels
-    # the planner accepts.
-    chain_inner_first = list(reversed(chain))
-    new_levels_inner_first: list[tuple[Axis, Role]] = []
-    sigma_map: dict[str, object] = {}
-    for i, lp in enumerate(chain_inner_first):
-        ext = int(lp.axis.extent)
-        if i >= len(target_tuple):
-            # Outer beyond target — BLOCK whole.
-            new_levels_inner_first.append((lp.axis, Role.BLOCK))
-            continue
-        target = int(target_tuple[i])
-        if ext <= target:
-            new_levels_inner_first.append((lp.axis, Role.THREAD))
-            continue
-        if ext % target != 0:
-            return None  # divisibility failure — can't σ-split cleanly
-        inner_ax = Axis(f"{lp.axis.name}_t", target)
-        outer_ax = Axis(f"{lp.axis.name}_b", ext // target)
-        new_levels_inner_first.append((inner_ax, Role.THREAD))
-        new_levels_inner_first.append((outer_ax, Role.BLOCK))
-        sigma_map[lp.axis.name] = Var(outer_ax.name) * Literal(target, "int") + Var(inner_ax.name)
-
-    inner_stmts = tuple(chain[-1].body)
-    if sigma_map:
-        sigma = Sigma(sigma_map)
-        inner_stmts = tuple(s.rewrite(_identity_rename, sigma) for s in inner_stmts)
-
-    # Build the wrapped body (outermost-first by reversing inner-first list).
-    current: tuple[Stmt, ...] = inner_stmts
-    for axis, role in new_levels_inner_first:
-        current = (Loop(axis=axis, role=role, body=current),)
-
-    new_body = leading + current
-    bn = int(target_tuple[0]) if target_tuple else 256
-    return [LoopOp(body=new_body, knobs={**loop_op.knobs, BN.name: bn})]
