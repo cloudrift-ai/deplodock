@@ -39,7 +39,11 @@ def test_plain_matmul_fires_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "register_tile" in recording_dump.fired_rules("lowering/tile")
+    # Either path is valid: legacy ``register_tile`` (post-staging) or
+    # planner-driven ``register_tile_planned`` (pre-staging, when
+    # ``DEPLODOCK_PLANNER`` is set).
+    fired = recording_dump.fired_rules("lowering/tile")
+    assert "register_tile" in fired or "register_tile_planned" in fired, fired
 
 
 def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
