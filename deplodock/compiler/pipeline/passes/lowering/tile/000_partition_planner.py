@@ -169,6 +169,21 @@ def _identity_rename(name: str) -> str:
     return name
 
 
+def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+    """Wrap ``inner`` in nested ``Loop``s — innermost layer first.
+    ``[(K_i, STAGE_INNER), (K_o, SERIAL_OUTER)]`` produces
+    ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, inner))``.
+
+    Used by ``_build_split_body`` for the output BLOCK/THREAD/REGISTER
+    wrap tower and by ``_replace_k_loops`` for the per-reduce K_o · K_i
+    tower. Returns a 1-tuple containing the outermost Loop (or ``inner``
+    unchanged when ``layers`` is empty)."""
+    current = inner
+    for axis, role in layers:
+        current = (Loop(axis=axis, role=role, body=current),)
+    return current
+
+
 def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
     """All divisors of ``n`` ≤ ``cap``, ascending. Used as the FM / FN
     candidate set: a divisor of ``E_M / bm_c`` automatically satisfies
@@ -575,27 +590,26 @@ def _build_split_body(
     # inlined by normalize_body, leaving K_c as the sole THREAD axis in
     # Tile.axes — which the materializer's _single_thread_var requires
     # for Combine emission.
-    current: tuple[Stmt, ...] = new_inner
-    current = (Loop(axis=N_r, role=Role.REGISTER, body=current),)
-    if M_r is not None:
-        current = (Loop(axis=M_r, role=Role.REGISTER, body=current),)
-    current = (Loop(axis=N_t, role=Role.THREAD, body=current),)
-    if M_t is not None:
-        current = (Loop(axis=M_t, role=Role.THREAD, body=current),)
-    if K_c is not None:
-        current = (Loop(axis=K_c, role=Role.COOPERATIVE_STRIDE, body=current),)
-    current = (Loop(axis=N_b, role=Role.BLOCK, body=current),)
-    if M_b is not None:
-        current = (Loop(axis=M_b, role=Role.BLOCK, body=current),)
-    if K_s is not None:
-        current = (Loop(axis=K_s, role=Role.SPLITK_BLOCK, body=current),)
+    #
     # Extra outer chain axes (e.g. head_idx in multi-head SDPA; or any
     # axis further out than the second-innermost in pointwise) become
     # BLOCK directly — they were already iteration axes in the original
     # body; we just re-stamp them so launch_geometry binds BIND_BLOCK.
-    for outer_lp in reversed(extra_outer):
-        current = (Loop(axis=outer_lp.axis, role=Role.BLOCK, body=current),)
-    return current
+    layers: list[tuple[Axis, Role | None]] = [(N_r, Role.REGISTER)]
+    if M_r is not None:
+        layers.append((M_r, Role.REGISTER))
+    layers.append((N_t, Role.THREAD))
+    if M_t is not None:
+        layers.append((M_t, Role.THREAD))
+    if K_c is not None:
+        layers.append((K_c, Role.COOPERATIVE_STRIDE))
+    layers.append((N_b, Role.BLOCK))
+    if M_b is not None:
+        layers.append((M_b, Role.BLOCK))
+    if K_s is not None:
+        layers.append((K_s, Role.SPLITK_BLOCK))
+    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(extra_outer))
+    return _wrap_tower(layers, new_inner)
 
 
 def _replace_k_loops(
@@ -657,15 +671,17 @@ def _replace_k_loops(
             K_i = Axis(f"{K_canonical_name}_i", bk)
             sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk)
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
-            k_i_loop = Loop(axis=K_i, role=Role.STAGE_INNER, body=new_body)
-            k_o_loop: Stmt = Loop(axis=K_o, role=Role.SERIAL_OUTER, body=(k_i_loop,))
+            tower = _wrap_tower([(K_i, Role.STAGE_INNER), (K_o, Role.SERIAL_OUTER)], new_body)
             if not s.is_reduce and K_s is not None:
-                k_o_loop = Cond(
-                    cond=BinaryExpr("==", Var(K_s.name), Literal(0, "int")),
-                    body=(k_o_loop,),
-                    else_body=(),
+                out.append(
+                    Cond(
+                        cond=BinaryExpr("==", Var(K_s.name), Literal(0, "int")),
+                        body=tower,
+                        else_body=(),
+                    )
                 )
-            out.append(k_o_loop)
+            else:
+                out.extend(tower)
             n_replaced += 1
             continue
         if isinstance(s, (Loop, StridedLoop)):
