@@ -2,8 +2,10 @@
 
 Mechanical translation: outer free-Loop chain becomes
 ``Tile(thread_axes=...)``, leaves and inner Loops pass through unchanged.
-Strategy passes (``002_chunk_matmul_k``, ``004_cooperative_reduce``) may
-later convert serial Loops to ``StridedLoop`` for cooperative iteration.
+The planner (``000_partition_planner``) stamps Role tags on body
+Loops before tileify runs; tileify just reads the tags via
+``_bind_for_role`` and lifts tagged Loops into ``Tile.axes`` with the
+appropriate ``BoundAxis.bind``.
 
 **Outer free-Loop chain → ``Tile.thread_axes``**. After stripping
 leading non-Loop stmts (scalar Loads) into the TileOp body prefix,
@@ -43,8 +45,8 @@ PATTERN = [Pattern("root", LoopOp)]
 
 def _bind_for_role(role: Role | None) -> str:
     """Resolve the ``BoundAxis.bind`` for a chain-lifted Loop. Untagged
-    Loops default to ``BIND_THREAD`` (legacy behavior for kernels the
-    planner hasn't fully tagged)."""
+    Loops default to ``BIND_THREAD`` — exercised only for kernels the
+    planner skips (currently: SDPA V matmul edge case)."""
     if role is Role.BLOCK or role is Role.SPLITK_BLOCK:
         return BIND_BLOCK
     if role is Role.THREAD:
@@ -142,8 +144,9 @@ def _strip_outer_free_chain(stmts: tuple[LoopStmt, ...]) -> tuple[tuple[tuple[Ax
     SERIAL_OUTER / STAGE_INNER / PIPELINE).
 
     Tagged Loops (BLOCK / THREAD / SPLITK_BLOCK) bind via
-    :func:`_bind_for_role`; untagged Loops default to ``BIND_THREAD``
-    (legacy behavior for kernels the planner hasn't fully tagged)."""
+    :func:`_bind_for_role`. Untagged Loops default to ``BIND_THREAD``
+    — a safety net for kernels the planner currently can't partition
+    (e.g. SDPA V matmul where M/N detection from the chain is wrong)."""
     axes_with_bind: list[tuple[Axis, str]] = []
     cur = stmts
     while (

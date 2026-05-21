@@ -38,9 +38,14 @@ Pruning order: divisibility → thread budget (≤ 1024) → register budget
 ``auto_splitk`` on the logical extents) is emitted as variant 0 so
 greedy callers without an autotune DB pick the heuristic.
 
-Non-matmul branches (pointwise + chunk-reduce) are not handled here yet
-— they fall through to ``004_launch_geometry`` (pointwise) and stay
-chunk-less. M16 brings them into the planner.
+**Pointwise** (no matmul reduce in body) is handled by
+``_split_pointwise_fully``: each chain axis is stamped ``Role.THREAD``
+(when ext ≤ target) or σ-split into ``A_b BLOCK`` over ``A_t THREAD``
+(when ext > target and divides). Outer chain axes beyond the THREAD
+slot become ``Role.BLOCK`` whole.
+
+Chunk-reduce for large-K non-matmul reductions is not yet brought
+back into the planner — current tests don't depend on it.
 """
 
 from __future__ import annotations
@@ -495,7 +500,10 @@ def _find_accum_name(k_o_loop: Loop) -> str | None:
 
 
 def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_value: str) -> bool:
-    """See ``003_split_matmul_k._is_linear_multiplicative_chain``."""
+    """``Write.value`` is reachable from ``acc`` only through multiplies
+    whose other operand is acc-independent (e.g. ``acc * silu(gate)``).
+    Then ``sum_i (c * a_i) = c * sum_i a_i`` distributes — every CTA
+    computes its own ``v = c * partial_acc`` and atomic-adds."""
     acc_dep = {acc_name}
     for s in epilogue_stmts:
         deps = set(s.deps())
@@ -518,7 +526,9 @@ def _is_linear_multiplicative_chain(epilogue_stmts: list, acc_name: str, write_v
 
 
 def _extract_simple_residual(prelude_stmts, epilogue_stmts: list, acc_name: str, write_value: str):
-    """See ``003_split_matmul_k._extract_simple_residual``."""
+    """Match ``Assign(v, add, r, acc); Write(v)`` where ``r`` is a Load
+    (in prelude or epilogue position). Returns ``(residual_name, in_epilogue)``
+    or ``None`` on any deviation."""
     if not epilogue_stmts:
         return None
     asn = epilogue_stmts[-1]
@@ -569,17 +579,18 @@ def _split_pointwise_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp]
     extents_desc = tuple(sorted((int(lp.axis.extent) for lp in chain), reverse=True))
     target_tuple = thread_tile_shape(extents_desc, body_info)
 
-    # Walk innermost-first; build (axis, role) entries.
+    # Walk innermost-first; build (axis, role) entries. Every chain
+    # axis is tagged (THREAD/BLOCK) so tileify's chain walker reads
+    # the role directly — no untagged fallback needed for kernels the
+    # planner accepts.
     chain_inner_first = list(reversed(chain))
     new_levels_inner_first: list[tuple[Axis, Role]] = []
     sigma_map: dict[str, object] = {}
-    changed = False
     for i, lp in enumerate(chain_inner_first):
         ext = int(lp.axis.extent)
         if i >= len(target_tuple):
             # Outer beyond target — BLOCK whole.
             new_levels_inner_first.append((lp.axis, Role.BLOCK))
-            changed = True
             continue
         target = int(target_tuple[i])
         if ext <= target:
@@ -592,10 +603,6 @@ def _split_pointwise_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp]
         new_levels_inner_first.append((inner_ax, Role.THREAD))
         new_levels_inner_first.append((outer_ax, Role.BLOCK))
         sigma_map[lp.axis.name] = Var(outer_ax.name) * Literal(target, "int") + Var(inner_ax.name)
-        changed = True
-
-    if not changed:
-        return None  # planner has nothing to add
 
     inner_stmts = tuple(chain[-1].body)
     if sigma_map:

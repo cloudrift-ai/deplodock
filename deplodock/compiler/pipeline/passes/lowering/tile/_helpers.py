@@ -41,9 +41,8 @@ _logger = logging.getLogger(__name__)
 def accums_independent(body: Body) -> bool:
     """True iff no Accum's value transitively depends on another Accum's
     running value. Permits multiple independent Accums; rejects online
-    algorithms (online softmax, Welford). Salvaged from the deleted
-    ``004_launch_geometry``; retained because the kernel-rule tests
-    use it as a structural predicate."""
+    algorithms (online softmax, Welford). Used by reduction-rule
+    tests as a structural predicate."""
     body = Body.coerce(body)
     accum_names = {s.name for s in body if isinstance(s, Accum)}
     return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
@@ -153,19 +152,17 @@ def loads_reading(body: Body, stage_name: str) -> list[Load]:
 # ---------------------------------------------------------------------------
 
 # Per-nest-level register-tile factor choices. Used by
-# ``008_register_tile`` (legacy fork) and ``000_partition_planner``
-# (planner-driven matmul register-tile fork).
+# ``000_partition_planner``'s matmul (FM, FN) enumeration.
 TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 
-# Cap on total per-thread replication (∏ factors). Mirrors
-# ``008_register_tile._MAX_CELLS_PER_THREAD``: NVRTC compile time
+# Cap on total per-thread replication (∏ factors). NVRTC compile time
 # explodes on more-unrolled bodies.
 MAX_CELLS_PER_THREAD: int = 128
 
 
 # ---------------------------------------------------------------------------
-# Axis replication (factored out of legacy 008_register_tile so the planner-
-# driven 006a_register_tile_planned can keep working after 008 is deleted)
+# Axis replication (used by ``006a_register_tile_planned`` to replicate
+# stmts along REGISTER-tagged axes after the planner pre-splits them).
 # ---------------------------------------------------------------------------
 
 

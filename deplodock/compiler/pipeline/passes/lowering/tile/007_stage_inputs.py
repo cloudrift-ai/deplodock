@@ -1,10 +1,9 @@
 """Stage frequently-reused external inputs into shared memory.
 
-Runs early in the tile-lowering chain — *before* ``008_register_tile``
-— so the classifier sees the clean PAT × PAT thread-axis layout from
-``005_blockify_launch``. ``register_tile`` σ-substitutes cache-axis
-Vars in the consumer Loads (Stages stay singleton across F²; only
-consumer Loads multiply).
+Runs *after* ``006a_register_tile_planned`` (planner-driven register
+tile is already applied: F×F per-cell Load replicas all share their
+source buffer). Stages stay singleton across F²; only consumer Loads
+σ-substitute cache-axis Vars.
 
 **Pipeline:**
 

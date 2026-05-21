@@ -1,6 +1,6 @@
 """Chunk the N register-tile into ``LDS.128``-sized strips when ``FN > 4``.
 
-After ``008_register_tile`` commits the canonical ``(THREAD-outer | RF-inner)``
+After ``006a_register_tile_planned`` commits the canonical ``(THREAD-outer | RF-inner)``
 ordering on the N axis, body Loads on the B operand stage read column
 ``Var(lane) * FN + c`` for ``c=0..FN-1``. Two regimes:
 

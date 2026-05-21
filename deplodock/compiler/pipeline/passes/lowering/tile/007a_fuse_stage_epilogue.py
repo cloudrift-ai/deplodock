@@ -47,8 +47,9 @@ Scope (conservative for the first cut):
   reduce-body region outside the cone). Multi-output cones are skipped.
 
 Runs once per TileOp (the rewriter returns ``RuleSkipped`` if no cone
-was found). Must run **before** ``008_register_tile`` — that pass
-introduces F-axis split and would tangle cones across register tiles.
+was found). Runs after ``006a_register_tile_planned`` — the F-axis
+replication is already applied, so the cone analysis sees the final
+per-cell layout.
 """
 
 from __future__ import annotations

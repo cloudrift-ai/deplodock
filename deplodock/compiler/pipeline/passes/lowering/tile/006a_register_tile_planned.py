@@ -4,21 +4,17 @@ When ``000_partition_planner`` pre-splits a matmul's output Loops and
 tags the inner halves ``Role.REGISTER``, this pass replicates those
 loops per-cell **before** staging picks cache axes. That matters: if
 the REGISTER tag survives into ``007_stage_inputs``, the Stage's cache
-slab won't include the per-cell M_i / N_i axes (they aren't in
-``Tile.axes``), and ``008_register_tile``'s post-staging replicate
-would duplicate Stage stmts with name collisions, corrupting smem.
+slab won't include the per-cell M_r / N_r axes (they aren't in
+``Tile.axes``).
 
 Running the per-cell replication here means ``007_stage_inputs`` sees
-F×F copies of each body Load with distinct M_o*F+i / N_o*F+j
-gmem indices. Staging then coalesces them through their shared source
-buffer and the cache slab spans the full BM × BK / BK × BN — exactly
-the layout today's post-staging ``008_register_tile`` produces in the
-no-planner path.
+F×F copies of each body Load with distinct M_b*F+i / N_b*F+j gmem
+indices. Staging then coalesces them through their shared source
+buffer and the cache slab spans the full BM × BK / BK × BN.
 
-When no REGISTER tags are present (default ``DEPLODOCK_PLANNER=0``),
-the pass skips and the legacy ``008_register_tile`` fork still owns
-the split-and-replicate work post-staging. Both stamp ``FN`` so the
-existing idempotence marker prevents double-replication.
+When no REGISTER tags are present (non-matmul kernels), the pass
+skips. Stamps ``FM`` / ``FN`` so the planner-stamped values persist
+and the rule is idempotent on a second visit.
 """
 
 from __future__ import annotations
@@ -43,15 +39,13 @@ def rewrite(root: Node) -> Graph | None:
 
     new_body, factors = _replicate_register_loops(tile.body)
     if not factors:
-        # Idempotence + bail-out: once REGISTER Loops are gone (either
-        # because the planner emitted a (FM=1, FN=1) variant or because
-        # 006a already replicated), this pass is a no-op. In env=0 mode
-        # no REGISTER tags ever appear so we bail to the legacy 008.
-        raise RuleSkipped("no Role.REGISTER tags in body — legacy 008 owns this kernel")
+        # No REGISTER tags in body — non-matmul kernel (planner only
+        # stamps REGISTER on matmul) or this rule has already run and
+        # consumed the tags. Either way, nothing to do.
+        raise RuleSkipped("no Role.REGISTER tags in body")
 
-    # FM/FN are stamped by the planner in env=1 mode; preserve them
-    # rather than overwriting. In env=0 the planner never fired so
-    # ``factors`` populates them on first run.
+    # FM/FN are stamped by the planner; preserve them rather than
+    # overwriting (factors carry the same values).
     knobs = dict(root.op.knobs)
     if len(factors) >= 1 and "FM" not in knobs:
         knobs["FM"] = factors[0]
