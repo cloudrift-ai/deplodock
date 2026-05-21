@@ -511,25 +511,36 @@ def _build_split_body(
     inner_stmts = tuple(outer_n.body)
     inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
 
-    # Step 2: replace every K reduce Loop with a K_o · K_i tower
-    # σ-rewriting its body. ``_replace_inner_reduce`` walks every match
-    # (not just the first) so multi-reduce kernels like softmax
-    # (max-reduce + sum-reduce over the same K) cooperatively split
-    # both reduces. All reduces share K_o / K_i axis NAMES (derived
-    # from the first reduce's K_name) so post-σ their Loads look
-    # structurally identical, letting M11's 007_stage_inputs row-cache
-    # merge them into one Stage.
+    # Step 2: rewrite every K-iteration Loop into a K_o · K_i tower
+    # σ-rewriting its body. One unified walk handles both:
     #
-    # Matmul branch uses ``is_matmul_reduce`` as the predicate;
-    # cooperative-reduce branch uses the complementary "reduce but not
-    # matmul-shape" predicate.
+    #   - reduce K iterators (matmul, cooperative-K max/sum/...): body
+    #     carries an Accum, so the K_i wrapper becomes reduce-tagged
+    #     automatically.
+    #   - per-K post-pointwise iterators (RMSNorm, softmax post-divide):
+    #     body has no Accum, K_i stays non-reduce. When SPLITK > 1, the
+    #     K_o tower wraps in ``Cond(K_s == 0)`` — every K_s CTA would
+    #     otherwise re-execute the post and clobber the gmem cell.
+    #     Reduce K skips the Cond; launch_geometry's atomic-Write
+    #     rewrite handles cross-CTA SPLITK.
+    #
+    # All matched Loops share K_o / K_i axis NAMES (derived from the
+    # first reduce's K_name). Multi-reduce kernels (softmax max + sum)
+    # and reduce + post (RMSNorm) emit structurally identical σ-Loads,
+    # which 007_stage_inputs row-cache exploits to merge into one Stage.
+    #
+    # Matmul calls the helper with ``is_matmul_reduce`` — only matmul-
+    # shape reduces match; matmul kernels have no per-K post-pointwise
+    # loop, so the cooperative-only Cond branch never fires.
+    # Cooperative non-matmul calls with the K-extent predicate so both
+    # the reduce K and the post K hit the same rewrite.
     if k_loop is not None:
+        K_canonical_name = k_loop.axis.name
         if k_is_matmul:
             match = is_matmul_reduce
         else:
-            match = lambda lp: lp.is_reduce and not is_matmul_reduce(lp)  # noqa: E731
-        K_canonical_name = k_loop.axis.name
-        new_inner, n_replaced = _replace_inner_reduce(
+            match = lambda lp: int(lp.axis.extent) == E_K and not is_matmul_reduce(lp)  # noqa: E731
+        new_inner, n_replaced = _replace_k_loops(
             inner_after_outer,
             match=match,
             K_canonical_name=K_canonical_name,
@@ -541,15 +552,6 @@ def _build_split_body(
         )
         if n_replaced == 0:
             raise _BuildSkipped("K reduce not found in body")
-
-        # Cooperative-K post-K loop rewrite: when br > 1 and the body has
-        # additional non-reduce free Loops iterating the same K extent
-        # (RMSNorm's per-K post-pointwise, softmax's final divide loop),
-        # rewrite them into a K_o' · K_i' tower under the cooperative
-        # K_c axis. The post tower uses the SAME K_o / K_i axis names as
-        # the reduce side so M11's row-cache merges their Loads.
-        if br > 1 and K_c is not None:
-            new_inner = _replace_post_k_loops(new_inner, K_extent=E_K, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk)
     else:
         new_inner = inner_after_outer
 
@@ -584,7 +586,7 @@ def _build_split_body(
     return current
 
 
-def _replace_inner_reduce(
+def _replace_k_loops(
     stmts: tuple[Stmt, ...],
     *,
     match,
@@ -595,40 +597,67 @@ def _replace_inner_reduce(
     bk: int,
     K_o_ext: int,
 ) -> tuple[tuple[Stmt, ...], int]:
-    """Walk ``stmts`` and replace *every* reduce Loop matching ``match``
-    with a ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce, STAGE_INNER,
-    σ_k(body)))`` tower. Returns ``(new_stmts, n_replaced)``.
+    """Walk ``stmts`` and rewrite every ``Loop`` matching ``match`` into
+    a ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, σ(body)))`` tower.
+    Returns ``(new_stmts, n_replaced)``.
 
-    All matched reduces share the SAME K_o / K_i axis names
-    (``{K_canonical_name}_o`` / ``{K_canonical_name}_i``) — different
-    Loop instances scoped to their own bodies but textually identical.
-    The σ-substitution rewrites each reduce's source K axis to the
-    canonical K_o / K_i expression, so post-σ the Loads in all reduce
-    bodies look structurally identical. M11's 007_stage_inputs
-    row-cache exploits this to merge multi-reduce + post-K Loads into
-    one Stage.
+    Handles both reduce K iterators (matmul + cooperative-K reduce) and
+    per-K post-pointwise iterators (RMSNorm / softmax post) uniformly —
+    they share the same σ, the same SERIAL_OUTER / STAGE_INNER role
+    pair, and the same canonical K_o / K_i axis names. ``Loop.is_reduce``
+    is a computed property of the body's Accum presence, so the K_i
+    wrapper inherits the correct reduce-status automatically: reduce-K
+    bodies (with Accum) produce a reduce-tagged K_i; post-K bodies (no
+    Accum) produce a non-reduce K_i.
 
-    ``match(loop)`` is ``is_matmul_reduce`` for matmul kernels, the
-    complementary "reduce but not matmul" predicate for non-matmul
-    cooperative-K reduces. No Combine emission here — that lives in
-    ``001_launch_geometry._insert_combines_after_reduces``, which walks
-    the lifted Tile body for every K_o reduce subtree."""
+    The shared canonical naming
+    (``{K_canonical_name}_o`` / ``{K_canonical_name}_i``) is what lets
+    007_stage_inputs' row-cache merge structurally-equivalent Loads
+    across reduce + post into a single Stage.
+
+    SPLITK + non-reduce: when the matched Loop is non-reduce AND
+    ``K_s`` is present, wrap the K_o tower in ``Cond(K_s == 0, …)`` so
+    only the K_s=0 CTA executes the post — every K_s CTA otherwise
+    repeats the same broadcast-value write. Reduce-K skips the Cond;
+    launch_geometry's atomic-Write rewrite handles cross-CTA SPLITK
+    via the symmetric ``Cond(K_s == 0, atomic(indep))`` decomposition.
+
+    Combine emission lives in
+    ``001_launch_geometry._insert_combines_after_reduces``, which keys
+    off STAGE_INNER + Accum — post-K's non-reduce STAGE_INNER produces
+    no Combine, exactly correct.
+
+    Match composition:
+
+    - Matmul: ``match=is_matmul_reduce`` — only the matmul-shape
+      reduce matches; matmul has no per-K post-pointwise.
+    - Cooperative non-matmul:
+      ``match=lambda lp: lp.axis.extent == E_K and not is_matmul_reduce(lp)``
+      — both the cooperative-K reduce and the per-K post-pointwise
+      iterate the same E_K and get rewritten in one walk.
+    """
     out: list[Stmt] = []
     n_replaced = 0
     for s in stmts:
-        if isinstance(s, Loop) and s.is_reduce and match(s):
+        if isinstance(s, Loop) and match(s):
             K_name = s.axis.name
             K_o = Axis(f"{K_canonical_name}_o", K_o_ext)
             K_i = Axis(f"{K_canonical_name}_i", bk)
             sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk)
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             k_i_loop = Loop(axis=K_i, role=Role.STAGE_INNER, body=new_body)
-            k_o_loop = Loop(axis=K_o, role=Role.SERIAL_OUTER, body=(k_i_loop,))
+            k_o_loop: Stmt = Loop(axis=K_o, role=Role.SERIAL_OUTER, body=(k_i_loop,))
+            if not s.is_reduce and K_s is not None:
+                k_o_loop = Cond(
+                    cond=BinaryExpr("==", Var(K_s.name), Literal(0, "int")),
+                    body=(k_o_loop,),
+                    else_body=(),
+                )
             out.append(k_o_loop)
             n_replaced += 1
             continue
         if isinstance(s, (Loop, StridedLoop)):
-            inner, r = _replace_inner_reduce(
+            inner, r = _replace_k_loops(
                 s.body, match=match, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
             )
             if r:
@@ -636,10 +665,10 @@ def _replace_inner_reduce(
                 n_replaced += r
                 continue
         if isinstance(s, Cond):
-            inner_b, rb = _replace_inner_reduce(
+            inner_b, rb = _replace_k_loops(
                 s.body, match=match, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
             )
-            inner_e, re_ = _replace_inner_reduce(
+            inner_e, re_ = _replace_k_loops(
                 s.else_body,
                 match=match,
                 K_canonical_name=K_canonical_name,
@@ -667,7 +696,7 @@ def _build_k_sigma(
     br: int,
     bk: int,
 ) -> Sigma:
-    """Build the σ for a single reduce's K-axis split:
+    """Build the σ for a single K-axis split:
     ``K = K_s · (K_o_ext · br · bk) + K_o · (br · bk) + K_i · br + K_c``.
     K_s and K_c terms collapse when those axes are None (SPLITK=1 and
     BR=1 respectively); the K_i · br term loses the ``· br`` when K_c
@@ -680,84 +709,6 @@ def _build_k_sigma(
     if K_s is not None:
         inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk, "int") + inner_expr
     return Sigma({K_name: inner_expr})
-
-
-def _replace_post_k_loops(
-    stmts: tuple[Stmt, ...],
-    *,
-    K_extent: int,
-    K_canonical_name: str,
-    K_s: Axis | None,
-    K_c: Axis,
-    br: int,
-    bk: int,
-) -> tuple[Stmt, ...]:
-    """Rewrite every non-reduce free Loop ``Loop(a_post=K_extent, body=...)``
-    in ``stmts`` into a K_o · K_i tower that σ-rewrites the post-iter
-    axis to ``K_o·(br·bk) + K_i·br + K_c.name``, matching the σ used by
-    the cooperative reduce side. The post Loop's iteration is now
-    distributed across the ``br`` K_c threads — each thread writes its
-    own K-slice instead of every thread redundantly iterating all K.
-
-    K_o carries ``Role.SERIAL_OUTER`` (launch_geometry won't lift it).
-    K_i carries ``Role.STAGE_INNER``, semantically "inner slab dim,
-    regardless of reduce-status," so M11's ``007_stage_inputs``
-    row-cache picks it up as a Load-collection site alongside the
-    reduce K_i.
-
-    Axis names are SHARED with the reduce side
-    (``{K_canonical_name}_o`` / ``{K_canonical_name}_i``) so post-σ the
-    Loads in reduce and post bodies look structurally identical —
-    007's row-cache groups them into one Stage.
-
-    When ``K_s`` is present (SPLITK > 1), wrap the K_o tower in
-    ``Cond(K_s == 0, body=[…])`` so only the K_s=0 CTA executes the
-    post — every K_s CTA otherwise repeats the same broadcast-value
-    write. Mirrors the existing atomic-Write Cond pattern."""
-    K_o_ext = K_extent // (br * bk)
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, Loop) and not s.is_reduce and int(s.axis.extent) == K_extent:
-            a_post = s.axis
-            K_op = Axis(f"{K_canonical_name}_o", K_o_ext)
-            K_ip = Axis(f"{K_canonical_name}_i", bk)
-            # σ: a_post = K_o · (br · bk) + K_i · br + K_c
-            post_expr = Var(K_op.name) * Literal(br * bk, "int") + Var(K_ip.name) * Literal(br, "int") + Var(K_c.name)
-            sigma_post = Sigma({a_post.name: post_expr})
-            new_body = tuple(c.rewrite(_identity_rename, sigma_post) for c in s.body)
-            k_ip_loop = Loop(axis=K_ip, role=Role.STAGE_INNER, body=new_body)
-            k_op_loop: Stmt = Loop(axis=K_op, role=Role.SERIAL_OUTER, body=(k_ip_loop,))
-            if K_s is not None:
-                k_op_loop = Cond(
-                    cond=BinaryExpr("==", Var(K_s.name), Literal(0, "int")),
-                    body=(k_op_loop,),
-                    else_body=(),
-                )
-            out.append(k_op_loop)
-            continue
-        if isinstance(s, (Loop, StridedLoop)):
-            inner = _replace_post_k_loops(
-                tuple(s.body), K_extent=K_extent, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk
-            )
-            if inner != tuple(s.body):
-                out.append(replace(s, body=inner))
-                continue
-        if isinstance(s, Cond):
-            b = _replace_post_k_loops(tuple(s.body), K_extent=K_extent, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk)
-            e = _replace_post_k_loops(
-                tuple(s.else_body),
-                K_extent=K_extent,
-                K_canonical_name=K_canonical_name,
-                K_s=K_s,
-                K_c=K_c,
-                br=br,
-                bk=bk,
-            )
-            if b != tuple(s.body) or e != tuple(s.else_body):
-                out.append(Cond(cond=s.cond, body=b, else_body=e))
-                continue
-        out.append(s)
-    return tuple(out)
 
 
 def _find_first_reduce(stmts, *, match) -> Loop | None:
