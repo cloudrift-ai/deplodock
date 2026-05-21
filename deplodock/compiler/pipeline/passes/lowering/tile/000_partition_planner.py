@@ -210,15 +210,11 @@ def _try_matmul_register_tile(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | N
         body=chain[-1].body,
     )
     h_fm, h_fn = (int(x) for x in register_tile_shape(synthetic))
-    if h_fm == 1 and h_fn == 1:
-        # ``register_tile_shape`` is pre-blockify here — without the
-        # (BN, BM) split (Step 4) the synthetic Tile has full extents
-        # and the heuristic is too pessimistic for small / fused matmuls
-        # (e.g. SDPA's 32×64 inner matmul). Defer to ``008_register_tile``
-        # post-staging, which sees the actual blockified shape. Once
-        # Step 4 hoists (BN, BM) into the planner, this short-circuit
-        # goes away and the full fork emits.
-        return None
+    # Note: ``register_tile_shape`` runs against the pre-blockify
+    # synthetic, so for small / fused matmuls it tends to return
+    # ``(1, 1)``. In that case variant 0 (the heuristic) is the
+    # no-register-tile case; the tune sweep still walks the FM/FN
+    # cartesian via the loop below.
 
     seen: set[tuple[int, int]] = set()
     ordered: list[tuple[int, int]] = []

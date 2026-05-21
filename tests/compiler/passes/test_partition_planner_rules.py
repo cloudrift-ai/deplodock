@@ -257,41 +257,5 @@ def test_006a_replicates_register_tagged_body_loop():
     assert new_tile_op.knobs.get("FM") == 4
 
 
-# --- 006 chunk_reduce STAGE_INNER guard (M3 plumbing) ---------------
-
-
-def test_006_skips_stage_inner_tagged_loop():
-    """``006_chunk_reduce`` must treat a ``Role.STAGE_INNER``-tagged
-    reduce Loop as already-chunked (planner-driven path) and not
-    re-chunk it. Otherwise the planner pre-split would double-chunk
-    on 006's natural run."""
-    from importlib import import_module
-
-    from deplodock.compiler.pipeline.passes.lowering.tile import _helpers  # noqa: F401 — ensure import
-
-    chunk_reduce = import_module("deplodock.compiler.pipeline.passes.lowering.tile.006_chunk_reduce")
-
-    # Build a reduce Loop that would normally qualify (large slab),
-    # tag it STAGE_INNER, assert ``_qualifies`` rejects it.
-    k = Axis("k", 512)
-    out = Axis("out", 16)
-    tagged_reduce = Loop(
-        axis=k,
-        role=Role.STAGE_INNER,
-        body=(
-            Load(name="x_v", input="x", index=(Var("k"),)),
-            Accum(name="acc", value="x_v", op=ElementwiseImpl("add")),
-        ),
-    )
-    assert chunk_reduce._qualifies(tagged_reduce, (out,)) is False, "STAGE_INNER tag should suppress _qualifies"
-
-    # Sanity: same loop without the tag does qualify (slab = 8192*4 =
-    # 32 KB > 16 KB cap; out absent from the load index → fan-in).
-    untagged = Loop(
-        axis=Axis("k", 8192),
-        body=(
-            Load(name="x_v", input="x", index=(Var("k"),)),
-            Accum(name="acc", value="x_v", op=ElementwiseImpl("add")),
-        ),
-    )
-    assert chunk_reduce._qualifies(untagged, (out,)) is True, "untagged 32KB-slab reduce should qualify"
+# --- (006 chunk_reduce STAGE_INNER guard test deleted alongside the
+#       legacy pass — planner owns chunk-reduce now.)

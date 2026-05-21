@@ -133,10 +133,10 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    # Pure elementwise → chunk_matmul_k raises RuleSkipped (no matmul-shaped
-    # reduce) and cooperative_reduce raises (no reduce Loop). The engine's
-    # ``debug_on`` gate keys off the engine logger's level — bump that to
-    # DEBUG so ``emit`` actually fires.
+    # Pure elementwise → partition_planner raises RuleSkipped (no matmul
+    # / cooperative / chunk-reduce branch matched) and cooperative_reduce
+    # raises (no reduce Loop). The engine's ``debug_on`` gate keys off
+    # the engine logger's level — bump that to DEBUG so ``emit`` fires.
     logging.getLogger("deplodock.compiler.pipeline").setLevel(logging.DEBUG)
     try:
         Pipeline.build(TILE_PASSES).run(g)
@@ -145,7 +145,7 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
 
     out = capsys.readouterr().out
     skip_messages = [ln for ln in out.splitlines() if ln.startswith("--- ") and "skipped" in ln]
-    assert any("chunk_matmul_k" in m for m in skip_messages), skip_messages
+    assert any("partition_planner" in m for m in skip_messages), skip_messages
     assert any("cooperative_reduce" in m for m in skip_messages), skip_messages
 
 

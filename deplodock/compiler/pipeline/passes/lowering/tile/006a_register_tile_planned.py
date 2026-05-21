@@ -32,7 +32,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Loop, Stmt
 from deplodock.compiler.ir.tile.ir import Tile, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import replicate_along_axis, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -67,13 +67,6 @@ def _replicate_register_loops(body: Body) -> tuple[Body, list[int]]:
     layer's body by ``axis.extent`` with ``σ: axis → literal(i)``.
     Returns ``(new_body, factors)`` with factors in outermost-first
     order. Caller stamps factors[0] → FM, factors[1] → FN."""
-    # Import lazily — the legacy 008 module's filename starts with
-    # ``008_`` which Python can't import via dotted syntax.
-    from importlib import import_module
-
-    legacy = import_module("deplodock.compiler.pipeline.passes.lowering.tile.008_register_tile")
-    replicate_along_axis = legacy.replicate_along_axis
-
     out: list[Stmt] = []
     factors: list[int] = []
     for s in body:

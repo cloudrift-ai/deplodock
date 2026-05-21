@@ -48,7 +48,7 @@ from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, Stmt, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
@@ -57,7 +57,11 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     TUNE_F_CHOICES as _TUNE_F_CHOICES_SHARED,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+    is_matmul_reduce,
+    replicate_along_axis,
+    single_tile,
+)
 from deplodock.compiler.tuning import register_tile_shape
 
 PATTERN = [Pattern("root", TileOp)]
@@ -282,7 +286,15 @@ def _find_slots(tile: Tile) -> list[_Slot]:
     slots (M-axis outer → ``FM``, N-axis inner → ``FN``), one site
     each. Cooperative-reduce body → one slot at the innermost level
     (``FN``), one site per reduce ``StridedLoop`` with shared factor.
-    Returns ``[]`` when neither shape matches or no factor > 1 fits."""
+    Returns ``[]`` when neither shape matches or no factor > 1 fits.
+
+    The matmul branch is the fallback path for kernels where the
+    planner's pre-blockify ``register_tile_shape`` heuristic returned
+    ``(1, 1)`` (small / fused matmuls — SDPA's 32×64 inner matmul);
+    those kernels arrive here without an FN stamp and this rule does
+    the post-blockify register-tile split."""
+    from math import gcd  # noqa: PLC0415
+
     if any(is_matmul_reduce(s) for s in tile.body.iter() if isinstance(s, Loop)):
         heuristic = register_tile_shape(tile)
         if heuristic[0] <= 1 and heuristic[1] <= 1:
@@ -290,7 +302,6 @@ def _find_slots(tile: Tile) -> list[_Slot]:
         thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
         if len(thread_axes) != 2:
             return []
-        # Smaller-extent axis = M (outer level → FM); larger = N (inner level → FN).
         sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
         knob_names = (FM.name, FN.name)
         return [
@@ -304,8 +315,6 @@ def _find_slots(tile: Tile) -> list[_Slot]:
             )
             for i, (ba, h) in enumerate(zip(sorted_ba, heuristic, strict=True))
         ]
-
-    from math import gcd  # noqa: PLC0415
 
     reduce_loops = [s for s in tile.body if isinstance(s, StridedLoop) and s.is_reduce and isinstance(s.step, Literal)]
     if not reduce_loops:
@@ -368,58 +377,6 @@ def _find_slots(tile: Tile) -> list[_Slot]:
             ),
         )
     ]
-
-
-def replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callable[[int], Sigma]) -> Body:
-    """F× replicate every stmt whose value transitively depends on
-    ``axis``. Each such stmt is emitted ``factor`` times with σ given
-    by ``sigma_for(i)`` and SSA names suffixed ``_<i>``. Stmts that
-    don't depend on ``axis`` pass through. Block stmts recurse into
-    their bodies and rebuild via :meth:`Stmt.with_bodies`; a wrapper
-    that shadows ``axis`` isn't itself replicated (the fold's
-    bound-axis filter keeps shadowed references local).
-
-    Dependency analysis is one :meth:`Body.fold` over the def-use DAG
-    with bound-axis filtering. ``keep[name]`` records which SSA names
-    must carry the suffix vs. pass through unchanged (Tile-input
-    buffers, constants, axis-free producers)."""
-
-    def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
-        # Stage cache-axis Vars are smem-local — they don't vary per replica.
-        # Mark them bound here so Stages aren't tagged for replication; only
-        # the consumer Loads (which σ-rewrite cache-axis Vars) multiply.
-        local_bound = bound | frozenset(ax.name for ax in s.axes) if isinstance(s, Stage) else bound
-        own: frozenset[str] = frozenset()
-        for e in s.exprs():
-            own = own | frozenset(v for v in e.free_vars() if v not in local_bound)
-        for c in child_T:
-            if c is not None:
-                own = own | c
-        return own
-
-    deps = body.fold(fn)
-    keep: dict[str, bool] = {n: axis in deps[id(s)] for s in body.iter() for n in s.defines()}
-
-    def rename_for(i: int):
-        def _rename(name: str) -> str:
-            return f"{name}_{i}" if keep.get(name, False) else name
-
-        return _rename
-
-    def go(b: Body) -> Body:
-        out: list[Stmt] = []
-        for s in b:
-            nested = s.nested()
-            if nested:
-                out.append(s.with_bodies(tuple(go(child) for child in nested)))
-            elif axis in deps.get(id(s), frozenset()):
-                for i in range(factor):
-                    out.append(s.rewrite(rename_for(i), sigma_for(i)))
-            else:
-                out.append(s)
-        return Body(out)
-
-    return go(body)
 
 
 def _sigma_split(axis: str, axis_o: str, factor: int) -> Callable[[int], Sigma]:
