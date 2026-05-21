@@ -230,9 +230,10 @@ recipe.
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
 `knobs=` line — they're treated as pass-presence markers, not values.
 
-`FUSED_PIPELINE` is an autotune fork: `007b_hoist_invariant_compute` emits both variants per fusable cone unless
-`DEPLODOCK_FUSED_PIPELINE` is pinned in the env. `BUFFER_COMPUTE` is single-variant (env-gated) — the experimental
-ring-buffered ComputeStage path doesn't yet have enough signal to be candidate-driven.
+`FUSED_PIPELINE` is an autotune fork: `007b_hoist_invariant_compute` emits both variants per fusable cone in a fixed
+order (inline-fuse first as the greedy default — smaller smem, works on every architecture). No env override; the
+autotuner is the only mechanism for picking the hoist variant. `BUFFER_COMPUTE` is single-variant (env-gated) — the
+experimental ring-buffered ComputeStage path doesn't yet have enough signal to be candidate-driven.
 
 ## Pass directories
 

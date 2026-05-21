@@ -225,14 +225,13 @@ class _Node:
         self.op = op
 
 
-def test_rewrite_emits_both_variants_by_default(monkeypatch):
-    monkeypatch.delenv("DEPLODOCK_FUSED_PIPELINE", raising=False)
+def test_rewrite_emits_both_variants_in_fixed_order():
+    """Both polarities always emitted; inline-fuse first (greedy default —
+    smaller smem footprint, works on every architecture)."""
     op = _silu_mul_matmul_tile()
     variants = _pass.rewrite(_Node(op))
     assert isinstance(variants, list) and len(variants) == 2
 
-    # First variant = FUSED_PIPELINE=False (inline-fuse) per default-seed
-    # ordering; second = True (hoist-compute).
     v0, v1 = variants
     assert v0.knobs["FUSED_PIPELINE"] is False
     assert v1.knobs["FUSED_PIPELINE"] is True
@@ -245,19 +244,3 @@ def test_rewrite_emits_both_variants_by_default(monkeypatch):
     v1_tile = v1.body[0]
     v1_computes = [s for s in v1_tile.body if isinstance(s, ComputeStage)]
     assert len(v1_computes) == 1
-
-
-def test_rewrite_env_pins_to_hoist(monkeypatch):
-    monkeypatch.setenv("DEPLODOCK_FUSED_PIPELINE", "1")
-    op = _silu_mul_matmul_tile()
-    variants = _pass.rewrite(_Node(op))
-    assert len(variants) == 1
-    assert variants[0].knobs["FUSED_PIPELINE"] is True
-
-
-def test_rewrite_env_pins_to_inline(monkeypatch):
-    monkeypatch.setenv("DEPLODOCK_FUSED_PIPELINE", "0")
-    op = _silu_mul_matmul_tile()
-    variants = _pass.rewrite(_Node(op))
-    assert len(variants) == 1
-    assert variants[0].knobs["FUSED_PIPELINE"] is False

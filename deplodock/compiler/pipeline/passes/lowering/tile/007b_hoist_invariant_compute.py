@@ -63,10 +63,12 @@ pipeline the transport across K_outer iterations while the
 Both shapes collapse the reduce-body silu chain to a single Load on
 the cone's output buffer.
 
-Forks unconditionally so the autotuner sees both options. The
-``DEPLODOCK_FUSED_PIPELINE`` env var pins to a single polarity when
-set (legacy behavior: unset → both, ``=1`` → hoist only, ``=0`` →
-inline only).
+Forks unconditionally — both polarities are always emitted in a fixed
+order (inline-fuse first, hoist second). Inline-fuse is the greedy
+default because it has a smaller smem footprint and works on every
+architecture; hoist is the per-recipe autotune win on sm_90+ with TMA.
+Autotune-side variant ordering / pinning is the autotuner's job, not
+this pass's.
 
 Scope (conservative for the first cut):
 
@@ -87,7 +89,6 @@ per-cell layout.
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Node
@@ -113,17 +114,19 @@ FUSED_PIPELINE = Knob(
 )
 
 
+_VARIANT_ORDER: tuple[bool, ...] = (False, True)
+"""Fixed emission order for the FUSED_PIPELINE fork: inline-fuse first
+(greedy default — smaller smem, works everywhere), hoist second."""
+
+
 def rewrite(root: Node) -> list[TileOp] | None:
-    """Emit one TileOp variant per ``FUSED_PIPELINE`` polarity. Inline-fuse
-    first (default-seed perf), hoist-compute second. When
-    ``DEPLODOCK_FUSED_PIPELINE`` is set in the env, emit only that polarity
-    (legacy behaviour: ``=1`` → hoist, ``=0`` → inline, unset → both)."""
+    """Emit both ``FUSED_PIPELINE`` polarities in a fixed order. Greedy
+    picks the first (inline-fuse); autotune searches both."""
     if FUSED_PIPELINE.name in root.op.knobs:
         raise RuleSkipped("hoist already applied (idempotence via knob)")
 
-    polarities = _polarities_from_env()
     variants: list[TileOp] = []
-    for fused_pipeline in polarities:
+    for fused_pipeline in _VARIANT_ORDER:
         new_body = _maybe_rewrite(root.op.body, fused_pipeline=fused_pipeline)
         if new_body is None:
             continue
@@ -132,17 +135,6 @@ def rewrite(root: Node) -> list[TileOp] | None:
     if not variants:
         raise RuleSkipped("no fusable epilogue cone found")
     return variants
-
-
-def _polarities_from_env() -> tuple[bool, ...]:
-    raw = os.environ.get(FUSED_PIPELINE.env)
-    if raw is None or raw == "":
-        return (False, True)  # inline-fuse first (default-seed perf)
-    if raw in ("1", "true", "True"):
-        return (True,)
-    if raw in ("0", "false", "False"):
-        return (False,)
-    return (False, True)
 
 
 def _maybe_rewrite(body: Body, *, fused_pipeline: bool) -> Body | None:
