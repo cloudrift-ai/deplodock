@@ -47,7 +47,7 @@ import os
 from typing import NamedTuple
 
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
@@ -173,8 +173,9 @@ def _candidate_buffers(body: Body) -> list[tuple[str, int]]:
     if n_thread <= _WARP_SIZE:
         return []
     block_axis_names = frozenset(ax.name for ax in tile.block_axes)
+    is_cooperative = any(ba.role is Role.COOPERATIVE_STRIDE for ba in tile.axes)
     found: dict[str, int] = {}
-    _collect_candidates(tile, tile.thread_axes, tile.all_axes, block_axis_names, found, slab_cap=10**12)
+    _collect_candidates(tile, tile.thread_axes, tile.all_axes, block_axis_names, found, slab_cap=10**12, is_cooperative=is_cooperative)
     return list(found.items())
 
 
@@ -186,24 +187,66 @@ def _collect_candidates(
     found: dict[str, int],
     *,
     slab_cap: int,
+    is_cooperative: bool = False,
 ) -> None:
     """Mirror of ``_process_scope``'s buffer-walk side: record each
-    candidate buffer's classified slab size without building Stages."""
-    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...]]]] = {}
+    candidate buffer's classified slab size without building Stages.
+    Mirrors the cooperative-K row-cache treatment so preflight matches
+    actual staging behavior."""
+    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]] = {}
     for s in scope.body:
+        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
+            inner_stage = _peel_to_stage_inner(s)
+            if inner_stage is not None:
+                scope_axes = (*in_scope_axes, s.axis, inner_stage.axis)
+                extra = (s.axis,)
+                for stmt in inner_stage.body:
+                    if isinstance(stmt, Load):
+                        loads_by_buf.setdefault(stmt.input, []).append((stmt, inner_stage.axis, scope_axes, extra))
+                continue
+        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.STAGE_INNER:
+            scope_axes = (*in_scope_axes, s.axis)
+            for stmt in s.body:
+                if isinstance(stmt, Load):
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, ()))
+            continue
         if isinstance(s, Loop) and not s.is_reduce:
-            _collect_candidates(s, thread_axes, (*in_scope_axes, s.axis), block_axis_names, found, slab_cap=slab_cap)
+            _collect_candidates(
+                s,
+                thread_axes,
+                (*in_scope_axes, s.axis),
+                block_axis_names,
+                found,
+                slab_cap=slab_cap,
+                is_cooperative=is_cooperative,
+            )
             continue
         if isinstance(s, (Loop, StridedLoop)):
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
-                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes))
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, ()))
     for buf, items in loads_by_buf.items():
-        if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _ in items):
+        if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _, _ in items):
             continue
-        for load, reduce_axis, scope_axes in items:
-            slab = _classify(load, thread_axes, reduce_axis, scope_axes, slab_cap=slab_cap)
+        # Mirror _build_stages' partition-by-index + member-count logic:
+        # multi-member partitions enable allow_no_fan_in (temporal reuse).
+        partitions_count: dict[tuple, int] = {}
+        for load, _, _, _ in items:
+            key = tuple(e.pretty() for e in load.index)
+            partitions_count[key] = partitions_count.get(key, 0) + 1
+        for load, reduce_axis, scope_axes, extra in items:
+            key = tuple(e.pretty() for e in load.index)
+            allow_no_fan_in = partitions_count[key] >= 2
+            slab = _classify(
+                load,
+                thread_axes,
+                reduce_axis,
+                scope_axes,
+                slab_cap=slab_cap,
+                extra_candidates=extra,
+                allow_no_fan_in=allow_no_fan_in,
+            )
             if slab is None:
                 continue
             # Sum slab sizes across all distinct slabs in this buffer.
@@ -245,6 +288,7 @@ def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs
 
     used_names: set[str] = set()
     block_axis_names = frozenset(ax.name for ax in tile.block_axes)
+    is_cooperative = any(ba.role is Role.COOPERATIVE_STRIDE for ba in tile.axes)
     new_tile_body = _process_scope(
         tile,
         tile.thread_axes,
@@ -254,6 +298,7 @@ def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs
         slab_cap=slab_cap,
         scope_budget=scope_budget,
         allowed_bufs=allowed_bufs,
+        is_cooperative=is_cooperative,
     )
     if new_tile_body == tile.body:
         # No stage admitted. For the variant enumerator this is the
@@ -263,6 +308,26 @@ def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs
             raise RuleSkipped("no Load qualifies for staging")
         return body
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
+
+
+def _peel_to_stage_inner(outer: Loop) -> Loop | None:
+    """Walk the outer SERIAL_OUTER's single-stmt body chain. If the
+    chain terminates in a ``Role.STAGE_INNER`` Loop (reduce or
+    non-reduce) — the cooperative-K K_i / K_i' shape — return that
+    inner Loop. Otherwise return ``None``: the outer SERIAL_OUTER is
+    treated as opaque, and the regular non-reduce recursion handles it.
+
+    The reduce-K case (K_o · K_i, matmul or cooperative-K reduce)
+    matches: inner is STAGE_INNER reduce with an Accum. The post-K case
+    (cooperative-K RMSNorm/softmax post-pointwise) also matches: inner
+    is STAGE_INNER non-reduce with body Load+Write."""
+    cur = tuple(outer.body)
+    while len(cur) == 1 and isinstance(cur[0], (Loop, StridedLoop)):
+        s = cur[0]
+        if isinstance(s, Loop) and s.role is Role.STAGE_INNER:
+            return s
+        cur = tuple(s.body)
+    return None
 
 
 def _process_scope(
@@ -275,15 +340,47 @@ def _process_scope(
     slab_cap: int,
     scope_budget: int,
     allowed_bufs: frozenset[str] | None = None,
+    is_cooperative: bool = False,
 ) -> Body:
     """Free Loops recurse; reduce loops contribute Loads to this scope's
     per-buffer bucket. Per buffer, derive one slab if all Loads agree;
-    admit under budget; emit Stages at scope head; rewrite Loads."""
+    admit under budget; emit Stages at scope head; rewrite Loads.
+
+    Cooperative-K (``is_cooperative=True``) row-cache treatment:
+    when a non-reduce ``Loop`` carrying ``Role.SERIAL_OUTER`` wraps a
+    ``Role.STAGE_INNER`` Loop, treat the SERIAL_OUTER as *transparent*
+    — collect the inner STAGE_INNER's Loads at THIS scope (don't
+    recurse). With both reduce and post-K Loads landing in the same
+    bucket, a single row-cache Stage feeds both consumers. The
+    SERIAL_OUTER's axis joins the scope axes so the slab classifier
+    sizes the slab as the full K row instead of just the per-K_o-iter
+    slab. Disabled for non-cooperative tiles (matmul) — matmul K-outer
+    needs the per-K_o-iter slab behavior preserved."""
     rewritten_inner: list[Stmt] = []
-    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...]]]] = {}
+    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]] = {}
 
     for s in scope.body:
-        if isinstance(s, Loop) and not s.is_reduce:
+        # Transparent-SERIAL_OUTER (cooperative tiles only). Includes the
+        # SERIAL_OUTER's axis as an extra cache-axis candidate so the
+        # slab sizes as the full K row instead of a per-K_o-iter slab.
+        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
+            inner_stage = _peel_to_stage_inner(s)
+            if inner_stage is not None:
+                scope_axes = (*in_scope_axes, s.axis, inner_stage.axis)
+                extra = (s.axis,)
+                for stmt in inner_stage.body:
+                    if isinstance(stmt, Load):
+                        loads_by_buf.setdefault(stmt.input, []).append((stmt, inner_stage.axis, scope_axes, extra))
+                rewritten_inner.append(s)
+                continue
+        # Cooperative-K post-K bare STAGE_INNER (K_o was extent-1 and
+        # inlined): treat as a sibling collection site. Falls through
+        # to the collection branch below so its Loads land in the
+        # same bucket as the reduce K_i's Loads (and partition-by-index
+        # merges them for row-cache).
+        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.STAGE_INNER:
+            pass  # fall through to the collection branch
+        elif isinstance(s, Loop) and not s.is_reduce:
             new_body = _process_scope(
                 s,
                 thread_axes,
@@ -293,6 +390,7 @@ def _process_scope(
                 slab_cap=slab_cap,
                 scope_budget=scope_budget,
                 allowed_bufs=allowed_bufs,
+                is_cooperative=is_cooperative,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -300,7 +398,7 @@ def _process_scope(
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
-                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes))
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, ()))
         rewritten_inner.append(s)
 
     if allowed_bufs is not None:
@@ -316,7 +414,7 @@ def _process_scope(
 
 
 def _build_stages(
-    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...]]]],
+    loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]],
     thread_axes: tuple[Axis, ...],
     block_axis_names: frozenset[str],
     used_names: set[str],
@@ -330,7 +428,13 @@ def _build_stages(
     becomes a candidate Stage; classify the representative, admit if
     it fits the per-scope smem budget. Multiple distinct slabs per
     buffer are allowed (e.g. rotate-half kernels load the same buffer
-    at multiple conditional positions, each requiring its own slab)."""
+    at multiple conditional positions, each requiring its own slab).
+
+    Partitions with ≥ 2 members signal *temporal* reuse: the same Load
+    fires from multiple sibling scopes (e.g. cooperative-K reduce + per-K
+    post-pointwise both read ``x``). Such partitions stage even without
+    spatial fan-in across threads — see ``_classify``'s
+    ``allow_no_fan_in`` parameter."""
     stages: list[Stage] = []
     name_rewrites: dict[str, tuple[str, tuple[Expr, ...]]] = {}
     used_bytes = 0
@@ -345,22 +449,31 @@ def _build_stages(
         # which is faster than re-staging in every block. RMSNorm's
         # ``w[k]`` and any matmul's frozen-weight Loads are the
         # canonical examples.
-        if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _ in items):
+        if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _, _ in items):
             continue
 
         # Partition this buffer's Loads by structural index equality.
         # Each partition gets its own slab; admission decides which fit.
-        partitions: list[tuple[Load, Axis, tuple[Axis, ...], list[Load]]] = []
-        for load, reduce_axis, scope_axes in items:
-            for rep_load, _, _, members in partitions:
+        partitions: list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...], list[Load]]] = []
+        for load, reduce_axis, scope_axes, extra_cache_axes in items:
+            for rep_load, _, _, _, members in partitions:
                 if load.index == rep_load.index:
                     members.append(load)
                     break
             else:
-                partitions.append((load, reduce_axis, scope_axes, [load]))
+                partitions.append((load, reduce_axis, scope_axes, extra_cache_axes, [load]))
 
-        for rep_load, rep_reduce, rep_scope, members in partitions:
-            slab = _classify(rep_load, thread_axes, rep_reduce, rep_scope, slab_cap=slab_cap)
+        for rep_load, rep_reduce, rep_scope, rep_extra, members in partitions:
+            allow_no_fan_in = len(members) >= 2
+            slab = _classify(
+                rep_load,
+                thread_axes,
+                rep_reduce,
+                rep_scope,
+                slab_cap=slab_cap,
+                extra_candidates=rep_extra,
+                allow_no_fan_in=allow_no_fan_in,
+            )
             if slab is None:
                 continue
             if used_bytes + slab.n_bytes > scope_budget:
@@ -403,9 +516,12 @@ def _classify(
     scope_axes: tuple[Axis, ...],
     *,
     slab_cap: int,
+    extra_candidates: tuple[Axis, ...] = (),
+    allow_no_fan_in: bool = False,
 ) -> _Slab | None:
     """Derive the slab for ``load`` by evaluating ``load.index`` over
-    the cache vars (thread axes + this loop's reduce axis):
+    the cache vars (thread axes + this loop's reduce axis + any
+    ``extra_candidates`` such as the cooperative-K SERIAL_OUTER axis):
 
     1. ``origin`` = ``index`` with every cache var → 0.
     2. For each cache var, find which source dim its Var appears in.
@@ -415,10 +531,13 @@ def _classify(
        and compare to ``origin[d] + 1``. If any axis disagrees, emit
        ``TemplateAddressing`` instead of ``AffineAddressing``.
 
-    Returns ``None`` when no fan-in axis exists (no reuse), when a
-    cache var spans multiple dims, or when the slab exceeds the cap.
-    """
-    candidates = (*thread_axes, reduce_axis)
+    Returns ``None`` when no fan-in axis exists (no spatial reuse) —
+    unless ``allow_no_fan_in`` is set, in which case the slab is
+    returned regardless (temporal-reuse path: same Load occurs in ≥ 2
+    sibling scopes, so a single Stage saves duplicate gmem reads). Also
+    returns ``None`` when a cache var spans multiple dims or when the
+    slab exceeds the cap."""
+    candidates = (*thread_axes, reduce_axis, *extra_candidates)
     ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
     candidate_names = tuple(ax.name for ax in candidates)
 
@@ -434,8 +553,12 @@ def _classify(
             return None
         var_to_dim[ax.name] = dims[0]
 
-    # No cache axis appears, or every bound axis appears (no fan-in) → no slab.
-    if not var_to_dim or len(var_to_dim) == len(candidates):
+    if not var_to_dim:
+        return None
+    # No fan-in (every candidate appears in the index): without temporal
+    # reuse this Load has no smem benefit. Lift the check when the
+    # caller signals that ≥ 2 sibling scopes contain the same Load.
+    if len(var_to_dim) == len(candidates) and not allow_no_fan_in:
         return None
 
     cache_axes_unsorted = tuple(ax for ax in candidates if ax.name in var_to_dim)
