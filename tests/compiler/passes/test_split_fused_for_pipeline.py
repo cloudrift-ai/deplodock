@@ -1,4 +1,4 @@
-"""Tests for ``007b_split_fused_for_pipeline`` — splits fused multi-source
+"""Tests for ``007c_split_fused_for_pipeline`` — splits fused multi-source
 Stages into per-source transport stages + a compute stage so 015 can
 software-pipeline the transport without dragging the compute along."""
 
@@ -15,8 +15,8 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Tile, Write
 from deplodock.compiler.ir.tile.ir import Stage, TileOp
 
-_split = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.007b_split_fused_for_pipeline")
-_fuse = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.007a_fuse_stage_epilogue")
+_split = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.007c_split_fused_for_pipeline")
+_fuse = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.007b_fuse_stage_epilogue")
 
 
 @contextmanager

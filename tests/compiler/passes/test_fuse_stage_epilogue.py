@@ -1,4 +1,4 @@
-"""Tests for ``007a_fuse_stage_epilogue`` — the silu·gate·matmul fuser.
+"""Tests for ``007b_fuse_stage_epilogue`` — the silu·gate·matmul fuser.
 
 The pass walks each Tile body produced by ``007_stage_inputs``, finds
 groups of Stages with identical cache axes whose epilogue cone in the
@@ -19,7 +19,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Tile, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, TileOp, trivial_stage_body
 
-_pass = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.007a_fuse_stage_epilogue")
+_pass = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.007b_fuse_stage_epilogue")
 
 
 def _silu_mul_matmul_tile() -> TileOp:

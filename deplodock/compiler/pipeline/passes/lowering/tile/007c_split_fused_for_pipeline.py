@@ -1,6 +1,6 @@
 """Split fused multi-source Stages into transport + compute stages so 015 can pipeline.
 
-After ``007a_fuse_stage_epilogue`` runs, multi-source fused stages carry
+After ``007b_fuse_stage_epilogue`` runs, multi-source fused stages carry
 both the gmem source Loads AND the producer compute (silu chain etc.) in
 a single ``Stage.body``. ``015_pipeline_k_outer`` software-pipelines by
 σ-shifting Stages and placing cloned-with-K_outer→K_outer+1 issues
