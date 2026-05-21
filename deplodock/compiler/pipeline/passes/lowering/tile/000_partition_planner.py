@@ -83,11 +83,10 @@ _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 
-# Cooperative-reduce thread-count fork. Mirrors
-# ``004_launch_geometry._TUNE_AXIS_CHOICES`` and ``_WARP_SIZE`` so the
-# planner-driven fork enumerates the same BN candidates the legacy
-# ``_emit_cooperative_launch`` fork did.
-_COOP_BN_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
+# Mirrors ``004_launch_geometry._TUNE_AXIS_CHOICES`` and ``_WARP_SIZE``
+# so planner-driven forks (cooperative-BN, matmul BN/BM) enumerate the
+# same candidates the legacy 004 fork did.
+_TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _WARP_SIZE = 32
 
 
@@ -137,9 +136,24 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
         else:
             chunked.append(cand)
 
-    fired = reg_variants is not None or any_k_chunk or any_coop or any_chunk_reduce
+    # Matmul (BN, BM) stamp fork — pure knob enumeration, no body
+    # change. The planner is the source of truth; ``004_launch_geometry``
+    # reads BN/BM from knobs and emits one deterministic TileOp.
+    bn_bm_results: list[LoopOp] = []
+    any_bn_bm = False
+    for cand in chunked:
+        bn_bm_variants = _try_matmul_bn_bm_fork(cand)
+        if bn_bm_variants is not None:
+            any_bn_bm = True
+            bn_bm_results.extend(bn_bm_variants)
+        else:
+            bn_bm_results.append(cand)
+
+    fired = reg_variants is not None or any_k_chunk or any_coop or any_chunk_reduce or any_bn_bm
     if not fired:
         raise RuleSkipped("no planner branch matched")
+
+    chunked = bn_bm_results
 
     if len(chunked) == 1:
         return _stamp_planned(chunked[0])
@@ -696,7 +710,7 @@ def _try_cooperative_reduce(loop_op: LoopOp) -> list[LoopOp] | None:
     1. Tag every top-level reduce Loop in the inner body with
        ``Role.COOPERATIVE_STRIDE``.
     2. Fork over BN candidates (heuristic ``_effective_block_size``
-       first; powers-of-two in ``_COOP_BN_CHOICES`` ≥ WARP_SIZE next).
+       first; powers-of-two in ``_TUNE_AXIS_CHOICES`` ≥ WARP_SIZE next).
     3. Stamp ``knobs={"BN": bn}`` per variant.
 
     Returns ``None`` when not cooperative-viable (matmul-shape, no
@@ -718,7 +732,7 @@ def _try_cooperative_reduce(loop_op: LoopOp) -> list[LoopOp] | None:
     new_body = _rebuild_outer_chain(chain, tagged_inner) if chain else tagged_inner
 
     heuristic_bn = _effective_block_size(reduce_extent)
-    bn_set = {bn for bn in _COOP_BN_CHOICES if _WARP_SIZE <= bn <= heuristic_bn}
+    bn_set = {bn for bn in _TUNE_AXIS_CHOICES if _WARP_SIZE <= bn <= heuristic_bn}
     bn_set.add(heuristic_bn)
     ordered = [heuristic_bn] + sorted([bn for bn in bn_set if bn != heuristic_bn], reverse=True)
 
@@ -761,3 +775,74 @@ def _has_cooperative_stride(stmts) -> bool:
             if _has_cooperative_stride(s.body) or _has_cooperative_stride(s.else_body):
                 return True
     return False
+
+
+# --- matmul (BN, BM) stamp fork --------------------------------------
+
+
+def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
+    """Enumerate ``(BN, BM)`` candidates for a matmul kernel and stamp
+    them as knobs (no body change). ``004_launch_geometry`` reads BN/BM
+    from knobs and does the deterministic axis split.
+
+    Mirrors ``004_launch_geometry._matmul_variants`` clamping logic:
+    candidates from ``_TUNE_AXIS_CHOICES``, clamped to the chain's
+    outer two extents, dropped on non-divisibility, deduped after
+    clamp. Heuristic shape (from :func:`tuning.thread_tile_shape`) is
+    variant 0.
+
+    Returns ``None`` for non-matmul kernels, kernels with < 2 outer
+    chain Loops, or kernels that already carry ``BN`` in knobs (e.g.
+    cooperative kernels — they stamp BN via the cooperative branch)."""
+    from deplodock.compiler.tuning import _has_matmul_reduce, thread_tile_shape  # noqa: PLC0415
+
+    if not _has_matmul_reduce(loop_op.body):
+        return None
+    if "BN" in loop_op.knobs:
+        return None
+    chain = _outer_free_loop_chain(loop_op.body)
+    if len(chain) < 2:
+        return None
+
+    ext_outer = int(chain[-2].axis.extent)
+    ext_inner = int(chain[-1].axis.extent)
+
+    synthetic = Tile(
+        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain),
+        body=chain[-1].body,
+    )
+    heuristic = thread_tile_shape(synthetic)
+    h_bn = int(heuristic[0]) if len(heuristic) >= 1 else _TUNE_AXIS_CHOICES[2]
+    h_bm = int(heuristic[1]) if len(heuristic) >= 2 else _TUNE_AXIS_CHOICES[2]
+
+    seen: set[tuple[int, int]] = set()
+    ordered: list[tuple[int, int]] = []
+
+    def _add(bn: int, bm: int) -> None:
+        bn = min(bn, ext_inner)
+        bm = min(bm, ext_outer)
+        if ext_inner > bn and ext_inner % bn != 0:
+            return
+        if ext_outer > bm and ext_outer % bm != 0:
+            return
+        # Skip noop partitions — both axes staying full THREAD means
+        # 004's ``_plan_partition`` produces no split. Greedy would
+        # then have no launch geometry to use.
+        if bn == ext_inner and bm == ext_outer:
+            return
+        shape = (bn, bm)
+        if shape in seen:
+            return
+        seen.add(shape)
+        ordered.append(shape)
+
+    _add(h_bn, h_bm)
+    for bn in _TUNE_AXIS_CHOICES:
+        for bm in _TUNE_AXIS_CHOICES:
+            _add(bn, bm)
+
+    variants: list[LoopOp] = []
+    for bn, bm in ordered:
+        knobs = {**loop_op.knobs, "BN": bn, "BM": bm}
+        variants.append(LoopOp(body=loop_op.body, knobs=knobs))
+    return variants or None

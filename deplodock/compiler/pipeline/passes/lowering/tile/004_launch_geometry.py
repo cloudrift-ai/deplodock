@@ -53,6 +53,10 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
         raise RuleSkipped("Tile already has block_axes — launch geometry already decided")
 
     if _has_matmul_reduce(tile.body):
+        # Planner-driven path: (BN, BM) already stamped on the parent
+        # TileOp's knobs. Emit a single deterministic variant.
+        if BN.name in root.op.knobs and BM.name in root.op.knobs:
+            return _matmul_deterministic(body, idx, tile, root.op.name, root.op.knobs)
         variants = _matmul_variants(body, idx, tile, root.op.name)
         if not variants:
             raise RuleSkipped("no viable (BN, BM) candidate")
@@ -194,6 +198,22 @@ def _emit_cooperative_launch(body: tuple[Stmt, ...], idx: int, tile: Tile, name:
 # ---------------------------------------------------------------------------
 # Matmul launch — fork over (BN, BM)
 # ---------------------------------------------------------------------------
+
+
+def _matmul_deterministic(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str, parent_knobs: dict) -> TileOp:
+    """Planner-driven matmul launch: read ``(BN, BM)`` from parent
+    knobs, plan the partition once, no fork. The planner already
+    enumerated the candidate space (:func:`partition_planner.
+    _try_matmul_bn_bm_fork`)."""
+    bn = int(parent_knobs[BN.name])
+    bm = int(parent_knobs[BM.name])
+    new_axes, sigma_map = _plan_partition(tile, (bn, bm))
+    if _is_noop_plan(tile, new_axes, sigma_map):
+        raise RuleSkipped("partition is a no-op — tile already fits one CTA")
+    partitioned = _apply_partition(tile, new_axes, sigma_map)
+    # No new knobs — BN, BM stamped on the parent LoopOp by the planner
+    # and propagate via ``Candidate.apply``.
+    return TileOp(body=body[:idx] + (partitioned,) + body[idx + 1 :], name=name)
 
 
 def _matmul_variants(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str) -> list[TileOp]:
