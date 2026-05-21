@@ -76,28 +76,28 @@ def _make_matmul_then_elwise() -> Graph:
 def test_plain_matmul_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_plain_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "chunk_matmul_k" in fired
+    assert ("chunk_matmul_k" in fired) or ("partition_planner" in fired)
     assert "launch_geometry" in fired
 
 
 def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_elwise_lhs_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "chunk_matmul_k" in fired
+    assert ("chunk_matmul_k" in fired) or ("partition_planner" in fired)
     assert "launch_geometry" in fired
 
 
 def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_two_elwise_lhs_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "chunk_matmul_k" in fired
+    assert ("chunk_matmul_k" in fired) or ("partition_planner" in fired)
     assert "launch_geometry" in fired
 
 
 def test_matmul_then_elwise_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_matmul_then_elwise())
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "chunk_matmul_k" in fired
+    assert ("chunk_matmul_k" in fired) or ("partition_planner" in fired)
     assert "launch_geometry" in fired
 
 

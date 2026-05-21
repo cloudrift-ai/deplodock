@@ -63,7 +63,7 @@ from dataclasses import replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop, Tile
@@ -99,6 +99,8 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | list[TileOp]:
     site = _find_first_matmul_reduce(tile.body)
     if site is None:
         raise RuleSkipped("no matmul-shaped reduce Loop in body")
+    if site.role is Role.STAGE_INNER:
+        raise RuleSkipped("planner already chunked matmul K (Role.STAGE_INNER on reduce)")
     if any(inner.is_reduce for inner in site.body.of_type(Loop)):
         raise RuleSkipped("matmul reduce already chunked (idempotence)")
 
