@@ -1,60 +1,26 @@
 """Partition planner — decide axis-structure splits up front.
 
-Runs first in the Tile-IR lowering chain, **before** ``001_launch_geometry``. The
-planner is the source of truth for launch-axis structure: it decides
-splits (output partition, K chunking, register tile, split-K) and tags
-the resulting axes with ``Role`` values (see :class:`Role`). Downstream
-materialization passes read the tags and skip their own equivalent
-decisions.
+Runs first in the Tile-IR lowering chain. Stamps ``Role`` tags on body Loops;
+``001_launch_geometry`` and other downstream rules read the tags and skip
+their own decisions.
 
-``_split_kernel_fully`` handles both matmul and pointwise via the same
-σ-split machinery. Each output axis splits into ``A → A_b·(T·R) + A_t·R + A_r``
-where ``(T, R) = (BN, FN)`` for the innermost N axis and ``(BM, FM)``
-for the second-innermost M axis (matmul; or degenerate ``(1, 1)`` for
-pointwise). Anything further out in the chain becomes ``Role.BLOCK``
-whole. For matmul, the reduce axis K splits as
-``K → K_s·(K_o_count·BK) + K_o·BK + K_i`` (K_s omitted when SPLITK=1).
+Output axes split as ``A → A_b·(T·R) + A_t·R + A_r`` (T = BN or BM, R = FN or
+FM). K splits as ``K → K_s·(K_o·br·bk) + K_o·(br·bk) + K_i·br + K_c`` (K_s for
+SPLITK > 1, K_c for cooperative-K BR > 1). Resulting nesting:
 
-The resulting nesting (matmul, SPLITK > 1):
+    K_s SPLITK_BLOCK → M_b BLOCK → N_b BLOCK → K_c COOPERATIVE_STRIDE →
+      M_t THREAD → N_t THREAD → M_r REGISTER → N_r REGISTER →
+        prelude → K_o SERIAL_OUTER → K_i STAGE_INNER (reduce σ(body)) →
+        Combine (cross-thread, when K_c is present) → post-K tower → Write
 
-    Loop(K_s SPLITK_BLOCK) →
-      Loop(M_b BLOCK) → Loop(N_b BLOCK) →
-        Loop(M_t THREAD) → Loop(N_t THREAD) →
-          Loop(M_r REGISTER) → Loop(N_r REGISTER) →
-            <σ-substituted prelude> →
-            Loop(K_o SERIAL_OUTER) →
-              Loop(K_i STAGE_INNER, reduce, σ(K body)) →
-            <σ-substituted post — Write is non-atomic here>
+Pointwise collapses to BM = FM = FN = 1; extent-1 sub-axes get inlined by
+normalize_body. SPLITK + Write atomicity is handled by launch_geometry's
+generic BLOCK-lift rewrite, not here. Cooperative-K's Combine emission lives
+in ``001_launch_geometry`` (folded from the deleted ``002_cooperative_reduce``).
 
-For pointwise the same structure applies with K-related levels absent
-and ``BM = FM = FN = 1`` so the M_t / M_r / N_r sub-axes have extent
-1 and are removed by the downstream normalize pass; only ``M_b BLOCK``
-(whole-extent) and ``N_b BLOCK + N_t THREAD`` remain.
-
-When ``SPLITK > 1`` the planner just produces the σ-split structure
-with a non-atomic Write — ``001_launch_geometry`` does the generic
-"BIND_BLOCK lift → atomic Write" rewrite once it commits the binding,
-including the ``Cond(K_s == 0, …)`` decomposition for the residual
-case (where ``Write.value = add(K_s-indep, K_s-dep)``).
-
-Matmul cartesian iterates only structurally valid candidates: BN/BM
-from a pow-2 preset (post-clamp to extent + divisibility check),
-FM/FN as divisors of the per-thread remainder, BK as divisors of E_K,
-SPLITK as divisors of K_o_total. Thread (≤ 1024) and register
-(FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) budgets gate the inner loops.
-Variant 0 (what greedy compiles pick) comes from a priority sort:
-highest cells/thread (capped at 32), threads closest to 256/CTA,
-larger BK, smaller SPLITK.
-
-Pointwise enumerates the same ``(BN, BM, FM, FN)`` cartesian with
-``BK = SPLITK = 1``. The priority key for pointwise prefers FEWER
-cells/thread (memory-bandwidth-bound — extra register tiling hurts
-SM occupancy), still targeting threads close to 256/CTA. Autotune
-can explore higher-cells variants where they help (~2.5× win
-measured on rotary-style 4D shapes via ``FM=32``).
-
-Chunk-reduce for large-K non-matmul reductions is not yet brought
-back into the planner — current tests don't depend on it.
+Priority keys: matmul prefers high cells/thread (amortize K-loop overhead);
+pointwise prefers low cells/thread (memory-bandwidth bound); cooperative
+reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 """
 
 from __future__ import annotations
@@ -78,22 +44,13 @@ PATTERN = [Pattern("root", LoopOp)]
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
-# Cooperative-K thread count (non-matmul reductions). BR=1 collapses to
-# a serial chunked reduce; BR>1 distributes K across `BR` threads with a
-# cross-thread Combine after the K_o reduce. v1 constraint: BR>1 requires
-# BN=BM=1 (single THREAD axis for materializer's _single_thread_var).
+# Cooperative-K thread count. v1: BR > 1 requires BN = BM = 1 (single THREAD
+# axis for materializer's _single_thread_var).
 _BR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-# Per-axis register-tile factor choices (FM, FN candidates).
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
-# Cap on total per-thread replication (∏ factors). NVRTC compile time
-# explodes on more-unrolled bodies.
+# Cap on per-thread cell-product. NVRTC compile time explodes past this.
 _MAX_CELLS_PER_THREAD: int = 128
 
-# Knob declarations. The planner is the source of truth for matmul
-# axis-structure tuning (BN/BM CTA tile, FM/FN per-thread cells, BK
-# K-chunk, SPLITK cross-CTA, BR cooperative-K threads). Each enumerates
-# its own candidate space in ``_enumerate_cartesian``; ``hints`` is
-# autotune metadata + the ``DEPLODOCK_<NAME>`` env-var registry binding.
 BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
 BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul M (output) axis")
@@ -105,13 +62,9 @@ BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread c
 
 @dataclass(frozen=True)
 class TileParams:
-    """One concrete (BN, BM, FM, FN, BK, SPLITK, BR) variant produced by
-    ``_enumerate_cartesian``. Carries the axis-structure factors that
-    flow from the cartesian into ``_build_split_body`` (σ-split tower
-    construction) and into the per-variant knob stamps on the emitted
-    ``LoopOp``. ``frozen`` for hashability + de-dup in the cartesian's
-    ``seen`` set; default ``br=1`` keeps matmul / pointwise call sites
-    that ignore cooperative-K terse."""
+    """One ``(BN, BM, FM, FN, BK, SPLITK, BR)`` variant. Frozen for de-dup in
+    the cartesian's ``seen`` set; ``br=1`` default keeps matmul / pointwise
+    sites terse."""
 
     bn: int
     bm: int
@@ -125,11 +78,8 @@ class TileParams:
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     loop_op: LoopOp = root.op
     body_info = BodyInfo.of(loop_op.body)
-
-    # Idempotence: once the planner has stamped roles on the body's
-    # outer chain, ``_outer_free_loop_chain`` (which requires
-    # ``role is None``) returns an empty chain and ``_split_kernel_fully``
-    # returns ``None``. No explicit "already planned" marker needed.
+    # Idempotence is structural: once roles are stamped, _outer_free_loop_chain
+    # returns empty (it requires role=None) and _split_kernel_fully → None.
     variants = _split_kernel_fully(loop_op, body_info, ctx)
     if variants is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
@@ -139,12 +89,9 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     return variants
 
 
-# --- chain helpers ----------------------------------------------------
-
-
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
-    """Mirror ``001_launch_geometry``: strip leading non-Loop stmts off the body
-    (typically hoisted Loads / Stages). Returns ``(leading, rest)``."""
+    """Split body into ``(leading non-Loop stmts, rest)``. Mirrors
+    ``001_launch_geometry``'s prefix handling."""
     leading: list[Stmt] = []
     rest = tuple(body)
     while rest and not isinstance(rest[0], Loop):
@@ -154,8 +101,7 @@ def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
 
 
 def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
-    """Walk the outer single-stmt chain of untagged free Loops outermost-
-    first, after skipping leading non-Loop stmts."""
+    """Walk the outer single-stmt chain of untagged free Loops, outermost-first."""
     _, rest = _split_leading_non_loops(body)
     out: list[Loop] = []
     cur = rest
@@ -170,14 +116,9 @@ def _identity_rename(name: str) -> str:
 
 
 def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-    """Wrap ``inner`` in nested ``Loop``s — innermost layer first.
-    ``[(K_i, STAGE_INNER), (K_o, SERIAL_OUTER)]`` produces
-    ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, inner))``.
-
-    Used by ``_build_split_body`` for the output BLOCK/THREAD/REGISTER
-    wrap tower and by ``_replace_k_loops`` for the per-reduce K_o · K_i
-    tower. Returns a 1-tuple containing the outermost Loop (or ``inner``
-    unchanged when ``layers`` is empty)."""
+    """Wrap ``inner`` in nested Loops, innermost layer first.
+    ``[(K_i, STAGE_INNER), (K_o, SERIAL_OUTER)]`` →
+    ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, inner))``."""
     current = inner
     for axis, role in layers:
         current = (Loop(axis=axis, role=role, body=current),)
@@ -185,59 +126,36 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
 
 
 def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
-    """All divisors of ``n`` ≤ ``cap``, ascending. Used as the FM / FN
-    candidate set: a divisor of ``E_M / bm_c`` automatically satisfies
-    the ``E_M % (bm_c * fm) == 0`` constraint, and for pow-2 ``n`` the
-    result is the same pow-2 set the legacy preset enumerated."""
+    """Divisors of ``n`` ≤ ``cap``, ascending. FM / FN candidate set — a
+    divisor of ``E / bm_c`` automatically satisfies the divisibility check."""
     if n < 1 or cap < 1:
         return ()
     return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-# --- unified kernel split ---------------------------------------------
-
-
 class _BuildSkipped(Exception):
-    """Raised by ``_build_split_body`` when the body has a shape we
-    don't know how to rewrite (e.g. matmul K reduce not where we
-    expect)."""
+    """Raised by ``_build_split_body`` when the body's shape doesn't match."""
 
 
 def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> list[LoopOp] | None:
-    """Unified σ-split for matmul, pointwise, and non-matmul-reduce
-    kernels.
+    """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
 
-    Single-pass detection: extract the outer chain (innermost = N, next
-    out = M if present), then look inside the innermost body for reduce
-    Loops. Classify by predicate, not branch — ``is_matmul_reduce``
-    (≥ 2 K-indexed Loads + Accum) selects the matmul knob set;
-    any other reduce selects the cooperative-reduce knob set (BR > 1
-    allowed); no reduce at all selects the pointwise knob set
-    (degenerate K).
-
-    For v1, kernels must have at most one reduce extent (multi-reduce
-    fused SDPA-class kernels are out of scope). When multiple reduces
-    are present with matching extents, the first matched reduce drives
-    the σ-split; downstream rules consume the cooperative role on the
-    lifted K_c axis to emit Combine.
-
-    Returns ``None`` when the kernel has no outer chain at all."""
+    Detection is predicate-driven, not branch-driven: ``is_matmul_reduce``
+    (≥ 2 K-indexed Loads + Accum) picks the matmul knob set; any other reduce
+    with extent ≥ warp_size picks the cooperative-K set; no qualifying reduce
+    falls to pointwise. ``None`` only when there's no outer chain at all."""
     chain = _outer_free_loop_chain(loop_op.body)
     if not chain:
         return None
 
-    # Output axes — innermost is N, next-out is M (when ≥ 2 chain
-    # axes), everything further out is extra_outer (BLOCK-whole).
     outer_n: Loop = chain[-1]
     outer_m: Loop | None = chain[-2] if len(chain) >= 2 else None
     extra_outer: tuple[Loop, ...] = chain[:-2] if outer_m is not None else chain[:-1]
     E_N = int(outer_n.axis.extent)
     E_M = int(outer_m.axis.extent) if outer_m is not None else 1
 
-    # Reduce detection — predicate-driven, not branch-driven. The
-    # matmul-shape predicate uses ``is_matmul_reduce``; the cooperative
-    # path uses the negation. ``body_info.has_matmul`` is used as a
-    # fast preflight to avoid scanning the body twice.
+    # body_info.has_matmul is a cheap preflight — saves a body walk for
+    # pointwise / cooperative kernels.
     k_matmul: Loop | None = None
     k_nonmatmul: Loop | None = None
     if body_info.has_matmul:
@@ -246,7 +164,6 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
         k_nonmatmul = _find_first_reduce(tuple(outer_n.body), match=lambda lp: lp.is_reduce and not is_matmul_reduce(lp))
 
     if k_matmul is not None:
-        # Matmul branch — innermost two chain axes are M/N (require ≥ 2).
         if outer_m is None:
             return None
         k_loop: Loop | None = k_matmul
@@ -264,19 +181,10 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
             priority_mode="matmul",
         )
     elif k_nonmatmul is not None and int(k_nonmatmul.axis.extent) >= ctx.warp_size:
-        # Non-matmul reduce branch — cooperative-K enabled via BR.
-        # Output axes M / N (M optional) go to BLOCK/THREAD as usual;
-        # K splits as K_s · K_o · K_c · K_i with K_c at COOPERATIVE_STRIDE.
-        # ``bn_choices`` / ``bm_choices`` prepend 1 so the cartesian can
-        # explore (BN=1, BM=1) — the v1 BR>1 constraint requires the
-        # output thread axes to be extent-1 (sole THREAD axis is K_c).
-        # Per-K post-pointwise loops (RMSNorm, softmax) are σ-rewritten
-        # in ``_build_split_body`` via ``_replace_post_k_loops`` so they
-        # share K_c with the reduce side — no need to gate them out.
-        # Gate:
-        #   - ``E_K >= ctx.warp_size``: small reduces aren't worth a
-        #     cross-thread Combine (a single thread walks the row
-        #     faster than a warp-shuffle / tree-halve setup).
+        # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
+        # _single_thread_var) — so bn/bm_choices prepend 1 to enable
+        # (BN=BM=1). E_K ≥ warp_size: smaller reduces don't justify a
+        # warp-shuffle / tree-halve over sequential per-thread iteration.
         k_loop = k_nonmatmul
         k_is_matmul = False
         E_K = int(k_loop.axis.extent)
@@ -293,9 +201,9 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo, ctx: Context) -> l
             priority_mode="reduce",
         )
     else:
-        # Pointwise — no reduce in body. Degenerate K (E_K = bk = splitk = 1).
+        # Pointwise — no qualifying reduce.
         k_loop = None
-        k_is_matmul = True  # unused (no K loop), keep default
+        k_is_matmul = True  # unused
         param_combos = _enumerate_cartesian(
             E_M=E_M,
             E_N=E_N,
@@ -343,37 +251,20 @@ def _enumerate_cartesian(
     max_cells_per_thread: int,
     priority_mode: str,
 ) -> list[TileParams]:
-    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``.
+    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
+    priority.
 
-    BN / BM iterate the supplied candidate sets, clamped to extent and
-    divisibility-checked. FM / FN iterate as divisors of the per-thread
-    remainder so divisibility is automatic, with ``FM·FN`` capped at
-    ``max_cells_per_thread``. BK / SPLITK iterate the supplied
-    candidate sets, divisor-checked against per-thread K / K_o_total.
-    BR iterates the supplied cooperative-K thread-count set; ``per_thread_K
-    = E_K // BR`` replaces the raw ``E_K`` in the K divisibility checks.
-    Total thread budget ``BN · BM · BR ≤ 1024`` gates the inner loops.
+    BN/BM clamped to extent + divisibility-checked. FM/FN as divisors of the
+    per-thread remainder (auto-divisibility), capped by ``max_cells_per_thread``.
+    BK/SPLITK divisor-checked against ``per_thread_K = E_K // BR``.
+    ``BN·BM·BR ≤ 1024`` (CTA thread budget).
 
-    Same algorithm for matmul, pointwise, and reduce — callers supply
-    appropriate degenerate sets to collapse unused axes (e.g. pointwise
-    passes ``bk_choices=(1,)``, ``splitk_choices=(1,)``, ``br_choices=(1,)``;
-    matmul passes ``br_choices=(1,)``). The single-K-iter case
-    (``per_thread_K == bk``) is allowed for ``E_K == 1`` (pointwise) and
-    for the cooperative-reduce path (``priority_mode == "reduce"``), but
-    rejected for matmul (``priority_mode == "matmul"``) which wants ≥ 2
-    K chunks per thread to amortize K-loop overhead.
+    Single-K-iter (per_thread_K == bk) is allowed for pointwise and
+    cooperative-reduce, rejected for matmul (≥ 2 chunks needed to amortize
+    K-loop overhead).
 
-    **v1 cooperative constraint:** BR > 1 requires the sole THREAD axis
-    (materializer's ``_single_thread_var``). When ``BN_c > 1`` or
-    ``BM_c > 1``, BR is forced to 1 — the M_t / N_t output thread axes
-    are not extent-1 and can't coexist with a cooperative-K thread axis
-    in v1.
-
-    Returns survivors sorted by priority. ``priority_mode`` selects the
-    key — matmul wants high cells/thread (amortize K-loop overhead),
-    pointwise wants low cells/thread (memory-bandwidth-bound, more CTAs
-    help SM occupancy), reduce wants warp-sized-or-larger cooperative
-    groups. All prefer threads close to 256/CTA."""
+    v1 cooperative constraint: BR > 1 forces BN = BM = 1 — the materializer's
+    Combine path requires a single THREAD axis."""
     seen: set[TileParams] = set()
     ordered: list[TileParams] = []
     for bn in bn_choices:
@@ -386,8 +277,7 @@ def _enumerate_cartesian(
                 continue
             if bn_c * bm_c > 1024:
                 continue
-            # v1: BR > 1 requires the sole THREAD axis. When output
-            # thread fan-out exists, force BR = 1.
+            # v1 cooperative constraint: BR > 1 ⇒ BN = BM = 1.
             br_eligible: tuple[int, ...] = br_choices if (bn_c == 1 and bm_c == 1) else (1,)
             for br in br_eligible:
                 if br < 1 or E_K % br != 0:
@@ -400,8 +290,7 @@ def _enumerate_cartesian(
                         for bk in bk_choices:
                             if per_thread_K % bk != 0:
                                 continue
-                            # Matmul: require ≥ 2 K chunks per thread.
-                            # Reduce/pointwise: single chunk per thread is fine.
+                            # Matmul needs ≥ 2 K chunks per thread; reduce/pointwise OK with 1.
                             if priority_mode == "matmul" and per_thread_K > 1 and per_thread_K <= bk:
                                 continue
                             if bk > per_thread_K:
@@ -417,38 +306,21 @@ def _enumerate_cartesian(
                                 ordered.append(params)
 
     def _priority_matmul(p: TileParams) -> tuple[int, ...]:
+        # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
+        # threads near 256, larger BK, smaller SPLITK.
         threads = p.bn * p.bm
-        cells = p.fm * p.fn
-        return (
-            min(cells, 32),  # high cells/thread (capped — NVRTC compile time)
-            -abs(256 - threads),  # threads close to 256
-            p.bk,  # bigger BK (fewer K iters)
-            -p.splitk,  # smaller SPLITK (less atomic contention)
-        )
+        return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk)
 
     def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
+        # Memory-bandwidth bound — fewer cells/thread → more CTAs → better
+        # SM occupancy. Threads near 256.
         threads = p.bn * p.bm
-        cells = p.fm * p.fn
-        # Pointwise is memory-bandwidth-bound: prefer FEW cells/thread
-        # (each cell = one load+op+store; no K-loop arithmetic to
-        # amortize register pressure) and threads close to 256/CTA.
-        return (
-            -cells,  # fewer cells/thread (negate → ascending preference)
-            -abs(256 - threads),  # threads close to 256
-        )
+        return (-(p.fm * p.fn), -abs(256 - threads))
 
     def _priority_reduce(p: TileParams) -> tuple[int, ...]:
+        # Warp-sized BR enables warp-shuffle Combine; threads near 256.
         threads = p.bn * p.bm * p.br
-        # Cooperative reduce: prefer warp-sized-or-larger cooperative
-        # groups (BR ≥ 32 lets the materializer use warp-shuffle), threads
-        # close to 256/CTA, larger BK (fewer K iters), smaller SPLITK
-        # (less atomic contention).
-        return (
-            min(p.br, 256),
-            -abs(256 - threads),
-            p.bk,
-            -p.splitk,
-        )
+        return (min(p.br, 256), -abs(256 - threads), p.bk, -p.splitk)
 
     priority_fn = {
         "matmul": _priority_matmul,
@@ -468,24 +340,15 @@ def _build_split_body(
     *,
     k_is_matmul: bool = True,
 ) -> tuple[Stmt, ...]:
-    """Unified σ-split body construction. The N axis is always present;
-    ``outer_m`` and ``k_loop`` are ``None`` for 1D pointwise and
-    non-matmul kernels respectively, in which case the corresponding
-    σ-substitution + Loop tower levels are skipped.
+    """σ-split ``outer_n``'s body and wrap in the output BLOCK/THREAD/REGISTER
+    tower. N axis is always present; ``outer_m`` / ``k_loop`` are None for 1D
+    pointwise / non-reduce kernels.
 
-    Each output axis splits as ``A → A_b·(T·R) + A_t·R + A_r`` (with
-    ``T = BN | BM``, ``R = FN | FM``); the extent-1 sub-axes generated
-    when ``T = R = 1`` (pointwise M and outer slots) are removed
-    downstream by ``normalize_extent_one_loops``. K splits as
-    ``K → K_s·(K_o_count·BK) + K_o·BK + K_i`` (K_s omitted when
-    ``SPLITK == 1``).
-
-    The atomic-Write rewrite for the K_s case is deferred to
-    ``001_launch_geometry`` — it's the generic "BIND_BLOCK lift →
-    atomic Write" rewrite triggered when K_s lifts to BIND_BLOCK."""
+    K_s and K_c (when present) are shared across all reduces in the kernel;
+    K_o / K_i are per-K-Loop, built inside ``_replace_k_loops``. SPLITK
+    atomic-Write is deferred to ``001_launch_geometry``."""
     sigma_map: dict[str, object] = {}
 
-    # N axis split (always present).
     N_name = outer_n.axis.name
     E_N = int(outer_n.axis.extent)
     N_b_ext = E_N // (params.bn * params.fn)
@@ -494,7 +357,6 @@ def _build_split_body(
     N_r = Axis(f"{N_name}_r", params.fn)
     sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
 
-    # M axis split (optional — None for 1D pointwise).
     M_b = M_t = M_r = None
     if outer_m is not None:
         M_name = outer_m.axis.name
@@ -509,20 +371,8 @@ def _build_split_body(
 
     sigma_outer = Sigma(sigma_map)
 
-    # K axis split (optional — None for non-matmul).
-    #
-    # Cooperative-K (br > 1) introduces a K_c THREAD axis between K_o
-    # SERIAL_OUTER and K_i STAGE_INNER, distributing each K_o chunk's
-    # ``br · bk`` K-values across ``br`` threads. K_c sits innermost in
-    # the σ-stride so adjacent threads read adjacent K (coalesced
-    # cooperative loads). When br == 1, K_c is absent and the σ
-    # collapses to the existing matmul pattern ``K_o · bk + K_i``.
-    #
-    # K_s (cross-CTA) and K_c (cross-thread) are *shared* across all
-    # reduces in the kernel — single SPLITK and single cooperative
-    # thread axis. K_o and K_i are per-reduce (each reduce gets its own
-    # inner-body tower with axis names derived from its source K axis
-    # name), built lazily inside ``_replace_k_loops``.
+    # K axes: K_s / K_c are kernel-wide (single SPLITK / single cooperative
+    # thread direction); K_o / K_i are per-K-Loop, built inside _replace_k_loops.
     K_s = K_c = None
     E_K = K_o_ext = 0
     if k_loop is not None:
@@ -532,37 +382,14 @@ def _build_split_body(
         K_s = Axis(f"{K_name}_s", params.splitk) if params.splitk > 1 else None
         K_c = Axis(f"{K_name}_c", params.br) if params.br > 1 else None
 
-    # Step 1: apply σ_outer over all stmts inside outer_n's body. K
-    # loop's body Loads pick up M/N substitutions; K iter var is
-    # untouched.
-    inner_stmts = tuple(outer_n.body)
-    inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in inner_stmts)
+    # σ-rewrite outer_n's body (M/N axes), then replace every K-iter Loop with
+    # a K_o · K_i tower. Both paths use shared canonical K_o / K_i names so
+    # 007_stage_inputs row-cache can merge structurally-equivalent Loads.
+    inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in outer_n.body)
 
-    # Step 2: rewrite every K-iteration Loop into a K_o · K_i tower
-    # σ-rewriting its body. One unified walk handles both:
-    #
-    #   - reduce K iterators (matmul, cooperative-K max/sum/...): body
-    #     carries an Accum, so the K_i wrapper becomes reduce-tagged
-    #     automatically.
-    #   - per-K post-pointwise iterators (RMSNorm, softmax post-divide):
-    #     body has no Accum, K_i stays non-reduce. When SPLITK > 1, the
-    #     K_o tower wraps in ``Cond(K_s == 0)`` — every K_s CTA would
-    #     otherwise re-execute the post and clobber the gmem cell.
-    #     Reduce K skips the Cond; launch_geometry's atomic-Write
-    #     rewrite handles cross-CTA SPLITK.
-    #
-    # All matched Loops share K_o / K_i axis NAMES (derived from the
-    # first reduce's K_name). Multi-reduce kernels (softmax max + sum)
-    # and reduce + post (RMSNorm) emit structurally identical σ-Loads,
-    # which 007_stage_inputs row-cache exploits to merge into one Stage.
-    #
-    # Matmul calls the helper with ``is_matmul_reduce`` — only matmul-
-    # shape reduces match; matmul kernels have no per-K post-pointwise
-    # loop, so the cooperative-only Cond branch never fires.
-    # Cooperative non-matmul calls with the K-extent predicate so both
-    # the reduce K and the post K hit the same rewrite.
     if k_loop is not None:
-        K_canonical_name = k_loop.axis.name
+        # Matmul: match only matmul-shape reduces. Cooperative: match every
+        # K-extent Loop — reduce K and per-K post-pointwise both rewrite.
         if k_is_matmul:
             match = is_matmul_reduce
         else:
@@ -570,7 +397,7 @@ def _build_split_body(
         new_inner, n_replaced = _replace_k_loops(
             inner_after_outer,
             match=match,
-            K_canonical_name=K_canonical_name,
+            K_canonical_name=k_loop.axis.name,
             K_s=K_s,
             K_c=K_c,
             br=params.br,
@@ -582,19 +409,8 @@ def _build_split_body(
     else:
         new_inner = inner_after_outer
 
-    # Step 3: wrap inside-out with REGISTER → THREAD → BLOCK loops.
-    # K_c (cooperative-K) slots between the output THREAD layer
-    # (M_t / N_t) and the BLOCK layer; launch_geometry's
-    # _strip_outer_free_chain lifts it as BIND_THREAD. With v1's
-    # BR>1 ⇒ BN=BM=1 constraint, the M_t/N_t Loops are extent-1 and get
-    # inlined by normalize_body, leaving K_c as the sole THREAD axis in
-    # Tile.axes — which the materializer's _single_thread_var requires
-    # for Combine emission.
-    #
-    # Extra outer chain axes (e.g. head_idx in multi-head SDPA; or any
-    # axis further out than the second-innermost in pointwise) become
-    # BLOCK directly — they were already iteration axes in the original
-    # body; we just re-stamp them so launch_geometry binds BIND_BLOCK.
+    # Wrap tower, innermost first. extent-1 layers (e.g. M_t / N_t under v1
+    # cooperative BN=BM=1) are inlined later by normalize_body.
     layers: list[tuple[Axis, Role | None]] = [(N_r, Role.REGISTER)]
     if M_r is not None:
         layers.append((M_r, Role.REGISTER))
@@ -623,45 +439,19 @@ def _replace_k_loops(
     bk: int,
     K_o_ext: int,
 ) -> tuple[tuple[Stmt, ...], int]:
-    """Walk ``stmts`` and rewrite every ``Loop`` matching ``match`` into
-    a ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, σ(body)))`` tower.
-    Returns ``(new_stmts, n_replaced)``.
+    """Replace every matched Loop with a ``Loop(K_o, SERIAL_OUTER, Loop(K_i,
+    STAGE_INNER, σ(body)))`` tower. Returns ``(new_stmts, n_replaced)``.
 
-    Handles both reduce K iterators (matmul + cooperative-K reduce) and
-    per-K post-pointwise iterators (RMSNorm / softmax post) uniformly —
-    they share the same σ, the same SERIAL_OUTER / STAGE_INNER role
-    pair, and the same canonical K_o / K_i axis names. ``Loop.is_reduce``
-    is a computed property of the body's Accum presence, so the K_i
-    wrapper inherits the correct reduce-status automatically: reduce-K
-    bodies (with Accum) produce a reduce-tagged K_i; post-K bodies (no
-    Accum) produce a non-reduce K_i.
+    Handles both reduce K iterators (matmul + cooperative reduce) and per-K
+    post-pointwise iterators (RMSNorm / softmax post) — ``Loop.is_reduce`` is
+    derived from body Accum presence, so K_i inherits the right status. All
+    matches share the canonical K_o / K_i axis names, so post-σ their Loads
+    look structurally identical (key to 007_stage_inputs row-cache merging).
 
-    The shared canonical naming
-    (``{K_canonical_name}_o`` / ``{K_canonical_name}_i``) is what lets
-    007_stage_inputs' row-cache merge structurally-equivalent Loads
-    across reduce + post into a single Stage.
-
-    SPLITK + non-reduce: when the matched Loop is non-reduce AND
-    ``K_s`` is present, wrap the K_o tower in ``Cond(K_s == 0, …)`` so
-    only the K_s=0 CTA executes the post — every K_s CTA otherwise
-    repeats the same broadcast-value write. Reduce-K skips the Cond;
-    launch_geometry's atomic-Write rewrite handles cross-CTA SPLITK
-    via the symmetric ``Cond(K_s == 0, atomic(indep))`` decomposition.
-
-    Combine emission lives in
-    ``001_launch_geometry._insert_combines_after_reduces``, which keys
-    off STAGE_INNER + Accum — post-K's non-reduce STAGE_INNER produces
-    no Combine, exactly correct.
-
-    Match composition:
-
-    - Matmul: ``match=is_matmul_reduce`` — only the matmul-shape
-      reduce matches; matmul has no per-K post-pointwise.
-    - Cooperative non-matmul:
-      ``match=lambda lp: lp.axis.extent == E_K and not is_matmul_reduce(lp)``
-      — both the cooperative-K reduce and the per-K post-pointwise
-      iterate the same E_K and get rewritten in one walk.
-    """
+    Non-reduce match + SPLITK > 1: wrap the K_o tower in ``Cond(K_s == 0)`` —
+    every K_s CTA would otherwise re-execute the post. Reduce-K skips the
+    Cond; launch_geometry's atomic-Write rewrite handles cross-CTA SPLITK.
+    Combine emission lives in launch_geometry, keyed off STAGE_INNER + Accum."""
     out: list[Stmt] = []
     n_replaced = 0
     for s in stmts:
@@ -724,11 +514,9 @@ def _build_k_sigma(
     br: int,
     bk: int,
 ) -> Sigma:
-    """Build the σ for a single K-axis split:
-    ``K = K_s · (K_o_ext · br · bk) + K_o · (br · bk) + K_i · br + K_c``.
-    K_s and K_c terms collapse when those axes are None (SPLITK=1 and
-    BR=1 respectively); the K_i · br term loses the ``· br`` when K_c
-    is absent, matching the existing matmul σ shape."""
+    """σ for ``K = K_s·(K_o_ext·br·bk) + K_o·(br·bk) + K_i·br + K_c``.
+    K_s / K_c terms collapse when those axes are None (SPLITK=1 / BR=1);
+    when K_c is absent, K_i loses its ``·br`` stride."""
     inner_expr = Var(K_o.name) * Literal(br * bk, "int")
     if K_c is not None:
         inner_expr = inner_expr + Var(K_i.name) * Literal(br, "int") + Var(K_c.name)
@@ -740,9 +528,7 @@ def _build_k_sigma(
 
 
 def _find_first_reduce(stmts, *, match) -> Loop | None:
-    """Find the first reduce Loop satisfying ``match`` anywhere in the
-    subtree. ``match`` is ``is_matmul_reduce`` for matmul, the negation
-    for cooperative-K reduces."""
+    """First reduce Loop satisfying ``match`` anywhere in the subtree."""
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and match(s):
             return s
