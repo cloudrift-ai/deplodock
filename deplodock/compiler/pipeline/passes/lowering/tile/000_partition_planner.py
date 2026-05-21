@@ -78,6 +78,11 @@ PATTERN = [Pattern("root", LoopOp)]
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
+# Cooperative-K thread count (non-matmul reductions). BR=1 collapses to
+# a serial chunked reduce; BR>1 distributes K across `BR` threads with a
+# cross-thread Combine after the K_o reduce. v1 constraint: BR>1 requires
+# BN=BM=1 (single THREAD axis for materializer's _single_thread_var).
+_BR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 # Per-axis register-tile factor choices (FM, FN candidates).
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 # Cap on total per-thread replication (∏ factors). NVRTC compile time
@@ -86,15 +91,16 @@ _MAX_CELLS_PER_THREAD: int = 128
 
 # Knob declarations. The planner is the source of truth for matmul
 # axis-structure tuning (BN/BM CTA tile, FM/FN per-thread cells, BK
-# K-chunk, SPLITK cross-CTA). Each enumerates its own candidate space
-# in ``_split_matmul_fully``; ``hints`` is autotune metadata + the
-# ``DEPLODOCK_<NAME>`` env-var registry binding.
+# K-chunk, SPLITK cross-CTA, BR cooperative-K threads). Each enumerates
+# its own candidate space in ``_enumerate_cartesian``; ``hints`` is
+# autotune metadata + the ``DEPLODOCK_<NAME>`` env-var registry binding.
 BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
 BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul M (output) axis")
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul N (output) axis")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
+BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
@@ -209,7 +215,7 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             bk_choices=_BK_CANDIDATES,
             splitk_choices=_SPLITK_CANDIDATES,
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
-            has_matmul=True,
+            priority_mode="matmul",
         )
     else:
         # No matmul reduce. Innermost is N; if there's a second-innermost
@@ -236,14 +242,14 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             bk_choices=(1,),
             splitk_choices=(1,),
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
-            has_matmul=False,
+            priority_mode="pointwise",
         )
 
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
-    for bn, bm, fm, fn, bk, splitk in param_combos:
+    for bn, bm, fm, fn, bk, splitk, br in param_combos:
         try:
-            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk)
+            chain_body = _build_split_body(extra_outer, outer_m, outer_n, k_loop, bn, bm, fm, fn, bk, splitk, br)
         except _BuildSkipped:
             continue
         new_body = leading + chain_body
@@ -255,6 +261,7 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
             FN.name: fn,
             BK.name: bk,
             SPLITK.name: splitk,
+            BR.name: br,
         }
         variants.append(LoopOp(body=new_body, knobs=knobs))
     return variants or None
@@ -269,31 +276,43 @@ def _enumerate_cartesian(
     bm_choices: tuple[int, ...],
     bk_choices: tuple[int, ...],
     splitk_choices: tuple[int, ...],
+    br_choices: tuple[int, ...] = (1,),
     max_cells_per_thread: int,
-    has_matmul: bool,
-) -> list[tuple[int, int, int, int, int, int]]:
-    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)``.
+    priority_mode: str,
+) -> list[tuple[int, int, int, int, int, int, int]]:
+    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``.
 
     BN / BM iterate the supplied candidate sets, clamped to extent and
     divisibility-checked. FM / FN iterate as divisors of the per-thread
     remainder so divisibility is automatic, with ``FM·FN`` capped at
     ``max_cells_per_thread``. BK / SPLITK iterate the supplied
-    candidate sets, divisor-checked against E_K / K_o_total. Thread
-    budget (≤ 1024) gates the inner loops.
+    candidate sets, divisor-checked against per-thread K / K_o_total.
+    BR iterates the supplied cooperative-K thread-count set; ``per_thread_K
+    = E_K // BR`` replaces the raw ``E_K`` in the K divisibility checks.
+    Total thread budget ``BN · BM · BR ≤ 1024`` gates the inner loops.
 
-    Same algorithm for matmul and pointwise — pointwise just passes
-    ``E_K=1``, ``bk_choices=(1,)``, ``splitk_choices=(1,)`` to collapse
-    the K iteration. The single-K-iter case (``BK = E_K``) is allowed
-    for ``E_K == 1`` (pointwise) and rejected when ``E_K > 1`` (matmul
-    wants at least 2 chunks).
+    Same algorithm for matmul, pointwise, and reduce — callers supply
+    appropriate degenerate sets to collapse unused axes (e.g. pointwise
+    passes ``bk_choices=(1,)``, ``splitk_choices=(1,)``, ``br_choices=(1,)``;
+    matmul passes ``br_choices=(1,)``). The single-K-iter case
+    (``per_thread_K == bk``) is allowed for ``E_K == 1`` (pointwise) and
+    for the cooperative-reduce path (``priority_mode == "reduce"``), but
+    rejected for matmul (``priority_mode == "matmul"``) which wants ≥ 2
+    K chunks per thread to amortize K-loop overhead.
 
-    Returns survivors sorted by priority. ``has_matmul`` selects the
-    priority key — matmul wants high cells/thread (amortize K-loop
-    overhead), pointwise wants low cells/thread (memory-bandwidth-
-    bound, more CTAs help SM occupancy). Both prefer threads close to
-    256/CTA."""
-    seen: set[tuple[int, int, int, int, int, int]] = set()
-    ordered: list[tuple[int, int, int, int, int, int]] = []
+    **v1 cooperative constraint:** BR > 1 requires the sole THREAD axis
+    (materializer's ``_single_thread_var``). When ``BN_c > 1`` or
+    ``BM_c > 1``, BR is forced to 1 — the M_t / N_t output thread axes
+    are not extent-1 and can't coexist with a cooperative-K thread axis
+    in v1.
+
+    Returns survivors sorted by priority. ``priority_mode`` selects the
+    key — matmul wants high cells/thread (amortize K-loop overhead),
+    pointwise wants low cells/thread (memory-bandwidth-bound, more CTAs
+    help SM occupancy), reduce wants warp-sized-or-larger cooperative
+    groups. All prefer threads close to 256/CTA."""
+    seen: set[tuple[int, int, int, int, int, int, int]] = set()
+    ordered: list[tuple[int, int, int, int, int, int, int]] = []
     for bn in bn_choices:
         bn_c = min(bn, E_N)
         if bn_c < 1 or E_N % bn_c != 0:
@@ -304,27 +323,38 @@ def _enumerate_cartesian(
                 continue
             if bn_c * bm_c > 1024:
                 continue
-            for fm in _divisors_up_to(E_M // bm_c, max_cells_per_thread):
-                for fn in _divisors_up_to(E_N // bn_c, max_cells_per_thread // fm):
-                    for bk in bk_choices:
-                        if E_K % bk != 0:
-                            continue
-                        if E_K > 1 and E_K <= bk:
-                            continue  # matmul: require ≥ 2 K chunks
-                        if bk > E_K:
-                            continue
-                        k_o_total = E_K // bk
-                        for splitk in splitk_choices:
-                            if k_o_total % splitk != 0:
+            # v1: BR > 1 requires the sole THREAD axis. When output
+            # thread fan-out exists, force BR = 1.
+            br_eligible: tuple[int, ...] = br_choices if (bn_c == 1 and bm_c == 1) else (1,)
+            for br in br_eligible:
+                if br < 1 or E_K % br != 0:
+                    continue
+                if bn_c * bm_c * br > 1024:
+                    continue
+                per_thread_K = E_K // br
+                for fm in _divisors_up_to(E_M // bm_c, max_cells_per_thread):
+                    for fn in _divisors_up_to(E_N // bn_c, max_cells_per_thread // fm):
+                        for bk in bk_choices:
+                            if per_thread_K % bk != 0:
                                 continue
-                            key = (bn_c, bm_c, fm, fn, bk, splitk)
-                            if key in seen:
+                            # Matmul: require ≥ 2 K chunks per thread.
+                            # Reduce/pointwise: single chunk per thread is fine.
+                            if priority_mode == "matmul" and per_thread_K > 1 and per_thread_K <= bk:
                                 continue
-                            seen.add(key)
-                            ordered.append(key)
+                            if bk > per_thread_K:
+                                continue
+                            k_o_total = per_thread_K // bk
+                            for splitk in splitk_choices:
+                                if k_o_total % splitk != 0:
+                                    continue
+                                key = (bn_c, bm_c, fm, fn, bk, splitk, br)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                ordered.append(key)
 
-    def _priority_matmul(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
-        bn, bm, fm, fn, bk, splitk = combo
+    def _priority_matmul(combo: tuple[int, int, int, int, int, int, int]) -> tuple[int, ...]:
+        bn, bm, fm, fn, bk, splitk, _br = combo
         threads = bn * bm
         cells = fm * fn
         return (
@@ -334,8 +364,8 @@ def _enumerate_cartesian(
             -splitk,  # smaller SPLITK (less atomic contention)
         )
 
-    def _priority_pointwise(combo: tuple[int, int, int, int, int, int]) -> tuple[int, ...]:
-        bn, bm, fm, fn, bk, splitk = combo
+    def _priority_pointwise(combo: tuple[int, int, int, int, int, int, int]) -> tuple[int, ...]:
+        bn, bm, fm, fn, bk, splitk, _br = combo
         threads = bn * bm
         cells = fm * fn
         # Pointwise is memory-bandwidth-bound: prefer FEW cells/thread
@@ -346,7 +376,25 @@ def _enumerate_cartesian(
             -abs(256 - threads),  # threads close to 256
         )
 
-    priority_fn = _priority_matmul if has_matmul else _priority_pointwise
+    def _priority_reduce(combo: tuple[int, int, int, int, int, int, int]) -> tuple[int, ...]:
+        bn, bm, _fm, _fn, bk, splitk, br = combo
+        threads = bn * bm * br
+        # Cooperative reduce: prefer warp-sized-or-larger cooperative
+        # groups (BR ≥ 32 lets the materializer use warp-shuffle), threads
+        # close to 256/CTA, larger BK (fewer K iters), smaller SPLITK
+        # (less atomic contention).
+        return (
+            min(br, 256),
+            -abs(256 - threads),
+            bk,
+            -splitk,
+        )
+
+    priority_fn = {
+        "matmul": _priority_matmul,
+        "pointwise": _priority_pointwise,
+        "reduce": _priority_reduce,
+    }[priority_mode]
     ordered.sort(key=priority_fn, reverse=True)
     return ordered
 
@@ -362,6 +410,7 @@ def _build_split_body(
     fn: int,
     bk: int,
     splitk: int,
+    br: int = 1,
 ) -> tuple[Stmt, ...]:
     """Unified σ-split body construction. The N axis is always present;
     ``outer_m`` and ``k_loop`` are ``None`` for 1D pointwise and
