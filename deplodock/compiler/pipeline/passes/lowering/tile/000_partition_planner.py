@@ -79,6 +79,13 @@ _BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
 
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 
+# Cooperative-reduce thread-count fork. Mirrors
+# ``004_launch_geometry._TUNE_AXIS_CHOICES`` and ``_WARP_SIZE`` so the
+# planner-driven fork enumerates the same BN candidates the legacy
+# ``_emit_cooperative_launch`` fork did.
+_COOP_BN_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
+_WARP_SIZE = 32
+
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     if not os.environ.get(_ENABLE_ENV):
@@ -93,9 +100,25 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     k_variants = _try_matmul_k_chunk(ctx, base)
     candidates: list[LoopOp] = list(k_variants) if k_variants is not None else [base]
 
+    coop_results: list[LoopOp] = []
+    any_coop = False
+    for cand in candidates:
+        coop_variants = _try_cooperative_reduce(cand)
+        if coop_variants is not None:
+            any_coop = True
+            coop_results.extend(coop_variants)
+        else:
+            coop_results.append(cand)
+
     chunked: list[LoopOp] = []
     any_chunk_reduce = False
-    for cand in candidates:
+    for cand in coop_results:
+        # Cooperative-tagged kernels: their reduce axes are mapped to a
+        # strided thread axis; the per-load slab degenerates and
+        # chunk-reduce doesn't apply.
+        if _has_cooperative_stride(cand.body):
+            chunked.append(cand)
+            continue
         after_cr = _try_chunk_reduce(cand)
         if after_cr is not None:
             any_chunk_reduce = True
@@ -103,7 +126,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
         else:
             chunked.append(cand)
 
-    fired = after_reg is not None or k_variants is not None or any_chunk_reduce
+    fired = after_reg is not None or k_variants is not None or any_coop or any_chunk_reduce
     if not fired:
         raise RuleSkipped("no planner branch matched")
 
@@ -604,3 +627,85 @@ def _pick_reduce_bk(K: int, in_extent_product: int) -> int | None:
             continue
         return c
     return None
+
+
+# --- cooperative-reduce branch ---------------------------------------
+
+
+def _try_cooperative_reduce(loop_op: LoopOp) -> list[LoopOp] | None:
+    """Tag cooperative-viable reduce Loops with ``Role.COOPERATIVE_STRIDE``
+    and fork over the cooperative thread count ``BN``.
+
+    Mirrors ``004_launch_geometry._cooperative_viable`` at the LoopOp
+    level: the inner body (post-chain) has at least one reduce Loop
+    with extent ≥ WARP_SIZE, every reduce has an ``Accum``, and Accums
+    are independent. For each viable kernel:
+
+    1. Tag every top-level reduce Loop in the inner body with
+       ``Role.COOPERATIVE_STRIDE``.
+    2. Fork over BN candidates (heuristic ``_effective_block_size``
+       first; powers-of-two in ``_COOP_BN_CHOICES`` ≥ WARP_SIZE next).
+    3. Stamp ``knobs={"BN": bn}`` per variant.
+
+    Returns ``None`` when not cooperative-viable (matmul-shape, no
+    reduce, or short reduce axis)."""
+    from deplodock.compiler.tuning import _has_matmul_reduce  # noqa: PLC0415
+
+    if _has_matmul_reduce(loop_op.body):
+        return None
+    chain = _outer_free_loop_chain(loop_op.body)
+    if not _cooperative_shape(loop_op.body, chain):
+        return None
+    inner_body = tuple(chain[-1].body) if chain else tuple(loop_op.body)
+    reduce_loops = [s for s in inner_body if isinstance(s, Loop) and s.is_reduce]
+    if not reduce_loops:
+        return None
+    reduce_extent = int(reduce_loops[0].axis.extent)
+
+    tagged_inner = tuple(replace(s, role=Role.COOPERATIVE_STRIDE) if (isinstance(s, Loop) and s.is_reduce) else s for s in inner_body)
+    new_body = _rebuild_outer_chain(chain, tagged_inner) if chain else tagged_inner
+
+    heuristic_bn = _effective_block_size(reduce_extent)
+    bn_set = {bn for bn in _COOP_BN_CHOICES if _WARP_SIZE <= bn <= heuristic_bn}
+    bn_set.add(heuristic_bn)
+    ordered = [heuristic_bn] + sorted([bn for bn in bn_set if bn != heuristic_bn], reverse=True)
+
+    variants: list[LoopOp] = []
+    for bn in ordered:
+        knobs = dict(loop_op.knobs)
+        knobs["BN"] = bn
+        variants.append(LoopOp(body=new_body, knobs=knobs))
+    return variants
+
+
+def _effective_block_size(reduce_extent: int) -> int:
+    """Threads/CTA for the cooperative reduce — mirrors
+    ``004_launch_geometry._effective_block_size``."""
+    from deplodock.compiler.ir.tile.ir import BLOCK_SIZE  # noqa: PLC0415
+
+    p = 1
+    while p < reduce_extent:
+        p <<= 1
+    return max(_WARP_SIZE, min(BLOCK_SIZE, p))
+
+
+def _rebuild_outer_chain(chain: tuple[Loop, ...], new_inner: tuple) -> tuple:
+    """Re-wrap ``new_inner`` with the outer free-Loop chain unchanged."""
+    result = new_inner
+    for lp in reversed(chain):
+        result = (Loop(axis=lp.axis, body=result, unroll=lp.unroll, role=lp.role),)
+    return result
+
+
+def _has_cooperative_stride(stmts) -> bool:
+    """True iff any reachable reduce Loop carries
+    ``Role.COOPERATIVE_STRIDE``."""
+    for s in stmts:
+        if isinstance(s, Loop) and s.role is Role.COOPERATIVE_STRIDE:
+            return True
+        if isinstance(s, (Loop, StridedLoop)) and _has_cooperative_stride(s.body):
+            return True
+        if isinstance(s, Cond):
+            if _has_cooperative_stride(s.body) or _has_cooperative_stride(s.else_body):
+                return True
+    return False

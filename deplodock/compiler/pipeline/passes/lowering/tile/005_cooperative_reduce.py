@@ -29,7 +29,7 @@ Trigger:
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Loop, StridedLoop
@@ -55,10 +55,12 @@ def rewrite(root: Node) -> Graph | None:
     reduce_loops = [s for s in tile.body if isinstance(s, Loop) and s.is_reduce]
     if not reduce_loops:
         raise RuleSkipped("Tile body has no reduce Loop")
-    # Mirror 004's viability gate: extent ≥ WARP_SIZE means 004 elected
-    # cooperative launch and added ``t``; otherwise the lone THREAD axis
-    # is just a pointwise output dim and we mustn't rewrite the body.
-    if int(reduce_loops[0].axis.extent) < _WARP_SIZE:
+    # Trigger preference: planner-tagged ``Role.COOPERATIVE_STRIDE`` on a
+    # reduce Loop is the authoritative signal. Otherwise fall back to the
+    # legacy viability gate (extent ≥ WARP_SIZE) so non-planner mode
+    # keeps working.
+    has_coop_tag = any(lp.role is Role.COOPERATIVE_STRIDE for lp in reduce_loops)
+    if not has_coop_tag and int(reduce_loops[0].axis.extent) < _WARP_SIZE:
         raise RuleSkipped(f"first reduce-axis extent < WARP_SIZE={_WARP_SIZE} (004 didn't elect cooperative)")
     # Idempotence: post-rewrite the reduces have become StridedLoops.
     if any(isinstance(s, StridedLoop) and s.is_reduce for s in tile.body):

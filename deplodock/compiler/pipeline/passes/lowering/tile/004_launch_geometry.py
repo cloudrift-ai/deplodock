@@ -27,7 +27,7 @@ is a no-op (every axis fits one CTA), the pass skips.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis, Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Loop, Stmt, Tile
@@ -59,6 +59,15 @@ def rewrite(root: Node) -> Graph | None | list[TileOp]:
         if len(variants) == 1:
             return variants[0]
         return variants
+
+    if _has_cooperative_stride_tag(tile):
+        # Planner pre-tagged the cooperative reduce(s) and stamped BN.
+        # The launch is now deterministic: read BN from the parent
+        # TileOp's knobs and emit a single variant.
+        bn = root.op.knobs.get(BN.name)
+        if bn is None:
+            raise RuleSkipped("cooperative-stride tag present but BN knob missing")
+        return _emit_cooperative_launch_deterministic(body, idx, tile, root.op.name, int(bn), root.op.knobs)
 
     if _cooperative_viable(tile):
         result = _emit_cooperative_launch(body, idx, tile, root.op.name)
@@ -100,6 +109,29 @@ def _accums_independent(body: Body) -> bool:
     body = Body.coerce(body)
     accum_names = {s.name for s in body if isinstance(s, Accum)}
     return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
+
+
+def _has_cooperative_stride_tag(tile: Tile) -> bool:
+    """True iff any reduce Loop in ``tile.body`` carries the planner's
+    ``Role.COOPERATIVE_STRIDE`` tag — signals the planner already
+    elected cooperative launch and stamped ``BN``."""
+    return any(lp.role is Role.COOPERATIVE_STRIDE for lp in tile.body.iter_of_type(Loop))
+
+
+def _emit_cooperative_launch_deterministic(body: tuple[Stmt, ...], idx: int, tile: Tile, name: str, bn: int, parent_knobs: dict) -> TileOp:
+    """Planner-driven cooperative launch: add ``t=THREAD`` axis sized to
+    ``bn`` and rebind every output axis to ``BLOCK``. No fork — the
+    planner already enumerated BN candidates."""
+    t_axis = Axis("t", bn)
+    new_axes = (
+        BoundAxis(axis=t_axis, bind=BIND_THREAD),
+        *(BoundAxis(axis=ba.axis, bind=BIND_BLOCK) for ba in tile.axes),
+    )
+    new_tile = Tile(axes=new_axes, body=tile.body)
+    # No new knobs — BN was stamped on the parent LoopOp by the planner
+    # and propagates via ``Candidate.apply``.
+    del parent_knobs
+    return TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=name)
 
 
 def _cooperative_viable(tile: Tile) -> bool:
