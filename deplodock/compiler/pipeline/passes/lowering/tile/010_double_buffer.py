@@ -54,7 +54,7 @@ BUFFER_COMPUTE = Knob(
     KnobType.BOOL,
     hints=(True, False),
     help=(
-        "Promote a multi-source compute Stage (produced by 007c_split) to a ring-buffered "
+        "Promote a ComputeStage (produced by 007b_hoist) to a ring-buffered "
         "Stage so its output is double-buffered alongside the per-source transport stages. "
         "Experimental — lets a downstream pass try to overlap compute and reduce across "
         "K_outer iterations. Default off."

@@ -149,7 +149,7 @@ def test_hoist_compute_keeps_transports_and_adds_compute_stage():
     compute = computes[0]
 
     # Original transport names survive (no rename to A_xport / B_xport
-    # like the old 007c chain produced).
+    # like the legacy 007b-then-split chain produced).
     transport_names = {s.name for s in transports}
     assert transport_names == {"gate_smem", "up_smem", "w_smem"}, transport_names
 

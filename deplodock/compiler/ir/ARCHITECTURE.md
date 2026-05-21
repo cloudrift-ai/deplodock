@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, `Stage`/`BufferedStage`/`AsyncBufferedStage` with `Affine`/`TemplateAddressing`, `AsyncWait`, `Combine`, `StridedLoop`) |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, `Stage`/`BufferedStage`/`AsyncBufferedStage`/`TmaBufferedStage`/`ComputeStage` with `Affine`/`TemplateAddressing`, `AsyncWait`, `Combine`, `StridedLoop`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -219,9 +219,10 @@ flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`.
 |--------------------|-------------------------------------------------------------------|
 | `TileOp`              | Graph-op carrying a `Tile`-rooted body. One per kernel.                                                                              |
 | `Tile`                | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).                                                                     |
-| `Stage`               | Sync, single-slot smem cache of an input slab. Materialize emits leading `Sync` + cooperative `Load+Write` + trailing `Sync`.        |
+| `Stage`               | Sync, single-slot smem cache of an input slab. Materialize emits leading `Sync` + cooperative `Load+Write` + trailing `Sync`. Single-source body is canonical; multi-source body is the inline-fuse shape (`007b` with `FUSED_PIPELINE=False`) carrying gmem Loads + cone Assigns + Write. |
 | `BufferedStage`       | `Stage` subtype with `buffer_count >= 2` rotating slabs selected by `phase`. Sync transport, ping-pong slabs (no leading `Sync`).    |
 | `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async`; emits `Smem`+`CpAsyncCopy`+`CpAsyncCommit` only — caller must dominate consumers with `AsyncWait`. |
+| `ComputeStage`        | `Stage` subtype representing hoisted invariant compute (`007b` with `FUSED_PIPELINE=True`). Body Loads read sibling Stage smem (not gmem); `external_reads()` returns `()`. Optional `buffer_count` + `phase` mirror `BufferedStage` so `010` can ring-buffer the output. |
 | `AffineAddressing`    | `Stage.addressing` variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
 | `TemplateAddressing`  | `Stage.addressing` variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
 | `AsyncWait`           | Sync point for outstanding cp.async groups. `keep` is the `wait_group` argument: `0` drains all; `len(stages)` leaves the just-issued chunk in flight. |
