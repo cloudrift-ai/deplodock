@@ -167,15 +167,17 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
 
     Matmul (``body_info.has_matmul``): innermost two chain axes are
     output M, N; reduce axis K is detected inside ``outer_n.body``.
-    Enumerates the full pruned cartesian over ``(BN, BM, FM, FN, BK,
-    SPLITK)`` and emits one variant per surviving combo, sorted by
-    priority so variant 0 is the heuristic-spirit shape.
+    Calls the cartesian with the full ``(BN, BM, BK, SPLITK)``
+    candidate sets — FM / FN come out of divisor enumeration.
 
     Pointwise / non-matmul (no K detected): innermost chain axis is N
     (``outer_m`` is ``None`` for 1D pointwise; for ≥ 2D chains the
-    second-innermost is M but with degenerate ``BM = FM = 1`` so it
-    block-only). No register tile, no K — emits a single variant with
-    ``BN`` from :func:`tuning.thread_tile_shape`.
+    second-innermost is M). E_K = 1, BK = SPLITK = 1 collapse the
+    K iteration. By default, BM is also locked to 1 so the visible
+    output matches the legacy single-variant pointwise heuristic; for
+    autotune-driven exploration of pointwise FM / FN / BM widening
+    (which the cartesian fully supports), the caller can flip the
+    ``_POINTWISE_WIDE`` flag below.
 
     Returns ``None`` when the kernel doesn't match either shape (no
     outer chain, or matmul-detected but K reduce missing)."""
@@ -197,18 +199,50 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
         E_M = int(outer_m.axis.extent)
         E_N = int(outer_n.axis.extent)
         E_K = int(k_loop.axis.extent)
-        param_combos = _matmul_cartesian(E_M, E_N, E_K)
+        param_combos = _enumerate_cartesian(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=E_K,
+            bn_choices=_TUNE_AXIS_CHOICES,
+            bm_choices=_TUNE_AXIS_CHOICES,
+            bk_choices=_BK_CANDIDATES,
+            splitk_choices=_SPLITK_CANDIDATES,
+            max_cells_per_thread=_MAX_CELLS_PER_THREAD,
+        )
     else:
         # No matmul reduce. Innermost is N; if there's a second-innermost
-        # it's treated as a degenerate M (BM = FM = 1 → block-only). Any
-        # further-out axes become extra_outer BLOCK-whole.
+        # it's treated as the M axis. Any further-out axes become
+        # extra_outer BLOCK-whole.
         outer_n = chain[-1]
         outer_m = chain[-2] if len(chain) >= 2 else None
         extra_outer = chain[:-2] if len(chain) >= 2 else ()
         k_loop = None
+        E_M = int(outer_m.axis.extent) if outer_m is not None else 1
         E_N = int(outer_n.axis.extent)
-        bn = _pointwise_bn(E_N, body_info)
-        param_combos = [(bn, 1, 1, 1, 1, 1)]
+        # Pointwise locks BK / SPLITK to (1,) (no K reduction). Narrow
+        # mode (default) reproduces the legacy single-variant pointwise:
+        # ``BN`` clamped to the heuristic target, ``BM = FM = FN = 1``.
+        # Wide mode (``_POINTWISE_WIDE = True``) enumerates the full
+        # ``(BN, BM, FM, FN)`` cartesian for autotune-driven exploration.
+        bn_heuristic = _pointwise_bn(E_N, body_info)
+        if _POINTWISE_WIDE:
+            bn_choices = _TUNE_AXIS_CHOICES
+            bm_choices = _TUNE_AXIS_CHOICES
+            max_cells = _MAX_CELLS_PER_THREAD
+        else:
+            bn_choices = (bn_heuristic,)
+            bm_choices = (1,)
+            max_cells = 1  # forces FM = FN = 1 → single-variant
+        param_combos = _enumerate_cartesian(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=1,
+            bn_choices=bn_choices,
+            bm_choices=bm_choices,
+            bk_choices=(1,),
+            splitk_choices=(1,),
+            max_cells_per_thread=max_cells,
+        )
 
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
@@ -231,36 +265,69 @@ def _split_kernel_fully(loop_op: LoopOp, body_info: BodyInfo) -> list[LoopOp] | 
     return variants or None
 
 
-def _matmul_cartesian(E_M: int, E_N: int, E_K: int) -> list[tuple[int, int, int, int, int, int]]:
-    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)`` for a
-    matmul kernel. BN/BM from a pow-2 preset (clamped to extent +
-    divisibility check); FM/FN as divisors of the per-thread remainder
-    so divisibility is automatic; BK as divisor of E_K; SPLITK as
-    divisor of K_o_total. Thread (≤ 1024) and register
-    (FM·FN ≤ ``_MAX_CELLS_PER_THREAD``) budgets gate the inner loops.
+# Flip to ``True`` to let pointwise emit the full ``(BN, BM, FM, FN)``
+# cartesian — gives autotune more variants to explore at the cost of
+# more compile time per pointwise kernel. Greedy compile picks variant
+# 0 per the priority sort; with wider enumeration this may pick a
+# matmul-shaped tile (e.g. ``BN=16, BM=16, FM=8, FN=4``) instead of
+# the legacy row-major-wide (``BN=256, BM=1``). Worth measuring before
+# enabling by default.
+_POINTWISE_WIDE = False
 
-    Returns the survivors sorted by priority so variant 0 is the
+
+def _enumerate_cartesian(
+    *,
+    E_M: int,
+    E_N: int,
+    E_K: int,
+    bn_choices: tuple[int, ...],
+    bm_choices: tuple[int, ...],
+    bk_choices: tuple[int, ...],
+    splitk_choices: tuple[int, ...],
+    max_cells_per_thread: int,
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK)``.
+
+    BN / BM iterate the supplied candidate sets, clamped to extent and
+    divisibility-checked. FM / FN iterate as divisors of the per-thread
+    remainder so divisibility is automatic, with ``FM·FN`` capped at
+    ``max_cells_per_thread``. BK / SPLITK iterate the supplied
+    candidate sets, divisor-checked against E_K / K_o_total. Thread
+    budget (≤ 1024) gates the inner loops.
+
+    Same algorithm for matmul and pointwise — pointwise just passes
+    ``E_K=1``, ``bk_choices=(1,)``, ``splitk_choices=(1,)`` to collapse
+    the K iteration. The single-K-iter case (``BK = E_K``) is allowed
+    for ``E_K == 1`` (pointwise) and rejected when ``E_K > 1`` (matmul
+    wants at least 2 chunks). Setting ``max_cells_per_thread=1`` forces
+    ``FM = FN = 1`` (the narrow pointwise default — single-variant).
+
+    Returns survivors sorted by priority so variant 0 is the
     heuristic-spirit shape (high cells/thread capped at 32, threads
     closest to 256/CTA, larger BK, smaller SPLITK)."""
     seen: set[tuple[int, int, int, int, int, int]] = set()
     ordered: list[tuple[int, int, int, int, int, int]] = []
-    for bn in _TUNE_AXIS_CHOICES:
+    for bn in bn_choices:
         bn_c = min(bn, E_N)
         if bn_c < 1 or E_N % bn_c != 0:
             continue
-        for bm in _TUNE_AXIS_CHOICES:
+        for bm in bm_choices:
             bm_c = min(bm, E_M)
             if bm_c < 1 or E_M % bm_c != 0:
                 continue
             if bn_c * bm_c > 1024:
                 continue
-            for fm in _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD):
-                for fn in _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm):
-                    for bk in _BK_CANDIDATES:
-                        if E_K % bk != 0 or E_K <= bk:
+            for fm in _divisors_up_to(E_M // bm_c, max_cells_per_thread):
+                for fn in _divisors_up_to(E_N // bn_c, max_cells_per_thread // fm):
+                    for bk in bk_choices:
+                        if E_K % bk != 0:
+                            continue
+                        if E_K > 1 and E_K <= bk:
+                            continue  # matmul: require ≥ 2 K chunks
+                        if bk > E_K:
                             continue
                         k_o_total = E_K // bk
-                        for splitk in _SPLITK_CANDIDATES:
+                        for splitk in splitk_choices:
                             if k_o_total % splitk != 0:
                                 continue
                             key = (bn_c, bm_c, fm, fn, bk, splitk)
