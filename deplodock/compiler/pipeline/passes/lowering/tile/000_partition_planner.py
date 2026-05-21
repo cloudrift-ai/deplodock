@@ -110,9 +110,19 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
         else:
             after_k.append(base)
 
+    after_splitk: list[LoopOp] = []
+    any_splitk = False
+    for cand in after_k:
+        sk_variants = _try_splitk(ctx, cand)
+        if sk_variants is not None:
+            any_splitk = True
+            after_splitk.extend(sk_variants)
+        else:
+            after_splitk.append(cand)
+
     coop_results: list[LoopOp] = []
     any_coop = False
-    for cand in after_k:
+    for cand in after_splitk:
         coop_variants = _try_cooperative_reduce(cand)
         if coop_variants is not None:
             any_coop = True
@@ -149,7 +159,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
         else:
             bn_bm_results.append(cand)
 
-    fired = reg_variants is not None or any_k_chunk or any_coop or any_chunk_reduce or any_bn_bm
+    fired = reg_variants is not None or any_k_chunk or any_splitk or any_coop or any_chunk_reduce or any_bn_bm
     if not fired:
         raise RuleSkipped("no planner branch matched")
 
@@ -846,3 +856,66 @@ def _try_matmul_bn_bm_fork(loop_op: LoopOp) -> list[LoopOp] | None:
         knobs = {**loop_op.knobs, "BN": bn, "BM": bm}
         variants.append(LoopOp(body=loop_op.body, knobs=knobs))
     return variants or None
+
+
+# --- SPLITK stamp fork ----------------------------------------------
+
+
+# Mirrors ``003_split_matmul_k._SPLITK_CANDIDATES``. Planner stamps one
+# SPLITK value per variant; ``003_split_matmul_k`` reads the stamp and
+# does the σ-split + epilogue rewrite deterministically.
+_SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
+
+
+def _try_splitk(ctx: Context, loop_op: LoopOp) -> list[LoopOp] | None:
+    """Enumerate ``SPLITK`` candidates for a K-chunked matmul kernel
+    and stamp them as knobs (no body change). The heuristic from
+    :func:`tuning.auto_splitk` against the synthetic Tile (post-register-
+    tile, post-K-chunk) becomes variant 0 — when it's ``1`` the fork
+    skips because no candidate would split the K_o loop.
+
+    Returns ``None`` when the kernel isn't matmul-shaped, hasn't been
+    K-chunked (no ``Role.SERIAL_OUTER`` K loop), or already carries
+    ``SPLITK`` in knobs."""
+    from deplodock.compiler.tuning import _has_matmul_reduce, auto_splitk  # noqa: PLC0415
+
+    if not _has_matmul_reduce(loop_op.body):
+        return None
+    if "SPLITK" in loop_op.knobs:
+        return None
+    chain = _outer_free_loop_chain(loop_op.body)
+    inner_body = tuple(chain[-1].body) if chain else tuple(loop_op.body)
+    k_o = _find_serial_outer_k(inner_body)
+    if k_o is None:
+        return None
+    K_o_extent = int(k_o.axis.extent)
+
+    synthetic = Tile(
+        axes=tuple(BoundAxis(axis=lp.axis, bind=BIND_THREAD) for lp in chain) if chain else (),
+        body=inner_body,
+    )
+    heuristic = int(auto_splitk(synthetic, K_o_extent))
+    if heuristic <= 1:
+        return None
+    # No fork — one-shot stamp matching today's 003 behavior. The
+    # autotune layer can search SPLITK by overriding via env knobs;
+    # multi-variant SPLITK fork is out of scope for now.
+    knobs = {**loop_op.knobs, "SPLITK": heuristic}
+    return [LoopOp(body=loop_op.body, knobs=knobs)]
+
+
+def _find_serial_outer_k(stmts) -> Loop | None:
+    """Find the first ``Loop`` with ``Role.SERIAL_OUTER`` reachable in
+    ``stmts`` (the M7 K-chunk marker)."""
+    for s in stmts:
+        if isinstance(s, Loop) and s.role is Role.SERIAL_OUTER:
+            return s
+        if isinstance(s, (Loop, StridedLoop)):
+            found = _find_serial_outer_k(s.body)
+            if found is not None:
+                return found
+        if isinstance(s, Cond):
+            found = _find_serial_outer_k(s.body) or _find_serial_outer_k(s.else_body)
+            if found is not None:
+                return found
+    return None

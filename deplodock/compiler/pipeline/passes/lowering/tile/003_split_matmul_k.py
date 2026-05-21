@@ -74,13 +74,13 @@ SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA 
 
 
 def rewrite(root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
+    new_body = _maybe_rewrite(root.op.body, root.op.knobs)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")
     return TileOp(body=new_body, name=root.op.name)
 
 
-def _maybe_rewrite(body):
+def _maybe_rewrite(body, parent_knobs):
     idx, tile = single_tile(body)
     if tile.block_axes:
         raise RuleSkipped("Tile already partitioned — must run before 005")
@@ -89,9 +89,15 @@ def _maybe_rewrite(body):
     k_outer = next((s for s in tile.body if isinstance(s, Loop) and _is_chunked_matmul(s)), None)
     if k_outer is None:
         raise RuleSkipped("no chunked matmul Loop in tile body")
-    splitk = auto_splitk(tile, int(k_outer.axis.extent))
+    # Planner-driven path: ``000_partition_planner`` stamps SPLITK on
+    # the parent LoopOp's knobs. Honor that stamp deterministically.
+    # In env=0 (no planner) we fall back to the local auto_splitk pick.
+    if "SPLITK" in parent_knobs:
+        splitk = int(parent_knobs["SPLITK"])
+    else:
+        splitk = auto_splitk(tile, int(k_outer.axis.extent))
     if splitk <= 1:
-        raise RuleSkipped(f"auto-picked splitK={splitk} (grid already fills the GPU or no useful split)")
+        raise RuleSkipped(f"splitK={splitk} (planner / heuristic elected no split)")
 
     new_tile = _split_tile(tile, splitk)
     if new_tile is None:
