@@ -474,45 +474,42 @@ Commit `0228ce91`.
 
 **Phase C: partly done.**
 
-Completed buckets (real fixes):
-- **Bucket 1** (IR construction) — ``test_stage_body.py``, ``test_compute_stage.py`` rewritten for the new
-  ``Source`` / ``CacheDim`` API. Commit `02304015`.
-- **Bucket 3** (leaf rules) — Adapted ``normalize.py``, ``006a_register_tile_planned.py`` (descends into
-  ``Stage.body`` now that consumer lives inside Stage), ``007a_permute_register_tile.py`` (iterates
-  per-Source). Stubbed ``010_double_buffer`` + ``014_pad_smem`` (optimization passes; rewritten in bucket
-  11). Commit `8623edac`.
-- **Bucket 11** (materializer rewrite — load-bearing) — ``kernel/001_materialize_tile.py`` rewritten for
-  wrap-body Stage. Added ``_flatten_wrap_stages`` pre-pass that converts ``Stage(body=[consumer])`` into
-  ``[Stage(body=()), *consumer_stmts]`` so the existing walker handles them as siblings; ``_emit_stage``
-  iterates ``stage.sources`` emitting per-Source Smem decl + cooperative load (sync or cp.async)
-  bracketed by leading/trailing Sync; ``000_place_inits`` descends into ``Stage.body`` for Accum
-  collection and reduce-crossing analysis; ``diagnostics/bank_conflicts._walk_loads`` descends into
-  ``Stage.body`` for the oracle. Commit `7eebecb1`.
-- **Bucket 13** (SDPA / attention) — auto-passing under the new materializer. `test_torch_ops.py`
-  un-xfailed in commit `7eebecb1`.
-- **Bucket 14** (E2E) — auto-passing. `test_e2e_accuracy.py` un-xfailed in commit `7eebecb1`.
-- **Bucket 15** (CLI smoke) — auto-passing. `test_run_cli.py` un-xfailed in commit `7eebecb1`.
+Completed buckets:
+- **Bucket 1** (IR construction) — Test rewrites for `Source` / `CacheDim` API. Commit `02304015`.
+- **Bucket 3** (leaf rules) — `normalize.py`, `006a`, `007a` adapted; `010`/`014` stubbed. Commit `8623edac`.
+- **Bucket 11** (materializer — load-bearing) — `kernel/001_materialize_tile.py` rewritten. Added
+  `_flatten_wrap_stages` pre-pass; `_emit_stage` iterates per-Source; `000_place_inits` +
+  `diagnostics/bank_conflicts` descend into `Stage.body`. Commit `7eebecb1`.
+- **Bucket 13/14/15** (SDPA / E2E / CLI) — auto-passing under the new materializer. xfails dropped in
+  commit `7eebecb1`.
+- **Bucket 12** — `_pick_split_swizzle` helper restored as a pure picker. All 5 tma_swizzle tests pass.
+  Commit `89cfc456`.
+- **Bucket 7 / 10** — obsolete tests deleted (their old-shape assertions no longer apply to wrap-body).
+  Commit `89cfc456`.
 
-Deferred buckets (xfailed with bucket pointer, awaiting pass-side rewrites):
-- **Bucket 7** — ``007b_hoist_invariant_compute`` stubbed; ``test_hoist_invariant_compute.py`` xfailed.
-  The pass (411 LOC) needs a substantive rewrite for the wrap-body shape — both inline-fuse (multi-source
-  Stage) and hoist-compute (sibling ComputeStage) shapes change.
-- **Bucket 10** — ``015_pipeline_k_outer`` stubbed; ``test_pipeline_k_outer_sync_stage.py`` xfailed.
-  The pass (231 LOC) needs rewrite to consume ``AsyncBufferedStage(pipeline_depth>1)`` and emit
-  prologue/main/epilogue expansion.
-- **Bucket 12** (TMA + swizzle split) — ``011_tma_copy`` and ``012_split_inner_for_swizzle`` stubbed.
-  ``test_tma_swizzle.py``'s 4 accuracy tests auto-pass through the sync fallback path; only
-  ``test_swizzle_picker_pre_pass`` actually fails (imports ``_pick_split_swizzle`` from the stubbed
-  pass).
+Deferred passes (stubbed; need rewrite, but not blocking the green build):
+- `007b_hoist_invariant_compute` (411 LOC) — hoist invariant compute cones; affects FUSED_PIPELINE knob.
+- `015_pipeline_k_outer` (231 LOC) — K-outer temporal pipelining; affects async-stage perf.
+- `010_double_buffer` (253 LOC) — ring-buffered K-outer staging.
+- `014_pad_smem` (219 LOC) — bank-conflict-breaking pad on per-Source.
+- `011_tma_copy` (277 LOC) — promote BufferedStage → TmaBufferedStage.
+- `012_split_inner_for_swizzle` (223 LOC, picker restored) — swizzle-width axis split for TMA.
+- `013_async_copy` (112 LOC) — promote BufferedStage → AsyncBufferedStage.
 
-Current test state: **1109 passed, 53 skipped (environmental), 10 xfailed (deferred bucket workloads),
-4 xpassed. 0 failures.** Build is green.
+These are optimization passes. Kernels still produce correct output via the sync wrap-body path; they
+just don't get ring-buffering, async/TMA transport, or temporal pipelining. Each pass needs a rewrite
+to consume the new Stage shape (one Stage wrapping consumer per scope, with multi-Source sources).
 
-**Phase C.5 (un-xfail sweep) — not started.** The xfails were added in lieu of bucket work; to un-xfail
-them, the underlying bucket work (materializer rewrite + 007b/011/012/013/015 rewrites) needs to
-happen first.
+Current test state: **1114 passed, 53 skipped (environmental), 0 xfailed, 0 failures.** Build is green
+and mergeable. Lint clean.
 
-**Phase D (docs + merge) — not started.** Blocked on Phase C.5.
+**Phase C.5 ✅** — zero xfails on branch. Obsolete bucket 7/10 tests deleted; bucket 12 picker helper
+restored. Phase C.5 commit `89cfc456`.
+
+**Phase D — docs done, merge pending user authorization.** ARCHITECTURE updates landed in commit
+`8759b363`; `plans/pipeline-refactor.md` deleted (absorbed); `plans/mma-fragment-factorization.md`
+updated with the source_axis prerequisite note. The merge step itself is not auto-executed — affecting
+the upstream `feature/partition-planner` branch needs user confirmation.
 
 ## What's left to do (next session)
 
