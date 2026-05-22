@@ -70,6 +70,21 @@ option 0 inline and pushes one `Candidate` per remaining option onto the
 search queue (deep-copying the graph at the fork point). Single-option
 returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
+**Lazy hierarchical forks via `Fork`.** A rule can also return a list of
+`Fork(knobs=..., expand=..., score=...)` objects — each Fork carries the
+knob delta it pins plus a thunk that produces the next level of options
+(more Forks, concrete `Op`/`Graph` leaves, or a mix). The search loop
+pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize
+the children, pushes them back, and continues; cursor advance only
+fires when the lineage resolves to a concrete leaf. Lets a rule expose
+a hierarchy of decisions lazily — only the subtrees MCTS actually walks
+into get materialized. The partition planner uses this to descend
+`SPLITK → BR → (BN, BM) → BK → (FM, FN)` without enumerating every leaf
+up front. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy
+replay) without firing the thunk; `Fork.score` is the MCTS prior the
+producing rule attaches (typically the priority rank of the
+best-reachable leaf under this branch).
+
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
 from pass 0; rules whose output is already in the graph must `RuleSkipped`
