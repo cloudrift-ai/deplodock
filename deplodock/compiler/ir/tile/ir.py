@@ -700,27 +700,40 @@ class TileOp(BodyOp):
           load goes to global memory (no register reuse), memory-bound.
         - Massive unroll (cells/thread > 64) → graduated penalty up to
           ``-1.0``. NVRTC compile time explodes on the unrolled body.
-        - CTA count below 32 → ``-0.5``. Too few CTAs to fill the SMs.
+        - Under-filled launch (ctas < ``_TARGET_CTAS``) → linear penalty
+          up to ``-1.0`` at 1 CTA, scaled by ``(target − ctas) / target``.
+          The dominant failure mode on transformer-prefill GEMMs — a
+          ``(1,128) @ (128,2048)`` matmul at ``FM·FN = 32`` lands ~32
+          CTAs, ~10% of a 1-wave fill on a 100-SM GPU, and cuBLAS beats
+          us 4× until SPLITK kicks more CTAs into the launch.
+        - Well-filled launch (``_TARGET_CTAS`` ≤ ctas ≤ 2048) → ``+0.5``.
+          Modest positive credit so SPLITK variants that lift an
+          under-filled launch into the sweet spot can beat their
+          SPLITK=1 sibling on prior alone (before any measurement).
         - CTA count above ``2048`` → graduated penalty up to ``-2.5``.
           A typical sm_120-class GPU has ~150 SMs running ~2 concurrent
-          CTAs each, so ~300 in flight; 2 k CTAs is ~7 waves, beyond
-          which we burn time in the command processor scheduling waves
-          of light per-CTA work, and atomic-fanin on output writebacks
-          starts dominating (see the ``BM=16, BN=16`` failure on
-          ``(M=32, K=3584, N=18944)`` — 2 k+ CTAs, 1 cell/thread, kernel
-          runs >3 s).
+          CTAs each; 2 k CTAs is ~7 waves, beyond which the command
+          processor spends most of its time scheduling tiny waves and
+          atomic fan-in on output writebacks serializes hard (see the
+          ``BM=16, BN=16`` failure on ``(M=32, K=3584, N=18944)`` —
+          2 k+ CTAs, 1 cell/thread, kernel runs >3 s).
         - Distance from 256 threads/CTA → up to ``-1.0`` baseline,
           doubled to ``-2.0`` when post-register-tile ``cells < 16``
           (thin per-thread compute can't amortize the launch + atomic
           overhead at a wide launch).
-        - Total global atomic writes (cross-CTA split-K ``atomicAdd``)
-          above ~256 k → graduated penalty up to ``-2.0``. Each split-K
-          CTA contributes one ``atomicAdd`` per output cell; total ops
-          scale as ``threads × ctas × atomic_writes_per_thread`` and
-          contention through L2 dominates the kernel once the count is
-          in the millions (observed on ``BM=64, BN=16`` matmul where
-          2 M FP atomics blew the bench timeout).
-        - Stages (smem staging) → ``+1.0``.
+        - High SPLITK (``> 8``) → graduated penalty up to ``-1.0``.
+          Cross-CTA L2 contention per output cell scales with SPLITK
+          (each CTA in the split races on the same address). The earlier
+          ``atomic_writes × threads × ctas`` formula counted each cell of
+          the unrolled register tile as a separate atomic op, then hit
+          the threshold on every realistic transformer matmul because
+          ``M·N ≥ 256k`` always — anti-correlated with measured perf
+          (penalised SPLITK=4 / 37 µs winner harder than SPLITK=1 /
+          752 µs loser on q_proj s128). The SPLITK-only formula matches
+          empirical L2 contention without firing on healthy splits.
+        - Stages (smem staging) → ``+1.0``. Walks the body recursively
+          (Stage stmts live inside the loop nest post-staging, not at
+          the Tile's direct children).
         - Register tile fired (``FM * FN > 1``) → ``+1.0``.
 
         Pre-register-tile TileOps are scored on a *predicted* final thread
@@ -733,6 +746,10 @@ class TileOp(BodyOp):
         from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
 
         target_threads = 256
+        # ~1 wave on a 100-SM GPU at 2-4 concurrent CTAs/SM. Used as the
+        # boundary between under-filled (penalty) and well-filled (bonus)
+        # launches.
+        target_ctas = 256
         score = 0.0
         # ``self.body.iter()`` is recursive — by the time this TileOp
         # is scored, ``chunk_matmul_k`` etc. may have wrapped the Tile
@@ -786,32 +803,35 @@ class TileOp(BodyOp):
         elif cells > 64:
             score -= min((cells - 64) / 64.0, 1.0)
 
-        # CTA count penalty — flat for under-fill, graduated for huge launches.
-        # Above ~2 k CTAs the command processor spends most of its time
-        # scheduling tiny waves and atomic fan-in on output writebacks
-        # serializes hard, so the penalty grows linearly past the limit.
-        if ctas < 32:
-            score -= 0.5
-        elif ctas > 2048:
-            score -= min(0.5 + (ctas - 2048) / 4096.0, 2.5)
+        # CTA count: under-fill BAD (the dominant failure mode), well-fill
+        # GOOD (modest bonus), over-fill BAD again. The previous formula
+        # only had a flat ``-0.5`` at ``ctas < 32`` plus a tail penalty
+        # past 2 k; that left a huge under-filled-launch dead zone (32 ≤
+        # ctas < 256) where the heuristic was indifferent between filling
+        # the GPU and not — and on transformer-prefill GEMMs that's
+        # exactly the regime where SPLITK matters.
+        if ctas < target_ctas:
+            score -= (target_ctas - ctas) / target_ctas
+        elif ctas <= 2048:
+            score += 0.5
+        else:
+            score -= min((ctas - 2048) / 4096.0, 2.5)
 
-        # Atomic-fanin penalty. Cross-CTA split-K emits one ``atomicAdd``
-        # per output cell per CTA. Score on ``final_threads × ctas`` —
-        # the predicted post-register-tile launch geometry — so pre-008
-        # variants are compared on what their *kernel* will look like,
-        # not their intermediate IR shape. The earlier ``threads × ctas``
-        # formula penalised the heuristic (BN=128, BM=64) tile with its
-        # raw 8 192 thread extent even though 008 was about to divide it
-        # down to ~256, making small (BN, BM) tiles score artificially
-        # higher and dominate bootstrap exploration.
-        atomic_writes = sum(1 for s in self.body.iter() if isinstance(s, Write) and s.reduce_op is not None)
-        if atomic_writes:
-            total_atomics = atomic_writes * final_threads * ctas
-            if total_atomics > 256_000:
-                score -= min((total_atomics - 256_000) / 1_000_000, 2.0)
+        # SPLITK contention penalty. Cross-CTA split-K races ``SPLITK``
+        # CTAs on each output cell's L2 line; the previous formula was
+        # ``atomic_writes × threads × ctas`` which counted each cell of
+        # the FM·FN-unrolled register tile as a separate atomic and hit
+        # the threshold on every realistic matmul (M·N ≥ 256 k always).
+        # SPLITK ≤ 8 is fine on sm_120; past that L2 contention rises
+        # super-linearly.
+        splitk = int(self.knobs.get("SPLITK", 1))
+        if splitk > 8:
+            score -= min((splitk - 8) / 8.0, 1.0)
 
-        # Bonuses.
-        if any(isinstance(b, _Stage) for b in tile.body):
+        # Bonuses. Stage stmts get added by ``007_stage_inputs`` deeper
+        # inside the body (under the loop nest), not at ``tile.body``'s
+        # direct children — walk the body recursively to find them.
+        if any(isinstance(s, _Stage) for s in self.body.iter()):
             score += 1.0
         if "FM" in self.knobs:
             score += 1.0
