@@ -320,6 +320,70 @@ def _source_pretty(src: Source) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tile-flavor pretty-print helper — bracket-on-right style
+# ---------------------------------------------------------------------------
+#
+# Every tile flavor renders its axes as Python-style ``for X in 0..N:``
+# lines (one per axis, progressively indented like a regular loop nest),
+# with a vertical-pipe-and-corner bracket on the right margin grouping
+# the axes belonging to one tile. The tile's label (``GridTile``,
+# ``serial_outer``, ``reduce stage_inner``, etc.) sits on the closing
+# corner.
+#
+# Example::
+#
+#     for a0 in 0..8:                  │
+#         for a1 in 0..1:              └ GridTile
+#             for a2 in 0..16:         │
+#                 for a3 in 0..16:     └ ThreadTile
+#                     for a4 in 0..64: └ reduce stage_inner
+#                         <body>
+#
+# Single-axis tiles render as one line with ``└ <label>`` directly.
+
+
+_BRACKET_PAD = 2  # spaces between for-text and the right-margin bracket
+
+
+def _render_tile_bracket(
+    indent: str,
+    for_lines: list[str],
+    label: str,
+    body: Body,
+) -> list[str]:
+    """Render a tile flavor's ``for`` lines with a right-margin bracket
+    grouping them, then recurse into the body at the post-innermost indent.
+
+    ``for_lines`` are the bare ``for ... :`` strings (one per axis),
+    rendered without indentation; this helper adds progressive indent.
+    ``indent`` is the indent prefix for the outermost ``for``. ``label``
+    is the tile-flavor annotation (``"GridTile"``, ``"reduce stage_inner"``,
+    etc.) that lands on the closing corner.
+    """
+    # Each successive for-line indents one more level (Python loop-nest
+    # convention). Compute the absolute indent per line.
+    lines: list[tuple[str, str]] = []  # (indent_prefix, for_text)
+    cur = indent
+    for text in for_lines:
+        lines.append((cur, text))
+        cur = cur + INDENT
+    # Right-margin column: pad to the longest (indent+text) of this group.
+    max_w = max(len(ind) + len(text) for ind, text in lines)
+    margin_col = max_w + _BRACKET_PAD
+
+    out: list[str] = []
+    for i, (ind, text) in enumerate(lines):
+        line = ind + text
+        pad = " " * (margin_col - len(line))
+        is_last = i == len(lines) - 1
+        bracket = f"└ {label}" if is_last else "│"
+        out.append(line + pad + bracket)
+    # Body lives inside the innermost ``for``, at one more indent level.
+    out.extend(pretty_body(body, cur))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Tile flavors — typed parallel / serial scoping wrappers
 # ---------------------------------------------------------------------------
 #
@@ -374,9 +438,19 @@ class ParallelTile(Stmt):
     def _pretty_axes(self) -> str:
         return ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes) or "-"
 
+    def _pretty_label(self) -> str:
+        """Right-margin bracket label. Subclasses override to append
+        flavor-specific metadata (splitk_axes, cooperative_axes, etc.)."""
+        return type(self).__name__.lower().replace("tile", "")
+
     def pretty(self, indent: str = "") -> list[str]:
-        head = f"{indent}{type(self).__name__}(axes=({self._pretty_axes()})):"
-        return [head, *pretty_body(self.body, indent + INDENT)]
+        if not self.axes:
+            # Degenerate empty-axis tile (shouldn't normally happen) — just
+            # render the label as a one-line header so the body still nests.
+            head = f"{indent}{self._pretty_label()}:"
+            return [head, *pretty_body(self.body, indent + INDENT)]
+        for_lines = [f"for {ax.name} in 0..{ax.extent}:" for ax in self.axes]
+        return _render_tile_bracket(indent, for_lines, self._pretty_label(), self.body)
 
 
 @dataclass
@@ -394,12 +468,10 @@ class GridTile(ParallelTile):
         (body,) = bodies
         return GridTile(axes=self.axes, body=body, splitk_axes=self.splitk_axes)
 
-    def pretty(self, indent: str = "") -> list[str]:
-        extra = ""
+    def _pretty_label(self) -> str:
         if self.splitk_axes:
-            extra = f" splitk=({', '.join(self.splitk_axes)})"
-        head = f"{indent}GridTile(axes=({self._pretty_axes()})){extra}:"
-        return [head, *pretty_body(self.body, indent + INDENT)]
+            return f"grid splitk=({', '.join(self.splitk_axes)})"
+        return "grid"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Emit ``blockIdx.x`` axis decode + body. The inner ``ThreadTile``
@@ -427,12 +499,10 @@ class ThreadTile(ParallelTile):
         (body,) = bodies
         return ThreadTile(axes=self.axes, body=body, cooperative_axes=self.cooperative_axes)
 
-    def pretty(self, indent: str = "") -> list[str]:
-        extra = ""
+    def _pretty_label(self) -> str:
         if self.cooperative_axes:
-            extra = f" coop=({', '.join(self.cooperative_axes)})"
-        head = f"{indent}ThreadTile(axes=({self._pretty_axes()})){extra}:"
-        return [head, *pretty_body(self.body, indent + INDENT)]
+            return f"thread coop=({', '.join(self.cooperative_axes)})"
+        return "thread"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Two render forms picked by ``ctx.inside_grid_tile``.
@@ -540,10 +610,7 @@ class SerialTile(SerialTileBase):
         return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll)
 
     def pretty(self, indent: str = "") -> list[str]:
-        red = "reduce" if self.is_reduce else "free"
-        kind = "" if self.kind == "plain" else f" {self.kind}"
-        unroll = " unroll" if self.unroll else ""
-        head = f"{indent}SerialTile({self.axis.name} in 0..{self.axis.extent}):  # {red}{kind}{unroll}"
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -600,11 +667,9 @@ class StridedTile(SerialTileBase):
         return out
 
     def pretty(self, indent: str = "") -> list[str]:
-        red = "reduce" if self.is_reduce else "free"
-        unroll = " unroll" if self.unroll else ""
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}StridedTile({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {red}{unroll}"
+        head = f"{indent}for {self.axis.name} = {start}; < {self.axis.extent}; += {step}:"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
