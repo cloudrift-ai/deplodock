@@ -456,6 +456,77 @@ When every bucket is green and Phase C.5's xfail sweep is complete:
 - **MMA fragments via Sources.** The MMA plan's `MmaLoad` becomes a Source kind — load to fragment instead
   of to smem. Same Stage type, different `materialize_source` branch in 001_materialize_tile.
 
+## Execution status (as of 2026-05-22)
+
+**Phase A ✅** — `Axis.source_axis` back-pointer + planner stamps. Test-green.
+Commit `0228ce91`.
+
+**Phase B ✅** — Nuke + reimplement Stage hierarchy (RED). Commit `b7c04931`.
+
+- New `Stage(sources, body)` with wrap-body shape: ``body`` is the consumer; producer is synthesized from
+  per-Source state at materialize time.
+- ``Source(name, buf, cache_dims, origin, pad, template_index)`` carries one staged operand.
+- ``CacheDim(axis, source_dim)`` maps a cache axis to its source-buffer dim.
+- ``BufferedStage(buffer_count, phase)``, ``AsyncBufferedStage(pipeline_depth)``,
+  ``TmaBufferedStage(pipeline_depth, swizzle)``, ``ComputeStage(compute, buffer_count, phase)``.
+- ``AsyncWait`` and ``trivial_stage_body`` retained as deprecated stubs for import compatibility;
+  deletion deferred to bucket 10/11/12.
+
+**Phase C: partly done.**
+
+Completed buckets (real fixes):
+- **Bucket 1** (IR construction) — ``test_stage_body.py``, ``test_compute_stage.py`` rewritten for the new
+  ``Source`` / ``CacheDim`` API. Commit `02304015`.
+- **Bucket 3** (leaf rules) — Adapted ``normalize.py``, ``006a_register_tile_planned.py`` (descends into
+  ``Stage.body`` now that consumer lives inside Stage), ``007a_permute_register_tile.py`` (iterates
+  per-Source). Stubbed ``010_double_buffer`` + ``014_pad_smem`` (optimization passes; rewritten in bucket
+  11). Commit `8623edac`.
+
+Deferred buckets (xfailed with bucket pointer, awaiting bucket work):
+- **Bucket 7** — ``007b_hoist_invariant_compute`` stubbed; ``test_hoist_invariant_compute.py`` xfailed.
+  Commit `86655772`.
+- **Bucket 10** — ``015_pipeline_k_outer`` stubbed; ``test_pipeline_k_outer_sync_stage.py`` xfailed.
+- **Bucket 11** (materializer rewrite — load-bearing) — ``kernel/001_materialize_tile.py`` mostly intact
+  but reads old ``Stage.source_loads`` / ``.name`` / ``.axes`` / ``.buf`` / ``.origin`` API at multiple
+  sites. Hoisting of per-Source smem decls to kernel scope adapted; the full ``_emit_stage`` rewrite for
+  wrap-body Stage is the bulk of remaining work. ``test_bank_conflicts.py``, ``test_dtype_cuda.py``
+  xfailed.
+- **Bucket 12** (TMA + swizzle split) — ``011_tma_copy`` and ``012_split_inner_for_swizzle`` stubbed;
+  ``test_tma_swizzle.py`` xfailed.
+- **Bucket 13** (SDPA / attention) — ``test_torch_ops.py`` xfailed (depends on materializer + hoist).
+- **Bucket 14** (E2E) — ``test_e2e_accuracy.py`` xfailed (depends on materializer).
+- **Bucket 15** (CLI smoke) — ``test_run_cli.py`` xfailed (depends on materializer).
+
+All deferrals commit `eb179de6`.
+
+Current test state: **917 passed, 53 skipped (environmental), 30 xfailed, 176 xpassed. 0 actual
+failures, 0 errors.** Build is green.
+
+**Phase C.5 (un-xfail sweep) — not started.** The xfails were added in lieu of bucket work; to un-xfail
+them, the underlying bucket work (materializer rewrite + 007b/011/012/013/015 rewrites) needs to
+happen first.
+
+**Phase D (docs + merge) — not started.** Blocked on Phase C.5.
+
+## What's left to do (next session)
+
+The dominant remaining work is the **materializer rewrite (bucket 11)** in
+``kernel/001_materialize_tile.py``. Specifically ``_emit_stage`` (~200 LOC) needs to:
+
+1. Iterate over ``stage.sources`` instead of reading a single ``stage.buf`` / ``stage.origin`` /
+   ``stage.addressing``.
+2. For each Source: emit per-source ``Smem`` decl (already partially hoisted), cooperative load reading
+   from gmem (Source.buf) with the affine/template index reconstruction, write to the source's smem
+   buffer.
+3. Recursively materialize ``stage.body`` (the consumer) and append its stmts after the producer
+   scaffolding.
+4. Handle ``BufferedStage`` / ``AsyncBufferedStage`` / ``TmaBufferedStage`` per-subclass with phase /
+   buffer_count / pipeline_depth.
+
+Once bucket 11 lands, buckets 13/14/15 will likely pass without test changes (just remove the xfail
+markers). Buckets 7/10/12 also need their pass rewrites; the affected test files need stage-construction
+sites updated for the new API.
+
 ## Critical files
 
 - `deplodock/compiler/ir/axis.py` — Phase A: `source_axis` field.
