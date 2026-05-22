@@ -86,14 +86,24 @@ def compute_capability() -> tuple[int, int]:
     """Active compute capability as ``(major, minor)``.
 
     Returns the override set via :func:`set_target` if any; otherwise
-    probes the live CUDA device through cupy. Returns ``(0, 0)`` when
-    cupy is unavailable — callers treat that as "no hardware feature
-    support" and skip themselves via ``RuleSkipped``. Cached so repeated
+    delegates to :func:`live_compute_capability`. Cached so repeated
     rule firings don't re-query the driver; :func:`set_target` clears
     the cache.
     """
     if _OVERRIDE is not None:
         return _OVERRIDE
+    return live_compute_capability()
+
+
+@functools.cache
+def live_compute_capability() -> tuple[int, int]:
+    """The live CUDA device's compute capability, ignoring any
+    :func:`set_target` override.
+
+    Returns ``(0, 0)`` when cupy is unavailable. Used by ``Context.probe``
+    to size ``max_dynamic_smem`` to what the actual hardware can honor
+    even when the target-derived gate cap is higher.
+    """
     try:
         import cupy as cp
 
@@ -103,5 +113,5 @@ def compute_capability() -> tuple[int, int]:
         cap = str(dev.compute_capability)
         return (int(cap[:-1]), int(cap[-1]))
     except Exception as e:  # pragma: no cover
-        _logger.debug("compute_capability query failed (%s)", e)
+        _logger.debug("live_compute_capability query failed (%s)", e)
         return (0, 0)

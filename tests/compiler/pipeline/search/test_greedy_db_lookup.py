@@ -38,9 +38,14 @@ def _shrink_autotune_search(monkeypatch: pytest.MonkeyPatch) -> None:
     that this test doesn't care about (only blockify ``(BN, BM)`` needs
     to fork) via ``DEPLODOCK_*`` env knobs and disables the per-buffer
     staging power-set so ``007_stage_inputs`` emits a single variant
-    (its pre-knob behavior)."""
+    (its pre-knob behavior). Forces ``sm_80`` so the TMA path
+    self-skips and only cp.async fires."""
+    from deplodock.compiler import target as target_mod
+
     monkeypatch.setenv("DEPLODOCK_STAGE", "all")
-    monkeypatch.setenv("DEPLODOCK_TMA", "0")
+    target_mod.set_target((8, 0))
+    yield
+    target_mod.set_target(None)
 
 
 def _make_matmul() -> Graph:

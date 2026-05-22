@@ -104,8 +104,24 @@ class Context:
     def probe(cls) -> Context:
         """Build by probing the live CUDA device. Falls back to (0, 0) if
         cupy is unavailable — callers treat that as "no hardware feature
-        support" (rules gating on capability self-skip via ``RuleSkipped``)."""
-        from deplodock.compiler.target import compute_capability  # noqa: PLC0415
+        support" (rules gating on capability self-skip via ``RuleSkipped``).
+
+        ``max_dynamic_smem`` is the *live device's* opt-in cap, not the
+        target's: passes that gate on compute capability honor the
+        ``set_target`` override (so they take the target's codegen path),
+        but the dynamic-smem budget must still fit the actual hardware
+        the kernel will run on — otherwise ``cudaFuncSetAttribute`` rejects
+        the launch. Without this distinction, ``--target sm_90`` on an
+        sm_86 box would request 227 KB on a 99 KB device.
+        """
+        from deplodock.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
 
         cap = compute_capability()
-        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap))
+        live = live_compute_capability()
+        # No live CUDA device → compile-only flow, trust the target's cap.
+        # Live device present → clamp so the actual launch fits.
+        if live == (0, 0):
+            smem = _max_dynamic_smem_for(cap)
+        else:
+            smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
+        return cls(compute_capability=cap, max_dynamic_smem=smem)

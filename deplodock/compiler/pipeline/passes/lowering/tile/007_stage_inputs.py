@@ -252,7 +252,9 @@ def _collect_candidates(
             break  # one representative per partition; budget accounting is best-effort
 
 
-def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None, warp_size: int) -> Body | None:
+def _maybe_rewrite(
+    body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None, warp_size: int
+) -> Body | None:
     """Stage every qualifying Load in ``body`` (or only those whose
     buffer is in ``allowed_bufs`` when supplied) into a smem ``Stage``.
 

@@ -1,9 +1,9 @@
 """Accuracy tests for the matmul kernel under each TMA + swizzle config.
 
-Cross-checks four points in the env-flag matrix:
+Cross-checks four points in the capability + swizzle matrix:
 
-- ``DEPLODOCK_TMA=0`` → cp.async transport with ``+1`` pad_smem.
-- ``DEPLODOCK_TMA=1`` (default sm_90+) → ``cp.async.bulk.tensor`` /
+- ``--target sm_80`` → cp.async transport with ``+1`` pad_smem.
+- ``--target sm_90`` (default sm_90+) → ``cp.async.bulk.tensor`` /
   TMA with ``swizzle=NONE``.
 - ``DEPLODOCK_TMA_SWIZZLE=1`` (paired with a small ``BN/BM`` so the
   inner box-dim byte size matches a swizzle width) → TMA with
@@ -67,27 +67,45 @@ def _check_close(actual: np.ndarray, expected: np.ndarray) -> None:
     assert max_diff < tol, f"max_diff={max_diff:.4f} >= tol={tol:.4f} (peak_eager={peak:.4f})"
 
 
+def _live_capability() -> tuple[int, int]:
+    from deplodock.compiler.target import compute_capability  # noqa: PLC0415
+
+    return compute_capability()
+
+
 @requires_cuda
 @pytest.mark.parametrize(
-    ("tma", "swizzle", "bn", "bm"),
+    ("target", "swizzle", "bn", "bm"),
     [
-        ("0", "0", None, None),  # cp.async + pad_smem (default geometry)
-        ("1", "0", None, None),  # TMA, swizzle=NONE (default geometry)
-        ("1", "0", "32", "32"),  # TMA, swizzle=NONE, small slab (no perf gain, sanity)
-        ("1", "1", "32", "32"),  # TMA + SWIZZLE_128B + body-Load XOR decode
+        ((8, 0), "0", None, None),  # cp.async + pad_smem (default geometry)
+        ((9, 0), "0", None, None),  # TMA, swizzle=NONE (default geometry)
+        ((9, 0), "0", "32", "32"),  # TMA, swizzle=NONE, small slab (no perf gain, sanity)
+        ((9, 0), "1", "32", "32"),  # TMA + SWIZZLE_128B + body-Load XOR decode
     ],
     ids=["cpasync", "tma_no_swizzle", "tma_no_swizzle_bn32", "tma_swizzle_b128"],
 )
-def test_matmul_accuracy_across_tma_modes(monkeypatch, tma, swizzle, bn, bm):
-    monkeypatch.setenv("DEPLODOCK_TMA", tma)
+def test_matmul_accuracy_across_tma_modes(monkeypatch, target, swizzle, bn, bm):
+    """Use ``set_target`` to force the codegen path the test wants. Live
+    hardware must be ≥ the requested cap so the launch-time smem opt-in
+    (derived from ``Context.max_dynamic_smem``) doesn't exceed the actual
+    device cap. Tests requesting a cap above the live device are skipped."""
+    from deplodock.compiler import target as target_mod
+
+    live = _live_capability()
+    if live < target:
+        pytest.skip(f"live device sm_{live[0]}{live[1]} < requested sm_{target[0]}{target[1]}")
+
+    target_mod.set_target(target)
     monkeypatch.setenv("DEPLODOCK_TMA_SWIZZLE", swizzle)
     if bn is not None:
         monkeypatch.setenv("DEPLODOCK_BN", bn)
         monkeypatch.setenv("DEPLODOCK_BM", bm)
-
-    _, _, expected = _eager()
-    actual = _run_matmul()
-    _check_close(actual, expected)
+    try:
+        _, _, expected = _eager()
+        actual = _run_matmul()
+        _check_close(actual, expected)
+    finally:
+        target_mod.set_target(None)
 
 
 def test_swizzle_picker_pre_pass(monkeypatch):

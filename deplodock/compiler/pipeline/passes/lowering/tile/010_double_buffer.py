@@ -30,6 +30,13 @@ Trigger:
   per-block dynamic-smem opt-in cap derived from compute capability
   (99 KB on sm_86/89/120, 163 KB on sm_80, 227 KB on sm_90+).
 
+The ``BUFFER_COMPUTE`` knob forks when a ``ComputeStage`` is present
+in the K_o body (i.e. ``007b_hoist`` ran with ``FUSED_PIPELINE=True``):
+``False`` (default) leaves the compute stage single-buffered; ``True``
+ring-buffers it alongside the transports. The fork only fires when a
+``ComputeStage`` is actually present — single-buffer-eligible bodies
+emit one variant with ``BUFFER_COMPUTE=False`` stamped for idempotence.
+
 Idempotence: a Stage that's already a ``BufferedStage`` is left alone.
 """
 
@@ -38,7 +45,7 @@ from __future__ import annotations
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Role
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
@@ -63,24 +70,57 @@ BUFFER_COMPUTE = Knob(
 
 _BUFFER_COUNT = 2
 
+_VARIANT_ORDER: tuple[bool, ...] = (False, True)
+"""Emission order for the BUFFER_COMPUTE fork: leave the compute stage
+single-buffered first (greedy default — smaller smem), ring-buffer it
+second. Only emitted when a ``ComputeStage`` sits inside an eligible
+K_o; otherwise the rule emits a single variant with
+``BUFFER_COMPUTE=False`` stamped for idempotence."""
 
-def rewrite(ctx: Context, root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body, ctx.max_dynamic_smem)
-    if new_body is None:
+
+def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
+    """Emit BUFFER_COMPUTE polarities for any K-outer Loop carrying a
+    ``ComputeStage``; single variant otherwise."""
+    if BUFFER_COMPUTE.name in root.op.knobs:
+        raise RuleSkipped("double-buffer already applied (idempotence via knob)")
+
+    polarities: tuple[bool, ...] = _VARIANT_ORDER if _has_compute_stage_in_kouter(root.op.body) else (False,)
+    variants: list[TileOp] = []
+    for buffer_compute in polarities:
+        new_body = _maybe_rewrite(root.op.body, ctx.max_dynamic_smem, buffer_compute=buffer_compute)
+        if new_body is None:
+            continue
+        knobs = {**root.op.knobs, BUFFER_COMPUTE.name: buffer_compute}
+        variants.append(TileOp(body=new_body, name=root.op.name, knobs=knobs))
+    if not variants:
         raise RuleSkipped("no K-outer matmul Loop eligible for double-buffering")
-    return TileOp(body=new_body, name=root.op.name)
+    return variants
 
 
-def _maybe_rewrite(body: Body, smem_budget: int) -> Body | None:
+def _has_compute_stage_in_kouter(body: Body) -> bool:
+    """True if any K-outer Loop in the Tile body contains a ``ComputeStage``
+    — the only shape where ``BUFFER_COMPUTE`` polarity affects output."""
+    try:
+        _, tile = single_tile(body)
+    except Exception:
+        return False
+    for s in tile.body:
+        if isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
+            if any(isinstance(c, ComputeStage) for c in s.body):
+                return True
+    return False
+
+
+def _maybe_rewrite(body: Body, smem_budget: int, *, buffer_compute: bool) -> Body | None:
     idx, tile = single_tile(body)
 
-    new_tile_body = _process_scope(tile.body, smem_budget)
+    new_tile_body = _process_scope(tile.body, smem_budget, buffer_compute=buffer_compute)
     if new_tile_body is tile.body or new_tile_body == tile.body:
-        raise RuleSkipped("no K-outer matmul Loop eligible for double-buffering within smem budget")
+        return None
     return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
 
 
-def _process_scope(body: Body, smem_budget: int) -> Body:
+def _process_scope(body: Body, smem_budget: int, *, buffer_compute: bool) -> Body:
     """Walk the body looking for K-outer Loops eligible for double-buffering.
 
     Tracks ``invariant_names`` — the set of SSA names defined by
@@ -101,7 +141,7 @@ def _process_scope(body: Body, smem_budget: int) -> Body:
             if not any(isinstance(st, BufferedStage) for st in s.body):
                 stages = [st for st in s.body if isinstance(st, Stage)]
                 if _BUFFER_COUNT * sum(st.smem_bytes for st in stages) <= smem_budget:
-                    updated = _double_buffer(s)
+                    updated = _double_buffer(s, buffer_compute=buffer_compute)
                     if updated is not None:
                         new_body[i] = updated
                         changed = True
@@ -156,15 +196,12 @@ def _is_kouter_matmul(loop: Loop, invariant_names: set[str]) -> bool:
     return True
 
 
-def _double_buffer(loop: Loop) -> Loop | None:
+def _double_buffer(loop: Loop, *, buffer_compute: bool) -> Loop | None:
     """Promote each ``Stage`` in the loop body to ``BufferedStage`` with
     ``buffer_count=2`` and a shared phase expression, and rewrite each
     body Load that reads from a staged buffer to prepend the phase
-    index."""
-    import os  # noqa: PLC0415
-
-    buffer_compute = os.environ.get(BUFFER_COMPUTE.env, "0") in ("1", "true", "True")
-
+    index. ``buffer_compute`` decides whether a ``ComputeStage``'s own
+    output is ring-buffered alongside the transports."""
     phase = Var(loop.axis.name) % Literal(_BUFFER_COUNT, "int")
     staged_names: set[str] = set()
 

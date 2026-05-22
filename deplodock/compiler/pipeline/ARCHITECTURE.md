@@ -241,10 +241,9 @@ recipe.
 | `STAGE`       | BINMASK  | `007_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. `"111"` stages all three.    |
 | `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
 | `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
-| `TMA`             | BOOL     | `011_tma_copy`                       | Use `cp.async.bulk.tensor` staging (sm_90+ only); default tracks arch.                            |
 | `TMA_SWIZZLE`     | BOOL     | `011_tma_copy`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
 | `FUSED_PIPELINE`  | BOOL     | `007b_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
-| `BUFFER_COMPUTE`  | BOOL     | `010_double_buffer`                  | Ring-buffer the ComputeStage output alongside transport stages; experimental.                     |
+| `BUFFER_COMPUTE`  | BOOL     | `010_double_buffer`                  | Ring-buffer the ComputeStage output alongside transport stages. Autotune fork (only when a ComputeStage is present). |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
@@ -252,8 +251,10 @@ or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs
 
 `FUSED_PIPELINE` is an autotune fork: `007b_hoist_invariant_compute` emits both variants per fusable cone in a fixed
 order (inline-fuse first as the greedy default — smaller smem, works on every architecture). No env override; the
-autotuner is the only mechanism for picking the hoist variant. `BUFFER_COMPUTE` is single-variant (env-gated) — the
-experimental ring-buffered ComputeStage path doesn't yet have enough signal to be candidate-driven.
+autotuner is the only mechanism for picking the hoist variant. `BUFFER_COMPUTE` follows the same shape in
+`010_double_buffer`: when a K-outer Loop carries a `ComputeStage`, the rule emits both polarities (single-buffered
+compute first, ring-buffered second); without a `ComputeStage` it emits one variant with `BUFFER_COMPUTE=False`
+stamped for idempotence.
 
 ## Pass directories
 

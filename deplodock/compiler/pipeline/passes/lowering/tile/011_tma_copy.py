@@ -66,12 +66,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_til
 
 logger = logging.getLogger(__name__)
 
-TMA = Knob(
-    "TMA",
-    KnobType.BOOL,
-    hints=(True, False),
-    help="Use cp.async.bulk.tensor staging (sm_90+ only); default tracks arch",
-)
 TMA_SWIZZLE = Knob(
     "TMA_SWIZZLE",
     KnobType.BOOL,
@@ -94,13 +88,6 @@ _TMA_ALIGN_BYTES = 16
 
 def rewrite(ctx: Context, match: Match, root: Node) -> Graph | None:
     graph = match.graph
-    # TMA is on by default on sm_90+ (Hopper / Blackwell — the hardware
-    # that has ``cp.async.bulk.tensor``). ``DEPLODOCK_TMA=0`` forces
-    # the cp.async + ``+1`` padding baseline for A/B comparison.
-    from deplodock.compiler.tuning import _tma_enabled  # noqa: PLC0415
-
-    if not _tma_enabled():
-        raise RuleSkipped("TMA disabled (DEPLODOCK_TMA=0 or compute capability < sm_90)")
     if ctx.compute_capability < _MIN_CAPABILITY:
         raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
 

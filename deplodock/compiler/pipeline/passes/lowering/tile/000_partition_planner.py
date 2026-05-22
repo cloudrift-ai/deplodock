@@ -317,9 +317,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         #    partial softmax stat would feed a partial matmul.
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
         force_splitk_one = multi_accum or bool(prologue)
-        param_combos = _enumerate_cartesian(
-            E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one
-        )
+        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one)
     elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.

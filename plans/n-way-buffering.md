@@ -154,7 +154,8 @@ load-bearing correctness check for the whole plan.
 ## Step 5 — Env-var override for forced buffer count (debugging / A/B)
 
 **Why.** Letting the user force `DEPLODOCK_FORCE_BUFFERS=3` (or `=2` to restore today's behavior) is the
-fastest A/B comparison for the perf win. Matches the pattern of `DEPLODOCK_BUFFER_COMPUTE` and `DEPLODOCK_TMA`.
+fastest A/B comparison for the perf win. Matches the pattern of `DEPLODOCK_FUSED_PIPELINE` and other
+knob-pin env vars in `pipeline/knob.py`.
 
 **Change.** In `_pick_buffer_count` (Step 1): if `os.environ.get("DEPLODOCK_FORCE_BUFFERS")` is set, parse to
 int and either (a) return it if it fits + respects extent, or (b) raise a clear `RuleSkipped` so the user

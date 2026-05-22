@@ -31,13 +31,6 @@ Env vars:
 - ``DEPLODOCK_BK`` — K-split size (subject to ``K % BK == 0 and K > BK``).
   Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
-- ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
-  weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
-  (Hopper / Blackwell), default-off below. ``=1`` forces on, ``=0``
-  forces off. ``011_tma_copy`` gates eligibility on rank ≤ 5,
-  ConstantOp source with a recorded transpose load_op chain, and
-  source-inner-extent alignment ≥ 16 B with ≥ 2× headroom past the
-  box inner extent.
 - ``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes
   (``SWIZZLE_{128,64,32}B``). ``=1`` enables; default off. Stages whose
   inner box-dim byte size matches a swizzle width pick the matching
@@ -347,20 +340,6 @@ def _default_tile(output_extents: tuple[int, ...], body_info: BodyInfo) -> tuple
 # --- TMA gates ---------------------------------------------------------
 
 
-def _tma_enabled() -> bool:
-    """TMA staging gate. Default-on for sm_90+ (Hopper / Blackwell) which
-    have ``cp.async.bulk.tensor``; default-off below sm_90. ``DEPLODOCK_TMA``
-    overrides either way."""
-    raw = os.environ.get("DEPLODOCK_TMA")
-    if raw == "1":
-        return True
-    if raw == "0":
-        return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability  # noqa: PLC0415
-
-    return compute_capability() >= (9, 0)
-
-
 def _tma_swizzle_enabled() -> bool:
     """TMA hardware-swizzle gate. Off by default — only fires when the
     inner box-dim byte size matches a swizzle width AND ``DEPLODOCK_TMA_SWIZZLE``
@@ -439,7 +418,10 @@ def forced_bk(
     if not body_info.has_matmul:
         return None
     m = output_extents[1] if len(output_extents) >= 2 else 0
-    bk = _BK_SMALL_M if m <= _M_THRESHOLD else (_BK_LARGE_M_TMA if _tma_enabled() else _BK_LARGE_M_DEFAULT)
+    from deplodock.compiler.target import compute_capability  # noqa: PLC0415
+
+    tma_path = compute_capability() >= (9, 0)
+    bk = _BK_SMALL_M if m <= _M_THRESHOLD else (_BK_LARGE_M_TMA if tma_path else _BK_LARGE_M_DEFAULT)
     if static_smem_cap is None:
         from deplodock.compiler.context import STATIC_SMEM_CAP  # noqa: PLC0415
 
