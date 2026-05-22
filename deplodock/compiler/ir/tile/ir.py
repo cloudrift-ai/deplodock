@@ -310,6 +310,11 @@ def trivial_stage_body(
 
 
 def _source_pretty(src: Source) -> str:
+    """Legacy single-line source description — kept for debugging / dump
+    output. New consumer-facing pretty-print uses ``_source_decl_line``
+    which formats each source as ``shared name[...] = buf[...]`` at the
+    Stage's indent.
+    """
     cache = ", ".join(f"{ax.name}:{ax.extent}@{cd.source_dim}" for ax, cd in zip(src.cache_axes, src.cache_dims, strict=True))
     origin = ", ".join(e.pretty() for e in src.origin)
     pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
@@ -317,6 +322,37 @@ def _source_pretty(src: Source) -> str:
     if src.template_index is not None:
         tpl = " template=[" + ", ".join(e.pretty() for e in src.template_index) + "]"
     return f"{src.name}<-{src.buf}(origin=({origin}), slab=({cache})){pad}{tpl}"
+
+
+def _source_decl_line(src: Source) -> str:
+    """Render one ``Source`` as ``shared <name>[<cache_axes>] = <buf>[<source_index>];``.
+
+    Cache axes show their extents (``a5:64, a3:16``). The source index
+    prefers the literal ``template_index`` when set (preserves explicit
+    stride math like ``a3*16 + a6``); otherwise reconstructs from
+    ``origin + decoded`` per affine addressing semantics.
+
+    Trailing ``pad`` and stage-flavor suffixes are NOT appended here — the
+    Stage subclasses prepend / postfix those at the call site.
+    """
+    cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in src.cache_axes)
+    if src.template_index is not None:
+        idx = ", ".join(e.pretty() for e in src.template_index)
+    else:
+        decoded: dict[int, str] = {}
+        for ax, cd in zip(src.cache_axes, src.cache_dims, strict=True):
+            existing = decoded.get(cd.source_dim, "")
+            decoded[cd.source_dim] = (existing + " + " if existing else "") + ax.name
+        parts: list[str] = []
+        for d, origin_expr in enumerate(src.origin):
+            o = origin_expr.pretty()
+            if d in decoded:
+                parts.append(f"{o} + {decoded[d]}")
+            else:
+                parts.append(o)
+        idx = ", ".join(parts)
+    pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
+    return f"shared {src.name}[{cache}] = {src.buf}[{idx}]{pad}"
 
 
 # ---------------------------------------------------------------------------
@@ -447,9 +483,9 @@ class ParallelTile(Stmt):
         if not self.axes:
             # Degenerate empty-axis tile (shouldn't normally happen) — just
             # render the label as a one-line header so the body still nests.
-            head = f"{indent}{self._pretty_label()}:"
+            head = f"{indent}{self._pretty_label()}"
             return [head, *pretty_body(self.body, indent + INDENT)]
-        for_lines = [f"for {ax.name} in 0..{ax.extent}:" for ax in self.axes]
+        for_lines = [f"for {ax.name} in 0..{ax.extent}" for ax in self.axes]
         return _render_tile_bracket(indent, for_lines, self._pretty_label(), self.body)
 
 
@@ -610,7 +646,7 @@ class SerialTile(SerialTileBase):
         return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll)
 
     def pretty(self, indent: str = "") -> list[str]:
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:"
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -669,7 +705,7 @@ class StridedTile(SerialTileBase):
     def pretty(self, indent: str = "") -> list[str]:
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}for {self.axis.name} = {start}; < {self.axis.extent}; += {step}:"
+        head = f"{indent}for {self.axis.name} in {start}..{self.axis.extent}:{step}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -765,11 +801,28 @@ class Stage(Stmt):
         return replace(self, sources=sources)
 
     def pretty(self, indent: str = "") -> list[str]:
-        sources_pretty = "; ".join(_source_pretty(s) for s in self.sources)
-        head = f"{indent}{type(self).__name__}([{sources_pretty}]){self._pretty_extra()}:"
-        return [head, *pretty_body(self.body, indent + INDENT)]
+        """Per-source ``shared name[...] = buf[...];`` decls at ``indent``,
+        followed by the consumer body at the SAME indent (no extra nest).
 
-    def _pretty_extra(self) -> str:
+        Subclasses prepend a flavor prefix (``buffered`` / ``async`` /
+        ``tma`` / ``compute``) and may append a metadata suffix via
+        :meth:`_pretty_prefix` / :meth:`_pretty_suffix`.
+        """
+        prefix = self._pretty_prefix()
+        suffix = self._pretty_suffix()
+        prefix = f"{prefix} " if prefix else ""
+        decls = [f"{indent}{prefix}{_source_decl_line(s)}{suffix}" for s in self.sources]
+        return decls + list(pretty_body(self.body, indent))
+
+    def _pretty_prefix(self) -> str:
+        """Optional prefix (``buffered`` / ``async`` / ``tma`` / ``compute``)
+        prepended to each ``shared`` decl line. Defaults to empty for plain
+        ``Stage``."""
+        return ""
+
+    def _pretty_suffix(self) -> str:
+        """Optional suffix (``  # depth=N`` / ``  # swizzle=B128``) appended
+        after each ``shared`` decl. Defaults to empty."""
         return ""
 
 
@@ -800,8 +853,8 @@ class BufferedStage(Stage):
     def exprs(self) -> tuple[Expr, ...]:
         return (*super().exprs(), self.phase)
 
-    def _pretty_extra(self) -> str:
-        return f" buffers={self.buffer_count}@{self.phase.pretty()}"
+    def _pretty_prefix(self) -> str:
+        return f"buffered[{self.buffer_count}@{self.phase.pretty()}]"
 
 
 @dataclass
@@ -821,9 +874,9 @@ class AsyncBufferedStage(BufferedStage):
 
     pipeline_depth: int = field(default=1, kw_only=True)
 
-    def _pretty_extra(self) -> str:
+    def _pretty_prefix(self) -> str:
         depth = f" depth={self.pipeline_depth}" if self.pipeline_depth > 1 else ""
-        return f"{super()._pretty_extra()} async{depth}"
+        return f"async[{self.buffer_count}@{self.phase.pretty()}{depth}]"
 
 
 class SwizzleMode(enum.Enum):
@@ -868,10 +921,10 @@ class TmaBufferedStage(BufferedStage):
             if s.pad and any(s.pad):
                 raise ValueError(f"TmaBufferedStage: source {s.name!r} pad must be empty, got {s.pad!r}")
 
-    def _pretty_extra(self) -> str:
+    def _pretty_prefix(self) -> str:
         depth = f" depth={self.pipeline_depth}" if self.pipeline_depth > 1 else ""
         sw = "" if self.swizzle == SwizzleMode.NONE else f" swizzle={self.swizzle.value}"
-        return f"{super()._pretty_extra()} tma{depth}{sw}"
+        return f"tma[{self.buffer_count}@{self.phase.pretty()}{depth}{sw}]"
 
 
 @dataclass
@@ -928,10 +981,26 @@ class ComputeStage(Stage):
             out = (*out, self.phase)
         return out
 
-    def _pretty_extra(self) -> str:
+    def _pretty_prefix(self) -> str:
         if self.buffer_count > 1 and self.phase is not None:
-            return f" compute buffers={self.buffer_count}@{self.phase.pretty()}"
-        return " compute"
+            return f"compute[{self.buffer_count}@{self.phase.pretty()}]"
+        return "compute"
+
+    def pretty(self, indent: str = "") -> list[str]:
+        """``compute shared <name>[...] = <smem-buf>[...];`` per source,
+        then the compute body at the same indent (an inline block, not
+        wrapped in a separate construct), then the consumer body.
+
+        ComputeStage carries TWO bodies: ``compute`` runs once per
+        activation to populate the output slabs from sibling-Stage smem;
+        ``body`` is the regular consumer subtree.
+        """
+        prefix = self._pretty_prefix()
+        prefix = f"{prefix} " if prefix else ""
+        decls = [f"{indent}{prefix}{_source_decl_line(s)}" for s in self.sources]
+        compute_lines = list(pretty_body(self.compute, indent))
+        body_lines = list(pretty_body(self.body, indent))
+        return decls + compute_lines + body_lines
 
 
 # ---------------------------------------------------------------------------

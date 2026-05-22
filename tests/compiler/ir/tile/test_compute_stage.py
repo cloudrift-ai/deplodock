@@ -80,4 +80,4 @@ def test_pretty_marks_as_compute():
 def test_pretty_marks_buffered_compute():
     cs = _compute_stage(buffer_count=2, phase=Var("k_outer") % Literal(2, "int"))
     rendered = "\n".join(cs.pretty())
-    assert "compute buffers=2" in rendered
+    assert "compute[2@" in rendered

@@ -86,9 +86,7 @@ class Loop(Stmt):
         return any(isinstance(s, Accum) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
-        kind = "reduce" if self.is_reduce else "free"
-        unroll = " unroll" if self.unroll else ""
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}:  # {kind}{unroll}"
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -325,14 +323,9 @@ class StridedLoop(Stmt):
         return any(isinstance(s, Accum) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
-        kind = "reduce" if self.is_reduce else "free"
-        unroll = " unroll" if self.unroll else ""
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = (
-            f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step})"
-            f"{_source_suffix(self.axis)}:  # {kind}{unroll}"
-        )
+        head = f"{indent}for {self.axis.name} in {start}..{self.axis.extent}:{step}{_source_suffix(self.axis)}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
