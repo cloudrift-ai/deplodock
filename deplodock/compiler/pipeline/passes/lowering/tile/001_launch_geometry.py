@@ -229,29 +229,54 @@ def _rewrite_for_lifted_axis(body: tuple[LoopStmt, ...], axis_name: str, *, mode
 
 
 def _rewrite_for_atomic_lift(body: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
-    """Descend through wrapper Loops (REGISTER / SERIAL_OUTER / etc.)
-    until we reach the level where ``Write`` stmts live, then rewrite
-    each Write whose index doesn't reference ``axis_name`` — those
-    are being raced by multiple CTAs to the same output cell now that
-    the axis is BIND_BLOCK.
+    """Descend through wrapper Loops until we reach the level where
+    ``Write`` stmts live, then rewrite each Write whose index doesn't
+    reference ``axis_name`` — those are being raced by multiple CTAs
+    to the same output cell now that the axis is BIND_BLOCK.
 
     Writes whose index *does* mention ``axis_name`` write distinct
     cells across CTAs (the regular output-tile case) and pass through
-    unchanged."""
-    wrappers: list[Loop] = []
-    cur: tuple[LoopStmt, ...] = tuple(body)
-    while not any(isinstance(s, Write) for s in cur):
-        if len(cur) != 1 or not isinstance(cur[0], Loop):
-            return tuple(body)  # can't locate the kernel level
-        wrappers.append(cur[0])
-        cur = tuple(cur[0].body)
+    unchanged.
 
-    new_kernel_stmts = _rewrite_kernel_writes_atomic(cur, axis_name)
+    Multi-stmt scopes (e.g. SDPA kernel 1 — sibling Init / reduce-Loop
+    / output-Loop at top of Tile.body) are handled by recursing into
+    every nested Loop / StridedLoop / Cond that contains a Write; the
+    rewrite happens at the deepest level that still has Writes as
+    immediate siblings of any post-reduce Accum-dep stmts.
+    """
+    if any(isinstance(s, Write) for s in body):
+        return _rewrite_kernel_writes_atomic(tuple(body), axis_name)
 
-    current: tuple[LoopStmt, ...] = new_kernel_stmts
-    for w in reversed(wrappers):
-        current = (dc_replace(w, body=current),)
-    return current
+    changed = False
+    out: list[LoopStmt] = []
+    for s in body:
+        if isinstance(s, (Loop, StridedLoop)) and _contains_write(s):
+            new_inner = _rewrite_for_atomic_lift(tuple(s.body), axis_name)
+            if new_inner != tuple(s.body):
+                changed = True
+            out.append(dc_replace(s, body=new_inner))
+        elif isinstance(s, Cond) and (_contains_write(s) or any(_contains_write(c) for c in s.else_body)):
+            new_b = _rewrite_for_atomic_lift(tuple(s.body), axis_name)
+            new_e = _rewrite_for_atomic_lift(tuple(s.else_body), axis_name)
+            if new_b != tuple(s.body) or new_e != tuple(s.else_body):
+                changed = True
+            out.append(Cond(cond=s.cond, body=Body(new_b), else_body=Body(new_e)))
+        else:
+            out.append(s)
+    if not changed:
+        return tuple(body)
+    return tuple(out)
+
+
+def _contains_write(stmt: LoopStmt) -> bool:
+    """True if ``stmt`` is or transitively contains a ``Write``."""
+    if isinstance(stmt, Write):
+        return True
+    for sub in stmt.nested():
+        for c in sub:
+            if _contains_write(c):
+                return True
+    return False
 
 
 def _rewrite_kernel_writes_atomic(stmts: tuple[LoopStmt, ...], axis_name: str) -> tuple[LoopStmt, ...]:
@@ -334,11 +359,23 @@ def _compute_axis_dep_set(stmts: tuple[LoopStmt, ...]) -> set[str]:
     kernel level. Since the lifted axis wraps every kernel-level stmt,
     any value that flows through an ``Accum`` is by construction
     axis-dependent (the Accum aggregates iterations of an inner loop
-    that itself iterates inside the lifted axis's scope)."""
+    that itself iterates inside the lifted axis's scope).
+
+    Accums sit inside reduce Loops (one or more nesting levels below
+    the kernel-level Writes), so collect them by descending through
+    every nested ``Loop`` / ``StridedLoop`` / ``Cond`` body — the
+    aggregated value is still visible at the kernel scope through the
+    Accum's SSA name."""
     axis_dep: set[str] = set()
-    for s in stmts:
-        if isinstance(s, Accum):
-            axis_dep.add(s.name)
+
+    def _collect_accums(body: tuple[LoopStmt, ...]) -> None:
+        for s in body:
+            if isinstance(s, Accum):
+                axis_dep.add(s.name)
+            for child in s.nested():
+                _collect_accums(tuple(child))
+
+    _collect_accums(stmts)
     changed = True
     while changed:
         changed = False
