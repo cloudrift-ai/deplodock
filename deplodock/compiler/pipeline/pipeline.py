@@ -637,9 +637,25 @@ def _best_fork(forks, parent_cand, db):
         _, opt = f.pending
         opt_knobs = getattr(opt, "knobs", None) or {}
         merged = {**parent_knobs, **opt_knobs}
-        probe = replace(opt, knobs=merged) if merged != opt_knobs else opt
-        if op_cache_key(probe) == row.child_key:
-            return f
+        if isinstance(opt, Fork):
+            # Fork option (deferred expansion, no body to build a child
+            # cache key from yet) — match by knobs-delta against the
+            # recorded row's knobs. The fork "wins" iff every knob it
+            # pins appears in ``row.knobs`` with the same value AND at
+            # least one of those knobs is constrained by the row;
+            # otherwise every sibling is equally consistent and we fall
+            # back to option-0. Lets DB-seeded greedy descend a
+            # hierarchical fork chain whose intermediate levels don't
+            # have ``op_cache_key`` defined.
+            if not opt_knobs:
+                continue
+            constraining = [k for k in opt_knobs if k in row.knobs]
+            if constraining and all(row.knobs.get(k) == v for k, v in opt_knobs.items()):
+                return f
+        else:
+            probe = replace(opt, knobs=merged) if merged != opt_knobs else opt
+            if op_cache_key(probe) == row.child_key:
+                return f
     return None
 
 
