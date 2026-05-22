@@ -1,43 +1,49 @@
-"""Chunk the N register-tile into ``LDS.128``-sized strips when ``FN > 4``.
+"""Chunk the N register-tile into ``LDS.128``-sized strips when ``FN > V``.
+
+``V = ctx.lds128_bytes // BYTES_PER_ELEM`` — elements per ``LDS.128``
+transaction at the current tile-IR dtype. Tile-IR is fp32-only today, so
+``V = 16 // 4 = 4`` in practice; the bytes/dtype split makes the
+hardware constant (the 128-bit bus width) live in Context while the
+per-pass elem count auto-tracks ``BYTES_PER_ELEM``.
 
 After ``006a_register_tile_planned`` commits the canonical ``(THREAD-outer | RF-inner)``
 ordering on the N axis, body Loads on the B operand stage read column
 ``Var(lane) * FN + c`` for ``c=0..FN-1``. Two regimes:
 
-* ``FN <= 4`` (canonical default): lane ``l`` reads the contiguous strip
+* ``FN <= V`` (canonical default): lane ``l`` reads the contiguous strip
   ``[FN*l, FN*l+FN-1]``. nvcc auto-vectorizes the unrolled scalar reads
   into a single ``ld.shared.v4`` per K-iter — and within each LDS.128
-  phase (8 lanes × 4 fp32) the warp covers 32 distinct banks, so no
+  phase (8 lanes × V elems) the warp covers 32 distinct banks, so no
   conflicts. **No transform needed; pass skips.**
 
-* ``FN > 4`` (e.g. FN=8): lane ``l`` reads ``[8l..8l+7]``. Each LDS.128
-  carries 4 fp32, so the per-thread N-strip splits into ``FN/4``
+* ``FN > V`` (e.g. FN=8 at fp32): lane ``l`` reads ``[8l..8l+7]``. Each
+  LDS.128 carries V elems, so the per-thread N-strip splits into ``FN/V``
   successive LDS.128. *Within* one LDS.128 phase, the 8 lanes are
   stride-``FN`` apart (lane 0 → cols 0-3, lane 1 → 8-11, …, lane 4
-  wraps). 8 lanes × 4 fp32 = 32 fp32 of accesses, but with that stride
+  wraps). 8 lanes × V elems = 32 elems of accesses, but with that stride
   they land on only 16 banks → 2-way conflict per phase, 8-way per
   LDS.128. ncu confirms 25 M+ conflicts on this shape.
 
-Fix: keep each LDS.128 reading 4 *contiguous* fp32 (so the phase covers
-32 distinct banks), but spread the ``FN/4`` LDS.128's *across the
+Fix: keep each LDS.128 reading V *contiguous* elems (so the phase covers
+32 distinct banks), but spread the ``FN/V`` LDS.128's *across the
 N-tile* instead of stacking them at lane-stride FN. Lane ``l`` now owns
-``FN/4`` chunks of 4 cols each, the chunks spaced ``4 * lane_ext``
-apart inside the BN-wide tile (which is exactly ``FN/4`` chunks ×
-``4 * lane_ext`` cols since ``BN = FN * lane_ext``). For the canonical
-``FN=8, lane_ext=16`` (``BN=128``) shape, the chunk stride is 64.
+``FN/V`` chunks of V cols each, the chunks spaced ``V * lane_ext``
+apart inside the BN-wide tile (which is exactly ``FN/V`` chunks ×
+``V * lane_ext`` cols since ``BN = FN * lane_ext``). For the canonical
+``FN=8, lane_ext=16`` (``BN=128``) shape at fp32, the chunk stride is 64.
 
 Rewrite (applied to every Load + Write index expression containing
 ``Var(lane) * FN + Literal(c)``):
 
     Var(lane) * FN + Literal(c)
-        →   4 * Var(lane) + Literal((c // 4) * (4 * lane_ext) + (c % 4))
+        →   V * Var(lane) + Literal((c // V) * (V * lane_ext) + (c % V))
 
-For ``FN=8, lane_ext=16``:
+For ``FN=8, lane_ext=16`` at fp32 (``V=4``):
 
     c=0..3 → ``4*lane + c``           (chunk 0, cols 0..63 of the tile)
     c=4..7 → ``4*lane + 64 + (c-4)``  (chunk 1, cols 64..127 of the tile)
 
-Per LDS.128 phase: 8 lanes read 32 contiguous fp32 (one chunk), 32
+Per LDS.128 phase: 8 lanes read 32 contiguous elems (one chunk), 32
 distinct banks, **0 conflicts**. The Write to global memory follows
 the same per-thread mapping, so each chunk's lane-to-output assignment
 is also stride-1 (improved coalescing vs the FN-stride default).
@@ -49,8 +55,8 @@ within a warp at this point and don't carry a fixable conflict.
 
 Skips when:
 
-* The picked axis has no body Load with stride F > 4 divisible by 4.
-  Captures the ``FN <= 4`` no-op case and any non-canonical shape.
+* The picked axis has no body Load with stride F > V divisible by V.
+  Captures the ``FN <= V`` no-op case and any non-canonical shape.
 * Bank-conflict analysis (reusing ``014_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
 """
@@ -60,12 +66,13 @@ from __future__ import annotations
 import logging
 from dataclasses import replace as dc_replace
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Tile, Write
-from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
@@ -74,23 +81,23 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 
 logger = logging.getLogger(__name__)
 
-# ``LDS.128`` carries 4 fp32 per lane. The chunk size in this pass is
-# the maximum-vector-load width; we keep each per-thread N-chunk that
-# size so nvcc can keep emitting LDS.128 + the warp's 8-lane phase
-# covers exactly 32 banks.
-_LDS128_FLOATS = 4
-
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(root: Node) -> Graph | None:
-    new_body = _maybe_rewrite(root.op.body)
+def rewrite(ctx: Context, root: Node) -> Graph | None:
+    # Elements per LDS.128 transaction at the staged dtype. Tile-IR is
+    # fp32-only today, so this is ``16 // 4 = 4``. The chunk size in
+    # this pass is the maximum-vector-load width; we keep each per-thread
+    # N-chunk that size so nvcc can keep emitting LDS.128 + the warp's
+    # 8-lane phase covers exactly 32 banks.
+    vec_elems = ctx.lds128_bytes // BYTES_PER_ELEM
+    new_body = _maybe_rewrite(root.op.body, vec_elems=vec_elems)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")
     return TileOp(body=new_body, name=root.op.name)
 
 
-def _maybe_rewrite(body: Body) -> Body | None:
+def _maybe_rewrite(body: Body, *, vec_elems: int) -> Body | None:
     idx, tile = single_tile(body)
 
     thread_axes = tile.thread_axes
@@ -102,31 +109,31 @@ def _maybe_rewrite(body: Body) -> Body | None:
     # (the M axis sits at extent BM/FM, the N axis at BN/FN, with BN
     # >= BM by convention). We confirm via the access pattern that the
     # picked axis appears in some Stage Load with stride F divisible by
-    # ``_LDS128_FLOATS`` and > _LDS128_FLOATS — otherwise the chunked
-    # rewrite is a no-op or doesn't apply.
+    # ``vec_elems`` and > ``vec_elems`` — otherwise the chunked rewrite
+    # is a no-op or doesn't apply.
     sorted_threads = sorted(thread_axes, key=lambda ax: int(ax.extent))
     candidates: list[tuple[Axis, int]] = []
     for ax in reversed(sorted_threads):  # try N (largest) first
         F = _infer_lane_stride(tile.body, ax.name)
-        if F is None or F <= _LDS128_FLOATS or F % _LDS128_FLOATS != 0:
+        if F is None or F <= vec_elems or F % vec_elems != 0:
             continue
         candidates.append((ax, F))
     if not candidates:
-        raise RuleSkipped(f"no THREAD axis has Load-stride F divisible by {_LDS128_FLOATS} and > {_LDS128_FLOATS}")
+        raise RuleSkipped(f"no THREAD axis has Load-stride F divisible by {vec_elems} and > {vec_elems}")
     lane, F = candidates[0]
     lane_ext = int(lane.extent)
 
-    if not _swap_helps_any_stage(tile, lane.name, F, lane_ext):
+    if not _swap_helps_any_stage(tile, lane.name, F, lane_ext, vec_elems=vec_elems):
         raise RuleSkipped("no Stage has a fixable lane-stride bank conflict")
 
-    chunk_stride = _LDS128_FLOATS * lane_ext
-    new_tile = Tile(axes=tile.axes, body=_rewrite_body(tile.body, lane.name, F, chunk_stride))
+    chunk_stride = vec_elems * lane_ext
+    new_tile = Tile(axes=tile.axes, body=_rewrite_body(tile.body, lane.name, F, chunk_stride, vec_elems=vec_elems))
     logger.debug(
         "chunk N register-tile on lane=%s F=%d -> stride=%d, chunks=%d (chunk_stride=%d, BN=%d)",
         lane.name,
         F,
-        _LDS128_FLOATS,
-        F // _LDS128_FLOATS,
+        vec_elems,
+        F // vec_elems,
         chunk_stride,
         lane_ext * F,
     )
@@ -183,7 +190,7 @@ def _stage_max_way(loads: list[Load], extents: tuple[int, ...], leading_phase: b
     return worst
 
 
-def _swap_helps_any_stage(tile: Tile, lane_var: str, F: int, lane_ext: int) -> bool:
+def _swap_helps_any_stage(tile: Tile, lane_var: str, F: int, lane_ext: int, *, vec_elems: int) -> bool:
     """At least one Stage has a fixable bank conflict that the chunked
     rewrite would drive lower. Reuses the shared bank kernel from
     ``compiler/diagnostics/bank_conflicts``.
@@ -208,8 +215,8 @@ def _swap_helps_any_stage(tile: Tile, lane_var: str, F: int, lane_ext: int) -> b
         pre = _stage_max_way(loads, extents, leading_phase, tile)
         if pre is None or pre <= 1:
             continue
-        chunk_stride = _LDS128_FLOATS * lane_ext
-        rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride) for ld in loads]
+        chunk_stride = vec_elems * lane_ext
+        rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride, vec_elems=vec_elems) for ld in loads]
         post = _stage_max_way(rewritten, extents, leading_phase, tile)
         if post is None:
             continue
@@ -224,34 +231,35 @@ def _swap_helps_any_stage(tile: Tile, lane_var: str, F: int, lane_ext: int) -> b
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_body(body: Body, lane_var: str, F: int, chunk_stride: int) -> Body:
-    return body.map(lambda s: _rewrite_stmt(s, lane_var, F, chunk_stride))
+def _rewrite_body(body: Body, lane_var: str, F: int, chunk_stride: int, *, vec_elems: int) -> Body:
+    return body.map(lambda s: _rewrite_stmt(s, lane_var, F, chunk_stride, vec_elems=vec_elems))
 
 
-def _rewrite_stmt(s: Stmt, lane_var: str, F: int, chunk_stride: int) -> Stmt:
+def _rewrite_stmt(s: Stmt, lane_var: str, F: int, chunk_stride: int, *, vec_elems: int) -> Stmt:
     if isinstance(s, Load):
-        return _rewrite_load_index(s, lane_var, F, chunk_stride)
+        return _rewrite_load_index(s, lane_var, F, chunk_stride, vec_elems=vec_elems)
     if isinstance(s, Write):
-        new_idx = tuple(_chunk_expr(e, lane_var, F, chunk_stride) for e in s.index)
+        new_idx = tuple(_chunk_expr(e, lane_var, F, chunk_stride, vec_elems=vec_elems) for e in s.index)
         if new_idx != s.index:
             return dc_replace(s, index=new_idx)
     return s
 
 
-def _rewrite_load_index(ld: Load, lane_var: str, F: int, chunk_stride: int) -> Load:
-    new_idx = tuple(_chunk_expr(e, lane_var, F, chunk_stride) for e in ld.index)
+def _rewrite_load_index(ld: Load, lane_var: str, F: int, chunk_stride: int, *, vec_elems: int) -> Load:
+    new_idx = tuple(_chunk_expr(e, lane_var, F, chunk_stride, vec_elems=vec_elems) for e in ld.index)
     if new_idx == ld.index:
         return ld
     return dc_replace(ld, index=new_idx)
 
 
-def _chunk_expr(e: Expr, lane_var: str, F: int, chunk_stride: int) -> Expr:
+def _chunk_expr(e: Expr, lane_var: str, F: int, chunk_stride: int, *, vec_elems: int) -> Expr:
     """Rewrite ``Var(lane_var) * F + Literal(c)`` into
-    ``_LDS128_FLOATS * Var(lane_var) + Literal(off)`` where
-    ``off = (c // 4) * chunk_stride + (c % 4)``. The bare-``Var(lane)
-    * F`` form (the c=0 replica) lowers to ``_LDS128_FLOATS *
-    Var(lane)``. ``chunk_stride = _LDS128_FLOATS * lane_ext`` so the
-    chunks tile the BN-wide N tile evenly. Other subtrees pass through.
+    ``vec_elems * Var(lane_var) + Literal(off)`` where
+    ``off = (c // vec_elems) * chunk_stride + (c % vec_elems)``. The
+    bare-``Var(lane) * F`` form (the c=0 replica) lowers to
+    ``vec_elems * Var(lane)``. ``chunk_stride = vec_elems * lane_ext``
+    so the chunks tile the BN-wide N tile evenly. Other subtrees pass
+    through.
     """
     if lane_var not in e.free_vars():
         return e
@@ -260,23 +268,35 @@ def _chunk_expr(e: Expr, lane_var: str, F: int, chunk_stride: int) -> Expr:
         for left, right in ((e.left, e.right), (e.right, e.left)):
             if _matches_lane_mul(left, lane_var, F) and isinstance(right, Literal) and isinstance(right.value, int):
                 c = right.value
-                chunk_idx, within = divmod(c, _LDS128_FLOATS)
+                chunk_idx, within = divmod(c, vec_elems)
                 off = chunk_idx * chunk_stride + within
                 return BinaryExpr(
                     "+",
-                    BinaryExpr("*", Var(lane_var), Literal(_LDS128_FLOATS, "int")),
+                    BinaryExpr("*", Var(lane_var), Literal(vec_elems, "int")),
                     Literal(off, "int"),
                 )
-        return BinaryExpr("+", _chunk_expr(e.left, lane_var, F, chunk_stride), _chunk_expr(e.right, lane_var, F, chunk_stride))
+        return BinaryExpr(
+            "+",
+            _chunk_expr(e.left, lane_var, F, chunk_stride, vec_elems=vec_elems),
+            _chunk_expr(e.right, lane_var, F, chunk_stride, vec_elems=vec_elems),
+        )
 
     if isinstance(e, BinaryExpr) and e.op == "-":
-        return BinaryExpr("-", _chunk_expr(e.left, lane_var, F, chunk_stride), _chunk_expr(e.right, lane_var, F, chunk_stride))
+        return BinaryExpr(
+            "-",
+            _chunk_expr(e.left, lane_var, F, chunk_stride, vec_elems=vec_elems),
+            _chunk_expr(e.right, lane_var, F, chunk_stride, vec_elems=vec_elems),
+        )
 
     if _matches_lane_mul(e, lane_var, F):
-        return BinaryExpr("*", Var(lane_var), Literal(_LDS128_FLOATS, "int"))
+        return BinaryExpr("*", Var(lane_var), Literal(vec_elems, "int"))
 
     if isinstance(e, BinaryExpr):
-        return BinaryExpr(e.op, _chunk_expr(e.left, lane_var, F, chunk_stride), _chunk_expr(e.right, lane_var, F, chunk_stride))
+        return BinaryExpr(
+            e.op,
+            _chunk_expr(e.left, lane_var, F, chunk_stride, vec_elems=vec_elems),
+            _chunk_expr(e.right, lane_var, F, chunk_stride, vec_elems=vec_elems),
+        )
 
     return e
 

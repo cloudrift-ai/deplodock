@@ -67,6 +67,14 @@ class Context:
     # and warp-shuffle dispatch (``001_materialize_tile``) read a single
     # source of truth instead of redefining the constant module-locally.
     warp_size: int = 32
+    # Shared-memory vector-load width in bytes — ``LDS.128`` carries 128
+    # bits (16 bytes) per lane on every NVIDIA arch since Volta, so this
+    # is genuinely hardware-universal. Element counts are derived per
+    # dtype at the use site (``lds128_bytes // BYTES_PER_ELEM``): 4 fp32
+    # / 8 fp16 / 16 fp8 fuse into one transaction. ``007a`` uses it to
+    # pick the per-thread N-chunk width that keeps each LDS.128 phase
+    # bank-conflict-free.
+    lds128_bytes: int = 16
     # Identifies which backend's perf rows this compile should consult
     # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
     # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the
