@@ -66,7 +66,6 @@ from deplodock.compiler.ir.tile.ir import (
     SerialTile,
     Stage,
     StridedTile,
-    SwizzleMode,
     TemplateAddressing,
     ThreadTile,
     TileOp,
@@ -204,9 +203,8 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
 
     rename: dict[str, str] = {}
 
-    # Body-Load XOR decode for TMA-swizzled stages is now handled by
-    # ``012_split_inner_for_swizzle`` (which both picks the swizzle mode
-    # AND rewrites Loads). Materialize just sees the post-rewrite IR.
+    # TMA stages always emit with ``swizzle=NONE`` — the post-refactor
+    # pipeline doesn't carry a swizzle-picker pass (012 was dropped).
 
     def transform(s: Stmt) -> Stmt:
         if rename:
@@ -313,109 +311,62 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
-        desc_name = f"{stage.name}_desc"
+        # Wrap-body invariant: 011_tma_copy only promotes single-Source
+        # stages, so the box-copy here issues exactly one TMA load per
+        # group activation.
+        assert len(stage.sources) == 1, f"TmaBufferedStage requires one Source, got {len(stage.sources)}"
+        src = stage.sources[0]
+        addressing = src.addressing
+        assert isinstance(addressing, AffineAddressing), f"TmaBufferedStage source {src.name!r} must use AffineAddressing"
+        desc_name = f"{src.name}_desc"
         gid = stage_group[id(stage)]
         mbar_name = _mbar_name(gid)
-        assert isinstance(stage.addressing, AffineAddressing)
         # Box extents per source dim: product of cache extents that map
-        # to that dim (a single source dim can be spanned by multiple
-        # cache axes, e.g. matmul fragments where the M-dim is split
-        # across an outer-block axis and a per-thread fragment axis).
-        # Dims not covered by any cache axis get extent 1 — the coord
-        # supplies the origin and the slab is scalar in that dim.
-        # Per-source-dim box product. When two or more cache axes map to
-        # the same source dim, multiplying yields the total slab span on
-        # that dim — except when ``012_split_inner_for_swizzle`` has
-        # split the inner axis: there we want the descriptor to *see* the
-        # split as separate inner box dims (so the innermost matches the
-        # swizzle width). Detect a tail repeat in ``addressing.dims`` and
-        # don't collapse it.
-        dims = stage.addressing.dims
-        split_tail = len(dims) >= 2 and dims[-1] == dims[-2] and stage.swizzle != SwizzleMode.NONE
-        if split_tail:
-            collapse_axes = stage.axes[:-2]
-            collapse_dims = dims[:-2]
-            tail_axes = stage.axes[-2:]
-        else:
-            collapse_axes = stage.axes
-            collapse_dims = dims
-            tail_axes = ()
+        # to that dim (multiple cache axes can sweep the same source dim
+        # — e.g. an outer-block axis and a per-thread fragment axis both
+        # decoded into the M dim of a matmul slab). Source dims not
+        # covered by any cache axis get extent 1.
+        dims = addressing.dims
         box_per_dim: dict[int, int] = {}
-        for d, ax in zip(collapse_dims, collapse_axes, strict=True):
+        for d, ax in zip(dims, src.cache_axes, strict=True):
             box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
-        full_box = tuple(box_per_dim.get(d, 1) for d in range(len(stage.origin)))
+        full_box = tuple(box_per_dim.get(d, 1) for d in range(len(src.origin)))
         # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
-        # 0) that sit between the first and last swept source dims.
-        # Leading singletons stay in the descriptor — keeping them
-        # matches the rank-3 shape the working linear-matmul TMA kernels
-        # emit. Gap singletons (e.g. the kv_head=1 axis between seq and
-        # head_dim in GQA's V tensor) must be dropped — without it, the
-        # rank-4 descriptor with the gap singleton deadlocks pipelined
-        # TMA at seq=512. The runtime encoder reconstructs the same
-        # collapse from ``arr.shape`` + ``box_extents`` alone (a literal-
-        # 0 origin coord can only be emitted for a singleton arr dim, so
-        # at runtime "drop extent-1 arr dims that align with box dims of
-        # extent > 1" recovers exactly the materializer's decision).
-        swept = collapse_dims if collapse_dims else dims
-        outer, inner = swept[0], swept[-1]
+        # 0) between the first and last swept source dims. Leading
+        # singletons stay in the descriptor — keeping them matches the
+        # working linear-matmul rank-3 shape. Gap singletons (e.g. GQA
+        # V's kv_head=1 between seq and head_dim) must be dropped to
+        # avoid the rank-4 pipelined-TMA deadlock at seq=512. The
+        # runtime encoder reconstructs the same collapse from
+        # ``arr.shape`` + ``box_extents`` alone.
+        outer, inner = dims[0], dims[-1]
         kept = tuple(
             d
-            for d in range(len(stage.origin))
+            for d in range(len(src.origin))
             if d < outer
             or d > inner
-            or d in swept
-            or not (full_box[d] == 1 and isinstance(stage.origin[d], Literal) and int(stage.origin[d].value) == 0)
+            or d in dims
+            or not (full_box[d] == 1 and isinstance(src.origin[d], Literal) and int(src.origin[d].value) == 0)
         )
         box = tuple(full_box[d] for d in kept)
-        coords = tuple(stage.origin[d] for d in kept)
-        # Append the split-tail box dims + decomposed coords. The split
-        # source dim is the last one in ``swept``; the inner cache axis
-        # has extent IPS, the outer factor = orig_extent / IPS. Coord on
-        # the new outer dim = ``origin[split_dim] / IPS``; coord on the
-        # new inner dim = ``origin[split_dim] % IPS``. The previous
-        # ``coords`` entry for the split dim already holds origin —
-        # replace it with the split pair.
-        if tail_axes:
-            split_dim = dims[-1]
-            ips = int(tail_axes[-1].extent)
-            # Find where split_dim sits in `kept` and remove it; its place
-            # is taken by the (outer_coord, inner_coord) pair.
-            kept_idx = kept.index(split_dim)
-            orig_coord = stage.origin[split_dim]
-            outer_coord = BinaryExpr("/", orig_coord, Literal(ips, "int"))
-            inner_coord = BinaryExpr("%", orig_coord, Literal(ips, "int"))
-            coords = (
-                *coords[:kept_idx],
-                *coords[kept_idx + 1 :],
-                outer_coord,
-                inner_coord,
-            )
-            box = (
-                *box[:kept_idx],
-                *box[kept_idx + 1 :],
-                int(tail_axes[0].extent),
-                int(tail_axes[1].extent),
-            )
+        coords = tuple(src.origin[d] for d in kept)
         if desc_name not in descriptors:
             # Source shape is unknown at materialization time — the
-            # backend resolves it from the bound array at launch. Pass
-            # an empty tuple as a sentinel; descriptor encoding fills it.
+            # backend resolves it from the bound array at launch.
             descriptors[desc_name] = TmaDescriptor(
                 name=desc_name,
-                src_buf=stage.buf,
+                src_buf=src.buf,
                 src_shape=(),
                 box_extents=box,
                 swizzle=stage.swizzle.value,
-                dtype="float",
+                dtype=buf_cuda.get(src.buf, "float"),
             )
         if mbar_name not in declared_mbar:
             declared_mbar.add(mbar_name)
             # Per-group mbarrier array: one mbar per ring-buffer slot,
             # with arrive count = number of distinct stages in *this*
             # group (so all of the group's stages must arrive before its
-            # phase flips). Multiple expect_tx on the same mbar
-            # accumulate transaction bytes for the current phase,
-            # exactly the semantics we want.
+            # phase flips).
             bc = group_buffer_count[gid]
             mbar_prologue.append(
                 Smem(name=mbar_name, extents=(bc,), dtype="unsigned long long"),
@@ -423,20 +374,20 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
             for s in range(bc):
                 mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=len(group_stage_names[gid]), slot=Literal(s, "int")))
         slab_bytes = BYTES_PER_ELEM
-        for ax in stage.axes:
+        for ax in src.cache_axes:
             slab_bytes *= int(ax.extent)
         # Smem allocation: leading phase dim + cache extents (with pad).
-        full_extents = (stage.buffer_count, *stage.alloc_extents)
-        smem_index = (stage.phase, *([Literal(0, "int")] * len(stage.axes)))
-        # Distribute issuer threads across stages so each stage's
-        # arrive+TMA pair issues from a different thread (stage 0 → tid 0,
-        # stage 1 → tid 1, ...) rather than serializing on tid 0.
+        full_extents = (stage.buffer_count, *src.alloc_extents)
+        smem_index = (stage.phase, *([Literal(0, "int")] * len(src.cache_axes)))
+        # Distribute issuer threads across stages within a group so each
+        # stage's arrive+TMA pair issues from a different thread (stage
+        # 0 → tid 0, stage 1 → tid 1, ...) rather than serializing on tid 0.
         cond = Cond(
-            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(issuer_tid[stage.name], "int")),
+            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(issuer_tid[src.name], "int")),
             body=(
                 MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=stage.phase),
                 TmaLoad(
-                    smem=stage.name,
+                    smem=src.name,
                     smem_index=smem_index,
                     desc=desc_name,
                     coords=coords,
@@ -445,24 +396,33 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
                 ),
             ),
         )
-        # B128 swizzle uses byte-address bits 7..9 to drive the XOR, so the
-        # buffer base must be 1024-aligned (next multiple of the swizzle
-        # group size: 8 rows × 128 B). Otherwise the row-bit position
-        # leaks bits from a non-zero base offset and the body decoder's
-        # ``(row & 7) * shift`` reads from off-by-N permuted positions.
-        # B64 needs 512-byte alignment, B32 needs 256.
+        # 128 B = NVIDIA's recommended TMA-destination alignment for box
+        # copies. Swizzle modes would need wider alignment but the swizzle
+        # picker (012) was dropped from the wrap-body pipeline, so every
+        # TMA stage runs at the base recommendation.
         align = _TMA_ALIGN_BYTES
-        if stage.swizzle == SwizzleMode.B128:
-            align = 1024
-        elif stage.swizzle == SwizzleMode.B64:
-            align = 512
-        elif stage.swizzle == SwizzleMode.B32:
-            align = 256
-        return [Smem(name=stage.name, extents=full_extents, align=align), cond]
+        smem_dtype = buf_cuda.get(src.buf, "float")
+        out: list[Stmt] = [
+            Smem(name=src.name, extents=full_extents, align=align, dtype=smem_dtype),
+            cond,
+        ]
+        # Implicit wait at the wrap boundary for unpipelined stages
+        # (pipeline_depth == 1). Mirrors the AsyncBufferedStage flow in
+        # ``_emit_stage`` — the consumer body sees the committed copy
+        # before reading. ``015_lower_pipelined_async_stage`` (when it
+        # lands) expands depth > 1 stages and emits its own waits.
+        if stage.pipeline_depth == 1:
+            mbar_phase = _mbar_wait_phase(stage.phase, stage.buffer_count)
+            out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=stage.phase))
+            out.append(Sync())
+        return out
 
     for stmt in body:
         if isinstance(stmt, TmaBufferedStage):
             new_body.extend(filter_emit(emit_tma_stage(stmt)))
+            pending_reduce = {}
+        elif isinstance(stmt, ComputeStage):
+            new_body.extend(filter_emit(_emit_compute_stage(stmt, tid_expr, n_threads)))
             pending_reduce = {}
         elif isinstance(stmt, Stage):
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads, buf_cuda)))
@@ -599,6 +559,8 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
     def materialize_leaf(s: Stmt):
         if isinstance(s, TmaBufferedStage):
             return filter_emit(emit_tma_stage(s))
+        if isinstance(s, ComputeStage):
+            return filter_emit(_emit_compute_stage(s, tid_expr, n_threads))
         if isinstance(s, Stage):
             return filter_emit(_emit_stage(s, tid_expr, n_threads, buf_cuda))
         if isinstance(s, AsyncWait):
@@ -672,7 +634,11 @@ def _partition_tma_groups(
 
     def _add_stage(gid: int, stage: TmaBufferedStage) -> None:
         stage_group_by_id[id(stage)] = gid
-        group_stage_names[gid].add(stage.name)
+        # 011_tma_copy promotes single-source stages only; group_stage_names
+        # tracks per-Source smem name so issuer-tid allocation distributes
+        # the arrive+TmaLoad across distinct elected threads.
+        for src in stage.sources:
+            group_stage_names[gid].add(src.name)
         group_buffer_count[gid] = max(group_buffer_count[gid], stage.buffer_count)
 
     pending_prologue: list[TmaBufferedStage] = []
@@ -820,6 +786,21 @@ def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, 
 # ---------------------------------------------------------------------------
 
 
+def _mbar_wait_phase(stage_phase, buffer_count: int):
+    """Derive the mbarrier-test phase from a ``TmaBufferedStage.phase``.
+
+    011_tma_copy stamps ``stage.phase = Var(K_o.name) % buffer_count``
+    (the ring slot). The matching mbarrier phase rotates one bit per
+    full ring sweep — ``(K_o / buffer_count) % 2``. For the degenerate
+    single-shot case (``phase`` is a literal) the mbar phase starts at
+    0 and never flips.
+    """
+    if isinstance(stage_phase, BinaryExpr) and stage_phase.op == "%":
+        k_expr = stage_phase.left
+        return BinaryExpr("%", BinaryExpr("/", k_expr, Literal(buffer_count, "int")), Literal(2, "int"))
+    return Literal(0, "int")
+
+
 def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str] | None = None) -> list[Stmt]:
     """Emit producer scaffolding for a wrap-body Stage.
 
@@ -924,6 +905,65 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
             body_out.append(Sync())
     else:
         body_out.append(Sync())
+    return body_out
+
+
+def _emit_compute_stage(stage: ComputeStage, tid_expr, n_threads: int) -> list[Stmt]:
+    """Emit producer scaffolding for a ``ComputeStage``.
+
+    Wraps ``stage.compute`` in a cooperative ``StridedLoop`` over the
+    fused cache axes — each thread executes the compute template once
+    per cell it owns, σ-substituting cache-axis Vars with row-major
+    flat-iter decoded coords. ``stage.body`` (the consumer subtree) is
+    pre-flattened to siblings by ``_flatten_wrap_stages`` before we run,
+    so it's empty here.
+
+    The output Source's smem decl is hoisted to kernel scope by
+    ``_materialize``'s prologue walk; the dedup filter drops the
+    redundant in-line decl. Leading ``Sync`` ensures sibling-Stage
+    smem writes are visible; trailing ``Sync`` makes the freshly
+    computed slab CTA-visible to the consumer.
+    """
+    from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+
+    # ComputeStage has exactly one output Source (the slab it fills).
+    if len(stage.sources) != 1:
+        raise ValueError(f"ComputeStage: expected 1 output Source, got {len(stage.sources)}")
+    out = stage.sources[0]
+    cache_axes = out.cache_axes
+    if not cache_axes:
+        raise ValueError(f"ComputeStage {out.name!r}: needs at least one cache axis")
+    padded_extents = out.alloc_extents
+    total = 1
+    for ax in cache_axes:
+        total *= int(ax.extent)
+    iter_axis = Axis(name=f"{out.name}_flat", extent=total)
+    if len(cache_axes) == 1:
+        coord_for = {cache_axes[0].name: Var(iter_axis.name)}
+    else:
+        coord_for = _flat_decode(cache_axes, iter_axis.name)
+    sigma = Sigma(coord_for)
+
+    # σ-substitute cache vars in every stmt of the compute body. Loads /
+    # Assigns / Writes are leaves so a flat ``map`` over the body is
+    # enough; no recursion into nested bodies is needed for the cone
+    # shape this pass produces.
+    new_stmts: list[Stmt] = []
+    for s in stage.compute:
+        new_stmts.append(s.rewrite(lambda n: n, sigma))
+
+    full_extents = (stage.buffer_count, *padded_extents) if stage.buffer_count > 1 else padded_extents
+    body_out: list[Stmt] = [
+        Sync(),
+        Smem(name=out.name, extents=full_extents),
+        StridedLoop(
+            axis=iter_axis,
+            start=tid_expr,
+            step=Literal(n_threads, "int"),
+            body=tuple(new_stmts),
+        ),
+        Sync(),
+    ]
     return body_out
 
 

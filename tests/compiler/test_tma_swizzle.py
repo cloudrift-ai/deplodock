@@ -1,20 +1,13 @@
-"""Accuracy tests for the matmul kernel under each TMA + swizzle config.
+"""Accuracy tests for the matmul kernel under each TMA transport config.
 
-Cross-checks four points in the capability + swizzle matrix:
+Cross-checks the live capability + transport matrix:
 
 - ``--target sm_80`` → cp.async transport with ``+1`` pad_smem.
 - ``--target sm_90`` (default sm_90+) → ``cp.async.bulk.tensor`` /
   TMA with ``swizzle=NONE``.
-- ``DEPLODOCK_TMA_SWIZZLE=1`` (paired with a small ``BN/BM`` so the
-  inner box-dim byte size matches a swizzle width) → TMA with
-  ``SWIZZLE_128B`` + body-Load XOR decode.
 
-Pinned to a matmul size large enough that the K-outer pipeline + the
-swizzle decoder both fire (``N=384`` triggers ``010_double_buffer``,
-``011_tma_copy``, and ``015_pipeline_k_outer``). Swizzle-on at the
-default ``BN=128`` geometry stays at ``swizzle=NONE`` (inner = 512 B,
-no swizzle width matches), so the swizzle row only meaningfully runs
-when paired with ``BN=BM=32``.
+Swizzle support (``012_split_inner_for_swizzle``) was dropped during the
+wrap-body refactor; TMA stages always emit with ``swizzle=NONE``.
 """
 
 from __future__ import annotations
@@ -75,16 +68,15 @@ def _live_capability() -> tuple[int, int]:
 
 @requires_cuda
 @pytest.mark.parametrize(
-    ("target", "swizzle", "bn", "bm"),
+    ("target", "bn", "bm"),
     [
-        ((8, 0), "0", None, None),  # cp.async + pad_smem (default geometry)
-        ((9, 0), "0", None, None),  # TMA, swizzle=NONE (default geometry)
-        ((9, 0), "0", "32", "32"),  # TMA, swizzle=NONE, small slab (no perf gain, sanity)
-        ((9, 0), "1", "32", "32"),  # TMA + SWIZZLE_128B + body-Load XOR decode
+        ((8, 0), None, None),  # cp.async + pad_smem (default geometry)
+        ((9, 0), None, None),  # TMA, swizzle=NONE (default geometry)
+        ((9, 0), "32", "32"),  # TMA, swizzle=NONE, small slab (no perf gain, sanity)
     ],
-    ids=["cpasync", "tma_no_swizzle", "tma_no_swizzle_bn32", "tma_swizzle_b128"],
+    ids=["cpasync", "tma_no_swizzle", "tma_no_swizzle_bn32"],
 )
-def test_matmul_accuracy_across_tma_modes(monkeypatch, target, swizzle, bn, bm):
+def test_matmul_accuracy_across_tma_modes(monkeypatch, target, bn, bm):
     """Use ``set_target`` to force the codegen path the test wants. Live
     hardware must be ≥ the requested cap so the launch-time smem opt-in
     (derived from ``Context.max_dynamic_smem``) doesn't exceed the actual
@@ -96,7 +88,6 @@ def test_matmul_accuracy_across_tma_modes(monkeypatch, target, swizzle, bn, bm):
         pytest.skip(f"live device sm_{live[0]}{live[1]} < requested sm_{target[0]}{target[1]}")
 
     target_mod.set_target(target)
-    monkeypatch.setenv("DEPLODOCK_TMA_SWIZZLE", swizzle)
     if bn is not None:
         monkeypatch.setenv("DEPLODOCK_BN", bn)
         monkeypatch.setenv("DEPLODOCK_BM", bm)
@@ -106,25 +97,3 @@ def test_matmul_accuracy_across_tma_modes(monkeypatch, target, swizzle, bn, bm):
         _check_close(actual, expected)
     finally:
         target_mod.set_target(None)
-
-
-def test_swizzle_picker_pre_pass(monkeypatch):
-    """Picker (in ``012_split_inner_for_swizzle``) maps inner byte size
-    to a ``(swizzle_mode, ips_fp32)`` pair. Wider-than-width extents pick
-    the largest fitting width. Pure unit test, no CUDA needed."""
-    import importlib
-
-    from deplodock.compiler.ir.tile.ir import SwizzleMode
-
-    pick = importlib.import_module(
-        "deplodock.compiler.pipeline.passes.lowering.tile.012_split_inner_for_swizzle",
-    )._pick_split_swizzle
-
-    monkeypatch.setenv("DEPLODOCK_TMA_SWIZZLE", "1")  # picker doesn't gate; just ensure no env effect
-    assert pick(128) == (SwizzleMode.B128, 32)  # exact B128
-    assert pick(64) == (SwizzleMode.B64, 16)  # exact B64
-    assert pick(32) == (SwizzleMode.B32, 8)  # exact B32
-    assert pick(512) == (SwizzleMode.B128, 32)  # 4× B128 → split
-    assert pick(256) == (SwizzleMode.B128, 32)  # 2× B128 → split
-    assert pick(192) == (SwizzleMode.B64, 16)  # 3× B64 → split
-    assert pick(16) is None  # below smallest width
