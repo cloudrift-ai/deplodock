@@ -22,7 +22,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.ir.tile.ir import BIND_THREAD, SerialTile, ThreadTile, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import SerialTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 
