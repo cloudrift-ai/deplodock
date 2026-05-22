@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field, replace
+from typing import Literal as _Lit
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -78,6 +79,9 @@ from deplodock.compiler.ir.stmt import (
     pretty_body,
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
+
+SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
+
 
 # ---------------------------------------------------------------------------
 # Deprecated AsyncWait stub (stage-wrap-body refactor)
@@ -307,6 +311,220 @@ def _source_pretty(src: Source) -> str:
     if src.template_index is not None:
         tpl = " template=[" + ", ".join(e.pretty() for e in src.template_index) + "]"
     return f"{src.name}<-{src.buf}(origin=({origin}), slab=({cache})){pad}{tpl}"
+
+
+# ---------------------------------------------------------------------------
+# Tile flavors — typed parallel / serial scoping wrappers
+# ---------------------------------------------------------------------------
+#
+# Each tile flavor's *type* encodes its binding decision (block-grid /
+# threadIdx / register / serial / strided). Together with the wrap-body
+# ``Stage`` family, these are the only block-structured Stmts allowed
+# inside a ``TileOp.body`` post-``001_launch_geometry``. ``Loop`` /
+# ``StridedLoop`` / ``Tile`` survive in Loop IR (``LoopOp.body``) and as
+# transient inputs to ``001_launch_geometry``, but downstream Tile-IR
+# passes and Tile→Kernel materialization only see the new flavors.
+#
+# Shape contract (mirrors ``Stage``'s wrap-body):
+#
+# - ``ParallelTile`` subclasses (``GridTile`` / ``ThreadTile`` /
+#   ``RegisterTile``) carry ``axes: tuple[Axis, ...]`` + ``body: Body``.
+#   The body executes once per coord tuple; coords are implicit from the
+#   binding (``blockIdx`` / ``threadIdx`` / per-thread register cell).
+# - ``SerialTileBase`` subclasses (``SerialTile`` / ``StridedTile``)
+#   carry ``axis: Axis`` + ``body: Body`` and run sequentially. Reduce
+#   semantics are derived: ``is_reduce`` iff the body contains ``Accum``.
+
+
+@dataclass
+class ParallelTile(Stmt):
+    """Abstract base for tile flavors that bind a parallel axis tuple.
+
+    Subclasses pick a parallel coord (``blockIdx`` / ``threadIdx`` /
+    register file) for the body to be executed under. Coord decode happens
+    at materialize time; the tile itself only carries the axes + body.
+    """
+
+    axes: tuple[Axis, ...]
+    body: Body
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            self.body = Body(self.body)
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.body,)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return replace(self, body=body)
+
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset(ax.name for ax in self.axes)
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    def _pretty_axes(self) -> str:
+        return ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes) or "-"
+
+    def pretty(self, indent: str = "") -> list[str]:
+        head = f"{indent}{type(self).__name__}(axes=({self._pretty_axes()})):"
+        return [head, *pretty_body(self.body, indent + INDENT)]
+
+
+@dataclass
+class GridTile(ParallelTile):
+    """CTA-grid parallel tile. Axes lift to ``blockIdx`` (row-major).
+
+    Replaces ``Tile`` with ``BIND_BLOCK`` axes. ``splitk_axes`` carries
+    the subset of axis names that are split-K outer axes — materializer
+    rewrites the epilogue ``Write`` to atomic-add for those.
+    """
+
+    splitk_axes: tuple[str, ...] = ()
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return GridTile(axes=self.axes, body=body, splitk_axes=self.splitk_axes)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        extra = ""
+        if self.splitk_axes:
+            extra = f" splitk=({', '.join(self.splitk_axes)})"
+        head = f"{indent}GridTile(axes=({self._pretty_axes()})){extra}:"
+        return [head, *pretty_body(self.body, indent + INDENT)]
+
+
+@dataclass
+class ThreadTile(ParallelTile):
+    """Thread-parallel tile. Axes lift to ``threadIdx`` (row-major flatten).
+
+    Replaces ``Tile`` with ``BIND_THREAD`` axes. ``cooperative_axes``
+    carries the subset of axis names that are cross-thread cooperative
+    (today's ``Role.COOPERATIVE_STRIDE``) — drives ``Combine`` emission
+    after the matching reduce.
+    """
+
+    cooperative_axes: tuple[str, ...] = ()
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return ThreadTile(axes=self.axes, body=body, cooperative_axes=self.cooperative_axes)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        extra = ""
+        if self.cooperative_axes:
+            extra = f" coop=({', '.join(self.cooperative_axes)})"
+        head = f"{indent}ThreadTile(axes=({self._pretty_axes()})){extra}:"
+        return [head, *pretty_body(self.body, indent + INDENT)]
+
+
+@dataclass
+class RegisterTile(ParallelTile):
+    """Per-thread register-cell tile. Body replicated F× per axis by 006a.
+
+    Replaces ``Loop(role=REGISTER)``. The ``axes`` tuple carries one or
+    more register axes (typically M_r / N_r for matmul); the planner
+    chooses the extents (``FM`` / ``FN`` knobs). After the 006a
+    register-tile pass runs, every ``RegisterTile`` is consumed: the
+    body is fully unrolled, SSA names get per-cell suffixes, and the
+    ``RegisterTile`` wrapper disappears.
+    """
+
+
+@dataclass
+class SerialTileBase(Stmt):
+    """Abstract base for serial-iteration tile flavors. One axis, one body."""
+
+    axis: Axis
+    body: Body
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            self.body = Body(self.body)
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.body,)
+
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset({self.axis.name})
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    def is_reduce(self) -> bool:
+        """A serial tile is a reduce iff its immediate body contains an ``Accum``."""
+        return any(isinstance(s, Accum) for s in self.body)
+
+
+@dataclass
+class SerialTile(SerialTileBase):
+    """Sequential iteration over ``axis``. Replaces ``Loop``.
+
+    ``kind`` carries the planner's structural intent:
+
+    - ``"plain"``: ordinary serial loop (no special role).
+    - ``"serial_outer"``: outer chunked-K loop driving slab refresh
+      (today's ``Role.SERIAL_OUTER``). Targeted by ``010_double_buffer``
+      / ``015_pipeline_k_outer``.
+    - ``"stage_inner"``: inner reduce loop inside a ``Stage``'s wrapped
+      body (today's ``Role.STAGE_INNER``). Slab-axis marker for
+      ``002_stage_inputs``.
+    - ``"pipeline"``: serial outer loop marked for temporal pipelining
+      by ``015_pipeline_k_outer``.
+
+    ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
+    time. Set by ``016_mark_unroll``; has no effect on iteration semantics.
+    """
+
+    kind: SerialKind = "plain"
+    unroll: bool = False
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        red = "reduce" if self.is_reduce else "free"
+        kind = "" if self.kind == "plain" else f" {self.kind}"
+        unroll = " unroll" if self.unroll else ""
+        head = f"{indent}SerialTile({self.axis.name} in 0..{self.axis.extent}):  # {red}{kind}{unroll}"
+        return [head, *pretty_body(self.body, indent + INDENT)]
+
+
+@dataclass
+class StridedTile(SerialTileBase):
+    """Strided serial iteration: ``for (axis = start; axis < extent; axis += step)``.
+
+    Replaces ``StridedLoop``. Cooperative thread-stride iteration when a
+    surrounding ``ThreadTile`` axis covers the stride (typical
+    ``start = Var('tid'), step = BLOCK_SIZE``). Reduce semantics derive
+    from body content like ``SerialTile``.
+    """
+
+    start: Expr = field(default_factory=lambda: Literal(0, "int"))
+    step: Expr = field(default_factory=lambda: Literal(1, "int"))
+    unroll: bool = False
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return StridedTile(axis=self.axis, body=body, start=self.start, step=self.step, unroll=self.unroll)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        out: tuple[Expr, ...] = (self.start,)
+        if isinstance(self.step, Expr):
+            out = (*out, self.step)
+        return out
+
+    def pretty(self, indent: str = "") -> list[str]:
+        red = "reduce" if self.is_reduce else "free"
+        unroll = " unroll" if self.unroll else ""
+        start = self.start.pretty()
+        step = self.step.pretty() if isinstance(self.step, Expr) else self.step
+        head = f"{indent}StridedTile({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {red}{unroll}"
+        return [head, *pretty_body(self.body, indent + INDENT)]
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +901,17 @@ __all__ = [
     "Cond",
     "Loop",
     "StridedLoop",
-    # Tile-IR statements
+    # Tile-IR statements — legacy (kept for Loop-IR shared use + transitional API)
     "Tile",
+    # Tile-IR statements — new flavor hierarchy
+    "ParallelTile",
+    "GridTile",
+    "ThreadTile",
+    "RegisterTile",
+    "SerialTileBase",
+    "SerialTile",
+    "StridedTile",
+    "SerialKind",
     "Combine",
     "Stage",
     "BufferedStage",

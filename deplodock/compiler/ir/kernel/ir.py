@@ -57,6 +57,7 @@ from deplodock.compiler.ir.stmt import (
     _pad,
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -591,8 +592,14 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Kernel-IR statements
+    # Kernel-IR statements — legacy Tile + new tile flavor hierarchy (the
+    # kernel-IR materialization preserves the wrappers that Tile IR emits)
     "Tile",
+    "GridTile",
+    "ThreadTile",
+    "RegisterTile",
+    "SerialTile",
+    "StridedTile",
     "Smem",
     "Sync",
     "TreeHalve",
