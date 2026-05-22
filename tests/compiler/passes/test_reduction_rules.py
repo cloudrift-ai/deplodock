@@ -165,11 +165,13 @@ def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
     assert all(t.length < 256 for t in tree_halves), [t.length for t in tree_halves]
 
 
-@pytest.mark.xfail(reason="v1 cooperative path skips smem staging (no reuse with sole K_c THREAD axis)", strict=False)
-def test_block_cooperative_still_uses_stage_inputs(recording_dump):
-    """K=256 → cooperative tile has BLOCK_SIZE threads; stage_inputs
-    still fires (the smem stage avoids redundant DRAM reads when the
-    row is too wide to keep register-resident across the warp)."""
+def test_block_cooperative_skips_stage_inputs(recording_dump):
+    """K=256 cooperative reduce: the v1 cooperative path uses a sole
+    ``K_c`` THREAD axis (BR>1 ⇒ BN=BM=1), so each thread reads its
+    own K_c-strided slice of the row with no cross-thread reuse —
+    ``stage_inputs`` correctly skips. The kernel still gets a Combine
+    (cross-thread reduce after the per-thread partial sums) and lowers
+    via the planner's cooperative branch."""
     g = Graph()
     _input(g, "x", (4, 256))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -179,7 +181,7 @@ def test_block_cooperative_still_uses_stage_inputs(recording_dump):
     out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
     assert _tile_has_combine(out)
-    assert "stage_inputs" in fired
+    assert "stage_inputs" not in fired
 
 
 def test_matmul_does_not_fire_cooperative_reduce(recording_dump):

@@ -12,7 +12,6 @@ import pytest
 import torch
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-_COOP_XFAIL = pytest.mark.xfail(reason="cooperative-reduce removed; planner-driven replacement pending", strict=False)
 
 
 def _randn(shape: str, dtype, scale: float | None = None) -> str:
@@ -108,7 +107,6 @@ def test_run_code_sdpa_k_chunked(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_code_sdpa_tinyllama_per_head(run_cli):
     """Per-head SDPA at TinyLlama-block-seq=512 dimensions, mirroring the
