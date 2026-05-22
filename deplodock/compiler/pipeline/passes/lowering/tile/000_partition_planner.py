@@ -70,7 +70,6 @@ from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
-from deplodock.compiler.pipeline.pipeline import Fork
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -114,8 +113,7 @@ class KernelShape:
     variant of a single kernel: the output axis Loops (innermost-N, optional
     M, extra outer chain), the K reduce Loop (None for pointwise), and the
     set of axis names ``_replace_k_loops`` should rewrite (collected once
-    upfront by ``_classify_and_pick_choices`` instead of re-classified per
-    variant).
+    upfront by ``_split_kernel_fully`` instead of re-classified per variant).
     """
 
     outer_n: Loop
@@ -125,38 +123,17 @@ class KernelShape:
     target_names: frozenset[str]
 
 
-@dataclass(frozen=True)
-class PartitionPlan:
-    """Output of the up-front classification. Holds the body-shape info
-    (``shape``) plus every priority-sorted leaf the kernel admits.
-
-    The fork chain (``_fork_splitk`` → … → ``_fork_fm_fn``) slices
-    ``leaves`` by progressively-pinned knobs; the first leaf in each
-    slice is the highest-priority leaf reachable through that branch.
-    Greedy descends through option-0 at every fork level and lands on
-    ``leaves[0]`` — the same variant the flat enumeration would have
-    picked. MCTS uses each fork's pre-computed ``score`` (priority rank
-    of best-reachable leaf) as its UCB1 unvisited-tiebreak."""
-
-    shape: KernelShape
-    leaves: tuple[TileParams, ...]  # priority-sorted; leaves[0] = today's option-0
-
-
-def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp | Fork]:
+def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
     loop_op: LoopOp = root.op
     # Idempotence is structural: once roles are stamped, _outer_free_loop_chain
-    # returns empty (it requires role=None) and the classifier → None.
-    plan = _classify_and_pick_choices(loop_op, ctx)
-    if plan is None:
+    # returns empty (it requires role=None) and _split_kernel_fully → None.
+    variants = _split_kernel_fully(loop_op, ctx)
+    if variants is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
-    # Cascade through the five fork levels. Degenerate single-value
-    # levels (e.g. matmul has only BR=1; pointwise has BK=SPLITK=1)
-    # recurse inline so no Fork wraps them — the returned shape is
-    # whatever the deepest non-degenerate level produces. Single-leaf
-    # kernels cascade all the way through and emerge as a one-element
-    # list[LoopOp] that ``try_rewrite`` applies inline.
-    return _fork_splitk(loop_op, plan, TileParams(bn=0, bm=0, fm=0, fn=0, bk=0, splitk=0, br=1))
+    if len(variants) == 1:
+        return variants[0]
+    return variants
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -207,14 +184,13 @@ class _BuildSkipped(Exception):
     """Raised by ``_build_split_body`` when the body's shape doesn't match."""
 
 
-def _classify_and_pick_choices(loop_op: LoopOp, ctx: Context) -> PartitionPlan | None:
-    """Up-front classification + priority-sorted leaf enumeration.
+def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
+    """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
 
     Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
     Accum) picks the matmul knob set; any other reduce with extent ≥ warp_size
     picks the cooperative-K set; no qualifying reduce falls to pointwise.
-    ``None`` only when there's no outer chain at all OR no feasible leaf
-    survives the joint cartesian gates."""
+    ``None`` only when there's no outer chain at all."""
     chain = _outer_free_loop_chain(loop_op.body)
     if not chain:
         return None
@@ -312,189 +288,27 @@ def _classify_and_pick_choices(loop_op: LoopOp, ctx: Context) -> PartitionPlan |
         )
 
     param_combos = _filter_by_env(param_combos)
-    if not param_combos:
-        return None
     shape = KernelShape(outer_n=outer_n, outer_m=outer_m, extra_outer=extra_outer, k_loop=k_loop, target_names=target_names)
-    return PartitionPlan(shape=shape, leaves=tuple(param_combos))
-
-
-# --- hierarchical fork chain ----------------------------------------------
-#
-# The hierarchy descends SPLITK → BR → (BN, BM) → BK → (FM, FN). Each level's
-# helper closes over ``loop_op`` and ``plan`` and threads the partially-built
-# ``TileParams``; it slices ``plan.leaves`` by the knobs pinned so far and
-# emits one Fork per remaining choice at this level. Degenerate single-value
-# levels recurse inline (no Fork wrap) so flat shapes (e.g. pointwise) don't
-# pay any indirection.
-
-
-def _build_leaf_loopop(loop_op: LoopOp, shape: KernelShape, params: TileParams) -> LoopOp:
-    """Apply the σ-split body rewrite and stamp all seven knobs. The single
-    place ``_build_split_body`` is called from production code."""
     leading, _ = _split_leading_non_loops(loop_op.body)
-    chain_body = _build_split_body(shape, params)
-    new_body = leading + chain_body
-    knobs = {
-        **loop_op.knobs,
-        BN.name: params.bn,
-        BM.name: params.bm,
-        FM.name: params.fm,
-        FN.name: params.fn,
-        BK.name: params.bk,
-        SPLITK.name: params.splitk,
-        BR.name: params.br,
-    }
-    return LoopOp(body=new_body, knobs=knobs)
-
-
-def _unique_ordered(values) -> list:
-    """Return unique values in first-appearance order. ``plan.leaves`` is
-    priority-sorted so the first leaf carrying a given knob value is the
-    highest-priority leaf reachable through that branch — preserving that
-    order is what makes greedy descend to the same final variant the flat
-    enumeration would have picked."""
-    seen: list = []
-    s: set = set()
-    for v in values:
-        if v not in s:
-            s.add(v)
-            seen.append(v)
-    return seen
-
-
-def _fork_score(plan: PartitionPlan, first_idx: int) -> float:
-    """Fork's MCTS prior — derived from the priority rank of the best leaf
-    reachable through this fork. Highest-priority leaf (index 0) gets the
-    largest score; the last leaf gets the smallest. Lets MCTS's UCB1
-    unvisited-tiebreak (which orders unvisited siblings by ``score``)
-    preserve the priority signal the flat enumeration would have given."""
-    return float(len(plan.leaves) - first_idx)
-
-
-def _fork_splitk(loop_op: LoopOp, plan: PartitionPlan, partial: TileParams) -> list[LoopOp | Fork]:
-    """Outermost fork — pin SPLITK. Most bimodal knob (SPLITK=1 dominates
-    square-matmul shapes within one MCTS measurement); degenerate (1,) for
-    pointwise / cooperative-K, which collapses to a direct recursion."""
-    values_and_idx = _unique_with_first_index(plan.leaves, lambda p: p.splitk)
-    if len(values_and_idx) == 1:
-        v, _ = values_and_idx[0]
-        return _fork_br(loop_op, plan, replace(partial, splitk=v))
-    return [
-        Fork(
-            knobs={SPLITK.name: v},
-            expand=lambda v=v: _fork_br(loop_op, plan, replace(partial, splitk=v)),
-            score=_fork_score(plan, idx),
-        )
-        for v, idx in values_and_idx
-    ]
-
-
-def _fork_br(loop_op: LoopOp, plan: PartitionPlan, partial: TileParams) -> list[LoopOp | Fork]:
-    """Second fork — pin BR (cooperative-K thread count). Degenerate (1,)
-    for matmul / pointwise — only cooperative-reduce kernels see BR>1."""
-    slice_ = [p for p in plan.leaves if p.splitk == partial.splitk]
-    values_and_idx = _unique_with_first_index_in(plan.leaves, slice_, lambda p: p.br)
-    if len(values_and_idx) == 1:
-        v, _ = values_and_idx[0]
-        return _fork_bn_bm(loop_op, plan, replace(partial, br=v))
-    return [
-        Fork(
-            knobs={BR.name: v},
-            expand=lambda v=v: _fork_bn_bm(loop_op, plan, replace(partial, br=v)),
-            score=_fork_score(plan, idx),
-        )
-        for v, idx in values_and_idx
-    ]
-
-
-def _fork_bn_bm(loop_op: LoopOp, plan: PartitionPlan, partial: TileParams) -> list[LoopOp | Fork]:
-    """Third fork — pin (BN, BM) jointly. They couple via thread budget
-    (BN·BM·BR ≤ ctx.max_threads_per_cta), so splitting them across two
-    fork levels would force one level to enumerate joint-infeasible
-    combinations only to filter them at the next level. Joint is sharper."""
-    slice_ = [p for p in plan.leaves if p.splitk == partial.splitk and p.br == partial.br]
-    values_and_idx = _unique_with_first_index_in(plan.leaves, slice_, lambda p: (p.bn, p.bm))
-    if len(values_and_idx) == 1:
-        (bn, bm), _ = values_and_idx[0]
-        return _fork_bk(loop_op, plan, replace(partial, bn=bn, bm=bm))
-    return [
-        Fork(
-            knobs={BN.name: bn, BM.name: bm},
-            expand=lambda bn=bn, bm=bm: _fork_bk(loop_op, plan, replace(partial, bn=bn, bm=bm)),
-            score=_fork_score(plan, idx),
-        )
-        for (bn, bm), idx in values_and_idx
-    ]
-
-
-def _fork_bk(loop_op: LoopOp, plan: PartitionPlan, partial: TileParams) -> list[LoopOp | Fork]:
-    """Fourth fork — pin BK (per-stage K-chunk). Degenerate (1,) for pointwise."""
-    slice_ = [p for p in plan.leaves if p.splitk == partial.splitk and p.br == partial.br and p.bn == partial.bn and p.bm == partial.bm]
-    values_and_idx = _unique_with_first_index_in(plan.leaves, slice_, lambda p: p.bk)
-    if len(values_and_idx) == 1:
-        v, _ = values_and_idx[0]
-        return _fork_fm_fn(loop_op, plan, replace(partial, bk=v))
-    return [
-        Fork(
-            knobs={BK.name: v},
-            expand=lambda v=v: _fork_fm_fn(loop_op, plan, replace(partial, bk=v)),
-            score=_fork_score(plan, idx),
-        )
-        for v, idx in values_and_idx
-    ]
-
-
-def _fork_fm_fn(loop_op: LoopOp, plan: PartitionPlan, partial: TileParams) -> list[LoopOp]:
-    """Bottom of the fork chain — enumerate surviving (FM, FN) pairs and
-    materialize each as a fully-σ-split ``LoopOp``. The only level where
-    ``_build_split_body`` actually runs — upstream Fork thunks pay only
-    knob-filtering cost until MCTS pops one of these leaves."""
-    matches = [
-        p
-        for p in plan.leaves
-        if p.splitk == partial.splitk and p.br == partial.br and p.bn == partial.bn and p.bm == partial.bm and p.bk == partial.bk
-    ]
-    out: list[LoopOp] = []
-    for params in matches:
+    variants: list[LoopOp] = []
+    for params in param_combos:
         try:
-            out.append(_build_leaf_loopop(loop_op, plan.shape, params))
+            chain_body = _build_split_body(shape, params)
         except _BuildSkipped:
             continue
-    return out
-
-
-def _unique_with_first_index(leaves, key):
-    """Walk ``leaves`` (priority-sorted) and return ``[(value, first_idx)]``
-    in first-appearance order. The index gives ``_fork_score`` the priority
-    rank to derive its MCTS prior from."""
-    seen: dict = {}
-    out: list = []
-    for i, p in enumerate(leaves):
-        v = key(p)
-        if v not in seen:
-            seen[v] = i
-            out.append((v, i))
-    return out
-
-
-def _unique_with_first_index_in(all_leaves, slice_, key):
-    """Same as ``_unique_with_first_index`` but indices are positions in
-    ``all_leaves`` (= ``plan.leaves``) for ``_fork_score``'s global rank
-    while ``slice_`` controls which leaves are considered. The slice's
-    iteration order matches its filter from ``all_leaves`` (Python
-    preserves list order), so first-appearance ranks align."""
-    seen: dict = {}
-    out: list = []
-    # Build a quick id-to-index lookup for the slice's positions in all_leaves.
-    all_index = {id(p): i for i, p in enumerate(all_leaves)}
-    for p in slice_:
-        v = key(p)
-        if v in seen:
-            continue
-        idx = all_index[id(p)]
-        seen[v] = idx
-        out.append((v, idx))
-    return out
+        new_body = leading + chain_body
+        knobs = {
+            **loop_op.knobs,
+            BN.name: params.bn,
+            BM.name: params.bm,
+            FM.name: params.fm,
+            FN.name: params.fn,
+            BK.name: params.bk,
+            SPLITK.name: params.splitk,
+            BR.name: params.br,
+        }
+        variants.append(LoopOp(body=new_body, knobs=knobs))
+    return variants or None
 
 
 def _filter_by_env(params: list[TileParams]) -> list[TileParams]:

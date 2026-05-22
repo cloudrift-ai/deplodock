@@ -667,8 +667,10 @@ def _best_fork(forks, parent_cand, db):
             # in ``row.knobs`` with the same value AND at least one of
             # those knobs is constrained by the row; otherwise every
             # sibling is equally consistent and we fall back to option-0.
-            # Lets DB-seeded greedy descend a hierarchical fork chain
-            # whose intermediate levels carry no leaf op yet.
+            # No rule currently emits branch Forks (the partition planner's
+            # hierarchical conversion was reverted as it degraded MCTS
+            # efficiency on small-to-medium shapes); kept here as
+            # documented infrastructure for future hierarchical rules.
             if not opt_knobs:
                 continue
             constraining = [k for k in opt_knobs if k in row.knobs]
