@@ -58,7 +58,17 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Loop, StridedLoop, Write
 from deplodock.compiler.ir.stmt import Stmt as LoopStmt
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.tile.ir import Combine, Stmt, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import (
+    Combine,
+    GridTile,
+    RegisterTile,
+    SerialTile,
+    Stmt,
+    StridedTile,
+    ThreadTile,
+    Tile,
+    TileOp,
+)
 from deplodock.compiler.pipeline import Pattern
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -130,11 +140,97 @@ def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
     body: list[Stmt] = list(leading)
     if output_axes_with_bind:
         bound = tuple(BoundAxis(axis=ax, bind=bind, role=role) for ax, bind, role in output_axes_with_bind)
-        body.append(_lift_output_loops(Tile(axes=bound, body=inner)))
+        lifted = _lift_output_loops(Tile(axes=bound, body=inner))
+        body.append(_convert_tile_to_flavors(lifted))
     else:
-        body.extend(inner)
+        body.extend(_convert_stmt(s) for s in inner)
 
     return TileOp(body=body, name=kernel_name)
+
+
+# ---------------------------------------------------------------------------
+# Final conversion: legacy Tile + Loop-with-roles → new tile-flavor hierarchy
+# ---------------------------------------------------------------------------
+#
+# Coordination passes above run on the still-Loop-IR body (so Role tags and
+# the existing rewrite helpers stay intact). This final walk converts the
+# Tile + body Loop tree into the typed flavor hierarchy that all downstream
+# Tile-IR passes (002+) consume. Once this conversion runs, no ``Loop`` /
+# ``StridedLoop`` / ``Tile`` survives inside ``TileOp.body``.
+
+
+def _convert_tile_to_flavors(tile: Tile) -> Stmt:
+    """Convert the legacy ``Tile(axes=BoundAxis tuple, body=...)`` into a
+    typed parallel-tile flavor (or a ``GridTile`` wrapping a ``ThreadTile``
+    when both bindings are present). Role information that used to live on
+    each ``BoundAxis`` is projected onto the flavor:
+
+    - ``BIND_BLOCK`` axes → ``GridTile.axes``; ``Role.SPLITK_BLOCK`` axis
+      names → ``GridTile.splitk_axes``.
+    - ``BIND_THREAD`` axes → ``ThreadTile.axes``; ``Role.COOPERATIVE_STRIDE``
+      axis names → ``ThreadTile.cooperative_axes``.
+
+    Body stmts are converted recursively via :func:`_convert_stmt`.
+    """
+    block_axes: list[Axis] = []
+    thread_axes: list[Axis] = []
+    splitk_axes: list[str] = []
+    coop_axes: list[str] = []
+    for ba in tile.axes:
+        if ba.bind == BIND_BLOCK:
+            block_axes.append(ba.axis)
+            if ba.role is Role.SPLITK_BLOCK:
+                splitk_axes.append(ba.axis.name)
+        else:  # BIND_THREAD
+            thread_axes.append(ba.axis)
+            if ba.role is Role.COOPERATIVE_STRIDE:
+                coop_axes.append(ba.axis.name)
+
+    new_body = Body(tuple(_convert_stmt(s) for s in tile.body))
+
+    if block_axes and thread_axes:
+        inner = ThreadTile(axes=tuple(thread_axes), body=new_body, cooperative_axes=tuple(coop_axes))
+        return GridTile(axes=tuple(block_axes), body=Body((inner,)), splitk_axes=tuple(splitk_axes))
+    if block_axes:
+        return GridTile(axes=tuple(block_axes), body=new_body, splitk_axes=tuple(splitk_axes))
+    if thread_axes:
+        return ThreadTile(axes=tuple(thread_axes), body=new_body, cooperative_axes=tuple(coop_axes))
+    raise ValueError(f"Tile must have at least one axis, got: {tile.axes!r}")
+
+
+_SERIAL_KIND_FOR_ROLE: dict[Role, str] = {
+    Role.SERIAL_OUTER: "serial_outer",
+    Role.STAGE_INNER: "stage_inner",
+    Role.PIPELINE: "pipeline",
+}
+
+
+def _convert_stmt(s: LoopStmt) -> Stmt:
+    """Recursively rewrite a Loop-IR statement into the new tile-flavor
+    hierarchy. ``Tile`` → ``GridTile`` / ``ThreadTile`` via
+    :func:`_convert_tile_to_flavors`; ``Loop`` → ``RegisterTile`` for the
+    REGISTER role, otherwise ``SerialTile`` with a matching ``kind``;
+    ``StridedLoop`` → ``StridedTile``; ``Cond`` recurses into both bodies;
+    leaves pass through unchanged.
+    """
+    if isinstance(s, Loop):
+        body = Body(tuple(_convert_stmt(c) for c in s.body))
+        if s.role is Role.REGISTER:
+            return RegisterTile(axes=(s.axis,), body=body)
+        kind = _SERIAL_KIND_FOR_ROLE.get(s.role, "plain") if s.role is not None else "plain"
+        return SerialTile(axis=s.axis, body=body, kind=kind, unroll=s.unroll)
+    if isinstance(s, StridedLoop):
+        body = Body(tuple(_convert_stmt(c) for c in s.body))
+        return StridedTile(axis=s.axis, body=body, start=s.start, step=s.step, unroll=s.unroll)
+    if isinstance(s, Cond):
+        return Cond(
+            cond=s.cond,
+            body=Body(tuple(_convert_stmt(c) for c in s.body)),
+            else_body=Body(tuple(_convert_stmt(c) for c in s.else_body)),
+        )
+    if isinstance(s, Tile):
+        return _convert_tile_to_flavors(s)
+    return s
 
 
 def _lift_output_loops(tile: Tile) -> Tile:
