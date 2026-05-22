@@ -1,4 +1,4 @@
-"""Tile IR — schedule decisions as structural Stmts.
+"""Tile IR — schedule decisions as structural Stmts (wrap-body Stage).
 
 Tile IR sits between Loop IR (math) and Kernel IR (fully-scheduled
 kernel form). Its job is to encode the *logical* compute plus the
@@ -13,32 +13,41 @@ Pipeline shape::
                      ──materialize_tile──▶ Kernel IR
                      ──render_kernelop──▶ CUDA source
 
+**Wrap-body Stage:** every ``Stage`` is a block-structured Stmt whose
+``body`` is the *consumer* subtree that uses the staged smem buffers.
+The producer (cooperative Load+Write per source) is synthesized at
+materialize time from ``Stage.sources``. Smem lifetime is structural
+(decl-to-end-of-Stage.body, not implicit-end-of-block).
+
+**Sources.** Each Stage carries one or more ``Source`` entries; each
+Source maps one gmem buffer into one smem slab with its own cache axes
+and origin. Multi-source stages (e.g. A + B in a matmul reduce) load
+both behind a single sync boundary. Stages with genuinely different
+consumer scopes nest instead of multi-sourcing.
+
+**Transport subclasses** (``Stage``, ``BufferedStage``,
+``AsyncBufferedStage``, ``TmaBufferedStage``) encode transport policy:
+sync cooperative load, ring-buffered sync, cp.async, TMA box-copy.
+``pipeline_depth > 1`` on the async / TMA flavors marks a stage for
+temporal pipelining (prologue/main/epilogue), expanded by
+``015_lower_pipelined_async_stage`` before materialization.
+
 **Leaf compute reuses Loop IR.** ``Load`` / ``Assign`` / ``Select`` /
 ``Write`` / ``Accum`` / ``Cond`` come straight from ``ir.loop`` — buf
 names are strings so they're directly renderable.
 
-**Scheduling decisions live where they naturally belong**:
-
-- ``Tile.thread_axes`` / ``Tile.block_axes`` — same shape as
-  ``Tile``: which output axes are bound to thread coords vs CUDA
-  block coords. Pointwise has ``thread_axes`` populated and
-  ``block_axes`` empty (one thread per output element). Cooperative
-  reductions have ``block_axes`` populated and ``thread_axes`` empty;
-  the cooperative thread axis is synthesized at materialization.
-- Loop constructs in the Tile-IR body are ``Loop`` (serial) and
-  ``StridedLoop`` (cooperative — threads stride through the axis).
-  Both are shared with Loop-IR / Kernel-IR via ``ir.stmt``.
-- ``Combine`` — cross-thread collapse of an Accum target; sibling
-  Stmt because it's buffer/accumulator-scoped, not axis-local.
-
-The compute body is ``Loop`` / ``StridedLoop`` / ``Accum`` / ``Load`` /
-``Assign`` / ``Write`` — a straight iteration tree.
+**Tile launch-geometry.** ``Tile.thread_axes`` / ``Tile.block_axes``:
+which output axes are bound to thread coords vs CUDA block coords.
+Pointwise has ``thread_axes`` populated and ``block_axes`` empty (one
+thread per output element). Cooperative reductions have ``block_axes``
+populated and ``thread_axes`` empty; the cooperative thread axis is
+synthesized at materialization.
 """
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -70,52 +79,31 @@ from deplodock.compiler.ir.stmt import (
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
+
 # ---------------------------------------------------------------------------
-# Schedule-bearing Stmts
+# Deprecated AsyncWait stub (stage-wrap-body refactor)
 # ---------------------------------------------------------------------------
 #
-# Scheduling decisions are expressed via ``BoundAxis.bind`` values on
-# ``Tile.axes`` (``BIND_THREAD`` / ``BIND_BLOCK`` for launch geometry)
-# and via the choice of body loop construct (``Loop`` for serial,
-# ``StridedLoop`` for cooperative striding).
-
-
-# ``Tile`` is shared infrastructure — defined in ``ir/stmt.py`` and
-# re-exported here. Used at Tile IR (with Stage / Combine in the body)
-# and at Kernel IR (with Smem / Sync / TreeHalve after materialization).
-
-
-# Tile-IR loop constructs are ``Loop`` (serial) and ``StridedLoop``
-# (cooperative — threads of the block stride through the axis). Both
-# come from ``ir.stmt`` directly; Tile IR doesn't add a wrapper.
+# AsyncWait is preserved as a stub for import compatibility during the
+# stage-wrap-body refactor. The async/TMA pipelining passes that used to
+# emit AsyncWait are stubbed in Phase B and rewritten in Phase C buckets
+# 10/11/12 to fold wait semantics into the wrapping stage's transport
+# policy (pipeline_depth on AsyncBufferedStage / TmaBufferedStage). No
+# new passes should emit AsyncWait; the class deletion happens once
+# Phase C's pipelining + TMA + cp.async buckets close.
 
 
 @dataclass
 class AsyncWait(Stmt):
-    """Synchronize with previously-issued ``AsyncBufferedStage`` /
-    ``TmaBufferedStage`` loads.
+    """**Deprecated** — kept for import compatibility during stage-wrap-body refactor.
 
-    ``keep`` is the number of most-recently-issued cp.async groups that
-    may *remain* in flight after the wait — i.e. the PTX
-    ``cp.async.wait_group N`` argument. ``keep=0`` drains every
-    outstanding group (epilogue / synchronous-style use). ``keep=K``
-    where K equals the number of ``AsyncBufferedStage`` issued per
-    pipelined iteration leaves the just-issued chunk in flight while
-    older chunks complete (steady-state body of a software-pipelined
-    K-outer loop).
+    Pre-refactor: synchronization with previously-issued ``AsyncBufferedStage``
+    / ``TmaBufferedStage`` loads. ``keep`` = cp.async wait_group argument;
+    ``phase`` / ``slot`` = TMA mbarrier phase + ring slot.
 
-    ``phase`` is the consumer-side ring-buffer phase for TMA waits:
-    when set, materialization emits ``MbarrierWait(mbar, phase)`` for
-    each pending TMA mbar, where ``phase`` is the EXPRESSION the consumer
-    is about to read (e.g. ``K_outer % 2`` inside the pipelined main
-    loop, ``(n_chunks - 1) % 2`` for the epilogue's tail wait). Without
-    this, the materializer would have to guess from issuance-time phase
-    expressions, which leak loop-axis Vars across scopes. ``None`` means
-    "cp.async wait" — falls back to ``CpAsyncWait(keep) + Sync()``.
-
-    Carrying ``keep`` explicitly (rather than re-deriving it from the
-    surrounding stage count) keeps the wait correct after structural
-    rewrites such as unrolling a 1-iteration steady-state loop.
+    Post-refactor: wait semantics fold into the wrapping stage's transport
+    policy. Phase C bucket 10 (pipelining) / 11 (cp.async) / 12 (TMA)
+    delete the last emission sites and this class.
     """
 
     keep: int = 0
@@ -137,6 +125,11 @@ class AsyncWait(Stmt):
         if self.slot is not None:
             extra += f", slot={self.slot.pretty()}"
         return [f"{indent}AsyncWait(keep={self.keep}{extra})"]
+
+
+# ---------------------------------------------------------------------------
+# Cross-thread combine (Tile-IR-specific Stmt for cooperative reductions)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -163,9 +156,12 @@ class Combine(Stmt):
         return [f"{indent}Combine({self.name}, op={self.op.name})"]
 
 
-# Bytes per stored element in smem. Today's pipeline emits fp32 only;
-# Stage carries no dtype. If multi-dtype support lands, move this onto
-# Stage as a per-instance field and update callers.
+# ---------------------------------------------------------------------------
+# Stage primitives: Source + CacheDim + AffineAddressing/TemplateAddressing
+# ---------------------------------------------------------------------------
+
+# Bytes per stored element in smem. fp32-only assumption — fp16 paths
+# over-count by 2x (soft latent bug; see project_tile_ir_fp32_only memory).
 BYTES_PER_ELEM = 4
 
 
@@ -197,6 +193,84 @@ class TemplateAddressing:
     exprs: tuple[Expr, ...]
 
 
+@dataclass(frozen=True)
+class CacheDim:
+    """One cache (smem) axis + which source-buffer dim it covers.
+
+    ``axis`` carries the cache axis identity (its ``source_axis``
+    back-pointer, set by 002_stage_inputs at construction time, identifies
+    which original output axis this cache dim corresponds to — used by
+    downstream passes for per-source-axis grouping).
+
+    ``source_dim`` is the index into the source buffer's shape that this
+    cache axis decodes into (i.e. the dim the cache var is added to).
+    """
+
+    axis: Axis
+    source_dim: int
+
+
+@dataclass(frozen=True)
+class Source:
+    """One gmem operand staged into one smem slab.
+
+    Carries everything needed to materialize the cooperative producer:
+
+    - ``name`` — smem buffer name visible to consumer Loads.
+    - ``buf`` — gmem source buffer name (the input).
+    - ``cache_dims`` — per-cache-axis source-dim mapping; defines the
+      slab layout in smem and how cache vars decode into source dims.
+    - ``origin`` — per-source-dim CTA-uniform anchor. The cooperative
+      load reads ``buf[origin[d] + cache_var(d)]`` (affine) or
+      ``buf[template_index[d]]`` (template).
+    - ``pad`` — per-cache-axis bank-conflict-breaking pad. Empty = no
+      pad. Padding affects smem allocation, not the cooperative-load
+      iteration extent.
+    - ``addressing`` — affine when every cache axis appears coef-1 in
+      exactly one source dim; template when the consumer's original
+      Load was a collapsed-reshape and ``origin + decoded`` can't
+      reconstruct it. ``cache_dims`` carries the affine mapping (which
+      source_dim each cache axis maps to); ``template_index`` carries
+      the verbatim source-dim Exprs for the template case.
+    """
+
+    name: str
+    buf: str
+    cache_dims: tuple[CacheDim, ...]
+    origin: tuple[Expr, ...]
+    pad: tuple[int, ...] = ()
+    template_index: tuple[Expr, ...] | None = None
+
+    @property
+    def cache_axes(self) -> tuple[Axis, ...]:
+        return tuple(cd.axis for cd in self.cache_dims)
+
+    @property
+    def addressing(self) -> AffineAddressing | TemplateAddressing:
+        if self.template_index is not None:
+            return TemplateAddressing(exprs=self.template_index)
+        return AffineAddressing(dims=tuple(cd.source_dim for cd in self.cache_dims))
+
+    @property
+    def alloc_extents(self) -> tuple[int, ...]:
+        """Per-cache-axis smem allocation extent: cache extent + pad."""
+        extents = tuple(int(ax.extent) for ax in self.cache_axes)
+        if not self.pad:
+            return extents
+        return tuple(e + p for e, p in zip(extents, self.pad, strict=True))
+
+    @property
+    def smem_bytes(self) -> int:
+        """Bytes of dynamic shared memory this Source allocates (single-slot)."""
+        n = BYTES_PER_ELEM
+        for e in self.alloc_extents:
+            n *= e
+        return n
+
+    def with_pad(self, pad: tuple[int, ...]) -> Source:
+        return replace(self, pad=pad)
+
+
 def trivial_stage_body(
     name: str,
     buf: str,
@@ -204,15 +278,13 @@ def trivial_stage_body(
     axes: tuple[Axis, ...],
     addressing: AffineAddressing | TemplateAddressing,
 ) -> Body:
-    """Build the canonical ``Load + Write`` body for a cooperative-load
-    Stage. Source-side index is reconstructed from ``origin + cache_var``
-    pairs (affine) or kept verbatim (template); the Write target is the
-    Stage's smem name with cache-local Var coords.
+    """**Deprecated** — kept for import compatibility during stage-wrap-body refactor.
 
-    Single source of truth for body synthesis: ``Stage`` callers that don't
-    fuse anything into the producer use this helper directly; the
-    ``primary_load`` / ``origin`` / ``addressing`` properties round-trip
-    through it."""
+    Pre-refactor: built the canonical ``Load + Write`` cooperative-load body
+    for a Stage. Post-refactor: producer body is reconstructed at materialize
+    time from ``Source`` entries; no caller should need this helper. Phase C
+    bucket 12 (swizzle split) removes the last reference.
+    """
     cache_index = tuple(Var(ax.name) for ax in axes)
     if isinstance(addressing, AffineAddressing):
         decoded: dict[int, Expr] = dict(zip(addressing.dims, cache_index, strict=True))
@@ -228,210 +300,82 @@ def trivial_stage_body(
     )
 
 
+def _source_pretty(src: Source) -> str:
+    cache = ", ".join(f"{ax.name}:{ax.extent}@{cd.source_dim}" for ax, cd in zip(src.cache_axes, src.cache_dims, strict=True))
+    origin = ", ".join(e.pretty() for e in src.origin)
+    pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
+    tpl = ""
+    if src.template_index is not None:
+        tpl = " template=[" + ", ".join(e.pretty() for e in src.template_index) + "]"
+    return f"{src.name}<-{src.buf}(origin=({origin}), slab=({cache})){pad}{tpl}"
+
+
+# ---------------------------------------------------------------------------
+# Stage hierarchy — wrap-body
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class Stage(Stmt):
-    """Operand-cache declaration — stage a contiguous slab of a gmem buffer
-    into a named local buffer for reuse across the surrounding ``Tile``
-    body.
+    """Wrap-body cooperative stage. ``body`` is the CONSUMER subtree.
 
-    Synchronous, single-slot form. Materialization emits a leading
-    ``Sync`` (so iter-N compute can finish reading before iter-N+1
-    overwrites smem) plus a cooperative ``Load+Write`` pair and a
-    trailing ``Sync`` so the freshly-loaded smem is visible to all
-    threads in the CTA.
+    Materializes to: ``Sync`` + cooperative ``Load+Write`` per source +
+    ``Sync`` + ``<materialized body>``.
 
-    Carried state:
+    The leading ``Sync`` ensures prev-iteration compute finishes reading
+    before this iteration's slab is overwritten; the trailing ``Sync``
+    makes the freshly-loaded slab visible CTA-wide before the consumer
+    reads it.
 
-    - ``name`` — staged buffer's SSA-like identifier. Subsequent
-      ``Load(input=name, index=cache-local)`` reads in the surrounding
-      Tile body refer to it directly.
-    - ``axes`` — cache axes (smem layout, in this order).
-    - ``body`` — cooperative-load program. Today this is the trivial
-      ``Load(input=src_buf, index=...); Write(output=name, ...)`` pair
-      built by :func:`trivial_stage_body`; future producer-side fusion
-      will inline elementwise compute between the Load and Write.
-    - ``pad`` — bank-conflict-breaking padding (per cache axis).
-
-    The legacy slab-geometry fields (``buf``, ``origin``, ``addressing``)
-    are now derived from ``body``'s primary Load via properties:
-
-    - ``buf = body[0].input``
-    - ``origin = body[0].index`` with cache-axis Vars substituted to 0
-    - ``addressing`` = ``AffineAddressing`` iff every cache axis appears
-      coef-1 in exactly one source dim, else ``TemplateAddressing``
-
-    Transport is encoded structurally via subclass:
-
-    - ``Stage`` (this class) — synchronous cooperative ``Load+Write+Sync``.
-    - ``BufferedStage`` — N rotating smem slabs, sync transport.
-    - ``AsyncBufferedStage`` — cp.async transport, caller-owned ``AsyncWait``.
-    - ``TmaBufferedStage`` — TMA box copy issued by one elected thread,
-      mbarrier-synchronized via ``AsyncWait``.
+    Subclasses (``BufferedStage``, ``AsyncBufferedStage``,
+    ``TmaBufferedStage``) override the producer transport — ring-buffered
+    sync slabs, cp.async copy, or TMA box copy via mbarrier respectively.
     """
 
-    name: str
-    axes: tuple[Axis, ...]
+    sources: tuple[Source, ...]
     body: Body
-    # Per-cache-axis extra extent added to the smem allocation (not to the
-    # cooperative-load extent). Empty tuple = no padding. Used by the bank-
-    # conflict pass to break stride-aliased smem layouts: padding dim ``d``
-    # by ``+1`` shifts every higher-stride row by one float, eliminating
-    # 32-way bank conflicts that arise when adjacent threads stride through
-    # power-of-2 multiples of bank width.
-    pad: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        # Coerce tuple inputs (e.g. from rewrite/with_bodies that build a
-        # plain tuple comprehension) into the Body subclass so downstream
-        # walkers can call ``.map`` / ``.iter`` on Stage's nested body.
         if not isinstance(self.body, Body):
             self.body = Body.coerce(self.body)
-        if len(self.body) < 2:
-            raise ValueError(f"Stage {self.name!r}: body must contain at least one Load and one Write, got {len(self.body)} stmts")
+        if not self.sources:
+            raise ValueError(f"{type(self).__name__}: requires at least one Source")
 
-    # Stage stays opaque to generic body walkers (no ``nested()`` /
-    # ``with_bodies()`` override). Exposing the cooperative-load Loads to
-    # ``008_register_tile``'s ``Body.map``-based F-axis replication would
-    # corrupt their semantics — cache-axis Vars in the body are
-    # smem-local, not values that participate in F-axis register tiling.
-    # σ-substitution through the body is handled explicitly by the
-    # Stage-specific ``rewrite`` / ``simplify`` handlers in
-    # ``deplodock/compiler/ir/tile/passes.py``.
+    def nested(self) -> tuple[Body, ...]:
+        return (self.body,)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return replace(self, body=body)
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
     def external_reads(self) -> tuple[str, ...]:
-        return tuple(s.input for s in self.source_loads)
+        return tuple(s.buf for s in self.sources)
 
     def local_decls(self) -> tuple[str, ...]:
-        return (self.name,)
+        return tuple(s.name for s in self.sources)
 
-    # ------------------------------------------------------------------
-    # Derived slab-geometry views (legacy ``buf`` / ``origin`` /
-    # ``addressing`` field accessors, re-expressed as body-driven
-    # properties so the body is the single source of truth).
-    # ------------------------------------------------------------------
-
-    @property
-    def primary_load(self) -> Load:
-        """The producer-side Load that anchors this Stage's slab.
-
-        Today every Stage body has exactly one Load (trivial cooperative
-        load); raises if a future fused body has more than one source
-        Load. Callers needing all source Loads should use
-        :attr:`source_loads`."""
-        loads = tuple(s for s in self.body if isinstance(s, Load))
-        if len(loads) != 1:
-            raise ValueError(
-                f"Stage {self.name!r}: primary_load undefined — body has {len(loads)} Loads "
-                "(multi-source fused stages must use ``source_loads``)."
-            )
-        return loads[0]
-
-    @property
-    def source_loads(self) -> tuple[Load, ...]:
-        """Every Load in ``body``, in body order. Trivial body returns a
-        1-tuple; fused bodies (future) may return more."""
-        return tuple(s for s in self.body if isinstance(s, Load))
-
-    @property
-    def buf(self) -> str:
-        """Source gmem buffer name. ``body[0].input`` for the trivial /
-        single-source case."""
-        return self.primary_load.input
-
-    @property
-    def origin(self) -> tuple[Expr, ...]:
-        """Per-source-dim CTA-uniform anchor: ``primary_load.index`` with
-        every cache-axis Var substituted to 0 and simplified."""
-        from deplodock.compiler.ir.expr import SimplifyCtx  # noqa: PLC0415
-        from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
-
-        sigma = Sigma({ax.name: Literal(0, "int") for ax in self.axes})
-        ctx = SimplifyCtx.empty()
-        return tuple(sigma.reduce(e, ctx) for e in self.primary_load.index)
-
-    @property
-    def addressing(self) -> AffineAddressing | TemplateAddressing:
-        """Affine if every cache axis appears coef-1 in exactly one source
-        dim of ``primary_load.index``, else template (verbatim index)."""
-        from deplodock.compiler.ir.expr import SimplifyCtx  # noqa: PLC0415
-        from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
-
-        index = self.primary_load.index
-        var_to_dim: dict[str, int] = {}
-        for ax in self.axes:
-            dims = [d for d, e in enumerate(index) if ax.name in e.free_vars()]
-            if len(dims) != 1:
-                return TemplateAddressing(exprs=index)
-            var_to_dim[ax.name] = dims[0]
-
-        ctx = SimplifyCtx.empty()
-        origin = self.origin
-        for ax in self.axes:
-            d = var_to_dim[ax.name]
-            one_sigma = Sigma({a.name: (Literal(1, "int") if a.name == ax.name else Literal(0, "int")) for a in self.axes})
-            actual = one_sigma.reduce(index[d], ctx)
-            expected = (origin[d] + Literal(1, "int")).simplify(ctx)
-            if actual.pretty() != expected.pretty():
-                return TemplateAddressing(exprs=index)
-
-        return AffineAddressing(dims=tuple(var_to_dim[ax.name] for ax in self.axes))
-
-    @property
-    def alloc_extents(self) -> tuple[int, ...]:
-        """Per-cache-axis smem allocation extent: cache extent + ``pad``.
-
-        The cooperative load iterates over the unpadded extents; the
-        smem allocation reserves the padded ones. Used by every smem-
-        sizing check in the tile-lowering chain (007 admission, 012
-        bank-pad budget, 013 double-buffer budget, materialize
-        ``Smem.extents``)."""
-        extents = tuple(int(ax.extent) for ax in self.axes)
-        if not self.pad:
-            return extents
-        return tuple(e + p for e, p in zip(extents, self.pad, strict=True))
+    def exprs(self) -> tuple[Expr, ...]:
+        out: tuple[Expr, ...] = ()
+        for s in self.sources:
+            out = (*out, *s.origin)
+            if s.template_index is not None:
+                out = (*out, *s.template_index)
+        return out
 
     @property
     def smem_bytes(self) -> int:
-        """Bytes of dynamic shared memory this Stage allocates.
+        return sum(s.smem_bytes for s in self.sources)
 
-        ``product(alloc_extents) * BYTES_PER_ELEM`` × ``buffer_count``
-        (the latter only for ``BufferedStage`` subtypes). Assumes
-        ``BYTES_PER_ELEM == 4`` (fp32) — matches today's kernel
-        codegen, which has no per-Stage dtype field."""
-        n = BYTES_PER_ELEM
-        for e in self.alloc_extents:
-            n *= e
-        return n
-
-    def exprs(self) -> tuple[Expr, ...]:
-        # Exprs visible to generic Expr walkers (axis-dep analysis in 008,
-        # σ-substitution targets in 015). Iterate every source Load's index
-        # so fused stages expose all gmem references; trivial stages
-        # reduce to ``(*origin,)`` (one Load, AffineAddressing).
-        out: tuple[Expr, ...] = ()
-        for src in self.source_loads:
-            out = (*out, *src.index)
-        return out
+    def replace_sources(self, sources: tuple[Source, ...]) -> Stage:
+        return replace(self, sources=sources)
 
     def pretty(self, indent: str = "") -> list[str]:
-        if len(self.source_loads) > 1:
-            srcs = ", ".join(src.input for src in self.source_loads)
-            cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes)
-            pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
-            head = f"{indent}{self.name} = {type(self).__name__}(fuse[{srcs}], cache=({cache})){pad}{self._pretty_extra()}:"
-            return [head, *pretty_body(self.body, indent + INDENT)]
-        origin = ", ".join(e.pretty() for e in self.origin)
-        if isinstance(self.addressing, AffineAddressing):
-            slab = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(self.axes, self.addressing.dims, strict=True))
-        else:
-            cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in self.axes)
-            tpl = ", ".join(e.pretty() for e in self.addressing.exprs)
-            slab = f"{cache} template=[{tpl}]"
-        pad = f" pad=({', '.join(str(p) for p in self.pad)})" if self.pad and any(self.pad) else ""
-        return [f"{indent}{self.name} = {type(self).__name__}({self.buf}, origin=({origin}), slab=({slab})){pad}{self._pretty_extra()}"]
+        sources_pretty = "; ".join(_source_pretty(s) for s in self.sources)
+        head = f"{indent}{type(self).__name__}([{sources_pretty}]){self._pretty_extra()}:"
+        return [head, *pretty_body(self.body, indent + INDENT)]
 
     def _pretty_extra(self) -> str:
         return ""
@@ -455,7 +399,7 @@ class BufferedStage(Stage):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.buffer_count < 2:
-            raise ValueError(f"BufferedStage {self.name!r}: buffer_count must be >= 2, got {self.buffer_count}")
+            raise ValueError(f"BufferedStage: buffer_count must be >= 2, got {self.buffer_count}")
 
     @property
     def smem_bytes(self) -> int:
@@ -473,13 +417,21 @@ class AsyncBufferedStage(BufferedStage):
     """Buffered stage transported via ``cp.async``.
 
     Materialize emits ``Smem`` + cooperative ``CpAsyncCopy`` +
-    ``CpAsyncCommit`` only — *no* implicit wait, *no* ``Sync``. The
-    caller must dominate every consumer with an ``AsyncWait`` Stmt.
-    Requires sm_80+ (gated by ``013_async_copy``).
+    ``CpAsyncCommit`` per source; the wait is implicit at the wrap
+    boundary (cp.async wait_group(0) + Sync). Requires sm_80+.
+
+    ``pipeline_depth == 1`` ⇒ simple wait-at-boundary lowering.
+    ``pipeline_depth > 1`` ⇒ the enclosing K-outer Loop is software-
+    pipelined: a prologue issues the first depth-1 chunks, the main
+    Loop overlaps issue+wait+compute, the epilogue drains. Expansion
+    happens in ``015_lower_pipelined_async_stage`` before materialize.
     """
 
+    pipeline_depth: int = field(default=1, kw_only=True)
+
     def _pretty_extra(self) -> str:
-        return f"{super()._pretty_extra()} async"
+        depth = f" depth={self.pipeline_depth}" if self.pipeline_depth > 1 else ""
+        return f"{super()._pretty_extra()} async{depth}"
 
 
 class SwizzleMode(enum.Enum):
@@ -503,102 +455,76 @@ class TmaBufferedStage(BufferedStage):
     Materialize emits a ``TmaDescriptor`` (host-side ``CUtensorMap``,
     hoisted to kernel prologue), an ``MbarrierInit``, and at the stage
     site a ``Cond(tid==0, [MbarrierArriveExpectTx, TmaLoad])`` — one
-    elected thread issues the box copy. Pairs with ``AsyncWait`` which
-    lowers to ``MbarrierWait(phase)`` (no trailing ``Sync`` — mbarrier
-    arrival already provides CTA-wide visibility).
+    elected thread issues the box copy. The mbarrier wait is implicit
+    at the wrap boundary; the trailing ``Sync`` is omitted because
+    mbarrier arrival already provides CTA-wide visibility.
 
-    Requires sm_90+ and ``--gpu-architecture=sm_90a`` (gated by
-    ``011_tma_copy``). Eligible only for ``AffineAddressing`` with the
-    inner source dim contiguous and 16 B aligned.
+    Requires sm_90+ and ``--gpu-architecture=sm_90a``. Eligible only for
+    ``AffineAddressing`` with the inner source dim contiguous and 16 B
+    aligned. ``pad`` must be empty (TMA box writes contiguous rows;
+    bank-pad would misalign).
+
+    ``pipeline_depth`` mirrors ``AsyncBufferedStage``.
     """
 
+    pipeline_depth: int = field(default=1, kw_only=True)
     swizzle: SwizzleMode = field(default=SwizzleMode.NONE, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        # TMA box copies write rows back-to-back at the cache extent;
-        # bank-conflict ``+1`` padding (set by ``014_pad_smem`` for
-        # cp.async / sync stages) would put body Loads' padded stride out
-        # of step with the unpadded box write. The pad pass already skips
-        # ``TmaBufferedStage`` — this assertion catches any future caller
-        # that constructs a TMA stage with stale pad.
-        if self.pad and any(self.pad):
-            raise ValueError(f"TmaBufferedStage {self.name!r}: pad must be empty, got {self.pad!r}")
+        for s in self.sources:
+            if s.pad and any(s.pad):
+                raise ValueError(f"TmaBufferedStage: source {s.name!r} pad must be empty, got {s.pad!r}")
 
     def _pretty_extra(self) -> str:
+        depth = f" depth={self.pipeline_depth}" if self.pipeline_depth > 1 else ""
         sw = "" if self.swizzle == SwizzleMode.NONE else f" swizzle={self.swizzle.value}"
-        return f"{super()._pretty_extra()} tma{sw}"
+        return f"{super()._pretty_extra()} tma{depth}{sw}"
 
 
 @dataclass
 class ComputeStage(Stage):
-    """Compute Stage — hoisted invariant compute sitting between transport
-    Stages and a reduce body.
+    """Hoisted invariant compute Stage.
 
-    Distinguished from a canonical (transport) ``Stage`` by what its body
-    Loads read: a transport Stage's body Loads target the gmem source
-    buffer; a ``ComputeStage``'s body Loads target *sibling* Stage smem
-    buffers and the body runs an elementwise chain whose result is
-    written into ``ComputeStage``'s own smem buffer.
+    Distinguished from a transport Stage by ``compute``: a per-thread
+    cooperative compute body that runs once per stage activation,
+    reading from sibling-stage smem (via ``Source`` entries whose ``buf``
+    names a sibling Stage's smem buffer) and writing into this Stage's
+    smem allocation.
 
-    Produced by the hoist-invariant-compute path: when a reduce-body
-    cone depends only on cache-axes of a producer-Stage group, the cone
-    Assigns are lifted into a ``ComputeStage`` that allocates its own
-    smem and reads from the sibling transports. Downstream:
-
-    - 010 keeps the canonical transport-Stage promotion path and
-      handles a ``ComputeStage`` separately (no gmem to ring-buffer; the
-      ``BUFFER_COMPUTE`` knob optionally ring-buffers the *output*
-      buffer so reduce reads pipeline across K_outer).
-    - 011 / 013 skip ``ComputeStage`` (no gmem transport to narrow).
-    - 015 places ``ComputeStage`` between the wait and the K_inner
-      reduce in the steady-state body — exactly the slot the cone needs.
-    - materialize_tile hoists the smem allocation to kernel scope and
-      emits the body as a per-thread cooperative compute (no
-      ``CpAsyncCopy`` / ``TmaLoad`` — body Loads target sibling smem).
+    No gmem transport — sources' ``buf`` names target smem, not gmem.
+    ``external_reads`` returns empty so 015 / 013 / 011 don't classify
+    compute stages as gmem-transport eligibility candidates.
 
     Optional ``buffer_count`` / ``phase`` mirror ``BufferedStage`` so 010
-    can promote a ``ComputeStage`` to a ring-buffered output without a
-    separate ``BufferedComputeStage`` class. ``buffer_count = 1``
-    (default) means single-slot; ``>= 2`` requires ``phase``.
+    can promote a ``ComputeStage`` to a ring-buffered output. ``buffer_count
+    = 1`` (default) means single-slot; ``>= 2`` requires ``phase``.
     """
 
+    compute: Body = field(default_factory=lambda: Body(()), kw_only=True)
     buffer_count: int = field(default=1, kw_only=True)
     phase: Expr | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if not isinstance(self.compute, Body):
+            self.compute = Body.coerce(self.compute)
         if self.buffer_count < 1:
-            raise ValueError(f"ComputeStage {self.name!r}: buffer_count must be >= 1, got {self.buffer_count}")
+            raise ValueError(f"ComputeStage: buffer_count must be >= 1, got {self.buffer_count}")
         if self.buffer_count > 1 and self.phase is None:
-            raise ValueError(f"ComputeStage {self.name!r}: phase required when buffer_count > 1")
+            raise ValueError("ComputeStage: phase required when buffer_count > 1")
 
-    # Sibling-smem reads aren't external buffer dependencies — the
-    # producers live in the same Tile scope. Returning empty here keeps
-    # 015's TMA/async eligibility checks and the gmem-buffer
-    # enumeration in tuning.py from misclassifying ComputeStage's body
-    # Loads as gmem.
+    def nested(self) -> tuple[Body, ...]:
+        return (self.compute, self.body)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (compute, body) = bodies
+        return replace(self, compute=compute, body=body)
+
     def external_reads(self) -> tuple[str, ...]:
+        # Sibling-smem reads aren't external buffer dependencies — the
+        # producers live in the same Tile scope.
         return ()
-
-    @property
-    def primary_load(self) -> Load:
-        raise ValueError(
-            f"ComputeStage {self.name!r}: primary_load undefined — compute stages read from "
-            "multiple sibling smem buffers. Use ``source_loads`` for the body Loads."
-        )
-
-    @property
-    def buf(self) -> str:
-        raise ValueError(f"ComputeStage {self.name!r}: buf undefined — compute stages have no single gmem source.")
-
-    @property
-    def origin(self) -> tuple[Expr, ...]:
-        raise ValueError(f"ComputeStage {self.name!r}: origin undefined — compute stages have no gmem slab anchor.")
-
-    @property
-    def addressing(self) -> AffineAddressing | TemplateAddressing:
-        raise ValueError(f"ComputeStage {self.name!r}: addressing undefined — compute stages have no gmem source dim.")
 
     @property
     def smem_bytes(self) -> int:
@@ -633,9 +559,6 @@ class TileOp(BodyOp):
     def __post_init__(self) -> None:
         from deplodock.compiler.ir.stmt import normalize_body
 
-        # Body is a tuple subclass; coerce so ``Op(body=tuple_value)``
-        # keeps working without forcing wrapping at every rule's
-        # rewrite site.
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
@@ -646,40 +569,17 @@ class TileOp(BodyOp):
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would
-        exceed device limits. Two checks:
+        exceed device limits (threads-per-CTA and dynamic smem).
 
-        - **threads ≤ ``ctx.max_threads_per_cta``** (1024 on every CUDA
-          capability we support). Without this, F-fork candidates like
-          ``(FM=1, FN=2)`` on a ``BM=64, BN=128`` tile spawn a CTA of
-          64×64=4096 threads — the driver rejects it but the engine has
-          already burned compile + bench wall-budget on it.
-        - **staged smem footprint ≤ ``ctx.max_dynamic_smem``**.
-          Sums every ``Stage.smem_bytes`` in the body (including nested
-          Stages inside reduce loops). The check uses raw stage bytes —
-          no upfront slack for the upcoming ``010_double_buffer`` /
-          ``014_pad_smem`` overhead. Those passes' decisions are part of
-          the autotune surface; when their multipliers push a variant
-          over the cap, ``KernelOp.validate`` is the second-line gate.
-          Without this tile-stage check, three-pass naive softmax +
-          ``@V`` at large head_dim/seq stages mul+mask in three separate
-          smem regions whose total exceeds the device cap and crashes
-          the launch with ``CUDA_ERROR_INVALID_VALUE``.
-
-        Pre-register-tile TileOps (the post-blockify state, where THREAD
-        extents are ``BM, BN`` and the register-tile rule will still
-        divide by ``(FM, FN)``) skip the THREAD check — otherwise we'd
-        reject every healthy pre-tile candidate. The smem check runs at
-        every stage where Stages are present."""
+        Pre-register-tile TileOps skip the THREAD check; the smem check
+        runs whenever Stages are present.
+        """
         from math import prod  # noqa: PLC0415
 
-        # Staged-smem check — runs whether or not register_tile fired,
-        # since 002_stage_inputs can add Stages independently.
         staged = sum(s.smem_bytes for s in self.body.iter() if isinstance(s, Stage))
         if staged > ctx.max_dynamic_smem:
             return False
 
-        # THREAD-count check — only after register_tile committed.
-        # ``FM`` presence in knobs is the post-008 marker.
         if "FM" not in self.knobs:
             return True
         tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
@@ -692,68 +592,13 @@ class TileOp(BodyOp):
         return threads <= ctx.max_threads_per_cta
 
     def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
-        """Autotune prior over the failure modes we've observed:
-
-        - Sub-warp launch (threads < 32) → ``-2.0``. A 4-thread CTA wastes
-          ~7/8 of every warp instruction.
-        - Single cell per thread → ``-1.0``. No work per thread, every
-          load goes to global memory (no register reuse), memory-bound.
-        - Massive unroll (cells/thread > 64) → graduated penalty up to
-          ``-1.0``. NVRTC compile time explodes on the unrolled body.
-        - Under-filled launch (ctas < ``_TARGET_CTAS``) → linear penalty
-          up to ``-1.0`` at 1 CTA, scaled by ``(target − ctas) / target``.
-          The dominant failure mode on transformer-prefill GEMMs — a
-          ``(1,128) @ (128,2048)`` matmul at ``FM·FN = 32`` lands ~32
-          CTAs, ~10% of a 1-wave fill on a 100-SM GPU, and cuBLAS beats
-          us 4× until SPLITK kicks more CTAs into the launch.
-        - Well-filled launch (``_TARGET_CTAS`` ≤ ctas ≤ 2048) → ``+0.5``.
-          Modest positive credit so SPLITK variants that lift an
-          under-filled launch into the sweet spot can beat their
-          SPLITK=1 sibling on prior alone (before any measurement).
-        - CTA count above ``2048`` → graduated penalty up to ``-2.5``.
-          A typical sm_120-class GPU has ~150 SMs running ~2 concurrent
-          CTAs each; 2 k CTAs is ~7 waves, beyond which the command
-          processor spends most of its time scheduling tiny waves and
-          atomic fan-in on output writebacks serializes hard (see the
-          ``BM=16, BN=16`` failure on ``(M=32, K=3584, N=18944)`` —
-          2 k+ CTAs, 1 cell/thread, kernel runs >3 s).
-        - Distance from 256 threads/CTA → up to ``-1.0`` baseline,
-          doubled to ``-2.0`` when post-register-tile ``cells < 16``
-          (thin per-thread compute can't amortize the launch + atomic
-          overhead at a wide launch).
-        - High SPLITK (``> 8``) → graduated penalty up to ``-1.0``.
-          Cross-CTA L2 contention per output cell scales with SPLITK
-          (each CTA in the split races on the same address). The earlier
-          ``atomic_writes × threads × ctas`` formula counted each cell of
-          the unrolled register tile as a separate atomic op, then hit
-          the threshold on every realistic transformer matmul because
-          ``M·N ≥ 256k`` always — anti-correlated with measured perf
-          (penalised SPLITK=4 / 37 µs winner harder than SPLITK=1 /
-          752 µs loser on q_proj s128). The SPLITK-only formula matches
-          empirical L2 contention without firing on healthy splits.
-        - Stages (smem staging) → ``+1.0``. Walks the body recursively
-          (Stage stmts live inside the loop nest post-staging, not at
-          the Tile's direct children).
-        - Register tile fired (``FM * FN > 1``) → ``+1.0``.
-
-        Pre-register-tile TileOps are scored on a *predicted* final thread
-        count (assuming 008 will pick F to target ~256 threads when
-        possible). Post-register-tile TileOps use the actual ``FM``,
-        ``FN`` from knobs.
-        """
         from math import prod  # noqa: PLC0415
 
         from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
 
         target_threads = 256
-        # ~1 wave on a 100-SM GPU at 2-4 concurrent CTAs/SM. Used as the
-        # boundary between under-filled (penalty) and well-filled (bonus)
-        # launches.
         target_ctas = 256
         score = 0.0
-        # ``self.body.iter()`` is recursive — by the time this TileOp
-        # is scored, ``chunk_matmul_k`` etc. may have wrapped the Tile
-        # in a K-outer ``Loop``, so the top-level iter doesn't see it.
         tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
         if tile is None:
             return 0.0
@@ -767,27 +612,15 @@ class TileOp(BodyOp):
         ctas = prod(block_extents) if block_extents else 1
 
         if "FM" in self.knobs:
-            # Post-008: knobs carry the actual cell shape.
             final_threads = threads
             cells = max(1, int(self.knobs.get("FM", 1)) * int(self.knobs.get("FN", 1)))
         elif threads >= 1024:
-            # Pre-008 but large enough that 008 will likely divide F to
-            # target ~256 threads.
             final_threads = target_threads
             cells = max(1, threads // target_threads)
         else:
-            # Pre-008 small tile — 008's heuristic gate will likely skip,
-            # so the kernel emits 1 cell per thread.
             final_threads = threads
             cells = 1
 
-        # Thread count penalty. Slope is gentle by default (``/target``),
-        # but doubles when ``cells < 16`` post-register-tile — a wide
-        # launch with thin per-thread compute can't amortize the launch
-        # + atomic-fanin overhead. Observed on
-        # ``matmul_add (1,128,2048)x(2048,2048)+r``: (threads=512,
-        # cells=32) ran in 37 us while (threads=512, cells=8) hung the
-        # bench. The conjunctive penalty distinguishes them.
         if final_threads < 32:
             score -= 2.0
         elif final_threads > 1024:
@@ -797,19 +630,11 @@ class TileOp(BodyOp):
             multiplier = 2.0 if (cells < 16 and "FM" in self.knobs) else 1.0
             score -= min(distance / target_threads * multiplier, 2.0)
 
-        # Cells-per-thread penalty.
         if cells == 1:
             score -= 1.0
         elif cells > 64:
             score -= min((cells - 64) / 64.0, 1.0)
 
-        # CTA count: under-fill BAD (the dominant failure mode), well-fill
-        # GOOD (modest bonus), over-fill BAD again. The previous formula
-        # only had a flat ``-0.5`` at ``ctas < 32`` plus a tail penalty
-        # past 2 k; that left a huge under-filled-launch dead zone (32 ≤
-        # ctas < 256) where the heuristic was indifferent between filling
-        # the GPU and not — and on transformer-prefill GEMMs that's
-        # exactly the regime where SPLITK matters.
         if ctas < target_ctas:
             score -= (target_ctas - ctas) / target_ctas
         elif ctas <= 2048:
@@ -817,20 +642,10 @@ class TileOp(BodyOp):
         else:
             score -= min((ctas - 2048) / 4096.0, 2.5)
 
-        # SPLITK contention penalty. Cross-CTA split-K races ``SPLITK``
-        # CTAs on each output cell's L2 line; the previous formula was
-        # ``atomic_writes × threads × ctas`` which counted each cell of
-        # the FM·FN-unrolled register tile as a separate atomic and hit
-        # the threshold on every realistic matmul (M·N ≥ 256 k always).
-        # SPLITK ≤ 8 is fine on sm_120; past that L2 contention rises
-        # super-linearly.
         splitk = int(self.knobs.get("SPLITK", 1))
         if splitk > 8:
             score -= min((splitk - 8) / 8.0, 1.0)
 
-        # Bonuses. Stage stmts get added by ``002_stage_inputs`` deeper
-        # inside the body (under the loop nest), not at ``tile.body``'s
-        # direct children — walk the body recursively to find them.
         if any(isinstance(s, _Stage) for s in self.body.iter()):
             score += 1.0
         if "FM" in self.knobs:
@@ -840,17 +655,10 @@ class TileOp(BodyOp):
 
 
 # ---------------------------------------------------------------------------
-# Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
+# Cooperative thread-block size — number of threads per CUDA block when a
+# Tile uses BIND_THREAD axes from a cooperative strategy.
 # ---------------------------------------------------------------------------
 
-
-# Cooperative thread-block size — number of threads per CUDA block when a
-# Tile uses BIND_THREAD axes from a cooperative strategy. Lives at this
-# layer because cooperative strategies (cooperative-reduce, blockify)
-# already commit to "this many threads cooperate" when they choose axis
-# binds and tile sizes; materialization just consumes the choice.
-# Overridable via ``DEPLODOCK_BN`` for sweeps (shared with the matmul
-# path — mutually exclusive per kernel).
 from deplodock.compiler.tuning import cooperative_block_size as _coop_block_size  # noqa: E402
 
 BLOCK_SIZE = _coop_block_size()
@@ -887,7 +695,10 @@ __all__ = [
     "SwizzleMode",
     "AffineAddressing",
     "TemplateAddressing",
-    "AsyncWait",
+    "CacheDim",
+    "Source",
+    "AsyncWait",  # deprecated stub during refactor
+    "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
     # Bindings
     "BoundAxis",
@@ -903,9 +714,5 @@ __all__ = [
     "ElementwiseImpl",
 ]
 
-# Register Tile-IR stmts with the shared rewrite/simplify dispatch (Stage
-# subtree via introspection, AsyncWait + Combine via dedicated handlers).
-# Imported here — after class definitions — so the tile→stmt→tile cycle
-# resolves cleanly: ``stmt.passes`` doesn't know about Tile-IR types, and
-# ``tile.passes`` re-imports back into this module for the concrete classes.
+# Register Tile-IR stmts with the shared rewrite/simplify dispatch.
 from deplodock.compiler.ir.tile import passes as _passes  # noqa: E402, F401
