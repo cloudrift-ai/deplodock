@@ -72,12 +72,14 @@ from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, affine_form
-from deplodock.compiler.ir.stmt import Body, Load, Stmt, Tile, Write
+from deplodock.compiler.ir.stmt import Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
+    replace_thread_tile_body,
     single_tile,
+    thread_tile_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,9 +103,10 @@ def rewrite(ctx: Context, match: Match, root: Node) -> Graph | None:
 
 
 def _maybe_rewrite(body: Body, *, lds128_bytes: int, buf_nbytes: dict[str, int]) -> Body | None:
-    idx, tile = single_tile(body)
+    idx, outer = single_tile(body)
+    tile = thread_tile_of(outer)
 
-    thread_axes = tile.thread_axes
+    thread_axes = tile.axes
     if len(thread_axes) < 2:
         raise RuleSkipped("need >=2 THREAD axes (matmul-shaped tile)")
 
@@ -137,7 +140,8 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, buf_nbytes: dict[str, int])
         raise RuleSkipped("no Stage has a fixable lane-stride bank conflict")
 
     chunk_stride = vec_elems * lane_ext
-    new_tile = Tile(axes=tile.axes, body=_rewrite_body(tile.body, lane.name, F, chunk_stride, vec_elems=vec_elems))
+    new_body = _rewrite_body(tile.body, lane.name, F, chunk_stride, vec_elems=vec_elems)
+    new_tile = replace_thread_tile_body(outer, new_body)
     logger.debug(
         "chunk N register-tile on lane=%s F=%d -> stride=%d, chunks=%d (chunk_stride=%d, BN=%d)",
         lane.name,
@@ -150,7 +154,7 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, buf_nbytes: dict[str, int])
     return body[:idx] + (new_tile,) + body[idx + 1 :]
 
 
-def _vec_elems_for_lane(tile: Tile, lane_var: str, *, lds128_bytes: int, buf_nbytes: dict[str, int]) -> int | None:
+def _vec_elems_for_lane(tile, lane_var: str, *, lds128_bytes: int, buf_nbytes: dict[str, int]) -> int | None:
     """Elements per LDS.128 at the dtype of the Stage(s) whose consumer
     Loads reference ``lane_var``. Tile-IR Stages carry no dtype, so we
     look up ``stage.buf``'s dtype byte-size via ``buf_nbytes``.
@@ -216,7 +220,7 @@ def _infer_lane_stride(body: Body, lane_var: str) -> int | None:
     return F
 
 
-def _stage_max_way(loads: list[Load], extents: tuple[int, ...], leading_phase: bool, tile: Tile) -> int | None:
+def _stage_max_way(loads: list[Load], extents: tuple[int, ...], leading_phase: bool, tile) -> int | None:
     """Worst-case ``max_way`` across body ``loads`` of one Stage at the
     given (un-padded) cache extents. ``None`` when any Load can't be
     evaluated (rank mismatch). Auto-zero-binds non-thread free vars,
@@ -226,14 +230,14 @@ def _stage_max_way(loads: list[Load], extents: tuple[int, ...], leading_phase: b
         cache_idx = ld.index[1:] if leading_phase else ld.index
         if len(cache_idx) != len(extents):
             return None
-        dist = lane_bank_distribution(tuple(cache_idx), extents, tile.thread_axes)
+        dist = lane_bank_distribution(tuple(cache_idx), extents, tile.axes)
         if dist is None:
             return None
         worst = max(worst, dist.max_way)
     return worst
 
 
-def _swap_helps_any_stage(tile: Tile, lane_var: str, F: int, lane_ext: int, *, vec_elems: int) -> bool:
+def _swap_helps_any_stage(tile, lane_var: str, F: int, lane_ext: int, *, vec_elems: int) -> bool:
     """At least one Stage has a fixable bank conflict that the chunked
     rewrite would drive lower. Reuses the shared bank kernel from
     ``compiler/diagnostics/bank_conflicts``.

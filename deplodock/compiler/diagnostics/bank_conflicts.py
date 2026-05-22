@@ -30,8 +30,8 @@ from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.stmt import Cond, Load, Loop, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.stmt import Cond, Load
+from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, RegisterTile, SerialTile, Stage, StridedTile, ThreadTile, TileOp
 
 WARP_SIZE = 32
 BANKS = 32
@@ -52,10 +52,11 @@ class StageBinding:
 
     stage: Stage
     load: Load
-    tile: Tile
+    tile: ParallelTile  # the per-thread scope (ThreadTile, or GridTile+ThreadTile nest's ThreadTile)
     enclosing_loop_axes: tuple[Axis, ...]  # outermost-first
     tile_op_name: str = ""
     source: object = None  # the matching Source (carries .name / .buf / .cache_axes / .pad)
+    block_axes: tuple[Axis, ...] = ()  # outer GridTile axes (empty for pointwise)
 
 
 @dataclass
@@ -117,18 +118,31 @@ def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> lis
             continue
         tile_op = node.op
         for top in tile_op.body:
-            if not isinstance(top, Tile):
+            block_axes: tuple[Axis, ...] = ()
+            if isinstance(top, GridTile):
+                block_axes = top.axes
+                # Find the inner ThreadTile.
+                tt: ThreadTile | None = None
+                for child in top.body:
+                    if isinstance(child, ThreadTile):
+                        tt = child
+                        break
+                if tt is None:
+                    continue
+            elif isinstance(top, ThreadTile):
+                tt = top
+            else:
                 continue
             # Map smem buffer name → (Stage, Source) for every staged buffer.
             # The wrap-body Stage carries multiple Sources, each with its own
             # smem name — bank-conflict bindings are per-Source, not per-Stage.
             sources: dict[str, tuple[Stage, object]] = {}
-            for s in _walk(top.body):
+            for s in _walk(tt.body):
                 if isinstance(s, Stage):
                     for src in s.sources:
                         if stage_filter is None or src.name in stage_filter:
                             sources.setdefault(src.name, (s, src))
-            for load, axes in _walk_loads(top.body, ()):
+            for load, axes in _walk_loads(tt.body, ()):
                 if load.input in sources:
                     stage, src = sources[load.input]
                     out.append(
@@ -136,9 +150,10 @@ def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> lis
                             stage=stage,
                             source=src,
                             load=load,
-                            tile=top,
+                            tile=tt,
                             enclosing_loop_axes=axes,
                             tile_op_name=tile_op.name or "",
+                            block_axes=block_axes,
                         )
                     )
     return out
@@ -157,9 +172,11 @@ def _walk_loads(body, axes: tuple[Axis, ...]):
     for s in body:
         if isinstance(s, Load):
             yield s, axes
-        if isinstance(s, (Loop, StridedLoop)):
+        if isinstance(s, (SerialTile, StridedTile)):
             yield from _walk_loads(s.body, (*axes, s.axis))
-        elif isinstance(s, Tile):
+        elif isinstance(s, RegisterTile):
+            yield from _walk_loads(s.body, axes + tuple(s.axes))
+        elif isinstance(s, (GridTile, ThreadTile)):
             yield from _walk_loads(s.body, axes)
         elif isinstance(s, Cond):
             yield from _walk_loads(s.body, axes)
@@ -399,21 +416,36 @@ def _analyze_kernel(kernel_op, Smem, stage_filter, k_iter: int, warp_id: int) ->
     smem_decls = {s.name: s for s in body.iter_of_type(Smem) if stage_filter is None or s.name in stage_filter}
     if not smem_decls:
         return []
-    tiles = body.iter_of_type(Tile)
-    if not tiles:
+    # Locate the per-thread scope (ThreadTile) + block_axes (GridTile if any).
+    tt: ThreadTile | None = None
+    block_axes: tuple[Axis, ...] = ()
+    for s in body:
+        if isinstance(s, GridTile):
+            block_axes = s.axes
+            for child in s.body:
+                if isinstance(child, ThreadTile):
+                    tt = child
+                    break
+            if tt is not None:
+                break
+        elif isinstance(s, ThreadTile):
+            tt = s
+            break
+    if tt is None:
         return []
-    tile = tiles[0]  # KernelOp body has a single Tile holding thread/block axes
 
-    # Walk for smem Loads with their enclosing Loop / StridedLoop axes.
+    # Walk for smem Loads with their enclosing tile axes.
     bindings: list[tuple[object, Load, tuple[Axis, ...]]] = []
 
     def walk(b, encl: tuple[Axis, ...]):
         for s in b:
             if isinstance(s, Load) and s.input in smem_decls:
                 bindings.append((smem_decls[s.input], s, encl))
-            if isinstance(s, (Loop, StridedLoop)):
+            if isinstance(s, (SerialTile, StridedTile)):
                 walk(s.body, (*encl, s.axis))
-            elif isinstance(s, Tile):
+            elif isinstance(s, RegisterTile):
+                walk(s.body, encl + tuple(s.axes))
+            elif isinstance(s, (GridTile, ThreadTile)):
                 walk(s.body, encl)
             elif isinstance(s, Cond):
                 walk(s.body, encl)
@@ -430,33 +462,33 @@ def _analyze_kernel(kernel_op, Smem, stage_filter, k_iter: int, warp_id: int) ->
         if key in seen:
             continue
         seen.add(key)
-        r = _build_kernel_result(kernel_op, smem, load, encl, tile, k_iter, warp_id)
+        r = _build_kernel_result(kernel_op, smem, load, encl, tt, block_axes, k_iter, warp_id)
         if r is not None:
             out.append(r)
     return out
 
 
 def _build_kernel_result(
-    kernel_op, smem, load: Load, encl: tuple[Axis, ...], tile: Tile, k_iter: int, warp_id: int
+    kernel_op, smem, load: Load, encl: tuple[Axis, ...], tt: ThreadTile, block_axes: tuple[Axis, ...], k_iter: int, warp_id: int
 ) -> BankConflictResult | None:
     if not smem.extents or len(load.index) < len(smem.extents):
         return None
     cache_idx = tuple(load.index[-len(smem.extents) :])
 
-    extra_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
+    extra_env: dict[str, int] = {ax.name: 0 for ax in block_axes}
     if encl:
         for ax in encl[:-1]:
             extra_env.setdefault(ax.name, 0)
         extra_env[encl[-1].name] = k_iter
 
-    dist = lane_bank_distribution(cache_idx, smem.extents, tile.thread_axes, extra_env=extra_env, warp_id=warp_id)
+    dist = lane_bank_distribution(cache_idx, smem.extents, tt.axes, extra_env=extra_env, warp_id=warp_id)
     if dist is None:
         return None
 
     nz = [c for c in dist.counts if c > 0]
     avg = sum(nz) / len(nz) if nz else 0.0
 
-    full_sweep_touched, full_sweep_conflict = _full_sweep_static(cache_idx, smem.extents, tile, encl, warp_id)
+    full_sweep_touched, full_sweep_conflict = _full_sweep_static(cache_idx, smem.extents, tt, block_axes, encl, warp_id)
 
     smem_bytes = _nbytes_of(smem.dtype)
     for e in smem.extents:
@@ -489,7 +521,12 @@ def _build_kernel_result(
 
 
 def _full_sweep_static(
-    cache_idx: tuple[Expr, ...], extents: tuple[int, ...], tile: Tile, encl: tuple[Axis, ...], warp_id: int
+    cache_idx: tuple[Expr, ...],
+    extents: tuple[int, ...],
+    tt: ThreadTile,
+    block_axes: tuple[Axis, ...],
+    encl: tuple[Axis, ...],
+    warp_id: int,
 ) -> tuple[dict[tuple[int, int], list[tuple[int, int]]], set[tuple[int, int]]]:
     """Sweep the deepest enclosing loop axis; record every (row, col) cell
     touched by any (lane, k_iter) pair, plus the cells participating in a
@@ -508,7 +545,7 @@ def _full_sweep_static(
         loop_extent = int(encl[-1].extent)
         loop_axis_name = encl[-1].name
 
-    base_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
+    base_env: dict[str, int] = {ax.name: 0 for ax in block_axes}
     for ax in encl[:-1]:
         base_env.setdefault(ax.name, 0)
 
@@ -523,7 +560,7 @@ def _full_sweep_static(
         lds_cells: list[tuple[int, int, int]] = []
         for lane in range(WARP_SIZE):
             env: dict[str, object] = dict(env_k)
-            env.update(_thread_axis_env(tile.thread_axes, warp_id * WARP_SIZE + lane))
+            env.update(_thread_axis_env(tt.axes, warp_id * WARP_SIZE + lane))
             try:
                 coords = [int(idx.eval(env)) for idx in cache_idx]
             except (KeyError, TypeError):

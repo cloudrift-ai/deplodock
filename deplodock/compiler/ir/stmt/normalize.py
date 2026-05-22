@@ -771,16 +771,21 @@ def rename_ssa_sequential(stmts: Body) -> Body:
     """Canonicalize names in a fused body:
 
     - Axes from every axis-bearing scope (``Loop`` / ``StridedLoop`` /
-      ``Tile.axes``) renamed to ``a0, a1, ...`` in pre-order of first
-      declaration. All three share one numbering namespace so Tile.axes
-      ``a0_o`` and a Loop axis ``a2_o`` don't collide on rename.
+      ``Tile.axes`` / new tile flavors' axes) renamed to ``a0, a1, ...``
+      in pre-order of first declaration. All scopes share one numbering
+      namespace so Tile.axes ``a0_o`` and a Loop axis ``a2_o`` don't
+      collide on rename.
     - Load SSA names renamed to ``in0, in1, ...`` in definition order.
     - Accum names renamed to ``acc0, acc1, ...`` in definition order.
     - Assign / Select SSA names renamed to ``v0, v1, ...`` in definition
       order.
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
-    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415 — break stmt↔tile cycle
+    from deplodock.compiler.ir.tile.ir import (  # noqa: PLC0415 — break stmt↔tile cycle
+        ParallelTile,
+        SerialTileBase,
+        Stage,
+    )
 
     stmts = Body.coerce(stmts)
     ssa_rename: dict[str, str] = {}
@@ -817,11 +822,19 @@ def rename_ssa_sequential(stmts: Body) -> Body:
         elif isinstance(stmt, Tile):
             for ba in stmt.axes:
                 _record_axis(ba.axis.name)
+        elif isinstance(stmt, ParallelTile):
+            # GridTile / ThreadTile / RegisterTile — record every axis in
+            # the tuple before any nested Stage's cache axes so the
+            # parallel coords keep their pre-order rename slots.
+            for ax in stmt.axes:
+                _record_axis(ax.name)
         elif isinstance(stmt, Stage):
             for src in stmt.sources:
                 for ax in src.cache_axes:
                     _record_axis(ax.name)
         elif isinstance(stmt, (Loop, StridedLoop)):
+            _record_axis(stmt.axis.name)
+        elif isinstance(stmt, SerialTileBase):
             _record_axis(stmt.axis.name)
 
     if all(o == n for o, n in ssa_rename.items()) and all(o == n for o, n in axis_rename.items()):

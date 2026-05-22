@@ -34,14 +34,14 @@ the optimization.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace as _replace
 
 from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Body, Cond, Stmt, Write
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -79,10 +79,8 @@ def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
     descended: list[Stmt] = []
     for s in body:
-        if isinstance(s, Loop):
-            descended.append(_replace(s, body=_vectorize_body(kop, s.body)))
-        elif isinstance(s, StridedLoop):
-            descended.append(_replace(s, body=_vectorize_body(kop, s.body)))
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
+            descended.append(s.with_bodies((_vectorize_body(kop, s.body),)))
         elif isinstance(s, Cond):
             descended.append(
                 Cond(
@@ -91,8 +89,8 @@ def _vectorize_body(kop: KernelOp, body: Body) -> Body:
                     else_body=_vectorize_body(kop, s.else_body),
                 )
             )
-        elif isinstance(s, Tile):
-            descended.append(Tile(axes=s.axes, body=_vectorize_body(kop, s.body)))
+        elif isinstance(s, (GridTile, ThreadTile)):
+            descended.append(s.with_bodies((_vectorize_body(kop, s.body),)))
         else:
             descended.append(s)
 

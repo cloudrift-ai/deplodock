@@ -13,7 +13,7 @@ from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
-from deplodock.compiler.ir.stmt import RenderCtx, Tile, render_body
+from deplodock.compiler.ir.stmt import RenderCtx, render_body
 from deplodock.compiler.tensor import Tensor
 
 # Per-CTA static-smem hard cap on every CUDA arch we target. Above this,
@@ -272,15 +272,25 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:
-    """Derive ``__launch_bounds__`` from the first ``Tile``'s thread axes
-    when ``block_axes`` is populated; otherwise ``_BLOCK_SIZE``."""
+    """Derive ``__launch_bounds__`` from the outermost tile flavor.
+
+    - ``GridTile`` (cooperative): launch bounds = product of inner
+      ``ThreadTile`` axis extents (per-CTA thread count).
+    - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
+      since launch is flattened across blockIdx + threadIdx.
+    """
+    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+
     for s in kernel_op.body:
-        if isinstance(s, Tile):
-            if s.block_axes:
-                bsize = 1
-                for ax in s.thread_axes:
-                    bsize *= int(ax.extent)
-                return max(bsize, 1)
+        if isinstance(s, GridTile):
+            for child in s.body:
+                if isinstance(child, ThreadTile):
+                    bsize = 1
+                    for ax in child.axes:
+                        bsize *= int(ax.extent)
+                    return max(bsize, 1)
+            return _BLOCK_SIZE
+        if isinstance(s, ThreadTile):
             return _BLOCK_SIZE
     return _BLOCK_SIZE
 

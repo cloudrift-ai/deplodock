@@ -16,11 +16,24 @@ Registration runs at module import (loaded from the bottom of
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import SimplifyCtx
+from dataclasses import replace as _replace
+
+from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
-from deplodock.compiler.ir.tile.ir import AsyncWait, Combine, ComputeStage, Stage
+from deplodock.compiler.ir.tile.ir import (
+    AsyncWait,
+    Combine,
+    ComputeStage,
+    GridTile,
+    ParallelTile,
+    RegisterTile,
+    SerialTile,
+    Stage,
+    StridedTile,
+    ThreadTile,
+)
 
 
 @rewrite.register
@@ -65,3 +78,100 @@ def _(s: AsyncWait, ctx: SimplifyCtx) -> Stmt:
 
 
 # Combine has no Expr fields — default ``simplify`` (identity) handles it.
+
+
+# ---------------------------------------------------------------------------
+# New tile flavor hierarchy (GridTile / ThreadTile / RegisterTile / SerialTile
+# / StridedTile). Each carries a single body (or axes + body); rewrite descends
+# into the body recursively, simplify extends the SimplifyCtx with axis ranges.
+# ---------------------------------------------------------------------------
+
+
+def _parallel_rewrite(s: ParallelTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    new_axes = tuple(axis_fn(ax) for ax in s.axes)
+    new_body = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
+    return _replace(s, axes=new_axes, body=new_body)
+
+
+def _parallel_simplify(s: ParallelTile, ctx: SimplifyCtx) -> Stmt:
+    inner = ctx
+    for ax in s.axes:
+        inner = inner.extend(ax.name, Interval(0, int(ax.extent) - 1))
+    new_body = tuple(simplify(c, inner) for c in s.body)
+    return _replace(s, body=new_body)
+
+
+@rewrite.register
+def _(s: GridTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: GridTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
+def _(s: ThreadTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: ThreadTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
+def _(s: RegisterTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: RegisterTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
+def _(s: SerialTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return SerialTile(
+        axis=axis_fn(s.axis),
+        body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
+        kind=s.kind,
+        unroll=s.unroll,
+    )
+
+
+@simplify.register
+def _(s: SerialTile, ctx: SimplifyCtx) -> Stmt:
+    inner = ctx.extend(s.axis.name, Interval(0, int(s.axis.extent) - 1))
+    return SerialTile(
+        axis=s.axis,
+        body=tuple(simplify(c, inner) for c in s.body),
+        kind=s.kind,
+        unroll=s.unroll,
+    )
+
+
+@rewrite.register
+def _(s: StridedTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    step = sigma.apply(s.step) if isinstance(s.step, Expr) else s.step
+    return StridedTile(
+        axis=axis_fn(s.axis),
+        body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
+        start=sigma.apply(s.start),
+        step=step,
+        unroll=s.unroll,
+    )
+
+
+@simplify.register
+def _(s: StridedTile, ctx: SimplifyCtx) -> Stmt:
+    inner = ctx.extend(s.axis.name, Interval(0, int(s.axis.extent) - 1))
+    step = s.step.simplify(ctx) if isinstance(s.step, Expr) else s.step
+    return StridedTile(
+        axis=s.axis,
+        body=tuple(simplify(c, inner) for c in s.body),
+        start=s.start.simplify(ctx),
+        step=step,
+        unroll=s.unroll,
+    )

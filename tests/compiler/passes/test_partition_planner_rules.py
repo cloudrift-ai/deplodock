@@ -24,7 +24,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.tile.ir import BIND_THREAD, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 
@@ -105,14 +105,13 @@ def test_launch_geometry_stops_at_register_tagged_loop():
         ),
     )
     tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op))
-    tile = next(s for s in tile_op.body if isinstance(s, Tile))
-    # Outer ``i`` lifted to Tile.axes; inner REGISTER ``i_i`` stays in body.
-    assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
-    assert all(ba.bind == BIND_THREAD for ba in tile.axes)
-    body_loops = [s for s in tile.body if isinstance(s, Loop)]
-    assert len(body_loops) == 1
-    assert body_loops[0].role is Role.REGISTER
-    assert int(body_loops[0].axis.extent) == 2
+    # Outer ``i`` lifted to a ThreadTile (pointwise, no GridTile);
+    # inner REGISTER ``i_i`` becomes a RegisterTile in the body.
+    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
+    assert sorted(int(ax.extent) for ax in tile.axes) == [4]
+    register_tiles = [s for s in tile.body if isinstance(s, RegisterTile)]
+    assert len(register_tiles) == 1
+    assert tuple(int(ax.extent) for ax in register_tiles[0].axes) == (2,)
 
 
 def test_launch_geometry_skips_register_sibling_output_loop():
@@ -149,14 +148,13 @@ def test_launch_geometry_skips_register_sibling_output_loop():
         ),
     )
     tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op))
-    tile = next(s for s in tile_op.body if isinstance(s, Tile))
-    # Only ``i`` (outer chain) ends up in Tile.axes — ``r`` stays in body.
-    assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
-    body_loops = [s for s in tile.body if isinstance(s, Loop)]
-    # Body has the reduce Loop and the REGISTER Loop.
-    register_loops = [loop for loop in body_loops if loop.role is Role.REGISTER]
-    assert len(register_loops) == 1
-    assert int(register_loops[0].axis.extent) == 2
+    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
+    # Only ``i`` (outer chain) ends up in ThreadTile.axes — ``r`` becomes a
+    # RegisterTile in the body, alongside the inner reduce SerialTile.
+    assert sorted(int(ax.extent) for ax in tile.axes) == [4]
+    register_tiles = [s for s in tile.body if isinstance(s, RegisterTile)]
+    assert len(register_tiles) == 1
+    assert tuple(int(ax.extent) for ax in register_tiles[0].axes) == (2,)
 
 
 # --- Planner stub ----------------------------------------------------
@@ -201,26 +199,21 @@ def loop_op_pointwise() -> LoopOp:
 
 
 def test_006a_replicates_register_tagged_body_loop():
-    """When a TileOp body contains a ``Role.REGISTER`` Loop,
-    ``006a_register_tile_planned`` replicates the body by the loop's
-    extent (σ: axis → literal(i)), unwraps the wrapper, and stamps
+    """When a TileOp body contains a ``RegisterTile``,
+    ``006a_register_tile_planned`` replicates the body by the tile's
+    axis extent (σ: axis → literal(i)), unwraps the wrapper, and stamps
     ``FM`` / ``FN`` so the legacy ``008_register_tile`` falls through
     via its ``FN-in-knobs`` idempotence check.
 
-    Tests the simplest synthetic case — no Stages, just one REGISTER
-    Loop wrapping a Load+Write body."""
-    from deplodock.compiler.ir.axis import BIND_THREAD, BoundAxis
-    from deplodock.compiler.ir.stmt import Tile
-    from deplodock.compiler.ir.tile.ir import TileOp
-
+    Tests the simplest synthetic case — no Stages, just one
+    ``RegisterTile`` wrapping a Load+Write body."""
     a_outer = Axis("a_outer", 8)
     a_reg = Axis("a_reg", 4)
-    tile = Tile(
-        axes=(BoundAxis(axis=a_outer, bind=BIND_THREAD),),
+    tile = ThreadTile(
+        axes=(a_outer,),
         body=(
-            Loop(
-                axis=a_reg,
-                role=Role.REGISTER,
+            RegisterTile(
+                axes=(a_reg,),
                 body=(
                     Load(name="x_v", input="x", index=(Var("a_outer"), Var("a_reg"))),
                     Write(output="o", index=(Var("a_outer"), Var("a_reg")), value="x_v"),
@@ -239,10 +232,10 @@ def test_006a_replicates_register_tagged_body_loop():
     out = Pipeline.build(TILE_PASSES, select={"register_tile_planned"}).run(g)
     new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
 
-    # The REGISTER Loop wrapper is gone; its body got replicated 4 times.
-    new_tile = next(s for s in new_tile_op.body if isinstance(s, Tile))
-    body_loops = [s for s in new_tile.body if isinstance(s, Loop)]
-    assert body_loops == [], "REGISTER Loop wrapper should have been unwrapped"
+    # The RegisterTile wrapper is gone; its body got replicated 4 times.
+    new_tile = next(s for s in new_tile_op.body if isinstance(s, ThreadTile))
+    register_tiles = [s for s in new_tile.body if isinstance(s, RegisterTile)]
+    assert register_tiles == [], "RegisterTile wrapper should have been unwrapped"
     # 4 Loads + 4 Writes after replication.
     body_loads = list(new_tile.body.iter_of_type(Load))
     body_writes = [s for s in new_tile.body if isinstance(s, Write)]
@@ -253,7 +246,7 @@ def test_006a_replicates_register_tagged_body_loop():
     for w in body_writes:
         vars_in_index = {v for e in w.index for v in e.free_vars()}
         assert "a_reg" not in vars_in_index, f"unreplicated a_reg in Write: {w.index}"
-    # FM gets stamped from the outermost (and only) REGISTER axis extent.
+    # FM gets stamped from the outermost (and only) RegisterTile axis extent.
     assert new_tile_op.knobs.get("FM") == 4
 
 

@@ -22,7 +22,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.ir.tile.ir import BIND_THREAD, Tile, TileOp
+from deplodock.compiler.ir.tile.ir import SerialTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 
@@ -109,18 +109,17 @@ def _reduction_loopop() -> LoopOp:
 
 
 def test_launch_geometry_strips_outer_chain_for_reduction():
-    """Outer free-Loop chain (just ``i`` here) becomes ``Tile.axes``;
-    the inner reduce ``k`` Loop survives in the body."""
+    """Outer free-Loop chain (just ``i`` here) becomes ``ThreadTile.axes``;
+    the inner reduce ``k`` Loop survives in the body as a ``SerialTile``."""
     tile_op = _run_only_launch_geometry(_wrap_loopop(_reduction_loopop()))
-    tile = next(s for s in tile_op.body if isinstance(s, Tile))
-    assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
-    assert all(ba.bind == BIND_THREAD for ba in tile.axes)
-    body_loops = [s for s in tile.body if isinstance(s, Loop)]
-    assert len(body_loops) == 1 and body_loops[0].is_reduce
+    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
+    assert sorted(int(ax.extent) for ax in tile.axes) == [4]
+    body_serial = [s for s in tile.body if isinstance(s, SerialTile)]
+    assert len(body_serial) == 1 and body_serial[0].is_reduce
 
 
 def test_launch_geometry_handles_pointwise():
-    """No reduce — outer chain strips into thread axes; body is the
+    """No reduce — outer chain strips into ``ThreadTile.axes``; body is the
     leaf Load/Write pair."""
     i = Axis("i", 4)
     pointwise = LoopOp(
@@ -135,9 +134,9 @@ def test_launch_geometry_handles_pointwise():
         ),
     )
     tile_op = _run_only_launch_geometry(_wrap_loopop(pointwise))
-    tile = next(s for s in tile_op.body if isinstance(s, Tile))
-    assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4]
-    assert not any(isinstance(s, Loop) for s in tile.body)
+    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
+    assert sorted(int(ax.extent) for ax in tile.axes) == [4]
+    assert not any(isinstance(s, (SerialTile, Loop)) for s in tile.body)
 
 
 def test_launch_geometry_preserves_kernel_name():
@@ -179,9 +178,8 @@ def test_launch_geometry_lifts_sibling_output_loop():
         ),
     )
     tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op, output_shape=(4, 16)))
-    tile = next(s for s in tile_op.body if isinstance(s, Tile))
-    assert sorted(int(ba.axis.extent) for ba in tile.axes) == [4, 16]
-    assert all(ba.bind == BIND_THREAD for ba in tile.axes)
-    body_loops = [s for s in tile.body if isinstance(s, Loop)]
-    assert len(body_loops) == 1 and body_loops[0].is_reduce
-    assert int(body_loops[0].axis.extent) == 8
+    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
+    assert sorted(int(ax.extent) for ax in tile.axes) == [4, 16]
+    body_serial = [s for s in tile.body if isinstance(s, SerialTile)]
+    assert len(body_serial) == 1 and body_serial[0].is_reduce
+    assert int(body_serial[0].axis.extent) == 8

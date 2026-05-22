@@ -30,8 +30,16 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F16, F32, DataType
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile, Write
-from deplodock.compiler.ir.tile.ir import Stage, TileOp
+from deplodock.compiler.ir.stmt import Accum, Cond, Init, Stmt, Write
+from deplodock.compiler.ir.tile.ir import (
+    GridTile,
+    RegisterTile,
+    SerialTile,
+    Stage,
+    StridedTile,
+    ThreadTile,
+    TileOp,
+)
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -72,23 +80,38 @@ def _decide_dtype(accum: Accum, accumulating_dtype: DataType, selecting_dtype: D
 
 
 def _place_inits_in_body(body: tuple, accumulating_dtype: DataType, selecting_dtype: DataType) -> tuple:
-    """For each nested ``Tile`` in the TileOp body, open a scope and place
-    Inits inside it (the matmul / softmax / RMSNorm shape). When the
-    TileOp's body has no nested ``Tile`` (the simple-reduction shape —
-    body is a flat ``(Loop, Write)`` from the lowering pipeline), treat
-    the TileOp body itself as the scope so its Accums still get explicit
-    Inits with the chosen dtype."""
-    has_nested_tile = any(isinstance(s, Tile) for s in body)
-    if not has_nested_tile:
-        return _place_inits_in_scope(body, accumulating_dtype, selecting_dtype)
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Tile):
-            new_tile_body = _place_inits_in_scope(s.body, accumulating_dtype, selecting_dtype)
-            out.append(Tile(axes=s.axes, body=new_tile_body))
-        else:
-            out.append(s)
-    return tuple(out)
+    """Find the innermost ``ParallelTile`` (or the TileOp body itself when
+    none nests one) and place Inits at that scope.
+
+    Under the new tile-flavor IR, the TileOp body wraps a ``GridTile``
+    (cooperative) or a standalone ``ThreadTile`` (pointwise / single-CTA
+    reduce). For matmul / softmax / RMSNorm the scope where Inits land is
+    the ``ThreadTile`` body (the per-thread scope just above the K loop);
+    for a flat reduce kernel with no nested ParallelTile, the TileOp body
+    itself is the scope.
+    """
+
+    def _open_scope(stmts: tuple) -> tuple:
+        # Find the deepest ThreadTile / GridTile and recurse into its body.
+        out: list[Stmt] = []
+        opened = False
+        for s in stmts:
+            if isinstance(s, GridTile):
+                new_inner = _open_scope(tuple(s.body))
+                out.append(s.with_bodies((new_inner,)))
+                opened = True
+            elif isinstance(s, ThreadTile):
+                new_inner = _place_inits_in_scope(tuple(s.body), accumulating_dtype, selecting_dtype)
+                out.append(s.with_bodies((new_inner,)))
+                opened = True
+            else:
+                out.append(s)
+        if not opened:
+            # No ParallelTile in this scope — treat the scope itself.
+            return _place_inits_in_scope(stmts, accumulating_dtype, selecting_dtype)
+        return tuple(out)
+
+    return _open_scope(body)
 
 
 def _place_inits_in_scope(body: tuple, accumulating_dtype: DataType, selecting_dtype: DataType) -> tuple:
@@ -124,23 +147,32 @@ def _place_inits_in_scope(body: tuple, accumulating_dtype: DataType, selecting_d
 
 
 def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
-    """Collect Accums reachable from ``stmt`` through reduce loops only.
-    Stops at free loops — those Accums will be placed at the free loop's
+    """Collect Accums reachable from ``stmt`` through reduce tiles only.
+    Stops at free tiles — those Accums will be placed at the free tile's
     own scope when we recurse into it.
 
-    "Reduce loop" here is the recursive notion: a Loop whose body has an
-    Accum directly, *or* a nested reduce-Loop. This catches the
-    K-chunked matmul shape where ``K_o``'s immediate body is ``[Stage,
-    ..., Loop(K_i, reduce, body=[..., Accum])]`` — the inner Accum
-    accumulates across ``K_o`` too, so ``K_o`` is crossable for Init
-    placement and the Init lands at the surrounding Tile body head."""
+    "Reduce tile" here is the recursive notion: a ``SerialTile`` /
+    ``StridedTile`` whose body has an Accum directly, *or* a nested
+    reduce-tile. This catches the K-chunked matmul shape where ``K_o``'s
+    immediate body is ``[Stage, ..., SerialTile(K_i, reduce, body=[...,
+    Accum])]`` — the inner Accum accumulates across ``K_o`` too, so
+    ``K_o`` is crossable for Init placement and the Init lands at the
+    surrounding ``ThreadTile`` body head.
+
+    ``RegisterTile`` is transparent for Init scoping: 006a will replicate
+    Accums across register cells, but at placement time the inner Accums
+    are still single statements. We descend into ``RegisterTile.body``
+    unconditionally."""
     out: list[Accum] = []
     if isinstance(stmt, Accum):
         out.append(stmt)
-    elif isinstance(stmt, (Loop, StridedLoop)):
+    elif isinstance(stmt, (SerialTile, StridedTile)):
         if _is_reduce_recursive(stmt):
             for child in stmt.body:
                 out.extend(_accums_under_reduces_only(child))
+    elif isinstance(stmt, RegisterTile):
+        for child in stmt.body:
+            out.extend(_accums_under_reduces_only(child))
     elif isinstance(stmt, Cond):
         for child in stmt.body:
             out.extend(_accums_under_reduces_only(child))
@@ -156,27 +188,33 @@ def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
     return out
 
 
-def _is_reduce_recursive(loop: Loop | StridedLoop) -> bool:
-    """Recursive reduce check (Init-scoping only). A Loop is "crossable"
-    iff its body either has an Accum directly OR forms a pure
-    reduce-passthrough — no Write / output-escape stmts in body, and at
-    least one nested reduce-Loop carries the Accum.
+def _is_reduce_recursive(loop) -> bool:
+    """Recursive reduce check (Init-scoping only). A ``SerialTile`` /
+    ``StridedTile`` is "crossable" iff its body either has an Accum
+    directly OR forms a pure reduce-passthrough — no Write / output-escape
+    stmts in body, and at least one nested reduce-tile carries the Accum.
 
     The Write check is what distinguishes:
 
-    - **Matmul K-chunked** (``K_o`` body = [Stage, Stage, Loop(K_i,
+    - **Matmul K-chunked** (``K_o`` body = [Stage, Stage, SerialTile(K_i,
       reduce)]): no Write directly in body → crossable, Init lives at
-      the surrounding Tile.
-    - **SDPA per-output free loop** (``a4`` body = [Loop(reduce, ...),
-      Write[..., a4]]): the Write escapes per-iteration, so the Accum
-      must reset per ``a4`` → not crossable, Init lives inside ``a4``."""
+      the surrounding ThreadTile.
+    - **SDPA per-output free loop** (``a4`` body = [SerialTile(reduce,
+      ...), Write[..., a4]]): the Write escapes per-iteration, so the
+      Accum must reset per ``a4`` → not crossable, Init lives inside
+      ``a4``.
+
+    ``RegisterTile`` is transparent: descend into its body for the same
+    crossability check."""
     has_inner_reduce = False
     for s in loop.body:
         if isinstance(s, Accum):
             return True
         if isinstance(s, Write):
             return False
-        if isinstance(s, (Loop, StridedLoop)) and _is_reduce_recursive(s):
+        if isinstance(s, (SerialTile, StridedTile)) and _is_reduce_recursive(s):
+            has_inner_reduce = True
+        elif isinstance(s, RegisterTile) and _is_reduce_recursive(s):
             has_inner_reduce = True
         elif isinstance(s, Stage):
             # Wrap-body Stage is transparent for reduce-crossing: descend
@@ -187,27 +225,31 @@ def _is_reduce_recursive(loop: Loop | StridedLoop) -> bool:
                     return True
                 if isinstance(inner, Write):
                     return False
-                if isinstance(inner, (Loop, StridedLoop)) and _is_reduce_recursive(inner):
+                if isinstance(inner, (SerialTile, StridedTile)) and _is_reduce_recursive(inner):
+                    has_inner_reduce = True
+                elif isinstance(inner, RegisterTile) and _is_reduce_recursive(inner):
                     has_inner_reduce = True
     return has_inner_reduce
 
 
 def _recurse(stmt: Stmt, init_dtypes: dict[str, DataType], accumulating_dtype: DataType, selecting_dtype: DataType) -> Stmt:
-    """Descend into block-structured stmts so nested free Loops get their
+    """Descend into block-structured stmts so nested free tiles get their
     own Init placement at their own scope. Same recursive-reduce
-    distinction as ``_accums_under_reduces_only``: a Loop that
-    transitively wraps an Accum (matmul ``K_o`` chunking) descends
-    without opening a new scope. ``StridedLoop`` is treated identically
-    — SDPA's per-output free StridedLoop wraps a free Loop chain plus a
-    Write, so it's not reduce-crossable and must open a scope so the
-    inner Accum's Init lands inside (resetting per-iteration).
+    distinction as ``_accums_under_reduces_only``: a SerialTile / StridedTile
+    / RegisterTile that transitively wraps an Accum (matmul ``K_o``
+    chunking) descends without opening a new scope. Free tiles open a
+    scope so the inner Accum's Init lands inside (resetting per-iteration).
 
     Stamps the accumulator dtype on every ``Accum`` whose name we just
-    placed an Init for at the enclosing scope, so Init and Accum agree."""
+    placed an Init for at the enclosing scope, so Init and Accum agree.
+
+    ``ParallelTile`` (Grid/Thread/RegisterTile) are NOT scope-openers —
+    the scope is opened once at the outermost ``ThreadTile`` body. We
+    pass through them transparently."""
     if isinstance(stmt, Accum) and stmt.name in init_dtypes:
         return replace(stmt, dtype=init_dtypes[stmt.name])
-    if isinstance(stmt, (Loop, StridedLoop)) and not _is_reduce_recursive(stmt):
-        # Free loop — its body is its own scope; place Inits there.
+    if isinstance(stmt, (SerialTile, StridedTile)) and not _is_reduce_recursive(stmt):
+        # Free serial-tile loop — its body is its own scope; place Inits there.
         return replace(stmt, body=_place_inits_in_scope(stmt.body, accumulating_dtype, selecting_dtype))
     nested = stmt.nested()
     if not nested:

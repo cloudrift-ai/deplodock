@@ -57,6 +57,7 @@ from deplodock.compiler.ir.stmt import (
     _pad,
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -544,15 +545,22 @@ class KernelOp(BodyOp):
           hatch; better to drop them at the rule level before benching)."""
         from math import prod  # noqa: PLC0415
 
-        from deplodock.compiler.ir.stmt import Tile  # noqa: PLC0415
+        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 
         for s in self.body:
-            if isinstance(s, Tile):
-                threads = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_THREAD)
-                if threads > ctx.max_threads_per_cta:
-                    return False
-                ctas = prod(int(ba.axis.extent) for ba in s.axes if ba.bind == BIND_BLOCK)
+            if isinstance(s, GridTile):
+                ctas = prod(int(ax.extent) for ax in s.axes)
                 if ctas > _MAX_CTAS:
+                    return False
+                # ThreadTile lives inside the GridTile's body.
+                for child in s.body:
+                    if isinstance(child, ThreadTile):
+                        threads = prod(int(ax.extent) for ax in child.axes)
+                        if threads > ctx.max_threads_per_cta:
+                            return False
+            elif isinstance(s, ThreadTile):
+                threads = prod(int(ax.extent) for ax in s.axes)
+                if threads > ctx.max_threads_per_cta:
                     return False
         if self.smem_bytes() > ctx.max_dynamic_smem:
             return False
@@ -591,8 +599,14 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Kernel-IR statements
+    # Kernel-IR statements — legacy Tile + new tile flavor hierarchy (the
+    # kernel-IR materialization preserves the wrappers that Tile IR emits)
     "Tile",
+    "GridTile",
+    "ThreadTile",
+    "RegisterTile",
+    "SerialTile",
+    "StridedTile",
     "Smem",
     "Sync",
     "TreeHalve",

@@ -38,10 +38,10 @@ def test_oracle_matches_kernel_analyzer_on_small_matmul():
         if not cache_axes or len(load.index) < len(cache_axes):
             continue
         cache_idx = tuple(load.index[-len(cache_axes) :])
-        extra_env: dict[str, int] = {ax.name: 0 for ax in tile.block_axes}
+        extra_env: dict[str, int] = {ax.name: 0 for ax in binding.block_axes}
         for ax in binding.enclosing_loop_axes:
             extra_env.setdefault(ax.name, 0)
-        dist = lane_bank_distribution(cache_idx, src.alloc_extents, tile.thread_axes, extra_env=extra_env)
+        dist = lane_bank_distribution(cache_idx, src.alloc_extents, tile.axes, extra_env=extra_env)
         if dist is None:
             continue
         oracle_by_key[(binding.tile_op_name, src.name, load.name)] = (dist.lane_addrs, dist.lane_banks)
