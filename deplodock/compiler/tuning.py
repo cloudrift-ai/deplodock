@@ -272,7 +272,7 @@ def recover_logical_extents(body: Body) -> tuple[int, ...]:
 
     chain_extents: list[tuple[str, int]] = []
     cur = tuple(body)
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
         chain_extents.append((cur[0].axis.name, int(cur[0].axis.extent)))
         cur = tuple(cur[0].body)
 

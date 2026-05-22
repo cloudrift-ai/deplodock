@@ -20,50 +20,6 @@ output level) will land here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-
-
-class Role(Enum):
-    """Planner-assigned role tag on a body ``Loop`` / ``StridedLoop``.
-
-    Set by ``000_partition_planner`` to communicate axis-structure decisions
-    to downstream materialization passes. Excluded from ``Body.structural_key``
-    (not rendered by ``pretty()``) so adding a role doesn't invalidate
-    autotune cache entries.
-
-    Roles assigned to body loops:
-
-    - ``BLOCK``: output axis (or split sub-axis) that ``001_launch_geometry`` lifts
-      into ``Tile.axes`` with ``BIND_BLOCK``. Stamped by the planner.
-    - ``THREAD``: output axis (or split sub-axis) that ``001_launch_geometry`` lifts
-      into ``Tile.axes`` with ``BIND_THREAD``. Stamped by the planner.
-    - ``SPLITK_BLOCK``: cross-CTA split-K outer axis. Lifted by
-      ``001_launch_geometry`` into ``Tile.axes`` with ``BIND_BLOCK``;
-      the planner also rewrites the epilogue Write to be atomic when
-      this role is present.
-    - ``REGISTER``: inner axis of a thread-axis split. ``001_launch_geometry`` stops
-      lifting at this axis (keeps it as a body Loop instead of pulling into
-      ``Tile.axes``); ``006a_register_tile_planned`` replicates dependent
-      stmts along it.
-    - ``STAGE_INNER``: inner reduce axis after a K split. Slab dimension for
-      ``002_stage_inputs``.
-    - ``SERIAL_OUTER``: outer serial chunk loop (e.g. K_o). Pipeline / double-
-      buffer targets.
-    - ``PIPELINE``: serial outer loop marked for pipelining by ``015_pipeline_k_outer``.
-    - ``COOPERATIVE_STRIDE``: cooperative-K thread axis (K_c) for non-matmul reduces.
-      Lifted by ``001_launch_geometry`` to ``BIND_THREAD``; ``002_cooperative_reduce`` inserts
-      a ``Combine`` sibling after the K_o reduce subtree so the materializer emits the
-      cross-thread tree-halve / warp-shuffle.
-    """
-
-    BLOCK = "block"
-    THREAD = "thread"
-    SPLITK_BLOCK = "splitk_block"
-    REGISTER = "register"
-    STAGE_INNER = "stage_inner"
-    SERIAL_OUTER = "serial_outer"
-    PIPELINE = "pipeline"
-    COOPERATIVE_STRIDE = "cooperative_stride"
 
 
 @dataclass(frozen=True)
@@ -126,20 +82,15 @@ BIND_BLOCK = "BLOCK"
 class BoundAxis:
     """An axis paired with its GPU-coord binding.
 
-    Used by ``Tile`` (across Tile and Kernel IRs) to express how each
-    output axis maps to the parallel hierarchy. ``BIND_THREAD``
-    means "one thread per axis value"; ``BIND_BLOCK`` means "one CUDA
-    block per axis value, threads inside cooperate."
-
-    ``role`` preserves the source Loop's planner-stamped role across the
-    chain-lift in ``001_launch_geometry``. Downstream rules
-    (e.g. ``002_cooperative_reduce``) consume it to identify
-    ``COOPERATIVE_STRIDE`` axes after they've been lifted into ``Tile.axes``.
+    Used by the legacy ``Tile`` class (now Loop-IR-only after the
+    tile-flavor refactor — the new ``GridTile`` / ``ThreadTile`` carry
+    bare ``Axis`` tuples instead). ``BIND_THREAD`` means "one thread per
+    axis value"; ``BIND_BLOCK`` means "one CUDA block per axis value,
+    threads inside cooperate."
     """
 
     axis: Axis
     bind: str
-    role: Role | None = None
 
     @property
     def name(self) -> str:
@@ -150,4 +101,4 @@ class BoundAxis:
         return self.axis.extent
 
 
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK", "Role"]
+__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK"]

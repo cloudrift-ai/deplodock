@@ -121,7 +121,6 @@ def _(s: Loop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         axis=axis_fn(s.axis),
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
-        role=s.role,
     )
 
 
@@ -134,13 +133,12 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         step=step,
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
-        role=s.role,
     )
 
 
 @rewrite.register
 def _(s: Tile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind, role=ba.role) for ba in s.axes)
+    new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind) for ba in s.axes)
     return Tile(axes=new_axes, body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body))
 
 
@@ -187,7 +185,7 @@ def _(s: Select, ctx: SimplifyCtx) -> Stmt:
 @simplify.register
 def _(s: Loop, ctx: SimplifyCtx) -> Stmt:
     inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent - 1))
-    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll, role=s.role)
+    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll)
 
 
 @simplify.register
@@ -200,7 +198,6 @@ def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
         step=step,
         body=tuple(simplify(c, inner) for c in s.body),
         unroll=s.unroll,
-        role=s.role,
     )
 
 

@@ -65,13 +65,14 @@ reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 
 from __future__ import annotations
 
+import enum
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis, Role
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
@@ -86,6 +87,25 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+
+
+class Role(enum.Enum):
+    """Planner-internal label for ``_wrap_tower`` layers.
+
+    Drives which tile-flavor the layer becomes when the planner builds the
+    tower. Not part of the IR — never reaches downstream passes (which
+    discriminate on tile-flavor type instead).
+    """
+
+    BLOCK = "block"
+    THREAD = "thread"
+    SPLITK_BLOCK = "splitk_block"
+    REGISTER = "register"
+    STAGE_INNER = "stage_inner"
+    SERIAL_OUTER = "serial_outer"
+    PIPELINE = "pipeline"
+    COOPERATIVE_STRIDE = "cooperative_stride"
+
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -212,7 +232,7 @@ def _outer_free_loop_chain(body) -> tuple[tuple[Loop, ...], tuple[Stmt, ...]]:
     _, rest = _split_leading_non_loops(body)
     out: list[Loop] = []
     cur = rest
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
         out.append(cur[0])
         cur = tuple(cur[0].body)
 
@@ -802,7 +822,11 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
         body_inside_mr = prologue_rewritten + matmul_tower
         if M_r is not None:
-            body_after_register = (Loop(axis=M_r, role=Role.REGISTER, body=body_inside_mr),)
+            # M_r stays serial (not RegisterTile) — the SDPA prologue
+            # (softmax max/sum/reciprocal) computes once per output row
+            # and must NOT be replicated per register cell. Only N_r is
+            # the register-tile axis here.
+            body_after_register = (SerialTile(axis=M_r, body=Body(body_inside_mr), kind="plain"),)
         else:
             body_after_register = body_inside_mr
         outer_layers: list[tuple[Axis, Role | None]] = [(N_t, Role.THREAD)]

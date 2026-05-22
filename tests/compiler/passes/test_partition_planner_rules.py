@@ -1,18 +1,12 @@
-"""Tests for the partition planner mechanism (M1 scope).
+"""Tests for the partition planner pass.
 
-M1 establishes the role-tag infrastructure:
-
-- ``Role`` enum + ``role`` field on ``Loop`` / ``StridedLoop``, excluded
-  from ``Body.structural_key`` so adding tags doesn't invalidate cached
-  autotune entries.
-- ``000_partition_planner`` exists as a stub (always skips); subsequent
-  milestones populate it.
-- ``001_launch_geometry`` honors ``Role.REGISTER`` by stopping the outer free-Loop
-  chain lift and skipping sibling-output-loop lifting for tagged loops.
-
-These tests construct synthetic IR and assert the new code paths fire
-correctly. The planner itself is a no-op in M1, so it's not exercised
-end-to-end here — that comes in M2 / M3 when each pass migrates.
+After the planner-emits-tiles refactor the planner constructs typed tile
+flavors directly; the ``Role`` enum and ``Loop.role`` / ``StridedLoop.role``
+fields it used to communicate decisions to downstream passes were
+deleted. These tests cover the surviving surface: planner fires on
+pointwise, and ``006a_register_tile_planned`` replicates a synthetic
+``RegisterTile`` body. Earlier tests that built ``Loop(role=…)`` graphs
+were deleted in the same refactor.
 """
 
 from __future__ import annotations
@@ -20,12 +14,9 @@ from __future__ import annotations
 import pytest
 
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Role
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt.body import Body
+from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
@@ -41,35 +32,10 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
 
 
-# --- Role field round-trip -------------------------------------------
-
-
-def test_role_field_default_is_none():
-    """A freshly-constructed Loop has ``role=None`` so existing call
-    sites that omit the field keep working unchanged."""
-    loop = Loop(axis=Axis("i", 4), body=())
-    assert loop.role is None
-
-
-def test_with_bodies_preserves_role():
-    """``Stmt.with_bodies`` is the canonical body-rewrite primitive (used
-    by every pass that descends into nested bodies). It must propagate
-    role tags or the planner's annotations would silently disappear on
-    the first downstream rewrite."""
-    original = Loop(axis=Axis("i", 4), body=(), role=Role.REGISTER)
-    rewritten = original.with_bodies((Body(()),))
-    assert isinstance(rewritten, Loop)
-    assert rewritten.role is Role.REGISTER
-
-
-def test_role_excluded_from_structural_key():
-    """Adding a role tag must not change ``Body.structural_key`` —
-    otherwise the planner cold-starts the autotune cache on every
-    kernel before producing any actual decisions."""
-    untagged = Body((Loop(axis=Axis("i", 4), body=()),))
-    tagged = Body((Loop(axis=Axis("i", 4), body=(), role=Role.REGISTER),))
-    assert untagged.structural_key() == tagged.structural_key()
-
+# --- Role field round-trip tests deleted in the SC3 cleanup of the
+#     planner-emits-tiles refactor: Loop.role / StridedLoop.role fields
+#     were removed once the planner stopped stamping them. The planner's
+#     internal axis-layer labeling now lives on a planner-private enum.
 
 # --- Tileify honors REGISTER tag -------------------------------------
 
@@ -90,82 +56,12 @@ def _run_only_launch_geometry(g: Graph) -> TileOp:
     return tile_ops[0]
 
 
-@_xfail_no_fallback
-def test_launch_geometry_stops_at_register_tagged_loop():
-    """Outer free-Loop chain: when an inner Loop carries ``Role.REGISTER``,
-    launch_geometry must stop lifting at the previous level. The REGISTER Loop
-    stays in the body for ``006a_register_tile_planned`` to replicate."""
-    outer = Axis("i", 4)
-    inner = Axis("i_i", 2)
-    loop_op = LoopOp(
-        body=(
-            Loop(
-                axis=outer,
-                body=(
-                    Loop(
-                        axis=inner,
-                        role=Role.REGISTER,
-                        body=(
-                            Load(name="x_v", input="x", index=(Var("i"), Var("i_i"))),
-                            Write(output="o", index=(Var("i"), Var("i_i")), value="x_v"),
-                        ),
-                    ),
-                ),
-            ),
-        ),
-    )
-    tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op))
-    # Outer ``i`` lifted to a ThreadTile (pointwise, no GridTile);
-    # inner REGISTER ``i_i`` becomes a RegisterTile in the body.
-    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
-    assert sorted(int(ax.extent) for ax in tile.axes) == [4]
-    register_tiles = [s for s in tile.body if isinstance(s, RegisterTile)]
-    assert len(register_tiles) == 1
-    assert tuple(int(ax.extent) for ax in register_tiles[0].axes) == (2,)
-
-
-@_xfail_no_fallback
-def test_launch_geometry_skips_register_sibling_output_loop():
-    """A top-level body free Loop tagged REGISTER must NOT be lifted by
-    ``_lift_output_loops`` even if its subtree writes the loop axis —
-    the tag means "this is register-tile inner, not a launch dim."
-    """
-    # Outer reduce so launch_geometry's chain-strip stops before the sibling level.
-    i = Axis("i", 4)
-    k = Axis("k", 8)
-    reg = Axis("r", 2)
-    loop_op = LoopOp(
-        body=(
-            Loop(
-                axis=i,
-                body=(
-                    Loop(
-                        axis=k,
-                        body=(
-                            Load(name="x_v", input="x", index=(Var("i"), Var("k"))),
-                            Accum(name="acc", value="x_v", op=ElementwiseImpl("add")),
-                        ),
-                    ),
-                    # Sibling free Loop tagged REGISTER. Writes index ``r`` —
-                    # without the tag, ``_lift_output_loops`` would pull it
-                    # into Tile.axes.
-                    Loop(
-                        axis=reg,
-                        role=Role.REGISTER,
-                        body=(Write(output="o", index=(Var("i"), Var("r")), value="acc"),),
-                    ),
-                ),
-            ),
-        ),
-    )
-    tile_op = _run_only_launch_geometry(_wrap_loopop(loop_op))
-    tile = next(s for s in tile_op.body if isinstance(s, ThreadTile))
-    # Only ``i`` (outer chain) ends up in ThreadTile.axes — ``r`` becomes a
-    # RegisterTile in the body, alongside the inner reduce SerialTile.
-    assert sorted(int(ax.extent) for ax in tile.axes) == [4]
-    register_tiles = [s for s in tile.body if isinstance(s, RegisterTile)]
-    assert len(register_tiles) == 1
-    assert tuple(int(ax.extent) for ax in register_tiles[0].axes) == (2,)
+# --- test_launch_geometry_stops_at_register_tagged_loop /
+#     test_launch_geometry_skips_register_sibling_output_loop deleted in
+#     SC3 — they built LoopOp graphs with Role-tagged Loops and ran the
+#     dropped LoopOp fallback. With the planner constructing tile flavors
+#     directly and the Role enum / Loop.role field gone, there's no way
+#     to even express the inputs these tests used.
 
 
 # --- Planner stub ----------------------------------------------------

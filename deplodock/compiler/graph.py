@@ -231,7 +231,6 @@ def _stmt_eval_scope() -> dict:
         BIND_THREAD,
         Axis,
         BoundAxis,
-        Role,
     )
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.expr import (
@@ -282,7 +281,6 @@ def _stmt_eval_scope() -> dict:
         "BoundAxis": BoundAxis,
         "BIND_BLOCK": BIND_BLOCK,
         "BIND_THREAD": BIND_THREAD,
-        "Role": Role,
         "Var": Var,
         "Literal": Literal,
         "BinaryExpr": BinaryExpr,

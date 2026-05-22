@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 
-from deplodock.compiler.ir.axis import Axis, Role
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
@@ -93,9 +93,6 @@ def normalize_body(
 # ---------------------------------------------------------------------------
 
 
-_LAUNCH_GEOMETRY_ROLES: frozenset[Role] = frozenset({Role.BLOCK, Role.SPLITK_BLOCK})
-
-
 def drop_size_one_free_axes(stmts: Body) -> Body:
     """Inline every free ``Loop(axis, extent=1)``: replace it with its body
     after substituting ``Var(axis.name) → Literal(0, "int")``. Reduce Loops
@@ -103,20 +100,19 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
     Recurses through StridedLoop / Tile / Cond bodies without rewriting
     those wrappers (their iteration semantics aren't a free Loop).
 
-    Role-tagged Loops that drive launch geometry (``Role.BLOCK`` and
-    ``Role.SPLITK_BLOCK``) are kept even at extent=1 — they signal to
-    ``launch_geometry`` that the kernel runs as a single CTA cooperating
-    via shared memory. Dropping them turns the Tile renderer's
-    block_axes empty, which falls back to the linear-flatten launch
-    pattern (grid = ceil(threads / 256), block = 256). With smem in
-    play (any matmul / fused kernel) each CTA loads its own private
-    smem and reads from threads that landed in *other* CTAs, producing
-    garbage output."""
+    Size-1 BLOCK / SPLITK_BLOCK protection used to live here when the
+    planner stamped ``Loop.role`` for downstream launch_geometry to
+    consume. The planner now constructs ``GridTile`` / ``ThreadTile``
+    directly and applies its own size-1 filter (see
+    ``000_partition_planner::_wrap_tower``), so by the time
+    ``drop_size_one_free_axes`` runs on a LoopOp body, no Loop has any
+    binding role — every size-1 free Loop is safely inlinable.
+    """
     stmts = Body.coerce(stmts)
 
     def fn(s: Stmt) -> Stmt | Body:
         # Body.map post-order: ``s.body`` is already recursively mapped.
-        if isinstance(s, Loop) and int(s.axis.extent) == 1 and not s.is_reduce and s.role not in _LAUNCH_GEOMETRY_ROLES:
+        if isinstance(s, Loop) and int(s.axis.extent) == 1 and not s.is_reduce:
             sub = Sigma({s.axis.name: Literal(0, "int")})
             return tuple(c.rewrite(_identity_rename, sub) for c in s.body)
         return s
@@ -139,19 +135,15 @@ def _recurse_canonicalize(s: Stmt) -> Stmt:
 def canonicalize_free_axis_order(stmts: Body) -> Body:
     """Sort the outer chain of free ``Loop`` blocks alphabetically by axis
     name. The chain is the sequence of single-child free Loops at the top of
-    ``stmts``; it terminates at a reduce Loop, a role-tagged Loop, or a
-    branching body. Recursion continues into terminal block bodies (Loop
-    / StridedLoop / Tile / Cond).
-
-    Role-tagged Loops (planner output) terminate the sort window so the
-    planner's M_o/N_o → M_i/N_i nesting order survives. Loop ``unroll``
-    annotations travel with their axis through the sort."""
+    ``stmts``; it terminates at a reduce Loop or a branching body.
+    Recursion continues into terminal block bodies (Loop / StridedLoop /
+    Tile / Cond)."""
     stmts = Body.coerce(stmts)
     chain: list[Loop] = []
     current = stmts
     while len(current) == 1 and isinstance(current[0], Loop):
         loop = current[0]
-        if loop.is_reduce or loop.role is not None:
+        if loop.is_reduce:
             break
         chain.append(loop)
         current = loop.body
@@ -161,7 +153,7 @@ def canonicalize_free_axis_order(stmts: Body) -> Body:
     chain_sorted = sorted(chain, key=lambda lp: lp.axis.name)
     result: Body = terminal
     for loop in reversed(chain_sorted):
-        result = (Loop(axis=loop.axis, body=result, unroll=loop.unroll, role=loop.role),)
+        result = (Loop(axis=loop.axis, body=result, unroll=loop.unroll),)
     return result
 
 
@@ -388,7 +380,6 @@ def _merge_sibling_reduce_loops(body: Body) -> Body:
                 and t.axis.name == merged.axis.name
                 and int(t.axis.extent) == int(merged.axis.extent)
                 and t.unroll == merged.unroll
-                and t.role == merged.role
             ):
                 continue
             merged_defs = _all_ssa_defs(merged.body)
@@ -407,7 +398,6 @@ def _merge_sibling_reduce_loops(body: Body) -> Body:
                 axis=merged.axis,
                 body=Body(tuple(merged.body) + tuple(t.body)),
                 unroll=merged.unroll,
-                role=merged.role,
             )
             consumed.add(j)
         out.append(merged)
