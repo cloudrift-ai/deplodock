@@ -13,11 +13,6 @@ import torch
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
-_STAGE_REFACTOR_SKIP = pytest.mark.skip(
-    reason="002→pre-006a staging + REGISTER cache axes: misaligned float4 smem read poisons the worker's CUDA "
-    "context under parallel xdist load. Skipped to keep `make test` green."
-)
-
 
 def _randn(shape: str, dtype, scale: float | None = None) -> str:
     """Build a ``torch.randn(...)`` snippet for the given dtype.
@@ -74,21 +69,18 @@ def test_run_code_softmax_blockify(run_cli, dtype):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_matmul_blockify(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.matmul({_randn('64,128', dtype)}, {_randn('128,64', dtype)})")
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_linear_blockify(run_cli):
     rc, _, stderr = run_cli("run", "--code", "torch.nn.Linear(2048, 2048, bias=False)(torch.randn(1, 32, 2048))")
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_matmul_k_chunked(run_cli):
     """Matmul with K large enough to exercise the K-chunked SGEMM path
@@ -100,7 +92,6 @@ def test_run_code_matmul_k_chunked(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_sdpa_k_chunked(run_cli):
     """SDPA: the per-output free loop (head_dim) wraps a reduce loop +
@@ -116,7 +107,6 @@ def test_run_code_sdpa_k_chunked(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_sdpa_tinyllama_per_head(run_cli):
     """Per-head SDPA at TinyLlama-block-seq=512 dimensions, mirroring the
@@ -133,7 +123,6 @@ def test_run_code_sdpa_tinyllama_per_head(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_sdpa_seq1024_dynamic_smem(run_cli):
     """SDPA at seq_len=1024, 32 heads: the Q·Kᵀ kernel needs ~50 KB of
@@ -151,7 +140,6 @@ def test_run_code_sdpa_seq1024_dynamic_smem(run_cli):
     assert rc == 0, f"stderr: {stderr}"
 
 
-@_STAGE_REFACTOR_SKIP
 @requires_cuda
 def test_run_code_sdpa_tinyllama_full(run_cli):
     """Full multi-head TinyLlama-block-seq=512 SDPA (1 batch × 32 heads ×
