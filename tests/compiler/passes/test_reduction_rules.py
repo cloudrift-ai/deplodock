@@ -9,8 +9,6 @@ reordering rule files doesn't break these tests.
 
 from __future__ import annotations
 
-import pytest
-
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
