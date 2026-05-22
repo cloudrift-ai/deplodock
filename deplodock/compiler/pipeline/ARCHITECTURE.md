@@ -78,12 +78,17 @@ pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize
 the children, pushes them back, and continues; cursor advance only
 fires when the lineage resolves to a concrete leaf. Lets a rule expose
 a hierarchy of decisions lazily — only the subtrees MCTS actually walks
-into get materialized. The partition planner uses this to descend
-`SPLITK → BR → (BN, BM) → BK → (FM, FN)` without enumerating every leaf
-up front. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy
-replay) without firing the thunk; `Fork.score` is the MCTS prior the
-producing rule attaches (typically the priority rank of the
-best-reachable leaf under this branch).
+into get materialized. `Fork.knobs` is read by `_best_fork` (for
+DB-seeded greedy replay) without firing the thunk; `Fork.score` is the
+MCTS prior the producing rule attaches.
+
+No production rule currently emits branch Forks — an early experiment
+in the partition planner showed that a priority-rank-derived
+`Fork.score` is a coarser MCTS prior than the proper `TileOp.score`,
+so hierarchical exploration found best variants more slowly than the
+flat list. The infrastructure stays because it's straightforward to
+use once a richer per-level prior (or a search-space size that
+amortizes the structural overhead) justifies it.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
