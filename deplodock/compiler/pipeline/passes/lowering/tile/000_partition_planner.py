@@ -593,22 +593,31 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     the prologue's M-axis references resolve to the in-scope ``M_r``."""
     sigma_map: dict[str, object] = {}
 
-    N_name = shape.outer_n.axis.name
-    E_N = int(shape.outer_n.axis.extent)
+    # source_axis: every sub-axis points back to the original Axis it was
+    # carved out of (= ``shape.outer_n.axis`` for N, etc.). Downstream
+    # passes use this to group surrounding axes by source identity (e.g.
+    # the MMA factorization plan's BLOCK·GROUP·CELL·ATOM enumeration along
+    # each output axis) without name-suffix string matching.
+    N_axis = shape.outer_n.axis
+    N_name = N_axis.name
+    E_N = int(N_axis.extent)
     N_b_ext = E_N // (params.bn * params.fn)
-    N_b = Axis(f"{N_name}_b", N_b_ext)
-    N_t = Axis(f"{N_name}_t", params.bn)
-    N_r = Axis(f"{N_name}_r", params.fn)
+    N_src = N_axis.source_axis or N_axis
+    N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src)
+    N_t = Axis(f"{N_name}_t", params.bn, source_axis=N_src)
+    N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
     sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
 
     M_b = M_t = M_r = None
     if shape.outer_m is not None:
-        M_name = shape.outer_m.axis.name
-        E_M = int(shape.outer_m.axis.extent)
+        M_axis = shape.outer_m.axis
+        M_name = M_axis.name
+        E_M = int(M_axis.extent)
         M_b_ext = E_M // (params.bm * params.fm)
-        M_b = Axis(f"{M_name}_b", M_b_ext)
-        M_t = Axis(f"{M_name}_t", params.bm)
-        M_r = Axis(f"{M_name}_r", params.fm)
+        M_src = M_axis.source_axis or M_axis
+        M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src)
+        M_t = Axis(f"{M_name}_t", params.bm, source_axis=M_src)
+        M_r = Axis(f"{M_name}_r", params.fm, source_axis=M_src)
         sigma_map[M_name] = (
             Var(M_b.name) * Literal(params.bm * params.fm, "int") + Var(M_t.name) * Literal(params.fm, "int") + Var(M_r.name)
         )
@@ -619,12 +628,15 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # thread direction); K_o / K_i are per-K-Loop, built inside _replace_k_loops.
     K_s = K_c = None
     K_o_ext = 0
+    K_src: Axis | None = None
     if shape.k_loop is not None:
-        K_name = shape.k_loop.axis.name
-        E_K = int(shape.k_loop.axis.extent)
+        K_axis = shape.k_loop.axis
+        K_name = K_axis.name
+        E_K = int(K_axis.extent)
         K_o_ext = E_K // (params.splitk * params.br * params.bk)
-        K_s = Axis(f"{K_name}_s", params.splitk) if params.splitk > 1 else None
-        K_c = Axis(f"{K_name}_c", params.br) if params.br > 1 else None
+        K_src = K_axis.source_axis or K_axis
+        K_s = Axis(f"{K_name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None
+        K_c = Axis(f"{K_name}_c", params.br, source_axis=K_src) if params.br > 1 else None
 
     # σ-rewrite outer_n's body (M/N axes), then replace every K-iter Loop with
     # a K_o · K_i tower. Both paths use shared canonical K_o / K_i names so
@@ -743,8 +755,9 @@ def _replace_k_loops(
     for s in stmts:
         if isinstance(s, Loop) and s.axis.name in target_names:
             K_name = s.axis.name
-            K_o = Axis(f"{K_canonical_name}_o", K_o_ext)
-            K_i = Axis(f"{K_canonical_name}_i", bk)
+            K_src = s.axis.source_axis or s.axis
+            K_o = Axis(f"{K_canonical_name}_o", K_o_ext, source_axis=K_src)
+            K_i = Axis(f"{K_canonical_name}_i", bk, source_axis=K_src)
             sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk)
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             tower = _wrap_tower([(K_i, Role.STAGE_INNER), (K_o, Role.SERIAL_OUTER)], new_body)

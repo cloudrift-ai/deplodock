@@ -163,8 +163,9 @@ def _split_stage(stage: TmaBufferedStage, mode: SwizzleMode, ips: int) -> TmaBuf
     factor = int(orig.extent) // ips
     if factor * ips != int(orig.extent):
         raise RuleSkipped(f"stage {stage.name!r}: inner extent {orig.extent} not divisible by IPS {ips}")
-    outer_axis = Axis(f"{orig.name}_o", factor)
-    inner_axis = Axis(orig.name, ips)
+    src = orig.source_axis or orig
+    outer_axis = Axis(f"{orig.name}_o", factor, source_axis=src)
+    inner_axis = Axis(orig.name, ips, source_axis=src)
     new_axes = (*stage.axes[:-1], outer_axis, inner_axis)
     inner_dim = stage.addressing.dims[-1]
     new_dims = (*stage.addressing.dims, inner_dim)
