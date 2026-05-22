@@ -65,7 +65,7 @@ from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Cond, Loop, Stmt, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -215,6 +215,17 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         k_loop = matmul_reduces[0]
         target_names = frozenset(lp.axis.name for lp in matmul_reduces)
         E_K = int(k_loop.axis.extent)
+        # SPLITK > 1 only works when each Write's atomic-add is mathematically
+        # equivalent to the unsplit reduce. That requires a linear-in-Accum
+        # chain from Accum to Write: ``sum_i (c·a_i + r) = c·sum_i a_i + r``
+        # holds for matmul (Write=acc) and matmul_add (Write=add(acc, r))
+        # but breaks for non-linear post-reduce combines like
+        # ``silu(acc_g) * acc_u`` (gated_mlp) or softmax (sdpa). A simple,
+        # conservative proxy: any matmul-reduce loop with > 1 Accum is fusing
+        # multiple K-sums into one output cell — must be a non-linear combine
+        # (else the fusion would have merged them upstream). Force SPLITK=1.
+        multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
+        splitk_choices = (1,) if multi_accum else _SPLITK_CANDIDATES
         param_combos = _enumerate_cartesian(
             E_M=E_M,
             E_N=E_N,
@@ -222,7 +233,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             bn_choices=_TUNE_AXIS_CHOICES,
             bm_choices=_TUNE_AXIS_CHOICES,
             bk_choices=_BK_CANDIDATES,
-            splitk_choices=_SPLITK_CANDIDATES,
+            splitk_choices=splitk_choices,
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             max_threads_per_cta=ctx.max_threads_per_cta,
             priority_mode="matmul",
@@ -233,6 +244,15 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         # E_K ≥ warp_size: smaller reduces don't justify a warp-shuffle.
         # target_names includes both K-reduce axes AND per-K post-pointwise
         # axes (non-reduce free Loops sharing E_K), since both get rewritten.
+        #
+        # SPLITK is restricted to 1 here: cross-CTA reduce for cooperative-K
+        # would need atomic accumulation of the partial sums (the per-CTA
+        # Combine only reduces *within* a CTA), plus a barrier before the
+        # post-reduce pointwise epilogue reads the final value. Neither is
+        # wired up today — the K_s=0 CTA would race with K_s>0 CTAs that
+        # are still writing partial sums, and only K_s=0 writes the output
+        # using its own (half-data) reduction. Forcing SPLITK=1 keeps the
+        # search space honest.
         k_loop = nonmatmul_reduces[0]
         E_K = int(k_loop.axis.extent)
         target_names = frozenset(lp.axis.name for lp in all_loops if int(lp.axis.extent) == E_K and not is_matmul_reduce(lp))
@@ -243,7 +263,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             bn_choices=(1, *_TUNE_AXIS_CHOICES),
             bm_choices=(1, *_TUNE_AXIS_CHOICES),
             bk_choices=_BK_CANDIDATES,
-            splitk_choices=_SPLITK_CANDIDATES,
+            splitk_choices=(1,),
             br_choices=_BR_CANDIDATES,
             max_cells_per_thread=_MAX_CELLS_PER_THREAD,
             max_threads_per_cta=ctx.max_threads_per_cta,
@@ -335,6 +355,12 @@ def _enumerate_cartesian(
                 if br < 1 or E_K % br != 0:
                     continue
                 if bn_c * bm_c * br > max_threads_per_cta:
+                    continue
+                # Lowering requires at least one BIND_THREAD axis on the
+                # Tile (materializer's _materialize raises otherwise).
+                # With bn = bm = br = 1 every output axis lands in BLOCK
+                # / REGISTER and the THREAD set is empty — skip.
+                if bn_c * bm_c * br == 1:
                     continue
                 per_thread_K = E_K // br
                 for fm in _divisors_up_to(E_M // bm_c, max_cells_per_thread):
