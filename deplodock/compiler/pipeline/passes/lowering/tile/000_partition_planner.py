@@ -275,19 +275,33 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         if outer_m is None:
             return None
         k_loop = matmul_reduces[0]
-        target_names = frozenset(lp.axis.name for lp in matmul_reduces)
         E_K = int(k_loop.axis.extent)
+        # target_names unions over outer_n.body (the matmul K reduces) and
+        # the prologue (softmax max/sum reduces sharing the matmul K extent,
+        # axis-name-unified by unify_sibling_reduce_axes upstream). For
+        # plain matmul / matmul_add / gated_mlp the prologue is empty and
+        # this collapses to ``{lp.axis.name for lp in matmul_reduces}``.
+        prologue_reduces = tuple(lp for lp in Body(prologue).iter_of_type(Loop) if lp.is_reduce and int(lp.axis.extent) == E_K)
+        target_names = frozenset((*(lp.axis.name for lp in matmul_reduces), *(lp.axis.name for lp in prologue_reduces)))
         # SPLITK > 1 only works when each Write's atomic-add is mathematically
         # equivalent to the unsplit reduce. That requires a linear-in-Accum
         # chain from Accum to Write: ``sum_i (c·a_i + r) = c·sum_i a_i + r``
         # holds for matmul (Write=acc) and matmul_add (Write=add(acc, r))
-        # but breaks for non-linear post-reduce combines like
-        # ``silu(acc_g) * acc_u`` (gated_mlp) or softmax (sdpa). A simple,
-        # conservative proxy: any matmul-reduce loop with > 1 Accum is fusing
-        # multiple K-sums into one output cell — must be a non-linear combine
-        # (else the fusion would have merged them upstream). Force SPLITK=1.
+        # but breaks for two reasons:
+        #
+        # 1. Non-linear post-reduce combines like ``silu(acc_g) * acc_u``
+        #    (gated_mlp) or softmax (sdpa). Conservative proxy: any matmul-
+        #    reduce loop with > 1 Accum fuses multiple K-sums into one
+        #    output cell — must be non-linear (else fusion would have
+        #    merged them upstream).
+        # 2. A non-empty prologue (SDPA P@V) — softmax max/sum/reciprocal
+        #    are *consumed* by the matmul reduce, so each K_s CTA's
+        #    partial softmax stat would feed a partial matmul.
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
-        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", multi_accum=multi_accum)
+        force_splitk_one = multi_accum or bool(prologue)
+        param_combos = _enumerate_cartesian(
+            E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one
+        )
     elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
@@ -373,7 +387,7 @@ def _enumerate_cartesian(
     E_K: int,
     ctx: Context,
     priority_mode: str,
-    multi_accum: bool = False,
+    force_splitk_one: bool = False,
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
@@ -384,9 +398,11 @@ def _enumerate_cartesian(
 
         matmul   : BN/BM = _TUNE_AXIS_CHOICES; BK = _BK_CANDIDATES; BR = (1,);
                    SPLITK = _SPLITK_CANDIDATES — clipped to (1,) when
-                   ``multi_accum`` flags a non-linear post-reduce combine
-                   (the linear-in-Accum chain that lets ``sum_i (c·a_i + r) =
-                   c·sum_i a_i + r`` doesn't hold). min_k_chunks=2.
+                   ``force_splitk_one`` is set (caller passes True for
+                   non-linear post-reduce combines like gated_mlp /
+                   sdpa where ``sum_i (c·a_i + r) = c·sum_i a_i + r``
+                   doesn't hold, or for the matmul-with-prologue case
+                   where the prologue feeds the matmul). min_k_chunks=2.
         reduce   : BN/BM = (1, *_TUNE_AXIS_CHOICES) — the leading 1 enables
                    the cooperative-K v1 constraint (BR>1 ⇒ BN=BM=1, single
                    THREAD axis for the materializer). SPLITK = (1,) — atomic
@@ -420,7 +436,7 @@ def _enumerate_cartesian(
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
         bk_choices = _BK_CANDIDATES
-        splitk_choices = (1,) if multi_accum else _SPLITK_CANDIDATES
+        splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
         br_choices: tuple[int, ...] = (1,)
         min_k_chunks = 2
         priority_fn: Callable[[TileParams], tuple[int, ...]] = _priority_matmul
