@@ -76,6 +76,13 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.tile.ir import (
+    GridTile,
+    RegisterTile,
+    SerialTile,
+    ThreadTile,
+    TileOp,
+)
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -144,17 +151,40 @@ class KernelShape:
     prologue: tuple[Stmt, ...] = ()
 
 
-def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
+def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | list[TileOp]:
     loop_op: LoopOp = root.op
-    # Idempotence is structural: once roles are stamped, _outer_free_loop_chain
-    # returns empty (it requires role=None) and _split_kernel_fully → None.
-    variants = _split_kernel_fully(loop_op, ctx)
+    kernel_name = _kernel_name_for(loop_op, root.id)
+    # Idempotence is structural: once the planner has built a TileOp, the
+    # rule pattern (LoopOp) no longer matches.
+    variants = _split_kernel_fully(loop_op, ctx, kernel_name=kernel_name)
     if variants is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
     if len(variants) == 1:
         return variants[0]
     return variants
+
+
+def _kernel_name_for(loop: LoopOp, base_name: str) -> str:
+    """Build the rendered kernel-function name from the LoopOp shape and
+    the graph node id. ``k_<dedup_base>_<reduce|pointwise>``."""
+    suffix = "reduce" if any(isinstance(s, Accum) for s in loop) else "pointwise"
+    return f"k_{_dedup_tokens(base_name)}_{suffix}"
+
+
+def _dedup_tokens(name: str) -> str:
+    """Drop consecutive duplicate ``_``-separated tokens.
+
+    ``softmax_softmax_max`` → ``softmax_max``; ``rms_rms_norm`` → ``rms_norm``.
+    Preserves order; only collapses adjacent duplicates so structurally
+    distinct repeats (``add_mul_add``) survive.
+    """
+    out: list[str] = []
+    for tok in name.split("_"):
+        if not tok or (out and out[-1] == tok):
+            continue
+        out.append(tok)
+    return "_".join(out) if out else name
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -242,13 +272,92 @@ def _identity_rename(name: str) -> str:
 
 
 def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
-    """Wrap ``inner`` in nested Loops, innermost layer first.
-    ``[(K_i, STAGE_INNER), (K_o, SERIAL_OUTER)]`` →
-    ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, inner))``."""
-    current = inner
+    """Wrap ``inner`` in nested typed tile flavors, innermost layer first.
+
+    ``layers`` is innermost-first: ``[(K_i, STAGE_INNER), (K_o, SERIAL_OUTER)]``
+    walks outer ``K_o`` outermost. Consecutive parallel-binding axes group
+    into one tile (so ``[BLOCK, BLOCK, THREAD, THREAD, REGISTER]`` yields
+    ``GridTile(BLOCK,BLOCK) > ThreadTile(THREAD,THREAD) > RegisterTile(REGISTER)``).
+    Each serial-binding axis becomes its own ``SerialTile`` with the
+    matching ``kind``.
+
+    Role → flavor mapping:
+
+    - ``BLOCK`` / ``SPLITK_BLOCK`` → ``GridTile.axes`` (``SPLITK_BLOCK``
+      axis names go into ``GridTile.splitk_axes``).
+    - ``THREAD`` / ``COOPERATIVE_STRIDE`` → ``ThreadTile.axes``
+      (``COOPERATIVE_STRIDE`` axis names go into ``ThreadTile.cooperative_axes``).
+    - ``REGISTER`` → ``RegisterTile.axes``.
+    - ``SERIAL_OUTER`` / ``STAGE_INNER`` / ``PIPELINE`` → ``SerialTile(kind=…)``.
+    - Untagged (``None``) → ``SerialTile(kind="plain")``.
+
+    **Size-1 axis filtering.** ``Loop`` IR's ``drop_size_one_free_axes``
+    inlines extent-1 free Loops by substituting their var with 0. The
+    planner's σ-split sometimes generates such axes (e.g. cooperative
+    softmax with BN=BM=1 makes N_t / M_t extent-1 THREAD axes). Mirror
+    the same drop here — except for ``BLOCK`` / ``SPLITK_BLOCK`` axes,
+    which signal launch geometry to the CUDA backend and must survive
+    even at extent 1 (single-CTA cooperative kernels rely on this).
+    """
+    inner_body = tuple(inner)
+    # Drop size-1 axes that aren't launch-geometry markers; substitute
+    # ``Var(axis.name) → Literal(0, "int")`` in the inner body.
+    filtered: list[tuple[Axis, Role | None]] = []
     for axis, role in layers:
-        current = (Loop(axis=axis, role=role, body=current),)
+        if int(axis.extent) == 1 and role not in (Role.BLOCK, Role.SPLITK_BLOCK):
+            sub = Sigma({axis.name: Literal(0, "int")})
+            inner_body = tuple(c.rewrite(_identity_rename, sub) for c in inner_body)
+            continue
+        filtered.append((axis, role))
+
+    # Walk outermost-first so consecutive parallel axes group naturally.
+    outermost_first = list(reversed(filtered))
+    # Group: list of (group_kind, [axes], [roles])
+    groups: list[tuple[str, list[Axis], list[Role | None]]] = []
+    for axis, role in outermost_first:
+        kind = _layer_kind_for(role)
+        # Parallel kinds group consecutive same-kind axes; serial kinds always
+        # start a fresh group (each serial layer is its own SerialTile).
+        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register"):
+            groups[-1][1].append(axis)
+            groups[-1][2].append(role)
+        else:
+            groups.append((kind, [axis], [role]))
+
+    # Build the tree innermost-first by wrapping ``inner`` with each group
+    # in reverse order.
+    current: tuple[Stmt, ...] = inner_body
+    for kind, axes, roles in reversed(groups):
+        if kind == "grid":
+            splitk = tuple(ax.name for ax, r in zip(axes, roles, strict=True) if r is Role.SPLITK_BLOCK)
+            current = (GridTile(axes=tuple(axes), body=Body(current), splitk_axes=splitk),)
+        elif kind == "thread":
+            coop = tuple(ax.name for ax, r in zip(axes, roles, strict=True) if r is Role.COOPERATIVE_STRIDE)
+            current = (ThreadTile(axes=tuple(axes), body=Body(current), cooperative_axes=coop),)
+        elif kind == "register":
+            current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
+        else:  # serial — one axis per layer
+            ax = axes[0]
+            role = roles[0]
+            serial_kind: str = "plain"
+            if role is Role.SERIAL_OUTER:
+                serial_kind = "serial_outer"
+            elif role is Role.STAGE_INNER:
+                serial_kind = "stage_inner"
+            elif role is Role.PIPELINE:
+                serial_kind = "pipeline"
+            current = (SerialTile(axis=ax, body=Body(current), kind=serial_kind),)
     return current
+
+
+def _layer_kind_for(role: Role | None) -> str:
+    if role is Role.BLOCK or role is Role.SPLITK_BLOCK:
+        return "grid"
+    if role is Role.THREAD or role is Role.COOPERATIVE_STRIDE:
+        return "thread"
+    if role is Role.REGISTER:
+        return "register"
+    return "serial"
 
 
 def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
@@ -263,7 +372,7 @@ class _BuildSkipped(Exception):
     """Raised by ``_build_split_body`` when the body's shape doesn't match."""
 
 
-def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
+def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> list[TileOp] | None:
     """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
 
     Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
@@ -352,7 +461,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         prologue=prologue,
     )
     leading, _ = _split_leading_non_loops(loop_op.body)
-    variants: list[LoopOp] = []
+    variants: list[TileOp] = []
     for params in param_combos:
         try:
             chain_body = _build_split_body(shape, params)
@@ -369,7 +478,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             SPLITK.name: params.splitk,
             BR.name: params.br,
         }
-        variants.append(LoopOp(body=new_body, knobs=knobs))
+        variants.append(TileOp(body=new_body, name=kernel_name, knobs=knobs))
     return variants or None
 
 

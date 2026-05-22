@@ -34,6 +34,11 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def test_launch_geometry_fires_on_pointwise(recording_dump):
+    """``partition_planner`` is what lifts axes into ``GridTile`` /
+    ``ThreadTile`` now. ``launch_geometry`` only fires as a fallback for
+    kernels the planner skips. For pointwise / reduce the planner
+    handles everything, so we assert the planner fired (transitively
+    proving axes got lifted)."""
     g = Graph()
     _input(g, "x", (4, 8))
     g.add_node(op=ElementwiseOp("relu"), inputs=["x"], output=Tensor("o", (4, 8)), node_id="o")
@@ -41,7 +46,7 @@ def test_launch_geometry_fires_on_pointwise(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "launch_geometry" in recording_dump.fired_rules("lowering/tile")
+    assert "partition_planner" in recording_dump.fired_rules("lowering/tile")
 
 
 def test_launch_geometry_fires_on_reduction(recording_dump):
@@ -52,7 +57,7 @@ def test_launch_geometry_fires_on_reduction(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "launch_geometry" in recording_dump.fired_rules("lowering/tile")
+    assert "partition_planner" in recording_dump.fired_rules("lowering/tile")
 
 
 # --- behavior tests: build LoopOp graphs, run launch_geometry in isolation ---

@@ -69,7 +69,7 @@ from deplodock.compiler.ir.tile.ir import (
     Tile,
     TileOp,
 )
-from deplodock.compiler.pipeline import Pattern
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -95,6 +95,75 @@ def _bind_for_role(role: Role | None) -> str:
 def rewrite(root: Node) -> Graph | None:
     kname = _kernel_name_for(root.op, root.id)
     return launch_geometry(root.op, kname)
+
+
+def _coordinate(tile_op: TileOp) -> TileOp | None:
+    """Run coordination on a planner-produced ``TileOp``.
+
+    Walks the body for ``GridTile.splitk_axes`` and ``ThreadTile.cooperative_axes``;
+    rewrites Writes accordingly (atomic-add for splitk axes, Combine
+    siblings + ``Cond(axis==0)`` for cooperative axes). When no
+    coordination is needed, raises ``RuleSkipped`` so the engine doesn't
+    re-fire idempotently.
+    """
+    changed = False
+    new_body: list[Stmt] = []
+    for s in tile_op.body:
+        if isinstance(s, GridTile) and s.splitk_axes:
+            new_inner = list(s.body)
+            for axis_name in s.splitk_axes:
+                new_inner = list(_rewrite_for_lifted_axis(tuple(new_inner), axis_name, mode="atomic"))
+            new_grid = GridTile(axes=s.axes, body=Body(new_inner), splitk_axes=s.splitk_axes)
+            new_body.append(_coordinate_thread(new_grid))
+            changed = True
+        elif isinstance(s, GridTile):
+            new_body.append(_coordinate_thread(s))
+        elif isinstance(s, ThreadTile):
+            new_body.append(_coordinate_thread(s))
+        else:
+            new_body.append(s)
+    # Re-check whether the body actually changed.
+    if not changed and not _coordination_needed(tile_op.body):
+        raise RuleSkipped("no splitk / cooperative coordination needed")
+    return TileOp(body=tuple(new_body), name=tile_op.name, knobs=tile_op.knobs)
+
+
+def _coordinate_thread(parent: GridTile | ThreadTile) -> GridTile | ThreadTile:
+    """If ``parent`` (or its inner ThreadTile child) carries cooperative
+    axes, emit Combine + Cond-guard scalar Writes."""
+    if isinstance(parent, ThreadTile):
+        tt = parent
+    else:
+        # GridTile — find inner ThreadTile child
+        tt = next((c for c in parent.body if isinstance(c, ThreadTile)), None)
+        if tt is None or not tt.cooperative_axes:
+            return parent
+    if not tt.cooperative_axes:
+        return parent
+    new_inner = list(tt.body)
+    for axis_name in tt.cooperative_axes:
+        new_inner = list(_rewrite_for_lifted_axis(tuple(new_inner), axis_name, mode="cooperative"))
+    new_tt = ThreadTile(axes=tt.axes, body=Body(new_inner), cooperative_axes=tt.cooperative_axes)
+    if isinstance(parent, ThreadTile):
+        return new_tt
+    # GridTile wrapping — substitute the rebuilt ThreadTile in place.
+    new_grid_body = tuple(new_tt if c is tt else c for c in parent.body)
+    return GridTile(axes=parent.axes, body=Body(new_grid_body), splitk_axes=parent.splitk_axes)
+
+
+def _coordination_needed(body) -> bool:
+    """True iff any top-level GridTile / ThreadTile carries splitk /
+    cooperative axes that require coordination rewrites."""
+    for s in body:
+        if isinstance(s, GridTile):
+            if s.splitk_axes:
+                return True
+            for c in s.body:
+                if isinstance(c, ThreadTile) and c.cooperative_axes:
+                    return True
+        elif isinstance(s, ThreadTile) and s.cooperative_axes:
+            return True
+    return False
 
 
 def launch_geometry(loop_op: LoopOp, kernel_name: str = "") -> TileOp:
@@ -346,11 +415,11 @@ def _rewrite_for_atomic_lift(body: tuple[LoopStmt, ...], axis_name: str) -> tupl
     changed = False
     out: list[LoopStmt] = []
     for s in body:
-        if isinstance(s, (Loop, StridedLoop)) and _contains_write(s):
+        if isinstance(s, (Loop, StridedLoop, SerialTile, StridedTile, RegisterTile)) and _contains_write(s):
             new_inner = _rewrite_for_atomic_lift(tuple(s.body), axis_name)
             if new_inner != tuple(s.body):
                 changed = True
-            out.append(dc_replace(s, body=new_inner))
+            out.append(s.with_bodies((Body(new_inner),)))
         elif isinstance(s, Cond) and (_contains_write(s) or any(_contains_write(c) for c in s.else_body)):
             new_b = _rewrite_for_atomic_lift(tuple(s.body), axis_name)
             new_e = _rewrite_for_atomic_lift(tuple(s.else_body), axis_name)
@@ -531,17 +600,35 @@ def _insert_combines_after_reduces(stmts: tuple[LoopStmt, ...]) -> tuple[LoopStm
 
     # No subtree at this level. Try descending one wrapper.
     for i, s in enumerate(stmts):
-        if isinstance(s, (Loop, StridedLoop)):
+        if isinstance(s, (Loop, StridedLoop, SerialTile, StridedTile, RegisterTile)):
             inner = _insert_combines_after_reduces(tuple(s.body))
             if inner != tuple(s.body):
-                return stmts[:i] + (dc_replace(s, body=inner),) + stmts[i + 1 :]
+                return stmts[:i] + (s.with_bodies((Body(inner),)),) + stmts[i + 1 :]
     return tuple(stmts)
 
 
 def _accums_under_reduce_subtree(s: LoopStmt) -> list[Accum]:
     """If ``s`` is a cooperative-K reduce subtree (SERIAL_OUTER wrapping
     STAGE_INNER, or bare STAGE_INNER), return the immediate Accums of
-    the STAGE_INNER. Otherwise return an empty list."""
+    the STAGE_INNER. Otherwise return an empty list.
+
+    Accepts both Loop-IR (``Loop(role=…)``) and Tile-IR
+    (``SerialTile(kind=…)``) shapes — the same coordination logic runs
+    on planner-emitted TileOp bodies and on fallback LoopOp paths.
+    """
+    # Tile-IR shape
+    if isinstance(s, SerialTile) and s.is_reduce and s.kind == "stage_inner":
+        return [c for c in s.body if isinstance(c, Accum)]
+    if isinstance(s, SerialTile) and not s.is_reduce and s.kind == "serial_outer":
+        cur = tuple(s.body)
+        while len(cur) == 1 and isinstance(cur[0], (SerialTile, StridedTile, RegisterTile)):
+            inner = cur[0]
+            if isinstance(inner, SerialTile) and inner.is_reduce and inner.kind == "stage_inner":
+                accums = [c for c in inner.body if isinstance(c, Accum)]
+                if accums:
+                    return accums
+            cur = tuple(inner.body)
+    # Loop-IR shape (fallback path)
     if isinstance(s, Loop) and s.is_reduce and s.role is Role.STAGE_INNER:
         return [c for c in s.body if isinstance(c, Accum)]
     if isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
@@ -572,10 +659,10 @@ def _guard_scalar_write(s: LoopStmt, coop_name: str) -> LoopStmt:
                 else_body=Body(()),
             )
         return s
-    if isinstance(s, (Loop, StridedLoop)):
+    if isinstance(s, (Loop, StridedLoop, SerialTile, StridedTile, RegisterTile)):
         inner = tuple(_guard_scalar_write(c, coop_name) for c in s.body)
         if inner != tuple(s.body):
-            return dc_replace(s, body=inner)
+            return s.with_bodies((Body(inner),))
         return s
     if isinstance(s, Cond):
         b = tuple(_guard_scalar_write(c, coop_name) for c in s.body)
