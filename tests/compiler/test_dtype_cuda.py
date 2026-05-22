@@ -9,7 +9,6 @@ match eager numpy within fp16 tolerance.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from deplodock.compiler import dtype as dt
 from deplodock.compiler.graph import Graph, Tensor
@@ -116,7 +115,6 @@ def _fp16_sum_graph() -> Graph:
     return g
 
 
-@pytest.mark.xfail(reason="planner-emits-tiles dropped LoopOp fallback; global-sum kernels (no outer free Loop chain) need planner support")
 @requires_cuda
 def test_fp16_reduction_uses_fp32_accumulator_on_cuda():
     from deplodock.compiler.backend.cuda.backend import CudaBackend
@@ -230,7 +228,6 @@ def test_fp16_rmsnorm_cuda():
     np.testing.assert_allclose(out, expected, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.xfail(reason="planner-emits-tiles dropped LoopOp fallback; global-max kernels (no outer free Loop chain) need planner support")
 @requires_cuda
 def test_fp16_max_reduction_stays_in_fp16():
     """``max`` is a selection (no magnitude accumulation), so it stays in

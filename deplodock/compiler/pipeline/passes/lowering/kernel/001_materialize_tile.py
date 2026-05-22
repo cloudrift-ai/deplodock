@@ -486,6 +486,14 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
                 # ValueError, which preserves today's safety net against stray
                 # Combines.
                 pending_reduce = _find_nested_reduce_accums(stmt.body)
+        elif isinstance(stmt, Accum):
+            # Bare Accum at the ThreadTile scope — degenerate cooperative
+            # reduce where K_i collapsed to size-1 (e.g. K=warp_size with
+            # BR=warp_size cooperative threads each handling one element).
+            # Pass the Accum through and stage it as a pending reduce so
+            # the following Combine has something to consume.
+            new_body.append(transform(stmt))
+            pending_reduce = {stmt.name: stmt}
         elif isinstance(stmt, Combine):
             # ``Combine.name`` is the per-thread SSA value to combine across
             # threads. It usually matches one of the preceding Accums' names,

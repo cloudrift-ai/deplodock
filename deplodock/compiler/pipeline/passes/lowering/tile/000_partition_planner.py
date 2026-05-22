@@ -109,8 +109,8 @@ class Role(enum.Enum):
 
 PATTERN = [Pattern("root", LoopOp)]
 
-_BK_CANDIDATES = (64, 32, 16, 8, 4, 2)
-_TUNE_AXIS_CHOICES: tuple[int, ...] = (16, 32, 64, 128, 256)
+_BK_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
+_TUNE_AXIS_CHOICES: tuple[int, ...] = (1, 16, 32, 64, 128, 256)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 # Cooperative-K thread count. v1: BR > 1 requires BN = BM = 1 (single THREAD
 # axis for materializer's _single_thread_var).
@@ -398,10 +398,28 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
     Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
     Accum) picks the matmul knob set; any other reduce with extent ≥ warp_size
     picks the cooperative-K set; no qualifying reduce falls to pointwise.
-    ``None`` only when there's no outer chain at all."""
+
+    **Phantom outer axis for chain-less kernels.** Body shapes without an
+    outer free-Loop chain — e.g. global reductions ``[Loop(k, reduce),
+    Write(o[0])]`` — would otherwise have no axis to lift into
+    ``GridTile`` / ``ThreadTile``. We synthesize a size-1 ``__phantom__``
+    axis and wrap the LoopOp body in one outer free Loop so the rest of
+    the partitioner runs unchanged. ``_wrap_tower``'s size-1-axis filter
+    drops the phantom before it reaches the IR.
+    """
     chain, prologue = _outer_free_loop_chain(loop_op.body)
     if not chain:
-        return None
+        # Synthesize a single size-1 outer Loop so the rest of the
+        # partitioner has an axis to lift. We can't actually wrap it in a
+        # new LoopOp — ``LoopOp.__post_init__`` runs ``drop_size_one_free_axes``
+        # which would inline the phantom back out. Build the phantom Loop
+        # as a chain entry directly; downstream consumers (``shape.outer_n``,
+        # ``_split_leading_non_loops``) only need the Loop object and its
+        # body, not a containing LoopOp.
+        phantom_axis = Axis("__phantom__", 1)
+        phantom = Loop(axis=phantom_axis, body=Body(loop_op.body))
+        chain = (phantom,)
+        prologue = ()
 
     outer_n: Loop = chain[-1]
     outer_m: Loop | None = chain[-2] if len(chain) >= 2 else None
@@ -577,17 +595,22 @@ def _enumerate_cartesian(
     Single-K-iter (per_thread_K == bk) is allowed for pointwise and
     cooperative-reduce, rejected for matmul (``min_k_chunks=2`` — needs ≥ 2
     chunks to amortize K-loop overhead)."""
+    # ``_TUNE_AXIS_CHOICES`` already includes ``1`` so tiny output extents
+    # (e.g. ``torch.matmul`` of 4×3×2) and global-reduce kernels with a
+    # phantom size-1 outer axis survive enumeration. ``_wrap_tower`` drops
+    # the resulting size-1 THREAD axes before they reach the IR, so the
+    # broader search space only changes behavior for tiny shapes.
     if priority_mode == "matmul":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
         bk_choices = _BK_CANDIDATES
         splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
         br_choices: tuple[int, ...] = (1,)
-        min_k_chunks = 2
+        min_k_chunks = 1
         priority_fn: Callable[[TileParams], tuple[int, ...]] = _priority_matmul
     elif priority_mode == "reduce":
-        bn_choices = (1, *_TUNE_AXIS_CHOICES)
-        bm_choices = (1, *_TUNE_AXIS_CHOICES)
+        bn_choices = _TUNE_AXIS_CHOICES
+        bm_choices = _TUNE_AXIS_CHOICES
         bk_choices = _BK_CANDIDATES
         splitk_choices = (1,)
         br_choices = _BR_CANDIDATES

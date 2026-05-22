@@ -352,10 +352,24 @@ def _insert_combines_after_reduces(stmts: tuple[LoopStmt, ...]) -> tuple[LoopStm
 
 
 def _accums_under_reduce_subtree(s: LoopStmt) -> list[Accum]:
-    """If ``s`` is a cooperative-K reduce subtree
-    (``SerialTile(kind="serial_outer")`` wrapping ``stage_inner``, or
-    bare ``stage_inner``), return the immediate Accums of the
-    ``stage_inner``. Otherwise return an empty list."""
+    """Return the Accums of a cooperative-K reduce subtree rooted at ``s``,
+    or ``[]`` if ``s`` isn't one.
+
+    Recognized shapes:
+
+    - **Bare Accum** at the cooperative scope. Happens when both K_o and
+      K_i collapsed to size-1 (e.g. K=32 with BR=32 cooperative threads
+      each handling one element) and ``drop_size_one_free_axes`` inlined
+      both wrapping loops.
+    - **stage_inner SerialTile** with Accums in its immediate body — the
+      canonical single-chunk shape.
+    - **serial_outer SerialTile wrapping stage_inner** — the canonical
+      multi-chunk shape.
+
+    Returns the immediate Accums in the innermost reduce body of the
+    matched subtree."""
+    if isinstance(s, Accum):
+        return [s]
     if isinstance(s, SerialTile) and s.is_reduce and s.kind == "stage_inner":
         return [c for c in s.body if isinstance(c, Accum)]
     if isinstance(s, SerialTile) and not s.is_reduce and s.kind == "serial_outer":

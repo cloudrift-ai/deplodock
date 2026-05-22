@@ -61,7 +61,12 @@ def _replicate_register_tiles(body: Body) -> tuple[Body, list[int]]:
     into nested RegisterTiles first, then replicate this layer's body by
     ``axis.extent`` with ``σ: axis → literal(i)`` for each of the tile's
     axes (outermost first). Returns ``(new_body, factors)`` with factors
-    in outermost-first order. Caller stamps factors[0] → FM, factors[1] → FN."""
+    in outermost-first order. Caller stamps factors[0] → FM, factors[1] → FN.
+
+    Walks into non-RegisterTile block stmts (e.g. ``SerialTile`` wrapping
+    a softmax prologue + ``RegisterTile``-tiled matmul body for SDPA P@V)
+    so deeply-nested RegisterTiles get replicated too.
+    """
     out: list[Stmt] = []
     factors: list[int] = []
     for s in body:
@@ -78,6 +83,16 @@ def _replicate_register_tiles(body: Body) -> tuple[Body, list[int]]:
             out.extend(current)
             factors.extend(local_factors)
             factors.extend(inner_factors)
+        elif s.nested():
+            # Descend into block stmts (SerialTile / StridedTile / Cond / etc.)
+            # to find nested RegisterTiles. Each nested body is rewritten
+            # independently and re-attached via ``with_bodies``.
+            new_bodies: list[Body] = []
+            for sub in s.nested():
+                new_sub, sub_factors = _replicate_register_tiles(sub)
+                new_bodies.append(new_sub)
+                factors.extend(sub_factors)
+            out.append(s.with_bodies(tuple(new_bodies)))
         else:
             out.append(s)
     return Body(out), factors
