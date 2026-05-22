@@ -19,13 +19,6 @@ when paired with ``BN=BM=32``.
 
 from __future__ import annotations
 
-import pytest
-
-pytestmark = pytest.mark.xfail(
-    reason="stage-wrap: bucket-12 follow-up — TMA pass stubbed, materializer Stage path needs wrap-body rewrite",
-    strict=False,
-)
-
 import numpy as np
 import pytest
 
