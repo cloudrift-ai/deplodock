@@ -250,16 +250,18 @@ class LazyCandidate:
         substitute it for the op at the match's root in-place during
         scoring (no graph copy). When ``pending`` is a ``Graph`` splice,
         resolve fully and score the resolved graph. When ``pending`` is
-        a :class:`Fork`, fall back to ``inner.score()`` — a thunk fork
-        exposes only the knob delta to the search prior, no body-based
-        score, until it expands into concrete options."""
+        a :class:`Fork`, return ``inner.score() + fork.score`` — the
+        fork's score is the prior the producing rule attached (typically
+        the score of the best-reachable leaf under this branch), so
+        MCTS's unvisited-sibling tiebreak preserves the priority order
+        the flat enumeration would have given."""
         from deplodock.compiler.ir.base import Op  # noqa: PLC0415
 
         if self.pending is None:
             return self.inner.score()
         match, option = self.pending
         if isinstance(option, Fork):
-            return self.inner.score()
+            return self.inner.score() + option.score
         if not isinstance(option, Op):
             return self.resolve().score()
         ctx = self.inner.ctx

@@ -126,10 +126,16 @@ class Fork:
     children when the search actually descends into this branch.
 
     ``knobs`` is read by :func:`_best_fork` polymorphically alongside
-    ``Op.knobs`` — same attribute name on both, no isinstance branching."""
+    ``Op.knobs`` — same attribute name on both, no isinstance branching.
+
+    ``score`` is the MCTS prior for this fork — typically the score of the
+    best-reachable leaf under this branch, so MCTS's unvisited-sibling
+    tiebreak at each fork level preserves the priority signal the flat
+    enumeration would have given. Defaults to 0.0 (no prior preference)."""
 
     knobs: dict
     expand: Callable[[], list[Op | Graph | Fork]]
+    score: float = 0.0
 
 
 @dataclass
