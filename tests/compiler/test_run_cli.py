@@ -199,7 +199,6 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
     assert "lowering/tile" in log
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_ir_tile_stage(run_cli, project_root, tmp_path):
     """Tile-IR JSON loads and runs only the kernel + cuda tail."""
@@ -213,7 +212,6 @@ def test_run_ir_tile_stage(run_cli, project_root, tmp_path):
     assert "running tail passes: ['lowering/kernel'" in log
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_ir_kernel_stage(run_cli, project_root, tmp_path):
     """Kernel-IR JSON loads and runs only the cuda tail."""
@@ -236,7 +234,6 @@ def test_run_ir_cuda_stage_no_tail(run_cli, project_root, tmp_path):
     assert "running tail passes: (none)" in log
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_ir_bench(run_cli, project_root, tmp_path):
     """``--bench`` with ``--ir`` prints just the deplodock latency row
@@ -249,7 +246,6 @@ def test_run_ir_bench(run_cli, project_root, tmp_path):
     assert "Latency (us)" in log
 
 
-@_COOP_XFAIL
 @requires_cuda
 def test_run_ir_seed_reproducible(run_cli, project_root, tmp_path):
     """Two runs with the same seed produce the same output mean."""

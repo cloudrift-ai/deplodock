@@ -13,8 +13,6 @@ focus on the rule's *trigger* rather than its rewrite output.
 
 from __future__ import annotations
 
-import pytest
-
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp, SdpaOp
@@ -91,7 +89,6 @@ def test_small_matmul_does_not_fire_register_tile(recording_dump):
 # --- behavior tests --------------------------------------------------
 
 
-@pytest.mark.xfail(reason="M14: SDPA matmul N-axis lives in inner body, planner doesn't yet detect it", strict=False)
 def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     """``SdpaOp`` decomposes into two matmuls; the first (Q·Kᵀ) is a
     plain matmul shape with no pre_outer reduces, so register_tile
@@ -110,7 +107,6 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     assert "register_tile_planned" in fired, fired
 
 
-@pytest.mark.xfail(reason="M14: SDPA matmul N-axis lives in inner body, planner doesn't yet detect it", strict=False)
 def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
     """With ``007_stage_inputs`` running before register_tile, Stages
     stay singleton across F² and the smem budget no longer blows up on
