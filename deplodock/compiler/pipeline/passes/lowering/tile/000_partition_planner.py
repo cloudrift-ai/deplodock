@@ -45,6 +45,14 @@ a COOPERATIVE_STRIDE thread axis above the BLOCK level and σ_k extends to
 ``k = k_o·512 + k_i·256 + k_c``; launch_geometry emits a ``Combine`` after
 the reduce subtree.
 
+For the fused-prologue matmul (SDPA P@V — softmax max/sum/reciprocal sitting
+as siblings of an inner output Loop that holds the actual matmul), the chain
+walker extends through the inner Loop (``_classify_fused_prologue``), stashes
+the sibling reduces + assigns as ``KernelShape.prologue``, and the body builder
+places the σ-rewritten prologue inside the ``M_r`` REGISTER scope but outside
+the ``N_r`` register tower. SPLITK clamps to 1 in this branch — the prologue
+feeds the matmul, so each K_s CTA would consume a partial softmax stat.
+
 Pointwise collapses to BM = FM = FN = 1; extent-1 sub-axes get inlined by
 normalize_body. SPLITK + Write atomicity is handled by launch_geometry's
 generic BLOCK-lift rewrite, not here. Cooperative-K's Combine emission lives

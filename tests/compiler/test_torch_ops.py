@@ -351,18 +351,10 @@ def test_sdpa_causal(run_graph):
     np.testing.assert_allclose(_run(run_graph, g, {"q": q_np, "k": k_np, "v": v_np}), expected, rtol=1e-4, atol=1e-5)
 
 
-def test_sdpa_gqa(run_graph, request):
-    """GQA: Q has more heads than K/V (28 Q heads, 4 KV heads).
-
-    The cuda backend xfails — the SDPA P@V kernel's N-axis (head_dim)
-    lives inside the per-head free-Loop wrapper, sibling to the
-    softmax-max / softmax-sum reduces, so ``000_partition_planner``'s
-    ``_outer_free_loop_chain`` (which walks the *outer* single-stmt
-    chain) stops one level shy and never identifies the matmul shape.
-    Detection requires walking past sibling reduces — M14-class work."""
-    backend = request.node.callspec.params.get("run_graph") if hasattr(request.node, "callspec") else None
-    if backend == "cuda":
-        request.applymarker(pytest.mark.xfail(reason="M14: SDPA P@V N-axis sibling-to-reduces; planner detection pending", strict=True))
+def test_sdpa_gqa(run_graph):
+    """GQA: Q has more heads than K/V (28 Q heads, 4 KV heads). The
+    cuda backend reaches the P@V matmul via the planner's
+    fused-prologue chain extension (``_classify_fused_prologue``)."""
     B, Hq, Hkv, S, D = 1, 28, 4, 8, 16
     q_np = rng.standard_normal((B, Hq, S, D)).astype(np.float32)
     k_np = rng.standard_normal((B, Hkv, S, D)).astype(np.float32)
