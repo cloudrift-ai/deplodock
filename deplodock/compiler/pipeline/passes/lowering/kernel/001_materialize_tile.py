@@ -138,7 +138,11 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
         return s
 
     new_body: list[Stmt] = []
-    pending_reduce: Accum | None = None
+    # Sibling Combines (one per Accum) after a reduce loop share the same
+    # reduce — F-replicated rmsnorm bodies produce two Accums in one Loop,
+    # then one Combine each. Index by name so each Combine finds its own
+    # Accum's dtype.
+    pending_reduce: dict[str, Accum] = {}
     declared_smem: set[str] = set()
 
     # TMA hoist state. ``descriptors`` and ``mbar_prologue`` collect the
@@ -379,40 +383,48 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
     for stmt in body:
         if isinstance(stmt, TmaBufferedStage):
             new_body.extend(filter_emit(emit_tma_stage(stmt)))
-            pending_reduce = None
+            pending_reduce = {}
         elif isinstance(stmt, Stage):
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads, buf_cuda)))
-            pending_reduce = None
+            pending_reduce = {}
         elif isinstance(stmt, AsyncWait):
             new_body.extend(emit_async_wait(stmt))
-            pending_reduce = None
+            pending_reduce = {}
         elif isinstance(stmt, (Loop, StridedLoop)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
             if stmt.is_reduce:
-                # Single-loop reduce: Accum lives at the immediate-body level.
-                pending_reduce = next((a for a in stmt.body if isinstance(a, Accum)), None)
+                # Single-loop reduce: Accums live at the immediate-body level.
+                pending_reduce = {a.name: a for a in stmt.body if isinstance(a, Accum)}
             else:
                 # Non-reduce wrapper (e.g. ``Loop(K_o, SERIAL_OUTER, Loop(K_i,
                 # reduce, [Accum]))`` for cooperative-K reduce after the
                 # partition planner's σ-split). Descend into nested reduce
-                # subtrees so a sibling Combine can match the Accum's dtype.
-                # Returns ``None`` when no nested reduce-with-immediate-Accum
-                # exists — the Combine branch then raises ValueError, which
-                # preserves today's safety net against stray Combines.
-                pending_reduce = _find_nested_reduce_accum(stmt.body)
+                # subtrees so sibling Combines match their Accums' dtypes.
+                # Empty when no nested reduce-with-immediate-Accum exists —
+                # the Combine branch then raises ValueError, which preserves
+                # today's safety net against stray Combines.
+                pending_reduce = _find_nested_reduce_accums(stmt.body)
         elif isinstance(stmt, Combine):
-            if pending_reduce is None:
-                raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce loop")
             # ``Combine.name`` is the per-thread SSA value to combine across
-            # threads. It usually matches the preceding Accum's name, but the
-            # reduce-axis register-tile pass (008 RF path) introduces an
-            # Assign fold between the multi-Accum StridedLoop and the
+            # threads. It usually matches one of the preceding Accums' names,
+            # but the reduce-axis register-tile pass (008 RF path) introduces
+            # an Assign fold between the multi-Accum StridedLoop and the
             # Combine — so Combine.name may instead reference that fold's
             # output. The combine emission only needs (name, op).
-            accum_dtype = (pending_reduce.dtype or F32) if pending_reduce is not None else F32
+            if not pending_reduce:
+                raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce loop")
+            accum = pending_reduce.get(stmt.name)
+            # F-replicated bodies emit one Combine per sibling Accum — keep
+            # the pending dict alive so subsequent Combines find their own
+            # Accum. Only the matched Accum is consumed; an unmatched name
+            # (RF Assign fold) falls back to any pending Accum's dtype.
+            if accum is not None:
+                pending_reduce.pop(stmt.name)
+            else:
+                accum = next(iter(pending_reduce.values()))
+            accum_dtype = accum.dtype or F32
             new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, accum_dtype))
             rename[stmt.name] = f"{stmt.name}_b"
-            pending_reduce = None
         else:
             new_body.append(transform(stmt))
 
@@ -511,24 +523,26 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
     return loop.with_bodies((loop.body.map(materialize_leaf),))
 
 
-def _find_nested_reduce_accum(stmts) -> Accum | None:
-    """First ``Accum`` sitting at the immediate-body level of any nested
-    reduce ``Loop`` / ``StridedLoop`` subtree. Used by the materializer
-    when a non-reduce outer Loop wraps a deeper reduce — e.g. the
-    cooperative-K shape ``Loop(K_o, SERIAL_OUTER, Loop(K_i, reduce,
-    [Accum]))`` produced by the partition planner's σ-split. Returns
-    ``None`` when no reduce-with-immediate-Accum is found, preserving
-    the existing "stray Combine raises" safety net."""
+def _find_nested_reduce_accums(stmts) -> dict[str, Accum]:
+    """All ``Accum``s sitting at the immediate-body level of the first
+    nested reduce ``Loop`` / ``StridedLoop`` subtree, keyed by Accum
+    name. Used by the materializer when a non-reduce outer Loop wraps a
+    deeper reduce — e.g. the cooperative-K shape ``Loop(K_o,
+    SERIAL_OUTER, Loop(K_i, reduce, [Accum, ...]))`` produced by the
+    partition planner's σ-split, possibly with F-replicated sibling
+    Accums from ``006a_register_tile_planned``. Returns ``{}`` when no
+    reduce-with-immediate-Accum is found, preserving the existing
+    "stray Combine raises" safety net."""
     for s in stmts:
         if isinstance(s, (Loop, StridedLoop)) and s.is_reduce:
-            for inner in s.body:
-                if isinstance(inner, Accum):
-                    return inner
+            accums = {a.name: a for a in s.body if isinstance(a, Accum)}
+            if accums:
+                return accums
         if isinstance(s, (Loop, StridedLoop)):
-            found = _find_nested_reduce_accum(s.body)
-            if found is not None:
+            found = _find_nested_reduce_accums(s.body)
+            if found:
                 return found
-    return None
+    return {}
 
 
 def _single_thread_var(thread_axes: tuple) -> str:
