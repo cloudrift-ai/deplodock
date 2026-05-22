@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, Tile
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
+from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile
 from deplodock.compiler.pipeline import RuleSkipped
 
 _logger = logging.getLogger(__name__)
@@ -48,32 +49,78 @@ def accums_independent(body: Body) -> bool:
 from deplodock.compiler.target import compute_capability  # noqa: E402,F401
 
 
-def single_tile(body: Body) -> tuple[int, Tile]:
-    """Locate the (sole) ``Tile`` in a TileOp body.
+def thread_tile_of(outer: ParallelTile) -> ThreadTile:
+    """Return the per-thread scope for an outer ``GridTile`` / ``ThreadTile``.
 
-    ``TileOp.__post_init__`` enforces *at most* one Tile, so this only
-    needs to handle the zero-Tile case — which happens for the
-    degenerate single-thread serial body ``001_launch_geometry`` produces when
-    a LoopOp has no outer free-Loop chain to strip. Raises
+    The cooperative form (``GridTile`` wrapping ``ThreadTile``) puts the
+    per-thread scope one level deeper; the pointwise form (standalone
+    ``ThreadTile``) IS the per-thread scope. Downstream passes that operate
+    on the per-thread scope (``002_stage_inputs``, ``006a``, ...) call this
+    helper instead of branching on the outer flavor.
+    """
+    if isinstance(outer, ThreadTile):
+        return outer
+    if isinstance(outer, GridTile):
+        for child in outer.body:
+            if isinstance(child, ThreadTile):
+                return child
+        raise RuleSkipped("GridTile without an inner ThreadTile")
+    raise TypeError(f"thread_tile_of: expected GridTile/ThreadTile, got {type(outer).__name__}")
+
+
+def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
+    """Rebuild ``outer`` with the per-thread scope's body replaced.
+
+    Preserves the GridTile wrapper (if any) and the ThreadTile's
+    ``cooperative_axes`` / GridTile's ``splitk_axes`` metadata so downstream
+    rewrites are transparent to launch geometry.
+    """
+    new_body = Body.coerce(new_body) if not isinstance(new_body, Body) else new_body
+    if isinstance(outer, ThreadTile):
+        return ThreadTile(axes=outer.axes, body=new_body, cooperative_axes=outer.cooperative_axes)
+    if isinstance(outer, GridTile):
+        # Locate the ThreadTile child and rebuild it.
+        new_outer_body: list = []
+        for child in outer.body:
+            if isinstance(child, ThreadTile):
+                new_outer_body.append(ThreadTile(axes=child.axes, body=new_body, cooperative_axes=child.cooperative_axes))
+            else:
+                new_outer_body.append(child)
+        return GridTile(axes=outer.axes, body=Body(new_outer_body), splitk_axes=outer.splitk_axes)
+    raise TypeError(f"replace_thread_tile_body: expected GridTile/ThreadTile, got {type(outer).__name__}")
+
+
+def single_tile(body: Body) -> tuple[int, ParallelTile]:
+    """Locate the (sole) outermost ``GridTile`` / ``ThreadTile`` in a
+    TileOp body.
+
+    ``TileOp.__post_init__`` enforces *at most* one outer tile, so this
+    only needs to handle the zero-tile case — which happens for the
+    degenerate single-thread serial body ``001_launch_geometry`` produces
+    when a LoopOp has no outer free-Loop chain to strip. Raises
     ``RuleSkipped`` in that case so the rule cleanly bails.
+
+    Returns the outermost tile flavor regardless of cooperative shape
+    (``GridTile`` wrapping a ``ThreadTile``, or a standalone ``ThreadTile``).
+    Callers that need the per-thread scope navigate via ``tile.body``.
     """
     for i, s in enumerate(body):
-        if isinstance(s, Tile):
+        if isinstance(s, (GridTile, ThreadTile)):
             return (i, s)
-    raise RuleSkipped("TileOp has no Tile (degenerate single-thread body)")
+    raise RuleSkipped("TileOp has no outer ParallelTile (degenerate single-thread body)")
 
 
-def is_matmul_reduce(loop: Loop) -> bool:
-    """True iff ``loop`` is a reduce ``Loop`` whose body matches the
+def is_matmul_reduce(loop) -> bool:
+    """True iff ``loop`` is a reduce serial-tile whose body matches the
     matmul signature: ≥2 distinct buffers with K-indexed Loads (where
     K is ``loop.axis.name``) plus at least one ``Accum``.
 
-    Doesn't check body purity — that lives in :func:`is_matmul_k_outer`.
+    Accepts ``SerialTile`` / ``StridedTile`` (the post-lowering shape).
     Used directly by ``002_chunk_matmul_k`` (which needs to fire on
     matmul-shaped reduces wherever they sit, not only at the top level
     under a K-outer wrapper).
     """
-    if not (isinstance(loop, Loop) and loop.is_reduce):
+    if not (isinstance(loop, (SerialTile, StridedTile)) and loop.is_reduce):
         return False
     K_name = loop.axis.name
     bufs = {ld.input for ld in loop.body.of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}}

@@ -54,14 +54,28 @@ from typing import NamedTuple
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.axis import Axis, Role
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, CacheDim, Source, Stage, TileOp
+from deplodock.compiler.ir.stmt import Body, Load, Stmt
+from deplodock.compiler.ir.tile.ir import (
+    BYTES_PER_ELEM,
+    CacheDim,
+    GridTile,
+    RegisterTile,
+    SerialTile,
+    Source,
+    Stage,
+    StridedTile,
+    TileOp,
+)
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+    replace_thread_tile_body,
+    single_tile,
+    thread_tile_of,
+)
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -128,25 +142,28 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
 
 
 def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
-    idx, tile = single_tile(body)
-    if any(isinstance(s, Stage) for s in tile.body.iter()):
+    idx, outer = single_tile(body)
+    tt = thread_tile_of(outer)
+    if any(isinstance(s, Stage) for s in tt.body.iter()):
         return []
-    if not tile.thread_axes:
+    if not tt.axes:
         return []
     n_thread = 1
-    for ba in tile.thread_axes:
-        n_thread *= int(ba.extent)
+    for ax in tt.axes:
+        n_thread *= int(ax.extent)
     if n_thread <= warp_size:
         return []
-    block_axis_names = frozenset(ax.name for ax in tile.block_axes)
-    is_cooperative = any(ba.role is Role.COOPERATIVE_STRIDE for ba in tile.axes)
+    block_axes = outer.axes if isinstance(outer, GridTile) else ()
+    block_axis_names = frozenset(ax.name for ax in block_axes)
+    is_cooperative = bool(tt.cooperative_axes)
+    all_axes = tuple(block_axes) + tuple(tt.axes)
     found: dict[str, int] = {}
-    _collect_candidates(tile, tile.thread_axes, tile.all_axes, block_axis_names, found, slab_cap=10**12, is_cooperative=is_cooperative)
+    _collect_candidates(tt, tt.axes, all_axes, block_axis_names, found, slab_cap=10**12, is_cooperative=is_cooperative)
     return list(found.items())
 
 
 def _collect_candidates(
-    scope: Tile | Loop,
+    scope,
     thread_axes: tuple[Axis, ...],
     in_scope_axes: tuple[Axis, ...],
     block_axis_names: frozenset[str],
@@ -159,7 +176,7 @@ def _collect_candidates(
     """Preflight buffer-walk: record candidate buffers' slab sizes."""
     loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]] = {}
     for s in scope.body:
-        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
+        if is_cooperative and isinstance(s, SerialTile) and not s.is_reduce and s.kind == "serial_outer":
             inner_stage = _peel_to_stage_inner(s)
             if inner_stage is not None:
                 scope_axes = (*in_scope_axes, s.axis, inner_stage.axis)
@@ -168,14 +185,26 @@ def _collect_candidates(
                     if isinstance(stmt, Load):
                         loads_by_buf.setdefault(stmt.input, []).append((stmt, inner_stage.axis, scope_axes, extra))
                 continue
-        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.STAGE_INNER:
+        if is_cooperative and isinstance(s, SerialTile) and not s.is_reduce and s.kind == "stage_inner":
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
                     loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes))
             continue
-        if isinstance(s, Loop) and not s.is_reduce:
-            new_register_axes = register_axes + (s.axis,) if s.role is Role.REGISTER else register_axes
+        if isinstance(s, RegisterTile):
+            new_register_axes = register_axes + tuple(s.axes)
+            _collect_candidates(
+                s,
+                thread_axes,
+                tuple(in_scope_axes) + tuple(s.axes),
+                block_axis_names,
+                found,
+                slab_cap=slab_cap,
+                is_cooperative=is_cooperative,
+                register_axes=new_register_axes,
+            )
+            continue
+        if isinstance(s, SerialTile) and not s.is_reduce:
             _collect_candidates(
                 s,
                 thread_axes,
@@ -184,10 +213,10 @@ def _collect_candidates(
                 found,
                 slab_cap=slab_cap,
                 is_cooperative=is_cooperative,
-                register_axes=new_register_axes,
+                register_axes=register_axes,
             )
             continue
-        if isinstance(s, (Loop, StridedLoop)):
+        if isinstance(s, (SerialTile, StridedTile)):
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
@@ -220,27 +249,30 @@ def _collect_candidates(
 def _maybe_rewrite(
     body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None, warp_size: int
 ) -> Body | None:
-    idx, tile = single_tile(body)
-    if not tile.thread_axes:
+    idx, outer = single_tile(body)
+    tt = thread_tile_of(outer)
+    if not tt.axes:
         if allowed_bufs is None:
-            raise RuleSkipped("Tile has no thread_axes — no reuse to stage")
+            raise RuleSkipped("ThreadTile has no axes — no reuse to stage")
         return None
 
     n_thread = 1
-    for ba in tile.thread_axes:
-        n_thread *= int(ba.extent)
+    for ax in tt.axes:
+        n_thread *= int(ax.extent)
     if n_thread <= warp_size:
         if allowed_bufs is None:
             raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {warp_size}); register-resident, no smem stage")
         return None
 
     used_names: set[str] = set()
-    block_axis_names = frozenset(ax.name for ax in tile.block_axes)
-    is_cooperative = any(ba.role is Role.COOPERATIVE_STRIDE for ba in tile.axes)
+    block_axes = outer.axes if isinstance(outer, GridTile) else ()
+    block_axis_names = frozenset(ax.name for ax in block_axes)
+    is_cooperative = bool(tt.cooperative_axes)
+    all_axes = tuple(block_axes) + tuple(tt.axes)
     new_tile_body = _process_scope(
-        tile,
-        tile.thread_axes,
-        tile.all_axes,
+        tt,
+        tt.axes,
+        all_axes,
         block_axis_names,
         used_names,
         slab_cap=slab_cap,
@@ -248,25 +280,29 @@ def _maybe_rewrite(
         allowed_bufs=allowed_bufs,
         is_cooperative=is_cooperative,
     )
-    if new_tile_body == tile.body:
+    if new_tile_body == tt.body:
         if allowed_bufs is None:
             raise RuleSkipped("no Load qualifies for staging")
         return body
-    return body[:idx] + (Tile(axes=tile.axes, body=new_tile_body),) + body[idx + 1 :]
+    rebuilt = replace_thread_tile_body(outer, new_tile_body)
+    return body[:idx] + (rebuilt,) + body[idx + 1 :]
 
 
-def _peel_to_stage_inner(outer: Loop) -> Loop | None:
+def _peel_to_stage_inner(outer):
+    """Descend single-stmt SerialTile chains until a stage_inner SerialTile
+    is found. Returns ``None`` if the chain branches before reaching one.
+    """
     cur = tuple(outer.body)
-    while len(cur) == 1 and isinstance(cur[0], (Loop, StridedLoop)):
+    while len(cur) == 1 and isinstance(cur[0], (SerialTile, StridedTile, RegisterTile)):
         s = cur[0]
-        if isinstance(s, Loop) and s.role is Role.STAGE_INNER:
+        if isinstance(s, SerialTile) and s.kind == "stage_inner":
             return s
         cur = tuple(s.body)
     return None
 
 
 def _process_scope(
-    scope: Tile | Loop,
+    scope,
     thread_axes: tuple[Axis, ...],
     in_scope_axes: tuple[Axis, ...],
     block_axis_names: frozenset[str],
@@ -278,8 +314,8 @@ def _process_scope(
     is_cooperative: bool = False,
     register_axes: tuple[Axis, ...] = (),
 ) -> Body:
-    """Walk scope.body; recurse into non-reduce free loops; collect Loads
-    from reduce loops into per-buffer buckets. Per buffer, build a Source
+    """Walk scope.body; recurse into non-reduce free tiles; collect Loads
+    from reduce tiles into per-buffer buckets. Per buffer, build a Source
     if all Loads agree on slab geometry. Admit Sources under budget;
     emit one Stage wrapping the contiguous range of consumer stmts that
     contain rewritten Loads. Source name + index rewrites are applied
@@ -293,7 +329,7 @@ def _process_scope(
     stmt_contains_loads_idx: list[int] = []
 
     for s in scope.body:
-        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
+        if is_cooperative and isinstance(s, SerialTile) and not s.is_reduce and s.kind == "serial_outer":
             inner_stage = _peel_to_stage_inner(s)
             if inner_stage is not None:
                 scope_axes = (*in_scope_axes, s.axis, inner_stage.axis)
@@ -304,14 +340,14 @@ def _process_scope(
                 rewritten_inner.append(s)
                 stmt_contains_loads_idx.append(len(rewritten_inner) - 1)
                 continue
-        if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.STAGE_INNER:
+        if is_cooperative and isinstance(s, SerialTile) and not s.is_reduce and s.kind == "stage_inner":
             pass  # fall through to the collection branch
-        elif isinstance(s, Loop) and not s.is_reduce:
-            new_register_axes = register_axes + (s.axis,) if s.role is Role.REGISTER else register_axes
+        elif isinstance(s, RegisterTile):
+            new_register_axes = register_axes + tuple(s.axes)
             new_body = _process_scope(
                 s,
                 thread_axes,
-                (*in_scope_axes, s.axis),
+                tuple(in_scope_axes) + tuple(s.axes),
                 block_axis_names,
                 used_names,
                 slab_cap=slab_cap,
@@ -322,7 +358,22 @@ def _process_scope(
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
-        if isinstance(s, (Loop, StridedLoop)):
+        elif isinstance(s, SerialTile) and not s.is_reduce:
+            new_body = _process_scope(
+                s,
+                thread_axes,
+                (*in_scope_axes, s.axis),
+                block_axis_names,
+                used_names,
+                slab_cap=slab_cap,
+                scope_budget=scope_budget,
+                allowed_bufs=allowed_bufs,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
+            )
+            rewritten_inner.append(s.with_bodies((new_body,)))
+            continue
+        if isinstance(s, (SerialTile, StridedTile)):
             scope_axes = (*in_scope_axes, s.axis)
             had_load = False
             for stmt in s.body:

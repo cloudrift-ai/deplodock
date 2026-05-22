@@ -23,27 +23,27 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Role
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Loop, Stmt
-from deplodock.compiler.ir.tile.ir import Stage, Tile, TileOp
+from deplodock.compiler.ir.stmt import Body, Stmt
+from deplodock.compiler.ir.tile.ir import RegisterTile, Stage, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import single_tile
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import replace_thread_tile_body, single_tile, thread_tile_of
 
 PATTERN = [Pattern("root", TileOp)]
 
 
 def rewrite(root: Node) -> Graph | None:
     body = root.op.body
-    idx, tile = single_tile(body)
+    idx, outer = single_tile(body)
+    tt = thread_tile_of(outer)
 
-    new_body, factors = _replicate_register_loops(tile.body)
+    new_body, factors = _replicate_register_tiles(tt.body)
     if not factors:
-        # No REGISTER tags in body — non-matmul kernel (planner only
-        # stamps REGISTER on matmul) or this rule has already run and
-        # consumed the tags. Either way, nothing to do.
-        raise RuleSkipped("no Role.REGISTER tags in body")
+        # No RegisterTile in body — non-matmul kernel (planner only emits
+        # RegisterTile for matmul) or this rule has already run and
+        # consumed them. Either way, nothing to do.
+        raise RuleSkipped("no RegisterTile in body")
 
     # FM/FN are stamped by the planner; preserve them rather than
     # overwriting (factors carry the same values).
@@ -52,25 +52,31 @@ def rewrite(root: Node) -> Graph | None:
         knobs["FM"] = factors[0]
     if len(factors) >= 2 and "FN" not in knobs:
         knobs["FN"] = factors[1]
-    new_tile = Tile(axes=tile.axes, body=new_body)
-    return TileOp(body=body[:idx] + (new_tile,) + body[idx + 1 :], name=root.op.name, knobs=knobs)
+    rebuilt = replace_thread_tile_body(outer, new_body)
+    return TileOp(body=body[:idx] + (rebuilt,) + body[idx + 1 :], name=root.op.name, knobs=knobs)
 
 
-def _replicate_register_loops(body: Body) -> tuple[Body, list[int]]:
-    """Inside-out unwrap of ``Role.REGISTER`` Loops. For each tagged
-    layer, recurse into nested REGISTER first, then replicate this
-    layer's body by ``axis.extent`` with ``σ: axis → literal(i)``.
-    Returns ``(new_body, factors)`` with factors in outermost-first
-    order. Caller stamps factors[0] → FM, factors[1] → FN."""
+def _replicate_register_tiles(body: Body) -> tuple[Body, list[int]]:
+    """Inside-out unwrap of ``RegisterTile`` flavors. For each tile, recurse
+    into nested RegisterTiles first, then replicate this layer's body by
+    ``axis.extent`` with ``σ: axis → literal(i)`` for each of the tile's
+    axes (outermost first). Returns ``(new_body, factors)`` with factors
+    in outermost-first order. Caller stamps factors[0] → FM, factors[1] → FN."""
     out: list[Stmt] = []
     factors: list[int] = []
     for s in body:
-        if isinstance(s, Loop) and s.role is Role.REGISTER:
-            factor = int(s.axis.extent)
-            inner_unwrapped, inner_factors = _replicate_register_loops(s.body)
-            replicated = _replicate_along_axis(inner_unwrapped, s.axis.name, factor, _sigma_to_literal(s.axis.name))
-            out.extend(replicated)
-            factors.append(factor)
+        if isinstance(s, RegisterTile):
+            inner_unwrapped, inner_factors = _replicate_register_tiles(s.body)
+            current = inner_unwrapped
+            local_factors: list[int] = []
+            # Replicate from innermost axis outward.
+            for ax in reversed(s.axes):
+                factor = int(ax.extent)
+                current = _replicate_along_axis(current, ax.name, factor, _sigma_to_literal(ax.name))
+                local_factors.append(factor)
+            local_factors.reverse()
+            out.extend(current)
+            factors.extend(local_factors)
             factors.extend(inner_factors)
         else:
             out.append(s)

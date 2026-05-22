@@ -59,12 +59,11 @@ warp Smem, etc.) still see the original scalar names.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from deplodock.compiler.dtype import F16, F16x2
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Pack, Stmt, StridedLoop, Tile, Unpack
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Pack, Stmt, Unpack
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -84,23 +83,19 @@ def _pack_body_recursive(body: Body) -> tuple[Body, bool]:
     did_any = False
     descended: list[Stmt] = []
     for s in body:
-        if isinstance(s, Loop):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
             new_inner, d = _pack_body_recursive(s.body)
             did_any = did_any or d
-            descended.append(replace(s, body=new_inner))
-        elif isinstance(s, StridedLoop):
-            new_inner, d = _pack_body_recursive(s.body)
-            did_any = did_any or d
-            descended.append(replace(s, body=new_inner))
+            descended.append(s.with_bodies((new_inner,)))
         elif isinstance(s, Cond):
             nb, db = _pack_body_recursive(s.body)
             ne, de = _pack_body_recursive(s.else_body)
             did_any = did_any or db or de
             descended.append(Cond(cond=s.cond, body=nb, else_body=ne))
-        elif isinstance(s, Tile):
+        elif isinstance(s, (GridTile, ThreadTile)):
             nb, db = _pack_body_recursive(s.body)
             did_any = did_any or db
-            descended.append(Tile(axes=s.axes, body=nb))
+            descended.append(s.with_bodies((nb,)))
         else:
             descended.append(s)
     new_stmts, did_local = _pair_at_scope(descended)
@@ -144,7 +139,7 @@ def _pair_at_scope(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     # both Accums in the same Loop body.
     valid_pids: set[int] = set()
     for s in stmts:
-        if isinstance(s, (Loop, StridedLoop)):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
             pids_here = _pids_with_both_accums(s.body, name_to_pair, candidates)
             valid_pids |= pids_here
 
@@ -173,10 +168,10 @@ def _pair_at_scope(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
             low, _high, pair_name = valid_candidates[new_pid]
             out.append(Init(name=pair_name, op=low.op, dtype=F16x2))
             continue
-        if isinstance(s, (Loop, StridedLoop)) and _pids_with_both_accums(s.body, name_to_new_pid, valid_candidates):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile)) and _pids_with_both_accums(s.body, name_to_new_pid, valid_candidates):
             # Pair Accums inside.
             new_loop_body = _pair_accums_in_body(s.body, valid_candidates, name_to_new_pid)
-            out.append(replace(s, body=new_loop_body))
+            out.append(s.with_bodies((new_loop_body,)))
             # Unpack after the Loop to restore scalar names.
             for low, high, pair_name in valid_candidates:
                 out.append(Unpack(low_name=low.name, high_name=high.name, value=pair_name, lane_dtype=F16))
@@ -219,11 +214,8 @@ def _pair_accums_in_body(
     pending_low: dict[int, Accum] = {}  # pid -> first-seen Accum
 
     for s in body:
-        if isinstance(s, Loop):
-            out.append(replace(s, body=_pair_accums_in_body(s.body, candidates, name_to_pair)))
-            continue
-        if isinstance(s, StridedLoop):
-            out.append(replace(s, body=_pair_accums_in_body(s.body, candidates, name_to_pair)))
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
+            out.append(s.with_bodies((_pair_accums_in_body(s.body, candidates, name_to_pair),)))
             continue
         if isinstance(s, Cond):
             out.append(
@@ -234,8 +226,8 @@ def _pair_accums_in_body(
                 )
             )
             continue
-        if isinstance(s, Tile):
-            out.append(Tile(axes=s.axes, body=_pair_accums_in_body(s.body, candidates, name_to_pair)))
+        if isinstance(s, (GridTile, ThreadTile)):
+            out.append(s.with_bodies((_pair_accums_in_body(s.body, candidates, name_to_pair),)))
             continue
         if isinstance(s, Accum) and s.name in name_to_pair:
             pid = name_to_pair[s.name]

@@ -22,8 +22,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Body, Loop, Stmt, StridedLoop, Tile
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.stmt import Body, Stmt
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -50,7 +50,7 @@ def _walk_body(body: Body) -> tuple[Body, bool]:
 
 
 def _walk_stmt(s: Stmt) -> tuple[Stmt, bool]:
-    if isinstance(s, (Loop, StridedLoop)):
+    if isinstance(s, (SerialTile, StridedTile)):
         trips = _nest_trips(s)
         should_unroll = trips <= _MAX_UNROLL_TRIPS
         new_body, inner_changed = _walk_body(s.body)
@@ -59,10 +59,10 @@ def _walk_stmt(s: Stmt) -> tuple[Stmt, bool]:
         if new_body != s.body:
             return replace(s, body=new_body), inner_changed
         return s, False
-    if isinstance(s, Tile):
+    if isinstance(s, (GridTile, ThreadTile, RegisterTile)):
         new_body, c = _walk_body(s.body)
         if c:
-            return Tile(axes=s.axes, body=new_body), True
+            return s.with_bodies((new_body,)), True
         return s, False
     if hasattr(s, "body") and hasattr(s, "nested"):
         # Cond and other block stmts — recurse uniformly via existing fields.
@@ -72,13 +72,13 @@ def _walk_stmt(s: Stmt) -> tuple[Stmt, bool]:
     return s, False
 
 
-def _nest_trips(loop: Loop | StridedLoop) -> int:
+def _nest_trips(loop) -> int:
     """Trip count when ``loop`` is unrolled: ``axis.extent`` × the sum
     of inner loop trip counts. Siblings sum (each runs once per outer
     iteration) and a single child reduces to plain product. Used to
     estimate the unrolled body size."""
     total = int(loop.axis.extent)
-    inner_trips = sum(_nest_trips(s) for s in loop.body if isinstance(s, (Loop, StridedLoop)))
+    inner_trips = sum(_nest_trips(s) for s in loop.body if isinstance(s, (SerialTile, StridedTile)))
     if inner_trips:
         total *= inner_trips
     return total
