@@ -78,6 +78,44 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
+def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
+    """Pre-flatten wrap-body Stages: ``Stage(sources, body=[consumer])`` becomes
+    ``[Stage(sources, body=Body(())), *consumer_stmts]`` so the existing
+    materializer's flat walker can emit producer scaffolding then process
+    the consumer stmts as siblings.
+
+    Recurses into Loop / StridedLoop / Cond / Tile bodies so nested Stages
+    flatten too. ComputeStage's ``compute`` body is kept attached to the
+    stage; materializer emits it specially.
+    """
+    from dataclasses import replace as _replace  # noqa: PLC0415
+
+    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Stage):
+            inner = _flatten_wrap_stages(s.body)
+            # Recursively flatten ComputeStage.compute too (in case future
+            # passes nest stages inside it).
+            if isinstance(s, ComputeStage):
+                compute_inner = _flatten_wrap_stages(s.compute)
+                out.append(_replace(s, body=Body(()), compute=Body(compute_inner)))
+            else:
+                out.append(_replace(s, body=Body(())))
+            out.extend(inner)
+        elif isinstance(s, (Loop, StridedLoop)):
+            new_body = _flatten_wrap_stages(s.body)
+            out.append(s.with_bodies((Body(new_body),)))
+        elif isinstance(s, Cond):
+            new_body = _flatten_wrap_stages(s.body)
+            new_else = _flatten_wrap_stages(s.else_body) if s.else_body else ()
+            out.append(_replace(s, body=Body(new_body), else_body=Body(new_else)))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
 def rewrite(ctx: Context, match, root: Node) -> Graph | None:
     # Per-graph-buffer CUDA C type names (e.g. ``"__half"``) so Stage
     # materialization can stamp the matching ``Smem.dtype`` instead of
@@ -118,7 +156,13 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size
     output) wrap them in ``Cond(thread_var == 0)`` themselves —
     materialization passes Writes through unchanged."""
     axes = blk.axes
-    body = blk.body
+    # Pre-flatten wrap-body Stages so the rest of the walker sees the
+    # legacy flat shape ([Stage(empty body), *consumer_stmts]) it was
+    # designed for. _emit_stage consumes Stage.sources for the producer
+    # scaffolding; consumer stmts are handled as siblings.
+    from deplodock.compiler.ir.stmt.body import Body as _Body  # noqa: PLC0415
+
+    body = _Body(_flatten_wrap_stages(blk.body))
     thread_axes = tuple(ba for ba in axes if ba.bind == BIND_THREAD)
     if not thread_axes:
         raise ValueError("Tile must have at least one BIND_THREAD axis")
@@ -757,187 +801,101 @@ def _assert_stage_body_shape(stage: Stage) -> None:
 
 
 def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str] | None = None) -> list[Stmt]:
-    # ``Smem.dtype`` for a staged gmem buffer matches the gmem source's
-    # CUDA C type (so fp16 inputs stage into ``__half`` smem rather than
-    # promoting to ``float`` mid-load). Multi-source fused stages keep
-    # the default — the fused body's terminal Write produces a value of
-    # the same dtype as the surrounding compute chain, and ``stage.buf``
-    # is undefined for them (the property raises on multi-Load bodies).
-    source_loads = stage.source_loads
-    if len(source_loads) == 1:
-        stage_smem_dtype = (buf_cuda or {}).get(source_loads[0].input, "float")
-    else:
-        stage_smem_dtype = "float"
-    # Cooperative-reduce + VW permutation (``009b_permute_cooperative_reduce``)
-    # produces ``__half`` accesses up to 16 bytes wide; the LDS.128
-    # reinterpret-cast needs the smem buffer base to be 16-byte aligned.
-    # The default natural alignment of ``__half[N]`` is 2 bytes, so
-    # explicitly align fp16 staged smem to the widest LDS instruction
-    # (16 bytes). fp32 smem (``float[N]``) is already 4-byte aligned
-    # naturally and the existing LDS.128 path is fine.
-    stage_smem_align = 16 if stage_smem_dtype == "__half" else 0
-    """Expand a ``Stage`` Stmt into ``Smem`` decl + cooperative load + sync.
+    """Emit producer scaffolding for a wrap-body Stage.
 
-    The cooperative load reads a contiguous slab of ``stage.buf``
-    starting at ``stage.origin`` (block-uniform) and spanning
-    ``stage.axes`` extents. Each thread fetches one or more elements
-    via a StridedLoop driven by ``tid_expr``: for a 1D slab, the loop
-    iterates the cache axis directly; for N-D, it iterates a synthetic
-    flat axis decoded into per-axis coords.
+    For each ``Source`` in ``stage.sources``, emits per-source
+    cooperative ``Load + Write`` (or ``CpAsyncCopy`` for async transport).
+    Smem decls are hoisted to kernel scope in ``_materialize`` (we skip
+    them here unless not yet declared, in which case the dedup filter
+    will pass them through). Leading + trailing ``Sync`` bracket the
+    cooperative load.
 
-    Source index reconstruction depends on ``stage.addressing``:
+    Wrap-body semantics: ``stage.body`` is the *consumer* and has been
+    pre-flattened to siblings by ``_flatten_wrap_stages`` before this
+    function runs. ``stage.body`` is empty at this point.
+    """
+    buf_cuda = buf_cuda or {}
+    # Buffered: ping-pong-style ring with phase indexing. Leading Sync
+    # dropped (different physical buffer per iter).
+    is_buffered = isinstance(stage, BufferedStage)
+    is_async = isinstance(stage, AsyncBufferedStage)
 
-    - ``AffineAddressing(dims)`` — fast path. ``source_index[d] =
-      origin[d] + decoded[d]`` (the decoded slab coord, if any cache
-      axis maps to ``d`` via ``dims``); else just ``origin[d]``.
-    - ``TemplateAddressing(exprs)`` — escape hatch. Sigma-substitute
-      cache-axis Vars → iter-decoded coords into ``exprs``.
+    prelude: list[Stmt] = [] if is_buffered else [Sync()]
+    body_out: list[Stmt] = list(prelude)
 
-    Emits a leading ``Sync`` so iterations 2+ of an enclosing serial
-    loop (chunked-K matmul) wait for the prior iteration's compute to
-    finish reading smem before this iteration overwrites it. Iteration
-    1's leading Sync is harmless (no prior state)."""
-    if not stage.axes:
-        raise ValueError(f"Stage {stage.name!r} has no cache axes")
-    _assert_stage_body_shape(stage)
-    extents = tuple(int(ax.extent) for ax in stage.axes)
-    padded_extents = stage.alloc_extents
-
-    # Iteration axis + per-cache-axis coord. Always synthesize a fresh
-    # iter axis name so the cooperative-load ``for`` variable can't
-    # collide with a same-named outer thread-decode variable (C++
-    # init-expression scoping rules read the freshly-declared inner var,
-    # giving an undefined initial value when the inner name shadows an
-    # outer one). 1D cache: trivial map to the single cache axis. N-D:
-    # row-major decode of the flat iter into per-axis coords.
-    total = 1
-    for e in extents:
-        total *= e
-    iter_axis = Axis(name=f"{stage.name}_flat", extent=total)
-    if len(stage.axes) == 1:
-        coord_for = {stage.axes[0].name: Var(iter_axis.name)}
-    else:
-        coord_for = _flat_decode(stage.axes, iter_axis.name)
-
-    smem_index = tuple(coord_for[ax.name] for ax in stage.axes)
-    # Source-index reconstruction is only used by the trivial-body /
-    # cp.async paths below. For fused (multi-source) bodies we walk the
-    # body's Loads directly and σ-rewrite their indices, so ``stage.addressing``
-    # is never consulted (it raises on multi-Load bodies). Single-Load
-    # bodies always have a well-defined addressing.
-    trivial = len(stage.source_loads) == 1 and len(stage.body) == 2
-    if trivial:
-        if isinstance(stage.addressing, TemplateAddressing):
-            # Non-affine path (``/``, ``%`` from collapsed-reshape views).
-            # Cache extent equals the raw axis extent (no F-scale baked in),
-            # so substituting cache-axis Vars with their iter coords into
-            # the original Load index gives the right source address per
-            # cache position. Affine cases stay on the additive
-            # ``origin + decoded`` path because their cache extent IS scaled
-            # by F, so iter coord directly equals the cache-relative source
-            # position — no need to re-multiply via F.
-            from deplodock.compiler.ir.sigma import Sigma as _Sigma
-
-            cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
-            source_index = tuple(cache_sigma.apply(e) for e in stage.addressing.exprs)
+    for src in stage.sources:
+        # Per-Source iteration axis: synthesize a unique flat-iter axis
+        # so the StridedLoop's loop variable doesn't collide with outer
+        # thread-decode variables.
+        cache_axes = src.cache_axes
+        if not cache_axes:
+            raise ValueError(f"Source {src.name!r} has no cache axes")
+        extents = tuple(int(ax.extent) for ax in cache_axes)
+        padded_extents = src.alloc_extents
+        total = 1
+        for e in extents:
+            total *= e
+        iter_axis = Axis(name=f"{src.name}_flat", extent=total)
+        if len(cache_axes) == 1:
+            coord_for = {cache_axes[0].name: Var(iter_axis.name)}
         else:
-            assert isinstance(stage.addressing, AffineAddressing)
-            decoded_per_dim = {dim: coord_for[ax.name] for dim, ax in zip(stage.addressing.dims, stage.axes, strict=True)}
-            source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(stage.origin))
-    else:
-        source_index = ()  # unused on the fused path
+            coord_for = _flat_decode(cache_axes, iter_axis.name)
+        smem_index = tuple(coord_for[ax.name] for ax in cache_axes)
+        # Per-source source-index reconstruction.
+        addressing = src.addressing
+        if isinstance(addressing, TemplateAddressing):
+            from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
 
-    # Buffered stages prepend a phase dim to the smem allocation and to
-    # both the cooperative-load write index and (downstream) every body
-    # Load. The leading Sync is dropped — ping-pong avoids the
-    # prev-compute / next-load conflict by using different physical buffers.
-    if isinstance(stage, BufferedStage):
-        full_extents = (stage.buffer_count, *padded_extents)
-        smem_index = (stage.phase, *smem_index)
-        prelude: list[Stmt] = []  # leading Sync omitted
-    else:
-        full_extents = padded_extents
-        prelude = [Sync()]
+            cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in cache_axes})
+            source_index = tuple(cache_sigma.apply(e) for e in addressing.exprs)
+        else:
+            decoded_per_dim = {dim: coord_for[ax.name] for ax, dim in zip(cache_axes, addressing.dims, strict=True)}
+            source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(src.origin))
+        # Buffered: prepend phase dim to write index (writes the current
+        # ring slot).
+        if is_buffered:
+            smem_index = (stage.phase, *smem_index)
+        # Per-source dtype: use gmem source's CUDA C type so fp16 inputs
+        # stage into __half smem.
+        smem_dtype = buf_cuda.get(src.buf, "float")
+        smem_align = 16 if smem_dtype == "__half" else 0
+        full_extents = (stage.buffer_count, *padded_extents) if is_buffered else padded_extents
 
-    # ``cp.async.ca [smem], [gmem], 4`` requires the smem destination to
-    # be 4-byte aligned. For fp32 smem that's automatic (sizeof(float)=4
-    # so every ``float[k]`` is 4-byte aligned). For fp16 smem, only
-    # ``__half[even]`` is 4-byte aligned — the per-thread stride-1
-    # cooperative pattern lands odd-thread writes on 2-byte-aligned
-    # destinations and hits ``cudaErrorMisalignedAddress``.
-    #
-    # PTX ``cp.async`` doesn't support a 2-byte size, so the right
-    # fp16 path is to vectorize 4 halves per thread (8-byte cp.async)
-    # — that needs a stride change in the cooperative load too. Until
-    # that's wired up, fall through to the synchronous Load+Write
-    # path for fp16-staged buffers. The variant is still buffered
-    # (BufferedStage parent class), just not async.
-    if isinstance(stage, AsyncBufferedStage) and stage_smem_dtype == "float":
-        # Async transport: emit cooperative cp.async + commit only. The
-        # sibling ``AsyncWait`` Stmt that dominates every consumer
-        # lowers to ``CpAsyncWait + Sync``; no implicit wait here.
-        cooperative_load = StridedLoop(
-            axis=iter_axis,
-            start=tid_expr,
-            step=Literal(n_threads, "int"),
-            body=(CpAsyncCopy(smem=stage.name, smem_index=smem_index, src=stage.buf, src_index=source_index),),
-        )
-        return [
-            Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align),
-            cooperative_load,
-            CpAsyncCommit(),
-        ]
+        # cp.async path (sm_80+): fp32 only — fp16 falls through to sync
+        # path because cp.async.ca's 4-byte size isn't a clean fit for
+        # per-thread stride-1 __half writes.
+        if is_async and smem_dtype == "float":
+            cooperative_load = StridedLoop(
+                axis=iter_axis,
+                start=tid_expr,
+                step=Literal(n_threads, "int"),
+                body=(CpAsyncCopy(smem=src.name, smem_index=smem_index, src=src.buf, src_index=source_index),),
+            )
+            body_out.append(Smem(name=src.name, extents=full_extents, dtype=smem_dtype, align=smem_align))
+            body_out.append(cooperative_load)
+            continue
 
-    if trivial:
-        # Trivial body fast path — preserves byte-identical Kernel IR for
-        # every non-fused stage (matches the legacy ``Load + Write`` shape
-        # the rest of the compiler / golden tests expect).
-        load_name = f"{stage.name}_v"
+        # Sync path: cooperative Load + Write.
+        load_name = f"{src.name}_v"
         cooperative_load = StridedLoop(
             axis=iter_axis,
             start=tid_expr,
             step=Literal(n_threads, "int"),
             body=(
-                Load(name=load_name, input=stage.buf, index=source_index),
-                Write(output=stage.name, index=smem_index, value=load_name),
+                Load(name=load_name, input=src.buf, index=source_index),
+                Write(output=src.name, index=smem_index, value=load_name),
             ),
         )
-        return [
-            *prelude,
-            Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align),
-            cooperative_load,
-            Sync(),
-        ]
+        body_out.append(Smem(name=src.name, extents=full_extents, dtype=smem_dtype, align=smem_align))
+        body_out.append(cooperative_load)
 
-    # Fused-body path: the Stage body carries the full producer program
-    # (Loads from multiple gmem buffers + elementwise compute + final
-    # Write to smem). σ-rewrite cache-axis Vars to per-thread flat-iter
-    # coords and emit the whole body inside the cooperative StridedLoop.
-    from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
-
-    cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in stage.axes})
-
-    def _identity(name: str) -> str:
-        return name
-
-    walked_body = tuple(s.rewrite(_identity, cache_sigma) for s in stage.body)
-    # Buffered fused stages: the trivial-path prepends ``stage.phase`` to
-    # ``smem_index`` so the cooperative Write lands in the current ring
-    # slot. The fused path's terminal Write comes from the body's own
-    # Write stmt (with cache-local index) — apply the same prepend.
-    if isinstance(stage, BufferedStage):
-        *prefix, final = walked_body
-        assert isinstance(final, Write) and final.output == stage.name, (
-            f"Stage {stage.name!r}: buffered fused body must end with Write(output={stage.name!r}), got {final!r}"
-        )
-        walked_body = (*prefix, Write(output=final.output, index=(stage.phase, *final.index), value=final.value, reduce_op=final.reduce_op))
-    cooperative_load = StridedLoop(
-        axis=iter_axis,
-        start=tid_expr,
-        step=Literal(n_threads, "int"),
-        body=walked_body,
-    )
-    return [*prelude, Smem(name=stage.name, extents=full_extents, dtype=stage_smem_dtype, align=stage_smem_align), cooperative_load, Sync()]
+    # Trailing sync: cp.async stages emit Commit (caller-owned AsyncWait
+    # follows); sync stages emit __syncthreads so the slab is CTA-visible.
+    if is_async:
+        body_out.append(CpAsyncCommit())
+    else:
+        body_out.append(Sync())
+    return body_out
 
 
 def _flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:

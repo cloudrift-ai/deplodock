@@ -164,6 +164,10 @@ def _walk_loads(body, axes: tuple[Axis, ...]):
         elif isinstance(s, Cond):
             yield from _walk_loads(s.body, axes)
             yield from _walk_loads(s.else_body, axes)
+        elif isinstance(s, Stage):
+            # Wrap-body Stage: descend into the consumer body where the
+            # Loads from staged smem live.
+            yield from _walk_loads(s.body, axes)
 
 
 # ---------------------------------------------------------------------------

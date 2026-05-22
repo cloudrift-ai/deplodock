@@ -10,11 +10,6 @@ import numpy as np
 import pytest
 import torch
 
-pytestmark = pytest.mark.xfail(
-    reason="stage-wrap: bucket-13 follow-up — SDPA/attention paths need wrap-body materializer",
-    strict=False,
-)
-
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.frontend.ir import (

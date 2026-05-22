@@ -1,10 +1,4 @@
-"""STAGE-WRAP-BODY REFACTOR: xfailed pending bucket-11 (materializer rewrite).
-
-The test exercises Tile→Kernel lowering; the materializer's Stage handling
-still reads the old API (source_loads, .name etc.) and needs to be
-rewritten to consume per-Source smem decls. Phase C.5 sweeps the xfail.
-
-Cross-validation: Tile-IR oracle vs Kernel-IR static analyzer.
+"""Cross-validation: Tile-IR oracle vs Kernel-IR static analyzer.
 
 For each ``(Stage, body Load)`` binding produced by the Tile-IR pipeline,
 asks ``lane_bank_distribution`` (the oracle that ``007a_permute_register_tile``
@@ -15,10 +9,6 @@ checks both compute the same addresses. Pure static — no GPU required.
 """
 
 from __future__ import annotations
-
-import pytest
-
-pytestmark = pytest.mark.xfail(reason="stage-wrap: bucket-11 follow-up — materializer rewrite", strict=False)
 
 
 def test_oracle_matches_kernel_analyzer_on_small_matmul():

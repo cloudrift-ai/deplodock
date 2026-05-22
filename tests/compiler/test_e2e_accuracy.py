@@ -8,16 +8,8 @@ Expected values are computed with numpy directly — no torch dependency.
 """
 
 import numpy as np
-import pytest
 
 from deplodock.compiler.graph import Graph, Tensor
-
-pytestmark = [
-    pytest.mark.xfail(
-        reason="stage-wrap: bucket-14 follow-up — materializer Stage path needs wrap-body rewrite",
-        strict=False,
-    ),
-]
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
