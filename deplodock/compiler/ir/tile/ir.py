@@ -78,6 +78,12 @@ from deplodock.compiler.ir.stmt import (
     Write,
     pretty_body,
 )
+
+# `render_body` is the per-Stmt body renderer used by the new tile flavors'
+# render methods. Local import below to keep top-of-file imports tidy.
+from deplodock.compiler.ir.stmt import render_body as _render_body  # noqa: E402
+from deplodock.compiler.ir.stmt.base import RenderCtx, _pad
+from deplodock.compiler.ir.stmt.blocks import _body_uses_lane_warp, _render_grid_axis_decode, _render_thread_axis_decode
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
@@ -395,6 +401,15 @@ class GridTile(ParallelTile):
         head = f"{indent}GridTile(axes=({self._pretty_axes()})){extra}:"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Emit ``blockIdx.x`` axis decode + body. The inner ``ThreadTile``
+        renders its threadIdx decode under ``ctx.inside_grid_tile=True``,
+        so no per-CTA bounds guard is needed at this level."""
+        out = list(_render_grid_axis_decode(self.axes, "blockIdx.x", ctx))
+        inner_ctx = replace(ctx, inside_grid_tile=True)
+        out.extend(_render_body(self.body, inner_ctx))
+        return out
+
 
 @dataclass
 class ThreadTile(ParallelTile):
@@ -419,6 +434,38 @@ class ThreadTile(ParallelTile):
         head = f"{indent}ThreadTile(axes=({self._pretty_axes()})){extra}:"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Two render forms picked by ``ctx.inside_grid_tile``.
+
+        - **Cooperative** (inside ``GridTile``): emit ``threadIdx.x`` axis
+          decode + optional ``lane`` / ``warp`` helper decls + body. No
+          extra brace level — the surrounding ``__global__`` provides one.
+        - **Standalone** (pointwise — no enclosing ``GridTile``): flatten
+          all axes into a linear ``tid``; bounds-guard against the product
+          of extents.
+        """
+        pad = _pad(ctx.indent)
+        if ctx.inside_grid_tile:
+            out = list(_render_grid_axis_decode(self.axes, "threadIdx.x", ctx))
+            if _body_uses_lane_warp(self.body):
+                out.append(f"{pad}int lane = threadIdx.x & 31;")
+                out.append(f"{pad}int warp = threadIdx.x >> 5;")
+            out.extend(_render_body(self.body, ctx))
+            return out
+
+        inner = ctx.child()
+        n_threads = 1
+        for ax in self.axes:
+            n_threads *= int(ax.extent)
+        out = [
+            f"{pad}long long tid = blockIdx.x * blockDim.x + threadIdx.x;",
+            f"{pad}if (tid < {n_threads}) {{",
+        ]
+        out.extend(_render_thread_axis_decode(self.axes, inner))
+        out.extend(_render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
+
 
 @dataclass
 class RegisterTile(ParallelTile):
@@ -431,6 +478,12 @@ class RegisterTile(ParallelTile):
     body is fully unrolled, SSA names get per-cell suffixes, and the
     ``RegisterTile`` wrapper disappears.
     """
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise NotImplementedError(
+            "RegisterTile must be consumed by 006a_register_tile_planned before render — "
+            f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
+        )
 
 
 @dataclass
@@ -493,6 +546,34 @@ class SerialTile(SerialTileBase):
         head = f"{indent}SerialTile({self.axis.name} in 0..{self.axis.extent}):  # {red}{kind}{unroll}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Per-Loop accumulator-init prelude (same as ``Loop.render``) +
+        ``for (int axis = 0; axis < extent; axis++) { body }``."""
+        from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
+
+        pad = _pad(ctx.indent)
+        out: list[str] = []
+        seen: set[str] = set()
+        for s in self.body:
+            if isinstance(s, Accum) and s.name not in seen:
+                seen.add(s.name)
+                if s.name in ctx.explicit_inits:
+                    continue
+                identity = s.op.identity
+                if identity is None:
+                    raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
+                out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
+                ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
+        var = self.axis.name
+        extent = int(self.axis.extent)
+        if self.unroll:
+            out.append(f"{pad}#pragma unroll")
+        out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
+        inner = ctx.child()
+        out.extend(_render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
+
 
 @dataclass
 class StridedTile(SerialTileBase):
@@ -525,6 +606,35 @@ class StridedTile(SerialTileBase):
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
         head = f"{indent}StridedTile({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {red}{unroll}"
         return [head, *pretty_body(self.body, indent + INDENT)]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """``for (int axis = start; axis < extent; axis += step)`` with the
+        same per-Loop accumulator-init prelude as ``SerialTile.render``."""
+        from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
+
+        pad = _pad(ctx.indent)
+        out: list[str] = []
+        seen: set[str] = set()
+        for s in self.body:
+            if isinstance(s, Accum) and s.name not in seen:
+                seen.add(s.name)
+                if s.name in ctx.explicit_inits:
+                    continue
+                identity = s.op.identity
+                if identity is None:
+                    raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
+                out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
+                ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
+        var = self.axis.name
+        start_str = self.start.render(ctx)
+        step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        if self.unroll:
+            out.append(f"{pad}#pragma unroll")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
+        inner = ctx.child()
+        out.extend(_render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
 
 
 # ---------------------------------------------------------------------------

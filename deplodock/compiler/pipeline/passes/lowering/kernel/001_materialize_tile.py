@@ -35,7 +35,7 @@ from __future__ import annotations
 from deplodock.compiler.context import Context
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     CpAsyncCommit,
@@ -52,7 +52,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TreeHalve,
     WarpShuffle,
 )
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Loop, Stmt, StridedLoop, Tile, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -61,9 +61,14 @@ from deplodock.compiler.ir.tile.ir import (
     BufferedStage,
     Combine,
     ComputeStage,
+    GridTile,
+    RegisterTile,
+    SerialTile,
     Stage,
+    StridedTile,
     SwizzleMode,
     TemplateAddressing,
+    ThreadTile,
     TileOp,
     TmaBufferedStage,
 )
@@ -104,7 +109,7 @@ def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
             else:
                 out.append(_replace(s, body=Body(())))
             out.extend(inner)
-        elif isinstance(s, (Loop, StridedLoop)):
+        elif isinstance(s, (SerialTile, StridedTile, RegisterTile)):
             new_body = _flatten_wrap_stages(s.body)
             out.append(s.with_bodies((Body(new_body),)))
         elif isinstance(s, Cond):
@@ -130,12 +135,41 @@ def rewrite(ctx: Context, match, root: Node) -> Graph | None:
             buf_cuda[bid] = cuda_name(node.output.dtype)
     new_body: list[Stmt] = []
     for s in root.op.body:
-        if isinstance(s, Tile):
-            new_body.append(_materialize(s, buf_cuda, warp_size=ctx.warp_size))
+        if isinstance(s, (GridTile, ThreadTile)):
+            new_body.append(_materialize_top(s, buf_cuda, warp_size=ctx.warp_size))
         else:
             new_body.append(s)
 
     return KernelOp(body=new_body, name=root.op.name)
+
+
+def _materialize_top(top: Stmt, buf_cuda: dict[str, str], *, warp_size: int) -> Stmt:
+    """Dispatch the outermost tile of a TileOp body to materialization.
+
+    Two shapes are possible coming out of ``001_launch_geometry``:
+
+    - ``GridTile(... body=[ThreadTile(... body=actual)])``: cooperative
+      kernel (matmul / fused-reduce). The ThreadTile's body is what
+      ``_materialize`` walks; the GridTile wrapper preserved unchanged
+      so kernel render emits the ``blockIdx`` decode.
+    - ``ThreadTile(... body=actual)``: pointwise/standalone. Materialize
+      the body directly; the kernel renderer's linear-tid path handles
+      launch geometry from the ThreadTile's extents.
+    """
+    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+    if isinstance(top, GridTile):
+        # Locate the (sole) ThreadTile child.
+        new_outer: list[Stmt] = []
+        for child in top.body:
+            if isinstance(child, ThreadTile):
+                new_outer.append(_materialize(child, buf_cuda, warp_size=warp_size))
+            else:
+                new_outer.append(child)
+        return GridTile(axes=top.axes, body=Body(new_outer), splitk_axes=top.splitk_axes)
+    if isinstance(top, ThreadTile):
+        return _materialize(top, buf_cuda, warp_size=warp_size)
+    raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +177,11 @@ def rewrite(ctx: Context, match, root: Node) -> Graph | None:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size: int) -> Stmt:
+def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, warp_size: int) -> Stmt:
     buf_cuda = buf_cuda or {}
-    """Materialize a Tile. ``Tile.axes`` carries the launch geometry
-    (THREAD + optional BLOCK axes); strategies set this up — this pass
-    commits no axis decisions of its own. The body is walked uniformly
-    whether or not the Tile is cooperative: pointwise (no BLOCK axes)
-    is the degenerate case where Stage / Combine / StridedLoop don't
-    appear and no Accum nesting exists. The same walker handles both.
+    """Materialize a ThreadTile body. The ThreadTile carries the per-CTA
+    thread axes directly (no BoundAxis filtering needed); strategies set
+    this up — this pass commits no axis decisions of its own.
 
     Strategies that need single-thread Writes (e.g. cooperative scalar
     output) wrap them in ``Cond(thread_var == 0)`` themselves —
@@ -163,13 +194,13 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size
     from deplodock.compiler.ir.stmt.body import Body as _Body  # noqa: PLC0415
 
     body = _Body(_flatten_wrap_stages(blk.body))
-    thread_axes = tuple(ba for ba in axes if ba.bind == BIND_THREAD)
+    thread_axes = axes
     if not thread_axes:
-        raise ValueError("Tile must have at least one BIND_THREAD axis")
+        raise ValueError("ThreadTile must have at least one axis")
     tid_expr = _build_linear_tid(thread_axes)
     n_threads = 1
-    for ba in thread_axes:
-        n_threads *= int(ba.extent)
+    for ax in thread_axes:
+        n_threads *= int(ax.extent)
 
     rename: dict[str, str] = {}
 
@@ -440,19 +471,20 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size
         elif isinstance(stmt, AsyncWait):
             new_body.extend(emit_async_wait(stmt))
             pending_reduce = {}
-        elif isinstance(stmt, (Loop, StridedLoop)):
+        elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
-            if stmt.is_reduce:
+            if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
                 # Single-loop reduce: Accums live at the immediate-body level.
                 pending_reduce = {a.name: a for a in stmt.body if isinstance(a, Accum)}
             else:
-                # Non-reduce wrapper (e.g. ``Loop(K_o, SERIAL_OUTER, Loop(K_i,
-                # reduce, [Accum]))`` for cooperative-K reduce after the
-                # partition planner's σ-split). Descend into nested reduce
-                # subtrees so sibling Combines match their Accums' dtypes.
-                # Empty when no nested reduce-with-immediate-Accum exists —
-                # the Combine branch then raises ValueError, which preserves
-                # today's safety net against stray Combines.
+                # Non-reduce wrapper (e.g. ``SerialTile(K_o, kind="serial_outer",
+                # body=[SerialTile(K_i, kind="stage_inner", reduce, [Accum])])``
+                # for cooperative-K reduce after the partition planner's σ-split).
+                # Descend into nested reduce subtrees so sibling Combines match
+                # their Accums' dtypes. Empty when no nested reduce-with-
+                # immediate-Accum exists — the Combine branch then raises
+                # ValueError, which preserves today's safety net against stray
+                # Combines.
                 pending_reduce = _find_nested_reduce_accums(stmt.body)
         elif isinstance(stmt, Combine):
             # ``Combine.name`` is the per-thread SSA value to combine across
@@ -498,7 +530,7 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size
         new_body = prologue + new_body
     if compute_stage_prologue:
         new_body = compute_stage_prologue + new_body
-    return Tile(axes=axes, body=_drop_redundant_syncs(new_body))
+    return ThreadTile(axes=axes, body=_drop_redundant_syncs(new_body), cooperative_axes=blk.cooperative_axes)
 
 
 def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
@@ -544,9 +576,9 @@ def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
 
 
 def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda) -> Stmt:
-    """Translate a body Loop or StridedLoop. Recurses so nested staging
-    / loops / writes inside the body get the same uniform treatment.
-    The wrapper type (Loop vs StridedLoop) is preserved — strategies
+    """Translate a body SerialTile / StridedTile / RegisterTile. Recurses
+    so nested staging / loops / writes inside the body get the same
+    uniform treatment. The wrapper type is preserved — strategies
     decided the iteration shape; materialization just walks.
 
     ``filter_emit`` dedupes ``Smem`` decls by name across the whole
@@ -565,8 +597,8 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
         if isinstance(s, AsyncWait):
             return emit_async_wait(s)
         if s.nested():
-            # Block wrapper (Loop / StridedLoop / Cond / ...) — body.map
-            # has already mapped its child bodies post-order.
+            # Block wrapper (SerialTile / StridedTile / RegisterTile / Cond / ...) —
+            # body.map has already mapped its child bodies post-order.
             return s
         return transform(s)
 
@@ -575,33 +607,34 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
 
 def _find_nested_reduce_accums(stmts) -> dict[str, Accum]:
     """All ``Accum``s sitting at the immediate-body level of the first
-    nested reduce ``Loop`` / ``StridedLoop`` subtree, keyed by Accum
-    name. Used by the materializer when a non-reduce outer Loop wraps a
-    deeper reduce — e.g. the cooperative-K shape ``Loop(K_o,
-    SERIAL_OUTER, Loop(K_i, reduce, [Accum, ...]))`` produced by the
-    partition planner's σ-split, possibly with F-replicated sibling
-    Accums from ``006a_register_tile_planned``. Returns ``{}`` when no
-    reduce-with-immediate-Accum is found, preserving the existing
-    "stray Combine raises" safety net."""
+    nested reduce ``SerialTile`` / ``StridedTile`` subtree, keyed by
+    Accum name. Used by the materializer when a non-reduce outer tile
+    wraps a deeper reduce — e.g. the cooperative-K shape
+    ``SerialTile(K_o, "serial_outer", body=[SerialTile(K_i, "stage_inner",
+    reduce, [Accum, ...])])`` produced by the partition planner's σ-split,
+    possibly with F-replicated sibling Accums from
+    ``006a_register_tile_planned``. Returns ``{}`` when no reduce-with-
+    immediate-Accum is found, preserving the existing "stray Combine
+    raises" safety net."""
     for s in stmts:
-        if isinstance(s, (Loop, StridedLoop)) and s.is_reduce:
+        if isinstance(s, (SerialTile, StridedTile)) and s.is_reduce:
             accums = {a.name: a for a in s.body if isinstance(a, Accum)}
             if accums:
                 return accums
-        if isinstance(s, (Loop, StridedLoop)):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
             found = _find_nested_reduce_accums(s.body)
             if found:
                 return found
     return {}
 
 
-def _single_thread_var(thread_axes: tuple) -> str:
+def _single_thread_var(thread_axes: tuple[Axis, ...]) -> str:
     """Combine + TreeHalve emit a single ``tid_var`` string. Only valid
     when there's exactly one THREAD axis — softmax-style cooperation
     (matmul has multi-axis THREAD set but doesn't emit Combine)."""
     if len(thread_axes) != 1:
         raise ValueError(f"Combine requires a single THREAD axis; got {len(thread_axes)}")
-    return thread_axes[0].axis.name
+    return thread_axes[0].name
 
 
 def _partition_tma_groups(
@@ -648,7 +681,7 @@ def _partition_tma_groups(
         if isinstance(stmt, TmaBufferedStage):
             pending_prologue.append(stmt)
             continue
-        if isinstance(stmt, Loop) and any(isinstance(s, TmaBufferedStage) for s in stmt.body):
+        if isinstance(stmt, SerialTile) and any(isinstance(s, TmaBufferedStage) for s in stmt.body):
             gid = _new_group()
             for st in pending_prologue:
                 _add_stage(gid, st)
@@ -687,21 +720,21 @@ def _partition_tma_groups(
     return stage_group_by_id, wait_group_by_id, group_stage_names, group_buffer_count
 
 
-def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
+def _build_linear_tid(thread_axes: tuple[Axis, ...]):
     """Linear row-major thread index from the THREAD axes.
 
     Single-axis (softmax) → ``Var(name)``.
     Multi-axis (matmul) → ``m_i * BN + n_i`` for ``(m_i, n_i)``."""
     if len(thread_axes) == 1:
-        return Var(thread_axes[0].axis.name)
+        return Var(thread_axes[0].name)
     inner_stride = 1
     parts: list = []
-    for ba in reversed(thread_axes):
-        ext = int(ba.extent)
+    for ax in reversed(thread_axes):
+        ext = int(ax.extent)
         if inner_stride == 1:
-            parts.append(Var(ba.axis.name))
+            parts.append(Var(ax.name))
         else:
-            parts.append(Var(ba.axis.name) * Literal(inner_stride, "int"))
+            parts.append(Var(ax.name) * Literal(inner_stride, "int"))
         inner_stride *= ext
     expr = parts[0]
     for p in parts[1:]:
