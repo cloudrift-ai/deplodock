@@ -127,6 +127,10 @@ when eligible, and the scalar variants follow.
 
 ---
 
+**Prerequisite landed:** `Axis.source_axis` (Phase A of the stage-wrap-body refactor) is now in place. Every
+split sub-axis carries a back-pointer to its parent; the MMA enumerator can use this for BLOCK·GROUP·CELL·ATOM
+grouping without name-suffix matching. See `plans/stage-wrap-body.md`.
+
 ## M1 — Plumb `Role.ATOM` + `ATOM_KIND` registry through the planner as a no-op
 
 **Why.** Establish the unified factorization scaffolding without changing any emitted CUDA. The scalar path goes

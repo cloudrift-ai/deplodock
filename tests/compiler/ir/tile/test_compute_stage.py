@@ -23,9 +23,7 @@ def _compute_stage(buffer_count: int = 1, phase=None) -> ComputeStage:
     consumer) is empty here."""
     name = "fused"
     cache_dims = (CacheDim(axis=Axis("m", 16), source_dim=0), CacheDim(axis=Axis("k", 8), source_dim=1))
-    src = Source(
-        name=name, buf="", cache_dims=cache_dims, origin=(Literal(0, "int"), Literal(0, "int"))
-    )
+    src = Source(name=name, buf="", cache_dims=cache_dims, origin=(Literal(0, "int"), Literal(0, "int")))
     cache_index = (Var("m"), Var("k"))
     compute = Body(
         (

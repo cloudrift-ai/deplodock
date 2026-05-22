@@ -79,7 +79,6 @@ from deplodock.compiler.ir.stmt import (
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
-
 # ---------------------------------------------------------------------------
 # Deprecated AsyncWait stub (stage-wrap-body refactor)
 # ---------------------------------------------------------------------------
