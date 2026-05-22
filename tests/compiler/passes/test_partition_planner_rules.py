@@ -11,8 +11,6 @@ were deleted in the same refactor.
 
 from __future__ import annotations
 
-import pytest
-
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
@@ -20,48 +18,9 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
-# These tests construct LoopOp graphs with Role-tagged Loops and run the
-# pipeline with ``select={"launch_geometry"}``. With the planner-emits-tiles
-# refactor the LoopOp → TileOp fallback is gone — the planner handles every
-# kernel shape it can, and unhandled shapes fall through unconverted. These
-# direct-LoopOp tests need rebuilding to drive the planner instead.
-_xfail_no_fallback = pytest.mark.xfail(reason="launch_geometry fallback dropped; tests need rebuilding to drive the planner")
-
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
-
-
-# --- Role field round-trip tests deleted in the SC3 cleanup of the
-#     planner-emits-tiles refactor: Loop.role / StridedLoop.role fields
-#     were removed once the planner stopped stamping them. The planner's
-#     internal axis-layer labeling now lives on a planner-private enum.
-
-# --- Tileify honors REGISTER tag -------------------------------------
-
-
-def _wrap_loopop(loop_op: LoopOp) -> Graph:
-    g = Graph()
-    _input(g, "x", (4, 8))
-    g.add_node(op=loop_op, inputs=["x"], output=Tensor("o", (4,)), node_id="o")
-    g.inputs = ["x"]
-    g.outputs = ["o"]
-    return g
-
-
-def _run_only_launch_geometry(g: Graph) -> TileOp:
-    out = Pipeline.build(TILE_PASSES, select={"launch_geometry"}).run(g)
-    tile_ops = [n.op for n in out.nodes.values() if isinstance(n.op, TileOp)]
-    assert len(tile_ops) == 1
-    return tile_ops[0]
-
-
-# --- test_launch_geometry_stops_at_register_tagged_loop /
-#     test_launch_geometry_skips_register_sibling_output_loop deleted in
-#     SC3 — they built LoopOp graphs with Role-tagged Loops and ran the
-#     dropped LoopOp fallback. With the planner constructing tile flavors
-#     directly and the Role enum / Loop.role field gone, there's no way
-#     to even express the inputs these tests used.
 
 
 # --- Planner stub ----------------------------------------------------
@@ -155,7 +114,3 @@ def test_006a_replicates_register_tagged_body_loop():
         assert "a_reg" not in vars_in_index, f"unreplicated a_reg in Write: {w.index}"
     # FM gets stamped from the outermost (and only) RegisterTile axis extent.
     assert new_tile_op.knobs.get("FM") == 4
-
-
-# --- (006 chunk_reduce STAGE_INNER guard test deleted alongside the
-#       legacy pass — planner owns chunk-reduce now.)
