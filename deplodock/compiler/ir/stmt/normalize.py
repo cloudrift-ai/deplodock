@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
@@ -93,17 +93,30 @@ def normalize_body(
 # ---------------------------------------------------------------------------
 
 
+_LAUNCH_GEOMETRY_ROLES: frozenset[Role] = frozenset({Role.BLOCK, Role.SPLITK_BLOCK})
+
+
 def drop_size_one_free_axes(stmts: Body) -> Body:
     """Inline every free ``Loop(axis, extent=1)``: replace it with its body
     after substituting ``Var(axis.name) → Literal(0, "int")``. Reduce Loops
     keep their wrappers because dropping them would remove the accumulator.
     Recurses through StridedLoop / Tile / Cond bodies without rewriting
-    those wrappers (their iteration semantics aren't a free Loop)."""
+    those wrappers (their iteration semantics aren't a free Loop).
+
+    Role-tagged Loops that drive launch geometry (``Role.BLOCK`` and
+    ``Role.SPLITK_BLOCK``) are kept even at extent=1 — they signal to
+    ``launch_geometry`` that the kernel runs as a single CTA cooperating
+    via shared memory. Dropping them turns the Tile renderer's
+    block_axes empty, which falls back to the linear-flatten launch
+    pattern (grid = ceil(threads / 256), block = 256). With smem in
+    play (any matmul / fused kernel) each CTA loads its own private
+    smem and reads from threads that landed in *other* CTAs, producing
+    garbage output."""
     stmts = Body.coerce(stmts)
 
     def fn(s: Stmt) -> Stmt | Body:
         # Body.map post-order: ``s.body`` is already recursively mapped.
-        if isinstance(s, Loop) and int(s.axis.extent) == 1 and not s.is_reduce:
+        if isinstance(s, Loop) and int(s.axis.extent) == 1 and not s.is_reduce and s.role not in _LAUNCH_GEOMETRY_ROLES:
             sub = Sigma({s.axis.name: Literal(0, "int")})
             return tuple(c.rewrite(_identity_rename, sub) for c in s.body)
         return s
