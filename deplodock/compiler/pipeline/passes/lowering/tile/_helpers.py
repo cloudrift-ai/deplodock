@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile
 from deplodock.compiler.pipeline import RuleSkipped
 
@@ -111,16 +111,18 @@ def single_tile(body: Body) -> tuple[int, ParallelTile]:
 
 
 def is_matmul_reduce(loop) -> bool:
-    """True iff ``loop`` is a reduce serial-tile whose body matches the
-    matmul signature: ≥2 distinct buffers with K-indexed Loads (where
-    K is ``loop.axis.name``) plus at least one ``Accum``.
+    """True iff ``loop`` is a reduce-loop whose body matches the matmul
+    signature: ≥2 distinct buffers with K-indexed Loads (where K is
+    ``loop.axis.name``) plus at least one ``Accum``.
 
-    Accepts ``SerialTile`` / ``StridedTile`` (the post-lowering shape).
-    Used directly by ``002_chunk_matmul_k`` (which needs to fire on
-    matmul-shaped reduces wherever they sit, not only at the top level
-    under a K-outer wrapper).
+    Accepts both Loop-IR ``Loop`` / ``StridedLoop`` (the pre-launch_geometry
+    shape seen by ``000_partition_planner``) and Tile-IR ``SerialTile`` /
+    ``StridedTile`` (the post-launch_geometry shape). Used by
+    ``000_partition_planner`` to locate the matmul K reduce inside a LoopOp
+    body, and by downstream tile passes to confirm a matmul-shaped reduce
+    survived.
     """
-    if not (isinstance(loop, (SerialTile, StridedTile)) and loop.is_reduce):
+    if not (isinstance(loop, (Loop, StridedLoop, SerialTile, StridedTile)) and loop.is_reduce):
         return False
     K_name = loop.axis.name
     bufs = {ld.input for ld in loop.body.of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}}
