@@ -2,7 +2,7 @@
 compute cone out of the K-inner reduce body, emitting one of two shapes
 per the ``FUSED_PIPELINE`` knob.
 
-The pass walks each Tile body produced by ``007_stage_inputs``, finds
+The pass walks each Tile body produced by ``002_stage_inputs``, finds
 groups of Stages with identical cache axes whose epilogue cone in the
 reduce loop body has free axes contained in those cache axes, then:
 
@@ -32,7 +32,7 @@ _pass = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.til
 
 
 def _silu_mul_matmul_tile() -> TileOp:
-    """Hand-build the Tile-IR shape that ``007_stage_inputs`` would
+    """Hand-build the Tile-IR shape that ``002_stage_inputs`` would
     emit for ``F.silu(gate) * up @ W``: two same-axes Stages on
     ``gate`` / ``up``, a third single-source Stage on ``w``, then a
     reduce Loop containing the silu chain + matmul accumulate."""

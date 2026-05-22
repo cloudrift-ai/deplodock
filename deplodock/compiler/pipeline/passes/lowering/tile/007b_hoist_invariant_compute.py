@@ -1,6 +1,6 @@
 """Hoist a loop-invariant compute cone out of the K-inner reduce body.
 
-After ``007_stage_inputs`` runs, the Tile body has shape::
+After ``002_stage_inputs`` runs, the Tile body has shape::
 
     Tile(axes=...):
         for K_outer:                                 # free

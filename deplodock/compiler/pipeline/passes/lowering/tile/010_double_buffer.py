@@ -161,7 +161,7 @@ def _is_kouter_matmul(loop: Loop, invariant_names: set[str]) -> bool:
     Layered gates that aren't expressible as roles:
 
     - ``extent ≥ 2`` (need room for ping-pong).
-    - ``≥ 1 Stage`` in the K_o body (after 007_stage_inputs picked
+    - ``≥ 1 Stage`` in the K_o body (after 002_stage_inputs picked
       one — otherwise there's nothing to double-buffer).
     - No in-loop online-softmax-style merge in K_i (non-Accum stmt
       reading a local Accum's running value would compound fp32 drift

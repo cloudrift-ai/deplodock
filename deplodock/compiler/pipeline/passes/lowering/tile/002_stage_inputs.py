@@ -1,9 +1,15 @@
 """Stage frequently-reused external inputs into shared memory.
 
-Runs *after* ``006a_register_tile_planned`` (planner-driven register
-tile is already applied: F×F per-cell Load replicas all share their
-source buffer). Stages stay singleton across F²; only consumer Loads
-σ-substitute cache-axis Vars.
+Runs *before* ``006a_register_tile_planned`` (pre-register-tile: there
+is exactly one Load per ``(buffer, access-pattern)`` rather than F×F
+duplicates). REGISTER axes in scope join cache axes via the
+``register_axes`` channel — the slab spans ``BM·FM × BK`` (and similar)
+with stride-1 Affine addressing, instead of ``BM × BK`` with
+TemplateAddressing as it would post-006a. Stages emit at the
+K_o-body head; their cache-axis iteration vars shadow the outer
+REGISTER Loops, and ``006a_register_tile_planned`` treats Stages as
+opaque (no recursion into their bodies) when unwrapping the
+REGISTER tower.
 
 **Pipeline:**
 
@@ -186,18 +192,19 @@ def _collect_candidates(
     *,
     slab_cap: int,
     is_cooperative: bool = False,
+    register_axes: tuple[Axis, ...] = (),
 ) -> None:
     """Mirror of ``_process_scope``'s buffer-walk side: record each
     candidate buffer's classified slab size without building Stages.
-    Mirrors the cooperative-K row-cache treatment so preflight matches
-    actual staging behavior."""
+    Mirrors the cooperative-K row-cache treatment and the REGISTER-as-
+    cache-axis treatment so preflight matches actual staging behavior."""
     loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]] = {}
     for s in scope.body:
         if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.SERIAL_OUTER:
             inner_stage = _peel_to_stage_inner(s)
             if inner_stage is not None:
                 scope_axes = (*in_scope_axes, s.axis, inner_stage.axis)
-                extra = (s.axis,)
+                extra = (s.axis,) + register_axes
                 for stmt in inner_stage.body:
                     if isinstance(stmt, Load):
                         loads_by_buf.setdefault(stmt.input, []).append((stmt, inner_stage.axis, scope_axes, extra))
@@ -206,9 +213,10 @@ def _collect_candidates(
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
-                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, ()))
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes))
             continue
         if isinstance(s, Loop) and not s.is_reduce:
+            new_register_axes = register_axes + (s.axis,) if s.role is Role.REGISTER else register_axes
             _collect_candidates(
                 s,
                 thread_axes,
@@ -217,13 +225,14 @@ def _collect_candidates(
                 found,
                 slab_cap=slab_cap,
                 is_cooperative=is_cooperative,
+                register_axes=new_register_axes,
             )
             continue
         if isinstance(s, (Loop, StridedLoop)):
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
-                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, ()))
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes))
     for buf, items in loads_by_buf.items():
         if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _, _ in items):
             continue
@@ -341,10 +350,20 @@ def _process_scope(
     scope_budget: int,
     allowed_bufs: frozenset[str] | None = None,
     is_cooperative: bool = False,
+    register_axes: tuple[Axis, ...] = (),
 ) -> Body:
     """Free Loops recurse; reduce loops contribute Loads to this scope's
     per-buffer bucket. Per buffer, derive one slab if all Loads agree;
     admit under budget; emit Stages at scope head; rewrite Loads.
+
+    REGISTER axes in scope are tracked via ``register_axes`` and forwarded
+    to ``_classify`` as cache-axis candidates. With ``Role.REGISTER`` axes
+    in the candidate set, the slab covers ``BM·FM × BK`` (and similar)
+    instead of ``BM × BK`` with TemplateAddressing; pre-006a Stages emit
+    here at K_o body head while their cache-axis iteration vars shadow
+    the outer REGISTER Loops. ``006a_register_tile_planned`` later
+    unwraps the outer REGISTER Loops and replicates consumer Loads
+    inside K_i; Stages are passed through opaquely.
 
     Cooperative-K (``is_cooperative=True``) row-cache treatment:
     when a non-reduce ``Loop`` carrying ``Role.SERIAL_OUTER`` wraps a
@@ -367,7 +386,7 @@ def _process_scope(
             inner_stage = _peel_to_stage_inner(s)
             if inner_stage is not None:
                 scope_axes = (*in_scope_axes, s.axis, inner_stage.axis)
-                extra = (s.axis,)
+                extra = (s.axis,) + register_axes
                 for stmt in inner_stage.body:
                     if isinstance(stmt, Load):
                         loads_by_buf.setdefault(stmt.input, []).append((stmt, inner_stage.axis, scope_axes, extra))
@@ -381,6 +400,7 @@ def _process_scope(
         if is_cooperative and isinstance(s, Loop) and not s.is_reduce and s.role is Role.STAGE_INNER:
             pass  # fall through to the collection branch
         elif isinstance(s, Loop) and not s.is_reduce:
+            new_register_axes = register_axes + (s.axis,) if s.role is Role.REGISTER else register_axes
             new_body = _process_scope(
                 s,
                 thread_axes,
@@ -391,6 +411,7 @@ def _process_scope(
                 scope_budget=scope_budget,
                 allowed_bufs=allowed_bufs,
                 is_cooperative=is_cooperative,
+                register_axes=new_register_axes,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -398,7 +419,7 @@ def _process_scope(
             scope_axes = (*in_scope_axes, s.axis)
             for stmt in s.body:
                 if isinstance(stmt, Load):
-                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, ()))
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes))
         rewritten_inner.append(s)
 
     if allowed_bufs is not None:

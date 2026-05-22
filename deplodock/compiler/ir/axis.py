@@ -46,7 +46,7 @@ class Role(Enum):
       ``Tile.axes``); ``006a_register_tile_planned`` replicates dependent
       stmts along it.
     - ``STAGE_INNER``: inner reduce axis after a K split. Slab dimension for
-      ``007_stage_inputs``.
+      ``002_stage_inputs``.
     - ``SERIAL_OUTER``: outer serial chunk loop (e.g. K_o). Pipeline / double-
       buffer targets.
     - ``PIPELINE``: serial outer loop marked for pipelining by ``015_pipeline_k_outer``.

@@ -673,7 +673,7 @@ class TileOp(BodyOp):
         from math import prod  # noqa: PLC0415
 
         # Staged-smem check — runs whether or not register_tile fired,
-        # since 007_stage_inputs can add Stages independently.
+        # since 002_stage_inputs can add Stages independently.
         staged = sum(s.smem_bytes for s in self.body.iter() if isinstance(s, Stage))
         if staged > ctx.max_dynamic_smem:
             return False
@@ -828,7 +828,7 @@ class TileOp(BodyOp):
         if splitk > 8:
             score -= min((splitk - 8) / 8.0, 1.0)
 
-        # Bonuses. Stage stmts get added by ``007_stage_inputs`` deeper
+        # Bonuses. Stage stmts get added by ``002_stage_inputs`` deeper
         # inside the body (under the loop nest), not at ``tile.body``'s
         # direct children — walk the body recursively to find them.
         if any(isinstance(s, _Stage) for s in self.body.iter()):

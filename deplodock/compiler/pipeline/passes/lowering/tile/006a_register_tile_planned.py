@@ -1,16 +1,17 @@
-"""Planner-driven register tile — runs *before* ``007_stage_inputs``.
+"""Planner-driven register tile — runs *after* ``002_stage_inputs``.
 
 When ``000_partition_planner`` pre-splits a matmul's output Loops and
-tags the inner halves ``Role.REGISTER``, this pass replicates those
-loops per-cell **before** staging picks cache axes. That matters: if
-the REGISTER tag survives into ``007_stage_inputs``, the Stage's cache
-slab won't include the per-cell M_r / N_r axes (they aren't in
-``Tile.axes``).
-
-Running the per-cell replication here means ``007_stage_inputs`` sees
-F×F copies of each body Load with distinct M_b*F+i / N_b*F+j gmem
-indices. Staging then coalesces them through their shared source
-buffer and the cache slab spans the full BM × BK / BK × BN.
+tags the inner halves ``Role.REGISTER``, this pass unwraps those
+REGISTER Loops and replicates their bodies per-cell. By the time this
+pass runs, ``002_stage_inputs`` has already emitted Stages with
+REGISTER axes (M_r / N_r) as part of their cache axes — the slab spans
+the full ``BM·FM × BK`` (and similar) with Affine addressing. Stages
+are treated as opaque here: their internal gmem-load body has its own
+cache-axis iteration that shadows the outer REGISTER Loops, so the
+replicator passes them through unchanged. Consumer body Loads
+(reading from the Stages) carry outer-REGISTER ``Var``s in their
+smem indices, and those replicas multiply along the unwrapping axis
+in the usual way.
 
 When no REGISTER tags are present (non-matmul kernels), the pass
 skips. Stamps ``FM`` / ``FN`` so the planner-stamped values persist
@@ -124,6 +125,13 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
     def go(b: Body) -> Body:
         out: list[Stmt] = []
         for s in b:
+            # Stage is opaque: its cache-axis iteration vars (Stage.axes)
+            # shadow outer Loop axes, and its origin is computed with cache
+            # axes zeroed — so the Stage body never depends on the outer
+            # REGISTER axis we're replicating. Pass it through unchanged.
+            if isinstance(s, Stage):
+                out.append(s)
+                continue
             nested = s.nested()
             if nested:
                 out.append(s.with_bodies(tuple(go(child) for child in nested)))

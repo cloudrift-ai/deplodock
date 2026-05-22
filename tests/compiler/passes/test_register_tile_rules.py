@@ -108,7 +108,7 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
 
 
 def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
-    """With ``007_stage_inputs`` running before register_tile, Stages
+    """With ``002_stage_inputs`` running before register_tile, Stages
     stay singleton across F² and the smem budget no longer blows up on
     SDPA's softmax-pre-pass + (P·V) matmul kernel. Both SDPA matmul
     kernels (Q·Kᵀ and the dominant one) now fire."""

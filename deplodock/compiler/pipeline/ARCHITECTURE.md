@@ -238,7 +238,7 @@ recipe.
 | `SPLITK`      | INT      | `003_split_matmul_k`         | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
 | `BN`          | INT      | `004_launch_geometry`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
 | `BM`          | INT      | `004_launch_geometry`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
-| `STAGE`       | BINMASK  | `007_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. `"111"` stages all three.    |
+| `STAGE`       | BINMASK  | `002_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. `"111"` stages all three.    |
 | `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
 | `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
 | `TMA_SWIZZLE`     | BOOL     | `011_tma_copy`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |

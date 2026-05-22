@@ -4,7 +4,7 @@
 Problem
 =======
 
-After ``007_stage_inputs`` lays out a slab in shared memory, body
+After ``002_stage_inputs`` lays out a slab in shared memory, body
 Loads read it using thread-decoded coords. When the slab's per-thread-
 axis stride is a multiple of 32 floats (the smem bank count × 4 bytes
 / 4 bytes per float), every thread in a warp hits the same bank — a
@@ -156,14 +156,25 @@ def _try_fix(stage: Stage, loads: list[Load], tile: Tile) -> Stage | None:
     # first conflict-free configuration.
     no_pad = (0,) * n
     candidates: list[tuple[int, ...]] = []
-    # 1-dim: prefer innermost-first (likely the right granularity).
-    for dim in range(n - 1, -1, -1):
+    # 1-dim: prefer innermost-first (the natural granularity for bank-
+    # conflict breakage)... BUT skip the innermost dim when its extent
+    # is ≤ vec-load width (4 for fp32 float4 / 8 for fp16 half8). The
+    # materializer emits a vectorized load over consecutive innermost-
+    # dim cells in those cases, and a +1 pad on that dim breaks the
+    # 16-byte alignment of the float4. Pad an outer dim instead.
+    _VEC_INNERMOST_THRESHOLD = 8  # covers fp32 float4 + fp16 half8
+    skip_innermost = n >= 1 and base_extents[n - 1] <= _VEC_INNERMOST_THRESHOLD
+    inner_range = range(n - 1, -1, -1) if not skip_innermost else range(n - 2, -1, -1)
+    for dim in inner_range:
         pad = [0] * n
         pad[dim] = 1
         candidates.append(tuple(pad))
-    # 2-dim: every unordered pair.
+    # 2-dim: every unordered pair — skip pairs that include the
+    # innermost vec-load dim for the same alignment reason.
     for d1 in range(n):
         for d2 in range(d1 + 1, n):
+            if skip_innermost and (d1 == n - 1 or d2 == n - 1):
+                continue
             pad = [0] * n
             pad[d1] = 1
             pad[d2] = 1
