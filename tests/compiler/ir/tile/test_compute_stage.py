@@ -1,13 +1,10 @@
-"""Invariants for ``ComputeStage`` — the hoist-compute-side counterpart
-to ``Stage`` (transport).
+"""Invariants for ``ComputeStage`` in the wrap-body shape.
 
-A ``ComputeStage`` reads from sibling Stage smem (not gmem), so the
-gmem-slab-geometry properties (``buf`` / ``origin`` / ``addressing``)
-are nonsensical and raise; ``external_reads`` returns ``()`` so 015 and
-``tuning.py`` don't misclassify a compute stage's body Loads as gmem
-dependencies. Optional ``buffer_count`` + ``phase`` mirror
-``BufferedStage`` so 010 can ring-buffer the compute output without a
-separate subclass.
+A ``ComputeStage`` reads from sibling Stage smem (not gmem) via its
+``compute`` body, and wraps a consumer body that reads its own staged
+smem. ``external_reads`` returns ``()`` so 015 / tuning don't classify
+compute stages' sibling-smem reads as gmem dependencies. Optional
+``buffer_count`` + ``phase`` mirror ``BufferedStage`` for ring-buffering.
 """
 
 from __future__ import annotations
@@ -17,17 +14,20 @@ import pytest
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Write
-from deplodock.compiler.ir.tile.ir import ComputeStage, Stage
+from deplodock.compiler.ir.tile.ir import CacheDim, ComputeStage, Source, Stage
 
 
 def _compute_stage(buffer_count: int = 1, phase=None) -> ComputeStage:
-    """Build a representative compute stage: smem Loads on two sibling
-    Stages (``a_xport`` / ``b_xport``), an elementwise multiply, then
-    write into the compute stage's own smem buffer."""
+    """Representative compute stage: ``compute`` body reads two sibling
+    Stage smems and writes into this stage's own smem; ``body`` (the
+    consumer) is empty here."""
     name = "fused"
-    axes = (Axis("m", 16), Axis("k", 8))
+    cache_dims = (CacheDim(axis=Axis("m", 16), source_dim=0), CacheDim(axis=Axis("k", 8), source_dim=1))
+    src = Source(
+        name=name, buf="", cache_dims=cache_dims, origin=(Literal(0, "int"), Literal(0, "int"))
+    )
     cache_index = (Var("m"), Var("k"))
-    body = Body(
+    compute = Body(
         (
             Load(name="a_v", input="a_xport", index=cache_index),
             Load(name="b_v", input="b_xport", index=cache_index),
@@ -35,7 +35,7 @@ def _compute_stage(buffer_count: int = 1, phase=None) -> ComputeStage:
             Write(output=name, index=cache_index, value="prod"),
         )
     )
-    return ComputeStage(name=name, axes=axes, body=body, buffer_count=buffer_count, phase=phase)
+    return ComputeStage(sources=(src,), body=Body(()), compute=compute, buffer_count=buffer_count, phase=phase)
 
 
 def test_compute_stage_is_a_stage_subclass():
@@ -44,36 +44,16 @@ def test_compute_stage_is_a_stage_subclass():
 
 
 def test_external_reads_is_empty():
-    # Critical invariant: sibling smem reads are NOT external. If this
-    # returned ("a_xport", "b_xport"), 015's TMA/async eligibility checks
-    # and tuning.py's gmem enumeration would misclassify them as gmem
-    # dependencies and miscompile.
     cs = _compute_stage()
     assert cs.external_reads() == ()
 
 
-def test_source_loads_still_returns_body_loads():
-    # source_loads is unchanged — the body has two Loads (from sibling
-    # smems). Distinct from external_reads, which filters to gmem only.
+def test_nested_returns_compute_and_consumer_bodies():
     cs = _compute_stage()
-    assert len(cs.source_loads) == 2
-    assert {ld.input for ld in cs.source_loads} == {"a_xport", "b_xport"}
-
-
-def test_primary_load_raises():
-    cs = _compute_stage()
-    with pytest.raises(ValueError, match="primary_load undefined"):
-        _ = cs.primary_load
-
-
-def test_buf_origin_addressing_raise():
-    cs = _compute_stage()
-    with pytest.raises(ValueError, match="buf undefined"):
-        _ = cs.buf
-    with pytest.raises(ValueError, match="origin undefined"):
-        _ = cs.origin
-    with pytest.raises(ValueError, match="addressing undefined"):
-        _ = cs.addressing
+    bodies = cs.nested()
+    assert len(bodies) == 2
+    assert bodies[0] is cs.compute
+    assert bodies[1] is cs.body
 
 
 def test_buffer_count_one_is_default():
@@ -97,9 +77,6 @@ def test_pretty_marks_as_compute():
     cs = _compute_stage()
     rendered = "\n".join(cs.pretty())
     assert "compute" in rendered
-    # Multi-source rendering header from Stage.pretty still applies
-    # (shows the sibling smem source names).
-    assert "fuse[a_xport, b_xport]" in rendered
 
 
 def test_pretty_marks_buffered_compute():
