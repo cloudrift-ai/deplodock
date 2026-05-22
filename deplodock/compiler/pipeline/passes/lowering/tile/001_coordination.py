@@ -162,7 +162,7 @@ def _rewrite_for_atomic_lift(body: tuple[LoopStmt, ...], axis_name: str) -> tupl
     changed = False
     out: list[LoopStmt] = []
     for s in body:
-        if isinstance(s, (SerialTile, StridedTile, RegisterTile)) and _contains_write(s):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile, ThreadTile)) and _contains_write(s):
             new_inner = _rewrite_for_atomic_lift(tuple(s.body), axis_name)
             if new_inner != tuple(s.body):
                 changed = True
