@@ -46,6 +46,7 @@ from __future__ import annotations
 import os
 from typing import NamedTuple
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
@@ -71,7 +72,7 @@ class _Slab(NamedTuple):
     n_bytes: int
 
 
-def rewrite(root: Node, ctx) -> list[TileOp] | None:
+def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     """Emit one TileOp option per subset of stage-able input buffers,
     ordered most-staged first. Option-0 stages every qualifying buffer
     (the original behavior — best perf when smem fits). Subsequent
@@ -88,13 +89,10 @@ def rewrite(root: Node, ctx) -> list[TileOp] | None:
     if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
-    variants = _enumerate_variants(root.op.body, slab_cap=budget, scope_budget=budget, parent_op=root.op)
+    variants = _enumerate_variants(root.op.body, slab_cap=budget, scope_budget=budget, parent_op=root.op, warp_size=ctx.warp_size)
     if not variants:
         raise RuleSkipped("no Load qualifies for staging")
     return variants
-
-
-_WARP_SIZE = 32
 
 
 def _forced_stage_mask(n: int) -> int | None:
@@ -107,7 +105,7 @@ def _forced_stage_mask(n: int) -> int | None:
     return STAGE.parse(raw, width=n)
 
 
-def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_op: TileOp) -> list[TileOp]:
+def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_op: TileOp, warp_size: int) -> list[TileOp]:
     """Enumerate one TileOp variant per subset of stage-able buffers —
     ``2^N`` options for ``N`` candidates. Ordered most-staged first
     (greedy / option-0 = stage everything qualifying), then by descending
@@ -128,7 +126,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     fork point.
 
     Returns ``[]`` when no buffer qualifies for staging (no fan-in)."""
-    candidates = _candidate_buffers(body)
+    candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
         return []
     # Rank by descending slab size so larger buffers get priority within
@@ -150,7 +148,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     variants: list[TileOp] = []
     for mask in masks:
         allow = frozenset(b for i, b in enumerate(bufs_ranked) if mask & (1 << i))
-        new_body = _maybe_rewrite(body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow)
+        new_body = _maybe_rewrite(body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow, warp_size=warp_size)
         if new_body is None:
             continue
         knobs = {**parent_op.knobs, STAGE.name: STAGE.pretty(mask, width=n)}
@@ -158,7 +156,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     return variants
 
 
-def _candidate_buffers(body: Body) -> list[tuple[str, int]]:
+def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
     """List of ``(buf_name, slab_bytes)`` for every buffer that would
     qualify for staging under the default classifier. Used to drive the
     per-variant allow-set enumeration."""
@@ -170,7 +168,7 @@ def _candidate_buffers(body: Body) -> list[tuple[str, int]]:
     n_thread = 1
     for ba in tile.thread_axes:
         n_thread *= int(ba.extent)
-    if n_thread <= _WARP_SIZE:
+    if n_thread <= warp_size:
         return []
     block_axis_names = frozenset(ax.name for ax in tile.block_axes)
     is_cooperative = any(ba.role is Role.COOPERATIVE_STRIDE for ba in tile.axes)
@@ -254,7 +252,7 @@ def _collect_candidates(
             break  # one representative per partition; budget accounting is best-effort
 
 
-def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None) -> Body | None:
+def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None, warp_size: int) -> Body | None:
     """Stage every qualifying Load in ``body`` (or only those whose
     buffer is in ``allowed_bufs`` when supplied) into a smem ``Stage``.
 
@@ -281,9 +279,9 @@ def _maybe_rewrite(body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs
     n_thread = 1
     for ba in tile.thread_axes:
         n_thread *= int(ba.extent)
-    if n_thread <= _WARP_SIZE:
+    if n_thread <= warp_size:
         if allowed_bufs is None:
-            raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {_WARP_SIZE}); register-resident, no smem stage")
+            raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {warp_size}); register-resident, no smem stage")
         return None
 
     used_names: set[str] = set()

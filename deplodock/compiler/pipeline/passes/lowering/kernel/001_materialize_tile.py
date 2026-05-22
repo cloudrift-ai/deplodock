@@ -32,6 +32,7 @@ passes can pattern-match on it.
 
 from __future__ import annotations
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import BIND_THREAD, Axis, BoundAxis
@@ -77,7 +78,7 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
-def rewrite(match, root: Node) -> Graph | None:
+def rewrite(ctx: Context, match, root: Node) -> Graph | None:
     # Per-graph-buffer CUDA C type names (e.g. ``"__half"``) so Stage
     # materialization can stamp the matching ``Smem.dtype`` instead of
     # the legacy ``"float"`` default. Covers anything reachable as a
@@ -92,7 +93,7 @@ def rewrite(match, root: Node) -> Graph | None:
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, Tile):
-            new_body.append(_materialize(s, buf_cuda))
+            new_body.append(_materialize(s, buf_cuda, warp_size=ctx.warp_size))
         else:
             new_body.append(s)
 
@@ -104,7 +105,7 @@ def rewrite(match, root: Node) -> Graph | None:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
+def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size: int) -> Stmt:
     buf_cuda = buf_cuda or {}
     """Materialize a Tile. ``Tile.axes`` carries the launch geometry
     (THREAD + optional BLOCK axes); strategies set this up — this pass
@@ -423,7 +424,7 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None) -> Stmt:
             else:
                 accum = next(iter(pending_reduce.values()))
             accum_dtype = accum.dtype or F32
-            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, accum_dtype))
+            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, accum_dtype, warp_size=warp_size))
             rename[stmt.name] = f"{stmt.name}_b"
         else:
             new_body.append(transform(stmt))
@@ -659,10 +660,7 @@ def _build_linear_tid(thread_axes: tuple[BoundAxis, ...]):
     return expr
 
 
-_WARP_SIZE = 32
-
-
-def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32) -> list[Stmt]:
+def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, *, warp_size: int) -> list[Stmt]:
     """Emit the cross-thread combine producing ``<name>_b``.
 
     Three paths, picked by ``n_threads``:
@@ -699,14 +697,14 @@ def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32) 
 
     smem_c_name = _cuda_name(dtype)
     broadcast_name = f"{name}_b"
-    if n_threads <= _WARP_SIZE and (n_threads & (n_threads - 1)) == 0:
+    if n_threads <= warp_size and (n_threads & (n_threads - 1)) == 0:
         return [WarpShuffle(name=broadcast_name, value=name, op=op, length=n_threads, dtype=dtype)]
-    if n_threads % _WARP_SIZE == 0 and (n_threads & (n_threads - 1)) == 0:
-        n_warps = n_threads // _WARP_SIZE
+    if n_threads % warp_size == 0 and (n_threads & (n_threads - 1)) == 0:
+        n_warps = n_threads // warp_size
         smem_name = f"{name}_smem"
         warp_w = f"{name}_w"
         return [
-            WarpShuffle(name=warp_w, value=name, op=op, length=_WARP_SIZE, dtype=dtype),
+            WarpShuffle(name=warp_w, value=name, op=op, length=warp_size, dtype=dtype),
             Smem(name=smem_name, extents=(n_warps,), dtype=smem_c_name),
             Cond(
                 cond=BinaryExpr("==", Var("lane"), Literal(0, "int")), body=(Write(output=smem_name, index=(Var("warp"),), value=warp_w),)
