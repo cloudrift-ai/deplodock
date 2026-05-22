@@ -44,13 +44,18 @@ BANKS = 32
 
 @dataclass
 class StageBinding:
-    """One ``(Stage, body-Load reading it)`` pair plus its surrounding context."""
+    """One ``(Stage, Source, body-Load reading it)`` triple plus surrounding context.
+
+    Wrap-body Stages carry multiple Sources, each with its own smem buffer
+    and cache layout — bank-conflict analysis runs per-Source.
+    """
 
     stage: Stage
     load: Load
     tile: Tile
     enclosing_loop_axes: tuple[Axis, ...]  # outermost-first
     tile_op_name: str = ""
+    source: object = None  # the matching Source (carries .name / .buf / .cache_axes / .pad)
 
 
 @dataclass
@@ -114,15 +119,22 @@ def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> lis
         for top in tile_op.body:
             if not isinstance(top, Tile):
                 continue
-            stages: dict[str, Stage] = {}
+            # Map smem buffer name → (Stage, Source) for every staged buffer.
+            # The wrap-body Stage carries multiple Sources, each with its own
+            # smem name — bank-conflict bindings are per-Source, not per-Stage.
+            sources: dict[str, tuple[Stage, object]] = {}
             for s in _walk(top.body):
-                if isinstance(s, Stage) and (stage_filter is None or s.name in stage_filter):
-                    stages.setdefault(s.name, s)
+                if isinstance(s, Stage):
+                    for src in s.sources:
+                        if stage_filter is None or src.name in stage_filter:
+                            sources.setdefault(src.name, (s, src))
             for load, axes in _walk_loads(top.body, ()):
-                if load.input in stages:
+                if load.input in sources:
+                    stage, src = sources[load.input]
                     out.append(
                         StageBinding(
-                            stage=stages[load.input],
+                            stage=stage,
+                            source=src,
                             load=load,
                             tile=top,
                             enclosing_loop_axes=axes,

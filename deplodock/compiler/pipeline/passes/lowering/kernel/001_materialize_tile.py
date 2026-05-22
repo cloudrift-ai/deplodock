@@ -175,18 +175,23 @@ def _materialize(blk: Tile, buf_cuda: dict[str, str] | None = None, *, warp_size
     # emit Smem decls at kernel scope, and mark them ``declared_smem``
     # so ``_emit_stage``'s in-loop emit is dedup'd. Single-source
     # transport stages are hoisted to prologue naturally by 015.
+    # Hoist every Stage's per-Source Smem decl to kernel scope so the
+    # Stages' producer side (cooperative load) can emit the Smem decl
+    # in-line without escaping the Stage.body scope. The new wrap-body
+    # Stage's body IS the consumer; in CUDA, an Smem decl inside a Loop
+    # body doesn't reach kernel scope, so the hoist happens here.
     compute_stage_prologue: list[Stmt] = []
     for stmt in body.iter():
-        if isinstance(stmt, Stage) and (isinstance(stmt, ComputeStage) or len(stmt.source_loads) > 1):
-            if stmt.name in declared_smem:
-                continue
-            extents = stmt.alloc_extents
-            # Ring-buffer multiplier — ComputeStage carries its own
-            # buffer_count when promoted by the BUFFER_COMPUTE knob.
-            if isinstance(stmt, ComputeStage) and stmt.buffer_count > 1:
-                extents = (stmt.buffer_count, *extents)
-            compute_stage_prologue.append(Smem(name=stmt.name, extents=extents))
-            declared_smem.add(stmt.name)
+        if isinstance(stmt, Stage):
+            for src in stmt.sources:
+                if src.name in declared_smem:
+                    continue
+                extents = src.alloc_extents
+                buf_count = getattr(stmt, "buffer_count", 1)
+                if buf_count > 1:
+                    extents = (buf_count, *extents)
+                compute_stage_prologue.append(Smem(name=src.name, extents=extents))
+                declared_smem.add(src.name)
 
     stage_group, wait_group, group_stage_names, group_buffer_count = _partition_tma_groups(body)
     has_tma = bool(group_stage_names)
