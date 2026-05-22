@@ -165,37 +165,47 @@ def _outer_free_loop_chain(body) -> tuple[tuple[Loop, ...], tuple[Stmt, ...]]:
 
     Returns ``(chain, prologue)``. ``prologue`` is empty for the plain
     matmul / pointwise / cooperative-reduce paths. The fused-prologue
-    matmul (SDPA P@V — softmax max/sum/reciprocal sitting as siblings of
-    the head_dim Loop) is detected via :func:`_classify_fused_prologue`
-    but the chain extension is gated by the matmul branch (it only
-    triggers when both target_names expansion *and* the prologue-inside-
-    M_r placement are wired up; until then the helper exists and the
-    return shape is uniform but ``prologue`` stays ``()``)."""
+    matmul (SDPA P@V — softmax max/sum/reciprocal sitting as siblings
+    of the head_dim Loop) is detected via :func:`_classify_fused_prologue`:
+    when the chain stops because the body has siblings split as
+    ``[reduces..., assigns..., one non-reduce Loop containing a Write]``,
+    pull the inner Loop into the chain (so ``outer_n`` becomes the buried
+    output-N axis) and surface the siblings as ``prologue``."""
     _, rest = _split_leading_non_loops(body)
     out: list[Loop] = []
     cur = rest
     while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
         out.append(cur[0])
         cur = tuple(cur[0].body)
+
+    prologue, inner_loop = _classify_fused_prologue(cur)
+    if inner_loop is not None:
+        out.append(inner_loop)
+        return tuple(out), prologue
     return tuple(out), ()
 
 
 def _classify_fused_prologue(stmts: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], Loop | None]:
-    """Match the fused-prologue shape: ``[reduce Loops..., leaf stmts...,
-    exactly one non-reduce Loop containing a Write]``. Returns
-    ``(prologue, inner_loop)`` on match, ``((), None)`` otherwise.
+    """Match the fused-prologue matmul shape: ``[reduce Loops..., leaf
+    stmts..., exactly one non-reduce Loop whose body transitively contains
+    a matmul-shape reduce]``. Returns ``(prologue, inner_loop)`` on
+    match, ``((), None)`` otherwise.
 
-    Bail conditions: a second non-reduce Loop at this level, an unexpected
-    wrapper (``StridedLoop``), or a naked Write. ``Cond`` siblings are
-    treated as opaque prologue (they may legitimately gate the prologue
-    reduces) unless they themselves contain a Write — that would clash
-    with the inner Loop's role."""
+    The matmul-reduce requirement on the inner Loop is what keeps this
+    helper from over-matching non-matmul kernels with sibling shapes:
+    RMSNorm / softmax / mean follow ``[reduce..., assigns, Loop(post-
+    pointwise)]`` too, but their post-pointwise Loop has no matmul-shape
+    reduce — those fall through to the cooperative-K path the planner
+    already handles.
+
+    Bail conditions: a second non-reduce Loop at this level, an
+    unexpected wrapper (``StridedLoop``), or a naked Write."""
     prologue: list[Stmt] = []
     inner: Loop | None = None
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce:
             prologue.append(s)
-        elif isinstance(s, Loop) and not s.is_reduce and inner is None and _contains_write(s):
+        elif isinstance(s, Loop) and not s.is_reduce and inner is None and _contains_matmul_reduce(s):
             inner = s
         elif isinstance(s, (Loop, StridedLoop)):
             return (), None
@@ -206,15 +216,15 @@ def _classify_fused_prologue(stmts: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...],
     return (tuple(prologue), inner) if inner is not None else ((), None)
 
 
-def _contains_write(stmt: Stmt) -> bool:
-    """True if ``stmt`` is or transitively contains a ``Write``. Mirrors
-    the helper of the same name in ``001_launch_geometry`` so the planner
-    doesn't have to depend on a downstream pass."""
-    if isinstance(stmt, Write):
+def _contains_matmul_reduce(stmt: Stmt) -> bool:
+    """True if ``stmt`` is or transitively contains a matmul-shape reduce
+    Loop (``is_matmul_reduce``: reduce body has ≥ 2 K-indexed Loads + an
+    Accum)."""
+    if isinstance(stmt, Loop) and stmt.is_reduce and is_matmul_reduce(stmt):
         return True
     for sub in stmt.nested():
         for c in sub:
-            if _contains_write(c):
+            if _contains_matmul_reduce(c):
                 return True
     return False
 
@@ -568,7 +578,13 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
 
     K_s and K_c (when present) are shared across all reduces in the kernel;
     K_o / K_i are per-K-Loop, built inside ``_replace_k_loops``. SPLITK
-    atomic-Write is deferred to ``001_launch_geometry``."""
+    atomic-Write is deferred to ``001_launch_geometry``.
+
+    Fused-prologue matmul (``shape.prologue`` non-empty, SDPA P@V): the
+    prologue runs inside the ``M_r`` REGISTER scope but *outside* the
+    ``N_r`` register tower — softmax stats are per-seq-q-row (per M_r),
+    independent of the output N. σ_outer + σ_k are applied uniformly so
+    the prologue's M-axis references resolve to the in-scope ``M_r``."""
     sigma_map: dict[str, object] = {}
 
     N_name = shape.outer_n.axis.name
@@ -625,8 +641,56 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     else:
         new_inner = inner_after_outer
 
+    # σ-rewrite + K-replace the prologue when present. The prologue sits
+    # inside M_r (so M_r is in scope for σ_outer's M-axis mapping) and
+    # outside N_r (softmax stats are N-invariant).
+    prologue_rewritten: tuple[Stmt, ...] = ()
+    if shape.prologue:
+        prologue_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in shape.prologue)
+        if shape.k_loop is not None:
+            prologue_rewritten, _ = _replace_k_loops(
+                prologue_outer,
+                target_names=shape.target_names,
+                K_canonical_name=shape.k_loop.axis.name,
+                K_s=K_s,
+                K_c=K_c,
+                br=params.br,
+                bk=params.bk,
+                K_o_ext=K_o_ext,
+            )
+        else:
+            prologue_rewritten = prologue_outer
+
     # Wrap tower, innermost first. extent-1 layers (e.g. M_t / N_t under v1
     # cooperative BN=BM=1) are inlined later by normalize_body.
+    #
+    # Without prologue: REGISTER layers (N_r, M_r) join the same tower as
+    # THREAD/BLOCK, wrapped innermost-first by _wrap_tower.
+    #
+    # With prologue: N_r wraps the matmul body alone; the prologue stmts
+    # are prepended at the M_r scope, so the M_r Loop body becomes
+    # ``[prologue..., N_r tower]``. Outer layers (THREAD/BLOCK/SPLITK)
+    # then wrap that combined body.
+    if shape.prologue:
+        matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
+        body_inside_mr = prologue_rewritten + matmul_tower
+        if M_r is not None:
+            body_after_register = (Loop(axis=M_r, role=Role.REGISTER, body=body_inside_mr),)
+        else:
+            body_after_register = body_inside_mr
+        outer_layers: list[tuple[Axis, Role | None]] = [(N_t, Role.THREAD)]
+        if M_t is not None:
+            outer_layers.append((M_t, Role.THREAD))
+        if K_c is not None:
+            outer_layers.append((K_c, Role.COOPERATIVE_STRIDE))
+        outer_layers.append((N_b, Role.BLOCK))
+        if M_b is not None:
+            outer_layers.append((M_b, Role.BLOCK))
+        if K_s is not None:
+            outer_layers.append((K_s, Role.SPLITK_BLOCK))
+        outer_layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
+        return _wrap_tower(outer_layers, body_after_register)
+
     layers: list[tuple[Axis, Role | None]] = [(N_r, Role.REGISTER)]
     if M_r is not None:
         layers.append((M_r, Role.REGISTER))
