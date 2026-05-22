@@ -57,6 +57,7 @@ reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
@@ -286,6 +287,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
             priority_mode="pointwise",
         )
 
+    param_combos = _filter_by_env(param_combos)
     shape = KernelShape(outer_n=outer_n, outer_m=outer_m, extra_outer=extra_outer, k_loop=k_loop, target_names=target_names)
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
@@ -307,6 +309,42 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         }
         variants.append(LoopOp(body=new_body, knobs=knobs))
     return variants or None
+
+
+def _filter_by_env(params: list[TileParams]) -> list[TileParams]:
+    """Drop variants that don't match the env-pinned knob values.
+
+    ``DEPLODOCK_<KNOB>=V`` (or the aggregate ``DEPLODOCK_KNOBS="K1=V1,...``,
+    already splatted to per-knob env vars at ``knob.apply_knobs_env``)
+    pins the planner to a specific (BN, BM, FM, FN, BK, SPLITK, BR)
+    tuple — handy for reproducing a single autotune variant in tests
+    or one-off ``deplodock compile`` runs. Unset knobs aren't filtered
+    (i.e. ``DEPLODOCK_BN=16`` alone keeps every variant with BN=16
+    regardless of the other knobs).
+
+    Falls back to the unfiltered list when the pinned tuple doesn't
+    intersect any enumerated variant for *this* kernel's shape — pins
+    are meant to scope the matmul-style kernel under test, but a graph
+    that fuses several kernels with disparate shapes (SDPA = QK^T +
+    P@V; gated MLP at full-model scale) may have peers where the pin
+    is invalid by divisibility. Filtering them all out would
+    ``RuleSkipped`` the planner on the peer and leave a ``LoopOp`` in
+    the lowered graph, which trips ``CudaBackend``. The fallback keeps
+    those peer kernels lowering through rule defaults while the
+    pinned kernel still gets its forced variant."""
+    pins: dict[str, int] = {}
+    for knob, attr in ((BN, "bn"), (BM, "bm"), (FM, "fm"), (FN, "fn"), (BK, "bk"), (SPLITK, "splitk"), (BR, "br")):
+        raw = os.environ.get(knob.env)
+        if raw is None:
+            continue
+        try:
+            pins[attr] = int(raw)
+        except ValueError:
+            continue
+    if not pins:
+        return params
+    filtered = [p for p in params if all(getattr(p, attr) == v for attr, v in pins.items())]
+    return filtered if filtered else params
 
 
 def _enumerate_cartesian(
