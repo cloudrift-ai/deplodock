@@ -481,26 +481,32 @@ Completed buckets (real fixes):
   ``Stage.body`` now that consumer lives inside Stage), ``007a_permute_register_tile.py`` (iterates
   per-Source). Stubbed ``010_double_buffer`` + ``014_pad_smem`` (optimization passes; rewritten in bucket
   11). Commit `8623edac`.
+- **Bucket 11** (materializer rewrite — load-bearing) — ``kernel/001_materialize_tile.py`` rewritten for
+  wrap-body Stage. Added ``_flatten_wrap_stages`` pre-pass that converts ``Stage(body=[consumer])`` into
+  ``[Stage(body=()), *consumer_stmts]`` so the existing walker handles them as siblings; ``_emit_stage``
+  iterates ``stage.sources`` emitting per-Source Smem decl + cooperative load (sync or cp.async)
+  bracketed by leading/trailing Sync; ``000_place_inits`` descends into ``Stage.body`` for Accum
+  collection and reduce-crossing analysis; ``diagnostics/bank_conflicts._walk_loads`` descends into
+  ``Stage.body`` for the oracle. Commit `7eebecb1`.
+- **Bucket 13** (SDPA / attention) — auto-passing under the new materializer. `test_torch_ops.py`
+  un-xfailed in commit `7eebecb1`.
+- **Bucket 14** (E2E) — auto-passing. `test_e2e_accuracy.py` un-xfailed in commit `7eebecb1`.
+- **Bucket 15** (CLI smoke) — auto-passing. `test_run_cli.py` un-xfailed in commit `7eebecb1`.
 
-Deferred buckets (xfailed with bucket pointer, awaiting bucket work):
+Deferred buckets (xfailed with bucket pointer, awaiting pass-side rewrites):
 - **Bucket 7** — ``007b_hoist_invariant_compute`` stubbed; ``test_hoist_invariant_compute.py`` xfailed.
-  Commit `86655772`.
+  The pass (411 LOC) needs a substantive rewrite for the wrap-body shape — both inline-fuse (multi-source
+  Stage) and hoist-compute (sibling ComputeStage) shapes change.
 - **Bucket 10** — ``015_pipeline_k_outer`` stubbed; ``test_pipeline_k_outer_sync_stage.py`` xfailed.
-- **Bucket 11** (materializer rewrite — load-bearing) — ``kernel/001_materialize_tile.py`` mostly intact
-  but reads old ``Stage.source_loads`` / ``.name`` / ``.axes`` / ``.buf`` / ``.origin`` API at multiple
-  sites. Hoisting of per-Source smem decls to kernel scope adapted; the full ``_emit_stage`` rewrite for
-  wrap-body Stage is the bulk of remaining work. ``test_bank_conflicts.py``, ``test_dtype_cuda.py``
-  xfailed.
-- **Bucket 12** (TMA + swizzle split) — ``011_tma_copy`` and ``012_split_inner_for_swizzle`` stubbed;
-  ``test_tma_swizzle.py`` xfailed.
-- **Bucket 13** (SDPA / attention) — ``test_torch_ops.py`` xfailed (depends on materializer + hoist).
-- **Bucket 14** (E2E) — ``test_e2e_accuracy.py`` xfailed (depends on materializer).
-- **Bucket 15** (CLI smoke) — ``test_run_cli.py`` xfailed (depends on materializer).
+  The pass (231 LOC) needs rewrite to consume ``AsyncBufferedStage(pipeline_depth>1)`` and emit
+  prologue/main/epilogue expansion.
+- **Bucket 12** (TMA + swizzle split) — ``011_tma_copy`` and ``012_split_inner_for_swizzle`` stubbed.
+  ``test_tma_swizzle.py``'s 4 accuracy tests auto-pass through the sync fallback path; only
+  ``test_swizzle_picker_pre_pass`` actually fails (imports ``_pick_split_swizzle`` from the stubbed
+  pass).
 
-All deferrals commit `eb179de6`.
-
-Current test state: **917 passed, 53 skipped (environmental), 30 xfailed, 176 xpassed. 0 actual
-failures, 0 errors.** Build is green.
+Current test state: **1109 passed, 53 skipped (environmental), 10 xfailed (deferred bucket workloads),
+4 xpassed. 0 failures.** Build is green.
 
 **Phase C.5 (un-xfail sweep) — not started.** The xfails were added in lieu of bucket work; to un-xfail
 them, the underlying bucket work (materializer rewrite + 007b/011/012/013/015 rewrites) needs to
@@ -510,22 +516,27 @@ happen first.
 
 ## What's left to do (next session)
 
-The dominant remaining work is the **materializer rewrite (bucket 11)** in
-``kernel/001_materialize_tile.py``. Specifically ``_emit_stage`` (~200 LOC) needs to:
+Buckets 7, 10, 12 remain — each requires a substantive pass rewrite for the wrap-body shape:
 
-1. Iterate over ``stage.sources`` instead of reading a single ``stage.buf`` / ``stage.origin`` /
-   ``stage.addressing``.
-2. For each Source: emit per-source ``Smem`` decl (already partially hoisted), cooperative load reading
-   from gmem (Source.buf) with the affine/template index reconstruction, write to the source's smem
-   buffer.
-3. Recursively materialize ``stage.body`` (the consumer) and append its stmts after the producer
-   scaffolding.
-4. Handle ``BufferedStage`` / ``AsyncBufferedStage`` / ``TmaBufferedStage`` per-subclass with phase /
-   buffer_count / pipeline_depth.
+- **Bucket 7 — 007b_hoist_invariant_compute (411 LOC).** Walk the reduce body for invariant compute
+  cones. New shape: walk descends into ``Stage.body`` to find the K_inner reduce loop; cone candidates
+  must group Stages by per-Source ``cache_dims`` (same source axis identity → same group). Inline-fuse
+  output writes a new Stage with multiple Sources covering all the fused gmem operands; hoist-compute
+  output writes a sibling ``ComputeStage`` next to the transport Stage. Test rewrites needed —
+  ``test_hoist_invariant_compute.py`` constructs Stages with old ``Stage(name=, axes=, body=)`` API.
+- **Bucket 10 — 015_pipeline_k_outer (231 LOC).** Match Loop(SERIAL_OUTER) wrapping an
+  ``AsyncBufferedStage(pipeline_depth>1)``; emit σ_first / σ_next / σ_last via prologue/main/epilogue
+  expansion of Stage.sources + Stage.body. The wait is implicit at the lowered Stage boundary; no new
+  AsyncWait Stmts needed. Port σ math verbatim from the old implementation (in git history at
+  ``ffdf11ae``). Test rewrites needed — ``test_pipeline_k_outer_sync_stage.py`` calls ``_eligible``
+  directly with old-shape Stages.
+- **Bucket 12 — 011_tma_copy + 012_split_inner_for_swizzle (277 + 223 LOC).** Promotion passes:
+  BufferedStage → TmaBufferedStage when eligible (single-source per stage, contiguous inner dim,
+  16-byte aligned). The swizzle picker operates on per-Source ``cache_dims``. Re-export
+  ``_pick_split_swizzle`` so the existing pre-pass test continues to import it. ``test_tma_swizzle.py``'s
+  accuracy tests already pass through the sync fallback; the picker test needs the symbol back.
 
-Once bucket 11 lands, buckets 13/14/15 will likely pass without test changes (just remove the xfail
-markers). Buckets 7/10/12 also need their pass rewrites; the affected test files need stage-construction
-sites updated for the new API.
+Phase C.5 (un-xfail sweep) runs after these three buckets land. Phase D (docs + merge) runs after C.5.
 
 ## Critical files
 
