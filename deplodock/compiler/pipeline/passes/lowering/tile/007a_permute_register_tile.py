@@ -1,10 +1,11 @@
 """Chunk the N register-tile into ``LDS.128``-sized strips when ``FN > V``.
 
-``V = ctx.lds128_bytes // BYTES_PER_ELEM`` — elements per ``LDS.128``
-transaction at the current tile-IR dtype. Tile-IR is fp32-only today, so
-``V = 16 // 4 = 4`` in practice; the bytes/dtype split makes the
-hardware constant (the 128-bit bus width) live in Context while the
-per-pass elem count auto-tracks ``BYTES_PER_ELEM``.
+``V = ctx.lds128_bytes // stage.buf.dtype.nbytes`` — elements per
+``LDS.128`` transaction at the staged buffer's dtype. ``V = 4`` for an
+fp32 staged buffer, ``V = 8`` for fp16. The hardware constant (the
+128-bit bus width) lives on ``Context``; the per-stage elem count is
+looked up via ``match.graph.nodes[stage.buf].output.dtype.nbytes`` so
+fp16 matmuls don't waste half the LDS.128 bandwidth.
 
 After ``006a_register_tile_planned`` commits the canonical ``(THREAD-outer | RF-inner)``
 ordering on the N axis, body Loads on the B operand stage read column
@@ -72,8 +73,8 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Tile, Write
-from deplodock.compiler.ir.tile.ir import BYTES_PER_ELEM, BufferedStage, Stage, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.ir.tile.ir import BufferedStage, Stage, TileOp
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     single_tile,
@@ -84,20 +85,22 @@ logger = logging.getLogger(__name__)
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(ctx: Context, root: Node) -> Graph | None:
-    # Elements per LDS.128 transaction at the staged dtype. Tile-IR is
-    # fp32-only today, so this is ``16 // 4 = 4``. The chunk size in
-    # this pass is the maximum-vector-load width; we keep each per-thread
-    # N-chunk that size so nvcc can keep emitting LDS.128 + the warp's
-    # 8-lane phase covers exactly 32 banks.
-    vec_elems = ctx.lds128_bytes // BYTES_PER_ELEM
-    new_body = _maybe_rewrite(root.op.body, vec_elems=vec_elems)
+def rewrite(ctx: Context, match: Match, root: Node) -> Graph | None:
+    # Per-graph-buffer dtype-byte count so per-Stage ``vec_elems`` can
+    # adapt to fp16/fp32 staged buffers. Same lookup pattern as
+    # ``001_materialize_tile``'s ``buf_cuda``.
+    buf_nbytes: dict[str, int] = {}
+    for bid in root.inputs:
+        node = match.graph.nodes.get(bid)
+        if node is not None:
+            buf_nbytes[bid] = node.output.dtype.nbytes
+    new_body = _maybe_rewrite(root.op.body, lds128_bytes=ctx.lds128_bytes, buf_nbytes=buf_nbytes)
     if new_body is None:
         raise RuleSkipped("rewrite helper returned no change")
     return TileOp(body=new_body, name=root.op.name)
 
 
-def _maybe_rewrite(body: Body, *, vec_elems: int) -> Body | None:
+def _maybe_rewrite(body: Body, *, lds128_bytes: int, buf_nbytes: dict[str, int]) -> Body | None:
     idx, tile = single_tile(body)
 
     thread_axes = tile.thread_axes
@@ -107,20 +110,27 @@ def _maybe_rewrite(body: Body, *, vec_elems: int) -> Body | None:
     # Pick the lane axis: the THREAD axis tied to the *N dim of B*. In
     # the canonical post-008 layout that's the larger-extent THREAD axis
     # (the M axis sits at extent BM/FM, the N axis at BN/FN, with BN
-    # >= BM by convention). We confirm via the access pattern that the
-    # picked axis appears in some Stage Load with stride F divisible by
-    # ``vec_elems`` and > ``vec_elems`` — otherwise the chunked rewrite
-    # is a no-op or doesn't apply.
+    # >= BM by convention). The lane stride F is inferred from any body
+    # Load using that axis — typically the B-stage's consumers. The
+    # per-stage ``vec_elems`` is derived from the affected Stage's
+    # source-buffer dtype (4 for fp32, 8 for fp16); the tested F bounds
+    # use the *minimum* vec_elems across affected Stages so a single
+    # axis pick survives mixed-dtype tiles.
     sorted_threads = sorted(thread_axes, key=lambda ax: int(ax.extent))
-    candidates: list[tuple[Axis, int]] = []
+    candidates: list[tuple[Axis, int, int]] = []
     for ax in reversed(sorted_threads):  # try N (largest) first
         F = _infer_lane_stride(tile.body, ax.name)
-        if F is None or F <= vec_elems or F % vec_elems != 0:
+        if F is None:
             continue
-        candidates.append((ax, F))
+        vec_elems = _vec_elems_for_lane(tile, ax.name, lds128_bytes=lds128_bytes, buf_nbytes=buf_nbytes)
+        if vec_elems is None:
+            continue
+        if F <= vec_elems or F % vec_elems != 0:
+            continue
+        candidates.append((ax, F, vec_elems))
     if not candidates:
-        raise RuleSkipped(f"no THREAD axis has Load-stride F divisible by {vec_elems} and > {vec_elems}")
-    lane, F = candidates[0]
+        raise RuleSkipped("no THREAD axis has Load-stride F > vec_elems and divisible by vec_elems")
+    lane, F, vec_elems = candidates[0]
     lane_ext = int(lane.extent)
 
     if not _swap_helps_any_stage(tile, lane.name, F, lane_ext, vec_elems=vec_elems):
@@ -138,6 +148,38 @@ def _maybe_rewrite(body: Body, *, vec_elems: int) -> Body | None:
         lane_ext * F,
     )
     return body[:idx] + (new_tile,) + body[idx + 1 :]
+
+
+def _vec_elems_for_lane(tile: Tile, lane_var: str, *, lds128_bytes: int, buf_nbytes: dict[str, int]) -> int | None:
+    """Elements per LDS.128 at the dtype of the Stage(s) whose consumer
+    Loads reference ``lane_var``. Tile-IR Stages carry no dtype, so we
+    look up ``stage.buf``'s dtype byte-size via ``buf_nbytes``.
+
+    Returns the minimum across affected Stages (the conservative chunk
+    width that still vectorizes every involved Stage), or ``None`` when
+    no affected Stage's dtype is resolvable — caller treats that as
+    "skip this lane candidate"."""
+    sizes: set[int] = set()
+    for s in tile.body.iter():
+        if not isinstance(s, Stage):
+            continue
+        loads = loads_reading(tile.body, s.name)
+        if not any(lane_var in _load_free_vars(ld) for ld in loads):
+            continue
+        nbytes = buf_nbytes.get(s.buf)
+        if nbytes is None:
+            return None
+        sizes.add(lds128_bytes // nbytes)
+    if not sizes:
+        return None
+    return min(sizes)
+
+
+def _load_free_vars(load: Load) -> frozenset[str]:
+    out: set[str] = set()
+    for e in load.index:
+        out |= e.free_vars()
+    return frozenset(out)
 
 
 # ---------------------------------------------------------------------------
