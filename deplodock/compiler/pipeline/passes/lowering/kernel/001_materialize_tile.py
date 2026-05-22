@@ -909,10 +909,19 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
         body_out.append(Smem(name=src.name, extents=full_extents, dtype=smem_dtype, align=smem_align))
         body_out.append(cooperative_load)
 
-    # Trailing sync: cp.async stages emit Commit (caller-owned AsyncWait
-    # follows); sync stages emit __syncthreads so the slab is CTA-visible.
+    # Trailing transport: cp.async stages emit Commit; for the
+    # unpipelined wrap-body shape (pipeline_depth == 1), follow with the
+    # implicit CpAsyncWait(0) + Sync so the consumer body sees the
+    # committed copy at the wrap boundary. Pipelined stages
+    # (pipeline_depth > 1) get expanded by
+    # 015_lower_pipelined_async_stage before materialize and emit their
+    # own waits at the pipelined schedule positions.
+    # Sync stages just emit __syncthreads so the slab is CTA-visible.
     if is_async:
         body_out.append(CpAsyncCommit())
+        if stage.pipeline_depth == 1:
+            body_out.append(CpAsyncWait(group=0))
+            body_out.append(Sync())
     else:
         body_out.append(Sync())
     return body_out
