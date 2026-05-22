@@ -67,7 +67,7 @@ from deplodock.compiler.ir.axis import Axis, Role
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Cond, Loop, Stmt, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -130,6 +130,10 @@ class KernelShape:
     extra_outer: tuple[Loop, ...]
     k_loop: Loop | None
     target_names: frozenset[str]
+    # Sibling stmts of ``outer_n`` at the inner level where the chain stopped.
+    # Non-empty only for the fused-prologue matmul (softmax max/sum/reciprocal
+    # → SDPA P@V); empty for plain matmul / pointwise / cooperative-reduce.
+    prologue: tuple[Stmt, ...] = ()
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None | LoopOp | list[LoopOp]:
@@ -156,15 +160,63 @@ def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
     return tuple(leading), rest
 
 
-def _outer_free_loop_chain(body) -> tuple[Loop, ...]:
-    """Walk the outer single-stmt chain of untagged free Loops, outermost-first."""
+def _outer_free_loop_chain(body) -> tuple[tuple[Loop, ...], tuple[Stmt, ...]]:
+    """Walk the outer single-stmt chain of untagged free Loops, outermost-first.
+
+    Returns ``(chain, prologue)``. ``prologue`` is empty for the plain
+    matmul / pointwise / cooperative-reduce paths. The fused-prologue
+    matmul (SDPA P@V — softmax max/sum/reciprocal sitting as siblings of
+    the head_dim Loop) is detected via :func:`_classify_fused_prologue`
+    but the chain extension is gated by the matmul branch (it only
+    triggers when both target_names expansion *and* the prologue-inside-
+    M_r placement are wired up; until then the helper exists and the
+    return shape is uniform but ``prologue`` stays ``()``)."""
     _, rest = _split_leading_non_loops(body)
     out: list[Loop] = []
     cur = rest
     while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce and cur[0].role is None:
         out.append(cur[0])
         cur = tuple(cur[0].body)
-    return tuple(out)
+    return tuple(out), ()
+
+
+def _classify_fused_prologue(stmts: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], Loop | None]:
+    """Match the fused-prologue shape: ``[reduce Loops..., leaf stmts...,
+    exactly one non-reduce Loop containing a Write]``. Returns
+    ``(prologue, inner_loop)`` on match, ``((), None)`` otherwise.
+
+    Bail conditions: a second non-reduce Loop at this level, an unexpected
+    wrapper (``StridedLoop``), or a naked Write. ``Cond`` siblings are
+    treated as opaque prologue (they may legitimately gate the prologue
+    reduces) unless they themselves contain a Write — that would clash
+    with the inner Loop's role."""
+    prologue: list[Stmt] = []
+    inner: Loop | None = None
+    for s in stmts:
+        if isinstance(s, Loop) and s.is_reduce:
+            prologue.append(s)
+        elif isinstance(s, Loop) and not s.is_reduce and inner is None and _contains_write(s):
+            inner = s
+        elif isinstance(s, (Loop, StridedLoop)):
+            return (), None
+        elif isinstance(s, Write):
+            return (), None
+        else:
+            prologue.append(s)
+    return (tuple(prologue), inner) if inner is not None else ((), None)
+
+
+def _contains_write(stmt: Stmt) -> bool:
+    """True if ``stmt`` is or transitively contains a ``Write``. Mirrors
+    the helper of the same name in ``001_launch_geometry`` so the planner
+    doesn't have to depend on a downstream pass."""
+    if isinstance(stmt, Write):
+        return True
+    for sub in stmt.nested():
+        for c in sub:
+            if _contains_write(c):
+                return True
+    return False
 
 
 def _identity_rename(name: str) -> str:
@@ -200,7 +252,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
     Accum) picks the matmul knob set; any other reduce with extent ≥ warp_size
     picks the cooperative-K set; no qualifying reduce falls to pointwise.
     ``None`` only when there's no outer chain at all."""
-    chain = _outer_free_loop_chain(loop_op.body)
+    chain, prologue = _outer_free_loop_chain(loop_op.body)
     if not chain:
         return None
 
@@ -261,7 +313,14 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         target_names = frozenset()
         param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=1, ctx=ctx, priority_mode="pointwise")
 
-    shape = KernelShape(outer_n=outer_n, outer_m=outer_m, extra_outer=extra_outer, k_loop=k_loop, target_names=target_names)
+    shape = KernelShape(
+        outer_n=outer_n,
+        outer_m=outer_m,
+        extra_outer=extra_outer,
+        k_loop=k_loop,
+        target_names=target_names,
+        prologue=prologue,
+    )
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
     for params in param_combos:
