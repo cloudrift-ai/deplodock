@@ -58,6 +58,7 @@ reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
@@ -90,6 +91,14 @@ FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells alon
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
+
+_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR)
+
+
+def _planner_pin_set() -> bool:
+    """True if any planner knob has its ``DEPLODOCK_<NAME>`` env pin set.
+    Used by ``_enumerate_cartesian`` to gate the peer-kernel fallback."""
+    return any(os.environ.get(k.env) is not None for k in _PLANNER_KNOBS)
 
 
 @dataclass(frozen=True)
@@ -226,19 +235,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         # multiple K-sums into one output cell — must be a non-linear combine
         # (else the fusion would have merged them upstream). Force SPLITK=1.
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
-        splitk_choices = (1,) if multi_accum else _SPLITK_CANDIDATES
-        param_combos = _enumerate_cartesian(
-            E_M=E_M,
-            E_N=E_N,
-            E_K=E_K,
-            bn_choices=_TUNE_AXIS_CHOICES,
-            bm_choices=_TUNE_AXIS_CHOICES,
-            bk_choices=_BK_CANDIDATES,
-            splitk_choices=splitk_choices,
-            max_cells_per_thread=_MAX_CELLS_PER_THREAD,
-            max_threads_per_cta=ctx.max_threads_per_cta,
-            priority_mode="matmul",
-        )
+        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", multi_accum=multi_accum)
     elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
@@ -257,37 +254,13 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
         k_loop = nonmatmul_reduces[0]
         E_K = int(k_loop.axis.extent)
         target_names = frozenset(lp.axis.name for lp in all_loops if int(lp.axis.extent) == E_K and not is_matmul_reduce(lp))
-        param_combos = _enumerate_cartesian(
-            E_M=E_M,
-            E_N=E_N,
-            E_K=E_K,
-            bn_choices=(1, *_TUNE_AXIS_CHOICES),
-            bm_choices=(1, *_TUNE_AXIS_CHOICES),
-            bk_choices=_BK_CANDIDATES,
-            splitk_choices=(1,),
-            br_choices=_BR_CANDIDATES,
-            max_cells_per_thread=_MAX_CELLS_PER_THREAD,
-            max_threads_per_cta=ctx.max_threads_per_cta,
-            priority_mode="reduce",
-        )
+        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="reduce")
     else:
         # Pointwise — no qualifying reduce.
         k_loop = None
         target_names = frozenset()
-        param_combos = _enumerate_cartesian(
-            E_M=E_M,
-            E_N=E_N,
-            E_K=1,
-            bn_choices=_TUNE_AXIS_CHOICES,
-            bm_choices=_TUNE_AXIS_CHOICES,
-            bk_choices=(1,),
-            splitk_choices=(1,),
-            max_cells_per_thread=_MAX_CELLS_PER_THREAD,
-            max_threads_per_cta=ctx.max_threads_per_cta,
-            priority_mode="pointwise",
-        )
+        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=1, ctx=ctx, priority_mode="pointwise")
 
-    param_combos = _filter_by_env(param_combos)
     shape = KernelShape(outer_n=outer_n, outer_m=outer_m, extra_outer=extra_outer, k_loop=k_loop, target_names=target_names)
     leading, _ = _split_leading_non_loops(loop_op.body)
     variants: list[LoopOp] = []
@@ -311,43 +284,130 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context) -> list[LoopOp] | None:
     return variants or None
 
 
-def _filter_by_env(params: list[TileParams]) -> list[TileParams]:
-    """Drop variants that don't match the env-pinned knob values.
+def _priority_matmul(p: TileParams) -> tuple[int, ...]:
+    # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
+    # threads near 256, larger BK, smaller SPLITK.
+    threads = p.bn * p.bm
+    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk)
 
-    ``DEPLODOCK_<KNOB>=V`` (or the aggregate ``DEPLODOCK_KNOBS="K1=V1,...``,
-    already splatted to per-knob env vars at ``knob.apply_knobs_env``)
-    pins the planner to a specific (BN, BM, FM, FN, BK, SPLITK, BR)
-    tuple — handy for reproducing a single autotune variant in tests
-    or one-off ``deplodock compile`` runs. Unset knobs aren't filtered
-    (i.e. ``DEPLODOCK_BN=16`` alone keeps every variant with BN=16
-    regardless of the other knobs).
 
-    Falls back to the unfiltered list when the pinned tuple doesn't
-    intersect any enumerated variant for *this* kernel's shape — pins
-    are meant to scope the matmul-style kernel under test, but a graph
-    that fuses several kernels with disparate shapes (SDPA = QK^T +
-    P@V; gated MLP at full-model scale) may have peers where the pin
-    is invalid by divisibility. Filtering them all out would
-    ``RuleSkipped`` the planner on the peer and leave a ``LoopOp`` in
-    the lowered graph, which trips ``CudaBackend``. The fallback keeps
-    those peer kernels lowering through rule defaults while the
-    pinned kernel still gets its forced variant."""
-    pins: dict[str, int] = {}
-    for knob, attr in ((BN, "bn"), (BM, "bm"), (FM, "fm"), (FN, "fn"), (BK, "bk"), (SPLITK, "splitk"), (BR, "br")):
-        raw = os.environ.get(knob.env)
-        if raw is None:
-            continue
-        try:
-            pins[attr] = int(raw)
-        except ValueError:
-            continue
-    if not pins:
-        return params
-    filtered = [p for p in params if all(getattr(p, attr) == v for attr, v in pins.items())]
-    return filtered if filtered else params
+def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
+    # Memory-bandwidth bound — fewer cells/thread → more CTAs → better
+    # SM occupancy. Threads near 256.
+    threads = p.bn * p.bm
+    return (-(p.fm * p.fn), -abs(256 - threads))
+
+
+def _priority_reduce(p: TileParams) -> tuple[int, ...]:
+    # Warp-sized BR enables warp-shuffle Combine; threads near 256.
+    threads = p.bn * p.bm * p.br
+    return (min(p.br, 256), -abs(256 - threads), p.bk, -p.splitk)
+
+
+_NarrowFn = Callable[[tuple[int, ...]], tuple[int, ...]]
 
 
 def _enumerate_cartesian(
+    *,
+    E_M: int,
+    E_N: int,
+    E_K: int,
+    ctx: Context,
+    priority_mode: str,
+    multi_accum: bool = False,
+) -> list[TileParams]:
+    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
+    priority.
+
+    Picks the canonical candidate tuples for ``priority_mode`` (``matmul`` /
+    ``reduce`` / ``pointwise``); the choice sets are tightly coupled to the
+    kernel class so each one lives here, not at the call site:
+
+        matmul   : BN/BM = _TUNE_AXIS_CHOICES; BK = _BK_CANDIDATES; BR = (1,);
+                   SPLITK = _SPLITK_CANDIDATES — clipped to (1,) when
+                   ``multi_accum`` flags a non-linear post-reduce combine
+                   (the linear-in-Accum chain that lets ``sum_i (c·a_i + r) =
+                   c·sum_i a_i + r`` doesn't hold). min_k_chunks=2.
+        reduce   : BN/BM = (1, *_TUNE_AXIS_CHOICES) — the leading 1 enables
+                   the cooperative-K v1 constraint (BR>1 ⇒ BN=BM=1, single
+                   THREAD axis for the materializer). SPLITK = (1,) — atomic
+                   cross-CTA reduce + barrier for the post-reduce epilogue
+                   isn't wired up. BR = _BR_CANDIDATES.
+        pointwise: BN/BM = _TUNE_AXIS_CHOICES; BK = SPLITK = BR = (1,) — no
+                   K loop to chunk or split.
+
+    Env pins (``DEPLODOCK_<KNOB>``, set directly or splatted from
+    ``DEPLODOCK_KNOBS`` at ``knob.apply_knobs_env``) are folded into the
+    candidate lists via ``Knob.narrow`` here in the wrapper for the five
+    static choices, and via ``fm_narrow`` / ``fn_narrow`` callables passed
+    into the impl for the per-iteration FM/FN divisor lists. When the
+    pinned enumeration is empty *and* any planner pin is set we retry with
+    every narrow disabled (raw tuples, ``None`` callables): pins are meant
+    to scope the kernel under test, but a graph that fuses peer kernels
+    (SDPA = QK^T + P@V; gated MLP at full-model scale) may have peers where
+    the pin is invalid by divisibility. Without the fallback those peers
+    would ``RuleSkipped`` the planner and leave a ``LoopOp`` in the lowered
+    graph, tripping ``CudaBackend``.
+
+    BN/BM clamped to extent + divisibility-checked. FM/FN as divisors of the
+    per-thread remainder (auto-divisibility), capped by ``_MAX_CELLS_PER_THREAD``.
+    BK/SPLITK divisor-checked against ``per_thread_K = E_K // BR``.
+    ``BN·BM·BR ≤ ctx.max_threads_per_cta`` (typically 1024).
+
+    Single-K-iter (per_thread_K == bk) is allowed for pointwise and
+    cooperative-reduce, rejected for matmul (``min_k_chunks=2`` — needs ≥ 2
+    chunks to amortize K-loop overhead)."""
+    if priority_mode == "matmul":
+        bn_choices = _TUNE_AXIS_CHOICES
+        bm_choices = _TUNE_AXIS_CHOICES
+        bk_choices = _BK_CANDIDATES
+        splitk_choices = (1,) if multi_accum else _SPLITK_CANDIDATES
+        br_choices: tuple[int, ...] = (1,)
+        min_k_chunks = 2
+        priority_fn: Callable[[TileParams], tuple[int, ...]] = _priority_matmul
+    elif priority_mode == "reduce":
+        bn_choices = (1, *_TUNE_AXIS_CHOICES)
+        bm_choices = (1, *_TUNE_AXIS_CHOICES)
+        bk_choices = _BK_CANDIDATES
+        splitk_choices = (1,)
+        br_choices = _BR_CANDIDATES
+        min_k_chunks = 1
+        priority_fn = _priority_reduce
+    elif priority_mode == "pointwise":
+        bn_choices = _TUNE_AXIS_CHOICES
+        bm_choices = _TUNE_AXIS_CHOICES
+        bk_choices = (1,)
+        splitk_choices = (1,)
+        br_choices = (1,)
+        min_k_chunks = 1
+        priority_fn = _priority_pointwise
+    else:
+        raise ValueError(f"unknown priority_mode {priority_mode!r}")
+
+    def _run(apply_pins: bool) -> list[TileParams]:
+        return _enumerate_cartesian_impl(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=E_K,
+            bn_choices=BN.narrow(bn_choices) if apply_pins else bn_choices,
+            bm_choices=BM.narrow(bm_choices) if apply_pins else bm_choices,
+            bk_choices=BK.narrow(bk_choices) if apply_pins else bk_choices,
+            splitk_choices=SPLITK.narrow(splitk_choices) if apply_pins else splitk_choices,
+            br_choices=BR.narrow(br_choices) if apply_pins else br_choices,
+            fm_narrow=FM.narrow if apply_pins else None,
+            fn_narrow=FN.narrow if apply_pins else None,
+            max_threads_per_cta=ctx.max_threads_per_cta,
+            min_k_chunks=min_k_chunks,
+            priority_fn=priority_fn,
+        )
+
+    result = _run(apply_pins=True)
+    if result or not _planner_pin_set():
+        return result
+    return _run(apply_pins=False)
+
+
+def _enumerate_cartesian_impl(
     *,
     E_M: int,
     E_N: int,
@@ -356,25 +416,17 @@ def _enumerate_cartesian(
     bm_choices: tuple[int, ...],
     bk_choices: tuple[int, ...],
     splitk_choices: tuple[int, ...],
-    br_choices: tuple[int, ...] = (1,),
-    max_cells_per_thread: int,
+    br_choices: tuple[int, ...],
+    fm_narrow: _NarrowFn | None,
+    fn_narrow: _NarrowFn | None,
     max_threads_per_cta: int,
-    priority_mode: str,
+    min_k_chunks: int,
+    priority_fn: Callable[[TileParams], tuple[int, ...]],
 ) -> list[TileParams]:
-    """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
-    priority.
-
-    BN/BM clamped to extent + divisibility-checked. FM/FN as divisors of the
-    per-thread remainder (auto-divisibility), capped by ``max_cells_per_thread``.
-    BK/SPLITK divisor-checked against ``per_thread_K = E_K // BR``.
-    ``BN·BM·BR ≤ max_threads_per_cta`` (typically 1024, from ``ctx``).
-
-    Single-K-iter (per_thread_K == bk) is allowed for pointwise and
-    cooperative-reduce, rejected for matmul (≥ 2 chunks needed to amortize
-    K-loop overhead).
-
-    v1 cooperative constraint: BR > 1 forces BN = BM = 1 — the materializer's
-    Combine path requires a single THREAD axis."""
+    """Pure cartesian enumeration: caller supplies the (possibly already
+    pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
+    (``None`` to skip), the per-thread K-chunk floor, and the sort key.
+    No env reads, no mode dispatch."""
     seen: set[TileParams] = set()
     ordered: list[TileParams] = []
     for bn in bn_choices:
@@ -401,13 +453,22 @@ def _enumerate_cartesian(
                 if bn_c * bm_c * br == 1:
                     continue
                 per_thread_K = E_K // br
-                for fm in _divisors_up_to(E_M // bm_c, max_cells_per_thread):
-                    for fn in _divisors_up_to(E_N // bn_c, max_cells_per_thread // fm):
+                fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
+                if fm_narrow is not None:
+                    fm_candidates = fm_narrow(fm_candidates)
+                for fm in fm_candidates:
+                    fn_candidates = _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm)
+                    if fn_narrow is not None:
+                        fn_candidates = fn_narrow(fn_candidates)
+                    for fn in fn_candidates:
                         for bk in bk_choices:
                             if per_thread_K % bk != 0:
                                 continue
-                            # Matmul needs ≥ 2 K chunks per thread; reduce/pointwise OK with 1.
-                            if priority_mode == "matmul" and per_thread_K > 1 and per_thread_K <= bk:
+                            # Skip when this (bk, per_thread_K) yields fewer than
+                            # ``min_k_chunks`` K chunks — matmul uses 2 to amortize
+                            # K-loop overhead; reduce/pointwise pass 1 (a no-op
+                            # given the divisor check above).
+                            if per_thread_K > 1 and per_thread_K < bk * min_k_chunks:
                                 continue
                             if bk > per_thread_K:
                                 continue
@@ -421,28 +482,6 @@ def _enumerate_cartesian(
                                 seen.add(params)
                                 ordered.append(params)
 
-    def _priority_matmul(p: TileParams) -> tuple[int, ...]:
-        # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
-        # threads near 256, larger BK, smaller SPLITK.
-        threads = p.bn * p.bm
-        return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk)
-
-    def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
-        # Memory-bandwidth bound — fewer cells/thread → more CTAs → better
-        # SM occupancy. Threads near 256.
-        threads = p.bn * p.bm
-        return (-(p.fm * p.fn), -abs(256 - threads))
-
-    def _priority_reduce(p: TileParams) -> tuple[int, ...]:
-        # Warp-sized BR enables warp-shuffle Combine; threads near 256.
-        threads = p.bn * p.bm * p.br
-        return (min(p.br, 256), -abs(256 - threads), p.bk, -p.splitk)
-
-    priority_fn = {
-        "matmul": _priority_matmul,
-        "pointwise": _priority_pointwise,
-        "reduce": _priority_reduce,
-    }[priority_mode]
     ordered.sort(key=priority_fn, reverse=True)
     return ordered
 

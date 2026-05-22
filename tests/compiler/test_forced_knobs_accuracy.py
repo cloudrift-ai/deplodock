@@ -9,9 +9,10 @@ fp32 tolerance.
 Knob pinning rides on the existing ``DEPLODOCK_KNOBS="K1=V1,..."``
 env-var mechanism (see ``deplodock/compiler/pipeline/knob.py`` —
 ``apply_knobs_env`` splats the aggregate into per-knob
-``DEPLODOCK_<K>=V`` vars at import time, and
-``000_partition_planner._filter_by_env`` drops every enumerated
-``TileParams`` that disagrees with the pinned values).
+``DEPLODOCK_<K>=V`` vars at import time, and ``Knob.narrow`` intersects
+the planner's candidate lists with the pinned values inside
+``000_partition_planner._enumerate_cartesian`` so only matching
+``TileParams`` are enumerated).
 
 The shared failure mode is the "single-CTA + F-replicated" codegen
 class: ``BN·FN = full_N AND BM·FM = full_M`` with ``FM·FN > 1`` (so
