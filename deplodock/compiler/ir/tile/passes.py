@@ -103,7 +103,14 @@ def _parallel_simplify(s: ParallelTile, ctx: SimplifyCtx) -> Stmt:
 
 @rewrite.register
 def _(s: GridTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return _parallel_rewrite(s, rename, sigma, axis_fn)
+    new_axes = tuple(axis_fn(ax) for ax in s.axes)
+    new_body = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
+    # Keep splitk_axes (axis names) in sync with any axis renames applied
+    # via axis_fn. Build a name → renamed-name map from the (axis, axis_fn(axis))
+    # pairs we just computed.
+    name_map = {old.name: new.name for old, new in zip(s.axes, new_axes, strict=True)}
+    new_splitk = tuple(name_map.get(n, n) for n in s.splitk_axes)
+    return GridTile(axes=new_axes, body=new_body, splitk_axes=new_splitk)
 
 
 @simplify.register
@@ -113,7 +120,12 @@ def _(s: GridTile, ctx: SimplifyCtx) -> Stmt:
 
 @rewrite.register
 def _(s: ThreadTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return _parallel_rewrite(s, rename, sigma, axis_fn)
+    new_axes = tuple(axis_fn(ax) for ax in s.axes)
+    new_body = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
+    # Mirror GridTile's splitk_axes propagation for cooperative_axes.
+    name_map = {old.name: new.name for old, new in zip(s.axes, new_axes, strict=True)}
+    new_coop = tuple(name_map.get(n, n) for n in s.cooperative_axes)
+    return ThreadTile(axes=new_axes, body=new_body, cooperative_axes=new_coop)
 
 
 @simplify.register
