@@ -191,14 +191,12 @@ def test_is_expandable_discriminates_fork_vs_op() -> None:
     assert matches, "pattern must match the stub node"
     match = matches[0]
 
-    # Fork pending → True
-    fork_pending = (match, Fork(knobs={"X": 1}, expand=lambda: [_StubOp()]))
-    lc_fork = LazyCandidate(inner=cand, cursor=cand.cursor, pending=fork_pending)
+    # Branch Fork → True
+    lc_fork = LazyCandidate.from_fork(inner=cand, cursor=cand.cursor, match=match, fork=Fork(knobs={"X": 1}, expand=lambda: [_StubOp()]))
     assert lc_fork.is_expandable() is True
 
-    # Op pending → False
-    op_pending = (match, _StubOp(tag="leaf"))
-    lc_op = LazyCandidate(inner=cand, cursor=cand.cursor, pending=op_pending)
+    # Leaf-wrapped Op → False (resolves directly, no expand needed)
+    lc_op = LazyCandidate.from_op(inner=cand, cursor=cand.cursor, match=match, op=_StubOp(tag="leaf"))
     assert lc_op.is_expandable() is False
 
     # None pending → False

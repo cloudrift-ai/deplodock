@@ -117,25 +117,34 @@ class RuleSkipped(Exception):
 
 @dataclass(frozen=True)
 class Fork:
-    """A deferred fork option — when expanded, produces the next level of
-    options (more ``Fork``s, concrete ``Op``/``Graph`` leaves, or a mix).
+    """A deferred fork option in the search tree.
 
-    Lets rules return a hierarchy of decisions lazily: each ``Fork`` carries
-    the knob delta it pins (read by :func:`_best_fork` to match against the
-    lowering DB without firing the thunk) plus a callable that produces the
-    children when the search actually descends into this branch.
+    Two flavors share the same shape:
 
-    ``knobs`` is read by :func:`_best_fork` polymorphically alongside
-    ``Op.knobs`` — same attribute name on both, no isinstance branching.
+    - **Branch Fork** (``is_leaf=False``) — produced explicitly by a rule's
+      ``rewrite()`` to spawn a hierarchical fork point. ``expand()`` returns
+      the next level of options (more Forks, concrete leaves, or a mix);
+      the search loop drives this via :meth:`LazyCandidate.expand`.
+    - **Leaf Fork** (``is_leaf=True``) — produced by
+      :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` to
+      uniformly wrap concrete ``Op`` / ``Graph`` rewrites. ``expand()``
+      returns ``[option]`` (one element); :meth:`LazyCandidate.resolve`
+      invokes it once at resolve time to retrieve the leaf and apply it.
 
-    ``score`` is the MCTS prior for this fork — typically the score of the
-    best-reachable leaf under this branch, so MCTS's unvisited-sibling
-    tiebreak at each fork level preserves the priority signal the flat
-    enumeration would have given. Defaults to 0.0 (no prior preference)."""
+    Sharing one shape lets ``LazyCandidate.pending`` carry just ``Fork``
+    (no tagged union) — the search loop branches on ``Fork.is_leaf`` to
+    decide expand-vs-resolve, and :func:`_best_fork` reads ``Fork.knobs``
+    polymorphically without isinstance.
+
+    ``knobs`` is the knob-delta this Fork pins (used by :func:`_best_fork`
+    to match the lowering DB without firing the thunk). ``score`` is the
+    MCTS prior for the unvisited-sibling tiebreak — typically the score
+    of the best-reachable leaf under this branch."""
 
     knobs: dict
     expand: Callable[[], list[Op | Graph | Fork]]
     score: float = 0.0
+    is_leaf: bool = False
 
 
 @dataclass
@@ -461,10 +470,13 @@ class Pipeline:
                 # Multi-option fork point: spawn one ``LazyCandidate`` per
                 # option (option-0 included as the primary). Each shares
                 # ``cand`` as ``inner`` so siblings don't duplicate the
-                # snapshot. The fork's apply on resolve advances the
-                # cursor when ``match.is_last`` (the cursor advance the
-                # eager loop didn't do here, since we deferred to forks).
-                forks = [LazyCandidate(inner=cand, cursor=replace(cur), pending=(match, opt)) for opt in options]
+                # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
+                # options into leaf Forks so every LazyCandidate's pending
+                # carries a uniform Fork shape. The fork's apply on
+                # resolve advances the cursor when ``match.is_last`` (the
+                # cursor advance the eager loop didn't do here, since we
+                # deferred to forks).
+                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
                 break
 
             if forks is not None:
@@ -634,27 +646,33 @@ def _best_fork(forks, parent_cand, db):
     for f in forks:
         if f.pending is None:
             continue
-        _, opt = f.pending
-        opt_knobs = getattr(opt, "knobs", None) or {}
-        merged = {**parent_knobs, **opt_knobs}
-        if isinstance(opt, Fork):
-            # Fork option (deferred expansion, no body to build a child
-            # cache key from yet) — match by knobs-delta against the
-            # recorded row's knobs. The fork "wins" iff every knob it
-            # pins appears in ``row.knobs`` with the same value AND at
-            # least one of those knobs is constrained by the row;
-            # otherwise every sibling is equally consistent and we fall
-            # back to option-0. Lets DB-seeded greedy descend a
-            # hierarchical fork chain whose intermediate levels don't
-            # have ``op_cache_key`` defined.
+        _, fork = f.pending  # always a Fork after the constructor unification
+        opt_knobs = fork.knobs
+        if fork.is_leaf:
+            # Leaf Fork wrapping a concrete Op/Graph — match by structural
+            # cache key. Fire the (trivial) thunk to retrieve the wrapped
+            # leaf, then compare against the DB's child_key. The thunk
+            # for a leaf is ``lambda: [op]``, constant-time.
+            leaves = fork.expand()
+            if not leaves:
+                continue
+            leaf = leaves[0]
+            merged = {**parent_knobs, **opt_knobs}
+            probe = replace(leaf, knobs=merged) if merged != opt_knobs else leaf
+            if op_cache_key(probe) == row.child_key:
+                return f
+        else:
+            # Branch Fork — match by knobs-delta against the recorded
+            # row's knobs. The fork "wins" iff every knob it pins appears
+            # in ``row.knobs`` with the same value AND at least one of
+            # those knobs is constrained by the row; otherwise every
+            # sibling is equally consistent and we fall back to option-0.
+            # Lets DB-seeded greedy descend a hierarchical fork chain
+            # whose intermediate levels carry no leaf op yet.
             if not opt_knobs:
                 continue
             constraining = [k for k in opt_knobs if k in row.knobs]
             if constraining and all(row.knobs.get(k) == v for k, v in opt_knobs.items()):
-                return f
-        else:
-            probe = replace(opt, knobs=merged) if merged != opt_knobs else opt
-            if op_cache_key(probe) == row.child_key:
                 return f
     return None
 
