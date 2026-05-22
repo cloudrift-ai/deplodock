@@ -14,11 +14,11 @@ from collections.abc import Callable
 from dataclasses import fields, is_dataclass
 from functools import singledispatch
 
-from deplodock.compiler.ir.axis import Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, Write
 
 Rename = Callable[[str], str]
@@ -137,12 +137,6 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
-def _(s: Tile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind) for ba in s.axes)
-    return Tile(axes=new_axes, body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body))
-
-
-@rewrite.register
 def _(s: Cond, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Cond(
         cond=sigma.apply(s.cond),
@@ -199,14 +193,6 @@ def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
         body=tuple(simplify(c, inner) for c in s.body),
         unroll=s.unroll,
     )
-
-
-@simplify.register
-def _(s: Tile, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx
-    for ba in s.axes:
-        inner = inner.extend(ba.axis.name, Interval(0, ba.axis.extent - 1))
-    return Tile(axes=s.axes, body=tuple(simplify(c, inner) for c in s.body))
 
 
 @simplify.register

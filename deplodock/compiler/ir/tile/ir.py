@@ -50,7 +50,7 @@ import enum
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -74,7 +74,6 @@ from deplodock.compiler.ir.stmt import (
     SelectBranch,
     Stmt,
     StridedLoop,
-    Tile,
     Write,
     pretty_body,
 )
@@ -1023,10 +1022,30 @@ class TileOp(BodyOp):
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
-        n_tiles = sum(1 for s in self.body if isinstance(s, Tile))
+        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile)))
         if n_tiles > 1:
-            raise ValueError(f"TileOp.body must contain at most one Tile, got {n_tiles}")
+            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile, got {n_tiles}")
         self._seed_io_placeholders()
+
+    def _launch_geometry(self) -> tuple[tuple[Axis, ...], tuple[Axis, ...]]:
+        """``(block_axes, thread_axes)`` for the outermost tile flavor.
+
+        Returns ``((), ())`` if no ``GridTile``/``ThreadTile`` is present
+        (e.g. a degenerate body). For ``GridTile`` wrapping a ``ThreadTile``,
+        the block axes come from the GridTile and thread axes from the
+        inner ThreadTile. For a standalone ``ThreadTile`` (pointwise), the
+        block set is empty.
+        """
+        for s in self.body:
+            if isinstance(s, GridTile):
+                block_axes = s.axes
+                for child in s.body:
+                    if isinstance(child, ThreadTile):
+                        return block_axes, child.axes
+                return block_axes, ()
+            if isinstance(s, ThreadTile):
+                return (), s.axes
+        return (), ()
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would
@@ -1043,13 +1062,10 @@ class TileOp(BodyOp):
 
         if "FM" not in self.knobs:
             return True
-        tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
-        if tile is None:
+        _, thread_axes = self._launch_geometry()
+        if not thread_axes:
             return True
-        thread_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD]
-        if not thread_extents:
-            return True
-        threads = prod(thread_extents)
+        threads = prod(int(ax.extent) for ax in thread_axes)
         return threads <= ctx.max_threads_per_cta
 
     def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
@@ -1060,12 +1076,12 @@ class TileOp(BodyOp):
         target_threads = 256
         target_ctas = 256
         score = 0.0
-        tile = next((s for s in self.body.iter() if isinstance(s, Tile)), None)
-        if tile is None:
+        block_axes, thread_axes = self._launch_geometry()
+        if not thread_axes and not block_axes:
             return 0.0
 
-        thread_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_THREAD]
-        block_extents = [int(ba.axis.extent) for ba in tile.axes if ba.bind == BIND_BLOCK]
+        thread_extents = [int(ax.extent) for ax in thread_axes]
+        block_extents = [int(ax.extent) for ax in block_axes]
         if not thread_extents:
             return 0.0
 
@@ -1145,9 +1161,7 @@ __all__ = [
     "Cond",
     "Loop",
     "StridedLoop",
-    # Tile-IR statements — legacy (kept for Loop-IR shared use + transitional API)
-    "Tile",
-    # Tile-IR statements — new flavor hierarchy
+    # Tile-IR statements — typed tile flavor hierarchy
     "ParallelTile",
     "GridTile",
     "ThreadTile",
@@ -1170,10 +1184,6 @@ __all__ = [
     "AsyncWait",  # deprecated stub during refactor
     "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
-    # Bindings
-    "BoundAxis",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "Stmt",
     # Top-level
     "TileOp",

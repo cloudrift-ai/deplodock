@@ -1,20 +1,18 @@
 """Axis primitives shared across all IR layers.
 
 ``Axis`` is the iteration-variable identity (name + extent) used by Loop
-IR, Tile IR, and Kernel IR. ``BoundAxis`` pairs an axis with a parallel-
-coord binding (``BIND_THREAD`` / ``BIND_BLOCK``), used by Tile-IR
-``Tile`` (across Tile and Kernel IRs) to express how output axes map
-to GPU coords.
+IR, Tile IR, and Kernel IR.
 
-Lives at ``ir/axis.py`` rather than inside any one IR package because
-both concepts span every layer. Loop IR re-exports ``Axis`` for
-convenience (lifting passes use ``from ir.loop import ...`` to grab the
-full Loop-body vocabulary in one import); Tile and Kernel IR import
-``Axis`` and ``BoundAxis`` directly from here.
+Lives at ``ir/axis.py`` rather than inside any one IR package because the
+concept spans every layer. Loop IR re-exports ``Axis`` for convenience
+(lifting passes use ``from ir.loop import ...`` to grab the full Loop-body
+vocabulary in one import); Tile and Kernel IR import ``Axis`` directly
+from here.
 
-Future bindings (``BIND_SPLIT(factor, outer, inner)`` for matmul tile
-splits, ``BIND_CHUNKED(factor)`` if K-axis chunking ever lives at the
-output level) will land here.
+The pre-refactor ``BoundAxis`` / ``BIND_BLOCK`` / ``BIND_THREAD`` triple
+that packaged "axis plus its launch-coord binding" has been deleted: the
+typed tile flavors (``GridTile`` / ``ThreadTile`` / ``RegisterTile``)
+carry bare ``Axis`` tuples and encode the binding in the flavor's type.
 """
 
 from __future__ import annotations
@@ -66,39 +64,4 @@ class Axis:
         )
 
 
-# BoundAxis.bind values — used on ``Tile.axes`` / ``Tile.axes``
-# to describe launch-geometry. Body loops carry no bind; the loop
-# construct itself (``Loop`` for serial, ``StridedLoop`` for cooperative
-# striding) encodes iteration shape.
-
-# One thread per axis value (axis flattens into threadIdx.x).
-BIND_THREAD = "THREAD"
-# One CUDA block per axis value (axis flattens into blockIdx.x/y/z),
-# threads inside cooperate.
-BIND_BLOCK = "BLOCK"
-
-
-@dataclass(frozen=True)
-class BoundAxis:
-    """An axis paired with its GPU-coord binding.
-
-    Used by the legacy ``Tile`` class (now Loop-IR-only after the
-    tile-flavor refactor — the new ``GridTile`` / ``ThreadTile`` carry
-    bare ``Axis`` tuples instead). ``BIND_THREAD`` means "one thread per
-    axis value"; ``BIND_BLOCK`` means "one CUDA block per axis value,
-    threads inside cooperate."
-    """
-
-    axis: Axis
-    bind: str
-
-    @property
-    def name(self) -> str:
-        return self.axis.name
-
-    @property
-    def extent(self) -> int:
-        return self.axis.extent
-
-
-__all__ = ["Axis", "BoundAxis", "BIND_THREAD", "BIND_BLOCK"]
+__all__ = ["Axis"]

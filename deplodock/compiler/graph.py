@@ -226,12 +226,7 @@ def _stmt_eval_scope() -> dict:
     import numpy as _np
 
     from deplodock.compiler.dtype import DataType
-    from deplodock.compiler.ir.axis import (
-        BIND_BLOCK,
-        BIND_THREAD,
-        Axis,
-        BoundAxis,
-    )
+    from deplodock.compiler.ir.axis import Axis
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.expr import (
         BinaryExpr,
@@ -254,7 +249,6 @@ def _stmt_eval_scope() -> dict:
         Select,
         SelectBranch,
         StridedLoop,
-        Tile,
         Unpack,
         Write,
     )
@@ -278,9 +272,6 @@ def _stmt_eval_scope() -> dict:
 
     _STMT_EVAL_SCOPE = {
         "Axis": Axis,
-        "BoundAxis": BoundAxis,
-        "BIND_BLOCK": BIND_BLOCK,
-        "BIND_THREAD": BIND_THREAD,
         "Var": Var,
         "Literal": Literal,
         "BinaryExpr": BinaryExpr,
@@ -300,7 +291,6 @@ def _stmt_eval_scope() -> dict:
         "Loop": Loop,
         "StridedLoop": StridedLoop,
         "Cond": Cond,
-        "Tile": Tile,
         "GridTile": GridTile,
         "ThreadTile": ThreadTile,
         "RegisterTile": RegisterTile,

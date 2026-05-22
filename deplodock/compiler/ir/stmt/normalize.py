@@ -18,7 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, Write
 
@@ -179,7 +179,7 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
 
     def fn(s: Stmt) -> Stmt | None:
         # Body.map post-order: block bodies already recursed; only handle leaves.
-        if isinstance(s, (Loop, StridedLoop, Tile, Cond)):
+        if isinstance(s, (Loop, StridedLoop, Cond)):
             return s
         if isinstance(s, Assign) and s.op.name == "copy" and len(s.args) == 1:
             alias[s.name] = s.args[0]
@@ -539,8 +539,6 @@ def hoist_loop_invariants(stmts: Body) -> Body:
                 stay = [c for c in inner if id(c) not in hoisted_ids]
                 new_body.extend(hoisted)
                 new_body.append(replace(s, body=tuple(stay)))
-            elif isinstance(s, Tile):
-                new_body.append(Tile(axes=s.axes, body=tuple(walk(s.body))))
             elif isinstance(s, Cond):
                 new_body.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
             else:
@@ -609,8 +607,6 @@ def dedup_loads(stmts: Body) -> Body:
                 out.append(replace(s, body=walk(s.body, local, alias)))
             elif isinstance(s, StridedLoop):
                 out.append(replace(s, body=walk(s.body, local, alias)))
-            elif isinstance(s, Tile):
-                out.append(Tile(axes=s.axes, body=walk(s.body, local, alias)))
             elif isinstance(s, Cond):
                 out.append(Cond(cond=s.cond, body=walk(s.body, local, alias), else_body=walk(s.else_body, local, alias)))
             else:
@@ -809,9 +805,6 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             _rename(stmt.name, "acc")
         elif isinstance(stmt, (Assign, Select)) and stmt.name not in ssa_rename:
             _rename(stmt.name, "v")
-        elif isinstance(stmt, Tile):
-            for ba in stmt.axes:
-                _record_axis(ba.axis.name)
         elif isinstance(stmt, ParallelTile):
             # GridTile / ThreadTile / RegisterTile — record every axis in
             # the tuple before any nested Stage's cache axes so the

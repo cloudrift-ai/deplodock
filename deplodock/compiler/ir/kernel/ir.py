@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 
 from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -51,7 +51,6 @@ from deplodock.compiler.ir.stmt import (
     SelectBranch,
     Stmt,
     StridedLoop,
-    Tile,
     Unpack,
     Write,
     _pad,
@@ -599,9 +598,8 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Kernel-IR statements — legacy Tile + new tile flavor hierarchy (the
-    # kernel-IR materialization preserves the wrappers that Tile IR emits)
-    "Tile",
+    # Kernel-IR statements — typed tile flavor hierarchy (kernel-IR
+    # materialization preserves the wrappers Tile IR emits)
     "GridTile",
     "ThreadTile",
     "RegisterTile",
@@ -620,10 +618,6 @@ __all__ = [
     "MbarrierArriveExpectTx",
     "MbarrierWait",
     "StridedLoop",
-    # Bindings
-    "BoundAxis",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "Stmt",
     # Top-level
     "KernelOp",

@@ -1,20 +1,17 @@
 """Tile IR — schedule decisions as structural Stmts, pre-materialization.
 
-- :mod:`.ir` — dataclass definitions: ``Tile`` / ``Combine`` /
-  ``Stage`` + binding constants, plus re-exports of Loop-IR leaves
-  and shared expressions.
-- :mod:`.pretty` — structural pretty-printer for ``TileOp``.
+- :mod:`.ir` — typed tile flavor dataclasses (``GridTile``,
+  ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) +
+  ``Stage`` family + ``Combine``, plus re-exports of Loop-IR leaves and
+  shared expressions.
 
-Loop-IR → Tile-IR lowering (``launch_geometry``) lives next to its
-rule at ``passes/lowering/tile/001_launch_geometry.py`` — the
-convention is "rules own their logic".
-
-Materialization (Tile IR → Kernel IR) lives under
-``passes/lowering/kernel``; rendering of Kernel IR to CUDA source lives
-under ``ir.kernel``.
+Loop-IR → Tile-IR lowering is owned by ``passes/lowering/tile/000_partition_planner``
+(constructs tile flavors directly via ``_wrap_tower``). Materialization
+(Tile IR → Kernel IR) lives under ``passes/lowering/kernel``; rendering
+of Kernel IR to CUDA source lives under ``ir.kernel``.
 """
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.ir import (
     Accum,
     Assign,
@@ -43,7 +40,6 @@ from deplodock.compiler.ir.tile.ir import (
     StridedTile,
     TernaryExpr,
     ThreadTile,
-    Tile,
     TileOp,
     Var,
     Write,
@@ -67,9 +63,7 @@ __all__ = [
     "Cond",
     "Loop",
     "StridedLoop",
-    # Legacy Tile (Loop-IR shared)
-    "Tile",
-    # New tile flavor hierarchy
+    # Typed tile flavor hierarchy
     "ParallelTile",
     "GridTile",
     "ThreadTile",
@@ -80,9 +74,6 @@ __all__ = [
     "SerialKind",
     "Combine",
     "Stage",
-    "BoundAxis",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "Stmt",
     "TileOp",
     "Axis",
