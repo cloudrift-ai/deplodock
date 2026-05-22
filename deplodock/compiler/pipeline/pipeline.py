@@ -115,6 +115,23 @@ class RuleSkipped(Exception):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class Fork:
+    """A deferred fork option — when expanded, produces the next level of
+    options (more ``Fork``s, concrete ``Op``/``Graph`` leaves, or a mix).
+
+    Lets rules return a hierarchy of decisions lazily: each ``Fork`` carries
+    the knob delta it pins (read by :func:`_best_fork` to match against the
+    lowering DB without firing the thunk) plus a callable that produces the
+    children when the search actually descends into this branch.
+
+    ``knobs`` is read by :func:`_best_fork` polymorphically alongside
+    ``Op.knobs`` — same attribute name on both, no isinstance branching."""
+
+    knobs: dict
+    expand: Callable[[], list[Op | Graph | Fork]]
+
+
 @dataclass
 class Pass:
     """One pipeline pass: a named, indexed list of rules.
@@ -399,6 +416,15 @@ class Pipeline:
         from deplodock.compiler.pipeline.search.candidate import LazyCandidate  # noqa: PLC0415
 
         while (popped := search.pop()) is not None:
+            # Thunk-bearing fork: expand before resolving. Each expansion
+            # spawns the next level of ``LazyCandidate``s (more thunks or
+            # concrete options) sharing the same ``inner`` and ``match`` —
+            # cursor advance is deferred until a leaf actually resolves.
+            if popped.is_expandable():
+                children = popped.expand()
+                best = _best_fork(children, popped.inner, db) if db is not None else None
+                search.push(children[0], *children[1:], best=best)
+                continue
             cand = popped.resolve()
             cur = cand.cursor
             if cur.is_done:
