@@ -163,13 +163,14 @@ def _vec_elems_for_lane(tile: Tile, lane_var: str, *, lds128_bytes: int, buf_nby
     for s in tile.body.iter():
         if not isinstance(s, Stage):
             continue
-        loads = loads_reading(tile.body, s.name)
-        if not any(lane_var in _load_free_vars(ld) for ld in loads):
-            continue
-        nbytes = buf_nbytes.get(s.buf)
-        if nbytes is None:
-            return None
-        sizes.add(lds128_bytes // nbytes)
+        for src in s.sources:
+            loads = loads_reading(tile.body, src.name)
+            if not any(lane_var in _load_free_vars(ld) for ld in loads):
+                continue
+            nbytes = buf_nbytes.get(src.buf)
+            if nbytes is None:
+                return None
+            sizes.add(lds128_bytes // nbytes)
     if not sizes:
         return None
     return min(sizes)

@@ -17,6 +17,19 @@ from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum
 
 
+def _source_suffix(axis: Axis) -> str:
+    """Render ``" (of <source.name>)"`` when ``axis`` was carved out of a parent.
+
+    Returns empty for top-level axes (``source_axis is None``) or self-referential
+    sources (``source is axis``). Surfaces the partition-planner's split parentage
+    in IR dumps without affecting structural keys.
+    """
+    src = axis.source_axis
+    if src is None or src is axis or src.name == axis.name:
+        return ""
+    return f" (of {src.name})"
+
+
 @dataclass(frozen=True)
 class Loop(Stmt):
     """Explicit iteration block — one loop over an axis.
@@ -75,7 +88,7 @@ class Loop(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         kind = "reduce" if self.is_reduce else "free"
         unroll = " unroll" if self.unroll else ""
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:  # {kind}{unroll}"
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}:  # {kind}{unroll}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -158,7 +171,7 @@ class Tile(Stmt):
         return tuple(ba.axis for ba in self.axes)
 
     def pretty(self, indent: str = "") -> list[str]:
-        axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in self.axes) or "-"
+        axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}{_source_suffix(ba.axis)}={ba.bind}" for ba in self.axes) or "-"
         return [f"{indent}Tile(axes=({axes})):", *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -316,7 +329,10 @@ class StridedLoop(Stmt):
         unroll = " unroll" if self.unroll else ""
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}{unroll}"
+        head = (
+            f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step})"
+            f"{_source_suffix(self.axis)}:  # {kind}{unroll}"
+        )
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:

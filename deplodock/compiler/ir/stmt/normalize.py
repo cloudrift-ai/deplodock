@@ -818,8 +818,9 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             for ba in stmt.axes:
                 _record_axis(ba.axis.name)
         elif isinstance(stmt, Stage):
-            for ax in stmt.axes:
-                _record_axis(ax.name)
+            for src in stmt.sources:
+                for ax in src.cache_axes:
+                    _record_axis(ax.name)
         elif isinstance(stmt, (Loop, StridedLoop)):
             _record_axis(stmt.axis.name)
 

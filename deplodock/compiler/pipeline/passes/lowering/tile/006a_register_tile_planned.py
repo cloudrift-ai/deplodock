@@ -104,7 +104,10 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
         # Stage cache-axis Vars are smem-local — they don't vary per replica.
         # Mark them bound here so Stages aren't tagged for replication; only
         # the consumer Loads (which σ-rewrite cache-axis Vars) multiply.
-        local_bound = bound | frozenset(ax.name for ax in s.axes) if isinstance(s, Stage) else bound
+        if isinstance(s, Stage):
+            local_bound = bound | frozenset(ax.name for src in s.sources for ax in src.cache_axes)
+        else:
+            local_bound = bound
         own: frozenset[str] = frozenset()
         for e in s.exprs():
             own = own | frozenset(v for v in e.free_vars() if v not in local_bound)
@@ -125,15 +128,14 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
     def go(b: Body) -> Body:
         out: list[Stmt] = []
         for s in b:
-            # Stage is opaque: its cache-axis iteration vars (Stage.axes)
-            # shadow outer Loop axes, and its origin is computed with cache
-            # axes zeroed — so the Stage body never depends on the outer
-            # REGISTER axis we're replicating. Pass it through unchanged.
-            if isinstance(s, Stage):
-                out.append(s)
-                continue
             nested = s.nested()
             if nested:
+                # Wrap-body Stage's consumer body must be descended so the
+                # consumer Loads inside the staged scope replicate across the
+                # REGISTER axis. Stage's source-side state (cache_axes, origin)
+                # stays untouched — the per-source Vars are smem-local and
+                # the cache-axis 'bound' mask in the fold guard above prevents
+                # 006a from tagging them for replication.
                 out.append(s.with_bodies(tuple(go(child) for child in nested)))
             elif axis in deps.get(id(s), frozenset()):
                 for i in range(factor):

@@ -31,7 +31,7 @@ from dataclasses import replace
 from deplodock.compiler.dtype import F16, F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Cond, Init, Loop, Stmt, StridedLoop, Tile, Write
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.tile.ir import Stage, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -146,6 +146,13 @@ def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
             out.extend(_accums_under_reduces_only(child))
         for child in stmt.else_body:
             out.extend(_accums_under_reduces_only(child))
+    elif isinstance(stmt, Stage):
+        # Wrap-body Stage: consumer subtree (containing the reduce + Accum)
+        # lives inside Stage.body. Walk through it so Accums get their Init
+        # placed at the enclosing scope (which is the right behavior — the
+        # Stage is transparent for accumulator scoping).
+        for child in stmt.body:
+            out.extend(_accums_under_reduces_only(child))
     return out
 
 
@@ -171,6 +178,17 @@ def _is_reduce_recursive(loop: Loop | StridedLoop) -> bool:
             return False
         if isinstance(s, (Loop, StridedLoop)) and _is_reduce_recursive(s):
             has_inner_reduce = True
+        elif isinstance(s, Stage):
+            # Wrap-body Stage is transparent for reduce-crossing: descend
+            # into its consumer body and inherit the result. A Stage whose
+            # body wraps a reduce-Loop forms a reduce-passthrough.
+            for inner in s.body:
+                if isinstance(inner, Accum):
+                    return True
+                if isinstance(inner, Write):
+                    return False
+                if isinstance(inner, (Loop, StridedLoop)) and _is_reduce_recursive(inner):
+                    has_inner_reduce = True
     return has_inner_reduce
 
 
