@@ -52,7 +52,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TreeHalve,
     WarpShuffle,
 )
-from deplodock.compiler.ir.stmt import Accum, Assign, Cond, Load, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Cond, Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -313,7 +313,6 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
-        _assert_stage_body_shape(stage)
         desc_name = f"{stage.name}_desc"
         gid = stage_group[id(stage)]
         mbar_name = _mbar_name(gid)
@@ -819,26 +818,6 @@ def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, 
 # ---------------------------------------------------------------------------
 # Stage expansion
 # ---------------------------------------------------------------------------
-
-
-def _assert_stage_body_shape(stage: Stage) -> None:
-    """Materializer body precondition. Accepted bodies are a linear chain
-    of ``Load`` / ``Assign`` followed by exactly one terminal ``Write``
-    whose output is ``stage.name``. Single-source (trivial) and
-    multi-source (post-fusion) bodies both pass; anything richer (nested
-    Loops / Conds / extra Writes) is rejected so the materializer's flat
-    cooperative-load template stays meaningful.
-    """
-    if len(stage.body) < 2:
-        raise AssertionError(f"Stage {stage.name!r}: body must contain ≥ 1 Load and a trailing Write, got {len(stage.body)} stmts")
-    if not any(isinstance(s, Load) for s in stage.body):
-        raise AssertionError(f"Stage {stage.name!r}: body must contain at least one Load")
-    last = stage.body[-1]
-    if not isinstance(last, Write) or last.output != stage.name:
-        raise AssertionError(f"Stage {stage.name!r}: body must end with Write(output={stage.name!r}), got {last!r}")
-    for s in stage.body[:-1]:
-        if not isinstance(s, (Load, Assign)):
-            raise AssertionError(f"Stage {stage.name!r}: body may only contain Load / Assign / final Write, got {type(s).__name__}")
 
 
 def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str] | None = None) -> list[Stmt]:

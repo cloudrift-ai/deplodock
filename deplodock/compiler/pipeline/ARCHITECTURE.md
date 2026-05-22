@@ -243,7 +243,6 @@ recipe.
 | `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
 | `TMA_SWIZZLE`     | BOOL     | `011_tma_copy`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
 | `FUSED_PIPELINE`  | BOOL     | `007b_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
-| `BUFFER_COMPUTE`  | BOOL     | `010_double_buffer`                  | Ring-buffer the ComputeStage output alongside transport stages. Autotune fork (only when a ComputeStage is present). |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
@@ -251,10 +250,7 @@ or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs
 
 `FUSED_PIPELINE` is an autotune fork: `007b_hoist_invariant_compute` emits both variants per fusable cone in a fixed
 order (inline-fuse first as the greedy default — smaller smem, works on every architecture). No env override; the
-autotuner is the only mechanism for picking the hoist variant. `BUFFER_COMPUTE` follows the same shape in
-`010_double_buffer`: when a K-outer Loop carries a `ComputeStage`, the rule emits both polarities (single-buffered
-compute first, ring-buffered second); without a `ComputeStage` it emits one variant with `BUFFER_COMPUTE=False`
-stamped for idempotence.
+autotuner is the only mechanism for picking the hoist variant.
 
 ## Pass directories
 
@@ -268,7 +264,7 @@ ignores the prefix itself — it's only for ordering readability.
 | `frontend/optimization/`   | `compose_indexmaps`: collapse chains of single-source / single-consumer `IndexMapOp` into one coord_map — prevents trivial layout kernels from blocking fusion. |
 | `loop/lifting/`            | `lift_*` rules wrap each surviving tensor primitive (elementwise / reduce / indexmap / gather) in a trivial one-op `LoopOp`. |
 | `loop/fusion/`             | `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
-| `lowering/tile/`           | `partition_planner` runs first and emits `Role` tags on body Loops (`REGISTER`, `STAGE_INNER`, `SERIAL_OUTER`, `PIPELINE`, `COOPERATIVE_STRIDE`) — see `ir/axis.py::Role`. `tileify` produces a `TileOp` per `LoopOp` (strips the outer free-Loop chain into `Tile.thread_axes`, lifts inner output-write free Loops). `register_tile_planned` runs *before* `stage_inputs` to replicate REGISTER-tagged bodies per-cell. `stage_inputs` emits wrap-body `Stage(sources=[...], body=<consumer>)` — the producer cooperative load is synthesized at materialize time from per-Source `(name, buf, cache_dims, origin)` data; the Stage's body is the consumer subtree (Loop(K_i, reduce, ...)). Order: `partition_planner` → `tileify` → `register_tile_planned` → `stage_inputs` → `permute_register_tile` → `hoist_invariant_compute` (**stubbed**) → `register_tile` → `double_buffer` (**stubbed**) → `tma_copy` (**stubbed**) → `split_inner_for_swizzle` (**stubbed**) → `async_copy` (**stubbed**) → `pad_smem` (**stubbed**) → `pipeline_k_outer` (**stubbed**) → `mark_unroll`. **Stage-wrap-body refactor (in progress):** the bucket 7/10/11/12 optimization passes (hoist / pipelining / buffering / TMA) are stubbed during the refactor; kernels still produce correct output through the sync wrap-body path, just without ring-buffering, async/TMA transport, or temporal pipelining. The rewrites are the remaining bucket work — see `plans/stage-wrap-body.md`. |
+| `lowering/tile/`           | `partition_planner` runs first and emits `Role` tags on body Loops (`REGISTER`, `STAGE_INNER`, `SERIAL_OUTER`, `PIPELINE`, `COOPERATIVE_STRIDE`) — see `ir/axis.py::Role`. `tileify` produces a `TileOp` per `LoopOp` (strips the outer free-Loop chain into `Tile.thread_axes`, lifts inner output-write free Loops). `register_tile_planned` runs *before* `stage_inputs` to replicate REGISTER-tagged bodies per-cell. `stage_inputs` emits wrap-body `Stage(sources=[...], body=<consumer>)` — the producer cooperative load is synthesized at materialize time from per-Source `(name, buf, cache_dims, origin)` data; the Stage's body is the consumer subtree (Loop(K_i, reduce, ...)). Order: `partition_planner` → `tileify` → `register_tile_planned` → `stage_inputs` → `permute_register_tile` → `hoist_invariant_compute` (**stubbed**) → `register_tile` → `double_buffer` → `tma_copy` (**stubbed**) → `split_inner_for_swizzle` (**stubbed**) → `async_copy` (**stubbed**) → `pad_smem` (**stubbed**) → `pipeline_k_outer` (**stubbed**) → `mark_unroll`. **Stage-wrap-body refactor (in progress):** the bucket 7/10/11/12 optimization passes (hoist / pipelining / buffering / TMA) are stubbed during the refactor; kernels still produce correct output through the sync wrap-body path, just without ring-buffering, async/TMA transport, or temporal pipelining. The rewrites are the remaining bucket work — see `plans/stage-wrap-body.md`. |
 | `lowering/kernel/`         | `materialize_tile` consumes scheduling decisions and emits hardware primitives (`Smem`, `Sync`, `TreeHalve`, `StridedLoop`), mutating the node's op to `KernelOp` in place. |
 | `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 
