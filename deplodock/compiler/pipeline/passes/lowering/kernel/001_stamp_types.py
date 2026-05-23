@@ -77,8 +77,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     new_body = _stamp_body(root.op.body, ctx)
     if new_body == root.op.body:
         raise RuleSkipped("every Load/Assign/Write/Source already stamped")
-    new_op = replace(root.op, body=new_body)
-    return TileOp(body=new_op.body, name=new_op.name)
+    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
 def _stamp_body(body: Body, ctx: _StampCtx) -> Body:

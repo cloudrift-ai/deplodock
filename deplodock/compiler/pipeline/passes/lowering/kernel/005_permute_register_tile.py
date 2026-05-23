@@ -207,22 +207,23 @@ def _swap_helps_any_stage(tile, lane_var: str, F: int, lane_ext: int, *, vec_ele
     for s in tile.body.iter():
         if not isinstance(s, Stage):
             continue
-        loads = loads_reading(tile.body, s.name)
-        if not loads:
-            continue
         leading_phase = isinstance(s, BufferedStage)
-        extents = tuple(int(ax.extent) for ax in s.axes)
-        pre = _stage_max_way(loads, extents, leading_phase, tile)
-        if pre is None or pre <= 1:
-            continue
-        chunk_stride = vec_elems * lane_ext
-        rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride, vec_elems=vec_elems) for ld in loads]
-        post = _stage_max_way(rewritten, extents, leading_phase, tile)
-        if post is None:
-            continue
-        if post < pre:
-            logger.debug("Stage %s: bank conflict %d -> %d under chunk rewrite", s.name, pre, post)
-            return True
+        for src in s.sources:
+            loads = loads_reading(tile.body, src.name)
+            if not loads:
+                continue
+            extents = tuple(int(ax.extent) for ax in src.cache_axes)
+            pre = _stage_max_way(loads, extents, leading_phase, tile)
+            if pre is None or pre <= 1:
+                continue
+            chunk_stride = vec_elems * lane_ext
+            rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride, vec_elems=vec_elems) for ld in loads]
+            post = _stage_max_way(rewritten, extents, leading_phase, tile)
+            if post is None:
+                continue
+            if post < pre:
+                logger.debug("Stage %s: bank conflict %d -> %d under chunk rewrite", src.name, pre, post)
+                return True
     return False
 
 

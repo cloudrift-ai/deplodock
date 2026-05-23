@@ -263,7 +263,9 @@ def _materialize(blk: ThreadTile, *, warp_size: int) -> Stmt:
                 buf_count = getattr(stmt, "buffer_count", 1)
                 if buf_count > 1:
                     extents = (buf_count, *extents)
-                compute_stage_prologue.append(Smem(name=src.name, extents=extents))
+                smem_dtype = _smem_cuda_dtype(src)
+                smem_align = 16 if smem_dtype == "__half" else 0
+                compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
                 declared_smem.add(src.name)
 
     stage_group, wait_group, group_stage_names, group_buffer_count = _partition_tma_groups(body)
