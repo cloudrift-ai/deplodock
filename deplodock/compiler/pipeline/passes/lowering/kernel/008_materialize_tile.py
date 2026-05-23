@@ -133,14 +133,8 @@ def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
-    # M2 soundness check: assert the escape-analysis helper agrees with
-    # the planner-emitted tags and coordination-pass-emitted markers on
-    # every TileOp the materializer processes. Will be removed in M3
-    # when the helper becomes the sole source of truth.
     from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.escape_analysis import cross_check_against_tags  # noqa: PLC0415
 
-    cross_check_against_tags(root.op)
     escape = _analyze_escape(root.op)
 
     new_body: list[Stmt] = []

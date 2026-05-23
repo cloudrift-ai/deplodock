@@ -681,9 +681,17 @@ class Write(Stmt):
             # it; fall back to the legacy stamped ``self.reduce_op`` for
             # standalone-render unit tests that build a bare RenderCtx.
             is_atomic = bool(ctx.atomic_writes.get(id(self))) or self.reduce_op is not None
-            if is_atomic:
-                return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
-            return [f"{pad}{self.output}[{flat}] = {rhs};"]
+            store = f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});" if is_atomic else f"{pad}{self.output}[{flat}] = {rhs};"
+            # Broadcast guard: when the helper says this Write is missing
+            # one or more cooperative thread axes from its index, wrap the
+            # store in ``if (axis == 0)`` so only one thread of the
+            # cooperative group performs it. The guard condition is the
+            # conjunction of all missing axes.
+            broadcast = ctx.broadcast_writes.get(id(self), frozenset())
+            if broadcast:
+                cond = " && ".join(f"{ax} == 0" for ax in sorted(broadcast))
+                return [f"{pad}if ({cond}) {{", store, f"{pad}}}"]
+            return [store]
         # Vectorized path. Per-value dtype conversion: every SSA arg
         # must be at ``out_dt`` before packing.
         n = self.width

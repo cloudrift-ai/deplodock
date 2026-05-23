@@ -48,8 +48,12 @@ _TARGET = CudaRenderTarget()
 
 
 def rewrite(root: Node) -> Graph | None:
+    from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
+
     top: TileOp = root.op
-    new_body = _vectorize_body(top, top.body)
+    escape = _analyze_escape(top)
+    atomic_write_ids = {id(w) for w in escape.writes if escape.atomic_axes(w)}
+    new_body = _vectorize_body(top, top.body, atomic_write_ids)
     if new_body == top.body:
         raise RuleSkipped("no vectorizable Write runs found")
     return TileOp(body=new_body, name=top.name, knobs=dict(top.knobs))
@@ -66,7 +70,7 @@ def _buf_dtype(top: TileOp, name: str) -> str:
     return "f32"
 
 
-def _vectorize_body(top: TileOp, body: Body) -> Body:
+def _vectorize_body(top: TileOp, body: Body, atomic_write_ids: frozenset[int]) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
     scan this scope for consecutive-Write runs. Threads ``top`` through
     so ``_buf_dtype`` can resolve per-buffer dtypes against the same op.
@@ -78,18 +82,18 @@ def _vectorize_body(top: TileOp, body: Body) -> Body:
     descended: list[Stmt] = []
     for s in body:
         if isinstance(s, (SerialTile, StridedTile, RegisterTile, Stage)):
-            new_nested = tuple(_vectorize_body(top, b) for b in s.nested())
+            new_nested = tuple(_vectorize_body(top, b, atomic_write_ids) for b in s.nested())
             descended.append(s.with_bodies(new_nested))
         elif isinstance(s, Cond):
             descended.append(
                 Cond(
                     cond=s.cond,
-                    body=_vectorize_body(top, s.body),
-                    else_body=_vectorize_body(top, s.else_body),
+                    body=_vectorize_body(top, s.body, atomic_write_ids),
+                    else_body=_vectorize_body(top, s.else_body, atomic_write_ids),
                 )
             )
         elif isinstance(s, (GridTile, ThreadTile)):
-            descended.append(s.with_bodies((_vectorize_body(top, s.body),)))
+            descended.append(s.with_bodies((_vectorize_body(top, s.body, atomic_write_ids),)))
         else:
             descended.append(s)
 
@@ -98,7 +102,7 @@ def _vectorize_body(top: TileOp, body: Body) -> Body:
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_store(descended, i, run_n, top)
+            vec = _try_vec_store(descended, i, run_n, top, atomic_write_ids)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -110,7 +114,7 @@ def _vectorize_body(top: TileOp, body: Body) -> Body:
     return Body(tuple(out))
 
 
-def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Write | None:
+def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp, atomic_write_ids: frozenset[int]) -> Write | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Write pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     destination buffer's dtype, return the widened :class:`Write`.
@@ -131,8 +135,9 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Wr
     (output_name,) = outputs
 
     # Atomic reduce-writes cannot be vectorized (each lane needs its
-    # own atomicAdd). Require ``reduce_op is None`` for the whole run.
-    if any(s.reduce_op is not None for s in writes):
+    # own atomicAdd). Helper-driven: a Write is atomic iff some enclosing
+    # block axis is missing from its index (see ``escape_analysis``).
+    if any(id(s) in atomic_write_ids for s in writes):
         return None
 
     dst_dt = _buf_dtype(top, output_name)

@@ -16,7 +16,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.ir.tile.ir import Combine
+from deplodock.compiler.ir.tile.ir import ThreadTile
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import accums_independent as _accums_independent
 
@@ -26,17 +26,17 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def _tile_has_combine(g: Graph) -> bool:
-    """True iff any TileOp body in ``g`` contains a ``Combine`` stmt.
-    The cooperative-reduce path lifts a ``Role.COOPERATIVE_STRIDE`` axis
-    in launch_geometry and emits ``Combine`` siblings to each reduce
-    subtree — Combine presence is the structural signal that
-    cross-thread reduction was materialized."""
+    """True iff any ThreadTile in ``g`` has ``cooperative_axes`` set —
+    the structural signal that cross-thread reduction will be emitted
+    by ``008_materialize_tile``. (Pre-refactor, this was "Tile body
+    contains a ``Combine`` stmt"; coord no longer exists and the
+    materializer derives Combine emission from the helper.)"""
     for node in g.nodes.values():
         body = getattr(node.op, "body", None)
         if body is None:
             continue
         for s in body.iter():
-            if isinstance(s, Combine):
+            if isinstance(s, ThreadTile) and s.cooperative_axes:
                 return True
     return False
 

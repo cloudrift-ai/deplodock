@@ -123,8 +123,15 @@ def analyze(tile_op_or_body: TileOp | Body) -> EscapeAnalysis:
     # index. This conservatively guards any write that sits at
     # cooperative scope without using the cooperative thread var — same
     # rule ``001_coordination``'s ``_guard_scalar_write`` applies.
+    # Staging-buffer writes are skipped: the warp-shuffle / smem tree-
+    # halve code in ``_emit_combine`` carries its own per-lane / per-warp
+    # guards, and a second guard would collapse the broadcast write to
+    # thread 0 only (leaving the rest of the smem slab uninitialized).
     write_broadcast_axes: dict[int, frozenset[str]] = {}
     for w, chain in writes:
+        if w.output in staging_buffers:
+            write_broadcast_axes[id(w)] = frozenset()
+            continue
         coop_axes = _enclosing_cooperative_axes(chain)
         w_idx_vars = _free_vars_in_index(w)
         write_broadcast_axes[id(w)] = frozenset(coop_axes - w_idx_vars)
@@ -220,56 +227,4 @@ def _free_vars_in_index(w: Write) -> frozenset[str]:
     return frozenset(out)
 
 
-def cross_check_against_tags(tile_op: TileOp) -> None:
-    """Soundness check used during the M2 migration: assert that the
-    helper's predictions agree with the planner-emitted coordination
-    tags (``GridTile.splitk_axes``) and the coordination-pass-emitted
-    leaf markers (``Write.reduce_op``) on a single post-coordination
-    ``TileOp``.
-
-    Raises ``AssertionError`` on disagreement — used by the materializer
-    to fail loudly if any kernel in the test zoo would diverge. Will be
-    deleted in M3 when the materializer switches to the helper as the
-    sole source of truth and the markers are removed.
-
-    Cooperativity isn't cross-checked here: the helper reads
-    ``ThreadTile.cooperative_axes`` directly (see module docstring), so
-    they agree by construction.
-
-    Checked invariants:
-
-    1. Every ``GridTile.splitk_axes`` axis appears in the atomic-axis
-       set of at least one Write inside that GridTile.
-    2. Every ``Write`` with ``reduce_op != None`` is classified atomic
-       by the helper (``atomic_axes`` non-empty).
-    """
-    result = analyze(tile_op)
-    body = tile_op.body if isinstance(tile_op, TileOp) else tile_op
-
-    # Invariant 1: every splitk axis is missing from at least one Write's index
-    # somewhere in its scope.
-    splitk_seen: dict[str, bool] = {}
-    for s in body.iter():
-        if isinstance(s, GridTile) and s.splitk_axes:
-            for ax in s.splitk_axes:
-                splitk_seen.setdefault(ax, False)
-    for w in result.writes:
-        for ax in result.atomic_axes(w):
-            if ax in splitk_seen:
-                splitk_seen[ax] = True
-    for ax, seen in splitk_seen.items():
-        assert seen, (
-            f"GridTile.splitk_axes contains {ax!r} but no enclosed Write classifies it as atomic. "
-            f"Helper missed a Write or the tag is stale."
-        )
-
-    # Invariant 2: every reduce_op Write is classified atomic.
-    for w in result.writes:
-        if w.reduce_op is not None:
-            assert result.atomic_axes(w), (
-                f"Write(output={w.output!r}) has reduce_op={w.reduce_op.name!r} but escape analysis "
-                f"found no enclosing block axis missing from its index. Disagreement on atomicity."
-            )
-
-
-__all__ = ["EscapeAnalysis", "analyze", "cross_check_against_tags"]
+__all__ = ["EscapeAnalysis", "analyze"]
