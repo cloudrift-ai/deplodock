@@ -59,10 +59,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
     # zero-initialized before each launch so per-CTA partials accumulate
     # cleanly. Anything else can keep its prior contents. Helper-driven:
     # a Write is atomic iff some enclosing block axis is missing from its
-    # index (escape_analysis.analyze).
-    from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
-
-    escape = _analyze_escape(root.op.body)
+    # index (see ``body.coordination``).
+    escape = root.op.body.coordination
     atomic_outputs: list[str] = []
     seen_atomic: set[str] = set()
     output_set = set(root.op.outputs)

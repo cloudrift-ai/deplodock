@@ -48,10 +48,8 @@ _TARGET = CudaRenderTarget()
 
 
 def rewrite(root: Node) -> Graph | None:
-    from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
-
     top: TileOp = root.op
-    escape = _analyze_escape(top)
+    escape = top.body.coordination
     atomic_write_ids = {id(w) for w in escape.writes if escape.atomic_axes(w)}
     new_body = _vectorize_body(top, top.body, atomic_write_ids)
     if new_body == top.body:

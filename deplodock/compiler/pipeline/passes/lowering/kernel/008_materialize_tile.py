@@ -134,9 +134,7 @@ def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
-    from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
-
-    escape = _analyze_escape(root.op)
+    escape = root.op.body.coordination
 
     new_body: list[Stmt] = []
     for s in root.op.body:

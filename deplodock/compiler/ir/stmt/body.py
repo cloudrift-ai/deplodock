@@ -458,3 +458,19 @@ class Body(tuple[Stmt, ...]):
 
         normalized = normalize_body(self, hoist=False, canonical_buffers=True, cluster_ops=True)
         return "\n".join(pretty_body(normalized))
+
+    @cached_property
+    def coordination(self):
+        """Per-Write atomic / broadcast-guard classifications and
+        per-Accum cooperative-axis sets, derived from one walk of this
+        body. Returns an
+        :class:`deplodock.compiler.ir.tile.escape_analysis.EscapeAnalysis`.
+        Cached on the instance.
+
+        Materializer and Kernel-IR render consume this to pick
+        ``atomicAdd`` vs plain store, ``Cond(t == 0)`` guard wrapping,
+        and warp-shuffle / smem tree-halve emission points. See the
+        ``escape_analysis`` module for the exact derivation rules."""
+        from deplodock.compiler.ir.tile.escape_analysis import analyze  # noqa: PLC0415
+
+        return analyze(self)
