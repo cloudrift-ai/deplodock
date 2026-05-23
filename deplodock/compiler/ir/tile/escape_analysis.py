@@ -1,78 +1,63 @@
-"""Escape analysis on Tile-IR bodies.
+"""Escape analysis on Tile-IR bodies — derives coordination decisions.
 
-Recovers coordination decisions (cooperative reduce, atomic write,
-broadcast-write guard) from the structural shape of a ``TileOp`` body,
-without depending on the planner-emitted tags
-(``ThreadTile.cooperative_axes`` / ``GridTile.splitk_axes``) or the
-marker stmts (``Combine``, ``Write.reduce_op``) that today's
-``001_coordination`` pass produces.
+Computes three queries from a ``TileOp`` body:
 
-Why: those tags and stmts are derivable from data flow. Keeping them in
-the IR introduces a class of bugs (out-of-sync tag vs. body) and forces
-a separate coordination pass to interpret them. This helper computes the
-same answers by walking the body, so the materializer can consume the
-result directly and the tags / stmts / pass can be deleted.
-
-See ``plans/derive-coordination-from-body.md`` for the full refactor
-plan.
-
-Three queries are exposed via :class:`EscapeAnalysis`:
-
+- ``atomic_axes(write)`` — enclosing ``GridTile`` axis names NOT in the
+  Write's index. Non-empty ⇒ multiple CTAs race ⇒ ``atomicAdd``. Purely
+  structural — derivable from Write index vs. enclosing block axes.
+- ``broadcast_axes(write)`` — enclosing cooperative thread axes NOT in
+  the Write's index. Non-empty ⇒ ``Cond(axis == 0)`` guard required.
 - ``accum_cooperative_axes[name]`` — for each ``Accum.name``, the set of
-  enclosing ``ThreadTile`` axis names through which the accumulated
-  value escapes its reduce loop. Non-empty ⇒ a cross-thread combine
-  over those axes is required at the escape point.
-- ``write_atomic_axes[write]`` — for each ``Write``, the set of
-  enclosing ``GridTile`` axis names NOT referenced by the Write's
-  index. Non-empty ⇒ multiple CTAs race ⇒ ``atomicAdd`` required.
-- ``write_broadcast_axes[write]`` — for each ``Write``, the set of
-  enclosing thread axes that are functionally cooperative (some Accum
-  feeding the Write escapes through them) AND NOT referenced by the
-  Write's index. Non-empty ⇒ ``Cond(axis == 0)`` guard required so only
-  one thread of the cooperative group performs the store.
+  cooperative thread axes whose loop the Accum is updated inside and
+  whose escape requires a cross-thread ``Combine``.
+
+**Cooperativity is taken from ``ThreadTile.cooperative_axes`` directly**
+— not derived from data flow. After the partition planner emits a body,
+the cooperative-stride pattern lives in the load *index expression*
+(``x[..., a2*512 + a3*256 + a1]``) rather than in any loop kind, so a
+structural rule like "StridedLoop bound to thread axis ⇒ cooperative"
+misses BR=K degenerate kernels and post-staging shapes. The planner's
+tag is the structural source of truth; the helper treats it as input
+and derives only the operational consequences (Combine emission,
+atomic stamping, Cond-guard placement).
+
+This frames ``001_coordination``'s remaining responsibility as
+*emitting* the operational markers (Combine / Write.reduce_op / Cond
+wrappers) so the materializer can stay mechanical. The intent of the
+larger refactor (``plans/derive-coordination-from-body.md``) is to
+delete those markers in favor of materializer-side queries against this
+helper — see the plan for the milestone breakdown.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.stmt import Accum, Assign, Body
+from deplodock.compiler.ir.stmt import Accum, Body
 from deplodock.compiler.ir.stmt.leaves import Write
-from deplodock.compiler.ir.tile.ir import (
-    GridTile,
-    SerialTileBase,
-    Stmt,
-    ThreadTile,
-    TileOp,
-)
+from deplodock.compiler.ir.tile.ir import GridTile, Stmt, ThreadTile, TileOp
 
 
 @dataclass(frozen=True)
 class EscapeAnalysis:
-    """Per-stmt coordination metadata derived from data flow on a ``TileOp``.
+    """Per-stmt coordination metadata derived from a ``TileOp`` body.
 
-    ``accum_cooperative_axes`` is keyed by ``Accum.name`` (an SSA name,
-    hashable). ``Write`` keys use ``id(...)`` internally because the IR's
-    ``Write.index`` may hold ``BinaryExpr`` nodes that aren't hashable —
-    use the :meth:`atomic_axes` / :meth:`broadcast_axes` accessors
-    rather than touching ``_write_atomic_axes`` directly. ``writes``
-    holds the analyzed Writes in body-walk order so callers can iterate
-    deterministically.
+    ``cooperative_thread_axes`` is the union of every enclosing
+    ``ThreadTile.cooperative_axes`` (read from the planner-emitted tag,
+    not derived). ``accum_cooperative_axes`` maps each Accum to the
+    subset that actually encloses it. ``Write`` keys use ``id(...)``
+    internally because ``Write.index`` may hold ``BinaryExpr`` nodes
+    that aren't hashable — use the :meth:`atomic_axes` /
+    :meth:`broadcast_axes` accessors rather than touching the private
+    dicts. ``writes`` holds the analyzed Writes in body-walk order so
+    callers can iterate deterministically.
     """
 
+    cooperative_thread_axes: frozenset[str] = frozenset()
     accum_cooperative_axes: dict[str, frozenset[str]] = field(default_factory=dict)
     writes: tuple[Write, ...] = field(default_factory=tuple)
     _write_atomic_axes: dict[int, frozenset[str]] = field(default_factory=dict)
     _write_broadcast_axes: dict[int, frozenset[str]] = field(default_factory=dict)
-
-    @property
-    def cooperative_thread_axes(self) -> frozenset[str]:
-        """Union of every thread axis any Accum escapes through. These
-        are the functionally-cooperative axes of the analyzed TileOp."""
-        out: set[str] = set()
-        for axes in self.accum_cooperative_axes.values():
-            out.update(axes)
-        return frozenset(out)
 
     def atomic_axes(self, w: Write) -> frozenset[str]:
         """Block axes NOT in ``w.index`` — non-empty ⇒ ``atomicAdd``."""
@@ -101,89 +86,41 @@ def analyze(tile_op_or_body: TileOp | Body) -> EscapeAnalysis:
     # second traversal.
     accums: list[tuple[Accum, tuple[Stmt, ...]]] = []
     writes: list[tuple[Write, tuple[Stmt, ...]]] = []
-    assigns: list[tuple[Assign, tuple[Stmt, ...]]] = []
-    _collect(body, (), accums, writes, assigns)
+    _collect(body, (), accums, writes)
 
-    # Build def-use over SSA Assigns so we can ask "does this Write's
-    # value transitively depend on Accum X?" — needed for the broadcast-
-    # guard check (Rule 4) and the bias-decomposition heuristic.
-    assign_deps = {a.name: tuple(a.args) for a, _ in assigns}
-    accum_consumers = {acc.name: _names_reaching_into(acc.name, assign_deps) for acc, _ in accums}
-    # Reverse: for each SSA name, which Accums it transitively depends on.
-    accum_seeds_by_name: dict[str, set[str]] = {}
-    for acc_name, reach in accum_consumers.items():
-        for n in reach:
-            accum_seeds_by_name.setdefault(n, set()).add(acc_name)
-        accum_seeds_by_name.setdefault(acc_name, set()).add(acc_name)
-
-    # --- Atomic-Write classification (Rule 2) ---
+    # --- Atomic-Write classification ---
+    # Pure index analysis: any enclosing GridTile axis missing from a
+    # Write's index means CTAs race ⇒ atomic.
     write_atomic_axes: dict[int, frozenset[str]] = {}
     for w, chain in writes:
         block_axes = _block_axis_names_in_chain(chain)
         missing = block_axes - _free_vars_in_index(w)
         write_atomic_axes[id(w)] = frozenset(missing)
 
-    # --- Accum cooperativity (Rule 1) ---
-    # For each Accum, find the innermost enclosing reduce loop (the
-    # SerialTile/StridedTile whose body directly holds the Accum). Then
-    # find the enclosing ThreadTile axes above that loop. The Accum
-    # escapes through axis t iff some consumer of acc.name (recursively
-    # via Assigns and via Writes whose values depend on it) sits at a
-    # position outside the reduce loop but still inside the ThreadTile
-    # binding t. Cooperativity for t requires additionally that the
-    # consumer Write (when applicable) doesn't reference t — if it does,
-    # threads write distinct cells and the value is per-thread, not
-    # cooperative.
+    # --- Cooperative axes per Accum ---
+    # Read from the enclosing ThreadTile's planner-emitted tag rather
+    # than try to derive. See module docstring for why derivation is
+    # unreliable post-staging.
     accum_cooperative_axes: dict[str, frozenset[str]] = {}
-    for acc, acc_chain in accums:
-        reduce_loop = _innermost_reduce_loop(acc_chain)
-        enclosing_thread_axes = _thread_axes_above(acc_chain, reduce_loop)
-        if not enclosing_thread_axes:
-            accum_cooperative_axes[acc.name] = frozenset()
-            continue
-        coop: set[str] = set()
-        # Inspect every Write whose value transitively depends on this
-        # Accum, plus uses-via-Assign that escape the reduce loop. A
-        # thread axis t is cooperative for this Accum iff some such
-        # consumer escapes the reduce loop AND doesn't reference t in
-        # its index (Writes) or its enclosing scope (Assigns escape
-        # implicitly when they feed an unguarded Write).
-        for w, w_chain in writes:
-            if not _value_depends_on_accum(w, acc.name, accum_seeds_by_name):
-                continue
-            if reduce_loop is not None and reduce_loop in w_chain:
-                continue  # consumer is still inside the reduce loop
-            w_idx_vars = _free_vars_in_index(w)
-            for t in enclosing_thread_axes:
-                if t not in w_idx_vars:
-                    coop.add(t)
-        accum_cooperative_axes[acc.name] = frozenset(coop)
+    for acc, chain in accums:
+        accum_cooperative_axes[acc.name] = _enclosing_cooperative_axes(chain)
 
-    coop_thread_axes: set[str] = set()
-    for axes in accum_cooperative_axes.values():
-        coop_thread_axes.update(axes)
+    cooperative_thread_axes = frozenset().union(*accum_cooperative_axes.values()) if accum_cooperative_axes else frozenset()
 
-    # --- Broadcast-Write classification (Rule 4) ---
+    # --- Broadcast-Write classification ---
+    # A Write needs a Cond-guard for axis t iff t is in the enclosing
+    # ThreadTile.cooperative_axes AND t is not referenced by the Write's
+    # index. This conservatively guards any write that sits at
+    # cooperative scope without using the cooperative thread var — same
+    # rule ``001_coordination``'s ``_guard_scalar_write`` applies.
     write_broadcast_axes: dict[int, frozenset[str]] = {}
     for w, chain in writes:
-        thread_axes = _thread_axis_names_in_chain(chain)
-        # Only cooperative thread axes drive a guard. If the axis is
-        # output-partition (no Accum escapes through it), every thread
-        # writes a distinct cell anyway.
-        candidate_coop_axes = thread_axes & coop_thread_axes
+        coop_axes = _enclosing_cooperative_axes(chain)
         w_idx_vars = _free_vars_in_index(w)
-        # Restrict further: only the cooperative axes shared with the
-        # Accum chain that actually feeds this Write contribute. A Write
-        # that doesn't depend on any cooperative Accum doesn't need a
-        # guard even if its index happens to omit a coop axis.
-        feeding_coops: set[str] = set()
-        for acc_name, coop_for_acc in accum_cooperative_axes.items():
-            if _value_depends_on_accum(w, acc_name, accum_seeds_by_name):
-                feeding_coops.update(coop_for_acc)
-        guard_axes = (candidate_coop_axes & feeding_coops) - w_idx_vars
-        write_broadcast_axes[id(w)] = frozenset(guard_axes)
+        write_broadcast_axes[id(w)] = frozenset(coop_axes - w_idx_vars)
 
     return EscapeAnalysis(
+        cooperative_thread_axes=cooperative_thread_axes,
         accum_cooperative_axes=accum_cooperative_axes,
         writes=tuple(w for w, _ in writes),
         _write_atomic_axes=write_atomic_axes,
@@ -201,19 +138,16 @@ def _collect(
     chain: tuple[Stmt, ...],
     accums: list[tuple[Accum, tuple[Stmt, ...]]],
     writes: list[tuple[Write, tuple[Stmt, ...]]],
-    assigns: list[tuple[Assign, tuple[Stmt, ...]]],
 ) -> None:
-    """Walk ``body`` recursively, recording each ``Accum`` / ``Write`` /
-    ``Assign`` paired with its enclosing-stmt chain (root-first)."""
+    """Walk ``body`` recursively, recording each ``Accum`` / ``Write``
+    paired with its enclosing-stmt chain (root-first)."""
     for s in body:
         if isinstance(s, Accum):
             accums.append((s, chain))
         elif isinstance(s, Write):
             writes.append((s, chain))
-        elif isinstance(s, Assign):
-            assigns.append((s, chain))
         for sub in s.nested():
-            _collect(sub, chain + (s,), accums, writes, assigns)
+            _collect(sub, chain + (s,), accums, writes)
 
 
 # ---------------------------------------------------------------------------
@@ -230,35 +164,14 @@ def _block_axis_names_in_chain(chain: tuple[Stmt, ...]) -> frozenset[str]:
     return frozenset(out)
 
 
-def _thread_axis_names_in_chain(chain: tuple[Stmt, ...]) -> frozenset[str]:
-    """Set of axis names bound by every ``ThreadTile`` enclosing the leaf."""
+def _enclosing_cooperative_axes(chain: tuple[Stmt, ...]) -> frozenset[str]:
+    """Union of ``ThreadTile.cooperative_axes`` across every ``ThreadTile``
+    enclosing the leaf. This is the planner's structural source of truth
+    for cooperativity — see module docstring."""
     out: set[str] = set()
     for s in chain:
         if isinstance(s, ThreadTile):
-            out.update(ax.name for ax in s.axes)
-    return frozenset(out)
-
-
-def _innermost_reduce_loop(chain: tuple[Stmt, ...]) -> Stmt | None:
-    """Return the innermost ``SerialTileBase`` in ``chain`` whose body is
-    a reduce (``is_reduce`` is True — i.e. contains an ``Accum``).
-    ``None`` if no reduce loop encloses the leaf."""
-    for s in reversed(chain):
-        if isinstance(s, SerialTileBase) and s.is_reduce:
-            return s
-    return None
-
-
-def _thread_axes_above(chain: tuple[Stmt, ...], anchor: Stmt | None) -> frozenset[str]:
-    """Set of thread-axis names bound by ``ThreadTile`` ancestors at or
-    above ``anchor`` in ``chain``. If ``anchor`` is ``None``, all
-    ``ThreadTile`` axes in ``chain`` count."""
-    out: set[str] = set()
-    for s in chain:
-        if isinstance(s, ThreadTile):
-            out.update(ax.name for ax in s.axes)
-        if anchor is not None and s is anchor:
-            break
+            out.update(s.cooperative_axes)
     return frozenset(out)
 
 
@@ -275,39 +188,56 @@ def _free_vars_in_index(w: Write) -> frozenset[str]:
     return frozenset(out)
 
 
-# ---------------------------------------------------------------------------
-# Def-use over SSA Assigns
-# ---------------------------------------------------------------------------
+def cross_check_against_tags(tile_op: TileOp) -> None:
+    """Soundness check used during the M2 migration: assert that the
+    helper's predictions agree with the planner-emitted coordination
+    tags (``GridTile.splitk_axes``) and the coordination-pass-emitted
+    leaf markers (``Write.reduce_op``) on a single post-coordination
+    ``TileOp``.
+
+    Raises ``AssertionError`` on disagreement — used by the materializer
+    to fail loudly if any kernel in the test zoo would diverge. Will be
+    deleted in M3 when the materializer switches to the helper as the
+    sole source of truth and the markers are removed.
+
+    Cooperativity isn't cross-checked here: the helper reads
+    ``ThreadTile.cooperative_axes`` directly (see module docstring), so
+    they agree by construction.
+
+    Checked invariants:
+
+    1. Every ``GridTile.splitk_axes`` axis appears in the atomic-axis
+       set of at least one Write inside that GridTile.
+    2. Every ``Write`` with ``reduce_op != None`` is classified atomic
+       by the helper (``atomic_axes`` non-empty).
+    """
+    result = analyze(tile_op)
+    body = tile_op.body if isinstance(tile_op, TileOp) else tile_op
+
+    # Invariant 1: every splitk axis is missing from at least one Write's index
+    # somewhere in its scope.
+    splitk_seen: dict[str, bool] = {}
+    for s in body.iter():
+        if isinstance(s, GridTile) and s.splitk_axes:
+            for ax in s.splitk_axes:
+                splitk_seen.setdefault(ax, False)
+    for w in result.writes:
+        for ax in result.atomic_axes(w):
+            if ax in splitk_seen:
+                splitk_seen[ax] = True
+    for ax, seen in splitk_seen.items():
+        assert seen, (
+            f"GridTile.splitk_axes contains {ax!r} but no enclosed Write classifies it as atomic. "
+            f"Helper missed a Write or the tag is stale."
+        )
+
+    # Invariant 2: every reduce_op Write is classified atomic.
+    for w in result.writes:
+        if w.reduce_op is not None:
+            assert result.atomic_axes(w), (
+                f"Write(output={w.output!r}) has reduce_op={w.reduce_op.name!r} but escape analysis "
+                f"found no enclosing block axis missing from its index. Disagreement on atomicity."
+            )
 
 
-def _names_reaching_into(seed: str, assign_deps: dict[str, tuple[str, ...]]) -> frozenset[str]:
-    """Forward def-use closure: every SSA name whose definition transitively
-    depends on ``seed`` (via Assign-dependency edges)."""
-    out: set[str] = set()
-    stack = [seed]
-    while stack:
-        n = stack.pop()
-        # Walk all assigns: if any uses n in its args, add the defined name.
-        for defined, args in assign_deps.items():
-            if defined in out:
-                continue
-            if n in args:
-                out.add(defined)
-                stack.append(defined)
-    return frozenset(out)
-
-
-def _value_depends_on_accum(
-    w: Write,
-    accum_name: str,
-    accum_seeds_by_name: dict[str, set[str]],
-) -> bool:
-    """True iff any ``Write.values`` SSA name has ``accum_name`` among
-    its transitive Accum sources."""
-    for v in w.values:
-        if accum_name in accum_seeds_by_name.get(v, set()):
-            return True
-    return False
-
-
-__all__ = ["EscapeAnalysis", "analyze"]
+__all__ = ["EscapeAnalysis", "analyze", "cross_check_against_tags"]

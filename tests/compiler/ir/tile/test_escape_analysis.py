@@ -129,6 +129,7 @@ def test_cooperative_rmsnorm_acc_escapes():
     a1 = Axis("a1", 3584)
     tile = ThreadTile(
         axes=(t,),
+        cooperative_axes=("t",),
         body=(
             SerialTile(
                 axis=a1,
@@ -175,6 +176,7 @@ def test_cooperative_rmsnorm_write_inside_thread_loop_no_guard():
     a2 = Axis("a2", 3584)
     tile = ThreadTile(
         axes=(t,),
+        cooperative_axes=("t",),
         body=(
             SerialTile(
                 axis=a1,

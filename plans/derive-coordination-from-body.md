@@ -1,8 +1,23 @@
 # Derive Coordination From Body — Drop Tile-IR Coordination Metadata
 
-**Status:** Exploratory. Eliminates the `001_coordination` pass and five fields/stmts that all encode the same
-fact: "this axis is cooperating on a reduction". The fact is recoverable from data flow on the tile body, so
-the explicit metadata is redundant *and* a class of bugs (out-of-sync tag vs. body).
+**Status:** In progress on `feature/partition-planner`. M1 (helper) and M2 (cross-check) landed; revised
+scope below after M2 discovery.
+
+**Original premise:** every coordination decision (cooperative reduce, atomic write, broadcast guard) is
+derivable from data flow on the tile body, so the planner-emitted tags + coordination-pass-emitted markers
+are pure redundancy — delete the lot.
+
+**Revised after M2:** four of five are derivable, but `ThreadTile.cooperative_axes` is NOT. After the
+partition planner emits the body, the cooperative-K stride pattern lives in the load *index expression*
+(``x[..., a2*512 + a3*256 + a1]``) rather than in any loop kind — and BR=K degenerate kernels have no
+stride at all (the trivial 1-iteration loop is inlined, leaving the Accum directly in the ThreadTile body).
+A structural rule like "StridedLoop bound to thread axis ⇒ cooperative" misses both shapes. The planner's
+tag is the *only* structural source of truth.
+
+So `cooperative_axes` stays. The other four redundancies still go: `splitk_axes`, `Combine`,
+`Write.reduce_op`, and `Cond(coop == 0)` wrappers are all derivable from `cooperative_axes` + body index
+expressions. Coordination's job collapses from "infer + emit" to "emit" — and even that can be folded
+into the materializer once the helper consumes `cooperative_axes` as input.
 
 ## Context
 
@@ -78,14 +93,14 @@ Accum + Write structure.
 
 ## Goals
 
-1. **Single source of truth.** Body data flow is the only source of coordination decisions. No tile-level
-   metadata, no inserted marker stmts.
+1. **Two sources of truth, no more.** Body shape + `ThreadTile.cooperative_axes`. Everything else
+   (atomic, broadcast guard, Combine emission point) is derived by the helper at materialize time.
 2. **Delete `001_coordination`.** All its work moves into the materializer (`008_materialize_tile.py`) as
-   inference at codegen time.
-3. **Delete redundant fields and stmts.** `GridTile.splitk_axes`, `ThreadTile.cooperative_axes`,
-   `Write.reduce_op`, the `Combine` Stmt, and the synthesized `Cond(coop == 0)` wrappers all go away.
+   inference at codegen time, driven by the helper.
+3. **Delete redundant fields and stmts.** `GridTile.splitk_axes`, `Write.reduce_op`, the `Combine` Stmt,
+   and the synthesized `Cond(coop == 0)` wrappers all go away. `ThreadTile.cooperative_axes` stays.
 4. **Honest IR.** Reading a `TileOp.body` no longer requires mentally diffing "what's tagged vs. what's
-   computed." The body *is* the computation.
+   computed" for the four derivable cases. Cooperativity remains a single declarative tag on the tile.
 
 ## Non-goals
 
@@ -208,14 +223,16 @@ Remove `Combine` from `ir/tile/ir.py`. Remove from `graph.py` registry. Remove t
 `_helpers.py`, `stmt/passes.py`, `stmt/normalize.py`. Add a migration note in `ir/tile/ARCHITECTURE.md`
 documenting that cooperative-reduce coordination is now codegen-inferred.
 
-### M6 — Delete the redundant fields: `cooperative_axes`, `splitk_axes`
+### M6 — Delete the redundant field: `splitk_axes` (cooperative_axes stays)
 
-Strip the fields from `GridTile` / `ThreadTile` dataclasses. Remove planner code that populates them (lines
-352-356 of `000_partition_planner.py`). Remove the `_pretty_label` branches that render `coop=(...)` /
-`splitk=(...)` — tiles render as plain `grid` / `thread`.
+Strip `splitk_axes` from `GridTile` dataclass. Remove planner code that populates it. Remove the
+`_pretty_label` branch that renders `splitk=(...)` — `GridTile` renders as plain `grid`.
 
-Update `tile/passes.py` axis-rename helper to drop the splitk/coop propagation logic (was just keeping the
-tag in sync with axis renames).
+Update `tile/passes.py` axis-rename helper to drop the splitk propagation logic.
+
+**`ThreadTile.cooperative_axes` stays.** The cooperative-K stride pattern lives in load index expressions
+post-staging, and degenerate BR=K kernels have no stride loop at all, so the tag is the only structural
+source of truth for cooperativity. The helper reads it as input rather than deriving it (see M2 discovery).
 
 ### M7 — Delete the redundant field: `Write.reduce_op`
 
