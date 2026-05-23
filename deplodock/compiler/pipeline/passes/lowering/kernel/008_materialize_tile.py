@@ -40,8 +40,6 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
-    CpAsyncCommit,
-    CpAsyncCopy,
     CpAsyncWait,
     KernelOp,
     MbarrierArriveExpectTx,
@@ -51,8 +49,6 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
     TmaDescriptor,
     TmaLoad,
-    TreeHalve,
-    WarpShuffle,
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Stmt
 from deplodock.compiler.ir.tile.ir import (
@@ -459,49 +455,9 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         new_body = prologue + new_body
     if compute_stage_prologue:
         new_body = compute_stage_prologue + new_body
-    return ThreadTile(axes=axes, body=_drop_redundant_syncs(new_body))
-
-
-def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
-    """Drop ``Sync`` stmts that are guaranteed no-ops at the body level:
-
-    * Two consecutive ``Sync`` stmts collapse to one.
-    * A leading ``Sync`` before any smem access is unnecessary — at kernel
-      entry no thread can hold a stale view of smem because nothing has
-      been written yet.
-
-    Only handles the body-level (no descent into nested ``Loop`` / ``Cond``
-    bodies); the bulk of redundant syncs come from materializer templates
-    that emit a defensive ``Sync()`` at template boundaries, and those
-    surface here.
-    """
-    smem_seen = False
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Sync):
-            if not smem_seen:
-                continue  # nothing for the sync to fence yet
-            if out and isinstance(out[-1], Sync):
-                continue  # back-to-back sync collapses
-        else:
-            if isinstance(
-                s,
-                (
-                    Smem,
-                    MbarrierInit,
-                    MbarrierArriveExpectTx,
-                    MbarrierWait,
-                    TmaLoad,
-                    CpAsyncCopy,
-                    CpAsyncCommit,
-                    CpAsyncWait,
-                    TreeHalve,
-                    WarpShuffle,
-                ),
-            ):
-                smem_seen = True
-        out.append(s)
-    return out
+    # Redundant-Sync cleanup runs as the separate Kernel-IR pass
+    # ``009_drop_redundant_syncs`` after this lowering.
+    return ThreadTile(axes=axes, body=new_body)
 
 
 def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
