@@ -986,10 +986,11 @@ class ComputeStage(Stage):
         return "compute"
 
     def pretty(self, indent: str = "") -> list[str]:
-        """``compute shared <name>[<cache_axes>]:`` per output Source,
-        then an indented ``compute:`` block (the cooperative producer
-        body that fills the slab), then the consumer subtree at the
-        ComputeStage's own indent.
+        """``compute shared <name>[<cache_axes>]`` per output Source, then a
+        synthesized ``for <ax> in 0..<extent>`` nest labeled ``cooperative``
+        wrapping the producer body, then the native consumer subtree at the
+        same indent. Reads as two adjacent for-nests — one cooperative
+        compute, one consumer reduce — both belonging to the decl above.
 
         ComputeStage carries TWO bodies: ``compute`` runs once per
         activation to populate the output slabs from sibling-Stage smem;
@@ -999,14 +1000,19 @@ class ComputeStage(Stage):
         """
         prefix = self._pretty_prefix()
         prefix = f"{prefix} " if prefix else ""
-        decls = []
+        out: list[str] = []
         for s in self.sources:
             cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in s.cache_axes)
-            decls.append(f"{indent}{prefix}shared {s.name}[{cache}]:")
-        compute_lines = [f"{indent}{INDENT}compute:"]
-        compute_lines.extend(pretty_body(self.compute, indent + INDENT + INDENT))
-        body_lines = list(pretty_body(self.body, indent))
-        return decls + compute_lines + body_lines
+            out.append(f"{indent}{prefix}shared {s.name}[{cache}]")
+        # Synthesize a cooperative for-nest over the first source's cache
+        # axes — every Source in the ComputeStage shares the same cache
+        # axes by construction (007b builds a single fused output Source
+        # spanning the cone's cache axes).
+        cache_axes = self.sources[0].cache_axes
+        for_lines = [f"for {ax.name} in 0..{ax.extent}" for ax in cache_axes]
+        out.extend(_render_tile_bracket(indent + INDENT, for_lines, "cooperative", self.compute))
+        out.extend(pretty_body(self.body, indent + INDENT))
+        return out
 
 
 # ---------------------------------------------------------------------------
