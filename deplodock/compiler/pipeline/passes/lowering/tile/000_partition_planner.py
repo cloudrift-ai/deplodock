@@ -309,8 +309,9 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     - ``BLOCK`` / ``SPLITK_BLOCK`` → ``GridTile.axes``. Split-K vs.
       regular output-partition is derived at codegen time from
       ``escape_analysis.atomic_axes``.
-    - ``THREAD`` / ``COOPERATIVE_STRIDE`` → ``ThreadTile.axes``
-      (``COOPERATIVE_STRIDE`` axis names go into ``ThreadTile.cooperative_axes``).
+    - ``THREAD`` / ``COOPERATIVE_STRIDE`` → ``ThreadTile.axes``.
+      Cooperative-K cooperativity is recovered at materialize time from
+      ``Accum.axes ∩ ThreadTile.axes`` (see ``escape_analysis``).
     - ``REGISTER`` → ``RegisterTile.axes``.
     - ``SERIAL_OUTER`` / ``STAGE_INNER`` / ``PIPELINE`` → ``SerialTile(kind=…)``.
     - Untagged (``None``) → ``SerialTile(kind="plain")``.
@@ -358,8 +359,10 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
             # from Write.index).
             current = (GridTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "thread":
-            coop = tuple(ax.name for ax, r in zip(axes, roles, strict=True) if r is Role.COOPERATIVE_STRIDE)
-            current = (ThreadTile(axes=tuple(axes), body=Body(current), cooperative_axes=coop),)
+            # COOPERATIVE_STRIDE axes need no tag — they get into
+            # ``Accum.axes`` via the planner's σ-split and the helper
+            # recovers cooperativity from ``Accum.axes ∩ ThreadTile.axes``.
+            current = (ThreadTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "register":
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
         else:  # serial — one axis per layer

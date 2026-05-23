@@ -26,18 +26,24 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def _tile_has_combine(g: Graph) -> bool:
-    """True iff any ThreadTile in ``g`` has ``cooperative_axes`` set —
+    """True iff some Accum reduces over an enclosing ThreadTile axis —
     the structural signal that cross-thread reduction will be emitted
-    by ``008_materialize_tile``. (Pre-refactor, this was "Tile body
-    contains a ``Combine`` stmt"; coord no longer exists and the
-    materializer derives Combine emission from the helper.)"""
+    by ``008_materialize_tile``. (Pre-refactor variants: "Tile body
+    contains a ``Combine`` stmt", then "ThreadTile.cooperative_axes
+    set"; both are gone — cooperativity now lives on ``Accum.axes``
+    and the materializer / escape-analysis helper recovers it via
+    ``Accum.axes ∩ ThreadTile.axes``.)"""
     for node in g.nodes.values():
         body = getattr(node.op, "body", None)
         if body is None:
             continue
-        for s in body.iter():
-            if isinstance(s, ThreadTile) and s.cooperative_axes:
-                return True
+        for tt in body.iter():
+            if not isinstance(tt, ThreadTile):
+                continue
+            tt_axis_names = frozenset(ax.name for ax in tt.axes)
+            for s in tt.body.iter():
+                if isinstance(s, Accum) and tt_axis_names & frozenset(s.axes):
+                    return True
     return False
 
 

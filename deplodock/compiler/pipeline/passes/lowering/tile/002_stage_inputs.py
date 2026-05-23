@@ -57,7 +57,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     CacheDim,
@@ -67,6 +67,7 @@ from deplodock.compiler.ir.tile.ir import (
     Source,
     Stage,
     StridedTile,
+    ThreadTile,
     TileOp,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
@@ -80,6 +81,18 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 PATTERN = [Pattern("root", TileOp)]
 
 STAGE = Knob("STAGE", KnobType.BINMASK, help="Bitmask over ranked candidate buffers (char i = buffer i)")
+
+
+def _tile_is_cooperative(tt: ThreadTile) -> bool:
+    """True iff some Accum inside ``tt`` reduces over one of ``tt``'s
+    thread axes — i.e. the kernel is cooperative-K. Replaces the legacy
+    ``bool(tt.cooperative_axes)`` check now that cooperativity is derived
+    from ``Accum.axes`` (see ``ir/tile/escape_analysis.py``)."""
+    tt_axis_names = frozenset(ax.name for ax in tt.axes)
+    for s in tt.body.iter():
+        if isinstance(s, Accum) and tt_axis_names & frozenset(s.axes):
+            return True
+    return False
 
 
 class _Slab(NamedTuple):
@@ -155,7 +168,7 @@ def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
         return []
     block_axes = outer.axes if isinstance(outer, GridTile) else ()
     block_axis_names = frozenset(ax.name for ax in block_axes)
-    is_cooperative = bool(tt.cooperative_axes)
+    is_cooperative = _tile_is_cooperative(tt)
     all_axes = tuple(block_axes) + tuple(tt.axes)
     found: dict[str, int] = {}
     _collect_candidates(tt, tt.axes, all_axes, block_axis_names, found, slab_cap=10**12, is_cooperative=is_cooperative)
@@ -267,7 +280,7 @@ def _maybe_rewrite(
     used_names: set[str] = set()
     block_axes = outer.axes if isinstance(outer, GridTile) else ()
     block_axis_names = frozenset(ax.name for ax in block_axes)
-    is_cooperative = bool(tt.cooperative_axes)
+    is_cooperative = _tile_is_cooperative(tt)
     all_axes = tuple(block_axes) + tuple(tt.axes)
     new_tile_body = _process_scope(
         tt,

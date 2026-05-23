@@ -109,13 +109,7 @@ def _(s: GridTile, ctx: SimplifyCtx) -> Stmt:
 
 @rewrite.register
 def _(s: ThreadTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(axis_fn(ax) for ax in s.axes)
-    new_body = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
-    # Mirror axis renames into cooperative_axes (cooperative_axes stays
-    # as an input tag; see escape_analysis docstring for why).
-    name_map = {old.name: new.name for old, new in zip(s.axes, new_axes, strict=True)}
-    new_coop = tuple(name_map.get(n, n) for n in s.cooperative_axes)
-    return ThreadTile(axes=new_axes, body=new_body, cooperative_axes=new_coop)
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
 
 
 @simplify.register

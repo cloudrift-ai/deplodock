@@ -468,7 +468,7 @@ class ParallelTile(Stmt):
 
     def _pretty_label(self) -> str:
         """Right-margin bracket label. Subclasses override to append
-        flavor-specific metadata (e.g. cooperative_axes)."""
+        flavor-specific metadata if any."""
         return type(self).__name__.lower().replace("tile", "")
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -511,22 +511,17 @@ class GridTile(ParallelTile):
 class ThreadTile(ParallelTile):
     """Thread-parallel tile. Axes lift to ``threadIdx`` (row-major flatten).
 
-    Replaces ``Tile`` with ``BIND_THREAD`` axes. ``cooperative_axes``
-    carries the subset of axis names that are cross-thread cooperative
-    (today's ``Role.COOPERATIVE_STRIDE``) — read by the escape-analysis
-    helper to determine where the materializer emits cross-thread combine
-    after the matching reduce.
+    Replaces ``Tile`` with ``BIND_THREAD`` axes. Cooperative-K
+    cooperativity is derived at materialize / render time from
+    ``Accum.axes ∩ ThreadTile.axes`` — see
+    ``ir/tile/escape_analysis.py``.
     """
-
-    cooperative_axes: tuple[str, ...] = ()
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return ThreadTile(axes=self.axes, body=body, cooperative_axes=self.cooperative_axes)
+        return ThreadTile(axes=self.axes, body=body)
 
     def _pretty_label(self) -> str:
-        if self.cooperative_axes:
-            return f"thread coop=({', '.join(self.cooperative_axes)})"
         return "thread"
 
     def render(self, ctx: RenderCtx) -> list[str]:

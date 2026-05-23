@@ -484,7 +484,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         new_body = prologue + new_body
     if compute_stage_prologue:
         new_body = compute_stage_prologue + new_body
-    return ThreadTile(axes=axes, body=_drop_redundant_syncs(new_body), cooperative_axes=blk.cooperative_axes)
+    return ThreadTile(axes=axes, body=_drop_redundant_syncs(new_body))
 
 
 def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:

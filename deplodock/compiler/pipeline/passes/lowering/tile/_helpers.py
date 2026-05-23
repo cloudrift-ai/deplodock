@@ -71,19 +71,19 @@ def thread_tile_of(outer: ParallelTile) -> ThreadTile:
 def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
     """Rebuild ``outer`` with the per-thread scope's body replaced.
 
-    Preserves the GridTile wrapper (if any) and the ThreadTile's
-    ``cooperative_axes`` tag so downstream rewrites are transparent to
-    launch geometry.
+    Preserves the GridTile wrapper (if any). Cooperativity is recovered
+    from ``Accum.axes`` at materialize / render time so no per-tile tag
+    needs propagating here.
     """
     new_body = Body.coerce(new_body) if not isinstance(new_body, Body) else new_body
     if isinstance(outer, ThreadTile):
-        return ThreadTile(axes=outer.axes, body=new_body, cooperative_axes=outer.cooperative_axes)
+        return ThreadTile(axes=outer.axes, body=new_body)
     if isinstance(outer, GridTile):
         # Locate the ThreadTile child and rebuild it.
         new_outer_body: list = []
         for child in outer.body:
             if isinstance(child, ThreadTile):
-                new_outer_body.append(ThreadTile(axes=child.axes, body=new_body, cooperative_axes=child.cooperative_axes))
+                new_outer_body.append(ThreadTile(axes=child.axes, body=new_body))
             else:
                 new_outer_body.append(child)
         return GridTile(axes=outer.axes, body=Body(new_outer_body))
