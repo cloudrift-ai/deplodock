@@ -137,21 +137,23 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
     # the planner-emitted tags and coordination-pass-emitted markers on
     # every TileOp the materializer processes. Will be removed in M3
     # when the helper becomes the sole source of truth.
+    from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
     from deplodock.compiler.ir.tile.escape_analysis import cross_check_against_tags  # noqa: PLC0415
 
     cross_check_against_tags(root.op)
+    escape = _analyze_escape(root.op)
 
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile)):
-            new_body.append(_materialize_top(s, warp_size=ctx.warp_size))
+            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
         else:
             new_body.append(s)
 
     return KernelOp(body=new_body, name=root.op.name)
 
 
-def _materialize_top(top: Stmt, *, warp_size: int) -> Stmt:
+def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
     Two shapes are possible coming out of ``001_launch_geometry``:
@@ -171,7 +173,7 @@ def _materialize_top(top: Stmt, *, warp_size: int) -> Stmt:
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, ThreadTile):
-                new_outer.append(_materialize(child, warp_size=warp_size))
+                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
         # splitk_axes is intentionally NOT propagated — coordination has
@@ -180,7 +182,7 @@ def _materialize_top(top: Stmt, *, warp_size: int) -> Stmt:
         # only.
         return GridTile(axes=top.axes, body=Body(new_outer))
     if isinstance(top, ThreadTile):
-        return _materialize(top, warp_size=warp_size)
+        return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
@@ -189,7 +191,7 @@ def _materialize_top(top: Stmt, *, warp_size: int) -> Stmt:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: ThreadTile, *, warp_size: int) -> Stmt:
+def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     """Materialize a ThreadTile body. The ThreadTile carries the per-CTA
     thread axes directly (no BoundAxis filtering needed); strategies set
     this up — this pass commits no axis decisions of its own.
@@ -449,48 +451,40 @@ def _materialize(blk: ThreadTile, *, warp_size: int) -> Stmt:
             pending_reduce = {}
         elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
+            # Locate Accums whose value escapes this loop scope so we
+            # can emit helper-driven Combines for cooperative ones.
             if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
                 # Single-loop reduce: Accums live at the immediate-body level.
-                pending_reduce = {a.name: a for a in stmt.body if isinstance(a, Accum)}
+                accums_in_scope = {a.name: a for a in stmt.body if isinstance(a, Accum)}
             else:
                 # Non-reduce wrapper (e.g. ``SerialTile(K_o, kind="serial_outer",
                 # body=[SerialTile(K_i, kind="stage_inner", reduce, [Accum])])``
                 # for cooperative-K reduce after the partition planner's σ-split).
                 # Descend into nested reduce subtrees so sibling Combines match
-                # their Accums' dtypes. Empty when no nested reduce-with-
-                # immediate-Accum exists — the Combine branch then raises
-                # ValueError, which preserves today's safety net against stray
-                # Combines.
-                pending_reduce = _find_nested_reduce_accums(stmt.body)
+                # their Accums' dtypes.
+                accums_in_scope = _find_nested_reduce_accums(stmt.body)
+            pending_reduce = accums_in_scope
+            for acc_name, acc in accums_in_scope.items():
+                if escape is not None and escape.accum_cooperative_axes.get(acc_name):
+                    new_body.extend(_emit_combine(acc_name, acc.op, _single_thread_var(thread_axes), n_threads, acc.dtype or F32, warp_size=warp_size))
+                    rename[acc_name] = f"{acc_name}_b"
         elif isinstance(stmt, Accum):
             # Bare Accum at the ThreadTile scope — degenerate cooperative
             # reduce where K_i collapsed to size-1 (e.g. K=warp_size with
             # BR=warp_size cooperative threads each handling one element).
-            # Pass the Accum through and stage it as a pending reduce so
-            # the following Combine has something to consume.
             new_body.append(transform(stmt))
             pending_reduce = {stmt.name: stmt}
+            if escape is not None and escape.accum_cooperative_axes.get(stmt.name):
+                new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, stmt.dtype or F32, warp_size=warp_size))
+                rename[stmt.name] = f"{stmt.name}_b"
         elif isinstance(stmt, Combine):
-            # ``Combine.name`` is the per-thread SSA value to combine across
-            # threads. It usually matches one of the preceding Accums' names,
-            # but the reduce-axis register-tile pass (008 RF path) introduces
-            # an Assign fold between the multi-Accum StridedLoop and the
-            # Combine — so Combine.name may instead reference that fold's
-            # output. The combine emission only needs (name, op).
-            if not pending_reduce:
-                raise ValueError(f"Combine({stmt.name!r}) without a preceding reduce loop")
-            accum = pending_reduce.get(stmt.name)
-            # F-replicated bodies emit one Combine per sibling Accum — keep
-            # the pending dict alive so subsequent Combines find their own
-            # Accum. Only the matched Accum is consumed; an unmatched name
-            # (RF Assign fold) falls back to any pending Accum's dtype.
-            if accum is not None:
-                pending_reduce.pop(stmt.name)
-            else:
-                accum = next(iter(pending_reduce.values()))
-            accum_dtype = accum.dtype or F32
-            new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, accum_dtype, warp_size=warp_size))
-            rename[stmt.name] = f"{stmt.name}_b"
+            # Skip — helper-driven Combine emission above already handled
+            # cooperative Accums. Kept as a no-op branch so coordination's
+            # legacy Combine stmts don't fall into the ``else`` (which
+            # would copy them into the kernel body verbatim — they have
+            # no render() in Kernel IR). Will be removed in M5 when the
+            # Combine class is deleted.
+            pass
         else:
             new_body.append(transform(stmt))
 
