@@ -1,28 +1,53 @@
 # Derive Coordination From Body — Drop Tile-IR Coordination Metadata
 
-**Status:** Completed on `feature/partition-planner` (M1–M8). All 1182 tests pass; no production code reads
-`splitk_axes` / `Write.reduce_op` / the `Combine` Stmt; `001_coordination.py` is deleted. Atomic-write,
-cooperative-combine, and broadcast-guard decisions are derived at materialize / Kernel-IR render time via
-`ir/tile/escape_analysis.py`.
+**Status:** Completed on `feature/partition-planner` (M1–M8 + Option A follow-up A1–A7). All 1182 tests pass.
 
-`ThreadTile.cooperative_axes` stays as the structural source of truth for "this thread axis cooperates on a
-reduction" — see M2 notes below for why derivation from body data flow is unreliable post-staging.
+**End state:** the entire coordination machinery — `001_coordination.py`, the `Combine` Stmt, `splitk_axes`
+on GridTile, `cooperative_axes` on ThreadTile, `Write.reduce_op`, `Cond(coop == 0)` wrappers, the
+`Role.SPLITK_BLOCK` / `Role.COOPERATIVE_STRIDE` planner enums — is gone. Five things drive every
+coordination decision:
 
-**Original premise:** every coordination decision (cooperative reduce, atomic write, broadcast guard) is
-derivable from data flow on the tile body, so the planner-emitted tags + coordination-pass-emitted markers
-are pure redundancy — delete the lot.
+1. **`Accum.axes: tuple[str, ...]`** — the axis names this Accum reduces over. Populated by the lifting
+   pass (and the splicer during fusion); propagated through every Sigma rename including σ-splits
+   (`Var(K) → Var(K_o)*N + Var(K_i)` becomes `axes=('K_o', 'K_i')`).
+2. **`GridTile.axes`** — enclosing block axes for atomic-write classification.
+3. **`ThreadTile.axes`** — enclosing thread axes for cooperative-axis derivation.
+4. **`Write.index` free vars** — what each write actually addresses.
+5. **`Smem.name` / `Stage.sources`** — staging-buffer names to exclude from atomic/broadcast classification.
 
-**Revised after M2:** four of five are derivable, but `ThreadTile.cooperative_axes` is NOT. After the
-partition planner emits the body, the cooperative-K stride pattern lives in the load *index expression*
-(``x[..., a2*512 + a3*256 + a1]``) rather than in any loop kind — and BR=K degenerate kernels have no
-stride at all (the trivial 1-iteration loop is inlined, leaving the Accum directly in the ThreadTile body).
-A structural rule like "StridedLoop bound to thread axis ⇒ cooperative" misses both shapes. The planner's
-tag is the *only* structural source of truth.
+The escape-analysis helper (`ir/tile/escape_analysis.py`) reads those five inputs and derives:
 
-So `cooperative_axes` stays. The other four redundancies still go: `splitk_axes`, `Combine`,
-`Write.reduce_op`, and `Cond(coop == 0)` wrappers are all derivable from `cooperative_axes` + body index
-expressions. Coordination's job collapses from "infer + emit" to "emit" — and even that can be folded
-into the materializer once the helper consumes `cooperative_axes` as input.
+- `atomic_axes(write)` = enclosing `GridTile.axes` − `Write.index` free vars (minus staging-buffer writes)
+- `accum_cooperative_axes[name]` = `Accum.axes` ∩ enclosing `ThreadTile.axes`
+- `broadcast_axes(write)` = (union of all cooperative thread axes) − `Write.index` free vars (minus staging)
+
+`Write.render` consumes the atomic / broadcast results to emit `atomicAdd` and `Cond(axis == 0)` guards;
+the materializer consumes `accum_cooperative_axes` to emit warp-shuffle / smem tree-halve at each reduce
+loop's exit. No separate coordination pass; no markers on the IR.
+
+## History
+
+**Original premise (M1):** every coordination decision is derivable from data flow on the tile body —
+delete the tags and markers, keep only escape-analysis at codegen time.
+
+**M2 discovery:** four of five derivations work, but cooperativity can't be recovered from body shape
+alone. After the partition planner emits a body, the cooperative-K stride lives in the *load index
+expression* (`x[..., a2*512 + a3*256 + a1]`) rather than in any loop kind — and BR=K degenerate kernels
+have no stride loop at all (the trivial 1-iteration loop is inlined, leaving the Accum directly in the
+ThreadTile body). A structural rule like "StridedLoop bound to thread axis ⇒ cooperative" misses both
+shapes. The planner's intent (which K axes are parallelized) needs *some* persistent representation in the
+IR.
+
+**M3–M8 (initial refactor):** keep `ThreadTile.cooperative_axes` as the structural source of truth; delete
+the other four redundancies. The helper reads `cooperative_axes` as input, derives everything else.
+
+**Option A follow-up (A1–A7):** push cooperativity onto `Accum.axes` instead. Now the Accum is
+self-describing: looking at it tells you what's being reduced. `cooperative_axes` becomes derivable from
+`Accum.axes ∩ ThreadTile.axes` and gets deleted. The planner's σ-split naturally propagates `Accum.axes`
+(via `Expr.free_vars()` on the substitution expression), so cooperative-K with BR < K, BR = K degenerate,
+and serial-only matmul all produce different `Accum.axes` that the helper can distinguish structurally.
+With nothing left to differentiate them at the role level, `Role.SPLITK_BLOCK` and
+`Role.COOPERATIVE_STRIDE` were folded into `Role.BLOCK` and `Role.THREAD`.
 
 ## Context
 

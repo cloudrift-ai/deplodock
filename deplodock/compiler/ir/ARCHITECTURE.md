@@ -117,7 +117,7 @@ iteration axes. Free vs reduce is inferred from body structure — a
 | `LoopOp`                     | One kernel. Stored field: `body` (nested `Loop` tree). Computed: `axes`, `loads`, `accums`.                       |
 | `Load`                       | Body-form external read: `name = load(input)[index...]`. `input` matches the producing graph node's id.           |
 | `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseImpl`.                                                      |
-| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to its op's identity.            |
+| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to its op's identity. ``axes`` lists the reduction axis names — propagated through Sigma renames (including σ-splits via `Expr.free_vars()`); the escape-analysis helper derives cross-thread cooperativity from ``axes ∩ enclosing ThreadTile.axes``. |
 | `Init`                       | Explicit accumulator initialization at an outer scope (matmul chunked-K).                                         |
 | `Write`                      | Write an SSA value to output at `index`.                                                                          |
 | `Select` + `SelectBranch`    | Coord-predicated binding (replaces the old Mux).                                                                  |
@@ -214,13 +214,16 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 Tile IR encodes scheduling decisions structurally — `Tile.axes` carry
 `BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` wraps consumer subtrees
-that read smem-cached operands. Cooperative reduction (Combine
-emission), atomic-write classification, and broadcast guards are
-derived from the body at materialize / render time via
-``ir/tile/escape_analysis.py`` — there is no explicit `Combine` Stmt
-or atomic field. Compute leaves (`Load` / `Assign` / `Accum` /
-`Write`) and control flow (`Loop` / `StridedLoop` / `Cond`) come from
-`ir/stmt.py`.
+that read smem-cached operands. Coordination decisions are derived from
+the body at materialize / render time via ``ir/tile/escape_analysis.py``:
+cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
+atomic-write classification from enclosing ``GridTile.axes`` vs
+``Write.index``, broadcast-write guards from cooperative thread axes vs
+``Write.index``. No explicit coordination stmt or per-tile tag carries
+this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
+and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
+``Accum.axes`` carries the names of the loops being reduced over and is
+the source of truth for cooperativity.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative
