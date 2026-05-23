@@ -1,0 +1,222 @@
+============ Benchmark Task ============
+recipe_dir: experiments/Kimi-K2.5-MXFP4/optimal_mcr_mi350x
+variant: mi350xx4_mc28_np80_mcr28
+gpu_name: AMD Instinct MI350X
+gpu_count: 4
+recipe:
+  model:
+    huggingface: amd/Kimi-K2.5-MXFP4
+  engine:
+    llm:
+      context_length: 262144
+      max_concurrent_requests: 28
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      gpu_memory_utilization: 0.9
+      vllm:
+        image: vllm/vllm-openai-rocm:v0.17.0
+        extra_args: --mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser
+          kimi_k2
+        extra_env: {}
+      sglang: null
+  benchmark:
+    max_concurrency: 28
+    num_prompts: 80
+    random_input_len: 8000
+    random_output_len: 8000
+  deploy:
+    gpu: AMD Instinct MI350X
+    gpu_count: 4
+==================================================
+
+============ Serving Benchmark Result ============
+Successful requests:                     80        
+Failed requests:                         0         
+Maximum request concurrency:             28        
+Benchmark duration (s):                  1661.30   
+Total input tokens:                      640000    
+Total generated tokens:                  640000    
+Request throughput (req/s):              0.05      
+Output token throughput (tok/s):         385.24    
+Peak output token throughput (tok/s):    532.00    
+Peak concurrent requests:                31.00     
+Total token throughput (tok/s):          770.48    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          4273.65   
+Median TTFT (ms):                        1788.21   
+P99 TTFT (ms):                           16580.67  
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          68.83     
+Median TPOT (ms):                        69.69     
+P99 TPOT (ms):                           69.87     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           68.83     
+Median ITL (ms):                         67.59     
+P99 ITL (ms):                            80.62     
+==================================================
+
+============ Docker Compose Configuration ============
+services:
+
+  vllm_0:
+    image: vllm/vllm-openai-rocm:v0.17.0
+    container_name: vllm_0
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    volumes:
+      - /hf_models:/hf_models
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=***
+      - HF_HOME=/hf_models
+    ports:
+      - "8000:8000"
+    shm_size: '16gb'
+    ipc: host
+    command: >
+      --trust-remote-code
+      --gpu-memory-utilization=0.9
+      --host 0.0.0.0
+      --port 8000
+      --tensor-parallel-size 4
+      --pipeline-parallel-size 1
+      --data-parallel-size 1
+      --model amd/Kimi-K2.5-MXFP4
+      --served-model-name amd/Kimi-K2.5-MXFP4
+      --max-model-len 262144
+      --max-num-seqs 28
+      --mm-encoder-tp-mode data --tool-call-parser kimi_k2 --reasoning-parser kimi_k2
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -f http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 180
+      start_period: 1200s
+==================================================
+
+============ Benchmark Command ============
+vllm bench serve
+    --model amd/Kimi-K2.5-MXFP4
+    --trust-remote-code
+    --max-concurrency 28
+    --num-prompts 80
+    --random-input-len 8000
+    --random-output-len 8000
+    --base-url http://localhost:8000
+==================================================
+
+============ System Information ============
+=== HOSTNAME ===
+riftvm
+
+=== OS ===
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.1 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+=== KERNEL ===
+6.17.0-14-generic
+
+=== CPU INFORMATION ===
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  60
+On-line CPU(s) list:                     0-59
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC 9575F 64-Core Processor
+CPU family:                              26
+Model:                                   2
+Thread(s) per core:                      1
+Core(s) per socket:                      1
+Socket(s):                               60
+Stepping:                                1
+BogoMIPS:                                6600.00
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm rep_good nopl xtopology cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw perfctr_core ssbd ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d arch_capabilities
+Virtualization:                          AMD-V
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               3.8 MiB (60 instances)
+L1i cache:                               3.8 MiB (60 instances)
+L2 cache:                                30 MiB (60 instances)
+L3 cache:                                960 MiB (60 instances)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-59
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; Safe RET
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP disabled; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+
+=== CPU COUNT ===
+60
+
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:           786Gi        23Gi       765Gi       2.7Mi       2.4Gi       763Gi
+Swap:             0B          0B          0B
+
+=== GPU INFORMATION ===
+N/A
+
+=== GPU DETAILS ===
+N/A
+
+=== DISK USAGE ===
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs            79G  1.8M   79G   1% /run
+efivarfs        256K   17K  235K   7% /sys/firmware/efi/efivars
+/dev/vda1       3.8T   35G  3.8T   1% /
+tmpfs           394G     0  394G   0% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/vda16      881M  304M  516M  38% /boot
+/dev/vda15      105M  6.1M   99M   6% /boot/efi
+tmpfs            79G   16K   79G   1% /run/user/1000
+
+=== BLOCK DEVICES ===
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+sr0      11:0    1  368K  0 rom  
+vda     253:0    0  3.9T  0 disk 
+├─vda1  253:1    0  3.9T  0 part /
+├─vda14 253:14   0    4M  0 part 
+├─vda15 253:15   0  106M  0 part /boot/efi
+└─vda16 259:0    0  913M  0 part /boot
+
+=== UPTIME ===
+ 20:01:49 up 1 min,  1 user,  load average: 1.05, 0.35, 0.13
+
+=== DOCKER VERSION ===
+Docker version 29.2.1, build a5c7197
+
+=== DOCKER INFO ===
+29.2.1 | OS: Ubuntu 24.04.1 LTS | Containers: 0 | Images: 0
+==================================================
