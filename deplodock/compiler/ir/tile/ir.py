@@ -468,7 +468,7 @@ class ParallelTile(Stmt):
 
     def _pretty_label(self) -> str:
         """Right-margin bracket label. Subclasses override to append
-        flavor-specific metadata (splitk_axes, cooperative_axes, etc.)."""
+        flavor-specific metadata (e.g. cooperative_axes)."""
         return type(self).__name__.lower().replace("tile", "")
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -485,20 +485,16 @@ class ParallelTile(Stmt):
 class GridTile(ParallelTile):
     """CTA-grid parallel tile. Axes lift to ``blockIdx`` (row-major).
 
-    Replaces ``Tile`` with ``BIND_BLOCK`` axes. ``splitk_axes`` carries
-    the subset of axis names that are split-K outer axes — materializer
-    rewrites the epilogue ``Write`` to atomic-add for those.
+    Replaces ``Tile`` with ``BIND_BLOCK`` axes. Split-K is derived at
+    codegen time from ``escape_analysis.atomic_axes`` (Write index vs
+    enclosing block axes) — no per-tile metadata required.
     """
-
-    splitk_axes: tuple[str, ...] = ()
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return GridTile(axes=self.axes, body=body, splitk_axes=self.splitk_axes)
+        return GridTile(axes=self.axes, body=body)
 
     def _pretty_label(self) -> str:
-        if self.splitk_axes:
-            return f"grid splitk=({', '.join(self.splitk_axes)})"
         return "grid"
 
     def render(self, ctx: RenderCtx) -> list[str]:

@@ -171,10 +171,6 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
                 new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
-        # splitk_axes is intentionally NOT propagated — coordination has
-        # already used the tag to stamp Write.reduce_op (which is the
-        # only signal codegen needs). The output GridTile carries axes
-        # only.
         return GridTile(axes=top.axes, body=Body(new_outer))
     if isinstance(top, ThreadTile):
         return _materialize(top, warp_size=warp_size, escape=escape)

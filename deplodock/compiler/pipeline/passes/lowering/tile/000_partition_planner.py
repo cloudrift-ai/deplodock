@@ -306,8 +306,9 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
 
     Role → flavor mapping:
 
-    - ``BLOCK`` / ``SPLITK_BLOCK`` → ``GridTile.axes`` (``SPLITK_BLOCK``
-      axis names go into ``GridTile.splitk_axes``).
+    - ``BLOCK`` / ``SPLITK_BLOCK`` → ``GridTile.axes``. Split-K vs.
+      regular output-partition is derived at codegen time from
+      ``escape_analysis.atomic_axes``.
     - ``THREAD`` / ``COOPERATIVE_STRIDE`` → ``ThreadTile.axes``
       (``COOPERATIVE_STRIDE`` axis names go into ``ThreadTile.cooperative_axes``).
     - ``REGISTER`` → ``RegisterTile.axes``.
@@ -352,8 +353,10 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     current: tuple[Stmt, ...] = inner_body
     for kind, axes, roles in reversed(groups):
         if kind == "grid":
-            splitk = tuple(ax.name for ax, r in zip(axes, roles, strict=True) if r is Role.SPLITK_BLOCK)
-            current = (GridTile(axes=tuple(axes), body=Body(current), splitk_axes=splitk),)
+            # SPLITK_BLOCK axes need no tag — codegen derives atomic-add
+            # from ``escape_analysis.atomic_axes`` (block axis missing
+            # from Write.index).
+            current = (GridTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "thread":
             coop = tuple(ax.name for ax, r in zip(axes, roles, strict=True) if r is Role.COOPERATIVE_STRIDE)
             current = (ThreadTile(axes=tuple(axes), body=Body(current), cooperative_axes=coop),)

@@ -72,8 +72,8 @@ def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
     """Rebuild ``outer`` with the per-thread scope's body replaced.
 
     Preserves the GridTile wrapper (if any) and the ThreadTile's
-    ``cooperative_axes`` / GridTile's ``splitk_axes`` metadata so downstream
-    rewrites are transparent to launch geometry.
+    ``cooperative_axes`` tag so downstream rewrites are transparent to
+    launch geometry.
     """
     new_body = Body.coerce(new_body) if not isinstance(new_body, Body) else new_body
     if isinstance(outer, ThreadTile):
@@ -86,7 +86,7 @@ def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
                 new_outer_body.append(ThreadTile(axes=child.axes, body=new_body, cooperative_axes=child.cooperative_axes))
             else:
                 new_outer_body.append(child)
-        return GridTile(axes=outer.axes, body=Body(new_outer_body), splitk_axes=outer.splitk_axes)
+        return GridTile(axes=outer.axes, body=Body(new_outer_body))
     raise TypeError(f"replace_thread_tile_body: expected GridTile/ThreadTile, got {type(outer).__name__}")
 
 
