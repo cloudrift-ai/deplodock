@@ -23,6 +23,13 @@ from deplodock.compiler.ir.tile.ir import BufferedStage, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
+# Pin the compile context to sm_80 (163 KB dynamic smem) so the padded matmul
+# variant always survives ``TileOp.validate``'s smem-cap check. The default
+# ``Context.probe()`` would pick up whatever the test host runs (e.g. 99 KB
+# on sm_120) and silently reject ``PAD_SMEM=True`` variants on smem-tight
+# matmul shapes — masking the very firing the tests are meant to assert.
+_TEST_CTX = Context.from_target((8, 0))
+
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
@@ -60,7 +67,7 @@ def _padded_sources(op: TileOp) -> dict[str, tuple[int, ...]]:
 
 def test_pad_smem_fires_on_matmul(recording_dump):
     g = _build_matmul()
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=_TEST_CTX)
     assert "pad_smem" in recording_dump.fired_rules("lowering/tile")
 
 
@@ -68,7 +75,7 @@ def test_greedy_default_picks_pad_on(monkeypatch):
     """With no env pin, the greedy run picks variant 0 — PAD_SMEM=True."""
     monkeypatch.delenv("DEPLODOCK_PAD_SMEM", raising=False)
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
     assert op.knobs.get("PAD_SMEM") is True
     pads = _padded_sources(op)
@@ -81,7 +88,7 @@ def test_greedy_default_picks_pad_on(monkeypatch):
 def test_env_pin_false_drops_all_pads(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_PAD_SMEM", "false")
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
     assert op.knobs.get("PAD_SMEM") is False
     pads = _padded_sources(op)
@@ -91,7 +98,7 @@ def test_env_pin_false_drops_all_pads(monkeypatch):
 def test_env_pin_true_applies_pad(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_PAD_SMEM", "true")
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
     assert op.knobs.get("PAD_SMEM") is True
     pads = _padded_sources(op)
@@ -105,11 +112,10 @@ def test_pad_smem_is_idempotent():
     """Already-knobbed TileOps skip — the variant fork would otherwise
     re-emit on every pass."""
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     mod = _load_pass()
-    ctx = Context.from_target((8, 0))
     try:
-        mod.rewrite(ctx, g2.nodes["o"])
+        mod.rewrite(_TEST_CTX, g2.nodes["o"])
         raised = False
     except RuleSkipped:
         raised = True
@@ -134,7 +140,7 @@ def test_no_bank_conflict_means_no_variants():
         def on_pass(self, *a):
             pass
 
-    Pipeline.build(TILE_PASSES, dump=R()).run(g)
+    Pipeline.build(TILE_PASSES, dump=R()).run(g, ctx=_TEST_CTX)
     assert not any("pad_smem" in r for _, r in rec)
 
 
@@ -145,7 +151,7 @@ def test_pad_drives_max_way_to_one():
     from deplodock.compiler.ir.tile.ir import ThreadTile
 
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
     if op.knobs.get("PAD_SMEM") is not True:
         return  # variant order skipped pad; the env-pin test covers this case

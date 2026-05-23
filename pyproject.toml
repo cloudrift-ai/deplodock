@@ -32,7 +32,6 @@ deplodock = "deplodock.deplodock:main"
 asyncio_mode = "auto"
 markers = [
     "perf: GPU performance comparison vs PyTorch (deselected by default; run with `pytest -m perf`)",
-    "serial: must run with a dedicated CUDA context (excluded from the parallel xdist sweep; `make test` runs these alone after the parallel pass finishes — keeps multi-kernel tests that issue OOB-prone schedules from poisoning the workers of unrelated tests).",
 ]
 
 [tool.ruff]
