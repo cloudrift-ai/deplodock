@@ -17,7 +17,6 @@ from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import (
     benchmark_program,
     benchmark_program_isolated,
-    make_runner,
     run_program,
     run_program_debug,
 )
@@ -180,14 +179,3 @@ class CudaBackend(Backend):
             num_launches=result.num_launches,
             per_launch=result.per_launch,
         )
-
-    def make_runner(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None):
-        """Return a zero-arg ``run_once()`` callable that issues one full
-        kernel-sequence pass on the same pre-allocated buffers. Used for
-        interleaved benchmarking against PyTorch.
-
-        Per-call locking is intentionally omitted: callers that need
-        process-level serialization should hold ``gpu_lock()`` around
-        their entire iter loop instead of acquiring/releasing on every
-        kernel launch."""
-        return make_runner(compiled, input_data=input_data)
