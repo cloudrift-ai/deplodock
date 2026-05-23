@@ -1,8 +1,6 @@
-"""Tests for ``deplodock.compiler.ir.tile.escape_analysis``.
-
-Verifies the three queries (cooperative thread axes per Accum, atomic
-axes per Write, broadcast guard axes per Write) match the answers
-``001_coordination`` produces for canonical kernel shapes.
+"""Tests for ``Body.coordination`` — per-Write atomic /
+broadcast-guard / per-Accum cooperative-axis derivation that drives
+materialize-time / render-time coordination decisions.
 """
 
 from __future__ import annotations
@@ -13,7 +11,6 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Assign, Load
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.stmt.leaves import Write
-from deplodock.compiler.ir.tile.escape_analysis import analyze
 from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile
 
 # ---------------------------------------------------------------------------
@@ -57,7 +54,7 @@ def test_pointwise_no_coordination():
             Write(output="o", index=(Var("i"), Var("j")), value="x_v"),
         ),
     )
-    result = analyze(Body((tile,)))
+    result = Body((tile,)).coordination
 
     assert result.cooperative_thread_axes == frozenset()
     assert all(not result.atomic_axes(w) for w in result.writes)
@@ -93,7 +90,7 @@ def test_plain_matmul_no_cooperation():
             Write(output="C", index=(Var("M_t"), Var("N_t")), value="acc"),
         ),
     )
-    result = analyze(Body((tile,)))
+    result = Body((tile,)).coordination
 
     assert result.accum_cooperative_axes["acc"] == frozenset()
     assert result.cooperative_thread_axes == frozenset()
@@ -144,7 +141,7 @@ def test_cooperative_rmsnorm_acc_escapes():
             Write(output="o", index=(Literal(0, "int"),), value="v1"),
         ),
     )
-    result = analyze(Body((tile,)))
+    result = Body((tile,)).coordination
 
     assert result.accum_cooperative_axes["acc"] == frozenset({"t"})
     assert result.cooperative_thread_axes == frozenset({"t"})
@@ -195,7 +192,7 @@ def test_cooperative_rmsnorm_write_inside_thread_loop_no_guard():
             ),
         ),
     )
-    result = analyze(Body((tile,)))
+    result = Body((tile,)).coordination
 
     # acc still escapes the reduce loop, and the Write doesn't reference
     # t — so by the structural rule, the Write IS broadcast-guarded over
@@ -250,7 +247,7 @@ def test_split_k_matmul_is_atomic():
             ),
         ),
     )
-    result = analyze(Body((tile,)))
+    result = Body((tile,)).coordination
 
     (only_write,) = result.writes
     assert result.atomic_axes(only_write) == frozenset({"K_s"})
@@ -292,7 +289,7 @@ def test_plain_matmul_in_grid_no_atomic():
             ),
         ),
     )
-    result = analyze(Body((tile,)))
+    result = Body((tile,)).coordination
 
     (only_write,) = result.writes
     assert result.atomic_axes(only_write) == frozenset()
