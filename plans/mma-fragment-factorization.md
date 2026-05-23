@@ -111,7 +111,7 @@ when eligible, and the scalar variants follow.
    For MMA kernels (`ATOM_SHAPE != (1, 1, 1)`) there are no scalar f16 `Init` / `Accum` to pair — the C-fragment IS
    the accumulator. Add a structural guard: skip when body contains `MmaFragment` decls.
 
-8. **`permute_register_tile` interaction.** Permutes LDS.128 indices on Stage Loads to break bank conflicts. WMMA
+8. **`permute_lane_accesses` interaction.** Permutes LDS.128 indices on Stage Loads to break bank conflicts. WMMA
    uses `ld.matrix` (or the wmma::load_matrix_sync intrinsic), which has its own swizzled access pattern. Skip when
    `ATOM_SHAPE != (1, 1, 1)` to avoid double-permutation.
 
@@ -322,7 +322,7 @@ NVRTC compilation).
 
 ## M7 — Skip incompatible kernel passes
 
-**Why.** `pack_fp16_pairs` and `permute_register_tile` don't apply to MMA kernels and would corrupt them if
+**Why.** `pack_fp16_pairs` and `permute_lane_accesses` don't apply to MMA kernels and would corrupt them if
 they fired.
 
 **Change.**
@@ -330,13 +330,13 @@ they fired.
 - `006_pack_fp16_pairs.py`: at top of `rewrite`, add
   `if root.op.knobs.get("ATOM_KIND", "scalar") != "scalar": raise RuleSkipped("non-scalar atom kind; pack-half2 not
   applicable")`. Idempotent — knob value doesn't change between runs.
-- `007a_permute_register_tile.py`: same guard via `root.op.knobs.get("ATOM_KIND", "scalar") != "scalar"`. The check
+- `005_permute_lane_accesses.py`: same guard via `root.op.knobs.get("ATOM_KIND", "scalar") != "scalar"`. The check
   generalizes to every future MMA kind (WMMA-BF16, NVFP4, wgmma) without re-editing the guard.
 
 **Files.**
 
 - `deplodock/compiler/pipeline/passes/lowering/kernel/006_pack_fp16_pairs.py` (~5 lines)
-- `deplodock/compiler/pipeline/passes/lowering/tile/007a_permute_register_tile.py` (~3 lines)
+- `deplodock/compiler/pipeline/passes/lowering/tile/005_permute_lane_accesses.py` (~3 lines)
 
 **Verification.** Run an MMA-eligible kernel through the full pipeline with `DEPLODOCK_MMA=1`; assert via the
 `.rules.json` dump that both skipped passes log `RuleSkipped` with the expected reason on the MMA variant.
@@ -490,6 +490,6 @@ paths.
 - `deplodock/compiler/ir/kernel/render.py` — `<mma.h>` include
 - `deplodock/compiler/pipeline/knobs.py` — `KnobType.STR` + `ATOM_KIND` registration
 - `deplodock/compiler/pipeline/passes/lowering/kernel/006_pack_fp16_pairs.py` — skip guard
-- `deplodock/compiler/pipeline/passes/lowering/tile/007a_permute_register_tile.py` — skip guard
+- `deplodock/compiler/pipeline/passes/lowering/tile/005_permute_lane_accesses.py` — skip guard
 - `deplodock/compiler/pipeline/ARCHITECTURE.md` — documentation update
 - `deplodock/compiler/ir/ARCHITECTURE.md` — documentation update
