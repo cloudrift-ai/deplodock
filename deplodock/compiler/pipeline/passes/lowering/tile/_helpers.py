@@ -134,7 +134,7 @@ def is_matmul_reduce(loop) -> bool:
 def collect_invariant_names(stmt: Stmt) -> set[str]:
     """SSA names that ``stmt`` defines and exposes to its enclosing scope.
 
-    For leaf stmts (Load, Assign, Select, Accum, Stage, Combine, etc.)
+    For leaf stmts (Load, Assign, Select, Accum, Stage, etc.)
     that's just ``stmt.defines()``. For wrapper stmts (Loop, Tile,
     Cond, StridedLoop) it recursively collects every Accum name in
     every nested body — those are the values the wrapper exposes

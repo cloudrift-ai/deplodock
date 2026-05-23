@@ -24,7 +24,6 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
 from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
-    Combine,
     ComputeStage,
     GridTile,
     ParallelTile,
@@ -52,11 +51,6 @@ def _(s: Stage, ctx: SimplifyCtx) -> Stmt:
     if isinstance(s, ComputeStage):
         kwargs["compute"] = tuple(simplify(c, ctx) for c in s.compute)
     return type(s)(**kwargs)
-
-
-@rewrite.register
-def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Combine(name=rename(s.name), op=s.op)
 
 
 @rewrite.register

@@ -146,35 +146,6 @@ class AsyncWait(Stmt):
 
 
 # ---------------------------------------------------------------------------
-# Cross-thread combine (Tile-IR-specific Stmt for cooperative reductions)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Combine(Stmt):
-    """Cross-thread reduction of an ``Accum`` target.
-
-    Placed immediately after a cooperative reduce loop (``StridedLoop``
-    whose ``Accum`` produced ``name``). Materialization emits the
-    cross-thread combine — smem tree-halve today; warp-shuffle / atomic
-    in the future.
-
-    ``op`` is a redundant copy of the matching ``Accum.op`` — kept as a
-    cross-check; if the strategy constructs a Combine with the wrong op
-    relative to the matching Accum, validation surfaces the bug.
-    """
-
-    name: str
-    op: ElementwiseImpl
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.name,)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}Combine({self.name}, op={self.op.name})"]
-
-
-# ---------------------------------------------------------------------------
 # Stage primitives: Source + CacheDim + AffineAddressing/TemplateAddressing
 # ---------------------------------------------------------------------------
 
@@ -546,7 +517,8 @@ class ThreadTile(ParallelTile):
 
     Replaces ``Tile`` with ``BIND_THREAD`` axes. ``cooperative_axes``
     carries the subset of axis names that are cross-thread cooperative
-    (today's ``Role.COOPERATIVE_STRIDE``) — drives ``Combine`` emission
+    (today's ``Role.COOPERATIVE_STRIDE``) — read by the escape-analysis
+    helper to determine where the materializer emits cross-thread combine
     after the matching reduce.
     """
 
@@ -1225,7 +1197,6 @@ __all__ = [
     "SerialTile",
     "StridedTile",
     "SerialKind",
-    "Combine",
     "Stage",
     "BufferedStage",
     "AsyncBufferedStage",

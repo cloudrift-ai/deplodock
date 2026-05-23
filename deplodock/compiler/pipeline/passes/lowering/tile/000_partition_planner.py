@@ -11,7 +11,8 @@ SPLITK > 1, K_c for cooperative-K BR > 1). Resulting nesting:
     K_s SPLITK_BLOCK → M_b BLOCK → N_b BLOCK → K_c COOPERATIVE_STRIDE →
       M_t THREAD → N_t THREAD → M_r REGISTER → N_r REGISTER →
         prelude → K_o SERIAL_OUTER → K_i STAGE_INNER (reduce σ(body)) →
-        Combine (cross-thread, when K_c is present) → post-K tower → Write
+        (helper-driven cross-thread combine when K_c is cooperative) →
+        post-K tower → Write
 
 Example transformation (matmul A[M=64,K=32] @ B[K=32,N=64] with BN=BM=16,
 FM=FN=1, BK=16, SPLITK=1, BR=1):
@@ -42,8 +43,9 @@ FM=FN=1, BK=16, SPLITK=1, BR=1):
 
 For cooperative-K reduce (e.g. sum K=512 with BR=256, BK=2), K_c appears as
 a COOPERATIVE_STRIDE thread axis above the BLOCK level and σ_k extends to
-``k = k_o·512 + k_i·256 + k_c``; launch_geometry emits a ``Combine`` after
-the reduce subtree.
+``k = k_o·512 + k_i·256 + k_c``; the materializer emits the cross-thread
+combine after the reduce subtree based on the escape-analysis helper
+(``ir/tile/escape_analysis.py``) reading ``ThreadTile.cooperative_axes``.
 
 For the fused-prologue matmul (SDPA P@V — softmax max/sum/reciprocal sitting
 as siblings of an inner output Loop that holds the actual matmul), the chain
@@ -54,9 +56,10 @@ the ``N_r`` register tower. SPLITK clamps to 1 in this branch — the prologue
 feeds the matmul, so each K_s CTA would consume a partial softmax stat.
 
 Pointwise collapses to BM = FM = FN = 1; extent-1 sub-axes get inlined by
-normalize_body. SPLITK + Write atomicity is handled by launch_geometry's
-generic BLOCK-lift rewrite, not here. Cooperative-K's Combine emission lives
-in ``001_launch_geometry`` (folded from the deleted ``002_cooperative_reduce``).
+normalize_body. SPLITK + Write atomicity is derived at codegen time from
+``escape_analysis.atomic_axes`` (Write index vs enclosing block axes).
+Cooperative-K combine emission similarly happens in the materializer from
+the helper's ``accum_cooperative_axes``.
 
 Priority keys: matmul prefers high cells/thread (amortize K-loop overhead);
 pointwise prefers low cells/thread (memory-bandwidth bound); cooperative

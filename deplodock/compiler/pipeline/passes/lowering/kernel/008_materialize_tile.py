@@ -1,8 +1,9 @@
 """Materialize a Tile-IR ``TileOp`` into a Kernel-IR ``KernelOp``.
 
 The wrapper stays as ``Tile`` (shared with Tile IR via ``ir.stmt``);
-only the body content changes — ``Stage`` becomes
-``Smem`` + cooperative load, ``Combine`` becomes smem tree-halve,
+only the body content changes — ``Stage`` becomes ``Smem`` + cooperative
+load, cooperative ``Accum`` escapes become smem tree-halve / warp-shuffle
+via the escape-analysis helper (``ir/tile/escape_analysis.py``),
 ``Loop`` / ``StridedLoop`` pass through. Two paths:
 
 - **Non-cooperative** (no ``BIND_BLOCK`` axes): every BoundAxis is
@@ -20,11 +21,12 @@ only the body content changes — ``Stage`` becomes
       (multi-axis stages flatten via row-major decode).
     * ``Loop`` / ``StridedLoop`` → passed through (recursive walk for
       Stage / Write handling inside).
-    * ``Combine`` after a reduce loop → smem tree-halve + broadcast.
+    * Cooperative ``Accum`` (per ``accum_cooperative_axes``) → smem
+      tree-halve + broadcast emitted right after the enclosing reduce.
     * ``Write`` whose index references a THREAD axis is emitted
       unconditionally (each thread owns a unique output slot). Writes
-      that don't reference any THREAD axis are guarded by ``tid==0`` so
-      only one thread writes.
+      that don't reference any THREAD axis get a ``tid==0`` guard at
+      Kernel render time (``Write.render`` reads ``ctx.broadcast_writes``).
 
 Produces a ``KernelOp`` — distinct type from ``TileOp``, so Kernel-IR
 passes can pattern-match on it.
@@ -59,7 +61,6 @@ from deplodock.compiler.ir.tile.ir import (
     AsyncBufferedStage,
     AsyncWait,
     BufferedStage,
-    Combine,
     ComputeStage,
     GridTile,
     RegisterTile,
@@ -464,14 +465,6 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
                 dt = stmt.dtype or F32
                 new_body.extend(_emit_combine(stmt.name, stmt.op, tid_var, n_threads, dt, warp_size=warp_size))
                 rename[stmt.name] = f"{stmt.name}_b"
-        elif isinstance(stmt, Combine):
-            # Skip — helper-driven Combine emission above already handled
-            # cooperative Accums. Kept as a no-op branch so coordination's
-            # legacy Combine stmts don't fall into the ``else`` (which
-            # would copy them into the kernel body verbatim — they have
-            # no render() in Kernel IR). Will be removed in M5 when the
-            # Combine class is deleted.
-            pass
         else:
             new_body.append(transform(stmt))
 
