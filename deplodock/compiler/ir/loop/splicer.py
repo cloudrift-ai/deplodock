@@ -363,7 +363,7 @@ class _Splicer(LoopBuilder):
         inner_sigma = d.sigma.extend(orig_axis.name, Var(fresh_name))
         inner_scope = Scope(enclosing=d.demand_scope.enclosing + (reduce_axis,))
         value_bound = self._ensure_dep(stmt.value, d.origin, inner_sigma, inner_scope)
-        self.insert(Accum(name=d.bound_as, value=value_bound, op=stmt.op), inner_scope)
+        self.insert(Accum(name=d.bound_as, value=value_bound, op=stmt.op, axes=(fresh_name,)), inner_scope)
 
 
 # ---------------------------------------------------------------------------

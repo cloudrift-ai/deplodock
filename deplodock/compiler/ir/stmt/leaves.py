@@ -437,6 +437,13 @@ class Accum(Stmt):
 
     Default op is ``add`` — fixtures that sum values can omit ``op=``;
     ``max`` / ``min`` / ``mul`` must be passed explicitly.
+
+    ``axes`` is the tuple of axis names this Accum reduces over —
+    populated by the lifting pass (one axis name from the wrapping reduce
+    ``Loop``) and propagated by every rewrite that renames axes via
+    Sigma. Used by the escape-analysis helper to derive cross-thread
+    cooperativity (``Accum.axes ∩ enclosing ThreadTile.axes``); empty
+    tuple = legacy/handwritten path with no reduction-axis info.
     """
 
     name: str
@@ -450,6 +457,7 @@ class Accum(Stmt):
     # dtype disagrees with the accumulator's. ``None`` preserves the legacy
     # f32 rendering.
     dtype: DataType | None = None
+    axes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.op, str):

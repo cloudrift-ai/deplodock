@@ -5,21 +5,22 @@ Computes three queries from a ``TileOp`` body:
 - ``atomic_axes(write)`` — enclosing ``GridTile`` axis names NOT in the
   Write's index. Non-empty ⇒ multiple CTAs race ⇒ ``atomicAdd``. Purely
   structural — derivable from Write index vs. enclosing block axes.
-- ``broadcast_axes(write)`` — enclosing cooperative thread axes NOT in
-  the Write's index. Non-empty ⇒ ``Cond(axis == 0)`` guard required.
-- ``accum_cooperative_axes[name]`` — for each ``Accum.name``, the set of
-  cooperative thread axes whose loop the Accum is updated inside and
-  whose escape requires a cross-thread ``Combine``.
+- ``broadcast_axes(write)`` — cooperative thread axes (derived from
+  ``Accum.axes`` ∩ enclosing ``ThreadTile.axes``) NOT in the Write's
+  index. Non-empty ⇒ ``Cond(axis == 0)`` guard required.
+- ``accum_cooperative_axes[name]`` — for each ``Accum.name``, the
+  intersection of its declared reduction axes with the enclosing
+  ``ThreadTile.axes``. Non-empty ⇒ a cross-thread combine is required
+  at the Accum's escape point.
 
-**Cooperativity is taken from ``ThreadTile.cooperative_axes`` directly**
-— not derived from data flow. After the partition planner emits a body,
-the cooperative-stride pattern lives in the load *index expression*
-(``x[..., a2*512 + a3*256 + a1]``) rather than in any loop kind, so a
-structural rule like "StridedLoop bound to thread axis ⇒ cooperative"
-misses BR=K degenerate kernels and post-staging shapes. The planner's
-tag is the structural source of truth; the helper treats it as input
-and derives only the operational consequences (Combine emission,
-atomic stamping, Cond-guard placement).
+**Cooperativity is derived from ``Accum.axes``.** The planner populates
+``Accum.axes`` with every loop / thread axis the Accum reduces over, and
+σ-split propagates renames through (a single K axis becoming K_o × K_i ×
+K_c expands into three sub-axes on the Accum). When any of those axes is
+also bound by an enclosing ``ThreadTile``, the per-thread partials need
+combining cross-thread — that's the cooperative-K case. Plain-matmul
+Accums have only serial-loop axes, so the intersection is empty and no
+combine fires.
 
 The materializer / Kernel-IR render consume the analysis directly: there
 is no separate coordination pass. See
@@ -105,31 +106,32 @@ def analyze(tile_op_or_body: TileOp | Body) -> EscapeAnalysis:
         write_atomic_axes[id(w)] = frozenset(missing)
 
     # --- Cooperative axes per Accum ---
-    # Read from the enclosing ThreadTile's planner-emitted tag rather
-    # than try to derive. See module docstring for why derivation is
-    # unreliable post-staging.
+    # Intersection of the Accum's declared reduction axes with the
+    # enclosing ThreadTile's axes. Anything in both sets is a
+    # cooperative thread axis — per-thread partials need combining
+    # cross-thread before the Accum value escapes.
     accum_cooperative_axes: dict[str, frozenset[str]] = {}
     for acc, chain in accums:
-        accum_cooperative_axes[acc.name] = _enclosing_cooperative_axes(chain)
+        thread_axes = _enclosing_thread_axes(chain)
+        accum_cooperative_axes[acc.name] = frozenset(acc.axes) & thread_axes
 
     cooperative_thread_axes = frozenset().union(*accum_cooperative_axes.values()) if accum_cooperative_axes else frozenset()
 
     # --- Broadcast-Write classification ---
-    # A Write needs a Cond-guard for axis t iff t is in the enclosing
-    # ThreadTile.cooperative_axes AND t is not referenced by the Write's
-    # index. This conservatively guards any write that sits at
-    # cooperative scope without using the cooperative thread var — same
-    # rule ``001_coordination``'s ``_guard_scalar_write`` applies.
-    # Staging-buffer writes are skipped: the warp-shuffle / smem tree-
-    # halve code in ``_emit_combine`` carries its own per-lane / per-warp
-    # guards, and a second guard would collapse the broadcast write to
-    # thread 0 only (leaving the rest of the smem slab uninitialized).
+    # A Write needs a Cond-guard for axis t iff t is a cooperative thread
+    # axis derived from any Accum in the body AND t is not referenced by
+    # the Write's index. Staging-buffer writes are skipped: the warp-
+    # shuffle / smem tree-halve code in ``_emit_combine`` carries its own
+    # per-lane / per-warp guards, and a second guard would collapse the
+    # broadcast write to thread 0 only (leaving the rest of the smem
+    # slab uninitialized).
     write_broadcast_axes: dict[int, frozenset[str]] = {}
     for w, chain in writes:
         if w.output in staging_buffers:
             write_broadcast_axes[id(w)] = frozenset()
             continue
-        coop_axes = _enclosing_cooperative_axes(chain)
+        thread_axes = _enclosing_thread_axes(chain)
+        coop_axes = cooperative_thread_axes & thread_axes
         w_idx_vars = _free_vars_in_index(w)
         write_broadcast_axes[id(w)] = frozenset(coop_axes - w_idx_vars)
 
@@ -200,14 +202,13 @@ def _staging_buffer_names(body: Body) -> frozenset[str]:
     return frozenset(out)
 
 
-def _enclosing_cooperative_axes(chain: tuple[Stmt, ...]) -> frozenset[str]:
-    """Union of ``ThreadTile.cooperative_axes`` across every ``ThreadTile``
-    enclosing the leaf. This is the planner's structural source of truth
-    for cooperativity — see module docstring."""
+def _enclosing_thread_axes(chain: tuple[Stmt, ...]) -> frozenset[str]:
+    """Union of ``ThreadTile.axes`` (names) across every ``ThreadTile``
+    enclosing the leaf."""
     out: set[str] = set()
     for s in chain:
         if isinstance(s, ThreadTile):
-            out.update(s.cooperative_axes)
+            out.update(ax.name for ax in s.axes)
     return frozenset(out)
 
 

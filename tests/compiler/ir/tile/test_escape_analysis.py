@@ -129,14 +129,13 @@ def test_cooperative_rmsnorm_acc_escapes():
     a1 = Axis("a1", 3584)
     tile = ThreadTile(
         axes=(t,),
-        cooperative_axes=("t",),
         body=(
             SerialTile(
                 axis=a1,
                 body=(
                     Load(name="in2", input="x", index=(Var("a1"),)),
                     Assign(name="v0", op="multiply", args=("in2", "in2")),
-                    Accum(name="acc", value="v0", op=ElementwiseImpl("add")),
+                    Accum(name="acc", value="v0", op=ElementwiseImpl("add"), axes=("t", "a1")),
                 ),
                 kind="stage_inner",
             ),
@@ -176,13 +175,12 @@ def test_cooperative_rmsnorm_write_inside_thread_loop_no_guard():
     a2 = Axis("a2", 3584)
     tile = ThreadTile(
         axes=(t,),
-        cooperative_axes=("t",),
         body=(
             SerialTile(
                 axis=a1,
                 body=(
                     Load(name="in1", input="x", index=(Var("a1"),)),
-                    Accum(name="acc", value="in1", op=ElementwiseImpl("add")),
+                    Accum(name="acc", value="in1", op=ElementwiseImpl("add"), axes=("t", "a1")),
                 ),
                 kind="stage_inner",
             ),

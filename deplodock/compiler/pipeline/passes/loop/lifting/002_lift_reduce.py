@@ -61,7 +61,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
             axis=reduce_axis,
             body=(
                 Load(name="in0", input=src_id, index=load_index),
-                Accum(name="acc", value="in0", op=combine),
+                Accum(name="acc", value="in0", op=combine, axes=(reduce_axis_name,)),
             ),
         ),
         Write(output=f"lift_{root.id}", index=write_index, value="acc"),

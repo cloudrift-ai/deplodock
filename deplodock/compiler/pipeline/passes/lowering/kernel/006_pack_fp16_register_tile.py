@@ -245,7 +245,10 @@ def _pair_accums_in_body(
             low_accum = pending_low.pop(pid)
             pack_name = f"{low_accum.value}_{s.value}_p"
             out.append(Pack(name=pack_name, low=low_accum.value, high=s.value, dtype=F16x2))
-            out.append(Accum(name=pair_name, value=pack_name, op=s.op, dtype=F16x2))
+            # Carry forward axes from one of the paired Accums — the pair
+            # reduces over the same axis set (they're sibling Accums of
+            # the same reduce loop, hence the pre-validation check).
+            out.append(Accum(name=pair_name, value=pack_name, op=s.op, dtype=F16x2, axes=s.axes))
             continue
         out.append(s)
 

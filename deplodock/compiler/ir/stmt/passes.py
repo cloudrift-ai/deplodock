@@ -90,7 +90,31 @@ def _(s: Assign, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Accum(name=rename(s.name), value=rename(s.value), op=s.op, dtype=s.dtype)
+    new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
+    return Accum(
+        name=rename(s.name),
+        value=rename(s.value),
+        op=s.op,
+        dtype=s.dtype,
+        axes=new_axes,
+    )
+
+
+def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
+    """Apply ``sigma`` to an axis name and return the resulting axis
+    name(s). Handles three cases:
+
+    - ``sigma`` doesn't touch ``name``: returns ``(name,)``.
+    - Pure rename (``Var(old) → Var(new)``): returns ``(new,)``.
+    - σ-split (``Var(K) → Var(K_o)*N + Var(K_i)``, etc.): returns the
+      free-var names of the substitution expression. An Accum that
+      reduced over the original axis now reduces over the split sub-
+      axes.
+    """
+    replacement = sigma.mapping.get(name)
+    if replacement is None:
+        return (name,)
+    return tuple(sorted(replacement.free_vars()))
 
 
 @rewrite.register
