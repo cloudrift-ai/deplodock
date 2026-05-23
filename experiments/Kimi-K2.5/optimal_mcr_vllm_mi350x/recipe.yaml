@@ -1,0 +1,23 @@
+model:
+  huggingface: "moonshotai/Kimi-K2.5"
+
+engine:
+  llm:
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    context_length: 262144
+    vllm:
+      image: "vllm/vllm-openai-rocm:v0.17.1"
+      extra_args: "--tool-call-parser kimi_k2 --reasoning-parser kimi_k2"
+
+benchmark:
+  random_input_len: 8000
+  random_output_len: 8000
+
+matrices:
+  - deploy.gpu: "AMD Instinct MI350X"
+    deploy.gpu_count: 8
+    engine.llm.max_concurrent_requests: [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]
+    benchmark.max_concurrency: [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]
+    benchmark.num_prompts: 48
