@@ -35,7 +35,8 @@ format: setup
 	./venv/bin/ruff check --fix
 
 test: setup
-	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
+	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup -m "not serial"
+	./venv/bin/pytest tests/ -v -p no:xdist -m serial --ignore=tests/perf
 
 bench-kernels-clean: setup
 	@rm -f /tmp/deplodock-gpu.lock

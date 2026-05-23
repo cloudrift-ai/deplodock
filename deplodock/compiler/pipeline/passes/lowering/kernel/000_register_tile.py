@@ -158,7 +158,7 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
                 # the cache-axis 'bound' mask in the fold guard above prevents
                 # 006a from tagging them for replication.
                 out.append(s.with_bodies(tuple(go(child) for child in nested)))
-            elif axis in deps.get(id(s), frozenset()):
+            elif _needs_replication(s, axis, deps, keep):
                 for i in range(factor):
                     out.append(s.rewrite(rename_for(i), sigma_for(i)))
             else:
@@ -166,3 +166,19 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
         return Body(out)
 
     return go(body)
+
+
+def _needs_replication(s, axis: str, deps: dict, keep: dict[str, bool]) -> bool:
+    """A stmt needs replication along ``axis`` iff (a) the per-id deps for
+    this exact stmt include axis, OR (b) it defines an SSA name marked
+    ``keep[name] = True`` (the cross-scope-tolerant version of the same
+    check). The keep-fallback exists because ``body.fold``'s per-id deps
+    use ``body.definitions[name]`` (name → last-defining stmt) to look up
+    child memos: for two sibling scopes that re-use a name, the FIRST
+    sibling's stmts see ``memo[id(other_sibling_def)] = None`` and end up
+    with empty deps even though they transitively read the axis. Using
+    keep[name] (which is last-wins across the body and correctly reflects
+    *some* definer reads the axis) covers the missed case."""
+    if axis in deps.get(id(s), frozenset()):
+        return True
+    return any(keep.get(n, False) for n in s.defines())

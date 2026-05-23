@@ -64,6 +64,7 @@ def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         names=tuple(rename(n) for n in s.names),
         input=s.input,
         index=tuple(sigma.apply(e) for e in s.index),
+        dtype=s.dtype,
     )
 
 
@@ -84,7 +85,7 @@ def _(s: Unpack, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Assign, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Assign(name=rename(s.name), op=s.op, args=tuple(rename(a) for a in s.args))
+    return Assign(name=rename(s.name), op=s.op, args=tuple(rename(a) for a in s.args), dtype=s.dtype)
 
 
 @rewrite.register
@@ -104,6 +105,7 @@ def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         index=tuple(sigma.apply(e) for e in s.index),
         values=tuple(rename(n) for n in s.values),
         reduce_op=s.reduce_op,
+        value_dtype=s.value_dtype,
     )
 
 
@@ -158,7 +160,7 @@ def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
 
 @simplify.register
 def _(s: Load, ctx: SimplifyCtx) -> Stmt:
-    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index))
+    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index), dtype=s.dtype)
 
 
 @simplify.register
@@ -168,6 +170,7 @@ def _(s: Write, ctx: SimplifyCtx) -> Stmt:
         index=tuple(e.simplify(ctx) for e in s.index),
         values=s.values,
         reduce_op=s.reduce_op,
+        value_dtype=s.value_dtype,
     )
 
 

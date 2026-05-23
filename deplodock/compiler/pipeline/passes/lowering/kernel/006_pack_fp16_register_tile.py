@@ -61,20 +61,19 @@ from __future__ import annotations
 
 from deplodock.compiler.dtype import F16, F16x2
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Pack, Stmt, Unpack
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
-PATTERN = [Pattern("root", KernelOp)]
+PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
-    kop = root.op
-    new_body, did = _pack_body_recursive(kop.body)
+def rewrite(root: Node) -> Graph | None:
+    top = root.op
+    new_body, did = _pack_body_recursive(top.body)
     if not did:
         raise RuleSkipped("no f16 Accum/Init groups to pair")
-    return KernelOp(body=new_body, name=kop.name)
+    return TileOp(body=new_body, name=top.name, knobs=dict(top.knobs))
 
 
 def _pack_body_recursive(body: Body) -> tuple[Body, bool]:

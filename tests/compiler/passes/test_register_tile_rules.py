@@ -17,7 +17,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp, SdpaOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -102,9 +102,9 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "register_tile_planned" in fired, fired
+    Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    fired = recording_dump.fired_rules("lowering/kernel")
+    assert "register_tile" in fired, fired
 
 
 def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
@@ -120,5 +120,5 @@ def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "register_tile_planned" in recording_dump.fired_rules("lowering/tile")
+    Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    assert "register_tile" in recording_dump.fired_rules("lowering/kernel")

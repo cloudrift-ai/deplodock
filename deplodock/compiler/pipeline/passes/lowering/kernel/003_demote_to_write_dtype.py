@@ -67,12 +67,11 @@ from dataclasses import replace
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Stmt, Write
+from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
-PATTERN = [Pattern("root", KernelOp)]
+PATTERN = [Pattern("root", TileOp)]
 
 # Single shared target instance — the pass only consults its
 # ``has_native_op`` predicate, which is stateless.
@@ -80,16 +79,14 @@ _TARGET = CudaRenderTarget()
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
-    kop: KernelOp = root.op
-    body = kop.body
+    top: TileOp = root.op
+    body = top.body
 
-    # Output / input buffer dtypes come straight off ``kop.inputs`` /
-    # ``kop.outputs`` — the matcher has snapped them to the surrounding
-    # graph's Tensors. Fall back to ``root.output`` for the KernelOp's
-    # own node-output when not otherwise listed.
-    out_dtypes: dict[str, str] = {n: t.dtype.name for n, t in kop.outputs.items()}
+    # Output buffer dtypes — read off ``TileOp.outputs`` (same shape as
+    # the legacy ``KernelOp.outputs``: matcher-populated graph Tensors).
+    # Fall back to ``root.output`` for the op's own node-output.
+    out_dtypes: dict[str, str] = {n: t.dtype.name for n, t in top.outputs.items()}
     out_dtypes.setdefault(root.id, root.output.dtype.name)
-    in_dtypes: dict[str, str] = {n: t.dtype.name for n, t in kop.inputs.items()}
 
     # ssa-name → defining Stmt (deep traversal).
     defs: dict[str, Stmt] = {}
@@ -98,11 +95,11 @@ def rewrite(match: Match, root: Node) -> Graph | None:
             defs[n] = s
 
     # Step 1 (forward): the set of SSA names that already carry an f16
-    # value end-to-end — Loads from f16 buffers, Accums / Inits with
-    # ``dtype = F16``, WarpShuffle / TreeHalve broadcasts at f16, and
-    # any Assign whose op has a native f16 form AND at least one arg
-    # is itself an f16 carrier. Iterates to fixed point.
-    fp16_carrier: set[str] = _seed_fp16_carriers(body, in_dtypes)
+    # value end-to-end — Loads with stamped f16 dtype, Accums / Inits
+    # with ``dtype = F16``, and any Assign whose op has a native f16
+    # form AND at least one arg is itself an f16 carrier. Iterates to
+    # fixed point.
+    fp16_carrier: set[str] = _seed_fp16_carriers(body)
     changed = True
     while changed:
         changed = False
@@ -128,6 +125,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     queue: list[str] = []
     for s in body.iter():
         if isinstance(s, Write) and out_dtypes.get(s.output, "f32") == "f16":
+            # ``s.value`` asserts scalar; pre-materialize Writes are
+            # always scalar (vectorize_stores runs later).
             if s.value not in feeds_f16_write:
                 feeds_f16_write.add(s.value)
                 queue.append(s.value)
@@ -183,7 +182,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if new_body == body:
         raise RuleSkipped("no change after demotion (already stamped)")
 
-    return KernelOp(body=new_body, name=kop.name)
+    return TileOp(body=new_body, name=top.name)
 
 
 def _build_uses(body: Body) -> dict[str, list[Stmt]]:
@@ -195,7 +194,7 @@ def _build_uses(body: Body) -> dict[str, list[Stmt]]:
         if isinstance(s, Assign):
             deps = list(s.args)
         elif isinstance(s, Write):
-            deps = [s.value]
+            deps = list(s.values)
         elif isinstance(s, Accum):
             deps = [s.value]
         for d in deps:
@@ -225,41 +224,30 @@ def _all_uses_demoted(name: str, uses: dict[str, list[Stmt]], demote_set: set[st
     return True
 
 
-def _seed_fp16_carriers(body: Body, in_dtypes: dict[str, str]) -> set[str]:
+def _seed_fp16_carriers(body: Body) -> set[str]:
     """Initial fp16 carriers — SSA names whose value naturally lives in
     fp16 from the moment they're defined:
 
-    - ``Load`` from a graph buffer that's fp16 (input or fp16 Smem).
+    - ``Load`` whose stamped ``dtype.name == "f16"`` (either reading
+      from an fp16 graph buffer or from an fp16-stamped Stage source).
+      ``001_stamp_types`` populates ``Load.dtype`` from either side
+      before this pass runs.
     - ``Accum`` / ``Init`` with ``dtype == F16``.
-    - ``WarpShuffle`` / ``TreeHalve`` results when the stmt's dtype is
-      F16 (their renderers declare the local at that dtype).
-    - ``Load`` from a smem buffer declared as ``__half`` (the materializer
-      stamps ``Smem.dtype = "__half"`` for fp16-staged gmem inputs).
+
+    Pre-materialize there are no ``WarpShuffle`` / ``TreeHalve`` /
+    ``Smem`` Stmts to consider — those land at materialize time.
+    Pre-materialize Loads are always scalar (vectorize_loads runs
+    later), so ``s.names`` has length 1.
     """
-    smem_dtypes: dict[str, str] = {}
-    from deplodock.compiler.ir.kernel.ir import Smem  # noqa: PLC0415
-
-    for s in body.iter():
-        if isinstance(s, Smem):
-            smem_dtypes[s.name] = "f16" if s.dtype == "__half" else ("f32" if s.dtype == "float" else "")
-
     carriers: set[str] = set()
     for s in body.iter():
         if isinstance(s, Load):
-            buf_dt = in_dtypes.get(s.input) or smem_dtypes.get(s.input)
-            if buf_dt == "f16":
-                carriers.add(s.name)
+            if s.dtype is not None and s.dtype.name == "f16":
+                carriers.update(s.names)
         elif isinstance(s, Accum):
             if (s.dtype or F32).name == "f16":
                 carriers.add(s.name)
         elif isinstance(s, Init):
             if s.dtype.name == "f16":
                 carriers.add(s.name)
-        elif isinstance(s, (WarpShuffle, TreeHalve)):
-            if s.dtype.name == "f16":
-                # WarpShuffle defines a name; TreeHalve mutates its
-                # buf in-place. Both end at an f16-typed value.
-                defined = s.defines()
-                if defined:
-                    carriers.update(defined)
     return carriers

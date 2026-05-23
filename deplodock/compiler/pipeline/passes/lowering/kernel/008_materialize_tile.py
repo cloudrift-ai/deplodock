@@ -82,6 +82,18 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
+def _smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | None
+    """C type spelling for a Source's smem slab, derived from the
+    stamped ``Source.dtype`` (``001_stamp_types``). Defaults to the
+    legacy ``"float"`` when unstamped — handwritten test fixtures
+    rely on the fallback."""
+    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+    if src.dtype is None:
+        return "float"
+    return cuda_name(src.dtype)
+
+
 def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
     """Pre-flatten wrap-body Stages: ``Stage(sources, body=[consumer])`` becomes
     ``[Stage(sources, body=Body(())), *consumer_stmts]`` so the existing
@@ -120,29 +132,18 @@ def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
     return tuple(out)
 
 
-def rewrite(ctx: Context, match, root: Node) -> Graph | None:
-    # Per-graph-buffer CUDA C type names (e.g. ``"__half"``) so Stage
-    # materialization can stamp the matching ``Smem.dtype`` instead of
-    # the legacy ``"float"`` default. Covers anything reachable as a
-    # ``Stage.buf`` — the TileOp's input nodes are the natural set.
-    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
-
-    buf_cuda: dict[str, str] = {}
-    for bid in root.inputs:
-        node = match.graph.nodes.get(bid)
-        if node is not None:
-            buf_cuda[bid] = cuda_name(node.output.dtype)
+def rewrite(ctx: Context, root: Node) -> Graph | None:
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile)):
-            new_body.append(_materialize_top(s, buf_cuda, warp_size=ctx.warp_size))
+            new_body.append(_materialize_top(s, warp_size=ctx.warp_size))
         else:
             new_body.append(s)
 
     return KernelOp(body=new_body, name=root.op.name)
 
 
-def _materialize_top(top: Stmt, buf_cuda: dict[str, str], *, warp_size: int) -> Stmt:
+def _materialize_top(top: Stmt, *, warp_size: int) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
     Two shapes are possible coming out of ``001_launch_geometry``:
@@ -162,12 +163,12 @@ def _materialize_top(top: Stmt, buf_cuda: dict[str, str], *, warp_size: int) -> 
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, ThreadTile):
-                new_outer.append(_materialize(child, buf_cuda, warp_size=warp_size))
+                new_outer.append(_materialize(child, warp_size=warp_size))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer), splitk_axes=top.splitk_axes)
     if isinstance(top, ThreadTile):
-        return _materialize(top, buf_cuda, warp_size=warp_size)
+        return _materialize(top, warp_size=warp_size)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
@@ -176,8 +177,7 @@ def _materialize_top(top: Stmt, buf_cuda: dict[str, str], *, warp_size: int) -> 
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, warp_size: int) -> Stmt:
-    buf_cuda = buf_cuda or {}
+def _materialize(blk: ThreadTile, *, warp_size: int) -> Stmt:
     """Materialize a ThreadTile body. The ThreadTile carries the per-CTA
     thread axes directly (no BoundAxis filtering needed); strategies set
     this up — this pass commits no axis decisions of its own.
@@ -263,7 +263,9 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
                 buf_count = getattr(stmt, "buffer_count", 1)
                 if buf_count > 1:
                     extents = (buf_count, *extents)
-                compute_stage_prologue.append(Smem(name=src.name, extents=extents))
+                smem_dtype = _smem_cuda_dtype(src)
+                smem_align = 16 if smem_dtype == "__half" else 0
+                compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
                 declared_smem.add(src.name)
 
     stage_group, wait_group, group_stage_names, group_buffer_count = _partition_tma_groups(body)
@@ -359,7 +361,7 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
                 src_shape=(),
                 box_extents=box,
                 swizzle=stage.swizzle.value,
-                dtype=buf_cuda.get(src.buf, "float"),
+                dtype=_smem_cuda_dtype(src),
             )
         if mbar_name not in declared_mbar:
             declared_mbar.add(mbar_name)
@@ -373,7 +375,10 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
             )
             for s in range(bc):
                 mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=len(group_stage_names[gid]), slot=Literal(s, "int")))
-        slab_bytes = BYTES_PER_ELEM
+        # Use the stamped source dtype's byte count so TMA arrive-expect
+        # bytes match the actual copy size on fp16 inputs (legacy
+        # ``BYTES_PER_ELEM`` over-counted fp16 by 2x).
+        slab_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
         for ax in src.cache_axes:
             slab_bytes *= int(ax.extent)
         # Smem allocation: leading phase dim + cache extents (with pad).
@@ -401,7 +406,7 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
         # picker (012) was dropped from the wrap-body pipeline, so every
         # TMA stage runs at the base recommendation.
         align = _TMA_ALIGN_BYTES
-        smem_dtype = buf_cuda.get(src.buf, "float")
+        smem_dtype = _smem_cuda_dtype(src)
         out: list[Stmt] = [
             Smem(name=src.name, extents=full_extents, align=align, dtype=smem_dtype),
             cond,
@@ -425,13 +430,13 @@ def _materialize(blk: ThreadTile, buf_cuda: dict[str, str] | None = None, *, war
             new_body.extend(filter_emit(_emit_compute_stage(stmt, tid_expr, n_threads)))
             pending_reduce = {}
         elif isinstance(stmt, Stage):
-            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads, buf_cuda)))
+            new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
             pending_reduce = {}
         elif isinstance(stmt, AsyncWait):
             new_body.extend(emit_async_wait(stmt))
             pending_reduce = {}
         elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
-            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda))
+            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
             if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
                 # Single-loop reduce: Accums live at the immediate-body level.
                 pending_reduce = {a.name: a for a in stmt.body if isinstance(a, Accum)}
@@ -542,7 +547,7 @@ def _drop_redundant_syncs(body: list[Stmt]) -> list[Stmt]:
     return out
 
 
-def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait, buf_cuda) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
     """Translate a body SerialTile / StridedTile / RegisterTile. Recurses
     so nested staging / loops / writes inside the body get the same
     uniform treatment. The wrapper type is preserved — strategies
@@ -562,7 +567,7 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
         if isinstance(s, ComputeStage):
             return filter_emit(_emit_compute_stage(s, tid_expr, n_threads))
         if isinstance(s, Stage):
-            return filter_emit(_emit_stage(s, tid_expr, n_threads, buf_cuda))
+            return filter_emit(_emit_stage(s, tid_expr, n_threads))
         if isinstance(s, AsyncWait):
             return emit_async_wait(s)
         if s.nested():
@@ -801,7 +806,7 @@ def _mbar_wait_phase(stage_phase, buffer_count: int):
     return Literal(0, "int")
 
 
-def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str] | None = None) -> list[Stmt]:
+def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     """Emit producer scaffolding for a wrap-body Stage.
 
     For each ``Source`` in ``stage.sources``, emits per-source
@@ -815,7 +820,6 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
     pre-flattened to siblings by ``_flatten_wrap_stages`` before this
     function runs. ``stage.body`` is empty at this point.
     """
-    buf_cuda = buf_cuda or {}
     # Buffered: ping-pong-style ring with phase indexing. Leading Sync
     # dropped (different physical buffer per iter).
     is_buffered = isinstance(stage, BufferedStage)
@@ -857,8 +861,9 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int, buf_cuda: dict[str, str]
         if is_buffered:
             smem_index = (stage.phase, *smem_index)
         # Per-source dtype: use gmem source's CUDA C type so fp16 inputs
-        # stage into __half smem.
-        smem_dtype = buf_cuda.get(src.buf, "float")
+        # stage into __half smem. ``Source.dtype`` is stamped by
+        # ``001_stamp_types`` from the matching graph node's dtype.
+        smem_dtype = _smem_cuda_dtype(src)
         smem_align = 16 if smem_dtype == "__half" else 0
         full_extents = (stage.buffer_count, *padded_extents) if is_buffered else padded_extents
 
