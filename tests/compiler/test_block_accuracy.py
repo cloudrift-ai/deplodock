@@ -23,6 +23,8 @@ import torch
 
 from .conftest import requires_cuda
 
+pytestmark = pytest.mark.serial
+
 
 def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str = "cuda"):
     """Compile a single transformer block (random weights) and compare against eager.

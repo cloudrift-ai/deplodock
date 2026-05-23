@@ -22,6 +22,12 @@ Random fp32 weights are used so we hit the same magnitude regime that
 ``test_block_accuracy``'s composite test exercises. The thresholds are
 tight (1e-4) — these chains have so few kernels that benign drift
 shouldn't exceed it; anything larger is a real miscompute.
+
+All tests in this file are marked ``serial``: the multi-kernel attention
+schedules occasionally issue OOB writes that poison the CUDA context
+for adjacent xdist workers. ``make test`` runs the parallel sweep
+first, then re-invokes pytest with ``-m serial -p no:xdist`` so each
+serial test runs against a clean GPU.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ import torch
 import torch.nn.functional as F
 
 from .conftest import requires_cuda
+
+pytestmark = pytest.mark.serial
 
 
 @pytest.fixture(autouse=True)
