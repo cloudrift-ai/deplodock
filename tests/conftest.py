@@ -11,6 +11,19 @@ import pytest
 import torch
 import yaml
 
+# Cross-process GPU lock for CUDA tests. Set on conftest import so every
+# xdist worker (and any subprocess it spawns) coordinates on the same
+# path. With this set, ``CudaBackend.run`` (via
+# :func:`deplodock.compiler.backend.cuda.program.run_program`) holds the
+# lock end-to-end across compile + allocate + ``pre_run`` callback +
+# kernel launches + ``.get()``. Tests that compare deplodock against
+# torch eager pass ``pre_run=<eager closure>`` so the eager forward
+# and the deplodock launches share one uninterrupted GPU window —
+# without this serialization, peer-worker CUDA activity interleaves
+# with our kernels and the per-position fp32 rounding drift breaks
+# the accuracy comparison.
+os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
+
 
 @pytest.fixture(autouse=True)
 def _seed_rng():
@@ -108,13 +121,15 @@ def _is_cuda_item(item) -> bool:
 
 # Single xdist_group used for every CUDA-touching test. The host only has
 # one GPU; running CUDA tests across multiple xdist workers concurrently
-# would mean two processes pushing kernels onto the same device. With
-# multi-kernel attention schedules in the suite, that cross-worker GPU
-# contention surfaces as small but real numerical divergence in tests
-# that compare against PyTorch eager (the kernel-launch scheduling +
-# fp32 reduction ordering differ from the isolated-run baseline). Pinning
-# all CUDA tests to one group makes them run sequentially on one worker;
-# non-CUDA tests still parallelize via the LPT buckets below.
+# would mean two processes pushing kernels onto the same device. Even
+# with ``DEPLODOCK_GPU_LOCK`` serializing the kernel-launch window and
+# ``backend.run(pre_run=...)`` pulling the torch eager forward into the
+# same lock, multi-kernel attention schedules still occasionally drift
+# enough across worker contexts (per-context SM scheduling differs, and
+# fp32 atomic-add commit order with it) to break the
+# ``test_attention_chains`` / ``test_block_accuracy`` 1e-4 thresholds.
+# Pinning all CUDA tests to one group makes them run sequentially on
+# one worker; non-CUDA tests still parallelize via the LPT buckets below.
 _CUDA_GROUP = "cuda"
 
 

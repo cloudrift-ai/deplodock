@@ -34,7 +34,7 @@ _backend = NumpyBackend()
 
 
 def _run(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    return _backend.run(_backend.compile(graph), input_data=inputs).outputs
+    return _backend.run(_backend.compile(graph), input_data=inputs)[0].outputs
 
 
 def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-6):

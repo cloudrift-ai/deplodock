@@ -115,7 +115,7 @@ def _run_with_knobs(graph, inputs: dict[str, np.ndarray], out_name: str, knobs: 
 
     be = CudaBackend()
     compiled = be.compile(graph)
-    return be.run(compiled, input_data=inputs).outputs[out_name]
+    return be.run(compiled, input_data=inputs)[0].outputs[out_name]
 
 
 def _reference(graph, inputs: dict[str, np.ndarray], out_name: str) -> np.ndarray:
@@ -125,7 +125,7 @@ def _reference(graph, inputs: dict[str, np.ndarray], out_name: str) -> np.ndarra
 
     be = NumpyBackend()
     compiled = be.compile(graph)
-    return be.run(compiled, input_data=inputs).outputs[out_name]
+    return be.run(compiled, input_data=inputs)[0].outputs[out_name]
 
 
 def _random_inputs(input_shapes: dict[str, tuple[int, ...]], seed: int = 0) -> dict[str, np.ndarray]:

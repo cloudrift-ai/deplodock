@@ -56,7 +56,7 @@ def test_numpy_backend_elementwise_chain_fp16():
     x_data = rng.standard_normal(8).astype(np.float16)
 
     be = NumpyBackend()
-    out = be.run(be.compile(g), input_data={"x": x_data}).outputs["n"]
+    out = be.run(be.compile(g), input_data={"x": x_data})[0].outputs["n"]
 
     assert out.dtype == np.float16, f"expected float16 output, got {out.dtype}"
     expected = (-np.exp(x_data.astype(np.float32))).astype(np.float16)

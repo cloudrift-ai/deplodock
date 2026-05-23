@@ -142,7 +142,7 @@ def handle_run(args):
 
     try:
         if not skip_accuracy:
-            run_result = backend.run(compiled, input_data=input_data)
+            run_result, _ = backend.run(compiled, input_data=input_data)
             if dump and backend.last_debug_result is not None:
                 dump.dump_per_launch_values(backend.last_debug_result.per_launch)
 
@@ -578,7 +578,6 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
 
     if tail:
         graph = Pipeline.build(tail, dump=dump).run(graph)
-
     rng = np.random.default_rng(args.seed)
     input_data: dict[str, list[float]] = {}
     for nid, node in graph.nodes.items():
@@ -595,7 +594,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     if backend.tune_db is not None and backend.tune_db.exists():
         logger.info("Using tuning DB: %s", backend.tune_db)
-    result = backend.run(graph, input_data=input_data)
+    result, _ = backend.run(graph, input_data=input_data)
     for nid, arr in result.outputs.items():
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
