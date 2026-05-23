@@ -985,12 +985,20 @@ class ComputeStage(Stage):
             return f"compute[{self.buffer_count}@{self.phase.pretty()}]"
         return "compute"
 
+    def _cooperative_label(self) -> str:
+        """Right-margin label on the synthesized cooperative for-nest.
+        Carries the buffer/phase annotation when ring-buffered so the
+        prefix-less decl line doesn't have to."""
+        if self.buffer_count > 1 and self.phase is not None:
+            return f"cooperative[{self.buffer_count}@{self.phase.pretty()}]"
+        return "cooperative"
+
     def pretty(self, indent: str = "") -> list[str]:
-        """``compute shared <name>[<cache_axes>]`` per output Source, then a
+        """``shared <name>[<cache_axes>]`` per output Source, then a
         synthesized ``for <ax> in 0..<extent>`` nest labeled ``cooperative``
         wrapping the producer body, then the native consumer subtree at the
-        same indent. Reads as two adjacent for-nests — one cooperative
-        compute, one consumer reduce — both belonging to the decl above.
+        same indent. The ``compute`` nature reads from the body below —
+        no leading ``compute`` prefix is needed.
 
         ComputeStage carries TWO bodies: ``compute`` runs once per
         activation to populate the output slabs from sibling-Stage smem;
@@ -998,19 +1006,17 @@ class ComputeStage(Stage):
         is the ComputeStage's own smem, so the RHS that ``_source_decl_line``
         would print (``<self> = <self>[...]``) is suppressed here.
         """
-        prefix = self._pretty_prefix()
-        prefix = f"{prefix} " if prefix else ""
         out: list[str] = []
         for s in self.sources:
             cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in s.cache_axes)
-            out.append(f"{indent}{prefix}shared {s.name}[{cache}]")
+            out.append(f"{indent}shared {s.name}[{cache}]")
         # Synthesize a cooperative for-nest over the first source's cache
         # axes — every Source in the ComputeStage shares the same cache
         # axes by construction (007b builds a single fused output Source
         # spanning the cone's cache axes).
         cache_axes = self.sources[0].cache_axes
         for_lines = [f"for {ax.name} in 0..{ax.extent}" for ax in cache_axes]
-        out.extend(_render_tile_bracket(indent + INDENT, for_lines, "cooperative", self.compute))
+        out.extend(_render_tile_bracket(indent + INDENT, for_lines, self._cooperative_label(), self.compute))
         out.extend(pretty_body(self.body, indent + INDENT))
         return out
 

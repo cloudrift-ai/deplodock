@@ -71,13 +71,13 @@ def test_buffer_count_two_with_phase_doubles_smem():
     assert buffered.smem_bytes == single.smem_bytes * 2
 
 
-def test_pretty_marks_as_compute():
+def test_pretty_marks_as_cooperative():
     cs = _compute_stage()
     rendered = "\n".join(cs.pretty())
-    assert "compute" in rendered
+    assert "cooperative" in rendered
 
 
 def test_pretty_marks_buffered_compute():
     cs = _compute_stage(buffer_count=2, phase=Var("k_outer") % Literal(2, "int"))
     rendered = "\n".join(cs.pretty())
-    assert "compute[2@" in rendered
+    assert "cooperative[2@" in rendered
