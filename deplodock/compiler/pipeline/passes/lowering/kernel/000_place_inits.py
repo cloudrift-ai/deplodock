@@ -217,18 +217,16 @@ def _is_reduce_recursive(loop) -> bool:
         elif isinstance(s, RegisterTile) and _is_reduce_recursive(s):
             has_inner_reduce = True
         elif isinstance(s, Stage):
-            # Wrap-body Stage is transparent for reduce-crossing: descend
-            # into its consumer body and inherit the result. A Stage whose
-            # body wraps a reduce-Loop forms a reduce-passthrough.
-            for inner in s.body:
-                if isinstance(inner, Accum):
-                    return True
-                if isinstance(inner, Write):
-                    return False
-                if isinstance(inner, (SerialTile, StridedTile)) and _is_reduce_recursive(inner):
-                    has_inner_reduce = True
-                elif isinstance(inner, RegisterTile) and _is_reduce_recursive(inner):
-                    has_inner_reduce = True
+            # Wrap-body Stage is transparent for reduce-crossing: synthesize
+            # a probe-loop carrying the Stage's body so the recursive walk
+            # treats the consumer subtree as if it were the loop's body.
+            # Handles nested Stage chains (007b emits transport-Stage
+            # nests wrapping a ComputeStage with the reduce inside).
+            class _Probe:
+                body = s.body
+
+            if _is_reduce_recursive(_Probe()):
+                has_inner_reduce = True
     return has_inner_reduce
 
 
