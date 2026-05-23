@@ -79,44 +79,6 @@ PATTERN = [Pattern("root", TileOp)]
 _TMA_ALIGN_BYTES = 128
 
 
-def _flatten_wrap_stages(body) -> tuple[Stmt, ...]:
-    """Pre-flatten wrap-body Stages: ``Stage(sources, body=[consumer])`` becomes
-    ``[Stage(sources, body=Body(())), *consumer_stmts]`` so the existing
-    materializer's flat walker can emit producer scaffolding then process
-    the consumer stmts as siblings.
-
-    Recurses into Loop / StridedLoop / Cond / Tile bodies so nested Stages
-    flatten too. ComputeStage's ``compute`` body is kept attached to the
-    stage; materializer emits it specially.
-    """
-    from dataclasses import replace as _replace  # noqa: PLC0415
-
-    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Stage):
-            inner = _flatten_wrap_stages(s.body)
-            # Recursively flatten ComputeStage.compute too (in case future
-            # passes nest stages inside it).
-            if isinstance(s, ComputeStage):
-                compute_inner = _flatten_wrap_stages(s.compute)
-                out.append(_replace(s, body=Body(()), compute=Body(compute_inner)))
-            else:
-                out.append(_replace(s, body=Body(())))
-            out.extend(inner)
-        elif isinstance(s, (SerialTile, StridedTile, RegisterTile)):
-            new_body = _flatten_wrap_stages(s.body)
-            out.append(s.with_bodies((Body(new_body),)))
-        elif isinstance(s, Cond):
-            new_body = _flatten_wrap_stages(s.body)
-            new_else = _flatten_wrap_stages(s.else_body) if s.else_body else ()
-            out.append(_replace(s, body=Body(new_body), else_body=Body(new_else)))
-        else:
-            out.append(s)
-    return tuple(out)
-
-
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
 
@@ -173,13 +135,11 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     output) wrap them in ``Cond(thread_var == 0)`` themselves —
     materialization passes Writes through unchanged."""
     axes = blk.axes
-    # Pre-flatten wrap-body Stages so the rest of the walker sees the
-    # legacy flat shape ([Stage(empty body), *consumer_stmts]) it was
-    # designed for. _emit_stage consumes Stage.sources for the producer
-    # scaffolding; consumer stmts are handled as siblings.
-    from deplodock.compiler.ir.stmt.body import Body as _Body  # noqa: PLC0415
-
-    body = _Body(_flatten_wrap_stages(blk.body))
+    # Wrap-body Stages are already flattened to the legacy shape
+    # ([Stage(empty body), *consumer_stmts]) by ``007a_flatten_wrap_stages``,
+    # so the walker sees producer scaffolding (Stage.sources) followed by
+    # the consumer stmts as siblings.
+    body = blk.body
     thread_axes = axes
     if not thread_axes:
         raise ValueError("ThreadTile must have at least one axis")
