@@ -48,7 +48,7 @@ def _run_matmul() -> np.ndarray:
     a, b, _ = _eager()
     backend = CudaBackend()
     compiled = backend.compile(_matmul_graph())
-    out = backend.run(compiled, input_data={"a": a.flatten().tolist(), "b": b.flatten().tolist()})
+    out, _ = backend.run(compiled, input_data={"a": a.flatten().tolist(), "b": b.flatten().tolist()})
     return out.outputs["o"].reshape(_M, _N)
 
 

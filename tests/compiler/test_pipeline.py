@@ -82,7 +82,7 @@ def test_pointwise_chain_gpu():
     compiled = CudaBackend().compile(_pointwise_chain_graph())
     x_data = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 3.0, -3.0]
     expected = [math.exp(-xi) for xi in x_data]
-    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
     assert list(result.outputs.values())[0] == pytest.approx(expected, rel=1e-5)
 
 
@@ -98,5 +98,5 @@ def test_matmul_gpu():
     for mi in range(3):
         for ni in range(5):
             expected.append(sum(a_data[mi * 4 + k] * b_data[k * 5 + ni] for k in range(4)))
-    result = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
+    result, _ = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected, rel=1e-5)

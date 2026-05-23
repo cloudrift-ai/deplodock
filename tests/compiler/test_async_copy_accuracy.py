@@ -82,14 +82,14 @@ def _reference(graph: Graph, inputs: dict[str, np.ndarray]) -> np.ndarray:
     from deplodock.compiler.backend.numpy import NumpyBackend
 
     be = NumpyBackend()
-    return be.run(be.compile(graph), input_data=inputs).outputs["o"]
+    return be.run(be.compile(graph), input_data=inputs)[0].outputs["o"]
 
 
 def _run_cuda(graph: Graph, inputs: dict[str, np.ndarray]) -> np.ndarray:
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     be = CudaBackend()
-    return be.run(be.compile(graph), input_data=inputs).outputs["o"]
+    return be.run(be.compile(graph), input_data=inputs)[0].outputs["o"]
 
 
 @requires_cuda

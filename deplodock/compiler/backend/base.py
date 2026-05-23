@@ -5,9 +5,18 @@ executes it. Each backend (NumPy, Loop, CUDA, ...) implements this
 interface; all backends share the same call surface:
 
     compiled = backend.compile(graph)
-    result   = backend.run(compiled, input_data={...})
-    outputs  = result.outputs   # dict[name, ndarray]
-    elapsed  = result.time_ms
+    result, pre = backend.run(compiled, input_data={...})
+    outputs    = result.outputs   # dict[name, ndarray]
+    elapsed    = result.time_ms
+
+``run()`` always returns a 2-tuple ``(RunResult, T | None)``. ``T`` is
+whatever the optional ``pre_run`` callback returned; with no callback
+it is ``None``. ``pre_run`` runs once before the backend executes the
+graph and inside whatever serialization the backend uses
+(``gpu_lock()`` on the CUDA backend) — accuracy tests use this to
+compute a torch eager reference on the same GPU window the deplodock
+launches will see, so peer-worker CUDA activity can't interleave
+between the eager forward and the deplodock comparison.
 
 Individual backends may do different internal lowerings: the CUDA backend
 calls ``run_pipeline`` through the full chain (decomposition →
@@ -20,6 +29,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -103,8 +113,20 @@ class Backend(ABC):
     def compile(self, graph: Graph) -> Any:
         """Lower a ``Graph`` to a backend-specific runnable artifact."""
 
-    def run(self, compiled: Any, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
-        """Execute; return ``RunResult`` with outputs as ndarrays + wall-time.
+    def run(
+        self,
+        compiled: Any,
+        *,
+        input_data: dict[str, np.ndarray] | None = None,
+        pre_run: Callable[[], Any] | None = None,
+    ) -> tuple[RunResult, Any]:
+        """Execute; return ``(RunResult, pre_run_result)``.
+
+        ``pre_run`` runs once before the backend executes the graph and
+        inside whatever serialization the backend uses (the GPU lock on
+        :class:`~deplodock.compiler.backend.cuda.backend.CudaBackend`).
+        Its return value flows through as the tuple's second element.
+        With no callback the second element is ``None``.
 
         Default implementation walks ``compiled`` (a ``Graph``) in topological
         order and dispatches every compute node through ``op.forward``. Inputs
@@ -114,6 +136,7 @@ class Backend(ABC):
         graphs interpret identically — used by ``NumpyBackend`` and
         ``LoopBackend``. Backends with native runtimes (e.g. CUDA) override.
         """
+        pre_result = pre_run() if pre_run is not None else None
         input_data = input_data or {}
         input_set = set(compiled.inputs)
         values: dict[str, np.ndarray] = {}
@@ -152,7 +175,7 @@ class Backend(ABC):
 
         elapsed = (time.perf_counter() - t0) * 1000
         outputs = {name: values[name] for name in compiled.outputs}
-        return RunResult(outputs=outputs, time_ms=elapsed)
+        return RunResult(outputs=outputs, time_ms=elapsed), pre_result
 
     def benchmark(
         self,
@@ -194,7 +217,7 @@ class Backend(ABC):
         cumulative_ms = 0.0
         while True:
             t0 = time.perf_counter()
-            self.run(compiled, input_data=input_data)
+            self.run(compiled, input_data=input_data)  # discard tuple; only timing matters here
             dt = (time.perf_counter() - t0) * 1000
             if dt > kernel_timeout_ms:
                 raise RuntimeError(f"run() took {dt:.1f} ms — exceeds {kernel_timeout_ms:.0f} ms timeout")

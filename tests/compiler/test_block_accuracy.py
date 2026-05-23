@@ -47,15 +47,31 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     cos = torch.randn(1, 1, seq_len, head_dim)
     sin = torch.randn(1, 1, seq_len, head_dim)
 
+    # Trace + compile from the CPU copy first so the trace doesn't see
+    # CUDA tensors. The eager forward (cuda lane) moves the module to
+    # CUDA only after, inside ``eager_pre_run``, so the lock window
+    # covers the eager forward and the deplodock launches together.
+    graph = trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)})
+
+    eager_pre_run = None
     if backend_kind == "cuda":
         from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-        block_eager = block.cuda()
-        x_eager, cos_eager, sin_eager = x.cuda(), cos.cuda(), sin.cuda()
-        with torch.no_grad():
-            eager_out = block_eager(x_eager, position_embeddings=(cos_eager, sin_eager))[0]
-        eager_flat = eager_out.cpu().flatten().tolist()
         backend = CudaBackend()
+
+        def eager_pre_run():
+            # Compute the eager reference INSIDE ``backend.run``'s GPU
+            # lock so peer xdist workers can't interleave their CUDA
+            # kernels between the eager forward and the deplodock
+            # comparison run. The returned ndarray flows through
+            # ``backend.run``'s tuple second element. Move to CUDA
+            # here (not at module scope) so the param-extraction loop
+            # below can read CPU parameters cleanly.
+            block_eager = block.cuda()
+            x_eager, cos_eager, sin_eager = x.cuda(), cos.cuda(), sin.cuda()
+            with torch.no_grad():
+                out = block_eager(x_eager, position_embeddings=(cos_eager, sin_eager))[0]
+            return out.cpu().flatten().tolist()
     elif backend_kind == "loop":
         from deplodock.compiler.backend.loop.backend import LoopBackend
 
@@ -66,7 +82,6 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     else:
         raise ValueError(f"Unknown backend_kind: {backend_kind!r}")
 
-    graph = trace_module(block.cpu(), (x,), kwargs={"position_embeddings": (cos, sin)})
     compiled = backend.compile(graph)
 
     from deplodock.compiler.ir.base import ConstantOp
@@ -101,8 +116,10 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
             if nid not in input_data and node.op.value is not None:
                 input_data[nid] = np.array([node.op.value], dtype=np.float32)
 
-    run_result = backend.run(compiled, input_data=input_data)
+    run_result, pre_result = backend.run(compiled, input_data=input_data, pre_run=eager_pre_run)
     deplodock_flat = list(run_result.outputs.values())[0].flatten().tolist()
+    if pre_result is not None:
+        eager_flat = pre_result
 
     return deplodock_flat, eager_flat
 

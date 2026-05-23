@@ -39,7 +39,7 @@ def _make_add_graph(n: int = 8) -> Graph:
 
 @requires_cuda
 def test_run_program_elementwise_add():
-    result = run_program(_make_add_graph(8))
+    result, _ = run_program(_make_add_graph(8))
     assert "C" in result.outputs
     assert result.outputs["C"].shape == (8,)
     assert all(v == v for v in result.outputs["C"].tolist())  # NaN check

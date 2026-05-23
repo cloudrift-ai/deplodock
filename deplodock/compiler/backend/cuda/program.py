@@ -21,7 +21,7 @@ import select
 import subprocess
 import time as _time_module
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -533,15 +533,28 @@ class CompiledProgram:
 # ---------------------------------------------------------------------------
 
 
-def run_program(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
-    """Run the lowered graph once, return output ndarrays + total time."""
+def run_program(
+    graph: Graph,
+    input_data: dict[str, np.ndarray] | None = None,
+    *,
+    pre_run=None,
+) -> tuple[RunResult, Any]:
+    """Run the lowered graph once, return ``(RunResult, pre_run_result)``.
+
+    ``pre_run`` runs once inside the GPU lock, before deplodock's
+    kernel launches. Its return value flows through as the tuple's
+    second element. Tests use this to compute a torch eager reference
+    on the same GPU window the deplodock launches will see, so peer-
+    worker CUDA activity can't interleave the eager forward with the
+    deplodock comparison."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     with gpu_lock():
+        pre_result = pre_run() if pre_run is not None else None
         prog = CompiledProgram.build(graph, input_data)
         dts = prog.iter_once()
         outputs = prog.outputs()
-    return RunResult(outputs=outputs, time_ms=sum(dts))
+    return RunResult(outputs=outputs, time_ms=sum(dts)), pre_result
 
 
 @dataclass
@@ -550,16 +563,24 @@ class DebugResult:
     per_launch: dict[int, dict[str, np.ndarray]] = field(default_factory=dict)
 
 
-def run_program_debug(graph: Graph, input_data: dict[str, np.ndarray] | None = None) -> DebugResult:
-    """Run the graph once, snapshotting every non-input buffer after each launch."""
+def run_program_debug(
+    graph: Graph,
+    input_data: dict[str, np.ndarray] | None = None,
+    *,
+    pre_run=None,
+) -> tuple[DebugResult, Any]:
+    """Run the graph once, snapshotting every non-input buffer after
+    each launch. Returns ``(DebugResult, pre_run_result)`` — same
+    ``pre_run`` semantics as :func:`run_program`."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     per_launch: dict[int, dict[str, np.ndarray]] = {}
     with gpu_lock():
+        pre_result = pre_run() if pre_run is not None else None
         prog = CompiledProgram.build(graph, input_data)
         prog.iter_once(per_launch_hook=lambda li, _lc: per_launch.__setitem__(li, prog.snapshot()))
         outputs = prog.outputs()
-    return DebugResult(outputs=outputs, per_launch=per_launch)
+    return DebugResult(outputs=outputs, per_launch=per_launch), pre_result
 
 
 def benchmark_program(

@@ -130,7 +130,7 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     # Reference: rule defaults, no tune DB.
     ref_backend = CudaBackend()
     ref_compiled = ref_backend.compile(graph)
-    ref_out = ref_backend.run(ref_compiled, input_data=inputs).outputs[out_name]
+    ref_out = ref_backend.run(ref_compiled, input_data=inputs)[0].outputs[out_name]
     assert np.all(np.isfinite(ref_out)), "reference output has non-finite values"
 
     # Tune: low patience to keep wall time bounded; backend records perf
@@ -149,7 +149,7 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     # so the picked knobs survive into the lowered kernels.
     tuned_backend = CudaBackend(tune_db=db_path)
     tuned_compiled = tuned_backend.compile(graph)
-    tuned_out = tuned_backend.run(tuned_compiled, input_data=inputs).outputs[out_name]
+    tuned_out = tuned_backend.run(tuned_compiled, input_data=inputs)[0].outputs[out_name]
 
     assert tuned_out.shape == ref_out.shape, f"shape mismatch: tuned {tuned_out.shape} vs ref {ref_out.shape}"
     assert np.all(np.isfinite(tuned_out)), "tuned output has non-finite values"
