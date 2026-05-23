@@ -16,7 +16,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -95,7 +95,7 @@ def test_006a_replicates_register_tagged_body_loop():
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, select={"register_tile_planned"}).run(g)
+    out = Pipeline.build(KERNEL_PASSES, select={"register_tile"}).run(g)
     new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
 
     # The RegisterTile wrapper is gone; its body got replicated 4 times.
