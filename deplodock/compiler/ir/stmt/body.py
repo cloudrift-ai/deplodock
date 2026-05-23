@@ -493,14 +493,11 @@ class Body(tuple[Stmt, ...]):
         because those are per-thread slab slots, not racing global
         stores."""
         # Lazy imports avoid the ir/stmt → ir/tile cycle (ir/tile/ir.py
-        # imports Body from this module).
+        # imports Body from this module). Smem / Stage are picked up
+        # generically via ``Stmt.local_decls`` so no kernel-IR import
+        # is needed.
         from deplodock.compiler.ir.stmt.leaves import Accum, Write  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import GridTile, Stage, ThreadTile  # noqa: PLC0415
-
-        try:
-            from deplodock.compiler.ir.kernel.ir import Smem  # noqa: PLC0415
-        except ImportError:
-            Smem = None  # type: ignore[assignment]
+        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 
         block_axes: set[str] = set()
         thread_axes: set[str] = set()
@@ -509,14 +506,11 @@ class Body(tuple[Stmt, ...]):
         writes: list[Write] = []
 
         for s in self.iter():
+            staging_buffers.update(s.local_decls())
             if isinstance(s, GridTile):
                 block_axes.update(ax.name for ax in s.axes)
             elif isinstance(s, ThreadTile):
                 thread_axes.update(ax.name for ax in s.axes)
-            elif isinstance(s, Stage):
-                staging_buffers.update(src.name for src in s.sources)
-            elif Smem is not None and isinstance(s, Smem):
-                staging_buffers.add(s.name)
             elif isinstance(s, Accum):
                 accums.append(s)
             elif isinstance(s, Write):
