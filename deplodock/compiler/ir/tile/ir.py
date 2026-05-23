@@ -986,18 +986,25 @@ class ComputeStage(Stage):
         return "compute"
 
     def pretty(self, indent: str = "") -> list[str]:
-        """``compute shared <name>[...] = <smem-buf>[...];`` per source,
-        then the compute body at the same indent (an inline block, not
-        wrapped in a separate construct), then the consumer body.
+        """``compute shared <name>[<cache_axes>]:`` per output Source,
+        then an indented ``compute:`` block (the cooperative producer
+        body that fills the slab), then the consumer subtree at the
+        ComputeStage's own indent.
 
         ComputeStage carries TWO bodies: ``compute`` runs once per
         activation to populate the output slabs from sibling-Stage smem;
-        ``body`` is the regular consumer subtree.
+        ``body`` is the regular consumer subtree. The producer's source
+        is the ComputeStage's own smem, so the RHS that ``_source_decl_line``
+        would print (``<self> = <self>[...]``) is suppressed here.
         """
         prefix = self._pretty_prefix()
         prefix = f"{prefix} " if prefix else ""
-        decls = [f"{indent}{prefix}{_source_decl_line(s)}" for s in self.sources]
-        compute_lines = list(pretty_body(self.compute, indent))
+        decls = []
+        for s in self.sources:
+            cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in s.cache_axes)
+            decls.append(f"{indent}{prefix}shared {s.name}[{cache}]:")
+        compute_lines = [f"{indent}{INDENT}compute:"]
+        compute_lines.extend(pretty_body(self.compute, indent + INDENT + INDENT))
         body_lines = list(pretty_body(self.body, indent))
         return decls + compute_lines + body_lines
 
