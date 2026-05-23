@@ -1,6 +1,6 @@
 """CUDA accuracy regression for the wrap-body cp.async path.
 
-013_async_copy promotes ``BufferedStage`` to ``AsyncBufferedStage(pipeline_depth=1)``
+050_use_async_copy promotes ``BufferedStage`` to ``AsyncBufferedStage(pipeline_depth=1)``
 inside ``SerialTile(serial_outer)``. The materializer emits ``CpAsyncCopy`` per
 Source + ``CpAsyncCommit + CpAsyncWait(0) + Sync`` at the wrap boundary instead of
 the sync cooperative ``Load+Write``.
@@ -100,7 +100,9 @@ def test_async_copy_matmul_accuracy(case, monkeypatch):
         monkeypatch.setenv(f"DEPLODOCK_{key}", str(value))
 
     # Regression gate 1: pass actually fires (AsyncBufferedStage present).
-    assert _has_async_stage(m, k, n), f"013_async_copy did not produce an AsyncBufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
+    assert _has_async_stage(m, k, n), (
+        f"050_use_async_copy did not produce an AsyncBufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
+    )
 
     # Regression gate 2: rendered kernel really uses cp.async (no silent
     # fall-back to sync inside the materializer).

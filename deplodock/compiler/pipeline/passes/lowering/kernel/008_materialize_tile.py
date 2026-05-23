@@ -230,7 +230,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     # multiple K-loops over different stage sets (e.g. SDPA P@V whose
     # softmax-max + softmax-sum + weighted-V reduces have different stage
     # multiplicities) gets per-loop arrive counts and its mbar waits
-    # don't deadlock. ``011_tma_copy`` enforces all-or-nothing TMA
+    # don't deadlock. ``040_use_tma`` enforces all-or-nothing TMA
     # promotion per tile, so any tile with TMA stages is guaranteed to
     # have no cp.async stages in the same pipelined K-loop and the
     # AsyncWait lowering can stay as a pure ``MbarrierWait``.
@@ -239,7 +239,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     declared_mbar: set[str] = set()
 
     # Compute-Stage Smem hoist: a ComputeStage (produced by
-    # 007b_hoist_invariant_compute when FUSED_PIPELINE=True) and an
+    # 020_hoist_invariant_compute when FUSED_PIPELINE=True) and an
     # inline-fuse multi-source Stage (FUSED_PIPELINE=False) both emit
     # their body inside the K-outer loop body — Smem decls inside a
     # loop don't reach kernel scope in CUDA. Walk the body once, pre-
@@ -311,7 +311,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
-        # Wrap-body invariant: 011_tma_copy only promotes single-Source
+        # Wrap-body invariant: 040_use_tma only promotes single-Source
         # stages, so the box-copy here issues exactly one TMA load per
         # group activation.
         assert len(stage.sources) == 1, f"TmaBufferedStage requires one Source, got {len(stage.sources)}"
@@ -412,7 +412,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # Implicit wait at the wrap boundary for unpipelined stages
         # (pipeline_depth == 1). Mirrors the AsyncBufferedStage flow in
         # ``_emit_stage`` — the consumer body sees the committed copy
-        # before reading. ``015_lower_pipelined_async_stage`` (when it
+        # before reading. ``070_pipeline_stages`` (when it
         # lands) expands depth > 1 stages and emits its own waits.
         if stage.pipeline_depth == 1:
             mbar_phase = _mbar_wait_phase(stage.phase, stage.buffer_count)
@@ -619,7 +619,7 @@ def _partition_tma_groups(
 
     def _add_stage(gid: int, stage: TmaBufferedStage) -> None:
         stage_group_by_id[id(stage)] = gid
-        # 011_tma_copy promotes single-source stages only; group_stage_names
+        # 040_use_tma promotes single-source stages only; group_stage_names
         # tracks per-Source smem name so issuer-tid allocation distributes
         # the arrive+TmaLoad across distinct elected threads.
         for src in stage.sources:
@@ -774,7 +774,7 @@ def _emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, 
 def _mbar_wait_phase(stage_phase, buffer_count: int):
     """Derive the mbarrier-test phase from a ``TmaBufferedStage.phase``.
 
-    011_tma_copy stamps ``stage.phase = Var(K_o.name) % buffer_count``
+    040_use_tma stamps ``stage.phase = Var(K_o.name) % buffer_count``
     (the ring slot). The matching mbarrier phase rotates one bit per
     full ring sweep — ``(K_o / buffer_count) % 2``. For the degenerate
     single-shot case (``phase`` is a literal) the mbar phase starts at
@@ -880,7 +880,7 @@ def _emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     # implicit CpAsyncWait(0) + Sync so the consumer body sees the
     # committed copy at the wrap boundary. Pipelined stages
     # (pipeline_depth > 1) get expanded by
-    # 015_lower_pipelined_async_stage before materialize and emit their
+    # 070_pipeline_stages before materialize and emit their
     # own waits at the pipelined schedule positions.
     # Sync stages just emit __syncthreads so the slab is CTA-visible.
     if is_async:

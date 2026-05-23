@@ -242,13 +242,13 @@ class SearchDB:
         """Upsert one ``parent_key`` → ``child_key`` lowering edge.
 
         ``knobs`` is the delta this rewrite step stamps onto the child
-        (e.g. partition_planner adds ``{"BN": 64, "BM": 64, ...}``;
+        (e.g. partition_loops adds ``{"BN": 64, "BM": 64, ...}``;
         launch_geometry adds nothing). Greedy replay picks forks by
         knob-subset match against this delta, so the row is enough to
         reconstruct the chain without re-querying ``perf``.
 
         Best-of upsert across every dialect — autotune fork rules live
-        at Tile→Tile (blockify, register_tile) and used to be excluded
+        at Tile→Tile (blockify, split_register_axes) and used to be excluded
         here; recording every hop is how the chain stays replayable.
         Rows where the rewrite is genuinely deterministic (a single
         option) still trivially win their own slot, just via the same

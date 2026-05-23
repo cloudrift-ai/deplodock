@@ -1,6 +1,6 @@
 """Software-pipeline an async-staged K-outer loop into prologue/main/epilogue.
 
-Input shape (post 010 / 011 / 013):
+Input shape (post 030 / 040 / 050):
 
     SerialTile(K_o, kind="serial_outer", body=[
         AsyncBufferedStage(sources=..., body=[

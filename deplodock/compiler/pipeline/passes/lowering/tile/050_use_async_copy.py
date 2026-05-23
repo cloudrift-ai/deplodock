@@ -10,11 +10,11 @@ materializer's ``_emit_stage``.
 
 ``pipeline_depth = 1`` is the synchronous-style wait shape (every iter
 issues, commits, waits before the consumer reads). M7
-(``015_lower_pipelined_async_stage``) bumps the depth on eligible
+(``070_pipeline_stages``) bumps the depth on eligible
 stages and expands the K-outer loop into prologue / main / epilogue
 siblings whose waits sit at the pipelined schedule positions.
 
-Requires the upstream ``010_double_buffer`` to have run: cp.async
+Requires the upstream ``030_use_ring_buffers`` to have run: cp.async
 without ``buffer_count >= 2`` gives no producer-consumer overlap, so a
 plain ``Stage`` is intentionally not eligible (the materializer's
 async path also assumes ``is_buffered`` for its slab indexing).

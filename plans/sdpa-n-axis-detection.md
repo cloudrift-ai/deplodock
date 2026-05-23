@@ -88,7 +88,7 @@ the SDPA detection sits on top of:
   axis name + extent when the merge is semantically safe. For SDPA the sum reads `acc0` from the
   max, so the merge is correctly skipped. (Gated MLP's two reduces *do* merge — that's where this
   pass earns its keep.)
-- **M10's `_replace_k_loops`** (`000_partition_planner.py`) — walks every reduce in the body
+- **M10's `_replace_k_loops`** (`000_partition_loops.py`) — walks every reduce in the body
   whose axis name appears in `target_names` and σ-rewrites it to a `K_o → K_i` tower. Multiple
   reduces → multiple `K_o` / `K_i` axis pairs (named after the canonical K axis), but one shared
   K extent. Already the right primitive for "give every K-reduce the same schedule."
@@ -171,7 +171,7 @@ def _classify_fused_prologue(stmts):
 `_contains_write` already lives in `001_launch_geometry.py` (line 271). Import it (or inline —
 it's 8 lines) rather than reinventing.
 
-The single caller is `_split_kernel_fully` (line 203 of `000_partition_planner.py`); update the
+The single caller is `_split_kernel_fully` (line 203 of `000_partition_loops.py`); update the
 tuple unpack accordingly.
 
 ## `target_names` expansion (matmul branch)
@@ -329,7 +329,7 @@ Tile body as independent:
 - **`007_stage_inputs`** — builds a Stage per (cache-axis-stable) Load. The prologue's Loads
   reference `scaled[..., a2]` — a different buffer + reduce axis than the matmul's V load. Each
   gets its own Stage. ✓
-- **`010_double_buffer` / `011_tma_copy` / `013_async_copy`** — gate on Stage shape; both
+- **`030_use_ring_buffers` / `040_use_tma` / `050_use_async_copy`** — gate on Stage shape; both
   prologue and matmul Stages are eligible. ✓
 - **`001_launch_geometry`** — descends into Loops looking for Writes for the atomic-lift
   rewrite. The prologue Loops have no Writes (only Accums), so `_rewrite_for_atomic_lift`
@@ -370,7 +370,7 @@ Tile body as independent:
 
 Minimal viable change to flip the xfails:
 
-1. The walker extension + `_classify_fused_prologue` (~25 LoC in `000_partition_planner.py`,
+1. The walker extension + `_classify_fused_prologue` (~25 LoC in `000_partition_loops.py`,
    import `_contains_write` from `001_launch_geometry.py` or inline).
 2. `target_names` expansion in the matmul branch (~6 LoC — union over `outer_n.body` and
    `prologue`, gated on `is_reduce and extent == E_K`).

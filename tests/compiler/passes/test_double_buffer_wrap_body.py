@@ -1,4 +1,4 @@
-"""Tests for ``010_double_buffer`` (wrap-body promotion).
+"""Tests for ``030_use_ring_buffers`` (wrap-body promotion).
 
 The pass walks a Tile body for ``SerialTile(kind="serial_outer")`` whose body
 contains a wrap-body ``Stage`` carrying a ``stage_inner`` reduce; it swaps
@@ -45,11 +45,11 @@ def _find_kouter(op: TileOp) -> SerialTile | None:
 
 
 def test_matmul_fires_double_buffer(recording_dump):
-    """Plain matmul → 010_double_buffer fires after 002_stage_inputs."""
+    """Plain matmul → 030_use_ring_buffers fires after 010_stage_inputs."""
     g = _build_matmul()
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "double_buffer" in fired, fired
+    assert "use_ring_buffers" in fired, fired
 
 
 def test_double_buffer_emits_buffered_stage():
@@ -68,7 +68,7 @@ def test_double_buffer_emits_buffered_stage():
 
 def test_double_buffer_phase_prepended_to_body_loads():
     """Loads against staged smem buffers carry a leading phase index dim
-    (set by 010_double_buffer). Post-015 the consumer body lives as
+    (set by 030_use_ring_buffers). Post-015 the consumer body lives as
     siblings of the issue-only stage, so we scan the whole TileOp body
     for staged-smem Loads."""
     g = _build_matmul()
@@ -112,7 +112,7 @@ def test_double_buffer_is_idempotent():
     n_buffered = sum(1 for s in kouter.body if isinstance(s, BufferedStage))
     assert n_buffered > 0
 
-    pass_path = pathlib.Path(_helpers.__file__).parent / "010_double_buffer.py"
+    pass_path = pathlib.Path(_helpers.__file__).parent / "030_use_ring_buffers.py"
     spec = importlib.util.spec_from_file_location("dbl_pass", pass_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -123,7 +123,7 @@ def test_double_buffer_is_idempotent():
         raised = False
     except RuleSkipped:
         raised = True
-    assert raised, "010_double_buffer should be idempotent (BufferedStage already present)"
+    assert raised, "030_use_ring_buffers should be idempotent (BufferedStage already present)"
 
 
 # --- eligibility regression ----------------------------------------------
@@ -155,7 +155,7 @@ def test_no_stage_means_no_promotion(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "double_buffer" not in recording_dump.fired_rules("lowering/tile")
+    assert "use_ring_buffers" not in recording_dump.fired_rules("lowering/tile")
 
 
 def test_buffered_stages_in_tile_validate_under_smem_budget():

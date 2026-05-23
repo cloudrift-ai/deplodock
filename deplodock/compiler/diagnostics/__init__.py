@@ -5,7 +5,7 @@
 
 - :func:`.bank_conflicts.lane_bank_distribution` — pure oracle over Tile
   IR. Symbolic ``Expr.eval`` per lane against declared smem layouts.
-  Fast, GPU-free, used by Tile-IR passes (``014_pad_smem``,
+  Fast, GPU-free, used by Tile-IR passes (``060_pad_smem``,
   ``007a_permute_register_tile``) to score candidate rewrites.
 - :func:`.bank_conflicts.simulate_graph` — Kernel-IR static analyzer.
   Lowers the input graph through ``KERNEL_PASSES`` and walks each

@@ -1,9 +1,9 @@
-"""Planner-driven register tile — runs *after* ``002_stage_inputs``.
+"""Planner-driven register tile — runs *after* ``010_stage_inputs``.
 
-When ``000_partition_planner`` pre-splits a matmul's output Loops and
+When ``000_partition_loops`` pre-splits a matmul's output Loops and
 tags the inner halves ``Role.REGISTER``, this pass unwraps those
 REGISTER Loops and replicates their bodies per-cell. By the time this
-pass runs, ``002_stage_inputs`` has already emitted Stages with
+pass runs, ``010_stage_inputs`` has already emitted Stages with
 REGISTER axes (M_r / N_r) as part of their cache axes — the slab spans
 the full ``BM·FM × BK`` (and similar) with Affine addressing. Stages
 are treated as opaque here: their internal gmem-load body has its own

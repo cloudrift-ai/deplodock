@@ -120,7 +120,7 @@ def test_lowering_best_of_applies_across_dialects() -> None:
     """Every hop replays via the same best-median upsert — including
     Tile→Kernel and Kernel→Cuda, which used to be first-write-wins.
     The chain-replay design needs uniform semantics so intra-Tile
-    autotune hops (blockify, register_tile) get the same treatment as
+    autotune hops (blockify, split_register_axes) get the same treatment as
     Loop→Tile."""
     db = SearchDB()
     db.record_lowering("tile-A", "tile", "kernel-A", "kernel", measured_median_us=10.0)

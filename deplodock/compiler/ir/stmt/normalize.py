@@ -104,7 +104,7 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
     planner stamped ``Loop.role`` for downstream launch_geometry to
     consume. The planner now constructs ``GridTile`` / ``ThreadTile``
     directly and applies its own size-1 filter (see
-    ``000_partition_planner::_wrap_tower``), so by the time
+    ``000_partition_loops::_wrap_tower``), so by the time
     ``drop_size_one_free_axes`` runs on a LoopOp body, no Loop has any
     binding role — every size-1 free Loop is safely inlinable.
     """
@@ -308,8 +308,8 @@ def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tupl
 # both halves share — e.g. ``load x[0, a0, k]`` in the gated-MLP
 # pattern ``silu(x@Wg) * (x@Wu)`` where both matmuls reduce over the
 # same K and share x as a Load source. Symmetric staging follows: once
-# wu lives in the same K-loop as wg, ``stage_inputs`` / ``tma_copy`` /
-# ``double_buffer`` apply uniformly.
+# wu lives in the same K-loop as wg, ``stage_inputs`` / ``use_tma`` /
+# ``use_ring_buffers`` apply uniformly.
 # ---------------------------------------------------------------------------
 
 

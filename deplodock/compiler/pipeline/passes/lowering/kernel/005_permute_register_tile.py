@@ -58,7 +58,7 @@ Skips when:
 
 * The picked axis has no body Load with stride F > V divisible by V.
   Captures the ``FN <= V`` no-op case and any non-canonical shape.
-* Bank-conflict analysis (reusing ``014_pad_smem``'s analyzer) says
+* Bank-conflict analysis (reusing ``060_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
 """
 
@@ -89,7 +89,7 @@ PATTERN = [Pattern("root", TileOp)]
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     knobs = root.op.knobs
     if "FN" not in knobs:
-        raise RuleSkipped("no FN knob on TileOp (register_tile hasn't run)")
+        raise RuleSkipped("no FN knob on TileOp (split_register_axes hasn't run)")
     F = int(knobs["FN"])
     new_body = _maybe_rewrite(root.op.body, lds128_bytes=ctx.lds128_bytes, F=F)
     if new_body is None:
@@ -106,7 +106,7 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:
         raise RuleSkipped("need >=2 THREAD axes (matmul-shaped tile)")
 
     # Lane axis: the innermost THREAD axis (``tt.axes[-1]``). By
-    # convention that's the N axis post-register_tile — its extent is
+    # convention that's the N axis post-split_register_axes — its extent is
     # ``BN/FN``, and its consumer Loads carry the ``Var(lane) * FN + c``
     # pattern we rewrite. Lane stride ``F = knobs["FN"]`` is the register-tile
     # factor stamped by ``003_register_tile``.

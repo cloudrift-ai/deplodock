@@ -1,6 +1,6 @@
 """Per-source ``+1`` smem padding to break bank conflicts on body reads.
 
-After ``002_stage_inputs`` lays out each ``Source`` as one smem slab, body
+After ``010_stage_inputs`` lays out each ``Source`` as one smem slab, body
 Loads read it through thread-decoded coords. When the slab's per-thread-
 axis stride is a multiple of 32 floats (the bank count × 4 bytes / 4
 bytes per fp32), every lane in a warp hits the same bank — a 32-way
@@ -269,7 +269,7 @@ def _max_conflict(loads: list[Load], extents: tuple[int, ...], thread_axes: tupl
     """Worst-case ``max_way`` across body ``loads`` at the hypothetical
     ``extents`` — i.e. evaluating row-major strides as if the slab were
     sized to ``extents``. Loads in a wrap-body ``BufferedStage`` carry a
-    leading phase dim prepended by ``010_double_buffer``; drop it before
+    leading phase dim prepended by ``030_use_ring_buffers``; drop it before
     the rank check."""
     worst = 1
     for ld in loads:

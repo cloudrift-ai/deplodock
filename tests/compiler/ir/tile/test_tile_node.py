@@ -1,6 +1,6 @@
 """Tests for Tile-IR node helpers (``iter_body`` etc.).
 
-Tests for the ``partition_planner`` rule itself (Loop-IR ``LoopOp`` →
+Tests for the ``partition_loops`` rule itself (Loop-IR ``LoopOp`` →
 Tile-IR ``TileOp``) live in ``tests/compiler/passes/test_partition_planner_rules.py``.
 """
 

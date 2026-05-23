@@ -37,7 +37,7 @@ def test_planner_fires_on_pointwise(recording_dump, monkeypatch):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "partition_planner" in recording_dump.fired_rules("lowering/tile")
+    assert "partition_loops" in recording_dump.fired_rules("lowering/tile")
 
 
 def loop_op_pointwise() -> LoopOp:
@@ -95,7 +95,7 @@ def test_006a_replicates_register_tagged_body_loop():
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(KERNEL_PASSES, select={"register_tile"}).run(g)
+    out = Pipeline.build(KERNEL_PASSES, select={"split_register_axes"}).run(g)
     new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
 
     # The RegisterTile wrapper is gone; its body got replicated 4 times.

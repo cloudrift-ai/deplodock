@@ -46,7 +46,7 @@ instructions fire per K_o iteration — same role as today's BK for scalar paths
   σ-split output, not from a separate replication pass.
 - Two materializer branches → one. `001_materialize_tile.py` reads `TileOp.knobs["ATOM_SHAPE"]` and dispatches on it.
   Scalar emission stays the default; MMA emission is a single new branch.
-- The fp16 `__half2` packing pass (`004_pack_fp16_register_tile.py`) becomes structurally equivalent to
+- The fp16 `__half2` packing pass (`006_pack_fp16_pairs.py`) becomes structurally equivalent to
   `ATOM_SHAPE=(1, 2, 1)` for f16. v1 keeps it as a separate post-pass; v2 could fold it into the framework.
 
 ### Scope guard
@@ -107,7 +107,7 @@ when eligible, and the scalar variants follow.
    explicit drop rule), and the BLOCK·THREAD·REGISTER tower the planner emits today is structurally unchanged.
    If anything in M1 changes a golden, that's a bug, not a re-bless.
 
-7. **`pack_fp16_register_tile` interaction.** This kernel-level pass pairs scalar f16 accumulators into `__half2`.
+7. **`pack_fp16_pairs` interaction.** This kernel-level pass pairs scalar f16 accumulators into `__half2`.
    For MMA kernels (`ATOM_SHAPE != (1, 1, 1)`) there are no scalar f16 `Init` / `Accum` to pair — the C-fragment IS
    the accumulator. Add a structural guard: skip when body contains `MmaFragment` decls.
 
@@ -115,8 +115,8 @@ when eligible, and the scalar variants follow.
    uses `ld.matrix` (or the wmma::load_matrix_sync intrinsic), which has its own swizzled access pattern. Skip when
    `ATOM_SHAPE != (1, 1, 1)` to avoid double-permutation.
 
-9. **Other downstream passes stay unchanged.** `007_stage_inputs`, `010_double_buffer`, `011_tma_copy`,
-   `013_async_copy`, `014_pad_smem`, `015_pipeline_k_outer` all operate on K_o / STAGE_INNER and don't care about
+9. **Other downstream passes stay unchanged.** `007_stage_inputs`, `030_use_ring_buffers`, `040_use_tma`,
+   `050_use_async_copy`, `060_pad_smem`, `015_pipeline_k_outer` all operate on K_o / STAGE_INNER and don't care about
    the cell shape. Confirmed by reading their PATTERN matches — none of them touch the output-axis tower below
    STAGE_INNER.
 
@@ -147,7 +147,7 @@ the scaffolding is wrong; fix before proceeding.
   and `ATOM_REGISTRY: dict[str, AtomSpec]` seeded with one entry: `"scalar" → AtomSpec((1,1,1), {"a":…,"b":…,"c":…}
   inferred-or-F32, "fma", 1)`. Public helpers `atom_spec(kind) -> AtomSpec`, `atom_shape(kind)`,
   `atom_group_size(kind)`.
-- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_planner.py`: in `_build_split_body` (line 443-530),
+- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_loops.py`: in `_build_split_body` (line 443-530),
   read `kind = "scalar"`, `(atom_m, atom_n, atom_k) = atom_shape(kind)` (= `(1,1,1)`), extend the layers list with
   `Role.ATOM` Loops of the corresponding extents for N_a, M_a, K_a. Update the σ-substitution in
   `sigma_map[N_name]` / `sigma_map[M_name]` to include the `+ N_a` term (and equivalently for M), and the K-sigma
@@ -161,7 +161,7 @@ the scaffolding is wrong; fix before proceeding.
 
 - `deplodock/compiler/ir/axis.py` (~6 lines)
 - `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` (~40 lines new file)
-- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_planner.py` (~30 lines: layers extension +
+- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_loops.py` (~30 lines: layers extension +
   σ-rewrite + knob stamping)
 - `deplodock/compiler/pipeline/knobs.py` (~15 lines: `KnobType.STR` + `ATOM_KIND` registration + default elision)
 
@@ -191,7 +191,7 @@ ineligible ones (compile error or wrong output).
 **Files.**
 
 - `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` (~30 lines: WMMA registry entry + eligibility helper)
-- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_planner.py` (~15 lines)
+- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_loops.py` (~15 lines)
 
 **Verification.** Unit test: build a `Context(arch=75)` + a TinyLlama-shape matmul `LoopOp` with f16 Loads →
 `is_atom_eligible("wmma_m16n16k16_f16", …)` returns True. Build the same with f32 → False. Build with `arch=60`
@@ -220,7 +220,7 @@ than scalar). Final tiebreaker is the existing thread-count-near-256 heuristic.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_planner.py` (~40 lines: cartesian rewrite +
+- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_loops.py` (~40 lines: cartesian rewrite +
   priority adjust)
 
 **Verification.** Unit test: an eligible TinyLlama matmul `LoopOp` → enumerated variants include at least one with
@@ -322,12 +322,12 @@ NVRTC compilation).
 
 ## M7 — Skip incompatible kernel passes
 
-**Why.** `pack_fp16_register_tile` and `permute_register_tile` don't apply to MMA kernels and would corrupt them if
+**Why.** `pack_fp16_pairs` and `permute_register_tile` don't apply to MMA kernels and would corrupt them if
 they fired.
 
 **Change.**
 
-- `004_pack_fp16_register_tile.py`: at top of `rewrite`, add
+- `006_pack_fp16_pairs.py`: at top of `rewrite`, add
   `if root.op.knobs.get("ATOM_KIND", "scalar") != "scalar": raise RuleSkipped("non-scalar atom kind; pack-half2 not
   applicable")`. Idempotent — knob value doesn't change between runs.
 - `007a_permute_register_tile.py`: same guard via `root.op.knobs.get("ATOM_KIND", "scalar") != "scalar"`. The check
@@ -335,7 +335,7 @@ they fired.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/kernel/004_pack_fp16_register_tile.py` (~5 lines)
+- `deplodock/compiler/pipeline/passes/lowering/kernel/006_pack_fp16_pairs.py` (~5 lines)
 - `deplodock/compiler/pipeline/passes/lowering/tile/007a_permute_register_tile.py` (~3 lines)
 
 **Verification.** Run an MMA-eligible kernel through the full pipeline with `DEPLODOCK_MMA=1`; assert via the
@@ -385,7 +385,7 @@ beyond the new entries.
 **Files.**
 
 - `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` (~20 lines: new registry entries)
-- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_planner.py` (~3 lines: candidate list)
+- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_loops.py` (~3 lines: candidate list)
 
 **Verification.** Re-run M8's perf bench with the expanded candidate set; confirm the tuner picks
 `"wmma_m8n32k16_f16"` on at least one skinny matmul in Qwen 7B (the gate/up projections in MLP are good
@@ -484,12 +484,12 @@ paths.
 
 - `deplodock/compiler/ir/axis.py` — `Role.ATOM`, `BIND_WARP`
 - `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` — `AtomSpec`, `ATOM_REGISTRY`, `is_atom_eligible`
-- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_planner.py` — factorization + cartesian
+- `deplodock/compiler/pipeline/passes/lowering/tile/000_partition_loops.py` — factorization + cartesian
 - `deplodock/compiler/ir/kernel/ir.py` — `MmaFragment` / `MmaLoad` / `MmaSync` / `MmaStore`
 - `deplodock/compiler/pipeline/passes/lowering/kernel/001_materialize_tile.py` — dispatch on `ATOM_KIND`
 - `deplodock/compiler/ir/kernel/render.py` — `<mma.h>` include
 - `deplodock/compiler/pipeline/knobs.py` — `KnobType.STR` + `ATOM_KIND` registration
-- `deplodock/compiler/pipeline/passes/lowering/kernel/004_pack_fp16_register_tile.py` — skip guard
+- `deplodock/compiler/pipeline/passes/lowering/kernel/006_pack_fp16_pairs.py` — skip guard
 - `deplodock/compiler/pipeline/passes/lowering/tile/007a_permute_register_tile.py` — skip guard
 - `deplodock/compiler/pipeline/ARCHITECTURE.md` — documentation update
 - `deplodock/compiler/ir/ARCHITECTURE.md` — documentation update

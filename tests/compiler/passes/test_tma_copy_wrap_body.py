@@ -1,4 +1,4 @@
-"""Tests for ``011_tma_copy`` (single-source AsyncBufferedStage → TmaBufferedStage).
+"""Tests for ``040_use_tma`` (single-source AsyncBufferedStage → TmaBufferedStage).
 
 The pass walks for ``AsyncBufferedStage`` inside ``SerialTile(serial_outer)``
 and promotes to ``TmaBufferedStage(pipeline_depth=1, swizzle=NONE)`` when
@@ -35,7 +35,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
 
 def _load_pass():
-    p = pathlib.Path(_helpers.__file__).parent / "011_tma_copy.py"
+    p = pathlib.Path(_helpers.__file__).parent / "040_use_tma.py"
     spec = importlib.util.spec_from_file_location("tma_pass", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -54,7 +54,7 @@ def _build_matmul(m: int = 128, k: int = 256, n: int = 128) -> Graph:
 
 def _hand_build_single_source_async() -> tuple[TileOp, Graph]:
     """Construct a TileOp with a single-source AsyncBufferedStage to exercise
-    the TMA promotion. Mirrors the post-stage_inputs/double_buffer/async_copy
+    the TMA promotion. Mirrors the post-stage_inputs/use_ring_buffers/use_async_copy
     shape for a single-input reduction kernel."""
     M, K_i, K_o = 16, 4, 8
     m_ax = Axis("m", M)
@@ -111,7 +111,7 @@ def test_matmul_skips_tma_multi_source(recording_dump):
     """Matmul has multi-source AsyncBufferedStage (A + B); 011 must not fire."""
     g = _build_matmul()
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "tma_copy" not in recording_dump.fired_rules("lowering/tile")
+    assert "use_tma" not in recording_dump.fired_rules("lowering/tile")
 
 
 def test_single_source_async_promotes_to_tma():

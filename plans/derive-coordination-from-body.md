@@ -292,7 +292,7 @@ Generated from `grep -rn "splitk_axes\|cooperative_axes\|reduce_op\|Combine" dep
 | File | Lines | Use | Disposition |
 |---|---|---|---|
 | `passes/lowering/tile/001_coordination.py` | 7, 14, 72-76, 106, 113-114 | Trigger for atomic-Write rewrite | Deleted in M4 |
-| `passes/lowering/tile/000_partition_planner.py` | 306-307, 352-353 | Producer: planner sets the tag | Stripped in M6 |
+| `passes/lowering/tile/000_partition_loops.py` | 306-307, 352-353 | Producer: planner sets the tag | Stripped in M6 |
 | `passes/lowering/kernel/008_materialize_tile.py` | 169 | Pass-through during materialize | Replaced by helper in M3 |
 | `passes/lowering/tile/_helpers.py` | 75, 89 | Pass-through during tile-rewrite helpers | Stripped in M6 |
 | `ir/tile/passes.py` | 108, 112-113 | Axis-rename propagation | Stripped in M6 |
@@ -303,14 +303,14 @@ Generated from `grep -rn "splitk_axes\|cooperative_axes\|reduce_op\|Combine" dep
 | File | Lines | Use | Disposition |
 |---|---|---|---|
 | `passes/lowering/tile/001_coordination.py` | 8, 19, 64, 95-102 | Trigger for Combine emission + Cond-guard | Deleted in M4 |
-| `passes/lowering/tile/002_stage_inputs.py` | 158, 270 | `is_cooperative` flag for stage candidate walk | **See below** |
-| `passes/lowering/tile/000_partition_planner.py` | 308-309, 355-356 | Producer: planner sets the tag | Stripped in M6 |
+| `passes/lowering/tile/010_stage_inputs.py` | 158, 270 | `is_cooperative` flag for stage candidate walk | **See below** |
+| `passes/lowering/tile/000_partition_loops.py` | 308-309, 355-356 | Producer: planner sets the tag | Stripped in M6 |
 | `passes/lowering/kernel/008_materialize_tile.py` | 505 | Pass-through during materialize | Replaced by helper in M3 |
 | `passes/lowering/tile/_helpers.py` | 75, 80, 86 | Pass-through during tile-rewrite helpers | Stripped in M6 |
 | `ir/tile/passes.py` | 125, 127 | Axis-rename propagation | Stripped in M6 |
 | `ir/tile/ir.py` | 543-562 | Dataclass field + pretty render + with_bodies | Stripped in M6 |
 
-**`002_stage_inputs.py` is the one non-trivial reader.** It uses `is_cooperative = bool(tt.cooperative_axes)`
+**`010_stage_inputs.py` is the one non-trivial reader.** It uses `is_cooperative = bool(tt.cooperative_axes)`
 to gate which `_collect_candidates` branch runs. The cooperative case takes a different walk that descends
 into `serial_outer` SerialTiles to find loads. M3 needs to replace this with the helper:
 `is_cooperative = any(accum_escapes_thread_axis(tile_op).values())`. Same boolean, different source. Verify
@@ -336,7 +336,7 @@ in M3 that the staging output is byte-identical against a few cooperative kernel
 | `graph.py` | 260, 307 | Stmt registry for deserialization | Stripped in M5 |
 | `passes/lowering/tile/_helpers.py` | 137 | Mentioned in leaf-stmt list comment | Update comment |
 | `passes/lowering/tile/001_coordination.py` | 9, 19-20, 39, 64, 89, 130, 139, 298-340 | Producer: coordination emits Combine | Deleted in M4 |
-| `passes/lowering/tile/000_partition_planner.py` | 14, 45, 58, 477, 538 | Mentioned in docstrings (not code) | Update docstrings |
+| `passes/lowering/tile/000_partition_loops.py` | 14, 45, 58, 477, 538 | Mentioned in docstrings (not code) | Update docstrings |
 | `passes/lowering/kernel/008_materialize_tile.py` | 5 | Docstring mention of "Combine becomes smem tree-halve" | Update to "cooperative reduce inferred from body becomes ..." |
 | `ir/stmt/passes.py` | 157, 210 | Pass-through in stmt rewriter | Stripped in M5 |
 
@@ -355,7 +355,7 @@ in M3 that the staging output is byte-identical against a few cooperative kernel
    thread axis, the materializer won't emit the combine and the kernel produces wrong results silently. M2
    (parallel-run mode with assertion against the existing tags) is the safety net — full test suite must
    pass with the assertion live.
-2. **Performance regression from `is_cooperative` reclassification in `002_stage_inputs`.** If the helper
+2. **Performance regression from `is_cooperative` reclassification in `010_stage_inputs`.** If the helper
    declares cooperativity earlier/later than the tag did, staging might pick a different set of buffers.
    M3 includes a kernel-output diff against the cooperative kernel zoo as a checkpoint.
 3. **Hidden coupling.** Some pass we haven't audited may rely on the tag's presence (e.g. as a proxy for

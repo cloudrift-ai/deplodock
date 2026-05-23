@@ -1,4 +1,4 @@
-"""Tests for ``015_lower_pipelined_async_stage`` (depth-2 pipelining).
+"""Tests for ``070_pipeline_stages`` (depth-2 pipelining).
 
 The pass takes a ``SerialTile(serial_outer)`` whose body is a single
 ``AsyncBufferedStage(pipeline_depth=1)`` wrapping a ``stage_inner`` reduce
@@ -37,7 +37,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
 
 def _load_pass():
-    p = pathlib.Path(_helpers.__file__).parent / "015_lower_pipelined_async_stage.py"
+    p = pathlib.Path(_helpers.__file__).parent / "070_pipeline_stages.py"
     spec = importlib.util.spec_from_file_location("pipe_pass", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -141,7 +141,7 @@ def test_matmul_pipelines_through_full_pipeline(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "lower_pipelined_async_stage" in recording_dump.fired_rules("lowering/tile")
+    assert "pipeline_stages" in recording_dump.fired_rules("lowering/tile")
 
 
 def test_smem_validate_dedupes_pipelined_sources():

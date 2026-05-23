@@ -9,7 +9,7 @@
   multiply between the two K-indexed Loads is implicit (the only way
   two distinct K-indexed buffer Loads can contribute to an Accum
   in this IR is through a fused multiply-accumulate). Used by
-  ``000_partition_planner`` to locate the K reduce inside an output
+  ``000_partition_loops`` to locate the K reduce inside an output
   body; downstream K-outer passes (``010``, ``015``) key off the
   planner-stamped ``Role.SERIAL_OUTER`` / ``Role.STAGE_INNER`` tags
   instead of re-deriving the matmul shape structurally.
@@ -55,7 +55,7 @@ def thread_tile_of(outer: ParallelTile) -> ThreadTile:
     The cooperative form (``GridTile`` wrapping ``ThreadTile``) puts the
     per-thread scope one level deeper; the pointwise form (standalone
     ``ThreadTile``) IS the per-thread scope. Downstream passes that operate
-    on the per-thread scope (``002_stage_inputs``, ``006a``, ...) call this
+    on the per-thread scope (``010_stage_inputs``, ``006a``, ...) call this
     helper instead of branching on the outer flavor.
     """
     if isinstance(outer, ThreadTile):
@@ -116,9 +116,9 @@ def is_matmul_reduce(loop) -> bool:
     ``loop.axis.name``) plus at least one ``Accum``.
 
     Accepts both Loop-IR ``Loop`` / ``StridedLoop`` (the pre-launch_geometry
-    shape seen by ``000_partition_planner``) and Tile-IR ``SerialTile`` /
+    shape seen by ``000_partition_loops``) and Tile-IR ``SerialTile`` /
     ``StridedTile`` (the post-launch_geometry shape). Used by
-    ``000_partition_planner`` to locate the matmul K reduce inside a LoopOp
+    ``000_partition_loops`` to locate the matmul K reduce inside a LoopOp
     body, and by downstream tile passes to confirm a matmul-shaped reduce
     survived.
     """

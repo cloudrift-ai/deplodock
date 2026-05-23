@@ -1,7 +1,7 @@
 """Compile-time hardware target selection.
 
-The tile-IR passes that gate on compute capability (``011_tma_copy`` for
-TMA, ``013_async_copy`` for cp.async) read the target via
+The tile-IR passes that gate on compute capability (``040_use_tma`` for
+TMA, ``050_use_async_copy`` for cp.async) read the target via
 :func:`compute_capability`. By default that probes the live CUDA device
 through cupy. Callers can override the target via :func:`set_target` so
 the compiler emits code for a different architecture than the host —

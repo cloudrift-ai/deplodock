@@ -34,7 +34,7 @@ Env vars:
 - ``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes
   (``SWIZZLE_{128,64,32}B``). ``=1`` enables; default off. Stages whose
   inner box-dim byte size matches a swizzle width pick the matching
-  mode in ``011_tma_copy``; the materializer pairs each swizzled stage
+  mode in ``040_use_tma``; the materializer pairs each swizzled stage
   with body-Load XOR decoding and a 1024-byte (B128) / 512-byte (B64)
   / 256-byte (B32) smem alignment so the swizzle pattern lines up with
   the buffer base.
@@ -133,7 +133,7 @@ _BK_SMALL_M = 64
 _BK_LARGE_M_DEFAULT = 16  # cp.async path
 _BK_LARGE_M_TMA = 32  # TMA path
 
-# Reserve ~4 KB of headroom under the static-smem cap so 014_pad_smem's
+# Reserve ~4 KB of headroom under the static-smem cap so 060_pad_smem's
 # ``+1`` per-stage padding (to break 32-way bank conflicts) doesn't
 # push the kernel over.
 _PAD_HEADROOM_BYTES = 4 * 1024

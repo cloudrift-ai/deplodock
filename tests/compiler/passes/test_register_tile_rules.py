@@ -1,7 +1,7 @@
-"""Tests for the ``register_tile`` rule (``008_register_tile``).
+"""Tests for the ``split_register_axes`` rule (``008_register_tile``).
 
 Firing tests: build a frontend graph, run the full ``TILE_PASSES``,
-assert ``register_tile`` shows up (or doesn't) in
+assert ``split_register_axes`` shows up (or doesn't) in
 ``recording_dump.fired_rules``.
 
 The rule's axis-aware analysis (per-stmt replication factor of 1 / F
@@ -28,7 +28,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 
 
 def test_plain_matmul_fires_register_tile(recording_dump):
-    """``A @ B`` at sizes that clear PAT=16 → register_tile fires.
+    """``A @ B`` at sizes that clear PAT=16 → split_register_axes fires.
     Regression check: the new axis-aware rewrite must keep working on
     the case the rule was originally designed for."""
     g = Graph()
@@ -44,7 +44,7 @@ def test_plain_matmul_fires_register_tile(recording_dump):
     # the normalize pass before 006a sees them, so 006a doesn't fire. The
     # planner firing is the signal that the register-tile decision was made.
     fired = recording_dump.fired_rules("lowering/tile")
-    assert "partition_planner" in fired, fired
+    assert "partition_loops" in fired, fired
 
 
 def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
@@ -56,7 +56,7 @@ def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "register_tile" not in recording_dump.fired_rules("lowering/tile")
+    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
 
 
 def test_single_buffer_reduce_does_not_fire_register_tile(recording_dump):
@@ -69,12 +69,12 @@ def test_single_buffer_reduce_does_not_fire_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "register_tile" not in recording_dump.fired_rules("lowering/tile")
+    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
 
 
 def test_small_matmul_does_not_fire_register_tile(recording_dump):
     """M=N=8 < PAT=16 → blockify keeps every output axis at extent 8,
-    so register_tile finds no THREAD axes with ``extent == pat``."""
+    so split_register_axes finds no THREAD axes with ``extent == pat``."""
     g = Graph()
     _input(g, "a", (8, 32))
     _input(g, "b", (32, 8))
@@ -83,7 +83,7 @@ def test_small_matmul_does_not_fire_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
-    assert "register_tile" not in recording_dump.fired_rules("lowering/tile")
+    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
 
 
 # --- behavior tests --------------------------------------------------
@@ -91,7 +91,7 @@ def test_small_matmul_does_not_fire_register_tile(recording_dump):
 
 def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     """``SdpaOp`` decomposes into two matmuls; the first (Q·Kᵀ) is a
-    plain matmul shape with no pre_outer reduces, so register_tile
+    plain matmul shape with no pre_outer reduces, so split_register_axes
     fires on it. Confirms the rule still reaches the QK^T kernel after
     the new analysis was added."""
     g = Graph()
@@ -104,11 +104,11 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
 
     Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
     fired = recording_dump.fired_rules("lowering/kernel")
-    assert "register_tile" in fired, fired
+    assert "split_register_axes" in fired, fired
 
 
 def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
-    """With ``002_stage_inputs`` running before register_tile, Stages
+    """With ``010_stage_inputs`` running before split_register_axes, Stages
     stay singleton across F² and the smem budget no longer blows up on
     SDPA's softmax-pre-pass + (P·V) matmul kernel. Both SDPA matmul
     kernels (Q·Kᵀ and the dominant one) now fire."""
@@ -121,4 +121,4 @@ def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
-    assert "register_tile" in recording_dump.fired_rules("lowering/kernel")
+    assert "split_register_axes" in recording_dump.fired_rules("lowering/kernel")

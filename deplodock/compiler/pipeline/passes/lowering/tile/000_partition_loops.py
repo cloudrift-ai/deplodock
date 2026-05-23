@@ -798,7 +798,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
 
     # σ-rewrite outer_n's body (M/N axes), then replace every K-iter Loop with
     # a K_o · K_i tower. Both paths use shared canonical K_o / K_i names so
-    # 002_stage_inputs row-cache can merge structurally-equivalent Loads.
+    # 010_stage_inputs row-cache can merge structurally-equivalent Loads.
     inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in shape.outer_n.body)
 
     if shape.k_loop is not None:

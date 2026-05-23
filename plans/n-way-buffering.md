@@ -3,7 +3,7 @@
 ## Context
 
 Today the tile-lowering chain hardcodes a 2-deep ring buffer for K-outer staged matmul:
-`010_double_buffer.py` has `_BUFFER_COUNT = 2`, the pipelining schedule in `015_pipeline_k_outer.py` issues a
+`030_use_ring_buffers.py` has `_BUFFER_COUNT = 2`, the pipelining schedule in `015_pipeline_k_outer.py` issues a
 single-iteration prologue and uses `AsyncWait(keep=len(stages))` (which is structurally `keep = (N-1)·len(stages)`
 with `N=2`), and the smem budget check is `2 × Σ slab_bytes ≤ ctx.max_dynamic_smem`. The `BufferedStage`
 dataclass at `deplodock/compiler/ir/tile/ir.py:441-468` already carries `buffer_count: int` with `>= 2` enforced,
@@ -27,9 +27,9 @@ baseline before flipping any default.
 
 ### Design decisions
 
-1. **Where buffer_count is chosen.** `010_double_buffer.py` picks the largest `N ∈ {4, 3, 2}` whose
+1. **Where buffer_count is chosen.** `030_use_ring_buffers.py` picks the largest `N ∈ {4, 3, 2}` whose
    `N × Σ slab_bytes ≤ ctx.max_dynamic_smem` and whose `K_outer.extent ≥ N`, no fork. Rationale:
-   `Σ slab_bytes` is only known post-staging (after `007_stage_inputs` + `014_pad_smem` run); the planner sees
+   `Σ slab_bytes` is only known post-staging (after `007_stage_inputs` + `060_pad_smem` run); the planner sees
    pre-staging axis extents and would have to re-estimate slab sizes, double-counting the padding pass.
    Greedy-largest-that-fits is monotone (deeper buffers never hurt latency hiding once smem fits), so the
    autotune cartesian doesn't gain anything from a `BUFFERS` knob — and adding one would 3× the matmul variant
@@ -56,12 +56,12 @@ baseline before flipping any default.
    across the group — also N-buffer ready. The smem-index in the phase position is `stage.phase`, an `Expr`,
    so any modulus works. **No materializer code changes** are required; only an assertion-style smoke test.
 
-5. **Smem budget check.** Generalize line 89 of `010_double_buffer.py` from
+5. **Smem budget check.** Generalize line 89 of `030_use_ring_buffers.py` from
    `_BUFFER_COUNT * sum(...) <= smem_budget` to a loop over candidate `N` values, picking the largest fit. The
    planner's pre-staging extent doesn't see padding, so it can't make this decision soundly — keep it in `010`
    where post-staging slab bytes are visible via `Stage.smem_bytes`.
 
-6. **TMA / cp.async compatibility.** Both `011_tma_copy.py` and `013_async_copy.py` already propagate
+6. **TMA / cp.async compatibility.** Both `040_use_tma.py` and `050_use_async_copy.py` already propagate
    `buffer_count=s.buffer_count` when narrowing the type. No code changes needed there. One subtle concern: the
    TMA mbar array length scales linearly with `buffer_count`, and on sm_90+ each mbar is 8 B; 4-buffer with 3
    stages per group costs 96 B of smem for mbars — negligible against the 227 KB budget but worth budgeting
@@ -73,7 +73,7 @@ baseline before flipping any default.
 
 ---
 
-## Step 1 — Slab-fit picker helper in `010_double_buffer.py`
+## Step 1 — Slab-fit picker helper in `030_use_ring_buffers.py`
 
 **Why.** Centralize the "largest N that fits in smem and respects K_outer extent" decision so the rewrite
 function reads `picked_count = _pick_buffer_count(...)` rather than branching on a hardcoded constant. Keeps
@@ -85,7 +85,7 @@ or `None`. Note: `Stage.smem_bytes` returns the *unbuffered* slab — see `ir/ti
 subclass overrides with `× buffer_count`). Pass plain `Stage` instances at the gate (pre-promotion), so this
 stays a one-line product.
 
-**Files.** `deplodock/compiler/pipeline/passes/lowering/tile/010_double_buffer.py` (~15 lines added).
+**Files.** `deplodock/compiler/pipeline/passes/lowering/tile/030_use_ring_buffers.py` (~15 lines added).
 
 **Verification.** Unit test in `tests/compiler/passes/test_double_buffer_n_way.py`: synthesize a `Stage` with
 `slab_bytes = 30 KB`, set `ctx.max_dynamic_smem = 100 KB` → assert pick is 3 (3·30=90 ≤ 100, 4·30=120 > 100);
@@ -102,7 +102,7 @@ construction with the picked value.
 `buffer_count=_BUFFER_COUNT` literals and the `Literal(_BUFFER_COUNT, "int")` in `phase` with the parameter.
 Delete the `_BUFFER_COUNT` module constant.
 
-**Files.** `deplodock/compiler/pipeline/passes/lowering/tile/010_double_buffer.py` (~10 lines touched).
+**Files.** `deplodock/compiler/pipeline/passes/lowering/tile/030_use_ring_buffers.py` (~10 lines touched).
 
 **Verification.** `make test` — existing `test_double_buffer_*` tests must still pass with no diff in their
 emitted IR (smem budgets are sized so today's targets fit at N=2; if a small target happens to fit at N=3 it
@@ -162,7 +162,7 @@ int and either (a) return it if it fits + respects extent, or (b) raise a clear 
 notices the requested depth was infeasible (don't silently fall back — that defeats A/B intent). Document in
 `deplodock/compiler/pipeline/ARCHITECTURE.md` line ~232 alongside `DEPLODOCK_BUFFER_COMPUTE`.
 
-**Files.** `010_double_buffer.py` (~8 lines), `ARCHITECTURE.md` (~2 lines).
+**Files.** `030_use_ring_buffers.py` (~8 lines), `ARCHITECTURE.md` (~2 lines).
 
 **Verification.** Unit test: `monkeypatch.setenv("DEPLODOCK_FORCE_BUFFERS", "3")` → assert N=3 picked; set to
 "5" → assert `RuleSkipped`.
@@ -242,7 +242,7 @@ clean run.
 
 ## Critical files
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_double_buffer.py`
+- `deplodock/compiler/pipeline/passes/lowering/tile/030_use_ring_buffers.py`
 - `deplodock/compiler/pipeline/passes/lowering/tile/015_pipeline_k_outer.py`
 - `deplodock/compiler/ir/tile/ir.py`
 - `deplodock/compiler/pipeline/passes/lowering/kernel/001_materialize_tile.py`

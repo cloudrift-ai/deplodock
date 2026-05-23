@@ -1,7 +1,7 @@
 """Stamp per-statement dtypes on every Load / Assign / Write / Source.
 
 Runs once over a ``TileOp`` body before any analytical pass (demote,
-register_tile, vectorize_loads, permute, pack_fp16, vectorize_stores)
+split_register_axes, vectorize_loads, permute, pack_fp16, vectorize_stores)
 sees the IR. After this pass, downstream passes read dtypes directly
 off the IR instead of reaching for matcher-populated ``KernelOp``
 side channels (``inputs`` / ``outputs`` / ``smem_buffers``) or walking

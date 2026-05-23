@@ -77,28 +77,28 @@ def test_plain_matmul_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_plain_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
-    assert "partition_planner" in fired
+    assert "partition_loops" in fired
 
 
 def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_elwise_lhs_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
-    assert "partition_planner" in fired
+    assert "partition_loops" in fired
 
 
 def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_two_elwise_lhs_matmul())
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
-    assert "partition_planner" in fired
+    assert "partition_loops" in fired
 
 
 def test_matmul_then_elwise_fires_split_k_and_blockify(recording_dump):
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_matmul_then_elwise())
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
-    assert "partition_planner" in fired
+    assert "partition_loops" in fired
 
 
 def test_pure_elementwise_does_not_fire_split_k(recording_dump):
@@ -114,7 +114,7 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" not in fired
     # M16: planner owns partition for both matmul and pointwise.
-    assert "partition_planner" in fired
+    assert "partition_loops" in fired
 
 
 # --- engine: RuleSkipped exception path ------------------------------
