@@ -174,7 +174,11 @@ def _materialize_top(top: Stmt, *, warp_size: int) -> Stmt:
                 new_outer.append(_materialize(child, warp_size=warp_size))
             else:
                 new_outer.append(child)
-        return GridTile(axes=top.axes, body=Body(new_outer), splitk_axes=top.splitk_axes)
+        # splitk_axes is intentionally NOT propagated — coordination has
+        # already used the tag to stamp Write.reduce_op (which is the
+        # only signal codegen needs). The output GridTile carries axes
+        # only.
+        return GridTile(axes=top.axes, body=Body(new_outer))
     if isinstance(top, ThreadTile):
         return _materialize(top, warp_size=warp_size)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
