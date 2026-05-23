@@ -149,6 +149,24 @@ def _canonical_dtype_name(dtype) -> str:
     return dtype.name
 
 
+def dtype_promote(op_name: str, arg_dtypes: list[str]) -> str:
+    """Promote an elementwise op's arg dtypes to a single result dtype.
+
+    Mirrors the inline rule in ``Assign.render``: the result is the
+    common dtype iff every arg agrees; any disagreement promotes to f32.
+    Today's IR only meaningfully encounters f16/f32 mixes; the rule is
+    "all f16 → f16, otherwise f32." ``op_name`` is accepted for future
+    op-specific overrides (e.g. ``relu`` would still emit f16 even with
+    no f16 args), but is unused today.
+
+    Lifted out of ``Assign.render`` so the ``001_stamp_types`` pass can
+    reuse the same rule when stamping ``Assign.dtype`` on the IR.
+    """
+    if arg_dtypes and all(d == "f16" for d in arg_dtypes):
+        return "f16"
+    return "f32"
+
+
 def _pad(n: int) -> str:
     return "    " * n
 

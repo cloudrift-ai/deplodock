@@ -47,51 +47,35 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
-from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
+from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
-PATTERN = [Pattern("root", KernelOp)]
+PATTERN = [Pattern("root", TileOp)]
 
 _TARGET = CudaRenderTarget()
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
-    kop: KernelOp = root.op
-    new_body = _vectorize_body(kop, kop.body)
-    if new_body == kop.body:
+    top: TileOp = root.op
+    new_body = _vectorize_body(top, top.body)
+    if new_body == top.body:
         raise RuleSkipped("no vectorizable Load runs found")
-    return KernelOp(body=new_body, name=kop.name)
+    return TileOp(body=new_body, name=top.name)
 
 
-def _buf_dtype(kop: KernelOp, name: str) -> str:
-    """Resolve a buffer's canonical dtype: matcher-populated ``kop.inputs``
-    / ``kop.outputs`` for graph buffers, then ``kop.smem_buffers`` for
-    smem-local names, then ``f32``."""
-    t = kop.inputs.get(name) or kop.outputs.get(name)
-    if t is not None:
-        return t.dtype.name
-    smem = kop.smem_buffers.get(name)
-    if smem is not None:
-        canonical = canonical_from_cuda_name(smem.dtype)
-        if canonical is not None:
-            return canonical
-    return "f32"
-
-
-def _vectorize_body(kop: KernelOp, body: Body) -> Body:
+def _vectorize_body(top: TileOp, body: Body) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
-    scan this scope for consecutive-Load runs. Threads ``kop`` through so
-    ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
+    scan this scope for consecutive-Load runs. Threads ``top`` through so
+    constant-input filtering can resolve against the surrounding TileOp."""
     descended: list[Stmt] = []
     for s in body:
         nested = s.nested()
         if nested:
-            descended.append(s.with_bodies(tuple(_vectorize_body(kop, b) for b in nested)))
+            descended.append(s.with_bodies(tuple(_vectorize_body(top, b) for b in nested)))
         else:
             descended.append(s)
 
@@ -100,7 +84,7 @@ def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_load(descended, i, run_n, kop)
+            vec = _try_vec_load(descended, i, run_n, top)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -112,7 +96,7 @@ def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     return Body(tuple(out))
 
 
-def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> Load | None:
+def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Load | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Load pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     source buffer's dtype, return the widened :class:`Load`. Otherwise
@@ -129,19 +113,25 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> L
     # No literal-constant loads (those render as embedded scalar floats).
     if any(getattr(s, "input", None) is None for s in loads):
         return None
+    # Every Load in the run must carry a stamped dtype (set by
+    # ``001_stamp_types``). If not, bail — the source dtype is the
+    # decision point for picking a vector type, and falling back to f32
+    # would silently mis-vectorize fp16 chains.
+    if any(s.dtype is None for s in loads):
+        return None
 
     inputs = {s.input for s in loads}
     if len(inputs) != 1:
         return None
     (input_name,) = inputs
-    src_tensor = kop.inputs.get(input_name)
+    src_tensor = top.inputs.get(input_name)
     if src_tensor is not None and src_tensor.constant and src_tensor.value is not None:
         # Scalar-constant inputs get inlined at CUDA lowering — the
         # surrounding kernel doesn't take that buffer as a parameter,
         # so a vectorized reinterpret_cast would reference an undefined
         # symbol.
         return None
-    src_dt = _buf_dtype(kop, input_name)
+    src_dt = loads[0].dtype.name
     if _TARGET.vector_type(src_dt, n) is None:
         return None
 
@@ -195,4 +185,5 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> L
         names=tuple(s.name for s in loads),
         input=input_name,
         index=loads[0].index,
+        dtype=loads[0].dtype,
     )

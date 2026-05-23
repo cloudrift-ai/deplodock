@@ -35,62 +35,61 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
-from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Cond, Stmt, Write
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, Stage, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
-PATTERN = [Pattern("root", KernelOp)]
+PATTERN = [Pattern("root", TileOp)]
 
 _TARGET = CudaRenderTarget()
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
-    kop: KernelOp = root.op
-    new_body = _vectorize_body(kop, kop.body)
-    if new_body == kop.body:
+def rewrite(root: Node) -> Graph | None:
+    top: TileOp = root.op
+    new_body = _vectorize_body(top, top.body)
+    if new_body == top.body:
         raise RuleSkipped("no vectorizable Write runs found")
-    return KernelOp(body=new_body, name=kop.name)
+    return TileOp(body=new_body, name=top.name, knobs=dict(top.knobs))
 
 
-def _buf_dtype(kop: KernelOp, name: str) -> str:
-    """Resolve a buffer's canonical dtype — mirrors the helper in
-    ``003_vectorize_loads`` (graph Tensors via ``kop.inputs`` /
-    ``kop.outputs``, then ``kop.smem_buffers`` for smem-local names,
-    then ``f32``)."""
-    t = kop.inputs.get(name) or kop.outputs.get(name)
+def _buf_dtype(top: TileOp, name: str) -> str:
+    """Resolve a destination buffer's canonical dtype. TileOp-stage
+    Writes target either a kernel output (Tensor in ``top.outputs``)
+    or, in rare cases, a kernel input (when downstream optimizations
+    fold a copy). Falls back to f32 when not found."""
+    t = top.outputs.get(name) or top.inputs.get(name)
     if t is not None:
         return t.dtype.name
-    smem = kop.smem_buffers.get(name)
-    if smem is not None:
-        canonical = canonical_from_cuda_name(smem.dtype)
-        if canonical is not None:
-            return canonical
     return "f32"
 
 
-def _vectorize_body(kop: KernelOp, body: Body) -> Body:
+def _vectorize_body(top: TileOp, body: Body) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
-    scan this scope for consecutive-Write runs. Threads ``kop`` through so
-    ``_buf_dtype`` can resolve per-buffer dtypes against the same op."""
+    scan this scope for consecutive-Write runs. Threads ``top`` through
+    so ``_buf_dtype`` can resolve per-buffer dtypes against the same op.
+
+    Stage Writes belong to the *producer* side, synthesized at materialize
+    time — they aren't in the TileOp body yet, so the Stage block stmts
+    are walked as opaque (their consumer subtree's Writes target the
+    kernel output, not the smem slab)."""
     descended: list[Stmt] = []
     for s in body:
-        if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
-            descended.append(s.with_bodies((_vectorize_body(kop, s.body),)))
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile, Stage)):
+            new_nested = tuple(_vectorize_body(top, b) for b in s.nested())
+            descended.append(s.with_bodies(new_nested))
         elif isinstance(s, Cond):
             descended.append(
                 Cond(
                     cond=s.cond,
-                    body=_vectorize_body(kop, s.body),
-                    else_body=_vectorize_body(kop, s.else_body),
+                    body=_vectorize_body(top, s.body),
+                    else_body=_vectorize_body(top, s.else_body),
                 )
             )
         elif isinstance(s, (GridTile, ThreadTile)):
-            descended.append(s.with_bodies((_vectorize_body(kop, s.body),)))
+            descended.append(s.with_bodies((_vectorize_body(top, s.body),)))
         else:
             descended.append(s)
 
@@ -99,7 +98,7 @@ def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     while i < len(descended):
         replaced = False
         for run_n in (8, 4, 2):
-            vec = _try_vec_store(descended, i, run_n, kop)
+            vec = _try_vec_store(descended, i, run_n, top)
             if vec is not None:
                 out.append(vec)
                 i += run_n
@@ -111,7 +110,7 @@ def _vectorize_body(kop: KernelOp, body: Body) -> Body:
     return Body(tuple(out))
 
 
-def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> Write | None:
+def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Write | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Write pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     destination buffer's dtype, return the widened :class:`Write`.
@@ -136,7 +135,7 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> 
     if any(s.reduce_op is not None for s in writes):
         return None
 
-    dst_dt = _buf_dtype(kop, output_name)
+    dst_dt = _buf_dtype(top, output_name)
     if _TARGET.vector_type(dst_dt, n) is None:
         return None
 
@@ -190,4 +189,5 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, kop: KernelOp) -> 
         index=writes[0].index,
         values=tuple(s.value for s in writes),
         reduce_op=None,
+        value_dtype=writes[0].value_dtype,
     )

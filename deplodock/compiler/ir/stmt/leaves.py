@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
-from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, op_to_expr, render_index, select_to_ternary
+from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, dtype_promote, op_to_expr, render_index, select_to_ternary
 
 
 def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt: str) -> list[Expr]:
@@ -120,11 +120,20 @@ class Load(Stmt):
     ``input`` — the scalar-constant-inlining path populates that map at
     the cuda lowering boundary so kernels can embed ``ConstantOp``
     values directly instead of taking them as ``float*`` parameters.
+
+    ``dtype`` is optional and, when set, names the source-buffer element
+    dtype that this Load produces. The ``001_stamp_types`` Kernel-IR pass
+    populates it once before any analytical pass runs; downstream passes
+    (vectorize_loads, demote, etc.) read it instead of reaching for the
+    matcher-populated ``KernelOp.inputs``/``outputs`` side channels.
+    ``None`` keeps the legacy render-time inference path working for
+    tests that construct Loads by hand without dtype.
     """
 
     names: tuple[str, ...]
     input: str
     index: tuple[Expr, ...]
+    dtype: DataType | None
 
     def __init__(
         self,
@@ -133,6 +142,7 @@ class Load(Stmt):
         index: tuple[Expr, ...] | None = None,
         *,
         names: tuple[str, ...] | None = None,
+        dtype: DataType | None = None,
     ) -> None:
         if names is None:
             if name is None:
@@ -149,6 +159,7 @@ class Load(Stmt):
         object.__setattr__(self, "names", tuple(names))
         object.__setattr__(self, "input", input)
         object.__setattr__(self, "index", tuple(index))
+        object.__setattr__(self, "dtype", dtype)
 
     @property
     def name(self) -> str:
@@ -199,7 +210,10 @@ class Load(Stmt):
         if lit is not None and self.is_scalar:
             ctx.ssa_dtypes[self.names[0]] = "f32"
             return [f"{pad}{ctx.type_name('f32')} {self.names[0]} = {_float_lit(lit)};"]
-        src_dt = ctx.buffer_dtypes.get(self.input, "f32")
+        # Prefer the stamped ``self.dtype`` (set by ``001_stamp_types``);
+        # fall back to ``ctx.buffer_dtypes`` so handwritten test fixtures
+        # without a stamped dtype still render correctly.
+        src_dt = self.dtype.name if self.dtype is not None else ctx.buffer_dtypes.get(self.input, "f32")
         if self.is_scalar:
             # Scalar path. Declare the local in the source buffer's
             # element type so downstream ``Assign``s can pick native ops
@@ -368,7 +382,7 @@ class Assign(Stmt):
         if self.dtype is not None:
             result_dt = self.dtype.name
         else:
-            result_dt = "f16" if arg_dtypes and all(d == "f16" for d in arg_dtypes) else "f32"
+            result_dt = dtype_promote(op_name, arg_dtypes)
 
         all_args_at_result = bool(arg_dtypes) and all(d == result_dt for d in arg_dtypes)
         if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt) and all_args_at_result:
@@ -561,12 +575,17 @@ class Write(Stmt):
     of a plain store. Vectorizing atomic reduce-writes is unsound (each
     lane needs its own atomicAdd), so ``005_vectorize_stores`` excludes
     them and ``__init__`` rejects the combination here.
+
+    ``value_dtype`` is optional; when set, names the SSA-value dtype being
+    stored. Stamped by ``001_stamp_types``; downstream passes read it
+    instead of querying ``ctx.ssa_dtypes`` at render time.
     """
 
     output: str
     index: tuple[Expr, ...]
     values: tuple[str, ...]
     reduce_op: ElementwiseImpl | None
+    value_dtype: DataType | None
 
     def __init__(
         self,
@@ -576,6 +595,7 @@ class Write(Stmt):
         reduce_op: ElementwiseImpl | None = None,
         *,
         values: tuple[str, ...] | None = None,
+        value_dtype: DataType | None = None,
     ) -> None:
         if values is None:
             if value is None:
@@ -597,6 +617,7 @@ class Write(Stmt):
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "values", tuple(values))
         object.__setattr__(self, "reduce_op", reduce_op)
+        object.__setattr__(self, "value_dtype", value_dtype)
 
     @property
     def value(self) -> str:
@@ -641,6 +662,9 @@ class Write(Stmt):
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         out_dt = ctx.buffer_dtypes.get(self.output, "f32")
+        # Prefer the stamped ``self.value_dtype`` (set by ``001_stamp_types``);
+        # fall back to ``ctx.ssa_dtypes`` for legacy/handwritten paths.
+        stamped_value_dt = self.value_dtype.name if self.value_dtype is not None else None
         if self.is_scalar:
             # Scalar path. Convert at the store boundary only when the
             # value's SSA dtype disagrees with the destination buffer's
@@ -650,7 +674,7 @@ class Write(Stmt):
             # without conversion the ``atomicAdd(__half*, float)`` call
             # is silently broken).
             flat = render_index(self.output, self.index, ctx)
-            value_dt = ctx.ssa_dtypes.get(self.value, "f32")
+            value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(self.value, value_dt, out_dt)
             if self.reduce_op is not None:
                 return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
@@ -660,7 +684,7 @@ class Write(Stmt):
         n = self.width
         converted: list[str] = []
         for nm in self.values:
-            src_dt = ctx.ssa_dtypes.get(nm, "f32")
+            src_dt = stamped_value_dt or ctx.ssa_dtypes.get(nm, "f32")
             converted.append(nm if src_dt == out_dt else ctx.target.convert(nm, src_dt, out_dt))
         vec_pair = ctx.target.vector_type(out_dt, n)
         if vec_pair is None:

@@ -50,6 +50,7 @@ import enum
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
+from deplodock.compiler.dtype import DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -249,6 +250,12 @@ class Source:
       reconstruct it. ``cache_dims`` carries the affine mapping (which
       source_dim each cache axis maps to); ``template_index`` carries
       the verbatim source-dim Exprs for the template case.
+    - ``dtype`` — source buffer's element dtype. Stamped by
+      ``001_stamp_types`` from ``graph.nodes[buf].output.dtype`` so smem
+      allocation (``smem_bytes`` / ``alloc_extents``) and downstream
+      materialization can read it off the IR without reaching for the
+      matcher-populated graph node. ``None`` keeps legacy fp32-assuming
+      behavior for tests that construct Source by hand.
     """
 
     name: str
@@ -257,6 +264,7 @@ class Source:
     origin: tuple[Expr, ...]
     pad: tuple[int, ...] = ()
     template_index: tuple[Expr, ...] | None = None
+    dtype: DataType | None = None
 
     @property
     def cache_axes(self) -> tuple[Axis, ...]:
@@ -278,8 +286,13 @@ class Source:
 
     @property
     def smem_bytes(self) -> int:
-        """Bytes of dynamic shared memory this Source allocates (single-slot)."""
-        n = BYTES_PER_ELEM
+        """Bytes of dynamic shared memory this Source allocates (single-slot).
+
+        Uses ``self.dtype.nbytes`` when ``001_stamp_types`` has populated it;
+        falls back to the legacy fp32-assuming ``BYTES_PER_ELEM`` constant
+        otherwise so handwritten test fixtures without dtype continue to work.
+        """
+        n = self.dtype.nbytes if self.dtype is not None else BYTES_PER_ELEM
         for e in self.alloc_extents:
             n *= e
         return n
