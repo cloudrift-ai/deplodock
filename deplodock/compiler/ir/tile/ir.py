@@ -89,29 +89,38 @@ SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
 
 
 # ---------------------------------------------------------------------------
-# Deprecated AsyncWait stub (stage-wrap-body refactor)
+# AsyncWait — explicit wait carrier for pipelined schedules
 # ---------------------------------------------------------------------------
 #
-# AsyncWait is preserved as a stub for import compatibility during the
-# stage-wrap-body refactor. The async/TMA pipelining passes that used to
-# emit AsyncWait are stubbed in Phase B and rewritten in Phase C buckets
-# 10/11/12 to fold wait semantics into the wrapping stage's transport
-# policy (pipeline_depth on AsyncBufferedStage / TmaBufferedStage). No
-# new passes should emit AsyncWait; the class deletion happens once
-# Phase C's pipelining + TMA + cp.async buckets close.
+# Sync-style async / TMA stages (``pipeline_depth == 1``) get an
+# implicit wait at their wrap boundary, emitted by ``_emit_stage`` /
+# ``emit_tma_stage`` in the materializer. Pipelined stages
+# (``pipeline_depth > 1``) need explicit waits at non-default schedule
+# positions: ``015_lower_pipelined_async_stage`` emits ``AsyncWait``
+# Stmts between the issue and consume halves of each steady-state K_o
+# iteration (and at the epilogue drain). The materializer's
+# ``emit_async_wait`` closure lowers them to ``CpAsyncWait(group=keep)``
+# for cp.async, or ``MbarrierWait(mbar, phase, slot)`` for TMA.
 
 
 @dataclass
 class AsyncWait(Stmt):
-    """**Deprecated** — kept for import compatibility during stage-wrap-body refactor.
+    """Explicit wait carrier for pipelined async / TMA schedules.
 
-    Pre-refactor: synchronization with previously-issued ``AsyncBufferedStage``
-    / ``TmaBufferedStage`` loads. ``keep`` = cp.async wait_group argument;
-    ``phase`` / ``slot`` = TMA mbarrier phase + ring slot.
+    Sync-style stages (``pipeline_depth == 1``) don't need this — the
+    materializer emits an implicit wait at the wrap boundary. Pipelined
+    stages do: ``015_lower_pipelined_async_stage`` peels the steady
+    state into issue-now / wait-for-prev / consume-prev, with explicit
+    ``AsyncWait`` carrying the schedule:
 
-    Post-refactor: wait semantics fold into the wrapping stage's transport
-    policy. Phase C bucket 10 (pipelining) / 11 (cp.async) / 12 (TMA)
-    delete the last emission sites and this class.
+    - ``keep`` — cp.async ``wait_group`` argument (number of commits to
+      leave in flight). ``keep = 1`` in the steady-state body leaves
+      the just-issued chunk in flight while waiting for the older one;
+      ``keep = 0`` in the epilogue drains every outstanding commit.
+    - ``phase`` / ``slot`` — TMA mbarrier-test phase + ring slot for
+      the consumer-side ``MbarrierWait``. ``phase = (K_o / bc) % 2``
+      tracks how many times the slot has been reused; ``slot = K_o % bc``
+      picks the ring slot to wait on.
     """
 
     keep: int = 0
@@ -1075,7 +1084,21 @@ class TileOp(BodyOp):
         """
         from math import prod  # noqa: PLC0415
 
-        staged = sum(s.smem_bytes for s in self.body.iter() if isinstance(s, Stage))
+        # Dedupe by Source name: pipelining
+        # (015_lower_pipelined_async_stage) replicates an
+        # ``AsyncBufferedStage`` for prologue + steady-state issue, both
+        # writing into the same smem buffer (same name, same allocation).
+        # Counting them independently would double-charge the budget and
+        # silently reject pipelined variants on smem-tight kernels.
+        per_source: dict[str, int] = {}
+        for s in self.body.iter():
+            if isinstance(s, Stage):
+                for src in s.sources:
+                    # ``s.smem_bytes`` includes the buffer_count factor; the
+                    # per-source share is the source's slab × buffer_count.
+                    buf_count = getattr(s, "buffer_count", 1)
+                    per_source[src.name] = src.smem_bytes * buf_count
+        staged = sum(per_source.values())
         if staged > ctx.max_dynamic_smem:
             return False
 
@@ -1200,7 +1223,7 @@ __all__ = [
     "TemplateAddressing",
     "CacheDim",
     "Source",
-    "AsyncWait",  # deprecated stub during refactor
+    "AsyncWait",
     "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
     "Stmt",

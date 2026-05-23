@@ -238,7 +238,7 @@ behind one sync boundary; sibling Stages exist only when scopes differ.
 | `AffineAddressing`    | Property-derived addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
 | `TemplateAddressing`  | Property-derived addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
 | `Combine`             | Cross-thread collapse of an `Accum` target (post reduce loop).                                                                       |
-| `AsyncWait`           | **Deprecated stub** — kept for import compatibility during the stage-wrap-body refactor; wait semantics now fold into `pipeline_depth` on AsyncBufferedStage / TmaBufferedStage. Bucket 10 lowering will delete the last emission sites. |
+| `AsyncWait`           | Explicit wait carrier for pipelined async / TMA schedules. Emitted by `015_lower_pipelined_async_stage` between issue / consume halves of each steady-state K_o iter and at the epilogue drain. ``keep`` is the cp.async ``wait_group`` arg; ``phase`` / ``slot`` are TMA mbarrier-test args. Sync-style (``pipeline_depth==1``) stages don't carry one — the materializer emits an implicit wait at the wrap boundary. |
 
 ## `kernel/`
 

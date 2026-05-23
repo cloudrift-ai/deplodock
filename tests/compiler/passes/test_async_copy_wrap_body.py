@@ -61,16 +61,17 @@ def test_matmul_fires_async_copy(recording_dump):
 
 
 def test_async_copy_emits_async_buffered_stage():
+    """At least one AsyncBufferedStage with buffer_count=2 lands in the
+    lowered TileOp. Post-015 pipelining wraps two issue-only stages
+    (prologue + steady-state issue, pipeline_depth=2) around the original
+    stage; the structural assertion is "any async stage present" rather
+    than the specific pre-015 depth=1 shape."""
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g)
     op = g2.nodes["o"].op
-    kouter = _find_kouter(op)
-    assert kouter is not None
-    async_stages = [s for s in kouter.body if isinstance(s, AsyncBufferedStage)]
-    assert async_stages, f"K_o body has no AsyncBufferedStage: {[type(s).__name__ for s in kouter.body]}"
-    for st in async_stages:
-        assert st.pipeline_depth == 1, st.pipeline_depth
-        assert st.buffer_count == 2, st.buffer_count
+    async_stages = [s for s in op.body.iter() if isinstance(s, AsyncBufferedStage)]
+    assert async_stages, "no AsyncBufferedStage anywhere in the body"
+    assert all(st.buffer_count == 2 for st in async_stages), [st.buffer_count for st in async_stages]
 
 
 def test_async_copy_preserves_buffered_fields():

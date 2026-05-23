@@ -16,7 +16,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.stmt import Load
-from deplodock.compiler.ir.tile.ir import BufferedStage, SerialTile, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import BufferedStage, SerialTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
 
@@ -53,39 +53,42 @@ def test_matmul_fires_double_buffer(recording_dump):
 
 
 def test_double_buffer_emits_buffered_stage():
-    """The K_o SerialTile body has a BufferedStage with buffer_count=2 and
-    phase=Var(K_o.name) % 2 after the pass runs."""
+    """At least one BufferedStage (or subclass) with buffer_count=2 lands
+    in the lowered TileOp. Post-015 pipelining the K_o body's stage is an
+    AsyncBufferedStage; the phase may be σ-substituted (``(K_o+1) % 2``
+    in the main-loop issue, ``Literal(0)`` in the prologue) so the check
+    is structural: any buffer_count=2 stage anywhere in the body."""
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g)
     op = g2.nodes["o"].op
-    kouter = _find_kouter(op)
-    assert kouter is not None, "no SerialTile(serial_outer) survived the pipeline"
-    buffered = [s for s in kouter.body if isinstance(s, BufferedStage)]
-    assert buffered, f"K_o body has no BufferedStage: {[type(s).__name__ for s in kouter.body]}"
-    for bs in buffered:
-        assert bs.buffer_count == 2, bs.buffer_count
-        # phase is "Var(K_o.name) % 2"
-        assert bs.phase.pretty() == f"({kouter.axis.name} % 2)", bs.phase.pretty()
+    buffered = [s for s in op.body.iter() if isinstance(s, BufferedStage)]
+    assert buffered, f"no BufferedStage anywhere in the lowered body: {[type(s).__name__ for s in op.body.iter()]}"
+    assert all(bs.buffer_count == 2 for bs in buffered), [bs.buffer_count for bs in buffered]
 
 
 def test_double_buffer_phase_prepended_to_body_loads():
-    """Loads inside the BufferedStage's wrapped body that read from staged
-    smem must have phase as the leading index dim."""
+    """Loads against staged smem buffers carry a leading phase index dim
+    (set by 010_double_buffer). Post-015 the consumer body lives as
+    siblings of the issue-only stage, so we scan the whole TileOp body
+    for staged-smem Loads."""
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g)
     op = g2.nodes["o"].op
-    kouter = _find_kouter(op)
-    assert kouter is not None
-    for bs in [s for s in kouter.body if isinstance(s, BufferedStage)]:
-        staged = {src.name for src in bs.sources}
-        phase_str = bs.phase.pretty()
-        loads_against_smem = [s for s in bs.body.iter() if isinstance(s, Load) and s.input in staged]
-        assert loads_against_smem, "no Loads in body read from staged smem — pass found nothing to rewrite"
-        for ld in loads_against_smem:
-            assert ld.index, f"empty index on staged Load: {ld}"
-            assert ld.index[0].pretty() == phase_str, (
-                f"Load {ld.name!r} from {ld.input!r} missing phase prefix: leading={ld.index[0].pretty()!r}, expected={phase_str!r}"
-            )
+    staged_names: set[str] = set()
+    for s in op.body.iter():
+        if isinstance(s, BufferedStage):
+            staged_names.update(src.name for src in s.sources)
+    assert staged_names, "no staged-smem buffer names found"
+    loads_against_smem = [s for s in op.body.iter() if isinstance(s, Load) and s.input in staged_names]
+    assert loads_against_smem, "no Loads in body read from staged smem"
+    # Every staged-smem Load's leading index dim is a phase expression —
+    # either ``K_o % 2`` (the original 010-stamped phase) or a literal
+    # ring slot (post-015 σ_last on the epilogue consumer).
+    for ld in loads_against_smem:
+        assert ld.index, f"empty index on staged Load: {ld}"
+        leading = ld.index[0].pretty()
+        is_phase = "% 2" in leading or leading.strip("()").isdigit()
+        assert is_phase, f"Load {ld.name!r} leading index {leading!r} doesn't look like a ring-slot phase"
 
 
 # --- idempotence ---------------------------------------------------------
@@ -156,14 +159,14 @@ def test_no_stage_means_no_promotion(recording_dump):
 
 
 def test_buffered_stages_in_tile_validate_under_smem_budget():
-    """The promoted TileOp must still validate: smem_bytes × 2 must fit
-    in ctx.max_dynamic_smem. The pass enforces this; verify the budget
-    on the resulting BufferedStage."""
+    """The promoted TileOp must validate: total per-Source smem
+    (deduped by name, accounting for buffer_count) fits in
+    ``ctx.max_dynamic_smem``. Pipelined variants emit multiple Stages
+    against the same source name — ``TileOp.validate`` dedupes."""
     from deplodock.compiler.context import Context
 
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g)
     op = g2.nodes["o"].op
     ctx = Context.from_target((8, 0))
-    staged = sum(s.smem_bytes for s in op.body.iter() if isinstance(s, Stage))
-    assert staged <= ctx.max_dynamic_smem, f"smem {staged}B exceeds budget {ctx.max_dynamic_smem}B"
+    assert op.validate(ctx), "lowered TileOp must validate under sm_80 smem budget"
