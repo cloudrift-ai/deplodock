@@ -87,12 +87,22 @@ def analyze(tile_op_or_body: TileOp | Body) -> EscapeAnalysis:
     accums: list[tuple[Accum, tuple[Stmt, ...]]] = []
     writes: list[tuple[Write, tuple[Stmt, ...]]] = []
     _collect(body, (), accums, writes)
+    # Per-thread Writes to smem staging buffers must NOT be classified
+    # as atomic — each thread owns its own slab slot, no racing. The
+    # materializer's cooperative-load nest produces Writes whose index
+    # references the cooperative-load loop var (not the block axes), so
+    # block-axis-missing would otherwise flag them.
+    staging_buffers = _staging_buffer_names(body)
 
     # --- Atomic-Write classification ---
     # Pure index analysis: any enclosing GridTile axis missing from a
-    # Write's index means CTAs race ⇒ atomic.
+    # Write's index means CTAs race ⇒ atomic. Skipped for staging-buffer
+    # targets (smem).
     write_atomic_axes: dict[int, frozenset[str]] = {}
     for w, chain in writes:
+        if w.output in staging_buffers:
+            write_atomic_axes[id(w)] = frozenset()
+            continue
         block_axes = _block_axis_names_in_chain(chain)
         missing = block_axes - _free_vars_in_index(w)
         write_atomic_axes[id(w)] = frozenset(missing)
@@ -161,6 +171,28 @@ def _block_axis_names_in_chain(chain: tuple[Stmt, ...]) -> frozenset[str]:
     for s in chain:
         if isinstance(s, GridTile):
             out.update(ax.name for ax in s.axes)
+    return frozenset(out)
+
+
+def _staging_buffer_names(body: Body) -> frozenset[str]:
+    """Names declared as ``Smem`` (or ``Stage.sources``) anywhere in the
+    body — staging buffers, not global outputs. Writes to these names
+    are per-thread slab stores, not racing global stores."""
+    # Local imports to avoid a Tile-IR cycle and to keep Kernel-IR
+    # optional for callers analyzing pre-materialize bodies.
+    out: set[str] = set()
+    try:
+        from deplodock.compiler.ir.kernel.ir import Smem  # noqa: PLC0415
+    except ImportError:
+        Smem = None  # type: ignore[assignment]
+    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415
+
+    for s in body.iter():
+        if Smem is not None and isinstance(s, Smem):
+            out.add(s.name)
+        if isinstance(s, Stage):
+            for src in s.sources:
+                out.add(src.name)
     return frozenset(out)
 
 

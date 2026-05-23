@@ -186,6 +186,13 @@ def render_kernelop(
         for n, s in shapes.items():
             tmap.setdefault(n, Tensor(n, tuple(s)))
     smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
+    # Escape analysis populates atomic_writes / broadcast_writes so
+    # ``Write.render`` can decide ``atomicAdd`` and broadcast-guard
+    # emission from the helper instead of the pre-stamped ``reduce_op``
+    # field / surrounding Cond wrappers.
+    from deplodock.compiler.ir.tile.escape_analysis import analyze as _analyze_escape  # noqa: PLC0415
+
+    escape = _analyze_escape(kernel_op.body)
     ctx = RenderCtx(
         target=CudaRenderTarget(),
         shapes={n: tuple(t.shape) for n, t in tmap.items()},
@@ -195,6 +202,8 @@ def render_kernelop(
         literal_constants=literals,
         smem_dynamic_offsets=smem_offsets,
         buffer_dtypes={n: t.dtype.name for n, t in tmap.items()},
+        atomic_writes=dict(escape._write_atomic_axes),
+        broadcast_writes=dict(escape._write_broadcast_axes),
     )
 
     def _dtype_for(name: str) -> object:

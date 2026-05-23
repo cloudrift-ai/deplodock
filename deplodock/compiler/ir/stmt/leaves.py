@@ -676,7 +676,12 @@ class Write(Stmt):
             flat = render_index(self.output, self.index, ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(self.value, value_dt, out_dt)
-            if self.reduce_op is not None:
+            # Atomic-Write trigger: prefer the helper-derived signal
+            # (``ctx.atomic_writes``) when ``render_kernelop`` populated
+            # it; fall back to the legacy stamped ``self.reduce_op`` for
+            # standalone-render unit tests that build a bare RenderCtx.
+            is_atomic = bool(ctx.atomic_writes.get(id(self))) or self.reduce_op is not None
+            if is_atomic:
                 return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
             return [f"{pad}{self.output}[{flat}] = {rhs};"]
         # Vectorized path. Per-value dtype conversion: every SSA arg
