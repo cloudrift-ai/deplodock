@@ -226,11 +226,6 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         return s
 
     new_body: list[Stmt] = []
-    # Sibling Combines (one per Accum) after a reduce loop share the same
-    # reduce — F-replicated rmsnorm bodies produce two Accums in one Loop,
-    # then one Combine each. Index by name so each Combine finds its own
-    # Accum's dtype.
-    pending_reduce: dict[str, Accum] = {}
     declared_smem: set[str] = set()
 
     # TMA hoist state. ``descriptors`` and ``mbar_prologue`` collect the
@@ -439,16 +434,12 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     for stmt in body:
         if isinstance(stmt, TmaBufferedStage):
             new_body.extend(filter_emit(emit_tma_stage(stmt)))
-            pending_reduce = {}
         elif isinstance(stmt, ComputeStage):
             new_body.extend(filter_emit(_emit_compute_stage(stmt, tid_expr, n_threads)))
-            pending_reduce = {}
         elif isinstance(stmt, Stage):
             new_body.extend(filter_emit(_emit_stage(stmt, tid_expr, n_threads)))
-            pending_reduce = {}
         elif isinstance(stmt, AsyncWait):
             new_body.extend(emit_async_wait(stmt))
-            pending_reduce = {}
         elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
             new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
             # Locate Accums whose value escapes this loop scope so we
@@ -463,19 +454,21 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
                 # Descend into nested reduce subtrees so sibling Combines match
                 # their Accums' dtypes.
                 accums_in_scope = _find_nested_reduce_accums(stmt.body)
-            pending_reduce = accums_in_scope
             for acc_name, acc in accums_in_scope.items():
                 if escape is not None and escape.accum_cooperative_axes.get(acc_name):
-                    new_body.extend(_emit_combine(acc_name, acc.op, _single_thread_var(thread_axes), n_threads, acc.dtype or F32, warp_size=warp_size))
+                    tid_var = _single_thread_var(thread_axes)
+                    dt = acc.dtype or F32
+                    new_body.extend(_emit_combine(acc_name, acc.op, tid_var, n_threads, dt, warp_size=warp_size))
                     rename[acc_name] = f"{acc_name}_b"
         elif isinstance(stmt, Accum):
             # Bare Accum at the ThreadTile scope — degenerate cooperative
             # reduce where K_i collapsed to size-1 (e.g. K=warp_size with
             # BR=warp_size cooperative threads each handling one element).
             new_body.append(transform(stmt))
-            pending_reduce = {stmt.name: stmt}
             if escape is not None and escape.accum_cooperative_axes.get(stmt.name):
-                new_body.extend(_emit_combine(stmt.name, stmt.op, _single_thread_var(thread_axes), n_threads, stmt.dtype or F32, warp_size=warp_size))
+                tid_var = _single_thread_var(thread_axes)
+                dt = stmt.dtype or F32
+                new_body.extend(_emit_combine(stmt.name, stmt.op, tid_var, n_threads, dt, warp_size=warp_size))
                 rename[stmt.name] = f"{stmt.name}_b"
         elif isinstance(stmt, Combine):
             # Skip — helper-driven Combine emission above already handled
