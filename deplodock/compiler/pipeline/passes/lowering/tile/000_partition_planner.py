@@ -8,7 +8,7 @@ Output axes split as ``A → A_b·(T·R) + A_t·R + A_r`` (T = BN or BM, R = FN 
 FM). K splits as ``K → K_s·(K_o·br·bk) + K_o·(br·bk) + K_i·br + K_c`` (K_s for
 SPLITK > 1, K_c for cooperative-K BR > 1). Resulting nesting:
 
-    K_s SPLITK_BLOCK → M_b BLOCK → N_b BLOCK → K_c COOPERATIVE_STRIDE →
+    K_s BLOCK (split-K) → M_b BLOCK → N_b BLOCK → K_c THREAD (coop-K) →
       M_t THREAD → N_t THREAD → M_r REGISTER → N_r REGISTER →
         prelude → K_o SERIAL_OUTER → K_i STAGE_INNER (reduce σ(body)) →
         (helper-driven cross-thread combine when K_c is cooperative) →
@@ -42,7 +42,7 @@ FM=FN=1, BK=16, SPLITK=1, BR=1):
                                 Write(C[m_b·16 + m_t, n_b·16 + n_t], acc)
 
 For cooperative-K reduce (e.g. sum K=512 with BR=256, BK=2), K_c appears as
-a COOPERATIVE_STRIDE thread axis above the BLOCK level and σ_k extends to
+a THREAD axis above the BLOCK level and σ_k extends to
 ``k = k_o·512 + k_i·256 + k_c``; the materializer emits the cross-thread
 combine after the reduce subtree based on the escape-analysis helper
 (``ir/tile/escape_analysis.py``) reading ``ThreadTile.cooperative_axes``.
@@ -102,12 +102,10 @@ class Role(enum.Enum):
 
     BLOCK = "block"
     THREAD = "thread"
-    SPLITK_BLOCK = "splitk_block"
     REGISTER = "register"
     STAGE_INNER = "stage_inner"
     SERIAL_OUTER = "serial_outer"
     PIPELINE = "pipeline"
-    COOPERATIVE_STRIDE = "cooperative_stride"
 
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -306,12 +304,11 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
 
     Role → flavor mapping:
 
-    - ``BLOCK`` / ``SPLITK_BLOCK`` → ``GridTile.axes``. Split-K vs.
-      regular output-partition is derived at codegen time from
-      ``escape_analysis.atomic_axes``.
-    - ``THREAD`` / ``COOPERATIVE_STRIDE`` → ``ThreadTile.axes``.
-      Cooperative-K cooperativity is recovered at materialize time from
-      ``Accum.axes ∩ ThreadTile.axes`` (see ``escape_analysis``).
+    - ``BLOCK`` → ``GridTile.axes``. Split-K vs. regular output-partition
+      is derived at codegen time from ``escape_analysis.atomic_axes``.
+    - ``THREAD`` → ``ThreadTile.axes``. Cooperative-K cooperativity is
+      recovered at materialize time from ``Accum.axes ∩ ThreadTile.axes``
+      (see ``escape_analysis``).
     - ``REGISTER`` → ``RegisterTile.axes``.
     - ``SERIAL_OUTER`` / ``STAGE_INNER`` / ``PIPELINE`` → ``SerialTile(kind=…)``.
     - Untagged (``None``) → ``SerialTile(kind="plain")``.
@@ -320,7 +317,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     inlines extent-1 free Loops by substituting their var with 0. The
     planner's σ-split sometimes generates such axes (e.g. cooperative
     softmax with BN=BM=1 makes N_t / M_t extent-1 THREAD axes). Mirror
-    the same drop here — except for ``BLOCK`` / ``SPLITK_BLOCK`` axes,
+    the same drop here — except for ``BLOCK`` axes,
     which signal launch geometry to the CUDA backend and must survive
     even at extent 1 (single-CTA cooperative kernels rely on this).
     """
@@ -329,7 +326,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     # ``Var(axis.name) → Literal(0, "int")`` in the inner body.
     filtered: list[tuple[Axis, Role | None]] = []
     for axis, role in layers:
-        if int(axis.extent) == 1 and role not in (Role.BLOCK, Role.SPLITK_BLOCK):
+        if int(axis.extent) == 1 and role is not Role.BLOCK:
             sub = Sigma({axis.name: Literal(0, "int")})
             inner_body = tuple(c.rewrite(_identity_rename, sub) for c in inner_body)
             continue
@@ -354,14 +351,14 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     current: tuple[Stmt, ...] = inner_body
     for kind, axes, roles in reversed(groups):
         if kind == "grid":
-            # SPLITK_BLOCK axes need no tag — codegen derives atomic-add
-            # from ``escape_analysis.atomic_axes`` (block axis missing
-            # from Write.index).
+            # Split-K block axes (K_s) need no tag — codegen derives
+            # atomic-add from ``escape_analysis.atomic_axes`` (block axis
+            # missing from Write.index).
             current = (GridTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "thread":
-            # COOPERATIVE_STRIDE axes need no tag — they get into
-            # ``Accum.axes`` via the planner's σ-split and the helper
-            # recovers cooperativity from ``Accum.axes ∩ ThreadTile.axes``.
+            # Cooperative-K thread axes (K_c) get into ``Accum.axes``
+            # via the planner's σ-split; the materializer recovers
+            # cooperativity from ``Accum.axes ∩ ThreadTile.axes``.
             current = (ThreadTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "register":
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
@@ -380,9 +377,9 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
 
 
 def _layer_kind_for(role: Role | None) -> str:
-    if role is Role.BLOCK or role is Role.SPLITK_BLOCK:
+    if role is Role.BLOCK:
         return "grid"
-    if role is Role.THREAD or role is Role.COOPERATIVE_STRIDE:
+    if role is Role.THREAD:
         return "thread"
     if role is Role.REGISTER:
         return "register"
@@ -865,12 +862,12 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         if M_t is not None:
             outer_layers.append((M_t, Role.THREAD))
         if K_c is not None:
-            outer_layers.append((K_c, Role.COOPERATIVE_STRIDE))
+            outer_layers.append((K_c, Role.THREAD))  # cooperative-K stride
         outer_layers.append((N_b, Role.BLOCK))
         if M_b is not None:
             outer_layers.append((M_b, Role.BLOCK))
         if K_s is not None:
-            outer_layers.append((K_s, Role.SPLITK_BLOCK))
+            outer_layers.append((K_s, Role.BLOCK))  # split-K
         outer_layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
         return _wrap_tower(outer_layers, body_after_register)
 
@@ -881,12 +878,12 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     if M_t is not None:
         layers.append((M_t, Role.THREAD))
     if K_c is not None:
-        layers.append((K_c, Role.COOPERATIVE_STRIDE))
+        layers.append((K_c, Role.THREAD))  # cooperative-K stride
     layers.append((N_b, Role.BLOCK))
     if M_b is not None:
         layers.append((M_b, Role.BLOCK))
     if K_s is not None:
-        layers.append((K_s, Role.SPLITK_BLOCK))
+        layers.append((K_s, Role.BLOCK))  # split-K
     layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
     return _wrap_tower(layers, new_inner)
 
