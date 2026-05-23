@@ -104,7 +104,6 @@ def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         output=s.output,
         index=tuple(sigma.apply(e) for e in s.index),
         values=tuple(rename(n) for n in s.values),
-        reduce_op=s.reduce_op,
         value_dtype=s.value_dtype,
     )
 
@@ -169,7 +168,6 @@ def _(s: Write, ctx: SimplifyCtx) -> Stmt:
         output=s.output,
         index=tuple(e.simplify(ctx) for e in s.index),
         values=s.values,
-        reduce_op=s.reduce_op,
         value_dtype=s.value_dtype,
     )
 

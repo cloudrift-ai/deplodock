@@ -21,12 +21,9 @@ tag is the structural source of truth; the helper treats it as input
 and derives only the operational consequences (Combine emission,
 atomic stamping, Cond-guard placement).
 
-This frames ``001_coordination``'s remaining responsibility as
-*emitting* the operational markers (Combine / Write.reduce_op / Cond
-wrappers) so the materializer can stay mechanical. The intent of the
-larger refactor (``plans/derive-coordination-from-body.md``) is to
-delete those markers in favor of materializer-side queries against this
-helper — see the plan for the milestone breakdown.
+The materializer / Kernel-IR render consume the analysis directly: there
+is no separate coordination pass. See
+``plans/derive-coordination-from-body.md`` for the refactor history.
 """
 
 from __future__ import annotations

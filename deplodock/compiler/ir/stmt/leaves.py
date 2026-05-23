@@ -570,11 +570,11 @@ class Write(Stmt):
     node's id, or — for multi-output kernels — one of its output buffer
     names). ``index`` uses axis Vars to compute the per-dim offset.
 
-    ``reduce_op`` (optional, scalar-only): when set, the write becomes an
-    atomic reduction (``atomicAdd`` for ``ElementwiseImpl('add')``) instead
-    of a plain store. Vectorizing atomic reduce-writes is unsound (each
-    lane needs its own atomicAdd), so ``005_vectorize_stores`` excludes
-    them and ``__init__`` rejects the combination here.
+    Whether the store lowers to ``atomicAdd`` or a plain store is
+    decided at codegen time by ``escape_analysis.atomic_axes`` (any
+    enclosing block axis missing from ``index`` ⇒ atomic). The vectorize
+    pass also consults the helper to refuse atomic-add Writes (each lane
+    would need its own atomicAdd).
 
     ``value_dtype`` is optional; when set, names the SSA-value dtype being
     stored. Stamped by ``001_stamp_types``; downstream passes read it
@@ -584,7 +584,6 @@ class Write(Stmt):
     output: str
     index: tuple[Expr, ...]
     values: tuple[str, ...]
-    reduce_op: ElementwiseImpl | None
     value_dtype: DataType | None
 
     def __init__(
@@ -592,7 +591,6 @@ class Write(Stmt):
         output: str | None = None,
         index: tuple[Expr, ...] | None = None,
         value: str | None = None,
-        reduce_op: ElementwiseImpl | None = None,
         *,
         values: tuple[str, ...] | None = None,
         value_dtype: DataType | None = None,
@@ -609,14 +607,9 @@ class Write(Stmt):
             raise TypeError("Write requires `index=`")
         if not values:
             raise ValueError("Write.values must be non-empty")
-        if reduce_op is not None and reduce_op.name != "add":
-            raise NotImplementedError(f"Write.reduce_op={reduce_op.name!r} not lowered yet (only 'add')")
-        if reduce_op is not None and len(values) > 1:
-            raise ValueError("Write.reduce_op is incompatible with vector form (atomicAdd per lane is unsound)")
         object.__setattr__(self, "output", output)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "values", tuple(values))
-        object.__setattr__(self, "reduce_op", reduce_op)
         object.__setattr__(self, "value_dtype", value_dtype)
 
     @property
@@ -652,9 +645,6 @@ class Write(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
-        if self.reduce_op is not None:
-            op = _REDUCE_OP_SYMBOL.get(self.reduce_op.name, self.reduce_op.name)
-            return [f"{indent}{self.output}[{idx}] {op}= {self.values[0]}"]
         if self.is_vector:
             return [f"{indent}{self.output}[{idx}] = ({', '.join(self.values)})"]
         return [f"{indent}{self.output}[{idx}] = {self.values[0]}"]
@@ -676,11 +666,11 @@ class Write(Stmt):
             flat = render_index(self.output, self.index, ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(self.value, value_dt, out_dt)
-            # Atomic-Write trigger: prefer the helper-derived signal
-            # (``ctx.atomic_writes``) when ``render_kernelop`` populated
-            # it; fall back to the legacy stamped ``self.reduce_op`` for
-            # standalone-render unit tests that build a bare RenderCtx.
-            is_atomic = bool(ctx.atomic_writes.get(id(self))) or self.reduce_op is not None
+            # Atomic-Write trigger: helper-derived signal from
+            # ``ctx.atomic_writes``, populated by ``render_kernelop``.
+            # Standalone-render unit tests that build a bare RenderCtx
+            # see an empty dict and get a plain store.
+            is_atomic = bool(ctx.atomic_writes.get(id(self)))
             store = f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});" if is_atomic else f"{pad}{self.output}[{flat}] = {rhs};"
             # Broadcast guard: when the helper says this Write is missing
             # one or more cooperative thread axes from its index, wrap the

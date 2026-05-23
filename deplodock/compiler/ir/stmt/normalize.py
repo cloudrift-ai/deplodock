@@ -911,7 +911,7 @@ def canonicalize_op_clusters(stmts: Body) -> Body:
     The pass walks ``stmts`` with :meth:`Body.map` and uses
     ``dataclasses.fields`` to locate any field currently holding an
     ``ElementwiseImpl`` (covers ``Init.op`` / ``Assign.op`` /
-    ``Accum.op`` / ``Write.reduce_op`` / Kernel-IR's ``TreeHalve.op`` /
+    ``Accum.op`` / Kernel-IR's ``TreeHalve.op`` /
     ``WarpShuffle.op`` without coupling this module to those IR
     dialects). The replacement is destructive — the resulting body is
     only safe to consume from :attr:`Body.structural_key()`.

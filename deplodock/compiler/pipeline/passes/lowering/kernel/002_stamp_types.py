@@ -195,7 +195,6 @@ def _stamp_write(s: Write, ctx: _StampCtx) -> Write:
         output=s.output,
         index=s.index,
         values=s.values,
-        reduce_op=s.reduce_op,
         value_dtype=dt,
     )
 

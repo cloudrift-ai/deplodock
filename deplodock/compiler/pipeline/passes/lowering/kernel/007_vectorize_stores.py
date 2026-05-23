@@ -14,12 +14,12 @@ Tile body, post-order):
 
 1. Walk the stmts. At each position, try widths 8 then 4 then 2.
 2. If ``[body[i], ..., body[i+n-1]]`` are all scalar ``Write``s to the
-   same output buffer with ``reduce_op is None`` (atomic reduce-writes
-   do NOT vectorize), matching outer indices, and last-dim indices that
-   affinely decompose to ``anchor, anchor+1, ..., anchor+n-1`` (same
-   coefficients on free vars), AND the target supports
-   ``vector_type(elem_dtype, n)`` for the destination-buffer dtype,
-   replace the run with one widened ``Write``.
+   same output buffer with no atomic-write classification from
+   ``escape_analysis`` (atomic reduce-writes do NOT vectorize),
+   matching outer indices, and last-dim indices that affinely decompose
+   to ``anchor, anchor+1, ..., anchor+n-1`` (same coefficients on free
+   vars), AND the target supports ``vector_type(elem_dtype, n)`` for the
+   destination-buffer dtype, replace the run with one widened ``Write``.
 3. Otherwise advance one stmt.
 
 ## Why this lives at the Kernel-IR boundary
@@ -193,6 +193,5 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp, atomi
         output=output_name,
         index=writes[0].index,
         values=tuple(s.value for s in writes),
-        reduce_op=None,
         value_dtype=writes[0].value_dtype,
     )
