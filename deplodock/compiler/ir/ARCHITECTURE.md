@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, wrap-body `Stage`/`BufferedStage`/`AsyncBufferedStage`/`TmaBufferedStage`/`ComputeStage` carrying `Source`/`CacheDim` per-operand layouts, `Combine`, `StridedLoop`) |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, wrap-body `Stage`/`BufferedStage`/`AsyncBufferedStage`/`TmaBufferedStage`/`ComputeStage` carrying `Source`/`CacheDim` per-operand layouts, `StridedLoop`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -29,7 +29,10 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   op; reductions are `Accum` statements inside a reduce `Loop`).
 - **Loop → tile** (after `lowering/tile`): `LoopOp` nodes replaced by
   `TileOp` whose body is a `Tile` carrying scheduling decisions
-  (`BIND_THREAD`/`BIND_BLOCK` axes, `Stage`, `Combine`).
+  (`BIND_THREAD`/`BIND_BLOCK` axes, `Stage`). Cooperative-reduce
+  emission, atomic-write classification, and broadcast-write guards
+  are derived by ``escape_analysis`` at materialize / render time
+  rather than carried as explicit Stmts.
 - **Tile → kernel** (after `lowering/kernel`): `TileOp` materialized to
   `KernelOp` whose body uses hardware primitives (`Smem`, `Sync`,
   `TreeHalve`, `StridedLoop`).
@@ -211,8 +214,11 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 Tile IR encodes scheduling decisions structurally — `Tile.axes` carry
 `BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` wraps consumer subtrees
-that read smem-cached operands, `Combine` collapses an Accum across
-cooperating threads. Compute leaves (`Load` / `Assign` / `Accum` /
+that read smem-cached operands. Cooperative reduction (Combine
+emission), atomic-write classification, and broadcast guards are
+derived from the body at materialize / render time via
+``ir/tile/escape_analysis.py`` — there is no explicit `Combine` Stmt
+or atomic field. Compute leaves (`Load` / `Assign` / `Accum` /
 `Write`) and control flow (`Loop` / `StridedLoop` / `Cond`) come from
 `ir/stmt.py`.
 
@@ -237,7 +243,6 @@ behind one sync boundary; sibling Stages exist only when scopes differ.
 | `CacheDim`            | One cache (smem) axis paired with the source-buffer dim it maps to. `Source.cache_dims` is a tuple of these.                          |
 | `AffineAddressing`    | Property-derived addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
 | `TemplateAddressing`  | Property-derived addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
-| `Combine`             | Cross-thread collapse of an `Accum` target (post reduce loop).                                                                       |
 | `AsyncWait`           | Explicit wait carrier for pipelined async / TMA schedules. Emitted by `015_lower_pipelined_async_stage` between issue / consume halves of each steady-state K_o iter and at the epilogue drain. ``keep`` is the cp.async ``wait_group`` arg; ``phase`` / ``slot`` are TMA mbarrier-test args. Sync-style (``pipeline_depth==1``) stages don't carry one — the materializer emits an implicit wait at the wrap boundary. |
 
 ## `kernel/`

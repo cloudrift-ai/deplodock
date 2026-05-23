@@ -1,7 +1,12 @@
 # Derive Coordination From Body — Drop Tile-IR Coordination Metadata
 
-**Status:** In progress on `feature/partition-planner`. M1 (helper) and M2 (cross-check) landed; revised
-scope below after M2 discovery.
+**Status:** Completed on `feature/partition-planner` (M1–M8). All 1182 tests pass; no production code reads
+`splitk_axes` / `Write.reduce_op` / the `Combine` Stmt; `001_coordination.py` is deleted. Atomic-write,
+cooperative-combine, and broadcast-guard decisions are derived at materialize / Kernel-IR render time via
+`ir/tile/escape_analysis.py`.
+
+`ThreadTile.cooperative_axes` stays as the structural source of truth for "this thread axis cooperates on a
+reduction" — see M2 notes below for why derivation from body data flow is unreliable post-staging.
 
 **Original premise:** every coordination decision (cooperative reduce, atomic write, broadcast guard) is
 derivable from data flow on the tile body, so the planner-emitted tags + coordination-pass-emitted markers
