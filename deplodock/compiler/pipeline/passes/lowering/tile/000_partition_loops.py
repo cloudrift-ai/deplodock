@@ -79,7 +79,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
@@ -398,6 +398,128 @@ class _BuildSkipped(Exception):
     """Raised by ``_build_split_body`` when the body's shape doesn't match."""
 
 
+def _stmt_contains_accum(stmt: Stmt) -> bool:
+    """True if ``stmt`` is or transitively contains an ``Accum``."""
+    if isinstance(stmt, Accum):
+        return True
+    for body in stmt.nested():
+        for s in body:
+            if _stmt_contains_accum(s):
+                return True
+    return False
+
+
+def _find_first_accum_name(stmts: tuple[Stmt, ...]) -> str | None:
+    """Return the first Accum's ``name`` found anywhere in ``stmts``,
+    or None if no Accum exists. Used by the SPLITK matmul-add lowering
+    to spell the else-branch ``Write(out, acc_name)``."""
+    for s in stmts:
+        if isinstance(s, Accum):
+            return s.name
+        for body in s.nested():
+            n = _find_first_accum_name(tuple(body))
+            if n is not None:
+                return n
+    return None
+
+
+def _is_linear_in_accum(value_name: str, acc_name: str, assigns_by_name: dict[str, Assign]) -> bool:
+    """True iff ``value_name`` is computed from ``acc_name`` via a chain of
+    ``add`` Assigns (any number of external Load arguments allowed).
+
+    Recurses through the SSA chain of Assigns that produces ``value_name``.
+    At each ``Assign``, requires ``op == "add"`` and that at least one arg
+    transitively traces back to ``acc_name``. Bare Var args that are not
+    in ``assigns_by_name`` and not ``acc_name`` are treated as external
+    loads (residuals) — allowed under linearity. A non-``add`` Assign or
+    a chain that never reaches ``acc_name`` returns False."""
+    if value_name == acc_name:
+        return True
+    a = assigns_by_name.get(value_name)
+    if a is None:
+        return False
+    if a.op.name != "add":
+        return False
+    return any(
+        arg == acc_name or _is_linear_in_accum(arg, acc_name, assigns_by_name)
+        for arg in a.args
+    )
+
+
+def _has_nonlinear_post_reduce_epilogue(stmts: tuple[Stmt, ...]) -> bool:
+    """True iff ``stmts`` has any post-reduce epilogue that is NOT a linear
+    add chain over the Accum.
+
+    Used by ``_split_kernel_fully`` to decide ``force_splitk_one`` for
+    matmul-shape kernels: linear epilogues (``matmul_add``) are handled by
+    ``_gate_linear_epilogue_on_k_s_zero`` in ``_build_split_body``;
+    non-linear ones (e.g. ``v = acc * r``) must run at SPLITK=1."""
+    epilogue = tuple(s for s in stmts if not _stmt_contains_accum(s))
+    if not epilogue:
+        return False
+    writes = [s for s in epilogue if isinstance(s, Write)]
+    if len(writes) != 1:
+        return True
+    write = writes[0]
+    if write.is_vector:
+        return True
+    acc_name = _find_first_accum_name(stmts)
+    if acc_name is None:
+        return True
+    assigns_by_name = {s.name: s for s in epilogue if isinstance(s, Assign)}
+    return not _is_linear_in_accum(write.value, acc_name, assigns_by_name)
+
+
+def _gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]:
+    """Rewrite ``stmts`` so the linear post-reduce epilogue runs only on
+    the ``K_s == 0`` CTA, with the other CTAs atomic-adding the bare
+    Accum.
+
+    Input shape (matmul_add after ``_replace_k_loops``)::
+
+        [Load(r), <reduce tower>, Assign(v=acc+r), Write(out, v)]
+
+    Output shape::
+
+        [<reduce tower>,
+         Cond(K_s == 0,
+              body=[Load(r), Assign(v=acc+r), Write(out, v)],
+              else_body=[Write(out, acc)])]
+
+    Both Writes lower to ``atomicAdd`` under SPLITK > 1, so the final
+    output is ``sum_i acc_i + r`` — the residual added exactly once.
+    Returns ``stmts`` unchanged when no linear epilogue is present."""
+    epilogue = tuple(s for s in stmts if not _stmt_contains_accum(s))
+    if not epilogue:
+        return stmts
+    writes = [s for s in epilogue if isinstance(s, Write)]
+    if len(writes) != 1:
+        return stmts
+    write = writes[0]
+    if write.is_vector:
+        return stmts
+    acc_name = _find_first_accum_name(stmts)
+    if acc_name is None:
+        return stmts
+    assigns_by_name = {s.name: s for s in epilogue if isinstance(s, Assign)}
+    if not _is_linear_in_accum(write.value, acc_name, assigns_by_name):
+        return stmts
+
+    tower = tuple(s for s in stmts if _stmt_contains_accum(s))
+    write_acc = Write(
+        output=write.output,
+        index=write.index,
+        value=acc_name,
+        value_dtype=write.value_dtype,
+    )
+    cond = Cond(
+        cond=BinaryExpr("==", Var(k_s_name), Literal(0, "int")),
+        body=Body(epilogue),
+        else_body=Body((write_acc,)),
+    )
+    return tower + (cond,)
+
+
 def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> list[TileOp] | None:
     """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
 
@@ -455,10 +577,8 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         prologue_reduces = tuple(lp for lp in Body(prologue).iter_of_type(Loop) if lp.is_reduce and int(lp.axis.extent) == E_K)
         target_names = frozenset((*(lp.axis.name for lp in matmul_reduces), *(lp.axis.name for lp in prologue_reduces)))
         # SPLITK > 1 only works when each Write's atomic-add is mathematically
-        # equivalent to the unsplit reduce. That requires a linear-in-Accum
-        # chain from Accum to Write: ``sum_i (c·a_i + r) = c·sum_i a_i + r``
-        # holds for matmul (Write=acc) and matmul_add (Write=add(acc, r))
-        # but breaks for two reasons:
+        # equivalent to the unsplit reduce. SPLITK is forced off for two
+        # patterns:
         #
         # 1. Non-linear post-reduce combines like ``silu(acc_g) * acc_u``
         #    (gated_mlp) or softmax (sdpa). Conservative proxy: any matmul-
@@ -468,8 +588,17 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         # 2. A non-empty prologue (SDPA P@V) — softmax max/sum/reciprocal
         #    are *consumed* by the matmul reduce, so each K_s CTA's
         #    partial softmax stat would feed a partial matmul.
+        #
+        # A post-reduce *linear* epilogue (``matmul_add``: ``Load(r)`` +
+        # ``Assign(v = acc + r)`` → ``Write(v)``) IS allowed at SPLITK > 1.
+        # ``_build_split_body`` rewrites the body so the residual add is
+        # hoisted into a ``Cond(K_s == 0)`` — the K_s == 0 CTA atomic-adds
+        # ``acc + r`` while every other K_s CTA atomic-adds just ``acc``,
+        # so ``sum_i acc_i + r = c·sum_k a_k + r``. Non-linear epilogues
+        # (e.g. ``v = acc * r``) fall through here and force splitk=1.
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
-        force_splitk_one = multi_accum or bool(prologue)
+        has_nonlinear_epilogue = _has_nonlinear_post_reduce_epilogue(outer_n.body)
+        force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
         param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one)
     elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
@@ -814,6 +943,13 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         )
         if n_replaced == 0:
             raise _BuildSkipped("K reduce not found in body")
+        # SPLITK > 1 with a linear residual epilogue (matmul_add):
+        # hoist ``Load(r) + Assign(v=acc+r) + Write(v)`` behind
+        # ``Cond(K_s == 0)`` so the residual is added exactly once across
+        # the K_s CTAs (other K_s atomic-add the bare Accum). No-op for
+        # plain matmul / non-SPLITK / non-linear epilogues.
+        if K_s is not None:
+            new_inner = _gate_linear_epilogue_on_k_s_zero(new_inner, K_s.name)
     else:
         new_inner = inner_after_outer
 

@@ -87,15 +87,20 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
 2. **Tensor / Axis** (`compiler/tensor.py`, `compiler/ir/axis.py`) — shape elements and axis extents become `Dim`.
    `Axis.split(factor)` needs to refuse symbolic extents (M3).
 3. **Frontend decomposition** (`compiler/pipeline/passes/frontend/decomposition/`) — most rules propagate shapes and
-   are fine. Risk sites: `001_sdpa.py` (mask shape derived from seq_len), reshape/view (`ir/frontend/ir.py:74` does
-   `in_numel *= int(d)`), broadcast helpers, `013_cat.py` (already guards on `isinstance(..., int)`).
+   are fine. Risk sites: `001_sdpa.py` (mask shape derived from seq_len); reshape/view (`ir/frontend/ir.py:74,78` do
+   `in_numel *= int(d)` and `known *= int(d)`); `SliceOp` (`ir/frontend/ir.py:96`) also carries
+   `tuple[int | str, ...]` but only forwards it — its `forward` reads start/end from constant inputs, so symbolic dims
+   pass through without a cast; broadcast helpers; `013_cat.py` (already guards on `isinstance(..., int)`).
 4. **Loop lifting** (`compiler/pipeline/passes/loop/lifting/`) — all four lifting passes do `Axis(extent=int(d))`. Each
    becomes `Axis(extent=d)` with `d: Dim`.
-5. **Tile / Kernel / CUDA lowering** (`compiler/pipeline/passes/lowering/`, `compiler/backend/cuda/`) — kernel signature
-   gains a `seq_len: int` runtime arg; launch grid (`backend/cuda/program.py`), TMA descriptors (`_tma.py`), shared-mem
-   sizing all resolve the symbolic dim from the actual input tensor at launch time.
-6. **Autotune cache** (`Graph.structural_key()` in `compiler/graph.py`, tune DB schema in `pipeline/search/`) — symbolic
-   dims must hash by name, not by current binding, or the cache busts every batch.
+5. **Tile / Kernel / CUDA lowering** (`compiler/pipeline/passes/lowering/{tile,kernel,cuda}/`,
+   `compiler/backend/cuda/`) — kernel signature gains a `seq_len: int` runtime arg; launch grid
+   (`backend/cuda/program.py` — `_Buffer.shape` is currently `tuple[int, ...]` at line 66, statically resolved at launch
+   time), TMA descriptors (`backend/cuda/_tma.py`), shared-mem sizing all resolve the symbolic dim from the actual input
+   tensor at launch time.
+6. **Autotune cache** (`Graph.structural_key()` in `compiler/graph.py` at lines 563–621 — folds `tuple(out.shape)` into
+   the digest at line 611; tune DB schema in `compiler/pipeline/search/`) — symbolic dims must hash by name, not by
+   current binding, or the cache busts every batch.
 
 ## Open decisions
 
