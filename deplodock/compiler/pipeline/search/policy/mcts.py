@@ -4,15 +4,19 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
     select   — descend from root, picking at each level
                ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
                where ``Q_norm = best_reward / global_best``. Unvisited
-               children get a finite First-Play-Urgency (FPU) value
-               ``max(0, parent.Q_norm - fpu_reduction)`` so the search
-               can drill deeper into a known-decent branch instead of
-               exhaustively sweeping every sibling at the current
-               level. ``fpu_reduction=None`` (default) restores the
-               legacy ``+∞`` behavior. Ties (and the parent-Q=0
-               unwarmed-root case) fall back to the candidate's
+               children get ``+∞``, breaking ties on the candidate's
                ``score()`` prior. Live-count filtering skips subtrees
                whose frontier has been fully drained.
+
+               Optional First-Play-Urgency (``fpu_reduction``) replaces
+               the ``+∞`` for unvisited siblings with
+               ``max(0, parent.Q_norm - fpu_reduction)``. Empirically
+               unhelpful under max-Q backprop — a measured best
+               subtree's Q_norm sits at 1.0, and any finite FPU < 1.0
+               loses against visited UCB so the search never explores
+               alternatives. Defaults to ``None``; left as an opt-in
+               knob for future experiments (e.g. with mean-Q backprop
+               or higher-than-1.0 FPU bonuses).
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
                candidates as children of the last popped node;
     simulate — the engine runs the popped candidate and benches it;
@@ -83,12 +87,10 @@ class TuningSearch(Search):
     """SP-MCTS: max-Q normalized UCB1 with a rank-only prior."""
 
     DEFAULT_UCB_C = math.sqrt(2)
-    # Conservative First-Play-Urgency reduction. With normalized Q ∈ [0,1]
-    # the chess-engine convention is 0.10-0.25; 0.15 is the midpoint and
-    # leaves room for both deeper-drill (when parent.Q is high) and fresh
-    # exploration (FPU=0 when parent.Q ≤ 0.15). Pass ``fpu_reduction=None``
-    # to restore the legacy ``+∞`` breadth-first sweep when needed.
-    DEFAULT_FPU_REDUCTION = 0.15
+    # Opt-in only — see the module docstring for why max-Q backprop
+    # makes any finite FPU < 1.0 ineffective. ``None`` keeps the legacy
+    # ``+∞`` breadth-first sweep.
+    DEFAULT_FPU_REDUCTION: float | None = None
 
     def __init__(
         self,

@@ -147,15 +147,14 @@ def test_fpu_does_not_change_observe_or_record_terminal():
     assert abs(search.tree.root.best_reward - 0.1) < 1e-9
 
 
-def test_fpu_default_is_active():
-    """Default ``TuningSearch()`` should run with FPU on — the class
-    constant ``DEFAULT_FPU_REDUCTION`` is the contract, so callers
-    relying on legacy behavior must opt out explicitly."""
+def test_fpu_default_is_disabled():
+    """Default ``TuningSearch()`` runs with FPU off (legacy ``+∞`` for
+    unvisited siblings). Under max-Q backprop a finite FPU < 1.0 lets
+    the visited best subtree dominate UCB forever, so the feature is
+    opt-in only — callers wanting it must pass ``fpu_reduction=…``."""
     s = TuningSearch()
-    assert s._fpu_reduction == TuningSearch.DEFAULT_FPU_REDUCTION
-    assert s._fpu_reduction is not None
-    # Sanity: the default sits in the documented 0.10-0.25 band.
-    assert 0.10 <= TuningSearch.DEFAULT_FPU_REDUCTION <= 0.25
+    assert s._fpu_reduction is None
+    assert TuningSearch.DEFAULT_FPU_REDUCTION is None
 
 
 def test_lazycandidate_protocol_satisfied():

@@ -54,10 +54,9 @@ def register_tune_command(subparsers):
         type=float,
         default=TuningSearch.DEFAULT_FPU_REDUCTION,
         help=(
-            "First-Play Urgency reduction applied to unvisited siblings' UCB value (max(0, parent.Q_norm - fpu)). "
-            f"Default {TuningSearch.DEFAULT_FPU_REDUCTION:.2f} lets the search drill deeper into a known-decent "
-            "parent path instead of exhausting every sibling before going deeper — essential for hierarchical "
-            "Fork trees. Pass a negative value to restore the legacy +∞ breadth-first sweep."
+            "Opt-in First-Play-Urgency reduction (default: off; legacy +∞ sweep for unvisited siblings). "
+            "When set, replaces +∞ with max(0, parent.Q_norm - fpu) on unvisited candidates. "
+            "Empirically a regression under max-Q backprop — leave off unless experimenting."
         ),
     )
     add_diagnostics_args(parser)

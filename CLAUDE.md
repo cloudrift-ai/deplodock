@@ -68,8 +68,8 @@ same worker.
   normalized UCB1, rank-only `TileOp.score` prior). Pops candidates by UCB1, benches every CudaOp variant, persists
   `perf` / `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
   `~/.cache/deplodock/autotune.db`), and stops on patience (N consecutive measured terminals without a new best).
-  `--fpu R` (default 0.15) sets the First-Play-Urgency reduction for unvisited siblings — pass a negative value to
-  restore the legacy `+∞` breadth-first sweep.
+  `--fpu R` is an opt-in First-Play-Urgency reduction for unvisited siblings (default: off; empirically a regression
+  under max-Q backprop, kept for future experiments).
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - `deplodock knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB.
