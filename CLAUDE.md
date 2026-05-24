@@ -64,9 +64,17 @@ same worker.
 - `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR] [--target sm_NN]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model). `--target sm_NN` (e.g. `sm_80`, `sm_90`, `sm_120`) overrides the live device's compute capability so passes that gate on hardware features (TMA, cp.async) take the target's path.
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
 - `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
-- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C]` — autotune via SP-MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior). Pops candidates by UCB1, benches every CudaOp variant, persists `perf` / `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`), and stops on patience (N consecutive measured terminals without a new best). Prints the winning CUDA IR to stdout and a ranked variant summary to stderr.
+- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--fpu R]` — autotune via SP-MCTS (max-Q
+  normalized UCB1, rank-only `TileOp.score` prior). Pops candidates by UCB1, benches every CudaOp variant, persists
+  `perf` / `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
+  `~/.cache/deplodock/autotune.db`), and stops on patience (N consecutive measured terminals without a new best).
+  `--fpu R` (default 0.15) sets the First-Play-Urgency reduction for unvisited siblings — pass a negative value to
+  restore the legacy `+∞` breadth-first sweep.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
+- `deplodock knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB.
+  Joins `perf` with `cuda_op` and prints per-knob regret + a knob-interaction matrix sorted by geomean impact —
+  use the rankings to drive Fork-tree knob ordering in the planner.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

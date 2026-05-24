@@ -4,7 +4,13 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
     select   — descend from root, picking at each level
                ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
                where ``Q_norm = best_reward / global_best``. Unvisited
-               children get ``+∞``, breaking ties on the candidate's
+               children get a finite First-Play-Urgency (FPU) value
+               ``max(0, parent.Q_norm - fpu_reduction)`` so the search
+               can drill deeper into a known-decent branch instead of
+               exhaustively sweeping every sibling at the current
+               level. ``fpu_reduction=None`` (default) restores the
+               legacy ``+∞`` behavior. Ties (and the parent-Q=0
+               unwarmed-root case) fall back to the candidate's
                ``score()`` prior. Live-count filtering skips subtrees
                whose frontier has been fully drained.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
@@ -77,6 +83,12 @@ class TuningSearch(Search):
     """SP-MCTS: max-Q normalized UCB1 with a rank-only prior."""
 
     DEFAULT_UCB_C = math.sqrt(2)
+    # Conservative First-Play-Urgency reduction. With normalized Q ∈ [0,1]
+    # the chess-engine convention is 0.10-0.25; 0.15 is the midpoint and
+    # leaves room for both deeper-drill (when parent.Q is high) and fresh
+    # exploration (FPU=0 when parent.Q ≤ 0.15). Pass ``fpu_reduction=None``
+    # to restore the legacy ``+∞`` breadth-first sweep when needed.
+    DEFAULT_FPU_REDUCTION = 0.15
 
     def __init__(
         self,
@@ -84,10 +96,12 @@ class TuningSearch(Search):
         *,
         patience: int = 20,
         ucb_c: float = DEFAULT_UCB_C,
+        fpu_reduction: float | None = DEFAULT_FPU_REDUCTION,
     ) -> None:
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
         self._patience = patience
+        self._fpu_reduction = fpu_reduction
         self._best_reward = 0.0
         self._visits_at_best = 0
         self.stop_reason: str | None = None
@@ -126,12 +140,24 @@ class TuningSearch(Search):
 
     def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
         """Selection score = (UCB1 value, score-as-tiebreak). Returned as
-        a tuple so unvisited siblings (UCB1 = +∞) are ranked by their
-        prior. Reward is normalized against the global best so the
-        ``c`` constant is unit-free."""
-        if child.visits == 0:
-            return float("inf"), child.score
+        a tuple so unvisited siblings are ranked by their prior. Reward
+        is normalized against the global best so the ``c`` constant is
+        unit-free.
+
+        Unvisited siblings: ``+∞`` (legacy, forces breadth-first sweep)
+        when ``fpu_reduction is None``, otherwise the First-Play-Urgency
+        value ``max(0, parent.Q_norm - fpu_reduction)`` so that a known-
+        decent parent path lets the search drill deeper before trying
+        every sibling. Falls back to ``+∞`` for the unwarmed root
+        (parent.visits == 0 or global_best == 0) so a fresh tree still
+        explores all root siblings at least once."""
         global_best = self.tree.best_reward
+        if child.visits == 0:
+            if self._fpu_reduction is None or parent.visits == 0 or global_best <= 0:
+                return float("inf"), child.score
+            parent_q = (parent.best_reward / global_best) if global_best > 0 else 0.0
+            fpu = max(0.0, parent_q - self._fpu_reduction)
+            return fpu, child.score
         q_norm = (child.best_reward / global_best) if global_best > 0 else 0.0
         bonus = self._ucb_c * math.sqrt(math.log(max(parent.visits, 1)) / child.visits)
         return q_norm + bonus, child.score
