@@ -20,7 +20,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, Unpack, Write
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -804,6 +804,20 @@ def rename_ssa_sequential(stmts: Body) -> Body:
         elif isinstance(stmt, Accum) and stmt.name not in ssa_rename:
             _rename(stmt.name, "acc")
         elif isinstance(stmt, (Assign, Select)) and stmt.name not in ssa_rename:
+            _rename(stmt.name, "v")
+        elif isinstance(stmt, Unpack):
+            # ``low_name`` and ``high_name`` are fresh SSA scalars
+            # defined by Unpack — must get rename slots in the ``v`` pool.
+            # Without this, they collided with their input's renamed name
+            # (e.g. paired Accum ``acc0_acc1_p`` → ``acc0`` makes
+            # ``Unpack(low_name="acc0", value="acc0_acc1_p")`` rewrite to
+            # ``Unpack(low_name="acc0", value="acc0")`` — self-referential).
+            for old in (stmt.low_name, stmt.high_name):
+                if old not in ssa_rename:
+                    _rename(old, "v")
+        elif isinstance(stmt, Pack) and stmt.name not in ssa_rename:
+            # ``Pack.name`` defines a fresh f16x2 SSA value consumed by the
+            # next Accum. Same reasoning as Assign — give it a ``v`` slot.
             _rename(stmt.name, "v")
         elif isinstance(stmt, ParallelTile):
             # GridTile / ThreadTile / RegisterTile — record every axis in
