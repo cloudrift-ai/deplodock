@@ -53,6 +53,18 @@ def _load_pass():
     return mod
 
 
+def _pin_legacy_matmul_primary(monkeypatch) -> None:
+    """Pin the planner knobs to what the priority_fn greedy primary would
+    have picked for ``_build_matmul()`` (128x256x128). The score-driven
+    primary in 7c321867 picks SPLITK=8 / tiny-FM-FN configs that don't
+    trigger downstream passes like ``pad_smem`` / ``double_buffer`` /
+    ``async_copy`` — those passes only fire on the staged matmul shape
+    the legacy primary picked. Pinning forces the planner to emit just
+    that one variant so the rule actually has something to act on."""
+    for knob, value in {"BM": "16", "BN": "16", "FM": "4", "FN": "8", "BK": "64", "SPLITK": "1"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{knob}", value)
+
+
 def _padded_sources(op: TileOp) -> dict[str, tuple[int, ...]]:
     out: dict[str, tuple[int, ...]] = {}
     for s in op.body.iter():
@@ -65,15 +77,17 @@ def _padded_sources(op: TileOp) -> dict[str, tuple[int, ...]]:
 # --- firing tests --------------------------------------------------------
 
 
-def test_pad_smem_fires_on_matmul(recording_dump):
+def test_pad_smem_fires_on_matmul(recording_dump, monkeypatch):
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=_TEST_CTX)
     assert "pad_smem" in recording_dump.fired_rules("lowering/tile")
 
 
 def test_greedy_default_picks_pad_on(monkeypatch):
-    """With no env pin, the greedy run picks variant 0 — PAD_SMEM=True."""
+    """With no PAD_SMEM env pin, the greedy run picks variant 0 — PAD_SMEM=True."""
     monkeypatch.delenv("DEPLODOCK_PAD_SMEM", raising=False)
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
@@ -87,6 +101,7 @@ def test_greedy_default_picks_pad_on(monkeypatch):
 
 def test_env_pin_false_drops_all_pads(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_PAD_SMEM", "false")
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
@@ -97,6 +112,7 @@ def test_env_pin_false_drops_all_pads(monkeypatch):
 
 def test_env_pin_true_applies_pad(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_PAD_SMEM", "true")
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op

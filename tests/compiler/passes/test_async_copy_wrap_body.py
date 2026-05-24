@@ -55,22 +55,33 @@ def _find_kouter(op: TileOp) -> SerialTile | None:
     return None
 
 
+def _pin_legacy_matmul_primary(monkeypatch) -> None:
+    """Pin planner knobs to the priority_fn legacy primary so async_copy /
+    pipelined_async_stage downstream passes see the staged matmul shape
+    they're designed to act on. Score-driven primary picks SPLITK>1 /
+    tiny-cells configs that skip the staged K_o tower."""
+    for knob, value in {"BM": "16", "BN": "16", "FM": "4", "FN": "8", "BK": "64", "SPLITK": "1"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{knob}", value)
+
+
 # --- firing tests --------------------------------------------------------
 
 
-def test_matmul_fires_async_copy(recording_dump):
+def test_matmul_fires_async_copy(recording_dump, monkeypatch):
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=_TEST_CTX)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "use_async_copy" in fired, fired
 
 
-def test_async_copy_emits_async_buffered_stage():
+def test_async_copy_emits_async_buffered_stage(monkeypatch):
     """At least one AsyncBufferedStage with buffer_count=2 lands in the
     lowered TileOp. Post-015 pipelining wraps two issue-only stages
     (prologue + steady-state issue, pipeline_depth=2) around the original
     stage; the structural assertion is "any async stage present" rather
     than the specific pre-015 depth=1 shape."""
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
@@ -148,11 +159,12 @@ def test_async_copy_preserves_buffered_fields():
 # --- materializer end-to-end --------------------------------------------
 
 
-def test_kernel_source_contains_cp_async_commit_wait_sync():
+def test_kernel_source_contains_cp_async_commit_wait_sync(monkeypatch):
     """The materializer's wrap-boundary contract: CpAsyncCopy + Commit +
     Wait(0) + Sync per AsyncBufferedStage with pipeline_depth=1."""
     from deplodock.compiler.pipeline import CUDA_PASSES
 
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(CUDA_PASSES).run(g, ctx=_TEST_CTX)
     src = g2.nodes["o"].op.kernel_source

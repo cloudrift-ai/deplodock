@@ -133,7 +133,13 @@ def test_kouter_extent_below_two_rejected():
 # --- end-to-end with matmul ----------------------------------------------
 
 
-def test_matmul_pipelines_through_full_pipeline(recording_dump):
+def test_matmul_pipelines_through_full_pipeline(recording_dump, monkeypatch):
+    # Pin the planner knobs to the priority_fn legacy primary so the
+    # staged K_o tower (which pipeline_stages acts on) actually gets
+    # emitted. Score-driven primary (post 7c321867) picks SPLITK>1 /
+    # tiny-cells configs that skip the staged tower entirely.
+    for knob, value in {"BM": "16", "BN": "16", "FM": "4", "FN": "8", "BK": "64", "SPLITK": "1"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{knob}", value)
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (128, 256)), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (256, 128)), node_id="b")

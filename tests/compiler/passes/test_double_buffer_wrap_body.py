@@ -40,6 +40,16 @@ def _build_matmul(m: int = 128, k: int = 256, n: int = 128) -> Graph:
     return g
 
 
+def _pin_legacy_matmul_primary(monkeypatch) -> None:
+    """Pin planner knobs to the priority_fn legacy primary so downstream
+    passes (use_ring_buffers / async_copy / pad_smem) see the staged
+    matmul shape they're designed to act on. The score-driven primary
+    in 7c321867 picks SPLITK>1 / tiny-FM-FN configs without a useful
+    K_o tower for these passes."""
+    for knob, value in {"BM": "16", "BN": "16", "FM": "4", "FN": "8", "BK": "64", "SPLITK": "1"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{knob}", value)
+
+
 def _find_kouter(op: TileOp) -> SerialTile | None:
     for s in op.body.iter():
         if isinstance(s, SerialTile) and s.kind == "serial_outer":
@@ -50,20 +60,22 @@ def _find_kouter(op: TileOp) -> SerialTile | None:
 # --- firing tests --------------------------------------------------------
 
 
-def test_matmul_fires_double_buffer(recording_dump):
+def test_matmul_fires_double_buffer(recording_dump, monkeypatch):
     """Plain matmul → 030_use_ring_buffers fires after 010_stage_inputs."""
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=_TEST_CTX)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "use_ring_buffers" in fired, fired
 
 
-def test_double_buffer_emits_buffered_stage():
+def test_double_buffer_emits_buffered_stage(monkeypatch):
     """At least one BufferedStage (or subclass) with buffer_count=2 lands
     in the lowered TileOp. Post-015 pipelining the K_o body's stage is an
     AsyncBufferedStage; the phase may be σ-substituted (``(K_o+1) % 2``
     in the main-loop issue, ``Literal(0)`` in the prologue) so the check
     is structural: any buffer_count=2 stage anywhere in the body."""
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
@@ -72,11 +84,12 @@ def test_double_buffer_emits_buffered_stage():
     assert all(bs.buffer_count == 2 for bs in buffered), [bs.buffer_count for bs in buffered]
 
 
-def test_double_buffer_phase_prepended_to_body_loads():
+def test_double_buffer_phase_prepended_to_body_loads(monkeypatch):
     """Loads against staged smem buffers carry a leading phase index dim
     (set by 030_use_ring_buffers). Post-015 the consumer body lives as
     siblings of the issue-only stage, so we scan the whole TileOp body
     for staged-smem Loads."""
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
@@ -100,7 +113,7 @@ def test_double_buffer_phase_prepended_to_body_loads():
 # --- idempotence ---------------------------------------------------------
 
 
-def test_double_buffer_is_idempotent():
+def test_double_buffer_is_idempotent(monkeypatch):
     """Running the rewrite a second time on its own output is a no-op:
     BufferedStage is already present, so the rule skips."""
     import importlib.util
@@ -109,6 +122,7 @@ def test_double_buffer_is_idempotent():
     from deplodock.compiler.pipeline import RuleSkipped
     from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
+    _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
