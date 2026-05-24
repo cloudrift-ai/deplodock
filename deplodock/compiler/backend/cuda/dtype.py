@@ -20,6 +20,7 @@ from deplodock.compiler.dtype import DataType
 _CUDA_NAME: dict[DataType, str] = {
     _dtype.F32: "float",
     _dtype.F16: "__half",
+    _dtype.F16x2: "__half2",
 }
 
 # Inverse of _CUDA_NAME for the kernel-internal C-name -> canonical
@@ -40,6 +41,7 @@ def canonical_from_cuda_name(name: str) -> str | None:
 _CUDA_INCLUDE: dict[DataType, str | None] = {
     _dtype.F32: None,
     _dtype.F16: "<cuda_fp16.h>",
+    _dtype.F16x2: "<cuda_fp16.h>",
 }
 
 # Per-op intrinsic spellings and the native-op set used to live here as
@@ -59,6 +61,7 @@ _C_NAME_BYTES: dict[str, int] = {
     "int": 4,
     "half": _dtype.F16.nbytes,
     "__half": _dtype.F16.nbytes,
+    "__half2": _dtype.F16x2.nbytes,
     "__nv_bfloat16": 2,
     "bfloat16": 2,
     "bf16": 2,
