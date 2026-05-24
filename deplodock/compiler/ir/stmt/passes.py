@@ -15,7 +15,7 @@ from dataclasses import fields, is_dataclass
 from functools import singledispatch
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
+from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
@@ -23,6 +23,26 @@ from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, S
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
+
+
+def _rename_ssa_vars_in_expr(e: Expr, rename: Rename) -> Expr:
+    """Apply ``rename`` to every free ``Var`` leaf inside ``e``.
+
+    Used by ``Load`` / ``Write`` rewriters so that *indirect* indices
+    (gather: ``x[a0, (int)in0]``, scatter: ``out[(int)idx_v] = ...``)
+    have their SSA-name references rewritten when the enclosing body
+    is replicated. Without this, the register-tile replicator in
+    ``000_split_register_axes`` suffixes the defining Load's name
+    (``in0`` → ``in0_1``) but leaves dependent indirect Loads pointing
+    at the original ``in0`` — silently dropping the cross-replica data
+    dependency.
+
+    Axis-name Vars (``a0``, ``M_b``, …) are never in the rename map
+    (it only carries SSA defines), so ``rename(name) == name`` for
+    them and they pass through unchanged.
+    """
+    mapping = {n: Var(rename(n)) for n in e.free_vars() if rename(n) != n}
+    return e.substitute(mapping) if mapping else e
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +83,7 @@ def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Load(
         names=tuple(rename(n) for n in s.names),
         input=s.input,
-        index=tuple(sigma.apply(e) for e in s.index),
+        index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
         dtype=s.dtype,
     )
 
@@ -126,7 +146,7 @@ def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Write(
         output=s.output,
-        index=tuple(sigma.apply(e) for e in s.index),
+        index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
         values=tuple(rename(n) for n in s.values),
         value_dtype=s.value_dtype,
     )
