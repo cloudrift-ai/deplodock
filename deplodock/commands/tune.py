@@ -49,16 +49,6 @@ def register_tune_command(subparsers):
             f"shift the walk toward exploration. Default: {TuningSearch.DEFAULT_UCB_C:.4f}."
         ),
     )
-    parser.add_argument(
-        "--fpu",
-        type=float,
-        default=TuningSearch.DEFAULT_FPU_REDUCTION,
-        help=(
-            "Opt-in First-Play-Urgency reduction (default: off; legacy +∞ sweep for unvisited siblings). "
-            "When set, replaces +∞ with max(0, parent.Q_norm - fpu) on unvisited candidates. "
-            "Empirically a regression under max-Q backprop — leave off unless experimenting."
-        ),
-    )
     add_diagnostics_args(parser)
     parser.set_defaults(func=handle_tune)
 
@@ -98,10 +88,7 @@ def handle_tune(args):
     logger.info("Tuning DB: %s", db_path)
 
     patience = args.patience if args.patience is not None else int(os.environ.get("DEPLODOCK_TUNE_PATIENCE", 100))
-    # Negative ``--fpu`` opts out of FPU back to the legacy +∞ semantics
-    # (sentinel-via-out-of-range value since argparse can't mix float | "off").
-    fpu_reduction = None if args.fpu is not None and args.fpu < 0 else args.fpu
-    search = TuningSearch(patience=patience, ucb_c=args.ucb_c, fpu_reduction=fpu_reduction)
+    search = TuningSearch(patience=patience, ucb_c=args.ucb_c)
     t0 = time.monotonic()
     candidates: list = []
     try:
