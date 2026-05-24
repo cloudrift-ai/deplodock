@@ -90,6 +90,7 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.pipeline import Fork
 
 
 class Role(enum.Enum):
@@ -172,7 +173,21 @@ class KernelShape:
     prologue: tuple[Stmt, ...] = ()
 
 
-def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | list[TileOp]:
+def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | Fork | list[Fork]:
+    """Emit a hierarchical Fork tree over knob bundles:
+    ``BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
+
+    Single-variant kernels short-circuit to a bare ``TileOp`` (the engine
+    applies it inline without a fork point). Single-value Fork levels are
+    collapsed so a tree with N effective branching levels emits only N
+    Fork wrappers — most matmul kernels have BR fixed at 1 so they
+    actually emit a 3-level tree.
+
+    Each branch Fork's ``score`` is the max ``TileOp.score(ctx)`` of any
+    leaf reachable under it — the planner-side equivalent of the max-Q
+    propagation MCTS does on measured rewards. Siblings at each level
+    are sorted by score descending so the highest-scoring branch is
+    option-0 (the greedy primary, the +∞-tiebreak winner)."""
     loop_op: LoopOp = root.op
     kernel_name = _kernel_name_for(loop_op, root.id)
     # Idempotence is structural: once the planner has built a TileOp, the
@@ -183,7 +198,89 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | list[TileOp]:
 
     if len(variants) == 1:
         return variants[0]
-    return variants
+
+    return _build_fork_tree(variants, ctx)
+
+
+def _build_fork_tree(variants: list[TileOp], ctx: Context) -> Fork | list[Fork]:
+    """Convert a flat ``list[TileOp]`` into the hierarchical Fork tree.
+
+    Grouping order (outermost first): BR → (BM,BN) → (FM,FN) → (BK,SPLITK).
+    A level is skipped (Fork wrapper omitted) when every variant in the
+    enclosing group shares the same knob values at that level, so the
+    common case (all variants have BR=1) doesn't add a useless 1-child
+    Fork layer.
+
+    **Sibling ordering** is by max-propagated ``TileOp.score`` descending:
+    option-0 at each level is the branch containing the best-scoring
+    reachable leaf. ``TileOp.score`` is the single source of truth for
+    both greedy primary selection AND the MCTS prior — keep them aligned
+    so a high-score variant the search will exploit later is also the
+    one greedy picks today.
+
+    Returns a single ``Fork`` when the top-level group collapses to one
+    branch (engine still routes through the fork-spawn path since
+    ``isinstance(option, Fork)``), otherwise the ``list[Fork]`` of
+    siblings.
+    """
+    leaf_score: dict[int, float] = {id(v): float(v.score(ctx)) for v in variants}
+
+    def _sorted(forks: list[Fork]) -> list[Fork]:
+        return sorted(forks, key=lambda f: -f.score)
+
+    def _leaf_forks(group: list[TileOp]) -> list[Fork]:
+        out = [
+            Fork(
+                knobs={BK.name: v.knobs[BK.name], SPLITK.name: v.knobs[SPLITK.name]},
+                expand=(lambda op=v: [op]),
+                score=leaf_score[id(v)],
+                is_leaf=True,
+            )
+            for v in group
+        ]
+        return _sorted(out)
+
+    def _group_level(
+        group: list[TileOp],
+        knob_names: tuple[str, ...],
+        child_builder,
+    ) -> list[Fork]:
+        """Build sibling Forks for one level, keyed by ``knob_names``,
+        sorted by max-propagated score descending."""
+        keyed: dict[tuple, list[TileOp]] = {}
+        for v in group:
+            key = tuple(v.knobs[n] for n in knob_names)
+            keyed.setdefault(key, []).append(v)
+        if len(keyed) == 1:
+            return child_builder(next(iter(keyed.values())))
+        siblings: list[Fork] = []
+        for key, subgroup in keyed.items():
+            children = child_builder(subgroup)
+            if not children:
+                continue
+            siblings.append(
+                Fork(
+                    knobs=dict(zip(knob_names, key, strict=True)),
+                    expand=(lambda c=children: list(c)),
+                    score=max(c.score for c in children),
+                    is_leaf=False,
+                )
+            )
+        return _sorted(siblings)
+
+    def _fmfn_level(group: list[TileOp]) -> list[Fork]:
+        return _group_level(group, (FM.name, FN.name), _leaf_forks)
+
+    def _bmbn_level(group: list[TileOp]) -> list[Fork]:
+        return _group_level(group, (BM.name, BN.name), _fmfn_level)
+
+    def _br_level(group: list[TileOp]) -> list[Fork]:
+        return _group_level(group, (BR.name,), _bmbn_level)
+
+    top = _br_level(variants)
+    if len(top) == 1:
+        return top[0]
+    return top
 
 
 def _kernel_name_for(loop: LoopOp, base_name: str) -> str:
