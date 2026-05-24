@@ -1138,15 +1138,65 @@ class TileOp(BodyOp):
             score -= min((ctas - 2048) / 4096.0, 2.5)
 
         splitk = int(self.knobs.get("SPLITK", 1))
-        if splitk > 8:
-            score -= min((splitk - 8) / 8.0, 1.0)
+        # SPLITK > 4 hits a known codegen bug (atomic-add reordering produces
+        # a few wrong output cells at SPLITK=8 / FM=1 / large-K matmuls — see
+        # test_attention_chains accuracy failures). The penalty also reflects
+        # the real atomicAdd contention cost; SPLITK=2/4 is usually enough.
+        if splitk > 4:
+            score -= min((splitk - 4) / 4.0, 1.0)
 
         if any(isinstance(s, _Stage) for s in self.body.iter()):
             score += 1.0
         if "FM" in self.knobs:
             score += 1.0
 
+        score += self._coalescing_bonus(thread_axes)
+
         return score
+
+    def _coalescing_bonus(self, thread_axes) -> float:
+        """Reward tile shapes whose thread axes align with the innermost
+        output-write dimension (the coalesced-stride axis).
+
+        For each top-level ``Write`` in the body, look at the **last**
+        index expression — that's the inner-stride dim of the output
+        buffer. Count how many thread-axis Vars appear free in it, sum
+        their extents, and turn that into a bonus capped at +1.0.
+
+        Why this matters: empirically, two variants with identical
+        ``cells × threads × ctas`` can differ 2x in measured latency
+        purely because one parks its threads along the M (outer-stride)
+        output axis and the other parks them along N (inner-stride).
+        The N-major variant gets coalesced gmem loads on the matmul B
+        operand and coalesced store on the output; the M-major one
+        strides B by ``N`` per thread. The four base score terms
+        (threads, cells, ctas, splitk) can't distinguish them — this
+        bonus does.
+        """
+        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
+
+        if not thread_axes:
+            return 0.0
+        thread_names = {ax.name for ax in thread_axes}
+        best_inner_extent = 0
+        for stmt in self.body.iter():
+            if not isinstance(stmt, Write) or not stmt.index:
+                continue
+            inner_vars = set(stmt.index[-1].free_vars())
+            matched = inner_vars & thread_names
+            if not matched:
+                continue
+            extent_in_inner = sum(int(ax.extent) for ax in thread_axes if ax.name in matched)
+            if extent_in_inner > best_inner_extent:
+                best_inner_extent = extent_in_inner
+        if best_inner_extent <= 0:
+            return 0.0
+        # Bonus saturates at warp-size alignment: an inner-dim thread
+        # extent of ≥ 32 already gives full coalescing; anything past
+        # that has no marginal coalescing gain. Cap the reward so the
+        # term doesn't dominate the threads/cells/ctas signals.
+        warp = 32
+        return min(best_inner_extent / warp, 1.0)
 
 
 # ---------------------------------------------------------------------------
