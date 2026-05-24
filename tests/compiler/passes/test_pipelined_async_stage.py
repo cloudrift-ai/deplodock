@@ -140,7 +140,7 @@ def test_matmul_pipelines_through_full_pipeline(recording_dump):
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (128, 128)), node_id="o")
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=Context.from_target((8, 0)))
     assert "pipeline_stages" in recording_dump.fired_rules("lowering/tile")
 
 

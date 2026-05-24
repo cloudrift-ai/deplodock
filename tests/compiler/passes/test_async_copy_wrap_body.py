@@ -20,6 +20,11 @@ from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, BufferedStage, Ser
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
+# Pin the compile context to sm_80 so cp.async fires on CI runners (no GPU →
+# ``Context.probe()`` returns cc=(0,0), which gates off the cp.async promotion
+# this file is meant to assert).
+_TEST_CTX = Context.from_target((8, 0))
+
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
@@ -55,7 +60,7 @@ def _find_kouter(op: TileOp) -> SerialTile | None:
 
 def test_matmul_fires_async_copy(recording_dump):
     g = _build_matmul()
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=_TEST_CTX)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "use_async_copy" in fired, fired
 
@@ -67,7 +72,7 @@ def test_async_copy_emits_async_buffered_stage():
     stage; the structural assertion is "any async stage present" rather
     than the specific pre-015 depth=1 shape."""
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
     async_stages = [s for s in op.body.iter() if isinstance(s, AsyncBufferedStage)]
     assert async_stages, "no AsyncBufferedStage anywhere in the body"
@@ -122,8 +127,7 @@ def test_async_copy_preserves_buffered_fields():
             self.outputs = ["t"]
 
     mod = _load_pass()
-    ctx = Context.from_target((8, 0))
-    new_op = mod.rewrite(ctx, FakeNode(op))
+    new_op = mod.rewrite(_TEST_CTX, FakeNode(op))
     # Locate the lone BufferedStage in the input (post-normalize) and its
     # AsyncBufferedStage counterpart in the output to compare structurally.
     pre_kouter = _find_kouter(op)
@@ -150,7 +154,7 @@ def test_kernel_source_contains_cp_async_commit_wait_sync():
     from deplodock.compiler.pipeline import CUDA_PASSES
 
     g = _build_matmul()
-    g2 = Pipeline.build(CUDA_PASSES).run(g)
+    g2 = Pipeline.build(CUDA_PASSES).run(g, ctx=_TEST_CTX)
     src = g2.nodes["o"].op.kernel_source
     assert "cp.async.ca.shared.global" in src
     assert "cp.async.commit_group" in src
@@ -167,11 +171,10 @@ def test_kernel_source_contains_cp_async_commit_wait_sync():
 
 def test_async_copy_is_idempotent():
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     mod = _load_pass()
-    ctx = Context.from_target((8, 0))
     try:
-        mod.rewrite(ctx, g2.nodes["o"])
+        mod.rewrite(_TEST_CTX, g2.nodes["o"])
         raised = False
     except RuleSkipped:
         raised = True
@@ -181,7 +184,7 @@ def test_async_copy_is_idempotent():
 def test_arch_below_sm80_rejected():
     """sm_75 (Turing) and earlier don't have cp.async — pass must skip."""
     g = _build_matmul()
-    g2 = Pipeline.build(TILE_PASSES).run(g)  # ends in AsyncBufferedStage on sm_80+
+    g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)  # ends in AsyncBufferedStage on sm_80+
     # Re-run the rule on a context with cc < (8, 0) — must skip.
     mod = _load_pass()
     ctx = Context.from_target((7, 5))
@@ -217,6 +220,6 @@ def test_no_buffered_stage_means_no_promotion():
             pass
 
     r = R()
-    Pipeline.build(TILE_PASSES, dump=r).run(g)
+    Pipeline.build(TILE_PASSES, dump=r).run(g, ctx=_TEST_CTX)
     fired = {name for _, name in r.fired}
     assert not any("use_async_copy" in name for name in fired), fired
