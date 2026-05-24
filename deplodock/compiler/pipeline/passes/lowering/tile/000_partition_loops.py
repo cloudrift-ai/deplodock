@@ -582,8 +582,26 @@ def _gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) ->
 
     Both Writes lower to ``atomicAdd`` under SPLITK > 1, so the final
     output is ``sum_i acc_i + r`` — the residual added exactly once.
-    Returns ``stmts`` unchanged when no linear epilogue is present."""
-    epilogue = tuple(s for s in stmts if not _stmt_contains_accum(s))
+    Returns ``stmts`` unchanged when no linear epilogue is present.
+
+    **Partition is positional, not set-based.** When the K-loop is fully
+    unrolled (BK=1 + K_o_ext=1, i.e. ``_wrap_tower`` drops both K_o and
+    K_i as size-1) the Loads / Assigns that *feed* the Accum end up as
+    siblings of the Accum at this level. Those are reduce-body stmts,
+    not epilogue — they must stay with the Accum, not get moved into
+    the Cond (which would leave the Accum referencing values defined
+    inside a scope it no longer dominates). Split at the position of
+    the last Accum-bearing stmt: ``[:cut+1]`` is the reduce body that
+    the Cond skips over; ``[cut+1:]`` is the true post-reduce epilogue.
+    """
+    last_accum_idx = -1
+    for i, s in enumerate(stmts):
+        if _stmt_contains_accum(s):
+            last_accum_idx = i
+    if last_accum_idx < 0:
+        return stmts
+    reduce_part = stmts[: last_accum_idx + 1]
+    epilogue = stmts[last_accum_idx + 1 :]
     if not epilogue:
         return stmts
     writes = [s for s in epilogue if isinstance(s, Write)]
@@ -599,7 +617,6 @@ def _gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) ->
     if not _is_linear_in_accum(write.value, acc_name, assigns_by_name):
         return stmts
 
-    tower = tuple(s for s in stmts if _stmt_contains_accum(s))
     write_acc = Write(
         output=write.output,
         index=write.index,
@@ -611,7 +628,7 @@ def _gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) ->
         body=Body(epilogue),
         else_body=Body((write_acc,)),
     )
-    return tower + (cond,)
+    return reduce_part + (cond,)
 
 
 def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> list[TileOp] | None:
