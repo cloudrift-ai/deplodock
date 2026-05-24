@@ -440,10 +440,7 @@ def _is_linear_in_accum(value_name: str, acc_name: str, assigns_by_name: dict[st
         return False
     if a.op.name != "add":
         return False
-    return any(
-        arg == acc_name or _is_linear_in_accum(arg, acc_name, assigns_by_name)
-        for arg in a.args
-    )
+    return any(arg == acc_name or _is_linear_in_accum(arg, acc_name, assigns_by_name) for arg in a.args)
 
 
 def _has_nonlinear_post_reduce_epilogue(stmts: tuple[Stmt, ...]) -> bool:
