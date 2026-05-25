@@ -52,9 +52,18 @@ def trace_module(
     module: nn.Module,
     example_inputs: tuple[torch.Tensor, ...],
     kwargs: dict[str, Any] | None = None,
+    *,
+    dynamic_shapes: dict | None = None,
 ) -> Graph:
-    """Trace a PyTorch module and convert the FX graph to our IR."""
-    graph, _ = trace_module_with_constants(module, example_inputs, kwargs=kwargs)
+    """Trace a PyTorch module and convert the FX graph to our IR.
+
+    ``dynamic_shapes`` flows straight through to ``torch.export.export``.
+    Pass a nested dict like ``{"input": {1: torch.export.Dim("seq_len")}}``
+    to mark axis 1 of the ``input`` argument as dynamic — the resulting
+    graph carries ``Dim('seq_len')`` at every position where torch's
+    SymInt propagated, no post-trace shape rewrite needed.
+    """
+    graph, _ = trace_module_with_constants(module, example_inputs, kwargs=kwargs, dynamic_shapes=dynamic_shapes)
     return graph
 
 
@@ -62,6 +71,8 @@ def trace_module_with_constants(
     module: nn.Module,
     example_inputs: tuple[torch.Tensor, ...],
     kwargs: dict[str, Any] | None = None,
+    *,
+    dynamic_shapes: dict | None = None,
 ) -> tuple[Graph, dict[str, str]]:
     """Trace a module and return the IR graph plus a placeholder→attribute map.
 
@@ -70,6 +81,13 @@ def trace_module_with_constants(
     lives (e.g. ``self_attn.q_proj.weight``). ``torch.export`` sometimes
     strips prefixes like ``self_`` from the placeholder name, so this map
     is needed to feed constants at runtime.
+
+    ``dynamic_shapes`` is forwarded to ``torch.export.export``. When set,
+    the FX nodes' ``meta["val"]`` shapes contain ``SymInt`` entries for
+    every dynamic axis; the FX→IR walker converts those to symbolic
+    ``Dim`` instances. Internal names torch assigns (``s0``, ``s1``,
+    …) are renamed back to the user-supplied ``Dim`` names from
+    ``dynamic_shapes`` so the resulting IR reads as ``Dim('seq_len')``.
     """
     import time
 
@@ -77,11 +95,14 @@ def trace_module_with_constants(
 
     t0 = time.monotonic()
     logger.info("torch.export.export() starting...")
-    exported = torch.export.export(module, example_inputs, kwargs=kwargs or {})
+    expanded_dynamic = _expand_dynamic_shapes(module, example_inputs, kwargs or {}, dynamic_shapes) if dynamic_shapes else None
+    exported = torch.export.export(module, example_inputs, kwargs=kwargs or {}, dynamic_shapes=expanded_dynamic)
     gm = exported.graph_module
     t1 = time.monotonic()
     n_fx_nodes = sum(1 for _ in gm.graph.nodes)
     logger.info("torch.export.export() done in %.1fs (%d FX nodes)", t1 - t0, n_fx_nodes)
+
+    sym_rename = _sym_rename_map(exported, dynamic_shapes) if dynamic_shapes else {}
 
     g = Graph()
     node_map: dict[str, str] = {}
@@ -93,9 +114,9 @@ def trace_module_with_constants(
 
     for fx_node in gm.graph.nodes:
         if fx_node.op == "placeholder":
-            _handle_placeholder(g, fx_node, node_map, module, const_targets)
+            _handle_placeholder(g, fx_node, node_map, module, const_targets, sym_rename=sym_rename)
         elif fx_node.op == "call_function":
-            _handle_call_function(g, fx_node, node_map)
+            _handle_call_function(g, fx_node, node_map, sym_rename=sym_rename)
         elif fx_node.op == "output":
             _handle_output(g, fx_node, node_map)
         else:
@@ -105,11 +126,179 @@ def trace_module_with_constants(
     return g, const_targets
 
 
-def _get_shape(fx_node: Any) -> tuple:
+def _expand_dynamic_shapes(module, example_inputs: tuple, kwargs: dict, user_dynamic: dict) -> dict:
+    """Auto-fill ``None`` for any forward-arg the user didn't mark dynamic.
+
+    ``torch.export.export(dynamic_shapes=...)`` requires the top-level
+    dict to match EXACTLY the args / kwargs actually passed (not the
+    forward signature). Container-typed args (tuple of tensors for HF's
+    ``position_embeddings`` etc.) need a structurally-matching spec,
+    not a bare ``None``, or torch raises on the type mismatch."""
+    import inspect
+
+    sig = inspect.signature(module.forward)
+    sig_params = [n for n in sig.parameters if n != "self"]
+    positional_names = sig_params[: len(example_inputs)]
+    expected = list(zip(positional_names, example_inputs, strict=True)) + list(kwargs.items())
+    out: dict[str, object] = {}
+    for name, value in expected:
+        out[name] = user_dynamic.get(name) if name in user_dynamic else _static_spec_for(value)
+    # Pass through any user keys that weren't expected so torch's error
+    # message stays informative (e.g. typo'd input names).
+    for name, spec in user_dynamic.items():
+        out.setdefault(name, spec)
+    return out
+
+
+def _static_spec_for(value) -> object:
+    """Build a structurally-matching ``None`` spec for an input value.
+
+    Bare tensor → ``None``. Tuple / list of tensors → matching tuple /
+    list of ``None``. Anything else → ``None`` (torch accepts that for
+    non-tensor inputs)."""
+    if isinstance(value, tuple):
+        return tuple(_static_spec_for(v) for v in value)
+    if isinstance(value, list):
+        return [_static_spec_for(v) for v in value]
+    return None
+
+
+def _sym_rename_map(exported, dynamic_shapes: dict) -> dict[str, str]:
+    """Build a ``{torch-internal-symbol-name: user-Dim-name}`` mapping.
+
+    ``torch.export`` invents internal names (``s0``, ``s1``, …) for each
+    dynamic dim, but the user passed in ``torch.export.Dim('seq_len')``
+    and expects ``Dim('seq_len')`` to show up in the resulting IR.
+    Match by walking ``exported.graph_signature.input_specs`` against the
+    ``dynamic_shapes`` keys, then inspecting the placeholder FX node's
+    ``meta["val"].shape[axis]`` to find the SymInt torch assigned at
+    that position.
+    """
+    rename: dict[str, str] = {}
+    gm = exported.graph_module
+    # Map arg-name → placeholder FX node. ``torch.export`` may rename
+    # placeholders (strip ``self_`` etc.), but the signature carries
+    # the original user-arg-name → placeholder-name mapping.
+    sig = exported.graph_signature
+    user_to_placeholder: dict[str, str] = {}
+    for spec in sig.input_specs:
+        # ``user_inputs`` specs have ``arg.name == placeholder.name``;
+        # parameter / buffer specs aren't user-facing inputs.
+        if getattr(spec, "kind", None) is not None and spec.kind.name == "USER_INPUT":
+            user_to_placeholder[spec.arg.name] = spec.arg.name
+    placeholder_by_name: dict[str, Any] = {n.name: n for n in gm.graph.nodes if n.op == "placeholder"}
+
+    for arg_name, axis_map in dynamic_shapes.items():
+        ph_name = user_to_placeholder.get(arg_name, arg_name)
+        ph = placeholder_by_name.get(ph_name)
+        if ph is None:
+            continue
+        val = ph.meta.get("val")
+        if val is None or not hasattr(val, "shape"):
+            continue
+        for axis, user_dim in axis_map.items():
+            if axis >= len(val.shape):
+                continue
+            sym_int = val.shape[axis]
+            # ``SymInt`` carries the symbol via ``.node.expr`` (sympy
+            # ``Symbol``); ``str(symbol)`` is the internal name like ``s0``.
+            sym_name = _symint_name(sym_int)
+            if sym_name is None:
+                continue
+            rename[sym_name] = user_dim.__name__ if hasattr(user_dim, "__name__") else str(user_dim)
+    return rename
+
+
+def _symint_name(value) -> str | None:
+    """Return the underlying sympy symbol name for a ``SymInt`` placeholder,
+    or ``None`` if ``value`` is a plain int (the static-axis case)."""
+    if isinstance(value, int):
+        return None
+    node = getattr(value, "node", None)
+    if node is None:
+        return None
+    expr = getattr(node, "expr", None) or node
+    # Sympy Symbols stringify to their name (``s0``); compound expressions
+    # would stringify to e.g. ``2*s0`` — we only support plain symbols today.
+    return str(expr)
+
+
+def _wrap_shape(raw_shape, sym_rename: dict[str, str] | None = None):
+    """Convert a torch ``Size`` (possibly containing ``SymInt``) to the
+    tuple form our IR expects.
+
+    Plain ints pass through. ``SymInt`` placeholders become ``Dim(name)``
+    with ``name`` resolved through ``sym_rename`` (so torch's ``s0``
+    becomes the user's ``seq_len``); unrenamed symbols keep their
+    torch-internal name. The static-shape case (no SymInt anywhere)
+    returns a ``tuple[int, ...]`` — the existing IR construction path
+    coerces those to ``Dim(int)`` via ``Tensor.__post_init__``.
+    """
+    from deplodock.compiler.dim import Dim
+
+    if sym_rename is None:
+        sym_rename = {}
+    out = []
+    for d in raw_shape:
+        if isinstance(d, int):
+            out.append(d)
+        else:
+            sym_name = _symint_name(d)
+            if sym_name is None:
+                # Compound expression we can't represent — fall back to a stringified placeholder.
+                out.append(Dim(str(d)))
+            else:
+                out.append(Dim(sym_rename.get(sym_name, sym_name)))
+    return tuple(out)
+
+
+def _get_shape(fx_node: Any, sym_rename: dict[str, str] | None = None) -> tuple:
     meta = fx_node.meta.get("val", None)
     if meta is not None and hasattr(meta, "shape"):
-        return tuple(meta.shape)
+        return _wrap_shape(meta.shape, sym_rename)
     return ()
+
+
+def _op_shape(raw_shape, sym_rename: dict[str, str] | None = None):
+    """Convert an FX-arg shape (``view``/``reshape``'s second arg, etc.) to
+    the ``tuple[int | str, ...]`` form ``ReshapeOp.shape`` /
+    ``SliceOp.shape`` expect.
+
+    Ints pass through. ``-1`` (numpy/torch infer-this-dim sentinel) passes
+    through. FX node references to ``aten.sym_size.int`` outputs (which
+    appear in reshape arg lists as ``[1, sym_size_int_1, 4, -1]``)
+    resolve through ``meta["val"]`` to the underlying ``SymInt``.
+    ``SymInt`` becomes the renamed symbolic name (``s0`` → ``seq_len``).
+    Unknown values get stringified as a fallback so we don't silently
+    lose information.
+    """
+    sym_rename = sym_rename or {}
+    out = []
+    for d in raw_shape:
+        if isinstance(d, int):
+            out.append(d)
+            continue
+        # FX node reference: resolve to ``meta["val"]`` (a SymInt scalar).
+        meta = getattr(d, "meta", None)
+        if isinstance(meta, dict):
+            val = meta.get("val")
+            if val is not None:
+                d = val
+        sym = _symint_name(d)
+        if sym is not None:
+            out.append(sym_rename.get(sym, sym))
+        else:
+            out.append(str(d))
+    return tuple(out)
+
+
+def _dim_tuple_to_op_shape(shape):
+    """Convert a ``tuple[Dim | int, ...]`` (from ``_wrap_shape`` output) back
+    to the ``tuple[int | str, ...]`` form ``ReshapeOp.shape`` /
+    ``SliceOp.shape`` carry. ``Dim`` wrappers unwrap to ``.value``."""
+    from deplodock.compiler.dim import Dim
+
+    return tuple(d.value if isinstance(d, Dim) else d for d in shape)
 
 
 def _get_dtype(fx_node: Any) -> str:
@@ -152,6 +341,8 @@ def _handle_placeholder(
     node_map: dict[str, str],
     module: nn.Module,
     const_targets: dict[str, str],
+    *,
+    sym_rename: dict[str, str] | None = None,
 ) -> None:
     """Handle placeholder nodes (inputs, parameters, and buffers).
 
@@ -166,7 +357,7 @@ def _handle_placeholder(
     side-channel ``const_targets`` dict.
     """
     name = fx_node.name
-    shape = _get_shape(fx_node)
+    shape = _get_shape(fx_node, sym_rename)
     dtype = _get_dtype(fx_node)
     is_const = name.startswith(("p_", "b_"))
 
@@ -245,10 +436,17 @@ def _squeeze_indexmap(in_shape: tuple, out_shape: tuple, axis: int | str) -> Ind
     return IndexMapOp(out_shape=tuple(out_shape), sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),))
 
 
-def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> None:
+def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, sym_rename: dict[str, str] | None = None) -> None:
     """Handle call_function nodes — faithful 1:1 capture of FX ops."""
+    # ``aten.sym_size.int`` and similar shape-metadata ops return a
+    # scalar ``SymInt`` (no tensor shape). They're consumed inline by
+    # ``_op_shape`` when a downstream reshape / view references them via
+    # ``args``; making them graph nodes would only confuse the matcher.
+    val = fx_node.meta.get("val")
+    if val is not None and not hasattr(val, "shape"):
+        return
     name = fx_node.name
-    shape = _get_shape(fx_node)
+    shape = _get_shape(fx_node, sym_rename)
     dtype = _get_dtype(fx_node)
     op_name = _op_name(fx_node.target)
     input_ids = _resolve_inputs(fx_node, node_map, g)
@@ -413,7 +611,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     if op_name in ("view", "reshape", "_unsafe_view"):
         new_shape = fx_node.args[1] if len(fx_node.args) > 1 else shape
         if isinstance(new_shape, (list, tuple)):
-            new_shape = tuple(new_shape)
+            new_shape = _op_shape(new_shape, sym_rename)
         nid = g.add_node(
             op=ReshapeOp(shape=new_shape),
             inputs=input_ids[:1],
@@ -437,8 +635,11 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
 
     # --- Squeeze / permute / expand ---
     if op_name in ("squeeze", "expand", "permute"):
+        # ``ReshapeOp.shape`` is ``tuple[int | str, ...]`` — unwrap Dim wrappers
+        # so the op-level field carries the raw int / symbolic-name form.
+        op_shape = _dim_tuple_to_op_shape(shape)
         nid = g.add_node(
-            op=ReshapeOp(shape=shape),
+            op=ReshapeOp(shape=op_shape),
             inputs=input_ids[:1],
             output=Tensor(name, shape, dtype),
             node_id=name,
@@ -456,7 +657,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str]) -> N
     if op_name == "slice":
         if input_ids:
             nid = g.add_node(
-                op=SliceOp(shape=shape),
+                op=SliceOp(shape=_dim_tuple_to_op_shape(shape)),
                 inputs=input_ids,
                 output=Tensor(name, shape, dtype),
                 node_id=name,

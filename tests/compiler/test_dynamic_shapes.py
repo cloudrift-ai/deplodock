@@ -1,8 +1,11 @@
 """Symbolic-extent ``Dim`` round-trips through trace → lift → ``LoopOp.forward``.
 
-Plan: ``plans/dynamic-shapes.md``. M1 milestone: free-axis extents stay
-symbolic through lifting; ``LoopOp.forward`` binds them from input array
-shapes at execute time and specializes the body before C++ rendering.
+Plan: ``plans/dynamic-shapes.md``. Tests cover the position-based dynamic
+shape flow: ``torch.export(..., dynamic_shapes={input: {axis: Dim(name)}})``
+threads ``Dim(name)`` through every downstream FX node via SymInt, the
+compile pipeline emits one CudaOp whose signature carries
+``int <name>`` runtime arg, and the launch resolves the value from the
+runtime input shape.
 """
 
 from __future__ import annotations
@@ -16,6 +19,18 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import Pipeline
+
+
+def _seq_len_dim(*, min: int = 5, max: int = 4096):
+    """``torch.export.Dim('seq_len')`` instance for tests below.
+
+    ``min=5`` by default skirts torch.export's specialisation guards on
+    small concrete dims that SDPA / matmul reshape paths introduce
+    (e.g. ``num_heads=4`` would otherwise specialise the dim at
+    ``seq_len=4``)."""
+    import torch
+
+    return torch.export.Dim("seq_len", min=min, max=max)
 
 
 def _symbolic_elementwise_graph() -> Graph:
@@ -114,14 +129,12 @@ def test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens():
 
 
 def test_symbolic_sdpa_traces_and_decomposes():
-    """M4 validation: a single-layer causal SDPA + reshape traced from
-    torch, free seq_len dim rewritten to ``Dim('seq_len')``, decomposes
-    + lifts cleanly. Execution still requires M5 (symbolic reduce
-    axis); this test stops at the loop-lifted graph and asserts the
-    surviving op shapes carry symbolic dims end-to-end."""
+    """A single-layer causal SDPA + reshape traced with
+    ``dynamic_shapes={"q","k","v" → {2: Dim("seq_len")}}`` decomposes + lifts
+    cleanly. Stops at the loop-lifted graph and asserts the surviving op
+    shapes carry symbolic dims end-to-end."""
     import torch
 
-    from deplodock.compiler.ir.frontend.ir import ReshapeOp
     from deplodock.compiler.trace.torch import trace_module
 
     class AttnBlock(torch.nn.Module):
@@ -131,30 +144,25 @@ def test_symbolic_sdpa_traces_and_decomposes():
             return attn.reshape(B, S, H * D)
 
     b, h, s, d = 1, 4, 16, 64
-    graph = trace_module(AttnBlock(), (torch.randn(b, h, s, d), torch.randn(b, h, s, d), torch.randn(b, h, s, d)))
-    # Rewrite the seq_len position (index 2 of every shape, value 16) and ReshapeOp.shape.
-    for node in graph.nodes.values():
-        node.output.shape = tuple(Dim("seq_len") if (i in (1, 2) and dim == s) else dim for i, dim in enumerate(node.output.shape))
-        if isinstance(node.op, ReshapeOp):
-            node.op.shape = tuple("seq_len" if (i in (1, 2) and dim == s) else dim for i, dim in enumerate(node.op.shape))
-
+    seq_len = _seq_len_dim()
+    graph = trace_module(
+        AttnBlock(),
+        (torch.randn(b, h, s, d), torch.randn(b, h, s, d), torch.randn(b, h, s, d)),
+        dynamic_shapes={"q": {2: seq_len}, "k": {2: seq_len}, "v": {2: seq_len}},
+    )
     decomp = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
-    # SDPA decomposition stamps softmax (max + exp + sum) over the kv_len axis.
-    # That axis is symbolic — the reduce ops survive the decomposition pass but
-    # are accepted because M0 widened ``ReduceOp.axis`` handling.
     assert any(Dim("seq_len") in n.output.shape for n in decomp.nodes.values()), (
         "expected at least one node to carry symbolic seq_len after decomposition"
     )
-
     lifted = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting"]).run(graph)
     loop_op_count = sum(1 for n in lifted.nodes.values() if isinstance(n.op, LoopOp))
     assert loop_op_count >= 1, "expected at least one LoopOp after lifting"
 
 
 def test_cuda_softmax_over_symbolic_seq_len():
-    """M5 validation slice (part 1): softmax reducing over a symbolic
-    ``seq_len`` axis compiles to a single kernel whose serial reduce
-    loop's bound is the runtime ``int seq_len`` arg."""
+    """Softmax reducing over a symbolic ``seq_len`` axis compiles to a
+    single kernel whose serial reduce loop's bound is the runtime
+    ``int seq_len`` arg."""
     pytest = __import__("pytest")
     pytest.importorskip("cupy")
     import torch
@@ -166,11 +174,7 @@ def test_cuda_softmax_over_symbolic_seq_len():
         def forward(self, x):
             return torch.nn.functional.softmax(x, dim=-1)
 
-    s_trace = 16
-    graph = trace_module(Softmax(), (torch.randn(4, s_trace),))
-    for node in graph.nodes.values():
-        node.output.shape = tuple(Dim("seq_len") if (i == 1 and d == s_trace) else d for i, d in enumerate(node.output.shape))
-
+    graph = trace_module(Softmax(), (torch.randn(4, 16),), dynamic_shapes={"x": {1: _seq_len_dim()}})
     backend = CudaBackend()
     compiled = backend.compile(graph)
     for s in (5, 16, 32):
@@ -183,9 +187,9 @@ def test_cuda_softmax_over_symbolic_seq_len():
 
 
 def test_cuda_sdpa_over_symbolic_seq_len():
-    """M5 validation slice (part 2): full causal SDPA with symbolic
-    seq_len compiles + runs end-to-end. Stresses symbolic on free axes
-    (Q,K,V leading seq dim) AND on the matmul K axis (attn @ V)."""
+    """Full causal SDPA with symbolic seq_len compiles + runs
+    end-to-end. Stresses symbolic on free axes (Q/K/V leading seq dim)
+    AND on the matmul K axis (attn @ V)."""
     pytest = __import__("pytest")
     pytest.importorskip("cupy")
     import torch
@@ -198,12 +202,12 @@ def test_cuda_sdpa_over_symbolic_seq_len():
             return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     b, h, s_trace, d = 1, 4, 16, 64
+    seq_len = _seq_len_dim()
     graph = trace_module(
         Attn(),
         (torch.randn(b, h, s_trace, d), torch.randn(b, h, s_trace, d), torch.randn(b, h, s_trace, d)),
+        dynamic_shapes={"q": {2: seq_len}, "k": {2: seq_len}, "v": {2: seq_len}},
     )
-    for node in graph.nodes.values():
-        node.output.shape = tuple(Dim("seq_len") if dim == s_trace else dim for dim in node.output.shape)
     backend = CudaBackend()
     compiled = backend.compile(graph)
     for s in (8, 16):
@@ -221,21 +225,18 @@ def test_cuda_sdpa_over_symbolic_seq_len():
 
 
 def test_cuda_symbolic_rmsnorm_traced_and_run():
-    """End-to-end on a real ``torch.nn.RMSNorm``: trace at one seq_len,
-    rewrite the traced tensors' middle dim to ``Dim("seq_len")``, compile
-    once, run at two distinct seq_len values, compare to torch eager."""
+    """End-to-end on a real ``torch.nn.RMSNorm`` traced with
+    ``dynamic_shapes={"x": {1: Dim("seq_len")}}`` — compile once, run at
+    two distinct seq_len values, compare to torch eager."""
     pytest = __import__("pytest")
-    cupy = pytest.importorskip("cupy")
-    del cupy
+    pytest.importorskip("cupy")
     import torch
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.trace.torch import trace_module
 
     m = torch.nn.RMSNorm(2048)
-    graph = trace_module(m, (torch.randn(1, 32, 2048),))
-    for node in graph.nodes.values():
-        node.output.shape = tuple(Dim("seq_len") if (i == 1 and d == 32) else d for i, d in enumerate(node.output.shape))
+    graph = trace_module(m, (torch.randn(1, 32, 2048),), dynamic_shapes={"x": {1: _seq_len_dim()}})
     backend = CudaBackend()
     compiled = backend.compile(graph)
 
@@ -257,7 +258,6 @@ def test_reshape_negative_one_infers_through_symbolic_dim():
     import torch
 
     from deplodock.compiler.pipeline import Pipeline
-    from deplodock.compiler.trace.dynamic import make_dynamic
     from deplodock.compiler.trace.torch import trace_module
 
     class ReshapeWithMinusOne(torch.nn.Module):
@@ -265,8 +265,7 @@ def test_reshape_negative_one_infers_through_symbolic_dim():
             b, s, d = x.shape
             return x.reshape(b, s, 4, -1)
 
-    graph = trace_module(ReshapeWithMinusOne(), (torch.randn(1, 16, 128),))
-    make_dynamic(graph, "seq_len", 16)
+    graph = trace_module(ReshapeWithMinusOne(), (torch.randn(1, 16, 128),), dynamic_shapes={"x": {1: _seq_len_dim()}})
     out = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting"]).run(graph)
     loops = [n for n in out.nodes.values() if isinstance(n.op, LoopOp)]
     assert loops, "expected at least one LoopOp after lifting"
@@ -276,35 +275,10 @@ def test_reshape_negative_one_infers_through_symbolic_dim():
     assert any(e == Dim(32) for _, e in extents), f"reshape -1 didn't infer to static 32: {extents}"
 
 
-def test_make_dynamic_helper_rewrites_shapes_and_op_fields():
-    """``make_dynamic`` rewrites every ``Dim(value)`` in ``node.output.shape``
-    plus the ``shape`` field on ``ReshapeOp`` / ``SliceOp``. Mutates in place;
-    returns the graph for chaining."""
-    import torch
-
-    from deplodock.compiler.ir.frontend.ir import ReshapeOp
-    from deplodock.compiler.trace.dynamic import make_dynamic
-    from deplodock.compiler.trace.torch import trace_module
-
-    class Reshape1(torch.nn.Module):
-        def forward(self, x):
-            b, s, d = x.shape
-            return x.reshape(b, s, 4, d // 4)
-
-    graph = trace_module(Reshape1(), (torch.randn(1, 16, 128),))
-    out = make_dynamic(graph, "seq_len", 16)
-    assert out is graph
-    for node in graph.nodes.values():
-        assert Dim(16) not in node.output.shape, f"static 16 leaked into {node.output.shape}"
-        if isinstance(node.op, ReshapeOp):
-            assert 16 not in node.op.shape, f"static 16 leaked into ReshapeOp.shape {node.op.shape}"
-            assert "seq_len" in node.op.shape
-
-
 def test_cuda_symbolic_linear_traced_and_run():
-    """M6 validation: end-to-end on a real ``torch.nn.Linear`` traced from
-    torch — covers the matmul-on-symbolic-M code path (single compile, two
-    distinct runtime seq_lens, both within fp32 tolerance of eager)."""
+    """End-to-end on a real ``torch.nn.Linear`` traced with
+    ``dynamic_shapes={"x": {1: Dim("seq_len")}}`` — covers the
+    matmul-on-symbolic-M code path."""
     pytest = __import__("pytest")
     pytest.importorskip("cupy")
     import torch
@@ -312,12 +286,12 @@ def test_cuda_symbolic_linear_traced_and_run():
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.base import ConstantOp
     from deplodock.compiler.loader.binder import apply_load_ops
-    from deplodock.compiler.trace.dynamic import make_dynamic
     from deplodock.compiler.trace.torch import trace_module_with_constants
 
     m = torch.nn.Linear(128, 256, bias=False)
-    graph, _ = trace_module_with_constants(m, (torch.randn(1, 16, 128),))
-    make_dynamic(graph, "seq_len", 16)
+    # ``Linear.forward`` declares the activation arg as ``input`` — torch.export
+    # keys ``dynamic_shapes`` by the real forward-signature name.
+    graph, _ = trace_module_with_constants(m, (torch.randn(1, 16, 128),), dynamic_shapes={"input": {1: _seq_len_dim()}})
     backend = CudaBackend()
     compiled = backend.compile(graph)
 

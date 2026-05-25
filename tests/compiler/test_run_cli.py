@@ -274,17 +274,14 @@ def test_run_ir_missing_file(run_cli, tmp_path):
 
 @requires_cuda
 def test_run_code_dynamic_seq_len(run_cli):
-    """``run --code --dynamic seq_len --seq-len 32`` traces the inline
-    module, makes the seq_len dim symbolic, compiles to a single
-    ``int seq_len``-arg kernel, runs it at the canonical shape, and
-    checks accuracy against eager."""
+    """``run --code --dynamic seq_len@x:1`` traces with torch.export's
+    dynamic_shapes, compiles to a single ``int seq_len``-arg kernel,
+    runs it at the canonical shape, and checks accuracy against eager."""
     rc, _, stderr = run_cli(
         "run",
         "--code",
         "torch.nn.RMSNorm(64)(torch.randn(1,8,64))",
         "--dynamic",
-        "seq_len",
-        "--seq-len",
-        "8",
+        "seq_len@x:1",
     )
     assert rc == 0, f"stderr: {stderr}"

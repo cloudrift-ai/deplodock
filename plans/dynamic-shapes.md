@@ -178,14 +178,25 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   RoPE / KV cache / generation-loop is the remaining stretch — the planner / codegen / launch path is
   ready to receive it; the missing piece is tracer coverage for the permute+slice patterns in HF
   attention blocks.
-- **CLI — `--dynamic` flag landed.** ``deplodock compile`` / ``tune`` / ``run --code`` / ``run --ir`` all
-  accept ``--dynamic NAME[=VALUE]`` (repeatable). Bare ``--dynamic seq_len`` defaults VALUE to ``--seq-len``.
-  Wiring: ``parse_specs`` + ``apply_specs`` in ``compiler/trace/dynamic.py``; CLI handlers call
-  ``apply_dynamic(args, graph)`` right after ``load_or_trace`` / ``trace_inline_code`` so the symbolic
-  rewrite lands before any pass runs. Smoke covered by
-  ``test_compile_dynamic_emits_runtime_arg`` / ``test_compile_dynamic_explicit_value`` /
-  ``test_compile_dynamic_bad_spec_rejected`` (CLI args parse + ``int seq_len`` shows up in rendered
-  kernel) plus ``test_run_code_dynamic_seq_len`` (compile + run + accuracy-vs-eager).
+- **Position-based ``--dynamic NAME@INPUT:AXIS`` CLI + torch.export SymInt path.** ``deplodock {compile,
+  tune, run}`` accept ``--dynamic NAME@INPUT:AXIS`` (repeatable). ``compiler/trace/dynamic.py`` parses
+  the spec strings to ``(name, input, axis)`` triples and converts to ``torch.export.Dim`` instances
+  via ``build_torch_dynamic_shapes``. ``trace_module`` / ``trace_module_with_constants`` accept a
+  ``dynamic_shapes`` kwarg that flows straight to ``torch.export.export``; torch's SymInt
+  propagation determines which downstream FX tensors carry the dynamic dim. The FX walker
+  (``_get_shape`` / ``_wrap_shape`` / ``_op_shape``) converts ``SymInt`` to ``Dim``, with a
+  ``_sym_rename_map`` that maps torch's internal names (``s0``, ``s27``) back to the user's
+  ``Dim('seq_len')`` so the IR reads cleanly. ``_expand_dynamic_shapes`` auto-fills ``None`` for
+  any forward-arg the user didn't mark dynamic (torch requires ALL keys present); container args
+  (HF's ``position_embeddings`` tuple) get a structurally-matching ``(None, None)`` spec via
+  ``_static_spec_for``. The ``aten.sym_size.int`` FX nodes that torch emits to extract symbolic
+  dim sizes (e.g. ``b, s, d = x.shape``) are skipped during the IR walk — they're consumed inline
+  by reshape's ``_op_shape``, not represented as graph nodes. Value-based ``make_dynamic`` /
+  ``parse_specs`` / ``apply_specs`` are gone; the only path is position-based + torch.export.
+  Eliminates the value-collision class (``--seq-len 32`` colliding with ``num_heads=32``) by
+  construction. Caveat: per-layer HF trace (``compile <model> --layer N``) eagerly computes
+  ``cos/sin`` from a concrete seq_len, so position embeddings specialise the dim — only the
+  ``--code`` and whole-model paths work end-to-end today.
 
 ## Explicitly out of scope (v1)
 
