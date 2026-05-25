@@ -213,11 +213,11 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     if fn in _BINARY_OP:
         return BinaryExpr(_BINARY_OP[fn], inputs[0], inputs[1])
     if fn == "maximum":
-        return FuncCallExpr("fmax", list(inputs))
+        return FuncCallExpr("fmax", tuple(inputs))
     if fn == "minimum":
-        return FuncCallExpr("fmin", list(inputs))
+        return FuncCallExpr("fmin", tuple(inputs))
     if fn == "pow":
-        return FuncCallExpr("pow", list(inputs))
+        return FuncCallExpr("pow", tuple(inputs))
     if fn == "negative":
         return BinaryExpr("-", Literal(0.0, "float"), inputs[0])
     if fn == "copy":
@@ -225,15 +225,15 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     if fn == "reciprocal":
         return BinaryExpr("/", Literal(1.0, "float"), inputs[0])
     if fn == "relu":
-        return FuncCallExpr("fmax", [Literal(0.0, "float"), inputs[0]])
+        return FuncCallExpr("fmax", (Literal(0.0, "float"), inputs[0]))
     if fn == "sigmoid":
         neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
-        exp_neg = FuncCallExpr("exp", [neg_x])
+        exp_neg = FuncCallExpr("exp", (neg_x,))
         return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
     if fn in ("exp", "rsqrt", "tanh", "sqrt", "erf"):
-        return FuncCallExpr(fn, list(inputs))
+        return FuncCallExpr(fn, tuple(inputs))
     if fn == "abs":
-        return FuncCallExpr("fabs", list(inputs))
+        return FuncCallExpr("fabs", tuple(inputs))
     raise NotImplementedError(f"render: elementwise fn={fn!r} not supported")
 
 

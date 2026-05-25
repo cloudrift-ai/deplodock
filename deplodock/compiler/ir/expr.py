@@ -178,7 +178,7 @@ def apply_binop(op: str, lv: object, rv: object) -> object:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class Var(_ExprOps):
     """Variable reference."""
 
@@ -213,7 +213,7 @@ class Var(_ExprOps):
         return ctx.ranges.get(self.name)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Literal(_ExprOps):
     """Numeric constant."""
 
@@ -259,7 +259,7 @@ class Literal(_ExprOps):
         return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class BinaryExpr(_ExprOps):
     """Binary operation.
 
@@ -430,7 +430,7 @@ class BinaryExpr(_ExprOps):
         return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Builtin(_ExprOps):
     """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.).
 
@@ -462,7 +462,7 @@ class Builtin(_ExprOps):
         return self
 
 
-@dataclass
+@dataclass(frozen=True)
 class FuncCallExpr(_ExprOps):
     """Intrinsic / math function call.
 
@@ -474,7 +474,7 @@ class FuncCallExpr(_ExprOps):
     """
 
     name: str
-    args: list[Expr]
+    args: tuple[Expr, ...]
 
     def eval(self, env: dict[str, object]) -> object:
         from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -489,7 +489,7 @@ class FuncCallExpr(_ExprOps):
         return f"{self.name}({', '.join(a.pretty() for a in self.args)})"
 
     def substitute(self, mapping: dict[str, Expr]) -> Expr:
-        return FuncCallExpr(self.name, [a.substitute(mapping) for a in self.args])
+        return FuncCallExpr(self.name, tuple(a.substitute(mapping) for a in self.args))
 
     def free_vars(self) -> frozenset[str]:
         out: frozenset[str] = frozenset()
@@ -503,13 +503,13 @@ class FuncCallExpr(_ExprOps):
         return f"{spelling}({args})"
 
     def simplify(self, ctx: SimplifyCtx) -> Expr:
-        new_args = [a.simplify(ctx) for a in self.args]
+        new_args = tuple(a.simplify(ctx) for a in self.args)
         if all(x is y for x, y in zip(new_args, self.args, strict=True)):
             return self
         return FuncCallExpr(self.name, new_args)
 
 
-@dataclass
+@dataclass(frozen=True)
 class TernaryExpr(_ExprOps):
     """TernaryExpr expression: cond ? if_true : if_false.
 
@@ -555,7 +555,7 @@ class TernaryExpr(_ExprOps):
         return TernaryExpr(cond, a, b)
 
 
-@dataclass
+@dataclass(frozen=True)
 class CastExpr(_ExprOps):
     """Type cast of an inner expression to ``dtype`` (e.g. ``"int"``, ``"float"``)."""
 
