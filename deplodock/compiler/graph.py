@@ -786,6 +786,12 @@ class Graph:
                 "inputs": node.inputs,
                 "output": {
                     "name": node.output.name,
+                    # JSON dump preserves atomic Dims (int / Var name) so the
+                    # round-trip ``deplodock run --ir <json>`` flow reconstructs
+                    # them via ``Dim(value)``. Composite Dims (BinaryExpr-backed,
+                    # e.g. from a CatOp output) currently can't round-trip and
+                    # ``.value`` will raise — those graphs aren't yet a JSON
+                    # serialization target.
                     "shape": [d.value for d in node.output.shape],
                     "dtype": node.output.dtype.name,
                 },

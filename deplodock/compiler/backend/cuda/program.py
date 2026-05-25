@@ -28,6 +28,7 @@ import numpy as np
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
 from deplodock.compiler.backend.cuda import _tma
 from deplodock.compiler.backend.cuda.dtype import cupy_dtype
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import ConstantOp, InputOp
@@ -65,19 +66,20 @@ def _ensure_dynamic_smem_attr(kernel: cp.RawKernel, smem_bytes: int) -> None:
 @dataclass
 class _Buffer:
     name: str
-    # Shape factors are ``int`` (static) or ``str`` (symbolic axis name).
-    # Static-only kernels collapse to ``tuple[int, ...]``; symbolic dims
-    # are resolved at ``_allocate`` time from input array shapes.
-    shape: tuple
+    # ``Dim``-valued shape. Static dims carry a ``Literal`` expr, atomic
+    # symbolic carry a ``Var``, composite (e.g. ``S * 2`` from a reshape
+    # or cat) carry a ``BinaryExpr``. ``resolve_shape`` calls ``expr.eval``
+    # to turn any of those into a runtime int.
+    shape: tuple[Dim, ...]
     dtype: DataType
     role: str  # "input" | "constant" | "output" | "scratch"
 
     @property
     def is_symbolic(self) -> bool:
-        return any(isinstance(d, str) for d in self.shape)
+        return any(not d.is_static for d in self.shape)
 
     def resolve_shape(self, sym_values: dict[str, int]) -> tuple[int, ...]:
-        return tuple(d if isinstance(d, int) else sym_values[d] for d in self.shape)
+        return tuple(int(d.expr.eval(sym_values)) for d in self.shape)
 
 
 def _buffers(graph: Graph) -> list[_Buffer]:
@@ -93,11 +95,7 @@ def _buffers(graph: Graph) -> list[_Buffer]:
             role = "output"
         else:
             role = "scratch"
-        # ``Dim.value`` is ``int`` for static, ``str`` for symbolic — keep
-        # symbolic as the bare name so ``_allocate`` can resolve at launch
-        # time. Fully-static graphs collapse to ``tuple[int, ...]``.
-        shape = tuple(d.value for d in node.output.shape)
-        bufs.append(_Buffer(name=nid, shape=shape, dtype=node.output.dtype, role=role))
+        bufs.append(_Buffer(name=nid, shape=tuple(node.output.shape), dtype=node.output.dtype, role=role))
     return bufs
 
 

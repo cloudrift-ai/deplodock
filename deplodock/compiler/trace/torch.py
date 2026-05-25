@@ -303,7 +303,9 @@ def _op_shape(raw_shape, sym_rename: dict[str, str] | None = None):
 def _dim_tuple_to_op_shape(shape):
     """Convert a ``tuple[Dim | int, ...]`` (from ``_wrap_shape`` output) back
     to the ``tuple[int | str, ...]`` form ``ReshapeOp.shape`` /
-    ``SliceOp.shape`` carry. ``Dim`` wrappers unwrap to ``.value``."""
+    ``SliceOp.shape`` carry. Atomic ``Dim`` wrappers unwrap via ``.value``
+    (Literal → int, Var → name); composite Dims aren't emitted by the
+    tracer here so the int|str form is sufficient."""
     from deplodock.compiler.dim import Dim
 
     return tuple(d.value if isinstance(d, Dim) else d for d in shape)

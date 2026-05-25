@@ -93,6 +93,15 @@ class Dim:
             return self.expr.name
         raise TypeError(f"Dim({self.expr!r}).value: composite dim has no scalar value; use .expr")
 
+    def as_atom_name(self) -> str:
+        """Return the symbolic name when this Dim is a single ``Var``; raise
+        otherwise. Use at sites that route by symbolic name — kernel signature
+        params, structural-key entries, runtime ``sym_env`` lookups — and
+        want to fail loud if a static or composite Dim slips in."""
+        if isinstance(self.expr, Var):
+            return self.expr.name
+        raise TypeError(f"Dim({self.expr!r}).as_atom_name: dim is not an atomic Var")
+
     # ---- arithmetic — eager-fold via Expr.simplify -----------------------
 
     def __add__(self, other: int | Dim) -> Dim:
