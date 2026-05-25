@@ -652,7 +652,10 @@ class SerialTile(SerialTileBase):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
-        extent = self.axis.extent.as_static()
+        # ``Dim.__str__`` returns the bare value (literal for static, symbolic
+        # name for ``Dim('seq_len')``) so both static and symbolic SerialTile
+        # extents render correctly.
+        extent = str(self.axis.extent)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")

@@ -42,11 +42,10 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         axis += ndim
     if axis < 0 or axis >= ndim:
         raise RuleSkipped(f"reduce axis {axis_raw} out of range for ndim={ndim}")
-
-    # The reduce axis must be static — chunk_reduce / cooperative reduce bake the trip
-    # count into the kernel body today. Symbolic reduce is M5 in plans/dynamic-shapes.md.
-    if not src_shape[axis].is_static:
-        raise RuleSkipped(f"reduce axis {axis_raw}={src_shape[axis]!r} is symbolic; M5 lifts this restriction")
+    # M5: symbolic reduce axes are allowed. The CUDA emitter renders the reduce
+    # loop's bound as the runtime ``int <name>`` kernel arg; cooperative-reduce
+    # / chunk_reduce strategies that need a static trip count gate on
+    # ``axis.extent.is_static`` themselves and fall back to a serial reduce.
 
     axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(src_shape))
     reduce_axis_name = f"a{axis}"

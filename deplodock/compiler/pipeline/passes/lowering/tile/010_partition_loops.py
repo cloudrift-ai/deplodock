@@ -685,21 +685,19 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         if outer_m is None:
             return None
         k_loop = matmul_reduces[0]
-        # Matmul on symbolic K or free axes is M2+ territory (BK/BN/BM tiling
-        # all need a concrete extent to split against). Bail out cleanly.
-        if not k_loop.axis.extent.is_static or n_symbolic or m_symbolic:
-            raise RuleSkipped(
-                f"matmul kernel has symbolic axis (K={k_loop.axis.extent!r}, "
-                f"M={outer_m.axis.extent!r}, N={outer_n.axis.extent!r}); "
-                f"matmul split requires static extents (extend partition_loops to support this)"
-            )
-        E_K = k_loop.axis.extent.as_static()
+        # Symbolic M / N is allowed: planner forces BM/BN/FM/FN=1 so each output
+        # element runs on its own CTA with a serial K loop. Symbolic K also runs
+        # via the same path (BK=SPLITK=BR=1 — whole K stays as one serial
+        # iteration inside the per-output-element CTA). Both are inefficient
+        # but correct; perf follow-up uses strided cooperative threads.
+        k_symbolic = not k_loop.axis.extent.is_static
+        E_K = 1 if k_symbolic else k_loop.axis.extent.as_static()
         # target_names unions over outer_n.body (the matmul K reduces) and
         # the prologue (softmax max/sum reduces sharing the matmul K extent,
         # axis-name-unified by unify_sibling_reduce_axes upstream). For
         # plain matmul / matmul_add / gated_mlp the prologue is empty and
         # this collapses to ``{lp.axis.name for lp in matmul_reduces}``.
-        prologue_reduces = tuple(lp for lp in Body(prologue).iter_of_type(Loop) if lp.is_reduce and lp.axis.extent.as_static() == E_K)
+        prologue_reduces = tuple(lp for lp in Body(prologue).iter_of_type(Loop) if lp.is_reduce and lp.axis.extent == k_loop.axis.extent)
         target_names = frozenset((*(lp.axis.name for lp in matmul_reduces), *(lp.axis.name for lp in prologue_reduces)))
         # SPLITK > 1 only works when each Write's atomic-add is mathematically
         # equivalent to the unsplit reduce. SPLITK is forced off for two
@@ -887,6 +885,13 @@ def _enumerate_cartesian(
     else:
         raise ValueError(f"unknown priority_mode {priority_mode!r}")
 
+    # When the caller passed ``E_M=1`` / ``E_N=1`` only because both free axes
+    # were symbolic, the canonical bn*bm splits all collapse to (1, 1) and the
+    # planner needs to keep the 1-thread-per-CTA variant rather than skip it.
+    # Matmul honors this too so symbolic Q@K^T (M=N=seq_len) can still emit
+    # a degenerate single-thread variant.
+    allow_empty_threads = E_M == 1 and E_N == 1 and priority_mode in ("pointwise", "matmul")
+
     def _run(apply_pins: bool) -> list[TileParams]:
         return _enumerate_cartesian_impl(
             E_M=E_M,
@@ -902,6 +907,7 @@ def _enumerate_cartesian(
             max_threads_per_cta=ctx.max_threads_per_cta,
             min_k_chunks=min_k_chunks,
             priority_fn=priority_fn,
+            allow_empty_threads=allow_empty_threads,
         )
 
     result = _run(apply_pins=True)
@@ -925,6 +931,7 @@ def _enumerate_cartesian_impl(
     max_threads_per_cta: int,
     min_k_chunks: int,
     priority_fn: Callable[[TileParams], tuple[int, ...]],
+    allow_empty_threads: bool = False,
 ) -> list[TileParams]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
@@ -952,8 +959,12 @@ def _enumerate_cartesian_impl(
                 # Lowering requires at least one BIND_THREAD axis on the
                 # Tile (materializer's _materialize raises otherwise).
                 # With bn = bm = br = 1 every output axis lands in BLOCK
-                # / REGISTER and the THREAD set is empty — skip.
-                if bn_c * bm_c * br == 1:
+                # / REGISTER and the THREAD set is empty — skip. Symbolic
+                # all-free-axis kernels opt in to ``allow_empty_threads`` so
+                # the planner can still emit a 1-thread-per-CTA variant
+                # (slow but correct; perf optimization for strided
+                # cooperative work over symbolic axes is M5+ follow-up).
+                if bn_c * bm_c * br == 1 and not allow_empty_threads:
                     continue
                 per_thread_K = E_K // br
                 fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
@@ -1047,14 +1058,20 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # K axes: K_s / K_c are kernel-wide (single SPLITK / single cooperative
     # thread direction); K_o / K_i are per-K-Loop, built inside _replace_k_loops.
     K_s = K_c = None
-    K_o_ext = 0
+    K_o_ext: object = 0
     K_src: Axis | None = None
     if shape.k_loop is not None:
         K_axis = shape.k_loop.axis
         K_name = K_axis.name
-        E_K = K_axis.extent.as_static()
-        K_o_ext = E_K // (params.splitk * params.br * params.bk)
         K_src = K_axis.source_axis or K_axis
+        if K_axis.extent.is_static:
+            E_K = K_axis.extent.as_static()
+            K_o_ext = E_K // (params.splitk * params.br * params.bk)
+        else:
+            # Symbolic K (params.bk=splitk=br=1 by planner construction): whole
+            # axis stays as one serial K_o iteration. ``Axis.__post_init__``
+            # coerces the ``Dim`` straight back into the K_o axis.
+            K_o_ext = K_axis.extent
         K_s = Axis(f"{K_name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None
         K_c = Axis(f"{K_name}_c", params.br, source_axis=K_src) if params.br > 1 else None
 

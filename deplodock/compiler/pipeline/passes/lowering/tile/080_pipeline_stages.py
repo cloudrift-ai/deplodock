@@ -104,7 +104,9 @@ def _walk(body: Body) -> tuple[Body, bool]:
 
 
 def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
-    if kouter.axis.extent.as_static() < 2:
+    # Pipelining peels a static last iteration into a separate epilogue (sigma_last
+    # references ``n - 1``). Symbolic K can't be peeled at compile time — defer.
+    if not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < 2:
         return None
     if len(kouter.body) != 1:
         return None

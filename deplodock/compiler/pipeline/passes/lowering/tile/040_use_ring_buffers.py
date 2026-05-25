@@ -80,7 +80,10 @@ def _walk(body: Body, *, smem_budget: int) -> tuple[Body, bool]:
 
 
 def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int) -> SerialTile | None:
-    if kouter.axis.extent.as_static() < 2:
+    # Ring buffers need ≥2 K iterations to prologue + steady-state. Symbolic
+    # K can be either — defer the promotion (no per-iter overlap) rather than
+    # speculatively allocating a multi-buffer slab.
+    if not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < 2:
         return None
     promote_ids: set[int] = set()
     total_bytes = 0

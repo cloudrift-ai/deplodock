@@ -151,6 +151,75 @@ def test_symbolic_sdpa_traces_and_decomposes():
     assert loop_op_count >= 1, "expected at least one LoopOp after lifting"
 
 
+def test_cuda_softmax_over_symbolic_seq_len():
+    """M5 validation slice (part 1): softmax reducing over a symbolic
+    ``seq_len`` axis compiles to a single kernel whose serial reduce
+    loop's bound is the runtime ``int seq_len`` arg."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    class Softmax(torch.nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.softmax(x, dim=-1)
+
+    s_trace = 16
+    graph = trace_module(Softmax(), (torch.randn(4, s_trace),))
+    for node in graph.nodes.values():
+        node.output.shape = tuple(Dim("seq_len") if (i == 1 and d == s_trace) else d for i, d in enumerate(node.output.shape))
+
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    for s in (5, 16, 32):
+        x = np.random.RandomState(s).standard_normal((4, s)).astype(np.float32)
+        result, _ = backend.run(compiled, input_data={"x": x})
+        y = next(iter(result.outputs.values()))
+        ref = torch.nn.functional.softmax(torch.from_numpy(x), dim=-1).numpy()
+        assert y.shape == (4, s)
+        np.testing.assert_allclose(y, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_cuda_sdpa_over_symbolic_seq_len():
+    """M5 validation slice (part 2): full causal SDPA with symbolic
+    seq_len compiles + runs end-to-end. Stresses symbolic on free axes
+    (Q,K,V leading seq dim) AND on the matmul K axis (attn @ V)."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    class Attn(torch.nn.Module):
+        def forward(self, q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    b, h, s_trace, d = 1, 4, 16, 64
+    graph = trace_module(
+        Attn(),
+        (torch.randn(b, h, s_trace, d), torch.randn(b, h, s_trace, d), torch.randn(b, h, s_trace, d)),
+    )
+    for node in graph.nodes.values():
+        node.output.shape = tuple(Dim("seq_len") if dim == s_trace else dim for dim in node.output.shape)
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    for s in (8, 16):
+        q = np.random.RandomState(s).standard_normal((b, h, s, d)).astype(np.float32)
+        k = np.random.RandomState(s + 1).standard_normal((b, h, s, d)).astype(np.float32)
+        v = np.random.RandomState(s + 2).standard_normal((b, h, s, d)).astype(np.float32)
+        result, _ = backend.run(compiled, input_data={"q": q, "k": k, "v": v})
+        y = next(iter(result.outputs.values()))
+        with torch.no_grad():
+            ref = torch.nn.functional.scaled_dot_product_attention(
+                torch.from_numpy(q), torch.from_numpy(k), torch.from_numpy(v), is_causal=True
+            ).numpy()
+        assert y.shape == (b, h, s, d)
+        np.testing.assert_allclose(y, ref, rtol=1e-4, atol=1e-4)
+
+
 def test_cuda_symbolic_rmsnorm_traced_and_run():
     """End-to-end on a real ``torch.nn.RMSNorm``: trace at one seq_len,
     rewrite the traced tensors' middle dim to ``Dim("seq_len")``, compile

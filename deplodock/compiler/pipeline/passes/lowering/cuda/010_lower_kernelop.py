@@ -87,9 +87,11 @@ def _launch_geometry(
 
     Symbolic ``Axis.extent`` values flow through as ``str`` entries in the
     grid / block factor tuples; static extents collapse to a single int
-    factor (or the empty product ``(1,)``). ``runtime_args`` lists each
-    symbolic name referenced by either spec, in first-seen order — these
-    become ``int`` kernel parameters and arg-pack entries.
+    factor (or the empty product ``(1,)``). ``runtime_args`` lists every
+    symbolic axis name referenced anywhere in the body (grid / thread
+    tiles AND inner serial loops over symbolic reduce axes), in
+    first-seen order — these become ``int`` kernel parameters and
+    arg-pack entries.
 
     - ``GridTile`` (cooperative): one CTA per block-axis tuple; per-CTA
       threads = product of inner ``ThreadTile``'s axes.
@@ -99,7 +101,7 @@ def _launch_geometry(
       that prod is fully static — block count must be known at launch
       time and we don't have a ceil-div spec yet).
     """
-    seen: dict[str, None] = {}
+    seen = _collect_symbolic_axis_names(kernel_op)
 
     def _axes_spec(axes) -> GridDimSpec:
         factors: list[int | str] = []
@@ -109,7 +111,7 @@ def _launch_geometry(
                 if v != 1:
                     factors.append(v)
             else:
-                seen[a.extent.value] = None
+                seen.setdefault(a.extent.value, None)
                 factors.append(a.extent.value)
         return tuple(factors) if factors else (1,)
 
@@ -129,5 +131,42 @@ def _launch_geometry(
                 raise ValueError("standalone ThreadTile kernel with a symbolic axis cannot stamp a ceil-div grid at compile time")
             n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
             grid = (((n_threads + _BLOCK - 1) // _BLOCK,), (1,), (1,))
-            return grid, ((_BLOCK,), (1,), (1,)), ()
-    return ((1,), (1,), (1,)), ((1,), (1,), (1,)), ()
+            return grid, ((_BLOCK,), (1,), (1,)), tuple(seen)
+    return ((1,), (1,), (1,)), ((1,), (1,), (1,)), tuple(seen)
+
+
+def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:
+    """Walk the entire body and collect every symbolic ``Axis.extent.value``
+    referenced by any tile or loop. Dict (not set) so insertion order
+    matches first-seen order — kernel param signature is stable across
+    runs of the same kernel."""
+    from deplodock.compiler.ir.axis import Axis  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt.base import Stmt  # noqa: PLC0415
+
+    seen: dict[str, None] = {}
+
+    def visit(stmt: Stmt) -> None:
+        for ax in _stmt_axes(stmt):
+            if isinstance(ax, Axis) and not ax.extent.is_static:
+                seen.setdefault(ax.extent.value, None)
+        for body in stmt.nested():
+            for child in body:
+                visit(child)
+
+    for stmt in kernel_op.body:
+        visit(stmt)
+    return seen
+
+
+def _stmt_axes(stmt) -> tuple:
+    """Surface every ``Axis`` directly carried by ``stmt`` (``ParallelTile``
+    axes tuple or ``Loop`` / ``SerialTile`` / ``StridedTile`` single
+    axis). Excludes axes inside nested bodies — those get visited
+    recursively by the caller."""
+    axes = getattr(stmt, "axes", None)
+    if axes is not None:
+        return tuple(axes)
+    axis = getattr(stmt, "axis", None)
+    if axis is not None:
+        return (axis,)
+    return ()

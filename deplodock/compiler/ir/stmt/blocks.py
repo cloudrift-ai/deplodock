@@ -108,7 +108,7 @@ class Loop(Stmt):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
-        extent = self.axis.extent.as_static()
+        extent = _extent_c(self.axis)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")

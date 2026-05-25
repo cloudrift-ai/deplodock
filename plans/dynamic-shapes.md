@@ -157,6 +157,17 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   traces with symbolic seq_len") covered by ``test_symbolic_sdpa_traces_and_decomposes``. The remaining
   ``ReduceOp`` over symbolic seq_len (softmax max/sum + attn@V) survives decomposition but stays un-lifted
   pending M5. 1204 tests green.
+- **M5 — done.** ``020_lift_reduce`` drops the static-reduce-axis check; ``unify_sibling_reduce_axes`` and
+  the ``reduce`` merge phase compare extents via ``Dim`` equality so symbolic siblings unify cleanly.
+  ``SerialTile.render`` uses ``str(axis.extent)`` so the rendered C ``for`` loop bound resolves to the
+  symbolic kernel arg name. ``_launch_geometry`` now walks the entire kernel body (``_collect_symbolic_axis_names``)
+  to harvest symbolic names from inner loops, not just grid / thread tiles. ``partition_loops`` accepts:
+  pointwise / cooperative-reduce with all-symbolic free axes (``allow_empty_threads``: single-thread-per-CTA
+  variant, slow but correct); matmul with symbolic M / N / K (``_build_split_body`` uses the symbolic ``Dim``
+  directly for ``K_o`` when ``params.bk=1``). Ring-buffer and pipelined-stage passes defer cleanly on
+  symbolic K; ``mark_unroll`` returns a placeholder trip count so it declines to unroll runtime-bound loops.
+  End-to-end validation: ``softmax_over_S`` and full causal ``SDPA_over_S`` both compile to a single set of
+  cached kernels and run correctly at multiple seq_len values within fp32 tolerance. 1206 tests green.
 
 ## Explicitly out of scope (v1)
 

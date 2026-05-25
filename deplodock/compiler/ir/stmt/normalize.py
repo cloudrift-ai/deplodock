@@ -240,12 +240,15 @@ def _unify_siblings(body: Body) -> Body:
     """
     stmts = list(body)
 
-    entries: list[tuple[int, str, int, frozenset[tuple[str, int]]]] = []
+    # Store the ``Dim.value`` (int | str) rather than ``as_static`` so symbolic
+    # sibling reduces compare cleanly: two ``Dim('seq_len')`` siblings still
+    # unify, two distinct symbolic names don't.
+    entries: list[tuple[int, str, object, frozenset[tuple[str, int]]]] = []
     for i, s in enumerate(stmts):
         if isinstance(s, Loop) and s.is_reduce:
             positions = _reduce_axis_source_positions(s.body, s.axis.name)
             if positions:
-                entries.append((i, s.axis.name, s.axis.extent.as_static(), frozenset(positions)))
+                entries.append((i, s.axis.name, s.axis.extent.value, frozenset(positions)))
 
     if len(entries) < 2:
         return Body(stmts)
@@ -378,7 +381,7 @@ def _merge_sibling_reduce_loops(body: Body) -> Body:
                 isinstance(t, Loop)
                 and t.is_reduce
                 and t.axis.name == merged.axis.name
-                and t.axis.extent.as_static() == merged.axis.extent.as_static()
+                and t.axis.extent == merged.axis.extent
                 and t.unroll == merged.unroll
             ):
                 continue
