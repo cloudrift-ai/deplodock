@@ -21,13 +21,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from deplodock.compiler.dim import Dim, to_dim
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.base import Op, _keepdim_axis
 
 
-def _numel(shape: tuple[Dim, ...]) -> Dim:
-    """Product of a shape's extents as a single ``Dim``. Eager-fold makes the
-    all-static case match plain int arithmetic byte-for-byte."""
+def _numel(shape) -> Dim:
+    """Product of a shape's extents as a single ``Dim``. Accumulator starts
+    at ``Dim(1)`` so bare-int shape elements (from tests / loader scratch
+    shapes) are promoted to ``Dim`` on the first multiply; pure-Dim inputs
+    fold exactly via ``Expr.simplify``."""
     out = Dim(1)
     for d in shape:
         out = out * d
@@ -77,19 +79,17 @@ class ReshapeOp(Op):
 
     shape: tuple[int | str, ...]
 
-    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple[Dim, ...]:
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         if -1 not in self.shape:
-            return tuple(to_dim(d) for d in self.shape)
-        in_shape = tuple(to_dim(d) for d in input_shapes[0])
-        known = tuple(to_dim(d) for d in self.shape if d != -1)
+            return tuple(self.shape)
+        known = tuple(d for d in self.shape if d != -1)
         # Inferred axis takes whatever the remaining product needs. ``Dim``
         # arithmetic eager-folds the all-static case to a Literal int; mixed
         # static/symbolic produces a ``BinaryExpr`` Dim that resolves at launch.
-        inferred = _numel(in_shape) // _numel(known) if known else _numel(in_shape)
-        resolved: list[Dim] = []
-        for d in self.shape:
-            resolved.append(inferred if d == -1 else to_dim(d))
-        return tuple(resolved)
+        # ``_numel`` bootstraps the accumulator with ``Dim(1)``, so a raw-int
+        # input shape still yields a ``Dim`` result.
+        inferred = _numel(input_shapes[0]) // _numel(known) if known else _numel(input_shapes[0])
+        return tuple(inferred if d == -1 else d for d in self.shape)
 
     def forward(self, *inputs):
 
@@ -127,20 +127,24 @@ class CatOp(Op):
     is a scalar ConstantOp indicating the concat axis.
     """
 
-    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple[Dim, ...]:
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         # Tensor inputs are all but the trailing scalar dim-constant.
         # Find them by skipping shape-(1,) inputs at the tail.
         def _is_scalar_constant(s):
             return len(s) == 1 and s[0] == 1
 
-        tensor_shapes = [tuple(to_dim(d) for d in s) for s in input_shapes if len(s) > 1 or (len(s) == 1 and not _is_scalar_constant(s))]
+        tensor_shapes = [s for s in input_shapes if len(s) > 1 or (len(s) == 1 and not _is_scalar_constant(s))]
         if not tensor_shapes:
-            return tuple(to_dim(d) for d in input_shapes[0])
+            return tuple(input_shapes[0])
         # Cat along the last dim by default (matches CatOp tracer convention).
+        # Bootstrap ``total`` with ``Dim(0)`` so the cat-axis result is always
+        # a ``Dim`` (eager-fold collapses the static-input case to a Literal
+        # int-backed Dim). Other axes flow through as whatever the caller
+        # passed in; ``Tensor.__post_init__`` coerces on assignment.
         last = len(tensor_shapes[0]) - 1
         out = list(tensor_shapes[0])
-        total = tensor_shapes[0][last]
-        for s in tensor_shapes[1:]:
+        total: Dim = Dim(0)
+        for s in tensor_shapes:
             total = total + s[last]
         out[last] = total
         return tuple(out)
@@ -185,10 +189,10 @@ class LinearOp(Op):
 
     has_bias: bool = False
 
-    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple[Dim, ...]:
-        x_shape = tuple(to_dim(d) for d in input_shapes[0])
-        w_shape = tuple(to_dim(d) for d in input_shapes[1])  # (out_features, in_features)
-        return x_shape[:-1] + (w_shape[-2],)
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        x_shape = input_shapes[0]
+        w_shape = input_shapes[1]  # (out_features, in_features)
+        return tuple(x_shape[:-1]) + (w_shape[-2],)
 
     def forward(self, *inputs):
         x, w = inputs[0], inputs[1]
@@ -204,11 +208,11 @@ class MatmulOp(Op):
 
     has_bias: bool = False
 
-    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple[Dim, ...]:
-        a_shape = tuple(to_dim(d) for d in input_shapes[0])
-        b_shape = tuple(to_dim(d) for d in input_shapes[1])
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        a_shape = input_shapes[0]
+        b_shape = input_shapes[1]
         # Standard matmul: A(..., M, K) @ B(..., K, N) → (..., M, N)
-        return a_shape[:-1] + (b_shape[-1],)
+        return tuple(a_shape[:-1]) + (b_shape[-1],)
 
     def forward(self, *inputs):
         a, b = inputs[0], inputs[1]
