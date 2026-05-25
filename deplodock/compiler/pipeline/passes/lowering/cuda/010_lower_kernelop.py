@@ -10,10 +10,9 @@ kernel_op.outputs`` keys — matches the kernel signature emitted by
 
 from __future__ import annotations
 
-from math import prod
-
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
+from deplodock.compiler.ir.cuda.ir import GridDimSpec
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
@@ -39,7 +38,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
 
-    grid, block = _launch_geometry(root.op)
+    grid, block, runtime_args = _launch_geometry(root.op)
     # TMA descriptors are kernel parameters that come *after* the buffer
     # args (matching the signature emitted by ``render_kernelop``).
     # Collect dedup'd metadata so the backend can encode + bind them.
@@ -69,7 +68,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
             seen_atomic.add(s.output)
             atomic_outputs.append(s.output)
     return CudaOp(
-        kernel_source=render_kernelop(root.op, tensors=tensors, literal_constants=literal_constants),
+        kernel_source=render_kernelop(root.op, tensors=tensors, literal_constants=literal_constants, runtime_args=runtime_args),
         kernel_name=root.op.name,
         arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
         grid=grid,
@@ -77,29 +76,58 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
         smem_bytes=root.op.smem_bytes(),
         tma_descriptors=tuple(descriptors),
         zero_outputs=tuple(atomic_outputs),
+        runtime_args=runtime_args,
     )
 
 
-def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """Pick (grid, block) from the outermost tile flavor in the body.
+def _launch_geometry(
+    kernel_op: KernelOp,
+) -> tuple[tuple[GridDimSpec, GridDimSpec, GridDimSpec], tuple[GridDimSpec, GridDimSpec, GridDimSpec], tuple[str, ...]]:
+    """Pick (grid_spec, block_spec, runtime_args) from the outermost tile.
+
+    Symbolic ``Axis.extent`` values flow through as ``str`` entries in the
+    grid / block factor tuples; static extents collapse to a single int
+    factor (or the empty product ``(1,)``). ``runtime_args`` lists each
+    symbolic name referenced by either spec, in first-seen order — these
+    become ``int`` kernel parameters and arg-pack entries.
 
     - ``GridTile`` (cooperative): one CTA per block-axis tuple; per-CTA
       threads = product of inner ``ThreadTile``'s axes.
     - Standalone ``ThreadTile`` (pointwise): flatten all axes into a
       linear ``tid = blockIdx.x * blockDim.x + threadIdx.x`` and launch
-      ``ceil(n / _BLOCK)`` CTAs of ``_BLOCK`` threads.
+      ``ceil(n / _BLOCK)`` CTAs of ``_BLOCK`` threads (only legal when
+      that prod is fully static — block count must be known at launch
+      time and we don't have a ceil-div spec yet).
     """
+    seen: dict[str, None] = {}
+
+    def _axes_spec(axes) -> GridDimSpec:
+        factors: list[int | str] = []
+        for a in axes:
+            if a.extent.is_static:
+                v = a.extent.as_static()
+                if v != 1:
+                    factors.append(v)
+            else:
+                seen[a.extent.value] = None
+                factors.append(a.extent.value)
+        return tuple(factors) if factors else (1,)
+
     for s in kernel_op.body:
         if isinstance(s, GridTile):
-            grid_total = max(prod(a.extent.as_static() for a in s.axes), 1)
-            block_total = 1
+            grid_spec = _axes_spec(s.axes)
+            block_spec: GridDimSpec = (1,)
             for child in s.body:
                 if isinstance(child, ThreadTile):
-                    block_total = max(prod(a.extent.as_static() for a in child.axes), 1)
+                    block_spec = _axes_spec(child.axes)
                     break
-            return (grid_total, 1, 1), (block_total, 1, 1)
+            return (grid_spec, (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen)
         if isinstance(s, ThreadTile):
+            from math import prod  # noqa: PLC0415
+
+            if any(not a.extent.is_static for a in s.axes):
+                raise ValueError("standalone ThreadTile kernel with a symbolic axis cannot stamp a ceil-div grid at compile time")
             n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
-            grid = ((n_threads + _BLOCK - 1) // _BLOCK, 1, 1)
-            return grid, (_BLOCK, 1, 1)
-    return (1, 1, 1), (1, 1, 1)
+            grid = (((n_threads + _BLOCK - 1) // _BLOCK,), (1,), (1,))
+            return grid, ((_BLOCK,), (1,), (1,)), ()
+    return ((1,), (1,), (1,)), ((1,), (1,), (1,)), ()

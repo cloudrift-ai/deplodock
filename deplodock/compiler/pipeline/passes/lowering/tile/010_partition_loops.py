@@ -423,7 +423,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     # ``Var(axis.name) → Literal(0, "int")`` in the inner body.
     filtered: list[tuple[Axis, Role | None]] = []
     for axis, role in layers:
-        if axis.extent.as_static() == 1 and role is not Role.BLOCK:
+        if axis.extent.is_static and axis.extent.as_static() == 1 and role is not Role.BLOCK:
             sub = Sigma({axis.name: Literal(0, "int")})
             inner_body = tuple(c.rewrite(_identity_rename, sub) for c in inner_body)
             continue
@@ -663,8 +663,14 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
     outer_n: Loop = chain[-1]
     outer_m: Loop | None = chain[-2] if len(chain) >= 2 else None
     extra_outer: tuple[Loop, ...] = chain[:-2] if outer_m is not None else chain[:-1]
-    E_N = outer_n.axis.extent.as_static()
-    E_M = outer_m.axis.extent.as_static() if outer_m is not None else 1
+    # Symbolic free axes (Dim("seq_len") etc.) bind whole-to-block: no
+    # split, BN/BM forced to 1. Pass E=1 to the enumerator so divisibility
+    # filters pass vacuously; ``_build_split_body`` reads the real symbolic
+    # extent back from the Loop axis when stamping the ``*_b`` block axis.
+    n_symbolic = not outer_n.axis.extent.is_static
+    m_symbolic = outer_m is not None and not outer_m.axis.extent.is_static
+    E_N = 1 if n_symbolic else outer_n.axis.extent.as_static()
+    E_M = 1 if m_symbolic else (outer_m.axis.extent.as_static() if outer_m is not None else 1)
 
     # Single walk: classify body + collect every axis name _replace_k_loops
     # should rewrite. ``target_names`` survives σ_outer (only axis NAMES are
@@ -679,6 +685,14 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         if outer_m is None:
             return None
         k_loop = matmul_reduces[0]
+        # Matmul on symbolic K or free axes is M2+ territory (BK/BN/BM tiling
+        # all need a concrete extent to split against). Bail out cleanly.
+        if not k_loop.axis.extent.is_static or n_symbolic or m_symbolic:
+            raise RuleSkipped(
+                f"matmul kernel has symbolic axis (K={k_loop.axis.extent!r}, "
+                f"M={outer_m.axis.extent!r}, N={outer_n.axis.extent!r}); "
+                f"matmul split requires static extents (extend partition_loops to support this)"
+            )
         E_K = k_loop.axis.extent.as_static()
         # target_names unions over outer_n.body (the matmul K reduces) and
         # the prologue (softmax max/sum reduces sharing the matmul K extent,
@@ -711,7 +725,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         has_nonlinear_epilogue = _has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
         param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one)
-    elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
+    elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
         # E_K ≥ warp_size: smaller reduces don't justify a warp-shuffle.
@@ -998,10 +1012,15 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # each output axis) without name-suffix string matching.
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
-    E_N = N_axis.extent.as_static()
-    N_b_ext = E_N // (params.bn * params.fn)
     N_src = N_axis.source_axis or N_axis
-    N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src)
+    if N_axis.extent.is_static:
+        E_N = N_axis.extent.as_static()
+        N_b_ext = E_N // (params.bn * params.fn)
+        N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src)
+    else:
+        # Symbolic N (bn=fn=1 by planner construction): bind whole axis to GridTile;
+        # the size-1 normalizer drops N_t / N_r.
+        N_b = Axis(f"{N_name}_b", N_axis.extent, source_axis=N_src)
     N_t = Axis(f"{N_name}_t", params.bn, source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
     sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
@@ -1010,10 +1029,13 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     if shape.outer_m is not None:
         M_axis = shape.outer_m.axis
         M_name = M_axis.name
-        E_M = M_axis.extent.as_static()
-        M_b_ext = E_M // (params.bm * params.fm)
         M_src = M_axis.source_axis or M_axis
-        M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src)
+        if M_axis.extent.is_static:
+            E_M = M_axis.extent.as_static()
+            M_b_ext = E_M // (params.bm * params.fm)
+            M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src)
+        else:
+            M_b = Axis(f"{M_name}_b", M_axis.extent, source_axis=M_src)
         M_t = Axis(f"{M_name}_t", params.bm, source_axis=M_src)
         M_r = Axis(f"{M_name}_r", params.fm, source_axis=M_src)
         sigma_map[M_name] = (

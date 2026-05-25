@@ -134,6 +134,18 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   runtime-shape today; per-axis runtime args land in M2). Body normalize / simplify guard their
   `as_static()` calls behind `is_static`. New `tests/compiler/test_dynamic_shapes.py` covers elementwise +
   static-reduce lift preservation and forward-time specialization at two different `seq_len` values.
+- **M2 + M3 — done together.** ``CudaOp.grid`` / ``CudaOp.block`` widened to ``tuple[GridDimSpec, GridDimSpec,
+  GridDimSpec]`` where each spec is a tuple of ``int | str`` factors multiplied at launch time; new
+  ``runtime_args: tuple[str, ...]`` lists symbolic axis names. CUDA renderer emits ``int <name>`` kernel params after
+  buffers + TMA descriptors, and grid-axis decode + index-flatten both substitute symbolic names directly into the
+  rendered C (``int a0 = blockIdx.x / (4);``, ``x[a0 * 2048 + ...]``). ``partition_loops`` accepts symbolic free axes
+  for pointwise + cooperative-reduce paths (BM/BN forced to 1, whole axis bound to grid), refuses symbolic reduce
+  axes or symbolic matmul M/N/K with a clean ``RuleSkipped``. ``050_use_tma`` bails on any symbolic shape. The CUDA
+  backend ``_compile`` walks ``graph.inputs`` to build ``symbolic_bindings: name → (input_buf, dim_index)``;
+  ``CompiledProgram.build`` resolves them once from ``input_data``, and ``_launch`` substitutes those values into the
+  grid spec and tail-appends them to the kernel arg pack. End-to-end: symbolic elementwise `exp(x)` and `RMSNorm`
+  (traced + free-dim rewritten to ``Dim('seq_len')``) compile to a single ``CudaOp`` whose kernel source contains
+  ``int seq_len`` and run correctly at multiple seq_len values. 1203 tests green.
 
 ## Explicitly out of scope (v1)
 

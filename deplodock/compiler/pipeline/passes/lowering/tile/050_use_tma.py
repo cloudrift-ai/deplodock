@@ -61,6 +61,12 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     if ctx.compute_capability < _MIN_CAPABILITY:
         raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
 
+    # TMA descriptors bake the source shape statically into the cuTensorMap; bail
+    # out cleanly if any input shape carries a symbolic dim.
+    for nid, node in match.graph.nodes.items():
+        for d in node.output.shape:
+            if not d.is_static:
+                raise RuleSkipped(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
     src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
 
     body = root.op.body

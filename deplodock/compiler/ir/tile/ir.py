@@ -1083,7 +1083,7 @@ class TileOp(BodyOp):
         _, thread_axes = self._launch_geometry()
         if not thread_axes:
             return True
-        threads = prod(ax.extent.as_static() for ax in thread_axes)
+        threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes)
         return threads <= ctx.max_threads_per_cta
 
     def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
@@ -1098,8 +1098,10 @@ class TileOp(BodyOp):
         if not thread_axes and not block_axes:
             return 0.0
 
-        thread_extents = [ax.extent.as_static() for ax in thread_axes]
-        block_extents = [ax.extent.as_static() for ax in block_axes]
+        # Symbolic axes (Dim("seq_len")) substitute 1 for scoring — the value is
+        # the same across every variant of this LoopOp so it doesn't affect ranking.
+        thread_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in thread_axes]
+        block_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in block_axes]
         if not thread_extents:
             return 0.0
 
@@ -1184,7 +1186,7 @@ class TileOp(BodyOp):
             matched = inner_vars & thread_names
             if not matched:
                 continue
-            extent_in_inner = sum(ax.extent.as_static() for ax in thread_axes if ax.name in matched)
+            extent_in_inner = sum((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes if ax.name in matched)
             if extent_in_inner > best_inner_extent:
                 best_inner_extent = extent_in_inner
         if best_inner_extent <= 0:

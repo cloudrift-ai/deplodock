@@ -510,7 +510,7 @@ def _classify(
     allow_no_fan_in: bool = False,
 ) -> _Slab | None:
     candidates = (*thread_axes, reduce_axis, *extra_candidates)
-    ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes})
+    ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes if ax.extent.is_static})
     candidate_names = tuple(ax.name for ax in candidates)
 
     zero_sigma = Sigma({n: Literal(0, "int") for n in candidate_names})

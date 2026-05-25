@@ -80,3 +80,64 @@ def test_loop_forward_same_kernel_different_seq_lens():
         out = loop_op.forward(x)
         assert out.shape == (1, s, 2048)
         np.testing.assert_allclose(out, np.exp(x), rtol=1e-5, atol=1e-6)
+
+
+def test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens():
+    """M2 validation slice: same symbolic graph compiles to ONE CudaOp
+    whose kernel signature carries ``int seq_len``; running it at two
+    different ``seq_len`` values resolves the launch geometry from the
+    actual input shape without recompiling."""
+    pytest = __import__("pytest")
+    cupy = pytest.importorskip("cupy")
+    del cupy
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.ir.cuda import CudaOp
+
+    graph = _symbolic_elementwise_graph()
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    cuda_ops = [n.op for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
+    assert len(cuda_ops) == 1, f"expected one CudaOp, got {len(cuda_ops)}"
+    op = cuda_ops[0]
+    assert "seq_len" in op.runtime_args, f"runtime_args missing 'seq_len': {op.runtime_args}"
+    assert "int seq_len" in op.kernel_source, f"kernel signature missing int seq_len param:\n{op.kernel_source}"
+
+    cached_source = op.kernel_source
+    for s in (5, 13):
+        x = np.random.RandomState(s).standard_normal((1, s, 2048)).astype(np.float32)
+        result, _ = backend.run(compiled, input_data={"x": x})
+        y = result.outputs["y"]
+        assert y.shape == (1, s, 2048)
+        np.testing.assert_allclose(y, np.exp(x), rtol=1e-5, atol=1e-5)
+    # Sanity-check: nothing in the lowering path swapped the kernel source between runs.
+    assert op.kernel_source == cached_source
+
+
+def test_cuda_symbolic_rmsnorm_traced_and_run():
+    """End-to-end on a real ``torch.nn.RMSNorm``: trace at one seq_len,
+    rewrite the traced tensors' middle dim to ``Dim("seq_len")``, compile
+    once, run at two distinct seq_len values, compare to torch eager."""
+    pytest = __import__("pytest")
+    cupy = pytest.importorskip("cupy")
+    del cupy
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    m = torch.nn.RMSNorm(2048)
+    graph = trace_module(m, (torch.randn(1, 32, 2048),))
+    for node in graph.nodes.values():
+        node.output.shape = tuple(Dim("seq_len") if (i == 1 and d == 32) else d for i, d in enumerate(node.output.shape))
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+
+    weight = m.weight.detach().numpy().astype(np.float32)
+    for s in (8, 32):
+        x = np.random.RandomState(s).standard_normal((1, s, 2048)).astype(np.float32)
+        result, _ = backend.run(compiled, input_data={"x": x, "p_weight": weight})
+        y = next(iter(result.outputs.values()))
+        with torch.no_grad():
+            y_ref = torch.nn.functional.rms_norm(torch.from_numpy(x), (2048,), m.weight, eps=m.eps).numpy()
+        assert y.shape == (1, s, 2048)
+        np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)

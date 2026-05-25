@@ -65,16 +65,19 @@ def _ensure_dynamic_smem_attr(kernel: cp.RawKernel, smem_bytes: int) -> None:
 @dataclass
 class _Buffer:
     name: str
-    shape: tuple[int, ...]
+    # Shape factors are ``int`` (static) or ``str`` (symbolic axis name).
+    # Static-only kernels collapse to ``tuple[int, ...]``; symbolic dims
+    # are resolved at ``_allocate`` time from input array shapes.
+    shape: tuple
     dtype: DataType
     role: str  # "input" | "constant" | "output" | "scratch"
 
     @property
-    def size(self) -> int:
-        n = 1
-        for d in self.shape:
-            n *= int(d)
-        return n
+    def is_symbolic(self) -> bool:
+        return any(isinstance(d, str) for d in self.shape)
+
+    def resolve_shape(self, sym_values: dict[str, int]) -> tuple[int, ...]:
+        return tuple(d if isinstance(d, int) else sym_values[d] for d in self.shape)
 
 
 def _buffers(graph: Graph) -> list[_Buffer]:
@@ -90,7 +93,10 @@ def _buffers(graph: Graph) -> list[_Buffer]:
             role = "output"
         else:
             role = "scratch"
-        shape = tuple(d.as_static() for d in node.output.shape)
+        # ``Dim.value`` is ``int`` for static, ``str`` for symbolic — keep
+        # symbolic as the bare name so ``_allocate`` can resolve at launch
+        # time. Fully-static graphs collapse to ``tuple[int, ...]``.
+        shape = tuple(d.value for d in node.output.shape)
         bufs.append(_Buffer(name=nid, shape=shape, dtype=node.output.dtype, role=role))
     return bufs
 
@@ -121,11 +127,16 @@ class _Launch:
     node_id: str
     kernel_name: str
     arg_names: tuple[str, ...]
-    grid: tuple[int, int, int]
-    block: tuple[int, int, int]
+    # ``grid`` / ``block`` are per-dim ``GridDimSpec`` tuples whose factors may
+    # include symbolic axis names — resolved at launch time via the
+    # parent ``_Compiled.symbolic_bindings`` env. Static kernels collapse
+    # to single-int factors (``((128,), (1,), (1,))``).
+    grid: tuple
+    block: tuple
     smem_bytes: int
     zero_outputs: tuple[str, ...]
     tma_descriptors: tuple[TmaDescMeta, ...] = ()
+    runtime_args: tuple[str, ...] = ()
 
 
 @dataclass
@@ -135,6 +146,12 @@ class _Compiled:
     constants: dict[str, float]
     kernels: dict[str, cp.RawKernel]  # kernel_name → RawKernel
     launches: list[_Launch]
+    # Symbolic axis name → (input_buf_name, dim_index). Resolved from input
+    # array shapes at run-time; empty when the graph has no symbolic dims.
+    symbolic_bindings: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # Per-symbolic-name buffers whose shape carries that name — used to
+    # reshape ``input_data`` to the actual runtime shape before upload.
+    symbolic_buf_shape: dict[str, tuple] = field(default_factory=dict)
 
 
 def _compile(graph: Graph) -> _Compiled:
@@ -145,6 +162,7 @@ def _compile(graph: Graph) -> _Compiled:
     buf_by_name = {b.name: b for b in bufs}
     constants = _constant_values(graph)
     launches_nodes = _launches(graph)
+    symbolic_bindings = _symbolic_bindings(graph)
 
     kernels: dict[str, cp.RawKernel] = {}
     seen_source: dict[str, str] = {}
@@ -169,9 +187,30 @@ def _compile(graph: Graph) -> _Compiled:
                 smem_bytes=op.smem_bytes,
                 zero_outputs=tuple(op.zero_outputs),
                 tma_descriptors=tuple(op.tma_descriptors),
+                runtime_args=tuple(getattr(op, "runtime_args", ())),
             )
         )
-    return _Compiled(bufs=bufs, buf_by_name=buf_by_name, constants=constants, kernels=kernels, launches=launches)
+    return _Compiled(
+        bufs=bufs,
+        buf_by_name=buf_by_name,
+        constants=constants,
+        kernels=kernels,
+        launches=launches,
+        symbolic_bindings=symbolic_bindings,
+    )
+
+
+def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
+    """Walk graph inputs to map every symbolic dim name to its source
+    ``(input_buf, dim_index)`` — the launch resolver reads the runtime
+    value from ``input_arrays[buf].shape[dim_index]``. First-seen position
+    wins on conflicts so each name resolves deterministically."""
+    bindings: dict[str, tuple[str, int]] = {}
+    for nid in graph.inputs:
+        for d, dim in enumerate(graph.nodes[nid].output.shape):
+            if not dim.is_static:
+                bindings.setdefault(dim.value, (nid, d))
+    return bindings
 
 
 def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:
@@ -197,9 +236,11 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     import cupy as cp
 
     input_data = input_data or {}
+    sym_values = _resolve_symbolic(compiled, input_data)
     arrays: dict[str, cp.ndarray] = {}
     for buf in compiled.bufs:
-        shape = buf.shape or (1,)
+        resolved = buf.resolve_shape(sym_values)
+        shape = resolved or (1,)
         cp_dtype = cupy_dtype(buf.dtype)
         np_dtype = buf.dtype.np
         src = input_data.get(buf.name)
@@ -209,7 +250,10 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
             arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp_dtype)
         elif buf.role == "input":
             # Pseudo-random fill for un-supplied inputs (matches old generated program).
-            idx = np.arange(buf.size, dtype=np_dtype)
+            n = 1
+            for d in shape:
+                n *= int(d)
+            idx = np.arange(n, dtype=np_dtype)
             vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
             arr = cp.asarray(vals.reshape(shape))
         else:
@@ -218,17 +262,41 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     return arrays
 
 
+def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) -> dict[str, int]:
+    """Bind every symbolic axis name to a concrete ``int`` from the input
+    array shapes. ``compiled.symbolic_bindings`` says which input + dim
+    each name reads from; returns the per-name env that ``_launch`` and
+    ``_Buffer.resolve_shape`` consume."""
+    env: dict[str, int] = {}
+    for name, (buf, dim_idx) in compiled.symbolic_bindings.items():
+        arr = input_data.get(buf)
+        if arr is None:
+            raise ValueError(f"symbolic dim {name!r} reads from input {buf!r}.shape[{dim_idx}] but no array was supplied for that input")
+        env[name] = int(arr.shape[dim_idx])
+    return env
+
+
 def _launch(
     launch: _Launch,
     compiled: _Compiled,
     arrays: dict[str, cp.ndarray],
     desc_args: dict[str, cp.ndarray] | None = None,
+    sym_values: dict[str, int] | None = None,
 ) -> None:
+    from deplodock.compiler.ir.cuda.ir import resolve_dim  # noqa: PLC0415
+
     for zname in launch.zero_outputs:
         arrays[zname].fill(0)
     kernel = compiled.kernels[launch.kernel_name]
     desc_args = desc_args or {}
+    sym_values = sym_values or {}
     args = tuple(desc_args.get(name) if name in desc_args else arrays[name] for name in launch.arg_names)
+    # Symbolic axes appear as ``int`` kernel params after buffers + TMA
+    # descriptors — append their resolved values to the arg pack.
+    if launch.runtime_args:
+        args = (*args, *(sym_values[name] for name in launch.runtime_args))
+    grid = tuple(resolve_dim(spec, sym_values) for spec in launch.grid)
+    block = tuple(resolve_dim(spec, sym_values) for spec in launch.block)
     # Kernels whose Smem footprint exceeds the 48 KB static cap declare
     # an ``extern __shared__`` pool; the launch supplies the byte size
     # via ``shared_mem=`` and (for footprints above 48 KB) opts into the
@@ -236,9 +304,9 @@ def _launch(
     smem_bytes = launch.smem_bytes
     if smem_bytes > _STATIC_SMEM_CAP:
         _ensure_dynamic_smem_attr(kernel, smem_bytes)
-        kernel(launch.grid, launch.block, args, shared_mem=smem_bytes)
+        kernel(grid, block, args, shared_mem=smem_bytes)
     else:
-        kernel(launch.grid, launch.block, args, shared_mem=0)
+        kernel(grid, block, args, shared_mem=0)
 
 
 def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...]) -> tuple[int, ...]:
@@ -415,6 +483,11 @@ class CompiledProgram:
     compiled: _Compiled
     arrays: dict[str, cp.ndarray]
     descs: dict[int, dict[str, cp.ndarray]]
+    # Per-symbolic-axis runtime ``int`` resolved at ``build`` time from the
+    # supplied input shapes — fed straight to ``_launch`` for grid /
+    # block resolution and the runtime-arg tail. Empty for fully-static
+    # graphs.
+    sym_values: dict[str, int] = field(default_factory=dict)
     # Per-launch timing events, lazily created on first ``iter_once``
     # and reused across every subsequent call so multi-iter bench loops
     # don't churn the cupy ``Event`` pool (the pre-unification
@@ -443,6 +516,7 @@ class CompiledProgram:
         every subsequent method on the returned program."""
         t0 = _time_module.monotonic()
         compiled = _compile(graph)
+        sym_values = _resolve_symbolic(compiled, input_data or {})
         arrays = _allocate(compiled, input_data)
         descs = _prebuild_descriptors(compiled, arrays)
         elapsed = _time_module.monotonic() - t0
@@ -454,7 +528,7 @@ class CompiledProgram:
             elapsed,
             ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
         )
-        return cls(compiled=compiled, arrays=arrays, descs=descs)
+        return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values)
 
     def iter_once(
         self,
@@ -504,7 +578,7 @@ class CompiledProgram:
             b = batch_sizes[i]
             starts[i].record()
             for _ in range(b):
-                _launch(launch, self.compiled, self.arrays, self.descs.get(i))
+                _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
             stops[i].record()
             _wait_for_event(stops[i], _KERNEL_TIMEOUT_MS * b, launch.kernel_name)
             dts[i] = cp.cuda.get_elapsed_time(starts[i], stops[i]) / b

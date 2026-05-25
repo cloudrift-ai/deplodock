@@ -250,8 +250,12 @@ def _print_kernel_stats(graph, bench):
         op = node.op
         t_us = times_by_idx.get(idx, 0.0)
         pct = (t_us / total_us * 100) if total_us > 0 else 0.0
-        block_threads = op.block[0] * op.block[1] * op.block[2]
-        grid_total = op.grid[0] * op.grid[1] * op.grid[2]
+        from deplodock.compiler.ir.cuda.ir import resolve_dim
+
+        block_dims = [resolve_dim(d, {}) for d in op.block]
+        grid_dims = [resolve_dim(d, {}) for d in op.grid]
+        block_threads = block_dims[0] * block_dims[1] * block_dims[2]
+        grid_total = grid_dims[0] * grid_dims[1] * grid_dims[2]
         smem_kb = op.smem_bytes / 1024
         kname = op.kernel_name[:42]
         attrs = attrs_by_kname.get(op.kernel_name) or {}

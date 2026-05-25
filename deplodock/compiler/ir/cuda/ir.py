@@ -30,19 +30,49 @@ class TmaDescMeta:
     swizzle: str = "NONE"
 
 
+_GridFactor = int | str  # int = static factor; str = symbolic axis name (resolved at launch)
+GridDimSpec = tuple[_GridFactor, ...]  # product of factors → one grid dim's extent
+
+
 @dataclass
 class CudaOp(Op):
-    """One CUDA kernel invocation as a graph-op."""
+    """One CUDA kernel invocation as a graph-op.
+
+    ``grid`` and ``block`` each carry three per-dim ``GridDimSpec`` tuples;
+    every entry in a spec is multiplied together at launch time. Pure-int
+    specs (e.g. ``((128,), (1,), (1,))``) describe static launch geometry;
+    specs containing strings (e.g. ``(("seq_len",), (1,), (1,))``)
+    reference symbolic dims that the launch resolver looks up in the
+    runtime ``sym_values`` env. ``runtime_args`` lists those symbolic
+    names in the order they appear in the kernel signature (one ``int``
+    parameter per name, slotted after the buffer args and before any
+    TMA descriptor params).
+    """
 
     kernel_source: str = ""  # complete __global__ function
     kernel_name: str = ""
     arg_order: tuple[str, ...] = ()  # kernel-param names in positional order
-    grid: tuple[int, int, int] = (1, 1, 1)
-    block: tuple[int, int, int] = (1, 1, 1)
+    grid: tuple[GridDimSpec, GridDimSpec, GridDimSpec] = ((1,), (1,), (1,))
+    block: tuple[GridDimSpec, GridDimSpec, GridDimSpec] = ((1,), (1,), (1,))
     smem_bytes: int = 0
     zero_outputs: tuple[str, ...] = ()
     comment: str = ""
     tma_descriptors: tuple[TmaDescMeta, ...] = field(default_factory=tuple)
+    runtime_args: tuple[str, ...] = ()
 
     def pretty_body(self) -> str:
         return self.kernel_source
+
+
+def resolve_dim(spec, sym_values: dict[str, int]) -> int:
+    """Multiply a ``GridDimSpec``'s factors, resolving ``str`` factors
+    from ``sym_values``. Accepts a bare ``int`` (legacy static grid) as
+    shorthand for a single-int spec — keeps pre-symbolic CudaOps working
+    until every producer has been migrated. Raises ``KeyError`` on an
+    unknown symbolic name."""
+    if isinstance(spec, int):
+        return spec
+    total = 1
+    for factor in spec:
+        total *= factor if isinstance(factor, int) else sym_values[factor]
+    return total
