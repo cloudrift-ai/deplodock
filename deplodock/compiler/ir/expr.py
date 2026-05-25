@@ -178,7 +178,7 @@ def apply_binop(op: str, lv: object, rv: object) -> object:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class Var(_ExprOps):
     """Variable reference."""
 
@@ -213,7 +213,7 @@ class Var(_ExprOps):
         return ctx.ranges.get(self.name)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Literal(_ExprOps):
     """Numeric constant."""
 
@@ -259,7 +259,7 @@ class Literal(_ExprOps):
         return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class BinaryExpr(_ExprOps):
     """Binary operation.
 
@@ -368,6 +368,9 @@ class BinaryExpr(_ExprOps):
                 decomp = _div_mod_decompose(left, right.value, ctx)
                 if decomp is not None:
                     return decomp[0]
+            cancelled = _cancel_common_factors(op, left, right, ctx)
+            if cancelled is not None:
+                return cancelled
         elif op == "%":
             if _is_one(right) or _is_zero(left):
                 return _make_int_literal(0)
@@ -375,6 +378,9 @@ class BinaryExpr(_ExprOps):
                 decomp = _div_mod_decompose(left, right.value, ctx)
                 if decomp is not None:
                     return decomp[1]
+            cancelled = _cancel_common_factors(op, left, right, ctx)
+            if cancelled is not None:
+                return cancelled
         elif op == "&&":
             if _is_truthy(left):
                 return right
@@ -430,7 +436,7 @@ class BinaryExpr(_ExprOps):
         return None
 
 
-@dataclass
+@dataclass(frozen=True)
 class Builtin(_ExprOps):
     """GPU built-in variable (threadIdx.x, blockIdx.y, blockDim.x, etc.).
 
@@ -462,7 +468,7 @@ class Builtin(_ExprOps):
         return self
 
 
-@dataclass
+@dataclass(frozen=True)
 class FuncCallExpr(_ExprOps):
     """Intrinsic / math function call.
 
@@ -474,7 +480,7 @@ class FuncCallExpr(_ExprOps):
     """
 
     name: str
-    args: list[Expr]
+    args: tuple[Expr, ...]
 
     def eval(self, env: dict[str, object]) -> object:
         from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -489,7 +495,7 @@ class FuncCallExpr(_ExprOps):
         return f"{self.name}({', '.join(a.pretty() for a in self.args)})"
 
     def substitute(self, mapping: dict[str, Expr]) -> Expr:
-        return FuncCallExpr(self.name, [a.substitute(mapping) for a in self.args])
+        return FuncCallExpr(self.name, tuple(a.substitute(mapping) for a in self.args))
 
     def free_vars(self) -> frozenset[str]:
         out: frozenset[str] = frozenset()
@@ -503,13 +509,13 @@ class FuncCallExpr(_ExprOps):
         return f"{spelling}({args})"
 
     def simplify(self, ctx: SimplifyCtx) -> Expr:
-        new_args = [a.simplify(ctx) for a in self.args]
+        new_args = tuple(a.simplify(ctx) for a in self.args)
         if all(x is y for x, y in zip(new_args, self.args, strict=True)):
             return self
         return FuncCallExpr(self.name, new_args)
 
 
-@dataclass
+@dataclass(frozen=True)
 class TernaryExpr(_ExprOps):
     """TernaryExpr expression: cond ? if_true : if_false.
 
@@ -555,7 +561,7 @@ class TernaryExpr(_ExprOps):
         return TernaryExpr(cond, a, b)
 
 
-@dataclass
+@dataclass(frozen=True)
 class CastExpr(_ExprOps):
     """Type cast of an inner expression to ``dtype`` (e.g. ``"int"``, ``"float"``)."""
 
@@ -687,6 +693,100 @@ def _fold_binop_literals(op: str, left: Literal, right: Literal) -> Literal:
     if isinstance(folded, int) and both_int:
         return _make_int_literal(folded)
     return Literal(float(folded), "float")
+
+
+def _multiplicative_factors(expr: Expr) -> tuple[list[Expr], int]:
+    """Flatten an ``Expr`` tree of ``*`` into ``([non-int factors], int coefficient)``.
+
+    ``(a * 4) * b`` → ``([Var('a'), Var('b')], 4)``. Used by
+    ``_cancel_common_factors`` to canonicalize both sides of ``//`` / ``%``
+    before checking for cancellation.
+    """
+    if isinstance(expr, Literal) and expr.dtype == "int" and isinstance(expr.value, int):
+        return [], expr.value
+    if isinstance(expr, BinaryExpr) and expr.op == "*":
+        lf, lk = _multiplicative_factors(expr.left)
+        rf, rk = _multiplicative_factors(expr.right)
+        return lf + rf, lk * rk
+    return [expr], 1
+
+
+def _is_positive(expr: Expr, ctx: SimplifyCtx) -> bool:
+    """Conservatively decide whether ``expr`` is provably ``>= 1``.
+
+    Used to gate factor cancellation in ``a // b → ...`` — cancelling a
+    shared factor is unsound if that factor could be zero. Shape vars are
+    flagged via ``SimplifyCtx.ranges`` by ``Dim._simplify``."""
+    if isinstance(expr, Literal) and isinstance(expr.value, int):
+        return expr.value >= 1
+    rng = expr.range(ctx)
+    return rng is not None and rng.lo >= 1
+
+
+def _rebuild_product(factors: list[Expr], k: int) -> Expr:
+    """Inverse of ``_multiplicative_factors``: reassemble into an ``Expr``."""
+    if k == 0:
+        return _make_int_literal(0)
+    if not factors:
+        return _make_int_literal(k)
+    out: Expr = factors[0]
+    for f in factors[1:]:
+        out = BinaryExpr("*", out, f)
+    if k != 1:
+        out = BinaryExpr("*", out, _make_int_literal(k))
+    return out
+
+
+def _cancel_common_factors(op: str, left: Expr, right: Expr, ctx: SimplifyCtx) -> Expr | None:
+    """Try to simplify ``left op right`` (``op in {"/", "//", "%"}``) by
+    cancelling positive multiplicative factors common to both sides.
+
+    For ``(s * 128) // (s * 4)`` with ``s >= 1`` (from ``ctx.ranges``):
+    cancels the ``s`` and gcds the integer parts → ``32``. Returns ``None``
+    when no cancellation applies, letting the caller fall through to the
+    default ``BinaryExpr(op, left, right)`` path.
+    """
+    import math  # noqa: PLC0415
+
+    L_factors, L_k = _multiplicative_factors(left)
+    R_factors, R_k = _multiplicative_factors(right)
+
+    cancelled = False
+    R_remaining = list(R_factors)
+    L_remaining: list[Expr] = []
+    for f in L_factors:
+        matched_idx = None
+        for i, rf in enumerate(R_remaining):
+            if f == rf and _is_positive(f, ctx):
+                matched_idx = i
+                break
+        if matched_idx is not None:
+            R_remaining.pop(matched_idx)
+            cancelled = True
+        else:
+            L_remaining.append(f)
+
+    if L_k > 0 and R_k > 0:
+        g = math.gcd(L_k, R_k)
+        if g > 1:
+            L_k //= g
+            R_k //= g
+            cancelled = True
+
+    if not cancelled:
+        return None
+
+    new_left = _rebuild_product(L_remaining, L_k)
+    new_right = _rebuild_product(R_remaining, R_k)
+    if op in ("/", "//"):
+        if _is_one(new_right):
+            return new_left
+        if _is_zero(new_left):
+            return _make_int_literal(0)
+    elif op == "%":
+        if _is_one(new_right) or _is_zero(new_left):
+            return _make_int_literal(0)
+    return BinaryExpr(op, new_left, new_right)
 
 
 def _div_mod_decompose(expr: Expr, n: int, ctx: SimplifyCtx) -> tuple[Expr, Expr] | None:

@@ -62,7 +62,7 @@ def _promote_args_to_f32(target, args: tuple[str, ...], arg_dtypes: list[str]) -
             # returns ``"__half2float(x)"`` — we split on the open paren.
             paren = converted.index("(") if "(" in converted else -1
             if paren > 0 and converted.endswith(")"):
-                out.append(FuncCallExpr(converted[:paren], [Var(a)]))
+                out.append(FuncCallExpr(converted[:paren], (Var(a),)))
             else:
                 out.append(Var(a))
     return out

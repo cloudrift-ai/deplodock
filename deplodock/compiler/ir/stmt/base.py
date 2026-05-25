@@ -213,11 +213,11 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     if fn in _BINARY_OP:
         return BinaryExpr(_BINARY_OP[fn], inputs[0], inputs[1])
     if fn == "maximum":
-        return FuncCallExpr("fmax", list(inputs))
+        return FuncCallExpr("fmax", tuple(inputs))
     if fn == "minimum":
-        return FuncCallExpr("fmin", list(inputs))
+        return FuncCallExpr("fmin", tuple(inputs))
     if fn == "pow":
-        return FuncCallExpr("pow", list(inputs))
+        return FuncCallExpr("pow", tuple(inputs))
     if fn == "negative":
         return BinaryExpr("-", Literal(0.0, "float"), inputs[0])
     if fn == "copy":
@@ -225,15 +225,15 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     if fn == "reciprocal":
         return BinaryExpr("/", Literal(1.0, "float"), inputs[0])
     if fn == "relu":
-        return FuncCallExpr("fmax", [Literal(0.0, "float"), inputs[0]])
+        return FuncCallExpr("fmax", (Literal(0.0, "float"), inputs[0]))
     if fn == "sigmoid":
         neg_x = BinaryExpr("-", Literal(0.0, "float"), inputs[0])
-        exp_neg = FuncCallExpr("exp", [neg_x])
+        exp_neg = FuncCallExpr("exp", (neg_x,))
         return BinaryExpr("/", Literal(1.0, "float"), BinaryExpr("+", Literal(1.0, "float"), exp_neg))
     if fn in ("exp", "rsqrt", "tanh", "sqrt", "erf"):
-        return FuncCallExpr(fn, list(inputs))
+        return FuncCallExpr(fn, tuple(inputs))
     if fn == "abs":
-        return FuncCallExpr("fabs", list(inputs))
+        return FuncCallExpr("fabs", tuple(inputs))
     raise NotImplementedError(f"render: elementwise fn={fn!r} not supported")
 
 
@@ -268,7 +268,7 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
     for d, idx in enumerate(indices):
         stride: Expr = Literal(1, "int")
         for k in range(d + 1, len(shape)):
-            stride = BinaryExpr("*", stride, _shape_dim_expr(shape[k]))
+            stride = BinaryExpr("*", stride, _to_expr(shape[k]))
         stride = stride.simplify(SimplifyCtx.empty())
         term: Expr = idx if _is_one(stride) else BinaryExpr("*", idx, stride)
         flat = term if flat is None else BinaryExpr("+", flat, term)
@@ -276,15 +276,16 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
     return flat.simplify(SimplifyCtx.empty()).render(ctx)
 
 
-def _shape_dim_expr(d) -> Expr:
-    """Wrap a shape element as an ``Expr``: ``Literal`` for static ``Dim`` /
-    ``int``, ``Var`` for symbolic ``Dim('name')``. The simplifier folds
-    arithmetic across the resulting tree before rendering."""
+def _to_expr(d) -> Expr:
+    """Pull the ``Expr`` out of a shape element: ``Dim`` exposes its expr
+    directly; bare ``int`` becomes ``Literal``. ``Tensor.shape`` is always
+    ``tuple[Dim, ...]``, so the ``int`` branch only catches the rare
+    bare-int shape that slipped past coercion."""
     if isinstance(d, Dim):
-        return Literal(d.value, "int") if d.is_static else Var(d.value)
+        return d.expr
     if isinstance(d, int):
         return Literal(d, "int")
-    raise TypeError(f"_shape_dim_expr: unexpected shape element {d!r}")
+    raise TypeError(f"_to_expr: unexpected shape element {d!r}")
 
 
 def _is_one(e: Expr) -> bool:

@@ -134,16 +134,24 @@ class CudaBackend(Backend):
             result, pre_result = run_program(compiled, input_data=input_data, pre_run=pre_run)
             result_outputs = result.outputs
             time_ms = result.time_ms
-        # Symbolic output shapes (Dim("seq_len")) bind from the supplied input
-        # array shapes via the same per-buffer mapping the launch resolver uses.
+        # Symbolic output shapes bind from the supplied input array shapes:
+        # walk each input dim's expr.free_vars() and record where each name
+        # came from. Output dims (possibly composite Dim exprs) then resolve
+        # via ``expr.eval(sym_env)`` — one path covers Literal / Var /
+        # BinaryExpr uniformly.
+        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
         sym_env: dict[str, int] = {}
-        for nid in compiled.inputs:
-            for d, dim in enumerate(compiled.nodes[nid].output.shape):
-                if not dim.is_static and input_data is not None and nid in input_data:
-                    sym_env.setdefault(dim.value, int(input_data[nid].shape[d]))
+        if input_data is not None:
+            for nid in compiled.inputs:
+                if nid not in input_data:
+                    continue
+                for d, dim in enumerate(compiled.nodes[nid].output.shape):
+                    if isinstance(dim.expr, Var):
+                        sym_env.setdefault(dim.expr.name, int(input_data[nid].shape[d]))
         outputs: dict[str, np.ndarray] = {}
         for name, vals in result_outputs.items():
-            shape = tuple(d.as_static() if d.is_static else sym_env[d.value] for d in compiled.nodes[name].output.shape)
+            shape = tuple(int(d.expr.eval(sym_env)) for d in compiled.nodes[name].output.shape)
             outputs[name] = np.asarray(vals, dtype=compiled.nodes[name].output.dtype.np).reshape(shape)
         return RunResult(outputs=outputs, time_ms=time_ms), pre_result
 

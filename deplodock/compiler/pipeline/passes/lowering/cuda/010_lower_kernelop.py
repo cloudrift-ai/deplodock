@@ -111,8 +111,9 @@ def _launch_geometry(
                 if v != 1:
                     factors.append(v)
             else:
-                seen.setdefault(a.extent.value, None)
-                factors.append(a.extent.value)
+                name = a.extent.as_atom_name()
+                seen.setdefault(name, None)
+                factors.append(name)
         return tuple(factors) if factors else (1,)
 
     for s in kernel_op.body:
@@ -136,10 +137,10 @@ def _launch_geometry(
 
 
 def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:
-    """Walk the entire body and collect every symbolic ``Axis.extent.value``
-    referenced by any tile or loop. Dict (not set) so insertion order
-    matches first-seen order — kernel param signature is stable across
-    runs of the same kernel."""
+    """Walk the entire body and collect every symbolic axis name (via
+    ``Axis.extent.as_atom_name()``) referenced by any tile or loop. Dict
+    (not set) so insertion order matches first-seen order — kernel param
+    signature is stable across runs of the same kernel."""
     from deplodock.compiler.ir.axis import Axis  # noqa: PLC0415
     from deplodock.compiler.ir.stmt.base import Stmt  # noqa: PLC0415
 
@@ -148,7 +149,7 @@ def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:
     def visit(stmt: Stmt) -> None:
         for ax in _stmt_axes(stmt):
             if isinstance(ax, Axis) and not ax.extent.is_static:
-                seen.setdefault(ax.extent.value, None)
+                seen.setdefault(ax.extent.as_atom_name(), None)
         for body in stmt.nested():
             for child in body:
                 visit(child)
