@@ -116,7 +116,7 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:
         raise RuleSkipped("no Stage source dtype known for lane-axis consumers")
     if F <= vec_elems or F % vec_elems != 0:
         raise RuleSkipped(f"lane stride F={F} not > vec_elems={vec_elems} or not divisible")
-    lane_ext = int(lane.extent)
+    lane_ext = lane.extent.as_static()
 
     if not _swap_helps_any_stage(tile, lane.name, F, lane_ext, vec_elems=vec_elems):
         raise RuleSkipped("no Stage has a fixable lane-stride bank conflict")
@@ -212,7 +212,7 @@ def _swap_helps_any_stage(tile, lane_var: str, F: int, lane_ext: int, *, vec_ele
             loads = loads_reading(tile.body, src.name)
             if not loads:
                 continue
-            extents = tuple(int(ax.extent) for ax in src.cache_axes)
+            extents = tuple(ax.extent.as_static() for ax in src.cache_axes)
             pre = _stage_max_way(loads, extents, leading_phase, tile)
             if pre is None or pre <= 1:
                 continue

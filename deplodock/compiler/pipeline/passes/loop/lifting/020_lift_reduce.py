@@ -32,8 +32,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if src_node is None:
         raise RuleSkipped(f"reduce input {src_id!r} no longer in graph")
     src_shape = tuple(src_node.output.shape)
-    if not src_shape or not all(isinstance(d, int) for d in src_shape):
-        raise RuleSkipped(f"input shape {src_shape} is empty or has non-int dims")
+    if not src_shape:
+        raise RuleSkipped(f"input shape {src_shape} is empty")
 
     ndim = len(src_shape)
     axis_raw = root.op.axis
@@ -42,8 +42,12 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         axis += ndim
     if axis < 0 or axis >= ndim:
         raise RuleSkipped(f"reduce axis {axis_raw} out of range for ndim={ndim}")
+    # M5: symbolic reduce axes are allowed. The CUDA emitter renders the reduce
+    # loop's bound as the runtime ``int <name>`` kernel arg; cooperative-reduce
+    # / chunk_reduce strategies that need a static trip count gate on
+    # ``axis.extent.is_static`` themselves and fall back to a serial reduce.
 
-    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(src_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(src_shape))
     reduce_axis_name = f"a{axis}"
     load_index = tuple(Var(a.name) for a in axes)
 
@@ -98,7 +102,7 @@ def _build_write_index(axes: tuple[Axis, ...], reduce_axis_name: str, out_shape:
         )
     result: list[Expr] = []
     for a, d in zip(axes, out_shape, strict=True):
-        if a.name == reduce_axis_name or (isinstance(d, int) and d == 1):
+        if a.name == reduce_axis_name or (d.is_static and d.as_static() == 1):
             result.append(Literal(0, "int"))
         else:
             result.append(Var(a.name))

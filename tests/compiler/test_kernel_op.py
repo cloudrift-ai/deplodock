@@ -52,7 +52,7 @@ def _nest(axes, body):
             if isinstance(s, Write):
                 for e in s.index:
                     _walk(e)
-        reduce_axis_names = frozenset(a.name for a in axes if a.name not in write_axis_names and int(a.extent) > 1)
+        reduce_axis_names = frozenset(a.name for a in axes if a.name not in write_axis_names and a.extent.as_static() > 1)
 
     free_axes = [a for a in axes if a.name not in reduce_axis_names]
 

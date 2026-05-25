@@ -60,7 +60,7 @@ def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         cache_axes = src.cache_axes
         if not cache_axes:
             raise ValueError(f"Source {src.name!r} has no cache axes")
-        extents = tuple(int(ax.extent) for ax in cache_axes)
+        extents = tuple(ax.extent.as_static() for ax in cache_axes)
         padded_extents = src.alloc_extents
         total = 1
         for e in extents:
@@ -166,7 +166,7 @@ def emit_compute_stage(stage: ComputeStage, tid_expr, n_threads: int) -> list[St
     padded_extents = out.alloc_extents
     total = 1
     for ax in cache_axes:
-        total *= int(ax.extent)
+        total *= ax.extent.as_static()
     iter_axis = Axis(name=f"{out.name}_flat", extent=total)
     if len(cache_axes) == 1:
         coord_for = {cache_axes[0].name: Var(iter_axis.name)}
@@ -207,10 +207,10 @@ def flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:
     coords: dict = {}
     inner_stride = 1
     for ax in reversed(cache_axes):
-        ext = int(ax.extent)
+        ext = ax.extent.as_static()
         coords[ax.name] = flat % Literal(ext, "int") if inner_stride == 1 else (flat / Literal(inner_stride, "int")) % Literal(ext, "int")
         inner_stride *= ext
     outer = cache_axes[0]
-    outer_stride = inner_stride // int(outer.extent)
+    outer_stride = inner_stride // outer.extent.as_static()
     coords[outer.name] = flat if outer_stride == 1 else flat / Literal(outer_stride, "int")
     return coords

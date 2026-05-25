@@ -61,7 +61,13 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     if ctx.compute_capability < _MIN_CAPABILITY:
         raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
 
-    src_shapes = {nid: tuple(int(d) for d in node.output.shape) for nid, node in match.graph.nodes.items()}
+    # TMA descriptors bake the source shape statically into the cuTensorMap; bail
+    # out cleanly if any input shape carries a symbolic dim.
+    for nid, node in match.graph.nodes.items():
+        for d in node.output.shape:
+            if not d.is_static:
+                raise RuleSkipped(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
+    src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
 
     body = root.op.body
     # All-or-nothing per tile (see module docstring).
@@ -151,12 +157,12 @@ def _eligible(stage: AsyncBufferedStage, src_shapes: dict[str, tuple[int, ...]])
     # singletons — the materializer drops those from the descriptor.
     dims_set = set(dims)
     for d in range(dims[0], src_rank):
-        if d not in dims_set and int(src_shape[d]) != 1:
+        if d not in dims_set and src_shape[d] != 1:
             return False
-    inner_extent = int(cache_axes[-1].extent)
+    inner_extent = cache_axes[-1].extent.as_static()
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
-    src_inner = int(src_shape[-1])
+    src_inner = src_shape[-1]
     if (src_inner * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
     if src_inner < inner_extent * 2:

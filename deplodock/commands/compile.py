@@ -85,7 +85,25 @@ def add_input_args(parser) -> None:
         "--seq-len",
         type=int,
         default=32,
-        help="Sequence length for full-model tracing (default: 32).",
+        help=(
+            "Sequence length for full-model tracing (default: 32). With ``--dynamic``, "
+            "only sizes the example tensors handed to ``torch.export``; the value doesn't "
+            "appear in the resulting kernels since torch makes the dim symbolic."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic",
+        action="append",
+        default=None,
+        metavar="NAME@INPUT:AXIS",
+        help=(
+            "Make a tensor dim symbolic. Form: ``NAME@INPUT:AXIS`` — axis ``AXIS`` "
+            "of the traced input named ``INPUT`` becomes ``Dim(NAME)``. Repeatable for "
+            "multiple dynamic dims. Forwards to ``torch.export(..., dynamic_shapes={...})``, "
+            "so torch's SymInt propagation determines which downstream tensors carry the "
+            "symbolic dim — no value collisions. The compiled CUDA kernel signature gains "
+            "an ``int <NAME>`` runtime arg per dim. Example: ``--dynamic seq_len@x:1``."
+        ),
     )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
 
@@ -258,23 +276,39 @@ def _is_boundary(op) -> bool:
 
 
 def load_or_trace(args) -> tuple[Graph, str]:
+    dynamic_shapes = _resolve_dynamic_shapes(args)
     if args.code:
         from deplodock.commands.trace import graph_from_code
 
-        return graph_from_code(args.code)
+        return graph_from_code(args.code, dynamic_shapes=dynamic_shapes)
 
     input_path = Path(args.input)
     if input_path.suffix == ".json" and input_path.exists():
-        graph = _load_graph(input_path)
-        base_name = input_path.stem
-    else:
-        graph = _trace_model(args.input, args.layer, args.seq_len)
-        safe_name = args.input.replace("/", "-").lower()
-        if args.layer is None:
-            base_name = f"{safe_name}-full-s{args.seq_len}"
-        else:
-            base_name = f"{safe_name}-layer{args.layer}"
+        if dynamic_shapes is not None:
+            logger.error("--dynamic is incompatible with loading a pre-traced JSON IR (the trace is already complete)")
+            sys.exit(2)
+        return _load_graph(input_path), input_path.stem
+
+    graph = _trace_model(args.input, args.layer, args.seq_len, dynamic_shapes=dynamic_shapes)
+    safe_name = args.input.replace("/", "-").lower()
+    base_name = f"{safe_name}-full-s{args.seq_len}" if args.layer is None else f"{safe_name}-layer{args.layer}"
     return graph, base_name
+
+
+def _resolve_dynamic_shapes(args) -> dict | None:
+    """Parse every ``--dynamic NAME@INPUT:AXIS`` spec into a torch.export
+    ``dynamic_shapes`` dict. Returns ``None`` when no specs were passed."""
+    specs_raw = getattr(args, "dynamic", None)
+    if not specs_raw:
+        return None
+    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+
+    try:
+        specs = parse_position_specs(specs_raw)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(2)
+    return build_torch_dynamic_shapes(specs)
 
 
 def _load_graph(path: Path) -> Graph:
@@ -285,7 +319,7 @@ def _load_graph(path: Path) -> Graph:
     return Graph.from_dict(data)
 
 
-def _trace_model(model_id: str, layer: int | None, seq_len: int) -> Graph:
+def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shapes: dict | None = None) -> Graph:
     try:
         import torch
         from transformers import AutoModelForCausalLM
@@ -301,12 +335,22 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int) -> Graph:
     model.eval()
 
     if layer is None:
-        from deplodock.compiler.trace.huggingface import build_full_model_wrapper
+        from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
 
         logger.info("Tracing full model (seq_len=%d)...", seq_len)
+        if dynamic_shapes:
+            # Dynamic mode: wrapper takes (input_ids, attention_mask, position_ids)
+            # so the caller (here: the trace step + the eventual launch) can
+            # supply per-call mask + position_ids sized to the runtime seq_len.
+            wrapper = build_full_model_wrapper(model, seq_len, dtype, dynamic=True)
+            input_ids = torch.zeros((1, seq_len), dtype=torch.long)
+            attention_mask = build_causal_mask(seq_len, dtype)
+            position_ids = torch.arange(seq_len).unsqueeze(0)
+            return trace_module(wrapper, (input_ids, attention_mask, position_ids), dynamic_shapes=dynamic_shapes)
+
         wrapper = build_full_model_wrapper(model, seq_len, dtype)
         input_ids = torch.zeros((1, seq_len), dtype=torch.long)
-        return trace_module(wrapper, (input_ids,))
+        return trace_module(wrapper, (input_ids,), dynamic_shapes=dynamic_shapes)
 
     layers = model.model.layers
     if layer >= len(layers):
@@ -321,4 +365,4 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int) -> Graph:
     position_ids = torch.arange(seq_len).unsqueeze(0)
     cos, sin = model.model.rotary_emb(x, position_ids)
 
-    return trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)})
+    return trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)}, dynamic_shapes=dynamic_shapes)

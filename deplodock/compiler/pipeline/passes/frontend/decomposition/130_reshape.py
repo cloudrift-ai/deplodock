@@ -7,8 +7,9 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
@@ -22,6 +23,11 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     For reshape from in_shape to out_shape (same numel), each input
     coordinate is:  c_j = (flat // in_stride_j) % in_shape_j
     where flat = sum(out_coord_i * out_stride_i).
+
+    Strides are built as ``Expr`` trees rather than Python ints so symbolic
+    shape elements (``Dim('seq_len')``) thread through as ``Var('seq_len')``
+    factors. The simplifier folds constant runs before the tree lands in
+    the ``IndexMapOp.sources`` coord map.
     """
     out_ndim = len(out_shape)
     in_ndim = len(in_shape)
@@ -29,30 +35,46 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     if in_shape == out_shape:
         return tuple(placeholder(d) for d in range(out_ndim))
 
-    # Build flat = out_coord_0 * stride_0 + out_coord_1 * stride_1 + ...
     flat = None
-    out_stride = 1
+    out_stride: object = Literal(1, "int")
     for d in range(out_ndim - 1, -1, -1):
-        term = placeholder(d) if out_stride == 1 else BinaryExpr("*", placeholder(d), Literal(out_stride, "int"))
+        stride_simplified = out_stride.simplify(SimplifyCtx.empty())
+        term = placeholder(d) if _is_one(stride_simplified) else BinaryExpr("*", placeholder(d), stride_simplified)
         flat = term if flat is None else BinaryExpr("+", term, flat)
-        out_stride *= int(out_shape[d])
+        out_stride = BinaryExpr("*", out_stride, _dim_expr(out_shape[d]))
 
     if flat is None:
         flat = Literal(0, "int")
 
-    # Delinearize flat into input coords: c_j = (flat // in_stride_j) % in_shape_j
     coords = []
-    in_stride = 1
+    in_stride: object = Literal(1, "int")
     for j in range(in_ndim - 1, -1, -1):
-        in_stride_j = in_stride
-        coord = flat if in_stride_j == 1 else BinaryExpr("/", flat, Literal(in_stride_j, "int"))
-        dim_j = int(in_shape[j])
+        stride_j = in_stride.simplify(SimplifyCtx.empty())
+        coord = flat if _is_one(stride_j) else BinaryExpr("/", flat, stride_j)
+        dim_j = _dim_expr(in_shape[j])
         if j > 0:
-            coord = BinaryExpr("%", coord, Literal(dim_j, "int"))
-        coords.insert(0, coord)
-        in_stride *= dim_j
+            coord = BinaryExpr("%", coord, dim_j)
+        coords.insert(0, coord.simplify(SimplifyCtx.empty()))
+        in_stride = BinaryExpr("*", in_stride, dim_j)
 
     return tuple(coords)
+
+
+def _dim_expr(d) -> object:
+    """``Literal`` for static ``Dim`` / ``int``; ``Var`` for symbolic ``Dim('name')``
+    or bare ``str``. Mirrors ``ir/stmt/base.py:_shape_dim_expr`` for the reshape
+    coord-map's stride math."""
+    if isinstance(d, Dim):
+        return Literal(d.value, "int") if d.is_static else Var(d.value)
+    if isinstance(d, int):
+        return Literal(d, "int")
+    if isinstance(d, str):
+        return Var(d)
+    raise TypeError(f"_dim_expr: unexpected shape element {d!r}")
+
+
+def _is_one(e) -> bool:
+    return isinstance(e, Literal) and e.value == 1
 
 
 def rewrite(match: Match, root: Node, inp_x: Node, out: Tensor) -> Graph | None:

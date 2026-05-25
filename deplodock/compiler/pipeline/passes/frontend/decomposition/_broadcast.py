@@ -13,9 +13,14 @@ have shape equal to its output.
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+
+
+def _is_symbolic(d) -> bool:
+    return isinstance(d, Dim) and not d.is_static
 
 
 def broadcast_to(graph: Graph, node: Node | str, target_shape: tuple) -> Node:
@@ -39,7 +44,21 @@ def broadcast_to(graph: Graph, node: Node | str, target_shape: tuple) -> Node:
         return node
     indexmap = _broadcast_indexmap(inp_shape, target_shape)
     if indexmap is None:
-        raise ValueError(f"cannot broadcast shape {inp_shape} to {target_shape}: non-size-1 dim mismatch or rank exceeds target")
+        # Symbolic dims that propagated to where another concrete dim was
+        # expected are typically the symptom of a ``--dynamic`` value
+        # colliding with another model dim (e.g. ``--seq-len 32`` on a
+        # model where ``num_heads == 32`` rewrites both). Surface that hint
+        # so the user doesn't dig through the decomposition pass.
+        any_symbolic = any(_is_symbolic(d) for s in (inp_shape, target_shape) for d in s)
+        hint = (
+            " (note: shapes contain symbolic dims — if this came from "
+            "``--dynamic``, the canonical value may collide with another "
+            "model dim; try a non-colliding prime like 31 / 37 / 41 for "
+            "``--seq-len``)"
+            if any_symbolic
+            else ""
+        )
+        raise ValueError(f"cannot broadcast shape {inp_shape} to {target_shape}: non-size-1 dim mismatch or rank exceeds target{hint}")
     # Use the tensor's semantic name (not the node id) for the broadcast output
     # name — fragment ids get rewritten on splicing, but tensor names carry
     # through, so anchoring the "_bc" suffix on the name avoids collisions when

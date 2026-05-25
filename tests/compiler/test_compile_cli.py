@@ -127,3 +127,35 @@ def test_compile_code_and_input_mutually_exclusive(run_cli, tmp_path):
     rc, stdout, stderr = run_cli("compile", "--code", "x", str(dummy))
     assert rc != 0
     assert "mutually exclusive" in stdout + stderr
+
+
+def test_compile_dynamic_emits_runtime_arg(run_cli):
+    """``--dynamic seq_len@x:1`` traces with torch.export's dynamic_shapes
+    so the rendered CUDA kernel signature gains an ``int seq_len`` arg."""
+    rc, stdout, stderr = run_cli(
+        "compile",
+        "--code",
+        "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))",
+        "--dynamic",
+        "seq_len@x:1",
+        "--ir",
+        "cuda",
+    )
+    assert rc == 0, f"stderr: {stderr}"
+    assert "int seq_len" in stdout, f"expected ``int seq_len`` in kernel signature, got:\n{stdout[:500]}"
+
+
+def test_compile_dynamic_bad_spec_rejected(run_cli):
+    """Bad spec (missing ``@`` / ``:``) exits with usage error rather than
+    crashing inside the tracer."""
+    rc, stdout, stderr = run_cli(
+        "compile",
+        "--code",
+        "torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))",
+        "--dynamic",
+        "seq_len",
+        "--ir",
+        "cuda",
+    )
+    assert rc != 0
+    assert "NAME@INPUT:AXIS" in stdout + stderr

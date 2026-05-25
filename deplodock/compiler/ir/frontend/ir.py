@@ -21,7 +21,34 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.base import Op, _keepdim_axis
+
+
+def _static(d) -> int:
+    """Coerce a shape element (``Dim`` from Tensor.shape, or raw ``int``
+    from a numpy array) to a static int. Raises if the dim is symbolic."""
+    return d.as_static() if isinstance(d, Dim) else int(d)
+
+
+def _split_factors(shape) -> tuple[int, list[str]]:
+    """Split a shape into ``(static_product, [symbolic_names])`` — used by
+    ``ReshapeOp.infer_output_shape`` to handle ``-1`` inference in the
+    presence of symbolic dims."""
+    static = 1
+    symbolic: list[str] = []
+    for d in shape:
+        if isinstance(d, Dim):
+            if d.is_static:
+                static *= d.as_static()
+            else:
+                symbolic.append(d.value)
+        elif isinstance(d, str):
+            symbolic.append(d)
+        else:
+            static *= int(d)
+    return static, symbolic
+
 
 # ---------------------------------------------------------------------------
 # Layout-only ops (decomposed to IndexMapOp)
@@ -69,15 +96,35 @@ class ReshapeOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         if -1 not in self.shape:
             return tuple(self.shape)
-        in_numel = 1
-        for d in input_shapes[0]:
-            in_numel *= int(d)
-        known = 1
-        for d in self.shape:
-            if d != -1:
-                known *= int(d)
+        # Split each side's product into static-int and symbolic-name parts so
+        # ``-1`` can be inferred even when symbolic dims appear on both sides.
+        in_static, in_sym = _split_factors(input_shapes[0])
+        known_static, known_sym = _split_factors([d for d in self.shape if d != -1])
+        # Cancel matching symbolic factors (a symbolic dim that appears on both
+        # sides drops out, e.g. ``(1, S, 2048).reshape(1, S, H, -1)`` collapses).
+        for name in list(known_sym):
+            if name in in_sym:
+                in_sym.remove(name)
+                known_sym.remove(name)
+        if known_sym:
+            raise ValueError(
+                f"reshape from {tuple(input_shapes[0])} to {self.shape} leaves unresolved symbolic "
+                f"factor(s) {known_sym} on the target side — cannot infer -1 dim"
+            )
+        if not in_sym:
+            inferred: int | str = in_static // known_static if known_static else 1
+        elif len(in_sym) == 1 and in_static == known_static:
+            inferred = in_sym[0]  # the lone symbolic factor flows straight through
+        elif len(in_sym) == 1 and known_static and in_static % known_static == 0:
+            # Symbolic times a static factor — can't represent without an Expr.
+            raise ValueError(
+                f"reshape from {tuple(input_shapes[0])} to {self.shape} would infer -1 as "
+                f"{in_sym[0]} * {in_static // known_static} — symbolic * static products aren't supported yet"
+            )
+        else:
+            raise ValueError(f"reshape from {tuple(input_shapes[0])} to {self.shape}: cannot infer -1 dim symbolically")
         resolved = list(self.shape)
-        resolved[resolved.index(-1)] = in_numel // known if known else 1
+        resolved[resolved.index(-1)] = inferred
         return tuple(resolved)
 
     def forward(self, *inputs):
@@ -119,7 +166,10 @@ class CatOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         # Tensor inputs are all but the trailing scalar dim-constant.
         # Find them by skipping shape-(1,) inputs at the tail.
-        tensor_shapes = [s for s in input_shapes if len(s) > 1 or (len(s) == 1 and isinstance(s[0], int) and s[0] != 1)]
+        def _is_scalar_constant(s):
+            return len(s) == 1 and (s[0] == 1 if isinstance(s[0], (int, Dim)) else False)
+
+        tensor_shapes = [s for s in input_shapes if len(s) > 1 or (len(s) == 1 and not _is_scalar_constant(s))]
         if not tensor_shapes:
             return tuple(input_shapes[0])
         # Cat along the last dim by default (matches CatOp tracer convention).
@@ -129,9 +179,9 @@ class CatOp(Op):
         total = 0
         for s in tensor_shapes:
             d = s[last]
-            if not isinstance(d, int):
+            if isinstance(d, Dim) and not d.is_static:
                 return tuple(out)  # symbolic; bail out
-            total += d
+            total += _static(d)
         out[last] = total
         return tuple(out)
 

@@ -198,17 +198,24 @@ class LoopOp(BodyOp):
         by every backend whose graph contains ``LoopOp`` nodes (today:
         ``LoopBackend``) through the default ``Backend.run`` topo-walk
         dispatch.
+
+        Symbolic axis extents (``Axis(extent=Dim("seq_len"))``) get bound
+        from the input arrays' actual shapes by walking ``Load`` index
+        positions, and the body is specialized to concrete extents before
+        rendering — one C++ kernel per (kernel, runtime-shape) tuple
+        today; per-axis runtime args land in M2.
         """
         import numpy as np
 
         from deplodock.compiler.ir.loop.runner import execute_loop_op_cpp
 
-        out_shape = self._infer_write_shape()
         bufs = tuple(self.inputs)
         if len(inputs) != len(bufs):
             raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
         input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}
-        return execute_loop_op_cpp(self, input_arrays, out_shape)
+        loop = _specialize_symbolic_axes(self, input_arrays)
+        out_shape = loop._infer_write_shape()
+        return execute_loop_op_cpp(loop, input_arrays, out_shape)
 
     def _infer_write_shape(self) -> tuple[int, ...]:
         """Derive the output buffer shape from the kernel's ``Write`` index.
@@ -228,8 +235,8 @@ class LoopOp(BodyOp):
         env: dict[str, object] = {}
         for i, a in enumerate(self.axes):
             shape = [1] * len(self.axes)
-            shape[i] = int(a.extent)
-            env[a.name] = np.arange(int(a.extent)).reshape(shape)
+            shape[i] = a.extent.as_static()
+            env[a.name] = np.arange(a.extent.as_static()).reshape(shape)
         dims: list[int] = []
         for e in w.index:
             vals = e.eval(env)
@@ -238,6 +245,62 @@ class LoopOp(BodyOp):
             else:
                 dims.append(int(vals) + 1)
         return tuple(dims)
+
+
+# ---------------------------------------------------------------------------
+# Symbolic-extent specialization (M1)
+# ---------------------------------------------------------------------------
+
+
+def _bind_symbolic_axes(loop: LoopOp, input_arrays: dict) -> dict[str, int]:
+    """Build ``axis-name → runtime int`` for every symbolic axis used by a
+    body ``Load`` index. Each input array's actual shape is the source of
+    truth; a symbolic axis seen at index position ``d`` of input ``buf``
+    binds to ``input_arrays[buf].shape[d]``."""
+    from deplodock.compiler.ir.expr import Var
+
+    env: dict[str, int] = {}
+    symbolic_axis_names = {ax.name for ax in loop.axes if not ax.extent.is_static}
+    if not symbolic_axis_names:
+        return env
+    for stmt in loop.body.iter_of_type(Load):
+        arr = input_arrays.get(stmt.input)
+        if arr is None:
+            continue
+        for d, idx in enumerate(stmt.index):
+            if isinstance(idx, Var) and idx.name in symbolic_axis_names:
+                env.setdefault(idx.name, int(arr.shape[d]))
+    missing = symbolic_axis_names - env.keys()
+    if missing:
+        raise RuntimeError(f"LoopOp.forward: could not bind symbolic axes {sorted(missing)} from any input Load index")
+    return env
+
+
+def _specialize_symbolic_axes(loop: LoopOp, input_arrays: dict) -> LoopOp:
+    """Return ``loop`` with each symbolic ``Axis.extent`` replaced by the
+    runtime int from ``input_arrays``. Returns ``loop`` unchanged if every
+    axis is already static."""
+    env = _bind_symbolic_axes(loop, input_arrays)
+    if not env:
+        return loop
+
+    def _sub_axis(ax: Axis) -> Axis:
+        if ax.extent.is_static or ax.name not in env:
+            return ax
+        return Axis(name=ax.name, extent=env[ax.name], source_axis=ax.source_axis)
+
+    def _sub_body(body: Body) -> Body:
+        new: list[Stmt] = []
+        for s in body:
+            nested = s.nested()
+            if isinstance(s, Loop):
+                s = Loop(axis=_sub_axis(s.axis), body=_sub_body(s.body), unroll=s.unroll)
+            elif nested:
+                s = s.with_bodies(tuple(_sub_body(b) for b in nested))
+            new.append(s)
+        return Body(tuple(new))
+
+    return LoopOp(body=_sub_body(loop.body))
 
 
 # ---------------------------------------------------------------------------

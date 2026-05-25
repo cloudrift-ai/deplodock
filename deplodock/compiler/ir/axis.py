@@ -19,14 +19,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from deplodock.compiler.dim import Dim, to_dim
+
 
 @dataclass(frozen=True)
 class Axis:
     """One named iteration variable.
 
-    Referenced from ``Expr`` subtrees by ``Var(name)``. Extent is a
-    static integer in v1; future revisions may allow an ``Expr`` for
-    dynamic batch / sequence dims.
+    Referenced from ``Expr`` subtrees by ``Var(name)``. ``extent`` is a
+    :class:`Dim` — static (``Dim(32)``) in most cases today, symbolic
+    (``Dim("seq_len")``) for dynamic dims. Construction coerces a bare
+    ``int`` / ``str`` to ``Dim`` for ergonomics, so ``Axis("m", 32)``
+    keeps working.
 
     ``source_axis`` is the original (pre-split) axis this one was carved
     out of. Top-level axes (the ones the frontend traces) have
@@ -40,8 +44,12 @@ class Axis:
     """
 
     name: str
-    extent: int
+    extent: Dim
     source_axis: Axis | None = field(default=None, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.extent, Dim):
+            object.__setattr__(self, "extent", to_dim(self.extent))
 
     def split(self, factor: int) -> tuple[Axis, Axis]:
         """Split this axis into ``(outer, inner)`` for tile-style decomposition.
@@ -49,17 +57,19 @@ class Axis:
         Outer extent is ``self.extent // factor``, inner extent is ``factor``.
         Names follow the ``f"{self.name}_o"`` / ``f"{self.name}_i"`` convention
         so tiled IR remains readable. v1 requires divisibility — non-divisible
-        extents need a residue-tail story that no current rule wants.
+        extents need a residue-tail story that no current rule wants. Symbolic
+        extents refuse to split (M3 of the dynamic-shapes plan).
 
         Children inherit ``source_axis = self.source_axis or self`` — top-level
         axes become their own source on first split; further splits chain to
         the same original.
         """
-        if self.extent % factor != 0:
-            raise ValueError(f"Axis.split: {self.name} extent {self.extent} not divisible by {factor}")
+        ext = self.extent.as_static()
+        if ext % factor != 0:
+            raise ValueError(f"Axis.split: {self.name} extent {ext} not divisible by {factor}")
         src = self.source_axis or self
         return (
-            Axis(f"{self.name}_o", self.extent // factor, source_axis=src),
+            Axis(f"{self.name}_o", ext // factor, source_axis=src),
             Axis(f"{self.name}_i", factor, source_axis=src),
         )
 

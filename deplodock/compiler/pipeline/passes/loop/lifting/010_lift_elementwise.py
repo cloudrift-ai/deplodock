@@ -17,7 +17,7 @@ from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern
 
 PATTERN = [Pattern("root", ElementwiseOp)]
 
@@ -25,10 +25,9 @@ PATTERN = [Pattern("root", ElementwiseOp)]
 def rewrite(match: Match, root: Node) -> Graph | None:
     graph = match.graph
     out_shape = tuple(root.output.shape)
-    if out_shape and not all(isinstance(d, int) for d in out_shape):
-        raise RuleSkipped(f"output shape {out_shape} contains non-int dims; need static shapes")
-
-    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
+    # Symbolic dims on FREE axes are fine — they pass through as ``Axis(extent=Dim("name"))``
+    # and ``LoopOp.forward`` / launch geometry resolve them from input array shapes at run time.
+    axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(out_shape))
 
     load_stmts: list[Stmt] = []
     load_names: list[str] = []
@@ -86,9 +85,9 @@ def _identity_index(src_shape: tuple, axes: tuple[Axis, ...]) -> tuple[Expr, ...
 
     for i in range(len(src_shape) - 1, -1, -1):
         dim = src_shape[i]
-        if isinstance(dim, int) and dim == 1:
+        if dim.is_static and dim.as_static() == 1:
             continue
-        while cursor >= 0 and int(axes[cursor].extent) != int(dim):
+        while cursor >= 0 and axes[cursor].extent != dim:
             cursor -= 1
         if cursor < 0:
             break

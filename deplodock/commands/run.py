@@ -60,6 +60,18 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
+    parser.add_argument(
+        "--dynamic",
+        action="append",
+        default=None,
+        metavar="NAME@INPUT:AXIS",
+        help=(
+            "Make a tensor dim symbolic. Form: ``NAME@INPUT:AXIS`` — axis ``AXIS`` of the "
+            "traced input named ``INPUT`` becomes ``Dim(NAME)``. Repeatable. Forwards to "
+            "``torch.export(..., dynamic_shapes={...})``; the compiled CUDA kernel signature "
+            "gains an ``int <NAME>`` runtime arg per dim. Example: ``--dynamic seq_len@x:1``."
+        ),
+    )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
     parser.add_argument(
@@ -111,7 +123,7 @@ def handle_run(args):
         logger.error("Either --code or --ir is required")
         sys.exit(1)
 
-    info = trace_inline_code(args.code)
+    info = trace_inline_code(args.code, dynamic_shapes=_resolve_dynamic_shapes(args))
     graph = info["graph"]
     module = info["module"]
     example_args = info["args"]
@@ -205,6 +217,23 @@ def handle_run(args):
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
+def _resolve_dynamic_shapes(args) -> dict | None:
+    """Parse ``--dynamic NAME@INPUT:AXIS`` specs into a torch.export
+    ``dynamic_shapes`` dict. Returns ``None`` when no specs were passed.
+    Mirrors :func:`deplodock.commands.compile._resolve_dynamic_shapes`."""
+    specs_raw = getattr(args, "dynamic", None)
+    if not specs_raw:
+        return None
+    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+
+    try:
+        specs = parse_position_specs(specs_raw)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(2)
+    return build_torch_dynamic_shapes(specs)
+
+
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
     """Persist the eager / torch.compile / deplodock comparison table
     so downstream tooling (``make bench-kernels``) can parse one file
@@ -250,8 +279,12 @@ def _print_kernel_stats(graph, bench):
         op = node.op
         t_us = times_by_idx.get(idx, 0.0)
         pct = (t_us / total_us * 100) if total_us > 0 else 0.0
-        block_threads = op.block[0] * op.block[1] * op.block[2]
-        grid_total = op.grid[0] * op.grid[1] * op.grid[2]
+        from deplodock.compiler.ir.cuda.ir import resolve_dim
+
+        block_dims = [resolve_dim(d, {}) for d in op.block]
+        grid_dims = [resolve_dim(d, {}) for d in op.grid]
+        block_threads = block_dims[0] * block_dims[1] * block_dims[2]
+        grid_total = grid_dims[0] * grid_dims[1] * grid_dims[2]
         smem_kb = op.smem_bytes / 1024
         kname = op.kernel_name[:42]
         attrs = attrs_by_kname.get(op.kernel_name) or {}
@@ -567,6 +600,9 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     with open(path) as f:
         data = json.load(f)
     graph = Graph.from_dict(data)
+    if getattr(args, "dynamic", None):
+        logger.error("--dynamic is incompatible with --ir (the trace is already complete)")
+        sys.exit(2)
 
     stage = _detect_stage(graph)
     tail = _passes_after_stage(stage)
@@ -582,13 +618,13 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     input_data: dict[str, list[float]] = {}
     for nid, node in graph.nodes.items():
         if isinstance(node.op, InputOp):
-            shape = tuple(int(d) for d in node.output.shape)
+            shape = tuple(d.as_static() for d in node.output.shape)
             input_data[nid] = rng.standard_normal(shape, dtype=np.float32).flatten().tolist()
         elif isinstance(node.op, ConstantOp):
             if node.op.value is not None:
                 input_data[nid] = [float(node.op.value)]
             else:
-                shape = tuple(int(d) for d in node.output.shape)
+                shape = tuple(d.as_static() for d in node.output.shape)
                 input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")

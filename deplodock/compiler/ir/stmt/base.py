@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
@@ -265,13 +266,29 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
         return flat.simplify(SimplifyCtx.empty()).render(ctx)
     flat = None
     for d, idx in enumerate(indices):
-        stride = 1
+        stride: Expr = Literal(1, "int")
         for k in range(d + 1, len(shape)):
-            stride *= int(shape[k])
-        term: Expr = idx if stride == 1 else BinaryExpr("*", idx, Literal(stride, "int"))
+            stride = BinaryExpr("*", stride, _shape_dim_expr(shape[k]))
+        stride = stride.simplify(SimplifyCtx.empty())
+        term: Expr = idx if _is_one(stride) else BinaryExpr("*", idx, stride)
         flat = term if flat is None else BinaryExpr("+", flat, term)
     assert flat is not None
     return flat.simplify(SimplifyCtx.empty()).render(ctx)
+
+
+def _shape_dim_expr(d) -> Expr:
+    """Wrap a shape element as an ``Expr``: ``Literal`` for static ``Dim`` /
+    ``int``, ``Var`` for symbolic ``Dim('name')``. The simplifier folds
+    arithmetic across the resulting tree before rendering."""
+    if isinstance(d, Dim):
+        return Literal(d.value, "int") if d.is_static else Var(d.value)
+    if isinstance(d, int):
+        return Literal(d, "int")
+    raise TypeError(f"_shape_dim_expr: unexpected shape element {d!r}")
+
+
+def _is_one(e: Expr) -> bool:
+    return isinstance(e, Literal) and e.value == 1
 
 
 # ---------------------------------------------------------------------------

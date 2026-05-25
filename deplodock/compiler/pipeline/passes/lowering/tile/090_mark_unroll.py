@@ -76,8 +76,16 @@ def _nest_trips(loop) -> int:
     """Trip count when ``loop`` is unrolled: ``axis.extent`` × the sum
     of inner loop trip counts. Siblings sum (each runs once per outer
     iteration) and a single child reduces to plain product. Used to
-    estimate the unrolled body size."""
-    total = int(loop.axis.extent)
+    estimate the unrolled body size.
+
+    Symbolic-extent loops report a placeholder trip count above the
+    unroll threshold so ``mark_unroll`` declines to unroll them — there
+    is no compile-time bound to amortize and emitting ``#pragma unroll``
+    on a runtime-bound loop is a no-op (or worse, blocks NVRTC's
+    auto-unroll heuristic)."""
+    if not loop.axis.extent.is_static:
+        return 10**9
+    total = loop.axis.extent.as_static()
     inner_trips = sum(_nest_trips(s) for s in loop.body if isinstance(s, (SerialTile, StridedTile)))
     if inner_trips:
         total *= inner_trips

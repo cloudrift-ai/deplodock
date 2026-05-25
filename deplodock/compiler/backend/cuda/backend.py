@@ -134,9 +134,16 @@ class CudaBackend(Backend):
             result, pre_result = run_program(compiled, input_data=input_data, pre_run=pre_run)
             result_outputs = result.outputs
             time_ms = result.time_ms
+        # Symbolic output shapes (Dim("seq_len")) bind from the supplied input
+        # array shapes via the same per-buffer mapping the launch resolver uses.
+        sym_env: dict[str, int] = {}
+        for nid in compiled.inputs:
+            for d, dim in enumerate(compiled.nodes[nid].output.shape):
+                if not dim.is_static and input_data is not None and nid in input_data:
+                    sym_env.setdefault(dim.value, int(input_data[nid].shape[d]))
         outputs: dict[str, np.ndarray] = {}
         for name, vals in result_outputs.items():
-            shape = tuple(int(d) for d in compiled.nodes[name].output.shape)
+            shape = tuple(d.as_static() if d.is_static else sym_env[d.value] for d in compiled.nodes[name].output.shape)
             outputs[name] = np.asarray(vals, dtype=compiled.nodes[name].output.dtype.np).reshape(shape)
         return RunResult(outputs=outputs, time_ms=time_ms), pre_result
 

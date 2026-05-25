@@ -32,8 +32,8 @@ def _maybe_gqa(frag: Graph, src: Node | str, q_batch: tuple, src_batch: tuple, t
     """
     if not (q_batch and src_batch):
         return src
-    q_heads = q_batch[-1] if isinstance(q_batch[-1], int) else None
-    s_heads = src_batch[-1] if isinstance(src_batch[-1], int) else None
+    q_heads = q_batch[-1].as_static() if q_batch[-1].is_static else None
+    s_heads = src_batch[-1].as_static() if src_batch[-1].is_static else None
     if not (q_heads and s_heads and q_heads > s_heads and q_heads % s_heads == 0):
         return src
     head_axis = len(src_batch) - 1
@@ -65,7 +65,7 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out
     frag = open_fragment(graph, [inp_q, inp_k, inp_v])
 
     # K^T then GQA broadcast.
-    kt_shape = k_batch + (head_dim, seq_len) if isinstance(head_dim, int) else k_shape
+    kt_shape = k_batch + (head_dim, seq_len) if head_dim.is_static else k_shape
     kt_id = frag.add_node(
         op=TransposeOp(axes=(-2, -1)),
         inputs=[inp_k],
@@ -77,7 +77,7 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out
     qk = matmul_decompose(frag, inp_q, kt, name=f"{name}_qk")
 
     # Scale by 1/sqrt(head_dim).
-    scale_value = 1.0 / math.sqrt(head_dim) if isinstance(head_dim, int) else None
+    scale_value = 1.0 / math.sqrt(head_dim.as_static()) if head_dim.is_static else None
     scale_bc = const_bc(frag, name=f"{name}_scale", value=scale_value, target_shape=scores_shape, dtype=dtype)
     scaled_id = frag.add_node(
         op=ElementwiseOp(op="multiply"),

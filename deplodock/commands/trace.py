@@ -111,16 +111,18 @@ def _handle_trace_code(args):
     _save(graph, args, default_basename=slug)
 
 
-def graph_from_code(code: str):
+def graph_from_code(code: str, dynamic_shapes: dict | None = None):
     """Trace an inline torch expression and return ``(graph, filename_slug)``.
 
     Shared by ``deplodock trace --code`` and ``deplodock compile --code``.
+    ``dynamic_shapes`` flows through to ``torch.export.export`` so the
+    resulting graph can carry symbolic dims from the SymInt pass.
     """
-    info = trace_inline_code(code)
+    info = trace_inline_code(code, dynamic_shapes=dynamic_shapes)
     return info["graph"], info["slug"]
 
 
-def trace_inline_code(code: str) -> dict:
+def trace_inline_code(code: str, dynamic_shapes: dict | None = None) -> dict:
     """Trace an inline torch expression and return graph + the runnable module.
 
     Returns a dict with ``graph``, ``slug``, ``module``, ``args``, ``kwargs``,
@@ -167,7 +169,7 @@ def trace_inline_code(code: str) -> dict:
                 if kw.arg
             }
             logger.info("Tracing inline module: %s", ast.unparse(final_expr.func))
-            graph, const_targets = trace_module_with_constants(maybe_mod, args, kwargs=kws or None)
+            graph, const_targets = trace_module_with_constants(maybe_mod, args, kwargs=kws or None, dynamic_shapes=dynamic_shapes)
             return {
                 "graph": graph,
                 "slug": _slugify(ast.unparse(final_expr.func)),
@@ -207,7 +209,7 @@ def trace_inline_code(code: str) -> dict:
     module = scope["_Wrapper"]()
     example_inputs = tuple(tensor_params.values())
     logger.info("Tracing inline expression: %s", ast.unparse(final_expr))
-    graph, const_targets = trace_module_with_constants(module, example_inputs)
+    graph, const_targets = trace_module_with_constants(module, example_inputs, dynamic_shapes=dynamic_shapes)
     return {
         "graph": graph,
         "slug": _slugify(ast.unparse(final_expr)),

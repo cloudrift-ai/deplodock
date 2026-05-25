@@ -158,11 +158,14 @@ def _serialize_field(v):
     Everything else passes through. ``_deserialize_field`` reverses
     this on load.
     """
+    from deplodock.compiler.dim import Dim
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.stmt import Body
 
     if isinstance(v, ElementwiseImpl):
         return v.name
+    if isinstance(v, Dim):
+        return v.value
     if isinstance(v, Body):
         # Body is a ``tuple`` subclass; downcast to plain tuple so
         # JSON encodes element-by-element rather than via ``__repr__``
@@ -174,6 +177,8 @@ def _serialize_field(v):
             "fields": {k: _serialize_field(x) for k, x in v.__dict__.items() if not k.startswith("_")},
         }
     if isinstance(v, (list, tuple)) and v and all(isinstance(x, Op) for x in v):
+        return [_serialize_field(x) for x in v]
+    if isinstance(v, (list, tuple)) and v and any(isinstance(x, Dim) for x in v):
         return [_serialize_field(x) for x in v]
     return v
 
@@ -225,6 +230,7 @@ def _stmt_eval_scope() -> dict:
         return _STMT_EVAL_SCOPE
     import numpy as _np
 
+    from deplodock.compiler.dim import Dim
     from deplodock.compiler.dtype import DataType
     from deplodock.compiler.ir.axis import Axis
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -270,6 +276,7 @@ def _stmt_eval_scope() -> dict:
     )
 
     _STMT_EVAL_SCOPE = {
+        "Dim": Dim,
         "Axis": Axis,
         "Var": Var,
         "Literal": Literal,
@@ -590,8 +597,19 @@ class Graph:
         """
         from dataclasses import fields as dc_fields  # noqa: PLC0415
 
+        from deplodock.compiler.dim import Dim  # noqa: PLC0415
         from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
         from deplodock.compiler.structural import digest  # noqa: PLC0415
+
+        def _unwrap_dims(v: object) -> object:
+            """Unwrap ``Dim`` to its ``int | str`` value (recursively into
+            tuples). Keeps digests stable across the static-int → ``Dim``
+            migration; symbolic dims hash by name, not by current binding."""
+            if isinstance(v, Dim):
+                return v.value
+            if isinstance(v, tuple):
+                return tuple(_unwrap_dims(x) for x in v)
+            return v
 
         keys: dict[str, str] = {}
 
@@ -605,10 +623,12 @@ class Graph:
             if isinstance(body, Body):
                 op_payload: tuple = ("body", body.structural_key())
             else:
-                attrs = tuple((f.name, repr(getattr(op, f.name))) for f in dc_fields(op) if f.name not in _STRUCTURAL_SKIP_FIELDS)
+                attrs = tuple(
+                    (f.name, repr(_unwrap_dims(getattr(op, f.name)))) for f in dc_fields(op) if f.name not in _STRUCTURAL_SKIP_FIELDS
+                )
                 op_payload = ("attrs", attrs)
             out = node.output
-            out_payload = (tuple(out.shape), out.dtype)
+            out_payload = (_unwrap_dims(tuple(out.shape)), out.dtype)
             input_payload = tuple(node_key(i) for i in node.inputs)
             d = digest(type(op).__name__, op_payload, out_payload, input_payload)
             keys[nid] = d
@@ -766,7 +786,7 @@ class Graph:
                 "inputs": node.inputs,
                 "output": {
                     "name": node.output.name,
-                    "shape": list(node.output.shape),
+                    "shape": [d.value for d in node.output.shape],
                     "dtype": node.output.dtype.name,
                 },
             }

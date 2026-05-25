@@ -92,7 +92,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     def _numel(shape):
         n = 1
         for d in shape:
-            n *= int(d)
+            n *= d.as_static()
         return n
 
     input_data: dict[str, np.ndarray] = {}

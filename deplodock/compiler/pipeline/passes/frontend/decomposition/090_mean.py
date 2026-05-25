@@ -1,5 +1,6 @@
 """Decompose MeanOp into sum + div by the reduced dimension size."""
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.frontend.ir import MeanOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
@@ -18,7 +19,7 @@ def rewrite(match: Match, root: Node, inp_x: Node, out: Tensor) -> Graph | None:
         dim_size = x_shape[axis % len(x_shape)]
     else:
         dim_size = 1
-    count_value = float(dim_size) if isinstance(dim_size, int) else 1.0
+    count_value = float(dim_size.as_static()) if isinstance(dim_size, Dim) and dim_size.is_static else 1.0
 
     frag = open_fragment(graph, [inp_x])
     sum_id = frag.add_node(

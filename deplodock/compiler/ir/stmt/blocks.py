@@ -108,7 +108,7 @@ class Loop(Stmt):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
-        extent = int(self.axis.extent)
+        extent = _extent_c(self.axis)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
@@ -133,6 +133,23 @@ def _body_uses_lane_warp(body: Body) -> bool:
     return bool(body.iter_of_type(WarpShuffle, TreeHalve))
 
 
+def _extent_c(ax: Axis) -> str:
+    """Render one axis extent as a C expression: literal int for static
+    ``Dim``, the symbolic name for ``Dim('seq_len')``. ``Dim.__str__``
+    already returns the bare ``value`` so a plain ``str(ax.extent)`` is
+    enough — kept as a helper so the intent reads as ``_extent_c(ax)``
+    rather than the unobvious ``str``-of-``Dim`` idiom."""
+    return str(ax.extent)
+
+
+def _stride_c(axes) -> str:
+    """Build a C expression for the product of axis extents — used as the
+    stride divisor in the grid-axis decode. ``1`` if ``axes`` is empty."""
+    if not axes:
+        return "1"
+    return " * ".join(_extent_c(a) for a in axes)
+
+
 def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderCtx) -> list[str]:
     """Decode ``idx_expr`` (``blockIdx.x`` or ``threadIdx.x``) into per-axis ints."""
     pad = _pad(ctx.indent)
@@ -141,19 +158,17 @@ def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderC
     if len(axes) == 1:
         return [f"{pad}int {axes[0].name} = {idx_expr};"]
     decoded: list[str] = []
-    stride = 1
+    stride_axes: list[Axis] = []  # accumulated INNER axes (per-step product is their extents)
     for ax in reversed(axes):
-        extent = int(ax.extent)
-        if stride == 1:
+        extent = _extent_c(ax)
+        if not stride_axes:
             decoded.append(f"int {ax.name} = {idx_expr} % {extent};")
         else:
-            decoded.append(f"int {ax.name} = ({idx_expr} / {stride}) % {extent};")
-        stride *= extent
+            decoded.append(f"int {ax.name} = ({idx_expr} / ({_stride_c(stride_axes)})) % {extent};")
+        stride_axes.append(ax)
     outer = axes[0]
-    outer_stride = 1
-    for ax in axes[1:]:
-        outer_stride *= int(ax.extent)
-    decoded[-1] = f"int {outer.name} = {idx_expr} / {outer_stride};"
+    outer_stride = _stride_c(list(axes[1:]))
+    decoded[-1] = f"int {outer.name} = {idx_expr} / ({outer_stride});"
     return [pad + line for line in reversed(decoded)]
 
 
@@ -161,22 +176,20 @@ def _render_thread_axis_decode(axes: tuple[Axis, ...], ctx: RenderCtx) -> list[s
     """Emit ``int <axis> = (tid / stride) % extent;`` per axis."""
     pad = _pad(ctx.indent)
     decoded: list[str] = []
-    stride = 1
+    stride_axes: list[Axis] = []
     for ax in reversed(axes):
-        extent = int(ax.extent)
-        if stride == 1:
+        extent = _extent_c(ax)
+        if not stride_axes:
             decoded.append(f"int {ax.name} = tid % {extent};")
         else:
-            decoded.append(f"int {ax.name} = (tid / {stride}) % {extent};")
-        stride *= extent
+            decoded.append(f"int {ax.name} = (tid / ({_stride_c(stride_axes)})) % {extent};")
+        stride_axes.append(ax)
     if len(axes) == 1:
         decoded = [f"int {axes[0].name} = tid;"]
     else:
         outer = axes[0]
-        outer_stride = 1
-        for ax in axes[1:]:
-            outer_stride *= int(ax.extent)
-        decoded[-1] = f"int {outer.name} = tid / {outer_stride};"
+        outer_stride = _stride_c(list(axes[1:]))
+        decoded[-1] = f"int {outer.name} = tid / ({outer_stride});"
     return [pad + line for line in reversed(decoded)]
 
 
@@ -252,7 +265,7 @@ class StridedLoop(Stmt):
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")

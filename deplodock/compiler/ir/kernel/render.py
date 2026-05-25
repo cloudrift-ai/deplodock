@@ -151,6 +151,7 @@ def render_kernelop(
     tensors: dict[str, Tensor] | None = None,
     shapes: dict[str, tuple[int, ...]] | None = None,
     literal_constants: dict[str, float] | None = None,
+    runtime_args: tuple[str, ...] = (),
 ) -> str:
     """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
@@ -219,6 +220,10 @@ def render_kernelop(
     # by-value ``CUtensorMap`` parameters require, so this avoids a
     # CUDA_ERROR_MISALIGNED_ADDRESS at launch.
     sig_parts.extend(f"const CUtensorMap* __restrict__ {n}" for n in desc_names)
+    # Runtime int args for symbolic axis extents (Dim("seq_len") etc.) come
+    # after buffers and TMA descriptors so the launcher can simply tail-append
+    # the resolved int values to the kernel-arg pack.
+    sig_parts.extend(f"int {n}" for n in runtime_args)
     params_text = ", ".join(sig_parts)
     bounds = _launch_bounds_for(kernel_op)
     launch_bounds = f"\n__launch_bounds__({bounds})"
@@ -294,7 +299,7 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
                 if isinstance(child, ThreadTile):
                     bsize = 1
                     for ax in child.axes:
-                        bsize *= int(ax.extent)
+                        bsize *= ax.extent.as_static()
                     return max(bsize, 1)
             return _BLOCK_SIZE
         if isinstance(s, ThreadTile):

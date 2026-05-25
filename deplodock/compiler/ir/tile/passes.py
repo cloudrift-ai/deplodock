@@ -90,7 +90,8 @@ def _parallel_rewrite(s: ParallelTile, rename: Rename, sigma: Sigma, axis_fn: Ax
 def _parallel_simplify(s: ParallelTile, ctx: SimplifyCtx) -> Stmt:
     inner = ctx
     for ax in s.axes:
-        inner = inner.extend(ax.name, Interval(0, int(ax.extent) - 1))
+        if ax.extent.is_static:
+            inner = inner.extend(ax.name, Interval(0, ax.extent.as_static() - 1))
     new_body = tuple(simplify(c, inner) for c in s.body)
     return _replace(s, body=new_body)
 
@@ -139,7 +140,7 @@ def _(s: SerialTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: SerialTile, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, int(s.axis.extent) - 1))
+    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
     return SerialTile(
         axis=s.axis,
         body=tuple(simplify(c, inner) for c in s.body),
@@ -162,7 +163,7 @@ def _(s: StridedTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: StridedTile, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, int(s.axis.extent) - 1))
+    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
     step = s.step.simplify(ctx) if isinstance(s.step, Expr) else s.step
     return StridedTile(
         axis=s.axis,

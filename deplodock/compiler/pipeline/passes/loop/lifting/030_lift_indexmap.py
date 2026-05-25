@@ -23,7 +23,7 @@ PATTERN = [Pattern("root", IndexMapOp)]
 
 def rewrite(match: Match, root: Node) -> Graph | None:
     graph = match.graph
-    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(root.op.out_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(root.op.out_shape))
     mapping = {f"{PLACEHOLDER_PREFIX}{i}": Var(a.name) for i, a in enumerate(axes)}
     write_index = tuple(Var(a.name) for a in axes)
 
@@ -79,7 +79,7 @@ def _substituted_index(coord_map: tuple, mapping: dict, src_shape: tuple) -> tup
     """Substitute placeholders in ``coord_map``; force ``Literal(0)`` for size-1 source dims."""
     out = []
     for i, c in enumerate(coord_map):
-        if i < len(src_shape) and isinstance(src_shape[i], int) and src_shape[i] == 1:
+        if i < len(src_shape) and src_shape[i].is_static and src_shape[i].as_static() == 1:
             out.append(Literal(0, "int"))
         else:
             out.append(c.substitute(mapping))

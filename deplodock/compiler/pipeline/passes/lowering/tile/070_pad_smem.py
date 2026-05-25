@@ -219,7 +219,7 @@ def _apply_pad(body: Body, plan: dict[int, dict[str, tuple[int, ...]]]) -> tuple
 
 
 def _pick_pad(loads: list[Load], src: Source, *, thread_axes: tuple[Axis, ...], inner_safe: bool) -> tuple[int, ...] | None:
-    base_extents = tuple(int(ax.extent) for ax in src.cache_axes)
+    base_extents = tuple(ax.extent.as_static() for ax in src.cache_axes)
     if not base_extents:
         return None
     base_conflict = _max_conflict(loads, base_extents, thread_axes)

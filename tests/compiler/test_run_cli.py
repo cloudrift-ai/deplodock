@@ -270,3 +270,18 @@ def test_run_ir_invalid_json(run_cli, tmp_path):
 def test_run_ir_missing_file(run_cli, tmp_path):
     rc, _, stderr = run_cli("run", "--ir", str(tmp_path / "does_not_exist.json"))
     assert rc != 0
+
+
+@requires_cuda
+def test_run_code_dynamic_seq_len(run_cli):
+    """``run --code --dynamic seq_len@x:1`` traces with torch.export's
+    dynamic_shapes, compiles to a single ``int seq_len``-arg kernel,
+    runs it at the canonical shape, and checks accuracy against eager."""
+    rc, _, stderr = run_cli(
+        "run",
+        "--code",
+        "torch.nn.RMSNorm(64)(torch.randn(1,8,64))",
+        "--dynamic",
+        "seq_len@x:1",
+    )
+    assert rc == 0, f"stderr: {stderr}"

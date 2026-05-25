@@ -68,7 +68,7 @@ def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name:
 
             n = 1
             for d in node.output.shape:
-                n *= int(d)
+                n *= d.as_static()
             for key, p in module.named_parameters():
                 safe_key = "p_" + key.replace(".", "_")
                 # Match by the ConstantOp's stored name (which carries
@@ -205,7 +205,7 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
         elif isinstance(node.op, ConstantOp):
             n = 1
             for d in node.output.shape:
-                n *= int(d)
+                n *= d.as_static()
             for key, p in attn_cpu.named_parameters():
                 safe_key = "p_" + key.replace(".", "_")
                 if safe_key.endswith(node.op.name[2:]) and p.numel() == n:
