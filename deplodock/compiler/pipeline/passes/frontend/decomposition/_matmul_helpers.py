@@ -59,13 +59,19 @@ def matmul_unsqueeze(a_shape: tuple, b_shape: tuple) -> tuple[IndexMapOp, IndexM
     # Broadcast shape: max of each dim (they should be compatible now:
     # non-matching dims are size-1 from padding or unsqueeze).
     def _max_dim(a, b):
-        a_static = isinstance(a, Dim) and a.is_static or isinstance(a, int)
-        b_static = isinstance(b, Dim) and b.is_static or isinstance(b, int)
-        a_int = a.as_static() if isinstance(a, Dim) else (a if isinstance(a, int) else None)
-        b_int = b.as_static() if isinstance(b, Dim) else (b if isinstance(b, int) else None)
+        a_static = (isinstance(a, Dim) and a.is_static) or isinstance(a, int)
+        b_static = (isinstance(b, Dim) and b.is_static) or isinstance(b, int)
+        a_int = a.as_static() if isinstance(a, Dim) and a.is_static else (a if isinstance(a, int) else None)
+        b_int = b.as_static() if isinstance(b, Dim) and b.is_static else (b if isinstance(b, int) else None)
         if a_static and b_static:
             return max(a_int, b_int)
-        if a_static and a_int > 1:
+        # Symbolic vs static-1 collapses to the symbolic dim (broadcast). Two
+        # symbolic dims fall through to ``b`` — the typical matmul_unsqueeze
+        # case never pairs two distinct non-1 symbolic dims because the
+        # unsqueeze inserts size-1 entries on opposite sides.
+        if a_static and a_int == 1:
+            return b
+        if b_static and b_int == 1:
             return a
         return b
 

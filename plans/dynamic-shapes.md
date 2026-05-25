@@ -146,6 +146,17 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   grid spec and tail-appends them to the kernel arg pack. End-to-end: symbolic elementwise `exp(x)` and `RMSNorm`
   (traced + free-dim rewritten to ``Dim('seq_len')``) compile to a single ``CudaOp`` whose kernel source contains
   ``int seq_len`` and run correctly at multiple seq_len values. 1203 tests green.
+- **M4 — done.** ``_matmul_helpers._max_dim`` handles broadcast against symbolic dims (size-1-on-other-side
+  collapses cleanly); SDPA decomposition (``010_sdpa.py``) traces fine for symbolic seq_len because the inline
+  causal mask is already an ``IndexMapOp`` whose ``select`` clauses reference placeholder coords, not the extent.
+  ``130_reshape`` rewrites its coord-map strides as ``Expr`` trees (``Var('seq_len')`` for symbolic factors,
+  ``Literal`` for static) and runs them through ``simplify`` so a reshape through a symbolic dim threads cleanly.
+  ``build_full_model_wrapper`` gains a ``dynamic=True`` mode: forward becomes
+  ``forward(input_ids, attention_mask, position_ids)`` so the caller supplies a per-call mask sized to the
+  runtime seq_len; ``build_causal_mask`` is exposed for that purpose. M4 validation slice ("single-layer SDPA
+  traces with symbolic seq_len") covered by ``test_symbolic_sdpa_traces_and_decomposes``. The remaining
+  ``ReduceOp`` over symbolic seq_len (softmax max/sum + attn@V) survives decomposition but stays un-lifted
+  pending M5. 1204 tests green.
 
 ## Explicitly out of scope (v1)
 

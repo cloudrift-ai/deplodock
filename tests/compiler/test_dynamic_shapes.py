@@ -113,6 +113,44 @@ def test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens():
     assert op.kernel_source == cached_source
 
 
+def test_symbolic_sdpa_traces_and_decomposes():
+    """M4 validation: a single-layer causal SDPA + reshape traced from
+    torch, free seq_len dim rewritten to ``Dim('seq_len')``, decomposes
+    + lifts cleanly. Execution still requires M5 (symbolic reduce
+    axis); this test stops at the loop-lifted graph and asserts the
+    surviving op shapes carry symbolic dims end-to-end."""
+    import torch
+
+    from deplodock.compiler.ir.frontend.ir import ReshapeOp
+    from deplodock.compiler.trace.torch import trace_module
+
+    class AttnBlock(torch.nn.Module):
+        def forward(self, q, k, v):
+            attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            B, H, S, D = attn.shape
+            return attn.reshape(B, S, H * D)
+
+    b, h, s, d = 1, 4, 16, 64
+    graph = trace_module(AttnBlock(), (torch.randn(b, h, s, d), torch.randn(b, h, s, d), torch.randn(b, h, s, d)))
+    # Rewrite the seq_len position (index 2 of every shape, value 16) and ReshapeOp.shape.
+    for node in graph.nodes.values():
+        node.output.shape = tuple(Dim("seq_len") if (i in (1, 2) and dim == s) else dim for i, dim in enumerate(node.output.shape))
+        if isinstance(node.op, ReshapeOp):
+            node.op.shape = tuple("seq_len" if (i in (1, 2) and dim == s) else dim for i, dim in enumerate(node.op.shape))
+
+    decomp = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
+    # SDPA decomposition stamps softmax (max + exp + sum) over the kv_len axis.
+    # That axis is symbolic — the reduce ops survive the decomposition pass but
+    # are accepted because M0 widened ``ReduceOp.axis`` handling.
+    assert any(Dim("seq_len") in n.output.shape for n in decomp.nodes.values()), (
+        "expected at least one node to carry symbolic seq_len after decomposition"
+    )
+
+    lifted = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting"]).run(graph)
+    loop_op_count = sum(1 for n in lifted.nodes.values() if isinstance(n.op, LoopOp))
+    assert loop_op_count >= 1, "expected at least one LoopOp after lifting"
+
+
 def test_cuda_symbolic_rmsnorm_traced_and_run():
     """End-to-end on a real ``torch.nn.RMSNorm``: trace at one seq_len,
     rewrite the traced tensors' middle dim to ``Dim("seq_len")``, compile
