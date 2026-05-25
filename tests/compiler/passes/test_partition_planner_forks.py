@@ -25,9 +25,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.pipeline import Fork
 
-_planner = importlib.import_module(
-    "deplodock.compiler.pipeline.passes.lowering.tile.000_partition_loops"
-)
+_planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.000_partition_loops")
 _build_fork_tree = _planner._build_fork_tree
 _split_kernel_fully = _planner._split_kernel_fully
 
@@ -157,9 +155,7 @@ def test_leaves_preserve_every_variant():
     variants = _matmul_variants()
     tree = _build_fork_tree(variants, _ctx())
     leaves = _walk_leaves(tree)
-    assert len(leaves) == len(variants), (
-        f"leaf count {len(leaves)} doesn't match variant count {len(variants)}"
-    )
+    assert len(leaves) == len(variants), f"leaf count {len(leaves)} doesn't match variant count {len(variants)}"
 
 
 def test_leaf_knobs_are_bk_splitk_only():
@@ -169,9 +165,7 @@ def test_leaf_knobs_are_bk_splitk_only():
     variants = _matmul_variants()
     tree = _build_fork_tree(variants, _ctx())
     for leaf in _walk_leaves(tree):
-        assert set(leaf.knobs.keys()) <= {"BK", "SPLITK"}, (
-            f"leaf knobs leak into non-(BK,SPLITK): {leaf.knobs}"
-        )
+        assert set(leaf.knobs.keys()) <= {"BK", "SPLITK"}, f"leaf knobs leak into non-(BK,SPLITK): {leaf.knobs}"
 
 
 def test_branch_score_is_max_of_children():
@@ -183,9 +177,7 @@ def test_branch_score_is_max_of_children():
         children = branch.expand()
         assert children
         expected = max(c.score for c in children)
-        assert branch.score == pytest.approx(expected), (
-            f"branch.score {branch.score} != max(child scores) {expected}"
-        )
+        assert branch.score == pytest.approx(expected), f"branch.score {branch.score} != max(child scores) {expected}"
 
 
 def test_first_leaf_matches_best_score_variant():
