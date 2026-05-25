@@ -54,6 +54,7 @@ self-skips.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace as _replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
@@ -61,11 +62,11 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
-    BufferedStage,
     Source,
+    StageBundle,
+    StagePolicy,
     ThreadTile,
     TileOp,
-    TmaBufferedStage,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -133,29 +134,32 @@ def _plan_walk(body: Body, plan: dict[int, dict[str, tuple[int, ...]]], *, threa
         if isinstance(s, ThreadTile):
             _plan_walk(s.body, plan, thread_axes=s.axes)
             continue
-        if isinstance(s, BufferedStage) and not isinstance(s, TmaBufferedStage):
-            _plan_for_stage(s, plan, thread_axes=thread_axes)
+        # Pad applies to BUFFERED / ASYNC bundles; SYNC has no buffer
+        # rotation that needs the conflict break, TMA forbids padding.
+        if isinstance(s, StageBundle) and s.policy in (StagePolicy.BUFFERED, StagePolicy.ASYNC):
+            _plan_for_bundle(s, plan, thread_axes=thread_axes)
         for b in s.nested():
             _plan_walk(b, plan, thread_axes=thread_axes)
 
 
-def _plan_for_stage(stage: BufferedStage, plan: dict[int, dict[str, tuple[int, ...]]], *, thread_axes: tuple[Axis, ...]) -> None:
+def _plan_for_bundle(bundle: StageBundle, plan: dict[int, dict[str, tuple[int, ...]]], *, thread_axes: tuple[Axis, ...]) -> None:
     if not thread_axes:
         return
     per_src: dict[str, tuple[int, ...]] = {}
-    for src in stage.sources:
-        if src.pad and any(src.pad):
-            continue
-        loads = [s for s in stage.body.iter() if isinstance(s, Load) and s.input == src.name]
-        if not loads:
-            continue
-        inner_safe = not _has_vectorizable_run(loads)
-        pad = _pick_pad(loads, src, thread_axes=thread_axes, inner_safe=inner_safe)
-        if pad is None:
-            continue
-        per_src[src.name] = pad
+    for stage in bundle.stages:
+        for src in stage.sources:
+            if src.pad and any(src.pad):
+                continue
+            loads = [s for s in bundle.body.iter() if isinstance(s, Load) and s.input == src.name]
+            if not loads:
+                continue
+            inner_safe = not _has_vectorizable_run(loads)
+            pad = _pick_pad(loads, src, thread_axes=thread_axes, inner_safe=inner_safe)
+            if pad is None:
+                continue
+            per_src[src.name] = pad
     if per_src:
-        plan[id(stage)] = per_src
+        plan[id(bundle)] = per_src
 
 
 def _has_vectorizable_run(loads: list[Load]) -> bool:
@@ -193,16 +197,24 @@ def _apply_pad(body: Body, plan: dict[int, dict[str, tuple[int, ...]]]) -> tuple
     out: list[Stmt] = []
     applied = False
     for s in body:
-        if isinstance(s, BufferedStage) and id(s) in plan:
+        if isinstance(s, StageBundle) and id(s) in plan:
             per_src = plan[id(s)]
-            new_sources: list[Source] = []
-            for src in s.sources:
-                if src.name in per_src:
-                    new_sources.append(src.with_pad(per_src[src.name]))
-                    applied = True
+            new_stages = []
+            for stage in s.stages:
+                new_sources: list[Source] = []
+                src_changed = False
+                for src in stage.sources:
+                    if src.name in per_src:
+                        new_sources.append(src.with_pad(per_src[src.name]))
+                        applied = True
+                        src_changed = True
+                    else:
+                        new_sources.append(src)
+                if src_changed:
+                    new_stages.append(stage.replace_sources(tuple(new_sources)))
                 else:
-                    new_sources.append(src)
-            s = s.replace_sources(tuple(new_sources))
+                    new_stages.append(stage)
+            s = _replace(s, stages=tuple(new_stages))
         nested = s.nested()
         if nested:
             new_bodies: list[Body] = []

@@ -26,7 +26,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import RegisterTile, Stage, TileOp
+from deplodock.compiler.ir.tile.ir import RegisterTile, Stage, StageBundle, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import replace_thread_tile_body, single_tile, thread_tile_of
 
@@ -122,11 +122,14 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
     buffers, constants, axis-free producers)."""
 
     def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
-        # Stage cache-axis Vars are smem-local — they don't vary per replica.
-        # Mark them bound here so Stages aren't tagged for replication; only
-        # the consumer Loads (which σ-rewrite cache-axis Vars) multiply.
+        # Stage / StageBundle cache-axis Vars are smem-local — they don't vary
+        # per replica. Mark them bound here so the staging IR isn't tagged for
+        # replication; only the consumer Loads (which σ-rewrite cache-axis
+        # Vars) multiply.
         if isinstance(s, Stage):
             local_bound = bound | frozenset(ax.name for src in s.sources for ax in src.cache_axes)
+        elif isinstance(s, StageBundle):
+            local_bound = bound | frozenset(ax.name for stage in s.stages for src in stage.sources for ax in src.cache_axes)
         else:
             local_bound = bound
         own: frozenset[str] = frozenset()

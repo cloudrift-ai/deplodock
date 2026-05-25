@@ -50,6 +50,8 @@ Eligibility:
 
 from __future__ import annotations
 
+from dataclasses import replace as _replace
+
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
@@ -57,11 +59,11 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
-    AsyncBufferedStage,
     AsyncWait,
     SerialTile,
+    StageBundle,
+    StagePolicy,
     TileOp,
-    TmaBufferedStage,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
@@ -74,7 +76,7 @@ def rewrite(ctx: Context, root: Node) -> TileOp | None:
     body = root.op.body
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no eligible serial_outer with AsyncBufferedStage to pipeline")
+        raise RuleSkipped("no eligible serial_outer with ASYNC/TMA StageBundle to pipeline")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
@@ -110,22 +112,24 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
         return None
     if len(kouter.body) != 1:
         return None
-    stage = kouter.body[0]
-    if not isinstance(stage, AsyncBufferedStage):
+    bundle = kouter.body[0]
+    if not isinstance(bundle, StageBundle):
         return None
-    # Idempotence: already-pipelined stages bear pipeline_depth > 1.
-    if stage.pipeline_depth != 1:
+    if bundle.policy not in (StagePolicy.ASYNC, StagePolicy.TMA):
+        return None
+    # Idempotence: already-pipelined bundles bear pipeline_depth > 1.
+    if bundle.pipeline_depth != 1:
         return None
     # Consumer body must hold the K_i reduce — otherwise pipelining has
     # nothing to peel into the epilogue.
-    reduces = [s for s in stage.body.iter() if isinstance(s, SerialTile) and s.kind == "stage_inner" and s.is_reduce]
+    reduces = [s for s in bundle.body.iter() if isinstance(s, SerialTile) and s.kind == "stage_inner" and s.is_reduce]
     if not reduces:
         return None
     # Reject inter-iter SSA dependencies in the K_i reduce body — the
     # σ_next / σ_last rewrites assume each chunk is independent. Online
     # softmax (running max / sum read mid-iter) and similar shapes
     # compound fp32 drift under the prologue/main/epilogue peel and
-    # produce wrong output. Same gate the pre-refactor 015 carried.
+    # produce wrong output.
     from deplodock.compiler.ir.stmt import Accum  # noqa: PLC0415
 
     for k_inner in reduces:
@@ -141,24 +145,15 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
     sigma_next = Sigma({k_var: Var(k_var) + Literal(1, "int")})
     sigma_last = Sigma({k_var: Literal(n - 1, "int")})
 
-    is_tma = isinstance(stage, TmaBufferedStage)
-    buffer_count = stage.buffer_count
+    is_tma = bundle.policy == StagePolicy.TMA
+    buffer_count = bundle.buffer_count
 
-    def _issue_only(sigma: Sigma) -> AsyncBufferedStage:
-        rewritten = stage.rewrite(_id, sigma)
-        # Pre-pipelined stages carried the consumer body; the issue-only
-        # copy used in prologue / steady-state issue carries empty body
-        # so the materializer skips the wrap-boundary wait and emits
-        # just the producer scaffolding.
-        extra = {"swizzle": rewritten.swizzle} if is_tma else {}
-        return type(rewritten)(
-            sources=rewritten.sources,
-            body=Body(()),
-            buffer_count=buffer_count,
-            phase=rewritten.phase,
-            pipeline_depth=_PIPELINE_DEPTH,
-            **extra,
-        )
+    def _issue_only(sigma: Sigma) -> StageBundle:
+        rewritten = bundle.rewrite(_id, sigma)
+        # Issue-only copy used in prologue / steady-state issue carries
+        # empty body so the materializer skips the wrap-boundary wait
+        # and emits just the producer scaffolding.
+        return _replace(rewritten, body=Body(()), pipeline_depth=_PIPELINE_DEPTH)
 
     # Prologue: issue chunk 0.
     prologue: list[Stmt] = [_issue_only(sigma_first)]
@@ -167,35 +162,22 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
     next_issue = _issue_only(sigma_next)
     if is_tma:
         # Per-slot mbarrier semantics: each ring slot has its own mbar
-        # that alternates parity 0,1,0,1... over successive uses. At
-        # iter K_o the consumer reads slot K_o % bc; that slot was used
-        # K_o / bc times before, so the parity to test is
-        # (K_o / bc) % 2. TMA wants WAIT → PREFETCH ordering so the
-        # prefetch doesn't arrive on a slot mbarrier whose previous tx
-        # may not have drained yet.
+        # that alternates parity 0,1,0,1... over successive uses.
         body_slot = Var(k_var) % Literal(buffer_count, "int")
         body_phase = (Var(k_var) / Literal(buffer_count, "int")) % Literal(2, "int")
         main_body_stmts: tuple[Stmt, ...] = (
             AsyncWait(keep=1, phase=body_phase, slot=body_slot),
-            *stage.body,
+            *bundle.body,
             next_issue,
         )
     else:
         # cp.async: ISSUE → WAIT(keep=1) → CONSUME → WAIT(keep=1). The
-        # leading wait drains chunk K_o so consume reads fresh data;
-        # the just-issued chunk K_o+1 stays in flight. The trailing
-        # wait is a no-op for the in-flight count (still 1) but its
-        # paired __syncthreads is load-bearing: with buffer_count=2,
-        # the NEXT iter's next_issue writes slot (K_o+2)%2 = K_o%2 —
-        # the same slot this iter's consume just read. Without a
-        # CTA-wide barrier between consume and next-iter's cp.async
-        # issue, a fast warp's queued cp.async overwrites bytes a slow
-        # warp is still reading. Visible only at K_o >= 3 (K_o=1,2
-        # don't loop or don't rotate the ring far enough to alias).
+        # trailing wait's paired __syncthreads prevents next-iter's
+        # cp.async issue from overwriting the slot this iter just read.
         main_body_stmts = (
             next_issue,
             AsyncWait(keep=1),
-            *stage.body,
+            *bundle.body,
             AsyncWait(keep=1),
         )
 
@@ -215,7 +197,7 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
         epilogue.append(AsyncWait(keep=0, phase=epi_phase, slot=epi_slot))
     else:
         epilogue.append(AsyncWait(keep=0))
-    epilogue.extend(c.rewrite(_id, sigma_last) for c in stage.body)
+    epilogue.extend(c.rewrite(_id, sigma_last) for c in bundle.body)
 
     return [*prologue, main_loop, *epilogue]
 

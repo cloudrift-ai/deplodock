@@ -55,15 +55,15 @@ from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     AsyncWait,
-    ComputeStage,
     GridTile,
     RegisterTile,
     SerialTile,
     Stage,
+    StageBundle,
+    StagePolicy,
     StridedTile,
     ThreadTile,
     TileOp,
-    TmaBufferedStage,
 )
 from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
@@ -182,27 +182,21 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     mbar_prologue: list[Stmt] = []
     declared_mbar: set[str] = set()
 
-    # Compute-Stage Smem hoist: a ComputeStage (produced by
-    # 030_hoist_invariant_compute when FUSED_PIPELINE=True) and an
-    # inline-fuse multi-source Stage (FUSED_PIPELINE=False) both emit
-    # their body inside the K-outer loop body — Smem decls inside a
-    # loop don't reach kernel scope in CUDA. Walk the body once, pre-
-    # emit Smem decls at kernel scope, and mark them ``declared_smem``
-    # so ``_emit_stage``'s in-loop emit is dedup'd. Single-source
-    # transport stages are hoisted to prologue naturally by 015.
-    # Hoist every Stage's per-Source Smem decl to kernel scope so the
-    # Stages' producer side (cooperative load) can emit the Smem decl
-    # in-line without escaping the Stage.body scope. The new wrap-body
-    # Stage's body IS the consumer; in CUDA, an Smem decl inside a Loop
-    # body doesn't reach kernel scope, so the hoist happens here.
+    # Smem decls inside a loop don't reach kernel scope in CUDA. Walk the
+    # body once, pre-emit Smem decls at kernel scope, and mark them
+    # ``declared_smem`` so per-stage emits are dedup'd. The bundle's
+    # ``buffer_count`` scales the leading extent for BUFFERED/ASYNC/TMA;
+    # SYNC has buffer_count == 1 (no leading slot dim).
     compute_stage_prologue: list[Stmt] = []
     for stmt in body.iter():
-        if isinstance(stmt, Stage):
-            for src in stmt.sources:
+        if not isinstance(stmt, StageBundle):
+            continue
+        buf_count = stmt.buffer_count if stmt.policy != StagePolicy.SYNC else 1
+        for member in stmt.stages:
+            for src in member.sources:
                 if src.name in declared_smem:
                     continue
                 extents = src.alloc_extents
-                buf_count = getattr(stmt, "buffer_count", 1)
                 if buf_count > 1:
                     extents = (buf_count, *extents)
                 smem_dtype = smem_cuda_dtype(src)
@@ -243,16 +237,15 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # or AsyncWait whose pipeline group couldn't be inferred).
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
-    def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
-        # Wrap-body invariant: 050_use_tma only promotes single-Source
-        # stages, so the box-copy here issues exactly one TMA load per
-        # group activation.
-        assert len(stage.sources) == 1, f"TmaBufferedStage requires one Source, got {len(stage.sources)}"
+    def emit_tma_stage(bundle: StageBundle, stage: Stage) -> list[Stmt]:
+        # 050_use_tma only promotes single-Source bundles, so the box-copy
+        # here issues exactly one TMA load per group activation per member.
+        assert len(stage.sources) == 1, f"TMA stage requires one Source, got {len(stage.sources)}"
         src = stage.sources[0]
         addressing = src.addressing
-        assert isinstance(addressing, AffineAddressing), f"TmaBufferedStage source {src.name!r} must use AffineAddressing"
+        assert isinstance(addressing, AffineAddressing), f"TMA stage source {src.name!r} must use AffineAddressing"
         desc_name = f"{src.name}_desc"
-        gid = tma.stage_group[id(stage)]
+        gid = tma.stage_group[id(bundle)]
         mbar_name = tma.mbar_name(gid)
         # Box extents per source dim: product of cache extents that map
         # to that dim (multiple cache axes can sweep the same source dim
@@ -342,58 +335,81 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
             Smem(name=src.name, extents=full_extents, align=align, dtype=smem_dtype),
             cond,
         ]
-        # Implicit wait at the wrap boundary for unpipelined stages
-        # (pipeline_depth == 1). Mirrors the AsyncBufferedStage flow in
-        # ``_emit_stage`` — the consumer body sees the committed copy
-        # before reading. ``080_pipeline_stages`` (when it
-        # lands) expands depth > 1 stages and emits its own waits.
-        if stage.pipeline_depth == 1:
-            mbar_phase = _mbar_wait_phase(stage.phase, stage.buffer_count)
-            out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=stage.phase))
+        # Implicit wait at the wrap boundary for unpipelined bundles
+        # (pipeline_depth == 1). The bundle wrapping this stage carries
+        # the phase / buffer_count / pipeline_depth.
+        if bundle.pipeline_depth == 1:
+            mbar_phase = _mbar_wait_phase(bundle.phase, bundle.buffer_count)
+            out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=bundle.phase))
             out.append(Sync())
         return out
 
-    for stmt in body:
-        if isinstance(stmt, TmaBufferedStage):
-            new_body.extend(filter_emit(emit_tma_stage(stmt)))
-        elif isinstance(stmt, ComputeStage):
-            new_body.extend(filter_emit(emit_compute_stage(stmt, tid_expr, n_threads)))
-        elif isinstance(stmt, Stage):
-            new_body.extend(filter_emit(emit_stage(stmt, tid_expr, n_threads)))
-        elif isinstance(stmt, AsyncWait):
-            new_body.extend(emit_async_wait(stmt))
-        elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
-            new_body.append(_emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait))
-            # Locate Accums whose value escapes this loop scope so we
-            # can emit helper-driven Combines for cooperative ones.
+    def emit_bundle_producer(bundle: StageBundle) -> list[Stmt]:
+        """Emit producer-side scaffolding for every member Stage of a
+        bundle. Dispatch:
+
+        - ``member.compute is not None`` → cooperative compute template
+          (formerly ``ComputeStage``).
+        - ``bundle.policy == TMA`` → TMA box copy.
+        - otherwise (SYNC / BUFFERED / ASYNC) → cooperative
+          ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC).
+        """
+        out: list[Stmt] = []
+        for member in bundle.stages:
+            if member.compute is not None:
+                out.extend(emit_compute_stage(member, tid_expr, n_threads, buffer_count=bundle.buffer_count))
+            elif bundle.policy == StagePolicy.TMA:
+                out.extend(emit_tma_stage(bundle, member))
+            else:
+                out.extend(
+                    emit_stage(
+                        member,
+                        tid_expr,
+                        n_threads,
+                        policy=bundle.policy,
+                        buffer_count=bundle.buffer_count,
+                        phase=bundle.phase,
+                        pipeline_depth=bundle.pipeline_depth,
+                    )
+                )
+        return out
+
+    def _process_stmt(stmt: Stmt) -> list[Stmt]:
+        """Materialize one body Stmt — bundles inline their producer code
+        then recursively process their consumer body."""
+        if isinstance(stmt, StageBundle):
+            out_local: list[Stmt] = list(filter_emit(emit_bundle_producer(stmt)))
+            for inner in stmt.body:
+                out_local.extend(_process_stmt(inner))
+            return out_local
+        if isinstance(stmt, AsyncWait):
+            return list(emit_async_wait(stmt))
+        if isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
+            single = _emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, emit_async_wait)
+            extra: list[Stmt] = []
             if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
-                # Single-loop reduce: Accums live at the immediate-body level.
                 accums_in_scope = {a.name: a for a in stmt.body if isinstance(a, Accum)}
             else:
-                # Non-reduce wrapper (e.g. ``SerialTile(K_o, kind="serial_outer",
-                # body=[SerialTile(K_i, kind="stage_inner", reduce, [Accum])])``
-                # for cooperative-K reduce after the partition planner's σ-split).
-                # Descend into nested reduce subtrees so sibling Combines match
-                # their Accums' dtypes.
                 accums_in_scope = find_nested_reduce_accums(stmt.body)
             for acc_name, acc in accums_in_scope.items():
                 if escape is not None and escape.accum_cooperative_axes.get(acc_name):
                     tid_var = single_thread_var(thread_axes)
                     dt = acc.dtype or F32
-                    new_body.extend(emit_combine(acc_name, acc.op, tid_var, n_threads, dt, warp_size=warp_size))
+                    extra.extend(emit_combine(acc_name, acc.op, tid_var, n_threads, dt, warp_size=warp_size))
                     rename[acc_name] = f"{acc_name}_b"
-        elif isinstance(stmt, Accum):
-            # Bare Accum at the ThreadTile scope — degenerate cooperative
-            # reduce where K_i collapsed to size-1 (e.g. K=warp_size with
-            # BR=warp_size cooperative threads each handling one element).
-            new_body.append(transform(stmt))
+            return [single, *extra]
+        if isinstance(stmt, Accum):
+            out_local = [transform(stmt)]
             if escape is not None and escape.accum_cooperative_axes.get(stmt.name):
                 tid_var = single_thread_var(thread_axes)
                 dt = stmt.dtype or F32
-                new_body.extend(emit_combine(stmt.name, stmt.op, tid_var, n_threads, dt, warp_size=warp_size))
+                out_local.extend(emit_combine(stmt.name, stmt.op, tid_var, n_threads, dt, warp_size=warp_size))
                 rename[stmt.name] = f"{stmt.name}_b"
-        else:
-            new_body.append(transform(stmt))
+            return out_local
+        return [transform(stmt)]
+
+    for stmt in body:
+        new_body.extend(_process_stmt(stmt))
 
     # Init scoping for accumulators is handled by the upstream
     # ``020_place_inits`` pass — explicit ``Init`` Stmts already sit at
@@ -420,7 +436,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     return ThreadTile(axes=axes, body=new_body)
 
 
-def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage, emit_async_wait) -> Stmt:
+def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, emit_async_wait) -> Stmt:
     """Translate a body SerialTile / StridedTile / RegisterTile. Recurses
     so nested staging / loops / writes inside the body get the same
     uniform treatment. The wrapper type is preserved — strategies
@@ -435,12 +451,11 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_tma_stage
     TMA hoist + active-mbar state with the top-level walker."""
 
     def materialize_leaf(s: Stmt):
-        if isinstance(s, TmaBufferedStage):
-            return filter_emit(emit_tma_stage(s))
-        if isinstance(s, ComputeStage):
-            return filter_emit(emit_compute_stage(s, tid_expr, n_threads))
-        if isinstance(s, Stage):
-            return filter_emit(emit_stage(s, tid_expr, n_threads))
+        if isinstance(s, StageBundle):
+            # Producer-side stmts followed by the bundle's consumer body
+            # inlined as siblings. Bundle body has already been mapped
+            # post-order, so its contents are kernel-IR.
+            return [*filter_emit(emit_bundle_producer(s)), *s.body]
         if isinstance(s, AsyncWait):
             return emit_async_wait(s)
         if s.nested():

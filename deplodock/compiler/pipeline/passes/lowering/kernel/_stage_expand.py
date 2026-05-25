@@ -16,7 +16,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, BufferedStage, ComputeStage, Stage, TemplateAddressing
+from deplodock.compiler.ir.tile.ir import Stage, StagePolicy, TemplateAddressing
 
 
 def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | None
@@ -31,24 +31,30 @@ def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | N
     return cuda_name(src.dtype)
 
 
-def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
-    """Emit producer scaffolding for a wrap-body Stage.
+def emit_stage(
+    stage: Stage,
+    tid_expr,
+    n_threads: int,
+    *,
+    policy: StagePolicy,
+    buffer_count: int,
+    phase,
+    pipeline_depth: int,
+) -> list[Stmt]:
+    """Emit producer scaffolding for a Stage member of a StageBundle.
 
     For each ``Source`` in ``stage.sources``, emits per-source
-    cooperative ``Load + Write`` (or ``CpAsyncCopy`` for async transport).
-    Smem decls are hoisted to kernel scope in ``_materialize`` (we skip
-    them here unless not yet declared, in which case the dedup filter
-    will pass them through). Leading + trailing ``Sync`` bracket the
-    cooperative load.
+    cooperative ``Load + Write`` (``CpAsyncCopy`` for ASYNC). Smem decls
+    are hoisted to kernel scope in ``_materialize`` (we skip them via
+    the dedup filter). Leading + trailing ``Sync`` bracket the
+    cooperative load for SYNC policy; BUFFERED/ASYNC/TMA drop the
+    leading sync (different physical slab per iter).
 
-    Wrap-body semantics: ``stage.body`` is the *consumer* and has been
-    pre-flattened to siblings by ``flatten_wrap_stages`` before this
-    function runs. ``stage.body`` is empty at this point.
+    Bundle context (policy, buffer_count, phase, pipeline_depth) is
+    passed in; the Stage itself no longer carries those fields.
     """
-    # Buffered: ping-pong-style ring with phase indexing. Leading Sync
-    # dropped (different physical buffer per iter).
-    is_buffered = isinstance(stage, BufferedStage)
-    is_async = isinstance(stage, AsyncBufferedStage)
+    is_buffered = policy != StagePolicy.SYNC
+    is_async = policy == StagePolicy.ASYNC
 
     prelude: list[Stmt] = [] if is_buffered else [Sync()]
     body_out: list[Stmt] = list(prelude)
@@ -84,13 +90,13 @@ def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).
         if is_buffered:
-            smem_index = (stage.phase, *smem_index)
+            smem_index = (phase, *smem_index)
         # Per-source dtype: use gmem source's CUDA C type so fp16 inputs
         # stage into __half smem. ``Source.dtype`` is stamped by
         # ``030_stamp_types`` from the matching graph node's dtype.
         smem_dtype = smem_cuda_dtype(src)
         smem_align = 16 if smem_dtype == "__half" else 0
-        full_extents = (stage.buffer_count, *padded_extents) if is_buffered else padded_extents
+        full_extents = (buffer_count, *padded_extents) if is_buffered else padded_extents
 
         # cp.async path (sm_80+): fp32 only — fp16 falls through to sync
         # path because cp.async.ca's 4-byte size isn't a clean fit for
@@ -130,7 +136,7 @@ def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     # Sync stages just emit __syncthreads so the slab is CTA-visible.
     if is_async:
         body_out.append(CpAsyncCommit())
-        if stage.pipeline_depth == 1:
+        if pipeline_depth == 1:
             body_out.append(CpAsyncWait(group=0))
             body_out.append(Sync())
     else:
@@ -138,7 +144,7 @@ def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     return body_out
 
 
-def emit_compute_stage(stage: ComputeStage, tid_expr, n_threads: int) -> list[Stmt]:
+def emit_compute_stage(stage: Stage, tid_expr, n_threads: int, *, buffer_count: int) -> list[Stmt]:
     """Emit producer scaffolding for a ``ComputeStage``.
 
     Wraps ``stage.compute`` in a cooperative ``StridedLoop`` over the
@@ -156,9 +162,11 @@ def emit_compute_stage(stage: ComputeStage, tid_expr, n_threads: int) -> list[St
     """
     from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
 
-    # ComputeStage has exactly one output Source (the slab it fills).
+    # Compute Stage member has exactly one output Source (the slab it fills).
+    if stage.compute is None:
+        raise ValueError("emit_compute_stage: stage.compute is None — not a compute member")
     if len(stage.sources) != 1:
-        raise ValueError(f"ComputeStage: expected 1 output Source, got {len(stage.sources)}")
+        raise ValueError(f"compute Stage: expected 1 output Source, got {len(stage.sources)}")
     out = stage.sources[0]
     cache_axes = out.cache_axes
     if not cache_axes:
@@ -182,7 +190,7 @@ def emit_compute_stage(stage: ComputeStage, tid_expr, n_threads: int) -> list[St
     for s in stage.compute:
         new_stmts.append(s.rewrite(lambda n: n, sigma))
 
-    full_extents = (stage.buffer_count, *padded_extents) if stage.buffer_count > 1 else padded_extents
+    full_extents = (buffer_count, *padded_extents) if buffer_count > 1 else padded_extents
     body_out: list[Stmt] = [
         Sync(),
         Smem(name=out.name, extents=full_extents),

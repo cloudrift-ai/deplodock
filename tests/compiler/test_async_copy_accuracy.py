@@ -23,7 +23,7 @@ import pytest
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, TileOp
+from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 
 from .conftest import requires_cuda
 
@@ -66,7 +66,7 @@ def _has_async_stage(m: int, k: int, n: int) -> bool:
     op = g2.nodes["o"].op
     if not isinstance(op, TileOp):
         return False
-    return any(isinstance(s, AsyncBufferedStage) for s in op.body.iter())
+    return any((isinstance(s, StageBundle) and s.policy == StagePolicy.ASYNC) for s in op.body.iter())
 
 
 def _kernel_source(m: int, k: int, n: int) -> str:

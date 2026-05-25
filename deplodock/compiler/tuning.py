@@ -235,19 +235,25 @@ def _external_input_count(stmts) -> int:
     gated on ``count == 2``."""
     from deplodock.compiler.ir.stmt import Load
     from deplodock.compiler.ir.stmt.body import Body
-    from deplodock.compiler.ir.tile.ir import Stage
+    from deplodock.compiler.ir.tile.ir import Stage, StageBundle
 
     body = Body.coerce(stmts)
-    stage_names = {s.name for s in body.iter() if isinstance(s, Stage)}
+    # Collect smem decl names so we skip Loads that read from staged smem
+    # (not external gmem). Both Stage members (yielded inside a bundle's
+    # synthetic body) and the StageBundle itself expose ``local_decls()``.
+    stage_smem_names: set[str] = set()
+    for s in body.iter():
+        if isinstance(s, (Stage, StageBundle)):
+            stage_smem_names.update(s.local_decls())
     bufs: set[str] = set()
     for s in body.iter():
-        if isinstance(s, Stage):
-            # ``Stage.external_reads`` returns the gmem buffer names; a
-            # ``ComputeStage`` overrides it to ``()`` because its body
-            # Loads read sibling Stage smem, not gmem.
+        if isinstance(s, (Stage, StageBundle)):
+            # ``external_reads()`` returns gmem buffer names; Stage members
+            # with ``compute != None`` (hoisted-invariant cooperative
+            # compute) override to ``()`` because they read sibling smem.
             for buf_name in s.external_reads():
                 bufs.add(buf_name)
-        elif isinstance(s, Load) and s.input not in stage_names:
+        elif isinstance(s, Load) and s.input not in stage_smem_names:
             bufs.add(s.input)
     return len(bufs)
 

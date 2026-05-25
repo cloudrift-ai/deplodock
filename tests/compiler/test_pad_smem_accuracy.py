@@ -23,7 +23,7 @@ import pytest
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.ir import BufferedStage, TileOp
+from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 
 from .conftest import requires_cuda
 
@@ -55,7 +55,7 @@ def _tile_op_pad_summary(m: int, k: int, n: int) -> dict[str, tuple[int, ...]]:
         return {}
     out: dict[str, tuple[int, ...]] = {}
     for s in op.body.iter():
-        if isinstance(s, BufferedStage):
+        if isinstance(s, StageBundle) and s.policy == StagePolicy.BUFFERED:
             for src in s.sources:
                 out[src.name] = src.pad
     return out

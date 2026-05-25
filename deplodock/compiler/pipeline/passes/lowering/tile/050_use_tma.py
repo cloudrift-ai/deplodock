@@ -1,37 +1,28 @@
-"""Promote single-source ``AsyncBufferedStage`` to ``TmaBufferedStage`` on sm_90+.
+"""Promote ASYNC StageBundle to TMA on sm_90+.
 
-For each ``AsyncBufferedStage`` inside a ``SerialTile(serial_outer)``, swap
-to ``TmaBufferedStage(pipeline_depth=1, swizzle=NONE)`` when:
+For each ``StageBundle`` with ``policy == ASYNC`` inside a
+``SerialTile(serial_outer)``, switch ``policy`` to ``TMA`` (keeping
+``buffer_count`` / ``phase`` / ``pipeline_depth``; ``swizzle`` stays
+NONE) when every member ``Stage`` is TMA-eligible:
 
 - ``ctx.compute_capability >= (9, 0)`` (Hopper+).
-- Exactly one ``Source`` on the stage. Multi-source stages (matmul A+B)
-  stay on cp.async — TMA's elected-thread + arrive-tx model doesn't
-  trivially generalize to two sources without a fused-arrive-tx primitive.
+- Exactly one ``Source`` on each member Stage. Multi-source bundles
+  (matmul A+B) stay on cp.async — TMA's elected-thread + arrive-tx
+  model doesn't trivially generalize to two sources without a
+  fused-arrive-tx primitive.
 - The source uses ``AffineAddressing`` (template addressing is a
   collapsed-reshape view that ``cuTensorMapEncodeTiled`` can't describe).
 - ``addressing.dims`` is a strictly-increasing permutation; gap source
-  dims (not swept by any cache axis) must be extent-1 singletons so the
-  materializer drops them from the descriptor.
+  dims (not swept by any cache axis) must be extent-1 singletons.
 - Box-inner and source-inner extents both 16 B-aligned, with source
-  inner at least 2× the box inner (small matmuls otherwise trip
-  ``CUDA_ERROR_MISALIGNED_ADDRESS`` at the ``cp.async.bulk.tensor`` site).
+  inner at least 2× the box inner.
 - Source rank ≤ 5 (TMA descriptor limit).
 
-All other fields (sources, body, buffer_count, phase) pass through. The
-materializer emits a ``TmaDescriptor`` + per-group ``MbarrierInit`` in
-the kernel prologue and a ``Cond(tid==issuer, [arrive_expect_tx, tma_load])``
-plus an implicit ``MbarrierWait + Sync`` at the wrap boundary for
-``pipeline_depth == 1`` (mirroring the cp.async flow in ``_emit_stage``).
+The pass is **all-or-nothing per tile**: if any ASYNC bundle in the
+tile body is ineligible, leave the whole tile on cp.async (avoids
+mixed-mode pipeline deadlock).
 
-The pass is **all-or-nothing per tile**: if any ``AsyncBufferedStage`` in
-the tile body is ineligible, leave the whole tile on cp.async. Mixed TMA +
-cp.async pipelined K-loops force a per-iter ``CpAsyncWait + __syncthreads``
-(the per-CTA ``cp.async.commit_group`` tracker overflows past 64 under
-back-to-back launches and deadlocks the device); the required Sync also
-destroys the latency hiding the pipeline was supposed to provide.
-
-Idempotence: ``TmaBufferedStage`` is left alone — already promoted past
-cp.async.
+Idempotence: TMA-policy bundles are left alone.
 """
 
 from __future__ import annotations
@@ -42,11 +33,12 @@ from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
-    AsyncBufferedStage,
     SerialTile,
+    Stage,
+    StageBundle,
+    StagePolicy,
     SwizzleMode,
     TileOp,
-    TmaBufferedStage,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -72,17 +64,19 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     body = root.op.body
     # All-or-nothing per tile (see module docstring).
     for s in body.iter():
-        if isinstance(s, TmaBufferedStage):
+        if not isinstance(s, StageBundle):
             continue
-        if isinstance(s, AsyncBufferedStage) and not _eligible(s, src_shapes):
+        if s.policy == StagePolicy.TMA:
+            continue
+        if s.policy == StagePolicy.ASYNC and not _bundle_eligible(s, src_shapes):
             raise RuleSkipped(
-                f"AsyncBufferedStage on {[src.name for src in s.sources]!r} not TMA-eligible; "
+                f"ASYNC bundle on {list(s.local_decls())!r} not TMA-eligible; "
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
 
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no AsyncBufferedStage inside SerialTile(serial_outer) eligible for TMA")
+        raise RuleSkipped("no ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
@@ -116,7 +110,7 @@ def _promote_in_kouter(body: Body) -> tuple[Body, bool]:
     out: list[Stmt] = []
     changed = False
     for s in body:
-        if isinstance(s, AsyncBufferedStage) and not isinstance(s, TmaBufferedStage):
+        if isinstance(s, StageBundle) and s.policy == StagePolicy.ASYNC:
             out.append(_promote(s))
             changed = True
         else:
@@ -124,18 +118,27 @@ def _promote_in_kouter(body: Body) -> tuple[Body, bool]:
     return Body(tuple(out)), changed
 
 
-def _promote(stage: AsyncBufferedStage) -> TmaBufferedStage:
-    return TmaBufferedStage(
-        sources=stage.sources,
-        body=stage.body,
-        buffer_count=stage.buffer_count,
-        phase=stage.phase,
-        pipeline_depth=stage.pipeline_depth,
+def _promote(bundle: StageBundle) -> StageBundle:
+    return StageBundle(
+        stages=bundle.stages,
+        body=bundle.body,
+        policy=StagePolicy.TMA,
+        buffer_count=bundle.buffer_count,
+        phase=bundle.phase,
+        pipeline_depth=bundle.pipeline_depth,
         swizzle=SwizzleMode.NONE,
     )
 
 
-def _eligible(stage: AsyncBufferedStage, src_shapes: dict[str, tuple[int, ...]]) -> bool:
+def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]]) -> bool:
+    """A bundle is TMA-eligible iff every member Stage is."""
+    for stage in bundle.stages:
+        if not _stage_eligible(stage, src_shapes):
+            return False
+    return True
+
+
+def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> bool:
     if len(stage.sources) != 1:
         return False
     (src,) = stage.sources

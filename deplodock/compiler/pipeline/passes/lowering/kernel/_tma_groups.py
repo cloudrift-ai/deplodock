@@ -15,21 +15,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.stmt import Stmt
-from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, TmaBufferedStage
+from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy
+
+
+def _is_tma_bundle(s) -> bool:
+    return isinstance(s, StageBundle) and s.policy == StagePolicy.TMA
 
 
 @dataclass(frozen=True)
 class TmaGroups:
-    """Result of :func:`partition_tma_groups`. Stage / wait → group-id
+    """Result of :func:`partition_tma_groups`. Bundle / wait → group-id
     lookups use ``id(...)`` keys because the keyed nodes aren't hashable;
     the materializer passes the exact body nodes it walks, so the ids
     match.
 
-    - ``stage_group``: ``id(TmaBufferedStage)`` → group id
+    - ``stage_group``: ``id(TMA StageBundle)`` → group id
     - ``wait_group``: ``id(AsyncWait)`` → group id
-    - ``group_stage_names``: group id → distinct stage (smem) names
+    - ``group_stage_names``: group id → distinct smem names across all
+      member stages of the bundle(s) in the group
     - ``group_buffer_count``: group id → max ``buffer_count`` in the group
-    - ``issuer_tid``: stage name → issuer thread index within its group
+    - ``issuer_tid``: smem name → issuer thread index within its group
     """
 
     stage_group: dict[int, int] = field(default_factory=dict)
@@ -75,36 +80,38 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
         group_buffer_count.append(0)
         return len(group_stage_names) - 1
 
-    def _add_stage(gid: int, stage: TmaBufferedStage) -> None:
-        stage_group_by_id[id(stage)] = gid
-        # 050_use_tma promotes single-source stages only; group_stage_names
-        # tracks per-Source smem name so issuer-tid allocation distributes
-        # the arrive+TmaLoad across distinct elected threads.
-        for src in stage.sources:
-            group_stage_names[gid].add(src.name)
-        group_buffer_count[gid] = max(group_buffer_count[gid], stage.buffer_count)
+    def _add_bundle(gid: int, bundle: StageBundle) -> None:
+        stage_group_by_id[id(bundle)] = gid
+        # 050_use_tma keeps the bundle's stages tuple intact; group_stage_names
+        # tracks per-Source smem name across every member so issuer-tid
+        # allocation distributes the arrive+TmaLoad across distinct elected
+        # threads.
+        for member in bundle.stages:
+            for src in member.sources:
+                group_stage_names[gid].add(src.name)
+        group_buffer_count[gid] = max(group_buffer_count[gid], bundle.buffer_count)
 
-    pending_prologue: list[TmaBufferedStage] = []
+    pending_prologue: list[StageBundle] = []
     last_pipeline_group: int | None = None
 
     def _flush_prologues_as_singletons() -> None:
         for st in pending_prologue:
             gid = _new_group()
-            _add_stage(gid, st)
+            _add_bundle(gid, st)
         pending_prologue.clear()
 
     for stmt in body:
-        if isinstance(stmt, TmaBufferedStage):
+        if _is_tma_bundle(stmt):
             pending_prologue.append(stmt)
             continue
-        if isinstance(stmt, SerialTile) and any(isinstance(s, TmaBufferedStage) for s in stmt.body):
+        if isinstance(stmt, SerialTile) and any(_is_tma_bundle(s) for s in stmt.body):
             gid = _new_group()
             for st in pending_prologue:
-                _add_stage(gid, st)
+                _add_bundle(gid, st)
             pending_prologue.clear()
             for s in stmt.body:
-                if isinstance(s, TmaBufferedStage):
-                    _add_stage(gid, s)
+                if _is_tma_bundle(s):
+                    _add_bundle(gid, s)
                 elif isinstance(s, AsyncWait):
                     wait_group_by_id[id(s)] = gid
             last_pipeline_group = gid
@@ -123,7 +130,7 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
                 # into one group with arrive count = num pending.
                 gid = _new_group()
                 for st in pending_prologue:
-                    _add_stage(gid, st)
+                    _add_bundle(gid, st)
                 pending_prologue.clear()
                 wait_group_by_id[id(stmt)] = gid
                 last_pipeline_group = gid
