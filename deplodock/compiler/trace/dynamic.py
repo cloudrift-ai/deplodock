@@ -53,4 +53,49 @@ def make_dynamic(graph: Graph, symbolic_name: str, concrete_value: int) -> Graph
     return graph
 
 
-__all__ = ["make_dynamic"]
+def parse_specs(specs: list[str] | None, *, default_value: int) -> list[tuple[str, int]]:
+    """Parse ``--dynamic NAME[=VALUE]`` CLI strings to ``(name, value)`` pairs.
+
+    Bare ``NAME`` (no ``=``) uses ``default_value`` — typically
+    ``args.seq_len`` for the most common ``--dynamic seq_len`` shorthand.
+    Explicit ``NAME=VALUE`` requires ``VALUE`` to be a positive int.
+
+    Raises ``ValueError`` with a CLI-friendly message on a bad spec; the
+    caller is expected to ``sys.exit(2)`` so the failure surfaces as a
+    usage error rather than a stack trace.
+    """
+    out: list[tuple[str, int]] = []
+    if not specs:
+        return out
+    seen: set[str] = set()
+    for raw in specs:
+        if "=" in raw:
+            name, _, value_str = raw.partition("=")
+            name = name.strip()
+            try:
+                value = int(value_str)
+            except ValueError as e:
+                raise ValueError(f"--dynamic {raw!r}: VALUE must be a positive int, got {value_str!r}") from e
+        else:
+            name = raw.strip()
+            value = default_value
+        if not name:
+            raise ValueError(f"--dynamic {raw!r}: NAME is empty")
+        if value <= 0:
+            raise ValueError(f"--dynamic {raw!r}: VALUE must be > 0, got {value}")
+        if name in seen:
+            raise ValueError(f"--dynamic {raw!r}: NAME {name!r} appears more than once")
+        seen.add(name)
+        out.append((name, value))
+    return out
+
+
+def apply_specs(graph: Graph, specs: list[tuple[str, int]]) -> Graph:
+    """Apply a list of ``(name, value)`` rewrites in order — convenience
+    wrapper so callers don't need to loop over :func:`make_dynamic`."""
+    for name, value in specs:
+        make_dynamic(graph, name, value)
+    return graph
+
+
+__all__ = ["make_dynamic", "parse_specs", "apply_specs"]

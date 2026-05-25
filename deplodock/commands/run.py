@@ -60,6 +60,26 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
+    parser.add_argument(
+        "--dynamic",
+        action="append",
+        default=None,
+        metavar="NAME[=VALUE]",
+        help=(
+            "Make a tensor dim symbolic after tracing — every ``Dim(VALUE)`` in the traced "
+            "graph is rewritten to ``Dim(NAME)`` before compilation. Bare ``--dynamic seq_len`` "
+            "uses the inferred seq_len from the ``--code`` expression (or ``--seq-len`` for "
+            "``--ir`` inputs); explicit ``--dynamic NAME=VALUE`` overrides. Repeatable. The "
+            "compiled CUDA kernel signature gains an ``int <NAME>`` runtime arg per dim; "
+            "the launch resolves NAME from input array shapes."
+        ),
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="Default VALUE for bare ``--dynamic NAME`` specs (when no concrete value can be inferred).",
+    )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
     parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
     parser.add_argument(
@@ -116,6 +136,8 @@ def handle_run(args):
     module = info["module"]
     example_args = info["args"]
     example_kwargs = info["kwargs"]
+
+    _apply_dynamic(args, graph)
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
@@ -203,6 +225,31 @@ def handle_run(args):
     _print_kernel_stats(compiled, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+def _apply_dynamic(args, graph) -> None:
+    """Apply every ``--dynamic NAME[=VALUE]`` spec to ``graph`` before compile.
+
+    Bare ``--dynamic NAME`` uses ``args.seq_len`` as VALUE; if neither is
+    set the spec is rejected as a usage error. Mirrors
+    :func:`deplodock.commands.compile.apply_dynamic`.
+    """
+    specs_raw = getattr(args, "dynamic", None)
+    if not specs_raw:
+        return
+    from deplodock.compiler.trace.dynamic import apply_specs, parse_specs
+
+    default = getattr(args, "seq_len", None)
+    if default is None and any("=" not in spec for spec in specs_raw):
+        logger.error("--dynamic NAME (no =VALUE) needs --seq-len for the canonical VALUE")
+        sys.exit(2)
+    try:
+        specs = parse_specs(specs_raw, default_value=default or 0)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(2)
+    apply_specs(graph, specs)
+    logger.info("Applied dynamic shape rewrites: %s", ", ".join(f"{n}={v}→Dim({n!r})" for n, v in specs))
 
 
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
@@ -571,6 +618,8 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     with open(path) as f:
         data = json.load(f)
     graph = Graph.from_dict(data)
+
+    _apply_dynamic(args, graph)
 
     stage = _detect_stage(graph)
     tail = _passes_after_stage(stage)

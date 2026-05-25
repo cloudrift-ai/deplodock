@@ -176,8 +176,16 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   matmul on symbolic M (tested at seq_len 4, 16, 32). The earlier M4 ``build_full_model_wrapper(dynamic=True)``
   + ``build_causal_mask`` pair sits on top of this for HF whole-model use. Full TinyLlama whole-model with
   RoPE / KV cache / generation-loop is the remaining stretch — the planner / codegen / launch path is
-  ready to receive it; the missing pieces are tracer coverage for permute+slice patterns in HF attention
-  blocks and a CLI ``--dynamic seq_len`` wrapping in ``deplodock compile`` / ``run``.
+  ready to receive it; the missing piece is tracer coverage for the permute+slice patterns in HF
+  attention blocks.
+- **CLI — `--dynamic` flag landed.** ``deplodock compile`` / ``tune`` / ``run --code`` / ``run --ir`` all
+  accept ``--dynamic NAME[=VALUE]`` (repeatable). Bare ``--dynamic seq_len`` defaults VALUE to ``--seq-len``.
+  Wiring: ``parse_specs`` + ``apply_specs`` in ``compiler/trace/dynamic.py``; CLI handlers call
+  ``apply_dynamic(args, graph)`` right after ``load_or_trace`` / ``trace_inline_code`` so the symbolic
+  rewrite lands before any pass runs. Smoke covered by
+  ``test_compile_dynamic_emits_runtime_arg`` / ``test_compile_dynamic_explicit_value`` /
+  ``test_compile_dynamic_bad_spec_rejected`` (CLI args parse + ``int seq_len`` shows up in rendered
+  kernel) plus ``test_run_code_dynamic_seq_len`` (compile + run + accuracy-vs-eager).
 
 ## Explicitly out of scope (v1)
 

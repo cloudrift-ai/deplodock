@@ -87,6 +87,19 @@ def add_input_args(parser) -> None:
         default=32,
         help="Sequence length for full-model tracing (default: 32).",
     )
+    parser.add_argument(
+        "--dynamic",
+        action="append",
+        default=None,
+        metavar="NAME[=VALUE]",
+        help=(
+            "Make a tensor dim symbolic after tracing — every ``Dim(VALUE)`` in the graph "
+            "is rewritten to ``Dim(NAME)``. Bare ``--dynamic seq_len`` uses ``--seq-len`` "
+            "as VALUE; explicit ``--dynamic NAME=VALUE`` overrides. Repeatable for multiple "
+            "dynamic dims. The compiled CUDA kernel signature gains an ``int <NAME>`` "
+            "runtime arg per dim and the launch resolves NAME from input array shapes."
+        ),
+    )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
 
     from deplodock.compiler.target import add_target_arg
@@ -261,20 +274,42 @@ def load_or_trace(args) -> tuple[Graph, str]:
     if args.code:
         from deplodock.commands.trace import graph_from_code
 
-        return graph_from_code(args.code)
-
-    input_path = Path(args.input)
-    if input_path.suffix == ".json" and input_path.exists():
-        graph = _load_graph(input_path)
-        base_name = input_path.stem
+        graph, base_name = graph_from_code(args.code)
     else:
-        graph = _trace_model(args.input, args.layer, args.seq_len)
-        safe_name = args.input.replace("/", "-").lower()
-        if args.layer is None:
-            base_name = f"{safe_name}-full-s{args.seq_len}"
+        input_path = Path(args.input)
+        if input_path.suffix == ".json" and input_path.exists():
+            graph = _load_graph(input_path)
+            base_name = input_path.stem
         else:
-            base_name = f"{safe_name}-layer{args.layer}"
+            graph = _trace_model(args.input, args.layer, args.seq_len)
+            safe_name = args.input.replace("/", "-").lower()
+            if args.layer is None:
+                base_name = f"{safe_name}-full-s{args.seq_len}"
+            else:
+                base_name = f"{safe_name}-layer{args.layer}"
+    apply_dynamic(args, graph)
     return graph, base_name
+
+
+def apply_dynamic(args, graph: Graph) -> None:
+    """Apply every ``--dynamic NAME[=VALUE]`` spec from ``args`` to ``graph``.
+
+    Bare ``NAME`` uses ``args.seq_len`` as the value (the common
+    ``--dynamic seq_len`` shorthand). Errors exit with usage code 2 so
+    the failure surfaces as a CLI problem, not a tracer crash.
+    """
+    specs_raw = getattr(args, "dynamic", None)
+    if not specs_raw:
+        return
+    from deplodock.compiler.trace.dynamic import apply_specs, parse_specs
+
+    try:
+        specs = parse_specs(specs_raw, default_value=args.seq_len)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(2)
+    apply_specs(graph, specs)
+    logger.info("Applied dynamic shape rewrites: %s", ", ".join(f"{n}={v}→Dim({n!r})" for n, v in specs))
 
 
 def _load_graph(path: Path) -> Graph:
