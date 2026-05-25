@@ -31,6 +31,25 @@ def _static(d) -> int:
     return d.as_static() if isinstance(d, Dim) else int(d)
 
 
+def _split_factors(shape) -> tuple[int, list[str]]:
+    """Split a shape into ``(static_product, [symbolic_names])`` — used by
+    ``ReshapeOp.infer_output_shape`` to handle ``-1`` inference in the
+    presence of symbolic dims."""
+    static = 1
+    symbolic: list[str] = []
+    for d in shape:
+        if isinstance(d, Dim):
+            if d.is_static:
+                static *= d.as_static()
+            else:
+                symbolic.append(d.value)
+        elif isinstance(d, str):
+            symbolic.append(d)
+        else:
+            static *= int(d)
+    return static, symbolic
+
+
 # ---------------------------------------------------------------------------
 # Layout-only ops (decomposed to IndexMapOp)
 # ---------------------------------------------------------------------------
@@ -77,15 +96,35 @@ class ReshapeOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         if -1 not in self.shape:
             return tuple(self.shape)
-        in_numel = 1
-        for d in input_shapes[0]:
-            in_numel *= _static(d)
-        known = 1
-        for d in self.shape:
-            if d != -1:
-                known *= _static(d)
+        # Split each side's product into static-int and symbolic-name parts so
+        # ``-1`` can be inferred even when symbolic dims appear on both sides.
+        in_static, in_sym = _split_factors(input_shapes[0])
+        known_static, known_sym = _split_factors([d for d in self.shape if d != -1])
+        # Cancel matching symbolic factors (a symbolic dim that appears on both
+        # sides drops out, e.g. ``(1, S, 2048).reshape(1, S, H, -1)`` collapses).
+        for name in list(known_sym):
+            if name in in_sym:
+                in_sym.remove(name)
+                known_sym.remove(name)
+        if known_sym:
+            raise ValueError(
+                f"reshape from {tuple(input_shapes[0])} to {self.shape} leaves unresolved symbolic "
+                f"factor(s) {known_sym} on the target side — cannot infer -1 dim"
+            )
+        if not in_sym:
+            inferred: int | str = in_static // known_static if known_static else 1
+        elif len(in_sym) == 1 and in_static == known_static:
+            inferred = in_sym[0]  # the lone symbolic factor flows straight through
+        elif len(in_sym) == 1 and known_static and in_static % known_static == 0:
+            # Symbolic times a static factor — can't represent without an Expr.
+            raise ValueError(
+                f"reshape from {tuple(input_shapes[0])} to {self.shape} would infer -1 as "
+                f"{in_sym[0]} * {in_static // known_static} — symbolic * static products aren't supported yet"
+            )
+        else:
+            raise ValueError(f"reshape from {tuple(input_shapes[0])} to {self.shape}: cannot infer -1 dim symbolically")
         resolved = list(self.shape)
-        resolved[resolved.index(-1)] = in_numel // known if known else 1
+        resolved[resolved.index(-1)] = inferred
         return tuple(resolved)
 
     def forward(self, *inputs):

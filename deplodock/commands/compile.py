@@ -97,7 +97,9 @@ def add_input_args(parser) -> None:
             "is rewritten to ``Dim(NAME)``. Bare ``--dynamic seq_len`` uses ``--seq-len`` "
             "as VALUE; explicit ``--dynamic NAME=VALUE`` overrides. Repeatable for multiple "
             "dynamic dims. The compiled CUDA kernel signature gains an ``int <NAME>`` "
-            "runtime arg per dim and the launch resolves NAME from input array shapes."
+            "runtime arg per dim and the launch resolves NAME from input array shapes. "
+            "Gotcha: pick a VALUE that doesn't match any other model dim — a small prime "
+            "(31 / 37 / 41) rarely collides with the powers-of-two head counts."
         ),
     )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")

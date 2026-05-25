@@ -250,6 +250,32 @@ def test_cuda_symbolic_rmsnorm_traced_and_run():
         np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
 
 
+def test_reshape_negative_one_infers_through_symbolic_dim():
+    """``ReshapeOp(shape=(..., -1))`` flowing through a symbolic input
+    dim infers the ``-1`` by cancelling the matching symbolic factor on
+    each side — the typical ``x.reshape(B, S, H, -1)`` pattern."""
+    import torch
+
+    from deplodock.compiler.pipeline import Pipeline
+    from deplodock.compiler.trace.dynamic import make_dynamic
+    from deplodock.compiler.trace.torch import trace_module
+
+    class ReshapeWithMinusOne(torch.nn.Module):
+        def forward(self, x):
+            b, s, d = x.shape
+            return x.reshape(b, s, 4, -1)
+
+    graph = trace_module(ReshapeWithMinusOne(), (torch.randn(1, 16, 128),))
+    make_dynamic(graph, "seq_len", 16)
+    out = Pipeline.build(["frontend/decomposition", "frontend/optimization", "loop/lifting"]).run(graph)
+    loops = [n for n in out.nodes.values() if isinstance(n.op, LoopOp)]
+    assert loops, "expected at least one LoopOp after lifting"
+    # The reshape's inferred -1 is the static 32 (128 / 4); seq_len threads through unchanged.
+    extents = {(ax.name, ax.extent) for n in loops for ax in n.op.axes}
+    assert any(e == Dim("seq_len") for _, e in extents), f"seq_len axis dropped: {extents}"
+    assert any(e == Dim(32) for _, e in extents), f"reshape -1 didn't infer to static 32: {extents}"
+
+
 def test_make_dynamic_helper_rewrites_shapes_and_op_fields():
     """``make_dynamic`` rewrites every ``Dim(value)`` in ``node.output.shape``
     plus the ``shape`` field on ``ReshapeOp`` / ``SliceOp``. Mutates in place;
