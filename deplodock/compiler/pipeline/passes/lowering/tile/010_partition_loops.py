@@ -194,11 +194,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | Fork | list[For
     # rule pattern (LoopOp) no longer matches.
     variants = _split_kernel_fully(loop_op, ctx, kernel_name=kernel_name)
     if variants is None:
-        raise RuntimeError(
-            f"partition_loops: no tile variants for {root.id} ({kernel_name}). "
-            f"The kernel will not lower past tile-IR and the backend cannot execute it. "
-            f"Inspect the LoopOp body shape and extend _split_kernel_fully."
-        )
+        raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
     if len(variants) == 1:
         return variants[0]
@@ -889,16 +885,14 @@ def _enumerate_cartesian(
     else:
         raise ValueError(f"unknown priority_mode {priority_mode!r}")
 
-    # The 1-thread-per-CTA variant is normally suppressed (the materializer
-    # requires ≥1 BIND_THREAD axis), but it's the only viable mapping when
-    # neither free axis admits a >1 thread-axis split — either because both
-    # extents collapsed to 1 (symbolic free axes) or because the static N
-    # extent has no divisor in ``_TUNE_AXIS_CHOICES`` (e.g. lm_head with
-    # vocab=151669). We try strict enumeration first; if it returns nothing
-    # AND the mode permits a degenerate variant, retry with the flag set.
-    degenerate_allowed = priority_mode in ("pointwise", "matmul")
+    # When the caller passed ``E_M=1`` / ``E_N=1`` only because both free axes
+    # were symbolic, the canonical bn*bm splits all collapse to (1, 1) and the
+    # planner needs to keep the 1-thread-per-CTA variant rather than skip it.
+    # Matmul honors this too so symbolic Q@K^T (M=N=seq_len) can still emit
+    # a degenerate single-thread variant.
+    allow_empty_threads = E_M == 1 and E_N == 1 and priority_mode in ("pointwise", "matmul")
 
-    def _run(apply_pins: bool, allow_empty_threads: bool) -> list[TileParams]:
+    def _run(apply_pins: bool) -> list[TileParams]:
         return _enumerate_cartesian_impl(
             E_M=E_M,
             E_N=E_N,
@@ -916,15 +910,10 @@ def _enumerate_cartesian(
             allow_empty_threads=allow_empty_threads,
         )
 
-    result = _run(apply_pins=True, allow_empty_threads=False)
-    if not result and not _planner_pin_set() and degenerate_allowed:
-        result = _run(apply_pins=True, allow_empty_threads=True)
+    result = _run(apply_pins=True)
     if result or not _planner_pin_set():
         return result
-    result = _run(apply_pins=False, allow_empty_threads=False)
-    if not result and degenerate_allowed:
-        result = _run(apply_pins=False, allow_empty_threads=True)
-    return result
+    return _run(apply_pins=False)
 
 
 def _enumerate_cartesian_impl(

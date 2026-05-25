@@ -26,6 +26,21 @@ def test_datatype_resolution_aliases():
     assert str(dt.F16) == "f16"
 
 
+def test_int_datatype_resolution_aliases():
+    # Integer dtypes appear on placeholder inputs from HF whole-model traces
+    # (``input_ids``, ``position_ids``). The canonical name + numpy/PyTorch
+    # aliases must all resolve to the same DataType singleton.
+    assert dt.get("i32") is dt.I32
+    assert dt.get("int32") is dt.I32
+    assert dt.get("i64") is dt.I64
+    assert dt.get("int64") is dt.I64
+    assert dt.get("long") is dt.I64
+    assert dt.I32.nbytes == 4
+    assert dt.I64.nbytes == 8
+    assert dt.I32.np == np.dtype(np.int32)
+    assert dt.I64.np == np.dtype(np.int64)
+
+
 def test_tensor_dtype_coerces_string():
     t = Tensor("a", (4,), "float16")
     assert isinstance(t.dtype, DataType)

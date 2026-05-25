@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from deplodock.compiler import dtype as dt
+from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name, cuda_name, nbytes_of
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SoftmaxOp
@@ -18,6 +19,34 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
 from .conftest import requires_cuda
+
+
+def test_cuda_name_int_dtypes():
+    # I32/I64 must map to the C type names the kernel renderer emits in
+    # parameter signatures for graphs whose placeholder inputs carry an
+    # integer dtype (input_ids / position_ids from HF whole-model traces).
+    assert cuda_name(dt.I32) == "int"
+    assert cuda_name(dt.I64) == "long long"
+    # Aliases route through the same mapping.
+    assert cuda_name("int32") == "int"
+    assert cuda_name("int64") == "long long"
+    assert cuda_name("long") == "long long"
+
+
+def test_canonical_from_cuda_name_int_dtypes():
+    # The inverse mapping is what ``Smem.render`` consults to recover the
+    # canonical DataType from a kernel-internal C name.
+    assert canonical_from_cuda_name("int") == "i32"
+    assert canonical_from_cuda_name("long long") == "i64"
+
+
+def test_nbytes_of_int_dtypes():
+    # ``nbytes_of`` is the per-element size table used by the slab budget
+    # / smem accounting. Must agree with the canonical DataType sizes.
+    assert nbytes_of(dt.I32) == 4
+    assert nbytes_of(dt.I64) == 8
+    assert nbytes_of("i32") == 4
+    assert nbytes_of("i64") == 8
 
 
 def _fp16_chain_graph() -> Graph:
