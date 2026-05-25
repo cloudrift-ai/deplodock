@@ -148,7 +148,7 @@ def test_chained_pointwise_single_kernel():
 @requires_cuda
 def test_pointwise_runs_on_gpu():
     compiled = CudaBackend().compile(_pointwise_add_graph())
-    result = CudaBackend().run(compiled, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
+    result, _ = CudaBackend().run(compiled, input_data={"x": [1, 2, 3, 4], "y": [10, 20, 30, 40]})
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx([11, 22, 33, 44])
 
 
@@ -156,7 +156,7 @@ def test_pointwise_runs_on_gpu():
 def test_reduce_runs_on_gpu():
     compiled = CudaBackend().compile(_reduce_sum_graph())
     x_data = [float(i) for i in range(4 * 128)]
-    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = [sum(x_data[row * 128 : (row + 1) * 128]) for row in range(4)]
     assert list(result.outputs.values())[0].flatten().tolist() == pytest.approx(expected)
 
@@ -167,7 +167,7 @@ def test_softmax_runs_on_gpu():
 
     compiled = CudaBackend().compile(_softmax_graph())
     x_data = [float(i) for i in range(32)]
-    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
     expected = []
     for row in range(4):
         row_vals = x_data[row * 8 : (row + 1) * 8]
@@ -183,7 +183,7 @@ def test_matmul_runs_on_gpu():
     compiled = CudaBackend().compile(_matmul_graph())
     a_data = [float(i) for i in range(4 * 128)]
     b_data = [float(i) for i in range(128 * 4)]
-    result = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
+    result, _ = CudaBackend().run(compiled, input_data={"a": a_data, "b": b_data})
     expected = []
     for mi in range(4):
         for ni in range(4):

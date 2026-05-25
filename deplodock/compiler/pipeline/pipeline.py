@@ -115,6 +115,38 @@ class RuleSkipped(Exception):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class Fork:
+    """A deferred fork option in the search tree.
+
+    Two flavors share the same shape:
+
+    - **Branch Fork** (``is_leaf=False``) — produced explicitly by a rule's
+      ``rewrite()`` to spawn a hierarchical fork point. ``expand()`` returns
+      the next level of options (more Forks, concrete leaves, or a mix);
+      the search loop drives this via :meth:`LazyCandidate.expand`.
+    - **Leaf Fork** (``is_leaf=True``) — produced by
+      :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` to
+      uniformly wrap concrete ``Op`` / ``Graph`` rewrites. ``expand()``
+      returns ``[option]`` (one element); :meth:`LazyCandidate.resolve`
+      invokes it once at resolve time to retrieve the leaf and apply it.
+
+    Sharing one shape lets ``LazyCandidate.pending`` carry just ``Fork``
+    (no tagged union) — the search loop branches on ``Fork.is_leaf`` to
+    decide expand-vs-resolve, and :func:`_best_fork` reads ``Fork.knobs``
+    polymorphically without isinstance.
+
+    ``knobs`` is the knob-delta this Fork pins (used by :func:`_best_fork`
+    to match the lowering DB without firing the thunk). ``score`` is the
+    MCTS prior for the unvisited-sibling tiebreak — typically the score
+    of the best-reachable leaf under this branch."""
+
+    knobs: dict
+    expand: Callable[[], list[Op | Graph | Fork]]
+    score: float = 0.0
+    is_leaf: bool = False
+
+
 @dataclass
 class Pass:
     """One pipeline pass: a named, indexed list of rules.
@@ -399,6 +431,15 @@ class Pipeline:
         from deplodock.compiler.pipeline.search.candidate import LazyCandidate  # noqa: PLC0415
 
         while (popped := search.pop()) is not None:
+            # Thunk-bearing fork: expand before resolving. Each expansion
+            # spawns the next level of ``LazyCandidate``s (more thunks or
+            # concrete options) sharing the same ``inner`` and ``match`` —
+            # cursor advance is deferred until a leaf actually resolves.
+            if popped.is_expandable():
+                children = popped.expand()
+                best = _best_fork(children, popped.inner, db) if db is not None else None
+                search.push(children[0], *children[1:], best=best)
+                continue
             cand = popped.resolve()
             cur = cand.cursor
             if cur.is_done:
@@ -429,10 +470,13 @@ class Pipeline:
                 # Multi-option fork point: spawn one ``LazyCandidate`` per
                 # option (option-0 included as the primary). Each shares
                 # ``cand`` as ``inner`` so siblings don't duplicate the
-                # snapshot. The fork's apply on resolve advances the
-                # cursor when ``match.is_last`` (the cursor advance the
-                # eager loop didn't do here, since we deferred to forks).
-                forks = [LazyCandidate(inner=cand, cursor=replace(cur), pending=(match, opt)) for opt in options]
+                # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
+                # options into leaf Forks so every LazyCandidate's pending
+                # carries a uniform Fork shape. The fork's apply on
+                # resolve advances the cursor when ``match.is_last`` (the
+                # cursor advance the eager loop didn't do here, since we
+                # deferred to forks).
+                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
                 break
 
             if forks is not None:
@@ -602,12 +646,36 @@ def _best_fork(forks, parent_cand, db):
     for f in forks:
         if f.pending is None:
             continue
-        _, opt = f.pending
-        opt_knobs = getattr(opt, "knobs", None) or {}
-        merged = {**parent_knobs, **opt_knobs}
-        probe = replace(opt, knobs=merged) if merged != opt_knobs else opt
-        if op_cache_key(probe) == row.child_key:
-            return f
+        _, fork = f.pending  # always a Fork after the constructor unification
+        opt_knobs = fork.knobs
+        if fork.is_leaf:
+            # Leaf Fork wrapping a concrete Op/Graph — match by structural
+            # cache key. Fire the (trivial) thunk to retrieve the wrapped
+            # leaf, then compare against the DB's child_key. The thunk
+            # for a leaf is ``lambda: [op]``, constant-time.
+            leaves = fork.expand()
+            if not leaves:
+                continue
+            leaf = leaves[0]
+            merged = {**parent_knobs, **opt_knobs}
+            probe = replace(leaf, knobs=merged) if merged != opt_knobs else leaf
+            if op_cache_key(probe) == row.child_key:
+                return f
+        else:
+            # Branch Fork — match by knobs-delta against the recorded
+            # row's knobs. The fork "wins" iff every knob it pins appears
+            # in ``row.knobs`` with the same value AND at least one of
+            # those knobs is constrained by the row; otherwise every
+            # sibling is equally consistent and we fall back to option-0.
+            # No rule currently emits branch Forks (the partition planner's
+            # hierarchical conversion was reverted as it degraded MCTS
+            # efficiency on small-to-medium shapes); kept here as
+            # documented infrastructure for future hierarchical rules.
+            if not opt_knobs:
+                continue
+            constraining = [k for k in opt_knobs if k in row.knobs]
+            if constraining and all(row.knobs.get(k) == v for k, v in opt_knobs.items()):
+                return f
     return None
 
 

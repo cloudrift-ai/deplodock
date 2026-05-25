@@ -14,9 +14,10 @@ from math import prod
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
-from deplodock.compiler.ir.kernel import KernelOp, Tile
+from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
+from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.tensor import Tensor
 
@@ -56,12 +57,15 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
         desc_names.append(s.name)
     # Outputs receiving atomic-reduction writes (cross-CTA split-K) must be
     # zero-initialized before each launch so per-CTA partials accumulate
-    # cleanly. Anything else can keep its prior contents.
+    # cleanly. Anything else can keep its prior contents. Helper-driven:
+    # a Write is atomic iff some enclosing block axis is missing from its
+    # index (see ``body.coordination``).
+    escape = root.op.body.coordination
     atomic_outputs: list[str] = []
     seen_atomic: set[str] = set()
     output_set = set(root.op.outputs)
-    for s in root.op.writes:
-        if s.reduce_op is not None and s.output in output_set and s.output not in seen_atomic:
+    for s in escape.writes:
+        if escape.atomic_axes(s) and s.output in output_set and s.output not in seen_atomic:
             seen_atomic.add(s.output)
             atomic_outputs.append(s.output)
     return CudaOp(
@@ -77,14 +81,25 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
 
 
 def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """Pick (grid, block) from the first ``Tile`` in the body."""
+    """Pick (grid, block) from the outermost tile flavor in the body.
+
+    - ``GridTile`` (cooperative): one CTA per block-axis tuple; per-CTA
+      threads = product of inner ``ThreadTile``'s axes.
+    - Standalone ``ThreadTile`` (pointwise): flatten all axes into a
+      linear ``tid = blockIdx.x * blockDim.x + threadIdx.x`` and launch
+      ``ceil(n / _BLOCK)`` CTAs of ``_BLOCK`` threads.
+    """
     for s in kernel_op.body:
-        if isinstance(s, Tile):
-            if s.block_axes:
-                grid_total = max(prod(int(a.extent) for a in s.block_axes), 1)
-                block_total = max(prod(int(a.extent) for a in s.thread_axes), 1)
-                return (grid_total, 1, 1), (block_total, 1, 1)
-            n_threads = max(prod(int(a.extent) for a in s.thread_axes), 1)
+        if isinstance(s, GridTile):
+            grid_total = max(prod(int(a.extent) for a in s.axes), 1)
+            block_total = 1
+            for child in s.body:
+                if isinstance(child, ThreadTile):
+                    block_total = max(prod(int(a.extent) for a in child.axes), 1)
+                    break
+            return (grid_total, 1, 1), (block_total, 1, 1)
+        if isinstance(s, ThreadTile):
+            n_threads = max(prod(int(a.extent) for a in s.axes), 1)
             grid = ((n_threads + _BLOCK - 1) // _BLOCK, 1, 1)
             return grid, (_BLOCK, 1, 1)
     return (1, 1, 1), (1, 1, 1)

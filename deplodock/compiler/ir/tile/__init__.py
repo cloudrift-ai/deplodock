@@ -1,41 +1,44 @@
 """Tile IR — schedule decisions as structural Stmts, pre-materialization.
 
-- :mod:`.ir` — dataclass definitions: ``Tile`` / ``Combine`` /
-  ``Stage`` + binding constants, plus re-exports of Loop-IR leaves
-  and shared expressions.
-- :mod:`.pretty` — structural pretty-printer for ``TileOp``.
+- :mod:`.ir` — typed tile flavor dataclasses (``GridTile``,
+  ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) +
+  ``Stage`` family, plus re-exports of Loop-IR leaves and shared
+  expressions.
 
-Loop-IR → Tile-IR lowering (``tileify``) lives next to its rule at
-``passes/lowering/tile/001_tileify.py`` — the convention is "rules own
-their logic".
-
-Materialization (Tile IR → Kernel IR) lives under
-``passes/lowering/kernel``; rendering of Kernel IR to CUDA source lives
-under ``ir.kernel``.
+Loop-IR → Tile-IR lowering is owned by ``passes/lowering/tile/000_partition_loops``
+(constructs tile flavors directly via ``_wrap_tower``). Materialization
+(Tile IR → Kernel IR) lives under ``passes/lowering/kernel``; rendering
+of Kernel IR to CUDA source lives under ``ir.kernel``.
 """
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.ir import (
     Accum,
     Assign,
     BinaryExpr,
     Builtin,
     CastExpr,
-    Combine,
     Cond,
     ElementwiseImpl,
     Expr,
     FuncCallExpr,
+    GridTile,
     Literal,
     Load,
     Loop,
+    ParallelTile,
+    RegisterTile,
     Select,
     SelectBranch,
+    SerialKind,
+    SerialTile,
+    SerialTileBase,
     Stage,
     Stmt,
     StridedLoop,
+    StridedTile,
     TernaryExpr,
-    Tile,
+    ThreadTile,
     TileOp,
     Var,
     Write,
@@ -59,12 +62,16 @@ __all__ = [
     "Cond",
     "Loop",
     "StridedLoop",
-    "Tile",
-    "Combine",
+    # Typed tile flavor hierarchy
+    "ParallelTile",
+    "GridTile",
+    "ThreadTile",
+    "RegisterTile",
+    "SerialTileBase",
+    "SerialTile",
+    "StridedTile",
+    "SerialKind",
     "Stage",
-    "BoundAxis",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "Stmt",
     "TileOp",
     "Axis",

@@ -64,7 +64,6 @@ kernel k_rms_norm_reduce  inputs: rms_norm_mean_count, rms_norm_eps, x, p_weight
             in2 = load x_smem[a2]
             v0 = multiply(in2, in2)
             acc0 <- add(acc0, v0)
-        Combine(acc0, op=add)
         v1 = divide(acc0, in0)
         v2 = add(v1, in1)
         v3 = rsqrt(v2)

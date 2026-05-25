@@ -20,7 +20,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.pipeline import Cursor
+from deplodock.compiler.pipeline.pipeline import Cursor, Fork
 from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-
@@ -105,14 +105,21 @@ class Candidate:
             self._advance_if_last(match)
             return None
         options = list(result) if isinstance(result, (list, tuple)) else [result]
+        # ``Fork`` options pass through unconditionally — they're deferred
+        # expansions with no graph to validate yet. Concrete ``Op`` leaves
+        # still get the per-ctx validate filter; ``Graph`` splices are
+        # validated at splice time, not here.
         options = [o for o in options if not isinstance(o, Op) or o.validate(self.ctx)]
         if not options:
             self._advance_if_last(match)
             return None
-        if len(options) > 1:
-            # Defer to a fork — caller spawns ``LazyCandidate``
-            # siblings. Cursor advance happens via the fork's apply on
-            # resolve, so we leave it alone here.
+        if len(options) > 1 or isinstance(options[0], Fork):
+            # Defer to a fork — caller spawns ``LazyCandidate`` siblings.
+            # Single-option ``Fork`` also goes through this path: the
+            # search loop needs to dispatch on ``is_expandable()`` to
+            # invoke the thunk, which can't happen via the inline apply
+            # path below. Cursor advance for both cases happens via the
+            # eventual leaf's apply on resolve.
             return options
         self.apply(match, options[0])
         return None
@@ -177,32 +184,107 @@ class LazyCandidate:
     """Deferred-apply counterpart of :class:`Candidate`. Holds a parent
     ``inner`` Candidate (whose ``graph`` is the snapshot to clone from
     and whose ``ctx`` propagates onto the resolved Candidate) and an
-    optional ``pending`` ``(match, option)`` pair to replay on resolve.
+    optional ``pending`` ``(match, fork)`` pair to replay on resolve.
 
-    Sibling forks at the same rewrite point share ``inner`` by
-    reference — only one snapshot is ever held in memory per fork
-    point. Each fork's ``pending`` carries the alt option for that
-    fork's match site.
+    Sibling forks at the same rewrite point share ``inner`` by reference
+    — only one snapshot is ever held in memory per fork point. Each
+    sibling's ``pending`` carries its own :class:`Fork` (branch or leaf;
+    see :class:`deplodock.compiler.pipeline.pipeline.Fork`).
+
+    The constructor classmethods (:meth:`from_op` / :meth:`from_graph` /
+    :meth:`from_fork` / :meth:`from_option`) are the supported way to
+    spawn a non-trivial LazyCandidate — they handle the Op/Graph-to-Fork
+    leaf-wrapping uniformly so callers don't have to.
 
     ``cursor`` is the lazy candidate's own pipeline cursor (typically a
     copy of the parent's cursor at fork-creation time)."""
 
     inner: Candidate
     cursor: Cursor
-    pending: tuple[Match, Op | Graph | None] | None
+    pending: tuple[Match, Fork] | None
+
+    @classmethod
+    def from_op(cls, *, inner: Candidate, cursor: Cursor, match: Match, op: Op) -> LazyCandidate:
+        """Wrap a concrete ``Op`` rewrite as a leaf-Fork-pending LazyCandidate.
+        Validation has already happened upstream (in ``try_rewrite``'s
+        filter) — the constructor just lifts the option into the Fork
+        shape so resolve / expand / _best_fork can treat it uniformly."""
+        knobs = dict(getattr(op, "knobs", None) or {})
+        leaf = Fork(knobs=knobs, expand=lambda: [op], is_leaf=True)
+        return cls(inner=inner, cursor=cursor, pending=(match, leaf))
+
+    @classmethod
+    def from_graph(cls, *, inner: Candidate, cursor: Cursor, match: Match, graph: Graph) -> LazyCandidate:
+        """Wrap a ``Graph`` fragment splice as a leaf-Fork-pending LazyCandidate."""
+        leaf = Fork(knobs={}, expand=lambda: [graph], is_leaf=True)
+        return cls(inner=inner, cursor=cursor, pending=(match, leaf))
+
+    @classmethod
+    def from_fork(cls, *, inner: Candidate, cursor: Cursor, match: Match, fork: Fork) -> LazyCandidate:
+        """Direct wrap for an explicit branch ``Fork`` produced by a rule."""
+        return cls(inner=inner, cursor=cursor, pending=(match, fork))
+
+    @classmethod
+    def from_option(cls, *, inner: Candidate, cursor: Cursor, match: Match, option: Op | Graph | Fork) -> LazyCandidate:
+        """Dispatch on the option's type. The single entry point used by
+        ``Pipeline.search``'s fork-spawn site so every option gets lifted
+        consistently into a Fork-pending LazyCandidate."""
+        if isinstance(option, Fork):
+            return cls.from_fork(inner=inner, cursor=cursor, match=match, fork=option)
+        if isinstance(option, Op):
+            return cls.from_op(inner=inner, cursor=cursor, match=match, op=option)
+        return cls.from_graph(inner=inner, cursor=cursor, match=match, graph=option)
+
+    def is_expandable(self) -> bool:
+        """``True`` iff ``pending`` carries a *branch* :class:`Fork` —
+        one whose ``expand()`` produces the next level of options. Leaf
+        Forks (constructed from a concrete Op/Graph via :meth:`from_op`
+        / :meth:`from_graph`) are NOT expandable — they resolve directly
+        via :meth:`resolve`. ``False`` also for the no-pending wrapper
+        produced by :meth:`Candidate.lazy`."""
+        return self.pending is not None and not self.pending[1].is_leaf
+
+    def expand(self) -> list[LazyCandidate]:
+        """Fire the pending branch :class:`Fork`'s thunk and lift each
+        returned option into a sibling ``LazyCandidate`` via
+        :meth:`from_option`. Children share ``inner`` by reference (same
+        pattern as the flat-fork spawn site in ``pipeline.py``), carry
+        an independent cursor copy, and thread the same ``match`` — so
+        ``match.is_last`` only fires the cursor advance once a leaf
+        actually resolves.
+
+        Raises if called when :meth:`is_expandable` would return False —
+        the search loop dispatches on that predicate."""
+        from dataclasses import replace  # noqa: PLC0415
+
+        assert self.pending is not None and not self.pending[1].is_leaf, "expand() requires branch Fork pending"
+        match, fork = self.pending
+        children_options = fork.expand()
+        return [
+            LazyCandidate.from_option(inner=self.inner, cursor=replace(self.cursor), match=match, option=opt) for opt in children_options
+        ]
 
     def resolve(self) -> Candidate:
         """Materialize: copy ``inner.graph``, build a fresh Candidate
-        carrying our cursor, replay ``pending`` through its ``apply``,
-        drop ``pending`` so a second resolve is a no-op (returns the
-        cached resolved Candidate). Multiple sibling ``LazyCandidate``
+        carrying our cursor, replay the pending leaf Fork by invoking
+        its thunk (returns ``[op]`` or ``[graph]``) and applying that
+        single option through ``Candidate.apply``, drop ``pending`` so
+        a second resolve is a no-op. Multiple sibling ``LazyCandidate``
         instances pointing at the same ``inner`` each get their own
         copy — the snapshot is shared only across siblings, not across
-        resolve calls."""
+        resolve calls.
+
+        Caller must ensure :meth:`is_expandable` is False before
+        resolving — branch Forks expand into children that are
+        eventually leaves themselves."""
         if self.pending is None:
             return self.inner
+        match, fork = self.pending
+        assert fork.is_leaf, "resolve() called on branch Fork; use expand() first"
+        leaves = fork.expand()
+        assert len(leaves) == 1, f"leaf Fork must expand to a single option, got {len(leaves)}"
+        option = leaves[0]
         resolved = Candidate(ctx=self.inner.ctx, graph=self.inner.graph.copy(), cursor=self.cursor)
-        match, option = self.pending
         resolved.apply(match.remap(resolved.graph), option)
         self.pending = None
         self.inner = resolved
@@ -210,15 +292,25 @@ class LazyCandidate:
 
     def score(self) -> float:
         """Mean of every node's ``op.score(ctx)`` in the candidate's
-        graph. When ``pending`` carries a single replacement ``Op``,
-        substitute it for the op at the match's root in-place during
-        scoring (no graph copy). When ``pending`` is a ``Graph`` splice,
-        resolve fully and score the resolved graph."""
+        graph. For a branch :class:`Fork`, return
+        ``inner.score() + fork.score`` — the fork's prior preserves the
+        priority signal MCTS would otherwise lose at intermediate
+        levels. For a leaf Fork, fire the (trivial) thunk to retrieve
+        the wrapped ``Op``/``Graph``, then score with that option
+        substituted at the match's root (Op case) or via full resolve
+        + score (Graph case)."""
         from deplodock.compiler.ir.base import Op  # noqa: PLC0415
 
         if self.pending is None:
             return self.inner.score()
-        match, option = self.pending
+        match, fork = self.pending
+        if not fork.is_leaf:
+            return self.inner.score() + fork.score
+        # Leaf Fork — fire the trivial thunk to retrieve the wrapped option.
+        leaves = fork.expand()
+        if not leaves:
+            return self.inner.score()
+        option = leaves[0]
         if not isinstance(option, Op):
             return self.resolve().score()
         ctx = self.inner.ctx

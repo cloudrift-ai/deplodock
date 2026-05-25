@@ -2,13 +2,14 @@
 
 - :mod:`.ir` — dataclass definitions: ``KernelOp`` wrapper plus
   ``Smem`` / ``Sync`` / ``TreeHalve`` hardware primitives. Shared
-  structural types (``Tile``, ``Loop``, ``StridedLoop``) come from
-  ``ir.stmt``.
+  structural types (``Loop``, ``StridedLoop``) come from ``ir.stmt``;
+  the typed tile flavors (``GridTile``, ``ThreadTile``, etc.) come from
+  ``ir.tile.ir``.
 - :mod:`.render` — ``render_kernelop`` emitting CUDA source.
 - :mod:`.pretty` — structural pretty-printer.
 """
 
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.kernel.ir import (
     Accum,
     Assign,
@@ -30,7 +31,6 @@ from deplodock.compiler.ir.kernel.ir import (
     StridedLoop,
     Sync,
     TernaryExpr,
-    Tile,
     TreeHalve,
     Var,
     WarpShuffle,
@@ -54,15 +54,11 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    "Tile",
     "Smem",
     "Sync",
     "TreeHalve",
     "WarpShuffle",
     "StridedLoop",
-    "BoundAxis",
-    "BIND_THREAD",
-    "BIND_BLOCK",
     "Stmt",
     "KernelOp",
     "Axis",

@@ -352,7 +352,9 @@ def test_sdpa_causal(run_graph):
 
 
 def test_sdpa_gqa(run_graph):
-    """GQA: Q has more heads than K/V (28 Q heads, 4 KV heads)."""
+    """GQA: Q has more heads than K/V (28 Q heads, 4 KV heads). The
+    cuda backend reaches the P@V matmul via the planner's
+    fused-prologue chain extension (``_classify_fused_prologue``)."""
     B, Hq, Hkv, S, D = 1, 28, 4, 8, 16
     q_np = rng.standard_normal((B, Hq, S, D)).astype(np.float32)
     k_np = rng.standard_normal((B, Hkv, S, D)).astype(np.float32)

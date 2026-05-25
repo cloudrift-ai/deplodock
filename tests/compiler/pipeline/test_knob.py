@@ -81,6 +81,51 @@ def test_env_property():
 
 
 # ---------------------------------------------------------------------------
+# Knob.narrow — fold env pin into candidate enumeration
+# ---------------------------------------------------------------------------
+
+
+def test_narrow_unpinned_returns_candidates_unchanged(monkeypatch):
+    k = Knob("BN", KnobType.INT)
+    monkeypatch.delenv("DEPLODOCK_BN", raising=False)
+    assert k.narrow((16, 32, 64)) == (16, 32, 64)
+
+
+def test_narrow_pinned_keeps_matching_candidate(monkeypatch):
+    k = Knob("BN", KnobType.INT)
+    monkeypatch.setenv("DEPLODOCK_BN", "32")
+    assert k.narrow((16, 32, 64)) == (32,)
+
+
+def test_narrow_pinned_drops_unmatched(monkeypatch):
+    k = Knob("BN", KnobType.INT)
+    monkeypatch.setenv("DEPLODOCK_BN", "128")
+    assert k.narrow((16, 32, 64)) == ()
+
+
+def test_narrow_accepts_arbitrary_iterable(monkeypatch):
+    k = Knob("BN", KnobType.INT)
+    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    # generator, not a tuple
+    assert k.narrow(x for x in (8, 16, 32)) == (16,)
+
+
+def test_narrow_bool(monkeypatch):
+    k = Knob("FLAG", KnobType.BOOL)
+    monkeypatch.setenv("DEPLODOCK_FLAG", "true")
+    assert k.narrow((True, False)) == (True,)
+    monkeypatch.setenv("DEPLODOCK_FLAG", "0")
+    assert k.narrow((True, False)) == (False,)
+
+
+def test_narrow_binmask_rejected(monkeypatch):
+    k = Knob("STAGE", KnobType.BINMASK)
+    monkeypatch.setenv("DEPLODOCK_STAGE", "111")
+    with pytest.raises(ValueError, match="BINMASK"):
+        k.narrow((0b000, 0b111))
+
+
+# ---------------------------------------------------------------------------
 # DEPLODOCK_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
 

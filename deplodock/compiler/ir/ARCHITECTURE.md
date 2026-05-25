@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, `Stage`/`BufferedStage`/`AsyncBufferedStage` with `Affine`/`TemplateAddressing`, `AsyncWait`, `Combine`, `StridedLoop`) |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, wrap-body `Stage`/`BufferedStage`/`AsyncBufferedStage`/`TmaBufferedStage`/`ComputeStage` carrying `Source`/`CacheDim` per-operand layouts, `StridedLoop`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -29,7 +29,10 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   op; reductions are `Accum` statements inside a reduce `Loop`).
 - **Loop → tile** (after `lowering/tile`): `LoopOp` nodes replaced by
   `TileOp` whose body is a `Tile` carrying scheduling decisions
-  (`BIND_THREAD`/`BIND_BLOCK` axes, `Stage`, `Combine`).
+  (`BIND_THREAD`/`BIND_BLOCK` axes, `Stage`). Cooperative-reduce
+  emission, atomic-write classification, and broadcast-write guards
+  are derived by ``escape_analysis`` at materialize / render time
+  rather than carried as explicit Stmts.
 - **Tile → kernel** (after `lowering/kernel`): `TileOp` materialized to
   `KernelOp` whose body uses hardware primitives (`Smem`, `Sync`,
   `TreeHalve`, `StridedLoop`).
@@ -114,7 +117,7 @@ iteration axes. Free vs reduce is inferred from body structure — a
 | `LoopOp`                     | One kernel. Stored field: `body` (nested `Loop` tree). Computed: `axes`, `loads`, `accums`.                       |
 | `Load`                       | Body-form external read: `name = load(input)[index...]`. `input` matches the producing graph node's id.           |
 | `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseImpl`.                                                      |
-| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to its op's identity.            |
+| `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to its op's identity. ``axes`` lists the reduction axis names — propagated through Sigma renames (including σ-splits via `Expr.free_vars()`); the escape-analysis helper derives cross-thread cooperativity from ``axes ∩ enclosing ThreadTile.axes``. |
 | `Init`                       | Explicit accumulator initialization at an outer scope (matmul chunked-K).                                         |
 | `Write`                      | Write an SSA value to output at `index`.                                                                          |
 | `Select` + `SelectBranch`    | Coord-predicated binding (replaces the old Mux).                                                                  |
@@ -210,22 +213,40 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 ## `tile/`
 
 Tile IR encodes scheduling decisions structurally — `Tile.axes` carry
-`BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` marks smem-cached
-loads, `Combine` collapses an Accum across cooperating threads.
-Compute leaves (`Load` / `Assign` / `Accum` / `Write`) and control
-flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`.
+`BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` wraps consumer subtrees
+that read smem-cached operands. Coordination decisions are derived from
+the body at materialize / render time via ``ir/tile/escape_analysis.py``:
+cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
+atomic-write classification from enclosing ``GridTile.axes`` vs
+``Write.index``, broadcast-write guards from cooperative thread axes vs
+``Write.index``. No explicit coordination stmt or per-tile tag carries
+this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
+and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
+``Accum.axes`` carries the names of the loops being reduced over and is
+the source of truth for cooperativity.
+
+**Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
+the *consumer* subtree using the staged smem. The producer (cooperative
+`Load+Write` per source) is synthesized at materialize time from
+`Stage.sources` — each `Source` carries `name` (smem buffer), `buf`
+(gmem operand), `cache_dims`, `origin`, and optional `pad` /
+`template_index`. Multi-source Stages (e.g. matmul A+B) load both
+behind one sync boundary; sibling Stages exist only when scopes differ.
 
 | Symbol             | Role                                                              |
 |--------------------|-------------------------------------------------------------------|
 | `TileOp`              | Graph-op carrying a `Tile`-rooted body. One per kernel.                                                                              |
 | `Tile`                | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).                                                                     |
-| `Stage`               | Sync, single-slot smem cache of an input slab. Materialize emits leading `Sync` + cooperative `Load+Write` + trailing `Sync`.        |
+| `Stage`               | Wrap-body cooperative stage. ``sources: tuple[Source, ...]`` carries per-operand smem layouts; ``body`` is the consumer subtree. Materialize emits leading `Sync` + per-source cooperative `Load+Write` + trailing `Sync` + materialized consumer body. |
 | `BufferedStage`       | `Stage` subtype with `buffer_count >= 2` rotating slabs selected by `phase`. Sync transport, ping-pong slabs (no leading `Sync`).    |
-| `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async`; emits `Smem`+`CpAsyncCopy`+`CpAsyncCommit` only — caller must dominate consumers with `AsyncWait`. |
-| `AffineAddressing`    | `Stage.addressing` variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
-| `TemplateAddressing`  | `Stage.addressing` variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
-| `AsyncWait`           | Sync point for outstanding cp.async groups. `keep` is the `wait_group` argument: `0` drains all; `len(stages)` leaves the just-issued chunk in flight. |
-| `Combine`             | Cross-thread collapse of an `Accum` target (post reduce loop).                                                                       |
+| `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async` per source; emits `CpAsyncCopy`+`CpAsyncCommit`. `pipeline_depth>1` marks the stage for temporal pipelining (prologue/main/epilogue), expanded by the bucket-10 pass. |
+| `TmaBufferedStage`    | `BufferedStage` subtype using TMA (`cp.async.bulk.tensor` + mbarrier). `pipeline_depth>1` for pipelining; `swizzle` for shared-memory swizzle pattern. |
+| `ComputeStage`        | `Stage` subtype for hoisted invariant compute. Carries a separate `compute: Body` (per-thread compute reading sibling-stage smem, writing this stage's smem). `external_reads()` returns `()` so 015 / tuning don't classify sibling-smem reads as gmem dependencies. |
+| `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `template_index`. Each Stage carries one or more. |
+| `CacheDim`            | One cache (smem) axis paired with the source-buffer dim it maps to. `Source.cache_dims` is a tuple of these.                          |
+| `AffineAddressing`    | Property-derived addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
+| `TemplateAddressing`  | Property-derived addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
+| `AsyncWait`           | Explicit wait carrier for pipelined async / TMA schedules. Emitted by `070_pipeline_stages` between issue / consume halves of each steady-state K_o iter and at the epilogue drain. ``keep`` is the cp.async ``wait_group`` arg; ``phase`` / ``slot`` are TMA mbarrier-test args. Sync-style (``pipeline_depth==1``) stages don't carry one — the materializer emits an implicit wait at the wrap boundary. |
 
 ## `kernel/`
 

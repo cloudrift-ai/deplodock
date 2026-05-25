@@ -28,32 +28,34 @@ Env vars:
 
 - ``DEPLODOCK_BN``, ``DEPLODOCK_BM`` — per-CTA tile (innermost N, outer M).
 - ``DEPLODOCK_FN``, ``DEPLODOCK_FM`` — per-thread output cells.
-- ``DEPLODOCK_BK`` — K-split size for ``002_chunk_matmul_k`` (subject
-  to ``K % BK == 0 and K > BK``). Default is M-adaptive.
+- ``DEPLODOCK_BK`` — K-split size (subject to ``K % BK == 0 and K > BK``).
+  Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
-- ``DEPLODOCK_TMA`` — emit ``cp.async.bulk.tensor`` (TMA) loads + runtime
-  weight transpose (``004a_fold_into_constant``). Default-on for sm_90+
-  (Hopper / Blackwell), default-off below. ``=1`` forces on, ``=0``
-  forces off. ``011_tma_copy`` gates eligibility on rank ≤ 5,
-  ConstantOp source with a recorded transpose load_op chain, and
-  source-inner-extent alignment ≥ 16 B with ≥ 2× headroom past the
-  box inner extent.
 - ``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes
   (``SWIZZLE_{128,64,32}B``). ``=1`` enables; default off. Stages whose
   inner box-dim byte size matches a swizzle width pick the matching
-  mode in ``011_tma_copy``; the materializer pairs each swizzled stage
+  mode in ``040_use_tma``; the materializer pairs each swizzled stage
   with body-Load XOR decoding and a 1024-byte (B128) / 512-byte (B64)
   / 256-byte (B32) smem alignment so the swizzle pattern lines up with
   the buffer base.
+
+## API
+
+Heuristics are pure numeric functions: they take ``output_extents``
+(logical, sorted descending) and a :class:`BodyInfo` summary computed
+once per LoopOp at the start of the planner. Tile-taking callers
+compute these inputs themselves and call the heuristics directly.
 """
 
 from __future__ import annotations
 
 import os
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.tile.ir import Tile
+    from deplodock.compiler.ir.stmt.body import Body
 
 
 # Per-CTA matmul tile defaults. Three classes, picked from logical output
@@ -131,6 +133,23 @@ _BK_SMALL_M = 64
 _BK_LARGE_M_DEFAULT = 16  # cp.async path
 _BK_LARGE_M_TMA = 32  # TMA path
 
+# Reserve ~4 KB of headroom under the static-smem cap so 060_pad_smem's
+# ``+1`` per-stage padding (to break 32-way bank conflicts) doesn't
+# push the kernel over.
+_PAD_HEADROOM_BYTES = 4 * 1024
+_DTYPE_BYTES = 4
+
+# CTA inner-axis width default for paths that produce a single THREAD
+# axis (non-matmul kernels). Mutually exclusive with the matmul path,
+# so it shares the ``DEPLODOCK_BN`` env namespace.
+_NON_MATMUL_BN_DEFAULT = 256
+
+# Cross-CTA split-K target.
+_SPLITK_TARGET_WAVES_HIGH = 16
+_SPLITK_TARGET_WAVES_LARGE = 8
+_SPLITK_TARGET_WAVES_SMALL = 2
+_SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
+
 
 # --- Helpers ------------------------------------------------------------
 
@@ -143,6 +162,35 @@ def _int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+# --- BodyInfo -----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BodyInfo:
+    """Structural summary of a LoopOp / Tile body — what the heuristics
+    need to know that doesn't depend on axis extents.
+
+    Computed once per LoopOp at the start of the planner's ``rewrite``
+    and reused across every heuristic call as the body undergoes
+    σ-substitution. None of these flags change under axis splits or
+    σ-rewriting: matmul shape, fused-prologue load count, and external
+    input count are all about the body's def-use shape, not its axis
+    iteration extents.
+    """
+
+    has_matmul: bool
+    has_fused_prologue: bool
+    external_input_count: int
+
+    @classmethod
+    def of(cls, body) -> BodyInfo:
+        return cls(
+            has_matmul=_has_matmul_reduce(body),
+            has_fused_prologue=_has_fused_prologue(body),
+            external_input_count=_external_input_count(body),
+        )
 
 
 def _has_matmul_reduce(stmts) -> bool:
@@ -165,14 +213,7 @@ def _has_fused_prologue(stmts) -> bool:
     w_smem``). Pure ``matmul`` and ``matmul_add`` (epilogue-fused)
     have exactly 2 buffer Loads inside the K-reduce; the residual /
     bias of ``matmul_add`` is loaded *outside* the reduce loop and
-    doesn't push register pressure inside it.
-
-    The extra buffer Load is a structural proxy for "operand values
-    held across K iters that compete with the F-tile accumulators for
-    register space" — exactly the case where the canonical F=8×4
-    tile starves occupancy. ``_default_tile`` switches to F=4×4 BN=64
-    for these.
-    """
+    doesn't push register pressure inside it."""
     from deplodock.compiler.ir.stmt import Load, Loop
     from deplodock.compiler.ir.stmt.body import Body
 
@@ -191,12 +232,7 @@ def _external_input_count(stmts) -> int:
 
     Pure ``matmul`` = 2 (a, b). ``matmul_add`` = 3 (a, b, residual).
     ``silu_mul_matmul`` = 3 (g, u, w). The default-large class is
-    gated on ``count == 2`` to keep extra epilogue Loads (which steal
-    register slots per-output-cell) from forcing F=8×8 — sweep showed
-    ``matmul_add.tinyllama.o_proj.s512`` regressing 0.80× → 0.72×
-    when the residual Load piles on the F=8×8 accumulator tile
-    (regs 118 → 209, occ 33% → 17%).
-    """
+    gated on ``count == 2``."""
     from deplodock.compiler.ir.stmt import Load
     from deplodock.compiler.ir.stmt.body import Body
     from deplodock.compiler.ir.tile.ir import Stage
@@ -206,81 +242,90 @@ def _external_input_count(stmts) -> int:
     bufs: set[str] = set()
     for s in body.iter():
         if isinstance(s, Stage):
-            # Fused stages load from multiple gmem buffers (silu-mul → gate, up);
-            # count each unique source so the heuristic sees the right input count.
-            for src_load in s.source_loads:
-                bufs.add(src_load.input)
+            # ``Stage.external_reads`` returns the gmem buffer names; a
+            # ``ComputeStage`` overrides it to ``()`` because its body
+            # Loads read sibling Stage smem, not gmem.
+            for buf_name in s.external_reads():
+                bufs.add(buf_name)
         elif isinstance(s, Load) and s.input not in stage_names:
             bufs.add(s.input)
     return len(bufs)
 
 
-def _logical_output_extents(tile: Tile) -> list[int]:
-    """Recover the pre-blockify output extents from a (possibly
-    blockified) ``Tile``. Walks ``tile.axes`` folding adjacent
-    BLOCK-then-THREAD pairs into a single extent. Returns sorted
-    descending."""
-    from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD
-
-    extents: list[int] = []
-    i = 0
-    while i < len(tile.axes):
-        ba = tile.axes[i]
-        ext = int(ba.axis.extent)
-        if ba.bind == BIND_BLOCK and i + 1 < len(tile.axes) and tile.axes[i + 1].bind == BIND_THREAD:
-            extents.append(ext * int(tile.axes[i + 1].axis.extent))
-            i += 2
-            continue
-        extents.append(ext)
-        i += 1
-    return sorted(extents, reverse=True)
+# --- Extent recovery ----------------------------------------------------
 
 
-def _matmul_M(tile: Tile) -> int:
-    """The matmul's M extent — the smaller of the two largest output
-    axes. Convention: output[M, N] has M=batch×seq, N=hidden."""
-    extents = _logical_output_extents(tile)
-    return extents[1] if len(extents) >= 2 else 0
+_SUB_AXIS_SUFFIX = re.compile(r"_(o|i|reg|b|t|r|s)$")
 
 
-def _tile_class(tile: Tile | None) -> str:
+def recover_logical_extents(body: Body) -> tuple[int, ...]:
+    """Recover the pre-split logical output extents from a LoopOp /
+    Tile body. Walks the outer free-Loop chain and folds adjacent
+    σ-split sub-axes (``_o`` / ``_i`` / ``_reg`` / ``_b`` / ``_t`` /
+    ``_r`` / ``_s``) sharing the same parent name back into a single
+    extent. Returns extents sorted descending so callers can read
+    ``extents[0]`` as N (largest) and ``extents[1]`` as M.
+
+    Used after the planner has σ-split output axes so heuristics still
+    see logical extents."""
+    from deplodock.compiler.ir.stmt import Loop
+
+    chain_extents: list[tuple[str, int]] = []
+    cur = tuple(body)
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
+        chain_extents.append((cur[0].axis.name, int(cur[0].axis.extent)))
+        cur = tuple(cur[0].body)
+
+    folded: dict[str, int] = {}
+    order: list[str] = []
+    for name, ext in chain_extents:
+        parent = _SUB_AXIS_SUFFIX.sub("", name)
+        if parent in folded:
+            folded[parent] *= ext
+        else:
+            folded[parent] = ext
+            order.append(parent)
+    return tuple(sorted((folded[p] for p in order), reverse=True))
+
+
+# --- Class & default-tile pickers --------------------------------------
+
+
+def _tile_class(output_extents: tuple[int, ...], body_info: BodyInfo) -> str:
     """``"fused" | "huge" | "compact" | "default-large" | "default"``
     — picks the matmul tile class from the logical output extents and
-    body structure. Non-matmul tiles fall to ``"default"`` (the env
+    body structure. Non-matmul bodies fall to ``"default"`` (the env
     vars wouldn't apply anyway).
 
     ``"fused"`` is checked first because a fused-prologue matmul
     (``silu_mul_matmul``) can have output extents that would otherwise
     classify it as ``huge`` / ``default``, but its register pressure
-    profile is fundamentally different — the standard tiles starve
-    occupancy.
+    profile is fundamentally different.
 
     ``"default-large"`` is the default-class subclass for M ≥ 128 +
     N > _COMPACT_N_MAX + N < _HUGE_N_MIN. FN=8 (vs FN=4) doubles
     arithmetic intensity per thread; the chunk pass (``009``) keeps
-    LDS.128 vectorized.
-    """
-    if tile is None or not _has_matmul_reduce(tile.body):
+    LDS.128 vectorized."""
+    if not body_info.has_matmul:
         return "default"
-    if _has_fused_prologue(tile.body):
+    if body_info.has_fused_prologue:
         return "fused"
-    extents = _logical_output_extents(tile)
-    if len(extents) < 2:
+    if len(output_extents) < 2:
         return "default"
-    n, m = extents[0], extents[1]
+    n, m = output_extents[0], output_extents[1]
     if m >= _HUGE_M_MIN and n >= _HUGE_N_MIN:
         return "huge"
     if n <= _COMPACT_N_MAX:
         return "compact"
-    if m >= _DEFAULT_LARGE_M_MIN and _external_input_count(tile.body) == 2:
+    if m >= _DEFAULT_LARGE_M_MIN and body_info.external_input_count == 2:
         return "default-large"
     return "default"
 
 
-def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
+def _default_tile(output_extents: tuple[int, ...], body_info: BodyInfo) -> tuple[tuple[int, int], tuple[int, int]]:
     """``((BN, BM), (FM, FN))`` defaults for the matmul tile, picked
-    by ``_tile_class``."""
-    cls = _tile_class(tile)
+    by :func:`_tile_class`."""
+    cls = _tile_class(output_extents, body_info)
     if cls == "fused":
         return _TILE_SHAPE_FUSED, _F_PER_AXIS_FUSED
     if cls == "huge":
@@ -292,97 +337,59 @@ def _default_tile(tile: Tile | None) -> tuple[tuple[int, int], tuple[int, int]]:
     return _TILE_SHAPE_DEFAULT, _F_PER_AXIS_DEFAULT
 
 
-# --- Public API ---------------------------------------------------------
-
-
-def _tma_enabled() -> bool:
-    """TMA staging gate. Default-on for sm_90+ (Hopper / Blackwell) which
-    have ``cp.async.bulk.tensor``; default-off below sm_90. ``DEPLODOCK_TMA``
-    overrides either way: ``=1`` forces on, ``=0`` forces off.
-
-    The ``TMA`` ``Knob`` itself lives in ``011_tma_copy``; this function
-    duplicates a 3-line env read instead of importing it because
-    ``011_tma_copy``'s numeric-prefix filename can only be loaded via
-    ``importlib`` and ``_fold_constant`` (a frontend pass) calls this
-    before tile passes are loaded."""
-    raw = os.environ.get("DEPLODOCK_TMA")
-    if raw == "1":
-        return True
-    if raw == "0":
-        return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._helpers import compute_capability  # noqa: PLC0415
-
-    return compute_capability() >= (9, 0)
+# --- TMA gates ---------------------------------------------------------
 
 
 def _tma_swizzle_enabled() -> bool:
     """TMA hardware-swizzle gate. Off by default — only fires when the
     inner box-dim byte size matches a swizzle width AND ``DEPLODOCK_TMA_SWIZZLE``
-    opts in. The materializer pairs swizzle with body-Load XOR decoding +
-    1024-byte smem alignment for ``B128`` (proportionally smaller for
-    ``B64`` / ``B32``); a current default-on would regress kernels whose
-    slab geometry happens to fit a swizzle width but whose body Loads
-    weren't validated against the decoder."""
+    opts in."""
     return os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") in ("1", "true", "True")
 
 
-# CTA inner-axis width default for paths that produce a single THREAD
-# axis (non-matmul ``005_blockify_launch`` deterministic branch and
-# ``004_cooperative_reduce``'s synthetic ``t`` axis). Mutually exclusive
-# with the matmul path, so it shares the ``DEPLODOCK_BN`` env namespace
-# — at most one path applies per kernel.
-_NON_MATMUL_BN_DEFAULT = 256
+# --- Heuristics (pure numeric) -----------------------------------------
 
 
-def thread_tile_shape(tile: Tile | None = None) -> tuple[int, ...]:
-    """Per-axis THREAD-tile widths ``005_blockify_launch`` should emit,
+def thread_tile_shape(output_extents: tuple[int, ...], body_info: BodyInfo) -> tuple[int, ...]:
+    """Per-axis THREAD-tile widths the launch-geometry step should emit,
     innermost-first. ``(BN, BM)`` for matmul, ``(BN,)`` for non-matmul
     kernels (single THREAD axis; same env namespace as the matmul case)."""
-    if tile is not None and _has_matmul_reduce(tile.body):
-        (def_bn, def_bm), _ = _default_tile(tile)
+    if body_info.has_matmul:
+        (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
         bn = _int_env("DEPLODOCK_BN", def_bn)
         bm = _int_env("DEPLODOCK_BM", def_bm)
         return (bn, bm)
     return (_int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT),)
 
 
-def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
-    """Per-thread output tile ``(FM, FN)``. ``(1, 1)`` to skip
-    register tiling on non-matmul bodies and on tiny matmuls whose
-    post-blockify THREAD product is already at-or-below one warp.
+def register_tile_shape(
+    output_extents: tuple[int, ...],
+    thread_extents: tuple[int, ...],
+    body_info: BodyInfo,
+) -> tuple[int, int]:
+    """Per-thread output tile ``(FM, FN)``. ``(1, 1)`` to skip register
+    tiling on non-matmul bodies and on tiny matmuls whose THREAD product
+    is already at-or-below one warp.
 
     For tiles whose THREAD extents match the class's default (BN, BM),
-    return the class-tuned ``(FM, FN)``. For *off-default* (BN, BM)
-    — the autotune sweep over ``005_blockify_launch``'s ``_TUNE_AXIS_CHOICES``
-    — derive a heuristic F from the actual thread extents that targets
-    ~256 post-split threads, so 008 still forks (and the autotuner can
-    explore its F neighborhood) instead of bailing to ``(1, 1)`` and
-    leaving small-tile variants register-tile-less.
-    """
-    if tile is None or not _has_matmul_reduce(tile.body):
+    return the class-tuned ``(FM, FN)``. For off-default extents
+    derive a heuristic F from the actual thread extents that targets
+    ~256 post-split threads."""
+    if not body_info.has_matmul:
         return (1, 1)
-    (def_bn, def_bm), (def_fm, def_fn) = _default_tile(tile)
+    (def_bn, def_bm), (def_fm, def_fn) = _default_tile(output_extents, body_info)
     f_m = _int_env("DEPLODOCK_FM", def_fm)
     f_n = _int_env("DEPLODOCK_FN", def_fn)
     bn = _int_env("DEPLODOCK_BN", def_bn)
     bm = _int_env("DEPLODOCK_BM", def_bm)
-    from deplodock.compiler.ir.axis import BIND_THREAD
-
-    thread_axes = [ba for ba in tile.axes if ba.bind == BIND_THREAD]
-    if not thread_axes:
+    if not thread_extents:
         return (f_m, f_n)
-    thread_extents = {int(ba.axis.extent) for ba in thread_axes}
-    if thread_extents & {bn, bm}:
+    te_set = {int(e) for e in thread_extents}
+    if te_set & {bn, bm}:
         return (f_m, f_n)
-
-    # Off-default (BN, BM) — pick the largest symmetric F (power of 2)
-    # that divides both extents and leaves at least one warp's worth of
-    # threads post-split. The autotune fork over ``_TUNE_F_CHOICES``
-    # then explores neighbours; this just has to be non-(1, 1) so 008
-    # fires and emits the fork.
-    sorted_ba = sorted(thread_axes, key=lambda ba: int(ba.axis.extent))
-    m_ext = int(sorted_ba[0].axis.extent)
-    n_ext = int(sorted_ba[-1].axis.extent)
+    sorted_te = sorted(int(e) for e in thread_extents)
+    m_ext = sorted_te[0]
+    n_ext = sorted_te[-1]
     cur_threads = m_ext * n_ext
     if cur_threads <= 32:
         return (1, 1)
@@ -392,95 +399,98 @@ def register_tile_shape(tile: Tile | None = None) -> tuple[int, int]:
     return (1, 1)
 
 
-def forced_bk(tile: Tile | None = None, static_smem_cap: int | None = None) -> int | None:
-    """Force BK via env, or pick the M-adaptive default. Backs off to
-    a smaller BK when the M-adaptive choice would overflow the static-
-    smem cap at the active tile shape — happens for small matmuls where
-    the THREAD axes stay at the full output extent and BK_SMALL_M=64
-    produces a stage too large for two buffers.
+def forced_bk(
+    output_extents: tuple[int, ...],
+    body_info: BodyInfo,
+    static_smem_cap: int | None = None,
+) -> int | None:
+    """Force BK via env, or pick the M-adaptive default. Backs off to a
+    smaller BK when the M-adaptive choice would overflow the static-
+    smem cap at the active tile shape.
 
-    ``static_smem_cap`` defaults to ``Context.static_smem_cap`` (48 KB);
-    callers that have a ``Context`` should pass ``ctx.static_smem_cap``
-    so the budget tracks the target arch."""
+    ``static_smem_cap`` defaults to ``Context.static_smem_cap`` (48 KB)."""
     raw = os.environ.get("DEPLODOCK_BK")
     if raw:
         try:
             return int(raw)
         except ValueError:
             return None
-    if tile is None or not _has_matmul_reduce(tile.body):
+    if not body_info.has_matmul:
         return None
-    bk = _BK_SMALL_M if _matmul_M(tile) <= _M_THRESHOLD else (_BK_LARGE_M_TMA if _tma_enabled() else _BK_LARGE_M_DEFAULT)
+    m = output_extents[1] if len(output_extents) >= 2 else 0
+    from deplodock.compiler.target import compute_capability  # noqa: PLC0415
+
+    tma_path = compute_capability() >= (9, 0)
+    bk = _BK_SMALL_M if m <= _M_THRESHOLD else (_BK_LARGE_M_TMA if tma_path else _BK_LARGE_M_DEFAULT)
     if static_smem_cap is None:
         from deplodock.compiler.context import STATIC_SMEM_CAP  # noqa: PLC0415
 
         static_smem_cap = STATIC_SMEM_CAP
-    return _bk_fits_smem(tile, bk, static_smem_cap)
+    return _bk_fits_smem(output_extents, body_info, bk, static_smem_cap)
 
 
-# Reserve ~4 KB of headroom under the static-smem cap so 014_pad_smem's
-# ``+1`` per-stage padding (to break 32-way bank conflicts) doesn't
-# push the kernel over.
-_PAD_HEADROOM_BYTES = 4 * 1024
-_DTYPE_BYTES = 4
-
-
-def _bk_fits_smem(tile: Tile, bk: int, static_smem_cap: int) -> int:
+def _bk_fits_smem(output_extents: tuple[int, ...], body_info: BodyInfo, bk: int, static_smem_cap: int) -> int:
     """Halve BK until the per-stage smem fits in ``static_smem_cap``
     minus pad headroom. Returns the largest BK ≥ 1 that fits.
 
-    Stage footprint = ``n_inputs · max(BN, BM) · BK · 4 · 2``: each
-    external input gets staged at roughly ``tile × BK`` floats, with
-    two buffers for double-buffering. ``n_inputs`` is read from the
-    tile body — a plain ``matmul`` has 2 inputs (A, B); fused-prologue
-    matmuls (``silu_mul_matmul``, naive attention's ``softmax·mask @ V``)
-    have ≥3 and need a tighter BK to leave room for the extra stage.
-    The previous 2-input fixed assumption let naive_attn at head_dim=128
-    pick a BK that overflowed the dynamic-smem cap at launch.
-    """
+    Stage footprint = ``n_inputs · max(BN, BM) · BK · 4 · 2``."""
     budget = static_smem_cap - _PAD_HEADROOM_BYTES
-    extents = _logical_output_extents(tile)
-    if len(extents) < 2:
+    if len(output_extents) < 2:
         return bk
-    (def_bn, def_bm), _ = _default_tile(tile)
-    bn_actual = min(extents[0], _int_env("DEPLODOCK_BN", def_bn))
-    bm_actual = min(extents[1], _int_env("DEPLODOCK_BM", def_bm))
-    n_inputs = max(_external_input_count(tile.body), 2)
+    (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
+    bn_actual = min(output_extents[0], _int_env("DEPLODOCK_BN", def_bn))
+    bm_actual = min(output_extents[1], _int_env("DEPLODOCK_BM", def_bm))
+    n_inputs = max(body_info.external_input_count, 2)
     stage_footprint = n_inputs * max(bn_actual, bm_actual) * _DTYPE_BYTES * 2
     while bk > 1 and stage_footprint * bk > budget:
         bk //= 2
     return bk
 
 
-def cooperative_block_size() -> int:
-    """Threads/CTA for the synthetic cooperative ``t`` axis. Shares the
-    matmul ``DEPLODOCK_BN`` env namespace — cooperative-reduce and
-    matmul paths are mutually exclusive per kernel, so one env knob
-    suffices for both."""
-    return _int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT)
+def auto_splitk(
+    output_extents: tuple[int, ...],
+    body_info: BodyInfo,
+    k_o_extent: int,
+    thread_extents: tuple[int, ...],
+) -> int:
+    """Auto-pick a cross-CTA split-K factor.
+
+    ``DEPLODOCK_SPLITK`` env wins when set. Otherwise: target
+    ``waves_target * num_sms`` total CTAs, divide by the current
+    M-N grid count, clamp to the largest divisor of ``k_o_extent``
+    that is ≤ the target. Returns 1 when no useful split exists."""
+    forced = _int_env("DEPLODOCK_SPLITK", 0)
+    if forced > 0:
+        return forced
+    if not body_info.has_matmul:
+        return 1
+    (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
+    bn = _int_env("DEPLODOCK_BN", def_bn)
+    bm = _int_env("DEPLODOCK_BM", def_bm)
+    targets = (bn, bm)
+    # Pre-blockify thread extents — same shape as ``tile.axes`` extents
+    # in the legacy synthetic-Tile call. Sort descending; innermost-2
+    # axes become the matmul tile dims and map to (BN, BM).
+    extents = sorted((int(e) for e in thread_extents), reverse=True)
+    grid = 1
+    for i, ext in enumerate(extents):
+        if i < len(targets):
+            tgt = targets[i]
+            grid *= max(1, ext // tgt) if ext >= tgt else 1
+        else:
+            grid *= ext
+    target_total = _splitk_target_waves(output_extents, body_info) * _SPLITK_NUM_SMS
+    if grid >= target_total:
+        return 1
+    desired = max(1, target_total // grid)
+    splitk = max((d for d in range(1, min(desired, k_o_extent) + 1) if k_o_extent % d == 0), default=1)
+    return splitk
 
 
-# Cross-CTA split-K target. Class-adaptive: small-tile matmuls (narrow N
-# kv_proj-class, small-M s32, SDPA-shaped) win with a low waves target —
-# their grids already cover most of the SM array, so chasing 8 waves
-# inflates split-K and atomic-add contention dominates. Sweep on RTX 5090
-# fp32: ``waves=2`` cuts kv_proj.s512 48µs → 20µs and sdpa.qwen.s128 85µs
-# → 46µs, but regresses gate_proj.s512 — large-large GEMMs need ``waves=8``
-# (the prior comment's ``{4, 8, 16}`` empirical elbow on TinyLlama MLP).
-_SPLITK_TARGET_WAVES_HIGH = 16
-_SPLITK_TARGET_WAVES_LARGE = 8
-_SPLITK_TARGET_WAVES_SMALL = 2
-_SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
-
-
-def _splitk_target_waves(tile: Tile | None) -> int:
-    cls = _tile_class(tile)
-    if tile is not None and _has_matmul_reduce(tile.body):
-        extents = _logical_output_extents(tile)
-        n = extents[0] if extents else 0
-        m = extents[1] if len(extents) >= 2 else 0
-    else:
-        n = m = 0
+def _splitk_target_waves(output_extents: tuple[int, ...], body_info: BodyInfo) -> int:
+    cls = _tile_class(output_extents, body_info)
+    n = output_extents[0] if output_extents else 0
+    m = output_extents[1] if len(output_extents) >= 2 else 0
     if 0 < m <= _LOW_GRID_M_MAX and 0 < n <= _LOW_GRID_N_MAX:
         return _SPLITK_TARGET_WAVES_SMALL
     if cls == "compact":
@@ -490,36 +500,7 @@ def _splitk_target_waves(tile: Tile | None) -> int:
     return _SPLITK_TARGET_WAVES_LARGE
 
 
-def auto_splitk(tile: Tile, k_o_extent: int) -> int:
-    """Auto-pick a cross-CTA split-K factor for the given matmul Tile.
-
-    ``DEPLODOCK_SPLITK`` env wins when set. Otherwise: target
-    ``waves_target * num_sms`` total CTAs, divide by the current
-    M-N grid count, clamp to the largest divisor of ``k_o_extent``
-    that is ≤ the target. Returns 1 when no useful split exists."""
-    forced = _int_env("DEPLODOCK_SPLITK", 0)
-    if forced > 0:
-        return forced
-    if not _has_matmul_reduce(tile.body):
-        return 1
-    (def_bn, def_bm), _ = _default_tile(tile)
-    bn = _int_env("DEPLODOCK_BN", def_bn)
-    bm = _int_env("DEPLODOCK_BM", def_bm)
-    targets = (bn, bm)
-    grid = 1
-    extents = sorted([int(ba.axis.extent) for ba in tile.axes], reverse=True)
-    # Innermost-2 axes become the matmul tile dims; map them to (BN, BM).
-    # Outer axes go BLOCK whole (multiplying grid by their extents).
-    for i, ext in enumerate(extents):
-        if i < len(targets):
-            tgt = targets[i]
-            grid *= max(1, ext // tgt) if ext >= tgt else 1
-        else:
-            grid *= ext
-    target_total = _splitk_target_waves(tile) * _SPLITK_NUM_SMS
-    if grid >= target_total:
-        return 1
-    desired = max(1, target_total // grid)
-    # Largest divisor of k_o_extent that is ≤ desired.
-    splitk = max((d for d in range(1, min(desired, k_o_extent) + 1) if k_o_extent % d == 0), default=1)
-    return splitk
+def cooperative_block_size() -> int:
+    """Threads/CTA for synthetic-thread axes in non-matmul paths.
+    Shares the matmul ``DEPLODOCK_BN`` env namespace."""
+    return _int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT)

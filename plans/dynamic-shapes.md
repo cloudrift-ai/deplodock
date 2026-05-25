@@ -1,0 +1,122 @@
+# Dynamic Shapes in the Deplodock Compiler
+
+Scope: support symbolic `seq_len` end-to-end so a single compiled artifact runs at multiple sequence lengths. Batch,
+num_heads, and other dims stay static in v1.
+
+## Motivation
+
+Today the compiler is statically shaped: every `Tensor.shape` element is an `int`, every `Axis.extent` is an `int`, and
+every cached kernel is keyed on the exact concrete shape. The "full-model compile + `deplodock run`" work
+([[project_full_model_compile]]) and the autoregressive generation loop both want one compiled graph reused across
+prefill + decode lengths. The minimum needed to unlock that is one symbolic free dim: `seq_len`.
+
+## Representation: a `Dim` helper
+
+Introduce `compiler/dim.py` *before* touching any pass. The current `tuple[int | str, ...]` union on `Tensor.shape` is
+the source of the audit pain — every consumer has to branch on `isinstance(..., int)` and most don't, so a string
+silently means "skip this optimization" or crashes deep inside a backend.
+
+```python
+@dataclass(frozen=True)
+class Dim:
+    """One tensor / axis extent. Static int or symbolic name. Future: Expr."""
+    value: int | str
+
+    @property
+    def is_static(self) -> bool: ...
+    def as_static(self) -> int: ...        # raises on symbolic — loud failure at static-only sites
+    def __eq__(self, other): ...           # accepts int for migration ergonomics
+```
+
+No `__index__` / `__int__` — we *want* `int(dim)` and `range(dim)` to fail loudly at symbolic sites; that is the type's
+job. Construction is explicit (`Dim(32)`, `Dim("seq_len")`); reads use `.value` or `.as_static()`.
+
+Later additions (do not add until something forces them):
+
+- `multiple_of: int | None` — for `Axis.split` divisibility checks (M3).
+- `min / max: int | None` — for shape inference on `slice` / `select`, and for autotune bucketing.
+- `value: int | str | Expr` — when we hit `2*seq_len` style arithmetic.
+- `resolve(env: dict[str, int]) -> int` — for runtime launch-dim computation in the CUDA backend (M2).
+
+Rejected alternatives:
+
+- A `Symbol` / `StaticDim` class hierarchy — forks every call site between two branches, same pain as the union.
+- Auto-converting `int` to `Dim` at every callsite — keeps construction explicit; reads stay readable via `.value`.
+- Hiding `value` behind an opaque API — would hurt debugger / repr legibility for no real benefit.
+
+## Validation slice
+
+Smallest end-to-end thing that exercises the path:
+
+```
+deplodock compile --code "torch.nn.RMSNorm(2048)(torch.randn(1, S, 2048))"
+deplodock run --code "..."     # twice with different S, assert single cached kernel
+```
+
+RMSNorm is the minimal case: one *static* reduce axis (2048), free axes over `(1, S, 2048)`. It exercises
+lifting → tile-planner → CUDA emit without touching matmul K-chunking, SDPA mask construction, or split-K — all the
+places most likely to need separate fixes.
+
+Follow-on slices, in order of difficulty:
+
+1. **Softmax over symbolic `seq_len`** — reduce axis is dynamic. Forces chunk_reduce / cooperative reduce to handle a
+   non-int extent.
+2. **Single-layer SDPA with symbolic `seq_len`** — pulls in mask shape, GQA reshape, K reduction.
+3. **TinyLlama whole-model compile** — generation loop reuses one graph for prefill + decode.
+
+## Milestones (single branch, milestone commits per [[feedback_single_branch_milestones]])
+
+| M  | Slice | Validation |
+|----|-------|------------|
+| M0 | Add `compiler/dim.py`; switch `Tensor.shape: tuple[Dim, ...]` and `Axis.extent: Dim`; migrate ~30 `int(d)` sites to `d.as_static()`; fold `Dim.value` into `Graph.structural_key()` | `make test` green; no behavior change |
+| M1 | Lifting passes (`001_lift_elementwise`, `002_lift_reduce`, `003_lift_indexmap`, `004_lift_gather`) preserve symbolic free-axis extents; `Loop.forward()` reads extent from input arrays at execute time | `compile --code RMSNorm` with symbolic S prints loop IR with `Axis(extent=Dim("seq_len"))` |
+| M2 | Kernel signature carries `seq_len` as an i32 runtime arg; CUDA emitter renders `Axis` extent as that arg in grid bounds and free-axis loop limits | `run --code RMSNorm` with two different S values, one cached kernel |
+| M3 | Tile planner handles symbolic extent on free axes (no split — bind whole axis to BLOCK or stride); explicit error on symbolic reduce axes | RMSNorm passes; softmax-over-S fails cleanly with a known message |
+| M4 | SDPA decomposition + reshape handle symbolic `seq_len` (causal mask passed as input, not constructed inline); HF wrapper produces a symbolic-aware mask | Single-layer SDPA traces with symbolic seq_len |
+| M5 | Reduce-axis dynamism: chunk_reduce / cooperative reduce emit a runtime loop count instead of a baked-in `int` | Softmax-over-S runs; SDPA-over-S runs |
+| M6 | Trace path: `compile <hf_model> --dynamic seq_len` end-to-end on TinyLlama whole-model; generation loop reuses one graph | Two-token vs sixteen-token decode share one compiled artifact |
+
+M0–M3 is the load-bearing scope — once a free dim threads cleanly through to launch geometry, the rest is mechanical.
+M4–M6 is where the bodies are buried: mask construction, reduce-axis loop count, autotune cache keying.
+
+## Surfaces that need work (audit)
+
+1. **Trace** (`compiler/trace/torch.py`, `compiler/trace/huggingface.py`) — feed `dynamic_shapes={…}` into
+   `torch.export.export()`; capture `torch.SymInt` from FX meta as `Dim("seq_len")`; rework
+   `build_full_model_wrapper` so causal mask + `position_ids` are either symbolic-length tensors or graph inputs.
+2. **Tensor / Axis** (`compiler/tensor.py`, `compiler/ir/axis.py`) — shape elements and axis extents become `Dim`.
+   `Axis.split(factor)` needs to refuse symbolic extents (M3).
+3. **Frontend decomposition** (`compiler/pipeline/passes/frontend/decomposition/`) — most rules propagate shapes and
+   are fine. Risk sites: `001_sdpa.py` (mask shape derived from seq_len); reshape/view (`ir/frontend/ir.py:74,78` do
+   `in_numel *= int(d)` and `known *= int(d)`); `SliceOp` (`ir/frontend/ir.py:96`) also carries
+   `tuple[int | str, ...]` but only forwards it — its `forward` reads start/end from constant inputs, so symbolic dims
+   pass through without a cast; broadcast helpers; `013_cat.py` (already guards on `isinstance(..., int)`).
+4. **Loop lifting** (`compiler/pipeline/passes/loop/lifting/`) — all four lifting passes do `Axis(extent=int(d))`. Each
+   becomes `Axis(extent=d)` with `d: Dim`.
+5. **Tile / Kernel / CUDA lowering** (`compiler/pipeline/passes/lowering/{tile,kernel,cuda}/`,
+   `compiler/backend/cuda/`) — kernel signature gains a `seq_len: int` runtime arg; launch grid
+   (`backend/cuda/program.py` — `_Buffer.shape` is currently `tuple[int, ...]` at line 66, statically resolved at launch
+   time), TMA descriptors (`backend/cuda/_tma.py`), shared-mem sizing all resolve the symbolic dim from the actual input
+   tensor at launch time.
+6. **Autotune cache** (`Graph.structural_key()` in `compiler/graph.py` at lines 563–621 — folds `tuple(out.shape)` into
+   the digest at line 611; tune DB schema in `compiler/pipeline/search/`) — symbolic dims must hash by name, not by
+   current binding, or the cache busts every batch.
+
+## Open decisions
+
+- **Divisibility on symbolic axes.** `Axis.split` requires `extent % factor == 0`. v1 answer: refuse to split symbolic
+  axes — bind whole axis to BLOCK or use cooperative stride. Matches the current "no residue tail" stance in `axis.py`.
+  Revisit when M5 needs to chunk a symbolic reduce.
+- **Where the runtime binding lives.** Two options. (a) `KernelOp` carries a `runtime_args: dict[str, Dim]` and the
+  backend resolves at launch from input shapes. (b) Each `CudaOp` re-derives bindings by walking its inputs. (a) is
+  cleaner; (b) is closer to today. Defer until M2.
+- **`Dim` value promotion to `Expr`.** Keep `value: int | str` in v1. Graduate to `Expr` only if a real pass needs
+  `2*seq_len` or `seq_len + 1`. Most mask / position-id cases can be expressed as a separate symbolic name plus a
+  graph-level offset rather than as shape arithmetic.
+
+## Explicitly out of scope (v1)
+
+- Dynamic batch, num_heads, or any dim other than seq_len.
+- Symbolic arithmetic in shapes (`2*seq_len`, `seq_len - 1`). Decompose to a separate symbolic name if encountered.
+- Whole-model dynamic compile through `bench` / `deploy` paths. Stay on `compile --code` + `run --code` until M6.
+- Residue tails for non-divisible static splits. Unchanged from today.

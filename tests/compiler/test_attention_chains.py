@@ -39,14 +39,20 @@ def _seed():
     torch.manual_seed(42)
 
 
-def _run_module_on_cuda(module: torch.nn.Module, inputs_by_name: dict[str, np.ndarray]) -> np.ndarray:
-    """Trace ``module`` with the given inputs, compile via CudaBackend,
-    run, and return the (single) output flattened."""
+def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Trace + compile ``module``, then run the deplodock kernels and
+    the torch eager reference under one ``backend.run`` GPU-lock window
+    via the ``pre_run`` callback. Returns ``(deplodock_flat, eager_flat)``.
+
+    Keeping both halves under the same lock means peer xdist workers
+    can't interleave CUDA work between the eager forward and the
+    deplodock comparison — which used to surface as small numerical
+    divergence (max_diff ~0.03 on max_eager ~1.2) that flaked the
+    accuracy assertion."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.base import ConstantOp
     from deplodock.compiler.trace.torch import trace_module
 
-    args = tuple(torch.from_numpy(inputs_by_name[k]) for k in inputs_by_name)
     graph = trace_module(module.cpu(), args)
     backend = CudaBackend()
     compiled = backend.compile(graph)
@@ -74,18 +80,20 @@ def _run_module_on_cuda(module: torch.nn.Module, inputs_by_name: dict[str, np.nd
                     break
             if nid not in feed and node.op.value is not None:
                 feed[nid] = np.array([node.op.value], dtype=np.float32)
-    out = list(backend.run(compiled, input_data=feed).outputs.values())[0]
-    return out.flatten()
 
-
-def _eager_on_cuda(module: torch.nn.Module, *args: torch.Tensor) -> np.ndarray:
     cuda_module = module.cuda()
     cuda_args = tuple(a.cuda() for a in args)
-    with torch.no_grad():
-        out = cuda_module(*cuda_args)
-    if isinstance(out, tuple):
-        out = out[0]
-    return out.cpu().flatten().numpy()
+
+    def eager_pre_run() -> np.ndarray:
+        with torch.no_grad():
+            out = cuda_module(*cuda_args)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out.cpu().flatten().numpy()
+
+    run_result, eager = backend.run(compiled, input_data=feed, pre_run=eager_pre_run)
+    dpd = list(run_result.outputs.values())[0].flatten()
+    return dpd, eager
 
 
 def _assert_close(deplodock: np.ndarray, eager: np.ndarray, threshold: float = 1e-4) -> None:
@@ -116,8 +124,7 @@ def test_two_linears_tinyllama_shape():
     Confirms basic matmul-chain accuracy."""
     m = _StackedLinears().eval()
     x = torch.randn(1, 32, 2048)
-    eager = _eager_on_cuda(m, x)
-    dpd = _run_module_on_cuda(m, {"x": x.numpy()})
+    dpd, eager = _run_module_with_eager(m, (x,), {"x": x.numpy()})
     _assert_close(dpd, eager)
 
 
@@ -150,8 +157,7 @@ def test_qkv_attn_no_rope():
     its own."""
     m = _QKVAttnNoRope().eval()
     x = torch.randn(1, 32, 2048)
-    eager = _eager_on_cuda(m, x)
-    dpd = _run_module_on_cuda(m, {"x": x.numpy()})
+    dpd, eager = _run_module_with_eager(m, (x,), {"x": x.numpy()})
     _assert_close(dpd, eager)
 
 
@@ -175,21 +181,13 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     cos = torch.randn(1, 1, seq_len, head_dim)
     sin = torch.randn(1, 1, seq_len, head_dim)
 
-    attn_cuda = attn.cuda()
-    # Force the math (naive) SDPA backend so eager and deplodock compare
-    # the same algorithm — flash-attention re-orders FMAs and would
-    # otherwise drift O(0.5 × max_eager) from naive at seq ≥ 512.
-    with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-        eager_out = attn_cuda(x.cuda(), position_embeddings=(cos.cuda(), sin.cuda()))[0]
-    eager = eager_out.cpu().flatten().numpy()
-
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.base import ConstantOp
     from deplodock.compiler.loader.binder import apply_load_ops
     from deplodock.compiler.trace.torch import trace_module
 
-    attn = attn.cpu()
-    graph = trace_module(attn, (x,), kwargs={"position_embeddings": (cos, sin)})
+    attn_cpu = attn.cpu()
+    graph = trace_module(attn_cpu, (x,), kwargs={"position_embeddings": (cos, sin)})
     backend = CudaBackend()
     compiled = backend.compile(graph)
 
@@ -208,7 +206,7 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
             n = 1
             for d in node.output.shape:
                 n *= int(d)
-            for key, p in attn.named_parameters():
+            for key, p in attn_cpu.named_parameters():
                 safe_key = "p_" + key.replace(".", "_")
                 if safe_key.endswith(node.op.name[2:]) and p.numel() == n:
                     arr = p.detach().cpu().numpy()
@@ -216,7 +214,23 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
                     break
             if nid not in feed and node.op.value is not None:
                 feed[nid] = np.array([node.op.value], dtype=np.float32)
-    dpd = list(backend.run(compiled, input_data=feed).outputs.values())[0].flatten()
+
+    attn_cuda = attn.cuda()
+    x_cuda, cos_cuda, sin_cuda = x.cuda(), cos.cuda(), sin.cuda()
+
+    def eager_pre_run() -> np.ndarray:
+        # Force the math (naive) SDPA backend so eager and deplodock
+        # compare the same algorithm — flash-attention re-orders FMAs
+        # and would otherwise drift O(0.5 × max_eager) from naive at
+        # seq ≥ 512. Runs inside ``backend.run``'s GPU lock so the
+        # eager forward and the deplodock launches share one
+        # uninterrupted GPU window.
+        with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            out = attn_cuda(x_cuda, position_embeddings=(cos_cuda, sin_cuda))[0]
+        return out.cpu().flatten().numpy()
+
+    run_result, eager = backend.run(compiled, input_data=feed, pre_run=eager_pre_run)
+    dpd = list(run_result.outputs.values())[0].flatten()
     _assert_close(dpd, eager, threshold=threshold)
 
 

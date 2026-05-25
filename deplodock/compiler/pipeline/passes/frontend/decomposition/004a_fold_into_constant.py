@@ -12,9 +12,9 @@ Why fold here rather than later: a ``TransposeOp`` lowered through
 consumer Loads' index expressions. The runtime tensor stays in its
 original layout and the access pattern reads the transposed element of
 the original storage. That's correct but defeats the smem layout
-cuBLAS-style SGEMM kernels rely on (see ``007_stage_inputs``) and
+cuBLAS-style SGEMM kernels rely on (see ``010_stage_inputs``) and
 prevents TMA on the asymmetric ``(BN, BM)`` tile shape (see
-``011_tma_copy``). Pre-folding the constant solves both without
+``040_use_tma``). Pre-folding the constant solves both without
 changing the rest of the graph.
 
 Companion rule ``004b_fold_reshape_into_constant`` does the same for

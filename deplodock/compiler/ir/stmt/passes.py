@@ -14,15 +14,35 @@ from collections.abc import Callable
 from dataclasses import fields, is_dataclass
 from functools import singledispatch
 
-from deplodock.compiler.ir.axis import Axis, BoundAxis
-from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, Write
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
+
+
+def _rename_ssa_vars_in_expr(e: Expr, rename: Rename) -> Expr:
+    """Apply ``rename`` to every free ``Var`` leaf inside ``e``.
+
+    Used by ``Load`` / ``Write`` rewriters so that *indirect* indices
+    (gather: ``x[a0, (int)in0]``, scatter: ``out[(int)idx_v] = ...``)
+    have their SSA-name references rewritten when the enclosing body
+    is replicated. Without this, the register-tile replicator in
+    ``000_split_register_axes`` suffixes the defining Load's name
+    (``in0`` → ``in0_1``) but leaves dependent indirect Loads pointing
+    at the original ``in0`` — silently dropping the cross-replica data
+    dependency.
+
+    Axis-name Vars (``a0``, ``M_b``, …) are never in the rename map
+    (it only carries SSA defines), so ``rename(name) == name`` for
+    them and they pass through unchanged.
+    """
+    mapping = {n: Var(rename(n)) for n in e.free_vars() if rename(n) != n}
+    return e.substitute(mapping) if mapping else e
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +83,8 @@ def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Load(
         names=tuple(rename(n) for n in s.names),
         input=s.input,
-        index=tuple(sigma.apply(e) for e in s.index),
+        index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
+        dtype=s.dtype,
     )
 
 
@@ -84,12 +105,36 @@ def _(s: Unpack, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Assign, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Assign(name=rename(s.name), op=s.op, args=tuple(rename(a) for a in s.args))
+    return Assign(name=rename(s.name), op=s.op, args=tuple(rename(a) for a in s.args), dtype=s.dtype)
 
 
 @rewrite.register
 def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Accum(name=rename(s.name), value=rename(s.value), op=s.op, dtype=s.dtype)
+    new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
+    return Accum(
+        name=rename(s.name),
+        value=rename(s.value),
+        op=s.op,
+        dtype=s.dtype,
+        axes=new_axes,
+    )
+
+
+def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
+    """Apply ``sigma`` to an axis name and return the resulting axis
+    name(s). Handles three cases:
+
+    - ``sigma`` doesn't touch ``name``: returns ``(name,)``.
+    - Pure rename (``Var(old) → Var(new)``): returns ``(new,)``.
+    - σ-split (``Var(K) → Var(K_o)*N + Var(K_i)``, etc.): returns the
+      free-var names of the substitution expression. An Accum that
+      reduced over the original axis now reduces over the split sub-
+      axes.
+    """
+    replacement = sigma.mapping.get(name)
+    if replacement is None:
+        return (name,)
+    return tuple(sorted(replacement.free_vars()))
 
 
 @rewrite.register
@@ -101,9 +146,9 @@ def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Write(
         output=s.output,
-        index=tuple(sigma.apply(e) for e in s.index),
+        index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
         values=tuple(rename(n) for n in s.values),
-        reduce_op=s.reduce_op,
+        value_dtype=s.value_dtype,
     )
 
 
@@ -137,12 +182,6 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
-def _(s: Tile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(BoundAxis(axis=axis_fn(ba.axis), bind=ba.bind) for ba in s.axes)
-    return Tile(axes=new_axes, body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body))
-
-
-@rewrite.register
 def _(s: Cond, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Cond(
         cond=sigma.apply(s.cond),
@@ -164,7 +203,7 @@ def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
 
 @simplify.register
 def _(s: Load, ctx: SimplifyCtx) -> Stmt:
-    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index))
+    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index), dtype=s.dtype)
 
 
 @simplify.register
@@ -173,7 +212,7 @@ def _(s: Write, ctx: SimplifyCtx) -> Stmt:
         output=s.output,
         index=tuple(e.simplify(ctx) for e in s.index),
         values=s.values,
-        reduce_op=s.reduce_op,
+        value_dtype=s.value_dtype,
     )
 
 
@@ -199,14 +238,6 @@ def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
         body=tuple(simplify(c, inner) for c in s.body),
         unroll=s.unroll,
     )
-
-
-@simplify.register
-def _(s: Tile, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx
-    for ba in s.axes:
-        inner = inner.extend(ba.axis.name, Interval(0, ba.axis.extent - 1))
-    return Tile(axes=s.axes, body=tuple(simplify(c, inner) for c in s.body))
 
 
 @simplify.register

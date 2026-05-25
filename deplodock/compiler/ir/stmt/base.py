@@ -95,6 +95,20 @@ class RenderCtx:
     # so they compose with non-default-dtype operands. Set transiently
     # by ``Assign.render`` around the native expression render.
     literal_default_dtype: str | None = None
+    # True inside a ``GridTile``'s render scope. Set by ``GridTile.render``
+    # when descending into its body so a nested ``ThreadTile.render`` picks
+    # the cooperative-decode form (threadIdx → axes) rather than the
+    # standalone pointwise form (linear tid + bounds guard).
+    inside_grid_tile: bool = False
+    # Per-Write coordination metadata derived from the escape-analysis
+    # helper. Populated once at ``render_kernelop`` entry; consumed by
+    # ``Write.render`` to decide atomicAdd vs plain store and whether to
+    # wrap the store in a single-thread broadcast guard. Keyed by
+    # ``id(write)`` because ``Write.index`` may hold ``BinaryExpr`` nodes
+    # that aren't hashable. Empty when no helper analysis was run (legacy
+    # callers / unit-test fixtures that build a RenderCtx directly).
+    atomic_writes: dict[int, frozenset[str]] = field(default_factory=dict)
+    broadcast_writes: dict[int, frozenset[str]] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -111,6 +125,9 @@ class RenderCtx:
             buffer_dtypes=self.buffer_dtypes,
             ssa_dtypes=self.ssa_dtypes,
             literal_default_dtype=self.literal_default_dtype,
+            inside_grid_tile=self.inside_grid_tile,
+            atomic_writes=self.atomic_writes,
+            broadcast_writes=self.broadcast_writes,
         )
 
     # ---- Convenience wrappers over ``self.target``. These exist so the
@@ -141,6 +158,24 @@ def _canonical_dtype_name(dtype) -> str:
     if isinstance(dtype, str):
         return dtype
     return dtype.name
+
+
+def dtype_promote(op_name: str, arg_dtypes: list[str]) -> str:
+    """Promote an elementwise op's arg dtypes to a single result dtype.
+
+    Mirrors the inline rule in ``Assign.render``: the result is the
+    common dtype iff every arg agrees; any disagreement promotes to f32.
+    Today's IR only meaningfully encounters f16/f32 mixes; the rule is
+    "all f16 → f16, otherwise f32." ``op_name`` is accepted for future
+    op-specific overrides (e.g. ``relu`` would still emit f16 even with
+    no f16 args), but is unused today.
+
+    Lifted out of ``Assign.render`` so the ``001_stamp_types`` pass can
+    reuse the same rule when stamping ``Assign.dtype`` on the IR.
+    """
+    if arg_dtypes and all(d == "f16" for d in arg_dtypes):
+        return "f16"
+    return "f32"
 
 
 def _pad(n: int) -> str:

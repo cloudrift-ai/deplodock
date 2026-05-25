@@ -17,7 +17,6 @@ from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import (
     benchmark_program,
     benchmark_program_isolated,
-    make_runner,
     run_program,
     run_program_debug,
 )
@@ -111,27 +110,35 @@ class CudaBackend(Backend):
             db = SearchDB(path=self.tune_db)
         return Pipeline.build(CUDA_PASSES, dump=self.dump).run(graph, db=db)
 
-    def run(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None) -> RunResult:
-        # GPU serialization happens inside ``run_program`` /
-        # ``run_program_debug`` / ``benchmark_program`` — they grab
-        # ``gpu_lock()`` only around the launches + sync so parallel
-        # workers can NVRTC-compile in parallel and only contend for
-        # the device when it's time to time.
+    def run(
+        self,
+        compiled: Graph,
+        *,
+        input_data: dict[str, np.ndarray] | None = None,
+        pre_run=None,
+    ) -> tuple[RunResult, object]:
+        # ``run_program`` / ``run_program_debug`` hold the GPU lock end
+        # to end (compile + alloc + ``pre_run`` + launches + ``.get()``)
+        # so peer xdist workers / parallel ``deplodock run`` invocations
+        # can never interleave a kernel launch with our work on the
+        # shared device. The ``pre_run`` callback runs inside that lock
+        # so a torch eager reference computed for comparison sees the
+        # same GPU state our kernels do.
         if self.debug:
-            debug_result = run_program_debug(compiled, input_data=input_data)
+            debug_result, pre_result = run_program_debug(compiled, input_data=input_data, pre_run=pre_run)
             self.last_debug_result = debug_result
             result_outputs = debug_result.outputs
             time_ms = None
         else:
             self.last_debug_result = None
-            result = run_program(compiled, input_data=input_data)
+            result, pre_result = run_program(compiled, input_data=input_data, pre_run=pre_run)
             result_outputs = result.outputs
             time_ms = result.time_ms
         outputs: dict[str, np.ndarray] = {}
         for name, vals in result_outputs.items():
             shape = tuple(int(d) for d in compiled.nodes[name].output.shape)
             outputs[name] = np.asarray(vals, dtype=compiled.nodes[name].output.dtype.np).reshape(shape)
-        return RunResult(outputs=outputs, time_ms=time_ms)
+        return RunResult(outputs=outputs, time_ms=time_ms), pre_result
 
     def benchmark(
         self,
@@ -180,14 +187,3 @@ class CudaBackend(Backend):
             num_launches=result.num_launches,
             per_launch=result.per_launch,
         )
-
-    def make_runner(self, compiled: Graph, *, input_data: dict[str, np.ndarray] | None = None):
-        """Return a zero-arg ``run_once()`` callable that issues one full
-        kernel-sequence pass on the same pre-allocated buffers. Used for
-        interleaved benchmarking against PyTorch.
-
-        Per-call locking is intentionally omitted: callers that need
-        process-level serialization should hold ``gpu_lock()`` around
-        their entire iter loop instead of acquiring/releasing on every
-        kernel launch."""
-        return make_runner(compiled, input_data=input_data)

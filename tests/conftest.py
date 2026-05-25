@@ -11,6 +11,19 @@ import pytest
 import torch
 import yaml
 
+# Cross-process GPU lock for CUDA tests. Set on conftest import so every
+# xdist worker (and any subprocess it spawns) coordinates on the same
+# path. With this set, ``CudaBackend.run`` (via
+# :func:`deplodock.compiler.backend.cuda.program.run_program`) holds the
+# lock end-to-end across compile + allocate + ``pre_run`` callback +
+# kernel launches + ``.get()``. Tests that compare deplodock against
+# torch eager pass ``pre_run=<eager closure>`` so the eager forward
+# and the deplodock launches share one uninterrupted GPU window —
+# without this serialization, peer-worker CUDA activity interleaves
+# with our kernels and the per-position fp32 rounding drift breaks
+# the accuracy comparison.
+os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
+
 
 @pytest.fixture(autouse=True)
 def _seed_rng():
@@ -88,38 +101,89 @@ def _num_workers(config) -> int | None:
         return None
 
 
+def _is_cuda_item(item) -> bool:
+    """True iff this test item issues CUDA work.
+
+    Detected via either (a) a ``skipif`` marker whose reason starts with
+    ``"CUDA not available"`` (the ``requires_cuda`` decorator used across
+    ``tests/compiler/``), or (b) a ``[cuda...]`` callspec id (the
+    ``run_graph`` fixture's third variant + every ``test_e2e_accuracy``
+    parametrization). One of those signals is true for every test that
+    actually touches the device today; new CUDA-using tests inherit
+    routing for free as long as they reuse the conventions."""
+    for mark in item.iter_markers(name="skipif"):
+        reason = mark.kwargs.get("reason", "")
+        if isinstance(reason, str) and reason.startswith("CUDA not available"):
+            return True
+    nid = item.nodeid
+    return "[cuda" in nid or "-cuda-" in nid or nid.endswith("-cuda]")
+
+
+# Single xdist_group used for every CUDA-touching test. The host only has
+# one GPU; running CUDA tests across multiple xdist workers concurrently
+# would mean two processes pushing kernels onto the same device. Even
+# with ``DEPLODOCK_GPU_LOCK`` serializing the kernel-launch window and
+# ``backend.run(pre_run=...)`` pulling the torch eager forward into the
+# same lock, multi-kernel attention schedules still occasionally drift
+# enough across worker contexts (per-context SM scheduling differs, and
+# fp32 atomic-add commit order with it) to break the
+# ``test_attention_chains`` / ``test_block_accuracy`` 1e-4 thresholds.
+# Pinning all CUDA tests to one group makes them run sequentially on
+# one worker; non-CUDA tests still parallelize via the LPT buckets below.
+_CUDA_GROUP = "cuda"
+
+
 def pytest_collection_modifyitems(config, items):
     import heapq
 
+    # Step 1: pin every CUDA-touching item to a single xdist_group so
+    # they all land on one worker and run sequentially. Skip the LPT
+    # bucketing for those items entirely — they're already grouped.
+    cuda_items: list = []
+    other_items: list = []
+    for it in items:
+        if _is_cuda_item(it):
+            it.add_marker(pytest.mark.xdist_group(_CUDA_GROUP))
+            cuda_items.append(it)
+        else:
+            other_items.append(it)
+
     cache = getattr(config, "cache", None)
     if cache is None:
+        items[:] = cuda_items + other_items
         return
     durations = cache.get(_DURATIONS_KEY, {}) or {}
-    if not durations:
-        return
     nworkers = _num_workers(config)
-    if nworkers is None or nworkers < 2:
+    if not durations or nworkers is None or nworkers < 2:
+        items[:] = cuda_items + other_items
         return
 
-    known = sorted(durations[it.nodeid] for it in items if it.nodeid in durations)
+    known = sorted(durations[it.nodeid] for it in other_items if it.nodeid in durations)
     fallback = known[len(known) // 2] if known else 0.0
 
     def dur(item) -> float:
         return durations.get(item.nodeid, fallback)
 
-    sorted_items = sorted(items, key=dur, reverse=True)
+    sorted_others = sorted(other_items, key=dur, reverse=True)
+
+    # Reserve one worker for the CUDA group; LPT-bucket the rest across
+    # the remaining workers. With nworkers == 1 we fall back to a single
+    # bucket (no-op grouping). Sum CUDA-item durations into the CUDA
+    # bucket so it competes for ordering with the other heavy buckets.
+    cuda_load = sum(dur(it) for it in cuda_items)
+    other_workers = max(1, nworkers - 1)
 
     # LPT: pop the lightest bucket, add this item, push back.
-    buckets: list[tuple[float, int, list]] = [(0.0, w, []) for w in range(nworkers)]
+    buckets: list[tuple[float, int, list]] = [(0.0, w, []) for w in range(other_workers)]
     heapq.heapify(buckets)
-    for it in sorted_items:
+    for it in sorted_others:
         load, wid, bucket = heapq.heappop(buckets)
         bucket.append(it)
         heapq.heappush(buckets, (load + dur(it), wid, bucket))
 
-    # Tag items with their bucket's xdist_group so loadgroup routes them together.
-    # Reorder items so same-bucket tests are contiguous and heaviest bucket leads
-    # (helps xdist dispatch long work first).
+    # Tag non-CUDA items with their bucket's xdist_group so loadgroup
+    # routes them together. CUDA items keep their pre-applied ``cuda``
+    # group from step 1.
     buckets_sorted = sorted(buckets, key=lambda b: -b[0])
     reordered: list = []
     for _load, wid, bucket in buckets_sorted:
@@ -127,7 +191,13 @@ def pytest_collection_modifyitems(config, items):
         for it in bucket:
             it.add_marker(pytest.mark.xdist_group(group))
             reordered.append(it)
-    items[:] = reordered
+    # Put CUDA bucket first when it dominates load, otherwise interleave
+    # with the largest non-CUDA bucket. Heaviest-first dispatch lets xdist
+    # start the longest serial chain immediately.
+    if cuda_load >= buckets_sorted[0][0]:
+        items[:] = cuda_items + reordered
+    else:
+        items[:] = reordered + cuda_items
 
 
 @pytest.fixture(scope="session")

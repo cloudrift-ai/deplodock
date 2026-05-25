@@ -33,6 +33,7 @@ experiments/
 recipes/**/benchmark*.log
 recipes/**/instances.json
 recipes/**/tasks.json
+recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/
 
 # Claude Code per-user local settings (skills/agents under .claude/ are tracked)
 .claude/settings.local.json

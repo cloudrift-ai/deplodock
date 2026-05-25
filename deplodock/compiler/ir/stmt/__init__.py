@@ -8,8 +8,8 @@ Defined here rather than under any one IR package because all three IRs
 - Leaves: ``Load``, ``Assign``, ``Accum``, ``Init``, ``Write``, ``Select``,
   ``SelectBranch`` — pure compute primitives that read/write SSA names
   and external buffers (in :mod:`.leaves`).
-- Block stmts: ``Loop``, ``Tile``, ``StridedLoop``, ``Cond`` — carry
-  child bodies (in :mod:`.blocks`).
+- Block stmts: ``Loop``, ``StridedLoop``, ``Cond`` — carry child bodies
+  (in :mod:`.blocks`).
 - Tree walks: :meth:`Body.iter` (pre-order recursive) and
   :meth:`Body.map` (flat 1:N transformer) — methods on
   :class:`Body` (in :mod:`.body`).
@@ -23,8 +23,10 @@ Defined here rather than under any one IR package because all three IRs
 Each IR layer adds its own scheduling-specific Stmts on top:
 
 - Loop IR: nothing extra — its bodies are exactly Loop / leaves.
-- Tile IR: ``Stage``, ``Combine``, plus the shared ``Tile`` /
-  ``Loop`` / ``StridedLoop`` constructs from this module.
+- Tile IR: ``Stage``, ``Combine``, plus the shared ``Loop`` / ``StridedLoop``
+  constructs from this module and the typed tile flavors (``GridTile``,
+  ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) from
+  :mod:`deplodock.compiler.ir.tile.ir`.
 - Kernel IR: ``Smem``, ``Sync``, ``TreeHalve``, plus the shared
   constructs.
 
@@ -50,7 +52,7 @@ from deplodock.compiler.ir.stmt.base import (
 from deplodock.compiler.ir.stmt.base import (
     _pad as _pad,  # re-export for ir.kernel.ir
 )
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, Write
 from deplodock.compiler.ir.stmt.normalize import (
@@ -82,7 +84,6 @@ __all__ = [
     "SelectBranch",
     "Stmt",
     "StridedLoop",
-    "Tile",
     "Unpack",
     "Write",
     "canonicalize_buffer_names",

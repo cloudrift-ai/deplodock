@@ -62,6 +62,19 @@ class Context:
     # Used by ``KernelOp.validate`` to filter autotune variants whose launch
     # geometry would be rejected by the driver before the kernel ever runs.
     max_threads_per_cta: int = 1024
+    # Hardware warp width — 32 on every NVIDIA arch we target. Carried on
+    # ``Context`` so cooperative-reduce gating (``000_partition_loops``)
+    # and warp-shuffle dispatch (``001_materialize_tile``) read a single
+    # source of truth instead of redefining the constant module-locally.
+    warp_size: int = 32
+    # Shared-memory vector-load width in bytes — ``LDS.128`` carries 128
+    # bits (16 bytes) per lane on every NVIDIA arch since Volta, so this
+    # is genuinely hardware-universal. Element counts are derived per
+    # dtype at the use site (``lds128_bytes // BYTES_PER_ELEM``): 4 fp32
+    # / 8 fp16 / 16 fp8 fuse into one transaction. ``007a`` uses it to
+    # pick the per-thread N-chunk width that keeps each LDS.128 phase
+    # bank-conflict-free.
+    lds128_bytes: int = 16
     # Identifies which backend's perf rows this compile should consult
     # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
     # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the
@@ -91,8 +104,24 @@ class Context:
     def probe(cls) -> Context:
         """Build by probing the live CUDA device. Falls back to (0, 0) if
         cupy is unavailable — callers treat that as "no hardware feature
-        support" (rules gating on capability self-skip via ``RuleSkipped``)."""
-        from deplodock.compiler.target import compute_capability  # noqa: PLC0415
+        support" (rules gating on capability self-skip via ``RuleSkipped``).
+
+        ``max_dynamic_smem`` is the *live device's* opt-in cap, not the
+        target's: passes that gate on compute capability honor the
+        ``set_target`` override (so they take the target's codegen path),
+        but the dynamic-smem budget must still fit the actual hardware
+        the kernel will run on — otherwise ``cudaFuncSetAttribute`` rejects
+        the launch. Without this distinction, ``--target sm_90`` on an
+        sm_86 box would request 227 KB on a 99 KB device.
+        """
+        from deplodock.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
 
         cap = compute_capability()
-        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap))
+        live = live_compute_capability()
+        # No live CUDA device → compile-only flow, trust the target's cap.
+        # Live device present → clamp so the actual launch fits.
+        if live == (0, 0):
+            smem = _max_dynamic_smem_for(cap)
+        else:
+            smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
+        return cls(compute_capability=cap, max_dynamic_smem=smem)

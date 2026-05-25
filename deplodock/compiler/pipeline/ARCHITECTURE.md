@@ -70,6 +70,26 @@ option 0 inline and pushes one `Candidate` per remaining option onto the
 search queue (deep-copying the graph at the fork point). Single-option
 returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
+**Lazy hierarchical forks via `Fork`.** A rule can also return a list of
+`Fork(knobs=..., expand=..., score=...)` objects — each Fork carries the
+knob delta it pins plus a thunk that produces the next level of options
+(more Forks, concrete `Op`/`Graph` leaves, or a mix). The search loop
+pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize
+the children, pushes them back, and continues; cursor advance only
+fires when the lineage resolves to a concrete leaf. Lets a rule expose
+a hierarchy of decisions lazily — only the subtrees MCTS actually walks
+into get materialized. `Fork.knobs` is read by `_best_fork` (for
+DB-seeded greedy replay) without firing the thunk; `Fork.score` is the
+MCTS prior the producing rule attaches.
+
+No production rule currently emits branch Forks — an early experiment
+in the partition planner showed that a priority-rank-derived
+`Fork.score` is a coarser MCTS prior than the proper `TileOp.score`,
+so hierarchical exploration found best variants more slowly than the
+flat list. The infrastructure stays because it's straightforward to
+use once a richer per-level prior (or a search-space size that
+amortizes the structural overhead) justifies it.
+
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
 from pass 0; rules whose output is already in the graph must `RuleSkipped`
@@ -218,19 +238,22 @@ recipe.
 | `SPLITK`      | INT      | `003_split_matmul_k`         | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
 | `BN`          | INT      | `004_launch_geometry`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
 | `BM`          | INT      | `004_launch_geometry`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
-| `STAGE`       | BINMASK  | `007_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. `"111"` stages all three.    |
+| `STAGE`       | BINMASK  | `010_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one wrap-body Stage with per-source Source entries. |
 | `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
 | `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
-| `TMA`         | BOOL     | `011_tma_copy`               | Use `cp.async.bulk.tensor` staging (sm_90+ only); default tracks arch.                            |
-| `TMA_SWIZZLE` | BOOL     | `011_tma_copy`               | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
+| `TMA_SWIZZLE`     | BOOL     | `040_use_tma`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
+| `FUSED_PIPELINE`  | BOOL     | `020_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
+| `PAD_SMEM`        | BOOL     | `060_pad_smem`                       | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork. |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
 `knobs=` line — they're treated as pass-presence markers, not values.
 
-Two non-`Knob` env toggles also affect tile lowering: `DEPLODOCK_FUSED_PIPELINE=1` (`007b_split_fused_for_pipeline`)
-and `DEPLODOCK_BUFFER_COMPUTE=1` (`010_double_buffer`). These don't participate in the autotune fork lattice — they're
-binary opt-ins for experimental features that don't yet have enough signal to be candidate-driven.
+`FUSED_PIPELINE` is an autotune fork: `020_hoist_invariant_compute` emits both variants per fusable cone in a fixed
+order (inline-fuse first as the greedy default — smaller smem, works on every architecture). Honors
+`DEPLODOCK_FUSED_PIPELINE` for one-off pinning. `PAD_SMEM` follows the same shape in `060_pad_smem`: both polarities
+fire whenever any source has a fixable conflict; the greedy run picks pad-on first. Honors `DEPLODOCK_PAD_SMEM` for
+one-off pinning.
 
 ## Pass directories
 
@@ -244,8 +267,8 @@ ignores the prefix itself — it's only for ordering readability.
 | `frontend/optimization/`   | `compose_indexmaps`: collapse chains of single-source / single-consumer `IndexMapOp` into one coord_map — prevents trivial layout kernels from blocking fusion. |
 | `loop/lifting/`            | `lift_*` rules wrap each surviving tensor primitive (elementwise / reduce / indexmap / gather) in a trivial one-op `LoopOp`. |
 | `loop/fusion/`             | `merge_loop_ops` splices adjacent `LoopOp` pairs using `ir/loop/splicer.py::splice_graph`. |
-| `lowering/tile/`           | `tileify` produces a `TileOp` per `LoopOp` (strips the outer free-Loop chain into `Tile.thread_axes` and lifts inner output-write free Loops); follow-up rules annotate scheduling decisions on the `Tile` (block/thread bindings, `Stage` nodes, `Combine`). Order: `chunk_matmul_k` → `split_matmul_k` → `cooperative_reduce` → `blockify_launch` → `chunk_reduce` → `stage_inputs` → `register_tile` → `double_buffer` → `tma_copy` → `split_inner_for_swizzle` → `async_copy` → `pad_smem` → `pipeline_k_outer` → `mark_unroll`. `chunk_reduce` chunks non-matmul reduces (softmax, SDPA-reduce, RMSNorm) whose post-blockify candidate slab would exceed `stage_inputs`'s 16 KB cap — fires only when chunking would actually unblock staging. Staging runs before register tiling so the classifier sees clean PAT × PAT threads; `register_tile` keeps Stages singleton across F² (only consumer Loads multiply); `double_buffer` promotes K-outer Stages to `BufferedStage` (cross-loop SSA reads are allowed when they resolve to scope-level invariant names — e.g. SDPA's per-output reduce reading prior softmax `acc0` / hoisted `reciprocal(acc1)` — so all three SDPA-reduce reduces double-buffer + TMA on sm_90+); `tma_copy` narrows eligible BufferedStages to `TmaBufferedStage` (cp.async.bulk.tensor transport, sm_90+); `async_copy` narrows the rest to `AsyncBufferedStage` (cp.async transport, sm_80+); `pad_smem` adds `Stage.pad` to break smem bank conflicts (skips `TmaBufferedStage` — TMA uses its own swizzling); `pipeline_k_outer` rotates the K-outer loop into prologue + steady-state + epilogue with `AsyncWait` placement. |
-| `lowering/kernel/`         | `materialize_tile` consumes scheduling decisions and emits hardware primitives (`Smem`, `Sync`, `TreeHalve`, `StridedLoop`), mutating the node's op to `KernelOp` in place. |
+| `lowering/tile/`           | Tile-IR structural passes — Stage formation, transport (cp.async / TMA), double-buffering, pipelining, smem padding. Order: `partition_loops` → `stage_inputs` → `hoist_invariant_compute` → `use_ring_buffers` → `use_tma` → `use_async_copy` → `pad_smem` → `pipeline_stages` → `mark_unroll`. Coordination (split-K atomic-writes, cooperative-K Combine emission, broadcast-write guards) is no longer a separate pass: the materializer / Kernel-IR render derives those decisions from `ir/tile/escape_analysis.py` queries against the tile body. Cooperativity is derived from `Accum.axes ∩ ThreadTile.axes`; atomic writes from enclosing `GridTile.axes` vs `Write.index`. `split_register_axes` / `permute_lane_accesses` used to live here but moved to `lowering/kernel/` once dtype-aware analytical passes consolidated there (see `plans/stamp-ssa-dtypes-and-reorder.md`); they still pattern-match `TileOp` because they run pre-materialize. |
+| `lowering/kernel/`         | Pre-materialize dtype-aware analytical passes plus the final `TileOp → KernelOp` lowering. Order: `split_register_axes` (replicates REGISTER-tagged bodies per-cell) → `place_inits` (places explicit `Init` Stmts at correct accumulator scope) → `stamp_types` (single body walk populating `Load.dtype` / `Assign.dtype` / `Write.value_dtype` / `Source.dtype` from `graph.nodes[buf].output.dtype`) → `demote_to_write_dtype` (folds f16-only chains feeding f16 Writes) → `vectorize_loads` (widens consecutive scalar Loads into LDS.128 / `__half2`) → `permute_lane_accesses` (chunks the N register tile into LDS.128-sized strips to remove bank conflicts on `FN > V`) → `pack_fp16_pairs` (pairs scalar `__half` Inits/Accums into `__half2`) → `vectorize_stores` (widens consecutive scalar Writes) → `flatten_wrap_stages` (007a: flattens wrap-body `Stage(... body=[consumer])` into `[Stage(empty), *consumer]` so the materializer walks producer scaffolding then consumer siblings) → `materialize_tile` (purely-mechanical Tile → Kernel lowering; Smem decls read `Source.dtype` directly; its emit logic lives in sibling `_`-prefixed helper modules `_stage_expand` / `_combine` / `_tma_groups`, which the pass loader skips) → `drop_redundant_syncs` (Kernel-IR peephole collapsing back-to-back / leading `Sync`s at the tile-body level). Passes 000–007 and `flatten_wrap_stages` (007a) pattern-match `TileOp`; `materialize_tile` (008) consumes `TileOp` and produces the `KernelOp`; `drop_redundant_syncs` (009) rewrites `KernelOp → KernelOp`. |
 | `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 
 See `ir/ARCHITECTURE.md` for what each IR dialect looks like.

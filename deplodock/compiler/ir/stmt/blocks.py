@@ -1,8 +1,10 @@
-"""Block-structured ``Stmt`` subclasses — ``Loop``, ``Tile``, ``StridedLoop``, ``Cond``.
+"""Block-structured ``Stmt`` subclasses — ``Loop``, ``StridedLoop``, ``Cond``.
 
 Each carries a child body (or two, for ``Cond``) and overrides
 ``Stmt.nested`` so :func:`iter_body` can recurse uniformly. Tile-axis
-decode helpers used by ``Tile.render`` live alongside.
+decode helpers (``_render_grid_axis_decode``, ``_render_thread_axis_decode``,
+``_body_uses_lane_warp``) live alongside and are consumed by the typed
+tile flavors in :mod:`deplodock.compiler.ir.tile.ir`.
 """
 
 from __future__ import annotations
@@ -10,11 +12,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32 as _F32
-from deplodock.compiler.ir.axis import BIND_BLOCK, BIND_THREAD, Axis, BoundAxis
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum
+
+
+def _source_suffix(axis: Axis) -> str:
+    """Render ``" (of <source.name>)"`` when ``axis`` was carved out of a parent.
+
+    Returns empty for top-level axes (``source_axis is None``) or self-referential
+    sources (``source is axis``). Surfaces the partition-planner's split parentage
+    in IR dumps without affecting structural keys.
+    """
+    src = axis.source_axis
+    if src is None or src is axis or src.name == axis.name:
+        return ""
+    return f" (of {src.name})"
 
 
 @dataclass(frozen=True)
@@ -68,9 +83,7 @@ class Loop(Stmt):
         return any(isinstance(s, Accum) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
-        kind = "reduce" if self.is_reduce else "free"
-        unroll = " unroll" if self.unroll else ""
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}:  # {kind}{unroll}"
+        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -100,100 +113,6 @@ class Loop(Stmt):
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
         inner = ctx.child()
-        out.extend(render_body(self.body, inner))
-        out.append(f"{pad}}}")
-        return out
-
-
-@dataclass
-class Tile(Stmt):
-    """Axis-bound scope wrapper — one CUDA-kernel scope.
-
-    Carries ``axes: tuple[BoundAxis, ...]`` (launch geometry —
-    ``BIND_THREAD`` and ``BIND_BLOCK`` axes) plus a body of statements.
-    Used at both Tile IR (with Tile-IR-specific stmts like ``Stage`` /
-    ``Combine`` in the body) and Kernel IR (with hardware primitives
-    like ``Smem`` / ``Sync`` / ``TreeHalve`` after materialization).
-
-    Materialization rewrites the body content but preserves the
-    wrapper — same axes, same type, just different body shape.
-
-    ``thread_axes`` / ``block_axes`` are convenience properties that
-    project ``axes`` by binding kind — render and launch geometry use
-    them.
-    """
-
-    axes: tuple[BoundAxis, ...]
-    body: Body
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.body, Body):
-            self.body = Body(self.body)
-
-    def nested(self) -> tuple[Body, ...]:
-        return (self.body,)
-
-    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
-        (body,) = bodies
-        return Tile(axes=self.axes, body=body)
-
-    def binds_axes(self) -> frozenset[str]:
-        return frozenset(ba.axis.name for ba in self.axes)
-
-    @property
-    def thread_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_THREAD)
-
-    @property
-    def block_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes if ba.bind == BIND_BLOCK)
-
-    @property
-    def all_axes(self) -> tuple[Axis, ...]:
-        return tuple(ba.axis for ba in self.axes)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        axes = ", ".join(f"{ba.axis.name}:{ba.axis.extent}={ba.bind}" for ba in self.axes) or "-"
-        return [f"{indent}Tile(axes=({axes})):", *pretty_body(self.body, indent + INDENT)]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        """CUDA block / thread axis decode + body emission.
-
-        Two forms:
-
-        - **Cooperative (``block_axes`` populated):** one CUDA block per
-          ``block_axes`` slot, ``thread_axes`` index threads inside the
-          block. Decodes ``blockIdx.x`` and ``threadIdx.x`` directly.
-        - **Linear (``block_axes`` empty):** flatten all ``thread_axes``
-          into one linear ``tid``; bounds-guard against the product of
-          extents.
-        """
-        pad = _pad(ctx.indent)
-        if self.block_axes:
-            # Stay at the kernel's own brace level — the surrounding ``{ ... }``
-            # is already provided by the ``__global__ void k(...) { ... }``
-            # function body, so no extra inner scope is needed.
-            out: list[str] = []
-            out.extend(_render_grid_axis_decode(self.block_axes, "blockIdx.x", ctx))
-            out.extend(_render_grid_axis_decode(self.thread_axes, "threadIdx.x", ctx))
-            # Lane / warp helpers for hierarchical warp-shuffle combines.
-            # Only emit when the body actually references them — avoids the
-            # noise of unused decls in pointwise / matmul kernels.
-            if _body_uses_lane_warp(self.body):
-                out.append(f"{pad}int lane = threadIdx.x & 31;")
-                out.append(f"{pad}int warp = threadIdx.x >> 5;")
-            out.extend(render_body(self.body, ctx))
-            return out
-
-        inner = ctx.child()
-        n_threads = 1
-        for ax in self.thread_axes:
-            n_threads *= int(ax.extent)
-        out = [
-            f"{pad}long long tid = blockIdx.x * blockDim.x + threadIdx.x;",
-            f"{pad}if (tid < {n_threads}) {{",
-        ]
-        out.extend(_render_thread_axis_decode(self.thread_axes, inner))
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
         return out
@@ -306,11 +225,9 @@ class StridedLoop(Stmt):
         return any(isinstance(s, Accum) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
-        kind = "reduce" if self.is_reduce else "free"
-        unroll = " unroll" if self.unroll else ""
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}StridedLoop({self.axis.name} = {start}; < {self.axis.extent}; += {step}):  # {kind}{unroll}"
+        head = f"{indent}for {self.axis.name} in {start}..{self.axis.extent}:{step}{_source_suffix(self.axis)}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:

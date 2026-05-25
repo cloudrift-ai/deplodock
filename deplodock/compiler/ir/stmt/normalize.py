@@ -18,9 +18,9 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop, Tile
+from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Select, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, Unpack, Write
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -98,7 +98,16 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
     after substituting ``Var(axis.name) → Literal(0, "int")``. Reduce Loops
     keep their wrappers because dropping them would remove the accumulator.
     Recurses through StridedLoop / Tile / Cond bodies without rewriting
-    those wrappers (their iteration semantics aren't a free Loop)."""
+    those wrappers (their iteration semantics aren't a free Loop).
+
+    Size-1 BLOCK / SPLITK_BLOCK protection used to live here when the
+    planner stamped ``Loop.role`` for downstream launch_geometry to
+    consume. The planner now constructs ``GridTile`` / ``ThreadTile``
+    directly and applies its own size-1 filter (see
+    ``000_partition_loops::_wrap_tower``), so by the time
+    ``drop_size_one_free_axes`` runs on a LoopOp body, no Loop has any
+    binding role — every size-1 free Loop is safely inlinable.
+    """
     stmts = Body.coerce(stmts)
 
     def fn(s: Stmt) -> Stmt | Body:
@@ -126,24 +135,25 @@ def _recurse_canonicalize(s: Stmt) -> Stmt:
 def canonicalize_free_axis_order(stmts: Body) -> Body:
     """Sort the outer chain of free ``Loop`` blocks alphabetically by axis
     name. The chain is the sequence of single-child free Loops at the top of
-    ``stmts``; it terminates at a reduce Loop or a branching body. Recursion
-    continues into terminal block bodies (Loop / StridedLoop / Tile / Cond)."""
+    ``stmts``; it terminates at a reduce Loop or a branching body.
+    Recursion continues into terminal block bodies (Loop / StridedLoop /
+    Tile / Cond)."""
     stmts = Body.coerce(stmts)
-    chain_axes: list[Axis] = []
+    chain: list[Loop] = []
     current = stmts
     while len(current) == 1 and isinstance(current[0], Loop):
         loop = current[0]
         if loop.is_reduce:
             break
-        chain_axes.append(loop.axis)
+        chain.append(loop)
         current = loop.body
 
     terminal = tuple(_recurse_canonicalize(s) for s in current)
 
-    chain_axes_sorted = sorted(chain_axes, key=lambda a: a.name)
+    chain_sorted = sorted(chain, key=lambda lp: lp.axis.name)
     result: Body = terminal
-    for axis in reversed(chain_axes_sorted):
-        result = (Loop(axis=axis, body=result),)
+    for loop in reversed(chain_sorted):
+        result = (Loop(axis=loop.axis, body=result, unroll=loop.unroll),)
     return result
 
 
@@ -169,7 +179,7 @@ def eliminate_copy_aliases(stmts: Body) -> Body:
 
     def fn(s: Stmt) -> Stmt | None:
         # Body.map post-order: block bodies already recursed; only handle leaves.
-        if isinstance(s, (Loop, StridedLoop, Tile, Cond)):
+        if isinstance(s, (Loop, StridedLoop, Cond)):
             return s
         if isinstance(s, Assign) and s.op.name == "copy" and len(s.args) == 1:
             alias[s.name] = s.args[0]
@@ -298,8 +308,8 @@ def _reduce_axis_source_positions(body: Body, reduce_axis_name: str) -> set[tupl
 # both halves share — e.g. ``load x[0, a0, k]`` in the gated-MLP
 # pattern ``silu(x@Wg) * (x@Wu)`` where both matmuls reduce over the
 # same K and share x as a Load source. Symmetric staging follows: once
-# wu lives in the same K-loop as wg, ``stage_inputs`` / ``tma_copy`` /
-# ``double_buffer`` apply uniformly.
+# wu lives in the same K-loop as wg, ``stage_inputs`` / ``use_tma`` /
+# ``use_ring_buffers`` apply uniformly.
 # ---------------------------------------------------------------------------
 
 
@@ -529,8 +539,6 @@ def hoist_loop_invariants(stmts: Body) -> Body:
                 stay = [c for c in inner if id(c) not in hoisted_ids]
                 new_body.extend(hoisted)
                 new_body.append(replace(s, body=tuple(stay)))
-            elif isinstance(s, Tile):
-                new_body.append(Tile(axes=s.axes, body=tuple(walk(s.body))))
             elif isinstance(s, Cond):
                 new_body.append(Cond(cond=s.cond, body=tuple(walk(s.body)), else_body=tuple(walk(s.else_body))))
             else:
@@ -599,8 +607,6 @@ def dedup_loads(stmts: Body) -> Body:
                 out.append(replace(s, body=walk(s.body, local, alias)))
             elif isinstance(s, StridedLoop):
                 out.append(replace(s, body=walk(s.body, local, alias)))
-            elif isinstance(s, Tile):
-                out.append(Tile(axes=s.axes, body=walk(s.body, local, alias)))
             elif isinstance(s, Cond):
                 out.append(Cond(cond=s.cond, body=walk(s.body, local, alias), else_body=walk(s.else_body, local, alias)))
             else:
@@ -751,16 +757,21 @@ def rename_ssa_sequential(stmts: Body) -> Body:
     """Canonicalize names in a fused body:
 
     - Axes from every axis-bearing scope (``Loop`` / ``StridedLoop`` /
-      ``Tile.axes``) renamed to ``a0, a1, ...`` in pre-order of first
-      declaration. All three share one numbering namespace so Tile.axes
-      ``a0_o`` and a Loop axis ``a2_o`` don't collide on rename.
+      ``Tile.axes`` / new tile flavors' axes) renamed to ``a0, a1, ...``
+      in pre-order of first declaration. All scopes share one numbering
+      namespace so Tile.axes ``a0_o`` and a Loop axis ``a2_o`` don't
+      collide on rename.
     - Load SSA names renamed to ``in0, in1, ...`` in definition order.
     - Accum names renamed to ``acc0, acc1, ...`` in definition order.
     - Assign / Select SSA names renamed to ``v0, v1, ...`` in definition
       order.
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
-    from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415 — break stmt↔tile cycle
+    from deplodock.compiler.ir.tile.ir import (  # noqa: PLC0415 — break stmt↔tile cycle
+        ParallelTile,
+        SerialTileBase,
+        Stage,
+    )
 
     stmts = Body.coerce(stmts)
     ssa_rename: dict[str, str] = {}
@@ -794,13 +805,33 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             _rename(stmt.name, "acc")
         elif isinstance(stmt, (Assign, Select)) and stmt.name not in ssa_rename:
             _rename(stmt.name, "v")
-        elif isinstance(stmt, Tile):
-            for ba in stmt.axes:
-                _record_axis(ba.axis.name)
-        elif isinstance(stmt, Stage):
+        elif isinstance(stmt, Unpack):
+            # ``low_name`` and ``high_name`` are fresh SSA scalars
+            # defined by Unpack — must get rename slots in the ``v`` pool.
+            # Without this, they collided with their input's renamed name
+            # (e.g. paired Accum ``acc0_acc1_p`` → ``acc0`` makes
+            # ``Unpack(low_name="acc0", value="acc0_acc1_p")`` rewrite to
+            # ``Unpack(low_name="acc0", value="acc0")`` — self-referential).
+            for old in (stmt.low_name, stmt.high_name):
+                if old not in ssa_rename:
+                    _rename(old, "v")
+        elif isinstance(stmt, Pack) and stmt.name not in ssa_rename:
+            # ``Pack.name`` defines a fresh f16x2 SSA value consumed by the
+            # next Accum. Same reasoning as Assign — give it a ``v`` slot.
+            _rename(stmt.name, "v")
+        elif isinstance(stmt, ParallelTile):
+            # GridTile / ThreadTile / RegisterTile — record every axis in
+            # the tuple before any nested Stage's cache axes so the
+            # parallel coords keep their pre-order rename slots.
             for ax in stmt.axes:
                 _record_axis(ax.name)
+        elif isinstance(stmt, Stage):
+            for src in stmt.sources:
+                for ax in src.cache_axes:
+                    _record_axis(ax.name)
         elif isinstance(stmt, (Loop, StridedLoop)):
+            _record_axis(stmt.axis.name)
+        elif isinstance(stmt, SerialTileBase):
             _record_axis(stmt.axis.name)
 
     if all(o == n for o, n in ssa_rename.items()) and all(o == n for o, n in axis_rename.items()):
@@ -894,7 +925,7 @@ def canonicalize_op_clusters(stmts: Body) -> Body:
     The pass walks ``stmts`` with :meth:`Body.map` and uses
     ``dataclasses.fields`` to locate any field currently holding an
     ``ElementwiseImpl`` (covers ``Init.op`` / ``Assign.op`` /
-    ``Accum.op`` / ``Write.reduce_op`` / Kernel-IR's ``TreeHalve.op`` /
+    ``Accum.op`` / Kernel-IR's ``TreeHalve.op`` /
     ``WarpShuffle.op`` without coupling this module to those IR
     dialects). The replacement is destructive — the resulting body is
     only safe to consume from :attr:`Body.structural_key()`.

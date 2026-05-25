@@ -1,11 +1,10 @@
-"""Phase-2 tests for ``Stage.body``: body is the single source of truth;
-``buf`` / ``origin`` / ``addressing`` are derived properties.
+"""Tests for the wrap-body ``Stage`` IR.
 
-Stage stays opaque to generic body walkers (no ``nested()`` /
-``with_bodies()`` override) because exposing the cooperative-load Loads
-to ``008_register_tile``'s F-axis replication corrupts their semantics.
-σ-substitution through the body is handled by the Stage-specific
-``rewrite`` / ``simplify`` handlers in ``deplodock/compiler/ir/tile/passes.py``.
+``Stage.body`` is the consumer subtree; producer cooperative-load is
+synthesized at materialize time from ``Stage.sources``. Each Source
+carries ``buf`` / ``origin`` / ``cache_dims`` / ``addressing``
+explicitly; σ-substitution walks the consumer body via
+``deplodock/compiler/ir/tile/passes.py``.
 """
 
 from __future__ import annotations
@@ -15,95 +14,77 @@ import pytest
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Write
-from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, TemplateAddressing, trivial_stage_body
+from deplodock.compiler.ir.stmt import Body, Load
+from deplodock.compiler.ir.tile.ir import AffineAddressing, CacheDim, Source, Stage, TemplateAddressing
+
+
+def _affine_source() -> Source:
+    name = "x_smem"
+    cache_dims = (CacheDim(axis=Axis("c0", 16), source_dim=0), CacheDim(axis=Axis("c1", 8), source_dim=1))
+    origin = (Var("k_outer") * Literal(16, "int"), Literal(0, "int"))
+    return Source(name=name, buf="x", cache_dims=cache_dims, origin=origin)
 
 
 def _affine_stage() -> Stage:
-    name = "x_smem"
-    axes = (Axis("c0", 16), Axis("c1", 8))
-    origin = (Var("k_outer") * Literal(16, "int"), Literal(0, "int"))
-    body = trivial_stage_body(name, "x", origin, axes, AffineAddressing(dims=(0, 1)))
-    return Stage(name=name, axes=axes, body=body)
+    """Build a Stage wrapping a trivial consumer body (one Load from staged smem)."""
+    src = _affine_source()
+    consumer = Body((Load(name="v", input=src.name, index=(Var("c0"), Var("c1"))),))
+    return Stage(sources=(src,), body=consumer)
 
 
-def test_trivial_body_builder_matches_documented_shape():
-    name = "x_smem"
-    axes = (Axis("c0", 16), Axis("c1", 8))
-    origin = (Var("k_outer") * Literal(16, "int"), Literal(0, "int"))
-    body = trivial_stage_body(name, "x", origin, axes, AffineAddressing(dims=(0, 1)))
-
-    assert len(body) == 2
-    load, write = body
-    assert isinstance(load, Load)
-    assert load.input == "x"
-    assert load.index[0] == origin[0] + Var("c0")
-    assert load.index[1] == origin[1] + Var("c1")
-    assert isinstance(write, Write)
-    assert write.output == "x_smem"
-    assert write.index == (Var("c0"), Var("c1"))
-    assert write.value == load.name
-
-
-def test_derived_buf_origin_addressing_affine():
-    stage = _affine_stage()
-    assert stage.buf == "x"
-    # origin: cache-axis Vars substituted to 0 + simplified
-    assert stage.origin[0].pretty() == (Var("k_outer") * Literal(16, "int")).pretty()
-    assert stage.origin[1].pretty() == Literal(0, "int").pretty()
-    addr = stage.addressing
+def test_source_carries_buf_origin_addressing():
+    src = _affine_source()
+    assert src.buf == "x"
+    assert src.origin[0].pretty() == (Var("k_outer") * Literal(16, "int")).pretty()
+    assert src.origin[1].pretty() == Literal(0, "int").pretty()
+    addr = src.addressing
     assert isinstance(addr, AffineAddressing)
     assert addr.dims == (0, 1)
 
 
-def test_derived_addressing_template_for_nonaffine_index():
-    # Build a body whose Load index is non-affine in the cache axes —
-    # property derivation should fall back to TemplateAddressing.
-    name = "x_smem"
-    axes = (Axis("c0", 8),)
-    nonlinear_index = (Var("c0") * Literal(2, "int"),)  # 2·c0 — coef-1 probe rejects
-    body = Body(
-        (
-            Load(name=f"{name}__src", input="x", index=nonlinear_index),
-            Write(output=name, index=(Var("c0"),), value=f"{name}__src"),
-        )
+def test_source_template_addressing_for_explicit_template_index():
+    cache_dims = (CacheDim(axis=Axis("c0", 8), source_dim=0),)
+    nonlinear_index = (Var("c0") * Literal(2, "int"),)
+    src = Source(
+        name="x_smem",
+        buf="x",
+        cache_dims=cache_dims,
+        origin=(Literal(0, "int"),),
+        template_index=nonlinear_index,
     )
-    stage = Stage(name=name, axes=axes, body=body)
-    addr = stage.addressing
+    addr = src.addressing
     assert isinstance(addr, TemplateAddressing)
     assert addr.exprs == nonlinear_index
 
 
-def test_primary_load_raises_for_multi_load_body():
-    name = "x_smem"
-    axes = (Axis("c0", 4),)
-    body = Body(
-        (
-            Load(name="l0", input="a", index=(Var("c0"),)),
-            Load(name="l1", input="b", index=(Var("c0"),)),
-            Write(output=name, index=(Var("c0"),), value="l0"),
-        )
+def test_multi_source_stage():
+    """Multi-source Stages are the typical matmul case (A + B)."""
+    a = _affine_source()
+    b = Source(
+        name="b_smem",
+        buf="b",
+        cache_dims=(CacheDim(axis=Axis("k", 8), source_dim=0), CacheDim(axis=Axis("n", 16), source_dim=1)),
+        origin=(Literal(0, "int"), Var("n_b") * Literal(16, "int")),
     )
-    stage = Stage(name=name, axes=axes, body=body)
-    with pytest.raises(ValueError, match="primary_load undefined"):
-        _ = stage.primary_load
-    # source_loads still works
-    assert len(stage.source_loads) == 2
+    stage = Stage(sources=(a, b), body=Body(()))
+    assert stage.external_reads() == ("x", "b")
+    assert stage.local_decls() == ("x_smem", "b_smem")
 
 
-def test_rewrite_threads_sigma_through_body():
+def test_stage_requires_at_least_one_source():
+    with pytest.raises(ValueError, match="at least one Source"):
+        Stage(sources=(), body=Body(()))
+
+
+def test_rewrite_threads_sigma_through_body_and_sources():
+    """σ-rewrite must touch the consumer body's Loads AND each Source's origin."""
     stage = _affine_stage()
-    # k_outer → k_outer + 1 — touches body Load's index. ``origin`` is
-    # derived, so it picks up the σ-substitution transparently.
+    # k_outer → k_outer + 1 — touches sources[0].origin[0]; body has no k_outer.
     new_k = Var("k_outer") + Literal(1, "int")
     sigma = Sigma({"k_outer": new_k})
     rewritten = stage.rewrite(lambda n: n, sigma=sigma)
     assert isinstance(rewritten, Stage)
-    # body Load index reflects the substitution
-    assert rewritten.body[0].index[0] == new_k * Literal(16, "int") + Var("c0")
-    # derived origin also reflects it (no double-substitution because
-    # cache-axis Var → 0 happens at property access on the post-σ body).
-    assert rewritten.origin[0].pretty() == (new_k * Literal(16, "int")).pretty()
+    assert rewritten.sources[0].origin[0].pretty() == (new_k * Literal(16, "int")).pretty()
 
 
 def test_body_coerced_to_body_subclass_after_rewrite():
@@ -111,3 +92,18 @@ def test_body_coerced_to_body_subclass_after_rewrite():
     sigma = Sigma({"k_outer": Literal(7, "int")})
     rewritten = stage.rewrite(lambda n: n, sigma=sigma)
     assert isinstance(rewritten.body, Body)
+
+
+def test_nested_returns_consumer_body():
+    stage = _affine_stage()
+    (body,) = stage.nested()
+    assert body is stage.body
+
+
+def test_with_bodies_round_trips():
+    stage = _affine_stage()
+    new_body = Body((Load(name="v2", input=stage.sources[0].name, index=(Var("c0"), Var("c1"))),))
+    rebuilt = stage.with_bodies((new_body,))
+    assert isinstance(rebuilt, Stage)
+    assert rebuilt.body == new_body
+    assert rebuilt.sources == stage.sources

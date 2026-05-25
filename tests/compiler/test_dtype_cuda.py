@@ -36,7 +36,6 @@ def test_fp16_elementwise_chain_cuda():
 
     graph = _fp16_chain_graph()
     compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(graph))
-
     # Verify the rendered CUDA source picked up fp16 signature + include
     # for at least one kernel (there will be one after fusion).
     from deplodock.compiler.ir.cuda import CudaOp
@@ -55,7 +54,7 @@ def test_fp16_elementwise_chain_cuda():
     rng = np.random.default_rng(0)
     x_data = (rng.standard_normal(1024) * 0.5).astype(np.float16)
 
-    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
     out = next(iter(result.outputs.values()))
 
     assert out.dtype == np.float16, f"expected float16 output, got {out.dtype}"
@@ -91,7 +90,7 @@ def test_fp16_fallback_to_float_for_non_native_op():
 
     rng = np.random.default_rng(1)
     x_data = (rng.standard_normal(1024) * 0.5).astype(np.float16)
-    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
     out = next(iter(result.outputs.values()))
     assert out.dtype == np.float16
     import math  # noqa: PLC0415
@@ -130,7 +129,7 @@ def test_fp16_reduction_uses_fp32_accumulator_on_cuda():
 
     rng = np.random.default_rng(2)
     x_data = (rng.standard_normal(1024) * 0.1).astype(np.float16)
-    result = CudaBackend().run(compiled, input_data={"x": x_data})
+    result, _ = CudaBackend().run(compiled, input_data={"x": x_data})
     out = next(iter(result.outputs.values()))
     assert out.dtype == np.float16
     expected = np.array([x_data.astype(np.float32).sum()], dtype=np.float16)
@@ -162,7 +161,7 @@ def test_fp16_matmul_cuda():
     b_data = (rng.standard_normal((k, n)) * 0.1).astype(np.float16)
 
     be = CudaBackend()
-    result = be.run(be.compile(g), input_data={"a": a_data, "b": b_data})
+    result, _ = be.run(be.compile(g), input_data={"a": a_data, "b": b_data})
     out = next(iter(result.outputs.values())).reshape(m, n)
     assert out.dtype == np.float16
 
@@ -187,7 +186,7 @@ def test_fp16_softmax_cuda():
     x_data = rng.standard_normal((rows, cols)).astype(np.float16)
 
     be = CudaBackend()
-    result = be.run(be.compile(g), input_data={"x": x_data})
+    result, _ = be.run(be.compile(g), input_data={"x": x_data})
     out = next(iter(result.outputs.values())).reshape(rows, cols)
     assert out.dtype == np.float16
 
@@ -218,7 +217,7 @@ def test_fp16_rmsnorm_cuda():
     w_data = rng.standard_normal((cols,)).astype(np.float16)
 
     be = CudaBackend()
-    result = be.run(be.compile(g), input_data={"x": x_data, "w": w_data})
+    result, _ = be.run(be.compile(g), input_data={"x": x_data, "w": w_data})
     out = next(iter(result.outputs.values())).reshape(rows, cols)
     assert out.dtype == np.float16
 

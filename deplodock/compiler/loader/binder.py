@@ -46,7 +46,7 @@ def apply_load_ops(source: np.ndarray, load_ops: tuple) -> np.ndarray:
         def compile(self, graph):
             return graph
 
-    result = _NumpyInterp().run(g, input_data={in_id: np.ascontiguousarray(source)})
+    result, _ = _NumpyInterp().run(g, input_data={in_id: np.ascontiguousarray(source)})
     return np.ascontiguousarray(result.outputs[cur])
 
 

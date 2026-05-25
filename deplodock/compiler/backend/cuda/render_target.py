@@ -45,7 +45,7 @@ _INTRINSIC_F16: dict[str, str] = {
 
 # Per-pair (2-wide vector) fp16 intrinsics. Each entry is the cuda_fp16.h
 # ``h2`` / ``__h*2`` form. Used when an Init / Accum / Assign carries
-# dtype = F16x2 (paired by the ``004_pack_fp16_register_tile`` pass).
+# dtype = F16x2 (paired by the ``006_pack_fp16_pairs`` pass).
 _INTRINSIC_F16x2: dict[str, str] = {
     "exp": "h2exp",
     "log": "h2log",

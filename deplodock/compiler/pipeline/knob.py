@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from types import ModuleType
@@ -85,6 +86,31 @@ class Knob:
                 raise ValueError(f"BINMASK knob {self.name!r} pretty needs width")
             return "".join("1" if (value >> i) & 1 else "0" for i in range(width))
         return str(value)
+
+    def narrow(self, candidates: Iterable[Any]) -> tuple:
+        """Intersect ``candidates`` with the env pin ``DEPLODOCK_<NAME>``.
+
+        Folds env-driven pinning into the same iteration that produces
+        hint-driven candidates, so callers don't enumerate-then-filter:
+
+            bn_choices = BN.narrow(_TUNE_AXIS_CHOICES)  # 1-tuple if pinned
+
+        Returns ``tuple(candidates)`` unchanged when the env var is
+        absent; a 1-tuple ``(pinned,)`` when the pin matches a candidate;
+        ``()`` when the pin doesn't match anything in ``candidates``.
+        Callers that need a peer-kernel fallback (empty after structural
+        gates → invalid pin for *this* shape → re-enumerate without
+        pins) implement that policy rule-side.
+
+        ``BINMASK`` isn't supported — it would need ``width``, and no
+        rule enumerates BINMASK candidates today."""
+        raw = os.environ.get(self.env)
+        if raw is None:
+            return tuple(candidates)
+        if self.type is KnobType.BINMASK:
+            raise ValueError(f"Knob.narrow not supported for BINMASK ({self.name!r})")
+        pinned = self.parse(raw)
+        return tuple(c for c in candidates if c == pinned)
 
 
 # --- Registry --------------------------------------------------------------

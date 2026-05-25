@@ -87,6 +87,19 @@ class SearchDB:
     ``~/.cache/deplodock/autotune.db``).
     """
 
+    # Bumped whenever the fork-tree topology shifts in ways that change
+    # ``parent_key`` / ``child_key`` for the same physical decision —
+    # stale ``lowering`` rows from older versions won't match the new
+    # keys and would silently slow the next tune sweep. On version
+    # mismatch we drop the ``lowering`` table only; ``perf`` /
+    # ``loop_op`` / ``tile_op`` etc. survive (source-hash keyed,
+    # parent-tree-independent).
+    #
+    # Version log:
+    #   1: M9.4 — planner-hoisted FM / FN / BN / BM forks. Parent-tree
+    #       topology shifted vs. the legacy downstream forks.
+    _SCHEMA_VERSION = 1
+
     _SCHEMA = [
         """
         CREATE TABLE IF NOT EXISTS loop_op (
@@ -156,6 +169,13 @@ class SearchDB:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
+        # Drop the ``lowering`` table when an older schema is detected;
+        # everything else (op inventory, perf rows) is keyed off content
+        # hashes and remains valid across fork-tree changes.
+        cur_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_version != self._SCHEMA_VERSION:
+            self._conn.execute("DROP TABLE IF EXISTS lowering")
+            self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
         for stmt in self._SCHEMA:
             self._conn.execute(stmt)
 
@@ -222,13 +242,13 @@ class SearchDB:
         """Upsert one ``parent_key`` → ``child_key`` lowering edge.
 
         ``knobs`` is the delta this rewrite step stamps onto the child
-        (e.g. blockify_launch adds ``{"BN": 64, "BM": 64}``; tileify
-        adds nothing). Greedy replay picks forks by knob-subset match
-        against this delta, so the row is enough to reconstruct the
-        chain without re-querying ``perf``.
+        (e.g. partition_loops adds ``{"BN": 64, "BM": 64, ...}``;
+        launch_geometry adds nothing). Greedy replay picks forks by
+        knob-subset match against this delta, so the row is enough to
+        reconstruct the chain without re-querying ``perf``.
 
         Best-of upsert across every dialect — autotune fork rules live
-        at Tile→Tile (blockify, register_tile) and used to be excluded
+        at Tile→Tile (blockify, split_register_axes) and used to be excluded
         here; recording every hop is how the chain stays replayable.
         Rows where the rewrite is genuinely deterministic (a single
         option) still trivially win their own slot, just via the same

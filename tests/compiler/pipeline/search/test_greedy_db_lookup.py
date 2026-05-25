@@ -37,10 +37,15 @@ def _shrink_autotune_search(monkeypatch: pytest.MonkeyPatch) -> None:
     ``_enumerate_blockify_variants`` stays tractable. Pins everything
     that this test doesn't care about (only blockify ``(BN, BM)`` needs
     to fork) via ``DEPLODOCK_*`` env knobs and disables the per-buffer
-    staging power-set so ``007_stage_inputs`` emits a single variant
-    (its pre-knob behavior)."""
+    staging power-set so ``010_stage_inputs`` emits a single variant
+    (its pre-knob behavior). Forces ``sm_80`` so the TMA path
+    self-skips and only cp.async fires."""
+    from deplodock.compiler import target as target_mod
+
     monkeypatch.setenv("DEPLODOCK_STAGE", "all")
-    monkeypatch.setenv("DEPLODOCK_TMA", "0")
+    target_mod.set_target((8, 0))
+    yield
+    target_mod.set_target(None)
 
 
 def _make_matmul() -> Graph:
@@ -111,13 +116,16 @@ def _blockify_variants() -> list[tuple[str, str, dict]]:
     greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
     _record_pair(out, _final_tile_op(greedy))
     search = TuningSearch(patience=10**6)
-    option_zero = next(iter(out.values()))[2] if out else None
+    option_zero_entry = next(iter(out.values())) if out else None
+    option_zero = option_zero_entry[2] if option_zero_entry is not None else None
+    option_zero_pk = option_zero_entry[0] if option_zero_entry is not None else None
     for cand in Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()):
         _record_pair(out, _final_tile_op(cand.graph))
         # The only consumer (test_seeded_lowering_overrides_option_zero) just
-        # needs one variant whose knobs differ from option-0; stop as soon as
-        # we have it instead of draining the full autotune sweep (~3+ min).
-        if option_zero is not None and any(v[2] != option_zero for v in out.values()):
+        # needs one variant whose knobs differ from option-0 AND whose
+        # parent_key matches option-0's parent (so DB seeds resolve during
+        # greedy replay). Stop once we have it.
+        if option_zero is not None and any(v[2] != option_zero and v[0] == option_zero_pk for v in out.values()):
             break
     return list(out.values())
 
@@ -153,8 +161,12 @@ def test_seeded_lowering_overrides_option_zero(_blockify_variants: list[tuple[st
     to the seeded child instead of the rule's option-0."""
     variants = _blockify_variants
     assert len(variants) >= 2, f"need ≥2 variants to test; got {len(variants)}"
-    option_zero_knobs = variants[0][2]
-    parent_key, child_key, alt_knobs = next(v for v in variants[1:] if v[2] != option_zero_knobs)
+    option_zero_pk, _, option_zero_knobs = variants[0]
+    # Restrict to variants sharing the option-0 parent_key — with the
+    # partition planner now forking FM/FN upstream of 004, alt variants
+    # at different (FM, FN) have different parent_keys and the DB seed
+    # wouldn't match during the greedy replay.
+    parent_key, child_key, alt_knobs = next(v for v in variants[1:] if v[2] != option_zero_knobs and v[0] == option_zero_pk)
 
     db = SearchDB()
     db.record_lowering(parent_key, "tile", child_key, "tile", knobs=alt_knobs, measured_median_us=1.0)

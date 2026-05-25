@@ -103,21 +103,21 @@ def run_graph(request) -> Callable:
             from deplodock.compiler.backend.numpy import NumpyBackend
 
             be = NumpyBackend()
-            return be.run(be.compile(graph), input_data=input_data).outputs
+            return be.run(be.compile(graph), input_data=input_data)[0].outputs
         if kind == "loop":
             from deplodock.compiler.backend.loop import LoopBackend
 
             be = LoopBackend()
             compiled = be.compile(graph)
             augmented = _inject_constants(dict(input_data), compiled)
-            return be.run(compiled, input_data=augmented).outputs
+            return be.run(compiled, input_data=augmented)[0].outputs
         # cuda
         from deplodock.compiler.backend.cuda.backend import CudaBackend
 
         be = CudaBackend()
         compiled = be.compile(graph)
         augmented = _inject_constants(dict(input_data), compiled)
-        return be.run(compiled, input_data=augmented).outputs
+        return be.run(compiled, input_data=augmented)[0].outputs
 
     return _run
 
