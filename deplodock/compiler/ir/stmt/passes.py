@@ -223,13 +223,13 @@ def _(s: Select, ctx: SimplifyCtx) -> Stmt:
 
 @simplify.register
 def _(s: Loop, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1))
+    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
     return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll)
 
 
 @simplify.register
 def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1))
+    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
     step = s.step.simplify(ctx) if isinstance(s.step, Expr) else s.step
     return StridedLoop(
         axis=s.axis,

@@ -128,6 +128,12 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   `_serialize_field` both unwrap `Dim` to `Dim.value` so cached digests and on-disk JSON round-trip past the
   static-int era unchanged. `Dim.__str__` returns the bare value so pretty IR (`for i in 0..32`) and
   `Body.structural_key` digests don't shift either. All 1197 tests green.
+- **M1 — done.** `010_lift_elementwise` / `040_lift_gather` / `030_lift_indexmap` drop the all-static guard;
+  `020_lift_reduce` keeps a static-reduce-axis check (M5 owns symbolic reduce). `LoopOp.forward` binds symbolic
+  axis names from input-array Load positions and specializes the body before C++ rendering (one cached kernel per
+  runtime-shape today; per-axis runtime args land in M2). Body normalize / simplify guard their
+  `as_static()` calls behind `is_static`. New `tests/compiler/test_dynamic_shapes.py` covers elementwise +
+  static-reduce lift preservation and forward-time specialization at two different `seq_len` values.
 
 ## Explicitly out of scope (v1)
 

@@ -17,7 +17,7 @@ from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Assign, Axis, Load, Loop, LoopOp, Stmt, Write
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern
 
 PATTERN = [Pattern("root", ElementwiseOp)]
 
@@ -25,9 +25,8 @@ PATTERN = [Pattern("root", ElementwiseOp)]
 def rewrite(match: Match, root: Node) -> Graph | None:
     graph = match.graph
     out_shape = tuple(root.output.shape)
-    if out_shape and not all(d.is_static for d in out_shape):
-        raise RuleSkipped(f"output shape {out_shape} contains symbolic dims; need static shapes")
-
+    # Symbolic dims on FREE axes are fine — they pass through as ``Axis(extent=Dim("name"))``
+    # and ``LoopOp.forward`` / launch geometry resolve them from input array shapes at run time.
     axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(out_shape))
 
     load_stmts: list[Stmt] = []

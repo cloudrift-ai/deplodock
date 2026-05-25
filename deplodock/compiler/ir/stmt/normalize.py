@@ -112,7 +112,7 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
 
     def fn(s: Stmt) -> Stmt | Body:
         # Body.map post-order: ``s.body`` is already recursively mapped.
-        if isinstance(s, Loop) and s.axis.extent.as_static() == 1 and not s.is_reduce:
+        if isinstance(s, Loop) and s.axis.extent.is_static and s.axis.extent.as_static() == 1 and not s.is_reduce:
             sub = Sigma({s.axis.name: Literal(0, "int")})
             return tuple(c.rewrite(_identity_rename, sub) for c in s.body)
         return s

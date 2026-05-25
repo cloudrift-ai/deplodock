@@ -32,8 +32,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if src_node is None:
         raise RuleSkipped(f"reduce input {src_id!r} no longer in graph")
     src_shape = tuple(src_node.output.shape)
-    if not src_shape or not all(d.is_static for d in src_shape):
-        raise RuleSkipped(f"input shape {src_shape} is empty or has symbolic dims")
+    if not src_shape:
+        raise RuleSkipped(f"input shape {src_shape} is empty")
 
     ndim = len(src_shape)
     axis_raw = root.op.axis
@@ -42,6 +42,11 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         axis += ndim
     if axis < 0 or axis >= ndim:
         raise RuleSkipped(f"reduce axis {axis_raw} out of range for ndim={ndim}")
+
+    # The reduce axis must be static — chunk_reduce / cooperative reduce bake the trip
+    # count into the kernel body today. Symbolic reduce is M5 in plans/dynamic-shapes.md.
+    if not src_shape[axis].is_static:
+        raise RuleSkipped(f"reduce axis {axis_raw}={src_shape[axis]!r} is symbolic; M5 lifts this restriction")
 
     axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(src_shape))
     reduce_axis_name = f"a{axis}"
