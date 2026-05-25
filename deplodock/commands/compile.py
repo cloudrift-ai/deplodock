@@ -85,7 +85,11 @@ def add_input_args(parser) -> None:
         "--seq-len",
         type=int,
         default=32,
-        help="Sequence length for full-model tracing (default: 32).",
+        help=(
+            "Sequence length for full-model tracing (default: 32). With ``--dynamic``, "
+            "only sizes the example tensors handed to ``torch.export``; the value doesn't "
+            "appear in the resulting kernels since torch makes the dim symbolic."
+        ),
     )
     parser.add_argument(
         "--dynamic",

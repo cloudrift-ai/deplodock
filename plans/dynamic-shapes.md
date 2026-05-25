@@ -205,10 +205,10 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   ``  --dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 \``
   ``  --dynamic seq_len@attention_mask:3 --dynamic seq_len@position_ids:1 --ir cuda``
 
-  ``--seq-len`` is the canonical-value used to build the example tensors fed to
-  ``torch.export.export``; the value doesn't matter for the resulting kernels (torch makes the
-  dim symbolic), so the default (32) is fine. Earlier docs suggested 37 as a non-colliding
-  prime — that workaround was for the value-based path that no longer exists.
+  ``--seq-len`` only sizes the example tensors fed to ``torch.export.export`` (which needs
+  concrete inputs to actually run the forward during trace) and defaults to 32 — the value
+  doesn't appear in the resulting kernels since torch makes the dim symbolic. Skip the flag
+  unless you want larger trace inputs (e.g. to stress-test a guard at a specific size).
 
   ``build_torch_dynamic_shapes`` dedupes ``Dim`` instances by NAME so multiple specs sharing
   ``seq_len`` use the same ``torch.export.Dim`` object — torch needs Dim identity (not just
