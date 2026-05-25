@@ -75,7 +75,7 @@ same worker.
   Joins `perf` with `cuda_op` and prints per-knob regret + a knob-interaction matrix sorted by geomean impact —
   use the rankings to drive Fork-tree knob ordering in the planner.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
-- GPU benchmark model (ungated, 7B): `Qwen/Qwen2.5-7B`
+- GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
 
 ## Key Make Targets

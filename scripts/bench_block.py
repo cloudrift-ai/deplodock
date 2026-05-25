@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32
-    python scripts/bench_block.py --model Qwen/Qwen2.5-7B --seq-len 2048 --iters 50
+    python scripts/bench_block.py --model Qwen/Qwen3-Embedding-0.6B --seq-len 2048 --iters 50
     python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32 --backends eager,deplodock
 """
 

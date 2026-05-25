@@ -322,7 +322,7 @@ def test_cuda_symbolic_linear_traced_and_run():
 
 
 def test_qwen_whole_model_dynamic_traces():
-    """End-to-end whole-model dynamic trace on Qwen2.5-7B (1 layer,
+    """End-to-end whole-model dynamic trace on Qwen3-Embedding-0.6B (1 layer,
     random weights so no checkpoint download). Exercises the CLI's
     canonical whole-model invocation in test form: wrapper switches to
     ``dynamic=True``, every seq_len-carrying axis (``input_ids:1``,
@@ -341,7 +341,7 @@ def test_qwen_whole_model_dynamic_traces():
     from deplodock.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
-    config = AutoConfig.from_pretrained("Qwen/Qwen2.5-7B")
+    config = AutoConfig.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
     config.num_hidden_layers = 1
     model = AutoModelForCausalLM.from_config(config).float().eval()
 

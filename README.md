@@ -27,7 +27,7 @@ deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))"
 # Benchmark, profile and optimize kernels locally
 deplodock run --bench --profile -c "torch.nn.Softmax(dim=-1)(torch.randn(1, 28, 2048, 2048))"
 # Compile full model from HuggingFace (will download weights)
-deplodock compile Qwen/Qwen2.5-7B
+deplodock compile Qwen/Qwen3-Embedding-0.6B
 ```
 
 Layer-norm-style reduction (two reductions, broadcast subtract, elementwise chain) fused into two kernels:
