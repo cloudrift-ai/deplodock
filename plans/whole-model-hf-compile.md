@@ -8,7 +8,7 @@ adjustments. None of this work touches the dynamic-shape machinery itself — it
 ## Motivation
 
 `deplodock compile <hf_model> --dynamic seq_len@input_ids:1 …` runs `torch.export` to completion and the
-FX→IR walk yields a clean graph: 134 nodes for Qwen2.5-7B (1 layer), every internal tensor carrying
+FX→IR walk yields a clean graph for Qwen3-Embedding-0.6B (1 layer), every internal tensor carrying
 `Dim('seq_len')` where it should, only three `i64` nodes (the index tensors). The op set is unsurprising:
 
 ```
@@ -75,7 +75,7 @@ kernel set, asserts logits within fp32 tolerance of `transformers` eager forward
 | M3 | Single-layer TinyLlama block trace with the wrapper switched to dynamic mode AND cos/sin passed in as args (extend `_trace_model`'s `--layer N` path) | `compile <model> --layer 0 --dynamic seq_len@…` produces a kernel list (every node → CudaOp) |
 | M4 | `run` of M3 — execute single-layer prefill at two seq_lens; compare to torch eager | `test_cuda_tinyllama_layer_dynamic`: rtol≤1e-4 vs eager |
 | M5 | Whole-model TinyLlama prefill (1 layer, random weights) via the existing whole-model wrapper | `test_cuda_tinyllama_whole_model_dynamic_prefill`: rtol≤1e-4 vs eager, two seq_lens, single compiled artifact |
-| M6 | Whole-model Qwen2.5-7B prefill (1 layer, random weights). Stress for the bigger hidden (3584) / vocab (152k) / num_heads (28 / 4) shapes | `test_cuda_qwen_whole_model_dynamic_prefill`: rtol≤1e-3 vs eager |
+| M6 | Whole-model Qwen3-Embedding-0.6B prefill (1 layer, random weights). Exercises GQA (16/8 heads), explicit `head_dim=128`, vocab (~152k) shapes | `test_cuda_qwen_whole_model_dynamic_prefill`: rtol≤1e-3 vs eager |
 
 M0–M2 are independent unit pieces and can land in any order. M3 is the load-bearing integration
 milestone — once a single block compiles + runs dynamically, M4/M5/M6 are mostly scale-up.

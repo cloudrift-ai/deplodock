@@ -41,7 +41,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     block = model.model.layers[0].eval()
 
     hidden = config.hidden_size
-    head_dim = hidden // config.num_attention_heads
+    head_dim = getattr(config, "head_dim", None) or hidden // config.num_attention_heads
 
     x = torch.randn(1, seq_len, hidden)
     cos = torch.randn(1, 1, seq_len, head_dim)
@@ -125,20 +125,17 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
 
 
 def _assert_accuracy(deplodock, eager, max_threshold=3.0, mean_threshold=0.4):
-    """Cumulative-fp32-drift check. Pre-async-pipeline measurements were
-    ~1e-6 (TinyLlama) and ~7e-6 (Qwen). Form B (cp.async pipelined loads)
-    rearranges per-CTA load timing and so the warp scheduler picks
-    different FMA orderings; this compounds fp32 rounding through long-K
-    matmuls (3584+ for Qwen) and across 11 chained kernels in a block,
-    yielding diffs that are benign reordering drift, not miscompute.
+    """Cumulative-fp32-drift check. Form B (cp.async pipelined loads) rearranges per-CTA load
+    timing so the warp scheduler picks different FMA orderings; this compounds fp32 rounding
+    through long-K matmuls and across the ~11 chained kernels in a block, yielding diffs that
+    are benign reordering drift, not miscompute.
 
-    Thresholds are loose because TMA (default on sm_90+) reorders FMAs
-    further than cp.async — confirmed via DEPLODOCK_FP64_ACC=1, which
-    closes the gap entirely. Bound is ~22% of max_eager (TinyLlama,
-    max_eager≈5.9 → drift ~1.3) and ~17% of max_eager (Qwen,
-    max_eager≈13.4 → drift ~2.2). Still tight enough to catch sign
-    flips, NaNs, off-by-N indexing bugs, layout miscompute (which
-    produces drift comparable to max_eager itself, not 20%)."""
+    Thresholds are loose because TMA (default on sm_90+) reorders FMAs further than cp.async
+    — confirmed via DEPLODOCK_FP64_ACC=1, which closes the gap entirely. Bound is ~22% of
+    max_eager (TinyLlama, max_eager≈5.9 → drift ~1.3); Qwen3-Embedding-0.6B is much smaller
+    (max_eager≈5.0, drift ~2e-6) so the bound is far from binding for it. Still tight enough
+    to catch sign flips, NaNs, off-by-N indexing bugs, layout miscompute (which produces
+    drift comparable to max_eager itself, not 20%)."""
     assert len(deplodock) == len(eager), f"output length mismatch: {len(deplodock)} vs {len(eager)}"
     assert not any(v != v for v in deplodock), "deplodock output contains NaN"
     assert sum(1 for v in deplodock if abs(v) > 1e-12) > len(deplodock) // 2, "deplodock output is mostly zeros"
