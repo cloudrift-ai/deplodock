@@ -1138,10 +1138,8 @@ class TileOp(BodyOp):
             score -= min((ctas - 2048) / 4096.0, 2.5)
 
         splitk = int(self.knobs.get("SPLITK", 1))
-        # SPLITK > 4 hits a known codegen bug (atomic-add reordering produces
-        # a few wrong output cells at SPLITK=8 / FM=1 / large-K matmuls — see
-        # test_attention_chains accuracy failures). The penalty also reflects
-        # the real atomicAdd contention cost; SPLITK=2/4 is usually enough.
+        # SPLITK > 4 pays a real atomicAdd contention cost on top of the
+        # cross-CTA reduction tax; SPLITK=2/4 is usually enough.
         if splitk > 4:
             score -= min((splitk - 4) / 4.0, 1.0)
 

@@ -18,6 +18,9 @@ Output shape (depth-2 pipeline):
         AsyncBufferedStage(σ_next(sources), pipeline_depth=2, body=Body(())),
         AsyncWait(keep=1),  # leave the just-issued chunk in flight
         SerialTile(K_i, kind="stage_inner", reduce, body=[<reduce stmts>]),
+        AsyncWait(keep=1),  # CTA-wide barrier before next iter overwrites
+                            # the slot this iter consumed (see cp.async
+                            # branch comment in _try_pipeline).
     ])
 
     # Epilogue — drain final chunk, consume it
@@ -176,12 +179,22 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
             next_issue,
         )
     else:
-        # cp.async: ISSUE → WAIT(keep=1) → CONSUME. Keep the just-
-        # issued chunk in flight while waiting for the older one.
+        # cp.async: ISSUE → WAIT(keep=1) → CONSUME → WAIT(keep=1). The
+        # leading wait drains chunk K_o so consume reads fresh data;
+        # the just-issued chunk K_o+1 stays in flight. The trailing
+        # wait is a no-op for the in-flight count (still 1) but its
+        # paired __syncthreads is load-bearing: with buffer_count=2,
+        # the NEXT iter's next_issue writes slot (K_o+2)%2 = K_o%2 —
+        # the same slot this iter's consume just read. Without a
+        # CTA-wide barrier between consume and next-iter's cp.async
+        # issue, a fast warp's queued cp.async overwrites bytes a slow
+        # warp is still reading. Visible only at K_o >= 3 (K_o=1,2
+        # don't loop or don't rotate the ring far enough to alias).
         main_body_stmts = (
             next_issue,
             AsyncWait(keep=1),
             *stage.body,
+            AsyncWait(keep=1),
         )
 
     main_loop = SerialTile(

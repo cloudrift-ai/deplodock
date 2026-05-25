@@ -32,6 +32,11 @@ _CASES: tuple[tuple[tuple[int, int, int], dict[str, int]], ...] = (
     ((128, 256, 128), {"BN": 16, "BM": 16, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1}),
     # K_o = 128/64 = 2 — minimum async ping-pong.
     ((64, 128, 64), {"BN": 16, "BM": 16, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1}),
+    # K_o = 192/64 = 3 — smallest K_o that wraps the ring buffer back to slot 0.
+    # First broken case for the slot-aliasing race fixed by the trailing
+    # AsyncWait sync in 070_pipeline_stages — iter K_o=1's cp.async writes
+    # slot (1+1)%2 = 0, which iter K_o=0's consume just read.
+    ((64, 192, 64), {"BN": 16, "BM": 16, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1}),
     # K_o = 512/64 = 8 — deeper ring exercises repeated commit/wait pairs.
     ((64, 512, 64), {"BN": 16, "BM": 16, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1}),
 )

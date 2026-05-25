@@ -172,18 +172,7 @@ def test_tinyllama_block_accuracy(backend_kind, seq_len):
 
 
 @requires_cuda
-def test_qwen_block_accuracy(monkeypatch):
+def test_qwen_block_accuracy():
     """Qwen 7B block on CUDA: deplodock output matches PyTorch eager within tolerance."""
-    # TODO: drop these pins once the FM=1/FN=4 + SPLITK>1 codegen path is fixed.
-    # The score-driven greedy primary (post-7c321867) picks that config for
-    # several of Qwen's matmul kernels, producing CUDA_ERROR_MISALIGNED_ADDRESS
-    # at launch. Same bug as test_tma_swizzle::tma_no_swizzle_bn32. Legacy
-    # priority_fn primary (cells=32, big BK, no splitk) sidesteps it; pin to
-    # that so this end-to-end accuracy test remains green and catches *other*
-    # regressions in the Qwen pipeline.
-    monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "64")
-    monkeypatch.setenv("DEPLODOCK_SPLITK", "1")
     deplodock, eager = _compile_and_run_block("Qwen/Qwen2.5-7B", seq_len=32, backend_kind="cuda")
     _assert_accuracy(deplodock, eager)

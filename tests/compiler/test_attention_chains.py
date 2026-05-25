@@ -96,23 +96,6 @@ def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name:
     return dpd, eager
 
 
-def _pin_known_good_matmul_primary(monkeypatch) -> None:
-    """Pin to a known-accurate matmul config so the tight 1e-4 threshold
-    isn't tripped by latent codegen bugs the coalescing-score primary
-    happens to expose.
-
-    TODO: drop these pins once two known issues are fixed:
-      1. BM=1/BN=256 with FN=4 (any SPLITK) at M=32/K=2048 produces
-         non-trivial drift (max_diff ~0.1, mean ~0.01).
-      2. SPLITK=8 on M=32/K=2048 matmuls produces a few wildly-wrong
-         output cells (max_diff ~0.08, mean tiny) — likely an
-         atomic-add boundary bug in the SPLITK lowering.
-    Both bugs preexist 6c8fbdfb; that commit's score change just made
-    these variants the greedy primary."""
-    for knob, value in {"BM": "1", "BN": "256", "FM": "1", "FN": "8", "BK": "64", "SPLITK": "1"}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{knob}", value)
-
-
 def _assert_close(deplodock: np.ndarray, eager: np.ndarray, threshold: float = 1e-4) -> None:
     assert deplodock.shape == eager.shape, f"shape: {deplodock.shape} vs {eager.shape}"
     assert not np.any(np.isnan(deplodock)), "deplodock output has NaN"
@@ -136,10 +119,9 @@ class _StackedLinears(torch.nn.Module):
 
 
 @requires_cuda
-def test_two_linears_tinyllama_shape(monkeypatch):
+def test_two_linears_tinyllama_shape():
     """Two chained 2048×2048 Linears at TinyLlama hidden size and seq=32.
     Confirms basic matmul-chain accuracy."""
-    _pin_known_good_matmul_primary(monkeypatch)
     m = _StackedLinears().eval()
     x = torch.randn(1, 32, 2048)
     dpd, eager = _run_module_with_eager(m, (x,), {"x": x.numpy()})
@@ -169,11 +151,10 @@ class _QKVAttnNoRope(torch.nn.Module):
 
 
 @requires_cuda
-def test_qkv_attn_no_rope(monkeypatch):
+def test_qkv_attn_no_rope():
     """Q/K/V Linears + causal SDPA + O Linear, no RoPE. Confirms that
     the matmul-chain + masked-SDPA composition is numerically sound on
     its own."""
-    _pin_known_good_matmul_primary(monkeypatch)
     m = _QKVAttnNoRope().eval()
     x = torch.randn(1, 32, 2048)
     dpd, eager = _run_module_with_eager(m, (x,), {"x": x.numpy()})
@@ -254,14 +235,13 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
 
 
 @requires_cuda
-def test_full_self_attn_tinyllama(monkeypatch):
+def test_full_self_attn_tinyllama():
     """The real ``LlamaAttention`` from a TinyLlama config — the smallest
     scope that includes Q/K/V Linears, RoPE, masked SDPA, and O Linear
     with the actual decomposition graph the block test exercises. If
     this fails while (1) and (2) pass, the regression is in the RoPE
     elementwise kernel or its interaction with the surrounding
     attention numerics."""
-    _pin_known_good_matmul_primary(monkeypatch)
     _run_self_attn_tinyllama(seq_len=32, threshold=1e-4)
 
 

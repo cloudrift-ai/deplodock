@@ -92,7 +92,10 @@ def test_pipelining_emits_prologue_main_epilogue():
     n_issue = sum(1 for s in new_op.body.iter() if isinstance(s, AsyncBufferedStage) and s.pipeline_depth == 2 and len(s.body) == 0)
     n_waits = sum(1 for s in new_op.body.iter() if isinstance(s, AsyncWait))
     assert n_issue == 2, f"expected 2 issue-only async stages (prologue + main), got {n_issue}"
-    assert n_waits == 2, f"expected 2 AsyncWait stmts (main steady-state + epilogue drain), got {n_waits}"
+    # 3 = main steady-state leading wait + trailing cross-iter sync wait + epilogue drain.
+    # The trailing wait in the main loop is the slot-aliasing barrier required for
+    # buffer_count=2 (see 070_pipeline_stages docstring).
+    assert n_waits == 3, f"expected 3 AsyncWait stmts (main leading + main trailing sync + epilogue drain), got {n_waits}"
 
 
 def test_main_loop_extent_decrements_by_one():
