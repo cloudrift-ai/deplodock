@@ -127,7 +127,7 @@ def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.
 
     Also re-binds tensor constants whose ``ConstantOp.name`` matches an
     entry in the input data but whose graph node id differs (e.g. after
-    ``004a_fold_constant_transpose`` replaces ``TransposeOp(c)`` with a
+    ``050_fold_into_constant`` replaces ``TransposeOp(c)`` with a
     new ConstantOp carrying a runtime transpose marker — same source
     name, fresh node id, transposed shape). Applies the recorded
     permutation here so the loop / numpy backends see the post-transpose

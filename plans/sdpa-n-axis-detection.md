@@ -88,7 +88,7 @@ the SDPA detection sits on top of:
   axis name + extent when the merge is semantically safe. For SDPA the sum reads `acc0` from the
   max, so the merge is correctly skipped. (Gated MLP's two reduces *do* merge — that's where this
   pass earns its keep.)
-- **M10's `_replace_k_loops`** (`000_partition_loops.py`) — walks every reduce in the body
+- **M10's `_replace_k_loops`** (`010_partition_loops.py`) — walks every reduce in the body
   whose axis name appears in `target_names` and σ-rewrites it to a `K_o → K_i` tower. Multiple
   reduces → multiple `K_o` / `K_i` axis pairs (named after the canonical K axis), but one shared
   K extent. Already the right primitive for "give every K-reduce the same schedule."
@@ -171,7 +171,7 @@ def _classify_fused_prologue(stmts):
 `_contains_write` already lives in `001_launch_geometry.py` (line 271). Import it (or inline —
 it's 8 lines) rather than reinventing.
 
-The single caller is `_split_kernel_fully` (line 203 of `000_partition_loops.py`); update the
+The single caller is `_split_kernel_fully` (line 203 of `010_partition_loops.py`); update the
 tuple unpack accordingly.
 
 ## `target_names` expansion (matmul branch)
@@ -326,10 +326,10 @@ Tile body as independent:
 - **`006a_register_tile_planned`** — walks the BLOCK Tile body and folds REGISTER-tagged stmts.
   The M_r Loop now wraps `[prologue..., N_r tower]`; 006a sees the prologue as non-REGISTER
   sibling work and passes it through, replicating only the N_r-tagged inner tower. ✓
-- **`007_stage_inputs`** — builds a Stage per (cache-axis-stable) Load. The prologue's Loads
+- **`020_stage_inputs`** — builds a Stage per (cache-axis-stable) Load. The prologue's Loads
   reference `scaled[..., a2]` — a different buffer + reduce axis than the matmul's V load. Each
   gets its own Stage. ✓
-- **`030_use_ring_buffers` / `040_use_tma` / `050_use_async_copy`** — gate on Stage shape; both
+- **`040_use_ring_buffers` / `050_use_tma` / `060_use_async_copy`** — gate on Stage shape; both
   prologue and matmul Stages are eligible. ✓
 - **`001_launch_geometry`** — descends into Loops looking for Writes for the atomic-lift
   rewrite. The prologue Loops have no Writes (only Accums), so `_rewrite_for_atomic_lift`
@@ -361,7 +361,7 @@ Tile body as independent:
   list has `(head_b, seq_q_b, head_dim_b)` plus the SPLITK_BLOCK / cooperative axes (with
   SPLITK=1 forced, no `K_s` block axis).
 - **Prologue inside M_r — Stage / smem cost.** When `FM > 1`, each M_r iteration owns a
-  distinct seq_q row and its own max/sum stats. `007_stage_inputs` will produce a Stage scoped
+  distinct seq_q row and its own max/sum stats. `020_stage_inputs` will produce a Stage scoped
   inside M_r for the prologue's `scaled[..., M_r]` Load — that's correct but means a fresh smem
   slab per register cell. Watch for ballooning smem allocation at high FM; the current
   `_enumerate_cartesian` priority already caps `FM·FN ≤ 32`, which limits the damage.
@@ -370,7 +370,7 @@ Tile body as independent:
 
 Minimal viable change to flip the xfails:
 
-1. The walker extension + `_classify_fused_prologue` (~25 LoC in `000_partition_loops.py`,
+1. The walker extension + `_classify_fused_prologue` (~25 LoC in `010_partition_loops.py`,
    import `_contains_write` from `001_launch_geometry.py` or inline).
 2. `target_names` expansion in the matmul branch (~6 LoC — union over `outer_n.body` and
    `prologue`, gated on `is_reduce and extent == E_K`).

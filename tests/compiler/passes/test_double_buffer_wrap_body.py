@@ -1,4 +1,4 @@
-"""Tests for ``030_use_ring_buffers`` (wrap-body promotion).
+"""Tests for ``040_use_ring_buffers`` (wrap-body promotion).
 
 The pass walks a Tile body for ``SerialTile(kind="serial_outer")`` whose body
 contains a wrap-body ``Stage`` carrying a ``stage_inner`` reduce; it swaps
@@ -61,7 +61,7 @@ def _find_kouter(op: TileOp) -> SerialTile | None:
 
 
 def test_matmul_fires_double_buffer(recording_dump, monkeypatch):
-    """Plain matmul → 030_use_ring_buffers fires after 010_stage_inputs."""
+    """Plain matmul → 040_use_ring_buffers fires after 020_stage_inputs."""
     _pin_legacy_matmul_primary(monkeypatch)
     g = _build_matmul()
     Pipeline.build(TILE_PASSES, dump=recording_dump).run(g, ctx=_TEST_CTX)
@@ -86,7 +86,7 @@ def test_double_buffer_emits_buffered_stage(monkeypatch):
 
 def test_double_buffer_phase_prepended_to_body_loads(monkeypatch):
     """Loads against staged smem buffers carry a leading phase index dim
-    (set by 030_use_ring_buffers). Post-015 the consumer body lives as
+    (set by 040_use_ring_buffers). Post-015 the consumer body lives as
     siblings of the issue-only stage, so we scan the whole TileOp body
     for staged-smem Loads."""
     _pin_legacy_matmul_primary(monkeypatch)
@@ -131,7 +131,7 @@ def test_double_buffer_is_idempotent(monkeypatch):
     n_buffered = sum(1 for s in kouter.body if isinstance(s, BufferedStage))
     assert n_buffered > 0
 
-    pass_path = pathlib.Path(_helpers.__file__).parent / "030_use_ring_buffers.py"
+    pass_path = pathlib.Path(_helpers.__file__).parent / "040_use_ring_buffers.py"
     spec = importlib.util.spec_from_file_location("dbl_pass", pass_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -140,7 +140,7 @@ def test_double_buffer_is_idempotent(monkeypatch):
         raised = False
     except RuleSkipped:
         raised = True
-    assert raised, "030_use_ring_buffers should be idempotent (BufferedStage already present)"
+    assert raised, "040_use_ring_buffers should be idempotent (BufferedStage already present)"
 
 
 # --- eligibility regression ----------------------------------------------

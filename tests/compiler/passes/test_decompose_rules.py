@@ -47,7 +47,7 @@ def _assert_close(before: dict, after: dict, *, rtol=1e-5, atol=1e-6):
 
 def _apply(graph: Graph, rule_name: str) -> Graph:
     # Run a single rule out of the decomposition pass by selecting on
-    # its filename stem (e.g. ``"003_pow.py"`` → ``"003_pow"``).
+    # its filename stem (e.g. ``"030_pow.py"`` → ``"030_pow"``).
     return Pipeline.build([_DECOMP_PASS], select=[Path(rule_name).stem]).run(graph)
 
 
@@ -66,14 +66,14 @@ def _make_pow_graph():
 
 
 def test_pow_decomposes_to_self_mul():
-    result = _apply(_make_pow_graph(), "003_pow.py")
+    result = _apply(_make_pow_graph(), "030_pow.py")
     fns = [n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)]
     assert "pow" not in fns
     assert "multiply" in fns
 
 
 def test_pow_output_uses_self_multiply():
-    result = _apply(_make_pow_graph(), "003_pow.py")
+    result = _apply(_make_pow_graph(), "030_pow.py")
     out_node = result.nodes[result.outputs[0]]
     assert out_node.op.name == "multiply"
     assert out_node.inputs[0] == out_node.inputs[1]
@@ -82,14 +82,14 @@ def test_pow_output_uses_self_multiply():
 def test_pow_preserves_shape_and_dtype():
     g = _make_pow_graph()
     orig = g.nodes[g.outputs[0]].output
-    result = _apply(g, "003_pow.py")
+    result = _apply(g, "030_pow.py")
     assert result.nodes[result.outputs[0]].output.shape == orig.shape
     assert result.nodes[result.outputs[0]].output.dtype == orig.dtype
 
 
 def test_pow_idempotent():
-    once = _apply(_make_pow_graph(), "003_pow.py")
-    twice = _apply(once, "003_pow.py")
+    once = _apply(_make_pow_graph(), "030_pow.py")
+    twice = _apply(once, "030_pow.py")
     assert len(twice.nodes) == len(once.nodes)
 
 
@@ -98,7 +98,7 @@ def test_pow_correctness():
     x = rng.standard_normal((4, 128)).astype(np.float32)
     inputs = {"x": x}
     before = _run(g, inputs)
-    after = _run(_apply(g, "003_pow.py"), inputs)
+    after = _run(_apply(g, "030_pow.py"), inputs)
     _assert_close(before, after)
 
 
@@ -116,7 +116,7 @@ def _make_silu_graph():
 
 
 def test_silu_decomposes():
-    result = _apply(_make_silu_graph(), "002_silu.py")
+    result = _apply(_make_silu_graph(), "020_silu.py")
     fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert "silu" not in fns
     assert "exp" in fns
@@ -127,7 +127,7 @@ def test_silu_correctness():
     x = rng.standard_normal((4, 32)).astype(np.float32)
     inputs = {"x": x}
     before = _run(g, inputs)
-    after = _run(_apply(g, "002_silu.py"), inputs)
+    after = _run(_apply(g, "020_silu.py"), inputs)
     _assert_close(before, after)
 
 
@@ -145,7 +145,7 @@ def _make_mean_graph():
 
 
 def test_mean_decomposes():
-    result = _apply(_make_mean_graph(), "007_mean.py")
+    result = _apply(_make_mean_graph(), "090_mean.py")
     has_mean = any(isinstance(n.op, MeanOp) for n in result.nodes.values())
     assert not has_mean
     has_sum = any(isinstance(n.op, ReduceOp) and n.op.name == "sum" for n in result.nodes.values())
@@ -158,7 +158,7 @@ def test_mean_correctness():
     x = rng.standard_normal((4, 8)).astype(np.float32)
     inputs = {"x": x}
     before = _run(g, inputs)
-    after = _run(_apply(g, "007_mean.py"), inputs)
+    after = _run(_apply(g, "090_mean.py"), inputs)
     _assert_close(before, after)
 
 
@@ -177,7 +177,7 @@ def _make_rms_norm_graph(dim=64, seq_len=8, eps=1e-6):
 
 
 def test_rms_norm_decomposes():
-    result = _apply(_make_rms_norm_graph(), "006_rms_norm.py")
+    result = _apply(_make_rms_norm_graph(), "080_rms_norm.py")
     assert not any(isinstance(n.op, RmsNormOp) for n in result.nodes.values())
     fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert {"multiply", "add", "rsqrt"} <= fns
@@ -186,13 +186,13 @@ def test_rms_norm_decomposes():
 
 def test_rms_norm_with_eps_input_decomposes():
     """Custom eps value preserved through decomposition."""
-    result = _apply(_make_rms_norm_graph(eps=1e-5), "006_rms_norm.py")
+    result = _apply(_make_rms_norm_graph(eps=1e-5), "080_rms_norm.py")
     assert not any(isinstance(n.op, RmsNormOp) for n in result.nodes.values())
 
 
 def test_rms_norm_preserves_io_shape():
     g = _make_rms_norm_graph(dim=64, seq_len=8)
-    result = _apply(g, "006_rms_norm.py")
+    result = _apply(g, "080_rms_norm.py")
     assert result.nodes[result.outputs[0]].output.shape == (1, 8, 64)
 
 
@@ -229,7 +229,7 @@ def _make_softmax_graph(dim_extent=8, seq_len=4, axis=-1):
 
 
 def test_softmax_decomposes():
-    result = _apply(_make_softmax_graph(), "008_softmax.py")
+    result = _apply(_make_softmax_graph(), "100_softmax.py")
     assert not any(isinstance(n.op, SoftmaxOp) for n in result.nodes.values())
     fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     assert {"subtract", "exp", "divide"} <= fns
@@ -239,7 +239,7 @@ def test_softmax_decomposes():
 
 def test_softmax_preserves_io_shape():
     g = _make_softmax_graph(dim_extent=8, seq_len=4)
-    result = _apply(g, "008_softmax.py")
+    result = _apply(g, "100_softmax.py")
     assert result.nodes[result.outputs[0]].output.shape == (1, 4, 8)
 
 
@@ -250,7 +250,7 @@ def test_softmax_correctness():
     x = rng.standard_normal((1, 4, 8)).astype(np.float32)
     shifted = x - x.max(axis=-1, keepdims=True)
     expected = np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
-    after = _run(_apply(g, "008_softmax.py"), {"x": x})
+    after = _run(_apply(g, "100_softmax.py"), {"x": x})
     np.testing.assert_allclose(list(after.values())[0], expected, rtol=1e-5, atol=1e-6)
 
 
@@ -283,19 +283,19 @@ def _make_sdpa_graph(seq_len=4, head_dim=8, num_heads=1, is_causal=False):
 
 
 def test_sdpa_decomposes():
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     assert not any(isinstance(n.op, SdpaOp) for n in result.nodes.values())
 
 
 def test_sdpa_produces_transpose():
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     transposes = [n for n in result.nodes.values() if isinstance(n.op, TransposeOp)]
     assert len(transposes) >= 1
     assert transposes[0].op.axes == (-2, -1)
 
 
 def test_sdpa_produces_two_matmuls():
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     muls = [n for n in result.nodes.values() if isinstance(n.op, ElementwiseOp) and n.op.name == "multiply"]
     sums = [n for n in result.nodes.values() if isinstance(n.op, ReduceOp) and n.op.name == "sum"]
     assert len(muls) >= 3
@@ -303,7 +303,7 @@ def test_sdpa_produces_two_matmuls():
 
 
 def test_sdpa_produces_softmax_pattern():
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
     reduce_fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ReduceOp)}
     assert {"subtract", "exp", "divide"} <= fns
@@ -311,20 +311,20 @@ def test_sdpa_produces_softmax_pattern():
 
 
 def test_sdpa_produces_scale_constant():
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     scale_constants = [n for n in result.nodes.values() if isinstance(n.op, ConstantOp) and "scale" in n.op.name]
     assert len(scale_constants) >= 1
 
 
 def test_sdpa_preserves_io_count():
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     assert len(result.inputs) == 3
     assert len(result.outputs) == 1
 
 
 def test_sdpa_idempotent():
-    once = _apply(_make_sdpa_graph(), "001_sdpa.py")
-    twice = _apply(once, "001_sdpa.py")
+    once = _apply(_make_sdpa_graph(), "010_sdpa.py")
+    twice = _apply(once, "010_sdpa.py")
     assert len(twice.nodes) == len(once.nodes)
 
 
@@ -332,7 +332,7 @@ def test_sdpa_output_is_valid():
     """SDPA ends with a squeeze IndexMapOp (after the keepdim reduce)."""
     from deplodock.compiler.ir.tensor.ir import IndexMapOp
 
-    result = _apply(_make_sdpa_graph(), "001_sdpa.py")
+    result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     assert isinstance(result.nodes[result.outputs[0]].op, (ElementwiseOp, ReduceOp, IndexMapOp))
 
 
@@ -344,7 +344,7 @@ def test_sdpa_with_extra_args_decomposes():
     g.add_node(op=ConstantOp(name="dropout_p"), inputs=[], output=Tensor("dp", (1,)), node_id="dp")
     g.add_node(op=SdpaOp(), inputs=["Q", "K", "V", "dp"], output=Tensor("out", (1, 4, 8)), node_id="sdpa_out")
     g.inputs, g.outputs = ["Q", "K", "V"], ["sdpa_out"]
-    result = _apply(g, "001_sdpa.py")
+    result = _apply(g, "010_sdpa.py")
     assert not any(isinstance(n.op, SdpaOp) for n in result.nodes.values())
 
 
@@ -355,14 +355,14 @@ def test_sdpa_correctness():
     v = rng.standard_normal((1, 4, 8)).astype(np.float32)
     inputs = {"Q": q, "K": k, "V": v}
     before = _run(g, inputs)
-    after = _run(_apply(g, "001_sdpa.py"), inputs)
+    after = _run(_apply(g, "010_sdpa.py"), inputs)
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
 def test_sdpa_causal_decomposes():
     """Causal SDPA decomposes into primitives including a causal mask IndexMapOp."""
     g = _make_sdpa_graph(seq_len=4, head_dim=8, num_heads=1, is_causal=True)
-    result = _apply(g, "001_sdpa.py")
+    result = _apply(g, "010_sdpa.py")
     assert not any(isinstance(n.op, SdpaOp) for n in result.nodes.values())
 
 
@@ -374,7 +374,7 @@ def test_sdpa_causal_correctness():
     v = rng.standard_normal((2, 8, 16)).astype(np.float32)
     inputs = {"Q": q, "K": k, "V": v}
     before = _run(g, inputs)
-    after = _run(_apply(g, "001_sdpa.py"), inputs)
+    after = _run(_apply(g, "010_sdpa.py"), inputs)
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
@@ -398,7 +398,7 @@ def _make_linear_graph(has_bias=False):
 
 
 def test_linear_decomposes():
-    result = _apply(_make_linear_graph(), "004_linear.py")
+    result = _apply(_make_linear_graph(), "040_linear.py")
     assert not any(isinstance(n.op, LinearOp) for n in result.nodes.values())
 
 
@@ -407,7 +407,7 @@ def test_linear_correctness():
     x = rng.standard_normal((2, 8)).astype(np.float32)
     w = rng.standard_normal((4, 8)).astype(np.float32)
     before = _run(g, {"x": x, "w": w})
-    after = _run(_apply(g, "004_linear.py"), {"x": x, "w": w})
+    after = _run(_apply(g, "040_linear.py"), {"x": x, "w": w})
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
@@ -417,7 +417,7 @@ def test_linear_with_bias_correctness():
     w = rng.standard_normal((4, 8)).astype(np.float32)
     b = rng.standard_normal(4).astype(np.float32)
     before = _run(g, {"x": x, "w": w, "b": b})
-    after = _run(_apply(g, "004_linear.py"), {"x": x, "w": w, "b": b})
+    after = _run(_apply(g, "040_linear.py"), {"x": x, "w": w, "b": b})
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
@@ -442,7 +442,7 @@ def _make_matmul_graph(has_bias=False):
 
 
 def test_matmul_decomposes():
-    result = _apply(_make_matmul_graph(), "005_matmul.py")
+    result = _apply(_make_matmul_graph(), "070_matmul.py")
     assert not any(isinstance(n.op, MatmulOp) for n in result.nodes.values())
 
 
@@ -451,7 +451,7 @@ def test_matmul_correctness():
     a = rng.standard_normal((4, 8)).astype(np.float32)
     b = rng.standard_normal((8, 3)).astype(np.float32)
     before = _run(g, {"a": a, "b": b})
-    after = _run(_apply(g, "005_matmul.py"), {"a": a, "b": b})
+    after = _run(_apply(g, "070_matmul.py"), {"a": a, "b": b})
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
@@ -461,7 +461,7 @@ def test_matmul_with_bias_correctness():
     b = rng.standard_normal((8, 3)).astype(np.float32)
     bias = rng.standard_normal(3).astype(np.float32)
     before = _run(g, {"a": a, "b": b, "bias": bias})
-    after = _run(_apply(g, "005_matmul.py"), {"a": a, "b": b, "bias": bias})
+    after = _run(_apply(g, "070_matmul.py"), {"a": a, "b": b, "bias": bias})
     _assert_close(before, after, rtol=1e-4, atol=1e-5)
 
 
@@ -486,7 +486,7 @@ def test_unsqueeze_to_indexmap_correctness():
     g = _make_unsqueeze_graph(dim=0)
     x = rng.standard_normal((4, 8)).astype(np.float32)
     before = _run(g, {"x": x})
-    after = _run(_apply(g, "009_unsqueeze.py"), {"x": x})
+    after = _run(_apply(g, "110_unsqueeze.py"), {"x": x})
     _assert_close(before, after)
 
 
@@ -494,7 +494,7 @@ def test_unsqueeze_last_dim_correctness():
     g = _make_unsqueeze_graph(dim=-1)
     x = rng.standard_normal((4, 8)).astype(np.float32)
     before = _run(g, {"x": x})
-    after = _run(_apply(g, "009_unsqueeze.py"), {"x": x})
+    after = _run(_apply(g, "110_unsqueeze.py"), {"x": x})
     _assert_close(before, after)
 
 
@@ -515,7 +515,7 @@ def test_transpose_to_indexmap_correctness():
     g = _make_transpose_graph()
     x = rng.standard_normal((3, 4)).astype(np.float32)
     before = _run(g, {"x": x})
-    after = _run(_apply(g, "010_transpose.py"), {"x": x})
+    after = _run(_apply(g, "120_transpose.py"), {"x": x})
     _assert_close(before, after)
 
 
@@ -536,7 +536,7 @@ def test_reshape_to_indexmap_correctness():
     g = _make_reshape_graph()
     x = rng.standard_normal((3, 4)).astype(np.float32)
     before = _run(g, {"x": x})
-    after = _run(_apply(g, "011_reshape.py"), {"x": x})
+    after = _run(_apply(g, "130_reshape.py"), {"x": x})
     _assert_close(before, after)
 
 
@@ -560,7 +560,7 @@ def test_slice_to_indexmap_correctness():
     g = _make_slice_graph()
     x = rng.standard_normal((4, 8)).astype(np.float32)
     before = _run(g, {"x": x})
-    after = _run(_apply(g, "012_slice.py"), {"x": x})
+    after = _run(_apply(g, "140_slice.py"), {"x": x})
     _assert_close(before, after)
 
 
@@ -584,5 +584,5 @@ def test_cat_to_indexmap_correctness():
     a = rng.standard_normal((4, 3)).astype(np.float32)
     b = rng.standard_normal((4, 5)).astype(np.float32)
     before = _run(g, {"a": a, "b": b})
-    after = _run(_apply(g, "013_cat.py"), {"a": a, "b": b})
+    after = _run(_apply(g, "150_cat.py"), {"a": a, "b": b})
     _assert_close(before, after)

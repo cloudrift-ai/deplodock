@@ -1,6 +1,6 @@
 """CUDA accuracy regression for the wrap-body cp.async path.
 
-050_use_async_copy promotes ``BufferedStage`` to ``AsyncBufferedStage(pipeline_depth=1)``
+060_use_async_copy promotes ``BufferedStage`` to ``AsyncBufferedStage(pipeline_depth=1)``
 inside ``SerialTile(serial_outer)``. The materializer emits ``CpAsyncCopy`` per
 Source + ``CpAsyncCommit + CpAsyncWait(0) + Sync`` at the wrap boundary instead of
 the sync cooperative ``Load+Write``.
@@ -34,7 +34,7 @@ _CASES: tuple[tuple[tuple[int, int, int], dict[str, int]], ...] = (
     ((64, 128, 64), {"BN": 16, "BM": 16, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1}),
     # K_o = 192/64 = 3 — smallest K_o that wraps the ring buffer back to slot 0.
     # First broken case for the slot-aliasing race fixed by the trailing
-    # AsyncWait sync in 070_pipeline_stages — iter K_o=1's cp.async writes
+    # AsyncWait sync in 080_pipeline_stages — iter K_o=1's cp.async writes
     # slot (1+1)%2 = 0, which iter K_o=0's consume just read.
     ((64, 192, 64), {"BN": 16, "BM": 16, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1}),
     # K_o = 512/64 = 8 — deeper ring exercises repeated commit/wait pairs.
@@ -106,7 +106,7 @@ def test_async_copy_matmul_accuracy(case, monkeypatch):
 
     # Regression gate 1: pass actually fires (AsyncBufferedStage present).
     assert _has_async_stage(m, k, n), (
-        f"050_use_async_copy did not produce an AsyncBufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
+        f"060_use_async_copy did not produce an AsyncBufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
     )
 
     # Regression gate 2: rendered kernel really uses cp.async (no silent

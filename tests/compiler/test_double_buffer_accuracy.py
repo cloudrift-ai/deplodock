@@ -1,6 +1,6 @@
 """CUDA accuracy regression for the wrap-body double-buffer path.
 
-030_use_ring_buffers promotes a wrap-body ``Stage`` inside a
+040_use_ring_buffers promotes a wrap-body ``Stage`` inside a
 ``SerialTile(serial_outer)`` to ``BufferedStage(buffer_count=2,
 phase=K_o%2)``. The materializer doubles the smem allocation, prepends
 the phase to the cooperative-load Write and to every body Load that
@@ -109,7 +109,7 @@ def _run_cuda(graph: Graph, inputs: dict[str, np.ndarray]) -> np.ndarray:
 @requires_cuda
 @pytest.mark.parametrize("case", _CASES, ids=_id)
 def test_double_buffer_matmul_accuracy(case, monkeypatch):
-    """Pin planner knobs that force K_o >= 2 so 030_use_ring_buffers fires,
+    """Pin planner knobs that force K_o >= 2 so 040_use_ring_buffers fires,
     then check the CUDA-compiled kernel matches numpy within fp32 tolerance.
 
     A regression in the wrap-body promotion (wrong phase index, missed Load
@@ -130,7 +130,7 @@ def test_double_buffer_matmul_accuracy(case, monkeypatch):
     # double-buffer coverage. Assert explicitly.
     graph_for_inspection, _ = _build_matmul(m, k, n)
     assert _has_buffered_stage(graph_for_inspection), (
-        f"030_use_ring_buffers did not produce a BufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
+        f"040_use_ring_buffers did not produce a BufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
     )
 
     ref = _reference(graph, inputs)

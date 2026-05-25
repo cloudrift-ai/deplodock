@@ -170,7 +170,7 @@ def dtype_promote(op_name: str, arg_dtypes: list[str]) -> str:
     op-specific overrides (e.g. ``relu`` would still emit f16 even with
     no f16 args), but is unused today.
 
-    Lifted out of ``Assign.render`` so the ``001_stamp_types`` pass can
+    Lifted out of ``Assign.render`` so the ``030_stamp_types`` pass can
     reuse the same rule when stamping ``Assign.dtype`` on the IR.
     """
     if arg_dtypes and all(d == "f16" for d in arg_dtypes):
@@ -482,7 +482,7 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
 
     Detection of vectorizable Load runs (``LDS.128`` / ``__half2``) is
     no longer done here — the dedicated Kernel-IR pass
-    ``003_vectorize_loads`` widens those runs into one :class:`Load`
+    ``050_vectorize_loads`` widens those runs into one :class:`Load`
     with ``extra_names`` populated before render. This function's only
     pre-walk responsibility is registering literal-constant Loads so
     their ``Var(name)`` uses inline as float literals instead of

@@ -155,7 +155,7 @@ small K (pipeline drain dominates), or when smem won't fit a
 
 ### 3. Materializer / Kernel-IR lowering for warp-groups
 
-`passes/lowering/kernel/001_materialize_tile.py` extension:
+`passes/lowering/kernel/100_materialize_tile.py` extension:
 
 - A `WarpGroup` declaration emits a per-warp-id branch dispatching
   to each `WarpGroupBody`.
@@ -245,7 +245,7 @@ Phase 3 — extend to other fused-prologue shapes:
   `ir/kernel/ir.py`.
 - New tile pass `00X_warp_specialize_fused_prologue.py`: ~250 LOC.
 - Materializer extension: ~150 LOC in
-  `passes/lowering/kernel/001_materialize_tile.py`.
+  `passes/lowering/kernel/100_materialize_tile.py`.
 - Renderer + PTX preludes: ~80 LOC in `kernel/render.py`.
 - Tests + tuning fixture: ~100 LOC.
 

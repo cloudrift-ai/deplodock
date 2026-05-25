@@ -58,7 +58,7 @@ Skips when:
 
 * The picked axis has no body Load with stride F > V divisible by V.
   Captures the ``FN <= V`` no-op case and any non-canonical shape.
-* Bank-conflict analysis (reusing ``060_pad_smem``'s analyzer) says
+* Bank-conflict analysis (reusing ``070_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
 """
 
@@ -139,7 +139,7 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:
 def _vec_elems_for_lane(tile, lane_var: str, *, lds128_bytes: int) -> int | None:
     """Elements per LDS.128 at the dtype of the affected Stages. Reads
     each affected consumer Load's stamped ``load.dtype.nbytes``
-    (``001_stamp_types`` populated it from the matching Stage source).
+    (``030_stamp_types`` populated it from the matching Stage source).
 
     Returns the minimum across affected Loads (conservative chunk width
     that still vectorizes every involved Stage), or ``None`` when no

@@ -1,4 +1,4 @@
-"""Stage-expansion helpers for ``008_materialize_tile``.
+"""Stage-expansion helpers for ``100_materialize_tile``.
 
 Producer scaffolding for wrap-body Stages: a transport ``Stage`` becomes a
 cooperative ``Load + Write`` (or ``CpAsyncCopy``) nest, a ``ComputeStage``
@@ -21,7 +21,7 @@ from deplodock.compiler.ir.tile.ir import AsyncBufferedStage, BufferedStage, Com
 
 def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | None
     """C type spelling for a Source's smem slab, derived from the
-    stamped ``Source.dtype`` (``002_stamp_types``). Defaults to the
+    stamped ``Source.dtype`` (``030_stamp_types``). Defaults to the
     legacy ``"float"`` when unstamped — handwritten test fixtures
     rely on the fallback."""
     from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
@@ -87,7 +87,7 @@ def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
             smem_index = (stage.phase, *smem_index)
         # Per-source dtype: use gmem source's CUDA C type so fp16 inputs
         # stage into __half smem. ``Source.dtype`` is stamped by
-        # ``002_stamp_types`` from the matching graph node's dtype.
+        # ``030_stamp_types`` from the matching graph node's dtype.
         smem_dtype = smem_cuda_dtype(src)
         smem_align = 16 if smem_dtype == "__half" else 0
         full_extents = (stage.buffer_count, *padded_extents) if is_buffered else padded_extents
@@ -125,7 +125,7 @@ def emit_stage(stage: Stage, tid_expr, n_threads: int) -> list[Stmt]:
     # implicit CpAsyncWait(0) + Sync so the consumer body sees the
     # committed copy at the wrap boundary. Pipelined stages
     # (pipeline_depth > 1) get expanded by
-    # 070_pipeline_stages before materialize and emit their
+    # 080_pipeline_stages before materialize and emit their
     # own waits at the pipelined schedule positions.
     # Sync stages just emit __syncthreads so the slab is CTA-visible.
     if is_async:

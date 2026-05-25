@@ -1,4 +1,4 @@
-"""Cross-thread combine helpers for ``008_materialize_tile``.
+"""Cross-thread combine helpers for ``100_materialize_tile``.
 
 A cooperative ``Accum`` whose reduction axis is split across the CTA's
 threads needs a cross-thread reduce after the per-thread partials land.

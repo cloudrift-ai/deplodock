@@ -1,8 +1,8 @@
 """Cross-validation: Tile-IR oracle vs Kernel-IR static analyzer.
 
 For each ``(Stage, body Load)`` binding produced by the Tile-IR pipeline,
-asks ``lane_bank_distribution`` (the oracle that ``005_permute_lane_accesses``
-and ``060_pad_smem`` score against) what each lane's smem address should be at
+asks ``lane_bank_distribution`` (the oracle that ``060_permute_lane_accesses``
+and ``070_pad_smem`` score against) what each lane's smem address should be at
 ``k_iter=0``. Then runs ``simulate_graph`` (which lowers the graph through
 ``KERNEL_PASSES`` and analyzes ``Smem`` Loads at the Kernel-IR level) and
 checks both compute the same addresses. Pure static — no GPU required.

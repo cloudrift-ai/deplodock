@@ -1,6 +1,6 @@
 """Drop redundant ``Sync`` stmts left by the materializer's templates.
 
-``008_materialize_tile`` emits a defensive ``Sync()`` at several template
+``100_materialize_tile`` emits a defensive ``Sync()`` at several template
 boundaries (stage prologue, combine, TMA wait). Many collapse: two
 consecutive ``Sync``s are one, and a leading ``Sync`` before any smem
 access fences nothing. This Kernel-IR peephole runs after materialize

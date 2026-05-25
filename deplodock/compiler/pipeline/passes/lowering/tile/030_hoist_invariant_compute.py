@@ -1,6 +1,6 @@
 """Hoist invariant compute cones out of a multi-source Stage's K_i body.
 
-For the silu-gated MLP shape ``F.silu(gate) * up @ W``, ``010_stage_inputs``
+For the silu-gated MLP shape ``F.silu(gate) * up @ W``, ``020_stage_inputs``
 puts all three gmem operands into one multi-source ``Stage`` whose K_i
 reduce body interleaves a silu chain (on ``gate``+``up``) with the matmul
 ``Accum`` (on ``W``). The silu chain depends only on the M/K_i cache axes
@@ -26,7 +26,7 @@ When (1)-(3) all hold, the cone is "hoistable".
 **Autotune fork.** ``FUSED_PIPELINE`` is a BOOL knob; both polarities
 are emitted in fixed order whenever a cone is found:
 
-- ``False`` (greedy default) — pass-through. ``010_stage_inputs``
+- ``False`` (greedy default) — pass-through. ``020_stage_inputs``
   already produces the inline-fuse shape (multi-source Stage with the
   chain in the K_i body); the chain runs per-thread per-K_i, redundant
   across the N tile.
@@ -35,7 +35,7 @@ are emitted in fixed order whenever a cone is found:
   a fresh smem slab with the cone frontier; the K_i reduce reads the
   slab instead of re-running the chain. Non-cone sources move to an
   outer Stage so they stay in scope through the rewrite. Materialized
-  by ``001_materialize_tile._emit_compute_stage`` — emits a single
+  by ``100_materialize_tile._emit_compute_stage`` — emits a single
   cooperative ``StridedLoop`` over the fused cache axes that runs the
   compute body once per cell.
 
@@ -69,7 +69,7 @@ FUSED_PIPELINE = Knob(
     hints=(False, True),
     help=(
         "Hoist an invariant compute cone out of a multi-source Stage's K_i reduce body. "
-        "False (default) — pass-through the inline-fuse shape from 010_stage_inputs. "
+        "False (default) — pass-through the inline-fuse shape from 020_stage_inputs. "
         "True — split the multi-source Stage into transport + ComputeStage so the cone "
         "chain runs once per cell instead of per (N) thread per K_i. Autotune fork."
     ),

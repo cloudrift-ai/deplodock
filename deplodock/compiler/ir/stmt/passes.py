@@ -32,7 +32,7 @@ def _rename_ssa_vars_in_expr(e: Expr, rename: Rename) -> Expr:
     (gather: ``x[a0, (int)in0]``, scatter: ``out[(int)idx_v] = ...``)
     have their SSA-name references rewritten when the enclosing body
     is replicated. Without this, the register-tile replicator in
-    ``000_split_register_axes`` suffixes the defining Load's name
+    ``010_split_register_axes`` suffixes the defining Load's name
     (``in0`` → ``in0_1``) but leaves dependent indirect Loads pointing
     at the original ``in0`` — silently dropping the cross-replica data
     dependency.

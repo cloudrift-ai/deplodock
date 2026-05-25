@@ -28,7 +28,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
 def _tile_has_combine(g: Graph) -> bool:
     """True iff some Accum reduces over an enclosing ThreadTile axis —
     the structural signal that cross-thread reduction will be emitted
-    by ``008_materialize_tile``. (Pre-refactor variants: "Tile body
+    by ``100_materialize_tile``. (Pre-refactor variants: "Tile body
     contains a ``Combine`` stmt", then "ThreadTile.cooperative_axes
     set"; both are gone — cooperativity now lives on ``Accum.axes``
     and the materializer / escape-analysis helper recovers it via

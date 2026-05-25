@@ -1,5 +1,5 @@
 """Fold ``ReshapeOp(ConstantOp)`` into ``ConstantOp.load_ops`` —
-``ReshapeOp`` companion of ``004a_fold_into_constant``."""
+``ReshapeOp`` companion of ``050_fold_into_constant``."""
 
 from __future__ import annotations
 

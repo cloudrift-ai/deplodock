@@ -69,7 +69,7 @@ Follow-on slices, in order of difficulty:
 | M  | Slice | Validation |
 |----|-------|------------|
 | M0 | Add `compiler/dim.py`; switch `Tensor.shape: tuple[Dim, ...]` and `Axis.extent: Dim`; migrate ~30 `int(d)` sites to `d.as_static()`; fold `Dim.value` into `Graph.structural_key()` | `make test` green; no behavior change |
-| M1 | Lifting passes (`001_lift_elementwise`, `002_lift_reduce`, `003_lift_indexmap`, `004_lift_gather`) preserve symbolic free-axis extents; `Loop.forward()` reads extent from input arrays at execute time | `compile --code RMSNorm` with symbolic S prints loop IR with `Axis(extent=Dim("seq_len"))` |
+| M1 | Lifting passes (`010_lift_elementwise`, `020_lift_reduce`, `030_lift_indexmap`, `040_lift_gather`) preserve symbolic free-axis extents; `Loop.forward()` reads extent from input arrays at execute time | `compile --code RMSNorm` with symbolic S prints loop IR with `Axis(extent=Dim("seq_len"))` |
 | M2 | Kernel signature carries `seq_len` as an i32 runtime arg; CUDA emitter renders `Axis` extent as that arg in grid bounds and free-axis loop limits | `run --code RMSNorm` with two different S values, one cached kernel |
 | M3 | Tile planner handles symbolic extent on free axes (no split — bind whole axis to BLOCK or stride); explicit error on symbolic reduce axes | RMSNorm passes; softmax-over-S fails cleanly with a known message |
 | M4 | SDPA decomposition + reshape handle symbolic `seq_len` (causal mask passed as input, not constructed inline); HF wrapper produces a symbolic-aware mask | Single-layer SDPA traces with symbolic seq_len |
@@ -87,10 +87,10 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
 2. **Tensor / Axis** (`compiler/tensor.py`, `compiler/ir/axis.py`) — shape elements and axis extents become `Dim`.
    `Axis.split(factor)` needs to refuse symbolic extents (M3).
 3. **Frontend decomposition** (`compiler/pipeline/passes/frontend/decomposition/`) — most rules propagate shapes and
-   are fine. Risk sites: `001_sdpa.py` (mask shape derived from seq_len); reshape/view (`ir/frontend/ir.py:74,78` do
+   are fine. Risk sites: `010_sdpa.py` (mask shape derived from seq_len); reshape/view (`ir/frontend/ir.py:74,78` do
    `in_numel *= int(d)` and `known *= int(d)`); `SliceOp` (`ir/frontend/ir.py:96`) also carries
    `tuple[int | str, ...]` but only forwards it — its `forward` reads start/end from constant inputs, so symbolic dims
-   pass through without a cast; broadcast helpers; `013_cat.py` (already guards on `isinstance(..., int)`).
+   pass through without a cast; broadcast helpers; `150_cat.py` (already guards on `isinstance(..., int)`).
 4. **Loop lifting** (`compiler/pipeline/passes/loop/lifting/`) — all four lifting passes do `Axis(extent=int(d))`. Each
    becomes `Axis(extent=d)` with `d: Dim`.
 5. **Tile / Kernel / CUDA lowering** (`compiler/pipeline/passes/lowering/{tile,kernel,cuda}/`,

@@ -32,13 +32,13 @@ The decision needs the source-buffer dtype (graph node dtypes for
 graph dtypes via ``KernelOp.inputs`` keys + ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
 info, so ``normalize_body`` (which runs on every Body construction)
 can't make the call without external context. Running the pass here —
-after ``001_materialize_tile`` has placed the Smem decls and before
+after ``100_materialize_tile`` has placed the Smem decls and before
 the CUDA-source rendering in ``lowering/cuda`` — keeps both pieces of
 context available in one place.
 
 ## Composition with the demote pass
 
-Runs after ``002_demote_to_write_dtype`` so the demote pass sees the
+Runs after ``040_demote_to_write_dtype`` so the demote pass sees the
 original scalar Loads (the demote analysis is on Assigns, not Loads,
 so order is mostly independent; this is the conservative ordering).
 """
@@ -114,7 +114,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
     if any(getattr(s, "input", None) is None for s in loads):
         return None
     # Every Load in the run must carry a stamped dtype (set by
-    # ``001_stamp_types``). If not, bail — the source dtype is the
+    # ``030_stamp_types``). If not, bail — the source dtype is the
     # decision point for picking a vector type, and falling back to f32
     # would silently mis-vectorize fp16 chains.
     if any(s.dtype is None for s in loads):

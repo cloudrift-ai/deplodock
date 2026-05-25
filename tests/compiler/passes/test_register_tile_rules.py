@@ -108,7 +108,7 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
 
 
 def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
-    """With ``010_stage_inputs`` running before split_register_axes, Stages
+    """With ``020_stage_inputs`` running before split_register_axes, Stages
     stay singleton across F² and the smem budget no longer blows up on
     SDPA's softmax-pre-pass + (P·V) matmul kernel. Both SDPA matmul
     kernels (Q·Kᵀ and the dominant one) now fire."""

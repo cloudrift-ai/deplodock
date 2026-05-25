@@ -238,20 +238,20 @@ recipe.
 | `SPLITK`      | INT      | `003_split_matmul_k`         | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
 | `BN`          | INT      | `004_launch_geometry`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
 | `BM`          | INT      | `004_launch_geometry`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
-| `STAGE`       | BINMASK  | `010_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one wrap-body Stage with per-source Source entries. |
+| `STAGE`       | BINMASK  | `020_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one wrap-body Stage with per-source Source entries. |
 | `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
 | `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
-| `TMA_SWIZZLE`     | BOOL     | `040_use_tma`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
-| `FUSED_PIPELINE`  | BOOL     | `020_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
-| `PAD_SMEM`        | BOOL     | `060_pad_smem`                       | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork. |
+| `TMA_SWIZZLE`     | BOOL     | `050_use_tma`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
+| `FUSED_PIPELINE`  | BOOL     | `030_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
+| `PAD_SMEM`        | BOOL     | `070_pad_smem`                       | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork. |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
 `knobs=` line — they're treated as pass-presence markers, not values.
 
-`FUSED_PIPELINE` is an autotune fork: `020_hoist_invariant_compute` emits both variants per fusable cone in a fixed
+`FUSED_PIPELINE` is an autotune fork: `030_hoist_invariant_compute` emits both variants per fusable cone in a fixed
 order (inline-fuse first as the greedy default — smaller smem, works on every architecture). Honors
-`DEPLODOCK_FUSED_PIPELINE` for one-off pinning. `PAD_SMEM` follows the same shape in `060_pad_smem`: both polarities
+`DEPLODOCK_FUSED_PIPELINE` for one-off pinning. `PAD_SMEM` follows the same shape in `070_pad_smem`: both polarities
 fire whenever any source has a fixable conflict; the greedy run picks pad-on first. Honors `DEPLODOCK_PAD_SMEM` for
 one-off pinning.
 

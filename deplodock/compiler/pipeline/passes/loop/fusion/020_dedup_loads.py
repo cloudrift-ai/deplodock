@@ -1,6 +1,6 @@
 """Drop duplicate ``Load`` stmts within each fused ``LoopOp`` body.
 
-Runs after ``001_merge_loop_ops`` so the splicer sees un-deduped producer
+Runs after ``010_merge_loop_ops`` so the splicer sees un-deduped producer
 bodies (its prepend-at-leaf worklist relies on the original Load
 multiplicity for defined-before-use ordering). Once fusion is settled,
 identical ``(input, index)`` Loads at the same scope are equivalent —
