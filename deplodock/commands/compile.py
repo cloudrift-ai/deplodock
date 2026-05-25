@@ -331,9 +331,19 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
     model.eval()
 
     if layer is None:
-        from deplodock.compiler.trace.huggingface import build_full_model_wrapper
+        from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
 
         logger.info("Tracing full model (seq_len=%d)...", seq_len)
+        if dynamic_shapes:
+            # Dynamic mode: wrapper takes (input_ids, attention_mask, position_ids)
+            # so the caller (here: the trace step + the eventual launch) can
+            # supply per-call mask + position_ids sized to the runtime seq_len.
+            wrapper = build_full_model_wrapper(model, seq_len, dtype, dynamic=True)
+            input_ids = torch.zeros((1, seq_len), dtype=torch.long)
+            attention_mask = build_causal_mask(seq_len, dtype)
+            position_ids = torch.arange(seq_len).unsqueeze(0)
+            return trace_module(wrapper, (input_ids, attention_mask, position_ids), dynamic_shapes=dynamic_shapes)
+
         wrapper = build_full_model_wrapper(model, seq_len, dtype)
         input_ids = torch.zeros((1, seq_len), dtype=torch.long)
         return trace_module(wrapper, (input_ids,), dynamic_shapes=dynamic_shapes)

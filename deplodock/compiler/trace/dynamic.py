@@ -19,14 +19,21 @@ def parse_position_specs(specs: list[str] | None) -> list[tuple[str, str, int]]:
     axis)`` triples.
 
     These feed straight into ``torch.export.export``'s ``dynamic_shapes``
-    argument via :func:`build_torch_dynamic_shapes`. Raises ``ValueError``
-    with a CLI-friendly message on a bad spec; the caller is expected to
-    ``sys.exit(2)`` so the failure surfaces as a usage error.
+    argument via :func:`build_torch_dynamic_shapes`. Multiple specs may
+    share the same ``NAME`` — that's the canonical way to mark several
+    inputs as carrying the same symbolic dim (e.g.
+    ``input_ids:1`` AND ``attention_mask:2`` AND ``attention_mask:3``
+    are all ``seq_len``). The ``(INPUT, AXIS)`` pair must be unique
+    across specs to keep each location addressed unambiguously.
+
+    Raises ``ValueError`` with a CLI-friendly message on a bad spec; the
+    caller is expected to ``sys.exit(2)`` so the failure surfaces as a
+    usage error.
     """
     out: list[tuple[str, str, int]] = []
     if not specs:
         return out
-    seen: set[str] = set()
+    seen_positions: set[tuple[str, int]] = set()
     for raw in specs:
         if "@" not in raw or ":" not in raw:
             raise ValueError(f"--dynamic {raw!r}: expected NAME@INPUT:AXIS form (e.g. ``seq_len@x:1``)")
@@ -44,9 +51,9 @@ def parse_position_specs(specs: list[str] | None) -> list[tuple[str, str, int]]:
             raise ValueError(f"--dynamic {raw!r}: AXIS must be an int, got {axis_str!r}") from e
         if axis < 0:
             raise ValueError(f"--dynamic {raw!r}: AXIS must be ≥ 0, got {axis}")
-        if name in seen:
-            raise ValueError(f"--dynamic {raw!r}: NAME {name!r} appears more than once")
-        seen.add(name)
+        if (input_name, axis) in seen_positions:
+            raise ValueError(f"--dynamic {raw!r}: ({input_name}, axis {axis}) appears more than once")
+        seen_positions.add((input_name, axis))
         out.append((name, input_name, axis))
     return out
 
@@ -54,17 +61,22 @@ def parse_position_specs(specs: list[str] | None) -> list[tuple[str, str, int]]:
 def build_torch_dynamic_shapes(specs: list[tuple[str, str, int]]) -> dict | None:
     """Convert position specs to a ``torch.export`` ``dynamic_shapes`` dict.
 
-    Returns ``None`` when there are no position specs — callers pass the
-    result straight to ``torch.export.export(..., dynamic_shapes=...)``
-    without a guard.
+    Two specs that share the same ``NAME`` get the SAME
+    ``torch.export.Dim`` instance — torch needs Dim identity (not just
+    name) to recognise that ``input_ids.shape[1]`` and
+    ``attention_mask.shape[-1]`` are the same symbolic value. Returns
+    ``None`` when there are no specs.
     """
     if not specs:
         return None
     import torch
 
+    dims_by_name: dict[str, object] = {}
     out: dict[str, dict[int, object]] = {}
     for name, input_name, axis in specs:
-        out.setdefault(input_name, {})[axis] = torch.export.Dim(name, min=1, max=4096)
+        if name not in dims_by_name:
+            dims_by_name[name] = torch.export.Dim(name, min=1, max=4096)
+        out.setdefault(input_name, {})[axis] = dims_by_name[name]
     return out
 
 

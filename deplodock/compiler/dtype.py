@@ -38,9 +38,15 @@ F16 = DataType("f16", np.dtype(np.float16), 2)
 # distinguish — packing is a CUDA-side storage detail; the canonical
 # IR token "f16x2" is what the renderer keys on.
 F16x2 = DataType("f16x2", np.dtype(np.float16), 4)
+# Integer types — appear on ``input_ids`` placeholders from HF whole-model
+# traces. The compiler doesn't generate kernels that compute on them today
+# (LM-head gather + embedding lookup is index math); they exist so the
+# graph can carry the right Tensor.dtype past the placeholder.
+I32 = DataType("i32", np.dtype(np.int32), 4)
+I64 = DataType("i64", np.dtype(np.int64), 8)
 
 
-_BY_NAME: dict[str, DataType] = {dt.name: dt for dt in (F32, F16, F16x2)}
+_BY_NAME: dict[str, DataType] = {dt.name: dt for dt in (F32, F16, F16x2, I32, I64)}
 
 # Aliases let callers feed PyTorch/numpy-style names without re-canonicalizing
 # at every callsite. The canonical name (``F32.name == "f32"``) is what lands
@@ -50,6 +56,9 @@ _ALIASES: dict[str, str] = {
     "float": "f32",
     "float16": "f16",
     "half": "f16",
+    "int32": "i32",
+    "int64": "i64",
+    "long": "i64",
 }
 
 

@@ -194,9 +194,30 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   by reshape's ``_op_shape``, not represented as graph nodes. Value-based ``make_dynamic`` /
   ``parse_specs`` / ``apply_specs`` are gone; the only path is position-based + torch.export.
   Eliminates the value-collision class (``--seq-len 32`` colliding with ``num_heads=32``) by
-  construction. Caveat: per-layer HF trace (``compile <model> --layer N``) eagerly computes
-  ``cos/sin`` from a concrete seq_len, so position embeddings specialise the dim — only the
-  ``--code`` and whole-model paths work end-to-end today.
+  construction.
+
+  Whole-model HF trace switches the wrapper to ``dynamic=True`` mode when ``--dynamic`` is
+  passed — forward becomes ``forward(input_ids, attention_mask, position_ids)`` and the trace
+  step builds the mask + position_ids sized to the canonical seq_len. The user marks every
+  axis carrying the same logical dim, e.g.
+
+  ``deplodock compile <hf_model> --seq-len 37 \``
+  ``  --dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 \``
+  ``  --dynamic seq_len@attention_mask:3 --dynamic seq_len@position_ids:1 --ir cuda``
+
+  ``build_torch_dynamic_shapes`` dedupes ``Dim`` instances by NAME so multiple specs sharing
+  ``seq_len`` use the same ``torch.export.Dim`` object — torch needs Dim identity (not just
+  name) to recognise that two input axes carry the same symbolic value.
+  ``prefer_deferred_runtime_asserts_over_guards=True`` is set on the ``torch.export.export``
+  call whenever ``dynamic_shapes`` is non-None so HF internal guards (``min(head_dim*S,
+  max_pos*S)`` etc.) defer to runtime asserts instead of failing the trace.
+
+  Caveats: per-layer trace (``--layer N``) eagerly computes ``cos/sin`` from the concrete
+  seq_len, so position embeddings specialise the dim. Whole-model trace passes the FX walk
+  and lands in CUDA codegen, but the compiler doesn't yet generate kernels for the int64
+  index-math ops (embedding lookup, position_ids arithmetic) the HF forward emits —
+  ``i32`` / ``i64`` added to ``compiler/dtype.py`` so the trace doesn't crash on dtype
+  lookup, but full whole-model compile needs int-op kernel coverage as the next stretch.
 
 ## Explicitly out of scope (v1)
 

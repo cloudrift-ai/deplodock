@@ -96,7 +96,15 @@ def trace_module_with_constants(
     t0 = time.monotonic()
     logger.info("torch.export.export() starting...")
     expanded_dynamic = _expand_dynamic_shapes(module, example_inputs, kwargs or {}, dynamic_shapes) if dynamic_shapes else None
-    exported = torch.export.export(module, example_inputs, kwargs=kwargs or {}, dynamic_shapes=expanded_dynamic)
+    # ``prefer_deferred_runtime_asserts_over_guards`` lets torch.export accept
+    # internal model guards (HF attention's ``min(head_dim*S, max_pos*S)`` etc.)
+    # by deferring them to runtime asserts rather than failing the trace.
+    # Only meaningful when there are dynamic shapes — keeps the static path
+    # behavior identical.
+    export_kwargs: dict[str, object] = {"kwargs": kwargs or {}, "dynamic_shapes": expanded_dynamic}
+    if expanded_dynamic is not None:
+        export_kwargs["prefer_deferred_runtime_asserts_over_guards"] = True
+    exported = torch.export.export(module, example_inputs, **export_kwargs)
     gm = exported.graph_module
     t1 = time.monotonic()
     n_fx_nodes = sum(1 for _ in gm.graph.nodes)
