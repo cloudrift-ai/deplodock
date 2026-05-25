@@ -106,7 +106,7 @@ def test_main_loop_extent_decrements_by_one():
     serial_outers = [s for s in new_op.body.iter() if isinstance(s, SerialTile) and s.kind == "serial_outer"]
     # Exactly one new serial_outer survives (the steady-state main loop).
     assert len(serial_outers) == 1
-    assert int(serial_outers[0].axis.extent) == 3, serial_outers[0].axis.extent
+    assert serial_outers[0].axis.extent.as_static() == 3, serial_outers[0].axis.extent
 
 
 def test_idempotent_on_already_pipelined():

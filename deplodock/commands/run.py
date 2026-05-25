@@ -582,13 +582,13 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     input_data: dict[str, list[float]] = {}
     for nid, node in graph.nodes.items():
         if isinstance(node.op, InputOp):
-            shape = tuple(int(d) for d in node.output.shape)
+            shape = tuple(d.as_static() for d in node.output.shape)
             input_data[nid] = rng.standard_normal(shape, dtype=np.float32).flatten().tolist()
         elif isinstance(node.op, ConstantOp):
             if node.op.value is not None:
                 input_data[nid] = [float(node.op.value)]
             else:
-                shape = tuple(int(d) for d in node.output.shape)
+                shape = tuple(d.as_static() for d in node.output.shape)
                 input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")

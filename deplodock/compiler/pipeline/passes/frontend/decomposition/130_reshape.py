@@ -7,6 +7,7 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import as_static
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import ReshapeOp
@@ -35,7 +36,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     for d in range(out_ndim - 1, -1, -1):
         term = placeholder(d) if out_stride == 1 else BinaryExpr("*", placeholder(d), Literal(out_stride, "int"))
         flat = term if flat is None else BinaryExpr("+", term, flat)
-        out_stride *= int(out_shape[d])
+        out_stride *= as_static(out_shape[d])
 
     if flat is None:
         flat = Literal(0, "int")
@@ -46,7 +47,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     for j in range(in_ndim - 1, -1, -1):
         in_stride_j = in_stride
         coord = flat if in_stride_j == 1 else BinaryExpr("/", flat, Literal(in_stride_j, "int"))
-        dim_j = int(in_shape[j])
+        dim_j = as_static(in_shape[j])
         if j > 0:
             coord = BinaryExpr("%", coord, Literal(dim_j, "int"))
         coords.insert(0, coord)

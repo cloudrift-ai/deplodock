@@ -146,7 +146,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     tid_expr = _build_linear_tid(thread_axes)
     n_threads = 1
     for ax in thread_axes:
-        n_threads *= int(ax.extent)
+        n_threads *= ax.extent.as_static()
 
     rename: dict[str, str] = {}
 
@@ -262,7 +262,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         dims = addressing.dims
         box_per_dim: dict[int, int] = {}
         for d, ax in zip(dims, src.cache_axes, strict=True):
-            box_per_dim[d] = box_per_dim.get(d, 1) * int(ax.extent)
+            box_per_dim[d] = box_per_dim.get(d, 1) * ax.extent.as_static()
         full_box = tuple(box_per_dim.get(d, 1) for d in range(len(src.origin)))
         # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
         # 0) between the first and last swept source dims. Leading
@@ -311,7 +311,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # ``BYTES_PER_ELEM`` over-counted fp16 by 2x).
         slab_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
         for ax in src.cache_axes:
-            slab_bytes *= int(ax.extent)
+            slab_bytes *= ax.extent.as_static()
         # Smem allocation: leading phase dim + cache extents (with pad).
         full_extents = (stage.buffer_count, *src.alloc_extents)
         smem_index = (stage.phase, *([Literal(0, "int")] * len(src.cache_axes)))
@@ -462,7 +462,7 @@ def _build_linear_tid(thread_axes: tuple[Axis, ...]):
     inner_stride = 1
     parts: list = []
     for ax in reversed(thread_axes):
-        ext = int(ax.extent)
+        ext = ax.extent.as_static()
         if inner_stride == 1:
             parts.append(Var(ax.name))
         else:

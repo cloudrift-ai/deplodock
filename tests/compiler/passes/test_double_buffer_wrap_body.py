@@ -153,7 +153,7 @@ def test_small_kouter_not_promoted():
     g2 = Pipeline.build(TILE_PASSES).run(g, ctx=_TEST_CTX)
     op = g2.nodes["o"].op
     kouter = _find_kouter(op)
-    if kouter is not None and int(kouter.axis.extent) >= 2:
+    if kouter is not None and kouter.axis.extent.as_static() >= 2:
         # Skip: the planner gave us a K_o with enough room — not the case
         # we're testing.
         return

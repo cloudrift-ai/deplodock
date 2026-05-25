@@ -76,7 +76,7 @@ def _replicate_register_tiles(body: Body) -> tuple[Body, list[int]]:
             local_factors: list[int] = []
             # Replicate from innermost axis outward.
             for ax in reversed(s.axes):
-                factor = int(ax.extent)
+                factor = ax.extent.as_static()
                 current = _replicate_along_axis(current, ax.name, factor, _sigma_to_literal(ax.name))
                 local_factors.append(factor)
             local_factors.reverse()

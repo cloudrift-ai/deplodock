@@ -228,8 +228,8 @@ class LoopOp(BodyOp):
         env: dict[str, object] = {}
         for i, a in enumerate(self.axes):
             shape = [1] * len(self.axes)
-            shape[i] = int(a.extent)
-            env[a.name] = np.arange(int(a.extent)).reshape(shape)
+            shape[i] = a.extent.as_static()
+            env[a.name] = np.arange(a.extent.as_static()).reshape(shape)
         dims: list[int] = []
         for e in w.index:
             vals = e.eval(env)

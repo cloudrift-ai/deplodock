@@ -294,7 +294,7 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
                 if isinstance(child, ThreadTile):
                     bsize = 1
                     for ax in child.axes:
-                        bsize *= int(ax.extent)
+                        bsize *= ax.extent.as_static()
                     return max(bsize, 1)
             return _BLOCK_SIZE
         if isinstance(s, ThreadTile):

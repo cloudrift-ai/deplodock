@@ -423,7 +423,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     # ``Var(axis.name) → Literal(0, "int")`` in the inner body.
     filtered: list[tuple[Axis, Role | None]] = []
     for axis, role in layers:
-        if int(axis.extent) == 1 and role is not Role.BLOCK:
+        if axis.extent.as_static() == 1 and role is not Role.BLOCK:
             sub = Sigma({axis.name: Literal(0, "int")})
             inner_body = tuple(c.rewrite(_identity_rename, sub) for c in inner_body)
             continue
@@ -663,8 +663,8 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
     outer_n: Loop = chain[-1]
     outer_m: Loop | None = chain[-2] if len(chain) >= 2 else None
     extra_outer: tuple[Loop, ...] = chain[:-2] if outer_m is not None else chain[:-1]
-    E_N = int(outer_n.axis.extent)
-    E_M = int(outer_m.axis.extent) if outer_m is not None else 1
+    E_N = outer_n.axis.extent.as_static()
+    E_M = outer_m.axis.extent.as_static() if outer_m is not None else 1
 
     # Single walk: classify body + collect every axis name _replace_k_loops
     # should rewrite. ``target_names`` survives σ_outer (only axis NAMES are
@@ -679,13 +679,13 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         if outer_m is None:
             return None
         k_loop = matmul_reduces[0]
-        E_K = int(k_loop.axis.extent)
+        E_K = k_loop.axis.extent.as_static()
         # target_names unions over outer_n.body (the matmul K reduces) and
         # the prologue (softmax max/sum reduces sharing the matmul K extent,
         # axis-name-unified by unify_sibling_reduce_axes upstream). For
         # plain matmul / matmul_add / gated_mlp the prologue is empty and
         # this collapses to ``{lp.axis.name for lp in matmul_reduces}``.
-        prologue_reduces = tuple(lp for lp in Body(prologue).iter_of_type(Loop) if lp.is_reduce and int(lp.axis.extent) == E_K)
+        prologue_reduces = tuple(lp for lp in Body(prologue).iter_of_type(Loop) if lp.is_reduce and lp.axis.extent.as_static() == E_K)
         target_names = frozenset((*(lp.axis.name for lp in matmul_reduces), *(lp.axis.name for lp in prologue_reduces)))
         # SPLITK > 1 only works when each Write's atomic-add is mathematically
         # equivalent to the unsplit reduce. SPLITK is forced off for two
@@ -711,7 +711,7 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         has_nonlinear_epilogue = _has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
         param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one)
-    elif nonmatmul_reduces and int(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
+    elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
         # E_K ≥ warp_size: smaller reduces don't justify a warp-shuffle.
@@ -727,8 +727,8 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         # using its own (half-data) reduction. Forcing SPLITK=1 keeps the
         # search space honest.
         k_loop = nonmatmul_reduces[0]
-        E_K = int(k_loop.axis.extent)
-        target_names = frozenset(lp.axis.name for lp in all_loops if int(lp.axis.extent) == E_K and not is_matmul_reduce(lp))
+        E_K = k_loop.axis.extent.as_static()
+        target_names = frozenset(lp.axis.name for lp in all_loops if lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp))
         param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="reduce")
     else:
         # Pointwise — no qualifying reduce.
@@ -998,7 +998,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # each output axis) without name-suffix string matching.
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
-    E_N = int(N_axis.extent)
+    E_N = N_axis.extent.as_static()
     N_b_ext = E_N // (params.bn * params.fn)
     N_src = N_axis.source_axis or N_axis
     N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src)
@@ -1010,7 +1010,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     if shape.outer_m is not None:
         M_axis = shape.outer_m.axis
         M_name = M_axis.name
-        E_M = int(M_axis.extent)
+        E_M = M_axis.extent.as_static()
         M_b_ext = E_M // (params.bm * params.fm)
         M_src = M_axis.source_axis or M_axis
         M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src)
@@ -1030,7 +1030,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     if shape.k_loop is not None:
         K_axis = shape.k_loop.axis
         K_name = K_axis.name
-        E_K = int(K_axis.extent)
+        E_K = K_axis.extent.as_static()
         K_o_ext = E_K // (params.splitk * params.br * params.bk)
         K_src = K_axis.source_axis or K_axis
         K_s = Axis(f"{K_name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None

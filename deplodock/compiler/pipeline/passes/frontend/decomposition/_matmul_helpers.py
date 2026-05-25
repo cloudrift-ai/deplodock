@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.expr import placeholder
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
@@ -57,9 +58,17 @@ def matmul_unsqueeze(a_shape: tuple, b_shape: tuple) -> tuple[IndexMapOp, IndexM
 
     # Broadcast shape: max of each dim (they should be compatible now:
     # non-matching dims are size-1 from padding or unsqueeze).
-    mul_shape = tuple(
-        max(a, b) if isinstance(a, int) and isinstance(b, int) else (a if isinstance(a, int) and a > 1 else b)
-        for a, b in zip(a_out_shape, b_out_shape, strict=True)
-    )
+    def _max_dim(a, b):
+        a_static = isinstance(a, Dim) and a.is_static or isinstance(a, int)
+        b_static = isinstance(b, Dim) and b.is_static or isinstance(b, int)
+        a_int = a.as_static() if isinstance(a, Dim) else (a if isinstance(a, int) else None)
+        b_int = b.as_static() if isinstance(b, Dim) else (b if isinstance(b, int) else None)
+        if a_static and b_static:
+            return max(a_int, b_int)
+        if a_static and a_int > 1:
+            return a
+        return b
+
+    mul_shape = tuple(_max_dim(a, b) for a, b in zip(a_out_shape, b_out_shape, strict=True))
 
     return a_unsq, b_unsq, mul_shape, -2

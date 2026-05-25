@@ -80,7 +80,7 @@ def _walk(body: Body, *, smem_budget: int) -> tuple[Body, bool]:
 
 
 def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int) -> SerialTile | None:
-    if int(kouter.axis.extent) < 2:
+    if kouter.axis.extent.as_static() < 2:
         return None
     promote_ids: set[int] = set()
     total_bytes = 0

@@ -144,7 +144,7 @@ class Backend(ABC):
         t0 = time.perf_counter()
         for nid in compiled.topological_order():
             node = compiled.nodes[nid]
-            shape = tuple(int(d) for d in node.output.shape if isinstance(d, int))
+            shape = tuple(d.as_static() for d in node.output.shape if d.is_static)
 
             dtype_np = node.output.dtype.np
 

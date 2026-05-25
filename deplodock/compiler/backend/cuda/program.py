@@ -90,7 +90,7 @@ def _buffers(graph: Graph) -> list[_Buffer]:
             role = "output"
         else:
             role = "scratch"
-        shape = tuple(int(d) for d in node.output.shape)
+        shape = tuple(d.as_static() for d in node.output.shape)
         bufs.append(_Buffer(name=nid, shape=shape, dtype=node.output.dtype, role=role))
     return bufs
 

@@ -68,8 +68,8 @@ Follow-on slices, in order of difficulty:
 
 | M  | Slice | Validation |
 |----|-------|------------|
-| M0 | Add `compiler/dim.py`; switch `Tensor.shape: tuple[Dim, ...]` and `Axis.extent: Dim`; migrate ~30 `int(d)` sites to `d.as_static()`; fold `Dim.value` into `Graph.structural_key()` | `make test` green; no behavior change |
-| M1 | Lifting passes (`010_lift_elementwise`, `020_lift_reduce`, `030_lift_indexmap`, `040_lift_gather`) preserve symbolic free-axis extents; `Loop.forward()` reads extent from input arrays at execute time | `compile --code RMSNorm` with symbolic S prints loop IR with `Axis(extent=Dim("seq_len"))` |
+| M0 | Add `compiler/dim.py`; switch `Tensor.shape: tuple[Dim, ...]`, `Axis.extent: Dim`, and `IndexMapOp.out_shape: tuple[Dim, ...]`; migrate the ~15 `int(d)` and ~30 `int(ax.extent)` sites to `d.as_static()`; fold `Dim.value` into `Graph.structural_key()` | `make test` green; no behavior change |
+| M1 | Lifting passes (`010_lift_elementwise`, `020_lift_reduce`, `030_lift_indexmap`, `040_lift_gather`) preserve symbolic free-axis extents; `Loop.forward()` resolves them from input-array shapes at `ir/loop/runner.py:115` (already shape-from-array) | `compile --code RMSNorm` with symbolic S prints loop IR with `Axis(extent=Dim("seq_len"))` |
 | M2 | Kernel signature carries `seq_len` as an i32 runtime arg; CUDA emitter renders `Axis` extent as that arg in grid bounds and free-axis loop limits | `run --code RMSNorm` with two different S values, one cached kernel |
 | M3 | Tile planner handles symbolic extent on free axes (no split — bind whole axis to BLOCK or stride); explicit error on symbolic reduce axes | RMSNorm passes; softmax-over-S fails cleanly with a known message |
 | M4 | SDPA decomposition + reshape handle symbolic `seq_len` (causal mask passed as input, not constructed inline); HF wrapper produces a symbolic-aware mask | Single-layer SDPA traces with symbolic seq_len |
@@ -87,20 +87,25 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
 2. **Tensor / Axis** (`compiler/tensor.py`, `compiler/ir/axis.py`) — shape elements and axis extents become `Dim`.
    `Axis.split(factor)` needs to refuse symbolic extents (M3).
 3. **Frontend decomposition** (`compiler/pipeline/passes/frontend/decomposition/`) — most rules propagate shapes and
-   are fine. Risk sites: `010_sdpa.py` (mask shape derived from seq_len); reshape/view (`ir/frontend/ir.py:74,78` do
-   `in_numel *= int(d)` and `known *= int(d)`); `SliceOp` (`ir/frontend/ir.py:96`) also carries
-   `tuple[int | str, ...]` but only forwards it — its `forward` reads start/end from constant inputs, so symbolic dims
-   pass through without a cast; broadcast helpers; `150_cat.py` (already guards on `isinstance(..., int)`).
+   are fine, and several already `isinstance(..., int)`-guard symbolic dims (`010_sdpa.py:35-36,68,80`,
+   `090_mean.py:17,21`, `_matmul_helpers.py:61`, `150_cat.py:45`), so the audit work for compound math ops is
+   partially anticipated. Remaining risk sites: `010_sdpa.py` (mask shape derived from seq_len);
+   `ReshapeOp` (`ir/frontend/ir.py:74,78` do `in_numel *= int(d)` and `known *= int(d)`); `SliceOp`
+   (`ir/frontend/ir.py:96`) also carries `tuple[int | str, ...]` but only forwards it — its `forward` reads
+   start/end from constant inputs, so symbolic dims pass through without a cast; `_broadcast.py` / `_helpers.py`.
 4. **Loop lifting** (`compiler/pipeline/passes/loop/lifting/`) — all four lifting passes do `Axis(extent=int(d))`. Each
-   becomes `Axis(extent=d)` with `d: Dim`.
+   becomes `Axis(extent=d)` with `d: Dim`. `IndexMapOp.out_shape` (`ir/tensor/ir.py:254`) is currently
+   `tuple[int, ...]` and must widen too, since `030_lift_indexmap.py:26` reads from it.
 5. **Tile / Kernel / CUDA lowering** (`compiler/pipeline/passes/lowering/{tile,kernel,cuda}/`,
    `compiler/backend/cuda/`) — kernel signature gains a `seq_len: int` runtime arg; launch grid
-   (`backend/cuda/program.py` — `_Buffer.shape` is currently `tuple[int, ...]` at line 66, statically resolved at launch
-   time), TMA descriptors (`backend/cuda/_tma.py`), shared-mem sizing all resolve the symbolic dim from the actual input
-   tensor at launch time.
+   (`backend/cuda/program.py` — `_Buffer.shape: tuple[int, ...]` at line 68, statically resolved at launch
+   time via `_buffers()` at line 93), TMA descriptors (`backend/cuda/_tma.py:101`), shared-mem sizing
+   (`tile/070_pad_smem.py:222`, `tile/020_stage_inputs.py:166,274,538`) all resolve the symbolic dim from the actual
+   input tensor at launch time. ~20 `int(ax.extent)` call sites across `tile/` and `kernel/` will need to either pull
+   from the runtime env or refuse symbolic axes (M3).
 6. **Autotune cache** (`Graph.structural_key()` in `compiler/graph.py` at lines 563–621 — folds `tuple(out.shape)` into
-   the digest at line 611; tune DB schema in `compiler/pipeline/search/`) — symbolic dims must hash by name, not by
-   current binding, or the cache busts every batch.
+   the digest at line 611; tune DB schema in `compiler/pipeline/search/{db.py,keys.py}`) — symbolic dims must hash by
+   name, not by current binding, or the cache busts every batch.
 
 ## Open decisions
 
@@ -113,6 +118,16 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
 - **`Dim` value promotion to `Expr`.** Keep `value: int | str` in v1. Graduate to `Expr` only if a real pass needs
   `2*seq_len` or `seq_len + 1`. Most mask / position-id cases can be expressed as a separate symbolic name plus a
   graph-level offset rather than as shape arithmetic.
+
+## Progress
+
+- **M0 — done.** `compiler/dim.py` lives. `Tensor.shape: tuple[Dim, ...]`, `Axis.extent: Dim`, and
+  `IndexMapOp.out_shape: tuple[Dim, ...]` all converted with `__post_init__` coercion (producer call sites unchanged).
+  68 `int(<expr>.extent)` and ~10 shape-side reader sites migrated to `.as_static()`; the few remaining `int(d)` calls
+  operate on `_Buffer.shape` (already `tuple[int, ...]`) or numpy `arr.shape`. `Graph.structural_key()` and
+  `_serialize_field` both unwrap `Dim` to `Dim.value` so cached digests and on-disk JSON round-trip past the
+  static-int era unchanged. `Dim.__str__` returns the bare value so pretty IR (`for i in 0..32`) and
+  `Body.structural_key` digests don't shift either. All 1197 tests green.
 
 ## Explicitly out of scope (v1)
 

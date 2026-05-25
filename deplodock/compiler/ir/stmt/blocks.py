@@ -108,7 +108,7 @@ class Loop(Stmt):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
-        extent = int(self.axis.extent)
+        extent = self.axis.extent.as_static()
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
@@ -143,7 +143,7 @@ def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderC
     decoded: list[str] = []
     stride = 1
     for ax in reversed(axes):
-        extent = int(ax.extent)
+        extent = ax.extent.as_static()
         if stride == 1:
             decoded.append(f"int {ax.name} = {idx_expr} % {extent};")
         else:
@@ -152,7 +152,7 @@ def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderC
     outer = axes[0]
     outer_stride = 1
     for ax in axes[1:]:
-        outer_stride *= int(ax.extent)
+        outer_stride *= ax.extent.as_static()
     decoded[-1] = f"int {outer.name} = {idx_expr} / {outer_stride};"
     return [pad + line for line in reversed(decoded)]
 
@@ -163,7 +163,7 @@ def _render_thread_axis_decode(axes: tuple[Axis, ...], ctx: RenderCtx) -> list[s
     decoded: list[str] = []
     stride = 1
     for ax in reversed(axes):
-        extent = int(ax.extent)
+        extent = ax.extent.as_static()
         if stride == 1:
             decoded.append(f"int {ax.name} = tid % {extent};")
         else:
@@ -175,7 +175,7 @@ def _render_thread_axis_decode(axes: tuple[Axis, ...], ctx: RenderCtx) -> list[s
         outer = axes[0]
         outer_stride = 1
         for ax in axes[1:]:
-            outer_stride *= int(ax.extent)
+            outer_stride *= ax.extent.as_static()
         decoded[-1] = f"int {outer.name} = tid / {outer_stride};"
     return [pad + line for line in reversed(decoded)]
 
@@ -252,7 +252,7 @@ class StridedLoop(Stmt):
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deplodock.compiler.dim import Dim, to_dim
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.dtype import get as _get_dtype
 
@@ -22,6 +23,10 @@ from deplodock.compiler.dtype import get as _get_dtype
 @dataclass
 class Tensor:
     """Multidimensional array descriptor.
+
+    ``shape`` is a tuple of :class:`Dim`. Construction coerces bare
+    ``int`` / ``str`` elements to ``Dim`` so existing call sites that
+    pass ``(1, 32, 2048)`` keep working.
 
     ``constant`` marks tensors whose value is fixed at compile time
     (``ConstantOp.output`` — weights, RoPE tables, scalar literals).
@@ -33,7 +38,7 @@ class Tensor:
     """
 
     name: str
-    shape: tuple[int | str, ...]  # concrete ints or symbolic dim names
+    shape: tuple[Dim, ...]
     dtype: DataType = F32
     constant: bool = False
     value: float | None = None
@@ -41,3 +46,5 @@ class Tensor:
     def __post_init__(self) -> None:
         if not isinstance(self.dtype, DataType):
             self.dtype = _get_dtype(self.dtype)
+        if any(not isinstance(d, Dim) for d in self.shape):
+            self.shape = tuple(to_dim(d) for d in self.shape)

@@ -77,7 +77,7 @@ def _nest_trips(loop) -> int:
     of inner loop trip counts. Siblings sum (each runs once per outer
     iteration) and a single child reduces to plain product. Used to
     estimate the unrolled body size."""
-    total = int(loop.axis.extent)
+    total = loop.axis.extent.as_static()
     inner_trips = sum(_nest_trips(s) for s in loop.body if isinstance(s, (SerialTile, StridedTile)))
     if inner_trips:
         total *= inner_trips

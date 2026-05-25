@@ -91,15 +91,15 @@ def _launch_geometry(kernel_op: KernelOp) -> tuple[tuple[int, int, int], tuple[i
     """
     for s in kernel_op.body:
         if isinstance(s, GridTile):
-            grid_total = max(prod(int(a.extent) for a in s.axes), 1)
+            grid_total = max(prod(a.extent.as_static() for a in s.axes), 1)
             block_total = 1
             for child in s.body:
                 if isinstance(child, ThreadTile):
-                    block_total = max(prod(int(a.extent) for a in child.axes), 1)
+                    block_total = max(prod(a.extent.as_static() for a in child.axes), 1)
                     break
             return (grid_total, 1, 1), (block_total, 1, 1)
         if isinstance(s, ThreadTile):
-            n_threads = max(prod(int(a.extent) for a in s.axes), 1)
+            n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
             grid = ((n_threads + _BLOCK - 1) // _BLOCK, 1, 1)
             return grid, (_BLOCK, 1, 1)
     return (1, 1, 1), (1, 1, 1)

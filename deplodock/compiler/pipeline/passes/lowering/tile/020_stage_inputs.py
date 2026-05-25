@@ -163,7 +163,7 @@ def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
         return []
     n_thread = 1
     for ax in tt.axes:
-        n_thread *= int(ax.extent)
+        n_thread *= ax.extent.as_static()
     if n_thread <= warp_size:
         return []
     block_axes = outer.axes if isinstance(outer, GridTile) else ()
@@ -271,7 +271,7 @@ def _maybe_rewrite(
 
     n_thread = 1
     for ax in tt.axes:
-        n_thread *= int(ax.extent)
+        n_thread *= ax.extent.as_static()
     if n_thread <= warp_size:
         if allowed_bufs is None:
             raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {warp_size}); register-resident, no smem stage")
@@ -510,7 +510,7 @@ def _classify(
     allow_no_fan_in: bool = False,
 ) -> _Slab | None:
     candidates = (*thread_axes, reduce_axis, *extra_candidates)
-    ctx = SimplifyCtx({ax.name: Interval(0, int(ax.extent) - 1) for ax in scope_axes})
+    ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes})
     candidate_names = tuple(ax.name for ax in candidates)
 
     zero_sigma = Sigma({n: Literal(0, "int") for n in candidate_names})
@@ -535,7 +535,7 @@ def _classify(
     slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
     n_bytes = BYTES_PER_ELEM
     for ax in cache_axes:
-        n_bytes *= int(ax.extent)
+        n_bytes *= ax.extent.as_static()
     if n_bytes > slab_cap:
         return None
 

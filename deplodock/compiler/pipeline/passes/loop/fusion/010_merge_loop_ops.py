@@ -58,7 +58,7 @@ def _walk_leaf_costs(loop_op: LoopOp):
     def walk(stmts: Body, free_prod: int, reduce_prod: int):
         for s in stmts:
             if isinstance(s, Loop):
-                extent = int(s.axis.extent)
+                extent = s.axis.extent.as_static()
                 if s.axis.name in reduce_names:
                     yield from walk(s.body, free_prod, reduce_prod * extent)
                 else:
@@ -124,7 +124,7 @@ def _output_numel(loop_op: LoopOp) -> int:
     n = 1
     for a in loop_op.axes:
         if a.name not in reduce_names:
-            n *= int(a.extent)
+            n *= a.extent.as_static()
     return n
 
 

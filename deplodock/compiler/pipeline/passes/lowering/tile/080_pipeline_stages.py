@@ -104,7 +104,7 @@ def _walk(body: Body) -> tuple[Body, bool]:
 
 
 def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
-    if int(kouter.axis.extent) < 2:
+    if kouter.axis.extent.as_static() < 2:
         return None
     if len(kouter.body) != 1:
         return None
@@ -133,7 +133,7 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
             if any(isinstance(d, Accum) for d in k_inner.body.deps_of(c) if d is not None):
                 return None
 
-    n = int(kouter.axis.extent)
+    n = kouter.axis.extent.as_static()
     k_var = kouter.axis.name
     sigma_first = Sigma({k_var: Literal(0, "int")})
     sigma_next = Sigma({k_var: Var(k_var) + Literal(1, "int")})

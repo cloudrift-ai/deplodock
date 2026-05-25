@@ -250,7 +250,7 @@ class Source:
     @property
     def alloc_extents(self) -> tuple[int, ...]:
         """Per-cache-axis smem allocation extent: cache extent + pad."""
-        extents = tuple(int(ax.extent) for ax in self.cache_axes)
+        extents = tuple(ax.extent.as_static() for ax in self.cache_axes)
         if not self.pad:
             return extents
         return tuple(e + p for e, p in zip(extents, self.pad, strict=True))
@@ -546,7 +546,7 @@ class ThreadTile(ParallelTile):
         inner = ctx.child()
         n_threads = 1
         for ax in self.axes:
-            n_threads *= int(ax.extent)
+            n_threads *= ax.extent.as_static()
         out = [
             f"{pad}long long tid = blockIdx.x * blockDim.x + threadIdx.x;",
             f"{pad}if (tid < {n_threads}) {{",
@@ -652,7 +652,7 @@ class SerialTile(SerialTileBase):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
-        extent = int(self.axis.extent)
+        extent = self.axis.extent.as_static()
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
@@ -715,7 +715,7 @@ class StridedTile(SerialTileBase):
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {int(self.axis.extent)}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(_render_body(self.body, inner))
         out.append(f"{pad}}}")
@@ -1083,7 +1083,7 @@ class TileOp(BodyOp):
         _, thread_axes = self._launch_geometry()
         if not thread_axes:
             return True
-        threads = prod(int(ax.extent) for ax in thread_axes)
+        threads = prod(ax.extent.as_static() for ax in thread_axes)
         return threads <= ctx.max_threads_per_cta
 
     def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
@@ -1098,8 +1098,8 @@ class TileOp(BodyOp):
         if not thread_axes and not block_axes:
             return 0.0
 
-        thread_extents = [int(ax.extent) for ax in thread_axes]
-        block_extents = [int(ax.extent) for ax in block_axes]
+        thread_extents = [ax.extent.as_static() for ax in thread_axes]
+        block_extents = [ax.extent.as_static() for ax in block_axes]
         if not thread_extents:
             return 0.0
 
@@ -1184,7 +1184,7 @@ class TileOp(BodyOp):
             matched = inner_vars & thread_names
             if not matched:
                 continue
-            extent_in_inner = sum(int(ax.extent) for ax in thread_axes if ax.name in matched)
+            extent_in_inner = sum(ax.extent.as_static() for ax in thread_axes if ax.name in matched)
             if extent_in_inner > best_inner_extent:
                 best_inner_extent = extent_in_inner
         if best_inner_extent <= 0:

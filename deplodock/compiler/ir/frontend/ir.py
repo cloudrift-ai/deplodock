@@ -21,7 +21,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.base import Op, _keepdim_axis
+
+
+def _static(d) -> int:
+    """Coerce a shape element (``Dim`` from Tensor.shape, or raw ``int``
+    from a numpy array) to a static int. Raises if the dim is symbolic."""
+    return d.as_static() if isinstance(d, Dim) else int(d)
+
 
 # ---------------------------------------------------------------------------
 # Layout-only ops (decomposed to IndexMapOp)
@@ -71,11 +79,11 @@ class ReshapeOp(Op):
             return tuple(self.shape)
         in_numel = 1
         for d in input_shapes[0]:
-            in_numel *= int(d)
+            in_numel *= _static(d)
         known = 1
         for d in self.shape:
             if d != -1:
-                known *= int(d)
+                known *= _static(d)
         resolved = list(self.shape)
         resolved[resolved.index(-1)] = in_numel // known if known else 1
         return tuple(resolved)
@@ -119,7 +127,10 @@ class CatOp(Op):
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         # Tensor inputs are all but the trailing scalar dim-constant.
         # Find them by skipping shape-(1,) inputs at the tail.
-        tensor_shapes = [s for s in input_shapes if len(s) > 1 or (len(s) == 1 and isinstance(s[0], int) and s[0] != 1)]
+        def _is_scalar_constant(s):
+            return len(s) == 1 and (s[0] == 1 if isinstance(s[0], (int, Dim)) else False)
+
+        tensor_shapes = [s for s in input_shapes if len(s) > 1 or (len(s) == 1 and not _is_scalar_constant(s))]
         if not tensor_shapes:
             return tuple(input_shapes[0])
         # Cat along the last dim by default (matches CatOp tracer convention).
@@ -129,9 +140,9 @@ class CatOp(Op):
         total = 0
         for s in tensor_shapes:
             d = s[last]
-            if not isinstance(d, int):
+            if isinstance(d, Dim) and not d.is_static:
                 return tuple(out)  # symbolic; bail out
-            total += d
+            total += _static(d)
         out[last] = total
         return tuple(out)
 

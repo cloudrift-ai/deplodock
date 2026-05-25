@@ -202,7 +202,7 @@ def _thread_axis_env(thread_axes: tuple[Axis, ...], tid: int) -> dict[str, int]:
     """
     if not thread_axes:
         return {}
-    extents = [int(ax.extent) for ax in thread_axes]
+    extents = [ax.extent.as_static() for ax in thread_axes]
     if len(extents) == 1:
         return {thread_axes[0].name: tid}
     inner_prod = 1
@@ -542,7 +542,7 @@ def _full_sweep_static(
         loop_extent = 1
         loop_axis_name = None
     else:
-        loop_extent = int(encl[-1].extent)
+        loop_extent = encl[-1].extent.as_static()
         loop_axis_name = encl[-1].name
 
     base_env: dict[str, int] = {ax.name: 0 for ax in block_axes}

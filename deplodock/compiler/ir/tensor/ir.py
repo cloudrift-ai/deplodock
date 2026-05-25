@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from deplodock.compiler.dim import Dim, to_dim
 from deplodock.compiler.ir.base import Op, _keepdim_axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
@@ -251,15 +252,19 @@ class IndexMapOp(Op):
     output positions read which input.
     """
 
-    out_shape: tuple[int, ...] = ()
+    out_shape: tuple[Dim, ...] = ()
     sources: tuple[IndexSource, ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(d, Dim) for d in self.out_shape):
+            self.out_shape = tuple(to_dim(d) for d in self.out_shape)
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(self.out_shape)
 
     def forward(self, *inputs):
 
-        shape = tuple(int(d) for d in self.out_shape)
+        shape = tuple(d.as_static() for d in self.out_shape)
         output = np.empty(shape, dtype=inputs[0].dtype if inputs else np.float32)
         for out_idx in np.ndindex(shape):
             env = {f"out_coord_{i}": out_idx[i] for i in range(len(out_idx))}

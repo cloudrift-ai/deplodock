@@ -136,7 +136,7 @@ class CudaBackend(Backend):
             time_ms = result.time_ms
         outputs: dict[str, np.ndarray] = {}
         for name, vals in result_outputs.items():
-            shape = tuple(int(d) for d in compiled.nodes[name].output.shape)
+            shape = tuple(d.as_static() for d in compiled.nodes[name].output.shape)
             outputs[name] = np.asarray(vals, dtype=compiled.nodes[name].output.dtype.np).reshape(shape)
         return RunResult(outputs=outputs, time_ms=time_ms), pre_result
 

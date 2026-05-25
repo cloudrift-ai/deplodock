@@ -28,7 +28,7 @@ def rewrite(root: Node, inp_data: Node, inp_idx: Node, out: Tensor) -> Graph | N
     ndim = len(out_shape)
     axis = int(root.op.axis) if int(root.op.axis) >= 0 else ndim + int(root.op.axis)
 
-    axes = tuple(Axis(name=f"a{i}", extent=int(d)) for i, d in enumerate(out_shape))
+    axes = tuple(Axis(name=f"a{i}", extent=d) for i, d in enumerate(out_shape))
 
     # Load 0: idx — identity load over all output axes.
     idx_index = tuple(Var(a.name) for a in axes)

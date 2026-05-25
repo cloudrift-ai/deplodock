@@ -54,6 +54,7 @@ autotuning cache doesn't bust on cosmetic edits.
 | Path                  | Role                                    | See                          |
 |-----------------------|-----------------------------------------|------------------------------|
 | `graph.py`            | `Graph`, `Node`, `Tensor`, `Hints`      | —                            |
+| `dim.py`              | `Dim` — static-or-symbolic axis extent  | —                            |
 | `ir/`                 | Op-type definitions per dialect         | `ir/ARCHITECTURE.md`         |
 | `trace/`              | PyTorch/HuggingFace → Graph IR          | `trace/ARCHITECTURE.md`      |
 | `pipeline/`           | Rewrite engine, passes, dump hooks      | `pipeline/ARCHITECTURE.md`   |
@@ -73,7 +74,11 @@ autotuning cache doesn't bust on cosmetic edits.
 
 ## Shared invariants
 
-- **Shape lives on the graph**, not on the op — `node.output.shape`.
+- **Shape lives on the graph**, not on the op — `node.output.shape`. Each shape element is a `Dim`
+  (`compiler/dim.py`): static (`Dim(32)`) today, symbolic (`Dim("seq_len")`) once dynamic-shapes lands. Read sites use
+  `d.value` (always works) or `d.as_static()` (raises on symbolic); there is deliberately no `__int__` / `__index__`,
+  so `int(d)` and `range(d)` fail loudly when fed a symbolic dim. `Tensor.__post_init__` and `Axis.__post_init__`
+  coerce bare `int` / `str` to `Dim`, so producer call sites need no change.
 - **`ElementwiseOp` inputs must already share the output shape.** The
   decomposition helper
   `pipeline/passes/frontend/decomposition/_broadcast.broadcast_to` wraps

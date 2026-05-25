@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from deplodock.compiler.dim import as_static
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
@@ -267,7 +268,7 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
     for d, idx in enumerate(indices):
         stride = 1
         for k in range(d + 1, len(shape)):
-            stride *= int(shape[k])
+            stride *= as_static(shape[k])
         term: Expr = idx if stride == 1 else BinaryExpr("*", idx, Literal(stride, "int"))
         flat = term if flat is None else BinaryExpr("+", flat, term)
     assert flat is not None

@@ -42,9 +42,9 @@ def rewrite(match: Match, inp_a: Node, inp_b: Node, inp_dim: Node, out: Tensor) 
     dim = int(inp_dim.op.value)
     norm_dim = dim if dim >= 0 else ndim + dim
 
-    if not isinstance(a_shape[norm_dim], int):
+    if not a_shape[norm_dim].is_static:
         raise RuleSkipped(f"cat split point a_shape[{norm_dim}]={a_shape[norm_dim]!r} must be a static int")
-    split = a_shape[norm_dim]
+    split = a_shape[norm_dim].as_static()
 
     frag = open_fragment(graph, [inp_a, inp_b])
 

@@ -548,17 +548,17 @@ class KernelOp(BodyOp):
 
         for s in self.body:
             if isinstance(s, GridTile):
-                ctas = prod(int(ax.extent) for ax in s.axes)
+                ctas = prod(ax.extent.as_static() for ax in s.axes)
                 if ctas > _MAX_CTAS:
                     return False
                 # ThreadTile lives inside the GridTile's body.
                 for child in s.body:
                     if isinstance(child, ThreadTile):
-                        threads = prod(int(ax.extent) for ax in child.axes)
+                        threads = prod(ax.extent.as_static() for ax in child.axes)
                         if threads > ctx.max_threads_per_cta:
                             return False
             elif isinstance(s, ThreadTile):
-                threads = prod(int(ax.extent) for ax in s.axes)
+                threads = prod(ax.extent.as_static() for ax in s.axes)
                 if threads > ctx.max_threads_per_cta:
                     return False
         if self.smem_bytes() > ctx.max_dynamic_smem:
