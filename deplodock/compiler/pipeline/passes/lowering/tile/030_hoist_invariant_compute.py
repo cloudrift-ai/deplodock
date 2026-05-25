@@ -50,12 +50,12 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    BufferedStage,
     CacheDim,
-    ComputeStage,
     SerialTile,
     Source,
     Stage,
+    StageBundle,
+    StagePolicy,
     TileOp,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
@@ -102,11 +102,12 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
 
 
 class _ConeTarget:
-    """Cached cone-detection result for one Stage."""
+    """Cached cone-detection result for one Stage inside a SYNC bundle."""
 
-    __slots__ = ("stage", "reduce", "cone_sources", "cone_loads", "cone_assigns", "boundary_name", "fused_cache_axes")
+    __slots__ = ("bundle", "stage", "reduce", "cone_sources", "cone_loads", "cone_assigns", "boundary_name", "fused_cache_axes")
 
-    def __init__(self, stage, reduce, cone_sources, cone_loads, cone_assigns, boundary_name, fused_cache_axes):
+    def __init__(self, bundle, stage, reduce, cone_sources, cone_loads, cone_assigns, boundary_name, fused_cache_axes):
+        self.bundle = bundle
         self.stage = stage
         self.reduce = reduce
         self.cone_sources = cone_sources
@@ -117,18 +118,27 @@ class _ConeTarget:
 
 
 def _find_first_cone_target(body: Body) -> _ConeTarget | None:
+    """Scan for a SYNC bundle holding exactly one multi-source transport
+    Stage (no compute template) with a hoistable cone. Bundles produced
+    by 020_stage_inputs always satisfy this shape pre-promotion."""
     for s in body.iter():
-        if isinstance(s, Stage) and not isinstance(s, (BufferedStage, ComputeStage)):
-            target = _try_find_cone(s)
-            if target is not None:
-                return target
+        if not isinstance(s, StageBundle):
+            continue
+        if s.policy != StagePolicy.SYNC or len(s.stages) != 1:
+            continue
+        inner = s.stages[0]
+        if inner.compute is not None:
+            continue
+        target = _try_find_cone(s, inner)
+        if target is not None:
+            return target
     return None
 
 
-def _try_find_cone(stage: Stage) -> _ConeTarget | None:
+def _try_find_cone(bundle: StageBundle, stage: Stage) -> _ConeTarget | None:
     if len(stage.sources) < 2:
         return None
-    reduce = _find_unique_stage_inner_reduce(stage.body)
+    reduce = _find_unique_stage_inner_reduce(bundle.body)
     if reduce is None:
         return None
 
@@ -170,6 +180,7 @@ def _try_find_cone(stage: Stage) -> _ConeTarget | None:
         # source — they all share the same cache axes by construction.
         fused_cache_axes = group[0].cache_axes
         return _ConeTarget(
+            bundle=bundle,
             stage=stage,
             reduce=reduce,
             cone_sources=group_names,
@@ -235,24 +246,28 @@ def _find_boundary(body: Body, cone: set[str] | frozenset[str]) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# True-polarity rewrite (Stage split + ComputeStage insertion)
+# True-polarity rewrite (bundle stages split + compute member insertion)
 # ---------------------------------------------------------------------------
 
 
 def _apply_hoist(body: Body, target: _ConeTarget) -> Body:
-    """Replace ``target.stage`` with the hoisted shape:
+    """Replace ``target.bundle`` with a new SYNC bundle whose ``stages``
+    tuple is ``(non_cone_stage, cone_stage, compute_stage)`` (omitting
+    ``non_cone_stage`` if it has no sources) and whose ``body`` is the
+    original bundle body with the K_i reduce rewritten to read the
+    fused slab via a single Load.
 
-    ``Stage(non_cone_sources, body=Stage(cone_sources, body=ComputeStage(...)))``
+    The compute Stage carries ``compute=Body((cone_loads, cone_assigns,
+    fused_write))`` — a per-thread cooperative body that reads sibling
+    cone smem and writes into ``fused_name`` smem. The bundle shape
+    means producer ordering is `non_cone → cone → compute → consumer`
+    by stages-tuple position.
 
-    where the ``ComputeStage.compute`` carries the cone Loads+Assigns and
-    writes into a fresh smem slab; the K_i reduce body is rewritten to
-    Load that slab via the cone's boundary SSA name.
-
-    The walk is by-identity (``id(stmt) == id(target.stage)``) rather
-    than via :meth:`Body.map`, which would rebuild every wrapper Stmt
-    and break the identity-anchored match.
+    The walk is by-identity on the bundle (``id(stmt) == id(target.bundle)``)
+    rather than via :meth:`Body.map`, which would rebuild every wrapper
+    Stmt and break the identity-anchored match.
     """
-    target_id = id(target.stage)
+    target_id = id(target.bundle)
     replacement = _build_hoisted_replacement(target)
 
     def walk(b: Body) -> Body:
@@ -272,15 +287,15 @@ def _apply_hoist(body: Body, target: _ConeTarget) -> Body:
     return walk(body)
 
 
-def _build_hoisted_replacement(target: _ConeTarget) -> Stage:
+def _build_hoisted_replacement(target: _ConeTarget) -> StageBundle:
     cone_sources = tuple(src for src in target.stage.sources if src.name in target.cone_sources)
     non_cone_sources = tuple(src for src in target.stage.sources if src.name not in target.cone_sources)
     fused_name = "_".join(src.name for src in cone_sources) + "_fused"
     fused_index: tuple[Expr, ...] = tuple(Var(ax.name) for ax in target.fused_cache_axes)
 
-    # Compute body: cone Loads (verbatim, against the cone sources' smem
-    # at cache-axis indices), cone Assigns (verbatim), final Write into
-    # the fused slab.
+    # Compute template body: cone Loads (verbatim, against the cone
+    # sources' smem at cache-axis indices), cone Assigns (verbatim),
+    # final Write into the fused slab.
     compute_stmts: list[Stmt] = []
     for s in target.reduce.body:
         if isinstance(s, Load) and s.name in target.cone_loads:
@@ -313,8 +328,7 @@ def _build_hoisted_replacement(target: _ConeTarget) -> Stage:
     )
 
     # Output Source for the fused slab. ``buf`` is self-referential —
-    # ComputeStage writes into its own smem, not from gmem. Origin is a
-    # zero tuple matching the cache rank (smem-only, no gmem offset).
+    # the compute Stage writes into its own smem, not from gmem.
     from deplodock.compiler.ir.expr import Literal  # noqa: PLC0415
 
     zero_origin = tuple(Literal(0, "int") for _ in target.fused_cache_axes)
@@ -324,28 +338,37 @@ def _build_hoisted_replacement(target: _ConeTarget) -> Stage:
         cache_dims=tuple(CacheDim(axis=ax, source_dim=i) for i, ax in enumerate(target.fused_cache_axes)),
         origin=zero_origin,
     )
-    compute_stage = ComputeStage(sources=(fused_source,), body=Body((new_reduce,)), compute=Body(tuple(compute_stmts)))
+    compute_stage = Stage(sources=(fused_source,), compute=Body(tuple(compute_stmts)))
+    cone_stage = Stage(sources=cone_sources)
 
-    # Replace the cone-Stage stmts inside the original Stage.body — the
-    # ComputeStage now sits where the reduce used to live, wrapped by
-    # the inner transport Stage (cone sources) and then the outer
-    # transport Stage (non-cone sources, if any). The original consumer
-    # body's pre-reduce / post-reduce siblings come along for the ride.
-    inner_body_stmts: list[Stmt] = []
+    # New bundle body: original bundle.body with the reduce stmt replaced
+    # by the rewritten new_reduce (which reads the fused slab via the
+    # boundary SSA name).
+    new_body_stmts: list[Stmt] = []
     placed = False
-    for s in target.stage.body:
+    for s in target.bundle.body:
         if s is target.reduce:
-            inner_body_stmts.append(compute_stage)
+            new_body_stmts.append(new_reduce)
             placed = True
         else:
-            inner_body_stmts.append(s)
-    if not placed:  # defensive — reduce should be there
-        inner_body_stmts.append(compute_stage)
+            new_body_stmts.append(s)
+    if not placed:  # defensive — reduce should be at top level of bundle.body
+        new_body_stmts.append(new_reduce)
 
-    inner = Stage(sources=cone_sources, body=Body(tuple(inner_body_stmts)))
-    if not non_cone_sources:
-        return inner
-    return Stage(sources=non_cone_sources, body=Body((inner,)))
+    # Stage tuple order = producer issue order. non_cone first (gmem
+    # transport), then cone (gmem transport), then compute (sibling-smem
+    # → own-smem). When non_cone is empty, omit it.
+    stages: tuple[Stage, ...]
+    if non_cone_sources:
+        non_cone_stage = Stage(sources=non_cone_sources)
+        stages = (non_cone_stage, cone_stage, compute_stage)
+    else:
+        stages = (cone_stage, compute_stage)
+    return StageBundle(
+        stages=stages,
+        body=Body(tuple(new_body_stmts)),
+        policy=StagePolicy.SYNC,
+    )
 
 
 __all__ = ["FUSED_PIPELINE", "PATTERN", "rewrite"]

@@ -260,19 +260,17 @@ def _stmt_eval_scope() -> dict:
     )
     from deplodock.compiler.ir.tile.ir import (
         AffineAddressing,
-        AsyncBufferedStage,
         AsyncWait,
-        BufferedStage,
-        ComputeStage,
         GridTile,
         RegisterTile,
         SerialTile,
         Stage,
+        StageBundle,
+        StagePolicy,
         StridedTile,
         SwizzleMode,
         TemplateAddressing,
         ThreadTile,
-        TmaBufferedStage,
     )
 
     _STMT_EVAL_SCOPE = {
@@ -303,10 +301,8 @@ def _stmt_eval_scope() -> dict:
         "SerialTile": SerialTile,
         "StridedTile": StridedTile,
         "Stage": Stage,
-        "BufferedStage": BufferedStage,
-        "AsyncBufferedStage": AsyncBufferedStage,
-        "TmaBufferedStage": TmaBufferedStage,
-        "ComputeStage": ComputeStage,
+        "StageBundle": StageBundle,
+        "StagePolicy": StagePolicy,
         "SwizzleMode": SwizzleMode,
         "AffineAddressing": AffineAddressing,
         "TemplateAddressing": TemplateAddressing,

@@ -36,6 +36,7 @@ from deplodock.compiler.ir.tile.ir import (
     RegisterTile,
     SerialTile,
     Stage,
+    StageBundle,
     StridedTile,
     ThreadTile,
     TileOp,
@@ -178,12 +179,17 @@ def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
             out.extend(_accums_under_reduces_only(child))
         for child in stmt.else_body:
             out.extend(_accums_under_reduces_only(child))
-    elif isinstance(stmt, Stage):
-        # Wrap-body Stage: consumer subtree (containing the reduce + Accum)
-        # lives inside Stage.body. Walk through it so Accums get their Init
-        # placed at the enclosing scope (which is the right behavior — the
-        # Stage is transparent for accumulator scoping).
+    elif isinstance(stmt, StageBundle):
+        # StageBundle: consumer subtree (containing the reduce + Accum)
+        # lives inside bundle.body. Walk through it so Accums get their Init
+        # placed at the enclosing scope (the bundle is transparent for
+        # accumulator scoping).
         for child in stmt.body:
+            out.extend(_accums_under_reduces_only(child))
+    elif isinstance(stmt, Stage) and stmt.compute is not None:
+        # A Stage with a compute template (formerly ComputeStage) — accums
+        # could in principle live in the cooperative compute body; descend.
+        for child in stmt.compute:
             out.extend(_accums_under_reduces_only(child))
     return out
 
@@ -216,12 +222,10 @@ def _is_reduce_recursive(loop) -> bool:
             has_inner_reduce = True
         elif isinstance(s, RegisterTile) and _is_reduce_recursive(s):
             has_inner_reduce = True
-        elif isinstance(s, Stage):
-            # Wrap-body Stage is transparent for reduce-crossing: synthesize
-            # a probe-loop carrying the Stage's body so the recursive walk
+        elif isinstance(s, StageBundle):
+            # StageBundle is transparent for reduce-crossing: synthesize a
+            # probe-loop carrying the bundle's body so the recursive walk
             # treats the consumer subtree as if it were the loop's body.
-            # Handles nested Stage chains (007b emits transport-Stage
-            # nests wrapping a ComputeStage with the reduce inside).
             class _Probe:
                 body = s.body
 

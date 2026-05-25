@@ -31,7 +31,17 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt import Cond, Load
-from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, RegisterTile, SerialTile, Stage, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.ir.tile.ir import (
+    GridTile,
+    ParallelTile,
+    RegisterTile,
+    SerialTile,
+    Stage,
+    StageBundle,
+    StridedTile,
+    ThreadTile,
+    TileOp,
+)
 
 WARP_SIZE = 32
 BANKS = 32
@@ -160,6 +170,13 @@ def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> lis
 
 
 def _walk(body) -> Iterable:
+    # body may be a Body (recursive iter via nested()) or a plain tuple
+    # from a legacy caller. Body.iter() descends into every nested body
+    # (including the synthetic Body(stages) inside a StageBundle), so it
+    # naturally yields Stage members live inside bundles.
+    if hasattr(body, "iter"):
+        yield from body.iter()
+        return
     for s in body:
         yield s
         for attr in ("body", "else_body"):
@@ -181,9 +198,9 @@ def _walk_loads(body, axes: tuple[Axis, ...]):
         elif isinstance(s, Cond):
             yield from _walk_loads(s.body, axes)
             yield from _walk_loads(s.else_body, axes)
-        elif isinstance(s, Stage):
-            # Wrap-body Stage: descend into the consumer body where the
-            # Loads from staged smem live.
+        elif isinstance(s, StageBundle):
+            # StageBundle: descend into the consumer body where the Loads
+            # from staged smem live.
             yield from _walk_loads(s.body, axes)
 
 

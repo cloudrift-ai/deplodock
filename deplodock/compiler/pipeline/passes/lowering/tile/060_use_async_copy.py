@@ -29,11 +29,10 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
-    AsyncBufferedStage,
-    BufferedStage,
     SerialTile,
+    StageBundle,
+    StagePolicy,
     TileOp,
-    TmaBufferedStage,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
@@ -49,13 +48,13 @@ def rewrite(ctx: Context, root: Node) -> TileOp | None:
     body = root.op.body
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no BufferedStage inside SerialTile(serial_outer) eligible for cp.async")
+        raise RuleSkipped("no BUFFERED StageBundle inside SerialTile(serial_outer) eligible for cp.async")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
 def _walk(body: Body) -> tuple[Body, bool]:
-    """Recurse into wrappers; promote ``BufferedStage`` whose enclosing
-    ``SerialTile(serial_outer)`` we're descending through."""
+    """Recurse into wrappers; promote BUFFERED-policy bundles whose
+    enclosing ``SerialTile(serial_outer)`` we're descending through."""
     out: list[Stmt] = []
     changed = False
     for s in body:
@@ -85,7 +84,7 @@ def _promote_in_kouter(body: Body) -> tuple[Body, bool]:
     out: list[Stmt] = []
     changed = False
     for s in body:
-        if _is_promotable(s):
+        if isinstance(s, StageBundle) and s.policy == StagePolicy.BUFFERED:
             out.append(_promote(s))
             changed = True
         else:
@@ -93,26 +92,16 @@ def _promote_in_kouter(body: Body) -> tuple[Body, bool]:
     return Body(tuple(out)), changed
 
 
-def _is_promotable(s: Stmt) -> bool:
-    if not isinstance(s, BufferedStage):
-        return False
-    if isinstance(s, (AsyncBufferedStage, TmaBufferedStage)):
-        return False
-    # cp.async.ca fires per-thread 4-byte copies; fp32 source layout
-    # (the stage's smem slab is one element per thread per iter) is
-    # naturally 4-byte aligned for any addressing the materializer
-    # produces from a wrap-body Source. fp16 sources fall back to the
-    # sync cooperative-load path inside _emit_stage — the CpAsyncCommit
-    # / CpAsyncWait pair around an empty issue group is a no-op on the
-    # hardware, so we can over-promote here without correctness risk.
-    return True
-
-
-def _promote(stage: BufferedStage) -> AsyncBufferedStage:
-    return AsyncBufferedStage(
-        sources=stage.sources,
-        body=stage.body,
-        buffer_count=stage.buffer_count,
-        phase=stage.phase,
+def _promote(bundle: StageBundle) -> StageBundle:
+    # cp.async.ca fires per-thread 4-byte copies; fp32 source layout is
+    # naturally 4-byte aligned. fp16 sources fall back to the sync
+    # cooperative-load path inside _emit_stage so we can over-promote
+    # here without correctness risk.
+    return StageBundle(
+        stages=bundle.stages,
+        body=bundle.body,
+        policy=StagePolicy.ASYNC,
+        buffer_count=bundle.buffer_count,
+        phase=bundle.phase,
         pipeline_depth=1,
     )

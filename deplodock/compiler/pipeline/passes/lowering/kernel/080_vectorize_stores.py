@@ -39,7 +39,7 @@ from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.stmt import Body, Cond, Stmt, Write
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, Stage, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, Stage, StageBundle, StridedTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -79,7 +79,7 @@ def _vectorize_body(top: TileOp, body: Body, atomic_write_ids: frozenset[int]) -
     kernel output, not the smem slab)."""
     descended: list[Stmt] = []
     for s in body:
-        if isinstance(s, (SerialTile, StridedTile, RegisterTile, Stage)):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile, Stage, StageBundle)):
             new_nested = tuple(_vectorize_body(top, b, atomic_write_ids) for b in s.nested())
             descended.append(s.with_bodies(new_nested))
         elif isinstance(s, Cond):

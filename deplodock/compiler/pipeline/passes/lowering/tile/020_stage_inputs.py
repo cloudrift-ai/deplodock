@@ -66,6 +66,8 @@ from deplodock.compiler.ir.tile.ir import (
     SerialTile,
     Source,
     Stage,
+    StageBundle,
+    StagePolicy,
     StridedTile,
     ThreadTile,
     TileOp,
@@ -419,8 +421,16 @@ def _process_scope(
     if not stmt_contains_loads_idx:
         return tuple(rewritten)
     lo, hi = stmt_contains_loads_idx[0], stmt_contains_loads_idx[-1]
-    wrapped = Stage(sources=tuple(sources), body=Body(tuple(rewritten[lo : hi + 1])))
-    return tuple([*rewritten[:lo], wrapped, *rewritten[hi + 1 :]])
+    # Emit a single-policy SYNC bundle holding one multi-source Stage; the
+    # bundle owns the consumer body. Downstream passes (030 hoist, 040 ring-
+    # buffer promotion, 050/060 TMA/async promotion) operate on bundles.
+    wrapped_stage = Stage(sources=tuple(sources))
+    bundle = StageBundle(
+        stages=(wrapped_stage,),
+        body=Body(tuple(rewritten[lo : hi + 1])),
+        policy=StagePolicy.SYNC,
+    )
+    return tuple([*rewritten[:lo], bundle, *rewritten[hi + 1 :]])
 
 
 def _build_sources(
