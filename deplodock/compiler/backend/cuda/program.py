@@ -204,12 +204,25 @@ def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
     """Walk graph inputs to map every symbolic dim name to its source
     ``(input_buf, dim_index)`` — the launch resolver reads the runtime
     value from ``input_arrays[buf].shape[dim_index]``. First-seen position
-    wins on conflicts so each name resolves deterministically."""
+    wins on conflicts so each name resolves deterministically.
+
+    Input dims are atomic ``Var``-backed when symbolic (composite Dim exprs
+    appear only on derived tensors). We collect via ``expr.free_vars()`` so
+    each free name binds to the first input axis where it appears."""
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
     bindings: dict[str, tuple[str, int]] = {}
     for nid in graph.inputs:
         for d, dim in enumerate(graph.nodes[nid].output.shape):
-            if not dim.is_static:
-                bindings.setdefault(dim.value, (nid, d))
+            if dim.is_static:
+                continue
+            if not isinstance(dim.expr, Var):
+                raise ValueError(
+                    f"input {nid!r} axis {d} has a composite symbolic dim {dim!r}; "
+                    "inputs must carry atomic Var-backed symbolic dims so the launch "
+                    "resolver can recover each name from a single shape axis"
+                )
+            bindings.setdefault(dim.expr.name, (nid, d))
     return bindings
 
 
