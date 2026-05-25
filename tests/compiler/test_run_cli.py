@@ -285,3 +285,47 @@ def test_run_code_dynamic_seq_len(run_cli):
         "seq_len@x:1",
     )
     assert rc == 0, f"stderr: {stderr}"
+
+
+# ---------------------------------------------------------------------------
+# _bind_inputs: integer-dtype preservation
+# ---------------------------------------------------------------------------
+
+
+def test_bind_inputs_preserves_int_dtype():
+    """``_bind_inputs`` must cast each torch input to the numpy dtype
+    that matches the graph's declared ``Tensor.dtype`` — not blanket-
+    cast to float32 as it did before integer placeholders (``input_ids``,
+    ``position_ids``) became part of whole-model traces. A float32 cast
+    of int64 indices would silently corrupt the embedding-lookup path."""
+    import numpy as np
+
+    from deplodock.commands.run import _bind_inputs
+    from deplodock.compiler import dtype as dt
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("input_ids", (1, 8), dt.I64), node_id="input_ids")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("position_ids", (1, 8), dt.I32), node_id="position_ids")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("activations", (1, 8, 16), dt.F32), node_id="activations")
+    g.inputs = ["input_ids", "position_ids", "activations"]
+
+    class _EmptyModule:
+        def named_parameters(self):
+            return iter(())
+
+        def named_buffers(self):
+            return iter(())
+
+    input_ids = torch.zeros((1, 8), dtype=torch.long)
+    position_ids = torch.arange(8, dtype=torch.int32).unsqueeze(0)
+    activations = torch.randn(1, 8, 16)
+
+    bound = _bind_inputs(g, _EmptyModule(), (input_ids, position_ids, activations), {})
+
+    assert bound["input_ids"].dtype == np.int64
+    assert bound["position_ids"].dtype == np.int32
+    assert bound["activations"].dtype == np.float32
+    # Values must round-trip without precision loss.
+    np.testing.assert_array_equal(bound["position_ids"], np.arange(8, dtype=np.int32)[None, :])

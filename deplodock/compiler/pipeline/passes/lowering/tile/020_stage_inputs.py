@@ -543,6 +543,13 @@ def _classify(
     cache_axes_unsorted = tuple(ax for ax in candidates if ax.name in var_to_dim)
     cache_axes = tuple(sorted(cache_axes_unsorted, key=lambda ax: var_to_dim[ax.name]))
     slab_dims = tuple(var_to_dim[ax.name] for ax in cache_axes)
+    # A symbolic cache extent (e.g. seq_len) makes the slab size unbounded
+    # at compile time. We can't compare against ``slab_cap``, and a worst-case
+    # bound would force-disable staging on every symbolic load anyway —
+    # so skip the candidate. Drops the smem-caching optimization on
+    # seq_len-bearing loads but the load still works via direct global access.
+    if any(not ax.extent.is_static for ax in cache_axes):
+        return None
     n_bytes = BYTES_PER_ELEM
     for ax in cache_axes:
         n_bytes *= ax.extent.as_static()
