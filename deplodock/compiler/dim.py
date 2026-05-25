@@ -13,12 +13,21 @@ Reads:
 
 - ``d.expr`` always works — returns the underlying ``Expr``.
 - ``d.as_static()`` returns the int for ``Literal``-backed dims, raises otherwise.
+- ``d.as_atom_name()`` returns the str name for ``Var``-backed dims, raises otherwise.
+  Use at sites that route by symbolic name (kernel param signature, sym_env keys).
 - ``d.value`` returns the int (``Literal``) or the name (``Var``); raises on
-  composite. Kept for back-compat with existing call sites that key on the
-  symbolic name string (e.g. launch-time ``sym_env`` dicts).
+  composite. Back-compat shim — prefer ``.as_static()`` / ``.as_atom_name()`` / ``.expr``
+  at new call sites.
 - ``d == 32`` / ``d == "seq_len"`` / ``d == Dim(...)`` all work — the first
   two unwrap to ``Literal.value`` / ``Var.name``; composite dims only compare
   structurally to other Dims.
+
+Runtime resolution:
+
+- ``d.expr.eval(sym_env)`` gives the int extent at launch time, where
+  ``sym_env: dict[str, int]`` maps each symbolic name to its concrete value
+  (read from input array shapes). Composite Dims (e.g. ``S * 2`` from a cat
+  output) resolve uniformly with atomic ones — one path, no branch.
 
 No ``__int__`` / ``__index__``: ``int(d)`` and ``range(d)`` deliberately fail.
 Sites that need a static int must say so via ``.as_static()`` — that way

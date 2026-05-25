@@ -54,7 +54,7 @@ autotuning cache doesn't bust on cosmetic edits.
 | Path                  | Role                                    | See                          |
 |-----------------------|-----------------------------------------|------------------------------|
 | `graph.py`            | `Graph`, `Node`, `Tensor`, `Hints`      | —                            |
-| `dim.py`              | `Dim` — static-or-symbolic axis extent  | —                            |
+| `dim.py`              | `Dim` — shape extent backed by an `Expr` (static or symbolic) | —    |
 | `ir/`                 | Op-type definitions per dialect         | `ir/ARCHITECTURE.md`         |
 | `trace/`              | PyTorch/HuggingFace → Graph IR          | `trace/ARCHITECTURE.md`      |
 | `pipeline/`           | Rewrite engine, passes, dump hooks      | `pipeline/ARCHITECTURE.md`   |
@@ -75,10 +75,17 @@ autotuning cache doesn't bust on cosmetic edits.
 ## Shared invariants
 
 - **Shape lives on the graph**, not on the op — `node.output.shape`. Each shape element is a `Dim`
-  (`compiler/dim.py`): static (`Dim(32)`) today, symbolic (`Dim("seq_len")`) once dynamic-shapes lands. Read sites use
-  `d.value` (always works) or `d.as_static()` (raises on symbolic); there is deliberately no `__int__` / `__index__`,
-  so `int(d)` and `range(d)` fail loudly when fed a symbolic dim. `Tensor.__post_init__` and `Axis.__post_init__`
-  coerce bare `int` / `str` to `Dim`, so producer call sites need no change.
+  (`compiler/dim.py`) that wraps an `Expr` from `ir/expr.py`: static (`Dim(32)` → `Literal(32)`), atomic
+  symbolic (`Dim("seq_len")` → `Var("seq_len")`), or composite from arithmetic (`Dim("S") * Dim(2)` →
+  `BinaryExpr("*", Var("S"), Literal(2))`). `Dim` overloads `+`/`-`/`*`/`//`/`%` and eager-folds via
+  `Expr.simplify` — static math matches plain int math byte-for-byte; symbolic stays as `BinaryExpr`.
+  Read sites use `d.expr` (always works), `d.as_static()` (raises on symbolic), `d.as_atom_name()` (raises
+  unless `Var`-backed), or `d.value` (back-compat shim: int for `Literal`, str for `Var`, raises on
+  composite). There is deliberately no `__int__` / `__index__`, so `int(d)` and `range(d)` fail loudly
+  on anything but a static-int `Dim`. Symbolic dims resolve at launch via `d.expr.eval(sym_env)` —
+  composite shapes (e.g. an `S * 2` concat output) resolve from input array axes without per-site
+  branching. `Tensor.__post_init__` and `Axis.__post_init__` coerce bare `int` / `str` to `Dim`, so
+  producer call sites need no change.
 - **`ElementwiseOp` inputs must already share the output shape.** The
   decomposition helper
   `pipeline/passes/frontend/decomposition/_broadcast.broadcast_to` wraps
