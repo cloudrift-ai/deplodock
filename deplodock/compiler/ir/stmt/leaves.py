@@ -106,7 +106,7 @@ class Load(Stmt):
     Scalar (``width == 1``): one SSA binding ``names[0]``. Vector
     (``width > 1``): N SSA bindings; lane k reads
     ``index[:-1] + (index[-1] + k,)`` into ``names[k]``. The
-    ``003_vectorize_loads`` pass widens a run of consecutive scalar
+    ``050_vectorize_loads`` pass widens a run of consecutive scalar
     Loads into one Load with ``len(names) > 1``. Every pass before that
     produces scalar Loads and can keep using ``s.name`` / ``s.index``.
 
@@ -122,7 +122,7 @@ class Load(Stmt):
     values directly instead of taking them as ``float*`` parameters.
 
     ``dtype`` is optional and, when set, names the source-buffer element
-    dtype that this Load produces. The ``001_stamp_types`` Kernel-IR pass
+    dtype that this Load produces. The ``030_stamp_types`` Kernel-IR pass
     populates it once before any analytical pass runs; downstream passes
     (vectorize_loads, demote, etc.) read it instead of reaching for the
     matcher-populated ``KernelOp.inputs``/``outputs`` side channels.
@@ -210,7 +210,7 @@ class Load(Stmt):
         if lit is not None and self.is_scalar:
             ctx.ssa_dtypes[self.names[0]] = "f32"
             return [f"{pad}{ctx.type_name('f32')} {self.names[0]} = {_float_lit(lit)};"]
-        # Prefer the stamped ``self.dtype`` (set by ``001_stamp_types``);
+        # Prefer the stamped ``self.dtype`` (set by ``030_stamp_types``);
         # fall back to ``ctx.buffer_dtypes`` so handwritten test fixtures
         # without a stamped dtype still render correctly.
         src_dt = self.dtype.name if self.dtype is not None else ctx.buffer_dtypes.get(self.input, "f32")
@@ -564,7 +564,7 @@ class Write(Stmt):
     Scalar (``width == 1``): stores one SSA value at ``index``. Vector
     (``width > 1``): stores N values; ``values[0]`` goes to ``index``,
     ``values[k]`` goes to ``index[:-1] + (index[-1] + k,)``. The
-    ``005_vectorize_stores`` pass widens a run of consecutive scalar
+    ``080_vectorize_stores`` pass widens a run of consecutive scalar
     Writes into one Write with ``len(values) > 1``. Every pass before
     that produces scalar Writes and can keep using ``s.value`` /
     ``s.index``.
@@ -585,7 +585,7 @@ class Write(Stmt):
     would need its own atomicAdd).
 
     ``value_dtype`` is optional; when set, names the SSA-value dtype being
-    stored. Stamped by ``001_stamp_types``; downstream passes read it
+    stored. Stamped by ``030_stamp_types``; downstream passes read it
     instead of querying ``ctx.ssa_dtypes`` at render time.
     """
 
@@ -660,7 +660,7 @@ class Write(Stmt):
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         out_dt = ctx.buffer_dtypes.get(self.output, "f32")
-        # Prefer the stamped ``self.value_dtype`` (set by ``001_stamp_types``);
+        # Prefer the stamped ``self.value_dtype`` (set by ``030_stamp_types``);
         # fall back to ``ctx.ssa_dtypes`` for legacy/handwritten paths.
         stamped_value_dt = self.value_dtype.name if self.value_dtype is not None else None
         if self.is_scalar:

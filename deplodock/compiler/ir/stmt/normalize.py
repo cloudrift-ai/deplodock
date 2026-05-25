@@ -104,7 +104,7 @@ def drop_size_one_free_axes(stmts: Body) -> Body:
     planner stamped ``Loop.role`` for downstream launch_geometry to
     consume. The planner now constructs ``GridTile`` / ``ThreadTile``
     directly and applies its own size-1 filter (see
-    ``000_partition_loops::_wrap_tower``), so by the time
+    ``010_partition_loops::_wrap_tower``), so by the time
     ``drop_size_one_free_axes`` runs on a LoopOp body, no Loop has any
     binding role — every size-1 free Loop is safely inlinable.
     """

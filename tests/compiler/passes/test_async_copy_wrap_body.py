@@ -1,8 +1,8 @@
-"""Tests for ``050_use_async_copy`` (wrap-body BufferedStage → AsyncBufferedStage promotion).
+"""Tests for ``060_use_async_copy`` (wrap-body BufferedStage → AsyncBufferedStage promotion).
 
 The pass walks for ``BufferedStage`` inside ``SerialTile(serial_outer)`` and
 promotes to ``AsyncBufferedStage(pipeline_depth=1)`` when the target supports
-cp.async (sm_80+). Materialization (in ``001_materialize_tile._emit_stage``)
+cp.async (sm_80+). Materialization (in ``100_materialize_tile._emit_stage``)
 emits ``CpAsyncCopy`` per Source + ``CpAsyncCommit + CpAsyncWait(0) + Sync``
 at the wrap boundary.
 """
@@ -41,7 +41,7 @@ def _build_matmul(m: int = 128, k: int = 256, n: int = 128) -> Graph:
 
 
 def _load_pass():
-    pass_path = pathlib.Path(_helpers.__file__).parent / "050_use_async_copy.py"
+    pass_path = pathlib.Path(_helpers.__file__).parent / "060_use_async_copy.py"
     spec = importlib.util.spec_from_file_location("async_pass", pass_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -190,7 +190,7 @@ def test_async_copy_is_idempotent():
         raised = False
     except RuleSkipped:
         raised = True
-    assert raised, "050_use_async_copy should be idempotent — AsyncBufferedStage already present"
+    assert raised, "060_use_async_copy should be idempotent — AsyncBufferedStage already present"
 
 
 def test_arch_below_sm80_rejected():
@@ -207,7 +207,7 @@ def test_arch_below_sm80_rejected():
     except RuleSkipped as e:
         raised = True
         msg = str(e)
-    assert raised, "050_use_async_copy should reject sm_75"
+    assert raised, "060_use_async_copy should reject sm_75"
     assert "compute capability" in msg.lower(), msg
 
 

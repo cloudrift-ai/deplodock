@@ -1,4 +1,4 @@
-"""Tests for ``070_pipeline_stages`` (depth-2 pipelining).
+"""Tests for ``080_pipeline_stages`` (depth-2 pipelining).
 
 The pass takes a ``SerialTile(serial_outer)`` whose body is a single
 ``AsyncBufferedStage(pipeline_depth=1)`` wrapping a ``stage_inner`` reduce
@@ -37,7 +37,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
 
 def _load_pass():
-    p = pathlib.Path(_helpers.__file__).parent / "070_pipeline_stages.py"
+    p = pathlib.Path(_helpers.__file__).parent / "080_pipeline_stages.py"
     spec = importlib.util.spec_from_file_location("pipe_pass", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -94,7 +94,7 @@ def test_pipelining_emits_prologue_main_epilogue():
     assert n_issue == 2, f"expected 2 issue-only async stages (prologue + main), got {n_issue}"
     # 3 = main steady-state leading wait + trailing cross-iter sync wait + epilogue drain.
     # The trailing wait in the main loop is the slot-aliasing barrier required for
-    # buffer_count=2 (see 070_pipeline_stages docstring).
+    # buffer_count=2 (see 080_pipeline_stages docstring).
     assert n_waits == 3, f"expected 3 AsyncWait stmts (main leading + main trailing sync + epilogue drain), got {n_waits}"
 
 

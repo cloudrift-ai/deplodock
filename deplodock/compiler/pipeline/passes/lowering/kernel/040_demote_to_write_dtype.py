@@ -41,7 +41,7 @@ Backward dataflow over the KernelOp body:
 ## Why this is safe
 
 - ``Accum`` is not crossed — its dtype is the freeze point chosen by
-  ``000_place_inits``; changing it would change reduction semantics.
+  ``020_place_inits``; changing it would change reduction semantics.
 - ``Load`` is not crossed either — the source buffer's dtype is the
   ground truth; Load.render already declares the local in that dtype.
 - Ops without a native fp16 form aren't demoted; they stay in fp32
@@ -230,7 +230,7 @@ def _seed_fp16_carriers(body: Body) -> set[str]:
 
     - ``Load`` whose stamped ``dtype.name == "f16"`` (either reading
       from an fp16 graph buffer or from an fp16-stamped Stage source).
-      ``001_stamp_types`` populates ``Load.dtype`` from either side
+      ``030_stamp_types`` populates ``Load.dtype`` from either side
       before this pass runs.
     - ``Accum`` / ``Init`` with ``dtype == F16``.
 

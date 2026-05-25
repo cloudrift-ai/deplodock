@@ -1,6 +1,6 @@
 """Place explicit ``Init`` Stmts at the correct scope for every Accum.
 
-Runs before ``001_materialize_tile`` so materialize sees IR where each
+Runs before ``100_materialize_tile`` so materialize sees IR where each
 Accum's lifetime is explicit. Removes the need for materialize to make
 implicit scoping decisions.
 

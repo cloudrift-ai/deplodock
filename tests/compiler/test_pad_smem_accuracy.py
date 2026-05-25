@@ -1,6 +1,6 @@
 """CUDA accuracy regression for the wrap-body bank-pad path.
 
-060_pad_smem is a BOOL ``PAD_SMEM`` fork. Under PAD_SMEM=True the
+070_pad_smem is a BOOL ``PAD_SMEM`` fork. Under PAD_SMEM=True the
 materializer reads each ``Source.alloc_extents`` with the ``+1`` pad
 folded in, which (1) grows the smem allocation and (2) shifts every
 higher-stride row by one float so body Loads' bank distribution flattens.

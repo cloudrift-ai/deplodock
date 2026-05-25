@@ -1,4 +1,4 @@
-"""Tests for the hierarchical Fork tree emitted by ``000_partition_loops``.
+"""Tests for the hierarchical Fork tree emitted by ``010_partition_loops``.
 
 The planner converts its flat ``list[TileOp]`` variant set into a
 ``BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp leaf`` Fork tree. Levels
@@ -25,7 +25,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.pipeline import Fork
 
-_planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.000_partition_loops")
+_planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
 _build_fork_tree = _planner._build_fork_tree
 _split_kernel_fully = _planner._split_kernel_fully
 

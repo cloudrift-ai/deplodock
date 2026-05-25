@@ -1,4 +1,4 @@
-"""Tests for ``040_use_tma`` (single-source AsyncBufferedStage → TmaBufferedStage).
+"""Tests for ``050_use_tma`` (single-source AsyncBufferedStage → TmaBufferedStage).
 
 The pass walks for ``AsyncBufferedStage`` inside ``SerialTile(serial_outer)``
 and promotes to ``TmaBufferedStage(pipeline_depth=1, swizzle=NONE)`` when
@@ -35,7 +35,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
 
 def _load_pass():
-    p = pathlib.Path(_helpers.__file__).parent / "040_use_tma.py"
+    p = pathlib.Path(_helpers.__file__).parent / "050_use_tma.py"
     spec = importlib.util.spec_from_file_location("tma_pass", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

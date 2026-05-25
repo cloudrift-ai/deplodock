@@ -8,16 +8,16 @@ post-transpose shape. At bind time the loader reads the source tensor
 Loads see the post-chain layout.
 
 Why fold here rather than later: a ``TransposeOp`` lowered through
-``010_transpose`` becomes an ``IndexMapOp``, which gets fused into
+``120_transpose`` becomes an ``IndexMapOp``, which gets fused into
 consumer Loads' index expressions. The runtime tensor stays in its
 original layout and the access pattern reads the transposed element of
 the original storage. That's correct but defeats the smem layout
-cuBLAS-style SGEMM kernels rely on (see ``010_stage_inputs``) and
+cuBLAS-style SGEMM kernels rely on (see ``020_stage_inputs``) and
 prevents TMA on the asymmetric ``(BN, BM)`` tile shape (see
-``040_use_tma``). Pre-folding the constant solves both without
+``050_use_tma``). Pre-folding the constant solves both without
 changing the rest of the graph.
 
-Companion rule ``004b_fold_reshape_into_constant`` does the same for
+Companion rule ``060_fold_reshape_into_constant`` does the same for
 ``ReshapeOp``. The shared body is in ``_fold_constant.py``.
 """
 

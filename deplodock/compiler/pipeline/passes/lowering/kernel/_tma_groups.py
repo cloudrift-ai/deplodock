@@ -1,4 +1,4 @@
-"""TMA pipeline-unit grouping analysis for ``008_materialize_tile``.
+"""TMA pipeline-unit grouping analysis for ``100_materialize_tile``.
 
 Read-only analysis of a (flattened) Tile body — mirrors the
 ``Body.coordination`` precedent: one walk produces the per-stage /
@@ -77,7 +77,7 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
 
     def _add_stage(gid: int, stage: TmaBufferedStage) -> None:
         stage_group_by_id[id(stage)] = gid
-        # 040_use_tma promotes single-source stages only; group_stage_names
+        # 050_use_tma promotes single-source stages only; group_stage_names
         # tracks per-Source smem name so issuer-tid allocation distributes
         # the arrive+TmaLoad across distinct elected threads.
         for src in stage.sources:
@@ -111,7 +111,7 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
             continue
         if isinstance(stmt, AsyncWait):
             # Trailing epilogue wait pairs with the most recent
-            # pipeline-unit group (070_pipeline_stages always emits one
+            # pipeline-unit group (080_pipeline_stages always emits one
             # epilogue AsyncWait after its main loop). If there's no
             # pipeline group in scope but pending synchronous stages
             # exist, the wait pairs them with the next-to-be-flushed

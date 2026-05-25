@@ -38,7 +38,7 @@ SerialTile(K_o)
 ```
 
 `Stage.body` disappears. `ComputeStage.compute` stays — it's the producer template (cooperative load that fills the
-slab), not a consumer wrap. `_flatten_wrap_stages` in `001_materialize_tile.py:85-120` already does this conversion
+slab), not a consumer wrap. `_flatten_wrap_stages` in `100_materialize_tile.py:85-120` already does this conversion
 at the kernel-IR boundary — the proposal is to push that flat shape up into the Tile IR itself.
 
 ## Goals
@@ -55,37 +55,37 @@ From an audit of every `Stage.body` reader in `deplodock/compiler/`:
 
 ### Things that would need reconstruction in a flat shape
 
-1. **Scope-transparency for Init placement** (`000_place_inits.py:181-230`). Recently extended in commit `791c5a59`
+1. **Scope-transparency for Init placement** (`020_place_inits.py:181-230`). Recently extended in commit `791c5a59`
    to walk nested wrap-body Stage chains: when `stmt` is a `Stage`, `_accums_under_reduces_only` walks `stmt.body`
    to collect Accums that belong at the enclosing scope. `_is_reduce_recursive` synthesizes a probe-loop with
    `.body = s.body` so the recursive reduce-check treats the consumer subtree as if it were a loop body. Without
    `Stage.body`, this becomes a sibling-window walk: collect Accums from stmts *after* the last Stage in the scope,
    up to the next reduce boundary. Doable but loses the structural anchoring.
 
-2. **Phase-rewriting in 030_use_ring_buffers** (`030_use_ring_buffers.py:94-112`). Today: `body.map(_make_phase_load_
+2. **Phase-rewriting in 040_use_ring_buffers** (`040_use_ring_buffers.py:94-112`). Today: `body.map(_make_phase_load_
    rewriter(staged_names, phase))` rewrites every `Load` in the consumer subtree to prepend the ring phase. In a
    flat shape, this becomes: collect the stmts between the promoted Stage and the next non-staged stmt at K_o.body
    level, treat that window as the "consumer scope," and apply the rewriter. The window detection is the new logic.
 
-3. **Cone detection in 020_hoist_invariant_compute** (`020_hoist_invariant_compute.py:131-189`). Uses
+3. **Cone detection in 030_hoist_invariant_compute** (`030_hoist_invariant_compute.py:131-189`). Uses
    `_find_unique_stage_inner_reduce(stage.body)` to locate the K_inner reduce inside a multi-source Stage's
    consumer. Cone candidates are grouped by per-Source cache_dims, then Assign-dep walks happen inside the body.
    Flat shape needs explicit sibling-window scope tracking; cone-source grouping needs a way to know which sibling
    Stages contribute to which downstream reduce.
 
-4. **Pipelined-stage expansion in 015** (`070_pipeline_stages.py:116-200`). Today unpacks
+4. **Pipelined-stage expansion in 015** (`080_pipeline_stages.py:116-200`). Today unpacks
    `*stage.body` directly into prologue/main/epilogue siblings after σ-rewriting. Flat shape: identify the sibling
    window after the AsyncBufferedStage (up to and including the K_inner reduce), apply σ_first / σ_next / σ_last
    to *that window*, splice the rewritten copies back in. The expansion logic is the same; the window discovery
    is new.
 
-5. **Stage classification in 010_stage_inputs** (`010_stage_inputs.py:121-192`). Today walks
+5. **Stage classification in 020_stage_inputs** (`020_stage_inputs.py:121-192`). Today walks
    `SerialTile(stage_inner)` bodies inside the consumer subtree to collect Loads and classify by cache axes. Flat
    shape: walks K_o.body for `stage_inner` reduces directly (simpler — they're now siblings, not nested).
 
 ### Costs that are smaller than they look
 
-- **`_flatten_wrap_stages`** (`001_materialize_tile.py:85-120`) becomes a no-op — net deletion, not a cost.
+- **`_flatten_wrap_stages`** (`100_materialize_tile.py:85-120`) becomes a no-op — net deletion, not a cost.
 - **`Stage.pretty`** simplifies — no special-case logic to render wrapped consumer at same indent.
 - **`ComputeStage` doesn't need restructuring** — its `compute` field is the producer template, semantically
   unrelated to `body`. Only `body` goes away.
@@ -101,7 +101,7 @@ From an audit of every `Stage.body` reader in `deplodock/compiler/`:
 - **"Pretty rendering needs flat IR to render flatly."** False — the pretty printer could be changed independently
   to walk wrap-body chains and render siblings. The deceptive rendering today is a pretty-printer choice, not an
   IR constraint.
-- **"Pass simplification across the board."** Mixed. 002 / 015 simplify. 000_place_inits / 010 / 007b get more
+- **"Pass simplification across the board."** Mixed. 002 / 015 simplify. 020_place_inits / 010 / 007b get more
   complex (need sibling-window logic instead of structural traversal). Net LOC is approximately a wash.
 
 ## Scope
@@ -119,7 +119,7 @@ From an audit of every `Stage.body` reader in `deplodock/compiler/`:
 
 This refactor inverts work the team just landed. Before starting, verify:
 
-1. **`plans/finish-stage-wrap-body-refactor.md` is fully complete.** M5b (020_hoist_invariant_compute) was the
+1. **`plans/finish-stage-wrap-body-refactor.md` is fully complete.** M5b (030_hoist_invariant_compute) was the
    last open milestone per the doc; the recent commit history (`791c5a59`, `50eae636`) suggests it's done.
    Reversing in the middle of the wrap-body restoration would be much worse than reversing after it lands.
 2. **The user genuinely wants flat.** This plan should be approved against the alternative of "fix the pretty
@@ -138,7 +138,7 @@ plan should not land.
 
 2. **Sibling-window helper as shared infrastructure.** Multiple passes need "find the consumer scope after this
    Stage at K_o.body level." Implement `consumer_window(body: Body, stage_idx: int) -> tuple[int, int]` once in
-   `tile/passes.py` (or a new `tile/scope.py`); reuse from 010, 007b, 015, 000_place_inits. Single
+   `tile/passes.py` (or a new `tile/scope.py`); reuse from 010, 007b, 015, 020_place_inits. Single
    implementation = single source of truth for sibling-window semantics.
 
 3. **`ComputeStage.compute` unchanged.** The producer template stays as a separate Body. Only `body` is lifted.
@@ -158,7 +158,7 @@ plan should not land.
 
 ## M1 — Spike: sibling-window semantics + snapshot baseline
 
-**Why.** The single biggest unknown is whether sibling-window logic in 000_place_inits, 010, 007b, 015 can
+**Why.** The single biggest unknown is whether sibling-window logic in 020_place_inits, 010, 007b, 015 can
 faithfully reproduce wrap-body's scope transparency. Spike it on the simplest pass (010) before committing to
 the full migration.
 
@@ -203,9 +203,9 @@ the full migration.
 - `deplodock/compiler/ir/tile/scope.py` (~120 lines)
 - `tests/compiler/ir/test_tile_scope.py` (~150 lines)
 
-**Verification.** Unit tests cover the window-walk shapes seen in 010 / 007b / 015 / 000_place_inits.
+**Verification.** Unit tests cover the window-walk shapes seen in 010 / 007b / 015 / 020_place_inits.
 
-## M3 — Update 000_place_inits.py to use sibling-window
+## M3 — Update 020_place_inits.py to use sibling-window
 
 **Why.** Most subtle consumer of `Stage.body` (scope transparency for Accum collection). Validating the helper
 works here before touching the promotion passes catches sibling-window bugs early.
@@ -223,15 +223,15 @@ works here before touching the promotion passes catches sibling-window bugs earl
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/kernel/000_place_inits.py` (~40 lines net)
+- `deplodock/compiler/pipeline/passes/lowering/kernel/020_place_inits.py` (~40 lines net)
 
 **Verification.**
 
-- Existing tests for 000_place_inits pass unchanged (it still operates on wrap-body input).
+- Existing tests for 020_place_inits pass unchanged (it still operates on wrap-body input).
 - New test in dual-shape mode: construct a flat-shape input manually, verify same Init placement decisions
   as wrap-body equivalent.
 
-## M4 — Update 030_use_ring_buffers.py to use sibling-window
+## M4 — Update 040_use_ring_buffers.py to use sibling-window
 
 **Why.** Phase-rewriting is the most surgical body-walker; getting it right validates the helper for the
 promotion-chain passes.
@@ -245,7 +245,7 @@ promotion-chain passes.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/030_use_ring_buffers.py` (~50 lines net)
+- `deplodock/compiler/pipeline/passes/lowering/tile/040_use_ring_buffers.py` (~50 lines net)
 
 **Verification.**
 
@@ -253,7 +253,7 @@ promotion-chain passes.
 - Dual-shape test: flat-shape input → same `BufferedStage` output with phase-rewritten Loads in the sibling
   consumer scope.
 
-## M5 — Update 020_hoist_invariant_compute.py to use sibling-window
+## M5 — Update 030_hoist_invariant_compute.py to use sibling-window
 
 **Why.** Largest body-walker. The cone-source grouping logic is the trickiest sibling-window port.
 
@@ -267,14 +267,14 @@ promotion-chain passes.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/020_hoist_invariant_compute.py` (~60 lines net)
+- `deplodock/compiler/pipeline/passes/lowering/tile/030_hoist_invariant_compute.py` (~60 lines net)
 
 **Verification.**
 
 - `tests/compiler/passes/test_hoist_invariant_compute_wrap_body.py` passes unchanged.
 - Dual-shape test for both `FUSED_PIPELINE` polarities.
 
-## M6 — Update 070_pipeline_stages.py to use sibling-window
+## M6 — Update 080_pipeline_stages.py to use sibling-window
 
 **Why.** Pipelined expansion unpacks `*stage.body` into prologue/main/epilogue siblings — the most direct
 "give me the consumer stmts so I can σ-rewrite them" use case.
@@ -288,14 +288,14 @@ promotion-chain passes.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/070_pipeline_stages.py` (~50 lines net)
+- `deplodock/compiler/pipeline/passes/lowering/tile/080_pipeline_stages.py` (~50 lines net)
 
 **Verification.**
 
 - `tests/compiler/passes/test_pipelined_async_stage.py` passes unchanged.
 - Dual-shape test for both `AsyncBufferedStage` and `TmaBufferedStage` paths.
 
-## M7 — Update 010_stage_inputs.py + 060_pad_smem.py
+## M7 — Update 020_stage_inputs.py + 070_pad_smem.py
 
 **Why.** 002 today produces wrap-body chains; it needs to produce flat siblings instead. 014's only direct
 `Stage.body` interaction is via `op.body.iter()` for collection — minor update.
@@ -313,8 +313,8 @@ promotion-chain passes.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_stage_inputs.py` (~80 lines net)
-- `deplodock/compiler/pipeline/passes/lowering/tile/060_pad_smem.py` (verify; ~0 lines)
+- `deplodock/compiler/pipeline/passes/lowering/tile/020_stage_inputs.py` (~80 lines net)
+- `deplodock/compiler/pipeline/passes/lowering/tile/070_pad_smem.py` (verify; ~0 lines)
 
 **Verification.**
 
@@ -334,19 +334,19 @@ branch becomes dead. Delete it.
   `compute: Body` and `nested()` returns `(self.compute,)` only.
 - `Stage.pretty` simplifies to: emit per-source decl lines + optional prefix/suffix. No body rendering.
   `ComputeStage.pretty` keeps the cooperative for-nest rendering of `compute`; drops the consumer rendering.
-- Delete `_flatten_wrap_stages` from `001_materialize_tile.py:85-120`. Replace its callers with direct
+- Delete `_flatten_wrap_stages` from `100_materialize_tile.py:85-120`. Replace its callers with direct
   iteration over `body`.
-- Delete `_stage_body` shims from 000_place_inits / 010 / 007b / 015. They now always call `consumer_window`.
+- Delete `_stage_body` shims from 020_place_inits / 010 / 007b / 015. They now always call `consumer_window`.
 - Update `ARCHITECTURE.md` files for `tile/` and `pipeline/` to describe the flat shape.
 
 **Files.**
 
 - `deplodock/compiler/ir/tile/ir.py` (~80 lines deletion + simplification)
-- `deplodock/compiler/pipeline/passes/lowering/kernel/001_materialize_tile.py` (~40 lines deletion)
-- `deplodock/compiler/pipeline/passes/lowering/kernel/000_place_inits.py` (~15 lines deletion)
-- `deplodock/compiler/pipeline/passes/lowering/tile/030_use_ring_buffers.py` (~10 lines deletion)
-- `deplodock/compiler/pipeline/passes/lowering/tile/020_hoist_invariant_compute.py` (~10 lines deletion)
-- `deplodock/compiler/pipeline/passes/lowering/tile/070_pipeline_stages.py` (~10 lines deletion)
+- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py` (~40 lines deletion)
+- `deplodock/compiler/pipeline/passes/lowering/kernel/020_place_inits.py` (~15 lines deletion)
+- `deplodock/compiler/pipeline/passes/lowering/tile/040_use_ring_buffers.py` (~10 lines deletion)
+- `deplodock/compiler/pipeline/passes/lowering/tile/030_hoist_invariant_compute.py` (~10 lines deletion)
+- `deplodock/compiler/pipeline/passes/lowering/tile/080_pipeline_stages.py` (~10 lines deletion)
 - `deplodock/compiler/ir/ARCHITECTURE.md` (update Stage section)
 - `deplodock/compiler/pipeline/ARCHITECTURE.md` (update wrap-body description)
 
@@ -399,7 +399,7 @@ branch becomes dead. Delete it.
   Mitigation: this is a feature (honest rendering), but flag it for reviewer awareness. Update any
   documentation/examples that show ComputeStage rendering.
 
-- **Init placement loses an invariant.** 000_place_inits's wrap-body extension (commit `791c5a59`) was added
+- **Init placement loses an invariant.** 020_place_inits's wrap-body extension (commit `791c5a59`) was added
   specifically because flat shape needs explicit scope tracking. Reversing means trusting that the
   sibling-window walker reconstructs scope correctly. If place_inits ever needs to look across multiple
   K_o.body scopes (e.g. for outer-Init placement), the lack of structural anchoring may surface as a bug.
@@ -435,15 +435,15 @@ branch becomes dead. Delete it.
 
 - `deplodock/compiler/ir/tile/ir.py` — `Stage.body` deletion (M8)
 - `deplodock/compiler/ir/tile/scope.py` — new sibling-window helpers (M2)
-- `deplodock/compiler/pipeline/passes/lowering/kernel/000_place_inits.py` — sibling-window port (M3)
-- `deplodock/compiler/pipeline/passes/lowering/kernel/001_materialize_tile.py` — delete
+- `deplodock/compiler/pipeline/passes/lowering/kernel/020_place_inits.py` — sibling-window port (M3)
+- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py` — delete
   `_flatten_wrap_stages` (M8)
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_stage_inputs.py` — construct flat output (M7)
-- `deplodock/compiler/pipeline/passes/lowering/tile/020_hoist_invariant_compute.py` — sibling-window
+- `deplodock/compiler/pipeline/passes/lowering/tile/020_stage_inputs.py` — construct flat output (M7)
+- `deplodock/compiler/pipeline/passes/lowering/tile/030_hoist_invariant_compute.py` — sibling-window
   port (M5)
-- `deplodock/compiler/pipeline/passes/lowering/tile/030_use_ring_buffers.py` — sibling-window port (M4)
-- `deplodock/compiler/pipeline/passes/lowering/tile/060_pad_smem.py` — verify only (M7)
-- `deplodock/compiler/pipeline/passes/lowering/tile/070_pipeline_stages.py` — sibling-window
+- `deplodock/compiler/pipeline/passes/lowering/tile/040_use_ring_buffers.py` — sibling-window port (M4)
+- `deplodock/compiler/pipeline/passes/lowering/tile/070_pad_smem.py` — verify only (M7)
+- `deplodock/compiler/pipeline/passes/lowering/tile/080_pipeline_stages.py` — sibling-window
   port (M6)
 - `deplodock/compiler/ir/ARCHITECTURE.md`, `deplodock/compiler/pipeline/ARCHITECTURE.md` — flat shape docs
   (M8)

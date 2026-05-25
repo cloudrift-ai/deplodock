@@ -269,7 +269,7 @@ class RmsNormOp(Op):
 
     Inputs are ``(x, weight [, eps_const])``; ``eps`` falls back to the
     default when the optional constant isn't present. Decomposed by
-    ``passes/frontend/decomposition/006_rms_norm.py``.
+    ``passes/frontend/decomposition/080_rms_norm.py``.
     """
 
     eps: float = 1e-6
@@ -287,7 +287,7 @@ class RmsNormOp(Op):
 class SoftmaxOp(Op):
     """PyTorch aten.softmax.int: ``exp(x - max(x, dim)) / sum(exp(...), dim)``.
 
-    Decomposed by ``passes/frontend/decomposition/008_softmax.py``.
+    Decomposed by ``passes/frontend/decomposition/100_softmax.py``.
     """
 
     axis: int | str = -1

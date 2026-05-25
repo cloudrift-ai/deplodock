@@ -1,4 +1,4 @@
-"""Tests for ``060_pad_smem`` (per-source bank-conflict padding).
+"""Tests for ``070_pad_smem`` (per-source bank-conflict padding).
 
 The pass emits a BOOL ``PAD_SMEM`` autotune fork. Under ``PAD_SMEM=True``,
 each ``Source`` inside a ``BufferedStage`` / ``AsyncBufferedStage`` gets a
@@ -46,7 +46,7 @@ def _build_matmul(m: int = 128, k: int = 256, n: int = 128) -> Graph:
 
 
 def _load_pass():
-    pass_path = pathlib.Path(_helpers.__file__).parent / "060_pad_smem.py"
+    pass_path = pathlib.Path(_helpers.__file__).parent / "070_pad_smem.py"
     spec = importlib.util.spec_from_file_location("pad_pass", pass_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -135,7 +135,7 @@ def test_pad_smem_is_idempotent():
         raised = False
     except RuleSkipped:
         raised = True
-    assert raised, "060_pad_smem must self-skip when PAD_SMEM is already stamped"
+    assert raised, "070_pad_smem must self-skip when PAD_SMEM is already stamped"
 
 
 def test_no_bank_conflict_means_no_variants():

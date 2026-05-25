@@ -1,6 +1,6 @@
 """Widen runs of consecutive scalar ``Write`` Stmts into one vector ``Write``.
 
-Symmetric to ``003_vectorize_loads``. Until this pass, the body of every
+Symmetric to ``050_vectorize_loads``. Until this pass, the body of every
 Kernel-IR Tile carries scalar ``Write`` Stmts (``extra_values=()``).
 Some sequences have a "vector" shape: N consecutive Writes to the same
 output buffer whose last-dim indices differ by 0, 1, ..., N-1. The CUDA
@@ -24,7 +24,7 @@ Tile body, post-order):
 
 ## Why this lives at the Kernel-IR boundary
 
-Same reason as ``003_vectorize_loads``: the decision needs the
+Same reason as ``050_vectorize_loads``: the decision needs the
 destination-buffer dtype, which comes from graph node dtypes for ``KernelOp.outputs`` keys
 or the graph node's dtype. Running here keeps both pieces of context in
 one place and ensures the IR-visible form (``--ir kernel``) reflects
@@ -153,7 +153,7 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp, atomi
 
     # Last-dim indices: same free-var coefficients, anchor differs by
     # exactly k for the k-th write. Mirrors the affine-form check in
-    # ``003_vectorize_loads._try_vec_load``.
+    # ``050_vectorize_loads._try_vec_load``.
     inner_0 = writes[0].index[-1]
     free = inner_0.free_vars()
     for s in writes[1:]:
@@ -177,7 +177,7 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp, atomi
 
     # Alignment proof: for widths above the natural 4-byte boundary,
     # the reinterpret-cast destination must be aligned to
-    # ``n * elem_bytes``. Same as ``003_vectorize_loads``: every
+    # ``n * elem_bytes``. Same as ``050_vectorize_loads``: every
     # free-var coefficient on the last dim must be a multiple of n,
     # and the literal anchor must also be a multiple of n.
     if n > 2 or (n == 2 and dst_dt == "f32"):

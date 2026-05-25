@@ -30,7 +30,7 @@ consumer scopes nest instead of multi-sourcing.
 sync cooperative load, ring-buffered sync, cp.async, TMA box-copy.
 ``pipeline_depth > 1`` on the async / TMA flavors marks a stage for
 temporal pipelining (prologue/main/epilogue), expanded by
-``070_pipeline_stages`` before materialization.
+``080_pipeline_stages`` before materialization.
 
 **Leaf compute reuses Loop IR.** ``Load`` / ``Assign`` / ``Select`` /
 ``Write`` / ``Accum`` / ``Cond`` come straight from ``ir.loop`` — buf
@@ -97,7 +97,7 @@ SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
 # implicit wait at their wrap boundary, emitted by ``_emit_stage`` /
 # ``emit_tma_stage`` in the materializer. Pipelined stages
 # (``pipeline_depth > 1``) need explicit waits at non-default schedule
-# positions: ``070_pipeline_stages`` emits ``AsyncWait``
+# positions: ``080_pipeline_stages`` emits ``AsyncWait``
 # Stmts between the issue and consume halves of each steady-state K_o
 # iteration (and at the epilogue drain). The materializer's
 # ``emit_async_wait`` closure lowers them to ``CpAsyncWait(group=keep)``
@@ -110,7 +110,7 @@ class AsyncWait(Stmt):
 
     Sync-style stages (``pipeline_depth == 1``) don't need this — the
     materializer emits an implicit wait at the wrap boundary. Pipelined
-    stages do: ``070_pipeline_stages`` peels the steady
+    stages do: ``080_pipeline_stages`` peels the steady
     state into issue-now / wait-for-prev / consume-prev, with explicit
     ``AsyncWait`` carrying the schedule:
 
@@ -187,7 +187,7 @@ class CacheDim:
     """One cache (smem) axis + which source-buffer dim it covers.
 
     ``axis`` carries the cache axis identity (its ``source_axis``
-    back-pointer, set by 010_stage_inputs at construction time, identifies
+    back-pointer, set by 020_stage_inputs at construction time, identifies
     which original output axis this cache dim corresponds to — used by
     downstream passes for per-source-axis grouping).
 
@@ -222,7 +222,7 @@ class Source:
       source_dim each cache axis maps to); ``template_index`` carries
       the verbatim source-dim Exprs for the template case.
     - ``dtype`` — source buffer's element dtype. Stamped by
-      ``001_stamp_types`` from ``graph.nodes[buf].output.dtype`` so smem
+      ``030_stamp_types`` from ``graph.nodes[buf].output.dtype`` so smem
       allocation (``smem_bytes`` / ``alloc_extents``) and downstream
       materialization can read it off the IR without reaching for the
       matcher-populated graph node. ``None`` keeps legacy fp32-assuming
@@ -259,7 +259,7 @@ class Source:
     def smem_bytes(self) -> int:
         """Bytes of dynamic shared memory this Source allocates (single-slot).
 
-        Uses ``self.dtype.nbytes`` when ``001_stamp_types`` has populated it;
+        Uses ``self.dtype.nbytes`` when ``030_stamp_types`` has populated it;
         falls back to the legacy fp32-assuming ``BYTES_PER_ELEM`` constant
         otherwise so handwritten test fixtures without dtype continue to work.
         """
@@ -610,16 +610,16 @@ class SerialTile(SerialTileBase):
 
     - ``"plain"``: ordinary serial loop (no special role).
     - ``"serial_outer"``: outer chunked-K loop driving slab refresh
-      (today's ``Role.SERIAL_OUTER``). Targeted by ``030_use_ring_buffers``
+      (today's ``Role.SERIAL_OUTER``). Targeted by ``040_use_ring_buffers``
       / ``015_pipeline_k_outer``.
     - ``"stage_inner"``: inner reduce loop inside a ``Stage``'s wrapped
       body (today's ``Role.STAGE_INNER``). Slab-axis marker for
-      ``010_stage_inputs``.
+      ``020_stage_inputs``.
     - ``"pipeline"``: serial outer loop marked for temporal pipelining
       by ``015_pipeline_k_outer``.
 
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
-    time. Set by ``080_mark_unroll``; has no effect on iteration semantics.
+    time. Set by ``090_mark_unroll``; has no effect on iteration semantics.
     """
 
     kind: SerialKind = "plain"
@@ -853,7 +853,7 @@ class AsyncBufferedStage(BufferedStage):
     ``pipeline_depth > 1`` ⇒ the enclosing K-outer Loop is software-
     pipelined: a prologue issues the first depth-1 chunks, the main
     Loop overlaps issue+wait+compute, the epilogue drains. Expansion
-    happens in ``070_pipeline_stages`` before materialize.
+    happens in ``080_pipeline_stages`` before materialize.
     """
 
     pipeline_depth: int = field(default=1, kw_only=True)
@@ -1061,7 +1061,7 @@ class TileOp(BodyOp):
         from math import prod  # noqa: PLC0415
 
         # Dedupe by Source name: pipelining
-        # (070_pipeline_stages) replicates an
+        # (080_pipeline_stages) replicates an
         # ``AsyncBufferedStage`` for prologue + steady-state issue, both
         # writing into the same smem buffer (same name, same allocation).
         # Counting them independently would double-charge the budget and

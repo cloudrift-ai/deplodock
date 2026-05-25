@@ -136,7 +136,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     materialization passes Writes through unchanged."""
     axes = blk.axes
     # Wrap-body Stages are already flattened to the legacy shape
-    # ([Stage(empty body), *consumer_stmts]) by ``007a_flatten_wrap_stages``,
+    # ([Stage(empty body), *consumer_stmts]) by ``090_flatten_wrap_stages``,
     # so the walker sees producer scaffolding (Stage.sources) followed by
     # the consumer stmts as siblings.
     body = blk.body
@@ -174,7 +174,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     # multiple K-loops over different stage sets (e.g. SDPA P@V whose
     # softmax-max + softmax-sum + weighted-V reduces have different stage
     # multiplicities) gets per-loop arrive counts and its mbar waits
-    # don't deadlock. ``040_use_tma`` enforces all-or-nothing TMA
+    # don't deadlock. ``050_use_tma`` enforces all-or-nothing TMA
     # promotion per tile, so any tile with TMA stages is guaranteed to
     # have no cp.async stages in the same pipelined K-loop and the
     # AsyncWait lowering can stay as a pure ``MbarrierWait``.
@@ -183,7 +183,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     declared_mbar: set[str] = set()
 
     # Compute-Stage Smem hoist: a ComputeStage (produced by
-    # 020_hoist_invariant_compute when FUSED_PIPELINE=True) and an
+    # 030_hoist_invariant_compute when FUSED_PIPELINE=True) and an
     # inline-fuse multi-source Stage (FUSED_PIPELINE=False) both emit
     # their body inside the K-outer loop body — Smem decls inside a
     # loop don't reach kernel scope in CUDA. Walk the body once, pre-
@@ -244,7 +244,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         return [CpAsyncWait(group=stmt.keep), Sync()]
 
     def emit_tma_stage(stage: TmaBufferedStage) -> list[Stmt]:
-        # Wrap-body invariant: 040_use_tma only promotes single-Source
+        # Wrap-body invariant: 050_use_tma only promotes single-Source
         # stages, so the box-copy here issues exactly one TMA load per
         # group activation.
         assert len(stage.sources) == 1, f"TmaBufferedStage requires one Source, got {len(stage.sources)}"
@@ -345,7 +345,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # Implicit wait at the wrap boundary for unpipelined stages
         # (pipeline_depth == 1). Mirrors the AsyncBufferedStage flow in
         # ``_emit_stage`` — the consumer body sees the committed copy
-        # before reading. ``070_pipeline_stages`` (when it
+        # before reading. ``080_pipeline_stages`` (when it
         # lands) expands depth > 1 stages and emits its own waits.
         if stage.pipeline_depth == 1:
             mbar_phase = _mbar_wait_phase(stage.phase, stage.buffer_count)
@@ -396,7 +396,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
             new_body.append(transform(stmt))
 
     # Init scoping for accumulators is handled by the upstream
-    # ``000_place_inits`` pass — explicit ``Init`` Stmts already sit at
+    # ``020_place_inits`` pass — explicit ``Init`` Stmts already sit at
     # the correct scope (Tile body head for reduce-only nesting, inside
     # a free Loop body when one wraps the Accum). Materialize is purely
     # mechanical from here.
@@ -416,7 +416,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     if compute_stage_prologue:
         new_body = compute_stage_prologue + new_body
     # Redundant-Sync cleanup runs as the separate Kernel-IR pass
-    # ``009_drop_redundant_syncs`` after this lowering.
+    # ``110_drop_redundant_syncs`` after this lowering.
     return ThreadTile(axes=axes, body=new_body)
 
 
@@ -482,7 +482,7 @@ def _build_linear_tid(thread_axes: tuple[Axis, ...]):
 def _mbar_wait_phase(stage_phase, buffer_count: int):
     """Derive the mbarrier-test phase from a ``TmaBufferedStage.phase``.
 
-    040_use_tma stamps ``stage.phase = Var(K_o.name) % buffer_count``
+    050_use_tma stamps ``stage.phase = Var(K_o.name) % buffer_count``
     (the ring slot). The matching mbarrier phase rotates one bit per
     full ring sweep — ``(K_o / buffer_count) % 2``. For the degenerate
     single-shot case (``phase`` is a literal) the mbar phase starts at

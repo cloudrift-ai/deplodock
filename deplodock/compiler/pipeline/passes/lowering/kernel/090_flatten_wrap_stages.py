@@ -5,7 +5,7 @@ subtree nested inside ``Stage.body``. The materializer wants the legacy
 flat shape — ``[Stage(sources, body=()), *consumer_stmts]`` — so it can
 emit the producer cooperative-load scaffolding, then walk the consumer
 stmts as siblings. This pass performs that flatten as a discrete
-Tile-IR → Tile-IR rewrite, so ``008_materialize_tile`` receives an
+Tile-IR → Tile-IR rewrite, so ``100_materialize_tile`` receives an
 already-flat body and commits no structural rewrites of its own.
 
 Runs as ``007a`` (immediately before ``008``): nothing else observes the

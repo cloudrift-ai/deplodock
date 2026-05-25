@@ -1,6 +1,6 @@
 """Per-source ``+1`` smem padding to break bank conflicts on body reads.
 
-After ``010_stage_inputs`` lays out each ``Source`` as one smem slab, body
+After ``020_stage_inputs`` lays out each ``Source`` as one smem slab, body
 Loads read it through thread-decoded coords. When the slab's per-thread-
 axis stride is a multiple of 32 floats (the bank count × 4 bytes / 4
 bytes per fp32), every lane in a warp hits the same bank — a 32-way
@@ -37,7 +37,7 @@ overflow) get dropped silently by the search.
    the best partial fix.
 
 The innermost cache dim is padded only when the body Loads against this
-source can't be vectorized by ``003_vectorize_loads``. ``+1`` on the
+source can't be vectorized by ``050_vectorize_loads``. ``+1`` on the
 innermost adds 4 bytes to the next-outer stride (= 4 mod 16 in bytes),
 which mis-aligns any LDS.128 emitted with an outer-dim offset. We detect
 the vectorizable shape ahead of time: ≥ 2 consecutive Loads against the
@@ -162,7 +162,7 @@ def _has_vectorizable_run(loads: list[Load]) -> bool:
     """True iff ``loads`` (in source order) contain ≥ 2 consecutive Loads
     sharing every outer-index expression and differing in the last index
     by exactly 1 per step. This is the structural precondition for
-    ``003_vectorize_loads`` to emit ``ld.shared.v4`` against this source —
+    ``050_vectorize_loads`` to emit ``ld.shared.v4`` against this source —
     we use it as the gate for innermost-pad eligibility (a ``+1`` on the
     innermost would otherwise misalign the vectorized load)."""
     if len(loads) < 2:
@@ -269,7 +269,7 @@ def _max_conflict(loads: list[Load], extents: tuple[int, ...], thread_axes: tupl
     """Worst-case ``max_way`` across body ``loads`` at the hypothetical
     ``extents`` — i.e. evaluating row-major strides as if the slab were
     sized to ``extents``. Loads in a wrap-body ``BufferedStage`` carry a
-    leading phase dim prepended by ``030_use_ring_buffers``; drop it before
+    leading phase dim prepended by ``040_use_ring_buffers``; drop it before
     the rank check."""
     worst = 1
     for ld in loads:

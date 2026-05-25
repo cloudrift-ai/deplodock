@@ -8,7 +8,7 @@ in their ``PATTERN`` op type, so the body lives here.
 Gated on sm_90+ (the TMA path). Folding under the default cp.async path
 changes shapes in ways other passes (RoPE, SDPA, register-tile) don't
 expect — the consumer Load index already matches the smem layout via
-``010_transpose`` / ``011_reshape``'s IndexMap fusion. Folding under
+``120_transpose`` / ``130_reshape``'s IndexMap fusion. Folding under
 the TMA path is what enables LDS.128 vectorization on the asymmetric
 ``(BN, BM)`` tile shape (see ``tuning.py``). The gate is a behavior
 preservation choice; the ``load_ops`` field itself is general-purpose

@@ -98,14 +98,14 @@ def test_compile_dump_dir_writes_rule_application_files(run_cli, tmp_path):
 
     # Inspect one of the merge_loop_ops snapshots — that rule reliably
     # fires on RMSNorm decomposition.
-    fusion_txt = dump / "04_loop_fusion__001_merge_loop_ops.rules.txt"
-    fusion_json = dump / "04_loop_fusion__001_merge_loop_ops.rules.json"
+    fusion_txt = dump / "04_loop_fusion__010_merge_loop_ops.rules.txt"
+    fusion_json = dump / "04_loop_fusion__010_merge_loop_ops.rules.json"
     assert fusion_txt.exists() and fusion_json.exists()
     text = fusion_txt.read_text()
     # Diff-style rendering with bracketing markers (see pipeline/rule_diff.py);
     # the ``f:`` prefix is the loop/fusion pass shorthand.
-    assert ">>> f:001_merge_loop_ops" in text
-    assert "<<< f:001_merge_loop_ops" in text
+    assert ">>> f:010_merge_loop_ops" in text
+    assert "<<< f:010_merge_loop_ops" in text
     assert "@@ matched at" in text
 
     records = json.loads(fusion_json.read_text())

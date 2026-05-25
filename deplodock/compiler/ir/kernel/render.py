@@ -67,7 +67,7 @@ static __device__ __forceinline__ void mbarrier_wait_parity(unsigned long long* 
     // The ``"memory"`` clobber prevents the compiler from reordering
     // smem loads across this asm. The primary correctness anchor is
     // the trailing ``__syncthreads()`` materialize emits after each
-    // MbarrierWait (see ``001_materialize_tile.py``); the clobber is
+    // MbarrierWait (see ``100_materialize_tile.py``); the clobber is
     // defensive belt-and-braces so the asm itself reads as a fence
     // even if a future caller forgets the surrounding Sync.
     unsigned int addr = __cvta_generic_to_shared(mbar);

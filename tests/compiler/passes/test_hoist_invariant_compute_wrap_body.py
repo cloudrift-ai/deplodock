@@ -1,4 +1,4 @@
-"""Tests for ``020_hoist_invariant_compute`` (cone detection + Stage split).
+"""Tests for ``030_hoist_invariant_compute`` (cone detection + Stage split).
 
 Cone detection finds a multi-source ``Stage`` whose K_i reduce body has a
 chain of Assigns reading a subset of sources' smem (the cone) and feeding a
@@ -32,7 +32,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile import _helpers
 
 
 def _load_pass():
-    p = pathlib.Path(_helpers.__file__).parent / "020_hoist_invariant_compute.py"
+    p = pathlib.Path(_helpers.__file__).parent / "030_hoist_invariant_compute.py"
     spec = importlib.util.spec_from_file_location("hoist_pass", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

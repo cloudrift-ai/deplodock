@@ -5,7 +5,7 @@
   ``Stage`` family, plus re-exports of Loop-IR leaves and shared
   expressions.
 
-Loop-IR → Tile-IR lowering is owned by ``passes/lowering/tile/000_partition_loops``
+Loop-IR → Tile-IR lowering is owned by ``passes/lowering/tile/010_partition_loops``
 (constructs tile flavors directly via ``_wrap_tower``). Materialization
 (Tile IR → Kernel IR) lives under ``passes/lowering/kernel``; rendering
 of Kernel IR to CUDA source lives under ``ir.kernel``.
