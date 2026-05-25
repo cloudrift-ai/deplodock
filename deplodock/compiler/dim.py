@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 
 
 def _coerce_expr(value: int | str | Expr | Dim) -> Expr:
@@ -55,7 +55,13 @@ def _coerce_expr(value: int | str | Expr | Dim) -> Expr:
 
 
 def _simplify(expr: Expr) -> Expr:
-    return expr.simplify(SimplifyCtx.empty())
+    # Shape vars (every free ``Var`` in a Dim expression) are positive by
+    # definition: a tensor extent can't be zero or negative. Expose that
+    # via ``SimplifyCtx.ranges`` so the simplifier's ``//`` cancellation
+    # path can safely cancel matching factors (otherwise ``(s*128) // (s*4)``
+    # has no way to reduce to ``32``).
+    ranges = {name: Interval(1, 1 << 30) for name in expr.free_vars()}
+    return expr.simplify(SimplifyCtx(ranges))
 
 
 @dataclass(frozen=True, init=False, eq=False)

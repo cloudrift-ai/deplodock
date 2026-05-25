@@ -41,7 +41,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
         stride_simplified = out_stride.simplify(SimplifyCtx.empty())
         term = placeholder(d) if _is_one(stride_simplified) else BinaryExpr("*", placeholder(d), stride_simplified)
         flat = term if flat is None else BinaryExpr("+", term, flat)
-        out_stride = BinaryExpr("*", out_stride, _dim_expr(out_shape[d]))
+        out_stride = BinaryExpr("*", out_stride, _to_expr(out_shape[d]))
 
     if flat is None:
         flat = Literal(0, "int")
@@ -51,7 +51,7 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     for j in range(in_ndim - 1, -1, -1):
         stride_j = in_stride.simplify(SimplifyCtx.empty())
         coord = flat if _is_one(stride_j) else BinaryExpr("/", flat, stride_j)
-        dim_j = _dim_expr(in_shape[j])
+        dim_j = _to_expr(in_shape[j])
         if j > 0:
             coord = BinaryExpr("%", coord, dim_j)
         coords.insert(0, coord.simplify(SimplifyCtx.empty()))
@@ -60,17 +60,18 @@ def _reshape_coord_map(in_shape: tuple, out_shape: tuple):
     return tuple(coords)
 
 
-def _dim_expr(d) -> object:
-    """``Literal`` for static ``Dim`` / ``int``; ``Var`` for symbolic ``Dim('name')``
-    or bare ``str``. Mirrors ``ir/stmt/base.py:_shape_dim_expr`` for the reshape
-    coord-map's stride math."""
+def _to_expr(d) -> object:
+    """Pull the ``Expr`` out of a shape element. ``Tensor.shape`` is always
+    ``tuple[Dim, ...]`` so ``d.expr`` is the common path; bare ``int`` /
+    ``str`` only show up for the un-coerced literal-shape passed via
+    ``ReshapeOp.shape``."""
     if isinstance(d, Dim):
-        return Literal(d.value, "int") if d.is_static else Var(d.value)
+        return d.expr
     if isinstance(d, int):
         return Literal(d, "int")
     if isinstance(d, str):
         return Var(d)
-    raise TypeError(f"_dim_expr: unexpected shape element {d!r}")
+    raise TypeError(f"_to_expr: unexpected shape element {d!r}")
 
 
 def _is_one(e) -> bool:

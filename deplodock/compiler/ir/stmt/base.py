@@ -268,7 +268,7 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
     for d, idx in enumerate(indices):
         stride: Expr = Literal(1, "int")
         for k in range(d + 1, len(shape)):
-            stride = BinaryExpr("*", stride, _shape_dim_expr(shape[k]))
+            stride = BinaryExpr("*", stride, _to_expr(shape[k]))
         stride = stride.simplify(SimplifyCtx.empty())
         term: Expr = idx if _is_one(stride) else BinaryExpr("*", idx, stride)
         flat = term if flat is None else BinaryExpr("+", flat, term)
@@ -276,15 +276,16 @@ def render_index(buf: str, indices: tuple, ctx: RenderCtx) -> str:
     return flat.simplify(SimplifyCtx.empty()).render(ctx)
 
 
-def _shape_dim_expr(d) -> Expr:
-    """Wrap a shape element as an ``Expr``: ``Literal`` for static ``Dim`` /
-    ``int``, ``Var`` for symbolic ``Dim('name')``. The simplifier folds
-    arithmetic across the resulting tree before rendering."""
+def _to_expr(d) -> Expr:
+    """Pull the ``Expr`` out of a shape element: ``Dim`` exposes its expr
+    directly; bare ``int`` becomes ``Literal``. ``Tensor.shape`` is always
+    ``tuple[Dim, ...]``, so the ``int`` branch only catches the rare
+    bare-int shape that slipped past coercion."""
     if isinstance(d, Dim):
-        return Literal(d.value, "int") if d.is_static else Var(d.value)
+        return d.expr
     if isinstance(d, int):
         return Literal(d, "int")
-    raise TypeError(f"_shape_dim_expr: unexpected shape element {d!r}")
+    raise TypeError(f"_to_expr: unexpected shape element {d!r}")
 
 
 def _is_one(e: Expr) -> bool:
