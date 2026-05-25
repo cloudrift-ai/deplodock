@@ -677,7 +677,8 @@ def _bind_inputs(compiled, module, example_args, example_kwargs):
 
     input_data: dict[str, np.ndarray] = {}
     for nid, tensor in zip(input_ids, flat_inputs, strict=True):
-        input_data[nid] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+        np_dtype = compiled.nodes[nid].output.dtype.np
+        input_data[nid] = tensor.detach().cpu().numpy().astype(np_dtype, copy=False)
 
     sources: dict[str, np.ndarray] = {}
     for path, tensor in module.named_parameters():
