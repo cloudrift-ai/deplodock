@@ -248,3 +248,74 @@ def test_cuda_symbolic_rmsnorm_traced_and_run():
             y_ref = torch.nn.functional.rms_norm(torch.from_numpy(x), (2048,), m.weight, eps=m.eps).numpy()
         assert y.shape == (1, s, 2048)
         np.testing.assert_allclose(y, y_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_make_dynamic_helper_rewrites_shapes_and_op_fields():
+    """``make_dynamic`` rewrites every ``Dim(value)`` in ``node.output.shape``
+    plus the ``shape`` field on ``ReshapeOp`` / ``SliceOp``. Mutates in place;
+    returns the graph for chaining."""
+    import torch
+
+    from deplodock.compiler.ir.frontend.ir import ReshapeOp
+    from deplodock.compiler.trace.dynamic import make_dynamic
+    from deplodock.compiler.trace.torch import trace_module
+
+    class Reshape1(torch.nn.Module):
+        def forward(self, x):
+            b, s, d = x.shape
+            return x.reshape(b, s, 4, d // 4)
+
+    graph = trace_module(Reshape1(), (torch.randn(1, 16, 128),))
+    out = make_dynamic(graph, "seq_len", 16)
+    assert out is graph
+    for node in graph.nodes.values():
+        assert Dim(16) not in node.output.shape, f"static 16 leaked into {node.output.shape}"
+        if isinstance(node.op, ReshapeOp):
+            assert 16 not in node.op.shape, f"static 16 leaked into ReshapeOp.shape {node.op.shape}"
+            assert "seq_len" in node.op.shape
+
+
+def test_cuda_symbolic_linear_traced_and_run():
+    """M6 validation: end-to-end on a real ``torch.nn.Linear`` traced from
+    torch — covers the matmul-on-symbolic-M code path (single compile, two
+    distinct runtime seq_lens, both within fp32 tolerance of eager)."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.ir.base import ConstantOp
+    from deplodock.compiler.loader.binder import apply_load_ops
+    from deplodock.compiler.trace.dynamic import make_dynamic
+    from deplodock.compiler.trace.torch import trace_module_with_constants
+
+    m = torch.nn.Linear(128, 256, bias=False)
+    graph, _ = trace_module_with_constants(m, (torch.randn(1, 16, 128),))
+    make_dynamic(graph, "seq_len", 16)
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+
+    # Constants take their post-fold shape — bind via ``apply_load_ops``
+    # against the original parameter so any tracer-side transpose flows in.
+    const_feed: dict[str, np.ndarray] = {}
+    for nid, node in compiled.nodes.items():
+        if not isinstance(node.op, ConstantOp):
+            continue
+        numel = 1
+        for d in node.output.shape:
+            numel *= d.as_static()
+        for key, p in m.named_parameters():
+            safe = "p_" + key.replace(".", "_")
+            if safe.endswith(node.op.name[2:]) and p.numel() == numel:
+                const_feed[nid] = apply_load_ops(p.detach().numpy().astype(np.float32), node.op.load_ops)
+                break
+
+    in_name = graph.inputs[0]
+    for s in (4, 16, 32):
+        x = np.random.RandomState(s).standard_normal((1, s, 128)).astype(np.float32)
+        result, _ = backend.run(compiled, input_data={in_name: x, **const_feed})
+        y = next(iter(result.outputs.values()))
+        with torch.no_grad():
+            ref = m(torch.from_numpy(x)).numpy()
+        assert y.shape == (1, s, 256)
+        np.testing.assert_allclose(y, ref, rtol=1e-4, atol=1e-4)

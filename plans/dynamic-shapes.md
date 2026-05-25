@@ -168,6 +168,16 @@ M4–M6 is where the bodies are buried: mask construction, reduce-axis loop coun
   symbolic K; ``mark_unroll`` returns a placeholder trip count so it declines to unroll runtime-bound loops.
   End-to-end validation: ``softmax_over_S`` and full causal ``SDPA_over_S`` both compile to a single set of
   cached kernels and run correctly at multiple seq_len values within fp32 tolerance. 1206 tests green.
+- **M6 — initial path landed.** ``compiler/trace/dynamic.py`` exposes ``make_dynamic(graph, name, value)``
+  which post-trace rewrites every ``Dim(value)`` in ``node.output.shape`` plus the ``shape`` field on
+  ``ReshapeOp`` / ``SliceOp`` to the symbolic ``Dim(name)``. The trace flow becomes a two-step recipe:
+  ``trace_module`` at a canonical seq_len, then ``make_dynamic`` to swap the dim. Validation tests cover
+  a real ``torch.nn.RMSNorm`` (1208 green; tested at seq_len 8, 32) and a real ``torch.nn.Linear``
+  matmul on symbolic M (tested at seq_len 4, 16, 32). The earlier M4 ``build_full_model_wrapper(dynamic=True)``
+  + ``build_causal_mask`` pair sits on top of this for HF whole-model use. Full TinyLlama whole-model with
+  RoPE / KV cache / generation-loop is the remaining stretch — the planner / codegen / launch path is
+  ready to receive it; the missing pieces are tracer coverage for permute+slice patterns in HF attention
+  blocks and a CLI ``--dynamic seq_len`` wrapping in ``deplodock compile`` / ``run``.
 
 ## Explicitly out of scope (v1)
 
