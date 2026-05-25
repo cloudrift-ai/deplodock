@@ -319,3 +319,54 @@ def test_cuda_symbolic_linear_traced_and_run():
             ref = m(torch.from_numpy(x)).numpy()
         assert y.shape == (1, s, 256)
         np.testing.assert_allclose(y, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_qwen_whole_model_dynamic_traces():
+    """End-to-end whole-model dynamic trace on Qwen2.5-7B (1 layer,
+    random weights so no checkpoint download). Exercises the CLI's
+    canonical whole-model invocation in test form: wrapper switches to
+    ``dynamic=True``, every seq_len-carrying axis (``input_ids:1``,
+    ``attention_mask:2``, ``attention_mask:3``, ``position_ids:1``) is
+    marked with the SAME ``Dim('seq_len')`` instance, and the trace
+    threads the symbolic dim through every downstream FX tensor.
+
+    Asserts the trace yields a graph whose internal tensors carry
+    ``Dim('seq_len')`` — full CUDA lowering of the whole model is the
+    next-stretch (int64 index-math kernels for embedding lookup are
+    still uncovered)."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from deplodock.compiler.trace.torch import trace_module
+
+    torch.manual_seed(0)
+    config = AutoConfig.from_pretrained("Qwen/Qwen2.5-7B")
+    config.num_hidden_layers = 1
+    model = AutoModelForCausalLM.from_config(config).float().eval()
+
+    seq_len_int = 32
+    dtype = torch.float32
+    wrapper = build_full_model_wrapper(model, seq_len_int, dtype, dynamic=True)
+    input_ids = torch.zeros((1, seq_len_int), dtype=torch.long)
+    attention_mask = build_causal_mask(seq_len_int, dtype)
+    position_ids = torch.arange(seq_len_int).unsqueeze(0)
+
+    seq_dim = _seq_len_dim()
+    dynamic_shapes = {
+        "input_ids": {1: seq_dim},
+        "attention_mask": {2: seq_dim, 3: seq_dim},
+        "position_ids": {1: seq_dim},
+    }
+    graph = trace_module(wrapper, (input_ids, attention_mask, position_ids), dynamic_shapes=dynamic_shapes)
+
+    symbolic_nodes = [nid for nid, n in graph.nodes.items() if Dim("seq_len") in n.output.shape]
+    assert len(symbolic_nodes) > 10, (
+        f"expected the seq_len symbol to propagate to most downstream tensors, got only {len(symbolic_nodes)} of {len(graph.nodes)}"
+    )
+    # The three runtime inputs all carry the symbolic dim at their declared positions.
+    inputs_by_name = {nid: graph.nodes[nid] for nid in graph.inputs}
+    for name in ("input_ids", "attention_mask", "position_ids"):
+        node = inputs_by_name.get(name)
+        assert node is not None, f"missing graph input {name!r}; got {list(inputs_by_name)}"
+        assert Dim("seq_len") in node.output.shape, f"{name} shape {node.output.shape} missing Dim('seq_len')"
