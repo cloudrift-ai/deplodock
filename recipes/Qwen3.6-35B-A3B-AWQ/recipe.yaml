@@ -9,15 +9,21 @@
 # 8 routed + 1 shared per token, expert intermediate 512). Weights are ~17.5 GB at AWQ
 # 4-bit (group_size=128); fits on one 32 GB V100 with ~10 GB headroom for KV + buffers.
 #
-# TP CHOICE: TP=1 on a single V100, not TP=4. Measured on the same 4xV100 PCIe-only
-# CloudRift VM (no NVLink/NVSwitch exposed in guest):
+# TP=1 on a single V100, not TP=4. Measured on the same 4xV100 PCIe-only CloudRift VM
+# (no NVLink/NVSwitch exposed in guest):
 #   TP=1: 11.6 ms TPOT (peak 87 tok/s decode), single-stream 39 tok/s sustained,
 #         median TTFT 8.6 s -- prefill is slow but steady-state decode is fastest.
 #   TP=4: 12.2 ms TPOT, single-stream 75 tok/s sustained, median TTFT 0.48 s --
 #         all-reduce floor across 4 GPUs costs ~5% per-token decode but speeds prefill 18x.
-# TP=1 wins on the operational dimension that matters most here: it runs on one GPU,
-# freeing the other 3 for other workloads or to drop the rented gpu_count to 1
-# (~4x cheaper). The prefill penalty only matters for long-prompt workloads.
+# TP=1 wins operationally: runs on one GPU, ~4x cheaper to rent. Prefill penalty only
+# matters for long-prompt workloads.
+#
+# CONCURRENCY=4 at context_length=32K: measured 214 tok/s sustained output (5.5x the
+# single-stream baseline) on the same hardware. KV pool at gpu_mem_util=0.88 holds
+# ~78K tokens -- handles four concurrent 1K-1K-token requests with massive headroom;
+# longer real prompts (verified up to 60K input single-stream at gpu_mem_util=0.92)
+# also fit but will queue under heavy concurrency. context_length is the advertised
+# max -- actual KV usage is per-request.
 
 model:
   # 1Cat's README quotes "tclf90/Qwen3.6-35B-A3B-AWQ" as the validated repo, but that
@@ -36,31 +42,26 @@ engine:
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.88
-    # 17.5 GB weights + activation buffers + 32K KV cache fits in 28 GB (0.88 * 32) on
-    # one V100; verified empirically. Don't lower max_num_batched_tokens below the
-    # extra_args value or KV pool shrinks further.
     context_length: 32768
-    max_concurrent_requests: 1
+    max_concurrent_requests: 4
     vllm:
       image: "cloudriftai/1cat-vllm-sm70:1.0.0"
-      # Same flags as the 27B recipe: 1Cat's README launch example, with auto tool
-      # choice + qwen3_coder tool parser + qwen3 reasoning parser. --max-num-seqs is
-      # set via max_concurrent_requests above (recipe schema forbids it here). The
-      # config declares quant_method="awq" so no --quantization needed. QuantTrio's
-      # checkpoint is multimodal (Qwen3_5MoeForConditionalGeneration); we accept the
-      # small VRAM cost of loading the vision tower since 1Cat-vLLM v1.0.0 has no
-      # --language-model-only flag.
-      extra_args: "--max-num-batched-tokens 16384 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+      # max-num-batched-tokens 4096 keeps activation buffers small enough that the KV
+      # pool stays ~7.5 GB / ~78K tokens at conc=4. Other flags: auto tool choice +
+      # qwen3_coder tool parser + qwen3 reasoning parser. --max-num-seqs comes from
+      # max_concurrent_requests above (schema forbids it here). The model config
+      # declares quant_method="awq" so no --quantization needed.
+      extra_args: "--max-num-batched-tokens 4096 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
       extra_env:
         VLLM_ATTENTION_BACKEND: "FLASH_ATTN_V100"
 
 benchmark:
-  # Single-stream, 8 prompts x 2000/2000 tokens. Matches the 27B dense run exactly so
-  # we can compare output_tok/s, TPOT, TTFT, ITL one-to-one on the same 4xV100 host.
-  max_concurrency: 1
-  num_prompts: 8
-  random_input_len: 2000
-  random_output_len: 2000
+  # Concurrency-4 workload: 32 prompts x 1000/1000 tokens. Enough for steady-state
+  # under 4 concurrent streams (~8 reqs per stream).
+  max_concurrency: 4
+  num_prompts: 32
+  random_input_len: 1000
+  random_output_len: 1000
 
 matrices:
   deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
