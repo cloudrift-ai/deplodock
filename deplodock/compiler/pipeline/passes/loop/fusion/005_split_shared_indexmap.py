@@ -39,7 +39,7 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Load, LoopOp, splice_loop_ops
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap, rename_write_output
+from deplodock.compiler.pipeline.passes.loop.fusion._helpers import has_data_dependent_load, is_pure_indexmap, rename_write_output
 
 PATTERN = [Pattern("producer", LoopOp)]
 
@@ -59,6 +59,11 @@ def rewrite(match: Match, producer: Node) -> Graph | None:
     graph = match.graph
     if not (isinstance(producer.op, LoopOp) and is_pure_indexmap(producer.op)):
         raise RuleSkipped("producer is not a pure-indexmap LoopOp")
+    if has_data_dependent_load(producer.op):
+        # A gather (``weight[(int)in0, ...]`` where ``in0 = load ids``) is
+        # pure-indexmap but the splicer can't carry its index SSA across a fuse —
+        # privatizing + folding would corrupt the gathered row. Leave it its own kernel.
+        raise RuleSkipped("producer has a data-dependent Load (gather) — not safe to fuse")
     if producer.id in graph.outputs:
         raise RuleSkipped("producer is a graph output — must stay materialized")
     consumers = sorted(graph.consumers(producer.id))

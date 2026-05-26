@@ -42,6 +42,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, splice_graph
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.loop.fusion._helpers import has_data_dependent_load as _has_data_dependent_load
 from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap as _is_pure_indexmap
 from deplodock.compiler.pipeline.passes.loop.fusion._helpers import rename_write_output as _rename_write_output
 
@@ -147,6 +148,14 @@ def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
     # can hoist — stay fuseable.
     if _reduce_heavy(producer.op) and _count_loads_from(consumer.op, producer.id) > 1:
         raise RuleSkipped("reduce-heavy producer feeds consumer through >1 Load — fusion would duplicate the reduce")
+
+    # Data-dependent producer (gather: ``weight[(int)in0, ...]`` where ``in0 =
+    # load ids``). The splicer doesn't carry SSA names used in a Load's *index*,
+    # so inlining drops the index-defining Load and the index name collides with
+    # a consumer SSA — silently corrupting the gathered row (e.g. the embedding
+    # reads a constant row instead of ``input_ids[pos]``). Leave it its own kernel.
+    if _has_data_dependent_load(producer.op):
+        raise RuleSkipped("producer has a data-dependent Load (gather) — splicer can't carry the index SSA across a fuse")
 
     # Build a subgraph: producer, consumer, and their non-producer external
     # inputs as InputOp nodes. ``splice_graph`` classifies each Load via the
