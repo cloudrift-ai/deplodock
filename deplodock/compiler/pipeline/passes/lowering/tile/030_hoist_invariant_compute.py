@@ -23,7 +23,7 @@ body contains:
 
 When (1)-(3) all hold, the cone is "hoistable".
 
-**Autotune fork.** ``FUSED_PIPELINE`` is a BOOL knob; both polarities
+**Autotune fork.** ``HOIST_COMPUTE`` is a BOOL knob; both polarities
 are emitted in fixed order whenever a cone is found:
 
 - ``False`` (greedy default) — pass-through. ``020_stage_inputs``
@@ -39,7 +39,7 @@ are emitted in fixed order whenever a cone is found:
   cooperative ``StridedLoop`` over the fused cache axes that runs the
   compute body once per cell.
 
-Idempotence: stamps ``FUSED_PIPELINE`` on every emitted variant so
+Idempotence: stamps ``HOIST_COMPUTE`` on every emitted variant so
 re-entry self-skips.
 """
 
@@ -63,8 +63,8 @@ from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
-FUSED_PIPELINE = Knob(
-    "FUSED_PIPELINE",
+HOIST_COMPUTE = Knob(
+    "HOIST_COMPUTE",
     KnobType.BOOL,
     hints=(False, True),
     help=(
@@ -77,7 +77,7 @@ FUSED_PIPELINE = Knob(
 
 
 def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
-    if FUSED_PIPELINE.name in root.op.knobs:
+    if HOIST_COMPUTE.name in root.op.knobs:
         raise RuleSkipped("hoist_invariant_compute already applied (idempotence via knob)")
 
     target = _find_first_cone_target(root.op.body)
@@ -85,14 +85,14 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         raise RuleSkipped("no multi-source Stage with a hoistable cone")
 
     variants: list[TileOp] = []
-    for polarity in FUSED_PIPELINE.narrow((False, True)):
+    for polarity in HOIST_COMPUTE.narrow((False, True)):
         if polarity:
             new_body = _apply_hoist(root.op.body, target)
         else:
             new_body = root.op.body
-        variants.append(TileOp(body=new_body, name=root.op.name, knobs={**root.op.knobs, FUSED_PIPELINE.name: polarity}))
+        variants.append(TileOp(body=new_body, name=root.op.name, knobs={**root.op.knobs, HOIST_COMPUTE.name: polarity}))
     if not variants:
-        raise RuleSkipped("FUSED_PIPELINE env pin produced no matching variants")
+        raise RuleSkipped("HOIST_COMPUTE env pin produced no matching variants")
     return variants
 
 
@@ -371,4 +371,4 @@ def _build_hoisted_replacement(target: _ConeTarget) -> StageBundle:
     )
 
 
-__all__ = ["FUSED_PIPELINE", "PATTERN", "rewrite"]
+__all__ = ["HOIST_COMPUTE", "PATTERN", "rewrite"]
