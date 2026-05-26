@@ -1,0 +1,73 @@
+# Qwen3.6-35B-A3B-AWQ on 4x V100 SXM3 32GB (sm_70 Volta).
+#
+# Engine: 1Cat-vLLM fork (https://github.com/1CatAI/1Cat-vLLM). 1Cat's README explicitly
+# validates Qwen3.6-35B-A3B-AWQ on 4xV100 TP4 as its "stable public default for MoE"
+# reference. Their launch flags (max-model-len 262144, max-num-seqs 1, FLASH_ATTN_V100,
+# tp=4, gpu-mem 0.88) inform this recipe. Like the 27B dense recipe, we use our
+# cloudriftai/1cat-vllm-sm70 rebuild of v1.0.0 wheels with the gcc / _DEFAULT_MAX_TOKENS
+# / FLASH_ATTN_V100 patches.
+#
+# This is the MoE A3B variant: 35B total params, ~3B active per token (256 experts,
+# 8 routed + 1 shared per token, expert intermediate 512). Unlike a dense model of the
+# same total size, decode latency should be dominated by 3B-equivalent compute plus
+# expert-routing all-to-all overhead, not by the full 35B weight matmul. On PCIe-only
+# V100s (no NVLink on this VM) the all-reduce/all-to-all penalty may eat the active-param
+# win -- this benchmark exists to measure exactly that.
+#
+# KNOWN RISK: this model is MoE *with* shared experts (config.json shows
+# shared_expert_intermediate_size=512). 1Cat's SharedFusedMoE on SM70 had a
+# `sm70_hidden_logical_size` bug that prevented the 122B-A10B variant from loading.
+# We don't know yet whether the 35B-A3B hits the same path. If it crashes with that
+# error, leave this recipe parked with a KNOWN ISSUE block alongside the 122B one.
+
+model:
+  # 1Cat's README quotes "tclf90/Qwen3.6-35B-A3B-AWQ" as the validated repo, but that
+  # one returns 401 on HF (gated/removed, as of May 2026 -- same fate as their 27B
+  # reference). cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit carries the `compressed-tensors` tag,
+  # and prior 27B runs showed cyankiwi's compressed-tensors path hits a
+  # `Min capability: 75. Current capability: 70` gate inside compressed-tensors --
+  # 1Cat's SM70 patches only cover the vanilla AWQ path. QuantTrio's build uses real
+  # `quant_method="awq"`, group_size=128, bits=4, gemm version, with shared_expert /
+  # mlp.gate / linear_attn / visual in modules_to_not_convert. That AWQ path matches
+  # what 1Cat patched for Volta.
+  huggingface: "QuantTrio/Qwen3.6-35B-A3B-AWQ"
+
+engine:
+  llm:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.88
+    # 1Cat's recommended setup uses 262144; we cap at 32768 to keep KV cache budget
+    # tractable on PCIe-only all-reduce (no NVLink on this CloudRift VM, PHB only)
+    # and to keep the benchmark wall-clock inside the 45 min cap. Same choice as the
+    # 27B recipe for apples-to-apples comparison.
+    context_length: 32768
+    # Single-stream to match the 27B dense baseline (51.61 tok/s output, 17.48 ms
+    # TPOT, 1700 ms median TTFT). With only 3B active params per token, decode TPOT
+    # should drop noticeably vs 27B dense -- unless PCIe all-reduce/all-to-all
+    # dominates, in which case parity or worse means interconnect is the bottleneck.
+    max_concurrent_requests: 1
+    vllm:
+      image: "cloudriftai/1cat-vllm-sm70:1.0.0"
+      # Same flags as the 27B recipe: 1Cat's README launch example, with auto tool
+      # choice + qwen3_coder tool parser + qwen3 reasoning parser. --max-num-seqs is
+      # set via max_concurrent_requests above (recipe schema forbids it here). The
+      # config declares quant_method="awq" so no --quantization needed. QuantTrio's
+      # checkpoint is multimodal (Qwen3_5MoeForConditionalGeneration); we accept the
+      # small VRAM cost of loading the vision tower since 1Cat-vLLM v1.0.0 has no
+      # --language-model-only flag.
+      extra_args: "--max-num-batched-tokens 16384 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+      extra_env:
+        VLLM_ATTENTION_BACKEND: "FLASH_ATTN_V100"
+
+benchmark:
+  # Single-stream, 8 prompts x 2000/2000 tokens. Matches the 27B dense run exactly so
+  # we can compare output_tok/s, TPOT, TTFT, ITL one-to-one on the same 4xV100 host.
+  max_concurrency: 1
+  num_prompts: 8
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
+  deploy.gpu_count: 4
