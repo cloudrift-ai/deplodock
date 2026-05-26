@@ -212,6 +212,16 @@ The machinery `pipeline/passes/loop/fusion/010_merge_loop_ops.py` calls to
 splice adjacent `LoopOp` pairs. `Sigma` (from `ir/sigma.py`) is the
 axis-substitution bookkeeping threaded through the merge.
 
+`splice_graph` derives splice edges as `(node_id, node_id)` — it **assumes a
+producer LoopOp's sole `Write.output` buf is its node id** (the buf-name ==
+node-id invariant the whole graph maintains). A rule that emits a LoopOp whose
+`Write.output` doesn't match its node id silently breaks every later fold of
+that node: the edge points at a Write that doesn't exist, so the splicer raises
+`_NotSupported` and the node survives as its own kernel. Rules that rename a
+node must rename its body `Write.output` to match (`fusion/_helpers.py::rename_write_output`).
+Every `_NotSupported` carries a reason string, logged at DEBUG by `splice_loops`
+— `compile -vv` shows which pattern a rejected edge hit.
+
 ### `loop/interpret.py` — numpy interpreter
 
 `execute_loop_op(loop, input_arrays, out_shape) → ndarray` walks the

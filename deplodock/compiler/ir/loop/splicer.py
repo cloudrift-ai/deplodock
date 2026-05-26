@@ -77,7 +77,13 @@ logger = logging.getLogger(__name__)
 
 
 class _NotSupported(Exception):
-    """Pattern not handled — caller converts to ``None`` return."""
+    """Pattern not handled — caller converts to ``None`` return.
+
+    Always raised with a human-readable reason: ``splice_loops`` logs
+    ``type(exc).__name__: <reason>`` at DEBUG, so ``compile -vv`` shows
+    *which* unsupported pattern a given producer→consumer edge hit (σ-solve
+    failure, missing Write, scope shortfall, …) without re-instrumenting the
+    splicer."""
 
 
 # Unified binding key: ``(origin, name, emit_scope, sigma.restrict(enclosing))``.
@@ -285,7 +291,7 @@ class _Splicer(LoopBuilder):
         """
         meta = self.loops[origin]
         if name not in meta.defs:
-            raise _NotSupported
+            raise _NotSupported(f"_ensure_dep: {name!r} is not defined in loop {origin!r}")
 
         required_axes = tuple(_remap_axis_name(a, sigma) for a in meta.scopes[name].enclosing)
         emit_scope = _scope_for_axes(ref_scope, required_axes)
@@ -321,7 +327,7 @@ class _Splicer(LoopBuilder):
         elif isinstance(stmt, (Assign, Select)):
             self._resolve_plain(stmt, d)
         else:
-            raise _NotSupported
+            raise _NotSupported(f"_resolve: unsupported stmt type {type(stmt).__name__} for {d.name!r} in loop {d.origin!r}")
 
     def _resolve_plain(self, stmt: Stmt, d: _Demand) -> None:
         """Generic Assign / Select emission — rewrite the stmt with fresh args
@@ -345,11 +351,14 @@ class _Splicer(LoopBuilder):
         target = self.loops[target_tag]
         target_write = next((w for w, _ in target.writes if w.output == target_output_buf), None)
         if target_write is None:
-            raise _NotSupported
+            raise _NotSupported(
+                f"splice edge into {target_tag!r}: no Write with output={target_output_buf!r} "
+                f"(target writes {[w.output for w, _ in target.writes]}) — usually a buf-name != node-id mismatch on the producer"
+            )
         effective_index = tuple(d.sigma.apply(e) for e in stmt.index)
         sigma = _solve_sigma(target_write.index, effective_index, {a.name for a in target.op.axes})
         if sigma is None:
-            raise _NotSupported
+            raise _NotSupported(f"σ-solve failed pairing target write index {target_write.index} against reader index {effective_index}")
         v_bound = self._ensure_dep(target_write.value, target_tag, sigma, d.demand_scope)
         self.insert(Assign(name=d.bound_as, op="copy", args=(v_bound,)), d.demand_scope)
 
@@ -391,7 +400,7 @@ def _scope_for_axes(ref_scope: Scope, required: tuple[str, ...]) -> Scope:
         remaining.discard(names[k])
         k += 1
     if remaining:
-        raise _NotSupported
+        raise _NotSupported(f"emit scope {names} is missing required axes {sorted(remaining)}")
     return Scope(enclosing=ref_scope.enclosing[:k])
 
 
@@ -420,7 +429,7 @@ def _remap_axis_name(axis: Axis, sigma: Sigma) -> str:
     vars_in_target = target.free_vars()
     if len(vars_in_target) == 1:
         return next(iter(vars_in_target))
-    raise _NotSupported
+    raise _NotSupported(f"axis {axis.name!r} σ-maps to a multi-variable target {target.pretty()} (vars {sorted(vars_in_target)})")
 
 
 def _solve_sigma(

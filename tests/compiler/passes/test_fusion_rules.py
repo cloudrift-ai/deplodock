@@ -433,3 +433,158 @@ def test_softmax_has_both_accumulators():
 def test_softmax_single_kernel_correctness():
     x = rng.standard_normal((4, 8)).astype(np.float32)
     _assert_correctness(_make_softmax, {"x": x})
+
+
+# ===================================================================
+# Split shared (multi-consumer) index-map fan-out (005) so merge inlines it.
+#
+# A pure-indexmap LoopOp (broadcast / transpose) that fans out to ≥2
+# consumers is never absorbed by ``merge_loop_ops`` (the match-walker only
+# extends single-consumer edges). ``005_split_shared_indexmap`` peels each
+# consumer onto a private copy so every edge becomes single-consumer and
+# merge folds them — leaving no pure-indexmap copy kernel behind.
+# ===================================================================
+
+
+def _is_pure_indexmap(op: LoopOp) -> bool:
+    return not any(isinstance(s, (Assign, Accum)) for s in op.body.iter())
+
+
+def _pure_indexmap_kernels(graph: Graph) -> list:
+    return [n for n in _kernel_nodes(graph) if _is_pure_indexmap(n.op)]
+
+
+def _loads_from(op: LoopOp) -> set[str]:
+    return {ld.input for ld in op.body.loads}
+
+
+def _split_only(graph: Graph) -> Graph:
+    """Run lifting + the split rule alone (no merge) — the in-isolation view."""
+    return Pipeline.build(
+        ["loop/lifting", "loop/fusion"],
+        select={"lift_elementwise", "lift_reduce", "lift_indexmap", "lift_gather", "split_shared_indexmap"},
+    ).run(graph)
+
+
+def _make_shared_const_broadcast():
+    """A scalar ``const_bc(1.0)`` broadcast feeding two elementwise consumers —
+    the headline case: torch.export folds attention-mask / RoPE scaffolding to
+    scalar broadcasts that fan out (Qwen3 GQA query + key paths)."""
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    g.add_node(InputOp(), [], Tensor("y", (4, 8)), node_id="y")
+    bc = const_bc(g, name="one", value=1.0, target_shape=(4, 8), dtype="f32")
+    g.add_node(ElementwiseOp("multiply"), ["x", bc.id], Tensor("c1", (4, 8)), node_id="c1")
+    g.add_node(ElementwiseOp("add"), ["y", bc.id], Tensor("c2", (4, 8)), node_id="c2")
+    g.inputs, g.outputs = ["x", "y"], ["c1", "c2"]
+    return g
+
+
+def test_shared_const_broadcast_no_pure_indexmap_remains():
+    """After fusion the shared constant broadcast is gone — no pure-indexmap copy kernel."""
+    result = _fuse(_make_shared_const_broadcast())
+    assert _pure_indexmap_kernels(result) == []
+
+
+def test_shared_const_broadcast_consumers_load_constant_directly():
+    """Both consumers Load the ``ConstantOp`` (``one``) directly — the broadcast
+    folded in, so the cuda literal-inline path can stamp ``float x = 1.0f;``."""
+    result = _fuse(_make_shared_const_broadcast())
+    kernels = _kernel_nodes(result)
+    assert len(kernels) == 2, f"expected 2 consumer kernels, got {len(kernels)}"
+    for k in kernels:
+        assert "one" in _loads_from(k.op), f"{k.id} does not load the constant directly: {_loads_from(k.op)}"
+
+
+def test_shared_const_broadcast_correctness():
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    y = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_shared_const_broadcast, {"x": x, "y": y})
+
+
+def test_shared_const_broadcast_split_in_isolation():
+    """Split rule alone (no merge): the shared producer is un-shared into
+    single-consumer copies — one private duplicate plus the original, each
+    now read by exactly one consumer."""
+    result = _split_only(_make_shared_const_broadcast())
+    pure = _pure_indexmap_kernels(result)
+    assert len(pure) == 2, f"expected 2 single-consumer broadcast copies, got {len(pure)}"
+    for n in pure:
+        assert len(result.consumers(n.id)) == 1, f"{n.id} still shared: {result.consumers(n.id)}"
+
+
+def _make_shared_transpose():
+    """A transpose (general layout op) feeding two elementwise consumers —
+    covers the non-constant pure-indexmap path."""
+    from deplodock.compiler.ir.expr import placeholder
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import single_indexmap
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    # out[i, j] = x[j, i] — transpose (4, 8) -> (8, 4).
+    t = single_indexmap(g, "x", out_shape=(8, 4), coord_map=(placeholder(1), placeholder(0)), name="xt")
+    g.add_node(ElementwiseOp("exp"), [t.id], Tensor("c1", (8, 4)), node_id="c1")
+    g.add_node(ElementwiseOp("negative"), [t.id], Tensor("c2", (8, 4)), node_id="c2")
+    g.inputs, g.outputs = ["x"], ["c1", "c2"]
+    return g
+
+
+def test_shared_transpose_no_pure_indexmap_remains():
+    result = _fuse(_make_shared_transpose())
+    assert _pure_indexmap_kernels(result) == []
+
+
+def test_shared_transpose_consumers_index_source_directly():
+    """Both consumers read the transpose's source (``x``) directly — the layout
+    op folded into each as lazy per-consumer indexing."""
+    result = _fuse(_make_shared_transpose())
+    kernels = _kernel_nodes(result)
+    assert len(kernels) == 2, f"expected 2 consumer kernels, got {len(kernels)}"
+    for k in kernels:
+        assert "x" in _loads_from(k.op), f"{k.id} does not load the source directly: {_loads_from(k.op)}"
+
+
+def test_shared_transpose_correctness():
+    x = rng.standard_normal((4, 8)).astype(np.float32)
+    _assert_correctness(_make_shared_transpose, {"x": x})
+
+
+def _make_shared_broadcast_chain():
+    """A scalar broadcast (shared) feeding two *further* broadcasts that each feed
+    a downstream multiply — mirrors the full-model RoPE/mask shape:
+    ``scalar -> [1,1,4,8] (shared) -> {[1,3,4,8], [1,2,4,8]} -> multiply``.
+
+    The intermediate broadcasts are the regression trigger: lifting gives each a
+    node id (``lift_<id>``) that differs from its output Tensor name, so when the
+    split rule peels one onto a private copy it MUST rename the new node's
+    ``Write.output`` to its new id. Forgetting that leaves the node writing the
+    old buf — ``splice_graph`` (which assumes Write.output == node id) then can't
+    fold it into the downstream multiply, and a pure-indexmap copy survives."""
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("mq", (1, 3, 4, 8)), node_id="mq")
+    g.add_node(InputOp(), [], Tensor("mk", (1, 2, 4, 8)), node_id="mk")
+    shared = const_bc(g, name="zero", value=0.0, target_shape=(1, 1, 4, 8), dtype="f32")
+    bq = broadcast_to(g, shared.id, (1, 3, 4, 8))
+    bk = broadcast_to(g, shared.id, (1, 2, 4, 8))
+    g.add_node(ElementwiseOp("multiply"), ["mq", bq.id], Tensor("fq", (1, 3, 4, 8)), node_id="fq")
+    g.add_node(ElementwiseOp("multiply"), ["mk", bk.id], Tensor("fk", (1, 2, 4, 8)), node_id="fk")
+    g.inputs, g.outputs = ["mq", "mk"], ["fq", "fk"]
+    return g
+
+
+def test_shared_broadcast_chain_no_pure_indexmap_remains():
+    """Regression: the intermediate broadcasts (node id != output name) must fully
+    fold — no pure-indexmap copy left writing a stale buf."""
+    result = _fuse(_make_shared_broadcast_chain())
+    assert _pure_indexmap_kernels(result) == []
+
+
+def test_shared_broadcast_chain_correctness():
+    mq = rng.standard_normal((1, 3, 4, 8)).astype(np.float32)
+    mk = rng.standard_normal((1, 2, 4, 8)).astype(np.float32)
+    _assert_correctness(_make_shared_broadcast_chain, {"mq": mq, "mk": mk})
