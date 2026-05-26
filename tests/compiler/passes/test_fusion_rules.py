@@ -15,7 +15,7 @@ from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
 from deplodock.compiler.pipeline import Pipeline
 
 rng = np.random.default_rng(0)
@@ -550,6 +550,50 @@ def test_shared_transpose_consumers_index_source_directly():
 def test_shared_transpose_correctness():
     x = rng.standard_normal((4, 8)).astype(np.float32)
     _assert_correctness(_make_shared_transpose, {"x": x})
+
+
+# ===================================================================
+# Data-dependent (gather) producer fused into a multi-read reduce.
+#
+# A gather lowers to ``in1 = load w[(int)in0, h]`` where ``in0 = load idx`` — a
+# Load whose *index* reads SSA ``in0``. When the gather output feeds an
+# RMSNorm-like consumer that reads it at two scopes (the variance reduce + the
+# normalize), each read inlines the gather and its ``load idx``. Deduping the
+# duplicate ``load idx`` must rewire the surviving gather's *index* reference,
+# or the second read's index dangles and the canonical renamer collapses it into
+# a self-referential Load (``in4 = load w[(int)in4]``) — silently reading a
+# constant row instead of ``idx[pos]``. ``Load.deps()`` reporting index SSA +
+# ``dedup_loads`` rewiring kept Loads' indices is what makes this correct.
+# ===================================================================
+
+
+def _make_gather_into_reduce():
+    from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+
+    V, H, S = 16, 8, 4
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("w", (V, H)), node_id="w")
+    g.add_node(InputOp(), [], Tensor("idx", (1, S)), node_id="idx")
+    g.add_node(GatherOp(axis=0), ["w", "idx"], Tensor("emb", (1, S, H)), node_id="emb")
+    # RMSNorm-like: variance reduce reads emb, normalize reads emb again.
+    g.add_node(ElementwiseOp("multiply"), ["emb", "emb"], Tensor("sq", (1, S, H)), node_id="sq")
+    g.add_node(ReduceOp("sum", -1), ["sq"], Tensor("red", (1, S, 1)), node_id="red")
+    g.add_node(ElementwiseOp("multiply"), ["emb", broadcast_to(g, "red", (1, S, H))], Tensor("out", (1, S, H)), node_id="out")
+    g.inputs, g.outputs = ["w", "idx"], ["out"]
+    return g
+
+
+def test_gather_into_reduce_no_pure_indexmap():
+    """The gather fuses into its consumers — no standalone copy kernel survives
+    (it would, if the data-dependent index couldn't be carried across the fuse)."""
+    result = _fuse(_make_gather_into_reduce())
+    assert _pure_indexmap_kernels(result) == []
+
+
+def test_gather_into_reduce_correctness():
+    w = rng.standard_normal((16, 8)).astype(np.float32)
+    idx = rng.integers(0, 16, size=(1, 4)).astype(np.float32)
+    _assert_correctness(_make_gather_into_reduce, {"w": w, "idx": idx})
 
 
 def _make_shared_broadcast_chain():
