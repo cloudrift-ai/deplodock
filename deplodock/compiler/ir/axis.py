@@ -41,11 +41,22 @@ class Axis:
     of name-suffix convention. Equality and hashing exclude ``source_axis``
     so Var-rename invariance is preserved — two Axes with the same name
     and extent are the same axis regardless of where they came from.
+
+    ``real_extent`` is the original static N (or M) extent BEFORE ceil-div
+    rounding for masked tiles. Set on the block axis (``*_b``) by the
+    partition planner when the underlying source axis has no divisor in
+    ``_TUNE_AXIS_CHOICES``: the ``extent`` becomes ``ceil_div(real, BN·FN)``
+    so the grid covers a partial last tile, and ``real_extent`` carries
+    the bound used to gate boundary lanes. Materializer emits
+    ``if (decoded_src_coord < real_extent) { ... }`` around the per-thread
+    body. Excluded from equality / hashing for the same Var-rename-invariance
+    reason as ``source_axis``.
     """
 
     name: str
     extent: Dim
     source_axis: Axis | None = field(default=None, compare=False, hash=False)
+    real_extent: int | None = field(default=None, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.extent, Dim):
