@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from typing import Literal as _Lit
 
 from deplodock.compiler.dtype import DataType
@@ -104,7 +105,7 @@ SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
 # for cp.async, or ``MbarrierWait(mbar, phase, slot)`` for TMA.
 
 
-@dataclass
+@dataclass(frozen=True)
 class AsyncWait(Stmt):
     """Explicit wait carrier for pipelined async / TMA schedules.
 
@@ -434,7 +435,7 @@ def _render_tile_bracket(
 #   semantics are derived: ``is_reduce`` iff the body contains ``Accum``.
 
 
-@dataclass
+@dataclass(frozen=True)
 class ParallelTile(Stmt):
     """Abstract base for tile flavors that bind a parallel axis tuple.
 
@@ -448,7 +449,7 @@ class ParallelTile(Stmt):
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
-            self.body = Body(self.body)
+            object.__setattr__(self, "body", Body(self.body))
 
     def nested(self) -> tuple[Body, ...]:
         return (self.body,)
@@ -481,7 +482,7 @@ class ParallelTile(Stmt):
         return _render_tile_bracket(indent, for_lines, self._pretty_label(), self.body)
 
 
-@dataclass
+@dataclass(frozen=True)
 class GridTile(ParallelTile):
     """CTA-grid parallel tile. Axes lift to ``blockIdx`` (row-major).
 
@@ -507,7 +508,7 @@ class GridTile(ParallelTile):
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class ThreadTile(ParallelTile):
     """Thread-parallel tile. Axes lift to ``threadIdx`` (row-major flatten).
 
@@ -557,7 +558,7 @@ class ThreadTile(ParallelTile):
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class RegisterTile(ParallelTile):
     """Per-thread register-cell tile. Body replicated F× per axis by 006a.
 
@@ -576,7 +577,7 @@ class RegisterTile(ParallelTile):
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class SerialTileBase(Stmt):
     """Abstract base for serial-iteration tile flavors. One axis, one body."""
 
@@ -585,7 +586,7 @@ class SerialTileBase(Stmt):
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
-            self.body = Body(self.body)
+            object.__setattr__(self, "body", Body(self.body))
 
     def nested(self) -> tuple[Body, ...]:
         return (self.body,)
@@ -602,7 +603,7 @@ class SerialTileBase(Stmt):
         return any(isinstance(s, Accum) for s in self.body)
 
 
-@dataclass
+@dataclass(frozen=True)
 class SerialTile(SerialTileBase):
     """Sequential iteration over ``axis``. Replaces ``Loop``.
 
@@ -665,7 +666,7 @@ class SerialTile(SerialTileBase):
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class StridedTile(SerialTileBase):
     """Strided serial iteration: ``for (axis = start; axis < extent; axis += step)``.
 
@@ -789,7 +790,7 @@ class SwizzleMode(enum.Enum):
     B128 = "B128"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Stage(Stmt):
     """Cooperative-staging unit: one or more ``Source`` entries plus an
     optional cooperative ``compute`` template.
@@ -821,7 +822,7 @@ class Stage(Stmt):
         if not self.sources:
             raise ValueError("Stage: requires at least one Source")
         if self.compute is not None and not isinstance(self.compute, Body):
-            self.compute = Body.coerce(self.compute)
+            object.__setattr__(self, "compute", Body.coerce(self.compute))
 
     def nested(self) -> tuple[Body, ...]:
         return (self.compute,) if self.compute is not None else ()
@@ -882,7 +883,7 @@ class Stage(Stmt):
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class StageBundle(Stmt):
     """Single-policy group of cooperative ``Stage`` members sharing one
     consumer ``body``.
@@ -928,7 +929,7 @@ class StageBundle(Stmt):
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
-            self.body = Body.coerce(self.body)
+            object.__setattr__(self, "body", Body.coerce(self.body))
         if not self.stages:
             raise ValueError("StageBundle: requires at least one Stage")
         for s in self.stages:
@@ -1024,6 +1025,78 @@ class StageBundle(Stmt):
 # ---------------------------------------------------------------------------
 
 
+def score_tile_geometry(
+    *,
+    thread_extents: list[int],
+    block_extents: list[int],
+    knobs: dict,
+    has_stages: bool,
+    coalescing_inner_extent: int,
+) -> float:
+    """Pure-formula scoring shared by :meth:`TileOp.score` and the partition
+    planner. Takes the launch-geometry summary the score depends on (already
+    resolved to static ints, symbolic axes substituted as 1) plus the knob
+    bundle, so the planner can score un-materialized ``TileParams`` against
+    the same yardstick a fully-built ``TileOp`` would use.
+
+    ``coalescing_inner_extent`` is the summed extent of thread axes that
+    appear in any Write's inner-stride dim (0 when none align)."""
+    from math import prod  # noqa: PLC0415
+
+    target_threads = 256
+    target_ctas = 256
+    score = 0.0
+    if not thread_extents:
+        return 0.0
+    threads = prod(thread_extents)
+    ctas = prod(block_extents) if block_extents else 1
+
+    if "FM" in knobs:
+        final_threads = threads
+        cells = max(1, int(knobs.get("FM", 1)) * int(knobs.get("FN", 1)))
+    elif threads >= 1024:
+        final_threads = target_threads
+        cells = max(1, threads // target_threads)
+    else:
+        final_threads = threads
+        cells = 1
+
+    if final_threads < 32:
+        score -= 2.0
+    elif final_threads > 1024:
+        score -= 2.0
+    else:
+        distance = abs(final_threads - target_threads)
+        multiplier = 2.0 if (cells < 16 and "FM" in knobs) else 1.0
+        score -= min(distance / target_threads * multiplier, 2.0)
+
+    if cells == 1:
+        score -= 1.0
+    elif cells > 64:
+        score -= min((cells - 64) / 64.0, 1.0)
+
+    if ctas < target_ctas:
+        score -= (target_ctas - ctas) / target_ctas
+    elif ctas <= 2048:
+        score += 0.5
+    else:
+        score -= min((ctas - 2048) / 4096.0, 2.5)
+
+    splitk = int(knobs.get("SPLITK", 1))
+    if splitk > 4:
+        score -= min((splitk - 4) / 4.0, 1.0)
+
+    if has_stages:
+        score += 1.0
+    if "FM" in knobs:
+        score += 1.0
+
+    if coalescing_inner_extent > 0:
+        score += min(coalescing_inner_extent / 32, 1.0)
+
+    return score
+
+
 @dataclass
 class TileOp(BodyOp):
     """One GPU kernel as a Tile IR program — pre-materialization.
@@ -1100,98 +1173,173 @@ class TileOp(BodyOp):
         return threads <= ctx.max_threads_per_cta
 
     def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
-        from math import prod  # noqa: PLC0415
+        return self._cached_score
 
+    @cached_property
+    def _cached_score(self) -> float:
+        """Cached score — ``score(ctx)`` delegates here. ``ctx`` is unused
+        by the formula today (see :meth:`score`'s ARG002 noqa), so the
+        value is a pure function of ``self`` and is safe to memoize:
+        ``self.body`` is frozen after ``__post_init__`` (it's a ``Body``
+        which is a ``tuple[Stmt, ...]`` subclass, every Stmt is itself
+        a frozen dataclass), and ``self.knobs`` is set by
+        ``Candidate.apply`` BEFORE the op is installed on the graph
+        node — so by the time anyone reads ``score`` the inputs are
+        stable.
+
+        Why this matters: ``Candidate.score`` (the MCTS prior) walks
+        every node in the graph and calls ``op.score(ctx)``. Sibling
+        ``SearchNode``s share the same inner ``Candidate``, so the same
+        TileOp instance is scored from every sibling's ``inner.score()``
+        call. Without this cache each TileOp re-walked its body for
+        coalescing analysis on every visit; on Qwen3 0.6B with ~150
+        TileOps in the graph that was the dominant tune-mode cost.
+        """
         from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
 
-        target_threads = 256
-        target_ctas = 256
-        score = 0.0
         block_axes, thread_axes = self._launch_geometry()
         if not thread_axes and not block_axes:
             return 0.0
-
-        # Symbolic axes (Dim("seq_len")) substitute 1 for scoring — the value is
-        # the same across every variant of this LoopOp so it doesn't affect ranking.
         thread_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in thread_axes]
         block_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in block_axes]
         if not thread_extents:
             return 0.0
+        has_stages = any(isinstance(s, _Stage) for s in self.body.iter())
+        return score_tile_geometry(
+            thread_extents=thread_extents,
+            block_extents=block_extents,
+            knobs=self.knobs,
+            has_stages=has_stages,
+            coalescing_inner_extent=self._coalescing_inner_extent(thread_axes),
+        )
 
-        threads = prod(thread_extents)
-        ctas = prod(block_extents) if block_extents else 1
+    @staticmethod
+    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004
+        """Lazy scorer (see :meth:`Op.lazy_score`). Returns ``None`` unless
+        called with both ``shapes`` (a :class:`KernelShape` from the
+        partition planner) and ``params`` (a :class:`TileParams` variant).
+        Computes the same value :meth:`score` would on the materialized
+        TileOp, but without running ``_build_split_body`` or
+        ``TileOp.__post_init__`` — lets the planner rank dozens of
+        variants per LoopOp in microseconds instead of milliseconds each.
 
-        if "FM" in self.knobs:
-            final_threads = threads
-            cells = max(1, int(self.knobs.get("FM", 1)) * int(self.knobs.get("FN", 1)))
-        elif threads >= 1024:
-            final_threads = target_threads
-            cells = max(1, threads // target_threads)
+        Launch geometry the planner will produce (mirrors ``_wrap_tower``):
+            - block axes: ``[K_s?, M_b?, N_b]`` with extents
+              ``[SPLITK, ceil(E_M/(BM·FM)), ceil(E_N/(BN·FN))]``
+            - thread axes: ``[K_c?, M_t?, N_t]`` with extents
+              ``[BR, BM, BN]``
+
+        Symbolic outer M/N axes contribute extent 1 to the block-extent
+        product (matches what :meth:`score` does with non-static
+        ``Axis.extent``).
+        """
+        if shapes is None or params is None:
+            return None
+        # Lazy-import to avoid circulars (KernelShape / TileParams live in
+        # the planner module, which depends on this IR module).
+        shape = shapes
+        p = params
+
+        m_symbolic = shape.outer_m is not None and not shape.outer_m.axis.extent.is_static
+        n_symbolic = not shape.outer_n.axis.extent.is_static
+
+        thread_extents: list[int] = []
+        if p.br > 1:
+            thread_extents.append(p.br)
+        if shape.outer_m is not None:
+            thread_extents.append(p.bm)
+        thread_extents.append(p.bn)
+
+        block_extents: list[int] = []
+        if p.splitk > 1:
+            block_extents.append(p.splitk)
+        if shape.outer_m is not None:
+            if m_symbolic:
+                block_extents.append(1)
+            else:
+                E_M = shape.outer_m.axis.extent.as_static()
+                block_extents.append(max(1, E_M // (p.bm * p.fm)))
+        if n_symbolic:
+            block_extents.append(1)
         else:
-            final_threads = threads
-            cells = 1
+            E_N = shape.outer_n.axis.extent.as_static()
+            block_extents.append(max(1, E_N // (p.bn * p.fn)))
 
-        if final_threads < 32:
-            score -= 2.0
-        elif final_threads > 1024:
-            score -= 2.0
-        else:
-            distance = abs(final_threads - target_threads)
-            multiplier = 2.0 if (cells < 16 and "FM" in self.knobs) else 1.0
-            score -= min(distance / target_threads * multiplier, 2.0)
+        # Planner always stamps FM/FN — score keys off ``"FM" in knobs``.
+        score_knobs = {"FM": p.fm, "FN": p.fn, "SPLITK": p.splitk}
 
-        if cells == 1:
-            score -= 1.0
-        elif cells > 64:
-            score -= min((cells - 64) / 64.0, 1.0)
+        # Stages are added by later passes (020_stage_inputs); the planner's
+        # output never contains them at this point.
+        has_stages = False
 
-        if ctas < target_ctas:
-            score -= (target_ctas - ctas) / target_ctas
-        elif ctas <= 2048:
-            score += 0.5
-        else:
-            score -= min((ctas - 2048) / 4096.0, 2.5)
+        coalescing = TileOp._coalescing_inner_extent_from_writes(shape, p)
 
-        splitk = int(self.knobs.get("SPLITK", 1))
-        # SPLITK > 4 pays a real atomicAdd contention cost on top of the
-        # cross-CTA reduction tax; SPLITK=2/4 is usually enough.
-        if splitk > 4:
-            score -= min((splitk - 4) / 4.0, 1.0)
+        return score_tile_geometry(
+            thread_extents=thread_extents,
+            block_extents=block_extents,
+            knobs=score_knobs,
+            has_stages=has_stages,
+            coalescing_inner_extent=coalescing,
+        )
 
-        if any(isinstance(s, _Stage) for s in self.body.iter()):
-            score += 1.0
-        if "FM" in self.knobs:
-            score += 1.0
+    @staticmethod
+    def _coalescing_inner_extent_from_writes(shape, params) -> int:
+        """Mirror of :meth:`_coalescing_inner_extent` computed against the
+        un-rewritten LoopOp body. σ_outer keeps the outer M/N axis names
+        on the eventual thread tiles (M_t inherits ``outer_m.axis.name``,
+        N_t inherits ``outer_n.axis.name``, K_c inherits ``k_loop.axis.name``),
+        so the inner-stride free-var match works the same way before and
+        after body construction.
 
-        score += self._coalescing_bonus(thread_axes)
+        Size-1 thread axes are skipped — ``normalize_body`` inlines them
+        out of the materialized body, so they don't appear in the post-
+        materialization ``thread_axes`` ``_coalescing_inner_extent``
+        iterates. Mirroring that here keeps the lazy score consistent
+        with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
+        """
+        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
 
-        return score
+        thread_extent: dict[str, int] = {}
+        if params.br > 1 and shape.k_loop is not None:
+            thread_extent[shape.k_loop.axis.name] = params.br
+        if shape.outer_m is not None and params.bm > 1:
+            thread_extent[shape.outer_m.axis.name] = params.bm
+        if params.bn > 1:
+            thread_extent[shape.outer_n.axis.name] = params.bn
+        if not thread_extent:
+            return 0
 
-    def _coalescing_bonus(self, thread_axes) -> float:
-        """Reward tile shapes whose thread axes align with the innermost
-        output-write dimension (the coalesced-stride axis).
+        best = 0
+        for stmt in shape.outer_n.body.iter():
+            if not isinstance(stmt, Write) or not stmt.index:
+                continue
+            inner_vars = set(stmt.index[-1].free_vars())
+            matched = inner_vars & thread_extent.keys()
+            if not matched:
+                continue
+            extent = sum(thread_extent[name] for name in matched)
+            if extent > best:
+                best = extent
+        return best
 
-        For each top-level ``Write`` in the body, look at the **last**
-        index expression — that's the inner-stride dim of the output
-        buffer. Count how many thread-axis Vars appear free in it, sum
-        their extents, and turn that into a bonus capped at +1.0.
+    def _coalescing_inner_extent(self, thread_axes) -> int:
+        """Sum the extents of thread axes that appear in the inner-stride
+        dim of any top-level ``Write`` in the body. Feeds the coalescing
+        term in :func:`score_tile_geometry`.
 
-        Why this matters: empirically, two variants with identical
-        ``cells × threads × ctas`` can differ 2x in measured latency
-        purely because one parks its threads along the M (outer-stride)
-        output axis and the other parks them along N (inner-stride).
-        The N-major variant gets coalesced gmem loads on the matmul B
-        operand and coalesced store on the output; the M-major one
-        strides B by ``N`` per thread. The four base score terms
-        (threads, cells, ctas, splitk) can't distinguish them — this
-        bonus does.
+        Why this matters: two variants with identical ``cells × threads
+        × ctas`` can differ 2x in measured latency purely because one
+        parks its threads along the M (outer-stride) output axis and
+        the other along N (inner-stride). The N-major variant coalesces
+        gmem loads + the output store; the M-major one strides by N
+        per thread. The four base score terms can't distinguish them.
         """
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
 
         if not thread_axes:
-            return 0.0
+            return 0
         thread_names = {ax.name for ax in thread_axes}
-        best_inner_extent = 0
+        best = 0
         for stmt in self.body.iter():
             if not isinstance(stmt, Write) or not stmt.index:
                 continue
@@ -1199,17 +1347,10 @@ class TileOp(BodyOp):
             matched = inner_vars & thread_names
             if not matched:
                 continue
-            extent_in_inner = sum((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes if ax.name in matched)
-            if extent_in_inner > best_inner_extent:
-                best_inner_extent = extent_in_inner
-        if best_inner_extent <= 0:
-            return 0.0
-        # Bonus saturates at warp-size alignment: an inner-dim thread
-        # extent of ≥ 32 already gives full coalescing; anything past
-        # that has no marginal coalescing gain. Cap the reward so the
-        # term doesn't dominate the threads/cells/ctas signals.
-        warp = 32
-        return min(best_inner_extent / warp, 1.0)
+            extent = sum((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes if ax.name in matched)
+            if extent > best:
+                best = extent
+        return best
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1406,7 @@ __all__ = [
     "Stmt",
     # Top-level
     "TileOp",
+    "score_tile_geometry",
     # Scheduling constants
     "BLOCK_SIZE",
     # Re-exports

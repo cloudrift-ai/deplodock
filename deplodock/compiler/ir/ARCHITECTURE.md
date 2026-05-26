@@ -49,6 +49,20 @@ keep working unchanged. `source` is excluded from
 `Graph.structural_key` and from `op_cache_key` — kernels rendered
 along different lowering paths still dedup in the tuning cache.
 
+**Stmt subclasses are `@dataclass(frozen=True)`** — every concrete Loop-IR
+/ Tile-IR / Kernel-IR statement (`Loop`, `Cond`, leaves, `GridTile`,
+`ThreadTile`, `Stage`, `StageBundle`, `Smem`, `Sync`, `CpAsyncCopy`,
+`TmaDescriptor`, …) is immutable + hashable. `Body` is a `tuple[Stmt, ...]`
+subclass, so a full body tree hashes structurally end-to-end. This makes
+`Body.structural_key()` and any other bodies-as-cache-keys path work
+without a try/except fallback for unhashable stmts. To "edit" a frozen
+Stmt, return a fresh instance via `dataclasses.replace(stmt, field=value)`;
+`__post_init__` coercions use `object.__setattr__`. Ops, by contrast,
+are NOT frozen — the engine mutates `op.source` / `op.knobs` / `op.inputs` /
+`op.outputs` post-construction. Op fields stored inside Stmts (e.g.
+`Assign.op`) must be lightweight value objects (e.g. `ElementwiseImpl`,
+not `ElementwiseOp`) so the surrounding Stmt's hashability isn't poisoned.
+
 ## `base.py`
 
 Cross-cutting root. Imported by every dialect, imports nothing from

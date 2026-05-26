@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.stmt.base import Stmt
@@ -458,11 +458,20 @@ class Body(tuple[Stmt, ...]):
 
     @cached_property
     def _cached_structural_key(self) -> str:
-        from deplodock.compiler.ir.stmt.base import pretty_body  # noqa: PLC0415
-        from deplodock.compiler.ir.stmt.normalize import normalize_body  # noqa: PLC0415
-
-        normalized = normalize_body(self, hoist=False, canonical_buffers=True, cluster_ops=True)
-        return "\n".join(pretty_body(normalized))
+        # Delegates to a module-level lru_cache keyed by Body content
+        # (Body is ``tuple[Stmt, ...]`` and every Stmt subclass is a
+        # frozen dataclass, so the cache key is structural). Two
+        # different Body instances with identical stmts now share the
+        # one ``normalize_body`` call — matters in tune mode where
+        # ``_record_op_inventory`` walks the source chain of every
+        # CudaOp in every terminal and hammers ``op_cache_key`` ->
+        # ``Body.structural_key()`` on bodies that frequently recur
+        # structurally across variants. The cache is safe because
+        # ``structural_key`` always normalizes with the same fixed flag
+        # combination (``hoist=False, canonical_buffers=True,
+        # cluster_ops=True``); generic ``normalize_body`` callers with
+        # other flags do not share this cache.
+        return _shared_structural_key(self)
 
     @cached_property
     def coordination(self) -> Coordination:
@@ -543,6 +552,34 @@ class Body(tuple[Stmt, ...]):
             _write_atomic_axes=atomic_by_id,
             _write_broadcast_axes=broadcast_by_id,
         )
+
+
+@lru_cache(maxsize=4096)
+def _shared_structural_key(body: Body) -> str:
+    """Module-level memoization for :meth:`Body.structural_key`.
+
+    The structural-key formula is fixed: ``normalize_body(body,
+    hoist=False, canonical_buffers=True, cluster_ops=True)`` joined as
+    pretty-printed text. With every concrete ``Stmt`` subclass a frozen
+    dataclass and ``Body`` a ``tuple[Stmt, ...]`` subclass, equal-content
+    bodies hash equal — so two structurally identical Body instances
+    share one normalize+pretty walk through this cache. Tune mode hits
+    this hard from ``_record_op_inventory`` (one ``op_cache_key`` call
+    per ancestor in every CudaOp's source chain, per terminal candidate).
+
+    The cache is sound because the flag combination is hard-coded here.
+    Generic :func:`normalize_body` callers with other flags don't share
+    this cache — ``cluster_ops=True`` collapses semantically distinct ops
+    to a single cluster representative (``add``↔``sub``, ``div``↔``mod``,
+    …), which is the right canonicalization for structural-equivalence
+    queries but would be a *correctness bug* for any callsite running
+    the normalized body.
+    """
+    from deplodock.compiler.ir.stmt.base import pretty_body  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt.normalize import normalize_body  # noqa: PLC0415
+
+    normalized = normalize_body(body, hoist=False, canonical_buffers=True, cluster_ops=True)
+    return "\n".join(pretty_body(normalized))
 
 
 @dataclass(frozen=True)

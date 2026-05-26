@@ -166,7 +166,7 @@ class KernelShape:
     variant of a single kernel: the output axis Loops (innermost-N, optional
     M, extra outer chain), the K reduce Loop (None for pointwise), and the
     set of axis names ``_replace_k_loops`` should rewrite (collected once
-    upfront by ``_split_kernel_fully`` instead of re-classified per variant).
+    upfront by ``_plan_kernel`` instead of re-classified per variant).
     """
 
     outer_n: Loop
@@ -180,6 +180,27 @@ class KernelShape:
     prologue: tuple[Stmt, ...] = ()
 
 
+@dataclass(frozen=True)
+class _Plan:
+    """Cheap-to-build planning state shared across every variant of one
+    LoopOp. Holds the inputs ``_materialize`` needs to build any single
+    TileOp on demand: the per-LoopOp ``shape``, the leading non-Loop body
+    stmts, the LoopOp's carry-forward knobs, the rendered kernel name, and
+    the enumerated ``TileParams`` sorted by score. The planner runs every
+    classification + enumeration step once and stops short of body
+    construction — ``_materialize(plan, params)`` runs the expensive
+    ``_build_split_body`` + ``TileOp.__post_init__`` work for one
+    variant only, called lazily from the chosen Fork leaf's ``expand``.
+    """
+
+    shape: KernelShape
+    leading: tuple[Stmt, ...]
+    base_knobs: dict
+    kernel_name: str
+    loop_op: LoopOp
+    params: tuple[TileParams, ...]
+
+
 def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | Fork | list[Fork]:
     """Emit a hierarchical Fork tree over knob bundles:
     ``BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
@@ -190,27 +211,42 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | Fork | list[For
     Fork wrappers — most matmul kernels have BR fixed at 1 so they
     actually emit a 3-level tree.
 
-    Each branch Fork's ``score`` is the max ``TileOp.score(ctx)`` of any
-    leaf reachable under it — the planner-side equivalent of the max-Q
-    propagation MCTS does on measured rewards. Siblings at each level
-    are sorted by score descending so the highest-scoring branch is
-    option-0 (the greedy primary, the +∞-tiebreak winner)."""
+    Variant *materialization* (``_build_split_body`` + ``TileOp(...)``
+    which runs the body-normalize pipeline) is deferred to the leaf
+    Fork's ``expand`` thunk, so greedy compile only builds the one
+    chosen variant per LoopOp. ``_plan_kernel`` runs the cheap up-front
+    classification + enumeration and produces a ``_Plan`` with bare
+    ``TileParams`` tuples; sibling sorting uses :meth:`TileOp.lazy_score`
+    (mirrors :meth:`TileOp.score`) so the ordering matches what the
+    fully-built TileOps would have produced."""
     loop_op: LoopOp = root.op
     kernel_name = _kernel_name_for(loop_op, root.id)
     # Idempotence is structural: once the planner has built a TileOp, the
     # rule pattern (LoopOp) no longer matches.
-    variants = _split_kernel_fully(loop_op, ctx, kernel_name=kernel_name)
-    if variants is None:
+    plan = _plan_kernel(loop_op, ctx, kernel_name=kernel_name)
+    if plan is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
-    if len(variants) == 1:
-        return variants[0]
+    if len(plan.params) == 1:
+        return _materialize(plan, plan.params[0])
 
-    return _build_fork_tree(variants, ctx)
+    return _build_fork_tree_lazy(plan, ctx)
 
 
-def _build_fork_tree(variants: list[TileOp], ctx: Context) -> Fork | list[Fork]:
-    """Convert a flat ``list[TileOp]`` into the hierarchical Fork tree.
+def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
+    """Score one variant from the plan + params. Prefers
+    :meth:`TileOp.lazy_score` (cheap, params/shape-only) and falls back to
+    materializing + :meth:`TileOp.score` if a future TileOp drops its lazy
+    implementation. Lets the planner rank siblings before paying the
+    body-construction cost."""
+    lazy = TileOp.lazy_score(ctx, shapes=plan.shape, params=params)
+    if lazy is not None:
+        return lazy
+    return _materialize(plan, params).score(ctx)
+
+
+def _build_fork_tree_lazy(plan: _Plan, ctx: Context) -> Fork | list[Fork]:
+    """Convert ``plan.params`` into the hierarchical Fork tree.
 
     Grouping order (outermost first): BR → (BM,BN) → (FM,FN) → (BK,SPLITK).
     A level is skipped (Fork wrapper omitted) when every variant in the
@@ -218,46 +254,50 @@ def _build_fork_tree(variants: list[TileOp], ctx: Context) -> Fork | list[Fork]:
     common case (all variants have BR=1) doesn't add a useless 1-child
     Fork layer.
 
-    **Sibling ordering** is by max-propagated ``TileOp.score`` descending:
-    option-0 at each level is the branch containing the best-scoring
-    reachable leaf. ``TileOp.score`` is the single source of truth for
-    both greedy primary selection AND the MCTS prior — keep them aligned
-    so a high-score variant the search will exploit later is also the
-    one greedy picks today.
+    **Sibling ordering** is by max-propagated :func:`_score_variant`
+    descending — same yardstick :meth:`TileOp.score` would use post-
+    materialization, routed through :meth:`TileOp.lazy_score` (the lazy
+    cousin of ``score`` exposed on the Op base) so we don't have to
+    build every TileOp just to rank them. Leaf Fork ``expand`` thunks
+    defer ``_materialize(plan, params)`` until the search actually
+    resolves that leaf — greedy compile only fires one per LoopOp.
 
     Returns a single ``Fork`` when the top-level group collapses to one
     branch (engine still routes through the fork-spawn path since
     ``isinstance(option, Fork)``), otherwise the ``list[Fork]`` of
     siblings.
     """
-    leaf_score: dict[int, float] = {id(v): float(v.score(ctx)) for v in variants}
+    leaf_score: dict[int, float] = {id(p): _score_variant(plan, p, ctx) for p in plan.params}
 
     def _sorted(forks: list[Fork]) -> list[Fork]:
         return sorted(forks, key=lambda f: -f.score)
 
-    def _leaf_forks(group: list[TileOp]) -> list[Fork]:
+    def _leaf_forks(group: list[TileParams]) -> list[Fork]:
         out = [
             Fork(
-                knobs={BK.name: v.knobs[BK.name], SPLITK.name: v.knobs[SPLITK.name]},
-                expand=(lambda op=v: [op]),
-                score=leaf_score[id(v)],
+                knobs={BK.name: p.bk, SPLITK.name: p.splitk},
+                expand=(lambda p=p: [_materialize(plan, p)]),
+                score=leaf_score[id(p)],
                 is_leaf=True,
             )
-            for v in group
+            for p in group
         ]
         return _sorted(out)
 
     def _group_level(
-        group: list[TileOp],
+        group: list[TileParams],
         knob_names: tuple[str, ...],
+        knob_getters: tuple,
         child_builder,
     ) -> list[Fork]:
         """Build sibling Forks for one level, keyed by ``knob_names``,
-        sorted by max-propagated score descending."""
-        keyed: dict[tuple, list[TileOp]] = {}
-        for v in group:
-            key = tuple(v.knobs[n] for n in knob_names)
-            keyed.setdefault(key, []).append(v)
+        sorted by max-propagated score descending. ``knob_getters`` reads
+        the matching field off ``TileParams`` (the planner's source of
+        truth pre-materialization)."""
+        keyed: dict[tuple, list[TileParams]] = {}
+        for p in group:
+            key = tuple(g(p) for g in knob_getters)
+            keyed.setdefault(key, []).append(p)
         if len(keyed) == 1:
             return child_builder(next(iter(keyed.values())))
         siblings: list[Fork] = []
@@ -275,16 +315,16 @@ def _build_fork_tree(variants: list[TileOp], ctx: Context) -> Fork | list[Fork]:
             )
         return _sorted(siblings)
 
-    def _fmfn_level(group: list[TileOp]) -> list[Fork]:
-        return _group_level(group, (FM.name, FN.name), _leaf_forks)
+    def _fmfn_level(group: list[TileParams]) -> list[Fork]:
+        return _group_level(group, (FM.name, FN.name), (lambda p: p.fm, lambda p: p.fn), _leaf_forks)
 
-    def _bmbn_level(group: list[TileOp]) -> list[Fork]:
-        return _group_level(group, (BM.name, BN.name), _fmfn_level)
+    def _bmbn_level(group: list[TileParams]) -> list[Fork]:
+        return _group_level(group, (BM.name, BN.name), (lambda p: p.bm, lambda p: p.bn), _fmfn_level)
 
-    def _br_level(group: list[TileOp]) -> list[Fork]:
-        return _group_level(group, (BR.name,), _bmbn_level)
+    def _br_level(group: list[TileParams]) -> list[Fork]:
+        return _group_level(group, (BR.name,), (lambda p: p.br,), _bmbn_level)
 
-    top = _br_level(variants)
+    top = _br_level(list(plan.params))
     if len(top) == 1:
         return top[0]
     return top
@@ -638,8 +678,13 @@ def _gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) ->
     return reduce_part + (cond,)
 
 
-def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> list[TileOp] | None:
-    """Unified σ-split for matmul, pointwise, and cooperative-reduce kernels.
+def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> _Plan | None:
+    """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
+    kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
+    candidate ``TileParams`` but doesn't materialize any TileOp — the
+    expensive ``_build_split_body`` + ``TileOp.__post_init__`` work is
+    deferred to :func:`_materialize`, invoked from the chosen Fork leaf's
+    ``expand`` thunk in :func:`_build_fork_tree_lazy`.
 
     Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
     Accum) picks the matmul knob set; any other reduce with extent ≥ warp_size
@@ -807,25 +852,47 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         prologue=prologue,
     )
     leading, _ = _split_leading_non_loops(loop_op.body)
-    variants: list[TileOp] = []
-    for params in param_combos:
-        try:
-            chain_body = _build_split_body(shape, params)
-        except _BuildSkipped:
-            continue
-        new_body = leading + chain_body
-        knobs = {
-            **loop_op.knobs,
-            BN.name: params.bn,
-            BM.name: params.bm,
-            FM.name: params.fm,
-            FN.name: params.fn,
-            BK.name: params.bk,
-            SPLITK.name: params.splitk,
-            BR.name: params.br,
-        }
-        variants.append(TileOp(body=new_body, name=kernel_name, knobs=knobs))
-    return variants or None
+    if not param_combos:
+        return None
+    return _Plan(
+        shape=shape,
+        leading=leading,
+        base_knobs=dict(loop_op.knobs),
+        kernel_name=kernel_name,
+        loop_op=loop_op,
+        params=tuple(param_combos),
+    )
+
+
+def _materialize(plan: _Plan, params: TileParams) -> TileOp:
+    """Build one ``TileOp`` for a single ``TileParams`` against the
+    planner's pre-computed shape. The expensive bits — ``_build_split_body``
+    and ``TileOp.__post_init__`` (which runs ``normalize_body`` over the
+    fresh body) — happen here, lazily, from the chosen Fork leaf's
+    ``expand`` thunk.
+
+    ``_BuildSkipped`` is shape-determined (raised only when
+    ``_replace_k_loops`` can't find any K-axis Loops in the body, which
+    depends on ``shape.target_names`` matching the body's axis names, not
+    on params). If it ever fires here, the shape was misclassified at
+    plan time — the assertion surfaces the bug instead of silently
+    dropping a leaf.
+    """
+    try:
+        chain_body = _build_split_body(plan.shape, params)
+    except _BuildSkipped as exc:
+        raise AssertionError(f"shape-level _BuildSkipped fired at materialize time for kernel {plan.kernel_name!r}: {exc}") from exc
+    knobs = {
+        **plan.base_knobs,
+        BN.name: params.bn,
+        BM.name: params.bm,
+        FM.name: params.fm,
+        FN.name: params.fn,
+        BK.name: params.bk,
+        SPLITK.name: params.splitk,
+        BR.name: params.br,
+    }
+    return TileOp(body=plan.leading + chain_body, name=plan.kernel_name, knobs=knobs)
 
 
 def _priority_matmul(p: TileParams) -> tuple[int, ...]:
