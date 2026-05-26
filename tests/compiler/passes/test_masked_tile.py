@@ -183,3 +183,80 @@ def test_resolve_symbolic_falls_back_to_hint_without_inputs():
     )
     # No input_data → fall back to the hint.
     assert _resolve_symbolic(compiled, {}) == {"seq_len": DEFAULT_SEQ_HINT}
+
+
+def _n_write_index(tile_op):
+    """Return the N-column index Expr of the matmul output Write (the last
+    dim of the 2D output ``o[m, n]``), or None."""
+    for w in tile_op.body.iter_of_type(Write):
+        if w.output == "o" and len(w.index) == 2:
+            return w.index[-1]
+    return None
+
+
+def _tile_axis_names(tile_op, tile_cls):
+    """Axis names carried by every ``tile_cls`` (ThreadTile / RegisterTile)
+    in the body. ``normalize_body`` renames the planner's ``*_t`` / ``*_r``
+    axes to ``aN``, so identify them structurally by tile flavor rather than
+    by name suffix."""
+    return {ax.name for stmt in tile_op.body.iter() if isinstance(stmt, tile_cls) for ax in stmt.axes if isinstance(ax, Axis)}
+
+
+def _n_decode_coeffs(tile_op):
+    """Return ``(thread_coeff, register_coeff)`` of the N-column Write index —
+    the stride applied to the N ThreadTile axis and N RegisterTile axis. The
+    M tile axes don't appear in the N column (coeff 0), so passing all tile
+    axes is safe. ``None`` for an axis that's been inlined (extent 1)."""
+    from deplodock.compiler.ir.expr import affine_form
+
+    n_idx = _n_write_index(tile_op)
+    assert n_idx is not None, "no 2D matmul output Write found"
+    t_names = _tile_axis_names(tile_op, ThreadTile)
+    r_names = _tile_axis_names(tile_op, RegisterTile)
+    af = affine_form(n_idx, t_names | r_names)
+    assert af is not None, f"N index not affine in tile axes: {n_idx.pretty()}"
+    _, coeffs = af
+    t_coeff = next((coeffs[n] for n in t_names if n in coeffs), None)
+    r_coeff = next((coeffs[n] for n in r_names if n in coeffs), None)
+    return t_coeff, r_coeff
+
+
+def test_masked_n_uses_interleaved_thread_minor_decode(recording_dump):
+    """A masked (non-divisor) N tile must decode thread-minor: the N register
+    cell strides by BN so consecutive threads map to consecutive columns
+    (coalesced global weight loads). Regression guard for the lm_head
+    1024→vocab projection (94 ms → 3.5 ms). Shape picked so BN≠FN — otherwise
+    blocked and interleaved share the same coefficient and can't be told
+    apart."""
+    g = Graph()
+    _input(g, "a", (32, 256))
+    _input(g, "b", (256, 8191))  # N=8191: no divisor → masked; planner picks BN=256, FN=8
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (32, 8191)), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    t_coeff, r_coeff = _n_decode_coeffs(tile_op)
+    # Interleaved: thread axis is the minor one (coeff 1), register strides by BN.
+    assert t_coeff == 1, f"masked N should be thread-minor (thread coeff 1), got t={t_coeff} r={r_coeff}"
+    assert r_coeff is not None and r_coeff > 1, f"register cell should stride by BN>1, got t={t_coeff} r={r_coeff}"
+
+
+def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
+    """A clean-divisor N tile keeps the blocked (thread-major) decode so a
+    thread's FN cells stay contiguous (vectorizable / smem-conflict-free):
+    the N register cell is the minor axis (coeff 1)."""
+    g = Graph()
+    _input(g, "a", (32, 256))
+    _input(g, "b", (256, 8192))  # N=8192: clean divisor → not masked
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (32, 8192)), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    t_coeff, r_coeff = _n_decode_coeffs(tile_op)
+    # Blocked: the register cell is the minor axis (coeff 1); the thread axis
+    # carries the FN stride. (If FN==1 the register axis inlines away → None.)
+    if r_coeff is not None:
+        assert r_coeff == 1, f"clean N should be thread-major (register coeff 1), got t={t_coeff} r={r_coeff}"
+        assert t_coeff is not None and t_coeff > 1, f"thread axis should stride by FN>1, got t={t_coeff} r={r_coeff}"
