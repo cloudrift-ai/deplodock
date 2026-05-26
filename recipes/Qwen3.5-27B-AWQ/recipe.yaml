@@ -1,0 +1,61 @@
+# Qwen3.5-27B-AWQ on 4x V100 SXM3 32GB (sm_70 Volta).
+#
+# Engine: 1Cat-vLLM fork (https://github.com/1CatAI/1Cat-vLLM) -- mainline vLLM and SGLang
+# have dropped sm_70 and lack AWQ kernels patched for Volta. The 1Cat-vLLM fork integrates
+# lmdeploy TurboMind SM70 WMMA kernels + FLASH_ATTN_V100 and explicitly validates this
+# exact model on 4xV100 TP4 in its README (incremental decode TPS: 86.31 short-context,
+# 79.04 at 8k context). 1CatAI does not publish a Docker image; cloudriftai/1cat-vllm-sm70
+# is our rebuild from their v1.0.0 wheels with three required patches (gcc for Triton JIT,
+# `_DEFAULT_MAX_TOKENS` import rename, FLASH_ATTN_V100 backend selection).
+#
+# 27B is a dense (non-MoE) model, so it avoids the SharedFusedMoE.sm70_hidden_logical_size
+# bug that prevents the 122B-A10B variant from loading on Volta. Weights ~14 GB; would
+# fit on one V100 but TP=4 matches the published 1Cat benchmark.
+
+model:
+  # 1Cat-vLLM's README quotes "tclf90/Qwen3.5-27B-AWQ" as the validated repo, but that
+  # one has been removed from HF (404 as of May 2026). cyankiwi/Qwen3.5-27B-AWQ-4bit uses
+  # quant_method="compressed-tensors" with mixed 4/8-bit groups, and the DeltaNet linear
+  # attention path hits a `Min capability: 75. Current capability: 70` gate inside
+  # compressed-tensors -- 1Cat's SM70 patches only cover the vanilla AWQ path. QuantTrio's
+  # build uses real `quant_method="awq"`, group_size=128, dense 27B with Gated DeltaNet
+  # + Gated Attention. That AWQ path is the one 1Cat patched for Volta.
+  huggingface: "QuantTrio/Qwen3.5-27B-AWQ"
+
+engine:
+  llm:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.88
+    # 1Cat's recommended setup uses 262144; we cap at 32768 to keep KV cache budget
+    # tractable on PCIe-only all-reduce (no NVLink on this CloudRift VM, PHB only)
+    # and to keep the benchmark wall-clock inside the 45 min cap. This still matches
+    # 1Cat's "short-context decode" regime that produced the 86.31 tok/s number.
+    context_length: 32768
+    # 1Cat's published 86.31 tok/s benchmark is incremental-decode at max-num-seqs=1
+    # (single-stream). Matching that here so we have an apples-to-apples comparison.
+    max_concurrent_requests: 1
+    vllm:
+      image: "cloudriftai/1cat-vllm-sm70:1.0.0"
+      # Per 1Cat README's Qwen3.5-27B-AWQ launch example. The config declares
+      # quant_method="awq" so we don't need --quantization on the command line; the
+      # TurboMind SM70 WMMA path picks it up. This is a multimodal checkpoint
+      # (Qwen3_5ForConditionalGeneration); we accept the small VRAM cost of loading the
+      # vision tower since 1Cat-vLLM v1.0.0 has no --language-model-only flag and
+      # threading --limit-mm-per-prompt JSON through compose is fiddly. --max-num-seqs
+      # is set via max_concurrent_requests above (recipe schema forbids it here).
+      extra_args: "--max-num-batched-tokens 16384 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+      extra_env:
+        VLLM_ATTENTION_BACKEND: "FLASH_ATTN_V100"
+
+benchmark:
+  # Single-stream to match 1Cat's published 86.31 tok/s incremental-decode number.
+  # 8 prompts x 2000 tokens at ~86 tok/s = ~3 min wall-clock, leaves time for load + teardown.
+  max_concurrency: 1
+  num_prompts: 8
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
+  deploy.gpu_count: 4

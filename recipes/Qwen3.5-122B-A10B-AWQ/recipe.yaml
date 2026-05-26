@@ -1,0 +1,47 @@
+# Qwen3.5-122B-A10B-AWQ on 4x V100 SXM3 32GB (sm_70 Volta).
+#
+# Engine: 1Cat-vLLM fork (https://github.com/1CatAI/1Cat-vLLM) -- mainline vLLM and SGLang
+# have dropped sm_70 and lack AWQ kernels patched for Volta. The 1Cat-vLLM fork integrates
+# lmdeploy TurboMind SM70 WMMA kernels + FLASH_ATTN_V100 and explicitly validates this
+# exact model on 4xV100 TP4. 1CatAI does not publish a Docker image; cloudriftai/1cat-vllm-sm70
+# is our rebuild from their v1.0.0 wheels with three required patches (gcc for Triton JIT,
+# `_DEFAULT_MAX_TOKENS` import rename, FLASH_ATTN_V100 backend selection).
+#
+# KNOWN ISSUE: this recipe does not currently complete engine init on V100. 1Cat-vLLM v1.0.0's
+# `SharedFusedMoE` codepath is missing `sm70_hidden_logical_size` on shared-expert layers,
+# which fires during `profile_run` after weights load. Patching it is multi-hour work in
+# vLLM internals. Recipe is kept for when the fork ships a fix; for now use the 27B sibling.
+#
+# Per the 1Cat-vLLM README's launch example for this exact model:
+#   --max-model-len 262144  --max-num-seqs 1  --max-num-batched-tokens 8096
+# We start more conservatively (max-model-len 32768) because PCIe-only all-reduce on this
+# host (no NVLink/NVSwitch -- PHB only) limits KV cache budget and concurrent throughput.
+
+model:
+  # Qwen did not publish an AWQ for 122B; cyankiwi's 4-bit AWQ is the most-downloaded
+  # community quant (60k+ downloads, group_size=32, pack-quantized int4). Matches the
+  # Qwen3.5-122B-A10B-AWQ model class that 1Cat-vLLM v1.0.0 explicitly supports.
+  huggingface: "cyankiwi/Qwen3.5-122B-A10B-AWQ-4bit"
+
+engine:
+  llm:
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.88
+    context_length: 32768
+    max_concurrent_requests: 4
+    vllm:
+      image: "cloudriftai/1cat-vllm-sm70:1.0.0"
+      extra_args: "--max-num-batched-tokens 8192 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+      extra_env:
+        VLLM_ATTENTION_BACKEND: "FLASH_ATTN_V100"
+
+benchmark:
+  max_concurrency: 4
+  num_prompts: 16
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
+  deploy.gpu_count: 4
