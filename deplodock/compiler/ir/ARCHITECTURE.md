@@ -113,7 +113,7 @@ iteration axes. Free vs reduce is inferred from body structure — a
 
 | Symbol                       | Role                                                                                                              |
 |------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| `Axis`                       | Named iteration variable (`name`, `extent`). Defined in `ir/axis.py`, re-exported here.                           |
+| `Axis`                       | Named iteration variable (`name`, `extent`). Defined in `ir/axis.py`, re-exported here. Carries optional `source_axis` (pre-split origin) and `real_extent` (pre-ceil-div bound for masked tiles — block axis covers `ceil_div(real_extent, BN·FN)`; materializer reads it to gate boundary lanes). Both excluded from equality / hashing. |
 | `LoopOp`                     | One kernel. Stored field: `body` (nested `Loop` tree). Computed: `axes`, `loads`, `accums`.                       |
 | `Load`                       | Body-form external read: `name = load(input)[index...]`. `input` matches the producing graph node's id.           |
 | `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseImpl`.                                                      |

@@ -277,7 +277,9 @@ def _unify_siblings(body: Body) -> Body:
             continue
         loop = stmts[idx]
         assert isinstance(loop, Loop)
-        new_axis = Axis(name=canonical, extent=extent)
+        # Preserve source_axis / real_extent across the rename so masked-tile
+        # axes don't lose their pre-ceil-div bound.
+        new_axis = Axis(name=canonical, extent=extent, source_axis=loop.axis.source_axis, real_extent=loop.axis.real_extent)
         sub = Sigma({loop.axis.name: Var(canonical)})
         rename_axis = _make_axis_renamer(loop.axis.name, new_axis)
         renamed = tuple(s.rewrite(_identity_rename, sub, rename_axis) for s in loop.body)
@@ -848,7 +850,11 @@ def rename_ssa_sequential(stmts: Body) -> Body:
 
     def axis_fn(a: Axis) -> Axis:
         new = axis_rename.get(a.name, a.name)
-        return Axis(name=new, extent=a.extent) if new != a.name else a
+        if new == a.name:
+            return a
+        # Preserve source_axis / real_extent so masked-tile metadata
+        # survives the SSA rename pass.
+        return Axis(name=new, extent=a.extent, source_axis=a.source_axis, real_extent=a.real_extent)
 
     return tuple(s.rewrite(rename_ssa, sigma, axis_fn) for s in stmts)
 

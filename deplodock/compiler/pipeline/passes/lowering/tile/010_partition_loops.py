@@ -76,7 +76,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Loop, Stmt, StridedLoop, Write
@@ -142,7 +142,13 @@ def _planner_pin_set() -> bool:
 class TileParams:
     """One ``(BN, BM, FM, FN, BK, SPLITK, BR)`` variant. Frozen for de-dup in
     the cartesian's ``seen`` set; ``br=1`` default keeps matmul / pointwise
-    sites terse."""
+    sites terse.
+
+    ``overhang`` lists output-axis names admitted at a non-divisor BN/BM
+    (masked tiles). Empty for clean-divisor variants. The planner stamps the
+    same tuple onto the emitted ``TileOp.knobs["OVERHANG"]`` so downstream
+    passes (staging, materialization) can guard cooperative loads.
+    """
 
     bn: int
     bm: int
@@ -151,6 +157,7 @@ class TileParams:
     bk: int
     splitk: int
     br: int = 1
+    overhang: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -722,7 +729,16 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
         has_nonlinear_epilogue = _has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
-        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="matmul", force_splitk_one=force_splitk_one)
+        param_combos = _enumerate_cartesian(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=E_K,
+            ctx=ctx,
+            priority_mode="matmul",
+            force_splitk_one=force_splitk_one,
+            m_axis_name=outer_m.axis.name if outer_m is not None else None,
+            n_axis_name=outer_n.axis.name,
+        )
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
@@ -746,7 +762,15 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         # Pointwise — no qualifying reduce.
         k_loop = None
         target_names = frozenset()
-        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=1, ctx=ctx, priority_mode="pointwise")
+        param_combos = _enumerate_cartesian(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=1,
+            ctx=ctx,
+            priority_mode="pointwise",
+            m_axis_name=outer_m.axis.name if outer_m is not None else None,
+            n_axis_name=outer_n.axis.name,
+        )
 
     shape = KernelShape(
         outer_n=outer_n,
@@ -780,20 +804,23 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
 
 def _priority_matmul(p: TileParams) -> tuple[int, ...]:
     # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
-    # threads near 256, larger BK, smaller SPLITK.
+    # threads near 256, larger BK, smaller SPLITK. Final tiebreaker prefers
+    # clean-divisor variants over masked (negative len so fewer-overhang wins
+    # under reverse-sorted enumeration).
     threads = p.bn * p.bm
-    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk)
+    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
 
 
 def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
     # Memory-bandwidth bound — fewer cells/thread → more CTAs → better
-    # SM occupancy. Threads near 256.
+    # SM occupancy. Threads near 256. Final tiebreaker: clean-divisor wins.
     threads = p.bn * p.bm
-    return (-(p.fm * p.fn), -abs(256 - threads))
+    return (-(p.fm * p.fn), -abs(256 - threads), -len(p.overhang))
 
 
 def _priority_reduce(p: TileParams) -> tuple[int, ...]:
     # Warp-sized BR enables warp-shuffle Combine; threads near 256.
+    # Cooperative-reduce doesn't admit masked tiles (allow_masked is False).
     threads = p.bn * p.bm * p.br
     return (min(p.br, 256), -abs(256 - threads), p.bk, -p.splitk)
 
@@ -809,6 +836,8 @@ def _enumerate_cartesian(
     ctx: Context,
     priority_mode: str,
     force_splitk_one: bool = False,
+    m_axis_name: str | None = None,
+    n_axis_name: str | None = None,
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
@@ -892,6 +921,13 @@ def _enumerate_cartesian(
     # a degenerate single-thread variant.
     allow_empty_threads = E_M == 1 and E_N == 1 and priority_mode in ("pointwise", "matmul")
 
+    # Masked tiles: when a static output extent has no clean divisor in
+    # ``_TUNE_AXIS_CHOICES`` (e.g. lm_head vocab=151669), let the planner pick
+    # a normal BN/BM and emit per-thread ``if (n < N)`` guards instead of
+    # falling back to a degenerate 1-thread CTA. Only fires for static-int
+    # extents > 1 (a symbolic axis collapsed to E=1 stays as bn=bm=1).
+    allow_masked = priority_mode in ("pointwise", "matmul")
+
     def _run(apply_pins: bool) -> list[TileParams]:
         return _enumerate_cartesian_impl(
             E_M=E_M,
@@ -908,6 +944,9 @@ def _enumerate_cartesian(
             min_k_chunks=min_k_chunks,
             priority_fn=priority_fn,
             allow_empty_threads=allow_empty_threads,
+            allow_masked=allow_masked,
+            m_axis_name=m_axis_name,
+            n_axis_name=n_axis_name,
         )
 
     result = _run(apply_pins=True)
@@ -932,20 +971,36 @@ def _enumerate_cartesian_impl(
     min_k_chunks: int,
     priority_fn: Callable[[TileParams], tuple[int, ...]],
     allow_empty_threads: bool = False,
+    allow_masked: bool = False,
+    m_axis_name: str | None = None,
+    n_axis_name: str | None = None,
 ) -> list[TileParams]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
     (``None`` to skip), the per-thread K-chunk floor, and the sort key.
-    No env reads, no mode dispatch."""
+    No env reads, no mode dispatch.
+
+    When ``allow_masked`` is set, candidates that violate the BN/BM-divides-E
+    constraint are also admitted with the offending axis name recorded in
+    ``TileParams.overhang``. ``m_axis_name`` / ``n_axis_name`` are the names
+    stamped into ``overhang`` for the M / N axes respectively (the caller
+    knows them from the LoopOp; we don't reconstruct).
+    """
     seen: set[TileParams] = set()
     ordered: list[TileParams] = []
     for bn in bn_choices:
         bn_c = min(bn, E_N)
-        if bn_c < 1 or E_N % bn_c != 0:
+        if bn_c < 1:
+            continue
+        n_overhang = E_N % bn_c != 0
+        if n_overhang and not (allow_masked and n_axis_name is not None and E_N > 1):
             continue
         for bm in bm_choices:
             bm_c = min(bm, E_M)
-            if bm_c < 1 or E_M % bm_c != 0:
+            if bm_c < 1:
+                continue
+            m_overhang = E_M % bm_c != 0
+            if m_overhang and not (allow_masked and m_axis_name is not None and E_M > 1):
                 continue
             if bn_c * bm_c > max_threads_per_cta:
                 continue
@@ -967,11 +1022,23 @@ def _enumerate_cartesian_impl(
                 if bn_c * bm_c * br == 1 and not allow_empty_threads:
                     continue
                 per_thread_K = E_K // br
-                fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
+                # FM/FN normally are divisors of the per-axis remainder so
+                # the per-thread cell-grid covers cleanly. For an overhang
+                # axis the remainder isn't well-defined (non-divisor BM/BN
+                # leaves a fractional last tile), so any choice up to
+                # _MAX_CELLS_PER_THREAD is admissible — the per-cell guard
+                # in the masked Cond handles partial coverage.
+                if m_overhang:
+                    fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD)
+                else:
+                    fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
                 if fm_narrow is not None:
                     fm_candidates = fm_narrow(fm_candidates)
                 for fm in fm_candidates:
-                    fn_candidates = _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm)
+                    if n_overhang:
+                        fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD // fm)
+                    else:
+                        fn_candidates = _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm)
                     if fn_narrow is not None:
                         fn_candidates = fn_narrow(fn_candidates)
                     for fn in fn_candidates:
@@ -990,7 +1057,12 @@ def _enumerate_cartesian_impl(
                             for splitk in splitk_choices:
                                 if k_o_total % splitk != 0:
                                     continue
-                                params = TileParams(bn=bn_c, bm=bm_c, fm=fm, fn=fn, bk=bk, splitk=splitk, br=br)
+                                overhang_axes: tuple[str, ...] = ()
+                                if n_overhang and n_axis_name is not None:
+                                    overhang_axes = (*overhang_axes, n_axis_name)
+                                if m_overhang and m_axis_name is not None:
+                                    overhang_axes = (*overhang_axes, m_axis_name)
+                                params = TileParams(bn=bn_c, bm=bm_c, fm=fm, fn=fn, bk=bk, splitk=splitk, br=br, overhang=overhang_axes)
                                 if params in seen:
                                     continue
                                 seen.add(params)
@@ -1021,13 +1093,22 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # passes use this to group surrounding axes by source identity (e.g.
     # the MMA factorization plan's BLOCK·GROUP·CELL·ATOM enumeration along
     # each output axis) without name-suffix string matching.
+    overhang = frozenset(params.overhang)
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
     N_src = N_axis.source_axis or N_axis
+    n_real: int | None = None
     if N_axis.extent.is_static:
         E_N = N_axis.extent.as_static()
-        N_b_ext = E_N // (params.bn * params.fn)
-        N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src)
+        # Masked tiles (N in overhang): use ceil_div so the boundary CTA covers
+        # the partial tile. ``real_extent`` on N_b tells the materializer how
+        # to gate boundary lanes (``if decoded < real_extent``).
+        if N_name in overhang:
+            N_b_ext = -(-E_N // (params.bn * params.fn))
+            n_real = E_N
+        else:
+            N_b_ext = E_N // (params.bn * params.fn)
+        N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src, real_extent=n_real)
     else:
         # Symbolic N (bn=fn=1 by planner construction): bind whole axis to GridTile;
         # the size-1 normalizer drops N_t / N_r.
@@ -1041,10 +1122,15 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         M_axis = shape.outer_m.axis
         M_name = M_axis.name
         M_src = M_axis.source_axis or M_axis
+        m_real: int | None = None
         if M_axis.extent.is_static:
             E_M = M_axis.extent.as_static()
-            M_b_ext = E_M // (params.bm * params.fm)
-            M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src)
+            if M_name in overhang:
+                M_b_ext = -(-E_M // (params.bm * params.fm))
+                m_real = E_M
+            else:
+                M_b_ext = E_M // (params.bm * params.fm)
+            M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src, real_extent=m_real)
         else:
             M_b = Axis(f"{M_name}_b", M_axis.extent, source_axis=M_src)
         M_t = Axis(f"{M_name}_t", params.bm, source_axis=M_src)
@@ -1102,6 +1188,20 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
             new_inner = _gate_linear_epilogue_on_k_s_zero(new_inner, K_s.name)
     else:
         new_inner = inner_after_outer
+
+    # Masked tiles: when ceil-div has rounded a block-axis extent up past the
+    # real N (or M) extent, wrap the σ-rewritten body in
+    # ``Cond(decoded_axis_coord < real_extent)``. The Cond sits INSIDE the
+    # register tower (N_r is in scope for the predicate). The replicator in
+    # ``010_split_register_axes`` handles Conds whose predicate depends on the
+    # replicated axis by σ-substituting per replica so each replicated body
+    # gets a partly-constant-folded predicate (NVRTC drops always-true copies).
+    if N_name in overhang:
+        n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
+        new_inner = (Cond(cond=BinaryExpr("<", n_pred, Literal(E_N, "int")), body=Body(new_inner)),)
+    if shape.outer_m is not None and M_name in overhang:
+        m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
+        new_inner = (Cond(cond=BinaryExpr("<", m_pred, Literal(E_M, "int")), body=Body(new_inner)),)
 
     # σ-rewrite + K-replace the prologue when present. The prologue sits
     # inside M_r (so M_r is in scope for σ_outer's M-axis mapping) and

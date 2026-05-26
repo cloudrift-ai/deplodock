@@ -153,7 +153,24 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
         out: list[Stmt] = []
         for s in b:
             nested = s.nested()
-            if nested:
+            # Block stmts whose OWN exprs (predicate, etc.) reference the
+            # replicated axis need full replication — descending into the
+            # nested bodies only leaves the wrapper's expression unsubstituted.
+            # Example: a masked-tile ``Cond(<post-σ N expr> < real_extent)``
+            # wrapping a per-cell Write — each replica must get its own σ-folded
+            # predicate, otherwise the wrapper references a no-longer-defined
+            # register-axis Var (or worse, collides with a later loop axis
+            # named the same). Stage/StageBundle hide their cache axes from
+            # this check — those Vars are smem-local and shouldn't drive
+            # replication of the wrapper.
+            if isinstance(s, Stage):
+                wrapper_bound = frozenset(ax.name for src in s.sources for ax in src.cache_axes)
+            elif isinstance(s, StageBundle):
+                wrapper_bound = frozenset(ax.name for stage in s.stages for src in stage.sources for ax in src.cache_axes)
+            else:
+                wrapper_bound = frozenset()
+            own_refs_axis = axis not in wrapper_bound and any(axis in e.free_vars() for e in s.exprs())
+            if nested and not own_refs_axis:
                 # Wrap-body Stage's consumer body must be descended so the
                 # consumer Loads inside the staged scope replicate across the
                 # REGISTER axis. Stage's source-side state (cache_axes, origin)
