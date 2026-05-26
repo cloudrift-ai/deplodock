@@ -238,9 +238,11 @@ def _wrap_shape(raw_shape, sym_rename: dict[str, str] | None = None):
     Plain ints pass through. ``SymInt`` placeholders become ``Dim(name)``
     with ``name`` resolved through ``sym_rename`` (so torch's ``s0``
     becomes the user's ``seq_len``); unrenamed symbols keep their
-    torch-internal name. The static-shape case (no SymInt anywhere)
-    returns a ``tuple[int, ...]`` — the existing IR construction path
-    coerces those to ``Dim(int)`` via ``Tensor.__post_init__``.
+    torch-internal name. The symbolic ``Dim`` carries the default expected
+    size (``DEFAULT_SEQ_HINT``) so the planner / tuner can size tiles for it.
+    The static-shape case (no SymInt anywhere) returns a ``tuple[int, ...]``
+    — the existing IR construction path coerces those to ``Dim(int)`` via
+    ``Tensor.__post_init__``.
     """
     from deplodock.compiler.dim import Dim
 

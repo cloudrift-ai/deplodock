@@ -85,7 +85,21 @@ autotuning cache doesn't bust on cosmetic edits.
   on anything but a static-int `Dim`. Symbolic dims resolve at launch via `d.expr.eval(sym_env)` —
   composite shapes (e.g. an `S * 2` concat output) resolve from input array axes without per-site
   branching. `Tensor.__post_init__` and `Axis.__post_init__` coerce bare `int` / `str` to `Dim`, so
-  producer call sites need no change.
+  producer call sites need no change. An atomic symbolic `Dim` also carries a `hint` — its *expected*
+  size (default `DEFAULT_SEQ_HINT=512`, set automatically so reconstruction can't lose it; an explicit
+  `Dim(name, hint=...)` overrides). The hint is pure metadata (excluded from `==`/`hash`/structural keys),
+  read only by the tuner / partition planner to size tiles for a dynamic axis.
+- **A symbolic free axis is tiled for its hint and emitted as a *masked* tile.** The partition planner
+  (`pipeline/passes/lowering/tile/010_partition_loops.py`) treats a symbolic M/N axis as size `hint`,
+  always-overhang: the block axis becomes a composite ceil-div over the symbolic extent
+  (`(seq_len + bf - 1)//bf`), and a boundary `Cond(decoded_coord < seq_len)` wraps the body. So one cached
+  kernel runs at any runtime `seq_len` — the grid (`ir/cuda/ir.py:GridDimSpec` now accepts an `Expr`
+  factor, resolved via `Expr.eval` at launch) and the guard read the runtime value; the tile shape is
+  tuned for the hint. Cooperative-reduce and SDPA-prologue matmuls keep symbolic axes degenerate (one
+  element per thread) — masking would register-tile a per-row reduction (softmax/RMS) whose accumulator
+  must not be shared across cells. The backend benches a symbolic graph at the hint when no real inputs are
+  supplied (`backend/cuda/program.py:_symbolic_hints` / `_resolve_symbolic`), so `tune` and `compile`
+  agree on a hint-sized variant.
 - **`ElementwiseOp` inputs must already share the output shape.** The
   decomposition helper
   `pipeline/passes/frontend/decomposition/_broadcast.broadcast_to` wraps

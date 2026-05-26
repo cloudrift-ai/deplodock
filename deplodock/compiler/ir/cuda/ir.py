@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
+from deplodock.compiler.ir.expr import Expr
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,10 @@ class TmaDescMeta:
     swizzle: str = "NONE"
 
 
-_GridFactor = int | str  # int = static factor; str = symbolic axis name (resolved at launch)
+# int = static factor; str = symbolic axis name (resolved at launch from
+# sym_values); Expr = a composite extent (e.g. ceil-div ``(seq_len+15)//16`` for
+# a hint-driven masked block axis) evaluated against sym_values at launch.
+_GridFactor = int | str | Expr
 GridDimSpec = tuple[_GridFactor, ...]  # product of factors → one grid dim's extent
 
 
@@ -66,13 +70,19 @@ class CudaOp(Op):
 
 def resolve_dim(spec, sym_values: dict[str, int]) -> int:
     """Multiply a ``GridDimSpec``'s factors, resolving ``str`` factors
-    from ``sym_values``. Accepts a bare ``int`` (legacy static grid) as
-    shorthand for a single-int spec — keeps pre-symbolic CudaOps working
-    until every producer has been migrated. Raises ``KeyError`` on an
-    unknown symbolic name."""
+    from ``sym_values`` and ``Expr`` factors via ``Expr.eval`` (e.g. a
+    ceil-div block extent ``(seq_len+15)//16``). Accepts a bare ``int``
+    (legacy static grid) as shorthand for a single-int spec — keeps
+    pre-symbolic CudaOps working until every producer has been migrated.
+    Raises ``KeyError`` on an unknown symbolic name."""
     if isinstance(spec, int):
         return spec
     total = 1
     for factor in spec:
-        total *= factor if isinstance(factor, int) else sym_values[factor]
+        if isinstance(factor, int):
+            total *= factor
+        elif isinstance(factor, str):
+            total *= sym_values[factor]
+        else:
+            total *= factor.eval(sym_values)
     return total

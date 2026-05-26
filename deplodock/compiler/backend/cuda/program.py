@@ -150,6 +150,10 @@ class _Compiled:
     # Per-symbolic-name buffers whose shape carries that name — used to
     # reshape ``input_data`` to the actual runtime shape before upload.
     symbolic_buf_shape: dict[str, tuple] = field(default_factory=dict)
+    # Symbolic axis name → its ``Dim`` hint (default expected size). Used as a
+    # fallback concrete value when no ``input_data`` is supplied (the autotuner
+    # benches a symbolic graph at the hint size).
+    symbolic_hints: dict[str, int] = field(default_factory=dict)
 
 
 def _compile(graph: Graph) -> _Compiled:
@@ -161,6 +165,7 @@ def _compile(graph: Graph) -> _Compiled:
     constants = _constant_values(graph)
     launches_nodes = _launches(graph)
     symbolic_bindings = _symbolic_bindings(graph)
+    symbolic_hints = _symbolic_hints(graph)
 
     kernels: dict[str, cp.RawKernel] = {}
     seen_source: dict[str, str] = {}
@@ -195,6 +200,7 @@ def _compile(graph: Graph) -> _Compiled:
         kernels=kernels,
         launches=launches,
         symbolic_bindings=symbolic_bindings,
+        symbolic_hints=symbolic_hints,
     )
 
 
@@ -222,6 +228,22 @@ def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
                 )
             bindings.setdefault(dim.expr.name, (nid, d))
     return bindings
+
+
+def _symbolic_hints(graph: Graph) -> dict[str, int]:
+    """Map every symbolic input-dim name to its ``Dim`` hint (default expected
+    size). Read straight off the input ``Dim`` — convenient here since this
+    walks the same input shapes as ``_symbolic_bindings``. Used by
+    ``_resolve_symbolic`` as the fallback bench size when no ``input_data`` is
+    supplied (the autotuner case)."""
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
+    hints: dict[str, int] = {}
+    for nid in graph.inputs:
+        for dim in graph.nodes[nid].output.shape:
+            if isinstance(dim.expr, Var) and dim.hint is not None:
+                hints.setdefault(dim.expr.name, dim.hint)
+    return hints
 
 
 def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:
@@ -274,16 +296,22 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
 
 
 def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) -> dict[str, int]:
-    """Bind every symbolic axis name to a concrete ``int`` from the input
-    array shapes. ``compiled.symbolic_bindings`` says which input + dim
-    each name reads from; returns the per-name env that ``_launch`` and
-    ``_Buffer.resolve_shape`` consume."""
+    """Bind every symbolic axis name to a concrete ``int``. Reads the runtime
+    value from the supplied input array shape (``compiled.symbolic_bindings``
+    says which input + dim each name reads from). When no array is supplied for
+    that input — the autotuner benches without real inputs — falls back to the
+    ``Dim`` hint so the graph runs at its expected (tuned) size."""
     env: dict[str, int] = {}
     for name, (buf, dim_idx) in compiled.symbolic_bindings.items():
         arr = input_data.get(buf)
-        if arr is None:
-            raise ValueError(f"symbolic dim {name!r} reads from input {buf!r}.shape[{dim_idx}] but no array was supplied for that input")
-        env[name] = int(arr.shape[dim_idx])
+        if arr is not None:
+            env[name] = int(arr.shape[dim_idx])
+        elif name in compiled.symbolic_hints:
+            env[name] = compiled.symbolic_hints[name]
+        else:
+            raise ValueError(
+                f"symbolic dim {name!r} reads from input {buf!r}.shape[{dim_idx}] but no array was supplied and the dim carries no hint"
+            )
     return env
 
 

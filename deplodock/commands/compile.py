@@ -86,9 +86,11 @@ def add_input_args(parser) -> None:
         type=int,
         default=32,
         help=(
-            "Sequence length for full-model tracing (default: 32). With ``--dynamic``, "
-            "only sizes the example tensors handed to ``torch.export``; the value doesn't "
-            "appear in the resulting kernels since torch makes the dim symbolic."
+            "Sequence length for full-model tracing (default: 32). With ``--dynamic``, only "
+            "sizes the example tensors handed to ``torch.export``; the value doesn't appear "
+            "in the resulting kernels since torch makes the dim symbolic. The tuner / planner "
+            "instead tile a symbolic axis for ``Dim``'s default hint (DEFAULT_SEQ_HINT=512), "
+            "emitting a masked tile (ceil-div grid + boundary guard) correct at any runtime size."
         ),
     )
     parser.add_argument(
