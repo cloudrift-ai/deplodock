@@ -254,6 +254,38 @@ def test_gather(run_graph):
     np.testing.assert_allclose(_run(run_graph, g, {"x": x_np, "idx": idx.astype(np.float32)}), expected, rtol=1e-6, atol=1e-6)
 
 
+def test_embedding(run_graph):
+    # GatherOp with output rank = idx_rank + data_rank - 1 (embedding /
+    # index_select semantics). The lift must index data and idx at their
+    # actual ranks — not at the output rank. Qwen3-style: idx (1, S), weight
+    # (V, H), output (1, S, H).
+    V, H, S = 16, 4, 5
+    weight = rng.standard_normal((V, H)).astype(np.float32)
+    idx = rng.integers(0, V, size=(1, S))
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("w", (V, H)), node_id="w")
+    g.add_node(InputOp(), [], Tensor("idx", (1, S)), node_id="idx")
+    g.add_node(GatherOp(axis=0), ["w", "idx"], Tensor("y", (1, S, H)), node_id="y")
+    g.inputs, g.outputs = ["w", "idx"], ["y"]
+    expected = _torch_to_np(torch.nn.functional.embedding(torch.from_numpy(idx).long(), torch.from_numpy(weight)))
+    np.testing.assert_allclose(_run(run_graph, g, {"w": weight, "idx": idx.astype(np.float32)}), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_index_select_middle_axis(run_graph):
+    # index_select with axis != 0 and idx rank 1. Output rank equals data
+    # rank, with axis-dim replaced by idx size. The lift's embedding/index_select
+    # branch is exercised; mis-mapping the data axes would corrupt indexing.
+    data = rng.standard_normal((3, 5, 4)).astype(np.float32)
+    idx = rng.integers(0, 5, size=(3,))
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("d", (3, 5, 4)), node_id="d")
+    g.add_node(InputOp(), [], Tensor("idx", (3,)), node_id="idx")
+    g.add_node(GatherOp(axis=1), ["d", "idx"], Tensor("y", (3, 3, 4)), node_id="y")
+    g.inputs, g.outputs = ["d", "idx"], ["y"]
+    expected = _torch_to_np(torch.index_select(torch.from_numpy(data), 1, torch.from_numpy(idx).long()))
+    np.testing.assert_allclose(_run(run_graph, g, {"d": data, "idx": idx.astype(np.float32)}), expected, rtol=1e-6, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Matmul / Linear
 # ---------------------------------------------------------------------------

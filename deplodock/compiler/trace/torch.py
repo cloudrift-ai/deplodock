@@ -691,6 +691,14 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
     # --- Gather ---
     if op_name in ("index_select", "gather", "embedding"):
         axis = fx_node.args[1] if len(fx_node.args) > 1 and isinstance(fx_node.args[1], int) else 0
+        # ``index_select(input, dim, index)`` / ``gather(input, dim, index)``
+        # pass ``dim`` as a Python int in args[1] — ``_resolve_inputs`` has
+        # captured it as a ConstantOp at input_ids[1]. ``GatherOp.axis``
+        # already carries the dim value, so drop the spurious input or the
+        # lift sees a 3-input gather (and picks the wrong node as idx).
+        # ``embedding`` keeps the original args (args[1] is the index tensor).
+        if op_name in ("index_select", "gather") and len(input_ids) >= 3 and isinstance(fx_node.args[1], int):
+            input_ids = [input_ids[0], *input_ids[2:]]
         nid = g.add_node(
             op=GatherOp(axis=axis),
             inputs=input_ids,
