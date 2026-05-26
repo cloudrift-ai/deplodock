@@ -55,9 +55,14 @@ def _tile_op_pad_summary(m: int, k: int, n: int) -> dict[str, tuple[int, ...]]:
         return {}
     out: dict[str, tuple[int, ...]] = {}
     for s in op.body.iter():
-        if isinstance(s, StageBundle) and s.policy == StagePolicy.BUFFERED:
-            for src in s.sources:
-                out[src.name] = src.pad
+        # 070_pad_smem pads BUFFERED / ASYNC bundles (SYNC needs no
+        # rotation break, TMA forbids pad). On sm_80+ the double-buffer
+        # ring is realized as ASYNC, so read the pad off whichever of the
+        # two the pipeline produced. Sources live on the member Stages.
+        if isinstance(s, StageBundle) and s.policy in (StagePolicy.BUFFERED, StagePolicy.ASYNC):
+            for stage in s.stages:
+                for src in stage.sources:
+                    out[src.name] = src.pad
     return out
 
 

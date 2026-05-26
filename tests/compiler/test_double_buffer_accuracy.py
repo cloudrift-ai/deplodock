@@ -1,17 +1,20 @@
 """CUDA accuracy regression for the wrap-body double-buffer path.
 
-040_use_ring_buffers promotes a wrap-body ``Stage`` inside a
-``SerialTile(serial_outer)`` to ``BufferedStage(buffer_count=2,
-phase=K_o%2)``. The materializer doubles the smem allocation, prepends
+040_use_ring_buffers promotes a SYNC ``StageBundle`` inside a
+``SerialTile(serial_outer)`` to ``policy=BUFFERED, buffer_count=2,
+phase=K_o%2``. The materializer doubles the smem allocation, prepends
 the phase to the cooperative-load Write and to every body Load that
 reads from staged smem, and drops the leading ``__syncthreads`` because
-consecutive iterations write distinct physical slabs.
+consecutive iterations write distinct physical slabs. On sm_80+
+``060_use_async_copy`` then swaps that bundle's policy in-place to ASYNC
+(cp.async transport) — the ``buffer_count=2`` ring is unchanged.
 
 Each parametrized config pins planner knobs that force K_o >= 2 (so the
 double-buffer eligibility check passes). The test compiles the matmul
 through the full CUDA pipeline, asserts the resulting TileOp actually
-contains a ``BufferedStage`` (so a regression that silently turns off
-the promotion would surface), and then runs the compiled kernel and
+contains a double-buffered ring (``buffer_count >= 2``, regardless of
+the realized transport — so a regression that silently turns off the
+promotion would surface), and then runs the compiled kernel and
 compares against a NumpyBackend reference.
 
 Skipped without CUDA.
@@ -25,7 +28,7 @@ import pytest
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
+from deplodock.compiler.ir.tile.ir import StageBundle, TileOp
 
 from .conftest import requires_cuda
 
@@ -61,9 +64,17 @@ def _build_matmul(m: int, k: int, n: int) -> tuple[Graph, dict[str, tuple[int, .
 
 
 def _has_buffered_stage(compiled: Graph) -> bool:
-    """The CUDA pipeline lowers TileOp → KernelOp → CudaOp; the BufferedStage
-    only lives at the TileOp / KernelOp boundary. We re-compile through
-    TILE_PASSES to inspect that intermediate IR."""
+    """The CUDA pipeline lowers TileOp → KernelOp → CudaOp; the double-buffer
+    ring only lives at the TileOp / KernelOp boundary. We re-compile through
+    TILE_PASSES to inspect that intermediate IR.
+
+    040_use_ring_buffers promotes the SYNC bundle to ``buffer_count = 2``;
+    on sm_80+ 060_use_async_copy then swaps that bundle's policy in-place to
+    ASYNC (cp.async transport) — the ring is unchanged, only the transport.
+    So we detect "double-buffering fired" by ``buffer_count >= 2`` rather
+    than a specific policy: a SYNC bundle always has ``buffer_count == 1``,
+    so any bundle with ``>= 2`` proves 040 ran (and we're not on the plain
+    single-slab path)."""
     from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
     # Build a fresh graph (same shape/dims) and run only through TILE_PASSES.
@@ -74,8 +85,8 @@ def _has_buffered_stage(compiled: Graph) -> bool:
         node = compiled.nodes[nid]
         g.add_node(op=InputOp(), inputs=[], output=node.output, node_id=nid)
     o_node = compiled.nodes["o"]
-    # Skip — we just want to know if BufferedStage shows up for the same
-    # shape under the same pinned knobs (env vars are already set by the
+    # Skip — we just want to know if a double-buffered ring shows up for the
+    # same shape under the same pinned knobs (env vars are already set by the
     # caller's monkeypatch).
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=o_node.output, node_id="o")
     g.inputs = list(compiled.inputs)
@@ -84,7 +95,7 @@ def _has_buffered_stage(compiled: Graph) -> bool:
     op = g2.nodes["o"].op
     if not isinstance(op, TileOp):
         return False
-    return any((isinstance(s, StageBundle) and s.policy == StagePolicy.BUFFERED) for s in op.body.iter())
+    return any((isinstance(s, StageBundle) and s.buffer_count >= 2) for s in op.body.iter())
 
 
 def _random_inputs(input_shapes: dict[str, tuple[int, ...]], seed: int = 0) -> dict[str, np.ndarray]:
@@ -123,14 +134,16 @@ def test_double_buffer_matmul_accuracy(case, monkeypatch):
     graph, input_shapes = _build_matmul(m, k, n)
     inputs = _random_inputs(input_shapes)
 
-    # First: confirm the pass actually fires under these knobs. If 010 stopped
-    # firing for whatever reason (eligibility tightened, planner shape
-    # changed), the accuracy check below would still pass — but on the
-    # plain-Stage path, not BufferedStage — which would silently regress
-    # double-buffer coverage. Assert explicitly.
+    # First: confirm the pass actually fires under these knobs. If
+    # 040_use_ring_buffers stopped firing for whatever reason (eligibility
+    # tightened, planner shape changed), the accuracy check below would still
+    # pass — but on the plain single-slab SYNC path, not a double-buffered
+    # ring — which would silently regress double-buffer coverage. Assert
+    # explicitly (buffer_count >= 2 holds whether the ring is realized as
+    # BUFFERED or, on sm_80+, promoted to ASYNC cp.async transport).
     graph_for_inspection, _ = _build_matmul(m, k, n)
     assert _has_buffered_stage(graph_for_inspection), (
-        f"040_use_ring_buffers did not produce a BufferedStage for M={m}, K={k}, N={n} under knobs={knobs}"
+        f"040_use_ring_buffers did not produce a double-buffered ring (buffer_count >= 2) for M={m}, K={k}, N={n} under knobs={knobs}"
     )
 
     ref = _reference(graph, inputs)
