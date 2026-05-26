@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
@@ -38,8 +39,18 @@ class SearchNode:
     best_reward: float = 0.0  # max reward over this subtree's measured leaves
     live: int = 0  # count of un-popped frontier leaves in this subtree
 
-    @property
+    @cached_property
     def score(self) -> float:
+        """Cached :meth:`LazyCandidate.score` — UCB descent reads this on
+        every unvisited sibling at every level per pop. Without the
+        cache, ``Candidate.score`` (which iterates every graph node and
+        calls ``op.score(ctx)``) re-runs ~O(siblings) per pop, with
+        leaf-Fork siblings additionally materializing their TileOps via
+        ``fork.expand()`` (full ``_build_split_body`` + body
+        normalization). The cache is sound because ``LazyCandidate.score``
+        is a pure function of ``inner.graph`` + ``pending``, both
+        frozen once the SearchNode is attached.
+        """
         return self.candidate.score() if self.candidate is not None else float("-inf")
 
 

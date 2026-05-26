@@ -292,35 +292,30 @@ class LazyCandidate:
 
     def score(self) -> float:
         """Mean of every node's ``op.score(ctx)`` in the candidate's
-        graph. For a branch :class:`Fork`, return
-        ``inner.score() + fork.score`` — the fork's prior preserves the
-        priority signal MCTS would otherwise lose at intermediate
-        levels. For a leaf Fork, fire the (trivial) thunk to retrieve
-        the wrapped ``Op``/``Graph``, then score with that option
-        substituted at the match's root (Op case) or via full resolve
-        + score (Graph case)."""
-        from deplodock.compiler.ir.base import Op  # noqa: PLC0415
+        graph, with the pending Fork's planner prior added on top.
 
+        Branch and leaf Forks score identically: ``inner.score() +
+        fork.score``. ``fork.score`` is the planner-computed prior the
+        rule attached (for partition leaves, that's
+        ``TileOp.lazy_score(ctx, shapes=..., params=...)`` — the same
+        formula ``TileOp.score`` runs post-materialization, but cheap).
+
+        We deliberately do NOT fire ``fork.expand()`` here to recover
+        the option and re-score it: ``expand()`` for a partition leaf
+        runs ``_build_split_body`` + ``TileOp.__post_init__`` (full body
+        normalization), and MCTS's ``_ucb_key`` reads this score for
+        every unvisited sibling at every descent level. Materializing
+        every leaf just to rank them defeats the whole lazy-planner
+        design. The leaf's planner-side score is already an accurate
+        equivalent of what its post-materialization
+        ``TileOp.score(ctx)`` would return (the lazy/eager parity
+        check in ``test_lazy_score_matches_tile_op_score`` enforces
+        this), so the cheap signal is the right one to use.
+        """
         if self.pending is None:
             return self.inner.score()
-        match, fork = self.pending
-        if not fork.is_leaf:
-            return self.inner.score() + fork.score
-        # Leaf Fork — fire the trivial thunk to retrieve the wrapped option.
-        leaves = fork.expand()
-        if not leaves:
-            return self.inner.score()
-        option = leaves[0]
-        if not isinstance(option, Op):
-            return self.resolve().score()
-        ctx = self.inner.ctx
-        scores: list[float] = []
-        for n in self.inner.graph.nodes.values():
-            op = option if n.id == match.root_node_id else n.op
-            s = op.score(ctx)
-            if s is not None:
-                scores.append(s)
-        return sum(scores) / len(scores) if scores else 0.0
+        _, fork = self.pending
+        return self.inner.score() + fork.score
 
 
 # ---------------------------------------------------------------------------

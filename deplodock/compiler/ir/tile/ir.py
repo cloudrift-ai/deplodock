@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from typing import Literal as _Lit
 
 from deplodock.compiler.dtype import DataType
@@ -1172,6 +1173,28 @@ class TileOp(BodyOp):
         return threads <= ctx.max_threads_per_cta
 
     def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
+        return self._cached_score
+
+    @cached_property
+    def _cached_score(self) -> float:
+        """Cached score — ``score(ctx)`` delegates here. ``ctx`` is unused
+        by the formula today (see :meth:`score`'s ARG002 noqa), so the
+        value is a pure function of ``self`` and is safe to memoize:
+        ``self.body`` is frozen after ``__post_init__`` (it's a ``Body``
+        which is a ``tuple[Stmt, ...]`` subclass, every Stmt is itself
+        a frozen dataclass), and ``self.knobs`` is set by
+        ``Candidate.apply`` BEFORE the op is installed on the graph
+        node — so by the time anyone reads ``score`` the inputs are
+        stable.
+
+        Why this matters: ``Candidate.score`` (the MCTS prior) walks
+        every node in the graph and calls ``op.score(ctx)``. Sibling
+        ``SearchNode``s share the same inner ``Candidate``, so the same
+        TileOp instance is scored from every sibling's ``inner.score()``
+        call. Without this cache each TileOp re-walked its body for
+        coalescing analysis on every visit; on Qwen3 0.6B with ~150
+        TileOps in the graph that was the dominant tune-mode cost.
+        """
         from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
 
         block_axes, thread_axes = self._launch_geometry()
