@@ -41,6 +41,13 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 
+# Default "expected size" for a symbolic dim when none is supplied explicitly.
+# Atomic symbolic Dims (input axes like ``Dim("seq_len")``) carry this so the
+# planner / tuner always have a size to tile for — even when a pass reconstructs
+# a bare ``Dim(name)`` and the original hint would otherwise be lost. 512 is a
+# representative sequence length for tuning (vs the small trace example size).
+DEFAULT_SEQ_HINT = 512
+
 
 def _coerce_expr(value: int | str | Expr | Dim) -> Expr:
     """Coerce a Dim constructor argument to an ``Expr``.
@@ -76,10 +83,28 @@ def _simplify(expr: Expr) -> Expr:
 @dataclass(frozen=True, init=False, eq=False)
 class Dim:
     expr: Expr
+    # Advisory "expected size" for a symbolic dim — the value the tuner /
+    # partition planner pretends the axis has when picking tile sizes (set
+    # at trace time from ``--seq-len``). Pure metadata: excluded from
+    # equality / hashing / pretty-rendering so two Dims with the same
+    # ``expr`` stay structurally identical (and cache keys hint-independent)
+    # regardless of hint. Atomic symbolic Dims carry it; arithmetic results
+    # do not (only the input/axis Dim needs it). ``None`` on static dims.
+    hint: int | None
 
-    def __init__(self, value: int | str | Expr | Dim) -> None:
+    def __init__(self, value: int | str | Expr | Dim, *, hint: int | None = None) -> None:
         # ``frozen=True`` blocks normal assignment; route through object.__setattr__.
-        object.__setattr__(self, "expr", _coerce_expr(value))
+        expr = _coerce_expr(value)
+        object.__setattr__(self, "expr", expr)
+        # Explicit hint wins; otherwise inherit when wrapping an existing Dim,
+        # and finally fall back to ``DEFAULT_SEQ_HINT`` for an atomic symbolic
+        # dim (a single ``Var``) so the planner always sees an expected size.
+        # Composite (``BinaryExpr``) and static (``Literal``) dims keep ``None``.
+        if hint is None and isinstance(value, Dim):
+            hint = value.hint
+        if hint is None and isinstance(expr, Var):
+            hint = DEFAULT_SEQ_HINT
+        object.__setattr__(self, "hint", hint)
 
     # ---- inspection ------------------------------------------------------
 

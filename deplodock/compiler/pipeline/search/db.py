@@ -37,6 +37,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 
+def _jsonable_geometry(geometry) -> list:
+    """Render a launch grid/block to a JSON-safe nested list for the inventory
+    tables. Int / str pass through; nested specs recurse; composite ``Expr``
+    factors (ceil-div block extents for hint-driven masked tiles) render to
+    their pretty string — inventory rows are for human inspection, not
+    re-execution."""
+
+    def conv(x):
+        if isinstance(x, (int, str)):
+            return x
+        if isinstance(x, (tuple, list)):
+            return [conv(e) for e in x]
+        return x.pretty()  # Expr
+
+    return [conv(spec) for spec in geometry]
+
+
 @dataclass(frozen=True)
 class PerfStats:
     """Summary statistics over per-iter kernel latencies (microseconds)."""
@@ -218,8 +235,8 @@ class SearchDB:
                 key,
                 kernel_source,
                 json.dumps(list(arg_order)),
-                json.dumps(list(grid)),
-                json.dumps(list(block)),
+                json.dumps(_jsonable_geometry(grid)),
+                json.dumps(_jsonable_geometry(block)),
                 int(smem_bytes),
                 pretty,
             ),

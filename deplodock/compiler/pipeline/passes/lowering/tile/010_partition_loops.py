@@ -670,14 +670,16 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
     outer_n: Loop = chain[-1]
     outer_m: Loop | None = chain[-2] if len(chain) >= 2 else None
     extra_outer: tuple[Loop, ...] = chain[:-2] if outer_m is not None else chain[:-1]
-    # Symbolic free axes (Dim("seq_len") etc.) bind whole-to-block: no
-    # split, BN/BM forced to 1. Pass E=1 to the enumerator so divisibility
-    # filters pass vacuously; ``_build_split_body`` reads the real symbolic
-    # extent back from the Loop axis when stamping the ``*_b`` block axis.
+    # Symbolic free axes (Dim("seq_len") etc.) use their hint as the expected
+    # size and always emit a MASKED (overhang) tile: the enumerator picks tile
+    # sizes for the hint, ``_build_split_body`` ceil-divs the symbolic extent
+    # for the grid, and a boundary Cond gates lanes past the runtime value.
+    # ``hint`` is set at trace from ``--seq-len`` (assumed present on any
+    # symbolic axis the planner reaches).
     n_symbolic = not outer_n.axis.extent.is_static
     m_symbolic = outer_m is not None and not outer_m.axis.extent.is_static
-    E_N = 1 if n_symbolic else outer_n.axis.extent.as_static()
-    E_M = 1 if m_symbolic else (outer_m.axis.extent.as_static() if outer_m is not None else 1)
+    E_N = outer_n.axis.extent.hint if n_symbolic else outer_n.axis.extent.as_static()
+    E_M = (outer_m.axis.extent.hint if m_symbolic else outer_m.axis.extent.as_static()) if outer_m is not None else 1
 
     # Single walk: classify body + collect every axis name _replace_k_loops
     # should rewrite. ``target_names`` survives σ_outer (only axis NAMES are
@@ -729,15 +731,24 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
         has_nonlinear_epilogue = _has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
+        # A fused prologue (SDPA P@V: softmax max/sum) carries a per-M-row
+        # reduction whose accumulators must reset per register cell. Masking a
+        # symbolic M/N axis admits FM/FN > 1, register-tiling the row and
+        # sharing one accumulator across cells — wrong. So a prologue matmul
+        # keeps symbolic axes degenerate (E=1, no mask): correct via the
+        # symbolic grid, one output element per thread.
+        mask_ok = not prologue
         param_combos = _enumerate_cartesian(
-            E_M=E_M,
-            E_N=E_N,
+            E_M=E_M if (mask_ok or not m_symbolic) else 1,
+            E_N=E_N if (mask_ok or not n_symbolic) else 1,
             E_K=E_K,
             ctx=ctx,
             priority_mode="matmul",
             force_splitk_one=force_splitk_one,
             m_axis_name=outer_m.axis.name if outer_m is not None else None,
             n_axis_name=outer_n.axis.name,
+            m_forced_mask=m_symbolic and mask_ok,
+            n_forced_mask=n_symbolic and mask_ok,
         )
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
@@ -757,7 +768,20 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
         k_loop = nonmatmul_reduces[0]
         E_K = k_loop.axis.extent.as_static()
         target_names = frozenset(lp.axis.name for lp in all_loops if lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp))
-        param_combos = _enumerate_cartesian(E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx, priority_mode="reduce")
+        # Cooperative reduce binds the free axis whole-to-grid (BR>1 forces
+        # BN=BM=1, so the grid covers seq exactly — no overhang). A masked
+        # register-tile (FN>1) would wrap the reduce body in the boundary Cond
+        # and hide it from the cooperative-reduce + smem-staging passes,
+        # breaking the cross-thread combine. So a symbolic free axis stays
+        # degenerate here (E=1, no forced mask): correct at any seq_len via the
+        # symbolic grid, just not register-tiled.
+        param_combos = _enumerate_cartesian(
+            E_M=1 if m_symbolic else E_M,
+            E_N=1 if n_symbolic else E_N,
+            E_K=E_K,
+            ctx=ctx,
+            priority_mode="reduce",
+        )
     else:
         # Pointwise — no qualifying reduce.
         k_loop = None
@@ -770,6 +794,8 @@ def _split_kernel_fully(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "")
             priority_mode="pointwise",
             m_axis_name=outer_m.axis.name if outer_m is not None else None,
             n_axis_name=outer_n.axis.name,
+            m_forced_mask=m_symbolic,
+            n_forced_mask=n_symbolic,
         )
 
     shape = KernelShape(
@@ -820,7 +846,8 @@ def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
 
 def _priority_reduce(p: TileParams) -> tuple[int, ...]:
     # Warp-sized BR enables warp-shuffle Combine; threads near 256.
-    # Cooperative-reduce doesn't admit masked tiles (allow_masked is False).
+    # Static reduce never masks; a symbolic free axis forces masking (every
+    # variant then carries the same overhang, so no clean-divisor tiebreak).
     threads = p.bn * p.bm * p.br
     return (min(p.br, 256), -abs(256 - threads), p.bk, -p.splitk)
 
@@ -838,6 +865,8 @@ def _enumerate_cartesian(
     force_splitk_one: bool = False,
     m_axis_name: str | None = None,
     n_axis_name: str | None = None,
+    m_forced_mask: bool = False,
+    n_forced_mask: bool = False,
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
@@ -924,8 +953,9 @@ def _enumerate_cartesian(
     # Masked tiles: when a static output extent has no clean divisor in
     # ``_TUNE_AXIS_CHOICES`` (e.g. lm_head vocab=151669), let the planner pick
     # a normal BN/BM and emit per-thread ``if (n < N)`` guards instead of
-    # falling back to a degenerate 1-thread CTA. Only fires for static-int
-    # extents > 1 (a symbolic axis collapsed to E=1 stays as bn=bm=1).
+    # falling back to a degenerate 1-thread CTA. Pointwise / matmul opt in here;
+    # a symbolic free axis additionally forces masking in any mode (incl.
+    # reduce) via ``m_forced_mask`` / ``n_forced_mask``, tuned at its hint.
     allow_masked = priority_mode in ("pointwise", "matmul")
 
     def _run(apply_pins: bool) -> list[TileParams]:
@@ -947,6 +977,8 @@ def _enumerate_cartesian(
             allow_masked=allow_masked,
             m_axis_name=m_axis_name,
             n_axis_name=n_axis_name,
+            m_forced_mask=m_forced_mask,
+            n_forced_mask=n_forced_mask,
         )
 
     result = _run(apply_pins=True)
@@ -974,6 +1006,8 @@ def _enumerate_cartesian_impl(
     allow_masked: bool = False,
     m_axis_name: str | None = None,
     n_axis_name: str | None = None,
+    m_forced_mask: bool = False,
+    n_forced_mask: bool = False,
 ) -> list[TileParams]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
@@ -982,26 +1016,37 @@ def _enumerate_cartesian_impl(
 
     When ``allow_masked`` is set, candidates that violate the BN/BM-divides-E
     constraint are also admitted with the offending axis name recorded in
-    ``TileParams.overhang``. ``m_axis_name`` / ``n_axis_name`` are the names
-    stamped into ``overhang`` for the M / N axes respectively (the caller
-    knows them from the LoopOp; we don't reconstruct).
+    ``TileParams.overhang``. ``m_forced_mask`` / ``n_forced_mask`` (set for a
+    symbolic axis tuned at its hint) admit masking regardless of ``allow_masked``
+    AND record the axis in ``overhang`` even when BN/BM divides the hint — the
+    runtime extent is unknown, so the masked boundary guard is always needed.
+    ``m_axis_name`` / ``n_axis_name`` are the names stamped into ``overhang``
+    for the M / N axes respectively (the caller knows them from the LoopOp; we
+    don't reconstruct).
     """
+    # An axis is maskable if the mode allows masking (static non-divisor case)
+    # or it's a forced-mask symbolic axis. ``E > 1`` rules out the size-1
+    # phantom / degenerate axes.
+    n_maskable = (allow_masked or n_forced_mask) and n_axis_name is not None and E_N > 1
+    m_maskable = (allow_masked or m_forced_mask) and m_axis_name is not None and E_M > 1
     seen: set[TileParams] = set()
     ordered: list[TileParams] = []
     for bn in bn_choices:
         bn_c = min(bn, E_N)
         if bn_c < 1:
             continue
-        n_overhang = E_N % bn_c != 0
-        if n_overhang and not (allow_masked and n_axis_name is not None and E_N > 1):
+        n_nondiv = E_N % bn_c != 0
+        if n_nondiv and not n_maskable:
             continue
+        n_overhang = n_nondiv or (n_forced_mask and n_maskable)
         for bm in bm_choices:
             bm_c = min(bm, E_M)
             if bm_c < 1:
                 continue
-            m_overhang = E_M % bm_c != 0
-            if m_overhang and not (allow_masked and m_axis_name is not None and E_M > 1):
+            m_nondiv = E_M % bm_c != 0
+            if m_nondiv and not m_maskable:
                 continue
+            m_overhang = m_nondiv or (m_forced_mask and m_maskable)
             if bn_c * bm_c > max_threads_per_cta:
                 continue
             # v1 cooperative constraint: BR > 1 ⇒ BN = BM = 1.
@@ -1097,40 +1142,53 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
     N_src = N_axis.source_axis or N_axis
-    n_real: int | None = None
+    n_bnfn = params.bn * params.fn
+    # ``n_bound`` is the masked-boundary Cond RHS (an Expr): ``Literal(E_N)`` for
+    # a static overhang axis, the symbolic ``Var`` for a hint-driven one, None
+    # when N isn't masked.
+    n_bound: object | None = None
     if N_axis.extent.is_static:
         E_N = N_axis.extent.as_static()
         # Masked tiles (N in overhang): use ceil_div so the boundary CTA covers
         # the partial tile. ``real_extent`` on N_b tells the materializer how
         # to gate boundary lanes (``if decoded < real_extent``).
         if N_name in overhang:
-            N_b_ext = -(-E_N // (params.bn * params.fn))
-            n_real = E_N
+            N_b = Axis(f"{N_name}_b", -(-E_N // n_bnfn), source_axis=N_src, real_extent=E_N)
+            n_bound = Literal(E_N, "int")
         else:
-            N_b_ext = E_N // (params.bn * params.fn)
-        N_b = Axis(f"{N_name}_b", N_b_ext, source_axis=N_src, real_extent=n_real)
+            N_b = Axis(f"{N_name}_b", E_N // n_bnfn, source_axis=N_src)
+    elif N_name in overhang:
+        # Symbolic + hint-driven masked: ceil-div the SYMBOLIC extent so the grid
+        # covers the partial last tile at any runtime size; the boundary Cond
+        # gates lanes past the runtime value. ``Dim`` arithmetic builds the
+        # composite ceil-div Expr; the launch resolver evals it from sym_values.
+        N_b = Axis(f"{N_name}_b", (N_axis.extent + (n_bnfn - 1)) // n_bnfn, source_axis=N_src)
+        n_bound = N_axis.extent.expr
     else:
-        # Symbolic N (bn=fn=1 by planner construction): bind whole axis to GridTile;
-        # the size-1 normalizer drops N_t / N_r.
+        # Symbolic, no hint (degenerate): bn=fn=1 by construction, bind the
+        # whole axis to GridTile; the size-1 normalizer drops N_t / N_r.
         N_b = Axis(f"{N_name}_b", N_axis.extent, source_axis=N_src)
     N_t = Axis(f"{N_name}_t", params.bn, source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
     sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
 
     M_b = M_t = M_r = None
+    m_bound: object | None = None
     if shape.outer_m is not None:
         M_axis = shape.outer_m.axis
         M_name = M_axis.name
         M_src = M_axis.source_axis or M_axis
-        m_real: int | None = None
+        m_bnfm = params.bm * params.fm
         if M_axis.extent.is_static:
             E_M = M_axis.extent.as_static()
             if M_name in overhang:
-                M_b_ext = -(-E_M // (params.bm * params.fm))
-                m_real = E_M
+                M_b = Axis(f"{M_name}_b", -(-E_M // m_bnfm), source_axis=M_src, real_extent=E_M)
+                m_bound = Literal(E_M, "int")
             else:
-                M_b_ext = E_M // (params.bm * params.fm)
-            M_b = Axis(f"{M_name}_b", M_b_ext, source_axis=M_src, real_extent=m_real)
+                M_b = Axis(f"{M_name}_b", E_M // m_bnfm, source_axis=M_src)
+        elif M_name in overhang:
+            M_b = Axis(f"{M_name}_b", (M_axis.extent + (m_bnfm - 1)) // m_bnfm, source_axis=M_src)
+            m_bound = M_axis.extent.expr
         else:
             M_b = Axis(f"{M_name}_b", M_axis.extent, source_axis=M_src)
         M_t = Axis(f"{M_name}_t", params.bm, source_axis=M_src)
@@ -1190,18 +1248,20 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         new_inner = inner_after_outer
 
     # Masked tiles: when ceil-div has rounded a block-axis extent up past the
-    # real N (or M) extent, wrap the σ-rewritten body in
-    # ``Cond(decoded_axis_coord < real_extent)``. The Cond sits INSIDE the
-    # register tower (N_r is in scope for the predicate). The replicator in
-    # ``010_split_register_axes`` handles Conds whose predicate depends on the
-    # replicated axis by σ-substituting per replica so each replicated body
-    # gets a partly-constant-folded predicate (NVRTC drops always-true copies).
-    if N_name in overhang:
+    # axis bound, wrap the σ-rewritten body in ``Cond(decoded_axis_coord <
+    # bound)``. ``bound`` is the static ``real_extent`` (lm_head vocab) or the
+    # symbolic ``Var`` (hint-driven dynamic axis — resolved to the runtime
+    # value at launch). The Cond sits INSIDE the register tower (N_r is in
+    # scope for the predicate). The replicator in ``010_split_register_axes``
+    # handles Conds whose predicate depends on the replicated axis by
+    # σ-substituting per replica so each replicated body gets a partly-
+    # constant-folded predicate (NVRTC drops always-true copies).
+    if n_bound is not None:
         n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
-        new_inner = (Cond(cond=BinaryExpr("<", n_pred, Literal(E_N, "int")), body=Body(new_inner)),)
-    if shape.outer_m is not None and M_name in overhang:
+        new_inner = (Cond(cond=BinaryExpr("<", n_pred, n_bound), body=Body(new_inner)),)
+    if m_bound is not None:
         m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
-        new_inner = (Cond(cond=BinaryExpr("<", m_pred, Literal(E_M, "int")), body=Body(new_inner)),)
+        new_inner = (Cond(cond=BinaryExpr("<", m_pred, m_bound), body=Body(new_inner)),)
 
     # σ-rewrite + K-replace the prologue when present. The prologue sits
     # inside M_r (so M_r is in scope for σ_outer's M-axis mapping) and

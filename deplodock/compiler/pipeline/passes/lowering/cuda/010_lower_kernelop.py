@@ -104,16 +104,26 @@ def _launch_geometry(
     seen = _collect_symbolic_axis_names(kernel_op)
 
     def _axes_spec(axes) -> GridDimSpec:
-        factors: list[int | str] = []
+        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
+        factors: list = []
         for a in axes:
             if a.extent.is_static:
                 v = a.extent.as_static()
                 if v != 1:
                     factors.append(v)
-            else:
+            elif isinstance(a.extent.expr, Var):
                 name = a.extent.as_atom_name()
                 seen.setdefault(name, None)
                 factors.append(name)
+            else:
+                # Composite symbolic extent (ceil-div block axis for a
+                # hint-driven masked tile): carry the Expr; the launch resolver
+                # evals it. Its free names become ``int`` runtime args.
+                expr = a.extent.expr
+                for name in expr.free_vars():
+                    seen.setdefault(name, None)
+                factors.append(expr)
         return tuple(factors) if factors else (1,)
 
     for s in kernel_op.body:
@@ -128,11 +138,23 @@ def _launch_geometry(
         if isinstance(s, ThreadTile):
             from math import prod  # noqa: PLC0415
 
-            if any(not a.extent.is_static for a in s.axes):
-                raise ValueError("standalone ThreadTile kernel with a symbolic axis cannot stamp a ceil-div grid at compile time")
-            n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
-            grid = (((n_threads + _BLOCK - 1) // _BLOCK,), (1,), (1,))
-            return grid, ((_BLOCK,), (1,), (1,)), tuple(seen)
+            if all(a.extent.is_static for a in s.axes):
+                n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
+                grid = (((n_threads + _BLOCK - 1) // _BLOCK,), (1,), (1,))
+                return grid, ((_BLOCK,), (1,), (1,)), tuple(seen)
+            # Symbolic flattened pointwise: grid = ceil_div(prod(extents), _BLOCK).
+            # ``Dim`` arithmetic folds the static factors and carries the
+            # symbolic ones; the launch resolver evals the Expr per launch.
+            from deplodock.compiler.dim import Dim  # noqa: PLC0415
+
+            nthreads = Dim(1)
+            for a in s.axes:
+                nthreads = nthreads * a.extent
+                if not a.extent.is_static:
+                    for name in a.extent.expr.free_vars():
+                        seen.setdefault(name, None)
+            grid_expr = ((nthreads + (_BLOCK - 1)) // _BLOCK).expr
+            return ((grid_expr,), (1,), (1,)), ((_BLOCK,), (1,), (1,)), tuple(seen)
     return ((1,), (1,), (1,)), ((1,), (1,), (1,)), tuple(seen)
 
 
@@ -149,7 +171,11 @@ def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:
     def visit(stmt: Stmt) -> None:
         for ax in _stmt_axes(stmt):
             if isinstance(ax, Axis) and not ax.extent.is_static:
-                seen.setdefault(ax.extent.as_atom_name(), None)
+                # Composite extents (ceil-div block axes) contribute every free
+                # name (``free_vars``), not just an atomic one — each becomes a
+                # runtime arg.
+                for name in ax.extent.expr.free_vars():
+                    seen.setdefault(name, None)
         for body in stmt.nested():
             for child in body:
                 visit(child)

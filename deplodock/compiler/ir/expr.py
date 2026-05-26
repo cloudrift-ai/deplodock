@@ -331,7 +331,10 @@ class BinaryExpr(_ExprOps):
         prec = _PRECEDENCE.get(self.op, 10)
         left = self.left.render(ctx, prec)
         right = self.right.render(ctx, prec + 1)
-        result = f"{left} {self.op} {right}"
+        # ``//`` is Python floor-div; C integer division ``/`` floors for the
+        # non-negative operands shape arithmetic produces.
+        c_op = "/" if self.op == "//" else self.op
+        result = f"{left} {c_op} {right}"
         return f"({result})" if prec < parent_prec else result
 
     def simplify(self, ctx: SimplifyCtx) -> Expr:
@@ -619,6 +622,7 @@ _PRECEDENCE: dict[str, int] = {
     "-": 5,
     "*": 6,
     "/": 6,
+    "//": 6,  # integer floor-div — renders as C ``/`` (truncation == floor for ≥0)
     "%": 6,
 }
 

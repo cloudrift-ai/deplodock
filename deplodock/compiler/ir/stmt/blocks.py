@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum
@@ -108,7 +108,7 @@ class Loop(Stmt):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
-        extent = _extent_c(self.axis)
+        extent = _extent_c(self.axis, ctx)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
@@ -133,21 +133,27 @@ def _body_uses_lane_warp(body: Body) -> bool:
     return bool(body.iter_of_type(WarpShuffle, TreeHalve))
 
 
-def _extent_c(ax: Axis) -> str:
+def _extent_c(ax: Axis, ctx: RenderCtx) -> str:
     """Render one axis extent as a C expression: literal int for static
     ``Dim``, the symbolic name for ``Dim('seq_len')``. ``Dim.__str__``
-    already returns the bare ``value`` so a plain ``str(ax.extent)`` is
-    enough — kept as a helper so the intent reads as ``_extent_c(ax)``
-    rather than the unobvious ``str``-of-``Dim`` idiom."""
-    return str(ax.extent)
+    already returns the bare ``value`` for those, so a plain ``str`` is
+    enough. A composite extent (the ceil-div block axis of a hint-driven
+    masked tile, ``(seq_len+31)//32``) must go through the C expr renderer
+    so ``//`` becomes ``/`` — ``str`` would leak the Python spelling."""
+    ext = ax.extent
+    if ext.is_static or isinstance(ext.expr, Var):
+        return str(ext)
+    # Parenthesize: the extent lands as a ``%`` / ``/`` operand in the decode
+    # (``idx % (seq_len+31)/32`` would otherwise mis-associate).
+    return f"({ext.expr.render(ctx)})"
 
 
-def _stride_c(axes) -> str:
+def _stride_c(axes, ctx: RenderCtx) -> str:
     """Build a C expression for the product of axis extents — used as the
     stride divisor in the grid-axis decode. ``1`` if ``axes`` is empty."""
     if not axes:
         return "1"
-    return " * ".join(_extent_c(a) for a in axes)
+    return " * ".join(_extent_c(a, ctx) for a in axes)
 
 
 def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderCtx) -> list[str]:
@@ -160,14 +166,14 @@ def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderC
     decoded: list[str] = []
     stride_axes: list[Axis] = []  # accumulated INNER axes (per-step product is their extents)
     for ax in reversed(axes):
-        extent = _extent_c(ax)
+        extent = _extent_c(ax, ctx)
         if not stride_axes:
             decoded.append(f"int {ax.name} = {idx_expr} % {extent};")
         else:
-            decoded.append(f"int {ax.name} = ({idx_expr} / ({_stride_c(stride_axes)})) % {extent};")
+            decoded.append(f"int {ax.name} = ({idx_expr} / ({_stride_c(stride_axes, ctx)})) % {extent};")
         stride_axes.append(ax)
     outer = axes[0]
-    outer_stride = _stride_c(list(axes[1:]))
+    outer_stride = _stride_c(list(axes[1:]), ctx)
     decoded[-1] = f"int {outer.name} = {idx_expr} / ({outer_stride});"
     return [pad + line for line in reversed(decoded)]
 
@@ -178,17 +184,17 @@ def _render_thread_axis_decode(axes: tuple[Axis, ...], ctx: RenderCtx) -> list[s
     decoded: list[str] = []
     stride_axes: list[Axis] = []
     for ax in reversed(axes):
-        extent = _extent_c(ax)
+        extent = _extent_c(ax, ctx)
         if not stride_axes:
             decoded.append(f"int {ax.name} = tid % {extent};")
         else:
-            decoded.append(f"int {ax.name} = (tid / ({_stride_c(stride_axes)})) % {extent};")
+            decoded.append(f"int {ax.name} = (tid / ({_stride_c(stride_axes, ctx)})) % {extent};")
         stride_axes.append(ax)
     if len(axes) == 1:
         decoded = [f"int {axes[0].name} = tid;"]
     else:
         outer = axes[0]
-        outer_stride = _stride_c(list(axes[1:]))
+        outer_stride = _stride_c(list(axes[1:]), ctx)
         decoded[-1] = f"int {outer.name} = tid / ({outer_stride});"
     return [pad + line for line in reversed(decoded)]
 

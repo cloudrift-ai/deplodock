@@ -272,6 +272,17 @@ def _print_kernel_stats(graph, bench):
     attrs_by_kname = _collect_kernel_attrs(graph)
     occ_limits = _occupancy_limits()
 
+    # Symbolic grids (ceil-div over a dynamic axis) need a concrete env to
+    # resolve for display — use each symbolic input dim's hint, so the printed
+    # geometry reflects the hint-sized tile the kernel was tuned for.
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
+    sym_env: dict[str, int] = {}
+    for nid in graph.inputs:
+        for dim in graph.nodes[nid].output.shape:
+            if isinstance(dim.expr, Var) and dim.hint is not None:
+                sym_env.setdefault(dim.expr.name, dim.hint)
+
     print()
     print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}")
     print("-" * 90)
@@ -281,8 +292,8 @@ def _print_kernel_stats(graph, bench):
         pct = (t_us / total_us * 100) if total_us > 0 else 0.0
         from deplodock.compiler.ir.cuda.ir import resolve_dim
 
-        block_dims = [resolve_dim(d, {}) for d in op.block]
-        grid_dims = [resolve_dim(d, {}) for d in op.grid]
+        block_dims = [resolve_dim(d, sym_env) for d in op.block]
+        grid_dims = [resolve_dim(d, sym_env) for d in op.grid]
         block_threads = block_dims[0] * block_dims[1] * block_dims[2]
         grid_total = grid_dims[0] * grid_dims[1] * grid_dims[2]
         smem_kb = op.smem_bytes / 1024

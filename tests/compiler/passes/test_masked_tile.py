@@ -10,6 +10,7 @@ itself (not just descend into its body) to avoid leaving dangling Var refs.
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
@@ -96,3 +97,89 @@ def test_split_register_axes_replicates_cond_with_axis_dep_predicate():
     for c in conds:
         free = set(c.cond.free_vars())
         assert "a_reg" not in free, f"a_reg should be σ-substituted, got predicate {c.cond.pretty()!r}"
+
+
+# ---------------------------------------------------------------------------
+# Symbolic (hint-driven) masked tiles — a dynamic axis is tiled for its Dim
+# hint and emitted as a masked tile (ceil-div grid + boundary Cond against the
+# runtime symbolic value), so one kernel runs correctly at any seq_len.
+# ---------------------------------------------------------------------------
+
+
+def test_dim_defaults_symbolic_hint():
+    """Atomic symbolic Dims carry the default expected size; static and
+    composite dims don't (the planner only reads the hint off the input axis)."""
+    assert Dim("seq_len").hint == DEFAULT_SEQ_HINT
+    assert Dim(32).hint is None
+    assert (Dim("seq_len") * 2).hint is None  # composite
+    assert Dim("seq_len", hint=128).hint == 128  # explicit wins
+    # Hint is metadata: excluded from identity so cache keys stay hint-independent.
+    assert Dim("seq_len", hint=128) == Dim("seq_len")
+    assert hash(Dim("seq_len", hint=128)) == hash(Dim("seq_len"))
+
+
+def test_planner_masks_symbolic_m_axis_at_hint(recording_dump):
+    """A matmul with a symbolic M (seq_len) is tiled for the hint and masked:
+    the M block axis becomes a composite ceil-div over ``seq_len`` and the body
+    carries a boundary Cond referencing the symbolic ``seq_len`` (not a literal)."""
+    g = Graph()
+    _input(g, "a", (Dim("seq_len"), 64))
+    _input(g, "b", (64, 512))
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (Dim("seq_len"), 512)), node_id="o")
+    g.inputs = ["a", "b"]
+    g.outputs = ["o"]
+
+    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+
+    # A block axis should carry a composite ceil-div extent over seq_len (not a
+    # bare Var, not static) — i.e. a real tile, not the degenerate whole-axis bind.
+    def _is_ceildiv_over_seq(ax: Axis) -> bool:
+        e = ax.extent
+        return not e.is_static and not isinstance(e.expr, Var) and "seq_len" in e.expr.free_vars()
+
+    composite_block = [
+        ax for stmt in tile_op.body.iter() for ax in getattr(stmt, "axes", ()) if isinstance(ax, Axis) and _is_ceildiv_over_seq(ax)
+    ]
+    assert composite_block, "expected a ceil-div block axis over seq_len (hint-driven masked tile)"
+
+    # The boundary Cond should compare against the symbolic seq_len, not a literal.
+    conds = list(tile_op.body.iter_of_type(Cond))
+    assert conds, "expected a mask Cond"
+    assert any("seq_len" in c.cond.free_vars() for c in conds), f"mask should gate against seq_len, got {[c.cond.pretty() for c in conds]}"
+
+
+def test_resolve_dim_evaluates_ceildiv_grid_factor():
+    """A grid spec carrying a composite ceil-div Expr resolves at launch from
+    ``sym_values`` (one cached kernel, any runtime seq_len)."""
+    from deplodock.compiler.ir.cuda.ir import resolve_dim
+
+    ceil_div = ((Dim("seq_len") + 31) // 32).expr  # (seq_len + 31) // 32
+    spec = (4, ceil_div, 2)  # heads * M_blocks * splitk
+    assert resolve_dim(spec, {"seq_len": 100}) == 4 * ((100 + 31) // 32) * 2  # 4*4*2 = 32
+    assert resolve_dim(spec, {"seq_len": 512}) == 4 * 16 * 2
+
+
+def test_resolve_symbolic_falls_back_to_hint_without_inputs():
+    """Benchmarking a symbolic graph with no input arrays (the autotuner case)
+    resolves each symbolic dim to its ``Dim`` hint instead of raising."""
+    from deplodock.compiler.backend.cuda.program import _Compiled, _resolve_symbolic, _symbolic_hints
+
+    g = Graph()
+    _input(g, "x", (1, Dim("seq_len"), 2048))
+    g.inputs = ["x"]
+    g.outputs = ["x"]
+    hints = _symbolic_hints(g)
+    assert hints == {"seq_len": DEFAULT_SEQ_HINT}
+
+    compiled = _Compiled(
+        bufs=[],
+        buf_by_name={},
+        constants={},
+        kernels={},
+        launches=[],
+        symbolic_bindings={"seq_len": ("x", 1)},
+        symbolic_hints=hints,
+    )
+    # No input_data → fall back to the hint.
+    assert _resolve_symbolic(compiled, {}) == {"seq_len": DEFAULT_SEQ_HINT}
