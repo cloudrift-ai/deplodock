@@ -68,6 +68,19 @@ This invariant lets the orchestrator iterate candidates without leaking orphans:
 
 Both providers swallow termination errors and log them — the original failure is what the orchestrator needs to classify the next move, not a cascade from cleanup.
 
+## CloudRift image selection
+
+`cloudrift.select_image_url` maps the resolved instance type to one of three VM images:
+
+| Instance prefix       | Image                                                  | Why                                                              |
+|-----------------------|--------------------------------------------------------|------------------------------------------------------------------|
+| `mi*` (AMD Instinct)  | `DEFAULT_IMAGE_URL_AMD` (Ubuntu + ROCm)                | ROCm kernel module                                               |
+| `v100*`, `p100*`      | `DEFAULT_IMAGE_URL_NVIDIA_PROPRIETARY` (R580 proprietary) | Pre-Turing NVIDIA GPUs have no GSP and can't load the open kernel modules baked into the default image |
+| anything else (NVIDIA)| `DEFAULT_IMAGE_URL_NVIDIA` (R580 open)                 | Standard path for Turing-and-newer                               |
+
+Mismatches leave the GPU unusable because the wrong kernel-module flavor is on disk. The proprietary-driver image
+mirrors the recipe CloudRift's `rift-console` surfaces only for hosts whose `brand_short` matches `/\bV100|P100\b/`.
+
 ## Adding a new provider
 
 See `commands/ARCHITECTURE.md` § *Adding a New VM Provider*. The provider's `create_instance` must:

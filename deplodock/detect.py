@@ -44,6 +44,8 @@ GPU_PCI_DEVICE_IDS: dict[str, str] = {
     "20b5": "NVIDIA A100 80GB",
     # AMD Instinct MI350X
     "75b0": "AMD Instinct MI350X",
+    # NVIDIA Tesla V100 SXM3 32GB (DGX-2 / HGX-2 baseboard)
+    "1db8": "NVIDIA Tesla V100 SXM3 32GB",
 }
 
 _SYSFS_SCAN_CMD = (

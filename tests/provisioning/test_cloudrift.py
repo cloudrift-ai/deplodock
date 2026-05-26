@@ -12,6 +12,7 @@ from deplodock.provisioning.cloudrift import (
     DEFAULT_CLOUDINIT_URL,
     DEFAULT_IMAGE_URL_AMD,
     DEFAULT_IMAGE_URL_NVIDIA,
+    DEFAULT_IMAGE_URL_NVIDIA_PROPRIETARY,
     _add_ssh_key,
     _api_request,
     _ensure_ssh_key,
@@ -407,6 +408,14 @@ def test_select_image_url_nvidia_rtx5090():
 
 def test_select_image_url_nvidia_h200():
     assert select_image_url("h200-24-200-1000-generic.8") == DEFAULT_IMAGE_URL_NVIDIA
+
+
+def test_select_image_url_nvidia_v100_uses_proprietary_driver():
+    assert select_image_url("v100-5-85-800-generic.16") == DEFAULT_IMAGE_URL_NVIDIA_PROPRIETARY
+
+
+def test_select_image_url_nvidia_p100_uses_proprietary_driver():
+    assert select_image_url("p100-4-60-500-foo.1") == DEFAULT_IMAGE_URL_NVIDIA_PROPRIETARY
 
 
 # ── _instance_fully_ready ────────────────────────────────────────
