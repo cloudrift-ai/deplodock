@@ -338,9 +338,17 @@ class _Splicer(LoopBuilder):
 
     def _resolve_external_load(self, stmt: Load, d: _Demand) -> None:
         """A Load that isn't a splice edge — keep its buf name as-is (buf
-        identity is global across kernels), σ-sub the index, emit."""
-        new_index = tuple(d.sigma.apply(e) for e in stmt.index)
-        self.insert(Load(name=d.bound_as, input=stmt.input, index=new_index), d.demand_scope)
+        identity is global across kernels), σ-sub the index, emit.
+
+        A data-dependent index (gather ``weight[(int)in0, a]``) reads SSA names
+        via ``Load.deps()``. Resolve each one that names a source-loop def the
+        same way ``_resolve_plain`` resolves an Assign's args, then ``rewrite``
+        renames it inside the index. Axis-name deps aren't in ``meta.defs`` and
+        are left to σ."""
+        meta = self.loops[d.origin]
+        rename = {v: self._ensure_dep(v, d.origin, d.sigma, d.demand_scope) for v in stmt.deps() if v in meta.defs}
+        rename[stmt.name] = d.bound_as
+        self.insert(stmt.rewrite(lambda n: rename.get(n, n), d.sigma), d.demand_scope)
 
     def _resolve_splice_load(self, stmt: Load, d: _Demand, target_tag: str, target_output_buf: str) -> None:
         """A Load that's a splice edge to another registered loop — emit a
