@@ -11,8 +11,11 @@ Module-level state:
 - ``_PRELUDE_INSTALLED``: ``cppyy.cppdef(PRELUDE)`` is idempotent in
   effect but emits warnings on redefinition; we install the prelude
   once.
-- ``_FN_CACHE``: keyed by ``(loop id, input_shapes, output_shape)`` so
-  repeated calls with the same shapes don't re-JIT.
+- ``_FN_CACHE``: keyed by the rendered C++ source string (which folds in
+  the loop body + input/output shapes) so repeated calls with an identical
+  kernel don't re-JIT. NOT keyed on ``id(loop)`` — object addresses are
+  recycled by CPython, so a GC'd LoopOp's id can alias a later same-shape
+  one and serve the wrong cached kernel.
 - ``_FN_COUNTER``: monotonic id used to give every kernel a unique C
   symbol name; cppyy / Cling can't redefine a function once it's been
   compiled in the same process.
@@ -113,7 +116,14 @@ def execute_loop_op_cpp(
 
     bufs = tuple(loop.inputs)
     input_shapes = {name: tuple(int(d) for d in input_arrays[name].shape) for name in bufs}
-    cache_key = (id(loop), tuple(input_shapes.items()), tuple(out_shape))
+    # Key on the rendered source, NOT ``id(loop)``: a LoopOp plus its runtime
+    # shapes uniquely determine the C++ string (see module docstring), and the
+    # object address is unsafe — CPython reuses the id of a GC'd LoopOp, so a
+    # later same-shape LoopOp (e.g. tanh after a freed negate) could collide on
+    # ``id`` and be served the stale kernel. Render with a fixed placeholder
+    # name so the key is stable across calls; the JIT'd symbol gets its unique
+    # ``_FN_COUNTER`` name only on a miss.
+    cache_key = render_loopop_cpp(loop, "loopop_kern", input_shapes, out_shape)
 
     fn = _FN_CACHE.get(cache_key)
     if fn is None:
