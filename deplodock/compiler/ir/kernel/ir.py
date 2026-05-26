@@ -63,7 +63,7 @@ from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, St
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class Smem(Stmt):
     """Declare a per-block ``__shared__`` array.
 
@@ -122,7 +122,7 @@ class Smem(Stmt):
         return [f"{_pad(ctx.indent)}__shared__ {ali}{self.dtype} {self.name}[{total}];"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class Sync(Stmt):
     """``__syncthreads();`` — block-wide barrier."""
 
@@ -133,7 +133,7 @@ class Sync(Stmt):
         return [f"{_pad(ctx.indent)}__syncthreads();"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class CpAsyncCopy(Stmt):
     """Issue one ``cp.async.cg.shared.global`` instruction.
 
@@ -175,7 +175,7 @@ class CpAsyncCopy(Stmt):
         ]
 
 
-@dataclass
+@dataclass(frozen=True)
 class CpAsyncCommit(Stmt):
     """``cp.async.commit_group;`` — finalize the preceding cp.async copies
     issued by this thread into a commit group. Pairs with
@@ -188,7 +188,7 @@ class CpAsyncCommit(Stmt):
         return [f'{_pad(ctx.indent)}asm volatile("cp.async.commit_group;\\n" ::: "memory");']
 
 
-@dataclass
+@dataclass(frozen=True)
 class CpAsyncWait(Stmt):
     """``cp.async.wait_group N;`` — block this thread until ≤ N cp.async
     groups remain in flight. ``group=0`` waits for everything (synchronous
@@ -203,7 +203,7 @@ class CpAsyncWait(Stmt):
         return [f'{_pad(ctx.indent)}asm volatile("cp.async.wait_group {self.group};\\n" ::: "memory");']
 
 
-@dataclass
+@dataclass(frozen=True)
 class TmaDescriptor(Stmt):
     """Host-built ``CUtensorMap`` descriptor for a TMA box copy.
 
@@ -237,7 +237,7 @@ class TmaDescriptor(Stmt):
         return []
 
 
-@dataclass
+@dataclass(frozen=True)
 class TmaLoad(Stmt):
     """``cp.async.bulk.tensor.<rank>d`` — single-thread box copy.
 
@@ -289,7 +289,7 @@ def _mbar_addr_expr(mbar: str, slot: Expr | None) -> str:
     return f"__cvta_generic_to_shared(&{mbar}[{{slot_expr}}])".replace("{slot_expr}", "%(slot)s")
 
 
-@dataclass
+@dataclass(frozen=True)
 class MbarrierInit(Stmt):
     """``mbarrier.init.shared.b64 [&mbar[slot]], count;`` — one-shot init.
 
@@ -313,7 +313,7 @@ class MbarrierInit(Stmt):
         return [f"{pad}mbarrier_init({addr}, {self.count});"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class MbarrierArriveExpectTx(Stmt):
     """``mbarrier.arrive.expect_tx.shared.b64`` — declare the expected
     transaction byte count for the in-flight TMA copy on this barrier.
@@ -333,7 +333,7 @@ class MbarrierArriveExpectTx(Stmt):
         return [f"{pad}mbarrier_arrive_expect_tx({addr}, {self.bytes_});"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class MbarrierWait(Stmt):
     """``mbarrier.try_wait.parity.shared.b64`` — block until the barrier's
     parity flips for ``phase``. Replaces ``CpAsyncWait + Sync`` for TMA
@@ -355,7 +355,7 @@ class MbarrierWait(Stmt):
         return [f"{pad}mbarrier_wait_parity({addr}, {phase_expr});"]
 
 
-@dataclass
+@dataclass(frozen=True)
 class TreeHalve(Stmt):
     """Cooperative power-of-two tree reduction over a 1D smem buffer.
 
@@ -395,7 +395,7 @@ class TreeHalve(Stmt):
         ]
 
 
-@dataclass
+@dataclass(frozen=True)
 class WarpShuffle(Stmt):
     """Warp-shuffle reduction: combine ``value`` across ``length`` lanes
     via ``__shfl_xor_sync`` and bind the broadcast result to ``name``.

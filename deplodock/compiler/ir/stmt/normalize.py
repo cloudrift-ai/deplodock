@@ -66,6 +66,7 @@ def normalize_body(
     :attr:`Body.structural_key()` so two bodies that differ only in the
     *kind* of FMA / compare / SFU op at the same position hash equal.
     """
+    stmts = Body.coerce(stmts)
     stmts = topo_sort_siblings(stmts)
     stmts = drop_size_one_free_axes(stmts)
     stmts = canonicalize_free_axis_order(stmts)

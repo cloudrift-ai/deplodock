@@ -89,6 +89,27 @@ Group imports in this order, separated by blank lines:
 
 Style rules are enforced by [Ruff](https://docs.astral.sh/ruff/), configured in `pyproject.toml`. Run `make lint` to check and `make format` to auto-fix. Enabled rule sets: `E` (pycodestyle), `F` (pyflakes), `W` (warnings), `I` (isort), `UP` (pyupgrade), `B` (bugbear).
 
+### IR statements must be frozen dataclasses
+
+Every concrete `Stmt` subclass — Loop-IR (`Loop`, `StridedLoop`, `Cond`, leaves), Tile-IR (`GridTile`, `ThreadTile`,
+`RegisterTile`, `SerialTile`, `StridedTile`, `Stage`, `StageBundle`, `AsyncWait`), Kernel-IR (`Smem`, `Sync`,
+`CpAsyncCopy`, `TmaDescriptor`, `TmaLoad`, `MbarrierInit`, …) — must be declared `@dataclass(frozen=True)`. `Body` is
+already a `tuple[Stmt, ...]` subclass, so freezing every Stmt makes the entire body tree hashable end-to-end.
+
+Why: structural caches (`Body.structural_key()` and any future bodies-as-cache-keys work) traverse the body and hash
+every Stmt. A single mutable Stmt anywhere in the tree poisons every cache that keys on the surrounding Body — and
+the surrounding code can't degrade gracefully without losing the optimization.
+
+If you need to "edit" a frozen Stmt, return a new instance via `dataclasses.replace(stmt, field=value)`. If a
+`__post_init__` needs to coerce a field (e.g. `tuple → Body`), use `object.__setattr__(self, "field", coerced)` —
+that's the standard pattern for frozen dataclasses that still need light normalization at construction time. Don't
+add `try/except TypeError` fallbacks around structural caches to tolerate unhashable stmts; fix the unhashable stmt
+instead.
+
+Op subclasses don't have to be frozen (the engine mutates `op.source` / `op.knobs` / `op.inputs` / `op.outputs` post-
+construction). Just make sure no Op ends up as a *field value* of a Stmt — `Assign.op` / `Accum.op` / `Select.op` take
+an `ElementwiseImpl` (the lightweight value object, already hashable), never an `ElementwiseOp` wrapper.
+
 ### Dependency Injection for Testability
 
 Shared logic accepts callable parameters (`run_cmd`, `write_file`) so

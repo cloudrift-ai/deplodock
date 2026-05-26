@@ -15,7 +15,6 @@ from deplodock.compiler.ir.loop import (
     SelectBranch,
     Write,
 )
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
 
 def Port(index=()):
@@ -178,7 +177,7 @@ def test_load_stmt_binding():
                 axis=Axis("a0", 4),
                 body=(
                     Load("x_val", input="src_0", index=(Var("a0"),)),
-                    Assign("y", ElementwiseOp("negative"), ("x_val",)),
+                    Assign("y", ElementwiseImpl("negative"), ("x_val",)),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -199,7 +198,7 @@ def test_load_stmt_multiple_sources():
                 body=(
                     Load("a", input="src_0", index=(Var("a0"),)),
                     Load("b", input="src_2", index=(Var("a0"),)),
-                    Assign("y", ElementwiseOp("add"), ("a", "b")),
+                    Assign("y", ElementwiseImpl("add"), ("a", "b")),
                     Write(output="out_0", index=(Var("a0"),), value="y"),
                 ),
             ),
@@ -242,7 +241,7 @@ def test_update_synthesizes_accum_decl():
 
 
 def test_assign_construction():
-    a = Assign("out", ElementwiseOp("add"), args=("a", "b"))
+    a = Assign("out", ElementwiseImpl("add"), args=("a", "b"))
     assert a.name == "out"
     assert a.op.name == "add"
     assert a.args == ("a", "b")
@@ -264,7 +263,7 @@ def test_kernel_pointwise():
         axes=axes,
         inputs=(p, p),
         body=(
-            Assign("z", ElementwiseOp("add"), args=("$0", "$1")),
+            Assign("z", ElementwiseImpl("add"), args=("$0", "$1")),
             Write(output="out_0", index=(Var("a0"),), value="z"),
         ),
     )
@@ -292,7 +291,7 @@ def test_kernel_matmul():
         axes=axes,
         inputs=(p, p),
         body=(
-            Assign("multiply", ElementwiseOp("multiply"), args=("$0", "$1")),
+            Assign("multiply", ElementwiseImpl("multiply"), args=("$0", "$1")),
             Accum(name="dot", value="multiply"),
             Write(output="out_0", index=(Var("a0"),), value="dot"),
         ),
@@ -309,9 +308,9 @@ def test_kernel_matmul_bias():
         axes=axes,
         inputs=(p_mk, p_mk, p_bias),
         body=(
-            Assign("multiply", ElementwiseOp("multiply"), args=("$0", "$1")),
+            Assign("multiply", ElementwiseImpl("multiply"), args=("$0", "$1")),
             Accum(name="dot", value="multiply"),
-            Assign("out", ElementwiseOp("add"), args=("dot", "$2")),
+            Assign("out", ElementwiseImpl("add"), args=("dot", "$2")),
             Write(output="out_0", index=(Var("a0"),), value="out"),
         ),
     )
@@ -346,8 +345,8 @@ def test_kernel_unary_chain():
         axes=axes,
         inputs=(p,),
         body=(
-            Assign("negative", ElementwiseOp("negative"), args=("$0",)),
-            Assign("exp", ElementwiseOp("exp"), args=("negative",)),
+            Assign("negative", ElementwiseImpl("negative"), args=("$0",)),
+            Assign("exp", ElementwiseImpl("exp"), args=("negative",)),
             Write(output="out_0", index=(Var("a0"),), value="exp"),
         ),
     )
@@ -363,7 +362,7 @@ def test_kernel_scatter_output_via_select():
         axes=axes,
         inputs=(p, p),
         body=(
-            Assign("z", ElementwiseOp("add"), args=("$0", "$1")),
+            Assign("z", ElementwiseImpl("add"), args=("$0", "$1")),
             Select(
                 name="v",
                 branches=(
@@ -389,7 +388,7 @@ def test_ssa_rejects_undefined_arg():
         _loop(
             axes=axes,
             inputs=(p,),
-            body=(Assign("y", ElementwiseOp("exp"), args=("z",)),),
+            body=(Assign("y", ElementwiseImpl("exp"), args=("z",)),),
         )
 
 
@@ -401,8 +400,8 @@ def test_ssa_rejects_duplicate_name():
             axes=axes,
             inputs=(p,),
             body=(
-                Assign("y", ElementwiseOp("exp"), args=("$0",)),
-                Assign("y", ElementwiseOp("negative"), args=("y",)),
+                Assign("y", ElementwiseImpl("exp"), args=("$0",)),
+                Assign("y", ElementwiseImpl("negative"), args=("y",)),
             ),
         )
 
@@ -417,8 +416,8 @@ def test_ssa_topo_sorts_forward_reference():
         axes=axes,
         inputs=(p,),
         body=(
-            Assign("a", ElementwiseOp("add"), args=("$0", "b")),
-            Assign("b", ElementwiseOp("exp"), args=("$0",)),
+            Assign("a", ElementwiseImpl("add"), args=("$0", "b")),
+            Assign("b", ElementwiseImpl("exp"), args=("$0",)),
             Write(output="out_0", index=(Var("a0"),), value="a"),
         ),
     )
@@ -435,9 +434,9 @@ def test_ssa_allows_input_name_reuse_in_multiple_args():
         axes=axes,
         inputs=(p,),
         body=(
-            Assign("a", ElementwiseOp("exp"), args=("$0",)),
-            Assign("b", ElementwiseOp("negative"), args=("$0",)),
-            Assign("c", ElementwiseOp("add"), args=("a", "b")),
+            Assign("a", ElementwiseImpl("exp"), args=("$0",)),
+            Assign("b", ElementwiseImpl("negative"), args=("$0",)),
+            Assign("c", ElementwiseImpl("add"), args=("a", "b")),
             Write(output="out_0", index=(Var("a0"),), value="c"),
         ),
     )
@@ -477,7 +476,7 @@ def test_loop_stmt_basic():
             Loop(
                 axis=Axis("a0", 8),
                 body=(
-                    Assign("v", ElementwiseOp("negative"), args=("$0",)),
+                    Assign("v", ElementwiseImpl("negative"), args=("$0",)),
                     Write(output="out_0", index=(Var("a0"),), value="v"),
                 ),
             ),
@@ -498,7 +497,7 @@ def test_loop_axis_sibling_same_name_allowed():
         body=(
             Loop(axis=Axis("k", 8), body=(Accum(name="mx", value="$0", op="maximum"),)),
             Loop(axis=Axis("k", 8), body=(Accum(name="sm", value="$1"),)),
-            Assign("v", ElementwiseOp("add"), args=("mx", "sm")),
+            Assign("v", ElementwiseImpl("add"), args=("mx", "sm")),
             Write(output="out_0", index=(Var("a0"),), value="v"),
         ),
     )
@@ -519,7 +518,7 @@ def test_loop_ssa_scoping():
             body=(
                 Loop(
                     axis=Axis("a0_inner", 4),
-                    body=(Assign("v", ElementwiseOp("negative"), args=("$0",)),),
+                    body=(Assign("v", ElementwiseImpl("negative"), args=("$0",)),),
                 ),
                 # Reference 'v' outside the inner Loop — should fail.
                 Write(output="out_0", index=(Var("a0"),), value="v"),

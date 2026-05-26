@@ -82,13 +82,29 @@ into get materialized. `Fork.knobs` is read by `_best_fork` (for
 DB-seeded greedy replay) without firing the thunk; `Fork.score` is the
 MCTS prior the producing rule attaches.
 
-No production rule currently emits branch Forks — an early experiment
-in the partition planner showed that a priority-rank-derived
-`Fork.score` is a coarser MCTS prior than the proper `TileOp.score`,
-so hierarchical exploration found best variants more slowly than the
-flat list. The infrastructure stays because it's straightforward to
-use once a richer per-level prior (or a search-space size that
-amortizes the structural overhead) justifies it.
+The partition planner (`lowering/tile/010_partition_loops`) emits a
+hierarchical Fork tree: `BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp`
+leaf. Sibling sorting uses `TileOp.lazy_score(ctx, shapes=..., params=...)`
+— the static-method counterpart of `Op.score` that estimates the same
+formula from cheap inputs (knob bundle + planner shape) so siblings rank
+without anyone instantiating a TileOp. The branch tree's `Fork.score`
+propagates max from leaves, matching MCTS's max-Q semantics.
+
+Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
+`_build_split_body` + `TileOp.__post_init__` (which runs the full
+12-pass `normalize_body`) only fire for the variant the search actually
+resolves. In greedy `deplodock compile`, that's one variant per
+LoopOp. Earlier behavior materialized every variant up front (dozens
+to ~200 per matmul-class kernel) just to score them; the lazy split
+cut whole-model Qwen3 0.6B compile from 10+ minutes to ~48 seconds.
+
+For rules that want a custom lazy scorer, override
+`Op.lazy_score(cls, ctx, *, knobs=None, shapes=None, params=None)` on
+the producing Op class. The base implementation returns `None` (no
+lazy estimate available); callers fall back to constructing the op
+and calling `score(ctx)`. `TileOp.lazy_score` is the reference
+implementation — it consumes `KernelShape` + `TileParams` from the
+partition planner and replicates `TileOp.score`'s formula byte-for-byte.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
