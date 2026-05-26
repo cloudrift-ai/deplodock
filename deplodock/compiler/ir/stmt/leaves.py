@@ -15,6 +15,18 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_li
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, dtype_promote, op_to_expr, render_index, select_to_ternary
 
 
+def _resolve_value(name: str, ctx: RenderCtx) -> str:
+    """If ``name`` is an SSA name bound by a skipped literal-constant Load,
+    return its rendered float-literal form; otherwise return ``name``
+    unchanged. ``render_body`` drops the defining Load of every
+    literal-constant SSA (its value gets inlined at use sites), so
+    Stmts that carry raw SSA-name strings (``Write.values`` / ``Pack.low`` /
+    ``Accum.value``) must substitute here instead of emitting an
+    undefined identifier."""
+    lit = ctx.literal_ssa.get(name) if ctx.literal_ssa else None
+    return _float_lit(lit) if lit is not None else name
+
+
 def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt: str) -> list[Expr]:
     """Convert each SSA arg to ``dst_dt`` via ``target.convert``, returning
     Exprs ready to drop into ``op_to_expr``. Args already at ``dst_dt``
@@ -673,7 +685,7 @@ class Write(Stmt):
             # is silently broken).
             flat = render_index(self.output, self.index, ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
-            rhs = ctx.target.convert(self.value, value_dt, out_dt)
+            rhs = ctx.target.convert(_resolve_value(self.value, ctx), value_dt, out_dt)
             # Atomic-Write trigger: helper-derived signal from
             # ``ctx.atomic_writes``, populated by ``render_kernelop``.
             # Standalone-render unit tests that build a bare RenderCtx
@@ -696,7 +708,8 @@ class Write(Stmt):
         converted: list[str] = []
         for nm in self.values:
             src_dt = stamped_value_dt or ctx.ssa_dtypes.get(nm, "f32")
-            converted.append(nm if src_dt == out_dt else ctx.target.convert(nm, src_dt, out_dt))
+            resolved = _resolve_value(nm, ctx)
+            converted.append(resolved if src_dt == out_dt else ctx.target.convert(resolved, src_dt, out_dt))
         vec_pair = ctx.target.vector_type(out_dt, n)
         if vec_pair is None:
             # Target doesn't support this width — fall back to scalar
@@ -716,22 +729,27 @@ class Write(Stmt):
         # (``uint2`` / ``uint4``) re-interpret arrays of elements — we
         # stage the elements into a local array, then store the array's
         # uint{2,4} view in one transaction.
+        # ``id(self)`` disambiguates the temp name across sibling Writes
+        # that read from the same SSA — e.g. broadcasting a shared
+        # literal-constant value (where every Write's ``values[0]`` is the
+        # same SSA name) used to collide on ``_vs_<name>``.
+        temp = f"_vs_{self.values[0]}_{id(self) & 0xFFFF:04x}"
         if vec_type == "__half2":
             return [
-                f"{pad}{vec_type} _vs_{self.values[0]} = __halves2half2({converted[0]}, {converted[1]});",
-                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.values[0]};",
+                f"{pad}{vec_type} {temp} = __halves2half2({converted[0]}, {converted[1]});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = {temp};",
             ]
         if vec_type in ("float2", "float4"):
             args = ", ".join(converted)
             return [
-                f"{pad}{vec_type} _vs_{self.values[0]} = make_{vec_type}({args});",
-                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.values[0]};",
+                f"{pad}{vec_type} {temp} = make_{vec_type}({args});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = {temp};",
             ]
         # Packed widths (uint2 / uint4) over fp16: stage through a local
         # array of ``__half`` so we never need to construct a uint{2,4}
         # literal directly.
         elem_type = ctx.type_name(out_dt)
-        arr = f"_vs_{self.values[0]}"
+        arr = temp
         init = ", ".join(converted)
         return [
             f"{pad}{elem_type} {arr}[{n}] = {{ {init} }};",

@@ -195,7 +195,17 @@ class GatherOp(Op):
     def forward(self, *inputs):
 
         data, indices = inputs[0], inputs[1].astype(np.intp)
-        return np.take_along_axis(data, indices, axis=self.axis)
+        axis = self.axis if self.axis >= 0 else data.ndim + self.axis
+        # Three semantics share this op (see ``lift_gather``):
+        # - ``torch.gather`` — idx and data same rank with matching non-axis
+        #   dims; one idx value per output cell. Use ``take_along_axis``.
+        # - ``embedding`` / ``index_select`` — output rank is ``idx.ndim +
+        #   data.ndim - 1`` with idx contributing the slice axes. Use
+        #   ``np.take`` on the gather axis.
+        same_rank = data.ndim == indices.ndim
+        if same_rank and all(indices.shape[k] == data.shape[k] for k in range(data.ndim) if k != axis):
+            return np.take_along_axis(data, indices, axis=axis)
+        return np.take(data, indices, axis=axis)
 
 
 @dataclass

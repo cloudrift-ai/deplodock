@@ -1237,7 +1237,30 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         N_b = Axis(f"{N_name}_b", N_axis.extent, source_axis=N_src)
     N_t = Axis(f"{N_name}_t", params.bn, source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
-    sigma_map[N_name] = Var(N_b.name) * Literal(params.bn * params.fn, "int") + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
+    # N register-tile decode — two layouts:
+    #
+    #   blocked      ``N = N_b·(BN·FN) + N_t·FN + N_r``  (thread-major)
+    #   interleaved  ``N = N_b·(BN·FN) + N_r·BN + N_t``  (thread-minor)
+    #
+    # blocked keeps a thread's FN cells in contiguous columns. On a clean-
+    # divisor tile the FN cells share one K-loop, so those contiguous
+    # per-thread loads vectorize and the warp fully uses each cache line —
+    # blocked wins, and it's also what staged-smem reads want (conflict-free
+    # after permute_lane_accesses). A MASKED tile (N not a multiple of BN·FN
+    # — e.g. the lm_head vocab=151669 projection) instead wraps each cell in
+    # its own ``if (col < N)`` guard, splitting the FN cells into separate
+    # K-loops: no cross-cell vectorization, and consecutive threads land
+    # FN·elem bytes apart → fully uncoalesced global weight loads (~25×
+    # wasted bandwidth; 94 ms → 3.5 ms on Qwen3 lm_head). Interleaved strides
+    # the cell by BN so consecutive threads map to consecutive columns — the
+    # warp reads BN contiguous columns per step (coalesced) despite the
+    # per-cell guards. The Stage-fill (if any) and the register read share
+    # this σ, so the column order stays self-consistent either way.
+    n_block = Var(N_b.name) * Literal(params.bn * params.fn, "int")
+    if N_name in overhang:
+        sigma_map[N_name] = n_block + Var(N_r.name) * Literal(params.bn, "int") + Var(N_t.name)
+    else:
+        sigma_map[N_name] = n_block + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
 
     M_b = M_t = M_r = None
     m_bound: object | None = None

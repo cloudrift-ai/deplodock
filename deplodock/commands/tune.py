@@ -75,13 +75,18 @@ def handle_tune(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    # 10 s wall budget on each variant's bench. Backstops the
-    # in-process per-launch/per-iter watchdogs: if a kernel keeps
-    # the GPU busy past those, the subprocess worker is SIGKILLed
-    # and the dirty stream dies with it — the next bench respawns
-    # cleanly. Without this the autotune sweep wedges on the
-    # variant after a bench_fail (see ``benchmark_program_isolated``).
-    backend = CudaBackend(bench_wall_timeout_s=10.0)
+    # Wall + per-stage budgets on each variant's bench. The CudaBackend
+    # defaults (no wall cap, 2 s compile/run) are sized for single-kernel
+    # sweeps; full-model graphs with default greedy knobs (hundreds of
+    # mis-tiled kernels in one bench pass) routinely exceed them. The wall
+    # cap adds a SIGKILL backstop for real hangs; the bumped run budget
+    # lets a slow-but-progressing 394-kernel bench finish rather than
+    # getting pinned for cumulative GPU time alone.
+    backend = CudaBackend(
+        bench_wall_timeout_s=60.0,
+        bench_compile_timeout_s=10.0,
+        bench_run_timeout_s=20.0,
+    )
     # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
     db_path = resolve_tune_db()
     db = SearchDB(path=db_path)

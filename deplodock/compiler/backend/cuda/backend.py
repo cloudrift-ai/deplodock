@@ -78,6 +78,8 @@ class CudaBackend(Backend):
         debug: bool | None = None,
         dump: CompilerDump | None = None,
         bench_wall_timeout_s: float | None = None,
+        bench_compile_timeout_s: float = 2.0,
+        bench_run_timeout_s: float = 2.0,
         tune_db: Path | str | None = None,
     ) -> None:
         if debug is None:
@@ -93,6 +95,12 @@ class CudaBackend(Backend):
         # can SIGKILL a wedged worker. Defaults to ``None`` (in-process,
         # required when ``on_iter`` callbacks are supplied).
         self.bench_wall_timeout_s = bench_wall_timeout_s
+        # Per-stage bench budgets (override the ``Backend`` class defaults
+        # of 2.0 s). Single-kernel sweeps fit the 2 s defaults; whole-model
+        # graphs (hundreds of kernels in one bench pass) need more — the
+        # ``tune`` command bumps these well above the defaults.
+        self.bench_compile_timeout_s = bench_compile_timeout_s
+        self.bench_run_timeout_s = bench_run_timeout_s
         # Persistent autotune cache. ``None`` → no DB (test-isolation
         # default; tests construct ``CudaBackend()`` without args and
         # expect deterministic rule-defaults compiles). ``"auto"`` →

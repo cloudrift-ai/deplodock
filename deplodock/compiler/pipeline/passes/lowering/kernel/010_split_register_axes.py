@@ -143,6 +143,28 @@ def _replicate_along_axis(body: Body, axis: str, factor: int, sigma_for: Callabl
     deps = body.fold(fn)
     keep: dict[str, bool] = {n: axis in deps[id(s)] for s in body.iter() for n in s.defines()}
 
+    # SSA def-use propagation: if any SSA name a stmt reads has keep=True,
+    # then everything it defines must also be marked keep. The fold above
+    # tracks free-var presence per Expr but doesn't chase the SSA chain —
+    # e.g. ``in1 = load w[(int)in0, a3]`` has free vars ``{in0, a3}`` (no
+    # ``a2``), so its keep stays False even though ``in0`` is replicated.
+    # Without this propagation the dependent Load survives as one copy and
+    # all replicas read the lane-0 idx (the embedding-lookup bug).
+    defined_names = set(keep)
+    changed = True
+    while changed:
+        changed = False
+        for s in body.iter():
+            reads: set[str] = set(s.deps())
+            for e in s.exprs():
+                reads.update(e.free_vars())
+            reads &= defined_names
+            if any(keep.get(r, False) for r in reads):
+                for n in s.defines():
+                    if not keep.get(n, False):
+                        keep[n] = True
+                        changed = True
+
     def rename_for(i: int):
         def _rename(name: str) -> str:
             return f"{name}_{i}" if keep.get(name, False) else name
