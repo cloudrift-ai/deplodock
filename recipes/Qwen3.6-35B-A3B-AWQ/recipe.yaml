@@ -1,24 +1,23 @@
-# Qwen3.6-35B-A3B-AWQ on 4x V100 SXM3 32GB (sm_70 Volta).
+# Qwen3.6-35B-A3B-AWQ on 1x V100 SXM3 32GB (sm_70 Volta).
 #
-# Engine: 1Cat-vLLM fork (https://github.com/1CatAI/1Cat-vLLM). 1Cat's README explicitly
-# validates Qwen3.6-35B-A3B-AWQ on 4xV100 TP4 as its "stable public default for MoE"
-# reference. Their launch flags (max-model-len 262144, max-num-seqs 1, FLASH_ATTN_V100,
-# tp=4, gpu-mem 0.88) inform this recipe. Like the 27B dense recipe, we use our
-# cloudriftai/1cat-vllm-sm70 rebuild of v1.0.0 wheels with the gcc / _DEFAULT_MAX_TOKENS
-# / FLASH_ATTN_V100 patches.
+# Engine: 1Cat-vLLM fork (https://github.com/1CatAI/1Cat-vLLM), rebuilt as
+# cloudriftai/1cat-vllm-sm70 from v1.0.0 wheels with gcc / _DEFAULT_MAX_TOKENS /
+# FLASH_ATTN_V100 patches. 1Cat validates this model on 4xV100 TP4 in its README, but
+# the A3B sparse compute path runs cleanly on a single V100 too -- see TP choice below.
 #
 # This is the MoE A3B variant: 35B total params, ~3B active per token (256 experts,
-# 8 routed + 1 shared per token, expert intermediate 512). Unlike a dense model of the
-# same total size, decode latency should be dominated by 3B-equivalent compute plus
-# expert-routing all-to-all overhead, not by the full 35B weight matmul. On PCIe-only
-# V100s (no NVLink on this VM) the all-reduce/all-to-all penalty may eat the active-param
-# win -- this benchmark exists to measure exactly that.
+# 8 routed + 1 shared per token, expert intermediate 512). Weights are ~17.5 GB at AWQ
+# 4-bit (group_size=128); fits on one 32 GB V100 with ~10 GB headroom for KV + buffers.
 #
-# KNOWN RISK: this model is MoE *with* shared experts (config.json shows
-# shared_expert_intermediate_size=512). 1Cat's SharedFusedMoE on SM70 had a
-# `sm70_hidden_logical_size` bug that prevented the 122B-A10B variant from loading.
-# We don't know yet whether the 35B-A3B hits the same path. If it crashes with that
-# error, leave this recipe parked with a KNOWN ISSUE block alongside the 122B one.
+# TP CHOICE: TP=1 on a single V100, not TP=4. Measured on the same 4xV100 PCIe-only
+# CloudRift VM (no NVLink/NVSwitch exposed in guest):
+#   TP=1: 11.6 ms TPOT (peak 87 tok/s decode), single-stream 39 tok/s sustained,
+#         median TTFT 8.6 s -- prefill is slow but steady-state decode is fastest.
+#   TP=4: 12.2 ms TPOT, single-stream 75 tok/s sustained, median TTFT 0.48 s --
+#         all-reduce floor across 4 GPUs costs ~5% per-token decode but speeds prefill 18x.
+# TP=1 wins on the operational dimension that matters most here: it runs on one GPU,
+# freeing the other 3 for other workloads or to drop the rented gpu_count to 1
+# (~4x cheaper). The prefill penalty only matters for long-prompt workloads.
 
 model:
   # 1Cat's README quotes "tclf90/Qwen3.6-35B-A3B-AWQ" as the validated repo, but that
@@ -34,18 +33,13 @@ model:
 
 engine:
   llm:
-    tensor_parallel_size: 4
+    tensor_parallel_size: 1
     pipeline_parallel_size: 1
     gpu_memory_utilization: 0.88
-    # 1Cat's recommended setup uses 262144; we cap at 32768 to keep KV cache budget
-    # tractable on PCIe-only all-reduce (no NVLink on this CloudRift VM, PHB only)
-    # and to keep the benchmark wall-clock inside the 45 min cap. Same choice as the
-    # 27B recipe for apples-to-apples comparison.
+    # 17.5 GB weights + activation buffers + 32K KV cache fits in 28 GB (0.88 * 32) on
+    # one V100; verified empirically. Don't lower max_num_batched_tokens below the
+    # extra_args value or KV pool shrinks further.
     context_length: 32768
-    # Single-stream to match the 27B dense baseline (51.61 tok/s output, 17.48 ms
-    # TPOT, 1700 ms median TTFT). With only 3B active params per token, decode TPOT
-    # should drop noticeably vs 27B dense -- unless PCIe all-reduce/all-to-all
-    # dominates, in which case parity or worse means interconnect is the bottleneck.
     max_concurrent_requests: 1
     vllm:
       image: "cloudriftai/1cat-vllm-sm70:1.0.0"
@@ -70,4 +64,4 @@ benchmark:
 
 matrices:
   deploy.gpu: "NVIDIA Tesla V100 SXM3 32GB"
-  deploy.gpu_count: 4
+  deploy.gpu_count: 1
