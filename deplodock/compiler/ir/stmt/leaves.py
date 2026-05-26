@@ -729,22 +729,27 @@ class Write(Stmt):
         # (``uint2`` / ``uint4``) re-interpret arrays of elements — we
         # stage the elements into a local array, then store the array's
         # uint{2,4} view in one transaction.
+        # ``id(self)`` disambiguates the temp name across sibling Writes
+        # that read from the same SSA — e.g. broadcasting a shared
+        # literal-constant value (where every Write's ``values[0]`` is the
+        # same SSA name) used to collide on ``_vs_<name>``.
+        temp = f"_vs_{self.values[0]}_{id(self) & 0xFFFF:04x}"
         if vec_type == "__half2":
             return [
-                f"{pad}{vec_type} _vs_{self.values[0]} = __halves2half2({converted[0]}, {converted[1]});",
-                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.values[0]};",
+                f"{pad}{vec_type} {temp} = __halves2half2({converted[0]}, {converted[1]});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = {temp};",
             ]
         if vec_type in ("float2", "float4"):
             args = ", ".join(converted)
             return [
-                f"{pad}{vec_type} _vs_{self.values[0]} = make_{vec_type}({args});",
-                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = _vs_{self.values[0]};",
+                f"{pad}{vec_type} {temp} = make_{vec_type}({args});",
+                f"{pad}*reinterpret_cast<{vec_type}*>(&{self.output}[{flat}]) = {temp};",
             ]
         # Packed widths (uint2 / uint4) over fp16: stage through a local
         # array of ``__half`` so we never need to construct a uint{2,4}
         # literal directly.
         elem_type = ctx.type_name(out_dt)
-        arr = f"_vs_{self.values[0]}"
+        arr = temp
         init = ", ".join(converted)
         return [
             f"{pad}{elem_type} {arr}[{n}] = {{ {init} }};",
