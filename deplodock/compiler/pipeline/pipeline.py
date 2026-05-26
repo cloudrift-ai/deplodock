@@ -233,7 +233,10 @@ class Match:
     rule: Rule
     nodes: dict[str, str] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
-    output: str | None = None
+    # ``str`` redirects one node's consumers to the fragment's sole output;
+    # ``dict[old_id, frag_output_id]`` redirects several at once (multi-output
+    # splice — see ``Graph.splice``). ``None`` defaults to ``root_node_id``.
+    output: str | dict[str, str] | None = None
     is_last: bool = False
     # Snapshot of id(Node) at match time for every consumed node. The
     # ``is_alive`` check uses this to detect the case where an earlier

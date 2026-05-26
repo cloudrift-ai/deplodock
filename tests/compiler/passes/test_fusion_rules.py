@@ -505,14 +505,15 @@ def test_shared_const_broadcast_correctness():
 
 
 def test_shared_const_broadcast_split_in_isolation():
-    """Split rule alone (no merge): the shared producer is un-shared into
-    single-consumer copies — one private duplicate plus the original, each
-    now read by exactly one consumer."""
+    """Split rule alone (no merge): the producer is fused into *all* consumers in
+    one shot — no broadcast kernel survives and each consumer reads the constant
+    directly, without ``merge_loop_ops`` running at all."""
     result = _split_only(_make_shared_const_broadcast())
-    pure = _pure_indexmap_kernels(result)
-    assert len(pure) == 2, f"expected 2 single-consumer broadcast copies, got {len(pure)}"
-    for n in pure:
-        assert len(result.consumers(n.id)) == 1, f"{n.id} still shared: {result.consumers(n.id)}"
+    assert _pure_indexmap_kernels(result) == [], "the shared broadcast should be fully dissolved by the split rule alone"
+    kernels = _kernel_nodes(result)
+    assert len(kernels) == 2, f"expected 2 fused consumer kernels, got {len(kernels)}"
+    for k in kernels:
+        assert "one" in _loads_from(k.op), f"{k.id} does not load the constant directly: {_loads_from(k.op)}"
 
 
 def _make_shared_transpose():

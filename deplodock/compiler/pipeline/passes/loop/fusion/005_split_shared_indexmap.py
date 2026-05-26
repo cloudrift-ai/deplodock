@@ -1,121 +1,117 @@
-"""Un-share a multi-consumer pure-indexmap producer so ``merge_loop_ops`` can inline it.
+"""Fuse a multi-consumer pure-indexmap producer into all of its consumers at once.
 
 ``010_merge_loop_ops`` only extends a producer→consumer chain through
 **single-consumer** edges (the match-walker stops at a fan-out:
-``pipeline.py`` ``nid = consumers[0] if len(consumers) == 1 else None``).
-So a pure-indexmap ``LoopOp`` that fans out to ≥2 consumers — e.g. the
-scalar-constant broadcasts torch.export folds the attention-mask / RoPE
-scaffolding into — never gets absorbed and survives as its own kernel
-(a ``[1,1,32,128]`` copy of ``0.0``/``1.0`` that PyTorch never
-materializes).
+``pipeline.py`` ``nid = consumers[0] if len(consumers) == 1 else None``). So a
+pure-indexmap ``LoopOp`` that fans out to ≥2 consumers — e.g. the scalar-constant
+broadcasts torch.export folds the attention-mask / RoPE scaffolding into — never
+gets absorbed and survives as its own kernel (a ``[1,1,32,128]`` copy of
+``0.0``/``1.0`` that PyTorch never materializes).
 
-This rule, sorted *before* merge, only un-shares those producers — it
-does no fusion itself. Anchored on a consumer, it gives that consumer a
-**private duplicate** of every shared (≥2 consumers) pure-indexmap
-producer it reads, and rewrites the consumer's Loads to read the copy.
-Each firing peels one consumer onto its own copy, dropping the shared
-producer's consumer count by one; when it reaches a single consumer the
-``>= 2`` guard stops matching it and that last edge is a plain
-single-consumer producer→consumer pair that ``merge_loop_ops`` folds
-like any other. A private copy is itself single-consumer, so it never
-re-triggers the rule. Across the rule's batch + restart scans the net
-effect is: ``producer → {c1, c2, c3}`` becomes ``{c1, c2, c3}`` each with
-a private copy folded in by merge (the last reusing the original). For a
-scalar source the duplication is free — each copy is a constant ``Load``
-that the cuda-lowering literal-inline path turns into a ``float x =
-0.0f;`` with no buffer.
+Anchored on the **producer**, this rule fuses it into *every* consumer in one
+rewrite: it inlines the producer's body into each consumer (reusing the same
+``splice_loop_ops`` machinery ``merge_loop_ops`` uses), emits one fused node per
+consumer, and dissolves the producer — all via a single multi-output
+``Graph.splice`` (``output={consumer_id: fused_node_id}``). For a scalar source
+each fused consumer ends up loading the ``ConstantOp`` directly, which the
+cuda-lowering literal-inline path turns into a ``float x = 0.0f;`` with no buffer.
 
-Gate = pure-indexmap (broadcast / transpose / reshape / slice / cat) with
-≥2 consumers. Restricting to pure-indexmap keeps the duplication cheap
-and guarantees merge accepts it (merge's blowup guards never trip on a
-pure-indexmap producer, and its broadcast-materialization guard only
-fires the opposite way — pure-indexmap *consumer* over compute
-*producer*). Duplicating an expensive producer would multiply real work,
-so it is deliberately excluded.
+If the splicer can't inline the producer into a particular consumer (a σ-solve it
+doesn't support), that consumer falls back to a private duplicate of the producer
+plus a Load-redirected consumer — exactly what un-sharing did — so the producer
+still dissolves and ``merge_loop_ops`` can retry that copy later (at worst it stays
+a separate copy, never a regression).
+
+Gate = pure-indexmap (broadcast / transpose / reshape / slice / cat) with ≥2
+consumers, and not itself a graph output. Single-consumer pure-indexmaps stay
+``merge_loop_ops``'s job. Restricting to pure-indexmap keeps the per-consumer
+duplication cheap (the splicer's blowup logic doesn't even run here) — duplicating
+an *expensive* producer into every consumer would multiply real work.
+
+Terminates: each firing removes one multi-consumer pure-indexmap producer. A fused
+node no longer reads that producer, so the inlining marches one level down any
+broadcast tree per firing until it reaches the non-indexmap leaves.
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Load, LoopOp
+from deplodock.compiler.ir.loop import Load, LoopOp, splice_loop_ops
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap, rename_write_output
 
-PATTERN = [Pattern("consumer", LoopOp)]
+PATTERN = [Pattern("producer", LoopOp)]
 
 
-def rewrite(match: Match, consumer: Node) -> Graph | None:
-    graph = match.graph
-    # Inputs that are SHARED pure-indexmap producers. Single-consumer ones
-    # are already merge's job, so the ``>= 2`` guard skips them (and keeps
-    # the rule from re-firing on the private copies it just emitted).
-    shared = [
-        inp
-        for inp in consumer.inputs
-        if (p := graph.nodes.get(inp)) is not None
-        and isinstance(p.op, LoopOp)
-        and is_pure_indexmap(p.op)
-        and len(graph.consumers(inp)) >= 2
-    ]
-    if not shared:
-        raise RuleSkipped("consumer reads no shared pure-indexmap producer")
+def _redirect_loads(op: LoopOp, *, old: str, new: str) -> LoopOp:
+    """Return ``op`` with every ``Load`` reading buf ``old`` redirected to ``new``."""
 
-    # Map each shared producer to a private duplicate id (unique per
-    # producer+consumer pair) and collect the producers' own inputs — those
-    # become external InputOp aliases the copies read from.
-    remap: dict[str, str] = {}
-    ext_inputs: list[str] = []
-    for prod_id in shared:
-        remap[prod_id] = f"{prod_id}__dup__{consumer.id}"
-        for pin in graph.nodes[prod_id].inputs:
-            if pin not in ext_inputs:
-                ext_inputs.append(pin)
-
-    # Rewrite the consumer's body Loads to read the private copy. Index is
-    # unchanged — only the source buffer name moves to the duplicate.
     def fn(s):
-        if isinstance(s, Load) and s.input in remap:
-            return Load(names=s.names, input=remap[s.input], index=s.index, dtype=s.dtype)
+        if isinstance(s, Load) and s.input == old:
+            return Load(names=s.names, input=new, index=s.index, dtype=s.dtype)
         return s
 
-    # Rename the consumer's Write.output from its old node id to the new one so
-    # the rewritten node upholds the buf-name == node-id invariant. Skipping
-    # this leaves the new node writing the *old* buf, which silently breaks the
-    # next merge: ``splice_graph`` derives splice edges as ``(node_id, node_id)``
-    # — it assumes a producer's Write.output is its node id (splicer.py:205) — so
-    # a mismatched buf makes every downstream fold of this node hit
-    # ``_NotSupported`` ("no Write with output=<node_id>") and survive as its own
-    # kernel.
-    unshared_id = f"unshared_{consumer.id}"
-    new_consumer_op = rename_write_output(LoopOp(body=consumer.op.body.map(fn)), old=consumer.id, new=unshared_id)
+    return LoopOp(body=op.body.map(fn))
 
-    # Build the fragment: InputOp aliases for every external (producers'
-    # inputs + the consumer's non-shared inputs), then the copy producers,
-    # then the rewritten consumer. ``frag.add_node`` validates inputs exist,
-    # so the topological order (externals → copies → consumer) matters.
+
+def rewrite(match: Match, producer: Node) -> Graph | None:
+    graph = match.graph
+    if not (isinstance(producer.op, LoopOp) and is_pure_indexmap(producer.op)):
+        raise RuleSkipped("producer is not a pure-indexmap LoopOp")
+    if producer.id in graph.outputs:
+        raise RuleSkipped("producer is a graph output — must stay materialized")
+    consumers = sorted(graph.consumers(producer.id))
+    if len(consumers) < 2:
+        raise RuleSkipped("producer is not shared (< 2 consumers) — single-consumer folds are merge's job")
+
     frag = Graph()
-    externals = dict.fromkeys([*ext_inputs, *(i for i in consumer.inputs if i not in remap)])
-    for ext in externals:
+    output_map: dict[str, str] = {}  # old consumer id -> fragment output node id
+    # (op, inputs, output_tensor, node_id) specs; copies must be added before the
+    # fallback consumers that read them, so the two kinds are kept apart.
+    copy_specs: list[tuple[LoopOp, list[str], Tensor, str]] = []
+    consumer_specs: list[tuple[LoopOp, list[str], Tensor, str]] = []
+    referenced: set[str] = set()  # buf ids the fragment nodes read
+
+    for cid in consumers:
+        cons = graph.nodes[cid]
+        merged = splice_loop_ops(producer.op, cons.op, producer.id)
+        if merged is not None:
+            # Inline succeeded — one fused node replaces this consumer.
+            fused_id = f"fused_{cid}"
+            fused_op = rename_write_output(merged, old=cid, new=fused_id)
+            inputs = list(fused_op.inputs)
+            consumer_specs.append((fused_op, inputs, cons.output, fused_id))
+            output_map[cid] = fused_id
+            referenced.update(inputs)
+        else:
+            # Splicer can't inline here — fall back to a private copy + a
+            # Load-redirected consumer (the old un-share behavior for this edge).
+            copy_id = f"{producer.id}__dup__{cid}"
+            copy_op = rename_write_output(producer.op, old=producer.id, new=copy_id)
+            copy_specs.append((copy_op, list(producer.inputs), Tensor(copy_id, producer.output.shape, producer.output.dtype), copy_id))
+            referenced.update(producer.inputs)
+
+            unshared_id = f"unshared_{cid}"
+            new_cons_op = rename_write_output(_redirect_loads(cons.op, old=producer.id, new=copy_id), old=cid, new=unshared_id)
+            inputs = list(new_cons_op.inputs)
+            consumer_specs.append((new_cons_op, inputs, cons.output, unshared_id))
+            output_map[cid] = unshared_id
+            referenced.update(inputs)
+
+    # InputOp aliases for every referenced buf produced *outside* the fragment
+    # (the producer's own inputs, each consumer's other inputs). Add externals
+    # first, then copies, then consumers — ``add_node`` validates inputs exist.
+    frag_ids = {nid for *_r, nid in copy_specs} | {nid for *_r, nid in consumer_specs}
+    for ext in dict.fromkeys(r for r in referenced if r not in frag_ids):
         e = graph.nodes[ext]
         frag.add_node(InputOp(), [], Tensor(ext, e.output.shape, e.output.dtype), node_id=ext)
-    for prod_id, copy_id in remap.items():
-        prod = graph.nodes[prod_id]
-        copy_op = rename_write_output(prod.op, old=prod_id, new=copy_id)
-        frag.add_node(copy_op, list(prod.inputs), Tensor(copy_id, prod.output.shape, prod.output.dtype), node_id=copy_id)
-    # ``node.inputs`` must follow the body's first-use buf order (the
-    # interpreter zips it positionally against ``input_bufs``); read it
-    # straight off the rewritten op rather than reconstructing it.
-    out_id = frag.add_node(
-        new_consumer_op,
-        list(new_consumer_op.inputs),
-        Tensor(consumer.output.name, consumer.output.shape, consumer.output.dtype),
-        node_id=unshared_id,
-    )
-    frag.outputs = [out_id]
+    for op, inputs, out_t, nid in (*copy_specs, *consumer_specs):
+        frag.add_node(op, inputs, Tensor(out_t.name, out_t.shape, out_t.dtype), node_id=nid)
+    frag.outputs = list(output_map.values())
 
-    # Consume only the consumer — the shared producer stays until its last
-    # consumer is peeled, when ``remove_orphans`` reaps it.
-    match.output = consumer.id
-    match.consumed = {consumer.id}
+    # Multi-output splice: dissolve the producer and replace every consumer with
+    # its fused (or fallback) node in one shot.
+    match.consumed = {producer.id, *consumers}
+    match.output = output_map
     return frag
