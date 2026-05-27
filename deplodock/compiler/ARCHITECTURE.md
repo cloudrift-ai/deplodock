@@ -62,6 +62,7 @@ autotuning cache doesn't bust on cosmetic edits.
 | `loader/`             | Bind constants (safetensors / `nn.Module` → `input_data`) | —              |
 | `pipeline/search/`    | Autotune DB + MCTS tree (see below)     | `pipeline/ARCHITECTURE.md`   |
 | `structural.py`       | `Structural` protocol + `digest()` fold | —                            |
+| `provenance.py`       | Op provenance — map fused kernels back to original frontend ops | — (see below) |
 
 ## Per-layer rules
 
@@ -111,3 +112,24 @@ autotuning cache doesn't bust on cosmetic edits.
   `ir/loop/interpret.py` lets the default `Backend.run` topo-walk
   (`backend/base.py`) run post-fusion graphs on CPU — fusion
   correctness can be checked without a GPU.
+
+## Op provenance
+
+`provenance.py` threads a single `Node.hints["prov"]` map —
+`{origin_id: {"kind": <op-class>, "pieces": [piece_id, …]}}` — from the traced frontend graph all the way to each
+`CudaOp`, so a fused kernel knows which original PyTorch ops it implements. `origin_id` is the trace-time node id of an
+original op (`rms_norm_0`); `pieces` are the primitives it decomposed into and that this node embodies. Coverage of an
+origin is `len(pieces)` over the union of that origin's pieces across the whole graph (`totals` / `coverage`) — so the
+`i/N` fraction stays correct under CSE and recursive decomposition instead of freezing `N` at the first split.
+
+It rides on one chokepoint: `Graph.splice` calls `provenance.propagate` with a `mint_pieces` flag (set by
+`Candidate.apply` from the pass namespace — `True` only for `frontend/decomposition`). Decomposition *mints* each new
+fragment node as a fresh piece of the consumed origins; fusion / lifting / optimization folds *aggregate* the consumed
+piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing). Lowering is
+in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
+`Pipeline.tune` entry (idempotent); pure metadata, excluded from structural / cache keys.
+
+Consumers: `pipeline/passes/lowering/tile/010_partition_loops._kernel_name_for` names kernels after the ops they realize
+(`k_rms_norm` when full, `k_rms_norm_reduce` when partial); `pipeline/dump._dump_torch_repro` slices the pristine
+frontend graph by a kernel's origins into a runnable `<kname>.torch.json`; `backend/torch_ref` runs that slice through
+real torch for the `run --ir` vs-torch comparison.

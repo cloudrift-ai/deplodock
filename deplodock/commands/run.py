@@ -677,9 +677,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         if torch_fn is not None:
             backends = _resolve_backends(args.bench_backends)
             torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, args.warmup, backends=backends)
-            results, bench = _bench_interleaved(
-                torch_fn, torch_inputs, {}, backend, graph, args.warmup, args.iters, torch_fns=torch_fns
-            )
+            results, bench = _bench_interleaved(torch_fn, torch_inputs, {}, backend, graph, args.warmup, args.iters, torch_fns=torch_fns)
             if dump:
                 dump.dump_benchmark(bench)
             _print_table(results)

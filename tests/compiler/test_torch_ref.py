@@ -5,14 +5,16 @@ CPU (no GPU needed)."""
 import numpy as np
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from deplodock.compiler.backend import torch_ref
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp, SoftmaxOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
+
+# torch is only needed to build reference tensors / call the evaluator; the
+# deplodock imports above are torch-free, so gate after them.
+torch = pytest.importorskip("torch")
 
 
 def _assert_matches_numpy(g: Graph, arrays: dict[str, np.ndarray]):

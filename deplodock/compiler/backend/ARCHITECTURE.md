@@ -23,6 +23,18 @@ What differs is `compile()` — how far the backend lowers the graph:
 distinction is whether the graph has been fused yet. See
 `backend/cuda/ARCHITECTURE.md` for the CUDA-specific dispatch.
 
+## Torch reference (`torch_ref.py`)
+
+Not a `Backend` — a small Graph→torch evaluator that runs a frontend-dialect graph through **real PyTorch**, the eager /
+`torch.compile` baseline for `deplodock run --ir`. Each frontend / tensor op is mapped to its torch twin
+(`RmsNormOp`→`F.rms_norm`, `SdpaOp`→`F.scaled_dot_product_attention`, `LinearOp`→`F.linear`, `ElementwiseOp`/`ReduceOp`→
+the torch elementwise/reduce, layout ops→view/transpose/cat). `is_runnable(graph)` is `True` only when every compute op
+has a mapping — layout/data-dependent ops that appear post-decomposition (`IndexMapOp` / `GatherOp` / `ScatterOp`) are
+unsupported, so `run --ir` falls back to deplodock-only benchmarking for non-frontend IR. `build_callable(graph,
+input_tensors)` returns a pure `fn(*tensors)` (scalar constants read inline) so `torch.compile` can trace it. Used to
+turn a dumped `<kname>.torch.json` reproducer into an accuracy + latency comparison vs torch — see `../provenance.py`
+and `commands/run.py:_handle_run_ir`.
+
 ## Backend ABC (`base.py`)
 
 `Backend` is an abstract base class with `compile`, `run`, `benchmark`.

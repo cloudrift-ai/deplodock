@@ -4,9 +4,9 @@ from deplodock.compiler import provenance as prov
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda.ir import CudaOp
+from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.frontend.ir import RmsNormOp
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.search.keys import op_cache_key
@@ -18,8 +18,15 @@ def _pointwise_loop() -> LoopOp:
         body=(
             Loop(
                 axis=i,
-                body=(Loop(axis=j, body=(Load(name="x_v", input="x", index=(Var("i"), Var("j"))),
-                                              Write(output="o", index=(Var("i"), Var("j")), value="x_v"))),),
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Load(name="x_v", input="x", index=(Var("i"), Var("j"))),
+                            Write(output="o", index=(Var("i"), Var("j")), value="x_v"),
+                        ),
+                    ),
+                ),
             ),
         )
     )
@@ -38,7 +45,10 @@ def test_full_single_op_gets_bare_name():
     g.inputs, g.outputs = ["x"], ["o"]
     prov.put(g.nodes["o"], {"rms_norm_0": {"kind": "RmsNormOp", "pieces": ["o"]}})
 
-    assert "k_rms_norm" in _tile_names(g)
+    # Bare op name + a short structural-uniqueness hash (``k_rms_norm_<h>``),
+    # no reduce/pointwise qualifier since it's fully covered.
+    names = _tile_names(g)
+    assert any(n.startswith("k_rms_norm_") and "pointwise" not in n for n in names), names
 
 
 def test_glue_only_kernel_falls_back_to_node_id():

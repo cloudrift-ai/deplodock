@@ -69,6 +69,7 @@ reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 from __future__ import annotations
 
 import enum
+import hashlib
 import os
 import re
 from collections.abc import Callable
@@ -347,11 +348,19 @@ def _humanize_kind(kind: str) -> str:
 def _kernel_name_for(loop: LoopOp, base_name: str, node_prov: dict, totals: dict[str, set[str]]) -> str:
     """Name the kernel after the original ops it implements (op provenance).
 
-    A kernel that fully realizes exactly one meaningful op gets the bare
-    ``k_<op>`` (e.g. ``k_rms_norm``); a partial one keeps the
-    ``_<reduce|pointwise>`` qualifier so the reduce half is told apart from the
-    pointwise tail. Multiple meaningful ops join (``k_linear_sdpa_...``). With
-    no provenance (or only glue ops) it falls back to the node-id name."""
+    A kernel that fully realizes exactly one meaningful op gets ``k_<op>_<h>``
+    (e.g. ``k_rms_norm_3f2a1b``); a partial one keeps the ``_<reduce|pointwise>``
+    qualifier so the reduce half is told apart from the pointwise tail. Multiple
+    meaningful ops join (``k_linear_sdpa_...``). With no provenance (or only glue
+    ops) it falls back to the node-id name.
+
+    ``<h>`` is a short structural-body hash: prov labels are *not* unique (two
+    rms_norms, or SDPA's two distinct reduce kernels, share a label), but the
+    backend dispatches kernels by name and the launch dict holds one source per
+    name. The hash makes structurally-identical kernels share a name (so they
+    dedup to one compilation) and distinct kernels differ (so a duplicate label
+    never makes one launch reuse another's code). The node-id fallback is
+    already unique, so it needs no hash."""
     suffix = "reduce" if any(isinstance(s, Accum) for s in loop) else "pointwise"
     meaningful = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS]
     if not meaningful:
@@ -363,10 +372,13 @@ def _kernel_name_for(loop: LoopOp, base_name: str, node_prov: dict, totals: dict
         if lbl not in labels:
             labels.append(lbl)
     joined = _dedup_tokens("_".join(labels))
+    # ``structural_key`` is a pretty-printed body string; hash it to a short
+    # alphanumeric token (valid in a C identifier; identical bodies → same token).
+    h = hashlib.sha1(loop.body.structural_key().encode()).hexdigest()[:6]
     cov = provenance.coverage(node_prov, totals)
     if len(meaningful) == 1 and cov[meaningful[0]][2]:  # single op, fully covered
-        return f"k_{joined}"
-    return f"k_{joined}_{suffix}"
+        return f"k_{joined}_{h}"
+    return f"k_{joined}_{suffix}_{h}"
 
 
 def _dedup_tokens(name: str) -> str:

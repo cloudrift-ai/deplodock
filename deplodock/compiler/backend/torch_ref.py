@@ -12,7 +12,8 @@ to deplodock-only benchmarking.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
@@ -23,9 +24,19 @@ if TYPE_CHECKING:
 # GatherOp, ScatterOp, ScanOp, …) makes a graph non-runnable as a torch ref.
 SUPPORTED = frozenset(
     {
-        "TransposeOp", "ReshapeOp", "SliceOp", "CatOp", "UnsqueezeOp",
-        "LinearOp", "MatmulOp", "SdpaOp", "MeanOp", "RmsNormOp", "SoftmaxOp",
-        "ElementwiseOp", "ReduceOp",
+        "TransposeOp",
+        "ReshapeOp",
+        "SliceOp",
+        "CatOp",
+        "UnsqueezeOp",
+        "LinearOp",
+        "MatmulOp",
+        "SdpaOp",
+        "MeanOp",
+        "RmsNormOp",
+        "SoftmaxOp",
+        "ElementwiseOp",
+        "ReduceOp",
     }
 )
 
@@ -158,8 +169,11 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
 
     order = graph.topological_order()
     tensor_ids = [nid for nid in order if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is None]
-    scalars = {nid: float(graph.nodes[nid].op.value) for nid in order
-               if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is not None}
+    scalars = {
+        nid: float(graph.nodes[nid].op.value)
+        for nid in order
+        if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is not None
+    }
     compute = [nid for nid in order if not is_boundary(graph.nodes[nid].op)]
     out_id = graph.outputs[0]
 
