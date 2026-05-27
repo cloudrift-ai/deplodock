@@ -633,8 +633,18 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     # Non-frontend IR (loop/tile/…) has no torch twin → deplodock-only bench.
     frontend = graph.copy() if torch_ref.is_runnable(graph) else None
 
+    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
+    db = None
+    if backend.tune_db is not None and backend.tune_db.exists():
+        from deplodock.compiler.pipeline.search.db import SearchDB
+
+        db = SearchDB(path=backend.tune_db)
+        logger.info("Using tuning DB: %s", backend.tune_db)
     if tail:
-        graph = Pipeline.build(tail, dump=dump).run(graph)
+        # Thread the tune DB through the tail lowering so greedy fork selection
+        # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered
+        # at rule defaults and tuned results never showed up here.
+        graph = Pipeline.build(tail, dump=dump).run(graph, db=db)
     from deplodock.compiler.loader.binder import bind_constants
 
     rng = np.random.default_rng(args.seed)
@@ -680,9 +690,6 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32) * 0.02
             input_data[nid] = arr.flatten().tolist()
 
-    backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
-    if backend.tune_db is not None and backend.tune_db.exists():
-        logger.info("Using tuning DB: %s", backend.tune_db)
     result, _ = backend.run(graph, input_data=input_data)
     for nid, arr in result.outputs.items():
         finite = np.isfinite(arr).all()
