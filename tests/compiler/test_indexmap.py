@@ -125,3 +125,31 @@ def test_indexmap_infer_output_shape_returns_out_shape():
         sources=(IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1), placeholder(2))),),
     )
     assert op.infer_output_shape([(99, 99, 99)]) == (4, 5, 6)
+
+
+def test_indexmap_sources_round_trip_through_json():
+    """``IndexMapOp.sources`` (IndexSource dataclasses holding Exprs) survive
+    ``Graph.to_dict`` → ``from_dict``. Regression: they used to be stringified
+    by ``json.dumps(default=str)`` and reloaded as ``str``, crashing
+    ``030_lift_indexmap`` (``'str' has no attribute 'input_idx'``) on
+    ``run --ir`` recompiles."""
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (4, 8)), node_id="b")
+    src0 = IndexSource(
+        input_idx=0,
+        coord_map=(placeholder(0), placeholder(1) + Literal(2, "int")),
+        select=placeholder(1).lt(Literal(8, "int")),
+    )
+    src1 = IndexSource(input_idx=1, coord_map=(placeholder(0), placeholder(1)))
+    g.add_node(IndexMapOp(out_shape=(4, 16), sources=(src0, src1)), ["a", "b"], Tensor("c", (4, 16)), node_id="c")
+    g.inputs, g.outputs = ["a", "b"], ["c"]
+
+    sources = Graph.from_dict(g.to_dict()).nodes["c"].op.sources
+    assert all(isinstance(s, IndexSource) for s in sources)
+    assert [s.input_idx for s in sources] == [0, 1]
+    assert sources[0].coord_map == src0.coord_map and sources[1].coord_map == src1.coord_map
+    assert sources[0].select == src0.select and sources[1].select is None

@@ -161,7 +161,16 @@ def _serialize_field(v):
     from deplodock.compiler.dim import Dim
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.stmt import Body
+    from deplodock.compiler.ir.tensor.ir import IndexSource
 
+    # ``IndexSource`` (IndexMapOp.sources) is a plain dataclass holding ``Expr``
+    # objects — serialize as eval-able repr strings, the same round-trip the
+    # body-Stmt path uses, so it survives JSON instead of being stringified by
+    # ``json.dumps(default=str)`` (which ``_deserialize_field`` couldn't reverse).
+    if isinstance(v, IndexSource):
+        return repr(v)
+    if isinstance(v, (list, tuple)) and v and all(isinstance(x, IndexSource) for x in v):
+        return [repr(x) for x in v]
     if isinstance(v, ElementwiseImpl):
         return v.name
     if isinstance(v, Dim):
@@ -195,6 +204,8 @@ def _deserialize_field(k, v):
     if k == "op" and isinstance(v, str):
         return ElementwiseImpl(v)
     if k == "body" and isinstance(v, list) and v and all(isinstance(e, str) for e in v):
+        return tuple(_eval_stmt(e) for e in v)
+    if k == "sources" and isinstance(v, list) and v and all(isinstance(e, str) and e.startswith("IndexSource(") for e in v):
         return tuple(_eval_stmt(e) for e in v)
     if isinstance(v, dict) and "__op__" in v:
         op_cls = _lookup_op_class(v["__op__"])
@@ -258,6 +269,7 @@ def _stmt_eval_scope() -> dict:
         Unpack,
         Write,
     )
+    from deplodock.compiler.ir.tensor.ir import IndexSource
     from deplodock.compiler.ir.tile.ir import (
         AffineAddressing,
         AsyncWait,
@@ -312,6 +324,7 @@ def _stmt_eval_scope() -> dict:
         "TreeHalve": TreeHalve,
         "WarpShuffle": WarpShuffle,
         "ElementwiseImpl": ElementwiseImpl,
+        "IndexSource": IndexSource,
         "DataType": DataType,
         # ``repr(np.dtype('float32'))`` is ``dtype('float32')`` — eval needs
         # ``dtype`` in scope to round-trip ``DataType.np``.
