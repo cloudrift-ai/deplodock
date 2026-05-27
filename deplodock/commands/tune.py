@@ -10,6 +10,8 @@ from pathlib import Path
 from deplodock.commands.compile import (
     add_diagnostics_args,
     add_input_args,
+    add_nvcc_args,
+    apply_nvcc_flags,
     format_stage,
     load_or_trace,
     resolve_tune_db,
@@ -60,7 +62,13 @@ def register_tune_command(subparsers):
             "full-model tuning. Default: 20."
         ),
     )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Before tuning, delete the tuning DB and the cubin/kernel caches for a fresh sweep.",
+    )
     add_diagnostics_args(parser)
+    add_nvcc_args(parser)
     parser.set_defaults(func=handle_tune)
 
 
@@ -81,34 +89,43 @@ def handle_tune(args):
     from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
 
     setup_pipeline_runtime(args)
+    # tune compiles at -Xcicc -O1 by default: it dodges a cicc/LLVM blowup on
+    # big unrolled register-tile kernels (up to ~200x faster compile). The
+    # trade-off — VERY visible because it changes how you read the numbers:
+    nvcc_flags = apply_nvcc_flags(args, default="-Xcicc -O1")
+    if "-O1" in nvcc_flags or "-O0" in nvcc_flags:
+        sys.stderr.write(
+            "\n"
+            "  ┌─────────────────────────────────────────────────────────────────────────┐\n"
+            f"  │  tune is compiling at cicc {('-O1' if '-O1' in nvcc_flags else '-O0'):<4} — fast, but NOT runtime-optimal.        │\n"
+            "  │  Measured latencies are a RANKING signal only; reduction / attention      │\n"
+            "  │  kernels can run 1.5-3x slower than -O3. Re-bench the winner with          │\n"
+            "  │  `deplodock run --bench` (-O3) for deployable numbers.                     │\n"
+            "  └─────────────────────────────────────────────────────────────────────────┘\n\n"
+        )
+
     graph, _ = load_or_trace(args)
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
         dump.dump_input_graph(graph)
 
-    # Wall + per-stage budgets on each variant's bench. The CudaBackend
-    # defaults (no wall cap, 2 s compile/run) are sized for single-kernel
-    # sweeps; full-model graphs with default greedy knobs (hundreds of
-    # mis-tiled kernels in one bench pass) routinely exceed them. The wall
-    # cap adds a SIGKILL backstop for real hangs; the bumped run budget
-    # lets a slow-but-progressing 394-kernel bench finish rather than
-    # getting pinned for cumulative GPU time alone. The inner per-op search
-    # benches one kernel at a time, so the cold-start concern is milder, but
-    # the final assembled whole-graph bench still wants the headroom.
+    # Tight per-variant budgets: tune benches isolated single kernels compiled
+    # at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample and the 6 s wall
+    # SIGKILLs any runaway. (nvcc compiles eagerly in ``CompiledProgram.build``,
+    # so the compile budget now genuinely bounds compilation — unlike cupy's
+    # lazy NVRTC, where only the wall did.)
     _compile_timeout = 2.0
     _run_timeout = 2.0
     backend = CudaBackend(
         bench_compile_timeout_s=_compile_timeout,
         bench_run_timeout_s=_run_timeout,
-        # Wall backstop just above the two in-worker budgets — it's the only
-        # cap that bounds NVRTC compile (cupy compiles lazily on first launch,
-        # so the compile/run budgets above don't), SIGKILLing any variant whose
-        # total bench overruns.
         bench_wall_timeout_s=_compile_timeout + _run_timeout + 2.0,
     )
     # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
     db_path = resolve_tune_db()
+    if args.clean:
+        _clean_caches(db_path)
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
@@ -162,6 +179,32 @@ def handle_tune(args):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
+
+
+def _clean_caches(db_path) -> None:
+    """``--clean``: nuke the tuning DB (+ WAL/SHM sidecars) and the kernel
+    caches (deplodock's cubin cache + cupy's NVRTC cache) for a fresh sweep."""
+    import shutil
+
+    from deplodock.compiler.backend.cuda import nvcc
+
+    removed = []
+    if db_path is not None:
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(f"{db_path}{suffix}")
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+    nvcc.clear_cubin_cache()
+    removed.append(str(nvcc.cubin_cache_dir()))
+    try:
+        import cupy as cp
+
+        shutil.rmtree(cp.cuda.compiler.get_cache_dir(), ignore_errors=True)
+        removed.append(cp.cuda.compiler.get_cache_dir())
+    except Exception:  # noqa: BLE001 — cupy cache clear is best-effort
+        pass
+    sys.stderr.write(f"[tune] --clean: removed tuning DB + kernel caches ({', '.join(removed)})\n")
 
 
 def _print_two_level_summary(result) -> None:

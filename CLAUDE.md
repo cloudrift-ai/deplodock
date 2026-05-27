@@ -75,7 +75,12 @@ same worker.
   Prints per-op bests (`tuned`/`cached`), the `Σ` estimate, the assembled whole-graph latency, and the separability gap.
   Persists `perf` / `lowering` / `op_effort` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
   `~/.cache/deplodock/autotune.db`). The inner MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior) stops on
-  patience (N consecutive measured terminals without a new best).
+  patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches
+  first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
+  register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
+  slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
+  `run --bench`). Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the flags are folded into
+  the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)

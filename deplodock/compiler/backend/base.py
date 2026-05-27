@@ -89,10 +89,11 @@ class Backend(ABC):
     # ``benchmark()`` call. Enforced at the C-call boundary after compile
     # finishes so the worker raises cleanly and no daemon thread is ever
     # left holding the CUDA context. Autotune cache pins ``bench_fail``
-    # latency to (this + ``bench_run_timeout_s``). Default 10 s suits the
-    # whole-graph compile/run commands; the ``tune`` sweep overrides it
-    # down (it benches single kernels) — see ``commands/tune.py``.
-    bench_compile_timeout_s: float = 10.0
+    # latency to (this + ``bench_run_timeout_s``). Default 30 s gives the
+    # whole-graph compile/run commands headroom for a large kernel's -O3 nvcc
+    # compile; the ``tune`` sweep overrides it down (single kernels, and it
+    # compiles at -Xcicc -O1 which is fast) — see ``commands/tune.py``.
+    bench_compile_timeout_s: float = 30.0
     # Cumulative GPU-time cap on the iter loop. Enforced *after* each
     # iter completes — checked against the running sum of per-launch
     # event-measured ms. Catches the case where every iter is just

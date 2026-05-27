@@ -15,6 +15,7 @@ the signature alone.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 # Per-block static-smem cap. Hard hardware limit since Maxwell (sm_50);
@@ -36,6 +37,13 @@ _MAX_DYNAMIC_SMEM_BY_CC: dict[tuple[int, int], int] = {
     (10, 0): 227 * 1024,
     (12, 0): 99 * 1024,
 }
+
+
+def _env_compile_flags() -> str:
+    """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``). Set by the
+    CLI commands; folded into :meth:`Context.structural_key` so the perf cache
+    is partitioned by opt level."""
+    return os.environ.get("DEPLODOCK_NVCC_FLAGS", "")
 
 
 def _max_dynamic_smem_for(cc: tuple[int, int]) -> int:
@@ -81,24 +89,34 @@ class Context:
     # canonical autotune target. ``run_autotune`` replaces this when a
     # live :class:`Backend` is supplied.
     backend_name: str = "cuda"
+    # Extra nvcc flags this compile uses (from ``DEPLODOCK_NVCC_FLAGS`` — e.g.
+    # tune's ``-Xcicc -O1`` vs compile/run's -O3). Folded into
+    # ``structural_key`` so the autotune ``perf`` cache is partitioned by opt
+    # level: -O1-measured latencies (a fast-compile *ranking* signal) never
+    # clobber -O3 ones, and a later -O3 ``run`` re-benches rather than reading a
+    # stale -O1 number. Populated from the env by :meth:`probe` /
+    # :meth:`from_target`.
+    compile_flags: str = ""
 
     @classmethod
     def from_target(cls, cap: tuple[int, int]) -> Context:
-        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap))
+        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap), compile_flags=_env_compile_flags())
 
     def structural_key(self) -> str:
         """Implements :class:`deplodock.compiler.structural.Structural`.
 
         Folds in only codegen-affecting fields. ``compute_capability``
         gates hardware-feature passes (TMA, cp.async, dynamic smem cap);
-        anything derived from it (``max_dynamic_smem``) is implied. As
-        non-derived knobs land (forced TMA on/off, splitk overrides),
-        extend this method explicitly — keep ambient I/O fields out so
-        the autotuning cache survives debug-flag flips.
+        anything derived from it (``max_dynamic_smem``) is implied.
+        ``compile_flags`` is folded in because the nvcc opt level genuinely
+        changes the emitted SASS / measured latency (it is NOT a debug flag).
+        As other non-derived knobs land (forced TMA on/off, splitk overrides),
+        extend this method explicitly — keep ambient I/O fields out so the
+        autotuning cache survives debug-flag flips.
         """
         from deplodock.compiler.structural import digest  # noqa: PLC0415
 
-        return digest("Context", self.compute_capability)
+        return digest("Context", self.compute_capability, self.compile_flags)
 
     @classmethod
     def probe(cls) -> Context:
@@ -124,4 +142,4 @@ class Context:
             smem = _max_dynamic_smem_for(cap)
         else:
             smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
-        return cls(compute_capability=cap, max_dynamic_smem=smem)
+        return cls(compute_capability=cap, max_dynamic_smem=smem, compile_flags=_env_compile_flags())

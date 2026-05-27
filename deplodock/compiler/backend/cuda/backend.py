@@ -78,7 +78,7 @@ class CudaBackend(Backend):
         debug: bool | None = None,
         dump: CompilerDump | None = None,
         bench_wall_timeout_s: float | None = None,
-        bench_compile_timeout_s: float = 10.0,
+        bench_compile_timeout_s: float = 30.0,
         bench_run_timeout_s: float = 10.0,
         tune_db: Path | str | None = None,
     ) -> None:
