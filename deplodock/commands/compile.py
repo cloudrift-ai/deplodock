@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from deplodock import config
 from deplodock.compiler.pipeline import (
     CUDA_PASSES,
     KERNEL_PASSES,
@@ -58,8 +58,7 @@ def resolve_tune_db() -> Path:
     Callers should treat the path as advisory — the engine only opens
     it when the file actually exists; otherwise the compile falls back
     to rule defaults (greedy option-0)."""
-    override = os.environ.get("DEPLODOCK_TUNE_DB")
-    return Path(override) if override else Path.home() / ".cache" / "deplodock" / "autotune.db"
+    return config.tune_db_path()
 
 
 def add_input_args(parser) -> None:
@@ -167,17 +166,13 @@ def add_nvcc_args(parser) -> None:
 
 
 def apply_nvcc_flags(args, default: str) -> str:
-    """Resolve and publish the effective extra nvcc flags via the
-    ``DEPLODOCK_NVCC_FLAGS`` env var (the carrier the cubin compiler + the
-    bench-worker subprocess + ``Context.structural_key`` all read). Precedence:
-    ``--nvcc-flags`` > a pre-set env var > the command ``default``. Must run
-    before any compile/bench. Returns the effective string."""
-    val = getattr(args, "nvcc_flags", None)
-    if val is not None:
-        os.environ["DEPLODOCK_NVCC_FLAGS"] = val
-    elif "DEPLODOCK_NVCC_FLAGS" not in os.environ:
-        os.environ["DEPLODOCK_NVCC_FLAGS"] = default
-    return os.environ.get("DEPLODOCK_NVCC_FLAGS", "")
+    """Resolve and publish the effective extra nvcc flags. Thin CLI adapter that
+    extracts ``--nvcc-flags`` from ``args`` and delegates the override/precedence
+    (``--nvcc-flags`` > pre-set env > command ``default``) to
+    :func:`deplodock.config.set_nvcc_flags`, so every callsite (CLI, programmatic,
+    tests) shares one implementation. Must run before any compile/bench. Returns
+    the effective string."""
+    return config.set_nvcc_flags(getattr(args, "nvcc_flags", None), default)
 
 
 def setup_pipeline_runtime(args) -> None:

@@ -16,6 +16,13 @@ commands/vm ────► provisioning (create/delete instances)
 - `deplodock/deploy/` — compose generation, deploy orchestration
 - `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
 - `deplodock/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
+- `deplodock/config.py` — the single owner of `os.environ` for all `DEPLODOCK_*` config vars. Typed getters
+  (`tune_db_path`, `nvcc_flags`, `debug_enabled`, `dump_dir`, `tune_patience`, `bench_backends_raw`, `cubin_cache_dir`,
+  …) read the env live; `set_nvcc_flags(cli_value, default)` holds the `--nvcc-flags` > env > command-default precedence
+  that used to live in this CLI layer, so every callsite (CLI, programmatic, tests) shares it. The thin
+  `compile.apply_nvcc_flags` / `compile.resolve_tune_db` wrappers just adapt argparse to it. (Provider/secret vars stay
+  with `redact.py`; the dynamic `DEPLODOCK_<KNOB>` namespace stays with `compiler/pipeline/knob.py`, which borrows
+  `config.knob_var` / `config.knob_raw`.)
 - `deplodock/redact.py` — `redact_secrets()`, `SecretRedactingFilter`, `install_redaction()` (attach the filter to a handler — must be a handler, not a logger, so child-logger records that propagate up are still redacted), `register_secret()` (call after resolving any secret from a CLI flag — `--hf-token`, `--api-key` — or env var so its value is added to the redaction set)
 - `deplodock/benchmark/` — config, logging, workload, tasks, execution, structured JSON results
 

@@ -40,9 +40,12 @@ arg_order).
   Compile vs load is split (`compile_to_cubin` / `load_function`) so the
   GPU-free compile can run off-process; the loaded `Function` is launch- and
   smem-attr-compatible with `RawKernel`.
-- **Opt level** comes from `DEPLODOCK_NVCC_FLAGS` (`nvcc.effective_flags`): the
-  CLI sets it — `tune` → `-Xcicc -O1`, `compile`/`run` → nvcc default -O3,
-  `--nvcc-flags` overrides. -O1 dodges a cicc/LLVM front-end blowup on big
+- **Opt level** comes from `DEPLODOCK_NVCC_FLAGS` (`nvcc.effective_flags`, which
+  delegates to `config.nvcc_flags()` — `deplodock/config.py` is the single owner
+  of `os.environ` for `DEPLODOCK_*` vars, incl. `DEPLODOCK_NO_NVCC` /
+  `DEPLODOCK_CUBIN_CACHE`). The CLI sets the flags via `config.set_nvcc_flags`
+  (override logic, no longer in the command layer) — `tune` → `-Xcicc -O1`,
+  `compile`/`run` → nvcc default -O3, `--nvcc-flags` overrides. -O1 dodges a cicc/LLVM front-end blowup on big
   unrolled register-tile kernels (cicc, not ptxas, is the cost: a tall-thin
   register tile unrolls into a ~5K-instruction basic block → up to 21 s → 0.1 s
   at -O1) but is **NOT runtime-optimal** (reductions/attention ~1.5–3× slower),

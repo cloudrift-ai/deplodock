@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from deplodock import config
 
 if TYPE_CHECKING:
     from deplodock.compiler.backend.base import BenchmarkResult
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ENV_VAR = "DEPLODOCK_DUMP_DIR"
+ENV_VAR = config.DUMP_DIR
 
 
 @dataclass
@@ -59,10 +60,8 @@ class CompilerDump:
     @classmethod
     def from_env(cls) -> CompilerDump | None:
         """Create from DEPLODOCK_DUMP_DIR env var, or return None."""
-        dump_dir = os.environ.get(ENV_VAR)
-        if dump_dir:
-            return cls(dir=Path(dump_dir).expanduser())
-        return None
+        d = config.dump_dir()
+        return cls(dir=d) if d else None
 
     @classmethod
     def resolve(cls, cli_dir: str | Path | None = None) -> CompilerDump | None:

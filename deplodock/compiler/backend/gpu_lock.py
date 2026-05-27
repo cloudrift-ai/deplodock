@@ -22,16 +22,17 @@ nested calls inside the same process don't deadlock against themselves.
 from __future__ import annotations
 
 import contextlib
-import os
 from collections.abc import Iterator
 from pathlib import Path
+
+from deplodock import config
 
 _LOCK_CACHE: dict[str, object] = {}
 
 
 def _resolve_lock():
     """Return the cached ``FileLock`` instance, or ``None`` for no-op."""
-    path = os.environ.get("DEPLODOCK_GPU_LOCK")
+    path = config.gpu_lock_path()
     if not path:
         return None
     cached = _LOCK_CACHE.get(path)

@@ -283,11 +283,15 @@ rule module — no manual registration.
 
 **Pinning knobs from the environment.** Two equivalent forms:
 
-- **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_BK=32`). Read directly by the rule that owns the knob.
+- **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_BK=32`). Read by the rule that owns the knob (via
+  `Knob.narrow`) or by `compiler/tuning.py`'s heuristics. The `DEPLODOCK_<NAME>` env-var key is built by
+  `config.knob_var` and the value read via `config.knob_raw` / `config.int_env` — `deplodock/config.py` is the single
+  owner of `os.environ` for all `DEPLODOCK_*` vars; `knob.py` keeps the `Knob` descriptor's per-type decode.
 - **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="BK=2,BM=16,BN=128,FM=8,FN=8,STAGE=111"`).
   Parsed once at `knob.py` import via `apply_knobs_env()`, which splats each entry into the corresponding
-  `DEPLODOCK_<K>` env var so all the per-knob readers pick it up uniformly. An explicit per-knob var wins over the
-  aggregate (so `DEPLODOCK_BK=4 DEPLODOCK_KNOBS="BK=2,BM=16"` ends up with BK=4, BM=16).
+  `DEPLODOCK_<K>` env var (via `config.set_knob(..., overwrite=False)`) so all the per-knob readers pick it up
+  uniformly. An explicit per-knob var wins over the aggregate (so `DEPLODOCK_BK=4 DEPLODOCK_KNOBS="BK=2,BM=16"` ends up
+  with BK=4, BM=16).
 
 Pinning replaces tuner choice: the rule sees the env value and emits exactly that variant instead of forking. Useful for
 reproducing a tune-time variant from CI logs, A/B-comparing two configs, or pinning a known-good config in a Makefile

@@ -73,9 +73,11 @@ def handle_bench(args):
         sys.exit(1)
 
     # Inject DEPLODOCK_DUMP_DIR / DEPLODOCK_DEBUG into command tasks when
-    # --dump-dir / --debug are set. The env vars use $task_dir which is
-    # resolved at runtime by the command workload runner. Artifacts are
-    # pulled back via result_files glob.
+    # --dump-dir / --debug are set. These are keys in the *remote* command's
+    # env (resolved at runtime by the command workload runner via $task_dir),
+    # not local-process env access, so they stay literal (see deplodock/config.py
+    # for the local-process DEPLODOCK_* owner). Artifacts are pulled back via
+    # the result_files glob.
     if args.dump_dir or args.debug:
         for task in tasks:
             if task.recipe.command is not None:

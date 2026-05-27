@@ -15,8 +15,9 @@ the signature alone.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+
+from deplodock import config
 
 # Per-block static-smem cap. Hard hardware limit since Maxwell (sm_50);
 # anything declared as ``__shared__`` at compile time must fit.
@@ -41,9 +42,9 @@ _MAX_DYNAMIC_SMEM_BY_CC: dict[tuple[int, int], int] = {
 
 def _env_compile_flags() -> str:
     """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``). Set by the
-    CLI commands; folded into :meth:`Context.structural_key` so the perf cache
-    is partitioned by opt level."""
-    return os.environ.get("DEPLODOCK_NVCC_FLAGS", "")
+    CLI commands (via :func:`deplodock.config.set_nvcc_flags`); folded into
+    :meth:`Context.structural_key` so the perf cache is partitioned by opt level."""
+    return config.nvcc_flags()
 
 
 def _max_dynamic_smem_for(cc: tuple[int, int]) -> int:

@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+from deplodock import config
 from deplodock.commands.compile import (
     add_diagnostics_args,
     add_input_args,
@@ -129,7 +130,7 @@ def handle_tune(args):
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
-    patience = args.patience if args.patience is not None else int(os.environ.get("DEPLODOCK_TUNE_PATIENCE", 100))
+    patience = args.patience if args.patience is not None else config.tune_patience(100)
     ctx = Context.probe()
     t0 = time.monotonic()
     try:
