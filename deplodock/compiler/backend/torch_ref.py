@@ -4,10 +4,13 @@ reference for ``deplodock run --ir``.
 Each frontend / tensor-IR op is mapped to the equivalent torch op (the numpy
 ``forward()`` has a torch twin), so a dumped ``.torch.json`` reproducer can be
 accuracy-checked and timed against torch — including torch.compile fusion — not
-just numpy. Layout/data-dependent ops that only appear post-decomposition
-(``IndexMapOp`` / ``GatherOp`` / ``ScatterOp``) are deliberately unsupported:
-:func:`is_runnable` returns ``False`` for such graphs and the caller falls back
-to deplodock-only benchmarking.
+just numpy. ``IndexMapOp`` (the post-decomposition layout primitive — broadcast,
+transpose/reshape/slice/cat, RoPE rotate) is supported as a vectorized
+gather over coordinate grids, so HF norms/RoPE (which trace to primitive
+sequences, not fused aten ops) are torch-comparable. Only the data-dependent
+``GatherOp`` / ``ScatterOp`` (indices come from a runtime tensor, not from the
+output coordinates) stay unsupported: :func:`is_runnable` returns ``False`` and
+the caller falls back to deplodock-only benchmarking.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ SUPPORTED = frozenset(
         "SoftmaxOp",
         "ElementwiseOp",
         "ReduceOp",
+        "IndexMapOp",
     }
 )
 
@@ -154,7 +158,101 @@ def _eval(node, ins: list):
         tensors = [i for i in ins if isinstance(i, torch.Tensor)]
         dim = next((int(i) for i in ins if not isinstance(i, torch.Tensor)), -1)
         return torch.cat(tensors, dim=dim)
+    if name == "IndexMapOp":
+        return _index_map(op, ins)
     raise NotImplementedError(f"torch_ref: op {name!r} unmapped")
+
+
+def _idx_expr(e, env: dict):
+    """Evaluate a coord/select ``Expr`` over the output-coordinate grids.
+
+    Mirrors ``Expr.eval`` but with torch-/CUDA-safe boolean ops (``Expr.eval``
+    routes ``&&``/``||`` through ``np.logical_and``, which can't take a CUDA
+    tensor). Falls back to ``Expr.eval`` for leaf node types that don't appear
+    in coord maps."""
+    cls = type(e).__name__
+    if cls == "Var":
+        return env[e.name]
+    if cls == "Literal":
+        return e.value
+    if cls == "BinaryExpr":
+        lo, ro = _idx_expr(e.left, env), _idx_expr(e.right, env)
+        op = e.op
+        ops = {
+            "+": lambda a, b: a + b,
+            "-": lambda a, b: a - b,
+            "*": lambda a, b: a * b,
+            "/": lambda a, b: a // b,
+            "//": lambda a, b: a // b,
+            "%": lambda a, b: a % b,
+            "<": lambda a, b: a < b,
+            "<=": lambda a, b: a <= b,
+            ">": lambda a, b: a > b,
+            ">=": lambda a, b: a >= b,
+            "==": lambda a, b: a == b,
+            "!=": lambda a, b: a != b,
+            "&&": lambda a, b: a & b,
+            "&": lambda a, b: a & b,
+            "||": lambda a, b: a | b,
+            "|": lambda a, b: a | b,
+            "^": lambda a, b: a ^ b,
+        }
+        if op in ops:
+            return ops[op](lo, ro)
+    return e.eval(env)
+
+
+def _index_map(op, ins: list):
+    """Run an ``IndexMapOp`` as a vectorized gather over output coordinates.
+
+    For every output cell, the first source whose ``select`` predicate holds
+    supplies the value, read from that source at ``coord_map`` (each entry an
+    affine ``Expr`` over the output coords). Single-source / ``select=None`` is
+    the common case (broadcast, transpose, reshape, slice)."""
+    import torch  # noqa: PLC0415
+
+    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX  # noqa: PLC0415
+
+    out_shape = tuple(d.as_static() for d in op.out_shape)
+    # device / dtype from the first tensor-valued source (a source can be a
+    # scalar constant — stored as a python float).
+    base = next((ins[s.input_idx] for s in op.sources if torch.is_tensor(ins[s.input_idx])), None)
+    dev = base.device if base is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = base.dtype if base is not None else torch.float32
+    env = {}
+    for i, d in enumerate(out_shape):
+        shp = [1] * len(out_shape)
+        shp[i] = d
+        env[f"{PLACEHOLDER_PREFIX}{i}"] = torch.arange(d, device=dev, dtype=torch.long).reshape(shp).expand(out_shape)
+
+    result = torch.zeros(out_shape, dtype=dtype, device=dev)
+    filled = torch.zeros(out_shape, dtype=torch.bool, device=dev)
+    for src in op.sources:
+        s = ins[src.input_idx]
+        if not torch.is_tensor(s):  # scalar constant source → broadcast it
+            gathered = torch.full(out_shape, float(s), dtype=dtype, device=dev)
+        else:
+            idx = []
+            for i, c in enumerate(src.coord_map):
+                if i < s.dim() and s.shape[i] == 1:  # size-1 source dim → index 0 (mirror lift)
+                    idx.append(torch.zeros(out_shape, dtype=torch.long, device=dev))
+                else:
+                    v = _idx_expr(c, env)
+                    v = v if torch.is_tensor(v) else torch.full(out_shape, int(v), dtype=torch.long, device=dev)
+                    # Clamp: the gather runs on every cell, but a source's coord_map
+                    # may go out of range where its select is false (those values are
+                    # discarded by ``take`` below). Clamp so the gather never OOBs.
+                    idx.append(v.expand(out_shape).long().clamp(0, s.shape[i] - 1))
+            gathered = s[tuple(idx)]
+        if src.select is None:
+            sel = torch.ones(out_shape, dtype=torch.bool, device=dev)
+        else:
+            sv = _idx_expr(src.select, env)
+            sel = (sv if torch.is_tensor(sv) else torch.full(out_shape, bool(sv), device=dev)).expand(out_shape).bool()
+        take = sel & ~filled
+        result = torch.where(take, gathered, result)
+        filled = filled | take
+    return result
 
 
 def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tuple[Callable, list]:

@@ -156,8 +156,7 @@ def _compare_tuning(repros: list[Path], args) -> None:
 
     labels = [k for k in before if k in after]
     rows = [
-        (k, before[k]["Deplodock"], after[k]["Deplodock"], before[k].get("Eager PyTorch"), before[k].get("torch.compile"))
-        for k in labels
+        (k, before[k]["Deplodock"], after[k]["Deplodock"], before[k].get("Eager PyTorch"), before[k].get("torch.compile")) for k in labels
     ]
     rows.sort(key=lambda t: t[1], reverse=True)
     _render_comparison(rows, args)
@@ -228,10 +227,7 @@ def _render_latency(rows: list[tuple[str, dict[str, float]]], args) -> None:
         ],
         value_name="latency (µs) — lower is faster",
         title=f"{args.model} — per-kernel latency",
-        subtitle=(
-            f"Each kernel benched from its dumped .torch.json ({len(rows)} kernels; "
-            f"{n_vs} torch-comparable, rest deplodock-only)."
-        ),
+        subtitle=(f"Each kernel benched from its dumped .torch.json ({len(rows)} kernels; {n_vs} torch-comparable, rest deplodock-only)."),
         orientation="horizontal",
     )
     html = render_bar_chart(chart, theme="dark", transparent=True)

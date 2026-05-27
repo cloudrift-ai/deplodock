@@ -9,8 +9,9 @@ from deplodock.compiler.backend import torch_ref
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp, SoftmaxOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
+from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
 
 # torch is only needed to build reference tensors / call the evaluator; the
 # deplodock imports above are torch-free, so gate after them.
@@ -72,6 +73,45 @@ def test_reduce_sum_keepdim():
     g.add_node(ReduceOp(op="sum", axis=-1), ["x"], Tensor("o", (4, 1)), node_id="o")
     g.inputs, g.outputs = ["x"], ["o"]
     _assert_matches_numpy(g, {"x": _rng().standard_normal((4, 8))})
+
+
+def _imap_graph(in_shapes, out_shape, sources) -> Graph:
+    g = Graph()
+    names = [f"in{i}" for i in range(len(in_shapes))]
+    for n, shp in zip(names, in_shapes, strict=True):
+        g.add_node(InputOp(), [], Tensor(n, shp), node_id=n)
+    g.add_node(IndexMapOp(out_shape=out_shape, sources=sources), names, Tensor("o", out_shape), node_id="o")
+    g.inputs, g.outputs = names, ["o"]
+    return g
+
+
+def test_indexmap_transpose():
+    # output (4,3)[a0,a1] = in0[a1,a0]
+    g = _imap_graph([(3, 4)], (4, 3), (IndexSource(input_idx=0, coord_map=(placeholder(1), placeholder(0))),))
+    _assert_matches_numpy(g, {"in0": _rng().standard_normal((3, 4))})
+
+
+def test_indexmap_broadcast():
+    # (8,) → (4,8): every row reads in0[a1]
+    g = _imap_graph([(8,)], (4, 8), (IndexSource(input_idx=0, coord_map=(placeholder(1),)),))
+    _assert_matches_numpy(g, {"in0": _rng().standard_normal((8,))})
+
+
+def test_indexmap_cat_with_select():
+    # output (4,4): a1<2 → in0[a0,a1]; a1>=2 → in1[a0,a1-2]
+    s0 = IndexSource(input_idx=0, coord_map=(placeholder(0), placeholder(1)), select=placeholder(1).lt(Literal(2, "int")))
+    s1 = IndexSource(
+        input_idx=1,
+        coord_map=(placeholder(0), placeholder(1) - Literal(2, "int")),
+        select=BinaryExpr(">=", placeholder(1), Literal(2, "int")),
+    )
+    g = _imap_graph([(4, 2), (4, 2)], (4, 4), (s0, s1))
+    _assert_matches_numpy(g, {"in0": _rng().standard_normal((4, 2)), "in1": _rng().standard_normal((4, 2))})
+
+
+def test_is_runnable_accepts_indexmap():
+    g = _imap_graph([(8,)], (4, 8), (IndexSource(input_idx=0, coord_map=(placeholder(1),)),))
+    assert torch_ref.is_runnable(g)
 
 
 def test_is_runnable_rejects_gather():

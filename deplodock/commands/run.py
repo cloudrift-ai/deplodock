@@ -702,7 +702,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             torch_fn, torch_inputs = torch_ref.build_callable(frontend, input_tensors)
             with torch.no_grad():
                 eager_out = torch_fn(*torch_inputs)
-            _check_accuracy(result.outputs, eager_out)
+            _check_accuracy(result.outputs, eager_out, fatal=False)
         except Exception as exc:  # noqa: BLE001 — torch ref is best-effort
             logger.warning("torch reference unavailable (%s) — skipping vs-torch comparison", exc)
             torch_fn = None
@@ -826,16 +826,34 @@ def _to_cuda_kwargs(kwargs):
     return cuda_kwargs
 
 
-def _check_accuracy(outputs, eager_out):
+def _check_accuracy(outputs, eager_out, *, fatal=True):
+    """Compare backend ``outputs`` against the eager reference.
+
+    ``fatal`` (the ``--code`` path) aborts on mismatch / NaN. ``run --ir``
+    passes ``fatal=False``: a sliced reproducer is fed random *boundary* inputs
+    that can be out-of-domain for the op (e.g. a kernel expecting a
+    mean-of-squares gets random signed data → NaN from a downstream rsqrt), so
+    a failure there is informational, not a correctness gate — bench anyway."""
     import numpy as np  # noqa: PLC0415
 
+    def _fail(msg: str) -> None:
+        if fatal:
+            logger.error(msg)
+            sys.exit(1)
+        logger.warning("%s — non-fatal (random-input reproducer); skipping accuracy", msg)
+
     eager_flat = eager_out.detach().cpu().flatten().tolist()
+    if any(e != e for e in eager_flat):
+        _fail("eager reference contains NaN (reproducer inputs out of domain)")
+        if not fatal:
+            return
     failed = False
     for buf_name, arr in outputs.items():
         values = arr.flatten().tolist()
         if any(v != v for v in values):
-            logger.error("CORRECTNESS FAIL: output %s contains NaN", buf_name)
-            sys.exit(1)
+            _fail(f"CORRECTNESS FAIL: output {buf_name} contains NaN")
+            if not fatal:
+                return
         if len(values) == len(eager_flat):
             max_diff = max(abs(a - e) for a, e in zip(values, eager_flat, strict=True))
             mean_diff = sum(abs(a - e) for a, e in zip(values, eager_flat, strict=True)) / len(values)
@@ -885,7 +903,7 @@ def _check_accuracy(outputs, eager_out):
         else:
             logger.warning("Output size %d does not match eager %d; skipping accuracy", len(values), len(eager_flat))
     if failed:
-        sys.exit(1)
+        _fail("accuracy check failed vs eager")
 
 
 _BACKEND_ALIASES = {
