@@ -11,8 +11,10 @@ pipeline/
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
 │   ├── policy/       # Search ABC (base.py) + GreedySearch (greedy.py) / TuningSearch (mcts.py)
-│   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf
-│   └── keys.py       # op_cache_key / dialect_of / source_chain
+│   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf + op_effort
+│   ├── keys.py       # op_cache_key / dialect_of / source_chain
+│   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
+│   └── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
@@ -193,35 +195,80 @@ score.
 
 ## Tuning workflow
 
-The autotune loop selects one tile-lowering variant per CudaOp by repeatedly running the full pipeline with different knob
-choices at each fork point, benching the produced kernels, and steering subsequent rollouts toward the configurations that
-produced the lowest measured latency.
+The autotune loop selects one tile-lowering variant per CudaOp by repeatedly running the lowering pipeline with
+different knob choices at each fork point, benching the produced kernels, and steering subsequent rollouts toward the
+configurations that produced the lowest measured latency.
 
-**Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` constructs a `TuningSearch(patience=N, ucb_c=C)`,
-hands it to `Pipeline.tune(graph, search=...)`, and iterates terminals until the search's `stop_reason` fires. Each
-terminal is one fully-lowered `Graph[CudaOp]` whose every kernel got `_bench_terminal`'d. The tuning database (default
-`~/.cache/deplodock/autotune.db`, overridable via the `DEPLODOCK_TUNE_DB` env var) accumulates rows across runs;
-calling `tune` again on the same expression resumes from the cached state instead of re-benching.
+### Two-level search: outer fusion MCTS + inner separable per-op tuning
 
-**Search dynamics.** SP-MCTS over the fork DAG with max-Q normalized UCB1 (see `search/policy/mcts.py`):
+`deplodock tune` does **not** run one MCTS over the whole graph. The pipeline applies rules sequentially, so two very
+different kinds of fork — **op-variant** forks (tile / pad / stage choices for one kernel) and **fusion** forks (how ops
+group into kernels) — would nest and cross-product under one global patience. That cross-product is what starved deep
+ops (the bottleneck kernel exhausted patience before an SDPA P@V kernel reached its good tile). The two kinds have
+opposite structure, so `search/two_level.py` splits them:
+
+- **Outer search** (`run_two_level_tune`) drives only the graph-changing passes (`OUTER_PASSES` = `frontend` + `loop`,
+  i.e. `LOOP_PASSES`). A **terminal** is the state where the cursor would advance into `lowering/tile`
+  (`partition_loops`) — every op post-fusion and structurally final. Each terminal is a candidate fused graph; its
+  **reward** is `1 / Σ best-per-op time` from the inner search, backpropagated by the reused `TuningSearch`. **Today
+  fusion is deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`), so the outer
+  tree has exactly one terminal and this reduces to "tune each op once, sum, assemble". The outer tree is the
+  generalization that lets fusion forks plug in later with no change to the inner search. The outer uses
+  `Pipeline.search` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
+- **Inner search** (`inner_reward`) tunes each finalized kernel **independently** in its own single-node slice
+  (`single_node_graph`, `search/slice.py`) with a plain `TuningSearch` over `LOWERING_PASSES` only (`tile → kernel →
+  cuda`). The slice keeps the root kernel + its leaf-op closure and turns every other kernel-input into a synthetic
+  `InputOp`; the root op is shared **by reference**, so its body — and thus `op_cache_key` — is byte-for-byte the
+  full-graph op's. Lowering-only (never re-running `loop/fusion`) is what keeps that body untouched. Because the inner
+  tree holds one op, MCTS explores only that op's forks with `patience` as the op's own budget — `Σ_k n_k` benches,
+  never the product.
+
+**Separability + the structural handoff.** Op-variant forks are separable: every multi-option fork is an in-place `Op`
+rebind that leaves the graph unchanged, so whole-graph time is `Σ_k t_k`. Results key structurally (`op_cache_key` =
+name-invariant body+knobs digest), so a kernel tuned in its slice transfers to the assembled graph unchanged **and** is
+shared across outer terminals — two fusion candidates sharing an identical op reuse its tuning (a DB hit), so fusion
+search only pays for the ops that differ. After the best fusion is picked, the assembled `Graph[CudaOp]` (greedy replay
+of the DB-best forks over the original graph) is benched **once** for the real in-context whole-graph latency; comparing
+it to the `Σ` estimate is the **separability check** — a gap exposes L2 / clock / launch coupling the isolated benches
+can't see (in practice <2% for the small graphs above).
+
+**"Terminated" effort — skip already-tuned ops.** Per op, the inner search is gated on persisted effort
+(`SearchDB.record_effort` / `effort_for` / `terminated`, the `op_effort` table keyed by `(context_key, op_key)`). An op
+is `terminated` when its recorded effort `>= patience`; the recorded value is `∞` once the op's inner tree **exhausted**
+(the search drained without a patience stop, i.e. `stop_reason is None`), else the `patience` it ran with (max-kept).
+This makes re-runs idempotent (`cached` in the summary), higher patience re-deepen only under-tuned ops, and the whole
+sweep resumable across sessions. The inner search records the **best whole-slice total** (`Σ` over the slice's CudaOps,
+so a split-K main + combine both count) under the LoopOp key via `record_perf`; `best_per_op_time` prefers that direct
+row and otherwise walks the `lowering` chain down to the `cuda` terminal.
+
+**Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` probes a `Context`, opens the tuning database
+(default `~/.cache/deplodock/autotune.db`, overridable via `DEPLODOCK_TUNE_DB`), and calls `run_two_level_tune(...)`.
+It prints a per-op-best table (with `tuned` / `cached` state), the `Σ` estimate, the assembled whole-graph latency, and
+the separability gap. The DB accumulates rows across runs; re-running resumes from the cached state.
+
+**Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner
+over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
   `child.score` is a rank-only structural prior the rule stamped via `TileOp.score` (no magnitude — only relative ordering).
 - **Expansion** is implicit: `Pipeline.search` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
-- **Simulation** is the actual `backend.benchmark(...)` call on the terminal — one real GPU run per leaf.
+- **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU
+  run of a single-kernel slice per leaf.
 - **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
   UCB1 calls see the new max-Q.
-- **Patience** counts terminals visited *since the last new global best*; when it exceeds `--patience N` (default 20),
-  `TuningSearch.stop_reason` is set and `Pipeline.tune` exits.
+- **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
+  default 100), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
+  search records `∞` effort when it instead drains its tree (no patience stop).
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
-`op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped. A subsequent
-`deplodock compile` / `deplodock run` (or `make bench-kernels-tuned`) auto-resolves the same DB path (env or default)
-and replays the cached forks via `GreedySearch`, which walks the parent op's `op_cache_key` in `lowering` and follows
-the best-known child at each step. No GPU bench is
-required on the replay path when every kernel already has a `perf` row.
+`op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
+adds the whole-slice total under the LoopOp key). A subsequent `deplodock compile` / `deplodock run` (or
+`make bench-kernels-tuned`) auto-resolves the same DB path (env or default) and replays the cached forks via
+`GreedySearch`, which walks the parent op's `op_cache_key` in `lowering` and follows the best-known child at each step —
+the same replay `run_two_level_tune` uses to assemble its final graph. No GPU bench is required on the replay path when
+every kernel already has a `perf` row.
 
 **Stub backend.** With `backend=None`, `_bench_terminal` short-circuits to `latency_us=1.0` and persists nothing — used by
 test fixtures so `Pipeline.run`'s greedy replay doesn't clobber tuned rows with a stub when no GPU is available.

@@ -15,8 +15,7 @@ from deplodock.commands.compile import (
     resolve_tune_db,
     setup_pipeline_runtime,
 )
-from deplodock.compiler.pipeline import CUDA_PASSES, TuningSearch
-from deplodock.compiler.pipeline.knob import format_tuning_knobs
+from deplodock.compiler.pipeline import TuningSearch
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +75,10 @@ def handle_tune(args):
     import time
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import Pipeline
+    from deplodock.compiler.context import Context
     from deplodock.compiler.pipeline.dump import CompilerDump
     from deplodock.compiler.pipeline.search import SearchDB
+    from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
 
     setup_pipeline_runtime(args)
     graph, _ = load_or_trace(args)
@@ -93,7 +93,9 @@ def handle_tune(args):
     # mis-tiled kernels in one bench pass) routinely exceed them. The wall
     # cap adds a SIGKILL backstop for real hangs; the bumped run budget
     # lets a slow-but-progressing 394-kernel bench finish rather than
-    # getting pinned for cumulative GPU time alone.
+    # getting pinned for cumulative GPU time alone. The inner per-op search
+    # benches one kernel at a time, so the cold-start concern is milder, but
+    # the final assembled whole-graph bench still wants the headroom.
     backend = CudaBackend(
         bench_wall_timeout_s=max(60.0, args.bench_timeout * 3),
         bench_compile_timeout_s=10.0,
@@ -105,44 +107,43 @@ def handle_tune(args):
     logger.info("Tuning DB: %s", db_path)
 
     patience = args.patience if args.patience is not None else int(os.environ.get("DEPLODOCK_TUNE_PATIENCE", 100))
-    search = TuningSearch(patience=patience, ucb_c=args.ucb_c)
+    ctx = Context.probe()
     t0 = time.monotonic()
-    candidates: list = []
     try:
-        for cand in Pipeline.build(CUDA_PASSES, dump=dump).tune(graph, search=search, backend=backend, db=db):
-            candidates.append(cand)
+        result = run_two_level_tune(graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=args.ucb_c, dump=dump)
     except KeyboardInterrupt:
-        # Manual abort: cut the sweep, fall through to summary + best-pick.
-        search.stop("interrupted (Ctrl-C)")
-        sys.stderr.write("\n[tune] interrupted (Ctrl-C) — printing partial results\n")
+        # Manual abort: per-op bests already landed in the DB as they were
+        # measured, so a re-run resumes. Nothing structured to print here.
+        sys.stderr.write("\n[tune] interrupted (Ctrl-C) — partial per-op results are persisted in the DB\n")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     except RuntimeError as exc:
-        # An autotune-internal raise (bench watchdog couldn't bail
-        # in time because the GPU queue is saturated). The CUDA
-        # stream is dirty — bypass Python cleanup so cupy's atexit
-        # doesn't deadlock on the still-running launch.
+        # An autotune-internal raise (bench watchdog couldn't bail in time
+        # because the GPU queue is saturated). The CUDA stream is dirty —
+        # bypass Python cleanup so cupy's atexit doesn't deadlock on the
+        # still-running launch.
         sys.stderr.write(f"\n[tune] aborted: {exc}\n")
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(1)
 
     elapsed = time.monotonic() - t0
-    reason = search.stop_reason or "tree exhausted"
-    sys.stderr.write(f"\n[tune] stopped: {reason} after {len(candidates)} variant(s) in {elapsed:.1f}s\n")
-    if not candidates:
-        sys.stderr.write("[tune] no candidates produced — exiting without output\n")
+    sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {elapsed:.1f}s\n")
+    if result.best_reward is None:
+        sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
 
-    result = _pick_best_candidate(candidates, db).graph
-    _print_tune_summary(candidates, db)
+    _print_two_level_summary(result)
 
-    # Only write the winner's CUDA source when ``--output`` is given.
-    # Dumping a multi-kB kernel to stdout after a 40s tune is noise —
-    # callers that want it can pass ``-o`` (or re-run ``deplodock compile``
-    # with the winning knobs to reproduce).
-    if args.output:
-        Path(args.output).write_text(format_stage(result, "cuda"))
+    # Only write the assembled (DB-best) CUDA source when ``--output`` is
+    # given. Dumping a multi-kB kernel to stdout after a long tune is noise —
+    # callers that want it can pass ``-o`` (or re-run ``deplodock compile``,
+    # which replays the same cached forks).
+    if args.output and result.assembled is not None:
+        Path(args.output).write_text(format_stage(result.assembled, "cuda"))
         logger.info("Saved cuda IR: %s", args.output)
 
     # A bench-timeout abandons its NVRTC worker thread (see
@@ -157,94 +158,22 @@ def handle_tune(args):
     os._exit(0)
 
 
-def _format_knobs(cuda_op) -> str:
-    return format_tuning_knobs(getattr(cuda_op, "knobs", None) or {})
+def _print_two_level_summary(result) -> None:
+    """Print the per-op bests (the inner separable search), the ``Σ``
+    estimate, and the assembled whole-graph latency with the separability
+    gap. ``result`` is a :class:`TwoLevelResult`."""
+    reward = result.best_reward
+    per_op = sorted(reward.per_op, key=lambda r: (r.best_us is None, r.best_us or 0.0), reverse=True)
+    sys.stderr.write(f"\n[tune] per-op bests ({len(per_op)} kernel(s), best fused terminal):\n")
+    sys.stderr.write(f"{'rank':>4}  {'best_us':>10}  {'state':>8}  kernel\n")
+    for rank, r in enumerate(per_op):
+        us = f"{r.best_us:.2f}" if r.best_us is not None else "fail"
+        state = "tuned" if r.benched else "cached"
+        sys.stderr.write(f"{rank:>4}  {us:>10}  {state:>8}  {r.name}\n")
 
-
-def _pick_best_candidate(candidates, db):
-    """Pick the autotune candidate whose CudaOps all measured ``ok`` and
-    whose summed latency is lowest. Falls back to ``candidates[0]`` when
-    nothing has a clean measurement (e.g. every variant timed out)."""
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.pipeline.search import op_cache_key
-
-    ctx_key = Context.probe().structural_key()
-    best = None
-    best_total = float("inf")
-    for cand in candidates:
-        cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
-        if not cuda_nodes:
-            continue
-        total = 0.0
-        all_ok = True
-        for node in cuda_nodes:
-            key = op_cache_key(node.op)
-            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
-            if row is None or row.status != "ok":
-                all_ok = False
-                break
-            total += row.stats.median
-        if all_ok and total < best_total:
-            best_total = total
-            best = cand
-    return best if best is not None else candidates[0]
-
-
-def _print_tune_summary(candidates, db) -> None:
-    """Print all variants explored by the autotuner, sorted by total
-    GPU latency. Each ``Candidate`` is one terminal pipeline run (one
-    set of autotune choices); per-kernel latencies come from looking up
-    each ``CudaOp`` in ``CandidateGraph`` against the measurement
-    ``SearchDB``."""
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.pipeline.search import op_cache_key
-
-    ctx_key = Context.probe().structural_key()
-
-    rows: list[tuple[bool, float, str, list[tuple[str, float]]]] = []
-    for cand in candidates:
-        cuda_nodes = [cand.graph.nodes[nid] for nid in cand.graph.topological_order() if isinstance(cand.graph.nodes[nid].op, CudaOp)]
-        per_kernel: list[tuple[str, float]] = []
-        total = 0.0
-        all_ok = bool(cuda_nodes)
-        knob_strs: list[str] = []
-        for node in cuda_nodes:
-            key = op_cache_key(node.op)
-            row = db.lookup_perf(ctx_key, key, backend="cuda") if key else None
-            latency = row.stats.median if row else float("nan")
-            per_kernel.append((node.op.kernel_name, latency))
-            if row is not None and row.status == "ok":
-                total += latency
-            else:
-                all_ok = False
-            knob_strs.append(_format_knobs(node.op))
-        knobs_str = " | ".join(knob_strs) if knob_strs else "-"
-        rows.append((all_ok, total, knobs_str, per_kernel))
-
-    # Sort ok variants by ascending latency first, then any with a
-    # bench_fail / unmeasured kernel at the bottom (status tiebreaker
-    # before latency so 0.00 placeholders don't masquerade as the winner).
-    rows.sort(key=lambda r: (not r[0], r[1]))
-    sys.stderr.write(f"\n[tune] explored {len(rows)} variant(s):\n")
-    sys.stderr.write(f"{'rank':>4}  {'status':>7}  {'total_us':>10}  knobs per kernel\n")
-
-    def _emit(rank: int, row: tuple[bool, float, str, list[tuple[str, float]]]) -> None:
-        all_ok, total, knobs_str, _ = row
-        marker = "*" if rank == 0 and all_ok else " "
-        status = "ok" if all_ok else "fail"
-        sys.stderr.write(f"{rank:>4}{marker} {status:>7}  {total:>10.2f}  {knobs_str}\n")
-
-    # Collapse the middle of long tables: head 10 + ellipsis + tail 5.
-    # 20 is the threshold below which the full table fits on one screen
-    # and the elision would hide more than it saves.
-    if len(rows) > 20:
-        for rank, row in enumerate(rows[:10]):
-            _emit(rank, row)
-        sys.stderr.write(f"{'...':>4}   {'...':>7}  {'...':>10}  ({len(rows) - 15} variant(s) elided)\n")
-        for offset, row in enumerate(rows[-5:]):
-            _emit(len(rows) - 5 + offset, row)
-    else:
-        for rank, row in enumerate(rows):
-            _emit(rank, row)
+    sys.stderr.write(f"\n[tune] Σ per-op best (estimate):  {reward.total_us:>12.2f} us\n")
+    if result.whole_us is not None:
+        gap = result.whole_us - reward.total_us
+        pct = (gap / reward.total_us * 100.0) if reward.total_us > 0 else 0.0
+        sys.stderr.write(f"[tune] assembled whole-graph:     {result.whole_us:>12.2f} us\n")
+        sys.stderr.write(f"[tune] separability gap:          {gap:>+12.2f} us  ({pct:+.1f}%)\n")
