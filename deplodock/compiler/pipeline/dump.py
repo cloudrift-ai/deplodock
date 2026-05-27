@@ -51,6 +51,10 @@ class CompilerDump:
         # files once instead of N times for N rule applications.
         self._rule_records: dict[tuple[int, str, str], list[dict]] = {}
         self._rule_texts: dict[tuple[int, str, str], list[str]] = {}
+        # Pristine, pre-decomposition Torch-dialect snapshot — the source for
+        # the per-kernel ``.torch.json`` reproducers. Stashed by
+        # ``dump_input_graph`` before any pass mutates the graph in place.
+        self._input_graph: Graph | None = None
 
     @classmethod
     def from_env(cls) -> CompilerDump | None:
@@ -111,7 +115,13 @@ class CompilerDump:
             del self._rule_records[(pass_idx, pname, rule_name)]
 
     def dump_input_graph(self, graph: Graph) -> None:
-        """Graph as captured by the tracer, before any rewriter pass runs."""
+        """Graph as captured by the tracer, before any rewriter pass runs.
+
+        Stashes a *copy* — the pipeline mutates the passed graph in place, and
+        the per-kernel reproducers (``_dump_torch_repro``) need the pristine
+        frontend ops, keyed by the trace-time node ids that prov uses as
+        origins."""
+        self._input_graph = graph.copy()
         self._dump_graph("00_input", graph)
 
     def _dump_graph(self, prefix: str, graph: Graph) -> None:
@@ -175,6 +185,7 @@ class CompilerDump:
             sub.outputs.append(nid)
             safe = self._safe_filename(kname)
             self._write_json(f"{prefix}.kernels/{safe}.json", sub.to_dict())
+            self._dump_torch_repro(prefix, safe, node, graph)
             # Co-locate the pretty body. Skip duplicate CUDA kernel
             # names (same body across reuse sites).
             if isinstance(node.op, CudaOp):
@@ -184,6 +195,70 @@ class CompilerDump:
             body = node.op.pretty_body()
             if body is not None:
                 self._write_text(f"{prefix}.kernels/{safe}.txt", body)
+
+    def _dump_torch_repro(self, prefix: str, safe: str, node, graph: Graph) -> None:
+        """Write the original Torch ops a kernel implements as a standalone
+        sub-graph (``<safe>.torch.json``) + a readable summary with per-origin
+        ``i/N`` coverage (``<safe>.torch.txt``).
+
+        Sliced from the pristine ``_input_graph`` by the kernel's prov origins,
+        so it is always whole Torch ops — runnable via
+        ``deplodock run --ir <f>.torch.json --bench`` to reproduce accuracy /
+        latency vs torch for exactly those ops."""
+        from deplodock.compiler import provenance  # noqa: PLC0415
+
+        if self._input_graph is None:
+            return
+        node_prov = provenance.get(node)
+        origins = {oid for oid in node_prov if oid in self._input_graph.nodes}
+        if not origins:
+            return
+        sub = self._torch_repro_subgraph(origins)
+        self._write_json(f"{prefix}.kernels/{safe}.torch.json", sub.to_dict())
+        cov = provenance.coverage(node_prov, provenance.totals(graph))
+        header = [f"# matching torch ops for kernel '{safe}'"]
+        for oid in sorted(origins):
+            have, total, full = cov[oid]
+            header.append(f"#   {oid} ({node_prov[oid]['kind']}): {have}/{total} — {'full' if full else 'partial'}")
+        self._write_text(f"{prefix}.kernels/{safe}.torch.txt", "\n".join(header) + "\n\n" + sub.pretty_print())
+
+    def _torch_repro_subgraph(self, origins: set[str]) -> Graph:
+        """Slice ``_input_graph`` to ``origins`` + their input closure.
+
+        A frontend op feeding an origin but not itself an origin becomes a
+        synthetic ``InputOp`` boundary (so the slice is standalone); constants
+        and real graph inputs are kept. Outputs are the sink origins — those no
+        other kept node consumes."""
+        from deplodock.compiler.graph import Graph as _Graph  # noqa: PLC0415
+        from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
+
+        src = self._input_graph
+        keep: set[str] = set(origins)
+        synthetic: set[str] = set()
+        stack = [inp for oid in origins for inp in src.nodes[oid].inputs]
+        while stack:
+            cur = stack.pop()
+            if cur in keep or cur not in src.nodes:
+                continue
+            keep.add(cur)
+            if isinstance(src.nodes[cur].op, (ConstantOp, InputOp)):
+                stack.extend(src.nodes[cur].inputs)
+            else:
+                synthetic.add(cur)  # frontend op feeding an origin → boundary
+
+        consumed = {inp for nid in keep for inp in src.nodes[nid].inputs if inp in keep}
+        sub = _Graph()
+        for kid in self._topo_order(src, keep):
+            s = src.nodes[kid]
+            if kid in synthetic:
+                sub.add_node(InputOp(), [], s.output, node_id=s.id)
+                sub.inputs.append(kid)
+            else:
+                sub.add_node(s.op, list(s.inputs), s.output, node_id=s.id)
+                if isinstance(s.op, InputOp):
+                    sub.inputs.append(kid)
+        sub.outputs = [oid for oid in origins if oid not in consumed]
+        return sub
 
     def _collect_kernel_ancestors(self, graph: Graph, root_id: str, compute_types: tuple) -> tuple[set[str], set[str]]:
         """Collect ``root_id`` + transitive ConstantOp / InputOp ancestors.
