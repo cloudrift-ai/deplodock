@@ -149,7 +149,16 @@ class Candidate:
             self.graph.nodes[match.root_node_id].op = option
         else:
             assert isinstance(option, Graph), f"expected Graph or Op; got {type(option).__name__}"
-            self.graph.splice(option, consumed=match.consumed, output=match.output or match.root_node_id)
+            # Decomposition expands one op into many distinct pieces (mint);
+            # every other fragment splice aggregates the consumed pieces.
+            pass_ = match.rule.pass_
+            mint_pieces = pass_ is not None and pass_.name.startswith("frontend/decomposition")
+            self.graph.splice(
+                option,
+                consumed=match.consumed,
+                output=match.output or match.root_node_id,
+                mint_pieces=mint_pieces,
+            )
             self.cursor.n_applied += 1
         self._advance_if_last(match)
 

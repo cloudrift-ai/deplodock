@@ -1,0 +1,155 @@
+"""Op provenance — map fused kernels back to the original frontend (PyTorch) ops.
+
+A node carries one hint, ``prov`` (key :data:`PROV`), a JSON-safe map::
+
+    {origin_id: {"kind": <op-class-name>, "pieces": [piece_id, ...]}}
+
+``origin_id`` is the trace-time node id of an original frontend op (e.g.
+``rms_norm_0``); ``pieces`` are the node ids of the primitives that op
+decomposed into and that this node embodies. The piece set grows as
+decomposition expands an op into many primitives (mint, :func:`mint`) and as
+fusion merges primitives from one origin into a single kernel (aggregate,
+:func:`union`). A kernel's coverage of an origin is ``len(its pieces)`` over the
+union of that origin's pieces across the whole graph (:func:`totals` /
+:func:`coverage`) — so ``i/N`` stays correct under CSE and recursive
+decomposition instead of freezing ``N`` at the first split.
+
+Pure attribution metadata: it rides on ``Node.hints``, which structural and
+autotune-cache keys already skip, so it never affects codegen identity. Stored
+with ``list`` (never ``set``) piece collections so it round-trips through
+``Graph.to_dict`` / JSON unchanged.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from deplodock.compiler.graph import Graph, Node
+
+PROV = "prov"
+
+# Boundary sentinels compute nothing, so no kernel ever "implements" them —
+# they never carry provenance and never count toward coverage.
+_SKIP = ("InputOp", "ConstantOp")
+
+
+def is_boundary(op: object) -> bool:
+    """Whether ``op`` is a boundary sentinel that never carries provenance."""
+    return type(op).__name__ in _SKIP
+
+
+def get(node: Node) -> dict:
+    """Return ``node``'s prov map (an empty dict if unset).
+
+    May return the live hint dict — treat as read-only; mutate via :func:`put`.
+    """
+    return node.hints.get(PROV) or {}
+
+
+def put(node: Node, prov: dict) -> None:
+    """Store ``prov`` on ``node``, dropping the hint entirely when empty."""
+    if prov:
+        node.hints.set(PROV, prov)
+    else:
+        node.hints.remove(PROV)
+
+
+def origins(prov: dict) -> dict[str, str]:
+    """``{origin_id: kind}`` for every origin in ``prov``."""
+    return {oid: entry["kind"] for oid, entry in prov.items()}
+
+
+def union(*provs: dict) -> dict:
+    """Per-origin merge of several prov maps: union the piece lists, keep the
+    kind. The aggregate path (fusion / lifting / optimization folds) uses this
+    so a merged kernel accumulates every piece its inputs carried."""
+    out: dict = {}
+    for prov in provs:
+        for oid, entry in prov.items():
+            if oid in out:
+                out[oid]["pieces"] = sorted(set(out[oid]["pieces"]) | set(entry["pieces"]))
+            else:
+                out[oid] = {"kind": entry["kind"], "pieces": sorted(set(entry["pieces"]))}
+    return out
+
+
+def mint(origins_kind: dict[str, str], piece_id: str) -> dict:
+    """Build a prov where ``piece_id`` is a fresh single piece of each origin in
+    ``origins_kind`` (``{origin_id: kind}``). The mint path (decomposition) uses
+    this so each new fragment node becomes a distinct piece of the op it
+    expands."""
+    return {oid: {"kind": kind, "pieces": [piece_id]} for oid, kind in origins_kind.items()}
+
+
+def seed(graph: Graph) -> None:
+    """Idempotently stamp every compute node lacking prov with itself as a
+    single-piece origin: ``{node.id: {"kind": <op>, "pieces": [node.id]}}``.
+
+    Run once at pipeline entry. Nodes that already carry prov (a graph reloaded
+    mid-pipeline) keep it; boundary sentinels are skipped (see :data:`_SKIP`)."""
+    for nid, node in graph.nodes.items():
+        if is_boundary(node.op) or node.hints.has(PROV):
+            continue
+        node.hints.set(PROV, {nid: {"kind": type(node.op).__name__, "pieces": [nid]}})
+
+
+def totals(graph: Graph) -> dict[str, set[str]]:
+    """``{origin_id: all piece ids}`` unioned across every live node — the
+    denominator for ``i/N`` coverage."""
+    out: dict[str, set[str]] = {}
+    for node in graph.nodes.values():
+        for oid, entry in get(node).items():
+            out.setdefault(oid, set()).update(entry["pieces"])
+    return out
+
+
+def propagate(
+    graph: Graph,
+    *,
+    consumed_prov: dict[str, dict],
+    new_compute_ids: list[str],
+    new_by_old: dict[str, str],
+    output_map: dict[str, str],
+    mint_pieces: bool,
+) -> None:
+    """Thread provenance across one ``Graph.splice``.
+
+    ``consumed_prov`` is ``{consumed_node_id: prov}`` snapshotted before the
+    consumed nodes were removed; ``new_compute_ids`` are the graph ids of the
+    freshly-added non-boundary fragment nodes; ``new_by_old`` maps each
+    redirected consumed node to its fragment output.
+
+    - **mint** (``mint_pieces=True``, decomposition): each new fragment node
+      becomes a fresh piece of the consumed origins — one op expanding into
+      many distinct primitives.
+    - **aggregate** (otherwise — fusion / lifting / optimization folds): each
+      fragment output inherits its own consumed node's pieces unioned with the
+      ``shared`` pieces of every *dissolved* consumed node (those not in
+      ``output_map`` — e.g. a producer inlined into all its consumers), so no
+      origin is dropped at a multi-output splice."""
+    if mint_pieces:
+        origins_kind = origins(union(*consumed_prov.values())) if consumed_prov else {}
+        for nid in new_compute_ids:
+            put(graph.nodes[nid], mint(origins_kind, nid))
+        return
+
+    shared = union(*[p for cid, p in consumed_prov.items() if cid not in output_map])
+    for old_id, new_out in new_by_old.items():
+        put(graph.nodes[new_out], union(consumed_prov.get(old_id, {}), shared))
+    outputs = set(new_by_old.values())
+    for nid in new_compute_ids:
+        if nid not in outputs:
+            put(graph.nodes[nid], union(shared))
+
+
+def coverage(node_prov: dict, all_totals: dict[str, set[str]]) -> dict[str, tuple[int, int, bool]]:
+    """Per-origin ``(have, total, full)`` for one node given graph-wide
+    :func:`totals`. ``full`` means every piece of that origin lives in this
+    node — i.e. the kernel realizes the whole original op."""
+    out: dict[str, tuple[int, int, bool]] = {}
+    for oid, entry in node_prov.items():
+        have = len(set(entry["pieces"]))
+        total = len(all_totals.get(oid, set(entry["pieces"])))
+        out[oid] = (have, total, have >= total)
+    return out

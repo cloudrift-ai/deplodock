@@ -541,9 +541,15 @@ class Pipeline:
 
         ``ctx`` is built once (probing the live device if not provided)
         and shared by every candidate."""
+        from deplodock.compiler import provenance  # noqa: PLC0415
         from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.candidate import Candidate as _Candidate  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
+
+        # Seed op provenance on the input graph before any pass runs — the one
+        # universal entry both ``run`` and ``tune`` funnel through. Idempotent,
+        # so a graph reloaded mid-pipeline keeps whatever prov it carried.
+        provenance.seed(graph)
 
         if ctx is None:
             ctx = _Context.probe()
