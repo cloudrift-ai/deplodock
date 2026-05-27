@@ -35,6 +35,28 @@ def test_apply_load_ops_chain_transpose_then_reshape():
     np.testing.assert_array_equal(out, np.transpose(src, (0, 2, 1)).reshape(2, 12))
 
 
+def test_shared_source_across_lowering_transpose():
+    """The ``run --ir`` vs-torch path keys constant data by ``source_path``, so a
+    weight that lowering transposed + renamed (linear: out×in → in×out) draws
+    from the *same* source on both sides — the frontend reproducer gets ``W``,
+    the lowered graph gets ``Wᵀ`` — instead of two unrelated random draws."""
+    w = np.random.default_rng(0).standard_normal((4, 6)).astype(np.float32)
+    sources = {"m.w": w}
+
+    frontend = Graph()
+    frontend.add_node(ConstantOp(name="w", source_path="m.w", source_shape=(4, 6)), [], Tensor("w", (4, 6)), node_id="w")
+    lowered = Graph()
+    lowered.add_node(
+        ConstantOp(name="w", source_path="m.w", source_shape=(4, 6), load_ops=(TransposeOp(axes=(-2, -1)),)),
+        [],
+        Tensor("linear_wt", (6, 4)),
+        node_id="linear_wt",
+    )
+
+    np.testing.assert_array_equal(bind_constants(frontend, sources)["w"], w)
+    np.testing.assert_array_equal(bind_constants(lowered, sources)["linear_wt"], w.T)
+
+
 def test_bind_constants_resolves_by_source_path():
     g = Graph()
     g.add_node(

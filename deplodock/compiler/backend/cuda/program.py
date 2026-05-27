@@ -271,27 +271,35 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     input_data = input_data or {}
     sym_values = _resolve_symbolic(compiled, input_data)
     arrays: dict[str, cp.ndarray] = {}
-    for buf in compiled.bufs:
-        resolved = buf.resolve_shape(sym_values)
-        shape = resolved or (1,)
-        cp_dtype = cupy_dtype(buf.dtype)
-        np_dtype = buf.dtype.np
-        src = input_data.get(buf.name)
-        if src is not None:
-            arr = cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
-        elif buf.role == "constant" and buf.name in compiled.constants:
-            arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp_dtype)
-        elif buf.role == "input":
-            # Pseudo-random fill for un-supplied inputs (matches old generated program).
-            n = 1
-            for d in shape:
-                n *= int(d)
-            idx = np.arange(n, dtype=np_dtype)
-            vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
-            arr = cp.asarray(vals.reshape(shape))
-        else:
-            arr = cp.zeros(shape, dtype=cp_dtype)
-        arrays[buf.name] = arr
+    # Saturating casts here are intended, not bugs: e.g. an SDPA mask-fill
+    # constant (``-1e9``) is meant to become ``-inf`` in fp16 (masked → 0 after
+    # softmax). Ignore the over/invalid warnings so genuine output stays clean.
+    with np.errstate(over="ignore", invalid="ignore"):
+        for buf in compiled.bufs:
+            resolved = buf.resolve_shape(sym_values)
+            shape = resolved or (1,)
+            cp_dtype = cupy_dtype(buf.dtype)
+            np_dtype = buf.dtype.np
+            src = input_data.get(buf.name)
+            if src is not None:
+                arr = cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
+            elif buf.role == "constant" and buf.name in compiled.constants:
+                arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp_dtype)
+            elif buf.role == "input":
+                # Pseudo-random fill for un-supplied inputs (matches old generated program).
+                n = 1
+                for d in shape:
+                    n *= int(d)
+                # Build the index ramp in int64, not ``np_dtype``: a float16 buffer
+                # past 65504 elements would overflow to ``inf`` (then ``inf % 101``
+                # → ``nan``). Compute in fp32 and cast the final values — always in
+                # ``[-0.5, 0.5]``, so fp16-safe.
+                idx = np.arange(n, dtype=np.int64)
+                vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
+                arr = cp.asarray(vals.reshape(shape))
+            else:
+                arr = cp.zeros(shape, dtype=cp_dtype)
+            arrays[buf.name] = arr
     return arrays
 
 

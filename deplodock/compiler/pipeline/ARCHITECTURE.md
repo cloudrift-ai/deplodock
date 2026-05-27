@@ -307,6 +307,14 @@ fusion step and a leading `lift_` from lifting; `_canonical_node_id`
 collapses both for display, and the rendered body is rewritten with
 the same map so `Load`/`Write` references match.
 
+Per compute kernel, `_dump_per_kernel` also writes `<prefix>.kernels/<kname>.json` — a standalone sub-graph (kernel +
+its `InputOp`/`ConstantOp` producers) loadable via `deplodock run --ir`. When op provenance is present (see
+`compiler/provenance.py`), it additionally writes `<kname>.torch.json` + `<kname>.torch.txt`: the **original Torch ops**
+that kernel implements, sliced from the pristine pre-decomposition graph stashed in `dump_input_graph`, with an `i/N`
+coverage header per origin (full vs partial). Because the slice is taken from the original graph by origin id, it is
+always made of whole Torch ops — runnable via `deplodock run --ir <kname>.torch.json --bench` to reproduce accuracy /
+latency vs torch for exactly those ops.
+
 ## Per-rule diff output (`rule_diff.py`)
 
 At `compile -vv` (DEBUG log level) the engine emits one block per rule application: a unified diff between the

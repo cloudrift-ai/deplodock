@@ -36,7 +36,13 @@ def op_cache_key(op: object) -> str | None:
     from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
-        return digest("CudaOp", op.kernel_source, op.arg_order, op.grid, op.block, op.smem_bytes)
+        # Name-invariant: the kernel function name is rendered into the source
+        # (``void <name>(...)``) but doesn't change runtime behavior. Normalize
+        # it out so renaming a kernel (e.g. via op provenance) neither busts the
+        # perf cache nor blocks an isolated-kernel tune from transferring to a
+        # whole-model compile.
+        src = op.kernel_source.replace(op.kernel_name, "_K_") if op.kernel_name else op.kernel_source
+        return digest("CudaOp", src, op.arg_order, op.grid, op.block, op.smem_bytes)
     if isinstance(op, (LoopOp, TileOp, KernelOp)):
         # Knobs are part of the key: same-body / different-knobs variants
         # (e.g. ``020_stage_inputs`` emits a no-op TileOp with a

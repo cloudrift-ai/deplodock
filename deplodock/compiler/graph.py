@@ -161,7 +161,16 @@ def _serialize_field(v):
     from deplodock.compiler.dim import Dim
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.stmt import Body
+    from deplodock.compiler.ir.tensor.ir import IndexSource
 
+    # ``IndexSource`` (IndexMapOp.sources) is a plain dataclass holding ``Expr``
+    # objects — serialize as eval-able repr strings, the same round-trip the
+    # body-Stmt path uses, so it survives JSON instead of being stringified by
+    # ``json.dumps(default=str)`` (which ``_deserialize_field`` couldn't reverse).
+    if isinstance(v, IndexSource):
+        return repr(v)
+    if isinstance(v, (list, tuple)) and v and all(isinstance(x, IndexSource) for x in v):
+        return [repr(x) for x in v]
     if isinstance(v, ElementwiseImpl):
         return v.name
     if isinstance(v, Dim):
@@ -195,6 +204,8 @@ def _deserialize_field(k, v):
     if k == "op" and isinstance(v, str):
         return ElementwiseImpl(v)
     if k == "body" and isinstance(v, list) and v and all(isinstance(e, str) for e in v):
+        return tuple(_eval_stmt(e) for e in v)
+    if k == "sources" and isinstance(v, list) and v and all(isinstance(e, str) and e.startswith("IndexSource(") for e in v):
         return tuple(_eval_stmt(e) for e in v)
     if isinstance(v, dict) and "__op__" in v:
         op_cls = _lookup_op_class(v["__op__"])
@@ -258,6 +269,7 @@ def _stmt_eval_scope() -> dict:
         Unpack,
         Write,
     )
+    from deplodock.compiler.ir.tensor.ir import IndexSource
     from deplodock.compiler.ir.tile.ir import (
         AffineAddressing,
         AsyncWait,
@@ -312,6 +324,7 @@ def _stmt_eval_scope() -> dict:
         "TreeHalve": TreeHalve,
         "WarpShuffle": WarpShuffle,
         "ElementwiseImpl": ElementwiseImpl,
+        "IndexSource": IndexSource,
         "DataType": DataType,
         # ``repr(np.dtype('float32'))`` is ``dtype('float32')`` — eval needs
         # ``dtype`` in scope to round-trip ``DataType.np``.
@@ -465,7 +478,14 @@ class Graph:
         self.inputs = [new_id if i == old_id else i for i in self.inputs]
         self.outputs = [new_id if o == old_id else o for o in self.outputs]
 
-    def splice(self, fragment: Graph, *, consumed: Iterable[str], output: str | dict[str, str]) -> str | dict[str, str]:
+    def splice(
+        self,
+        fragment: Graph,
+        *,
+        consumed: Iterable[str],
+        output: str | dict[str, str],
+        mint_pieces: bool = False,
+    ) -> str | dict[str, str]:
         """Splice ``fragment`` into this graph in place of ``consumed``.
 
         Fragment ``InputOp`` nodes alias existing graph nodes by id (no
@@ -487,7 +507,18 @@ class Graph:
           each consumer is replaced by its own fused fragment node. Returns
           ``{old_id: new_id}`` (post-rename). Each redirected node's hints
           merge onto its own new output; other consumed nodes' hints (e.g.
-          the dissolved shared producer) are dropped."""
+          the dissolved shared producer) are dropped.
+
+        ``mint_pieces`` selects how op provenance threads through (see
+        :mod:`deplodock.compiler.provenance`): ``True`` for decomposition (each
+        new fragment node is a fresh piece of the consumed origins), ``False``
+        for fusion / lifting / folds (fragment outputs aggregate the consumed
+        pieces). The prov hint is overwritten after the generic hint merge so
+        union semantics win over last-writer."""
+        from deplodock.compiler import provenance  # noqa: PLC0415
+
+        consumed = list(consumed)
+        consumed_prov = {nid: provenance.get(self.nodes[nid]) for nid in consumed if nid in self.nodes}
         id_map: dict[str, str] = {}
         for frag_id in fragment.topological_order():
             frag_node = fragment.nodes[frag_id]
@@ -539,6 +570,19 @@ class Graph:
         for old_id in output_map:
             if old_id in self.nodes:
                 self.remove_node(old_id)
+
+        # Thread op provenance onto the new fragment nodes (mint fresh pieces
+        # for decomposition, aggregate consumed pieces otherwise). Runs after
+        # the generic hint merge so its union semantics win for the prov key.
+        new_compute_ids = [id_map[fid] for fid, fn in fragment.nodes.items() if not provenance.is_boundary(fn.op)]
+        provenance.propagate(
+            self,
+            consumed_prov=consumed_prov,
+            new_compute_ids=new_compute_ids,
+            new_by_old=new_by_old,
+            output_map=output_map,
+            mint_pieces=mint_pieces,
+        )
 
         # Promote each new node's id to its friendly output.name once consumed
         # nodes are gone — keeps kernel buf names (which embed the node id)

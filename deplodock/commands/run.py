@@ -619,41 +619,110 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     tail = _passes_after_stage(stage)
     logger.info("Loaded %s IR; running tail passes: %s", stage, tail or "(none)")
 
+    import torch
+
+    from deplodock.compiler.backend import torch_ref
+
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
         dump.dump_input_graph(graph)
 
-    if tail:
-        graph = Pipeline.build(tail, dump=dump).run(graph)
-    rng = np.random.default_rng(args.seed)
-    input_data: dict[str, list[float]] = {}
-    for nid, node in graph.nodes.items():
-        if isinstance(node.op, InputOp):
-            shape = tuple(d.as_static() for d in node.output.shape)
-            input_data[nid] = rng.standard_normal(shape, dtype=np.float32).flatten().tolist()
-        elif isinstance(node.op, ConstantOp):
-            if node.op.value is not None:
-                input_data[nid] = [float(node.op.value)]
-            else:
-                shape = tuple(d.as_static() for d in node.output.shape)
-                input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
+    # Snapshot the pre-lowering frontend graph so we can build a torch
+    # reference (eager + torch.compile) and compare accuracy/latency vs torch —
+    # the same table the --code path produces, now for a dumped .torch.json.
+    # Non-frontend IR (loop/tile/…) has no torch twin → deplodock-only bench.
+    frontend = graph.copy() if torch_ref.is_runnable(graph) else None
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
+    db = None
     if backend.tune_db is not None and backend.tune_db.exists():
+        from deplodock.compiler.pipeline.search.db import SearchDB
+
+        db = SearchDB(path=backend.tune_db)
         logger.info("Using tuning DB: %s", backend.tune_db)
+    if tail:
+        # Thread the tune DB through the tail lowering so greedy fork selection
+        # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered
+        # at rule defaults and tuned results never showed up here.
+        graph = Pipeline.build(tail, dump=dump).run(graph, db=db)
+    from deplodock.compiler.loader.binder import bind_constants
+
+    rng = np.random.default_rng(args.seed)
+
+    def _static(shape):
+        return tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in shape)
+
+    # One random source array per distinct constant ``source_path`` — shared by
+    # deplodock (lowered graph) and the torch ref (frontend graph). The loader's
+    # ``bind_constants`` replays each constant's ``load_ops`` on it, so a weight
+    # that lowering transposed + renamed (linear: out×in → in×out) stays the same
+    # underlying tensor on both sides instead of two unrelated random draws.
+    sources: dict[str, np.ndarray] = {}
+    for gph in ([frontend] if frontend is not None else []) + [graph]:
+        for node in gph.nodes.values():
+            op = node.op
+            if isinstance(op, ConstantOp) and op.value is None and op.source_path and op.source_path not in sources:
+                shp = _static(op.source_shape or node.output.shape)
+                sources[op.source_path] = rng.standard_normal(shp, dtype=np.float32) * 0.02
+
+    input_data: dict[str, object] = {}
+    input_tensors: dict[str, object] = {}
+    # Runtime inputs (activations): random, keyed by node id (preserved through
+    # lowering, so both sides see the same arrays). Scalar constants pass their
+    # literal value.
+    for nid, node in graph.nodes.items():
+        if isinstance(node.op, InputOp):
+            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32)
+            input_data[nid] = arr.flatten().tolist()
+            input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
+        elif isinstance(node.op, ConstantOp) and node.op.value is not None:
+            input_data[nid] = [float(node.op.value)]
+
+    # Parameter constants: bind the shared sources through each graph's load_ops.
+    input_data.update(bind_constants(graph, sources))
+    if frontend is not None:
+        for fid, arr in bind_constants(frontend, sources).items():
+            input_tensors[fid] = _to_cuda_tensor(arr, frontend.nodes[fid].output.dtype)
+
+    # Fallback for any value-None constant with no source_path (synthetic).
+    for nid, node in graph.nodes.items():
+        if isinstance(node.op, ConstantOp) and node.op.value is None and nid not in input_data:
+            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32) * 0.02
+            input_data[nid] = arr.flatten().tolist()
+
     result, _ = backend.run(graph, input_data=input_data)
     for nid, arr in result.outputs.items():
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
+    # Build the torch reference from the frontend snapshot, fed the same inputs.
+    torch_fn = torch_inputs = None
+    if frontend is not None:
+        try:
+            torch_fn, torch_inputs = torch_ref.build_callable(frontend, input_tensors)
+            with torch.no_grad():
+                eager_out = torch_fn(*torch_inputs)
+            _check_accuracy(result.outputs, eager_out, fatal=False)
+        except Exception as exc:  # noqa: BLE001 — torch ref is best-effort
+            logger.warning("torch reference unavailable (%s) — skipping vs-torch comparison", exc)
+            torch_fn = None
+
     if args.bench:
-        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-        print()
-        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-        print("-" * 38)
-        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-        if dump:
-            dump.dump_benchmark(bench)
+        if torch_fn is not None:
+            backends = _resolve_backends(args.bench_backends)
+            torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, args.warmup, backends=backends)
+            results, bench = _bench_interleaved(torch_fn, torch_inputs, {}, backend, graph, args.warmup, args.iters, torch_fns=torch_fns)
+            if dump:
+                dump.dump_benchmark(bench)
+            _print_table(results)
+        else:
+            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+            print()
+            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+            print("-" * 38)
+            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+            if dump:
+                dump.dump_benchmark(bench)
         _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -735,6 +804,14 @@ def _eager_output(module, args, kwargs):
     return out
 
 
+def _to_cuda_tensor(arr, dtype):
+    """numpy array → CUDA torch tensor in the node's dtype (default fp32)."""
+    import torch
+
+    td = getattr(torch, str(dtype), torch.float32)
+    return torch.from_numpy(arr).to("cuda").to(td)
+
+
 def _to_cuda_kwargs(kwargs):
     import torch
 
@@ -749,16 +826,34 @@ def _to_cuda_kwargs(kwargs):
     return cuda_kwargs
 
 
-def _check_accuracy(outputs, eager_out):
+def _check_accuracy(outputs, eager_out, *, fatal=True):
+    """Compare backend ``outputs`` against the eager reference.
+
+    ``fatal`` (the ``--code`` path) aborts on mismatch / NaN. ``run --ir``
+    passes ``fatal=False``: a sliced reproducer is fed random *boundary* inputs
+    that can be out-of-domain for the op (e.g. a kernel expecting a
+    mean-of-squares gets random signed data → NaN from a downstream rsqrt), so
+    a failure there is informational, not a correctness gate — bench anyway."""
     import numpy as np  # noqa: PLC0415
 
+    def _fail(msg: str) -> None:
+        if fatal:
+            logger.error(msg)
+            sys.exit(1)
+        logger.warning("%s — non-fatal (random-input reproducer); skipping accuracy", msg)
+
     eager_flat = eager_out.detach().cpu().flatten().tolist()
+    if any(e != e for e in eager_flat):
+        _fail("eager reference contains NaN (reproducer inputs out of domain)")
+        if not fatal:
+            return
     failed = False
     for buf_name, arr in outputs.items():
         values = arr.flatten().tolist()
         if any(v != v for v in values):
-            logger.error("CORRECTNESS FAIL: output %s contains NaN", buf_name)
-            sys.exit(1)
+            _fail(f"CORRECTNESS FAIL: output {buf_name} contains NaN")
+            if not fatal:
+                return
         if len(values) == len(eager_flat):
             max_diff = max(abs(a - e) for a, e in zip(values, eager_flat, strict=True))
             mean_diff = sum(abs(a - e) for a, e in zip(values, eager_flat, strict=True)) / len(values)
@@ -808,7 +903,7 @@ def _check_accuracy(outputs, eager_out):
         else:
             logger.warning("Output size %d does not match eager %d; skipping accuracy", len(values), len(eager_flat))
     if failed:
-        sys.exit(1)
+        _fail("accuracy check failed vs eager")
 
 
 _BACKEND_ALIASES = {

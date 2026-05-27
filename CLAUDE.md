@@ -20,7 +20,7 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - `make setup` to create the virtual environment and install dependencies
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
-- `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging
+- `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `deplodock run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
 - `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock compile` / `run` / `tune` all read from / write to this path so a tuned variant picked up by one command shows up in the next.
 
 ## Running Tests
@@ -70,6 +70,7 @@ same worker.
   `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`),
   and stops on patience (N consecutive measured terminals without a new best).
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
+- `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
 - `deplodock knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB.
   Joins `perf` with `cuda_op` and prints per-knob regret + a knob-interaction matrix sorted by geomean impact —
@@ -77,6 +78,7 @@ same worker.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
+- Per-kernel chart: `python scripts/bench_model_kernels.py --model Qwen/Qwen3-Embedding-0.6B --layer 0` — compiles with a dump, benches each prov-named kernel from its `.torch.json` reproducer (eager / `torch.compile` overlaid where the kernel is torch-runnable — including linear/attention, whose transposed weights are matched via `load_ops`-replayed constants), and renders a per-kernel latency bar chart via `deplodock.visualize`. `--tune` autotunes each kernel first.
 
 ## Key Make Targets
 
