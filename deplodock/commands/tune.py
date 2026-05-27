@@ -49,6 +49,18 @@ def register_tune_command(subparsers):
             f"shift the walk toward exploration. Default: {TuningSearch.DEFAULT_UCB_C:.4f}."
         ),
     )
+    parser.add_argument(
+        "--bench-timeout",
+        type=float,
+        default=20.0,
+        help=(
+            "Per-variant GPU-time budget (seconds) for the run stage of each bench; exceeding it marks the "
+            "variant bench_fail. The default 20s suits single-kernel sweeps but is too tight for whole-model "
+            "graphs: the first variant pays a one-time cold-start (hundreds of first-launch kernel loads) that "
+            "can exceed 20s even though steady-state is milliseconds, so every variant fails. Bump to ~90 for "
+            "full-model tuning. Default: 20."
+        ),
+    )
     add_diagnostics_args(parser)
     parser.set_defaults(func=handle_tune)
 
@@ -83,9 +95,9 @@ def handle_tune(args):
     # lets a slow-but-progressing 394-kernel bench finish rather than
     # getting pinned for cumulative GPU time alone.
     backend = CudaBackend(
-        bench_wall_timeout_s=60.0,
+        bench_wall_timeout_s=max(60.0, args.bench_timeout * 3),
         bench_compile_timeout_s=10.0,
-        bench_run_timeout_s=20.0,
+        bench_run_timeout_s=args.bench_timeout,
     )
     # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
     db_path = resolve_tune_db()
