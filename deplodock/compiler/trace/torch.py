@@ -549,15 +549,25 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
 
     # --- SDPA ---
     if op_name == "scaled_dot_product_attention":
-        # args: (Q, K, V, attn_mask, dropout_p, is_causal)
+        # args: (Q, K, V, attn_mask, dropout_p, is_causal). ``attn_mask`` is an
+        # additive float bias added to the QK^T scores — HF passes its causal
+        # mask this way (a precomputed (1,1,S,S) tensor) rather than via the
+        # ``is_causal`` flag. Thread it through as a 4th SdpaOp input so the
+        # decomposition can fold it into the scores; dropping it (the old
+        # ``input_ids[:3]``) silently turned masked attention into full
+        # bidirectional attention.
         is_causal = False
-        for a in fx_node.args[3:]:
+        for a in (*fx_node.args[3:], *(fx_node.kwargs or {}).values()):
             if isinstance(a, bool):
                 is_causal = a
                 break
+        sdpa_inputs = list(input_ids[:3])
+        mask_arg = fx_node.args[3] if len(fx_node.args) > 3 else (fx_node.kwargs or {}).get("attn_mask")
+        if mask_arg is not None and hasattr(mask_arg, "name") and mask_arg.name in node_map:
+            sdpa_inputs.append(node_map[mask_arg.name])
         nid = g.add_node(
             op=SdpaOp(is_causal=is_causal),
-            inputs=input_ids[:3],
+            inputs=sdpa_inputs,
             output=Tensor(name, shape, dtype),
             node_id=name,
         )
@@ -645,8 +655,21 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
         node_map[name] = nid
         return
 
-    # --- Squeeze / permute / expand ---
-    if op_name in ("squeeze", "expand", "permute"):
+    # --- Expand ---
+    if op_name == "expand":
+        # ``expand`` *broadcasts* size-1 dims (the element count changes), so it
+        # is a broadcast — NOT a reshape. Routing it through ``ReshapeOp`` makes
+        # the decomposition treat the broadcast dim as a real flat-offset stride
+        # (repeat_kv's ``(kv,1,...)->(kv,n_rep,...)`` then reshape gives a wrong
+        # ``q_head % kv`` index instead of ``q_head // n_rep``). Emit a broadcast
+        # IndexMapOp so each broadcast dim reads coord 0.
+        from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+
+        node_map[name] = broadcast_to(g, input_ids[0], shape).id
+        return
+
+    # --- Squeeze / permute ---
+    if op_name in ("squeeze", "permute"):
         # ``ReshapeOp.shape`` is ``tuple[int | str, ...]`` — unwrap Dim wrappers
         # so the op-level field carries the raw int / symbolic-name form.
         op_shape = _dim_tuple_to_op_shape(shape)

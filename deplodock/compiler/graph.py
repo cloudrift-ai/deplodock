@@ -465,18 +465,29 @@ class Graph:
         self.inputs = [new_id if i == old_id else i for i in self.inputs]
         self.outputs = [new_id if o == old_id else o for o in self.outputs]
 
-    def splice(self, fragment: Graph, *, consumed: Iterable[str], output: str) -> str:
+    def splice(self, fragment: Graph, *, consumed: Iterable[str], output: str | dict[str, str]) -> str | dict[str, str]:
         """Splice ``fragment`` into this graph in place of ``consumed``.
 
         Fragment ``InputOp`` nodes alias existing graph nodes by id (no
         copy); every other fragment node is added with its original id
-        when it doesn't collide, otherwise a fresh id. Hints on removed
-        nodes are merged onto the fragment's output. Returns the id of
-        the fragment's output in this graph (post-rename).
+        when it doesn't collide, otherwise a fresh id.
 
-        ``consumed`` is the set of node ids the rewriter declares the
-        match owns; ``output`` is the id whose consumers get redirected
-        to the fragment output (typically the match root)."""
+        ``consumed`` is the set of node ids the rewriter declares the match
+        owns. ``output`` selects which graph node(s) get their consumers
+        redirected onto fragment output(s):
+
+        - **single** (``str``) — the one node whose consumers redirect to
+          the fragment's sole output (``fragment.outputs[0]``). Returns the
+          new output's id (post-rename). Hints from every consumed node
+          merge onto that output.
+        - **multi** (``dict[str, str]``) — a ``{graph_node_id:
+          fragment_output_id}`` map redirecting several graph nodes to
+          distinct fragment outputs in one splice. Used to inline one
+          producer into *all* its consumers at once (``005_split_shared_indexmap``):
+          each consumer is replaced by its own fused fragment node. Returns
+          ``{old_id: new_id}`` (post-rename). Each redirected node's hints
+          merge onto its own new output; other consumed nodes' hints (e.g.
+          the dissolved shared producer) are dropped."""
         id_map: dict[str, str] = {}
         for frag_id in fragment.topological_order():
             frag_node = fragment.nodes[frag_id]
@@ -500,30 +511,48 @@ class Graph:
                 self.nodes[new_id].hints = frag_node.hints
             id_map[frag_id] = new_id
 
-        new_output = id_map[fragment.outputs[0]]
-        self.replace_node(output, new_output)
+        single = isinstance(output, str)
+        output_map = {output: fragment.outputs[0]} if single else dict(output)
 
+        # Redirect each old node's consumers onto its fragment output.
+        new_by_old: dict[str, str] = {}
+        for old_id, frag_out in output_map.items():
+            new_out = id_map[frag_out]
+            self.replace_node(old_id, new_out)
+            new_by_old[old_id] = new_out
+
+        # Merge consumed-node hints, then remove consumed. Single-output keeps
+        # the legacy behavior (every consumed node's hints land on the one
+        # output); multi-output routes each redirected node's hints to its own
+        # new output and drops the rest (the shared producer is dissolved).
         for nid in consumed:
             orig = self.nodes.get(nid)
             if orig is None:
                 continue
             if orig.hints:
-                self.nodes[new_output].hints.merge(orig.hints)
-            if nid != output:
+                if single:
+                    self.nodes[new_by_old[output]].hints.merge(orig.hints)
+                elif nid in new_by_old:
+                    self.nodes[new_by_old[nid]].hints.merge(orig.hints)
+            if nid not in output_map:
                 self.remove_node(nid)
-        if output in self.nodes:
-            self.remove_node(output)
+        for old_id in output_map:
+            if old_id in self.nodes:
+                self.remove_node(old_id)
 
-        # Promote the new node's id to its friendly output.name once consumed
+        # Promote each new node's id to its friendly output.name once consumed
         # nodes are gone — keeps kernel buf names (which embed the node id)
         # readable. Falls back silently if the friendly name is taken.
-        desired = self.nodes[new_output].output.name
-        if desired and desired != new_output and desired not in self.nodes:
-            self.rename_node(new_output, desired)
-            new_output = desired
+        result: dict[str, str] = {}
+        for old_id, new_out in new_by_old.items():
+            desired = self.nodes[new_out].output.name
+            if desired and desired != new_out and desired not in self.nodes:
+                self.rename_node(new_out, desired)
+                new_out = desired
+            result[old_id] = new_out
 
         self.remove_orphans()
-        return new_output
+        return result[output] if single else result
 
     def remove_orphans(self) -> None:
         """Remove nodes with zero consumers that aren't graph inputs/outputs."""

@@ -38,6 +38,20 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
     import torch
     import torch.nn as nn
 
+    class _PassThroughRotary(nn.Module):
+        """Replaces the model's ``rotary_emb`` and returns precomputed real
+        ``(cos, sin)`` — an ``nn.Module`` (not a bare callable) since the
+        attribute it overrides is a registered submodule. Buffers live on this
+        module (no wrapper backref) so it stays a clean leaf submodule."""
+
+        def __init__(self, cos, sin) -> None:
+            super().__init__()
+            self.register_buffer("cos", cos)
+            self.register_buffer("sin", sin)
+
+        def forward(self, *_, **__):
+            return self.cos, self.sin
+
     class FullModelWrapper(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -53,6 +67,20 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
             for attr in ("_update_causal_mask", "_prepare_4d_causal_attention_mask"):
                 if hasattr(inner, attr):
                     setattr(inner, attr, _PassThroughMask(self))
+            # Short-circuit the rotary embedding in static mode. Its cos/sin are
+            # ``inv_freq @ position_ids`` under ``@torch.no_grad`` / float32
+            # autocast; ``torch.export`` folds that to ``cos=1, sin=0`` (the
+            # ``inv_freq`` buffer, ``persistent=False``, doesn't survive tracing
+            # with its real value), so RoPE degenerates to identity. Compute the
+            # real per-position cos/sin eagerly and return them verbatim — the
+            # trace then captures correct constant tensors. Dynamic mode keeps
+            # the in-graph rotary (cos/sin must follow the runtime position_ids).
+            rotary = getattr(inner, "rotary_emb", None)
+            if not dynamic and rotary is not None:
+                with torch.no_grad():
+                    sample = torch.zeros((1, seq_len, model.config.hidden_size), dtype=dtype)
+                    cos, sin = rotary(sample, self.position_ids)
+                inner.rotary_emb = _PassThroughRotary(cos, sin)
 
         if dynamic:
 

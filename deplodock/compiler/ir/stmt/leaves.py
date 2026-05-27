@@ -193,7 +193,14 @@ class Load(Stmt):
         return len(self.names) == 1
 
     def deps(self) -> tuple[str, ...]:
-        return ()
+        # SSA names this Load reads through its *index* — a data-dependent
+        # (gather) index like ``weight[(int)in0, a]`` reads ``in0``. Returns
+        # the index Exprs' free Vars (first-use order, de-duped). Axis-name
+        # Vars (``a0``, ``a1``) appear too, but every consumer resolves deps
+        # against the body's ``definitions``, where axes are absent — so they
+        # pass through as no-ops, exactly as ``_rename_ssa_vars_in_expr`` and
+        # the dataflow helpers already assume.
+        return tuple(dict.fromkeys(v for e in self.index for v in e.free_vars()))
 
     def defines(self) -> tuple[str, ...]:
         return self.names

@@ -892,7 +892,17 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
         SPLITK.name: params.splitk,
         BR.name: params.br,
     }
-    return TileOp(body=plan.leading + chain_body, name=plan.kernel_name, knobs=knobs)
+    # Drop leading stmts whose SSA name is *also* defined inside ``chain_body``.
+    # A pre-loop invariant (e.g. ``v0 = reciprocal(1024)``) used only by a
+    # post-reduce stmt gets pulled into the thread scope by the body builder as
+    # that stmt's dependency; prepending it here too would put two defs of the
+    # same name in nested scopes — invalid CUDA ("v0 already declared"). The
+    # outer copy is dead (nothing at the outer scope uses it), so it's safe to
+    # drop. Leading stmts genuinely used at the outer scope aren't re-defined
+    # inside, so they're kept.
+    inner_defs = {name for s in Body.coerce(chain_body).iter() for name in s.defines()}
+    leading = tuple(s for s in plan.leading if not (set(s.defines()) & inner_defs))
+    return TileOp(body=leading + chain_body, name=plan.kernel_name, knobs=knobs)
 
 
 def _priority_matmul(p: TileParams) -> tuple[int, ...]:

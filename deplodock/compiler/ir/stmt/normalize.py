@@ -604,6 +604,12 @@ def dedup_loads(stmts: Body) -> Body:
         out: list[Stmt] = []
         for s in body:
             if isinstance(s, Load):
+                # Rewire any SSA names in this Load's *index* to their deduped
+                # alias first — a gather ``weight[(int)in0, a]`` whose index
+                # Load ``in0`` was itself deduped must follow ``in0`` to the
+                # kept name, or the index dangles after the duplicate is
+                # dropped. (No-op for plain axis indices: axes aren't aliased.)
+                s = s.rewrite(rename)
                 key = (s.input, tuple(e.pretty() for e in s.index))
                 if key in local:
                     alias[s.name] = local[key]

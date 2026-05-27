@@ -14,6 +14,7 @@ from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+    broadcast_to,
     const_bc,
     gqa_broadcast,
     matmul_decompose,
@@ -48,7 +49,7 @@ def _maybe_gqa(frag: Graph, src: Node | str, q_batch: tuple, src_batch: tuple, t
     )
 
 
-def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out: Tensor) -> Graph | None:
+def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, inp_mask: Node | None, out: Tensor) -> Graph | None:
     graph = match.graph
     q_shape = inp_q.output.shape
     k_shape = inp_k.output.shape
@@ -62,7 +63,8 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out
     v_batch = v_shape[:-2] if len(v_shape) > 2 else ()
     scores_shape = q_batch + (seq_len, seq_len)
 
-    frag = open_fragment(graph, [inp_q, inp_k, inp_v])
+    exts = [inp_q, inp_k, inp_v] + ([inp_mask] if inp_mask is not None else [])
+    frag = open_fragment(graph, exts)
 
     # K^T then GQA broadcast.
     kt_shape = k_batch + (head_dim, seq_len) if head_dim.is_static else k_shape
@@ -85,8 +87,18 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, out
         output=Tensor(f"{name}_scaled", scores_shape, dtype),
     )
 
+    # Explicit additive mask: scores += attn_mask (broadcast to scores_shape).
+    # HF passes its causal mask as a (1,1,S,S) float bias (0 / -inf) rather
+    # than via is_causal, so this is the path the whole-model trace takes.
+    if inp_mask is not None:
+        mask_bc = broadcast_to(frag, inp_mask.id, scores_shape)
+        scaled_id = frag.add_node(
+            op=ElementwiseOp(op="add"),
+            inputs=[scaled_id, mask_bc],
+            output=Tensor(f"{name}_masked", scores_shape, dtype),
+        )
     # Causal mask: add -1e9 where key_pos > query_pos.
-    if root.op.is_causal:
+    elif root.op.is_causal:
         ndim_scores = len(scores_shape)
         i_var = placeholder(ndim_scores - 2)
         j_var = placeholder(ndim_scores - 1)

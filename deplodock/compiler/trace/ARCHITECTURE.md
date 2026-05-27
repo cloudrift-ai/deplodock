@@ -19,6 +19,14 @@ Per-op handlers map aten names (`aten.add.Tensor`,
 pulled from the FX meta and fed into the op's `infer_output_shape` to
 stamp the output tensor.
 
+`scaled_dot_product_attention` captures an explicit `attn_mask` tensor (when
+present) as a 4th `SdpaOp` input — HF passes its precomputed `(1, 1, S, S)`
+causal mask this way (an additive `0` / `-inf` bias) rather than via the
+`is_causal` flag. The decomposition (`frontend/decomposition/010_sdpa.py`)
+broadcasts that mask to the scores shape and adds it before the softmax.
+Dropping it silently turns masked attention into full bidirectional
+attention — invisible to uniform input but wrong on any varying sequence.
+
 ### `huggingface.py` — trace-friendly wrapper
 
 HuggingFace `CausalLM` models build their causal attention mask

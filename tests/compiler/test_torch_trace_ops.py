@@ -348,3 +348,51 @@ def test_trace_multiple_outputs():
     g = trace_module(m, (x,))
 
     assert len(g.outputs) == 2
+
+
+def test_trace_expand_is_broadcast_not_reshape():
+    """``expand`` (size-1 -> N) is a broadcast, not a reshape: it changes the
+    element count. Tracing it as a ``ReshapeOp`` makes the decomposition apply
+    flat-offset semantics to the broadcast dim — for GQA's repeat_kv (expand
+    then reshape) that yields a ``q_head % kv_heads`` index instead of
+    ``q_head // n_rep``. It must trace to a broadcast ``IndexMapOp``."""
+    import torch
+    import torch.nn as nn
+
+    from deplodock.compiler.ir.frontend.ir import ReshapeOp
+    from deplodock.compiler.ir.tensor.ir import IndexMapOp
+    from deplodock.compiler.trace.torch import trace_module
+
+    class Expand(nn.Module):
+        def forward(self, x):  # (1, 8, 1, 4) -> (1, 8, 2, 4)
+            return x.expand(1, 8, 2, 4)
+
+    g = trace_module(Expand(), (torch.randn(1, 8, 1, 4),))
+    assert any(isinstance(n.op, IndexMapOp) for n in g.nodes.values()), "expand should produce a broadcast IndexMapOp"
+    assert not any(isinstance(n.op, ReshapeOp) for n in g.nodes.values()), "expand must not be a ReshapeOp"
+
+
+def test_trace_repeat_kv_correct():
+    """GQA ``repeat_kv`` (expand + reshape) maps output head ``h`` to KV head
+    ``h // n_rep``. Regression for expand-as-reshape giving ``h % kv_heads``
+    (so query head 8 wrongly read KV head 0 instead of 4)."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    from deplodock.compiler.backend.loop.backend import LoopBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    KV, NREP, S, Dh = 8, 2, 4, 16
+
+    class RepeatKV(nn.Module):
+        def forward(self, k):
+            b, h, s, d = k.shape
+            return k[:, :, None, :, :].expand(b, h, NREP, s, d).reshape(b, h * NREP, s, d)
+
+    k = torch.randn(1, KV, S, Dh)
+    ref = RepeatKV()(k).detach().numpy()
+    g = trace_module(RepeatKV(), (k,))
+    be = LoopBackend()
+    out = list(be.run(be.compile(g), input_data={g.inputs[0]: k.numpy()})[0].outputs.values())[0]
+    np.testing.assert_allclose(np.asarray(out).reshape(ref.shape), ref, rtol=1e-5, atol=1e-5)

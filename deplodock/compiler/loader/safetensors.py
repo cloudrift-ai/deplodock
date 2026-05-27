@@ -64,13 +64,26 @@ def _build_index(model_dir: Path) -> dict[str, Path]:
 
 
 def _candidate_keys(source_path: str) -> list[str]:
-    """Generate the names to try in the safetensors index for a constant."""
+    """Generate the names to try in the safetensors index for a constant.
+
+    Tolerates a mismatch in the number of leading ``model.`` prefixes
+    between the traced ``source_path`` and the checkpoint's key. The
+    whole-model trace wrapper nests the CausalLM under ``self.model``, so
+    a base-model parameter becomes ``model.model.<rest>`` — while some
+    checkpoints (e.g. Qwen3-Embedding) store the *bare* ``<rest>`` key.
+    Progressively strip each ``model.`` level so any of those forms
+    resolves, and also offer one added prefix for the inverse case. Tried
+    in order (as-is first); the first candidate present in the index wins,
+    so a checkpoint that genuinely uses a ``model.`` key still matches it
+    before a stripped form."""
     cands = [source_path]
-    if source_path.startswith("model."):
-        cands.append(source_path[len("model.") :])
-    else:
-        cands.append("model." + source_path)
-    return cands
+    s = source_path
+    while s.startswith("model."):
+        s = s[len("model.") :]
+        cands.append(s)
+    cands.append("model." + source_path)
+    seen: set[str] = set()
+    return [c for c in cands if not (c in seen or seen.add(c))]
 
 
 def load_constants_from_safetensors(graph: Graph, model_id_or_path: str) -> dict[str, np.ndarray]:

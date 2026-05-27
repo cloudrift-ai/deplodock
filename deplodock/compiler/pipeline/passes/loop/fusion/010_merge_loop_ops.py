@@ -42,6 +42,8 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, splice_graph
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap as _is_pure_indexmap
+from deplodock.compiler.pipeline.passes.loop.fusion._helpers import rename_write_output as _rename_write_output
 
 _BLOWUP_FACTOR = 8
 
@@ -104,22 +106,6 @@ _REDUCE_HEAVY_WORK_PER_OUTPUT = 4
 
 def _reduce_heavy(op: LoopOp) -> bool:
     return _total_work(op) > _REDUCE_HEAVY_WORK_PER_OUTPUT * _output_numel(op)
-
-
-def _is_pure_indexmap(loop_op: LoopOp) -> bool:
-    """Body contains only Loops / Loads / Writes — no compute (Assign) or Accum.
-
-    Such a kernel is an ``IndexMapOp`` lifted into Loop IR: broadcast,
-    transpose, reshape, slice. Its content is pure coord rewriting +
-    copying. Fusing a non-indexmap producer (one with real compute)
-    *into* such a consumer forces the producer's body to land inside
-    the indexmap's iteration space — materializing any broadcast the
-    indexmap was expressing lazily.
-    """
-    for s in loop_op.body.iter():
-        if isinstance(s, (Assign, Accum)):
-            return False
-    return True
 
 
 def _output_numel(loop_op: LoopOp) -> int:
@@ -238,18 +224,3 @@ def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
     match.output = consumer.id
     match.consumed = {producer.id, consumer.id}
     return frag
-
-
-def _rename_write_output(op: LoopOp, *, old: str, new: str) -> LoopOp:
-    """Return ``op`` with every ``Write`` whose ``output == old`` rewritten
-    to ``output=new`` (recursively descends into nested Loops). Used by
-    fusion to align the spliced root's Writes with the new graph node id.
-    """
-    from deplodock.compiler.ir.loop import Write
-
-    def fn(s):
-        if isinstance(s, Write) and s.output == old:
-            return Write(output=new, index=s.index, value=s.value)
-        return s
-
-    return LoopOp(body=op.body.map(fn))
