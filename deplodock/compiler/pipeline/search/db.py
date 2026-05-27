@@ -177,6 +177,22 @@ class SearchDB:
             PRIMARY KEY (context_key, op_key, backend)
         )
         """,
+        # ``op_effort`` — how hard the per-op inner search has tried each
+        # op, keyed by ``(context_key, op_key)``. ``effort`` is the
+        # patience the inner ``TuningSearch`` ran with, or ``inf`` once
+        # that search EXHAUSTED the op's variant tree (no more depth
+        # possible). The two-level driver's "skip already-tuned" gate
+        # reads this: an op is ``terminated`` when its recorded effort
+        # meets the requested patience, so re-runs are idempotent and a
+        # higher patience re-deepens only under-tuned ops. Max-kept.
+        """
+        CREATE TABLE IF NOT EXISTS op_effort (
+            context_key  TEXT NOT NULL,
+            op_key       TEXT NOT NULL,
+            effort       REAL NOT NULL,
+            PRIMARY KEY (context_key, op_key)
+        )
+        """,
     ]
 
     def __init__(self, path: Path | str | None = None) -> None:
@@ -401,6 +417,77 @@ class SearchDB:
             )
         for row in cur:
             yield _row_to_perf(row)
+
+    # ------------------------------------------------------------------
+    # Per-op tuning effort ("skip already-tuned" gate)
+    # ------------------------------------------------------------------
+
+    def record_effort(self, context_key: str, op_key: str, effort: float) -> None:
+        """Record how hard the inner search tuned ``op_key`` under
+        ``context_key``. Max-kept: a deeper run (higher patience, or the
+        ``inf`` exhausted sentinel) wins; a shallower re-run never lowers
+        a recorded effort. ``inf`` round-trips through SQLite as a REAL
+        and compares correctly, so the exhausted sentinel needs no special
+        encoding."""
+        existing = self.effort_for(context_key, op_key)
+        if effort <= existing:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO op_effort (context_key, op_key, effort) VALUES (?, ?, ?)",
+            (context_key, op_key, float(effort)),
+        )
+
+    def effort_for(self, context_key: str, op_key: str) -> float:
+        """Recorded inner-search effort for ``op_key``, or ``0.0`` when the
+        op has never been tuned in this context."""
+        row = self._conn.execute(
+            "SELECT effort FROM op_effort WHERE context_key = ? AND op_key = ?",
+            (context_key, op_key),
+        ).fetchone()
+        return row[0] if row is not None else 0.0
+
+    def terminated(self, context_key: str, op_key: str, patience: float) -> bool:
+        """``True`` when ``op_key`` has already been tuned in this context
+        to at least ``patience`` effort (an exhausted op records ``inf``,
+        so it is terminated at every patience). The two-level driver skips
+        the inner search for terminated ops."""
+        return self.effort_for(context_key, op_key) >= patience
+
+    def best_per_op_time(self, context_key: str, op_key: str, *, backend: str = "cuda") -> float | None:
+        """Best measured median (us) for the kernel that ``op_key`` lowers
+        to in ``context_key``, or ``None`` when it has no clean ``ok``
+        measurement.
+
+        ``op_key`` is typically a finalized ``LoopOp`` key (the unit the
+        outer search hands to the inner per-op tuner). Two ways it carries a
+        time:
+
+        1. **Direct row** — the two-level inner search records the best
+           *whole-slice* total (``Σ`` over the slice's CudaOps, so split-K
+           main + combine are both counted) under the LoopOp key itself.
+           Preferred when present.
+        2. **Chain walk** — otherwise follow the ``lowering`` best-known child
+           links (the same chain :class:`GreedySearch` replays) down to the
+           ``cuda`` dialect and read that terminal's context-keyed median. A
+           ``CudaOp`` key resolves here directly (no lowering row as parent).
+        """
+        direct = self.lookup_perf(context_key, op_key, backend=backend)
+        if direct is not None and direct.status == "ok":
+            return direct.stats.median
+        cur: str | None = op_key
+        seen: set[str] = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            row = self.lookup_lowering(cur)
+            if row is None:
+                break
+            cur = row.child_key
+            if row.child_dialect == "cuda":
+                break
+        if cur is None or cur == op_key:
+            return None
+        perf = self.lookup_perf(context_key, cur, backend=backend)
+        return perf.stats.median if perf is not None and perf.status == "ok" else None
 
     # ------------------------------------------------------------------
     # House-keeping

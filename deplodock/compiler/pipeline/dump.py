@@ -150,12 +150,11 @@ class CompilerDump:
         ``.txt`` side — the body is identical so writing it once is
         enough — but each launch still gets its own ``.json``
         sub-graph since the input bindings differ per node."""
-        from deplodock.compiler.graph import Graph as _Graph
-        from deplodock.compiler.ir.base import InputOp
         from deplodock.compiler.ir.cuda.ir import CudaOp
         from deplodock.compiler.ir.kernel.ir import KernelOp
         from deplodock.compiler.ir.loop import LoopOp
         from deplodock.compiler.ir.tile.ir import TileOp
+        from deplodock.compiler.pipeline.search.slice import single_node_graph
 
         compute_types = (LoopOp, TileOp, KernelOp, CudaOp)
         compute_nodes = [(nid, n) for nid, n in graph.nodes.items() if isinstance(n.op, compute_types)]
@@ -168,21 +167,7 @@ class CompilerDump:
         seen_cuda: set[str] = set()
         for nid, node in compute_nodes:
             kname = getattr(node.op, "kernel_name", None) or getattr(node.op, "name", None) or nid
-            keep_ids, synthetic_ids = self._collect_kernel_ancestors(graph, nid, compute_types)
-            sub = _Graph()
-            order = self._topo_order(graph, keep_ids)
-            for kid in order:
-                src = graph.nodes[kid]
-                if kid in synthetic_ids:
-                    # Compute-node ancestor → replaced with synthetic InputOp
-                    # so the sub-graph is standalone.
-                    sub.add_node(InputOp(), [], src.output, node_id=src.id)
-                    sub.inputs.append(kid)
-                else:
-                    sub.add_node(src.op, list(src.inputs), src.output, node_id=src.id)
-                    if isinstance(src.op, InputOp) and kid in graph.inputs:
-                        sub.inputs.append(kid)
-            sub.outputs.append(nid)
+            sub = single_node_graph(graph, nid)
             safe = self._safe_filename(kname)
             self._write_json(f"{prefix}.kernels/{safe}.json", sub.to_dict())
             self._dump_torch_repro(prefix, safe, node, graph)
@@ -231,6 +216,7 @@ class CompilerDump:
         other kept node consumes."""
         from deplodock.compiler.graph import Graph as _Graph  # noqa: PLC0415
         from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.slice import topo_order  # noqa: PLC0415
 
         src = self._input_graph
         keep: set[str] = set(origins)
@@ -248,7 +234,7 @@ class CompilerDump:
 
         consumed = {inp for nid in keep for inp in src.nodes[nid].inputs if inp in keep}
         sub = _Graph()
-        for kid in self._topo_order(src, keep):
+        for kid in topo_order(src, keep):
             s = src.nodes[kid]
             if kid in synthetic:
                 sub.add_node(InputOp(), [], s.output, node_id=s.id)
@@ -259,48 +245,6 @@ class CompilerDump:
                     sub.inputs.append(kid)
         sub.outputs = [oid for oid in origins if oid not in consumed]
         return sub
-
-    def _collect_kernel_ancestors(self, graph: Graph, root_id: str, compute_types: tuple) -> tuple[set[str], set[str]]:
-        """Collect ``root_id`` + transitive ConstantOp / InputOp ancestors.
-        Compute-op ancestors get marked as ``synthetic`` (boundary —
-        they'll become synthetic ``InputOp``s in the sub-graph and their
-        producers are NOT walked)."""
-        from deplodock.compiler.ir.base import ConstantOp, InputOp
-
-        keep: set[str] = {root_id}
-        synthetic: set[str] = set()
-        stack = list(graph.nodes[root_id].inputs)
-        while stack:
-            cur = stack.pop()
-            if cur in keep:
-                continue
-            keep.add(cur)
-            node = graph.nodes.get(cur)
-            if node is None:
-                continue
-            if isinstance(node.op, compute_types):
-                synthetic.add(cur)
-                continue
-            if isinstance(node.op, (ConstantOp, InputOp)):
-                stack.extend(node.inputs)
-        return keep, synthetic
-
-    def _topo_order(self, graph: Graph, keep: set[str]) -> list[str]:
-        """Topo-sorted node ids restricted to ``keep`` (producers first)."""
-        visited: set[str] = set()
-        order: list[str] = []
-
-        def visit(nid: str) -> None:
-            if nid in visited or nid not in keep:
-                return
-            visited.add(nid)
-            for dep in graph.nodes[nid].inputs:
-                visit(dep)
-            order.append(nid)
-
-        for nid in keep:
-            visit(nid)
-        return order
 
     def _collect_subgraph(self, graph: Graph, root_id: str) -> set[str]:
         """Transitive-input closure for a compute node: itself + every

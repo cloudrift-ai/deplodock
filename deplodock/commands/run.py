@@ -85,10 +85,16 @@ def register_run_command(subparsers):
             "-vv: also per-rule application snapshots."
         ),
     )
+    from deplodock.commands.compile import add_nvcc_args
+
+    add_nvcc_args(parser)
     parser.set_defaults(func=handle_run)
 
 
 def handle_run(args):
+    from deplodock.commands.compile import apply_nvcc_flags
+
+    apply_nvcc_flags(args, default="")  # run uses nvcc default -O3 (representative codegen)
     verbose = getattr(args, "verbose", 0)
     if verbose == 0:
         logging.getLogger().setLevel(logging.WARNING)

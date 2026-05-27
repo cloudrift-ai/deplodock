@@ -152,6 +152,34 @@ def add_diagnostics_args(parser) -> None:
     )
 
 
+def add_nvcc_args(parser) -> None:
+    """Register ``--nvcc-flags`` (shared by ``compile`` / ``run`` / ``tune``)."""
+    parser.add_argument(
+        "--nvcc-flags",
+        default=None,
+        help=(
+            "Override the extra nvcc compile flags (space-separated), e.g. "
+            '"-Xcicc -O3" or "-Xcicc -O1". Defaults: tune uses "-Xcicc -O1" (fast compile — but latencies are a '
+            "RANKING signal, NOT -O3-optimal: reductions/attention can run 1.5-3x slower); compile/run use nvcc's "
+            "default -O3. Folded into the cubin + perf cache keys. Equivalent to setting DEPLODOCK_NVCC_FLAGS."
+        ),
+    )
+
+
+def apply_nvcc_flags(args, default: str) -> str:
+    """Resolve and publish the effective extra nvcc flags via the
+    ``DEPLODOCK_NVCC_FLAGS`` env var (the carrier the cubin compiler + the
+    bench-worker subprocess + ``Context.structural_key`` all read). Precedence:
+    ``--nvcc-flags`` > a pre-set env var > the command ``default``. Must run
+    before any compile/bench. Returns the effective string."""
+    val = getattr(args, "nvcc_flags", None)
+    if val is not None:
+        os.environ["DEPLODOCK_NVCC_FLAGS"] = val
+    elif "DEPLODOCK_NVCC_FLAGS" not in os.environ:
+        os.environ["DEPLODOCK_NVCC_FLAGS"] = default
+    return os.environ.get("DEPLODOCK_NVCC_FLAGS", "")
+
+
 def setup_pipeline_runtime(args) -> None:
     """Apply verbosity, diff-render config, and target overrides from parsed args."""
     from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
@@ -201,6 +229,7 @@ def register_compile_command(subparsers):
         ),
     )
     add_diagnostics_args(parser)
+    add_nvcc_args(parser)
     parser.set_defaults(func=handle_compile)
 
 
@@ -217,6 +246,7 @@ def handle_compile(args):
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     setup_pipeline_runtime(args)
+    apply_nvcc_flags(args, default="")  # compile uses nvcc default -O3 (representative codegen)
     passes = resolve_passes(args)
     graph, _ = load_or_trace(args)
     initial_count = len(graph.nodes)

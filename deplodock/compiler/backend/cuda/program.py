@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
-from deplodock.compiler.backend.cuda import _tma
+from deplodock.compiler.backend.cuda import _tma, nvcc
 from deplodock.compiler.backend.cuda.dtype import cupy_dtype
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import DataType
@@ -157,9 +157,6 @@ class _Compiled:
 
 
 def _compile(graph: Graph) -> _Compiled:
-
-    import cupy as cp
-
     bufs = _buffers(graph)
     buf_by_name = {b.name: b for b in bufs}
     constants = _constant_values(graph)
@@ -167,7 +164,9 @@ def _compile(graph: Graph) -> _Compiled:
     symbolic_bindings = _symbolic_bindings(graph)
     symbolic_hints = _symbolic_hints(graph)
 
-    kernels: dict[str, cp.RawKernel] = {}
+    # ``nvcc.load_function`` returns a cupy ``Function`` (or a ``RawKernel`` on
+    # NVRTC fallback) — both launch-callable and smem-attr settable.
+    kernels: dict[str, object] = {}
     seen_source: dict[str, str] = {}
     launches: list[_Launch] = []
     for node in launches_nodes:
@@ -178,8 +177,11 @@ def _compile(graph: Graph) -> _Compiled:
             if prev_src is not None and prev_src != op.kernel_source:
                 raise ValueError(f"kernel name {kname!r} used by two distinct sources")
             seen_source[kname] = op.kernel_source
-            options = _nvrtc_options(uses_tma=bool(op.tma_descriptors))
-            kernels[kname] = cp.RawKernel(op.kernel_source, kname, options=options)
+            uses_tma = bool(op.tma_descriptors)
+            options = _nvrtc_options(uses_tma=uses_tma)
+            # Compile via offline nvcc (faster, cache-warmable) with an NVRTC
+            # fallback; returns a Function usable exactly like a RawKernel.
+            kernels[kname] = nvcc.load_function(op.kernel_source, kname, options, uses_tma=uses_tma)
         launches.append(
             _Launch(
                 node_id=node.id,
