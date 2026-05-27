@@ -161,6 +161,36 @@ def test_qkv_attn_no_rope():
     _assert_close(dpd, eager)
 
 
+class _SdpaExplicitMask(torch.nn.Module):
+    """SDPA fed an explicit additive float ``attn_mask`` (the way HF passes
+    its precomputed causal mask) rather than ``is_causal=True``."""
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
+@requires_cuda
+@pytest.mark.parametrize("n_heads,seq_len", [(1, 32), (16, 32)])
+def test_sdpa_explicit_additive_mask(n_heads: int, seq_len: int):
+    """SDPA with an explicit additive float mask must apply the mask, not
+    silently drop it. Regression for the tracer capturing only ``Q/K/V`` and
+    discarding ``attn_mask`` — which turned the whole-model causal attention
+    into full bidirectional attention. Invisible to uniform input (a softmax-
+    weighted sum of identical V is V regardless of the weights), so this uses
+    varying random Q/K/V and a tight threshold to actually exercise masking.
+    The mask is a ``(1, 1, S, S)`` additive bias broadcast over the head axis."""
+    head_dim = 128
+    m = _SdpaExplicitMask().eval()
+    q = torch.randn(1, n_heads, seq_len, head_dim)
+    k = torch.randn(1, n_heads, seq_len, head_dim)
+    v = torch.randn(1, n_heads, seq_len, head_dim)
+    mask = torch.zeros((seq_len, seq_len))
+    mask.masked_fill_(torch.triu(torch.ones_like(mask, dtype=torch.bool), diagonal=1), float("-inf"))
+    mask = mask[None, None]
+    dpd, eager = _run_module_with_eager(m, (q, k, v, mask), {"q": q.numpy(), "k": k.numpy(), "v": v.numpy(), "mask": mask.numpy()})
+    _assert_close(dpd, eager)
+
+
 # --- Layer 3: real LlamaAttention (= block.self_attn) ------------------------
 
 

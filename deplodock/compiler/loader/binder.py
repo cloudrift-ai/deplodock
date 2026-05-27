@@ -73,3 +73,26 @@ def bind_constants(graph: Graph, sources: dict[str, np.ndarray]) -> dict[str, np
             continue
         out[nid] = apply_load_ops(sources[path], node.op.load_ops)
     return out
+
+
+def bind_constants_from_module(graph: Graph, module) -> dict[str, np.ndarray]:  # noqa: ANN001 — torch.nn.Module, duck-typed
+    """Bind every parameter/buffer ``ConstantOp`` from a *live* ``nn.Module``.
+
+    The whole-model trace wrapper carries computed buffers — the precomputed
+    rotary ``cos``/``sin`` and the causal mask — that aren't in the checkpoint's
+    safetensors, so :func:`load_constants_from_safetensors` can't supply them.
+    Binding from the traced module's own ``state_dict`` covers those *and* the
+    weights uniformly: each ``ConstantOp.source_path`` is the module-attribute
+    path captured at trace time, so it matches a ``state_dict`` key verbatim.
+
+    ``state_dict`` (not ``named_parameters``) is the right source because it
+    lists *tied* weights under every name they're registered as — e.g. a model
+    with ``tie_word_embeddings=True`` traces an ``lm_head.weight`` constant, but
+    ``named_parameters`` dedups it down to the shared ``embed_tokens.weight``
+    only, leaving the final projection unbound (→ zero logits). Tensors are cast
+    to float32 numpy (the backend dtype; also sidesteps reading bf16 checkpoints
+    through numpy)."""
+    sources: dict[str, np.ndarray] = {}
+    for name, t in module.state_dict().items():
+        sources[name] = t.detach().cpu().float().numpy()
+    return bind_constants(graph, sources)
