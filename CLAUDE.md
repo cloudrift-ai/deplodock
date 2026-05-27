@@ -78,6 +78,7 @@ same worker.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
+- Per-kernel chart: `python scripts/bench_model_kernels.py --model Qwen/Qwen3-Embedding-0.6B --layer 0` — compiles with a dump, benches each prov-named kernel from its `.torch.json` reproducer (eager / `torch.compile` overlaid where the kernel is torch-comparable; const-transforming ops like linear are deplodock-only), and renders a per-kernel latency bar chart via `deplodock.visualize`. `--tune` autotunes each kernel first.
 
 ## Key Make Targets
 
