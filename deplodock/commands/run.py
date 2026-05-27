@@ -635,23 +635,50 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
 
     if tail:
         graph = Pipeline.build(tail, dump=dump).run(graph)
+    from deplodock.compiler.loader.binder import bind_constants
+
     rng = np.random.default_rng(args.seed)
-    input_data: dict[str, list[float]] = {}
+
+    def _static(shape):
+        return tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in shape)
+
+    # One random source array per distinct constant ``source_path`` — shared by
+    # deplodock (lowered graph) and the torch ref (frontend graph). The loader's
+    # ``bind_constants`` replays each constant's ``load_ops`` on it, so a weight
+    # that lowering transposed + renamed (linear: out×in → in×out) stays the same
+    # underlying tensor on both sides instead of two unrelated random draws.
+    sources: dict[str, np.ndarray] = {}
+    for gph in ([frontend] if frontend is not None else []) + [graph]:
+        for node in gph.nodes.values():
+            op = node.op
+            if isinstance(op, ConstantOp) and op.value is None and op.source_path and op.source_path not in sources:
+                shp = _static(op.source_shape or node.output.shape)
+                sources[op.source_path] = rng.standard_normal(shp, dtype=np.float32) * 0.02
+
+    input_data: dict[str, object] = {}
     input_tensors: dict[str, object] = {}
+    # Runtime inputs (activations): random, keyed by node id (preserved through
+    # lowering, so both sides see the same arrays). Scalar constants pass their
+    # literal value.
     for nid, node in graph.nodes.items():
         if isinstance(node.op, InputOp):
-            shape = tuple(d.as_static() for d in node.output.shape)
-            arr = rng.standard_normal(shape, dtype=np.float32)
+            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32)
             input_data[nid] = arr.flatten().tolist()
             input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
-        elif isinstance(node.op, ConstantOp):
-            if node.op.value is not None:
-                input_data[nid] = [float(node.op.value)]
-            else:
-                shape = tuple(d.as_static() for d in node.output.shape)
-                arr = rng.standard_normal(shape, dtype=np.float32) * 0.02
-                input_data[nid] = arr.flatten().tolist()
-                input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
+        elif isinstance(node.op, ConstantOp) and node.op.value is not None:
+            input_data[nid] = [float(node.op.value)]
+
+    # Parameter constants: bind the shared sources through each graph's load_ops.
+    input_data.update(bind_constants(graph, sources))
+    if frontend is not None:
+        for fid, arr in bind_constants(frontend, sources).items():
+            input_tensors[fid] = _to_cuda_tensor(arr, frontend.nodes[fid].output.dtype)
+
+    # Fallback for any value-None constant with no source_path (synthetic).
+    for nid, node in graph.nodes.items():
+        if isinstance(node.op, ConstantOp) and node.op.value is None and nid not in input_data:
+            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32) * 0.02
+            input_data[nid] = arr.flatten().tolist()
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     if backend.tune_db is not None and backend.tune_db.exists():
