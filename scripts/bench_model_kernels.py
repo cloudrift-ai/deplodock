@@ -132,8 +132,8 @@ def _render(rows: list[tuple[str, dict[str, float]]], args) -> None:
         title=f"{args.model} — per-kernel latency",
         subtitle=(
             f"Each kernel benched from its dumped .torch.json ({len(rows)} kernels; "
-            f"{n_vs} torch-comparable, rest deplodock-only — const-transforming ops like linear "
-            "have no standalone torch reference)."
+            f"{n_vs} torch-comparable, rest deplodock-only — kernels that don't recompile "
+            "standalone or contain ops without a torch twin)."
         ),
         orientation="horizontal",
     )
