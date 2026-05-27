@@ -54,6 +54,9 @@ GPU_INSTANCE_TYPES = {
     "AMD Instinct MI350X": [
         ("cloudrift", "mi350x-15-250-1000-gv"),
     ],
+    "NVIDIA Tesla V100 SXM3 32GB": [
+        ("cloudrift", "v100-5-85-800-generic"),
+    ],
 }
 
 
@@ -71,6 +74,7 @@ GPU_SHORT_NAMES = {
     "NVIDIA A100 40GB": "a100",
     "NVIDIA A100 80GB": "a100",
     "AMD Instinct MI350X": "mi350x",
+    "NVIDIA Tesla V100 SXM3 32GB": "v100",
 }
 
 
