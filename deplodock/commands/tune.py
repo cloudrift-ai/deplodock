@@ -96,10 +96,16 @@ def handle_tune(args):
     # getting pinned for cumulative GPU time alone. The inner per-op search
     # benches one kernel at a time, so the cold-start concern is milder, but
     # the final assembled whole-graph bench still wants the headroom.
+    _compile_timeout = 2.0
+    _run_timeout = 2.0
     backend = CudaBackend(
-        bench_wall_timeout_s=max(60.0, args.bench_timeout * 3),
-        bench_compile_timeout_s=10.0,
-        bench_run_timeout_s=args.bench_timeout,
+        bench_compile_timeout_s=_compile_timeout,
+        bench_run_timeout_s=_run_timeout,
+        # Wall backstop just above the two in-worker budgets — it's the only
+        # cap that bounds NVRTC compile (cupy compiles lazily on first launch,
+        # so the compile/run budgets above don't), SIGKILLing any variant whose
+        # total bench overruns.
+        bench_wall_timeout_s=_compile_timeout + _run_timeout + 2.0,
     )
     # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
     db_path = resolve_tune_db()
