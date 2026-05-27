@@ -51,6 +51,19 @@ def _strip_rule_prefix(name: str) -> str:
     return _RULE_PREFIX_RE.sub("", name)
 
 
+def variant_label(graph: Graph) -> str:
+    """A human label for one tuned variant: the ``|``-joined per-op tuning
+    knobs across the graph (``tile=128 | warps=4``), or ``"option-0"`` when no
+    op carries knobs. Shared by :meth:`Pipeline.tune`'s per-variant log line and
+    the ``tune`` progress bar so both render the same knob string."""
+    knob_strs = [
+        s
+        for nid in graph.topological_order()
+        if (k := getattr(graph.nodes[nid].op, "knobs", None)) and (s := format_tuning_knobs(k)) != "-"
+    ]
+    return " | ".join(knob_strs) if knob_strs else "option-0"
+
+
 @dataclass
 class Pattern:
     """One node in a chain-match pattern.
@@ -566,13 +579,7 @@ class Pipeline:
         for cand in self.search(search, ctx, db=db):
             n_terminals += 1
             if backend is not None:
-                knob_strs = [
-                    s
-                    for nid in cand.graph.topological_order()
-                    if (k := getattr(cand.graph.nodes[nid].op, "knobs", None)) and (s := format_tuning_knobs(k)) != "-"
-                ]
-                label = " | ".join(knob_strs) if knob_strs else "option-0"
-                logger.info("[tune] variant #%d  [%s]", n_terminals, label)
+                logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
             stats, status = _bench_terminal(cand, backend=backend, db=db)
             search.observe(stats, status)
             yield cand

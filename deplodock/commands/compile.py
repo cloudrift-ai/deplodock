@@ -114,8 +114,9 @@ def add_input_args(parser) -> None:
 
 
 def add_diagnostics_args(parser) -> None:
-    """Register the ``-v`` / diff-rendering args shared by ``compile`` and ``tune``."""
-    parser.add_argument(
+    """Register the ``-v`` / ``-q`` / diff-rendering args shared by ``compile`` and ``tune``."""
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -129,6 +130,15 @@ def add_diagnostics_args(parser) -> None:
             "Diffs go to stdout (no ``2>&1`` needed). "
             "Slice one pass: ``... -vv | awk '/^>>> t:/,/^<<< t:/'``. "
             "Slice one rule: ``... -vv | awk '/^>>> t:005/,/^<<< t:005/'``."
+        ),
+    )
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help=(
+            "Quiet mode: log only errors (suppresses INFO / WARNING chatter). For ``tune`` this also "
+            "disables the live progress bar; the final per-op / Σ summary still prints. Mutually exclusive with -v."
         ),
     )
     parser.add_argument(
@@ -181,7 +191,9 @@ def setup_pipeline_runtime(args) -> None:
     from deplodock.compiler.target import apply_target_arg
 
     verbose = getattr(args, "verbose", 0)
-    if verbose == 0:
+    if getattr(args, "quiet", False):
+        logging.getLogger().setLevel(logging.ERROR)
+    elif verbose == 0:
         logging.getLogger().setLevel(logging.WARNING)
     elif verbose == 1:
         logging.getLogger().setLevel(logging.INFO)

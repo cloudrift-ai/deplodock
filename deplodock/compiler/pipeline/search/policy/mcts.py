@@ -102,11 +102,18 @@ class TuningSearch(Search):
         self._best_reward = 0.0
         self._visits_at_best = 0
         self.stop_reason: str | None = None
+        # Last benched variant's measurement — read by the tune progress bar
+        # after each yielded terminal (the engine calls ``observe`` right before
+        # yielding). Carries no role in the search itself.
+        self.last_stats: PerfStats | None = None
+        self.last_status: str | None = None
 
     def stop(self, reason: str) -> None:
         self.stop_reason = reason
 
     def observe(self, stats: PerfStats, status: str) -> None:
+        self.last_stats = stats
+        self.last_status = status
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
         self.tree.record_terminal(reward)
 

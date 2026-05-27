@@ -124,6 +124,7 @@ def inner_reward(
     backend,
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
+    progress=None,
 ) -> InnerReward:
     """Tune every post-fusion kernel of ``fused_graph`` in its own single-node
     slice and return ``Σ best-per-op time`` — the outer terminal reward.
@@ -133,22 +134,45 @@ def inner_reward(
     best is summed directly. Otherwise its slice is tuned by a plain inner
     :class:`TuningSearch` over :data:`LOWERING_PASSES`, the effort is recorded
     (``inf`` when the inner tree drained, else ``patience``), and the new best
-    is summed. Benches scale as ``Σ_k n_k`` (per op), never the product."""
+    is summed. Benches scale as ``Σ_k n_k`` (per op), never the product.
+
+    ``progress`` (a duck-typed :class:`~deplodock.commands.tune_progress.TuneProgress`,
+    or ``None``) drives the CLI progress bar: one op leaf ticked per kernel, the
+    live tail updated per benched variant. Kept duck-typed so this module carries
+    no dependency on ``commands/``."""
+    from deplodock.compiler.pipeline.pipeline import variant_label  # noqa: PLC0415
+
     ctx_key = ctx.structural_key()
     backend_name = getattr(backend, "name", "cuda")
     total = 0.0
     ok = True
     per_op: list[OpResult] = []
-    for nid, op in _kernel_nodes(fused_graph):
+    # The tunable op leaves (skip ops with no cache key — never benched). Counted
+    # up front so the progress bar's denominator is correct before the first tick.
+    leaves = [(nid, op) for nid, op in _kernel_nodes(fused_graph) if op_cache_key(op) is not None]
+    if progress is not None:
+        progress.start_terminal(len(leaves))
+    for nid, op in leaves:
         key = op_cache_key(op)
-        if key is None:
-            continue
+        name = getattr(op, "name", None) or nid
+        if progress is not None:
+            progress.op_start(name)
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
             inner = TuningSearch(patience=patience, ucb_c=ucb_c)
-            for _ in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
-                pass
+            for idx, cand in enumerate(Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db)):
+                if progress is not None:
+                    st = inner.last_stats
+                    best_us = (1.0 / inner.tree.best_reward) if inner.tree.best_reward > 0 else None
+                    progress.variant(
+                        name,
+                        variant_label(cand.graph),
+                        median_us=st.median if st is not None else None,
+                        status=inner.last_status or "",
+                        idx=idx,
+                        best_us=best_us,
+                    )
             # The inner MCTS's best reward is ``1 / min whole-slice total``
             # (``_bench_terminal`` sums every CudaOp in the slice, so a split-K
             # main + combine both count). Record that total under the LoopOp
@@ -165,12 +189,14 @@ def inner_reward(
             db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
             benched = True
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
-        per_op.append(OpResult(name=getattr(op, "name", None) or nid, op_key=key, best_us=best, benched=benched))
+        per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched))
         if best is None:
             ok = False
             total += _FAIL_US
         else:
             total += best
+        if progress is not None:
+            progress.op_done(name)
     return InnerReward(total_us=total, ok=ok, per_op=per_op)
 
 
@@ -183,6 +209,7 @@ def run_two_level_tune(
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     dump=None,
+    progress=None,
 ) -> TwoLevelResult:
     """Drive the outer fusion search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
@@ -209,7 +236,7 @@ def run_two_level_tune(
     n_terminals = 0
     for fused in outer_pipeline.search(outer, ctx, db=db):
         n_terminals += 1
-        reward = inner_reward(fused.graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=ucb_c)
+        reward = inner_reward(fused.graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=ucb_c, progress=progress)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(stats, "ok" if reward.ok else "bench_fail")
         logger.info("[tune] fused terminal #%d: Σ per-op = %.2f us (%d kernels)", n_terminals, reward.total_us, len(reward.per_op))
