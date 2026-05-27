@@ -619,24 +619,39 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     tail = _passes_after_stage(stage)
     logger.info("Loaded %s IR; running tail passes: %s", stage, tail or "(none)")
 
+    import torch
+
+    from deplodock.compiler.backend import torch_ref
+
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
         dump.dump_input_graph(graph)
+
+    # Snapshot the pre-lowering frontend graph so we can build a torch
+    # reference (eager + torch.compile) and compare accuracy/latency vs torch —
+    # the same table the --code path produces, now for a dumped .torch.json.
+    # Non-frontend IR (loop/tile/…) has no torch twin → deplodock-only bench.
+    frontend = graph.copy() if torch_ref.is_runnable(graph) else None
 
     if tail:
         graph = Pipeline.build(tail, dump=dump).run(graph)
     rng = np.random.default_rng(args.seed)
     input_data: dict[str, list[float]] = {}
+    input_tensors: dict[str, object] = {}
     for nid, node in graph.nodes.items():
         if isinstance(node.op, InputOp):
             shape = tuple(d.as_static() for d in node.output.shape)
-            input_data[nid] = rng.standard_normal(shape, dtype=np.float32).flatten().tolist()
+            arr = rng.standard_normal(shape, dtype=np.float32)
+            input_data[nid] = arr.flatten().tolist()
+            input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
         elif isinstance(node.op, ConstantOp):
             if node.op.value is not None:
                 input_data[nid] = [float(node.op.value)]
             else:
                 shape = tuple(d.as_static() for d in node.output.shape)
-                input_data[nid] = (rng.standard_normal(shape, dtype=np.float32) * 0.02).flatten().tolist()
+                arr = rng.standard_normal(shape, dtype=np.float32) * 0.02
+                input_data[nid] = arr.flatten().tolist()
+                input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     if backend.tune_db is not None and backend.tune_db.exists():
@@ -646,14 +661,36 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         finite = np.isfinite(arr).all()
         logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
 
+    # Build the torch reference from the frontend snapshot, fed the same inputs.
+    torch_fn = torch_inputs = None
+    if frontend is not None:
+        try:
+            torch_fn, torch_inputs = torch_ref.build_callable(frontend, input_tensors)
+            with torch.no_grad():
+                eager_out = torch_fn(*torch_inputs)
+            _check_accuracy(result.outputs, eager_out)
+        except Exception as exc:  # noqa: BLE001 — torch ref is best-effort
+            logger.warning("torch reference unavailable (%s) — skipping vs-torch comparison", exc)
+            torch_fn = None
+
     if args.bench:
-        bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
-        print()
-        print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-        print("-" * 38)
-        print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-        if dump:
-            dump.dump_benchmark(bench)
+        if torch_fn is not None:
+            backends = _resolve_backends(args.bench_backends)
+            torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, args.warmup, backends=backends)
+            results, bench = _bench_interleaved(
+                torch_fn, torch_inputs, {}, backend, graph, args.warmup, args.iters, torch_fns=torch_fns
+            )
+            if dump:
+                dump.dump_benchmark(bench)
+            _print_table(results)
+        else:
+            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+            print()
+            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
+            print("-" * 38)
+            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+            if dump:
+                dump.dump_benchmark(bench)
         _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -733,6 +770,14 @@ def _eager_output(module, args, kwargs):
     if isinstance(out, tuple):
         out = out[0]
     return out
+
+
+def _to_cuda_tensor(arr, dtype):
+    """numpy array → CUDA torch tensor in the node's dtype (default fp32)."""
+    import torch
+
+    td = getattr(torch, str(dtype), torch.float32)
+    return torch.from_numpy(arr).to("cuda").to(td)
 
 
 def _to_cuda_kwargs(kwargs):
