@@ -16,13 +16,14 @@ instance — no ``register(...)`` wrapper, no manual bookkeeping.
 
 from __future__ import annotations
 
-import os
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from types import ModuleType
 from typing import Any
+
+from deplodock import config
 
 
 class KnobType(Enum):
@@ -50,7 +51,7 @@ class Knob:
 
     @property
     def env(self) -> str:
-        return f"DEPLODOCK_{self.name.upper()}"
+        return config.knob_var(self.name)
 
     def parse(self, raw: str, *, width: int | None = None) -> Any:
         """Decode an env-string value per ``type``. ``width`` is required
@@ -104,7 +105,7 @@ class Knob:
 
         ``BINMASK`` isn't supported — it would need ``width``, and no
         rule enumerates BINMASK candidates today."""
-        raw = os.environ.get(self.env)
+        raw = config.knob_raw(self.name)
         if raw is None:
             return tuple(candidates)
         if self.type is KnobType.BINMASK:
@@ -185,7 +186,7 @@ def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
     ``DEPLODOCK_KNOBS`` (useful in tests).
     """
     if raw is None:
-        raw = os.environ.get("DEPLODOCK_KNOBS", "")
+        raw = config.knobs_aggregate()
     applied: dict[str, str] = {}
     if not raw:
         return applied
@@ -200,19 +201,16 @@ def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
         value = value.strip()
         if not key:
             raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} has empty KEY")
-        env_name = f"DEPLODOCK_{key}"
         # Individual per-knob env vars win — don't clobber an explicit
         # ``DEPLODOCK_BK=4`` with whatever the aggregate says.
-        if env_name in os.environ:
-            continue
-        os.environ[env_name] = value
-        applied[env_name] = value
+        if config.set_knob(key, value, overwrite=False):
+            applied[config.knob_var(key)] = value
     return applied
 
 
-# Splat ``DEPLODOCK_KNOBS`` once at import so every later
-# ``os.environ.get("DEPLODOCK_<NAME>")`` reader (knob.py is imported
-# transitively by every pipeline pass) sees the per-knob keys.
+# Splat ``DEPLODOCK_KNOBS`` once at import so every later per-knob reader
+# (``config.knob_raw`` / ``config.int_env`` — knob.py is imported transitively
+# by every pipeline pass) sees the individual ``DEPLODOCK_<NAME>`` keys.
 apply_knobs_env()
 
 

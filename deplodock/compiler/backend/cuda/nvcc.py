@@ -31,9 +31,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from deplodock import config
 
-_CACHE_DIR = Path(os.environ.get("DEPLODOCK_CUBIN_CACHE", Path.home() / ".cache" / "deplodock" / "cubin"))
+logger = logging.getLogger(__name__)
 
 # Base nvcc flags deplodock always compiles with (matches ``program._nvrtc_options``).
 _BASE_FLAGS = ["--use_fast_math"]
@@ -47,25 +47,24 @@ def effective_flags() -> list[str]:
     Read fresh each call so a per-invocation override / the bench-worker
     subprocess (which inherits the env) both see the same value, and so the
     flags fold into the cache key."""
-    extra = os.environ.get("DEPLODOCK_NVCC_FLAGS", "").split()
-    return [*_BASE_FLAGS, *extra]
+    return [*_BASE_FLAGS, *config.nvcc_flags().split()]
 
 
 def cubin_cache_dir() -> Path:
-    """Directory holding the content-addressed cubin cache."""
-    return _CACHE_DIR
+    """Directory holding the content-addressed cubin cache (``DEPLODOCK_CUBIN_CACHE``)."""
+    return config.cubin_cache_dir()
 
 
 def clear_cubin_cache() -> None:
     """Delete the entire cubin cache (used by ``deplodock tune --clean``)."""
-    shutil.rmtree(_CACHE_DIR, ignore_errors=True)
+    shutil.rmtree(cubin_cache_dir(), ignore_errors=True)
 
 
 @functools.cache
 def nvcc_path() -> str | None:
     """Resolve the ``nvcc`` binary (PATH, then ``$CUDA_HOME``/``$CUDA_PATH``),
     or ``None`` when unavailable. Cached — looked up once per process."""
-    if os.environ.get("DEPLODOCK_NO_NVCC", "").strip().lower() in ("1", "true", "yes"):
+    if config.nvcc_disabled():
         return None
     found = shutil.which("nvcc")
     if found:
@@ -131,11 +130,12 @@ def compile_to_cubin(source: str, name: str, *, arch: str) -> Path:
     nvcc = nvcc_path()
     if nvcc is None:
         raise RuntimeError("nvcc unavailable")
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    out = _CACHE_DIR / f"{_cache_key(source, name, arch)}.cubin"
+    cache = cubin_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    out = cache / f"{_cache_key(source, name, arch)}.cubin"
     if out.exists():
         return out
-    with tempfile.TemporaryDirectory(dir=_CACHE_DIR) as td:
+    with tempfile.TemporaryDirectory(dir=cache) as td:
         cu = Path(td) / "k.cu"
         cu.write_text(source)
         tmp_cubin = Path(td) / "k.cubin"

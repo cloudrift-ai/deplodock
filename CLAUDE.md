@@ -23,6 +23,14 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `deplodock run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
 - `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock compile` / `run` / `tune` all read from / write to this path so a tuned variant picked up by one command shows up in the next.
 
+All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
+`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
+…) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
+CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
+layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
+`compiler/pipeline/knob.py` (which borrows `config.knob_var` / `config.knob_raw`); provider/secret vars stay with
+`deplodock/redact.py`.
+
 ## Running Tests
 
 ```bash

@@ -13,6 +13,8 @@ import os
 import sys
 from pathlib import Path
 
+from deplodock import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,7 +158,7 @@ def handle_run(args):
     # (b) pollutes the captured CSV with cutlass / cuBLAS kernel rows
     # the perf summary then has to filter out. The child only needs to
     # launch the deplodock kernels so ncu can sample our metrics.
-    skip_accuracy = os.environ.get(_NCU_RECURSE_GUARD) == "1"
+    skip_accuracy = config.ncu_child()
 
     try:
         if not skip_accuracy:
@@ -376,7 +378,7 @@ def _theoretical_occupancy(regs_per_thread: int, smem_per_block: int, threads_pe
     return min(100.0, 100.0 * active_warps / max_warps)
 
 
-_NCU_RECURSE_GUARD = "DEPLODOCK_NCU_CHILD"
+_NCU_RECURSE_GUARD = config.NCU_CHILD
 
 # Curated ncu metric set — verified to populate on RTX 5090 (sm_120) +
 # TMA kernels. ``--set detailed`` is broken there (``SpeedOfLight_Roofline``
@@ -420,7 +422,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
     import sys
     from pathlib import Path as _Path
 
-    if os.environ.get(_NCU_RECURSE_GUARD):
+    if config.ncu_child():
         return
 
     ncu = shutil.which("ncu")
@@ -435,7 +437,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
     # ``__post_init__``. Drop the env var for the child so the parent's
     # ``60_*.json`` (bench results) survive — ncu output is captured via
     # stdout and saved by the parent below.
-    env.pop("DEPLODOCK_DUMP_DIR", None)
+    env.pop(config.DUMP_DIR, None)
 
     cmd: list[str] = [
         ncu,
@@ -934,7 +936,7 @@ def _resolve_backends(cli_value: str | None) -> set[str]:
     test is the point of the bench). Returns the canonical backend
     keys ``{"eager", "tcompile", "deplodock"}``.
     """
-    raw = cli_value or os.environ.get("DEPLODOCK_BENCH_BACKENDS") or "eager,deplodock"
+    raw = config.bench_backends_raw(cli_value)
     selected: set[str] = {"deplodock"}
     for tok in raw.split(","):
         tok = tok.strip().lower()

@@ -7,12 +7,12 @@ node carries a rendered CUDA kernel source plus its launch geometry.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from deplodock import config
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import (
     benchmark_program,
@@ -39,25 +39,20 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.dump import CompilerDump
 
 
-_DEBUG_ENV = "DEPLODOCK_DEBUG"
-_TUNE_DB_ENV = "DEPLODOCK_TUNE_DB"
-_DEFAULT_TUNE_DB = Path.home() / ".cache" / "deplodock" / "autotune.db"
-
-
 def _resolve_tune_db(value: Path | str | None) -> Path | None:
     """Resolve the ``tune_db=`` constructor argument.
 
     - ``None`` → ``None`` (no DB; test-isolation default).
-    - ``"auto"`` → ``DEPLODOCK_TUNE_DB`` env → ``~/.cache/deplodock/autotune.db``.
-      The result is returned regardless of whether the file exists;
-      ``compile()`` skips opening it when missing.
+    - ``"auto"`` → ``DEPLODOCK_TUNE_DB`` env → ``~/.cache/deplodock/autotune.db``
+      (shared resolution in :func:`deplodock.config.tune_db_path`). The result
+      is returned regardless of whether the file exists; ``compile()`` skips
+      opening it when missing.
     - Explicit ``Path`` / ``str`` → that path (no env lookup).
     """
     if value is None:
         return None
     if value == "auto":
-        override = os.environ.get(_TUNE_DB_ENV)
-        return Path(override) if override else _DEFAULT_TUNE_DB
+        return config.tune_db_path()
     return Path(value)
 
 
@@ -83,7 +78,7 @@ class CudaBackend(Backend):
         tune_db: Path | str | None = None,
     ) -> None:
         if debug is None:
-            debug = os.environ.get(_DEBUG_ENV, "").strip().lower() in ("1", "true", "yes")
+            debug = config.debug_enabled()
         if dump is None:
             from deplodock.compiler.pipeline.dump import CompilerDump as _CD
 

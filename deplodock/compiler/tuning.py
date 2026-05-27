@@ -49,10 +49,11 @@ compute these inputs themselves and call the heuristics directly.
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from deplodock import config
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.stmt.body import Body
@@ -154,14 +155,12 @@ _SPLITK_NUM_SMS = 170  # RTX 5090; conservative upper bound for sm_120
 # --- Helpers ------------------------------------------------------------
 
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+def _knob_int(name: str, default: int) -> int:
+    """Read the matmul knob ``DEPLODOCK_<NAME>`` as an int (empty / invalid →
+    ``default``). Thin alias over :func:`deplodock.config.int_env` that builds the
+    env-var key via :func:`deplodock.config.knob_var` so the prefix lives in one
+    place; the ``Knob`` descriptor namespace is owned by ``pipeline/knob.py``."""
+    return config.int_env(config.knob_var(name), default)
 
 
 # --- BodyInfo -----------------------------------------------------------
@@ -350,7 +349,7 @@ def _tma_swizzle_enabled() -> bool:
     """TMA hardware-swizzle gate. Off by default — only fires when the
     inner box-dim byte size matches a swizzle width AND ``DEPLODOCK_TMA_SWIZZLE``
     opts in."""
-    return os.environ.get("DEPLODOCK_TMA_SWIZZLE", "0") in ("1", "true", "True")
+    return config.tma_swizzle_enabled()
 
 
 # --- Heuristics (pure numeric) -----------------------------------------
@@ -362,10 +361,10 @@ def thread_tile_shape(output_extents: tuple[int, ...], body_info: BodyInfo) -> t
     kernels (single THREAD axis; same env namespace as the matmul case)."""
     if body_info.has_matmul:
         (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
-        bn = _int_env("DEPLODOCK_BN", def_bn)
-        bm = _int_env("DEPLODOCK_BM", def_bm)
+        bn = _knob_int("BN", def_bn)
+        bm = _knob_int("BM", def_bm)
         return (bn, bm)
-    return (_int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT),)
+    return (_knob_int("BN", _NON_MATMUL_BN_DEFAULT),)
 
 
 def register_tile_shape(
@@ -384,10 +383,10 @@ def register_tile_shape(
     if not body_info.has_matmul:
         return (1, 1)
     (def_bn, def_bm), (def_fm, def_fn) = _default_tile(output_extents, body_info)
-    f_m = _int_env("DEPLODOCK_FM", def_fm)
-    f_n = _int_env("DEPLODOCK_FN", def_fn)
-    bn = _int_env("DEPLODOCK_BN", def_bn)
-    bm = _int_env("DEPLODOCK_BM", def_bm)
+    f_m = _knob_int("FM", def_fm)
+    f_n = _knob_int("FN", def_fn)
+    bn = _knob_int("BN", def_bn)
+    bm = _knob_int("BM", def_bm)
     if not thread_extents:
         return (f_m, f_n)
     te_set = {int(e) for e in thread_extents}
@@ -415,12 +414,9 @@ def forced_bk(
     smem cap at the active tile shape.
 
     ``static_smem_cap`` defaults to ``Context.static_smem_cap`` (48 KB)."""
-    raw = os.environ.get("DEPLODOCK_BK")
-    if raw:
-        try:
-            return int(raw)
-        except ValueError:
-            return None
+    forced = _knob_int("BK", 0)
+    if forced > 0:
+        return forced
     if not body_info.has_matmul:
         return None
     m = output_extents[1] if len(output_extents) >= 2 else 0
@@ -444,8 +440,8 @@ def _bk_fits_smem(output_extents: tuple[int, ...], body_info: BodyInfo, bk: int,
     if len(output_extents) < 2:
         return bk
     (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
-    bn_actual = min(output_extents[0], _int_env("DEPLODOCK_BN", def_bn))
-    bm_actual = min(output_extents[1], _int_env("DEPLODOCK_BM", def_bm))
+    bn_actual = min(output_extents[0], _knob_int("BN", def_bn))
+    bm_actual = min(output_extents[1], _knob_int("BM", def_bm))
     n_inputs = max(body_info.external_input_count, 2)
     stage_footprint = n_inputs * max(bn_actual, bm_actual) * _DTYPE_BYTES * 2
     while bk > 1 and stage_footprint * bk > budget:
@@ -465,14 +461,14 @@ def auto_splitk(
     ``waves_target * num_sms`` total CTAs, divide by the current
     M-N grid count, clamp to the largest divisor of ``k_o_extent``
     that is ≤ the target. Returns 1 when no useful split exists."""
-    forced = _int_env("DEPLODOCK_SPLITK", 0)
+    forced = _knob_int("SPLITK", 0)
     if forced > 0:
         return forced
     if not body_info.has_matmul:
         return 1
     (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
-    bn = _int_env("DEPLODOCK_BN", def_bn)
-    bm = _int_env("DEPLODOCK_BM", def_bm)
+    bn = _knob_int("BN", def_bn)
+    bm = _knob_int("BM", def_bm)
     targets = (bn, bm)
     # Pre-blockify thread extents — same shape as ``tile.axes`` extents
     # in the legacy synthetic-Tile call. Sort descending; innermost-2
@@ -509,4 +505,4 @@ def _splitk_target_waves(output_extents: tuple[int, ...], body_info: BodyInfo) -
 def cooperative_block_size() -> int:
     """Threads/CTA for synthetic-thread axes in non-matmul paths.
     Shares the matmul ``DEPLODOCK_BN`` env namespace."""
-    return _int_env("DEPLODOCK_BN", _NON_MATMUL_BN_DEFAULT)
+    return _knob_int("BN", _NON_MATMUL_BN_DEFAULT)
