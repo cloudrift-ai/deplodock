@@ -70,9 +70,11 @@ from __future__ import annotations
 
 import enum
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from deplodock.compiler import provenance
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
@@ -201,7 +203,7 @@ class _Plan:
     params: tuple[TileParams, ...]
 
 
-def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | Fork | list[Fork]:
+def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | list[Fork]:
     """Emit a hierarchical Fork tree over knob bundles:
     ``BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
 
@@ -220,7 +222,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None | TileOp | Fork | list[For
     (mirrors :meth:`TileOp.score`) so the ordering matches what the
     fully-built TileOps would have produced."""
     loop_op: LoopOp = root.op
-    kernel_name = _kernel_name_for(loop_op, root.id)
+    kernel_name = _kernel_name_for(loop_op, root.id, provenance.get(root), provenance.totals(match.graph))
     # Idempotence is structural: once the planner has built a TileOp, the
     # rule pattern (LoopOp) no longer matches.
     plan = _plan_kernel(loop_op, ctx, kernel_name=kernel_name)
@@ -330,11 +332,41 @@ def _build_fork_tree_lazy(plan: _Plan, ctx: Context) -> Fork | list[Fork]:
     return top
 
 
-def _kernel_name_for(loop: LoopOp, base_name: str) -> str:
-    """Build the rendered kernel-function name from the LoopOp shape and
-    the graph node id. ``k_<dedup_base>_<reduce|pointwise>``."""
+# Generic glue ops carry no descriptive name — a kernel made only of these
+# falls back to the node-id name. When a meaningful op (rms_norm / linear /
+# sdpa / …) is also present, the glue is dropped from the label.
+_GENERIC_KINDS = frozenset({"ElementwiseOp", "ReduceOp", "ScanOp", "IndexMapOp", "GatherOp", "ScatterOp"})
+
+
+def _humanize_kind(kind: str) -> str:
+    """``RmsNormOp`` → ``rms_norm``, ``SdpaOp`` → ``sdpa`` (CamelCase→snake, drop ``Op``)."""
+    stem = kind[:-2] if kind.endswith("Op") else kind
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", stem).lower()
+
+
+def _kernel_name_for(loop: LoopOp, base_name: str, node_prov: dict, totals: dict[str, set[str]]) -> str:
+    """Name the kernel after the original ops it implements (op provenance).
+
+    A kernel that fully realizes exactly one meaningful op gets the bare
+    ``k_<op>`` (e.g. ``k_rms_norm``); a partial one keeps the
+    ``_<reduce|pointwise>`` qualifier so the reduce half is told apart from the
+    pointwise tail. Multiple meaningful ops join (``k_linear_sdpa_...``). With
+    no provenance (or only glue ops) it falls back to the node-id name."""
     suffix = "reduce" if any(isinstance(s, Accum) for s in loop) else "pointwise"
-    return f"k_{_dedup_tokens(base_name)}_{suffix}"
+    meaningful = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS]
+    if not meaningful:
+        return f"k_{_dedup_tokens(base_name)}_{suffix}"
+
+    labels: list[str] = []
+    for oid in meaningful:
+        lbl = _humanize_kind(node_prov[oid]["kind"])
+        if lbl not in labels:
+            labels.append(lbl)
+    joined = _dedup_tokens("_".join(labels))
+    cov = provenance.coverage(node_prov, totals)
+    if len(meaningful) == 1 and cov[meaningful[0]][2]:  # single op, fully covered
+        return f"k_{joined}"
+    return f"k_{joined}_{suffix}"
 
 
 def _dedup_tokens(name: str) -> str:
