@@ -51,7 +51,7 @@ from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -168,18 +168,44 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         if not (isinstance(diff, Literal) and isinstance(diff.value, int) and diff.value == k):
             return None
 
-    # For widths above the natural 4-byte (one __half2 / one float)
-    # boundary, the reinterpret-cast destination must be aligned to
-    # ``n * elem_bytes``. Prove statically from the affine form: every
-    # free-var coefficient on the last dim must be a multiple of n,
-    # and the literal anchor must also be a multiple of n. (n=2 fp16
-    # = 4 bytes always works since __half2 is 4-byte aligned in cuda_fp16.h.)
-    if n > 2 or (n == 2 and src_dt == "f32"):
+    # The reinterpret-cast destination must be aligned to ``n * elem_bytes``.
+    # Prove statically from the affine form: every free-var coefficient on
+    # the last dim must be a multiple of n, and the literal anchor must also
+    # be a multiple of n.
+    #
+    # Earlier this check was skipped for n=2 fp16 with the comment "__half2
+    # is 4-byte aligned in cuda_fp16.h" — the TYPE is, but reinterpreting a
+    # fp16 pointer at an odd-element offset still misses the alignment. The
+    # register-blocked GEMM nest (default for matmul shapes with FN > 1)
+    # exposes this: an N-stride of 3 (lm_head-style vocab=3 test case) gives
+    # a3 a stride of 3 elements = 6 bytes — not a multiple of 4 — and the
+    # half2 read faults with CUDA_ERROR_MISALIGNED_ADDRESS.
+    if n >= 2:
         if not all(c % n == 0 for c in coeffs_0.values()):
             return None
         anchor_simplified = anchor_0.simplify(SimplifyCtx.empty())
         if not isinstance(anchor_simplified, Literal) or anchor_simplified.value % n != 0:
             return None
+
+        # Multi-dim staged smem case: the last logical dim may be a constant
+        # offset (cell index 0/1/...) while the BASE address ``Σ outer_dim ×
+        # outer_stride`` carries the per-cell stride packed into preceding
+        # dims (e.g. blocked-N smem with layout ``[K, N_t, N_r]`` and FN=3
+        # has stride ``a3 * 3`` from the N_t dim; packing two cells across
+        # the inner N_r yields byte offsets ``base + 0`` and ``base + 4``,
+        # but ``base = a3 * 12`` lands at 12 bytes for a3=1 — not 8-byte
+        # aligned for float2). The last-dim coeff check passes vacuously
+        # (no free vars there), so the broader check has to walk back into
+        # the preceding logical dims via the Source's cache_dims. If any
+        # preceding dim's cache-axis extent is not a multiple of n at the
+        # innermost slot (= the byte stride from the cell-offset Load
+        # group's base to its neighbour group isn't n-aligned), refuse to
+        # vectorize.
+        source = _find_source(top.body, input_name)
+        if source is not None and len(source.cache_dims) >= 2:
+            inner_extent = source.cache_axes[-1].extent.as_static()
+            if inner_extent % n != 0:
+                return None
 
     return Load(
         names=tuple(s.name for s in loads),
@@ -187,3 +213,21 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         index=loads[0].index,
         dtype=loads[0].dtype,
     )
+
+
+def _find_source(body: Body, name: str) -> Source | None:
+    """Walk ``body`` for a ``Source`` whose ``name`` matches — used by
+    multi-dim staged-smem alignment checks. Returns the first match
+    (sources are unique by name within a TileOp by construction) or
+    ``None`` if the buffer isn't a Stage-backed smem (e.g. a gmem input)."""
+    for stmt in body.iter():
+        if isinstance(stmt, Stage):
+            for src in stmt.sources:
+                if src.name == name:
+                    return src
+        elif isinstance(stmt, StageBundle):
+            for stage in stmt.stages:
+                for src in stage.sources:
+                    if src.name == name:
+                        return src
+    return None

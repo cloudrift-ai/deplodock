@@ -11,10 +11,13 @@ were deleted in the same refactor.
 
 from __future__ import annotations
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from deplodock.compiler.ir.stmt import Accum, Init
 from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
@@ -114,3 +117,144 @@ def test_006a_replicates_register_tagged_body_loop():
         assert "a_reg" not in vars_in_index, f"unreplicated a_reg in Write: {w.index}"
     # FM gets stamped from the outermost (and only) RegisterTile axis extent.
     assert new_tile_op.knobs.get("FM") == 4
+
+
+def test_006a_sibling_register_tile_towers_share_keep():
+    """The blocked-GEMM nest emits three sibling ``RegisterTile(N_r)``
+    towers (Init / K-reduce-Accum / Write) at the same ThreadTile level.
+    Each tower's local keep-analysis is incomplete — the Init tower
+    doesn't itself reference N_r, so a per-body fold would keep ``acc``
+    one name there, while the Accum tower would produce ``acc_0..F-1``.
+    Body-global keep aligns the three towers: ``acc`` is keep=True
+    everywhere because some sibling's Accum reads N_r → all three
+    towers replicate consistently to ``acc_0..F-1``.
+    """
+    n_outer = Axis("n_outer", 8)
+    n_reg = Axis("n_reg", 4)
+    k = Axis("k", 16)
+
+    init_tower = RegisterTile(axes=(n_reg,), body=(Init(name="acc", op=ElementwiseImpl("add"), dtype=F32),))
+    reduce_tower = Loop(
+        axis=k,
+        body=(
+            Load(name="w", input="w", index=(Var("k"), Var("n_outer"), Var("n_reg"))),
+            RegisterTile(axes=(n_reg,), body=(Accum(name="acc", value="w", op=ElementwiseImpl("add")),)),
+        ),
+    )
+    write_tower = RegisterTile(
+        axes=(n_reg,),
+        body=(Write(output="o", index=(Var("n_outer"), Var("n_reg")), value="acc"),),
+    )
+    tile = ThreadTile(
+        axes=(n_outer,),
+        body=(init_tower, reduce_tower, write_tower),
+    )
+    tile_op = TileOp(body=(tile,), name="t")
+
+    g = Graph()
+    _input(g, "w", (16, 8, 4))
+    g.add_node(op=tile_op, inputs=["w"], output=Tensor("o", (8, 4)), node_id="o")
+    g.inputs = ["w"]
+    g.outputs = ["o"]
+
+    out = Pipeline.build(KERNEL_PASSES, select={"split_register_axes"}).run(g)
+    new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    new_thread = next(s for s in new_tile_op.body if isinstance(s, ThreadTile))
+
+    assert not any(isinstance(s, RegisterTile) for s in new_thread.body.iter()), "RegisterTile should be fully unwrapped"
+
+    # All four init / write / accum cells should reference a per-cell ``acc<i>``
+    # — body-global keep saw the Accum's N_r dep and propagated. (Post-replicate
+    # ``rename_ssa_sequential`` canonicalizes ``acc_0..3`` → ``acc0..3``.)
+    inits = [s for s in new_thread.body if isinstance(s, Init)]
+    init_names = {s.name for s in inits}
+    assert len(init_names) == 4 and all(n.startswith("acc") for n in init_names), init_names
+    writes = [s for s in new_thread.body if isinstance(s, Write)]
+    write_values = {w.value for w in writes}
+    assert len(write_values) == 4 and all(n.startswith("acc") for n in write_values), write_values
+    # The Init / Accum / Write towers must align on the SAME per-cell name
+    # — that's the whole point of body-global keep. If the Init tower kept
+    # ``acc`` as one name (local fold), the rendered kernel would have one
+    # init with four uses → name collision.
+    accums = [s for s in new_thread.body.iter() if isinstance(s, Accum)]
+    accum_names = {a.name for a in accums}
+    assert init_names == write_values == accum_names, (init_names, write_values, accum_names)
+
+
+def test_planner_emits_register_blocked_structure():
+    """The blocked-GEMM materialization path produces sibling
+    RegisterTile(N_r) wrappers around the Write and inside the K-tower's
+    K_i body for a plain matmul. The K_i body has the M-axis Load BEFORE
+    the inner RegisterTile(N_r) wrapper (the N-invariant cone, shared
+    across F_N cells); the Write sits in its own RegisterTile(N_r).
+
+    Bypasses greedy variant selection (other knobs may dominate the
+    lazy-score yardstick depending on shape) by calling ``_materialize``
+    directly with a hand-picked ``TileParams(reg_block=True)`` from the
+    planner's enumeration. The planner's blocked emit is what we want
+    to lock down here — Fork-tree priority is the M3 concern.
+    """
+    import importlib  # noqa: PLC0415
+
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import SerialTile  # noqa: PLC0415
+
+    planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
+
+    m_ax, n_ax, k_ax = Axis("m", 64), Axis("n", 128), Axis("k", 32)
+    loop_op = LoopOp(
+        body=(
+            Loop(
+                axis=m_ax,
+                body=(
+                    Loop(
+                        axis=n_ax,
+                        body=(
+                            Loop(
+                                axis=k_ax,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("m"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("n"))),
+                                    Accum(name="acc", value="b", op=ElementwiseImpl("add")),
+                                ),
+                            ),
+                            Write(output="o", index=(Var("m"), Var("n")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    plan = planner._plan_kernel(loop_op, Context(compute_capability="sm_80"), kernel_name="k_blk")
+    assert plan is not None
+    # Find a variant the blocked builder will accept (FN > 1, SPLITK = 1,
+    # BR = 1, no M-overhang). Blocking is now the default — no REG_BLOCK
+    # knob to set.
+    blocked_params = [p for p in plan.params if p.fn > 1 and p.splitk == 1 and p.br == 1]
+    assert blocked_params, "no blocking-eligible variants enumerated for matmul"
+    chosen = blocked_params[0]
+    tile_op = planner._materialize(plan, chosen)
+
+    thread = next(iter(tile_op.body.iter_of_type(ThreadTile)))
+    layer_body: tuple = tuple(thread.body)
+    # Descend through any outer M_r RegisterTile (FM > 1 with M_r wrapping
+    # the N_r sibling towers).
+    if len(layer_body) == 1 and isinstance(layer_body[0], RegisterTile):
+        layer_body = tuple(layer_body[0].body)
+
+    # Init isn't in the source LoopOp body (Accum's identity is implicit) so
+    # the planner doesn't emit a separate Init tower; only the Write tower
+    # appears at this stage. 020_place_inits adds explicit Inits at the
+    # ThreadTile scope later, after 010_split_register_axes unwraps the
+    # per-cell RegisterTile in the K_i body.
+    top_register_tiles = [s for s in layer_body if isinstance(s, RegisterTile)]
+    assert len(top_register_tiles) == 1, [type(s).__name__ for s in layer_body]
+    write_tower = top_register_tiles[0]
+    assert any(isinstance(s, Write) for s in write_tower.body)
+
+    # K-tower sibling has its N-dep tail wrapped in its own RegisterTile(N_r).
+    k_towers = [s for s in layer_body if isinstance(s, SerialTile)]
+    assert k_towers, "expected K-tower SerialTile sibling of the Write tower"
+    nested = [s for s in k_towers[0].body.iter() if isinstance(s, RegisterTile)]
+    assert nested, "K-tower body should hold a RegisterTile(N_r) for the N-dep tail"

@@ -79,10 +79,10 @@ from deplodock.compiler import provenance
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
@@ -584,6 +584,137 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 
 class _BuildSkipped(Exception):
     """Raised by ``_build_split_body`` when the body's shape doesn't match."""
+
+
+def _classify_n_dep(body: Body, n_axis_name: str) -> tuple[list[Stmt], list[Stmt]]:
+    """Partition ``body`` stmts into (N-invariant, N-dependent) by transitive
+    free-var analysis over Exprs + SSA def-use. ``n_axis_name`` is the post-σ
+    N register axis (typically ``N_r.name``) — a stmt is N-dependent iff its
+    transitive Expr ``free_vars`` ∪ ``deps``-chain references ``n_axis_name``.
+    Order within each group is preserved (source order = SSA topo order, so
+    N-invariant stmts feeding N-dependent ones come first).
+
+    Used by :func:`_build_register_blocked_body` to split a matmul K-reduce
+    body into the N-invariant cone (RMSNorm prologue, M-axis Loads — shared
+    across F_N cells) and the N-dependent tail (weight Load + ``Accum`` —
+    replicated per cell).
+    """
+
+    def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
+        own: frozenset[str] = frozenset()
+        for e in s.exprs():
+            own = own | frozenset(v for v in e.free_vars() if v not in bound)
+        for c in child_T:
+            if c is not None:
+                own = own | c
+        return own
+
+    deps = body.fold(fn)
+    invariant: list[Stmt] = []
+    dependent: list[Stmt] = []
+    for s in body:
+        if n_axis_name in deps[id(s)]:
+            dependent.append(s)
+        else:
+            invariant.append(s)
+    return invariant, dependent
+
+
+def _split_k_tower_for_block(
+    stmt: Stmt,
+    n_axis_name: str,
+    n_r: Axis,
+    leaf_cond: Callable[[tuple[Stmt, ...]], tuple[Stmt, ...]] | None,
+) -> tuple[Stmt, int]:
+    """Walk into a SerialTile K-tower; at the innermost ``stage_inner`` layer
+    (K_i, the reduce), split its body into ``[N-invariant cone...,
+    RegisterTile(N_r, [N-dep tail])]``. ``leaf_cond`` (when set) wraps the
+    N-dep tail in a per-cell Cond — used for masked N tiles where each cell's
+    work must be guarded. Returns ``(new_stmt, n_replaced)``.
+    """
+    if isinstance(stmt, SerialTile) and stmt.kind == "stage_inner":
+        invariant, dependent = _classify_n_dep(stmt.body, n_axis_name)
+        if not dependent:
+            return stmt, 0
+        tail_body = tuple(dependent)
+        if leaf_cond is not None:
+            tail_body = leaf_cond(tail_body)
+        new_body = Body(tuple(invariant) + (RegisterTile(axes=(n_r,), body=Body(tail_body)),))
+        return replace(stmt, body=new_body), 1
+    if isinstance(stmt, SerialTile):
+        new_body_stmts: list[Stmt] = []
+        replaced = 0
+        for c in stmt.body:
+            new_c, r = _split_k_tower_for_block(c, n_axis_name, n_r, leaf_cond)
+            new_body_stmts.append(new_c)
+            replaced += r
+        if replaced:
+            return replace(stmt, body=Body(new_body_stmts)), replaced
+    return stmt, 0
+
+
+def _build_register_blocked_body(
+    new_inner: tuple[Stmt, ...],
+    n_axis_name: str,
+    n_r: Axis,
+    leaf_cond: Callable[[tuple[Stmt, ...]], tuple[Stmt, ...]] | None,
+) -> tuple[Stmt, ...] | None:
+    """Apply the register-blocked GEMM nest to ``new_inner`` (the σ-rewritten
+    matmul body sitting inside ``M_r`` REGISTER, before the outer N_r wrap).
+    Replaces the existing per-cell ``[Init, K-tower, Write]`` flat structure
+    with three sibling RegisterTile(N_r) towers separated by the (now shared)
+    K-loop:
+
+    - ``Init(acc)`` → ``RegisterTile(N_r, [Init(acc)])`` (per-cell accumulators).
+    - K-tower (SerialTile K_o > SerialTile K_i) → K_i body split into N-invariant
+      cone + ``RegisterTile(N_r, [N-dep tail])`` — the cone (e.g. fused RMSNorm
+      prologue, M-axis Loads) runs once per K iteration, the tail runs F_N×.
+    - ``Write(C, acc)`` → ``RegisterTile(N_r, [Write(C, acc)])`` (per-cell writes).
+
+    ``leaf_cond`` wraps each tower's leaf body in a per-cell Cond (the masked-N
+    boundary guard). The replicator (010_split_register_axes) replicates each
+    Cond per cell using σ N_r → i, producing F_N concrete-i guarded leaves.
+
+    Returns ``None`` when the shape doesn't fit (no K_i found, empty N-dep
+    tail, or unexpected outer-scope stmts — Cond from a prior masked wrap,
+    epilogue compute, etc.) so the caller falls back to per-cell.
+    """
+    out: list[Stmt] = []
+    n_replaced = 0
+    for s in new_inner:
+        if isinstance(s, Init):
+            # Init must be unconditional: it declares the per-cell accumulator
+            # variable at thread scope. Wrapping it in the masked-N Cond would
+            # scope ``acc_i`` to the if-block; the K-tower's Accum and the
+            # Write tower (both Cond-wrapped per cell) would reference an
+            # ``acc_i`` that's no longer in scope. OOB cells initialize a
+            # dead register, which is harmless.
+            out.append(RegisterTile(axes=(n_r,), body=Body((s,))))
+        elif isinstance(s, Write):
+            leaf_body: tuple[Stmt, ...] = (s,)
+            if leaf_cond is not None:
+                leaf_body = leaf_cond(leaf_body)
+            out.append(RegisterTile(axes=(n_r,), body=Body(leaf_body)))
+        elif isinstance(s, SerialTile):
+            new_s, r = _split_k_tower_for_block(s, n_axis_name, n_r, leaf_cond)
+            out.append(new_s)
+            n_replaced += r
+        elif isinstance(s, Cond):
+            # Post-K epilogue Cond — matmul_add's K_s==0 gate, or other
+            # N-uniform predicate wrapping a per-cell Write/epilogue. Wrap
+            # the whole Cond in RegisterTile(N_r); the replicator descends
+            # into Cond.body / Cond.else_body and replicates the inner Loads
+            # / Assigns / Writes per cell (Cond's own predicate is K_s-only
+            # so it doesn't itself get replicated, just its content).
+            out.append(RegisterTile(axes=(n_r,), body=Body((s,))))
+        else:
+            # Unrecognised outer-scope stmt. Fall back to the per-cell legacy
+            # path so the kernel still lowers (the planner-fallback branch in
+            # ``_build_split_body`` picks up).
+            return None
+    if n_replaced == 0:
+        return None
+    return tuple(out)
 
 
 def _stmt_contains_accum(stmt: Stmt) -> bool:
@@ -1228,7 +1359,16 @@ def _enumerate_cartesian_impl(
                                     overhang_axes = (*overhang_axes, n_axis_name)
                                 if m_overhang and m_axis_name is not None:
                                     overhang_axes = (*overhang_axes, m_axis_name)
-                                params = TileParams(bn=bn_c, bm=bm_c, fm=fm, fn=fn, bk=bk, splitk=splitk, br=br, overhang=overhang_axes)
+                                params = TileParams(
+                                    bn=bn_c,
+                                    bm=bm_c,
+                                    fm=fm,
+                                    fn=fn,
+                                    bk=bk,
+                                    splitk=splitk,
+                                    br=br,
+                                    overhang=overhang_axes,
+                                )
                                 if params in seen:
                                     continue
                                 seen.add(params)
@@ -1391,6 +1531,47 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     else:
         new_inner = inner_after_outer
 
+    # Register-blocked GEMM nest (default for matmul shapes the blocked
+    # builder accepts): split the N_r register-tile around the K-reduce so
+    # N-invariant compute runs once per K step and is shared across F_N
+    # cells. Emits sibling RegisterTile(N_r) towers (Init / K-reduce N-dep
+    # tail / Write) inside the M_r scope. Prologue kernels are in-scope
+    # too: the fused RMSNorm + lm_head matmul (linear_196) has K-dependent
+    # N-invariant compute (``v_k = x[m, k]·v4·norm_weight[k]``) inside the
+    # matmul K-loop — exactly the blocked-nest target. The prologue's own
+    # K-reduce (mean / softmax stats) still runs once at the M_r scope; the
+    # blocked transform only touches the matmul body's K_i.
+    # The blocked builder declines (returns None) on shapes it can't yet
+    # handle — SPLITK > 1 (``_gate_linear_epilogue_on_k_s_zero``'s Cond
+    # wrap and 020_stage_inputs's slab-shape inference for the inner-
+    # RegisterTile Load haven't been generalised yet), BR > 1's
+    # cooperative-K combine, M-mask, and F_N = 1 (no register-tile benefit
+    # anyway, and the downstream staging passes get the wrong slab geometry
+    # on the inner N_r=1 wrap) — the per-cell legacy path below picks up
+    # those cases.
+    reg_blocked = False
+    if params.splitk == 1 and params.br == 1 and params.fn > 1 and shape.k_loop is not None and m_bound is None:
+        if n_bound is not None:
+            # Masked N: wrap each tower's leaf body in its own Cond. The
+            # replicator (010_split_register_axes) replicates the Cond per
+            # cell using σ N_r → i, so each replica gets its own σ-folded
+            # predicate. A single top-level Cond wrapping all three towers
+            # would reference N_r in its predicate but expose nested
+            # RegisterTile(N_r) inside — the replicator can't reconcile
+            # both.
+            n_pred_for_cond = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
+
+            def _wrap_in_n_cond(stmts: tuple[Stmt, ...], pred: Expr = n_pred_for_cond, bound: Expr = n_bound) -> tuple[Stmt, ...]:  # type: ignore[assignment]
+                return (Cond(cond=BinaryExpr("<", pred, bound), body=Body(stmts)),)
+
+            leaf_cond = _wrap_in_n_cond
+        else:
+            leaf_cond = None
+        blocked_inner = _build_register_blocked_body(new_inner, N_r.name, N_r, leaf_cond)
+        if blocked_inner is not None:
+            new_inner = blocked_inner
+            reg_blocked = True
+
     # Masked tiles: when ceil-div has rounded a block-axis extent up past the
     # axis bound, wrap the σ-rewritten body in ``Cond(decoded_axis_coord <
     # bound)``. ``bound`` is the static ``real_extent`` (lm_head vocab) or the
@@ -1400,7 +1581,11 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # handles Conds whose predicate depends on the replicated axis by
     # σ-substituting per replica so each replicated body gets a partly-
     # constant-folded predicate (NVRTC drops always-true copies).
-    if n_bound is not None:
+    #
+    # Under REG_BLOCK the N-cond was already applied per-tower above, so skip
+    # the top-level N-cond here. The M-cond still always wraps (M_r is outside
+    # the N_r towers, regardless of reg_block).
+    if n_bound is not None and not reg_blocked:
         n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", n_pred, n_bound), body=Body(new_inner)),)
     if m_bound is not None:
@@ -1436,9 +1621,15 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # With prologue: N_r wraps the matmul body alone; the prologue stmts
     # are prepended at the M_r scope, so the M_r Loop body becomes
     # ``[prologue..., N_r tower]``. Outer layers (THREAD/BLOCK/SPLITK)
-    # then wrap that combined body.
+    # then wrap that combined body. When the blocked nest has already
+    # emitted the per-tower RegisterTile(N_r) wrappers inside new_inner,
+    # skip the outer ``_wrap_tower([(N_r, ...)], ...)`` — the N_r tile is
+    # already present per-tower.
     if shape.prologue:
-        matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
+        if reg_blocked:
+            matmul_tower = new_inner
+        else:
+            matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
         body_inside_mr = prologue_rewritten + matmul_tower
         if M_r is not None:
             # M_r stays serial (not RegisterTile) — the SDPA prologue
@@ -1461,7 +1652,12 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         outer_layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
         return _wrap_tower(outer_layers, body_after_register)
 
-    layers: list[tuple[Axis, Role | None]] = [(N_r, Role.REGISTER)]
+    # When REG_BLOCK has wrapped the three sibling RegisterTile(N_r) towers
+    # already, the outer layers list skips N_r — the towers each carry their
+    # own RegisterTile(N_r) wrapper inside the M_r/THREAD scope.
+    layers: list[tuple[Axis, Role | None]] = []
+    if not reg_blocked:
+        layers.append((N_r, Role.REGISTER))
     if M_r is not None:
         layers.append((M_r, Role.REGISTER))
     layers.append((N_t, Role.THREAD))

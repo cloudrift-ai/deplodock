@@ -92,6 +92,57 @@ formula from cheap inputs (knob bundle + planner shape) so siblings rank
 without anyone instantiating a TileOp. The branch tree's `Fork.score`
 propagates max from leaves, matching MCTS's max-Q semantics.
 
+**Register-blocked GEMM nest.** For matmul-shape kernels (`shape.k_loop is
+not None`, `params.fn > 1`, SPLITK = 1, BR = 1, no M-mask, no fused
+prologue), the planner emits the textbook blocked GEMM nest rather than
+wrapping the entire `{Init, K-reduce, Write}` in one outer
+`RegisterTile(N_r)`. The N_r register tile splits *around* the K-reduce:
+
+    M_r REGISTER:
+      RegisterTile(N_r) { Init(acc) }            # per-cell accumulators
+      K_o SERIAL_OUTER:
+        K_i STAGE_INNER (reduce):
+          <N-invariant cone>                     # M-axis Loads, RMSNorm
+                                                 # prologue, … — runs ONCE
+                                                 # per K iter
+          RegisterTile(N_r) { Load b, Accum }    # F_N per-cell FMAs into
+                                                 # the persistent acc_i
+      RegisterTile(N_r) { Write(C, acc) }        # per-cell writes
+
+`_build_register_blocked_body` partitions the σ-rewritten K_i body by
+N-dependence (a single `body.fold` over Expr free_vars ∪ SSA def-use,
+exempting `N_r` from `bound` so RegisterTile wrappers don't mask
+references) into the N-invariant cone (no transitive `N_r` ref) and the
+N-dependent tail (everything else, including the Accum). The cone stays
+at K_i body scope; the tail wraps in `RegisterTile(N_r)`. The masked-N
+variant (e.g. lm_head with non-divisor vocab) wraps each tower's leaf
+body in its own per-cell `Cond(pred(N_r) < extent)` so the replicator
+σ-folds the predicate per cell; the matmul_add `K_s == 0` linear-epilogue
+Cond likewise gets wrapped in `RegisterTile(N_r)` so its inner Load /
+Assign / Write replicate per cell while the outer K_s predicate stays
+single. Init stays unconditional regardless — declaring `acc_i` inside a
+Cond would scope-bind it to the if-block; the K-tower's Accum and the
+Write tower (both Cond-wrapped per cell) would reference an `acc_i`
+that's no longer in scope.
+
+Shapes the blocked builder declines (returns `None`) — SDPA P@V's fused
+prologue, SPLITK > 1, BR > 1, M-overhang, F_N = 1 — fall back to the
+legacy per-cell branch in `_build_split_body` (one `RegisterTile(N_r)`
+wrapping the whole `{Init, K-reduce, Write}` body). Generalising the
+blocked nest to those shapes is follow-up work; the legacy branch is the
+safety net.
+
+The Kernel-IR replicator (`lowering/kernel/010_split_register_axes`)
+computes a body-global keep set for each register axis present in the
+ThreadTile body before recursing into the per-axis replication. Without
+the global keep, each sibling tower's local keep-analysis would run
+independently and the Init tower (no N_r reference in its body) would
+keep `acc` as one name while the Accum tower produced `acc_0..F-1` — a
+naming mismatch the Write tower would inherit. The global keep is also
+what lets the masked-N per-tower `Cond` survive: its predicate references
+`N_r`, the replicator descends into Cond.body, and the per-cell σ
+substitution lines up the suffixes across all three towers.
+
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
 12-pass `normalize_body`) only fire for the variant the search actually
@@ -314,13 +365,14 @@ recipe.
 
 | Knob          | Type     | Owning rule                  | What it controls                                                                                  |
 |---------------|----------|------------------------------|---------------------------------------------------------------------------------------------------|
-| `BK`          | INT      | `002_chunk_matmul_k`         | Per-stage K-chunk size for matmul reductions; intra-CTA K-loop trip count = `K / BK`.             |
-| `SPLITK`      | INT      | `003_split_matmul_k`         | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
-| `BN`          | INT      | `004_launch_geometry`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
-| `BM`          | INT      | `004_launch_geometry`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
+| `BK`          | INT      | `010_partition_loops`        | Per-stage K-chunk size for matmul reductions; intra-CTA K-loop trip count = `K / BK`.             |
+| `SPLITK`      | INT      | `010_partition_loops`        | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
+| `BN`          | INT      | `010_partition_loops`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
+| `BM`          | INT      | `010_partition_loops`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
 | `STAGE`       | BINMASK  | `020_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one wrap-body Stage with per-source Source entries. |
-| `FM`          | INT      | `008_register_tile`          | Register-tile factor for the next-outer tilable nest level (per-thread row tile).                 |
-| `FN`          | INT      | `008_register_tile`          | Register-tile factor for the innermost tilable nest level (per-thread column tile).               |
+| `FM`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul M (output row) axis; per-thread cell-grid height.           |
+| `FN`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. With `FN > 1` and the simple-shape constraints (no prologue, SPLITK = 1, BR = 1, no M-overhang), the planner emits the register-blocked GEMM nest — three sibling `RegisterTile(N_r)` towers sharing an N-invariant cone inside the K loop. |
+| `BR`          | INT      | `010_partition_loops`        | Cooperative-K thread count (1 = pure serial chunked reduce); BR > 1 routes through the cooperative reduce path with cross-thread combine. |
 | `TMA_SWIZZLE`     | BOOL     | `050_use_tma`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
 | `HOIST_COMPUTE`   | BOOL     | `030_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
 | `PAD_SMEM`        | BOOL     | `070_pad_smem`                       | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork. |

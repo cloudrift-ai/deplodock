@@ -175,12 +175,13 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: TileOp, atomi
         if not (isinstance(diff, Literal) and isinstance(diff.value, int) and diff.value == k):
             return None
 
-    # Alignment proof: for widths above the natural 4-byte boundary,
-    # the reinterpret-cast destination must be aligned to
-    # ``n * elem_bytes``. Same as ``050_vectorize_loads``: every
-    # free-var coefficient on the last dim must be a multiple of n,
-    # and the literal anchor must also be a multiple of n.
-    if n > 2 or (n == 2 and dst_dt == "f32"):
+    # Alignment proof: the reinterpret-cast destination must be aligned to
+    # ``n * elem_bytes``. Same as ``050_vectorize_loads``: every free-var
+    # coefficient on the last dim must be a multiple of n, and the literal
+    # anchor must also be a multiple of n. n=2 fp16 is NOT a freebie despite
+    # __half2's 4-byte type alignment — a stride-3 (odd) coefficient on a
+    # surrounding axis still lands the cast at an odd half-offset.
+    if n >= 2:
         if not all(c % n == 0 for c in coeffs_0.values()):
             return None
         anchor_simplified = anchor_0.simplify(SimplifyCtx.empty())

@@ -211,7 +211,11 @@ def _is_reduce_recursive(loop) -> bool:
       ``a4``.
 
     ``RegisterTile`` is transparent: descend into its body for the same
-    crossability check."""
+    crossability check. ``Cond`` is likewise transparent — its body /
+    else_body get the same recursive treatment (the masked register-
+    blocked GEMM emits ``RegisterTile(N_r, [Cond(pred, [Load, Assign,
+    Accum])])`` per N-dependent tail; the Cond shouldn't hide the Accum
+    from the crossability check)."""
     has_inner_reduce = False
     for s in loop.body:
         if isinstance(s, Accum):
@@ -222,6 +226,19 @@ def _is_reduce_recursive(loop) -> bool:
             has_inner_reduce = True
         elif isinstance(s, RegisterTile) and _is_reduce_recursive(s):
             has_inner_reduce = True
+        elif isinstance(s, Cond):
+            # Treat Cond as a transparent wrapper: an Accum nested behind
+            # a per-cell predicate (the masked-N reg_block path) still
+            # accumulates across the enclosing reduce loop. ``Write``
+            # inside the Cond escapes per-iter the same way it does at
+            # body level — recurse and honor its False-return.
+            for branch in (s.body, s.else_body):
+
+                class _Probe:
+                    body = branch  # noqa: B023 — bound at iteration
+
+                if _is_reduce_recursive(_Probe()):
+                    has_inner_reduce = True
         elif isinstance(s, StageBundle):
             # StageBundle is transparent for reduce-crossing: synthesize a
             # probe-loop carrying the bundle's body so the recursive walk
