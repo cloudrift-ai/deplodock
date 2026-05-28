@@ -1,13 +1,16 @@
-"""Tests for op provenance (deplodock.compiler.provenance).
+"""Tests for op provenance (``deplodock.compiler.provenance``).
 
-M1 covers the data model + seeding; the splice-propagation behavior
-(mint / aggregate through decomposition + fusion) is exercised in
-``test_provenance_splice.py``.
+Two surfaces in one file: the data model + seeding (``seed`` / ``put`` /
+``get`` / ``union`` / ``mint`` / ``totals``), and propagation through the
+real passes (decomposition mints pieces under one origin; fusion
+aggregates pieces across origins via the ``Graph.splice`` hook). Same
+``_graph`` fixture serves both.
 """
 
 from deplodock.compiler import provenance as prov
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.frontend.ir import RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
@@ -92,3 +95,72 @@ def test_prov_roundtrips_through_serialization():
     got = prov.get(g2.nodes[ew])
     assert got == {"rms_0": {"kind": "RmsNormOp", "pieces": ["sq", "mean"]}}
     assert isinstance(got["rms_0"]["pieces"], list)  # stays a list, not stringified
+
+
+# --- propagation through real passes ---
+
+
+def _rms_graph() -> Graph:
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (1, 4, 8)))
+    w = g.add_node(InputOp(), [], Tensor("w", (8,)))
+    g.inputs = [x, w]
+    rms = g.add_node(RmsNormOp(), [x, w], Tensor("rms_norm_0", (1, 4, 8)))
+    g.outputs = [rms]
+    return g
+
+
+def test_decomposition_mints_pieces_under_one_origin():
+    """RmsNormOp decomposes (recursively, incl. its inner mean) into many
+    primitives, all distinct pieces of the single ``rms_norm_0`` origin."""
+    from deplodock.compiler.pipeline import Pipeline
+
+    out = Pipeline.build(["frontend/decomposition"]).run(_rms_graph())
+
+    pieces: set[str] = set()
+    for node in out.nodes.values():
+        p = prov.get(node)
+        if not p:
+            continue  # InputOp / ConstantOp boundary
+        assert set(p) == {"rms_norm_0"}
+        assert p["rms_norm_0"]["kind"] == "RmsNormOp"
+        pieces.update(p["rms_norm_0"]["pieces"])
+    # rms_norm fans out into well more than one primitive (mul, mean→sum/div,
+    # add-eps, rsqrt, two scales, broadcasts).
+    assert len(pieces) >= 5
+
+
+def test_fusion_aggregates_origins():
+    """mul + sum fuse into one LoopOp whose prov covers both source origins."""
+    from deplodock.compiler.ir.loop import LoopOp
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+
+    g, _, _, ew, c = _graph()
+    fused = Pipeline.build(LOOP_PASSES).run(g)
+
+    loops = [n for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
+    assert len(loops) == 1
+    merged = prov.get(loops[0])
+    # both the elementwise and the reduce origins survive the fusion
+    assert set(merged) == {ew, c}
+    assert merged[ew]["kind"] == "ElementwiseOp"
+    assert merged[c]["kind"] == "ReduceOp"
+
+
+def test_rms_norm_fully_covered_after_full_pipeline():
+    """Through decompose→lift→fuse, the rms_norm origin's pieces survive; the
+    kernels that carry it collectively realize every piece (full coverage)."""
+    from deplodock.compiler.ir.loop import LoopOp
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+
+    fused = Pipeline.build(LOOP_PASSES).run(_rms_graph())
+
+    totals = prov.totals(fused)
+    assert "rms_norm_0" in totals
+    # Union of pieces across all LoopOp kernels == the origin's total pieces:
+    # nothing was dropped crossing the fusion boundaries.
+    covered: set[str] = set()
+    for n in fused.nodes.values():
+        if isinstance(n.op, LoopOp):
+            covered.update(prov.get(n).get("rms_norm_0", {}).get("pieces", []))
+    assert covered == totals["rms_norm_0"]

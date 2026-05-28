@@ -12,7 +12,7 @@ from deplodock.compiler.ir.loop import Accum, LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
-from .conftest import requires_cuda
+from ..conftest import matmul_graph, requires_cuda
 
 
 def _compile(graph: Graph) -> Graph:
@@ -29,24 +29,12 @@ def _pointwise_chain_graph() -> Graph:
     return g
 
 
-def _matmul_graph(m: int, k: int, n: int) -> Graph:
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-
-    g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n)), node_id="b")
-    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("c", (m, n)), node_id="c")
-    g.inputs = ["a", "b"]
-    g.outputs = ["c"]
-    return g
-
-
 def _loop_nodes(graph: Graph) -> list:
     return [n for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
 
 
 def test_compile_fuses_matmul():
-    fused = _compile(_matmul_graph(4, 3, 2))
+    fused = _compile(matmul_graph(4, 3, 2))
     matmul_loops = [n for n in _loop_nodes(fused) if any(isinstance(s, Accum) for s in n.op)]
     assert len(matmul_loops) == 1
 
@@ -58,7 +46,7 @@ def test_compile_fuses_chain():
 
 
 def test_pipeline_to_program():
-    compiled = CudaBackend().compile(_matmul_graph(4, 3, 2))
+    compiled = CudaBackend().compile(matmul_graph(4, 3, 2))
     cuda_nodes = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
     assert len(cuda_nodes) >= 1
     assert "a" in compiled.inputs
@@ -91,7 +79,7 @@ def test_matmul_gpu():
     import random
 
     random.seed(0)
-    compiled = CudaBackend().compile(_matmul_graph(3, 4, 5))
+    compiled = CudaBackend().compile(matmul_graph(3, 4, 5))
     a_data = [random.random() for _ in range(12)]
     b_data = [random.random() for _ in range(20)]
     expected = []

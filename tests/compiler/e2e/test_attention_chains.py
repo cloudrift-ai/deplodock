@@ -31,7 +31,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from .conftest import requires_cuda
+from ..conftest import requires_cuda
 
 
 @pytest.fixture(autouse=True)

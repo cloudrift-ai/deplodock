@@ -13,7 +13,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
-from .conftest import dtype_input_scale, dtype_tol
+from ..conftest import dtype_input_scale, dtype_tol
 
 
 def _assert_close(actual, expected, dtype, **overrides):

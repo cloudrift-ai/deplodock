@@ -8,10 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-import torch
+import torch  # used by test_bind_inputs_preserves_int_dtype
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+from ..conftest import requires_cuda
 
 
 def _randn(shape: str, dtype, scale: float | None = None) -> str:

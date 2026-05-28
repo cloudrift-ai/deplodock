@@ -38,7 +38,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from .conftest import requires_cuda
+from ..conftest import requires_cuda
 
 # Shapes match the user's offline scan.
 _MATMUL_DIMS = {"M": 32, "K": 128, "N": 64}

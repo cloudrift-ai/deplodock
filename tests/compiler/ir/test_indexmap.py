@@ -1,8 +1,5 @@
 """Unit tests for IndexMapOp + coord_expr helpers."""
 
-import pytest
-import torch
-
 from deplodock.compiler.ir.expr import (
     PLACEHOLDER_PREFIX,
     BinaryExpr,
@@ -13,9 +10,6 @@ from deplodock.compiler.ir.expr import (
     placeholder,
 )
 from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
-
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-
 
 # ---------- placeholder helpers ----------
 

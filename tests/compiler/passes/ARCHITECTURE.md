@@ -18,11 +18,31 @@ scale constant, incorrect coordinate mapping, etc.
 ## File Layout
 
 ```
-tests/compiler/pipeline/passes/
-├── test_decompose_rules.py      # decomposition rules (structural + correctness)
-├── test_optimization_rules.py   # optimization rules (structural + correctness)
-└── test_fusion_rules.py         # fusion rules (structural only — LoopOp not numpy-executable)
+tests/compiler/passes/
+├── conftest.py                     # RecordingDump fixture for rule-fired assertions
+├── test_decompose_rules.py         # decomposition rules (structural + correctness)
+├── test_optimization_rules.py      # optimization rules (structural + correctness)
+├── test_fusion_rules.py            # fusion rules (structural — LoopOp not numpy-executable)
+├── test_matcher.py                 # Pattern matcher unit tests
+├── test_matmul_rules.py            # matmul-specific rewrite rules
+├── test_reduction_rules.py         # reduction-pattern rewrite rules
+├── test_register_tile_rules.py     # register-tile lowering rules
+├── test_partition_planner_rules.py # partition-planner pass
+├── test_partition_planner_forks.py # partition-planner fork generation
+├── test_launch_geometry_rules.py   # launch-geometry pass
+├── test_masked_tile.py             # masked-tile pass (dynamic-shape boundary guard)
+├── test_stage_inputs_classify.py   # Stage-input classifier
+├── test_lowering_accuracy.py       # 040 / 060 / 070 + TMA end-to-end CUDA accuracy
+├── test_lowering_blocked_gemm.py   # register-blocked GEMM nest
+├── test_knob_pinning.py            # DEPLODOCK_KNOBS-pinned regression configs
+├── test_tile_naming.py             # provenance-driven k_<op>_<suffix> kernel naming
+└── test_pipeline_semantics.py      # full pass chain (decompose → opt → fuse) vs numpy
 ```
+
+The `tests/compiler/conftest.py` exposes `matmul_graph(m, k, n)` — the
+shared (m,k)@(k,n)→(m,n) graph builder used by the lowering / backend /
+e2e tests, plus the `requires_cuda` skip marker and the `run_graph`
+parametrized fixture.
 
 ## Covered Rules
 
@@ -72,12 +92,12 @@ numpy backends in three places:
 - `test_fusion_rules.py::test_*_correctness` — runs the pre- and
   post-fusion graph through `NumpyBackend` (which uses `LoopOp.forward`
   post-fusion) and asserts outputs match.
-- `test_e2e_accuracy.py` — full-pipeline coverage on toy shapes
-  (pointwise, reduce, matmul, RMSNorm, softmax) via the `run_graph`
-  fixture parameterized over `numpy` / `loop` / `cuda`.
-- `test_block_accuracy.py` — real transformer block (TinyLlama layer 0
-  with random weights, `seq_len=8` for the CPU lane, `seq_len=32` for
-  the CUDA lane) compiled end-to-end and compared against PyTorch
+- `tests/compiler/e2e/test_accuracy.py` — full-pipeline coverage on
+  toy shapes (pointwise, reduce, matmul, RMSNorm, softmax) via the
+  `run_graph` fixture parameterized over `numpy` / `loop` / `cuda`.
+- `tests/compiler/e2e/test_block.py` — real transformer block (TinyLlama
+  layer 0 with random weights, `seq_len=8` for the CPU lane, `seq_len=32`
+  for the CUDA lane) compiled end-to-end and compared against PyTorch
   eager. The `_cpu` variant runs `LoopBackend` + CPU eager (always
   on, ~3s); the `_cuda` variants are gated by `@requires_cuda`.
 

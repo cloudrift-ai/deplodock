@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import torch
 
-from .conftest import requires_cuda
+from ..conftest import requires_cuda
 
 
 def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str = "cuda"):

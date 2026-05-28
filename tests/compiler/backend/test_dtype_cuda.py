@@ -18,7 +18,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SoftmaxOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
-from .conftest import requires_cuda
+from ..conftest import requires_cuda
 
 
 def test_cuda_name_int_dtypes():

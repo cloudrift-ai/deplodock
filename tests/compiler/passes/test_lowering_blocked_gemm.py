@@ -22,7 +22,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
-from .conftest import requires_cuda
+from ..conftest import requires_cuda
 
 
 def _random(shape: tuple[int, ...], *, seed: int = 0, scale: float = 1.0, dtype=np.float32) -> np.ndarray:
