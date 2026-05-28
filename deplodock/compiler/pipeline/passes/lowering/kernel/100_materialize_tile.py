@@ -81,18 +81,21 @@ _TMA_ALIGN_BYTES = 128
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
+    ws = int(root.op.knobs.get("WS", 0))
 
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile)):
-            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
+            new_body.append(
+                _materialize_top(s, warp_size=ctx.warp_size, escape=escape, ws_producer_warps=1 if ws else 0)
+            )
         else:
             new_body.append(s)
 
     return KernelOp(body=new_body, name=root.op.name)
 
 
-def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
+def _materialize_top(top: Stmt, *, warp_size: int, escape=None, ws_producer_warps: int = 0) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
     Two shapes are possible coming out of ``001_launch_geometry``:
@@ -104,20 +107,31 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     - ``ThreadTile(... body=actual)``: pointwise/standalone. Materialize
       the body directly; the kernel renderer's linear-tid path handles
       launch geometry from the ThreadTile's extents.
+
+    ``ws_producer_warps`` (default 0 = WS off) selects the warp-specialized
+    materializer path. When non-zero the ThreadTile body lowers to a
+    ``Cond(warp < P)`` split: producer warps issue TMA, consumer warps
+    wait + reduce, coordinated through ``tma_mbar`` (full) +
+    ``tma_mbar_empty`` (empty) mbarrier pairs.
     """
     from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+    materializer = _materialize_ws if ws_producer_warps > 0 else _materialize
+    kwargs = {"warp_size": warp_size, "escape": escape}
+    if ws_producer_warps > 0:
+        kwargs["producer_warps"] = ws_producer_warps
 
     if isinstance(top, GridTile):
         # Locate the (sole) ThreadTile child.
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, ThreadTile):
-                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
+                new_outer.append(materializer(child, **kwargs))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer))
     if isinstance(top, ThreadTile):
-        return _materialize(top, warp_size=warp_size, escape=escape)
+        return materializer(top, **kwargs)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
@@ -465,6 +479,30 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_bundle_pr
         return transform(s)
 
     return loop.with_bodies((loop.body.map(materialize_leaf),))
+
+
+def _materialize_ws(blk: ThreadTile, *, warp_size: int, escape=None, producer_warps: int) -> Stmt:
+    """Warp-specialized materialization path. Reachable when
+    ``TileOp.knobs["WS"] == 1`` (set by ``085_warp_specialize``).
+
+    Splits the ThreadTile body into producer + consumer subtrees, wraps
+    them in ``Cond(warp < producer_warps)``, and coordinates them
+    through an extra ``tma_mbar_empty`` mbarrier ring so the producer
+    can wait for the consumer to drain a slot before refilling.
+
+    NOT YET IMPLEMENTED — this is a routing stub. The full Phase D walk
+    (body partitioning, empty-mbarrier wiring, named-barrier consumer
+    syncs, SetMaxNReg emission) lands in subsequent commits on this
+    branch. See the plan file's "Implementation phases" table for
+    Stage 2+ design.
+
+    Raises ``NotImplementedError`` so a stray ``DEPLODOCK_WS=1`` env pin
+    or accidental knob stamp surfaces loudly rather than silently
+    producing a non-WS kernel."""
+    raise NotImplementedError(
+        f"warp-specialized materialization (WS={producer_warps}) not yet implemented; "
+        "see /home/dikobraz/.claude/plans/make-a-plan-buzzing-flame.md Phase D"
+    )
 
 
 def _build_linear_tid(thread_axes: tuple[Axis, ...]):
