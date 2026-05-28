@@ -73,22 +73,33 @@ same worker.
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
 - `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
 - `deplodock compile ... --dynamic NAME@INPUT:AXIS` (repeatable) — make axis `AXIS` of the traced input named `INPUT` symbolic. Forwards to `torch.export(..., dynamic_shapes={INPUT: {AXIS: Dim(NAME)}})`; torch's SymInt propagation threads `Dim(NAME)` through every downstream FX tensor. The compiled CUDA kernel signature gains an `int <NAME>` runtime arg per dim; the launch resolves NAME from input array shapes (one cached kernel runs at any seq_len). A symbolic free axis is tiled for its `Dim` hint (`DEFAULT_SEQ_HINT=512`) and emitted as a **masked tile**: a ceil-div grid over the symbolic extent plus an `if (coord < NAME)` boundary guard, so the hint-sized tile shape stays correct at any runtime size (`tune` benches and `compile` picks the hint-sized variant; the backend benches symbolic graphs at the hint when no inputs are supplied). Cooperative-reduce (RMSNorm/softmax) and SDPA-prologue matmuls keep the symbolic axis degenerate — masking would register-tile a per-row reduction whose accumulator can't be shared across cells. Multiple specs sharing a NAME use the same `torch.export.Dim` instance (required so torch recognises e.g. `input_ids:1` and `attention_mask:2` as the same symbol). Examples: `--code` form `--dynamic seq_len@x:1`; whole HF model `--dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 --dynamic seq_len@attention_mask:3 --dynamic seq_len@position_ids:1` (the whole-model wrapper switches to `dynamic=True` so mask + position_ids flow in as arg-positions). `--seq-len` only sizes the example tensors handed to `torch.export.export` (defaults to 32); skip it unless you want larger trace inputs. Per-layer trace specialises `cos/sin` and currently rejects `--dynamic`. Same flag accepted by `tune` and `run --code`. See `plans/dynamic-shapes.md`.
-- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C]` — **two-level** autotune (see
+- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--bench] [-q]` — **two-level** autotune (see
   `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over fusion forks (graph-changing `frontend`+`loop` passes;
   today deterministic → one terminal) whose reward is `Σ best-per-op time` from an inner search that tunes each
   post-fusion kernel **independently** in its own single-node slice (`lowering` passes only, so `Σ_k n_k` benches not
   the product). Per-op results key structurally (`op_cache_key`) so they transfer/share; an op already tuned to
   `>= patience` (or exhausted, recorded `∞`) is skipped via the `op_effort` table — re-runs idempotent, higher patience
   re-deepens.
-  Prints per-op bests (`tuned`/`cached`), the `Σ` estimate, the assembled whole-graph latency, and the separability gap.
   Persists `perf` / `lowering` / `op_effort` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
   `~/.cache/deplodock/autotune.db`). The inner MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior) stops on
   patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
-  `run --bench`). Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the flags are folded into
-  the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
+  `--bench` below, or `run --bench`). Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
+  flags are folded into the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
+  On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
+  `<kernel> <current us> (best <best us>) <knobs>` tail — the current latency is fixed-width and the knobs sit
+  last, so the prefix stays put as the per-variant latency changes (no flicker); `-v` shows the per-`[tune]` INFO
+  lines instead, `-q` is quiet (errors only, no bar — the final summary still prints). `--bench` re-benches the tuned
+  winner at **-O3** (deployable, not the -O1 ranking pass): the full model **against the real torch module** (eager /
+  `torch.compile` / Deplodock, end-to-end) and each kernel via its provenance `.torch.json` reproducer (re-lowered so
+  the tuned forks are picked) vs eager / `torch.compile` / Deplodock, then prints both comparison tables. The
+  full-model bench is skipped when the input is an `--ir` JSON file (no module available); the per-kernel table still
+  runs. `--bench-backends` defaults to `eager,tcompile,deplodock` (overrides the `run` default that drops tcompile —
+  the ~0.8 s JIT is worth paying for the deployable comparison). `--warmup`/`--iters`/`--seed` mirror `run`. When a
+  dump dir is set (`--dump-dir`/`DEPLODOCK_DUMP_DIR`) it also writes an HTML per-kernel chart to
+  `<dump-dir>/kernels.html` (+ best-effort `.png`).
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)

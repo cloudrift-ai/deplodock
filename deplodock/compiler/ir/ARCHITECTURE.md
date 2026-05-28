@@ -146,6 +146,15 @@ Body walkers: `iter_body(body)` (pre-order; powers `for s in loop_op`),
 `Stmt.pretty(indent)` (rendered lines for kernel dumps; block stmts
 recurse via `pretty_body`).
 
+`rewrite` has two distinct rename channels that must stay disjoint:
+`rename_ssa` carries **SSA-name** renames, `sigma` carries **axis**
+substitutions. `Load`/`Write` index exprs apply *both*
+(`_rename_ssa_vars_in_expr(sigma.apply(e), rename)`) so an indirect
+(gather) index Var gets renamed exactly once. Putting the same name in
+both maps renames it twice — and if the two passes form a chain (e.g.
+`x → in5` and a pre-existing `in5 → in26`) the double application
+collapses it transitively, silently wiring a gather to the wrong row.
+
 ### `loop/normalize.py` — structural canonicalization
 
 Pure `body → body` passes run from `LoopOp.__post_init__` so every
@@ -177,8 +186,11 @@ canonicalized before validation:
   multiply.
 - `hoist_loop_invariants` — pull loop-invariant Assigns out of reduce
   Loops.
-- `rename_ssa_sequential` — cosmetic: Assign/Select names become `v0,
-  v1, …` in definition order.
+- `rename_ssa_sequential` — cosmetic: `Load` names become `in0, in1,
+  …`, Assign/Select `v0, v1, …`, Accum `acc0, …`, in definition order.
+  Records renames only in the SSA channel (`rename`), never the axis
+  channel (`sigma`) — see the `rewrite` two-channel rule above; an SSA
+  name leaking into `sigma` double-renames indirect (gather) indices.
 - `canonicalize_buffer_names` — rename `Load.input` / `Write.output` to
   `b0, b1, …` in encounter order. Off by default (buffer names bind to
   graph nodes) — opt in via `normalize_body(..., canonical_buffers=True)`.

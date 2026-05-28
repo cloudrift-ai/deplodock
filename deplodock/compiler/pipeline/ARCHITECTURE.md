@@ -243,8 +243,21 @@ row and otherwise walks the `lowering` chain down to the `cuda` terminal.
 
 **Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` probes a `Context`, opens the tuning database
 (default `~/.cache/deplodock/autotune.db`, overridable via `DEPLODOCK_TUNE_DB`), and calls `run_two_level_tune(...)`.
-It prints a per-op-best table (with `tuned` / `cached` state), the `Σ` estimate, the assembled whole-graph latency, and
-the separability gap. The DB accumulates rows across runs; re-running resumes from the cached state.
+On completion it prints one `done: N fused terminal(s) in Xs` line — the deployable numbers come from the optional
+`--bench` step below. The DB accumulates rows across runs; re-running resumes from the cached state.
+
+On default verbosity (and a tty) a `commands/tune_progress.TuneProgress` draws a live single-line bar — completed/total
+tuned op leaves plus a `<kernel> <current us> (best <best us>) <knobs>` tail. The current latency is fixed-width and the
+variable-length `pipeline.variant_label` knob string sits last, so the prefix up to the knobs stays put as the
+per-variant latency changes (only a new best, which is rare, shifts the trailing part — no flicker). It is threaded as an optional `progress=` through `run_two_level_tune` → `inner_reward`
+(duck-typed, so the search package keeps no dependency on `commands/`): one op leaf ticked per kernel, the tail updated
+per benched variant (read off `TuningSearch.last_stats`). `-v` disables the bar (the per-`[tune]` INFO lines show
+progress instead); `-q` is quiet (errors only). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1 ranking pass) after tuning —
+the assembled full model **against the real torch module** (eager / `torch.compile` / Deplodock, via the bundle
+plumbed from `load_or_trace` → `commands/run.bench_full_model_real`) and each kernel's `.torch.json` provenance
+reproducer (re-lowered greedily so the tuned forks are picked) vs eager / `torch.compile` / Deplodock via
+`commands/run.bench_lowered_vs_torch`, printing
+full-model + per-kernel tables and (when a dump dir is set) an HTML chart at `<dump-dir>/kernels.html`.
 
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner
 over one op's forks — with max-Q normalized UCB1:
@@ -259,7 +272,7 @@ over one op's forks — with max-Q normalized UCB1:
 - **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
   UCB1 calls see the new max-Q.
 - **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
-  default 100), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
+  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on

@@ -114,8 +114,9 @@ def add_input_args(parser) -> None:
 
 
 def add_diagnostics_args(parser) -> None:
-    """Register the ``-v`` / diff-rendering args shared by ``compile`` and ``tune``."""
-    parser.add_argument(
+    """Register the ``-v`` / ``-q`` / diff-rendering args shared by ``compile`` and ``tune``."""
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -129,6 +130,15 @@ def add_diagnostics_args(parser) -> None:
             "Diffs go to stdout (no ``2>&1`` needed). "
             "Slice one pass: ``... -vv | awk '/^>>> t:/,/^<<< t:/'``. "
             "Slice one rule: ``... -vv | awk '/^>>> t:005/,/^<<< t:005/'``."
+        ),
+    )
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help=(
+            "Quiet mode: log only errors (suppresses INFO / WARNING chatter). For ``tune`` this also "
+            "disables the live progress bar; the final per-op / Σ summary still prints. Mutually exclusive with -v."
         ),
     )
     parser.add_argument(
@@ -181,7 +191,9 @@ def setup_pipeline_runtime(args) -> None:
     from deplodock.compiler.target import apply_target_arg
 
     verbose = getattr(args, "verbose", 0)
-    if verbose == 0:
+    if getattr(args, "quiet", False):
+        logging.getLogger().setLevel(logging.ERROR)
+    elif verbose == 0:
         logging.getLogger().setLevel(logging.WARNING)
     elif verbose == 1:
         logging.getLogger().setLevel(logging.INFO)
@@ -243,7 +255,7 @@ def handle_compile(args):
     setup_pipeline_runtime(args)
     apply_nvcc_flags(args, default="")  # compile uses nvcc default -O3 (representative codegen)
     passes = resolve_passes(args)
-    graph, _ = load_or_trace(args)
+    graph, _, _ = load_or_trace(args)
     initial_count = len(graph.nodes)
 
     dump = CompilerDump.resolve(args.dump_dir)
@@ -302,7 +314,10 @@ def _is_boundary(op) -> bool:
     return isinstance(op, (InputOp, ConstantOp))
 
 
-def load_or_trace(args) -> tuple[Graph, str]:
+def load_or_trace(args) -> tuple[Graph, str, tuple | None]:
+    """Return ``(graph, base_name, bundle)`` where ``bundle = (module, args, kwargs)``
+    is the runnable torch module + its example inputs (for ``--bench`` real-module
+    timing), or ``None`` when no module is available (``--ir`` JSON path)."""
     dynamic_shapes = _resolve_dynamic_shapes(args)
     if args.code:
         from deplodock.commands.trace import graph_from_code
@@ -314,12 +329,12 @@ def load_or_trace(args) -> tuple[Graph, str]:
         if dynamic_shapes is not None:
             logger.error("--dynamic is incompatible with loading a pre-traced JSON IR (the trace is already complete)")
             sys.exit(2)
-        return _load_graph(input_path), input_path.stem
+        return _load_graph(input_path), input_path.stem, None
 
-    graph = _trace_model(args.input, args.layer, args.seq_len, dynamic_shapes=dynamic_shapes)
+    graph, bundle = _trace_model(args.input, args.layer, args.seq_len, dynamic_shapes=dynamic_shapes)
     safe_name = args.input.replace("/", "-").lower()
     base_name = f"{safe_name}-full-s{args.seq_len}" if args.layer is None else f"{safe_name}-layer{args.layer}"
-    return graph, base_name
+    return graph, base_name, bundle
 
 
 def _resolve_dynamic_shapes(args) -> dict | None:
@@ -346,7 +361,11 @@ def _load_graph(path: Path) -> Graph:
     return Graph.from_dict(data)
 
 
-def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shapes: dict | None = None) -> Graph:
+def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shapes: dict | None = None) -> tuple[Graph, tuple]:
+    """Trace an HF model and return ``(graph, (module, args, kwargs))``. The bundle
+    is the runnable torch module + its trace-time example inputs — kept around so
+    ``tune --bench`` / ``run --bench`` can time eager / ``torch.compile`` end-to-end
+    against the lowered graph."""
     try:
         import torch
         from transformers import AutoModelForCausalLM
@@ -373,11 +392,14 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
             input_ids = torch.zeros((1, seq_len), dtype=torch.long)
             attention_mask = build_causal_mask(seq_len, dtype)
             position_ids = torch.arange(seq_len).unsqueeze(0)
-            return trace_module(wrapper, (input_ids, attention_mask, position_ids), dynamic_shapes=dynamic_shapes)
+            args_t = (input_ids, attention_mask, position_ids)
+            graph = trace_module(wrapper, args_t, dynamic_shapes=dynamic_shapes)
+            return graph, (wrapper, args_t, {})
 
         wrapper = build_full_model_wrapper(model, seq_len, dtype)
         input_ids = torch.zeros((1, seq_len), dtype=torch.long)
-        return trace_module(wrapper, (input_ids,), dynamic_shapes=dynamic_shapes)
+        graph = trace_module(wrapper, (input_ids,), dynamic_shapes=dynamic_shapes)
+        return graph, (wrapper, (input_ids,), {})
 
     layers = model.model.layers
     if layer >= len(layers):
@@ -392,4 +414,5 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
     position_ids = torch.arange(seq_len).unsqueeze(0)
     cos, sin = model.model.rotary_emb(x, position_ids)
 
-    return trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)}, dynamic_shapes=dynamic_shapes)
+    graph = trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)}, dynamic_shapes=dynamic_shapes)
+    return graph, (block, (x,), {"position_embeddings": (cos, sin)})

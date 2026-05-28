@@ -140,7 +140,7 @@ def dump_dir() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
-def tune_patience(default: int = 100) -> int:
+def tune_patience(default: int = 50) -> int:
     """``DEPLODOCK_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
     return int_env(TUNE_PATIENCE, default)
 

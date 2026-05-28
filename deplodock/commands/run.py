@@ -605,14 +605,123 @@ def _passes_after_stage(stage: str) -> list[str]:
     return [p for p in CUDA_PASSES if p not in completed]
 
 
+def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends):
+    """Run + (optionally) benchmark a lowered graph against its torch reference on
+    shared random inputs. The common bench primitive behind ``run --ir`` and
+    ``tune --bench``.
+
+    ``frontend`` is the pristine frontend-dialect snapshot (must be
+    ``torch_ref``-runnable); pass ``None`` for a non-frontend / unsupported graph to
+    bench deplodock-only. One random source is drawn per distinct constant
+    ``source_path`` and each side replays its own ``load_ops`` (so a weight lowering
+    transposed + renamed stays the same underlying tensor on both sides). The lowered
+    graph runs once for a non-fatal accuracy check vs the torch eager reference; then,
+    when ``do_bench``, the selected backends are timed — interleaved when a torch ref
+    exists (full ``warmup``/``iters``), else deplodock-only at reduced iters.
+
+    Returns ``(results, bench, torch_available)``: ``results`` is the
+    ``{backend: latency_us}`` dict (``None`` when ``do_bench`` is False), ``bench`` the
+    deplodock ``BenchmarkResult`` (``None`` when ``do_bench`` is False), and
+    ``torch_available`` whether an eager/torch.compile reference was built. Does no
+    printing / dumping — callers own that."""
+    import numpy as np
+    import torch
+
+    from deplodock.compiler.backend import torch_ref
+    from deplodock.compiler.ir.base import ConstantOp, InputOp
+    from deplodock.compiler.loader.binder import bind_constants
+
+    rng = np.random.default_rng(seed)
+
+    def _static(shape):
+        return tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in shape)
+
+    # One random source array per distinct constant ``source_path`` — shared by
+    # deplodock (lowered graph) and the torch ref (frontend graph). ``bind_constants``
+    # replays each constant's ``load_ops`` on it, so a weight that lowering transposed +
+    # renamed (linear: out×in → in×out) stays the same underlying tensor on both sides.
+    sources: dict[str, np.ndarray] = {}
+    for gph in ([frontend] if frontend is not None else []) + [lowered]:
+        for node in gph.nodes.values():
+            op = node.op
+            if isinstance(op, ConstantOp) and op.value is None and op.source_path and op.source_path not in sources:
+                shp = _static(op.source_shape or node.output.shape)
+                sources[op.source_path] = rng.standard_normal(shp, dtype=np.float32) * 0.02
+
+    input_data: dict[str, object] = {}
+    input_tensors: dict[str, object] = {}
+    for nid, node in lowered.nodes.items():
+        if isinstance(node.op, InputOp):
+            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32)
+            input_data[nid] = arr.flatten().tolist()
+            input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
+        elif isinstance(node.op, ConstantOp) and node.op.value is not None:
+            input_data[nid] = [float(node.op.value)]
+
+    input_data.update(bind_constants(lowered, sources))
+    if frontend is not None:
+        for fid, arr in bind_constants(frontend, sources).items():
+            input_tensors[fid] = _to_cuda_tensor(arr, frontend.nodes[fid].output.dtype)
+
+    # Fallback for any value-None constant with no source_path (synthetic).
+    for nid, node in lowered.nodes.items():
+        if isinstance(node.op, ConstantOp) and node.op.value is None and nid not in input_data:
+            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32) * 0.02
+            input_data[nid] = arr.flatten().tolist()
+
+    result, _ = backend.run(lowered, input_data=input_data)
+    for nid, arr in result.outputs.items():
+        finite = np.isfinite(arr).all()
+        logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
+
+    # Build the torch reference from the frontend snapshot, fed the same inputs.
+    torch_fn = torch_inputs = None
+    if frontend is not None:
+        try:
+            torch_fn, torch_inputs = torch_ref.build_callable(frontend, input_tensors)
+            with torch.no_grad():
+                eager_out = torch_fn(*torch_inputs)
+            _check_accuracy(result.outputs, eager_out, fatal=False)
+        except Exception as exc:  # noqa: BLE001 — torch ref is best-effort
+            logger.warning("torch reference unavailable (%s) — skipping vs-torch comparison", exc)
+            torch_fn = None
+
+    torch_available = torch_fn is not None
+    if not do_bench:
+        return None, None, torch_available
+
+    if torch_available:
+        backends = _resolve_backends(bench_backends)
+        torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, warmup, backends=backends)
+        results, bench = _bench_interleaved(torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns)
+        return results, bench, True
+    bench = backend.benchmark(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5))
+    return {"Deplodock": bench.time_ms * 1000}, bench, False
+
+
+def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
+    """End-to-end full-model bench against the **real torch module** — eager /
+    ``torch.compile`` / Deplodock — using ``_bench_interleaved``. The module + its
+    trace-time inputs come from ``load_or_trace``'s bundle. Skips the accuracy
+    check (deplodock's bench uses synthetic activations vs torch's bound inputs, so
+    only latency is comparable here — accuracy lives in the per-kernel path).
+    Returns ``(results, bench)``."""
+    import torch
+
+    cuda_module = module.to("cuda")
+    cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in args_t)
+    cuda_kwargs = _to_cuda_kwargs(kwargs)
+    backends = _resolve_backends(bench_backends)
+    torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, warmup, backends=backends)
+    return _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
+
+
 def _handle_run_ir(args, CudaBackend, CompilerDump):
     """Run path: load JSON IR (any stage), finish lowering, execute, bench."""
     import json
 
-    import numpy as np
-
+    from deplodock.compiler.backend import torch_ref
     from deplodock.compiler.graph import Graph
-    from deplodock.compiler.ir.base import ConstantOp, InputOp
     from deplodock.compiler.pipeline import Pipeline
 
     path = Path(args.ir)
@@ -626,10 +735,6 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     stage = _detect_stage(graph)
     tail = _passes_after_stage(stage)
     logger.info("Loaded %s IR; running tail passes: %s", stage, tail or "(none)")
-
-    import torch
-
-    from deplodock.compiler.backend import torch_ref
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
@@ -653,84 +758,29 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered
         # at rule defaults and tuned results never showed up here.
         graph = Pipeline.build(tail, dump=dump).run(graph, db=db)
-    from deplodock.compiler.loader.binder import bind_constants
 
-    rng = np.random.default_rng(args.seed)
-
-    def _static(shape):
-        return tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in shape)
-
-    # One random source array per distinct constant ``source_path`` — shared by
-    # deplodock (lowered graph) and the torch ref (frontend graph). The loader's
-    # ``bind_constants`` replays each constant's ``load_ops`` on it, so a weight
-    # that lowering transposed + renamed (linear: out×in → in×out) stays the same
-    # underlying tensor on both sides instead of two unrelated random draws.
-    sources: dict[str, np.ndarray] = {}
-    for gph in ([frontend] if frontend is not None else []) + [graph]:
-        for node in gph.nodes.values():
-            op = node.op
-            if isinstance(op, ConstantOp) and op.value is None and op.source_path and op.source_path not in sources:
-                shp = _static(op.source_shape or node.output.shape)
-                sources[op.source_path] = rng.standard_normal(shp, dtype=np.float32) * 0.02
-
-    input_data: dict[str, object] = {}
-    input_tensors: dict[str, object] = {}
-    # Runtime inputs (activations): random, keyed by node id (preserved through
-    # lowering, so both sides see the same arrays). Scalar constants pass their
-    # literal value.
-    for nid, node in graph.nodes.items():
-        if isinstance(node.op, InputOp):
-            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32)
-            input_data[nid] = arr.flatten().tolist()
-            input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
-        elif isinstance(node.op, ConstantOp) and node.op.value is not None:
-            input_data[nid] = [float(node.op.value)]
-
-    # Parameter constants: bind the shared sources through each graph's load_ops.
-    input_data.update(bind_constants(graph, sources))
-    if frontend is not None:
-        for fid, arr in bind_constants(frontend, sources).items():
-            input_tensors[fid] = _to_cuda_tensor(arr, frontend.nodes[fid].output.dtype)
-
-    # Fallback for any value-None constant with no source_path (synthetic).
-    for nid, node in graph.nodes.items():
-        if isinstance(node.op, ConstantOp) and node.op.value is None and nid not in input_data:
-            arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32) * 0.02
-            input_data[nid] = arr.flatten().tolist()
-
-    result, _ = backend.run(graph, input_data=input_data)
-    for nid, arr in result.outputs.items():
-        finite = np.isfinite(arr).all()
-        logger.info("Output %s: shape=%s finite=%s mean=%.4f", nid, arr.shape, bool(finite), float(arr.mean()))
-
-    # Build the torch reference from the frontend snapshot, fed the same inputs.
-    torch_fn = torch_inputs = None
-    if frontend is not None:
-        try:
-            torch_fn, torch_inputs = torch_ref.build_callable(frontend, input_tensors)
-            with torch.no_grad():
-                eager_out = torch_fn(*torch_inputs)
-            _check_accuracy(result.outputs, eager_out, fatal=False)
-        except Exception as exc:  # noqa: BLE001 — torch ref is best-effort
-            logger.warning("torch reference unavailable (%s) — skipping vs-torch comparison", exc)
-            torch_fn = None
+    results, bench, torch_available = bench_lowered_vs_torch(
+        frontend,
+        graph,
+        backend,
+        seed=args.seed,
+        do_bench=args.bench,
+        warmup=args.warmup,
+        iters=args.iters,
+        bench_backends=args.bench_backends,
+    )
 
     if args.bench:
-        if torch_fn is not None:
-            backends = _resolve_backends(args.bench_backends)
-            torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, args.warmup, backends=backends)
-            results, bench = _bench_interleaved(torch_fn, torch_inputs, {}, backend, graph, args.warmup, args.iters, torch_fns=torch_fns)
-            if dump:
-                dump.dump_benchmark(bench)
+        if dump:
+            dump.dump_benchmark(bench)
+        if torch_available:
             _print_table(results)
         else:
-            bench = backend.benchmark(graph, warmup=max(3, args.warmup // 5), num_iters=max(10, args.iters // 5))
+            # Non-frontend IR (loop/tile/…): no torch twin → deplodock-only.
             print()
             print(f"{'Backend':<24s} {'Latency (us)':>12s}")
             print("-" * 38)
             print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
-            if dump:
-                dump.dump_benchmark(bench)
         _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)

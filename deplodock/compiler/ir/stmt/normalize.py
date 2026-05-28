@@ -811,9 +811,19 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             for old in stmt.names:
                 if old in ssa_rename:
                     continue
-                new = _rename(old, "in")
-                if old != new:
-                    expr_sub[old] = Var(new)
+                # Only record the SSA rename in ``ssa_rename`` — NOT in
+                # ``expr_sub`` (sigma). The Load/Write rewriters apply
+                # ``_rename_ssa_vars_in_expr(sigma.apply(e), rename)`` to index
+                # exprs: ``sigma`` is the axis-substitution channel, ``rename``
+                # the SSA channel. Putting an SSA rename in *both* renames an
+                # indirect (gather) index Var twice. Sequential renumbering can
+                # form a chain — e.g. cell-3's index ``in2_3 → in5`` while a
+                # pre-existing ``in5`` (a layernorm-weight Load) → ``in26`` —
+                # and the double application collapses it (``in2_3 → in5 →
+                # in26``), wiring the gather to the wrong row. ``acc`` / ``v``
+                # names are likewise kept out of ``expr_sub`` (they reach exprs
+                # only via ``rename``), so this keeps Load names consistent.
+                _rename(old, "in")
         elif isinstance(stmt, Accum) and stmt.name not in ssa_rename:
             _rename(stmt.name, "acc")
         elif isinstance(stmt, (Assign, Select)) and stmt.name not in ssa_rename:
