@@ -181,54 +181,79 @@ def test_006a_sibling_register_tile_towers_share_keep():
     assert init_names == write_values == accum_names, (init_names, write_values, accum_names)
 
 
-def test_planner_emits_register_blocked_structure(monkeypatch):
-    """With ``DEPLODOCK_REG_BLOCK=1`` pinned, the planner's blocked-GEMM
-    path fires on a plain matmul: the post-partition TileOp body has two
-    sibling RegisterTile(N_r) wrappers (K-tower-inner + Write — Init is
-    implicit at this stage; 020_place_inits adds the explicit Inits at
-    the ThreadTile scope only after 010 has unwrapped RegisterTiles).
-    The K-tower's K_i body has the M-axis Load BEFORE the inner
-    RegisterTile(N_r) wrapper — the N-invariant cone, shared across F_N
-    cells.
+def test_planner_emits_register_blocked_structure():
+    """The blocked-GEMM materialization path produces sibling
+    RegisterTile(N_r) wrappers around the Write and inside the K-tower's
+    K_i body for a plain matmul. The K_i body has the M-axis Load BEFORE
+    the inner RegisterTile(N_r) wrapper (the N-invariant cone, shared
+    across F_N cells); the Write sits in its own RegisterTile(N_r).
+
+    Bypasses greedy variant selection (other knobs may dominate the
+    lazy-score yardstick depending on shape) by calling ``_materialize``
+    directly with a hand-picked ``TileParams(reg_block=True)`` from the
+    planner's enumeration. The planner's blocked emit is what we want
+    to lock down here — Fork-tree priority is the M3 concern.
     """
-    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+    import importlib  # noqa: PLC0415
+
+    from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.ir.tile.ir import SerialTile  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_REG_BLOCK", "1")
+    planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
 
-    g = Graph()
-    _input(g, "a", (64, 32))
-    _input(g, "b", (32, 128))
-    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (64, 128)), node_id="o")
-    g.inputs = ["a", "b"]
-    g.outputs = ["o"]
+    m_ax, n_ax, k_ax = Axis("m", 64), Axis("n", 128), Axis("k", 32)
+    loop_op = LoopOp(
+        body=(
+            Loop(
+                axis=m_ax,
+                body=(
+                    Loop(
+                        axis=n_ax,
+                        body=(
+                            Loop(
+                                axis=k_ax,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("m"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("n"))),
+                                    Accum(name="acc", value="b", op=ElementwiseImpl("add")),
+                                ),
+                            ),
+                            Write(output="o", index=(Var("m"), Var("n")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
 
-    out = Pipeline.build(TILE_PASSES).run(g)
-    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    plan = planner._plan_kernel(loop_op, Context(compute_capability="sm_80"), kernel_name="k_blk")
+    assert plan is not None
+    blocked_params = [p for p in plan.params if p.reg_block and p.fn > 1]
+    assert blocked_params, "no reg_block=True variants enumerated for matmul"
+    chosen = blocked_params[0]
+    tile_op = planner._materialize(plan, chosen)
+
+    assert tile_op.knobs.get("REG_BLOCK") is True
+
     thread = next(iter(tile_op.body.iter_of_type(ThreadTile)))
-
-    # Descend through any outer M_r RegisterTile (FM > 1 is allowed by the
-    # planner; M_r wraps the N_r sibling towers in the blocked-GEMM nest).
     layer_body: tuple = tuple(thread.body)
+    # Descend through any outer M_r RegisterTile (FM > 1 with M_r wrapping
+    # the N_r sibling towers).
     if len(layer_body) == 1 and isinstance(layer_body[0], RegisterTile):
         layer_body = tuple(layer_body[0].body)
 
-    # Top-level: exactly one RegisterTile(N_r) — the Write tower (no explicit
-    # Init in the source LoopOp body, so no Init tower at this stage).
+    # Init isn't in the source LoopOp body (Accum's identity is implicit) so
+    # the planner doesn't emit a separate Init tower; only the Write tower
+    # appears at this stage. 020_place_inits adds explicit Inits at the
+    # ThreadTile scope later, after 010_split_register_axes unwraps the
+    # per-cell RegisterTile in the K_i body.
     top_register_tiles = [s for s in layer_body if isinstance(s, RegisterTile)]
-    assert len(top_register_tiles) == 1, (
-        f"expected 1 top-level RegisterTile (Write tower), got {len(top_register_tiles)}: {[type(s).__name__ for s in layer_body]}"
-    )
+    assert len(top_register_tiles) == 1, [type(s).__name__ for s in layer_body]
     write_tower = top_register_tiles[0]
-    writes_in_tower = [s for s in write_tower.body if isinstance(s, Write)]
-    assert writes_in_tower, f"Write tower has no Write inside: {write_tower.body}"
+    assert any(isinstance(s, Write) for s in write_tower.body)
 
-    # K-tower (SerialTile, possibly nested K_o > K_i) sibling of the Write
-    # tower; its K_i body has the N-dep tail in its own inner RegisterTile.
+    # K-tower sibling has its N-dep tail wrapped in its own RegisterTile(N_r).
     k_towers = [s for s in layer_body if isinstance(s, SerialTile)]
-    assert k_towers, "expected K-tower (SerialTile) in the planner output"
-    nested_register_tiles = [s for s in k_towers[0].body.iter() if isinstance(s, RegisterTile)]
-    assert nested_register_tiles, "K-tower body should contain a RegisterTile (N-dep tail) for reg_block"
-
-    # REG_BLOCK is stamped on the materialized TileOp.
-    assert tile_op.knobs.get("REG_BLOCK") is True, f"REG_BLOCK should be True in knobs: {tile_op.knobs}"
+    assert k_towers, "expected K-tower SerialTile sibling of the Write tower"
+    nested = [s for s in k_towers[0].body.iter() if isinstance(s, RegisterTile)]
+    assert nested, "K-tower body should hold a RegisterTile(N_r) for the N-dep tail"

@@ -1406,14 +1406,15 @@ def _enumerate_cartesian_impl(
                                 # where the planner's ``_build_register_blocked_body`` will
                                 # actually fire (FN > 1 so blocking has real cells to share,
                                 # SPLITK = 1, BR = 1, M not overhang — v1 constraints). False
-                                # is always available. Env pin clamps the choice set, but
-                                # ``pin=True`` produces no variants on a non-qualifying shape —
-                                # the planner-level peer-kernel fallback drops the pin.
+                                # is always available. Env pin clamps the choice set; ``pin=True``
+                                # on a non-qualifying shape soft-falls-back to False (rather than
+                                # emitting nothing and triggering the peer-kernel pin drop, which
+                                # would also kill OTHER pins the user set alongside REG_BLOCK).
                                 shape_supports_reg_block = reg_block_eligible and fn > 1 and splitk == 1 and br == 1 and not m_overhang
                                 if reg_block_pin is None:
                                     reg_block_choices = (False, True) if shape_supports_reg_block else (False,)
                                 elif reg_block_pin:
-                                    reg_block_choices = (True,) if shape_supports_reg_block else ()
+                                    reg_block_choices = (True,) if shape_supports_reg_block else (False,)
                                 else:
                                     reg_block_choices = (False,)
                                 for rb in reg_block_choices:
