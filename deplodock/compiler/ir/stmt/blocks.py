@@ -121,16 +121,20 @@ class Loop(Stmt):
 def _body_uses_lane_warp(body: Body) -> bool:
     """True iff the body needs the ``lane`` / ``warp`` helper vars.
 
-    The materializer emits ``lane`` / ``warp`` use sites alongside
-    ``WarpShuffle`` and ``TreeHalve`` (the per-warp partial gate
-    ``if (lane == 0)``, ``TreeHalve(..., tid_var="warp")``), so checking
-    for those two primitives covers every kernel that references
-    either helper.
+    The materializer emits ``lane`` / ``warp`` use sites alongside:
+    - ``WarpShuffle`` and ``TreeHalve`` (the per-warp partial gate
+      ``if (lane == 0)``, ``TreeHalve(..., tid_var="warp")``).
+    - ``SetMaxNReg`` (only emitted by the warp-specialized materializer
+      path, which wraps in ``Cond(warp < P, ...)`` — the Cond predicate
+      references ``Var("warp")`` directly so the helper must be in scope).
+
+    Checking for these three primitives covers every kernel that
+    references either helper.
     """
     # Local import — kernel-IR primitives sit in a downstream module.
-    from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
+    from deplodock.compiler.ir.kernel.ir import SetMaxNReg, TreeHalve, WarpShuffle
 
-    return bool(body.iter_of_type(WarpShuffle, TreeHalve))
+    return bool(body.iter_of_type(WarpShuffle, TreeHalve, SetMaxNReg))
 
 
 def _extent_c(ax: Axis, ctx: RenderCtx) -> str:
