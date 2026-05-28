@@ -270,7 +270,7 @@ over one op's forks — with max-Q normalized UCB1:
 - **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
   UCB1 calls see the new max-Q.
 - **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
-  default 100), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
+  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on

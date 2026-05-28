@@ -39,7 +39,7 @@ def register_tune_command(subparsers):
         default=None,
         help=(
             "Stop after this many consecutive measured variants haven't beaten the current best latency. "
-            "Falls back to ``DEPLODOCK_TUNE_PATIENCE`` env var, then to 100."
+            "Falls back to ``DEPLODOCK_TUNE_PATIENCE`` env var, then to 50."
         ),
     )
     parser.add_argument(
@@ -179,7 +179,7 @@ def handle_tune(args):
         enabled=getattr(args, "verbose", 0) == 0 and not getattr(args, "quiet", False) and sys.stderr.isatty(),
     )
 
-    patience = args.patience if args.patience is not None else config.tune_patience(100)
+    patience = args.patience if args.patience is not None else config.tune_patience(50)
     ctx = Context.probe()
     t0 = time.monotonic()
     try:
