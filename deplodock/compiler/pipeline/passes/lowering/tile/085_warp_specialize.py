@@ -129,11 +129,7 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
     for stmt in op.body.iter():
         if isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
             for inner in stmt.body:
-                if (
-                    isinstance(inner, StageBundle)
-                    and inner.policy == StagePolicy.TMA
-                    and inner.pipeline_depth == 2
-                ):
+                if isinstance(inner, StageBundle) and inner.policy == StagePolicy.TMA and inner.pipeline_depth == 2:
                     has_tma_depth2 = True
                     break
         if has_tma_depth2:
@@ -166,9 +162,7 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
             return False, "ThreadTile inner axis has symbolic extent"
         inner_product *= ax.extent.as_static()
     if _N_PRODUCER_THREADS % inner_product != 0:
-        return False, (
-            f"producer_threads ({_N_PRODUCER_THREADS}) must be divisible by inner thread-axes product ({inner_product})"
-        )
+        return False, (f"producer_threads ({_N_PRODUCER_THREADS}) must be divisible by inner thread-axes product ({inner_product})")
     return True, ""
 
 
@@ -246,9 +240,7 @@ def _wire_producer_wait(stmts: list[Stmt], empty_mbar: str, bc: int) -> list[Stm
     return out
 
 
-def _wire_consumer_arrive(
-    stmts: list[Stmt], empty_mbar: str, bc: int, first_consumer_tid: int, n_consumer_threads: int
-) -> list[Stmt]:
+def _wire_consumer_arrive(stmts: list[Stmt], empty_mbar: str, bc: int, first_consumer_tid: int, n_consumer_threads: int) -> list[Stmt]:
     """Recursively walk the consumer subtree; inside each
     ``SerialTile(serial_outer)`` body, append a named-barrier ``Sync``
     + a single-thread ``MbarrierArrive`` on the empty-mbar slot.

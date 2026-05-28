@@ -446,9 +446,7 @@ class TreeHalve(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         bar = "" if self.barrier_id == 0 else f", bar={self.barrier_id}/{self.barrier_count}"
-        return [
-            f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var}{bar})"
-        ]
+        return [f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var}{bar})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
