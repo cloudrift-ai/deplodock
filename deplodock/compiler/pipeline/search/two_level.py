@@ -161,7 +161,7 @@ def inner_reward(
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
             inner = TuningSearch(patience=patience, ucb_c=ucb_c)
-            for idx, cand in enumerate(Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db)):
+            for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
                     best_us = (1.0 / inner.tree.best_reward) if inner.tree.best_reward > 0 else None
@@ -170,7 +170,6 @@ def inner_reward(
                         variant_label(cand.graph),
                         median_us=st.median if st is not None else None,
                         status=inner.last_status or "",
-                        idx=idx,
                         best_us=best_us,
                     )
             # The inner MCTS's best reward is ``1 / min whole-slice total``

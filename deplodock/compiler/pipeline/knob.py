@@ -20,10 +20,14 @@ import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from deplodock import config
+
+# The ``deplodock/`` package dir (knob.py → pipeline → compiler → deplodock).
+_PKG_ROOT = Path(__file__).resolve().parents[2]
 
 
 class KnobType(Enum):
@@ -120,11 +124,20 @@ _REGISTRY: dict[str, Knob] | None = None
 
 
 def _walk_modules() -> list[ModuleType]:
-    # Rule modules are loaded via ``importlib.util.spec_from_file_location``
-    # and registered under their bare file stem (e.g. ``005_blockify_launch``),
-    # not the full ``deplodock.compiler.pipeline.passes.…`` path. Walk every
-    # loaded module instead of prefix-filtering.
-    return [m for m in sys.modules.values() if m is not None]
+    # Every ``Knob`` is declared in a rule module under ``deplodock/`` — but rule
+    # modules are loaded via ``importlib.util.spec_from_file_location`` and registered
+    # under their bare file stem (e.g. ``005_blockify_launch``), not the full
+    # ``deplodock.compiler.pipeline.passes.…`` dotted path, so we can't filter on
+    # ``__name__``. Filter on ``__file__`` living under the package instead: this keeps
+    # every Knob-bearing module while skipping the thousands of stdlib / third-party
+    # modules — which both slows the walk and, for e.g. ``torch.distributed``, emits a
+    # spurious ``FutureWarning`` when ``vars(mod)`` materializes its deprecated members.
+    mods: list[ModuleType] = []
+    for m in sys.modules.values():
+        f = getattr(m, "__file__", None) if m is not None else None
+        if f and Path(f).is_relative_to(_PKG_ROOT):
+            mods.append(m)
+    return mods
 
 
 def registry() -> dict[str, Knob]:

@@ -89,9 +89,10 @@ same worker.
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
   `--bench` below, or `run --bench`). Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
   flags are folded into the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
-  On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with the
-  current kernel · variant knobs · perf; `-v` shows the per-`[tune]` INFO lines instead, `-q` is quiet (errors only,
-  no bar — the final summary still prints). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1
+  On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
+  `<kernel> <current us> (best <best us>) <knobs>` tail — the current latency is fixed-width and the knobs sit
+  last, so the prefix stays put as the per-variant latency changes (no flicker); `-v` shows the per-`[tune]` INFO
+  lines instead, `-q` is quiet (errors only, no bar — the final summary still prints). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1
   ranking pass): the full compiled model and each kernel (via its provenance `.torch.json` reproducer, re-lowered so
   the tuned forks are picked) vs eager / `torch.compile` / Deplodock, then prints full-model + per-kernel comparison
   tables (`--warmup`/`--iters`/`--seed`/`--bench-backends` mirror `run`). When a dump dir is set

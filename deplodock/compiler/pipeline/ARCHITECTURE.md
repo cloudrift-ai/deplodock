@@ -247,11 +247,12 @@ It prints a per-op-best table (with `tuned` / `cached` state), the `Σ` estimate
 the separability gap. The DB accumulates rows across runs; re-running resumes from the cached state.
 
 On default verbosity (and a tty) a `commands/tune_progress.TuneProgress` draws a live single-line bar — completed/total
-tuned op leaves plus the current kernel · variant knobs (`pipeline.variant_label`) · this variant's perf · running best.
-It is threaded as an optional `progress=` through `run_two_level_tune` → `inner_reward` (duck-typed, so the search
-package keeps no dependency on `commands/`): one op leaf ticked per kernel, the tail updated per benched variant (read
-off `TuningSearch.last_stats`). `-v` disables the bar (the per-`[tune]` INFO lines show progress instead); `-q` is quiet
-(errors only). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1 ranking pass) after tuning —
+tuned op leaves plus a `<kernel> <current us> (best <best us>) <knobs>` tail. The current latency is fixed-width and the
+variable-length `pipeline.variant_label` knob string sits last, so the prefix up to the knobs stays put as the
+per-variant latency changes (only a new best, which is rare, shifts the trailing part — no flicker). It is threaded as an optional `progress=` through `run_two_level_tune` → `inner_reward`
+(duck-typed, so the search package keeps no dependency on `commands/`): one op leaf ticked per kernel, the tail updated
+per benched variant (read off `TuningSearch.last_stats`). `-v` disables the bar (the per-`[tune]` INFO lines show
+progress instead); `-q` is quiet (errors only). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1 ranking pass) after tuning —
 the assembled full model and each kernel's `.torch.json` provenance reproducer (re-lowered greedily so the tuned forks
 are picked) vs eager / `torch.compile` / Deplodock — via the shared `commands/run.bench_lowered_vs_torch`, printing
 full-model + per-kernel tables and (when a dump dir is set) an HTML chart at `<dump-dir>/kernels.html`.

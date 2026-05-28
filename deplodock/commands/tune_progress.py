@@ -3,7 +3,10 @@
 The two-level tune evaluates a small number of outer fusion terminals (one today); each terminal's tuned op leaves
 are its post-fusion kernels (``LoopOp``s), tuned independently by the inner search. We measure progress as
 **completed vs total op leaves** across the registered terminals: the op counter advances once per kernel, while
-the live tail (current kernel · variant knobs · this variant's perf · running best) updates per benched variant.
+the live tail (current kernel · this variant's perf · running best · variant knobs) updates per benched variant.
+The current latency is fixed-width and the variable-length knob string sits last, so the prefix up to the knobs
+stays put as the per-variant latency changes (only a new best, which is rare, shifts the trailing part) — the
+bar / counter / kernel / current timing stay steady instead of flickering.
 
 When ``enabled`` is False every method is a no-op, so ``handle_tune`` can construct one unconditionally and let it
 decide whether to draw (disabled under ``-v`` / ``-q`` / a non-tty stream). Drawing uses ``\\r\\033[K`` to clear and
@@ -37,15 +40,19 @@ class TuneProgress:
             return
         self._redraw(tail=f"{name}  …")
 
-    def variant(self, kernel: str, knobs_label: str, *, median_us: float | None, status: str, idx: int, best_us: float | None) -> None:
-        """Update the live tail for the variant just benched within ``kernel``."""
+    def variant(self, kernel: str, knobs_label: str, *, median_us: float | None, status: str, best_us: float | None) -> None:
+        """Update the live tail for the variant just benched within ``kernel``.
+
+        Layout ``<kernel> <current> (best <best>) <knobs>``: the *current* latency is
+        fixed-width (it changes every variant, so a fixed field keeps everything after
+        it from shifting), and the variable-length knob string sits last where its churn
+        can't move the bar / counter / kernel / current timing. Only a new best (rare)
+        nudges the trailing part."""
         if not self.enabled:
             return
-        perf = f"{median_us:.1f}us" if median_us is not None and status == "ok" else (status or "—")
-        tail = f"{kernel} #{idx + 1}  {knobs_label}  {perf}"
-        if best_us is not None and best_us != float("inf"):
-            tail += f" (best {best_us:.1f}us)"
-        self._redraw(tail=tail)
+        cur = f"{median_us:8.1f}us" if (median_us is not None and status == "ok") else f"{status or '—':>10}"
+        best = f"{best_us:.1f}us" if (best_us is not None and best_us != float("inf")) else "—"
+        self._redraw(tail=f"{kernel} {cur} (best {best})  {knobs_label}")
 
     def op_done(self, name: str) -> None:
         if not self.enabled:
