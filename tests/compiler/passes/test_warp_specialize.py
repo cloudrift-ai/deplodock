@@ -1,0 +1,153 @@
+"""Tests for ``085_warp_specialize`` — the WS Fork-emitting tile-IR pass.
+
+The pass matches ``TileOp`` and emits a 2-child ``Fork`` (``WS=0`` /
+``WS=1``) when the body contains a TMA ``StageBundle`` with
+``pipeline_depth == 2`` inside a ``SerialTile(serial_outer)``. Otherwise
+``RuleSkipped``.
+"""
+
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+from deplodock.compiler.context import Context
+from deplodock.compiler.graph import Graph
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.stmt import Body, Load, Write
+from deplodock.compiler.ir.tile.ir import (
+    CacheDim,
+    SerialTile,
+    Source,
+    Stage,
+    StageBundle,
+    StagePolicy,
+    SwizzleMode,
+    ThreadTile,
+    TileOp,
+)
+from deplodock.compiler.pipeline import RuleSkipped
+from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.tensor import Tensor
+
+_ws = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.085_warp_specialize")
+
+
+def _ctx() -> Context:
+    return Context(compute_capability="sm_90")
+
+
+def _tile_op_pointwise() -> TileOp:
+    """Trivial pointwise TileOp with no StageBundle — should be RuleSkipped."""
+    ax = Axis("t", 4)
+    body = Body(
+        (
+            ThreadTile(
+                axes=(ax,),
+                body=Body(
+                    (
+                        Load(name="v", input="x", index=(Var("t"),)),
+                        Write(output="o", index=(Var("t"),), value="v"),
+                    )
+                ),
+            ),
+        )
+    )
+    return TileOp(body=body, name="k_pointwise")
+
+
+def _tile_op_tma_pipelined() -> TileOp:
+    """Synthetic TileOp shaped like post-080: SerialTile(serial_outer)
+    containing a TMA StageBundle with pipeline_depth=2."""
+    k_outer = Axis("k_outer", 8)
+    src = Source(
+        name="a_smem",
+        buf="a",
+        cache_dims=(
+            CacheDim(axis=Axis("a_c0", 16), source_dim=0),
+            CacheDim(axis=Axis("a_c1", 16), source_dim=1),
+        ),
+        origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
+    )
+    tma_bundle = StageBundle(
+        stages=(Stage(sources=(src,)),),
+        body=Body(()),
+        policy=StagePolicy.TMA,
+        buffer_count=2,
+        phase=Var("k_outer") % Literal(2, "int"),
+        pipeline_depth=2,
+        swizzle=SwizzleMode.NONE,
+    )
+    outer_loop = SerialTile(
+        axis=k_outer,
+        body=Body((tma_bundle,)),
+        kind="serial_outer",
+    )
+    # 2D ThreadTile so the inner axis (n_i, extent 16) divides
+    # n_producer_threads=32 cleanly (extension=2 rows). Single-axis
+    # extent 128 would not satisfy 32 % inner_extent == 0.
+    body = Body(
+        (
+            ThreadTile(
+                axes=(Axis("m_i", 16), Axis("n_i", 16)),
+                body=Body((outer_loop,)),
+            ),
+        )
+    )
+    return TileOp(body=body, name="k_tma_pipelined")
+
+
+def _run_rule(op: TileOp):
+    g = Graph()
+    g.add_node(op=op, inputs=[], output=Tensor(op.name, ()), node_id="op")
+    node = g.nodes["op"]
+    return _ws.rewrite(_ctx(), node)
+
+
+def test_rule_skipped_on_pointwise():
+    op = _tile_op_pointwise()
+    with pytest.raises(RuleSkipped, match="no TMA"):
+        _run_rule(op)
+
+
+def test_rule_skipped_when_ws_already_set():
+    op = _tile_op_tma_pipelined()
+    op_with_ws = TileOp(body=op.body, name=op.name, knobs={"WS": 1})
+    with pytest.raises(RuleSkipped, match="WS knob already set"):
+        _run_rule(op_with_ws)
+
+
+def test_emits_two_child_fork_on_tma_pipelined():
+    op = _tile_op_tma_pipelined()
+    result = _run_rule(op)
+    assert isinstance(result, list), f"expected list[Fork], got {type(result).__name__}"
+    assert len(result) == 2, f"expected 2 forks, got {len(result)}"
+    knob_values = sorted(f.knobs["WS"] for f in result)
+    assert knob_values == [0, 1]
+    for fork in result:
+        assert isinstance(fork, Fork)
+        assert fork.is_leaf
+        # Each leaf expand returns one TileOp with WS knob stamped
+        children = fork.expand()
+        assert len(children) == 1
+        assert isinstance(children[0], TileOp)
+        assert children[0].knobs["WS"] == fork.knobs["WS"]
+
+
+def test_env_pin_narrows_to_single_choice(monkeypatch):
+    monkeypatch.setenv("DEPLODOCK_WS", "1")
+    op = _tile_op_tma_pipelined()
+    result = _run_rule(op)
+    # Single-choice short-circuit: return a bare TileOp, not a Fork list.
+    assert isinstance(result, TileOp)
+    assert result.knobs["WS"] == 1
+
+
+def test_env_pin_zero_returns_bare_tileop(monkeypatch):
+    monkeypatch.setenv("DEPLODOCK_WS", "0")
+    op = _tile_op_tma_pipelined()
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs["WS"] == 0

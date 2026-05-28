@@ -81,14 +81,12 @@ _TMA_ALIGN_BYTES = 128
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
-
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile)):
             new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
         else:
             new_body.append(s)
-
     return KernelOp(body=new_body, name=root.op.name)
 
 
@@ -108,7 +106,6 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
     if isinstance(top, GridTile):
-        # Locate the (sole) ThreadTile child.
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, ThreadTile):
@@ -229,13 +226,18 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # (BM=16, BN=16 + stage) where the inner-loop schedule makes
         # the reorder profitable; on larger tiles the schedule is
         # dense enough that no useful hoist is possible.
+        # AsyncWait.barrier_id / barrier_count let the caller (085 for WS
+        # kernels) route the trailing CTA fence to a named barrier
+        # (``bar.sync N, count``) instead of ``__syncthreads()``. Default
+        # 0 keeps every legacy emission on ``__syncthreads()``.
+        trailing_sync = Sync(barrier_id=stmt.barrier_id, count=stmt.barrier_count)
         if stmt.phase is not None and tma.has_tma:
             gid = tma.wait_group.get(id(stmt))
             if gid is not None:
-                return [MbarrierWait(mbar=tma.mbar_name(gid), phase=stmt.phase, slot=stmt.slot), Sync()]
+                return [MbarrierWait(mbar=tma.mbar_name(gid), phase=stmt.phase, slot=stmt.slot), trailing_sync]
         # cp.async fallback (or pre-pipelining synchronous-style wait,
         # or AsyncWait whose pipeline group couldn't be inferred).
-        return [CpAsyncWait(group=stmt.keep), Sync()]
+        return [CpAsyncWait(group=stmt.keep), trailing_sync]
 
     def emit_tma_stage(bundle: StageBundle, stage: Stage) -> list[Stmt]:
         # 050_use_tma only promotes single-Source bundles, so the box-copy
@@ -245,7 +247,10 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         addressing = src.addressing
         assert isinstance(addressing, AffineAddressing), f"TMA stage source {src.name!r} must use AffineAddressing"
         desc_name = f"{src.name}_desc"
-        gid = tma.stage_group[id(bundle)]
+        # Key by smem name (Source.name) — id(bundle) isn't stable across
+        # Body.map's wrapper-rebuild on descent, but Source.name is set
+        # by 020_stage_inputs and survives every downstream rewrite.
+        gid = tma.stage_group[src.name]
         mbar_name = tma.mbar_name(gid)
         # Box extents per source dim: product of cache extents that map
         # to that dim (multiple cache axes can sweep the same source dim
@@ -284,7 +289,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
                 src_buf=src.buf,
                 src_shape=(),
                 box_extents=box,
-                swizzle=stage.swizzle.value,
+                swizzle=bundle.swizzle.value,
                 dtype=smem_cuda_dtype(src),
             )
         if mbar_name not in declared_mbar:
@@ -306,22 +311,25 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         for ax in src.cache_axes:
             slab_bytes *= ax.extent.as_static()
         # Smem allocation: leading phase dim + cache extents (with pad).
-        full_extents = (stage.buffer_count, *src.alloc_extents)
-        smem_index = (stage.phase, *([Literal(0, "int")] * len(src.cache_axes)))
+        # buffer_count / phase live on the StageBundle now (collapsed Stage
+        # hierarchy — Stage.{buffer_count,phase,swizzle} are no longer
+        # carried per-Stage; pull them from the enclosing bundle).
+        full_extents = (bundle.buffer_count, *src.alloc_extents)
+        smem_index = (bundle.phase, *([Literal(0, "int")] * len(src.cache_axes)))
         # Distribute issuer threads across stages within a group so each
         # stage's arrive+TMA pair issues from a different thread (stage
         # 0 → tid 0, stage 1 → tid 1, ...) rather than serializing on tid 0.
         cond = Cond(
             cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(tma.issuer_tid[src.name], "int")),
             body=(
-                MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=stage.phase),
+                MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=bundle.phase),
                 TmaLoad(
                     smem=src.name,
                     smem_index=smem_index,
                     desc=desc_name,
                     coords=coords,
                     mbar=mbar_name,
-                    mbar_slot=stage.phase,
+                    mbar_slot=bundle.phase,
                 ),
             ),
         )
@@ -384,6 +392,20 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
             return out_local
         if isinstance(stmt, AsyncWait):
             return list(emit_async_wait(stmt))
+        if isinstance(stmt, Cond):
+            # 085_warp_specialize wraps producer + consumer subtrees in
+            # a top-level ``Cond(warp_role_check, prod, cons)`` — both
+            # branches may contain StageBundles / AsyncWaits / SerialTiles
+            # that need recursive processing.
+            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+            body_out: list[Stmt] = []
+            for inner in stmt.body:
+                body_out.extend(_process_stmt(inner))
+            else_out: list[Stmt] = []
+            for inner in stmt.else_body:
+                else_out.extend(_process_stmt(inner))
+            return [Cond(cond=stmt.cond, body=Body(tuple(body_out)), else_body=Body(tuple(else_out)))]
         if isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
             single = _emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, emit_async_wait)
             extra: list[Stmt] = []

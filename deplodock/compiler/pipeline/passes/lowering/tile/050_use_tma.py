@@ -1,9 +1,17 @@
-"""Promote ASYNC StageBundle to TMA on sm_90+.
+"""Promote BUFFERED / ASYNC StageBundle to TMA on sm_90+.
 
-For each ``StageBundle`` with ``policy == ASYNC`` inside a
+For each ``StageBundle`` with ``policy in {BUFFERED, ASYNC}`` (i.e.
+ring-buffered cooperative-load OR cp.async) inside a
 ``SerialTile(serial_outer)``, switch ``policy`` to ``TMA`` (keeping
 ``buffer_count`` / ``phase`` / ``pipeline_depth``; ``swizzle`` stays
-NONE) when every member ``Stage`` is TMA-eligible:
+NONE) when every member ``Stage`` is TMA-eligible. Running on
+BUFFERED directly (the post-``040_use_ring_buffers`` state) means the
+rule fires before ``060_use_async_copy`` would promote to ASYNC —
+otherwise the file ordering (050 < 060) leaves 050 staring at SYNC /
+BUFFERED bundles with nothing to promote, since the cursor only
+restarts the rule scan on Graph splices not Op rebinds.
+
+Eligibility (per member ``Stage``):
 
 - ``ctx.compute_capability >= (9, 0)`` (Hopper+).
 - Exactly one ``Source`` on each member Stage. Multi-source bundles
@@ -48,6 +56,11 @@ _MIN_CAPABILITY = (9, 0)
 _MAX_RANK = 5
 _TMA_ALIGN_BYTES = 16
 
+# Policies this rule will promote to TMA. SYNC bundles (no ring buffer)
+# are excluded — the materializer's TMA emit path assumes a buffer-count
+# >= 1 phase dim on the smem slab; promoting SYNC would break that.
+_PROMOTABLE = frozenset({StagePolicy.BUFFERED, StagePolicy.ASYNC})
+
 
 def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     if ctx.compute_capability < _MIN_CAPABILITY:
@@ -62,21 +75,26 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
 
     body = root.op.body
-    # All-or-nothing per tile (see module docstring).
+    # All-or-nothing per tile (see module docstring): if any
+    # promotable-policy bundle is not TMA-eligible, leave the whole
+    # tile on cp.async — 060_use_async_copy promotes the BUFFERED
+    # leftovers to ASYNC. Mixed TMA + cp.async inside one pipelined
+    # K-loop deadlocks the mbarrier scheme, so we'd rather skip TMA
+    # for the whole tile than partially promote.
     for s in body.iter():
         if not isinstance(s, StageBundle):
             continue
         if s.policy == StagePolicy.TMA:
             continue
-        if s.policy == StagePolicy.ASYNC and not _bundle_eligible(s, src_shapes):
+        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes):
             raise RuleSkipped(
-                f"ASYNC bundle on {list(s.local_decls())!r} not TMA-eligible; "
+                f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
 
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
+        raise RuleSkipped("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
@@ -110,7 +128,7 @@ def _promote_in_kouter(body: Body) -> tuple[Body, bool]:
     out: list[Stmt] = []
     changed = False
     for s in body:
-        if isinstance(s, StageBundle) and s.policy == StagePolicy.ASYNC:
+        if isinstance(s, StageBundle) and s.policy in _PROMOTABLE:
             out.append(_promote(s))
             changed = True
         else:

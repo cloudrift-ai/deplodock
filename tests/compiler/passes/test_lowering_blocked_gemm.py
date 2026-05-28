@@ -230,14 +230,15 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     # Kernel-size check: legacy path duplicates the prologue chain inside
     # each register cell's scope. With FN=32 and a ~5-stmt v_k chain
     # (Load x, mul by inv_rms, Load norm_weight, mul, ...), the legacy
-    # path lands at ~330 lines; the blocked path at ~210. Assert under
-    # 270 lines so a regression that re-introduces the duplication
-    # surfaces here (a comfortable margin keeps the test stable against
-    # whitespace / comment changes in the renderer).
+    # path's body lands at ~330 lines; the blocked path's body at ~210.
+    # The renderer prepends the TMA prelude (~75 lines of mbarrier /
+    # cp_async_bulk_tensor helpers) when TMA descriptors are present, so
+    # the blocked+TMA total is ~286 and the legacy+TMA regression would
+    # land ~406. Threshold at 360 catches the regression with margin.
     cu_lines = cuda_src.count("\n")
-    assert cu_lines < 270, (
-        f"rendered kernel is {cu_lines} lines — the blocked-prologue path should produce ~210; "
-        f"a regression to the legacy per-cell path inflates it to ~330+ via duplicated v_k chains."
+    assert cu_lines < 360, (
+        f"rendered kernel is {cu_lines} lines — the blocked-prologue path should produce ~286 with TMA prelude; "
+        f"a regression to the legacy per-cell path inflates it to ~400+ via duplicated v_k chains."
     )
 
     out = backend.run(compiled, input_data=inputs)[0].outputs["o"]

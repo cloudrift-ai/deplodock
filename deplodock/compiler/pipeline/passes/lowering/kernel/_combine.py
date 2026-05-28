@@ -54,7 +54,17 @@ def single_thread_var(thread_axes: tuple[Axis, ...]) -> str:
     return thread_axes[0].name
 
 
-def emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, *, warp_size: int) -> list[Stmt]:
+def emit_combine(
+    name: str,
+    op,
+    t: str,
+    n_threads: int,
+    dtype: DataType = F32,
+    *,
+    warp_size: int,
+    barrier_id: int = 0,
+    barrier_count: int | None = None,
+) -> list[Stmt]:
     """Emit the cross-thread combine producing ``<name>_b``.
 
     Three paths, picked by ``n_threads``:
@@ -86,6 +96,14 @@ def emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, *
     ``int warp = threadIdx.x >> 5;`` for any cooperative Tile with
     ``n_threads > WARP_SIZE`` so the hierarchical path's ``Var("lane")``
     / ``Var("warp")`` references resolve.
+
+    ``barrier_id`` / ``barrier_count`` route the emitted Syncs +
+    TreeHalve's per-iter sync to a named barrier when non-zero. Used by
+    the warp-specialized materializer path — the cooperative reduce
+    lives inside the consumer branch and must sync only the consumer
+    threads, not the whole CTA. The warp-shuffle path uses
+    ``__shfl_xor_sync`` with the lane mask, which is intra-warp and
+    needs no CTA-wide sync, so it's unaffected.
     """
     from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
 
@@ -103,8 +121,10 @@ def emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, *
             Cond(
                 cond=BinaryExpr("==", Var("lane"), Literal(0, "int")), body=(Write(output=smem_name, index=(Var("warp"),), value=warp_w),)
             ),
-            Sync(),
-            TreeHalve(buf=smem_name, op=op, length=n_warps, tid_var="warp", dtype=dtype),
+            Sync(barrier_id=barrier_id, count=barrier_count),
+            TreeHalve(
+                buf=smem_name, op=op, length=n_warps, tid_var="warp", dtype=dtype, barrier_id=barrier_id, barrier_count=barrier_count
+            ),
             # TreeHalve's render ends each loop iter with __syncthreads(), so a
             # trailing Sync here would be a no-op pair with the loop's last sync.
             Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
@@ -113,8 +133,8 @@ def emit_combine(name: str, op, t: str, n_threads: int, dtype: DataType = F32, *
     return [
         Smem(name=smem_name, extents=(n_threads,), dtype=smem_c_name),
         Write(output=smem_name, index=(Var(t),), value=name),
-        Sync(),
-        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t, dtype=dtype),
+        Sync(barrier_id=barrier_id, count=barrier_count),
+        TreeHalve(buf=smem_name, op=op, length=n_threads, tid_var=t, dtype=dtype, barrier_id=barrier_id, barrier_count=barrier_count),
         # See note above on TreeHalve's trailing sync.
         Load(name=broadcast_name, input=smem_name, index=(Literal(0, "int"),)),
     ]
