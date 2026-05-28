@@ -42,6 +42,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     CpAsyncWait,
     KernelOp,
+    MbarrierArrive,
     MbarrierArriveExpectTx,
     MbarrierInit,
     MbarrierWait,
@@ -536,10 +537,9 @@ def _materialize_ws(blk: ThreadTile, *, warp_size: int, escape=None, producer_wa
     producer_main, consumer_main, mbar_groups = _split_roles(main)
 
     # 4. Add empty-mbarrier wiring: extra mbarrier per TMA group, init +
-    # pre-arrive in prologue, wait in producer K_o iters, arrive in
-    # consumer K_o iters.
+    # per-iter wait in producer / arrive in consumer.
     prologue_ws, producer_main_ws, consumer_main_ws = _wire_empty_mbarriers(
-        prologue, producer_main, consumer_main, mbar_groups
+        prologue, producer_main, consumer_main, mbar_groups, n_producer_threads
     )
 
     # 5. Rename consumer-side Syncs to named-barrier.
@@ -646,25 +646,121 @@ def _wire_empty_mbarriers(
     producer: list[Stmt],
     consumer: list[Stmt],
     mbar_groups: dict[str, int],
+    n_producer_threads: int,
 ) -> tuple[list[Stmt], list[Stmt], list[Stmt]]:
-    """Allocate ``<mbar_name>_empty[bc]`` per TMA group, init in prologue
-    with pre-arrives so producer's first ``bc`` issues don't block, then
-    insert producer-side ``MbarrierWait`` before each issue and
-    consumer-side ``MbarrierArrive`` after each reduce.
+    """Allocate ``<mbar_name>_empty[bc]`` per TMA group, init in prologue,
+    insert ``MbarrierWait`` in producer K_o body before each issue,
+    insert ``MbarrierArrive`` in consumer K_o body after each reduce.
 
-    bc is recovered from the existing ``Smem(name=mbar_name, extents=(bc,))``
-    in the prologue.
+    Producer wait is gated by ``Cond(K_o >= bc-1, ...)`` so the first
+    ``bc-1`` iters of the producer skip the wait — they fill slots
+    that weren't touched by the prologue's ``σ_first`` (which uses slot
+    0). No pre-arrives needed; the conditional skip is cleaner than
+    a pre-arrival scheme that needs different formulas per slot.
 
-    NOT YET FULLY IMPLEMENTED — this is a stub that returns inputs
-    unchanged. The empty-mbarrier wiring is Phase D Stage 4. For the
-    initial commit the WS path runs WITHOUT empty mbarriers, which is
-    correct only when K_o iters <= buffer_count (no slot wraparound).
-    Surfaces as silent corruption on larger K — gate the 085 pass to
-    those cases until Stage 4 lands."""
-    # TODO Stage 4: allocate tma_mbar_empty_<gid>, init, pre-arrive,
-    # insert MbarrierWait in producer K_o body, MbarrierArrive in
-    # consumer K_o body.
-    return prologue, producer, consumer
+    Consumer arrive is gated by ``Cond(threadIdx.x == n_producer_threads, ...)``
+    — a single consumer thread arrives so arrive_count stays 1.
+
+    Phase formula for producer wait (for K_o >= bc-1):
+        slot  = (K_o + 1) % bc
+        phase = ((K_o + 1) / bc - 1) % 2
+
+    Currently single-group only — multi-group TMA kernels skip the
+    empty-mbarrier wiring (raises a warning). Most matmul/SDPA kernels
+    are single-group post-080."""
+    bc_per_mbar: dict[str, int] = {}
+    for s in prologue:
+        if isinstance(s, Smem) and s.dtype == "unsigned long long":
+            bc_per_mbar[s.name] = int(s.extents[0])
+
+    # Filter to mbars that actually appear in mbar_groups (collected
+    # during _split_roles). This drops any prologue Smem leftovers from
+    # non-TMA paths.
+    relevant = {n: bc for n, bc in bc_per_mbar.items() if n in mbar_groups}
+    if not relevant:
+        return prologue, producer, consumer
+
+    # Single-group simplification for v1.
+    if len(relevant) > 1:
+        # Multi-group kernels (e.g., SDPA's multi-K-loop shape) need
+        # per-group wait/arrive insertion keyed by which K_o loop owns
+        # which mbar. Defer; today's matmul is single-group.
+        return prologue, producer, consumer
+
+    full_mbar = next(iter(relevant))
+    bc = relevant[full_mbar]
+    empty_mbar = f"{full_mbar}_empty"
+
+    # 1. Augment prologue: empty Smem + per-slot MbarrierInit.
+    extra_smem = Smem(name=empty_mbar, extents=(bc,), dtype="unsigned long long")
+    extra_inits = tuple(MbarrierInit(mbar=empty_mbar, count=1, slot=Literal(s, "int")) for s in range(bc))
+
+    new_prologue: list[Stmt] = []
+    smem_inserted = False
+    init_inserted = False
+    for s in prologue:
+        # Insert empty Smem right after the full mbar Smem.
+        if not smem_inserted and isinstance(s, Smem) and s.name == full_mbar:
+            new_prologue.append(s)
+            new_prologue.append(extra_smem)
+            smem_inserted = True
+            continue
+        # Splice empty inits into the MbarrierInit Cond.
+        if not init_inserted and isinstance(s, Cond) and all(isinstance(b, MbarrierInit) for b in s.body):
+            new_prologue.append(Cond(cond=s.cond, body=(*s.body, *extra_inits)))
+            init_inserted = True
+            continue
+        new_prologue.append(s)
+
+    # 2. Producer: insert MbarrierWait before each K_o issue.
+    def _augment_producer(stmts: list[Stmt]) -> list[Stmt]:
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, SerialTile) and s.kind == "serial_outer":
+                k_var = s.axis.name
+                k_plus_1 = Var(k_var) + Literal(1, "int")
+                slot_expr = k_plus_1 % Literal(bc, "int")
+                phase_expr = (k_plus_1 / Literal(bc, "int") - Literal(1, "int")) % Literal(2, "int")
+                wait_cond = Cond(
+                    cond=BinaryExpr(">=", Var(k_var), Literal(bc - 1, "int")),
+                    body=(MbarrierWait(mbar=empty_mbar, phase=phase_expr, slot=slot_expr),),
+                )
+                inner = Body((wait_cond, *s.body))
+                out.append(s.with_bodies((inner,)))
+            else:
+                out.append(s)
+        return out
+
+    new_producer = _augment_producer(producer)
+
+    # 3. Consumer: append MbarrierArrive after each K_o reduce.
+    # arrive_count=1 on empty mbar init means exactly one consumer
+    # thread arrives per K_o iter. We pick the first thread of the
+    # consumer range — ``threadIdx.x == n_producer_threads``.
+    consumer_first_tid = Literal(n_producer_threads, "int")
+
+    def _augment_consumer(stmts: list[Stmt]) -> list[Stmt]:
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, SerialTile) and s.kind == "serial_outer":
+                k_var = s.axis.name
+                slot_expr = Var(k_var) % Literal(bc, "int")
+                arrive_cond = Cond(
+                    cond=BinaryExpr("==", Builtin("thread_idx.x"), consumer_first_tid),
+                    body=(MbarrierArrive(mbar=empty_mbar, slot=slot_expr),),
+                )
+                inner = Body((*s.body, arrive_cond))
+                out.append(s.with_bodies((inner,)))
+            else:
+                out.append(s)
+        return out
+
+    new_consumer = _augment_consumer(consumer)
+    return new_prologue, new_producer, new_consumer
 
 
 def _rename_consumer_syncs(stmts: list[Stmt], n_consumer_threads: int) -> list[Stmt]:
