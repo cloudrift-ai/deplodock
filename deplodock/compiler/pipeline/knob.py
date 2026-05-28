@@ -132,8 +132,13 @@ def _walk_modules() -> list[ModuleType]:
     # every Knob-bearing module while skipping the thousands of stdlib / third-party
     # modules — which both slows the walk and, for e.g. ``torch.distributed``, emits a
     # spurious ``FutureWarning`` when ``vars(mod)`` materializes its deprecated members.
+    #
+    # Snapshot ``sys.modules`` with ``tuple(...)`` (one GIL-held C call) before walking:
+    # the per-module body releases the GIL, and a concurrent kernel compile / bench
+    # worker importing a module would otherwise mutate ``sys.modules`` mid-iteration
+    # ("dictionary changed size during iteration").
     mods: list[ModuleType] = []
-    for m in sys.modules.values():
+    for m in tuple(sys.modules.values()):
         f = getattr(m, "__file__", None) if m is not None else None
         if f and Path(f).is_relative_to(_PKG_ROOT):
             mods.append(m)
