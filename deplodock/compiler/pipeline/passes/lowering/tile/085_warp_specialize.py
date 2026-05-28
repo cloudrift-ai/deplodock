@@ -246,24 +246,36 @@ def _wire_producer_wait(stmts: list[Stmt], empty_mbar: str, bc: int) -> list[Stm
     return out
 
 
-def _wire_consumer_arrive(stmts: list[Stmt], empty_mbar: str, bc: int, first_consumer_tid: int) -> list[Stmt]:
+def _wire_consumer_arrive(
+    stmts: list[Stmt], empty_mbar: str, bc: int, first_consumer_tid: int, n_consumer_threads: int
+) -> list[Stmt]:
     """Recursively walk the consumer subtree; inside each
-    ``SerialTile(serial_outer)`` body, append a ``MbarrierArrive`` on
-    the empty-mbar slot gated by ``Cond(thread_idx == first_consumer_tid)``
-    — exactly one consumer thread arrives per slot release
-    (arrive_count == 1). Recursion descends into any wrapper (e.g.
-    ``RegisterTile`` around the K_o loop in blocked matmul); the K_o
-    loop itself isn't recursed into."""
+    ``SerialTile(serial_outer)`` body, append a named-barrier ``Sync``
+    + a single-thread ``MbarrierArrive`` on the empty-mbar slot.
+
+    The Sync is critical: without it, the chosen arriving thread
+    (``threadIdx.x == first_consumer_tid``) can race ahead of slower
+    consumer threads still reading the slot's smem. The arrive flips
+    the empty mbarrier → producer can refill the slot → racing reads
+    see corrupted data. The named ``bar.sync barrier_id=1,
+    n_consumer_threads`` blocks all consumer threads at the loop's
+    tail before the arrive, so the slot's reads are all finished by
+    the time the producer is free to refill.
+
+    Recursion descends into any wrapper (e.g. ``RegisterTile`` around
+    the K_o loop in blocked matmul); the K_o loop itself isn't
+    recursed into."""
 
     def _augment(stmt: Stmt) -> Stmt:
         if isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
             k_var = stmt.axis.name
             slot_expr = Var(k_var) % Literal(bc, "int")
+            barrier_sync = Sync(barrier_id=1, count=n_consumer_threads)
             arrive_cond = Cond(
                 cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(first_consumer_tid, "int")),
                 body=(MbarrierArrive(mbar=empty_mbar, slot=slot_expr),),
             )
-            return stmt.with_bodies((Body((*stmt.body, arrive_cond)),))
+            return stmt.with_bodies((Body((*stmt.body, barrier_sync, arrive_cond)),))
         nested = stmt.nested()
         if nested:
             return stmt.with_bodies(tuple(Body(tuple(_augment(c) for c in b)) for b in nested))
@@ -337,7 +349,7 @@ def _ws_transform(op: TileOp) -> TileOp:
     # Wire empty-mbarrier wait/arrive into the role-specific K_o bodies.
     prod_stmts = _wire_producer_wait(prod_stmts, empty_mbar, bc)
     # First consumer thread = extension * inner_product = _N_PRODUCER_THREADS.
-    cons_stmts = _wire_consumer_arrive(cons_stmts, empty_mbar, bc, _N_PRODUCER_THREADS)
+    cons_stmts = _wire_consumer_arrive(cons_stmts, empty_mbar, bc, _N_PRODUCER_THREADS, n_consumer_threads)
 
     # Apply the σ-shift to the consumer subtree (every Load/Write index,
     # Loop bound, Accum ref), then stamp consumer-side AsyncWaits with
