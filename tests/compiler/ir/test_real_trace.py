@@ -12,7 +12,7 @@ from pathlib import Path
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
-FIXTURE_DIR = Path(__file__).parent / "fixtures"
+FIXTURE_DIR = Path(__file__).parent.parent / "fixtures"
 
 
 def _load_fixture(name: str) -> Graph:

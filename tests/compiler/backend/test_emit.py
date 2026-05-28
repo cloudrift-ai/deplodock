@@ -15,7 +15,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: F401
 
-from .conftest import requires_cuda
+from ..conftest import matmul_graph, requires_cuda
 
 
 def _pointwise_add_graph() -> Graph:
@@ -41,15 +41,7 @@ def _reduce_sum_graph() -> Graph:
 
 def _matmul_graph() -> Graph:
     # K=128 > _MAX_UNROLL so the K loop survives in emitted CUDA.
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-
-    g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (4, 128)), node_id="a")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (128, 4)), node_id="b")
-    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (4, 4)), node_id="o")
-    g.inputs = ["a", "b"]
-    g.outputs = ["o"]
-    return g
+    return matmul_graph(4, 128, 4)
 
 
 def _softmax_graph() -> Graph:

@@ -24,11 +24,9 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
+from ..conftest import requires_cuda
 
-from tests.compiler.conftest import has_cuda_gpu
-
-PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 def _spawn(child_src: str) -> subprocess.Popen:
@@ -61,7 +59,7 @@ def _recv(proc: subprocess.Popen) -> dict | None:
 _DUMMY_REQ = {"graph": None, "kwargs": {}}
 
 
-@pytest.mark.skipif(not has_cuda_gpu(), reason="CUDA not available (need cupy + GPU)")
+@requires_cuda
 def test_worker_exits_after_context_corruption() -> None:
     # Child: first bench launches an out-of-bounds write (sticky illegal
     # access), then raises. The worker should detect the dirty context, answer

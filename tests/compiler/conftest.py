@@ -71,6 +71,28 @@ def _skip_if_no_cuda() -> None:
         pytest.skip("CUDA not available (need cupy + GPU)")
 
 
+def matmul_graph(m: int, k: int, n: int) -> Graph:  # noqa: F821
+    """Plain `(m,k) @ (k,n) -> (m,n)` matmul graph for lowering / backend tests.
+
+    Returned shape: two ``InputOp`` named ``a`` / ``b``, one ``MatmulOp``
+    named ``o`` — the same trivial GEMM graph that the lowering-accuracy
+    suites and several backend tests would otherwise rebuild inline.
+    Callers needing the input shapes can derive them as
+    ``{"a": (m, k), "b": (k, n)}``.
+    """
+    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
+    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n)), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (m, n)), node_id="o")
+    g.inputs = ["a", "b"]
+    g.outputs = ["o"]
+    return g
+
+
 @pytest.fixture(params=["numpy", "loop", "cuda"])
 def run_graph(request) -> Callable:
     """Return a callable ``run(graph, input_data) -> dict[name, ndarray]``.

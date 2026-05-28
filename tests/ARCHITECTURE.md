@@ -43,31 +43,61 @@ tests/
 │   ├── conftest.py                # `bench_pair` fixture, session summary, JSON dump
 │   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
 │   └── test_fused.py              # SDPA (xfail until fusion lands)
-├── compiler/
-│   ├── fixtures/               # pre-computed traces (tinyllama_layer0.json)
-│   ├── test_ir.py              # Graph, Node, Tensor — add/remove/replace/topo/copy
-│   ├── test_hints.py           # Hints get/set/merge/serialize + integration
-│   ├── test_matcher.py         # Pattern matching engine
-│   ├── test_rewriter.py        # Rewrite engine (SiLU decomposition)
-│   ├── rules/
-│   │   ├── test_decompose_rules.py    # Decomposition rules (structural + correctness)
-│   │   ├── test_optimization_rules.py # Optimization rules (broadcast indexmap)
-│   │   └── test_fusion_rules.py       # Fusion pass (lift-then-splice, structural + correctness)
-│   ├── test_fusion.py          # auto_fuse — softmax, RMSNorm, SiLU, matmul, etc.
-│   ├── test_plan.py            # plan_graph — ExecutionPlan from Graph
-│   ├── test_pipeline.py        # Full compile pipeline: graph → GPU
-│   ├── test_real_trace.py      # TinyLlama fixture validation
-│   ├── test_torch_trace.py     # PyTorch tracer smoke tests
-│   ├── test_torch_trace_ops.py # PyTorch tracer op handlers and helpers
-│   ├── test_backend_ir.py      # Backend IR AST nodes + codegen emission
-│   ├── test_kernel_gen.py      # Kernel generation from FusedRegionOps
-│   ├── test_loop_ir.py         # LoopIR dataclasses, pretty-print, structure, round-trip
-│   ├── test_cuda.py            # CUDA codegen, lowering, GPU correctness
-│   ├── test_cuda_backend.py    # CudaBackend compile/run/benchmark
-│   ├── test_program.py         # Program source gen + GPU execution
-│   ├── test_tuning.py          # GPU tuning profile dispatch
-│   ├── test_llama_block.py     # Full Llama block through compiler
-│   └── test_torch_ops.py   # Op.forward() + numpy backend (no GPU needed)
+├── compiler/                       # mirrors deplodock/compiler/
+│   ├── conftest.py                     # requires_cuda marker, run_graph fixture,
+│   │                                   # matmul_graph(m,k,n) shared builder
+│   ├── fixtures/                       # pre-computed traces (tinyllama_layer0.json)
+│   ├── ir/                             # IR datatypes (mirrors deplodock/compiler/ir/)
+│   │   ├── test_graph.py                       # Graph / Node / Tensor primitives
+│   │   ├── test_graph_splice.py                # Graph.splice rewrite primitive
+│   │   ├── test_graph_structural_key.py        # Merkle-style structural digest
+│   │   ├── test_hints.py                       # Hints get/set/merge/serialize
+│   │   ├── test_indexmap.py                    # IndexMapOp + coord_expr helpers
+│   │   ├── test_loop_op.py                     # LoopOp SSA body (Loop/Assign/Accum/…)
+│   │   ├── test_shape_inference.py             # infer_output_shape (static + Dim symbolic)
+│   │   ├── test_provenance.py                  # provenance data model + propagation
+│   │   ├── test_dynamic_shapes.py              # Dim round-trips through trace/lift/LoopOp
+│   │   ├── test_real_trace.py                  # TinyLlama fixture sanity (op-type counts)
+│   │   ├── test_body_deps.py / test_op_shape_invariants.py / …
+│   │   ├── stmt/   — SSA-body unit tests (hoist / merge / rename / structural_key)
+│   │   ├── tile/   — TileOp / StageBundle unit tests
+│   │   └── loop/   — splicer / runner-cache unit tests
+│   ├── passes/                         # single-pass + pass-suite tests
+│   │   ├── conftest.py                         # RecordingDump fixture
+│   │   ├── test_decompose_rules.py / test_optimization_rules.py / test_fusion_rules.py
+│   │   ├── test_matcher.py                     # Pattern matcher unit tests
+│   │   ├── test_matmul_rules.py / test_reduction_rules.py / test_register_tile_rules.py
+│   │   ├── test_partition_planner_rules.py / test_partition_planner_forks.py
+│   │   ├── test_launch_geometry_rules.py / test_masked_tile.py
+│   │   ├── test_stage_inputs_classify.py
+│   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
+│   │   ├── test_lowering_blocked_gemm.py       # register-blocked GEMM nest
+│   │   ├── test_knob_pinning.py                # DEPLODOCK_KNOBS regression configs
+│   │   ├── test_tile_naming.py                 # provenance-driven kernel naming
+│   │   └── test_pipeline_semantics.py          # full pass chain vs numpy
+│   ├── pipeline/                       # pipeline-level tests (knob, dump, rule_diff)
+│   │   ├── test_knob.py / test_rule_diff.py
+│   │   ├── test_dump.py                        # _graph_to_dot + CompilerDump repro
+│   │   └── search/ — DB, slice, thunk_forks, two_level, greedy_db_lookup, tune_accuracy
+│   ├── backend/                        # backend code-emission + dispatch
+│   │   ├── test_dtype_cuda.py / test_dtype_numpy.py
+│   │   ├── test_emit.py                        # CUDA source-level assertions + GPU runs
+│   │   ├── test_loader.py / test_nvcc_compile.py
+│   │   ├── test_program.py                     # cupy dispatch of Graph[CudaOp]
+│   │   ├── test_torch_ref.py                   # eager-reference evaluator
+│   │   └── test_bench_worker_recovery.py       # sticky-CUDA-error sub-process recovery
+│   ├── trace/
+│   │   └── test_torch.py                       # PyTorch tracer per-op handlers
+│   ├── cli/                            # subprocess CLI tests via run_cli fixture
+│   │   ├── test_compile.py / test_knobs.py / test_run.py
+│   ├── e2e/                            # end-to-end accuracy / pipeline / blocks
+│   │   ├── test_accuracy.py                    # backend × dtype × pattern matrix
+│   │   ├── test_block.py                       # TinyLlama / Qwen block vs eager
+│   │   ├── test_pipeline.py                    # LOOP_PASSES → CudaBackend on toys
+│   │   ├── test_attention_chains.py            # Q,K,V + SDPA bisection harness
+│   │   └── test_ops_vs_torch.py                # backend × op vs torch eager
+│   └── diagnostics/
+│       └── test_bank_conflicts.py
 ├── scripts/
 │   └── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
 ```
