@@ -75,6 +75,7 @@ from deplodock.compiler.ir.stmt import Body, Cond, Stmt
 from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
     GridTile,
+    RegisterTile,
     SerialTile,
     StageBundle,
     StagePolicy,
@@ -147,24 +148,26 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
     tt = _find_thread_tile(op.body)
     if tt is None:
         return False, "no ThreadTile in body"
-    inner = tt.axes[-1]
-    if not inner.extent.is_static:
-        return False, "ThreadTile inner axis has symbolic extent"
-    # Extend the inner axis by ``extension = n_producer_threads / outer_product``
-    # rows so the new total thread count = original + n_producer. The
-    # outer-axes product must divide n_producer_threads for the extension
-    # to be a clean integer. For a single-axis ThreadTile the outer
-    # product is 1 (empty product), which trivially divides — so the
-    # canonical matmul shape with one flattened thread axis is always
-    # eligible.
-    outer_product = 1
-    for ax in tt.axes[:-1]:
+    outer = tt.axes[0]
+    if not outer.extent.is_static:
+        return False, "ThreadTile outer axis has symbolic extent"
+    # Extend the OUTERMOST axis by ``extension = n_producer_threads /
+    # inner_product``. The linear thread decode is row-major
+    # (outer = tid / inner_product; inner = tid % inner_product), so
+    # extending the outermost axis keeps producer threads contiguous
+    # as ``tid ∈ [0, n_producer_threads)`` — i.e. a single warp 0 for
+    # n_producer_threads=32. Extending an inner axis instead would
+    # scatter producer threads (tid 0, 1, BN, BN+1, ...) which breaks
+    # the warp-specialization invariant. The inner-axes product must
+    # divide n_producer_threads for the extension to be integer.
+    inner_product = 1
+    for ax in tt.axes[1:]:
         if not ax.extent.is_static:
-            return False, "ThreadTile outer axis has symbolic extent"
-        outer_product *= ax.extent.as_static()
-    if _N_PRODUCER_THREADS % outer_product != 0:
+            return False, "ThreadTile inner axis has symbolic extent"
+        inner_product *= ax.extent.as_static()
+    if _N_PRODUCER_THREADS % inner_product != 0:
         return False, (
-            f"producer_threads ({_N_PRODUCER_THREADS}) must be divisible by outer thread-axes product ({outer_product})"
+            f"producer_threads ({_N_PRODUCER_THREADS}) must be divisible by inner thread-axes product ({inner_product})"
         )
     return True, ""
 
@@ -185,8 +188,15 @@ def _split_by_role(stmts: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
     """Classify each top-level stmt: ``StageBundle``s and the
     producer-side scaffolding inside ``SerialTile(serial_outer)`` →
     producer; ``AsyncWait`` + reduce ``SerialTile``s + output stmts →
-    consumer. Recurse into ``serial_outer`` to build two K_o loops, one
-    per role, both iterating the same axis with role-specific body."""
+    consumer.
+
+    Recurse into ``serial_outer`` to build two K_o loops (one per role,
+    both iterating the same axis with role-specific bodies). Recurse
+    into ``RegisterTile`` to **hoist** producer stmts out of the
+    register-cell wrapper — TMA loads don't depend on register-cell
+    axes, so duplicating them per cell (which ``010_split_register_axes``
+    would do if they stayed inside) would issue N redundant copies of
+    the same TMA. Consumer-side compute stays in its RegisterTile."""
     producer: list[Stmt] = []
     consumer: list[Stmt] = []
     for stmt in stmts:
@@ -198,9 +208,18 @@ def _split_by_role(stmts: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
                 producer.append(stmt.with_bodies((Body(tuple(inner_prod)),)))
             if inner_cons:
                 consumer.append(stmt.with_bodies((Body(tuple(inner_cons)),)))
+        elif isinstance(stmt, RegisterTile):
+            inner_prod, inner_cons = _split_by_role(tuple(stmt.body))
+            # Hoist producer stmts out of RegisterTile — they don't
+            # depend on the register-cell axes; running them once at
+            # top level avoids 010_split_register_axes replicating
+            # them per cell.
+            producer.extend(inner_prod)
+            if inner_cons:
+                consumer.append(stmt.with_bodies((Body(tuple(inner_cons)),)))
         else:
             # AsyncWait, SerialTile(stage_inner / plain), Write, Accum,
-            # Cond, RegisterTile — all consumer-side.
+            # Cond — all consumer-side.
             consumer.append(stmt)
     return producer, consumer
 
@@ -228,24 +247,29 @@ def _wire_producer_wait(stmts: list[Stmt], empty_mbar: str, bc: int) -> list[Stm
 
 
 def _wire_consumer_arrive(stmts: list[Stmt], empty_mbar: str, bc: int, first_consumer_tid: int) -> list[Stmt]:
-    """Inside each consumer K_o body, append a ``MbarrierArrive`` on
-    the empty mbarrier slot, gated by ``Cond(thread_idx == first_consumer_tid)``
+    """Recursively walk the consumer subtree; inside each
+    ``SerialTile(serial_outer)`` body, append a ``MbarrierArrive`` on
+    the empty-mbar slot gated by ``Cond(thread_idx == first_consumer_tid)``
     — exactly one consumer thread arrives per slot release
-    (arrive_count == 1)."""
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, SerialTile) and s.kind == "serial_outer":
-            k_var = s.axis.name
+    (arrive_count == 1). Recursion descends into any wrapper (e.g.
+    ``RegisterTile`` around the K_o loop in blocked matmul); the K_o
+    loop itself isn't recursed into."""
+
+    def _augment(stmt: Stmt) -> Stmt:
+        if isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
+            k_var = stmt.axis.name
             slot_expr = Var(k_var) % Literal(bc, "int")
             arrive_cond = Cond(
                 cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(first_consumer_tid, "int")),
                 body=(MbarrierArrive(mbar=empty_mbar, slot=slot_expr),),
             )
-            new_inner = Body((*s.body, arrive_cond))
-            out.append(s.with_bodies((new_inner,)))
-        else:
-            out.append(s)
-    return out
+            return stmt.with_bodies((Body((*stmt.body, arrive_cond)),))
+        nested = stmt.nested()
+        if nested:
+            return stmt.with_bodies(tuple(Body(tuple(_augment(c) for c in b)) for b in nested))
+        return stmt
+
+    return [_augment(s) for s in stmts]
 
 
 def _stamp_async_wait_barrier(body: Body, count: int) -> Body:
@@ -263,9 +287,12 @@ def _stamp_async_wait_barrier(body: Body, count: int) -> Body:
 
 
 def _apply_sigma(body: Body, sigma: Sigma) -> Body:
-    """Recursively apply ``sigma`` to every Stmt in ``body`` (substitutes
-    the extended-axis Var with its shifted form throughout)."""
-    return body.map(lambda s: s.rewrite(lambda n: n, sigma))
+    """Apply ``sigma`` to every Stmt in ``body`` — substitutes the
+    extended-axis Var with its shifted form throughout. ``Stmt.rewrite``
+    on wrapper stmts (SerialTile, Cond, Loop, …) recursively rewrites
+    their bodies, so we only iterate the top level — using ``Body.map``
+    here would double-apply σ at every nesting level."""
+    return Body(tuple(s.rewrite(lambda n: n, sigma) for s in body))
 
 
 def _ws_transform(op: TileOp) -> TileOp:
@@ -273,25 +300,25 @@ def _ws_transform(op: TileOp) -> TileOp:
     tt = _find_thread_tile(op.body)
     assert tt is not None  # _eligible enforces
 
-    inner = tt.axes[-1]
-    inner_extent = inner.extent.as_static()
-    outer_product = 1
-    for ax in tt.axes[:-1]:
-        outer_product *= ax.extent.as_static()
-    extension = _N_PRODUCER_THREADS // outer_product
-    extended_inner = Axis(name=inner.name, extent=inner.extent + Literal(extension, "int"))
-    new_axes = (*tt.axes[:-1], extended_inner)
+    outer = tt.axes[0]
+    outer_extent = outer.extent.as_static()
+    inner_product = 1
+    for ax in tt.axes[1:]:
+        inner_product *= ax.extent.as_static()
+    extension = _N_PRODUCER_THREADS // inner_product
+    extended_outer = Axis(name=outer.name, extent=outer.extent + Literal(extension, "int"))
+    new_axes = (extended_outer, *tt.axes[1:])
 
     # Consumer threads = original total (we extended by exactly the
     # producer count, so the consumer range still spans the original
     # axis product). Used for the named-barrier participant count.
-    n_consumer_threads = outer_product * inner_extent
+    n_consumer_threads = outer_extent * inner_product
 
-    # Sigma to shift the extended axis back into [0, inner_extent) inside
-    # the consumer body. Producer threads have inner-axis values in
-    # [0, extension); they never enter the consumer branch so the negative
-    # shift never appears in their executed code.
-    sigma = Sigma({inner.name: Var(inner.name) - Literal(extension, "int")})
+    # Sigma to shift the extended outer axis back into [0, outer_extent)
+    # inside the consumer body. Producer threads have outer-axis values
+    # in [0, extension); they never enter the consumer branch so the
+    # negative shift never appears in their executed code.
+    sigma = Sigma({outer.name: Var(outer.name) - Literal(extension, "int")})
 
     bc = _first_buffer_count(op.body)
     empty_mbar = "tma_mbar_empty"
@@ -309,8 +336,8 @@ def _ws_transform(op: TileOp) -> TileOp:
 
     # Wire empty-mbarrier wait/arrive into the role-specific K_o bodies.
     prod_stmts = _wire_producer_wait(prod_stmts, empty_mbar, bc)
-    first_consumer_tid = extension * inner_extent  # = _N_PRODUCER_THREADS
-    cons_stmts = _wire_consumer_arrive(cons_stmts, empty_mbar, bc, first_consumer_tid)
+    # First consumer thread = extension * inner_product = _N_PRODUCER_THREADS.
+    cons_stmts = _wire_consumer_arrive(cons_stmts, empty_mbar, bc, _N_PRODUCER_THREADS)
 
     # Apply the σ-shift to the consumer subtree (every Load/Write index,
     # Loop bound, Accum ref), then stamp consumer-side AsyncWaits with
@@ -318,10 +345,12 @@ def _ws_transform(op: TileOp) -> TileOp:
     cons_body = _apply_sigma(Body(tuple(cons_stmts)), sigma)
     cons_body = _stamp_async_wait_barrier(cons_body, count=n_consumer_threads)
 
-    # Wrap producer + consumer in Cond(inner < extension, prod, σ(cons))
-    # with SetMaxNReg framing each branch.
+    # Wrap producer + consumer in Cond(outer < extension, prod, σ(cons))
+    # with SetMaxNReg framing each branch. The outermost axis controls
+    # producer/consumer membership; row-major decode places producer
+    # threads (outer ∈ [0, extension)) at contiguous tid [0, n_producer).
     ws_cond = Cond(
-        cond=BinaryExpr("<", Var(inner.name), Literal(extension, "int")),
+        cond=BinaryExpr("<", Var(outer.name), Literal(extension, "int")),
         body=Body((SetMaxNReg(24, "dec"), *prod_stmts)),
         else_body=Body((SetMaxNReg(240, "inc"), *cons_body)),
     )

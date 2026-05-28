@@ -181,9 +181,16 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
                     wait_group_by_id[id(stmt)] = gid
                     last_pipeline_group[0] = gid
                 continue
-            # Any other statement breaks the prologue chain — flush.
+            # Flush any orphan prologue bundles (no following K_o), but
+            # KEEP ``last_pipeline_group`` intact — non-TMA stmts (Smem,
+            # SetMaxNReg, Loop, Load, …) that sit between a K_o and its
+            # epilogue AsyncWait shouldn't sever the pairing. Pre-WS
+            # this was a "reset on any other stmt" check; with WS-emitted
+            # Conds putting SetMaxNReg inside the consumer branch (right
+            # before the K_o-containing subtree), that reset would
+            # detach the epilogue AsyncWaits from their producer-side
+            # group.
             _flush_prologues_as_singletons()
-            last_pipeline_group[0] = None
 
     _walk(tuple(body))
     _flush_prologues_as_singletons()
