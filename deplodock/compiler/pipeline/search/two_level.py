@@ -100,7 +100,6 @@ class TwoLevelResult:
     best_reward: InnerReward | None  # its Σ-per-op breakdown
     n_terminals: int  # outer terminals evaluated (1 today)
     assembled: Graph | None  # greedy DB-best Graph[CudaOp] assembled from the bests
-    whole_us: float | None  # measured in-context whole-graph latency (separability check)
 
 
 def _point_stats(us: float) -> PerfStats:
@@ -243,41 +242,16 @@ def run_two_level_tune(
             best_fused, best_reward = fused.graph, reward
 
     assembled: Graph | None = None
-    whole_us: float | None = None
     if best_fused is not None:
         # Greedy replay over the *original* graph re-derives the same fused
         # LoopOps and lowers each via the DB-best forks the inner search
         # recorded. No backend → ``_bench_terminal`` persists nothing (so the
         # 1.0us stub never clobbers a tuned row). The dump (if any) rides here
-        # so it captures the winning config's full stage artifacts.
+        # so it captures the winning config's full stage artifacts. The
+        # whole-graph separability bench used to run here too; dropped — its
+        # only output was a small advisory gap line that nobody read, and at
+        # the tight tune compile budget it could (and did) abort whole-model
+        # tunes when a slow-compiling kernel raised. ``--bench`` re-benches
+        # the assembled graph at -O3 anyway, which is the deployable number.
         assembled = Pipeline.build(CUDA_PASSES, dump=dump).run(graph, ctx=ctx, db=db)
-        if backend is not None:
-            whole_us = _bench_whole_graph(assembled, backend)
-    return TwoLevelResult(best_fused=best_fused, best_reward=best_reward, n_terminals=n_terminals, assembled=assembled, whole_us=whole_us)
-
-
-def _bench_whole_graph(assembled: Graph, backend) -> float | None:
-    """Measured in-context whole-graph latency (us): sum of the per-launch
-    medians. The separability check compares this to the inner ``Σ`` of
-    isolated per-op bests — a gap exposes L2 / clock / launch coupling the
-    isolated benches can't see."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-
-    cuda_nodes = [n for n in assembled.nodes.values() if isinstance(n.op, CudaOp)]
-    if not cuda_nodes:
-        return None
-    try:
-        result = backend.benchmark(assembled, num_iters="auto")
-    except RuntimeError as exc:
-        # The whole-graph separability check is informational. A kernel that blows
-        # the tune backend's tight -O1 compile budget (e.g. the lm-head register
-        # tile) must NOT abort the whole tune the way an uncaught raise would —
-        # per-op bests are already persisted, and a ``--bench`` re-bench (separate
-        # -O3 backend) still needs to run. Skip the gap line; the caller proceeds.
-        logger.warning("[tune] whole-graph separability bench skipped (%s)", exc)
-        return None
-    per_launch = result.per_launch or []
-    if len(per_launch) == len(cuda_nodes):
-        # ``LaunchTime.time_ms`` is already the per-launch median over samples.
-        return sum(lt.time_ms for lt in per_launch) * 1000.0
-    return result.time_ms * 1000.0
+    return TwoLevelResult(best_fused=best_fused, best_reward=best_reward, n_terminals=n_terminals, assembled=assembled)

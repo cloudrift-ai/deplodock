@@ -243,8 +243,8 @@ row and otherwise walks the `lowering` chain down to the `cuda` terminal.
 
 **Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` probes a `Context`, opens the tuning database
 (default `~/.cache/deplodock/autotune.db`, overridable via `DEPLODOCK_TUNE_DB`), and calls `run_two_level_tune(...)`.
-It prints a per-op-best table (with `tuned` / `cached` state), the `Σ` estimate, the assembled whole-graph latency, and
-the separability gap. The DB accumulates rows across runs; re-running resumes from the cached state.
+On completion it prints one `done: N fused terminal(s) in Xs` line — the deployable numbers come from the optional
+`--bench` step below. The DB accumulates rows across runs; re-running resumes from the cached state.
 
 On default verbosity (and a tty) a `commands/tune_progress.TuneProgress` draws a live single-line bar — completed/total
 tuned op leaves plus a `<kernel> <current us> (best <best us>) <knobs>` tail. The current latency is fixed-width and the

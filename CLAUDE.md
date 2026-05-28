@@ -80,7 +80,6 @@ same worker.
   the product). Per-op results key structurally (`op_cache_key`) so they transfer/share; an op already tuned to
   `>= patience` (or exhausted, recorded `∞`) is skipped via the `op_effort` table — re-runs idempotent, higher patience
   re-deepens.
-  Prints per-op bests (`tuned`/`cached`), the `Σ` estimate, the assembled whole-graph latency, and the separability gap.
   Persists `perf` / `lowering` / `op_effort` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
   `~/.cache/deplodock/autotune.db`). The inner MCTS (max-Q normalized UCB1, rank-only `TileOp.score` prior) stops on
   patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches

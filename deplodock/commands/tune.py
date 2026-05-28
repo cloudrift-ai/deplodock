@@ -211,8 +211,6 @@ def handle_tune(args):
         sys.stderr.flush()
         os._exit(0)
 
-    _print_two_level_summary(result)
-
     # Only write the assembled (DB-best) CUDA source when ``--output`` is
     # given. Dumping a multi-kB kernel to stdout after a long tune is noise —
     # callers that want it can pass ``-o`` (or re-run ``deplodock compile``,
@@ -264,27 +262,6 @@ def _clean_caches(db_path) -> None:
     except Exception:  # noqa: BLE001 — cupy cache clear is best-effort
         pass
     sys.stderr.write(f"[tune] --clean: removed tuning DB + kernel caches ({', '.join(removed)})\n")
-
-
-def _print_two_level_summary(result) -> None:
-    """Print the per-op bests (the inner separable search), the ``Σ``
-    estimate, and the assembled whole-graph latency with the separability
-    gap. ``result`` is a :class:`TwoLevelResult`."""
-    reward = result.best_reward
-    per_op = sorted(reward.per_op, key=lambda r: (r.best_us is None, r.best_us or 0.0), reverse=True)
-    sys.stderr.write(f"\n[tune] per-op bests ({len(per_op)} kernel(s), best fused terminal):\n")
-    sys.stderr.write(f"{'rank':>4}  {'best_us':>10}  {'state':>8}  kernel\n")
-    for rank, r in enumerate(per_op):
-        us = f"{r.best_us:.2f}" if r.best_us is not None else "fail"
-        state = "tuned" if r.benched else "cached"
-        sys.stderr.write(f"{rank:>4}  {us:>10}  {state:>8}  {r.name}\n")
-
-    sys.stderr.write(f"\n[tune] Σ per-op best (estimate):  {reward.total_us:>12.2f} us\n")
-    if result.whole_us is not None:
-        gap = result.whole_us - reward.total_us
-        pct = (gap / reward.total_us * 100.0) if reward.total_us > 0 else 0.0
-        sys.stderr.write(f"[tune] assembled whole-graph:     {result.whole_us:>12.2f} us\n")
-        sys.stderr.write(f"[tune] separability gap:          {gap:>+12.2f} us  ({pct:+.1f}%)\n")
 
 
 def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:

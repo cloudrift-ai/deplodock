@@ -189,9 +189,7 @@ def test_inner_reward_shares_identical_kernel() -> None:
 
 def test_run_two_level_tune_single_terminal_assembles_bests() -> None:
     """With no fusion forks today the outer yields one terminal; the assembled
-    graph greedy-replays the per-op bests, and the measured whole-graph latency
-    matches the ``Σ`` estimate (the fake backend is separable by construction —
-    each CudaOp's latency depends only on its own key)."""
+    graph greedy-replays the per-op bests."""
     result = run_two_level_tune(
         _two_distinct_matmuls(),
         ctx=Context.from_target((8, 0)),
@@ -206,8 +204,3 @@ def test_run_two_level_tune_single_terminal_assembles_bests() -> None:
     # The winning fusion was greedy-assembled into a Graph[CudaOp] from the DB.
     assert result.assembled is not None
     assert any(isinstance(n.op, CudaOp) for n in result.assembled.nodes.values())
-
-    # Separability holds exactly for the fake backend: Σ isolated per-op bests
-    # == the measured assembled whole-graph latency.
-    assert result.whole_us is not None
-    assert result.whole_us == pytest.approx(result.best_reward.total_us)
