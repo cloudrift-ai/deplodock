@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.stmt import Stmt
+from deplodock.compiler.ir.stmt import Cond, Stmt
 from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy
 
 
@@ -152,6 +152,15 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
                 # Outer wrapper or unrelated SerialTile — recurse into
                 # its body so inner K_o loops still get discovered.
                 _walk(tuple(stmt.body))
+                continue
+            if isinstance(stmt, Cond):
+                # Warp-specialized output from 085_warp_specialize wraps
+                # producer + consumer subtrees in a Cond. Treat both
+                # branches as transparent: recurse with shared state so
+                # bundles in the producer branch + AsyncWaits in the
+                # consumer branch all join the same logical group.
+                _walk(tuple(stmt.body))
+                _walk(tuple(stmt.else_body))
                 continue
             if isinstance(stmt, AsyncWait):
                 # Trailing epilogue wait pairs with the most recent

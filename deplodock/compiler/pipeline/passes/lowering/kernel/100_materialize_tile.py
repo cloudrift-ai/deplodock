@@ -42,16 +42,13 @@ from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     CpAsyncWait,
     KernelOp,
-    MbarrierArrive,
     MbarrierArriveExpectTx,
     MbarrierInit,
     MbarrierWait,
-    SetMaxNReg,
     Smem,
     Sync,
     TmaDescriptor,
     TmaLoad,
-    TreeHalve,
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Stmt
 from deplodock.compiler.ir.tile.ir import (
@@ -84,21 +81,16 @@ _TMA_ALIGN_BYTES = 128
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
-    ws = int(root.op.knobs.get("WS", 0))
-
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile)):
-            new_body.append(
-                _materialize_top(s, warp_size=ctx.warp_size, escape=escape, ws_producer_warps=1 if ws else 0)
-            )
+            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
         else:
             new_body.append(s)
-
     return KernelOp(body=new_body, name=root.op.name)
 
 
-def _materialize_top(top: Stmt, *, warp_size: int, escape=None, ws_producer_warps: int = 0) -> Stmt:
+def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
     Two shapes are possible coming out of ``001_launch_geometry``:
@@ -110,31 +102,19 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None, ws_producer_warp
     - ``ThreadTile(... body=actual)``: pointwise/standalone. Materialize
       the body directly; the kernel renderer's linear-tid path handles
       launch geometry from the ThreadTile's extents.
-
-    ``ws_producer_warps`` (default 0 = WS off) selects the warp-specialized
-    materializer path. When non-zero the ThreadTile body lowers to a
-    ``Cond(warp < P)`` split: producer warps issue TMA, consumer warps
-    wait + reduce, coordinated through ``tma_mbar`` (full) +
-    ``tma_mbar_empty`` (empty) mbarrier pairs.
     """
     from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
-    materializer = _materialize_ws if ws_producer_warps > 0 else _materialize
-    kwargs = {"warp_size": warp_size, "escape": escape}
-    if ws_producer_warps > 0:
-        kwargs["producer_warps"] = ws_producer_warps
-
     if isinstance(top, GridTile):
-        # Locate the (sole) ThreadTile child.
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, ThreadTile):
-                new_outer.append(materializer(child, **kwargs))
+                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer))
     if isinstance(top, ThreadTile):
-        return materializer(top, **kwargs)
+        return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
@@ -246,13 +226,18 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # (BM=16, BN=16 + stage) where the inner-loop schedule makes
         # the reorder profitable; on larger tiles the schedule is
         # dense enough that no useful hoist is possible.
+        # AsyncWait.barrier_id / barrier_count let the caller (085 for WS
+        # kernels) route the trailing CTA fence to a named barrier
+        # (``bar.sync N, count``) instead of ``__syncthreads()``. Default
+        # 0 keeps every legacy emission on ``__syncthreads()``.
+        trailing_sync = Sync(barrier_id=stmt.barrier_id, count=stmt.barrier_count)
         if stmt.phase is not None and tma.has_tma:
             gid = tma.wait_group.get(id(stmt))
             if gid is not None:
-                return [MbarrierWait(mbar=tma.mbar_name(gid), phase=stmt.phase, slot=stmt.slot), Sync()]
+                return [MbarrierWait(mbar=tma.mbar_name(gid), phase=stmt.phase, slot=stmt.slot), trailing_sync]
         # cp.async fallback (or pre-pipelining synchronous-style wait,
         # or AsyncWait whose pipeline group couldn't be inferred).
-        return [CpAsyncWait(group=stmt.keep), Sync()]
+        return [CpAsyncWait(group=stmt.keep), trailing_sync]
 
     def emit_tma_stage(bundle: StageBundle, stage: Stage) -> list[Stmt]:
         # 050_use_tma only promotes single-Source bundles, so the box-copy
@@ -407,6 +392,20 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
             return out_local
         if isinstance(stmt, AsyncWait):
             return list(emit_async_wait(stmt))
+        if isinstance(stmt, Cond):
+            # 085_warp_specialize wraps producer + consumer subtrees in
+            # a top-level ``Cond(warp_role_check, prod, cons)`` — both
+            # branches may contain StageBundles / AsyncWaits / SerialTiles
+            # that need recursive processing.
+            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+            body_out: list[Stmt] = []
+            for inner in stmt.body:
+                body_out.extend(_process_stmt(inner))
+            else_out: list[Stmt] = []
+            for inner in stmt.else_body:
+                else_out.extend(_process_stmt(inner))
+            return [Cond(cond=stmt.cond, body=Body(tuple(body_out)), else_body=Body(tuple(else_out)))]
         if isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
             single = _emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, emit_async_wait)
             extra: list[Stmt] = []
@@ -488,325 +487,6 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_bundle_pr
         return transform(s)
 
     return loop.with_bodies((loop.body.map(materialize_leaf),))
-
-
-def _materialize_ws(blk: ThreadTile, *, warp_size: int, escape=None, producer_warps: int) -> Stmt:
-    """Warp-specialized materialization. Reuses ``_materialize`` to get a
-    baseline kernel body, then post-passes it into producer + consumer
-    subtrees wrapped in ``Cond(warp < producer_warps)``.
-
-    Producer warps issue TMA loads + ``MbarrierArriveExpectTx``; consumer
-    warps wait on the full mbarrier, run the per-iter reduce, and arrive
-    on an extra ``tma_mbar_empty`` mbarrier so the producer can refill
-    a slot only after the consumer drains it. Inside the consumer branch
-    every ``Sync`` becomes a named-barrier sync (``bar.sync 1,
-    n_consumer_threads``) — ``__syncthreads`` would be UB on the
-    warp-divergent ``Cond``.
-
-    Currently implemented for kernels without cooperative ``Accum``s
-    (matmul shape). SDPA cooperative reduces inside the consumer branch
-    need additional consumer-tid remapping; raises NotImplementedError
-    if `escape.accum_cooperative_axes` is non-empty."""
-    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-
-    # Eligibility: cooperative reduces need consumer-tid remap (Stage 5,
-    # not yet implemented). Surface loudly.
-    if escape is not None:
-        coop = {n: ax for n, ax in escape.accum_cooperative_axes.items() if ax}
-        if coop:
-            raise NotImplementedError(
-                f"WS materialization with cooperative Accum(s) {sorted(coop)} not yet implemented "
-                "(consumer-tid remap pending — see plan Phase D Stage 5)"
-            )
-
-    # 1. Run the regular materialization to get a baseline ThreadTile.
-    regular = _materialize(blk, warp_size=warp_size, escape=escape)
-    if not isinstance(regular, ThreadTile):
-        raise ValueError(f"_materialize returned {type(regular).__name__}, expected ThreadTile")
-
-    axes = regular.axes
-    n_threads = 1
-    for ax in axes:
-        n_threads *= ax.extent.as_static()
-    n_producer_threads = producer_warps * warp_size
-    n_consumer_threads = n_threads - n_producer_threads
-    if n_producer_threads <= 0 or n_consumer_threads <= 0:
-        raise ValueError(
-            f"WS requires both producer and consumer warps; got P={producer_warps} ({n_producer_threads} threads), "
-            f"total {n_threads} threads ({n_threads // warp_size} warps)"
-        )
-
-    # 2. Split into shared prologue (Smem/MbarrierInit/etc.) and main body.
-    prologue, main = _split_prologue(tuple(regular.body))
-
-    # 3. Walk main, classify each stmt and build producer + consumer lists.
-    producer_main, consumer_main, mbar_groups = _split_roles(main)
-
-    # 4. Add empty-mbarrier wiring: extra mbarrier per TMA group, init +
-    # per-iter wait in producer / arrive in consumer.
-    prologue_ws, producer_main_ws, consumer_main_ws = _wire_empty_mbarriers(
-        prologue, producer_main, consumer_main, mbar_groups, n_producer_threads
-    )
-
-    # 5. Rename consumer-side Syncs to named-barrier.
-    consumer_main_named = _rename_consumer_syncs(consumer_main_ws, n_consumer_threads)
-
-    # 6. Wrap in Cond.
-    ws_cond = Cond(
-        cond=BinaryExpr("<", Var("warp"), Literal(producer_warps, "int")),
-        body=Body((SetMaxNReg(24, "dec"), *producer_main_ws)),
-        else_body=Body((SetMaxNReg(240, "inc"), *consumer_main_named)),
-    )
-    new_body: list[Stmt] = [*prologue_ws, ws_cond]
-    return ThreadTile(axes=axes, body=Body(new_body))
-
-
-# ---------------------------------------------------------------------------
-# WS helpers
-# ---------------------------------------------------------------------------
-
-
-def _split_prologue(body: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
-    """Split a materialized ThreadTile body into (prologue, main).
-
-    Prologue is the leading run of kernel-scope declarations + mbarrier
-    init: ``TmaDescriptor`` / ``Smem`` / ``Cond(thread_idx==0, [MbarrierInit
-    ...])`` / the trailing ``Sync`` after init. Main is everything that
-    follows (the actual work)."""
-    cut = 0
-    for i, s in enumerate(body):
-        if isinstance(s, (TmaDescriptor, Smem)):
-            cut = i + 1
-            continue
-        # MbarrierInit init block: Cond(tid==0, [MbarrierInits])
-        if isinstance(s, Cond) and all(isinstance(b, MbarrierInit) for b in s.body):
-            cut = i + 1
-            continue
-        # Sync immediately after the MbarrierInit Cond.
-        if isinstance(s, Sync) and cut > 0 and isinstance(body[cut - 1], Cond):
-            cut = i + 1
-            continue
-        break
-    return list(body[:cut]), list(body[cut:])
-
-
-def _is_producer_stmt(s: Stmt) -> bool:
-    """A stmt belongs in the producer branch if it carries TMA-issue
-    scaffolding: ``Cond(thread_idx==N, [MbarrierArriveExpectTx, TmaLoad])``."""
-    if not isinstance(s, Cond):
-        return False
-    return any(isinstance(b, (MbarrierArriveExpectTx, TmaLoad)) for b in s.body)
-
-
-def _split_roles(main: list[Stmt]) -> tuple[list[Stmt], list[Stmt], dict[str, int]]:
-    """Walk the main body, classifying each top-level stmt as producer or
-    consumer. Returns (producer_body, consumer_body, mbar_groups) where
-    mbar_groups maps each TMA mbarrier name → its buffer_count (recovered
-    from the prologue's ``Smem(name, extents=(bc,))``).
-
-    For ``SerialTile(serial_outer)`` (the K_o loop), recurses: builds two
-    K_o loops, one per role, each iterating the same axis."""
-    producer: list[Stmt] = []
-    consumer: list[Stmt] = []
-    mbar_groups: dict[str, int] = {}
-
-    def _collect_mbar(stmts: tuple[Stmt, ...]):
-        for s in stmts:
-            if isinstance(s, Cond):
-                for b in s.body:
-                    if isinstance(b, MbarrierArriveExpectTx):
-                        mbar_groups.setdefault(b.mbar, 1)
-                    if isinstance(b, TmaLoad):
-                        mbar_groups.setdefault(b.mbar, 1)
-            if isinstance(s, MbarrierWait):
-                mbar_groups.setdefault(s.mbar, 1)
-
-    for stmt in main:
-        if _is_producer_stmt(stmt):
-            producer.append(stmt)
-            _collect_mbar((stmt,))
-        elif isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
-            # Recurse into K_o body, build two role-specific loops.
-            inner_prod, inner_cons, inner_mbar = _split_roles(list(stmt.body))
-            mbar_groups.update(inner_mbar)
-            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-
-            if inner_prod:
-                producer.append(stmt.with_bodies((Body(tuple(inner_prod)),)))
-            if inner_cons:
-                consumer.append(stmt.with_bodies((Body(tuple(inner_cons)),)))
-        elif isinstance(stmt, (MbarrierWait, Sync)):
-            consumer.append(stmt)
-            _collect_mbar((stmt,))
-        elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
-            # Inner reduce + epilogue reduce — consumer.
-            consumer.append(stmt)
-        else:
-            # Default: consumer (output Writes, Accums, etc.)
-            consumer.append(stmt)
-    return producer, consumer, mbar_groups
-
-
-def _wire_empty_mbarriers(
-    prologue: list[Stmt],
-    producer: list[Stmt],
-    consumer: list[Stmt],
-    mbar_groups: dict[str, int],
-    n_producer_threads: int,
-) -> tuple[list[Stmt], list[Stmt], list[Stmt]]:
-    """Allocate ``<mbar_name>_empty[bc]`` per TMA group, init in prologue,
-    insert ``MbarrierWait`` in producer K_o body before each issue,
-    insert ``MbarrierArrive`` in consumer K_o body after each reduce.
-
-    Producer wait is gated by ``Cond(K_o >= bc-1, ...)`` so the first
-    ``bc-1`` iters of the producer skip the wait — they fill slots
-    that weren't touched by the prologue's ``σ_first`` (which uses slot
-    0). No pre-arrives needed; the conditional skip is cleaner than
-    a pre-arrival scheme that needs different formulas per slot.
-
-    Consumer arrive is gated by ``Cond(threadIdx.x == n_producer_threads, ...)``
-    — a single consumer thread arrives so arrive_count stays 1.
-
-    Phase formula for producer wait (for K_o >= bc-1):
-        slot  = (K_o + 1) % bc
-        phase = ((K_o + 1) / bc - 1) % 2
-
-    Currently single-group only — multi-group TMA kernels skip the
-    empty-mbarrier wiring (raises a warning). Most matmul/SDPA kernels
-    are single-group post-080."""
-    bc_per_mbar: dict[str, int] = {}
-    for s in prologue:
-        if isinstance(s, Smem) and s.dtype == "unsigned long long":
-            bc_per_mbar[s.name] = int(s.extents[0])
-
-    # Filter to mbars that actually appear in mbar_groups (collected
-    # during _split_roles). This drops any prologue Smem leftovers from
-    # non-TMA paths.
-    relevant = {n: bc for n, bc in bc_per_mbar.items() if n in mbar_groups}
-    if not relevant:
-        return prologue, producer, consumer
-
-    # Single-group simplification for v1.
-    if len(relevant) > 1:
-        # Multi-group kernels (e.g., SDPA's multi-K-loop shape) need
-        # per-group wait/arrive insertion keyed by which K_o loop owns
-        # which mbar. Defer; today's matmul is single-group.
-        return prologue, producer, consumer
-
-    full_mbar = next(iter(relevant))
-    bc = relevant[full_mbar]
-    empty_mbar = f"{full_mbar}_empty"
-
-    # 1. Augment prologue: empty Smem + per-slot MbarrierInit.
-    extra_smem = Smem(name=empty_mbar, extents=(bc,), dtype="unsigned long long")
-    extra_inits = tuple(MbarrierInit(mbar=empty_mbar, count=1, slot=Literal(s, "int")) for s in range(bc))
-
-    new_prologue: list[Stmt] = []
-    smem_inserted = False
-    init_inserted = False
-    for s in prologue:
-        # Insert empty Smem right after the full mbar Smem.
-        if not smem_inserted and isinstance(s, Smem) and s.name == full_mbar:
-            new_prologue.append(s)
-            new_prologue.append(extra_smem)
-            smem_inserted = True
-            continue
-        # Splice empty inits into the MbarrierInit Cond.
-        if not init_inserted and isinstance(s, Cond) and all(isinstance(b, MbarrierInit) for b in s.body):
-            new_prologue.append(Cond(cond=s.cond, body=(*s.body, *extra_inits)))
-            init_inserted = True
-            continue
-        new_prologue.append(s)
-
-    # 2. Producer: insert MbarrierWait before each K_o issue.
-    def _augment_producer(stmts: list[Stmt]) -> list[Stmt]:
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-
-        out: list[Stmt] = []
-        for s in stmts:
-            if isinstance(s, SerialTile) and s.kind == "serial_outer":
-                k_var = s.axis.name
-                k_plus_1 = Var(k_var) + Literal(1, "int")
-                slot_expr = k_plus_1 % Literal(bc, "int")
-                phase_expr = (k_plus_1 / Literal(bc, "int") - Literal(1, "int")) % Literal(2, "int")
-                wait_cond = Cond(
-                    cond=BinaryExpr(">=", Var(k_var), Literal(bc - 1, "int")),
-                    body=(MbarrierWait(mbar=empty_mbar, phase=phase_expr, slot=slot_expr),),
-                )
-                inner = Body((wait_cond, *s.body))
-                out.append(s.with_bodies((inner,)))
-            else:
-                out.append(s)
-        return out
-
-    new_producer = _augment_producer(producer)
-
-    # 3. Consumer: append MbarrierArrive after each K_o reduce.
-    # arrive_count=1 on empty mbar init means exactly one consumer
-    # thread arrives per K_o iter. We pick the first thread of the
-    # consumer range — ``threadIdx.x == n_producer_threads``.
-    consumer_first_tid = Literal(n_producer_threads, "int")
-
-    def _augment_consumer(stmts: list[Stmt]) -> list[Stmt]:
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-
-        out: list[Stmt] = []
-        for s in stmts:
-            if isinstance(s, SerialTile) and s.kind == "serial_outer":
-                k_var = s.axis.name
-                slot_expr = Var(k_var) % Literal(bc, "int")
-                arrive_cond = Cond(
-                    cond=BinaryExpr("==", Builtin("thread_idx.x"), consumer_first_tid),
-                    body=(MbarrierArrive(mbar=empty_mbar, slot=slot_expr),),
-                )
-                inner = Body((*s.body, arrive_cond))
-                out.append(s.with_bodies((inner,)))
-            else:
-                out.append(s)
-        return out
-
-    new_consumer = _augment_consumer(consumer)
-    return new_prologue, new_producer, new_consumer
-
-
-def _rename_consumer_syncs(stmts: list[Stmt], n_consumer_threads: int) -> list[Stmt]:
-    """Recursively rewrite plain ``Sync()`` to ``Sync(barrier_id=1,
-    count=n_consumer_threads)`` inside the consumer subtree.
-
-    ``__syncthreads`` (the default Sync) inside the warp-divergent
-    ``Cond(warp<P)`` consumer branch is CUDA UB; a named bar.sync
-    synchronizes exactly the consumer threads.
-
-    Also descends into ``TreeHalve`` (which carries its own per-iter
-    barrier in the rendered loop): switches barrier_id/barrier_count
-    to match. ``WarpShuffle`` is intra-warp via ``__shfl_xor_sync``
-    and doesn't need a CTA-wide sync — unchanged."""
-    out: list[Stmt] = []
-    for s in stmts:
-        out.append(_rename_one_consumer_sync(s, n_consumer_threads))
-    return out
-
-
-def _rename_one_consumer_sync(s: Stmt, n: int) -> Stmt:
-    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-
-    if isinstance(s, Sync) and s.barrier_id == 0:
-        return Sync(barrier_id=1, count=n)
-    if isinstance(s, TreeHalve) and s.barrier_id == 0:
-        return TreeHalve(
-            buf=s.buf,
-            op=s.op,
-            length=s.length,
-            tid_var=s.tid_var,
-            dtype=s.dtype,
-            barrier_id=1,
-            barrier_count=n,
-        )
-    nested = s.nested()
-    if nested:
-        new_bodies = tuple(Body(tuple(_rename_one_consumer_sync(c, n) for c in b)) for b in nested)
-        return s.with_bodies(new_bodies)
-    return s
 
 
 def _build_linear_tid(thread_axes: tuple[Axis, ...]):

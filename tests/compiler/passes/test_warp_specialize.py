@@ -85,10 +85,13 @@ def _tile_op_tma_pipelined() -> TileOp:
         body=Body((tma_bundle,)),
         kind="serial_outer",
     )
+    # 2D ThreadTile so the inner axis (n_i, extent 16) divides
+    # n_producer_threads=32 cleanly (extension=2 rows). Single-axis
+    # extent 128 would not satisfy 32 % inner_extent == 0.
     body = Body(
         (
             ThreadTile(
-                axes=(Axis("t", 128),),
+                axes=(Axis("m_i", 16), Axis("n_i", 16)),
                 body=Body((outer_loop,)),
             ),
         )
