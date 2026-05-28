@@ -1535,17 +1535,22 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # builder accepts): split the N_r register-tile around the K-reduce so
     # N-invariant compute runs once per K step and is shared across F_N
     # cells. Emits sibling RegisterTile(N_r) towers (Init / K-reduce N-dep
-    # tail / Write) inside the M_r scope. The blocked builder declines
-    # (returns None) on shapes it can't yet handle — prologue (SDPA P@V's
-    # M-row-shared softmax stats), SPLITK > 1 (atomic-add per-cell Writes
-    # work fine, but ``_gate_linear_epilogue_on_k_s_zero``'s Cond wrap and
-    # 020_stage_inputs's slab-shape inference for the inner-RegisterTile
-    # Load haven't been generalised yet), BR > 1's cooperative-K combine,
-    # M-mask, and F_N = 1 (no register-tile benefit anyway, and the
-    # downstream staging passes get the wrong slab geometry on the inner
-    # N_r=1 wrap) — the per-cell legacy path below picks up those cases.
+    # tail / Write) inside the M_r scope. Prologue kernels are in-scope
+    # too: the fused RMSNorm + lm_head matmul (linear_196) has K-dependent
+    # N-invariant compute (``v_k = x[m, k]·v4·norm_weight[k]``) inside the
+    # matmul K-loop — exactly the blocked-nest target. The prologue's own
+    # K-reduce (mean / softmax stats) still runs once at the M_r scope; the
+    # blocked transform only touches the matmul body's K_i.
+    # The blocked builder declines (returns None) on shapes it can't yet
+    # handle — SPLITK > 1 (``_gate_linear_epilogue_on_k_s_zero``'s Cond
+    # wrap and 020_stage_inputs's slab-shape inference for the inner-
+    # RegisterTile Load haven't been generalised yet), BR > 1's
+    # cooperative-K combine, M-mask, and F_N = 1 (no register-tile benefit
+    # anyway, and the downstream staging passes get the wrong slab geometry
+    # on the inner N_r=1 wrap) — the per-cell legacy path below picks up
+    # those cases.
     reg_blocked = False
-    if not shape.prologue and params.splitk == 1 and params.br == 1 and params.fn > 1 and shape.k_loop is not None and m_bound is None:
+    if params.splitk == 1 and params.br == 1 and params.fn > 1 and shape.k_loop is not None and m_bound is None:
         if n_bound is not None:
             # Masked N: wrap each tower's leaf body in its own Cond. The
             # replicator (010_split_register_axes) replicates the Cond per
@@ -1616,9 +1621,15 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # With prologue: N_r wraps the matmul body alone; the prologue stmts
     # are prepended at the M_r scope, so the M_r Loop body becomes
     # ``[prologue..., N_r tower]``. Outer layers (THREAD/BLOCK/SPLITK)
-    # then wrap that combined body.
+    # then wrap that combined body. When the blocked nest has already
+    # emitted the per-tower RegisterTile(N_r) wrappers inside new_inner,
+    # skip the outer ``_wrap_tower([(N_r, ...)], ...)`` — the N_r tile is
+    # already present per-tower.
     if shape.prologue:
-        matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
+        if reg_blocked:
+            matmul_tower = new_inner
+        else:
+            matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
         body_inside_mr = prologue_rewritten + matmul_tower
         if M_r is not None:
             # M_r stays serial (not RegisterTile) — the SDPA prologue
