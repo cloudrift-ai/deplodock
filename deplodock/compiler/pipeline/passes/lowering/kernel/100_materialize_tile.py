@@ -262,7 +262,10 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         addressing = src.addressing
         assert isinstance(addressing, AffineAddressing), f"TMA stage source {src.name!r} must use AffineAddressing"
         desc_name = f"{src.name}_desc"
-        gid = tma.stage_group[id(bundle)]
+        # Key by smem name (Source.name) — id(bundle) isn't stable across
+        # Body.map's wrapper-rebuild on descent, but Source.name is set
+        # by 020_stage_inputs and survives every downstream rewrite.
+        gid = tma.stage_group[src.name]
         mbar_name = tma.mbar_name(gid)
         # Box extents per source dim: product of cache extents that map
         # to that dim (multiple cache axes can sweep the same source dim
@@ -301,7 +304,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
                 src_buf=src.buf,
                 src_shape=(),
                 box_extents=box,
-                swizzle=stage.swizzle.value,
+                swizzle=bundle.swizzle.value,
                 dtype=smem_cuda_dtype(src),
             )
         if mbar_name not in declared_mbar:
@@ -323,22 +326,25 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         for ax in src.cache_axes:
             slab_bytes *= ax.extent.as_static()
         # Smem allocation: leading phase dim + cache extents (with pad).
-        full_extents = (stage.buffer_count, *src.alloc_extents)
-        smem_index = (stage.phase, *([Literal(0, "int")] * len(src.cache_axes)))
+        # buffer_count / phase live on the StageBundle now (collapsed Stage
+        # hierarchy — Stage.{buffer_count,phase,swizzle} are no longer
+        # carried per-Stage; pull them from the enclosing bundle).
+        full_extents = (bundle.buffer_count, *src.alloc_extents)
+        smem_index = (bundle.phase, *([Literal(0, "int")] * len(src.cache_axes)))
         # Distribute issuer threads across stages within a group so each
         # stage's arrive+TMA pair issues from a different thread (stage
         # 0 → tid 0, stage 1 → tid 1, ...) rather than serializing on tid 0.
         cond = Cond(
             cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(tma.issuer_tid[src.name], "int")),
             body=(
-                MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=stage.phase),
+                MbarrierArriveExpectTx(mbar=mbar_name, bytes_=slab_bytes, slot=bundle.phase),
                 TmaLoad(
                     smem=src.name,
                     smem_index=smem_index,
                     desc=desc_name,
                     coords=coords,
                     mbar=mbar_name,
-                    mbar_slot=stage.phase,
+                    mbar_slot=bundle.phase,
                 ),
             ),
         )
