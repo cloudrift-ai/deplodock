@@ -124,13 +124,33 @@ class Smem(Stmt):
 
 @dataclass(frozen=True)
 class Sync(Stmt):
-    """``__syncthreads();`` — block-wide barrier."""
+    """Thread-group barrier.
+
+    ``barrier_id == 0`` (default): ``__syncthreads();`` — CTA-wide.
+
+    ``barrier_id > 0`` and ``count`` set: ``bar.sync <id>, <count>;`` —
+    named-barrier synchronizing exactly ``count`` threads on barrier id
+    ``<id>`` (one of 1..15). Used inside warp-specialized branches where
+    only a subset of CTA threads execute the sync — `__syncthreads()`
+    would be CUDA UB because the enclosing ``if (warp < P)`` condition
+    diverges across warps. The count must equal the number of threads
+    that actually arrive at this barrier in flight."""
+
+    barrier_id: int = 0
+    count: int | None = None
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}Sync"]
+        if self.barrier_id == 0:
+            return [f"{indent}Sync"]
+        return [f"{indent}Sync(bar={self.barrier_id}, count={self.count})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        return [f"{_pad(ctx.indent)}__syncthreads();"]
+        pad = _pad(ctx.indent)
+        if self.barrier_id == 0:
+            return [f"{pad}__syncthreads();"]
+        if self.count is None:
+            raise ValueError(f"Sync(barrier_id={self.barrier_id}) requires count")
+        return [f'{pad}asm volatile("bar.sync {self.barrier_id}, {self.count};\\n" ::: "memory");']
 
 
 @dataclass(frozen=True)
@@ -417,9 +437,18 @@ class TreeHalve(Stmt):
     length: int
     tid_var: str
     dtype: DataType = F32
+    # Named-barrier support: when ``barrier_id > 0`` the per-iter sync
+    # renders as ``bar.sync <id>, <count>;`` instead of ``__syncthreads()``.
+    # Required when this TreeHalve sits inside a warp-specialized consumer
+    # branch — __syncthreads on a warp-divergent condition is UB.
+    barrier_id: int = 0
+    barrier_count: int | None = None
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var})"]
+        bar = "" if self.barrier_id == 0 else f", bar={self.barrier_id}/{self.barrier_count}"
+        return [
+            f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var}{bar})"
+        ]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
@@ -430,12 +459,18 @@ class TreeHalve(Stmt):
             self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name
         )
         half = int(self.length) // 2
+        if self.barrier_id == 0:
+            sync_line = f"{inner_pad}__syncthreads();"
+        else:
+            if self.barrier_count is None:
+                raise ValueError(f"TreeHalve(barrier_id={self.barrier_id}) requires barrier_count")
+            sync_line = f'{inner_pad}asm volatile("bar.sync {self.barrier_id}, {self.barrier_count};\\n" ::: "memory");'
         return [
             f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
             f"{inner_pad}if ({self.tid_var} < s) {{",
             f"{halve_pad}{self.buf}[{self.tid_var}] = {op_expr};",
             f"{inner_pad}}}",
-            f"{inner_pad}__syncthreads();",
+            sync_line,
             f"{pad}}}",
         ]
 

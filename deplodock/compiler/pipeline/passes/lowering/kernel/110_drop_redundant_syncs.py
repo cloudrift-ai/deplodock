@@ -68,8 +68,12 @@ def _drop_redundant_syncs(body: tuple[Stmt, ...]) -> list[Stmt]:
         if isinstance(s, Sync):
             if not smem_seen:
                 continue  # nothing for the sync to fence yet
-            if out and isinstance(out[-1], Sync):
-                continue  # back-to-back sync collapses
+            if out and isinstance(out[-1], Sync) and out[-1] == s:
+                # Back-to-back identical syncs collapse. Equality (frozen
+                # dataclass) covers barrier_id + count, so a default
+                # ``Sync()`` and a named ``Sync(1, 192)`` placed adjacently
+                # are preserved as distinct (different semantics).
+                continue
         elif isinstance(s, _SMEM_TOUCHING):
             smem_seen = True
         out.append(s)
