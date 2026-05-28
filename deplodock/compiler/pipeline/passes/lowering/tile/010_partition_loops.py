@@ -69,13 +69,10 @@ reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 from __future__ import annotations
 
 import enum
-import hashlib
 import os
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from deplodock.compiler import provenance
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
@@ -223,7 +220,9 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     (mirrors :meth:`TileOp.score`) so the ordering matches what the
     fully-built TileOps would have produced."""
     loop_op: LoopOp = root.op
-    kernel_name = _kernel_name_for(loop_op, root.id, provenance.get(root), provenance.totals(match.graph))
+    # Name was stamped onto the LoopOp by ``loop/fusion/030_stamp_loop_names``
+    # (the last loop-dialect pass), so we just forward it onto the TileOp.
+    kernel_name = loop_op.name
     # Idempotence is structural: once the planner has built a TileOp, the
     # rule pattern (LoopOp) no longer matches.
     plan = _plan_kernel(loop_op, ctx, kernel_name=kernel_name)
@@ -331,69 +330,6 @@ def _build_fork_tree_lazy(plan: _Plan, ctx: Context) -> Fork | list[Fork]:
     if len(top) == 1:
         return top[0]
     return top
-
-
-# Generic glue ops carry no descriptive name — a kernel made only of these
-# falls back to the node-id name. When a meaningful op (rms_norm / linear /
-# sdpa / …) is also present, the glue is dropped from the label.
-_GENERIC_KINDS = frozenset({"ElementwiseOp", "ReduceOp", "ScanOp", "IndexMapOp", "GatherOp", "ScatterOp"})
-
-
-def _humanize_kind(kind: str) -> str:
-    """``RmsNormOp`` → ``rms_norm``, ``SdpaOp`` → ``sdpa`` (CamelCase→snake, drop ``Op``)."""
-    stem = kind[:-2] if kind.endswith("Op") else kind
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", stem).lower()
-
-
-def _kernel_name_for(loop: LoopOp, base_name: str, node_prov: dict, totals: dict[str, set[str]]) -> str:
-    """Name the kernel after the original ops it implements (op provenance).
-
-    A kernel that fully realizes exactly one meaningful op gets ``k_<op>_<h>``
-    (e.g. ``k_rms_norm_3f2a1b``); a partial one keeps the ``_<reduce|pointwise>``
-    qualifier so the reduce half is told apart from the pointwise tail. Multiple
-    meaningful ops join (``k_linear_sdpa_...``). With no provenance (or only glue
-    ops) it falls back to the node-id name.
-
-    ``<h>`` is a short structural-body hash: prov labels are *not* unique (two
-    rms_norms, or SDPA's two distinct reduce kernels, share a label), but the
-    backend dispatches kernels by name and the launch dict holds one source per
-    name. The hash makes structurally-identical kernels share a name (so they
-    dedup to one compilation) and distinct kernels differ (so a duplicate label
-    never makes one launch reuse another's code). The node-id fallback is
-    already unique, so it needs no hash."""
-    suffix = "reduce" if any(isinstance(s, Accum) for s in loop) else "pointwise"
-    meaningful = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS]
-    if not meaningful:
-        return f"k_{_dedup_tokens(base_name)}_{suffix}"
-
-    labels: list[str] = []
-    for oid in meaningful:
-        lbl = _humanize_kind(node_prov[oid]["kind"])
-        if lbl not in labels:
-            labels.append(lbl)
-    joined = _dedup_tokens("_".join(labels))
-    # ``structural_key`` is a pretty-printed body string; hash it to a short
-    # alphanumeric token (valid in a C identifier; identical bodies → same token).
-    h = hashlib.sha1(loop.body.structural_key().encode()).hexdigest()[:6]
-    cov = provenance.coverage(node_prov, totals)
-    if len(meaningful) == 1 and cov[meaningful[0]][2]:  # single op, fully covered
-        return f"k_{joined}_{h}"
-    return f"k_{joined}_{suffix}_{h}"
-
-
-def _dedup_tokens(name: str) -> str:
-    """Drop consecutive duplicate ``_``-separated tokens.
-
-    ``softmax_softmax_max`` → ``softmax_max``; ``rms_rms_norm`` → ``rms_norm``.
-    Preserves order; only collapses adjacent duplicates so structurally
-    distinct repeats (``add_mul_add``) survive.
-    """
-    out: list[str] = []
-    for tok in name.split("_"):
-        if not tok or (out and out[-1] == tok):
-            continue
-        out.append(tok)
-    return "_".join(out) if out else name
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
