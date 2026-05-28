@@ -699,6 +699,23 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
     return {"Deplodock": bench.time_ms * 1000}, bench, False
 
 
+def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
+    """End-to-end full-model bench against the **real torch module** — eager /
+    ``torch.compile`` / Deplodock — using ``_bench_interleaved``. The module + its
+    trace-time inputs come from ``load_or_trace``'s bundle. Skips the accuracy
+    check (deplodock's bench uses synthetic activations vs torch's bound inputs, so
+    only latency is comparable here — accuracy lives in the per-kernel path).
+    Returns ``(results, bench)``."""
+    import torch
+
+    cuda_module = module.to("cuda")
+    cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in args_t)
+    cuda_kwargs = _to_cuda_kwargs(kwargs)
+    backends = _resolve_backends(bench_backends)
+    torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, warmup, backends=backends)
+    return _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
+
+
 def _handle_run_ir(args, CudaBackend, CompilerDump):
     """Run path: load JSON IR (any stage), finish lowering, execute, bench."""
     import json

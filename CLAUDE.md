@@ -92,11 +92,15 @@ same worker.
   On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
   `<kernel> <current us> (best <best us>) <knobs>` tail — the current latency is fixed-width and the knobs sit
   last, so the prefix stays put as the per-variant latency changes (no flicker); `-v` shows the per-`[tune]` INFO
-  lines instead, `-q` is quiet (errors only, no bar — the final summary still prints). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1
-  ranking pass): the full compiled model and each kernel (via its provenance `.torch.json` reproducer, re-lowered so
-  the tuned forks are picked) vs eager / `torch.compile` / Deplodock, then prints full-model + per-kernel comparison
-  tables (`--warmup`/`--iters`/`--seed`/`--bench-backends` mirror `run`). When a dump dir is set
-  (`--dump-dir`/`DEPLODOCK_DUMP_DIR`) it also writes an HTML per-kernel chart to `<dump-dir>/kernels.html` (+ `.png`).
+  lines instead, `-q` is quiet (errors only, no bar — the final summary still prints). `--bench` re-benches the tuned
+  winner at **-O3** (deployable, not the -O1 ranking pass): the full model **against the real torch module** (eager /
+  `torch.compile` / Deplodock, end-to-end) and each kernel via its provenance `.torch.json` reproducer (re-lowered so
+  the tuned forks are picked) vs eager / `torch.compile` / Deplodock, then prints both comparison tables. The
+  full-model bench is skipped when the input is an `--ir` JSON file (no module available); the per-kernel table still
+  runs. `--bench-backends` defaults to `eager,tcompile,deplodock` (overrides the `run` default that drops tcompile —
+  the ~0.8 s JIT is worth paying for the deployable comparison). `--warmup`/`--iters`/`--seed` mirror `run`. When a
+  dump dir is set (`--dump-dir`/`DEPLODOCK_DUMP_DIR`) it also writes an HTML per-kernel chart to
+  `<dump-dir>/kernels.html` (+ best-effort `.png`).
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)

@@ -253,8 +253,10 @@ per-variant latency changes (only a new best, which is rare, shifts the trailing
 (duck-typed, so the search package keeps no dependency on `commands/`): one op leaf ticked per kernel, the tail updated
 per benched variant (read off `TuningSearch.last_stats`). `-v` disables the bar (the per-`[tune]` INFO lines show
 progress instead); `-q` is quiet (errors only). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1 ranking pass) after tuning —
-the assembled full model and each kernel's `.torch.json` provenance reproducer (re-lowered greedily so the tuned forks
-are picked) vs eager / `torch.compile` / Deplodock — via the shared `commands/run.bench_lowered_vs_torch`, printing
+the assembled full model **against the real torch module** (eager / `torch.compile` / Deplodock, via the bundle
+plumbed from `load_or_trace` → `commands/run.bench_full_model_real`) and each kernel's `.torch.json` provenance
+reproducer (re-lowered greedily so the tuned forks are picked) vs eager / `torch.compile` / Deplodock via
+`commands/run.bench_lowered_vs_torch`, printing
 full-model + per-kernel tables and (when a dump dir is set) an HTML chart at `<dump-dir>/kernels.html`.
 
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner

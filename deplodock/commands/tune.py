@@ -84,11 +84,11 @@ def register_tune_command(subparsers):
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --bench random inputs (default: 0).")
     parser.add_argument(
         "--bench-backends",
-        default=None,
+        default="eager,tcompile,deplodock",
         help=(
             "Comma-separated subset of backends to time under --bench: any of ``eager``, ``tcompile`` "
-            "(torch.compile), ``deplodock``. Falls back to ``DEPLODOCK_BENCH_BACKENDS``, then ``eager,deplodock``. "
-            "``deplodock`` is always included."
+            "(torch.compile), ``deplodock``. Default: all three — tune --bench is the deployable comparison, "
+            "so torch.compile's ~0.8s JIT is worth paying. ``deplodock`` is always included."
         ),
     )
     add_diagnostics_args(parser)
@@ -126,17 +126,14 @@ def handle_tune(args):
             "-O1" if "-O1" in nvcc_flags else "-O0",
         )
 
-    graph, _ = load_or_trace(args)
+    graph, _, bench_bundle = load_or_trace(args)
 
-    # --bench re-benches the tuned winner against torch after tuning. Snapshot the
-    # pristine frontend graph now (tuning seeds provenance / mutates it) so we can
-    # build the torch reference; ``None`` when the graph isn't torch_ref-runnable
-    # (whole-model / unsupported ops) → deplodock-only full-model bench.
-    bench_frontend = None
-    if args.bench:
-        from deplodock.compiler.backend import torch_ref
-
-        bench_frontend = graph.copy() if torch_ref.is_runnable(graph) else None
+    # ``--bench`` benches the assembled tuned graph against the **real torch module**
+    # end-to-end (eager / torch.compile / deplodock). ``bench_bundle`` carries the
+    # runnable module + its trace-time example inputs from ``load_or_trace`` — None
+    # only when the input was an ``--ir`` JSON file (no module). With a bundle we
+    # use the real module; without, the full-model bench is skipped (only the
+    # per-kernel table runs).
 
     dump = CompilerDump.resolve(args.dump_dir)
     # Per-kernel bench reads the ``.torch.json`` provenance reproducers the assembled
@@ -225,7 +222,7 @@ def handle_tune(args):
         logger.info("Saved cuda IR: %s", args.output)
 
     if args.bench and result.assembled is not None:
-        _run_bench(args, bench_frontend, result.assembled, dump, html_dir=html_dir)
+        _run_bench(args, bench_bundle, result.assembled, dump, html_dir=html_dir)
     if tmp_dump_dir is not None:
         import shutil
 
@@ -290,14 +287,15 @@ def _print_two_level_summary(result) -> None:
         sys.stderr.write(f"[tune] separability gap:          {gap:>+12.2f} us  ({pct:+.1f}%)\n")
 
 
-def _run_bench(args, frontend, assembled, dump, *, html_dir) -> None:
+def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     """``tune --bench``: re-bench the tuned winner at -O3 (deployable numbers, NOT the
-    -O1 ranking pass) — the full compiled model and each per-kernel provenance
-    reproducer vs eager / torch.compile / Deplodock — print a comparison table, and
-    (when ``html_dir`` is set) write an HTML per-kernel chart. ``frontend`` is the
-    torch-ref snapshot for the whole graph (``None`` → deplodock-only full-model bench).
-    Reuses the common bench primitive ``run.bench_lowered_vs_torch``."""
-    from deplodock.commands.run import _print_table, bench_lowered_vs_torch
+    -O1 ranking pass) — full model **against the real torch module** (eager /
+    torch.compile / Deplodock) and each per-kernel ``.torch.json`` reproducer against
+    its torch-ref reconstruction. Prints both tables and (when ``html_dir`` is set)
+    writes an HTML per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``;
+    when ``None`` (an ``--ir`` JSON tune with no module) the full-model bench is
+    skipped and only the per-kernel table runs."""
+    from deplodock.commands.run import _print_table, bench_full_model_real
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline.search.db import SearchDB
 
@@ -320,23 +318,27 @@ def _run_bench(args, frontend, assembled, dump, *, html_dir) -> None:
         os.environ[config.DUMP_DIR] = saved_dump_env
     db = SearchDB(path=backend.tune_db) if (backend.tune_db is not None and backend.tune_db.exists()) else None
 
-    sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / deplodock):\n")
-    try:
-        full, _, _ = bench_lowered_vs_torch(
-            frontend,
-            assembled,
-            backend,
-            seed=args.seed,
-            do_bench=True,
-            warmup=args.warmup,
-            iters=args.iters,
-            bench_backends=args.bench_backends,
-        )
-        _print_table(full)
-    except RuntimeError as exc:
-        # A whole-graph compile/bench failure (e.g. a slow-compiling kernel) must not
-        # cost us the per-kernel table — report and fall through to per-kernel.
-        sys.stderr.write(f"[tune] full-model bench failed ({exc}); continuing to per-kernel\n")
+    if bench_bundle is not None:
+        module, ex_args, ex_kwargs = bench_bundle
+        sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / deplodock):\n")
+        try:
+            full, _ = bench_full_model_real(
+                module,
+                ex_args,
+                ex_kwargs,
+                assembled,
+                backend,
+                warmup=args.warmup,
+                iters=args.iters,
+                bench_backends=args.bench_backends,
+            )
+            _print_table(full)
+        except RuntimeError as exc:
+            # A whole-graph compile/bench failure (e.g. a slow-compiling kernel) must not
+            # cost the per-kernel table — report and fall through.
+            sys.stderr.write(f"[tune] full-model bench failed ({exc}); continuing to per-kernel\n")
+    else:
+        sys.stderr.write("\n[tune] full-model bench skipped (no runnable module — --ir JSON path)\n")
 
     rows = _bench_per_kernel(args, dump.dir, backend, db)
     if rows:

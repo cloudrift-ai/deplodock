@@ -107,19 +107,22 @@ def _handle_trace_model(args):
 
 
 def _handle_trace_code(args):
-    graph, slug = graph_from_code(args.code)
+    graph, slug, _ = graph_from_code(args.code)
     _save(graph, args, default_basename=slug)
 
 
 def graph_from_code(code: str, dynamic_shapes: dict | None = None):
-    """Trace an inline torch expression and return ``(graph, filename_slug)``.
+    """Trace an inline torch expression and return ``(graph, slug, bundle)`` where
+    ``bundle = (module, args, kwargs)`` is the runnable torch module + example inputs
+    (used by ``tune --bench`` / ``run --bench`` to time eager / ``torch.compile``
+    against the lowered graph).
 
     Shared by ``deplodock trace --code`` and ``deplodock compile --code``.
-    ``dynamic_shapes`` flows through to ``torch.export.export`` so the
-    resulting graph can carry symbolic dims from the SymInt pass.
+    ``dynamic_shapes`` flows through to ``torch.export.export`` so the resulting
+    graph can carry symbolic dims from the SymInt pass.
     """
     info = trace_inline_code(code, dynamic_shapes=dynamic_shapes)
-    return info["graph"], info["slug"]
+    return info["graph"], info["slug"], (info["module"], info["args"], info["kwargs"])
 
 
 def trace_inline_code(code: str, dynamic_shapes: dict | None = None) -> dict:
