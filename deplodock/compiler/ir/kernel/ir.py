@@ -334,6 +334,51 @@ class MbarrierArriveExpectTx(Stmt):
 
 
 @dataclass(frozen=True)
+class MbarrierArrive(Stmt):
+    """``mbarrier.arrive.shared.b64`` — simple arrive (no transaction-byte
+    count). Used by warp-specialized consumer warps to signal "slot empty"
+    so the producer can refill it on the next ring iteration. The producer
+    side uses ``MbarrierArriveExpectTx`` instead (which declares the
+    incoming TMA byte count)."""
+
+    mbar: str
+    slot: Expr | None = None
+
+    def pretty(self, indent: str = "") -> list[str]:
+        s = "" if self.slot is None else f"[{self.slot.pretty()}]"
+        return [f"{indent}MbarrierArrive({self.mbar}{s})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        addr = "&" + self.mbar if self.slot is None else f"&{self.mbar}[{self.slot.render(ctx)}]"
+        return [f"{pad}mbarrier_arrive({addr});"]
+
+
+@dataclass(frozen=True)
+class SetMaxNReg(Stmt):
+    """``setmaxnreg.{inc,dec}.sync.aligned.u32 N;`` — Hopper+ register-budget
+    redistribution. ``direction="dec"`` shrinks the calling warp's max
+    register count to ``count`` (returning registers to the pool);
+    ``direction="inc"`` claims up to ``count`` registers. Used by warp-
+    specialized kernels so producer warps drop registers and consumer
+    warps claim them, decoupling occupancy from the consumer's pressure.
+
+    Requires sm_90+. On older targets NVCC rejects the instruction at
+    compile time — the materializer only emits this Stmt on the WS=1 path
+    where the kernel is already TMA-gated to sm_90+ anyway."""
+
+    count: int
+    direction: str  # "inc" or "dec"
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}SetMaxNReg.{self.direction}({self.count})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        return [f'{pad}asm volatile("setmaxnreg.{self.direction}.sync.aligned.u32 {self.count};\\n");']
+
+
+@dataclass(frozen=True)
 class MbarrierWait(Stmt):
     """``mbarrier.try_wait.parity.shared.b64`` — block until the barrier's
     parity flips for ``phase``. Replaces ``CpAsyncWait + Sync`` for TMA
@@ -616,7 +661,9 @@ __all__ = [
     "TmaLoad",
     "MbarrierInit",
     "MbarrierArriveExpectTx",
+    "MbarrierArrive",
     "MbarrierWait",
+    "SetMaxNReg",
     "StridedLoop",
     "Stmt",
     # Top-level
@@ -713,12 +760,25 @@ def _(s: MbarrierArriveExpectTx, rename, sigma, axis_fn):
 
 
 @_rewrite.register
+def _(s: MbarrierArrive, rename, sigma, axis_fn):
+    return MbarrierArrive(
+        mbar=s.mbar,
+        slot=sigma.apply(s.slot) if s.slot is not None else None,
+    )
+
+
+@_rewrite.register
 def _(s: MbarrierWait, rename, sigma, axis_fn):
     return MbarrierWait(
         mbar=s.mbar,
         phase=sigma.apply(s.phase),
         slot=sigma.apply(s.slot) if s.slot is not None else None,
     )
+
+
+@_rewrite.register
+def _(s: SetMaxNReg, rename, sigma, axis_fn):
+    return s
 
 
 @_rewrite.register

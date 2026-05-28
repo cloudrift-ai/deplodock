@@ -48,6 +48,16 @@ static __device__ __forceinline__ void mbarrier_arrive_expect_tx(unsigned long l
                  : "=l"(state) : "r"(addr), "r"(bytes) : "memory");
 }
 
+static __device__ __forceinline__ void mbarrier_arrive(unsigned long long* mbar) {
+    // Simple arrive — no transaction-byte count. Used by warp-specialized
+    // consumer warps to signal "slot empty" after the producer's
+    // expect-tx round has been consumed.
+    unsigned int addr = __cvta_generic_to_shared(mbar);
+    unsigned long long state;
+    asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\\n"
+                 : "=l"(state) : "r"(addr) : "memory");
+}
+
 static __device__ __forceinline__ bool mbarrier_try_wait_parity(unsigned long long* mbar, int phase) {
     unsigned int addr = __cvta_generic_to_shared(mbar);
     int ready;
