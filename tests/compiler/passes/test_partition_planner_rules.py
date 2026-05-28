@@ -228,12 +228,13 @@ def test_planner_emits_register_blocked_structure():
 
     plan = planner._plan_kernel(loop_op, Context(compute_capability="sm_80"), kernel_name="k_blk")
     assert plan is not None
-    blocked_params = [p for p in plan.params if p.reg_block and p.fn > 1]
-    assert blocked_params, "no reg_block=True variants enumerated for matmul"
+    # Find a variant the blocked builder will accept (FN > 1, SPLITK = 1,
+    # BR = 1, no M-overhang). Blocking is now the default — no REG_BLOCK
+    # knob to set.
+    blocked_params = [p for p in plan.params if p.fn > 1 and p.splitk == 1 and p.br == 1]
+    assert blocked_params, "no blocking-eligible variants enumerated for matmul"
     chosen = blocked_params[0]
     tile_op = planner._materialize(plan, chosen)
-
-    assert tile_op.knobs.get("REG_BLOCK") is True
 
     thread = next(iter(tile_op.body.iter_of_type(ThreadTile)))
     layer_body: tuple = tuple(thread.body)
