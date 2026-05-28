@@ -72,6 +72,19 @@ warmup loop + timed loop wrapped in `cupy.cuda.Event` pairs — one
 global pair for `BenchmarkResult.time_ms`, one pair per launch index
 (averaged over iters) for `BenchmarkResult.per_launch`.
 
+`benchmark_program_isolated(...)` (the autotune path, gated on
+`bench_wall_timeout_s`) runs the bench in a **persistent** subprocess
+(`_bench_worker.py`, one per `CudaBackend`) so a wedged kernel can be
+SIGKILLed without dirtying the parent's stream. Because the worker is reused
+across configs, a kernel that does an illegal / misaligned access is a hazard:
+that error is **sticky** — it corrupts the CUDA context so every later call
+returns the same status until the process dies, which would cascade identical
+false `bench_fail`s across all subsequent configs. So after any failure the
+worker probes its context (`_context_dirty` — a cheap `deviceSynchronize`) and
+*exits* if it's poisoned; the parent respawns a clean context on the next
+request. Benign failures (NVRTC compile errors, cleaned-up OOM) leave the
+context healthy and keep the worker alive, so they pay no respawn cost.
+
 `run_program_debug(...)` snapshots every non-input buffer after each
 launch — consumed by `--dump-dir` runs.
 
