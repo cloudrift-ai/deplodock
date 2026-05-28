@@ -169,14 +169,14 @@ def test_leaves_preserve_every_variant():
     assert len(leaves) == len(plan.params), f"leaf count {len(leaves)} doesn't match variant count {len(plan.params)}"
 
 
-def test_leaf_knobs_are_bk_splitk_only():
-    """Leaf Forks pin only (BK, SPLITK) — the rest is committed by ancestor
-    branch Forks. The DB lookup at fork-replay time matches deltas
-    per-level, so the partition must be tight."""
+def test_leaf_knobs_are_bk_splitk_reg_block_only():
+    """Leaf Forks pin only (BK, SPLITK, REG_BLOCK) — the rest is committed
+    by ancestor branch Forks. The DB lookup at fork-replay time matches
+    deltas per-level, so the partition must be tight."""
     plan = _matmul_plan()
     tree = _build_fork_tree_lazy(plan, _ctx())
     for leaf in _walk_leaves(tree):
-        assert set(leaf.knobs.keys()) <= {"BK", "SPLITK"}, f"leaf knobs leak into non-(BK,SPLITK): {leaf.knobs}"
+        assert set(leaf.knobs.keys()) <= {"BK", "SPLITK", "REG_BLOCK"}, f"leaf knobs leak into non-(BK,SPLITK,REG_BLOCK): {leaf.knobs}"
 
 
 def test_branch_score_is_max_of_children():
@@ -242,11 +242,12 @@ def test_pointwise_collapses_br_layer():
 
 def test_branch_knobs_partition_cleanly():
     """The union of (root-fork knobs, walked branch knobs, leaf knobs)
-    along any root→leaf path must cover ``{BR, BM, BN, FM, FN, BK, SPLITK}``
-    exactly once each — no knob duplicated across levels, none missing."""
+    along any root→leaf path must cover
+    ``{BR, BM, BN, FM, FN, BK, SPLITK, REG_BLOCK}`` exactly once each —
+    no knob duplicated across levels, none missing."""
     plan = _matmul_plan()
     tree = _build_fork_tree_lazy(plan, _ctx())
-    expected = {"BR", "BM", "BN", "FM", "FN", "BK", "SPLITK"}
+    expected = {"BR", "BM", "BN", "FM", "FN", "BK", "SPLITK", "REG_BLOCK"}
 
     # Walk one root→leaf path and check.
     def _first_path(node: Fork) -> list[Fork]:

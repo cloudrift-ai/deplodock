@@ -79,10 +79,10 @@ from deplodock.compiler import provenance
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
@@ -131,8 +131,24 @@ FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells alon
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
+REG_BLOCK = Knob(
+    "REG_BLOCK",
+    KnobType.BOOL,
+    hints=(False, True),
+    help=(
+        "Register-blocked GEMM nest: split N_r register-tile around the K-reduce so "
+        "N-invariant compute (RMSNorm prologue, M-axis Loads) runs once per K step "
+        "and is shared across FN cells. False (greedy default) — today's per-cell "
+        "structure: the whole {Init, K-reduce, Write} runs F_N× per output cell. "
+        "True — three sibling RegisterTile(N_r) towers (Init / K-reduce body's "
+        "N-dependent tail / Write) wrap the shared compute; the K-loop runs once, "
+        "feeding all F_N accumulators. Cuts both compile time and runtime FLOPs for "
+        "large FN. v1 supports the simplest shape only: no prologue (no SDPA P@V), "
+        "no SPLITK > 1, no BR > 1; falls back to per-cell otherwise."
+    ),
+)
 
-_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR)
+_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR, REG_BLOCK)
 
 
 def _planner_pin_set() -> bool:
@@ -143,14 +159,23 @@ def _planner_pin_set() -> bool:
 
 @dataclass(frozen=True)
 class TileParams:
-    """One ``(BN, BM, FM, FN, BK, SPLITK, BR)`` variant. Frozen for de-dup in
-    the cartesian's ``seen`` set; ``br=1`` default keeps matmul / pointwise
-    sites terse.
+    """One ``(BN, BM, FM, FN, BK, SPLITK, BR, REG_BLOCK)`` variant. Frozen
+    for de-dup in the cartesian's ``seen`` set; ``br=1`` / ``reg_block=False``
+    defaults keep matmul / pointwise sites terse.
 
     ``overhang`` lists output-axis names admitted at a non-divisor BN/BM
     (masked tiles). Empty for clean-divisor variants. The planner stamps the
     same tuple onto the emitted ``TileOp.knobs["OVERHANG"]`` so downstream
     passes (staging, materialization) can guard cooperative loads.
+
+    ``reg_block`` toggles the register-blocked GEMM nest. False (default)
+    keeps the legacy per-cell structure: the planner wraps the entire
+    ``{Init, K-reduce, Write}`` in one ``RegisterTile(N_r)`` and 010_split_register_axes
+    replicates the whole thing FN×. True emits three sibling RegisterTile(N_r)
+    towers (Init / K-reduce N-dependent tail / Write) with N-invariant compute
+    hoisted between them, so the K-loop runs once and shared compute happens
+    once per K iteration rather than ×FN. Only set on matmul shapes with
+    FN > 1, no prologue, SPLITK = 1, BR = 1 — falls back to per-cell otherwise.
     """
 
     bn: int
@@ -161,6 +186,7 @@ class TileParams:
     splitk: int
     br: int = 1
     overhang: tuple[str, ...] = ()
+    reg_block: bool = False
 
 
 @dataclass(frozen=True)
@@ -278,7 +304,7 @@ def _build_fork_tree_lazy(plan: _Plan, ctx: Context) -> Fork | list[Fork]:
     def _leaf_forks(group: list[TileParams]) -> list[Fork]:
         out = [
             Fork(
-                knobs={BK.name: p.bk, SPLITK.name: p.splitk},
+                knobs={BK.name: p.bk, SPLITK.name: p.splitk, REG_BLOCK.name: p.reg_block},
                 expand=(lambda p=p: [_materialize(plan, p)]),
                 score=leaf_score[id(p)],
                 is_leaf=True,
@@ -584,6 +610,130 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 
 class _BuildSkipped(Exception):
     """Raised by ``_build_split_body`` when the body's shape doesn't match."""
+
+
+def _classify_n_dep(body: Body, n_axis_name: str) -> tuple[list[Stmt], list[Stmt]]:
+    """Partition ``body`` stmts into (N-invariant, N-dependent) by transitive
+    free-var analysis over Exprs + SSA def-use. ``n_axis_name`` is the post-σ
+    N register axis (typically ``N_r.name``) — a stmt is N-dependent iff its
+    transitive Expr ``free_vars`` ∪ ``deps``-chain references ``n_axis_name``.
+    Order within each group is preserved (source order = SSA topo order, so
+    N-invariant stmts feeding N-dependent ones come first).
+
+    Used by :func:`_build_register_blocked_body` to split a matmul K-reduce
+    body into the N-invariant cone (RMSNorm prologue, M-axis Loads — shared
+    across F_N cells) and the N-dependent tail (weight Load + ``Accum`` —
+    replicated per cell).
+    """
+
+    def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
+        own: frozenset[str] = frozenset()
+        for e in s.exprs():
+            own = own | frozenset(v for v in e.free_vars() if v not in bound)
+        for c in child_T:
+            if c is not None:
+                own = own | c
+        return own
+
+    deps = body.fold(fn)
+    invariant: list[Stmt] = []
+    dependent: list[Stmt] = []
+    for s in body:
+        if n_axis_name in deps[id(s)]:
+            dependent.append(s)
+        else:
+            invariant.append(s)
+    return invariant, dependent
+
+
+def _split_k_tower_for_block(
+    stmt: Stmt,
+    n_axis_name: str,
+    n_r: Axis,
+    leaf_cond: Callable[[tuple[Stmt, ...]], tuple[Stmt, ...]] | None,
+) -> tuple[Stmt, int]:
+    """Walk into a SerialTile K-tower; at the innermost ``stage_inner`` layer
+    (K_i, the reduce), split its body into ``[N-invariant cone...,
+    RegisterTile(N_r, [N-dep tail])]``. ``leaf_cond`` (when set) wraps the
+    N-dep tail in a per-cell Cond — used for masked N tiles where each cell's
+    work must be guarded. Returns ``(new_stmt, n_replaced)``.
+    """
+    if isinstance(stmt, SerialTile) and stmt.kind == "stage_inner":
+        invariant, dependent = _classify_n_dep(stmt.body, n_axis_name)
+        if not dependent:
+            return stmt, 0
+        tail_body = tuple(dependent)
+        if leaf_cond is not None:
+            tail_body = leaf_cond(tail_body)
+        new_body = Body(tuple(invariant) + (RegisterTile(axes=(n_r,), body=Body(tail_body)),))
+        return replace(stmt, body=new_body), 1
+    if isinstance(stmt, SerialTile):
+        new_body_stmts: list[Stmt] = []
+        replaced = 0
+        for c in stmt.body:
+            new_c, r = _split_k_tower_for_block(c, n_axis_name, n_r, leaf_cond)
+            new_body_stmts.append(new_c)
+            replaced += r
+        if replaced:
+            return replace(stmt, body=Body(new_body_stmts)), replaced
+    return stmt, 0
+
+
+def _build_register_blocked_body(
+    new_inner: tuple[Stmt, ...],
+    n_axis_name: str,
+    n_r: Axis,
+    leaf_cond: Callable[[tuple[Stmt, ...]], tuple[Stmt, ...]] | None,
+) -> tuple[Stmt, ...] | None:
+    """Apply the register-blocked GEMM nest to ``new_inner`` (the σ-rewritten
+    matmul body sitting inside ``M_r`` REGISTER, before the outer N_r wrap).
+    Replaces the existing per-cell ``[Init, K-tower, Write]`` flat structure
+    with three sibling RegisterTile(N_r) towers separated by the (now shared)
+    K-loop:
+
+    - ``Init(acc)`` → ``RegisterTile(N_r, [Init(acc)])`` (per-cell accumulators).
+    - K-tower (SerialTile K_o > SerialTile K_i) → K_i body split into N-invariant
+      cone + ``RegisterTile(N_r, [N-dep tail])`` — the cone (e.g. fused RMSNorm
+      prologue, M-axis Loads) runs once per K iteration, the tail runs F_N×.
+    - ``Write(C, acc)`` → ``RegisterTile(N_r, [Write(C, acc)])`` (per-cell writes).
+
+    ``leaf_cond`` wraps each tower's leaf body in a per-cell Cond (the masked-N
+    boundary guard). The replicator (010_split_register_axes) replicates each
+    Cond per cell using σ N_r → i, producing F_N concrete-i guarded leaves.
+
+    Returns ``None`` when the shape doesn't fit (no K_i found, empty N-dep
+    tail, or unexpected outer-scope stmts — Cond from a prior masked wrap,
+    epilogue compute, etc.) so the caller falls back to per-cell.
+    """
+    out: list[Stmt] = []
+    n_replaced = 0
+    for s in new_inner:
+        if isinstance(s, Init):
+            # Init must be unconditional: it declares the per-cell accumulator
+            # variable at thread scope. Wrapping it in the masked-N Cond would
+            # scope ``acc_i`` to the if-block; the K-tower's Accum and the
+            # Write tower (both Cond-wrapped per cell) would reference an
+            # ``acc_i`` that's no longer in scope. OOB cells initialize a
+            # dead register, which is harmless.
+            out.append(RegisterTile(axes=(n_r,), body=Body((s,))))
+        elif isinstance(s, Write):
+            leaf_body: tuple[Stmt, ...] = (s,)
+            if leaf_cond is not None:
+                leaf_body = leaf_cond(leaf_body)
+            out.append(RegisterTile(axes=(n_r,), body=Body(leaf_body)))
+        elif isinstance(s, SerialTile):
+            new_s, r = _split_k_tower_for_block(s, n_axis_name, n_r, leaf_cond)
+            out.append(new_s)
+            n_replaced += r
+        else:
+            # Outer-scope stmt we haven't taught the blocked builder about
+            # (Cond from prior masked wrap, post-K epilogue compute, etc.).
+            # Fall back to per-cell — the planner will materialize the
+            # ``reg_block=False`` sibling instead.
+            return None
+    if n_replaced == 0:
+        return None
+    return tuple(out)
 
 
 def _stmt_contains_accum(stmt: Stmt) -> bool:
@@ -935,6 +1085,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
         BK.name: params.bk,
         SPLITK.name: params.splitk,
         BR.name: params.br,
+        REG_BLOCK.name: params.reg_block,
     }
     # Drop leading stmts whose SSA name is *also* defined inside ``chain_body``.
     # A pre-loop invariant (e.g. ``v0 = reciprocal(1024)``) used only by a
@@ -953,9 +1104,11 @@ def _priority_matmul(p: TileParams) -> tuple[int, ...]:
     # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
     # threads near 256, larger BK, smaller SPLITK. Final tiebreaker prefers
     # clean-divisor variants over masked (negative len so fewer-overhang wins
-    # under reverse-sorted enumeration).
+    # under reverse-sorted enumeration). REG_BLOCK=False ranks higher than
+    # True (greedy default; M3 may invert) — `0` for False, `-1` for True keeps
+    # False ahead under reverse-sorted enumeration.
     threads = p.bn * p.bm
-    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
+    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang), -int(p.reg_block))
 
 
 def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
@@ -1079,7 +1232,24 @@ def _enumerate_cartesian(
     # reduce) via ``m_forced_mask`` / ``n_forced_mask``, tuned at its hint.
     allow_masked = priority_mode in ("pointwise", "matmul")
 
+    # REG_BLOCK eligibility: only matmul shapes can register-block the K-loop
+    # (pointwise / cooperative-reduce don't have a K-loop to share across N
+    # cells). Per-variant gates (FN > 1, SPLITK = 1, BR = 1, no M-overhang)
+    # apply inside ``_enumerate_cartesian_impl``. The env pin (``DEPLODOCK_REG_BLOCK``)
+    # threads in as ``reg_block_pin`` — narrowing inline at the cartesian innermost
+    # loop would discard the False variant whenever pin=True on a non-qualifying
+    # shape, leaving the kernel un-lowered. Letting the planner's peer-kernel
+    # fallback drop the pin is the right answer.
+    reg_block_eligible = priority_mode == "matmul"
+
     def _run(apply_pins: bool) -> list[TileParams]:
+        reg_block_pin_value: bool | None = None
+        if apply_pins:
+            from deplodock import config as _config  # noqa: PLC0415 — local import; avoid module cycle
+
+            raw = _config.knob_raw(REG_BLOCK.name)
+            if raw is not None:
+                reg_block_pin_value = REG_BLOCK.parse(raw)
         return _enumerate_cartesian_impl(
             E_M=E_M,
             E_N=E_N,
@@ -1100,6 +1270,8 @@ def _enumerate_cartesian(
             n_axis_name=n_axis_name,
             m_forced_mask=m_forced_mask,
             n_forced_mask=n_forced_mask,
+            reg_block_eligible=reg_block_eligible,
+            reg_block_pin=reg_block_pin_value,
         )
 
     result = _run(apply_pins=True)
@@ -1129,6 +1301,8 @@ def _enumerate_cartesian_impl(
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
+    reg_block_eligible: bool = False,
+    reg_block_pin: bool | None = None,
 ) -> list[TileParams]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
@@ -1228,11 +1402,36 @@ def _enumerate_cartesian_impl(
                                     overhang_axes = (*overhang_axes, n_axis_name)
                                 if m_overhang and m_axis_name is not None:
                                     overhang_axes = (*overhang_axes, m_axis_name)
-                                params = TileParams(bn=bn_c, bm=bm_c, fm=fm, fn=fn, bk=bk, splitk=splitk, br=br, overhang=overhang_axes)
-                                if params in seen:
-                                    continue
-                                seen.add(params)
-                                ordered.append(params)
+                                # REG_BLOCK candidate set: True is emitted only on the shape
+                                # where the planner's ``_build_register_blocked_body`` will
+                                # actually fire (FN > 1 so blocking has real cells to share,
+                                # SPLITK = 1, BR = 1, M not overhang — v1 constraints). False
+                                # is always available. Env pin clamps the choice set, but
+                                # ``pin=True`` produces no variants on a non-qualifying shape —
+                                # the planner-level peer-kernel fallback drops the pin.
+                                shape_supports_reg_block = reg_block_eligible and fn > 1 and splitk == 1 and br == 1 and not m_overhang
+                                if reg_block_pin is None:
+                                    reg_block_choices = (False, True) if shape_supports_reg_block else (False,)
+                                elif reg_block_pin:
+                                    reg_block_choices = (True,) if shape_supports_reg_block else ()
+                                else:
+                                    reg_block_choices = (False,)
+                                for rb in reg_block_choices:
+                                    params = TileParams(
+                                        bn=bn_c,
+                                        bm=bm_c,
+                                        fm=fm,
+                                        fn=fn,
+                                        bk=bk,
+                                        splitk=splitk,
+                                        br=br,
+                                        overhang=overhang_axes,
+                                        reg_block=rb,
+                                    )
+                                    if params in seen:
+                                        continue
+                                    seen.add(params)
+                                    ordered.append(params)
 
     ordered.sort(key=priority_fn, reverse=True)
     return ordered
@@ -1391,6 +1590,45 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     else:
         new_inner = inner_after_outer
 
+    # Register-blocked GEMM nest (REG_BLOCK True): split the N_r register-tile
+    # around the K-reduce so N-invariant compute runs once per K step and is
+    # shared across F_N cells. Emits three sibling RegisterTile(N_r) towers
+    # (Init / K-reduce N-dep tail / Write) inside the M_r scope. v1 supports
+    # only the simplest shape: no prologue (SDPA P@V uses M-row-shared softmax
+    # stats that can't trivially block over N), SPLITK = 1, BR = 1, FN > 1
+    # (otherwise no register-tile benefit), and no M-mask (the M-cond would
+    # wrap all three towers and tangle with the replicator).
+    reg_blocked = False
+    if (
+        params.reg_block
+        and not shape.prologue
+        and params.splitk == 1
+        and params.br == 1
+        and params.fn > 1
+        and shape.k_loop is not None
+        and m_bound is None
+    ):
+        if n_bound is not None:
+            # Masked N: wrap each tower's leaf body in its own Cond. The
+            # replicator (010_split_register_axes) replicates the Cond per
+            # cell using σ N_r → i, so each replica gets its own σ-folded
+            # predicate. A single top-level Cond wrapping all three towers
+            # would reference N_r in its predicate but expose nested
+            # RegisterTile(N_r) inside — the replicator can't reconcile
+            # both.
+            n_pred_for_cond = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
+
+            def _wrap_in_n_cond(stmts: tuple[Stmt, ...], pred: Expr = n_pred_for_cond, bound: Expr = n_bound) -> tuple[Stmt, ...]:  # type: ignore[assignment]
+                return (Cond(cond=BinaryExpr("<", pred, bound), body=Body(stmts)),)
+
+            leaf_cond = _wrap_in_n_cond
+        else:
+            leaf_cond = None
+        blocked_inner = _build_register_blocked_body(new_inner, N_r.name, N_r, leaf_cond)
+        if blocked_inner is not None:
+            new_inner = blocked_inner
+            reg_blocked = True
+
     # Masked tiles: when ceil-div has rounded a block-axis extent up past the
     # axis bound, wrap the σ-rewritten body in ``Cond(decoded_axis_coord <
     # bound)``. ``bound`` is the static ``real_extent`` (lm_head vocab) or the
@@ -1400,7 +1638,11 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # handles Conds whose predicate depends on the replicated axis by
     # σ-substituting per replica so each replicated body gets a partly-
     # constant-folded predicate (NVRTC drops always-true copies).
-    if n_bound is not None:
+    #
+    # Under REG_BLOCK the N-cond was already applied per-tower above, so skip
+    # the top-level N-cond here. The M-cond still always wraps (M_r is outside
+    # the N_r towers, regardless of reg_block).
+    if n_bound is not None and not reg_blocked:
         n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", n_pred, n_bound), body=Body(new_inner)),)
     if m_bound is not None:
@@ -1461,7 +1703,12 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         outer_layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
         return _wrap_tower(outer_layers, body_after_register)
 
-    layers: list[tuple[Axis, Role | None]] = [(N_r, Role.REGISTER)]
+    # When REG_BLOCK has wrapped the three sibling RegisterTile(N_r) towers
+    # already, the outer layers list skips N_r — the towers each carry their
+    # own RegisterTile(N_r) wrapper inside the M_r/THREAD scope.
+    layers: list[tuple[Axis, Role | None]] = []
+    if not reg_blocked:
+        layers.append((N_r, Role.REGISTER))
     if M_r is not None:
         layers.append((M_r, Role.REGISTER))
     layers.append((N_t, Role.THREAD))

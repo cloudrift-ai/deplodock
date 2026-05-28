@@ -179,3 +179,56 @@ def test_006a_sibling_register_tile_towers_share_keep():
     accums = [s for s in new_thread.body.iter() if isinstance(s, Accum)]
     accum_names = {a.name for a in accums}
     assert init_names == write_values == accum_names, (init_names, write_values, accum_names)
+
+
+def test_planner_emits_register_blocked_structure(monkeypatch):
+    """With ``DEPLODOCK_REG_BLOCK=1`` pinned, the planner's blocked-GEMM
+    path fires on a plain matmul: the post-partition TileOp body has two
+    sibling RegisterTile(N_r) wrappers (K-tower-inner + Write — Init is
+    implicit at this stage; 020_place_inits adds the explicit Inits at
+    the ThreadTile scope only after 010 has unwrapped RegisterTiles).
+    The K-tower's K_i body has the M-axis Load BEFORE the inner
+    RegisterTile(N_r) wrapper — the N-invariant cone, shared across F_N
+    cells.
+    """
+    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import SerialTile  # noqa: PLC0415
+
+    monkeypatch.setenv("DEPLODOCK_REG_BLOCK", "1")
+
+    g = Graph()
+    _input(g, "a", (64, 32))
+    _input(g, "b", (32, 128))
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (64, 128)), node_id="o")
+    g.inputs = ["a", "b"]
+    g.outputs = ["o"]
+
+    out = Pipeline.build(TILE_PASSES).run(g)
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    thread = next(iter(tile_op.body.iter_of_type(ThreadTile)))
+
+    # Descend through any outer M_r RegisterTile (FM > 1 is allowed by the
+    # planner; M_r wraps the N_r sibling towers in the blocked-GEMM nest).
+    layer_body: tuple = tuple(thread.body)
+    if len(layer_body) == 1 and isinstance(layer_body[0], RegisterTile):
+        layer_body = tuple(layer_body[0].body)
+
+    # Top-level: exactly one RegisterTile(N_r) — the Write tower (no explicit
+    # Init in the source LoopOp body, so no Init tower at this stage).
+    top_register_tiles = [s for s in layer_body if isinstance(s, RegisterTile)]
+    assert len(top_register_tiles) == 1, (
+        f"expected 1 top-level RegisterTile (Write tower), got {len(top_register_tiles)}: {[type(s).__name__ for s in layer_body]}"
+    )
+    write_tower = top_register_tiles[0]
+    writes_in_tower = [s for s in write_tower.body if isinstance(s, Write)]
+    assert writes_in_tower, f"Write tower has no Write inside: {write_tower.body}"
+
+    # K-tower (SerialTile, possibly nested K_o > K_i) sibling of the Write
+    # tower; its K_i body has the N-dep tail in its own inner RegisterTile.
+    k_towers = [s for s in layer_body if isinstance(s, SerialTile)]
+    assert k_towers, "expected K-tower (SerialTile) in the planner output"
+    nested_register_tiles = [s for s in k_towers[0].body.iter() if isinstance(s, RegisterTile)]
+    assert nested_register_tiles, "K-tower body should contain a RegisterTile (N-dep tail) for reg_block"
+
+    # REG_BLOCK is stamped on the materialized TileOp.
+    assert tile_op.knobs.get("REG_BLOCK") is True, f"REG_BLOCK should be True in knobs: {tile_op.knobs}"
