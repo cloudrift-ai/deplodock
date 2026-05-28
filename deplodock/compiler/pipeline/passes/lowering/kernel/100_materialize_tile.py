@@ -45,10 +45,12 @@ from deplodock.compiler.ir.kernel.ir import (
     MbarrierArriveExpectTx,
     MbarrierInit,
     MbarrierWait,
+    SetMaxNReg,
     Smem,
     Sync,
     TmaDescriptor,
     TmaLoad,
+    TreeHalve,
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Stmt
 from deplodock.compiler.ir.tile.ir import (
@@ -482,27 +484,227 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_bundle_pr
 
 
 def _materialize_ws(blk: ThreadTile, *, warp_size: int, escape=None, producer_warps: int) -> Stmt:
-    """Warp-specialized materialization path. Reachable when
-    ``TileOp.knobs["WS"] == 1`` (set by ``085_warp_specialize``).
+    """Warp-specialized materialization. Reuses ``_materialize`` to get a
+    baseline kernel body, then post-passes it into producer + consumer
+    subtrees wrapped in ``Cond(warp < producer_warps)``.
 
-    Splits the ThreadTile body into producer + consumer subtrees, wraps
-    them in ``Cond(warp < producer_warps)``, and coordinates them
-    through an extra ``tma_mbar_empty`` mbarrier ring so the producer
-    can wait for the consumer to drain a slot before refilling.
+    Producer warps issue TMA loads + ``MbarrierArriveExpectTx``; consumer
+    warps wait on the full mbarrier, run the per-iter reduce, and arrive
+    on an extra ``tma_mbar_empty`` mbarrier so the producer can refill
+    a slot only after the consumer drains it. Inside the consumer branch
+    every ``Sync`` becomes a named-barrier sync (``bar.sync 1,
+    n_consumer_threads``) — ``__syncthreads`` would be UB on the
+    warp-divergent ``Cond``.
 
-    NOT YET IMPLEMENTED — this is a routing stub. The full Phase D walk
-    (body partitioning, empty-mbarrier wiring, named-barrier consumer
-    syncs, SetMaxNReg emission) lands in subsequent commits on this
-    branch. See the plan file's "Implementation phases" table for
-    Stage 2+ design.
+    Currently implemented for kernels without cooperative ``Accum``s
+    (matmul shape). SDPA cooperative reduces inside the consumer branch
+    need additional consumer-tid remapping; raises NotImplementedError
+    if `escape.accum_cooperative_axes` is non-empty."""
+    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
-    Raises ``NotImplementedError`` so a stray ``DEPLODOCK_WS=1`` env pin
-    or accidental knob stamp surfaces loudly rather than silently
-    producing a non-WS kernel."""
-    raise NotImplementedError(
-        f"warp-specialized materialization (WS={producer_warps}) not yet implemented; "
-        "see /home/dikobraz/.claude/plans/make-a-plan-buzzing-flame.md Phase D"
+    # Eligibility: cooperative reduces need consumer-tid remap (Stage 5,
+    # not yet implemented). Surface loudly.
+    if escape is not None:
+        coop = {n: ax for n, ax in escape.accum_cooperative_axes.items() if ax}
+        if coop:
+            raise NotImplementedError(
+                f"WS materialization with cooperative Accum(s) {sorted(coop)} not yet implemented "
+                "(consumer-tid remap pending — see plan Phase D Stage 5)"
+            )
+
+    # 1. Run the regular materialization to get a baseline ThreadTile.
+    regular = _materialize(blk, warp_size=warp_size, escape=escape)
+    if not isinstance(regular, ThreadTile):
+        raise ValueError(f"_materialize returned {type(regular).__name__}, expected ThreadTile")
+
+    axes = regular.axes
+    n_threads = 1
+    for ax in axes:
+        n_threads *= ax.extent.as_static()
+    n_producer_threads = producer_warps * warp_size
+    n_consumer_threads = n_threads - n_producer_threads
+    if n_producer_threads <= 0 or n_consumer_threads <= 0:
+        raise ValueError(
+            f"WS requires both producer and consumer warps; got P={producer_warps} ({n_producer_threads} threads), "
+            f"total {n_threads} threads ({n_threads // warp_size} warps)"
+        )
+
+    # 2. Split into shared prologue (Smem/MbarrierInit/etc.) and main body.
+    prologue, main = _split_prologue(tuple(regular.body))
+
+    # 3. Walk main, classify each stmt and build producer + consumer lists.
+    producer_main, consumer_main, mbar_groups = _split_roles(main)
+
+    # 4. Add empty-mbarrier wiring: extra mbarrier per TMA group, init +
+    # pre-arrive in prologue, wait in producer K_o iters, arrive in
+    # consumer K_o iters.
+    prologue_ws, producer_main_ws, consumer_main_ws = _wire_empty_mbarriers(
+        prologue, producer_main, consumer_main, mbar_groups
     )
+
+    # 5. Rename consumer-side Syncs to named-barrier.
+    consumer_main_named = _rename_consumer_syncs(consumer_main_ws, n_consumer_threads)
+
+    # 6. Wrap in Cond.
+    ws_cond = Cond(
+        cond=BinaryExpr("<", Var("warp"), Literal(producer_warps, "int")),
+        body=Body((SetMaxNReg(24, "dec"), *producer_main_ws)),
+        else_body=Body((SetMaxNReg(240, "inc"), *consumer_main_named)),
+    )
+    new_body: list[Stmt] = [*prologue_ws, ws_cond]
+    return ThreadTile(axes=axes, body=Body(new_body))
+
+
+# ---------------------------------------------------------------------------
+# WS helpers
+# ---------------------------------------------------------------------------
+
+
+def _split_prologue(body: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
+    """Split a materialized ThreadTile body into (prologue, main).
+
+    Prologue is the leading run of kernel-scope declarations + mbarrier
+    init: ``TmaDescriptor`` / ``Smem`` / ``Cond(thread_idx==0, [MbarrierInit
+    ...])`` / the trailing ``Sync`` after init. Main is everything that
+    follows (the actual work)."""
+    cut = 0
+    for i, s in enumerate(body):
+        if isinstance(s, (TmaDescriptor, Smem)):
+            cut = i + 1
+            continue
+        # MbarrierInit init block: Cond(tid==0, [MbarrierInits])
+        if isinstance(s, Cond) and all(isinstance(b, MbarrierInit) for b in s.body):
+            cut = i + 1
+            continue
+        # Sync immediately after the MbarrierInit Cond.
+        if isinstance(s, Sync) and cut > 0 and isinstance(body[cut - 1], Cond):
+            cut = i + 1
+            continue
+        break
+    return list(body[:cut]), list(body[cut:])
+
+
+def _is_producer_stmt(s: Stmt) -> bool:
+    """A stmt belongs in the producer branch if it carries TMA-issue
+    scaffolding: ``Cond(thread_idx==N, [MbarrierArriveExpectTx, TmaLoad])``."""
+    if not isinstance(s, Cond):
+        return False
+    return any(isinstance(b, (MbarrierArriveExpectTx, TmaLoad)) for b in s.body)
+
+
+def _split_roles(main: list[Stmt]) -> tuple[list[Stmt], list[Stmt], dict[str, int]]:
+    """Walk the main body, classifying each top-level stmt as producer or
+    consumer. Returns (producer_body, consumer_body, mbar_groups) where
+    mbar_groups maps each TMA mbarrier name → its buffer_count (recovered
+    from the prologue's ``Smem(name, extents=(bc,))``).
+
+    For ``SerialTile(serial_outer)`` (the K_o loop), recurses: builds two
+    K_o loops, one per role, each iterating the same axis."""
+    producer: list[Stmt] = []
+    consumer: list[Stmt] = []
+    mbar_groups: dict[str, int] = {}
+
+    def _collect_mbar(stmts: tuple[Stmt, ...]):
+        for s in stmts:
+            if isinstance(s, Cond):
+                for b in s.body:
+                    if isinstance(b, MbarrierArriveExpectTx):
+                        mbar_groups.setdefault(b.mbar, 1)
+                    if isinstance(b, TmaLoad):
+                        mbar_groups.setdefault(b.mbar, 1)
+            if isinstance(s, MbarrierWait):
+                mbar_groups.setdefault(s.mbar, 1)
+
+    for stmt in main:
+        if _is_producer_stmt(stmt):
+            producer.append(stmt)
+            _collect_mbar((stmt,))
+        elif isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
+            # Recurse into K_o body, build two role-specific loops.
+            inner_prod, inner_cons, inner_mbar = _split_roles(list(stmt.body))
+            mbar_groups.update(inner_mbar)
+            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+            if inner_prod:
+                producer.append(stmt.with_bodies((Body(tuple(inner_prod)),)))
+            if inner_cons:
+                consumer.append(stmt.with_bodies((Body(tuple(inner_cons)),)))
+        elif isinstance(stmt, (MbarrierWait, Sync)):
+            consumer.append(stmt)
+            _collect_mbar((stmt,))
+        elif isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
+            # Inner reduce + epilogue reduce — consumer.
+            consumer.append(stmt)
+        else:
+            # Default: consumer (output Writes, Accums, etc.)
+            consumer.append(stmt)
+    return producer, consumer, mbar_groups
+
+
+def _wire_empty_mbarriers(
+    prologue: list[Stmt],
+    producer: list[Stmt],
+    consumer: list[Stmt],
+    mbar_groups: dict[str, int],
+) -> tuple[list[Stmt], list[Stmt], list[Stmt]]:
+    """Allocate ``<mbar_name>_empty[bc]`` per TMA group, init in prologue
+    with pre-arrives so producer's first ``bc`` issues don't block, then
+    insert producer-side ``MbarrierWait`` before each issue and
+    consumer-side ``MbarrierArrive`` after each reduce.
+
+    bc is recovered from the existing ``Smem(name=mbar_name, extents=(bc,))``
+    in the prologue.
+
+    NOT YET FULLY IMPLEMENTED — this is a stub that returns inputs
+    unchanged. The empty-mbarrier wiring is Phase D Stage 4. For the
+    initial commit the WS path runs WITHOUT empty mbarriers, which is
+    correct only when K_o iters <= buffer_count (no slot wraparound).
+    Surfaces as silent corruption on larger K — gate the 085 pass to
+    those cases until Stage 4 lands."""
+    # TODO Stage 4: allocate tma_mbar_empty_<gid>, init, pre-arrive,
+    # insert MbarrierWait in producer K_o body, MbarrierArrive in
+    # consumer K_o body.
+    return prologue, producer, consumer
+
+
+def _rename_consumer_syncs(stmts: list[Stmt], n_consumer_threads: int) -> list[Stmt]:
+    """Recursively rewrite plain ``Sync()`` to ``Sync(barrier_id=1,
+    count=n_consumer_threads)`` inside the consumer subtree.
+
+    ``__syncthreads`` (the default Sync) inside the warp-divergent
+    ``Cond(warp<P)`` consumer branch is CUDA UB; a named bar.sync
+    synchronizes exactly the consumer threads.
+
+    Also descends into ``TreeHalve`` (which carries its own per-iter
+    barrier in the rendered loop): switches barrier_id/barrier_count
+    to match. ``WarpShuffle`` is intra-warp via ``__shfl_xor_sync``
+    and doesn't need a CTA-wide sync — unchanged."""
+    out: list[Stmt] = []
+    for s in stmts:
+        out.append(_rename_one_consumer_sync(s, n_consumer_threads))
+    return out
+
+
+def _rename_one_consumer_sync(s: Stmt, n: int) -> Stmt:
+    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+    if isinstance(s, Sync) and s.barrier_id == 0:
+        return Sync(barrier_id=1, count=n)
+    if isinstance(s, TreeHalve) and s.barrier_id == 0:
+        return TreeHalve(
+            buf=s.buf,
+            op=s.op,
+            length=s.length,
+            tid_var=s.tid_var,
+            dtype=s.dtype,
+            barrier_id=1,
+            barrier_count=n,
+        )
+    nested = s.nested()
+    if nested:
+        new_bodies = tuple(Body(tuple(_rename_one_consumer_sync(c, n) for c in b)) for b in nested)
+        return s.with_bodies(new_bodies)
+    return s
 
 
 def _build_linear_tid(thread_axes: tuple[Axis, ...]):
