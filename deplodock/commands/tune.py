@@ -321,17 +321,22 @@ def _run_bench(args, frontend, assembled, dump, *, html_dir) -> None:
     db = SearchDB(path=backend.tune_db) if (backend.tune_db is not None and backend.tune_db.exists()) else None
 
     sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / deplodock):\n")
-    full, _, _ = bench_lowered_vs_torch(
-        frontend,
-        assembled,
-        backend,
-        seed=args.seed,
-        do_bench=True,
-        warmup=args.warmup,
-        iters=args.iters,
-        bench_backends=args.bench_backends,
-    )
-    _print_table(full)
+    try:
+        full, _, _ = bench_lowered_vs_torch(
+            frontend,
+            assembled,
+            backend,
+            seed=args.seed,
+            do_bench=True,
+            warmup=args.warmup,
+            iters=args.iters,
+            bench_backends=args.bench_backends,
+        )
+        _print_table(full)
+    except RuntimeError as exc:
+        # A whole-graph compile/bench failure (e.g. a slow-compiling kernel) must not
+        # cost us the per-kernel table — report and fall through to per-kernel.
+        sys.stderr.write(f"[tune] full-model bench failed ({exc}); continuing to per-kernel\n")
 
     rows = _bench_per_kernel(args, dump.dir, backend, db)
     if rows:

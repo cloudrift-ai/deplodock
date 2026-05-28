@@ -266,7 +266,16 @@ def _bench_whole_graph(assembled: Graph, backend) -> float | None:
     cuda_nodes = [n for n in assembled.nodes.values() if isinstance(n.op, CudaOp)]
     if not cuda_nodes:
         return None
-    result = backend.benchmark(assembled, num_iters="auto")
+    try:
+        result = backend.benchmark(assembled, num_iters="auto")
+    except RuntimeError as exc:
+        # The whole-graph separability check is informational. A kernel that blows
+        # the tune backend's tight -O1 compile budget (e.g. the lm-head register
+        # tile) must NOT abort the whole tune the way an uncaught raise would —
+        # per-op bests are already persisted, and a ``--bench`` re-bench (separate
+        # -O3 backend) still needs to run. Skip the gap line; the caller proceeds.
+        logger.warning("[tune] whole-graph separability bench skipped (%s)", exc)
+        return None
     per_launch = result.per_launch or []
     if len(per_launch) == len(cuda_nodes):
         # ``LaunchTime.time_ms`` is already the per-launch median over samples.
