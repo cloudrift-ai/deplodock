@@ -290,7 +290,12 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     # (and which the per-kernel bench reads). Clearing it also avoids per-launch dump
     # noise during benching. (No-op when tuning used a temp dump — the env wasn't set.)
     saved_dump_env = os.environ.pop(config.DUMP_DIR, None)
-    backend = CudaBackend(tune_db="auto")
+    # Generous per-stage budgets: a whole-model bench compiles 100s of -O3 kernels
+    # (the lm-head alone can take ~5-10 s) and the first iteration warms DRAM / L2 /
+    # cubin loads for the full weights, so the default 10 s run + 30 s compile are
+    # tight. Bump both to 60 s so first-iter cold-start doesn't bench_fail. The
+    # bench is in-process (on_iter callback) — bench_wall_timeout_s stays None.
+    backend = CudaBackend(tune_db="auto", bench_compile_timeout_s=60.0, bench_run_timeout_s=60.0)
     if saved_dump_env is not None:
         os.environ[config.DUMP_DIR] = saved_dump_env
     db = SearchDB(path=backend.tune_db) if (backend.tune_db is not None and backend.tune_db.exists()) else None

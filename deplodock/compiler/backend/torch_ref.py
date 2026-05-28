@@ -54,11 +54,11 @@ def is_runnable(graph: Graph) -> bool:
     return all(is_boundary(n.op) or type(n.op).__name__ in SUPPORTED for n in graph.nodes.values())
 
 
-def _elementwise(fn: str, ins: list):
+def _build_elementwise_table() -> dict[str, Callable]:
     import torch  # noqa: PLC0415
     import torch.nn.functional as F  # noqa: PLC0415
 
-    table: dict[str, Callable] = {
+    return {
         "add": lambda a: a[0] + a[1],
         "sum": lambda a: a[0] + a[1],
         "subtract": lambda a: a[0] - a[1],
@@ -88,9 +88,29 @@ def _elementwise(fn: str, ins: list):
         "gelu_tanh": lambda a: F.gelu(a[0], approximate="tanh"),
         "copy": lambda a: a[0],
     }
-    if fn not in table:
+
+
+# Module-level table — built once on first import (when torch is loaded). The
+# per-name lookup happens at ``build_callable`` time, not inside the traced ``fn``,
+# so ``torch.compile`` doesn't re-trace per distinct elementwise op (the previous
+# in-trace ``if fn not in table`` was the dominant recompile trigger).
+_ELEMENTWISE_TABLE: dict[str, Callable] | None = None
+
+
+def _elementwise_callable(fn: str) -> Callable:
+    global _ELEMENTWISE_TABLE
+    if _ELEMENTWISE_TABLE is None:
+        _ELEMENTWISE_TABLE = _build_elementwise_table()
+    op = _ELEMENTWISE_TABLE.get(fn)
+    if op is None:
         raise NotImplementedError(f"torch_ref: elementwise {fn!r} unmapped")
-    return table[fn](ins)
+    return op
+
+
+def _elementwise(fn: str, ins: list):
+    """Back-compat shim — used by ``_eval`` for one-shot evaluation paths that
+    don't go through ``build_callable``'s pre-resolution."""
+    return _elementwise_callable(fn)(ins)
 
 
 def _eval(node, ins: list):
@@ -262,7 +282,13 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
     returns the graph's first output; the input list is the ``tensors`` to call
     it with (drawn from ``input_tensors`` in boundary topo order). Scalar
     constants are read inline from the graph (so ``fn`` is a pure function of
-    its tensor inputs and ``torch.compile`` can trace it)."""
+    its tensor inputs and ``torch.compile`` can trace it).
+
+    Per-node op callables are resolved **at build time** (not inside ``fn``) so
+    ``torch.compile`` sees a stable call sequence — dispatching on the op kind
+    inside the traced function used to trigger a dynamo recompile per distinct
+    op (``add`` vs ``multiply`` vs …), hitting the recompile limit on big
+    graphs."""
     from deplodock.compiler.provenance import is_boundary  # noqa: PLC0415
 
     order = graph.topological_order()
@@ -272,15 +298,27 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
         for nid in order
         if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is not None
     }
-    compute = [nid for nid in order if not is_boundary(graph.nodes[nid].op)]
+    # Pre-resolve a flat list of (nid, op_callable, input_ids). ElementwiseOps get
+    # the table lookup once here (the main recompile source); other op kinds wrap
+    # ``_eval`` with the node bound so the traced ``fn`` invokes a uniform
+    # ``op(ins) -> tensor`` callable per step without per-call string dispatch.
+    compute_steps: list[tuple[str, Callable, list[str]]] = []
+    for nid in order:
+        node = graph.nodes[nid]
+        if is_boundary(node.op):
+            continue
+        if type(node.op).__name__ == "ElementwiseOp":
+            op_callable = _elementwise_callable(node.op.op.name)
+        else:
+            op_callable = (lambda n: lambda ins: _eval(n, ins))(node)
+        compute_steps.append((nid, op_callable, list(node.inputs)))
     out_id = graph.outputs[0]
 
     def fn(*tensors):
         env = dict(scalars)
         env.update(zip(tensor_ids, tensors, strict=True))
-        for nid in compute:
-            node = graph.nodes[nid]
-            env[nid] = _eval(node, [env[i] for i in node.inputs])
+        for nid, op_callable, in_ids in compute_steps:
+            env[nid] = op_callable([env[i] for i in in_ids])
         return env[out_id]
 
     return fn, [input_tensors[i] for i in tensor_ids]
