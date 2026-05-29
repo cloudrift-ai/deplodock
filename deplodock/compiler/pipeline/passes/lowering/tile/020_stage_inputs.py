@@ -57,7 +57,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     CacheDim,
@@ -227,6 +227,27 @@ def _collect_candidates(
                 register_axes=new_register_axes,
             )
             continue
+        if isinstance(s, Cond) and os.environ.get("DEPLODOCK_AFFINE_COLLAPSE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # Masked-tile boundary guard wrapping the K-loop chain (FM/FN
+            # × BM/BN non-divisor of E_M/E_N → per-cell ``if (row < M)``).
+            # Opt-in via ``DEPLODOCK_AFFINE_COLLAPSE=1`` (same flag as the
+            # multi-axis cache collapse — both are article-reproduction
+            # features that bypass conservative defaults). Treat as
+            # transparent for candidate scanning — the cooperative load
+            # that ``_process_scope`` later emits will be hoisted ABOVE
+            # the Cond at rewrite time so all threads participate
+            # regardless of which cells the mask excludes.
+            _collect_candidates(
+                s,
+                thread_axes,
+                in_scope_axes,
+                block_axis_names,
+                found,
+                slab_cap=slab_cap,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
+            )
+            continue
         if isinstance(s, SerialTile) and not s.is_reduce:
             _collect_candidates(
                 s,
@@ -309,6 +330,40 @@ def _maybe_rewrite(
         return body
     rebuilt = replace_parallel_tile_body(outer, new_tile_body)
     return body[:idx] + (rebuilt,) + body[idx + 1 :]
+
+
+def _contains_stage_bundle(body: Body) -> bool:
+    """Recursive: ``True`` iff any stmt inside ``body`` (at any nesting
+    depth) is a ``StageBundle``. Used by the masked-tile Cond hoist to
+    decide whether to split the Cond — only worth doing when the inner
+    body actually picked up a cooperative-load bundle to hoist."""
+    for s in body:
+        if isinstance(s, StageBundle):
+            return True
+        for nb in s.nested():
+            if _contains_stage_bundle(nb):
+                return True
+    return False
+
+
+def _is_k_pipeline_stmt(stmt: Stmt) -> bool:
+    """Identify the stmts the masked-tile Cond hoist should pull above
+    the boundary guard. The K-pipeline structure stage_inputs produces
+    inside a Cond is a single ``SerialTile`` (K-outer) whose body
+    contains a ``StageBundle`` (the cooperative load). After downstream
+    pipelining (080) that may also expand to one prologue ``StageBundle``
+    + the K-outer + a trailing ``AsyncWait`` / tail ``SerialTile``;
+    matching ``StageBundle``-bearing stmts (recursively) plus bare
+    ``StageBundle`` siblings covers both shapes. Everything else —
+    ``Write`` outputs, ``Cond(a0==0)`` invariant-compute guards from
+    ``030_hoist_invariant_compute``, constant init ``Assign``s — stays
+    inside the original Cond so the boundary predicate keeps guarding
+    output emission."""
+    if isinstance(stmt, StageBundle):
+        return True
+    if isinstance(stmt, (SerialTile, StridedTile)) and _contains_stage_bundle(stmt.body):
+        return True
+    return False
 
 
 def _peel_to_stage_inner(outer):
@@ -395,6 +450,65 @@ def _process_scope(
                 register_axes=register_axes,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
+            continue
+        elif isinstance(s, Cond) and os.environ.get("DEPLODOCK_AFFINE_COLLAPSE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # Masked-tile boundary guard. Stage transparently through
+            # the Cond, then HOIST the cooperative-load + K-pipeline
+            # above the Cond — the cooperative load must run for every
+            # thread regardless of which output cells the mask excludes
+            # (TMA elects a single issuer thread; cp.async needs all
+            # 256 threads to fetch their lane; with the load inside the
+            # Cond the elected thread might be in if-false and the
+            # consumer mbarriers would never complete). The Cond's
+            # per-cell guard now wraps only the surviving Write — the
+            # K-loop's per-iter Accum runs unconditionally per thread
+            # (a few extra FMAs on masked-row accumulators are benign;
+            # the Write that emits them is still guarded below).
+            #
+            # Split point: ``Write`` (and anything after it). Everything
+            # before the first Write — StageBundle prologue, K-pipeline
+            # SerialTile (with its steady-state StageBundle inside),
+            # epilogue AsyncWait + K-tail — gets hoisted; the Write
+            # itself stays inside the Cond.
+            new_body = _process_scope(
+                s,
+                thread_axes,
+                in_scope_axes,
+                block_axis_names,
+                used_names,
+                slab_cap=slab_cap,
+                scope_budget=scope_budget,
+                allowed_bufs=allowed_bufs,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
+            )
+            # The staged StageBundle lives INSIDE the K-outer SerialTile
+            # (one level below ``new_body``'s top level) — same as the
+            # unmasked path, where the bundle wraps the K-inner inside
+            # the K-outer body. Hoist *just* the K-pipeline stmts
+            # (SerialTile / StageBundle whose subtree contains a
+            # StageBundle, plus their direct sibling AsyncWait /
+            # post-K-tail SerialTile) above the Cond; everything else
+            # (Writes, ``Cond(a0==0)`` invariant-compute guards,
+            # constant init Assigns) stays inside the original Cond so
+            # the boundary predicate keeps guarding output emission.
+            hoisted: list[Stmt] = []
+            inside_cond: list[Stmt] = []
+            for sub in new_body:
+                if _is_k_pipeline_stmt(sub):
+                    hoisted.append(sub)
+                else:
+                    inside_cond.append(sub)
+            # Only hoist when the descent actually produced a
+            # StageBundle anywhere inside ``hoisted`` (any nesting depth)
+            # — otherwise the Cond's contents are unchanged and we emit
+            # it as-is to avoid splitting a body that didn't benefit.
+            if not _contains_stage_bundle(Body(tuple(hoisted))):
+                rewritten_inner.append(s)
+                continue
+            rewritten_inner.extend(hoisted)
+            if inside_cond or s.else_body:
+                rewritten_inner.append(Cond(cond=s.cond, body=Body(tuple(inside_cond)), else_body=s.else_body))
             continue
         if isinstance(s, (SerialTile, StridedTile)):
             scope_axes = (*in_scope_axes, s.axis)

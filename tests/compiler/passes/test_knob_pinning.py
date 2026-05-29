@@ -251,6 +251,25 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
         {"DEPLODOCK_AFFINE_COLLAPSE": "1", "DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
+    # Article's EXACT tile: ``BM=8 BN=32 FM=26 FN=4 BK=32`` produces a
+    # 208×128 masked-M tile (M=2048 not a multiple of 208 → ceil-div
+    # grid + per-row boundary Cond on the Write). Exercises (1) the
+    # masked-tile boundary Cond hoist in ``020_stage_inputs`` that
+    # ``DEPLODOCK_AFFINE_COLLAPSE=1`` enables — without it the Cond
+    # blocks the cooperative-load StageBundle, falling back to a
+    # per-thread gmem-load kernel ~6× slower than the article. With
+    # the hoist + multi-source TMA + multi-axis collapse on, this
+    # config lowers to a kernel structurally byte-equivalent to
+    # ``_lower_matmul_tma_db``'s TM=26 emit (104 cells/thread, 255
+    # registers, 17 % occupancy) and benches at ~97 % of cuBLAS on
+    # RTX 5090. A regression here means one of the article-repro
+    # commits in the ``feature/run-target-flag`` chain has stopped
+    # threading through.
+    (
+        "article_exact_fm26_masked",
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
+        {"DEPLODOCK_AFFINE_COLLAPSE": "1"},
+    ),
 )
 
 
