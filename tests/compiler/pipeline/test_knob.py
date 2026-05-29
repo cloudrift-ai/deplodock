@@ -97,10 +97,13 @@ def test_narrow_pinned_keeps_matching_candidate(monkeypatch):
     assert k.narrow((16, 32, 64)) == (32,)
 
 
-def test_narrow_pinned_drops_unmatched(monkeypatch):
+def test_narrow_pinned_out_of_set_is_authoritative(monkeypatch):
+    # Hints are guidance, not constraint — an env pin outside the candidate
+    # tuple is honored, not silently dropped. Downstream structural gates
+    # (divisibility, threads-per-CTA budget, …) still apply.
     k = Knob("BN", KnobType.INT)
     monkeypatch.setenv("DEPLODOCK_BN", "128")
-    assert k.narrow((16, 32, 64)) == ()
+    assert k.narrow((16, 32, 64)) == (128,)
 
 
 def test_narrow_accepts_arbitrary_iterable(monkeypatch):

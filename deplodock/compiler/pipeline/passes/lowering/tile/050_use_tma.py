@@ -35,6 +35,7 @@ Idempotence: TMA-policy bundles are left alone.
 
 from __future__ import annotations
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
@@ -49,6 +50,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -61,17 +63,51 @@ _TMA_ALIGN_BYTES = 16
 # >= 1 phase dim on the smem slab; promoting SYNC would break that.
 _PROMOTABLE = frozenset({StagePolicy.BUFFERED, StagePolicy.ASYNC})
 
+# USE_TMA knob — hints ``(True, False)`` so the *first* candidate is True
+# (the preferred policy on Hopper+). On sm < 9.0 the rule hands ``(False,)``
+# alone to narrow, so the False candidate wins without the user ever pinning.
+# When ``DEPLODOCK_USE_TMA=1`` is set, narrow returns ``(True,)`` even on
+# unsupported arch (a pin is authoritative — the user knows what they're
+# doing); the downstream eligibility checks then raise ``ValueError`` rather
+# than the silent ``RuleSkipped`` fallback that used to mask the article's
+# matmul A+B case. ``DEPLODOCK_USE_TMA=0`` skips the pass so
+# ``060_use_async_copy`` promotes BUFFERED → ASYNC — useful when A/B-benching
+# cp.async vs TMA on the same shape.
+USE_TMA = Knob(
+    "USE_TMA",
+    KnobType.BOOL,
+    hints=(True, False),
+    help="Promote BUFFERED/ASYNC bundles to TMA. 1 = force (hard-fail on ineligibility), 0 = skip pass.",
+)
+
 
 def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
-    if ctx.compute_capability < _MIN_CAPABILITY:
-        raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
+    # Arch-gated default: only Hopper+ offers TMA at all. Hand narrow the
+    # full ``(True, False)`` hint tuple on supported arch, ``(False,)`` alone
+    # otherwise — the first remaining candidate wins by priority order.
+    candidates = USE_TMA.hints if ctx.compute_capability >= _MIN_CAPABILITY else (False,)
+    use_tma = USE_TMA.narrow(candidates)[0]
+    pinned = config.knob_raw(USE_TMA.name) is not None
+
+    if not use_tma:
+        if pinned:
+            raise RuleSkipped("USE_TMA=0 pinned")
+        if ctx.compute_capability < _MIN_CAPABILITY:
+            raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
+        raise RuleSkipped("USE_TMA defaulted off")
+
+    def _fail(msg: str) -> None:
+        """Raise ``ValueError`` when explicitly pinned on, ``RuleSkipped`` otherwise."""
+        if pinned:
+            raise ValueError(f"DEPLODOCK_USE_TMA=1 but TMA cannot fire: {msg}")
+        raise RuleSkipped(msg)
 
     # TMA descriptors bake the source shape statically into the cuTensorMap; bail
     # out cleanly if any input shape carries a symbolic dim.
     for nid, node in match.graph.nodes.items():
         for d in node.output.shape:
             if not d.is_static:
-                raise RuleSkipped(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
+                _fail(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
     src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
 
     body = root.op.body
@@ -87,14 +123,14 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
         if s.policy == StagePolicy.TMA:
             continue
         if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes):
-            raise RuleSkipped(
+            _fail(
                 f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
 
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
+        _fail("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 

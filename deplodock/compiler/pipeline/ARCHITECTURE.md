@@ -372,6 +372,13 @@ Pinning replaces tuner choice: the rule sees the env value and emits exactly tha
 reproducing a tune-time variant from CI logs, A/B-comparing two configs, or pinning a known-good config in a Makefile
 recipe.
 
+Pinning is **authoritative** — an env value outside the knob's hint tuple is honored, not silently dropped. `Knob.narrow`
+returns `(pinned,)` regardless of hint membership; downstream structural gates (divisibility, threads-per-CTA budget,
+TMA eligibility, …) still apply, so a structurally invalid pin yields an empty enumeration and the per-call-site
+fallback (`_enumeration._run(apply_pins=False)`) takes over. This lets a tile shape that the planner wouldn't reach
+on its own — e.g. the article's BM=8, FM=26, fat 208×128 matmul tile — be explored manually, while peer kernels with
+incompatible divisibility still get a sensible default.
+
 **Registered knobs.** All knobs in `passes/lowering/tile/*.py`:
 
 | Knob          | Type     | Owning rule                  | What it controls                                                                                  |

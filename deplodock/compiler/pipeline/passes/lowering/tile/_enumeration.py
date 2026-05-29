@@ -466,6 +466,13 @@ def _enumerate_cartesian_impl(
                 # leaves a fractional last tile), so any choice up to
                 # _MAX_CELLS_PER_THREAD is admissible — the per-cell guard
                 # in the masked Cond handles partial coverage.
+                #
+                # A pin (``fm_narrow`` returns a 1-tuple authoritatively;
+                # see ``Knob.narrow``) may force a non-divisor FM/FN even
+                # when BM/BN cleanly divides E_M/E_N. In that case BM·FM
+                # / BN·FN doesn't divide E_M / E_N, so the masking guard
+                # is needed — we admit the value and flip overhang for
+                # that variant.
                 if m_overhang:
                     fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD)
                 else:
@@ -473,6 +480,14 @@ def _enumerate_cartesian_impl(
                 if fm_narrow is not None:
                     fm_candidates = fm_narrow(fm_candidates)
                 for fm in fm_candidates:
+                    if fm < 1 or fm > _MAX_CELLS_PER_THREAD:
+                        continue
+                    # Pinned FM may violate BM·FM | E_M; force masking when
+                    # admissible (allow_masked + named axis).
+                    fm_nondiv = E_M % (bm_c * fm) != 0
+                    if fm_nondiv and not m_maskable:
+                        continue
+                    fm_overhang = m_overhang or fm_nondiv
                     if n_overhang:
                         fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD // fm)
                     else:
@@ -480,6 +495,12 @@ def _enumerate_cartesian_impl(
                     if fn_narrow is not None:
                         fn_candidates = fn_narrow(fn_candidates)
                     for fn in fn_candidates:
+                        if fn < 1 or fm * fn > _MAX_CELLS_PER_THREAD:
+                            continue
+                        fn_nondiv = E_N % (bn_c * fn) != 0
+                        if fn_nondiv and not n_maskable:
+                            continue
+                        fn_overhang = n_overhang or fn_nondiv
                         for bk in bk_choices:
                             if per_thread_K % bk != 0:
                                 continue
@@ -496,9 +517,9 @@ def _enumerate_cartesian_impl(
                                 if k_o_total % splitk != 0:
                                     continue
                                 overhang_axes: tuple[str, ...] = ()
-                                if n_overhang and n_axis_name is not None:
+                                if fn_overhang and n_axis_name is not None:
                                     overhang_axes = (*overhang_axes, n_axis_name)
-                                if m_overhang and m_axis_name is not None:
+                                if fm_overhang and m_axis_name is not None:
                                     overhang_axes = (*overhang_axes, m_axis_name)
                                 params = ScalarTileParams(
                                     bn=bn_c,
