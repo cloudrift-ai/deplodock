@@ -25,6 +25,7 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
 from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
+    AtomTile,
     GridTile,
     ParallelTile,
     RegisterTile,
@@ -174,6 +175,16 @@ def _(s: WarpTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: WarpTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
+def _(s: AtomTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: AtomTile, ctx: SimplifyCtx) -> Stmt:
     return _parallel_simplify(s, ctx)
 
 

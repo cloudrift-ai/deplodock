@@ -36,6 +36,7 @@ class KnobType(Enum):
     INT = "int"
     BOOL = "bool"
     BINMASK = "binmask"
+    STR = "str"
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,8 @@ class Knob:
             if len(s) == width and all(c in "01" for c in s):
                 return sum(int(c) << i for i, c in enumerate(s))
             return int(s, 0) & ((1 << width) - 1)
+        if self.type is KnobType.STR:
+            return s
         raise ValueError(f"unhandled knob type: {self.type}")
 
     def pretty(self, value: Any, *, width: int | None = None) -> str:

@@ -268,9 +268,14 @@ parallel coord: `GridTile` (one coord = one CTA, lifts to `blockIdx`),
 collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 `ThreadTile` and `WarpTile` are mutually exclusive inside one
 `TileOp.body` — both bind `threadIdx`. `RegisterTile` (per-thread
-register cell) is consumed before kernel render; downstream consumer
-plans (MMA fragment factorization, warp-specialize refactor) emit
-`WarpTile` to drive warp-cooperative codegen.
+register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
+one fragment) are both consumed before kernel render: `RegisterTile` by
+`kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
+the MMA arm of the same pass (its presence is the structural "this
+matmul factorizes through tensor cores" signal, paired with the
+`ATOM_KIND` knob on the enclosing `TileOp`). Downstream consumer plans
+(MMA fragment factorization, warp-specialize refactor) emit `WarpTile`
+to drive warp-cooperative codegen.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative

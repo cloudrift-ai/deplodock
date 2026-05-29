@@ -94,11 +94,17 @@ propagates max from leaves, matching MCTS's max-Q semantics.
 
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
-`Role.WARP` (→ `WarpTile`) is wired through `_layer_kind_for` /
-`_wrap_tower` but no rule in this pass emits it — the MMA
+`Role.WARP` (→ `WarpTile`) and `Role.ATOM` (→ `AtomTile`, the
+hardware-atomic MMA cell tier) are wired through `_layer_kind_for` /
+`_wrap_tower` but no rule in this pass emits either today — the MMA
 fragment-factorization consumer plan (`plans/mma-fragment-factorization.md`)
-will flip a tier when it ships, without revisiting the tower
-mechanics. `085_warp_specialize` already emits `WarpTile(role)` (one
+will flip these tiers when its M3 ships, without revisiting the tower
+mechanics. M1 of that plan landed the `AtomTile` flavor + empty
+`_atom.ATOM_REGISTRY` + the `TileParams = ScalarTileParams |
+WarpTileParams` sum-type split in `_enumeration` (`ScalarTileParams`
+carries today's `(BN, BM, FM, FN, BK, SPLITK, BR)`; `WarpTileParams`
+carries `(WN, WM, FM, FN, BK, SPLITK, ATOM_KIND)` — no `BR`, no
+`BN`/`BM`). `085_warp_specialize` already emits `WarpTile(role)` (one
 role axis = total CTA warps) wrapping `WarpSpecialize` directly,
 bypassing the planner's tower builder — its role split is structural
 (`Cond(role < n_producer_warps, …)`), not the σ-shifted extended

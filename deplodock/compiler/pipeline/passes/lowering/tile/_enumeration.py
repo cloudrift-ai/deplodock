@@ -1,25 +1,36 @@
 """Knob-cartesian enumeration for the partition planner.
 
-Owns the planner's tunable knob globals (BN / BM / FM / FN / BK / SPLITK /
-BR), the per-mode candidate tuples (matmul / pointwise / reduce), the
-pruned cartesian generator over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, and
-the per-mode priority/score functions used to rank the resulting
-``TileParams`` set.
+Owns the planner's tunable knob globals (BN / BM / WM / WN / FM / FN / BK /
+SPLITK / BR / ATOM_KIND), the per-mode candidate tuples (matmul / pointwise
+/ reduce), the pruned cartesian generator, and the per-mode priority/score
+functions used to rank the resulting ``TileParams`` set.
 
 Three layers:
 
-1. Public ``TileParams`` dataclass — the cartesian product element. One
-   ``(bn, bm, fm, fn, bk, splitk, br, overhang)`` variant; frozen for de-dup
-   in the ``seen`` set inside the impl.
+1. Public ``TileParams`` sum type — the cartesian product element. Two
+   row types share the alias:
+     - :class:`ScalarTileParams` — today's row, used for scalar matmul /
+       reduce / pointwise. Carries ``(bn, bm, fm, fn, bk, splitk, br,
+       overhang)``.
+     - :class:`WarpTileParams` — MMA / tensor-core warp-tier matmul. Carries
+       ``(wn, wm, fm, fn, bk, splitk, atom_kind, overhang)`` — no ``br``
+       (MMA gates BR=1 by construction), no ``bn``/``bm``. ``atom_kind``
+       resolves through :mod:`_atom` to the hardware instruction spec.
+   Frozen for de-dup in the ``seen`` set inside the impls.
 2. Public ``enumerate_cartesian(...)`` — mode-dispatched wrapper that picks
    the candidate tuples + priority function for ``matmul`` / ``reduce`` /
    ``pointwise``, folds ``DEPLODOCK_<KNOB>`` env pins via ``Knob.narrow``,
    and retries without pins if every candidate was filtered out and any pin
    is set (fallback so peer-kernel pins don't strand a graph with an
-   un-lowered LoopOp).
+   un-lowered LoopOp). For ``matmul`` the binding tier can be selected with
+   a 2-tuple ``("matmul", "thread")`` / ``("matmul", "warp")`` mode; the
+   bare ``"matmul"`` string is an alias for the thread tier.
 3. Private ``_enumerate_cartesian_impl(...)`` — pure cartesian generator
-   over caller-supplied (already-narrowed) tuples; no env reads, no mode
-   dispatch. Tests can hit this directly to exercise prune paths.
+   over caller-supplied (already-narrowed) tuples; produces
+   :class:`ScalarTileParams` rows. Used for scalar matmul / reduce /
+   pointwise. A sibling ``_enumerate_warp_matmul_impl`` produces
+   :class:`WarpTileParams` rows for the warp tier; at M1 it returns ``[]``
+   (no atom kinds registered yet) — M3 fleshes it out.
 
 Kept as a non-pass sibling module (``_`` prefix → Pass loader skips) so
 the planner imports the public API without going through
@@ -48,15 +59,26 @@ _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 # Cap on per-thread cell-product. NVRTC compile time explodes past this.
 _MAX_CELLS_PER_THREAD: int = 128
 
+# Scalar-tier knobs (THREAD-binding). MMA warp-tier rows don't carry these —
+# their per-axis warp count lives on WM/WN below.
 BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
 BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")
-FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul M (output) axis")
-FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread cells along the matmul N (output) axis")
+BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
+# Warp-tier knobs (WARP-binding, MMA matmul only). Plumbed at M1; populated
+# with real choices in M3 when the warp enumerator goes live.
+_TUNE_WARP_AXIS_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+WN = Knob("WN", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA innermost WARP count along matmul output N")
+WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WARP count along matmul output M")
+ATOM_KIND = Knob(
+    "ATOM_KIND", KnobType.STR, hints=(), help="Hardware matmul atom kind (MMA/wgmma/...) — see pipeline/passes/lowering/tile/_atom.py"
+)
+# Tier-shared knobs (same arithmetic role in both scalar and warp tiers).
+FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul M (output) axis")
+FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul N (output) axis")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
-BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
 
-_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR)
+_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR, WN, WM, ATOM_KIND)
 
 
 def planner_pin_set() -> bool:
@@ -66,10 +88,13 @@ def planner_pin_set() -> bool:
 
 
 @dataclass(frozen=True)
-class TileParams:
-    """One ``(BN, BM, FM, FN, BK, SPLITK, BR)`` variant. Frozen for de-dup in
-    the cartesian's ``seen`` set; ``br=1`` default keeps matmul / pointwise
-    sites terse.
+class ScalarTileParams:
+    """One ``(BN, BM, FM, FN, BK, SPLITK, BR)`` scalar-tier variant. Frozen
+    for de-dup in the cartesian's ``seen`` set; ``br=1`` default keeps matmul
+    / pointwise sites terse.
+
+    Used for scalar matmul, cooperative-K reduce, and pointwise kernels — any
+    kernel whose per-output-cell compute is owned by a single thread.
 
     ``overhang`` lists output-axis names admitted at a non-divisor BN/BM
     (masked tiles). Empty for clean-divisor variants. The planner stamps the
@@ -87,6 +112,39 @@ class TileParams:
     overhang: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class WarpTileParams:
+    """One ``(WN, WM, FM, FN, BK, SPLITK, ATOM_KIND)`` warp-tier variant —
+    MMA / tensor-core matmul. No ``br`` (MMA gates ``BR=1`` by construction);
+    no ``bn``/``bm`` (the binding tier is WARP, not THREAD).
+
+    ``atom_kind`` resolves through :func:`_atom.atom_spec` to the hardware
+    instruction's cell shape ``(M, N, K)``, per-operand dtype, and group
+    size. ``wn``/``wm`` are the per-CTA warp count along the output N / M
+    axes; together with the atom cell shape and ``fn``/``fm`` they
+    determine the matmul tile dimensions
+    ``BN = wn × fn × atom_n``, ``BM = wm × fm × atom_m``.
+
+    ``overhang`` mirrors :class:`ScalarTileParams.overhang` for masked tiles.
+    """
+
+    wn: int
+    wm: int
+    fm: int
+    fn: int
+    bk: int
+    splitk: int
+    atom_kind: str
+    overhang: tuple[str, ...] = ()
+
+
+# Sum type alias — keeps existing import sites (``from … import TileParams``)
+# working unchanged. Per Design decision 11 of the MMA plan, readers that
+# need to discriminate the tier do so at the type level
+# (``isinstance(p, WarpTileParams)``), not via a flag field.
+TileParams = ScalarTileParams | WarpTileParams
+
+
 def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
     """Divisors of ``n`` ≤ ``cap``, ascending. FM / FN candidate set — a
     divisor of ``E / bm_c`` automatically satisfies the divisibility check."""
@@ -95,7 +153,7 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
     return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-def _priority_matmul(p: TileParams) -> tuple[int, ...]:
+def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
     # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
     # threads near 256, larger BK, smaller SPLITK. Final tiebreaker prefers
     # clean-divisor variants over masked (negative len so fewer-overhang wins
@@ -104,14 +162,26 @@ def _priority_matmul(p: TileParams) -> tuple[int, ...]:
     return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
 
 
-def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
+def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
+    # Warp-tier ranking parallels the thread-tier priority but reads warp-tier
+    # fields. Threads = ``wn × wm × 32`` (warps × lanes-per-warp). Cells-per-
+    # cell-owner cap = 64 (looser than the thread tier's 32 — MMA amortizes
+    # K-loop overhead better, so bigger register tiles stay profitable).
+    # Stub-quality for M1: no warp rows enumerate yet (the warp impl returns
+    # []), so this function is never called. M3 wires the warp impl and this
+    # priority drives the fork tree's sibling ordering.
+    threads = p.wn * p.wm * 32
+    return (min(p.fm * p.fn, 64), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
+
+
+def _priority_pointwise(p: ScalarTileParams) -> tuple[int, ...]:
     # Memory-bandwidth bound — fewer cells/thread → more CTAs → better
     # SM occupancy. Threads near 256. Final tiebreaker: clean-divisor wins.
     threads = p.bn * p.bm
     return (-(p.fm * p.fn), -abs(256 - threads), -len(p.overhang))
 
 
-def _priority_reduce(p: TileParams) -> tuple[int, ...]:
+def _priority_reduce(p: ScalarTileParams) -> tuple[int, ...]:
     # Warp-sized BR enables warp-shuffle Combine; threads near 256.
     # Static reduce never masks; a symbolic free axis forces masking (every
     # variant then carries the same overhang, so no clean-divisor tiebreak).
@@ -128,12 +198,13 @@ def enumerate_cartesian(
     E_N: int,
     E_K: int,
     ctx: Context,
-    priority_mode: str,
+    priority_mode: str | tuple[str, ...],
     force_splitk_one: bool = False,
     m_axis_name: str | None = None,
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
+    atom_kinds: tuple[str, ...] = (),
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
@@ -178,20 +249,45 @@ def enumerate_cartesian(
     Single-K-iter (per_thread_K == bk) is allowed for pointwise and
     cooperative-reduce, rejected for matmul (``min_k_chunks=2`` — needs ≥ 2
     chunks to amortize K-loop overhead)."""
+    # Normalize ``priority_mode`` — accept the bare strings ``"matmul"`` /
+    # ``"reduce"`` / ``"pointwise"`` plus the 2-tuple ``("matmul", "thread")``
+    # / ``("matmul", "warp")`` per the MMA plan's Design decision 11. ``"matmul"``
+    # is an alias for the thread tier (today's only matmul path).
+    if isinstance(priority_mode, str):
+        mode_kind: str = priority_mode
+        mode_tier: str = "thread" if priority_mode == "matmul" else ""
+    else:
+        mode_kind, mode_tier = priority_mode[0], priority_mode[1]
+
     # ``_TUNE_AXIS_CHOICES`` already includes ``1`` so tiny output extents
     # (e.g. ``torch.matmul`` of 4×3×2) and global-reduce kernels with a
     # phantom size-1 outer axis survive enumeration. ``_wrap_tower`` drops
     # the resulting size-1 THREAD axes before they reach the IR, so the
     # broader search space only changes behavior for tiny shapes.
-    if priority_mode == "matmul":
+    if mode_kind == "matmul" and mode_tier == "warp":
+        # Warp-tier matmul — enumerate one WarpTileParams row per eligible
+        # ``atom_kind``. At M1 the impl returns []; M3 fills it in.
+        return _enumerate_warp_matmul_impl(
+            E_M=E_M,
+            E_N=E_N,
+            E_K=E_K,
+            ctx=ctx,
+            force_splitk_one=force_splitk_one,
+            atom_kinds=atom_kinds,
+            m_axis_name=m_axis_name,
+            n_axis_name=n_axis_name,
+            m_forced_mask=m_forced_mask,
+            n_forced_mask=n_forced_mask,
+        )
+    if mode_kind == "matmul":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
         bk_choices = _BK_CANDIDATES
         splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
         br_choices: tuple[int, ...] = (1,)
         min_k_chunks = 1
-        priority_fn: Callable[[TileParams], tuple[int, ...]] = _priority_matmul
-    elif priority_mode == "reduce":
+        priority_fn: Callable[[ScalarTileParams], tuple[int, ...]] = _priority_matmul_thread
+    elif mode_kind == "reduce":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
         bk_choices = _BK_CANDIDATES
@@ -199,7 +295,7 @@ def enumerate_cartesian(
         br_choices = _BR_CANDIDATES
         min_k_chunks = 1
         priority_fn = _priority_reduce
-    elif priority_mode == "pointwise":
+    elif mode_kind == "pointwise":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
         bk_choices = (1,)
@@ -215,7 +311,7 @@ def enumerate_cartesian(
     # planner needs to keep the 1-thread-per-CTA variant rather than skip it.
     # Matmul honors this too so symbolic Q@K^T (M=N=seq_len) can still emit
     # a degenerate single-thread variant.
-    allow_empty_threads = E_M == 1 and E_N == 1 and priority_mode in ("pointwise", "matmul")
+    allow_empty_threads = E_M == 1 and E_N == 1 and mode_kind in ("pointwise", "matmul")
 
     # Masked tiles: when a static output extent has no clean divisor in
     # ``_TUNE_AXIS_CHOICES`` (e.g. lm_head vocab=151669), let the planner pick
@@ -223,7 +319,7 @@ def enumerate_cartesian(
     # falling back to a degenerate 1-thread CTA. Pointwise / matmul opt in here;
     # a symbolic free axis additionally forces masking in any mode (incl.
     # reduce) via ``m_forced_mask`` / ``n_forced_mask``, tuned at its hint.
-    allow_masked = priority_mode in ("pointwise", "matmul")
+    allow_masked = mode_kind in ("pointwise", "matmul")
 
     def _run(apply_pins: bool) -> list[TileParams]:
         return _enumerate_cartesian_impl(
@@ -268,14 +364,14 @@ def _enumerate_cartesian_impl(
     fn_narrow: _NarrowFn | None,
     max_threads_per_cta: int,
     min_k_chunks: int,
-    priority_fn: Callable[[TileParams], tuple[int, ...]],
+    priority_fn: Callable[[ScalarTileParams], tuple[int, ...]],
     allow_empty_threads: bool = False,
     allow_masked: bool = False,
     m_axis_name: str | None = None,
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
-) -> list[TileParams]:
+) -> list[ScalarTileParams]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
     (``None`` to skip), the per-thread K-chunk floor, and the sort key.
@@ -296,8 +392,8 @@ def _enumerate_cartesian_impl(
     # phantom / degenerate axes.
     n_maskable = (allow_masked or n_forced_mask) and n_axis_name is not None and E_N > 1
     m_maskable = (allow_masked or m_forced_mask) and m_axis_name is not None and E_M > 1
-    seen: set[TileParams] = set()
-    ordered: list[TileParams] = []
+    seen: set[ScalarTileParams] = set()
+    ordered: list[ScalarTileParams] = []
     for bn in bn_choices:
         bn_c = min(bn, E_N)
         if bn_c < 1:
@@ -374,7 +470,7 @@ def _enumerate_cartesian_impl(
                                     overhang_axes = (*overhang_axes, n_axis_name)
                                 if m_overhang and m_axis_name is not None:
                                     overhang_axes = (*overhang_axes, m_axis_name)
-                                params = TileParams(
+                                params = ScalarTileParams(
                                     bn=bn_c,
                                     bm=bm_c,
                                     fm=fm,
@@ -391,3 +487,40 @@ def _enumerate_cartesian_impl(
 
     ordered.sort(key=priority_fn, reverse=True)
     return ordered
+
+
+def _enumerate_warp_matmul_impl(
+    *,
+    E_M: int,  # noqa: ARG001
+    E_N: int,  # noqa: ARG001
+    E_K: int,  # noqa: ARG001
+    ctx: Context,  # noqa: ARG001
+    force_splitk_one: bool,  # noqa: ARG001
+    atom_kinds: tuple[str, ...],
+    m_axis_name: str | None,  # noqa: ARG001
+    n_axis_name: str | None,  # noqa: ARG001
+    m_forced_mask: bool,  # noqa: ARG001
+    n_forced_mask: bool,  # noqa: ARG001
+) -> list[WarpTileParams]:
+    """Pure cartesian enumeration for the warp tier — produces
+    :class:`WarpTileParams` rows. Parallel in spirit to
+    :func:`_enumerate_cartesian_impl` but with the warp divisibility +
+    per-CTA-thread budget formulae (per Design decision 11 of
+    ``plans/mma-fragment-factorization.md``):
+    ``E_M % (wm·fm·atom_m) == 0`` / ``wn·wm·32 ≤ max_threads_per_cta``.
+
+    At M1 the implementation is a stub returning ``[]`` — the warp branch is
+    plumbed end-to-end (the planner calls this, the priority function exists,
+    the row type exists) but no atom kinds are registered yet
+    (``ATOM_REGISTRY`` is empty in :mod:`_atom`), so ``atom_kinds`` is always
+    empty in practice and the loop body never runs. M3 fleshes this out into
+    a real cartesian (one row per eligible ``atom_kind``) and the planner's
+    matmul branch starts emitting both scalar and warp variants as siblings.
+    """
+    if not atom_kinds:
+        return []
+    # M3 will iterate ``atom_kinds`` × ``_TUNE_WARP_AXIS_CHOICES`` × FM/FN
+    # divisor lists × BK/SPLITK candidates, gated on ``E_M % (wm·fm·atom_m)``
+    # / ``wn·wm·32 ≤ ctx.max_threads_per_cta``, and sort by
+    # ``_priority_matmul_warp`` (max-cells-per-cell-owner cap=64).
+    return []

@@ -738,6 +738,36 @@ class RegisterTile(ParallelTile):
 
 
 @dataclass(frozen=True)
+class AtomTile(ParallelTile):
+    """Hardware-atomic-cell tile — one coord = one MMA fragment cell.
+
+    Marker for the per-cell hardware-atomic extent on a matmul-reduce kernel
+    (see ``plans/mma-fragment-factorization.md``). The axes carry the cell
+    shape (e.g. ``(M=16, N=16)`` for ``wmma_m16n16k16_f16``); the body inside
+    is the per-cell compute the materializer will replace with a fragment
+    instruction chain (``MmaFragment`` decls + ``MmaLoad`` + ``MmaSync``).
+
+    The MMA cell materializer (``kernel/010_split_register_axes`` MMA arm)
+    consumes ``AtomTile`` structurally — its presence is the "this kernel
+    factorizes through tensor cores" signal, complementing the
+    ``ATOM_KIND`` knob on the enclosing ``TileOp``. Scalar matmul kernels
+    never emit an ``AtomTile`` (the absence of the tier is the absence of
+    the atom — see :class:`ScalarTileParams` in
+    ``passes/lowering/tile/_enumeration``).
+
+    Render is intentionally unimplemented: every ``AtomTile`` must be
+    consumed before kernel render, mirroring ``RegisterTile``'s contract.
+    """
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise NotImplementedError(
+            "AtomTile must be consumed by the MMA materializer "
+            "(kernel/010_split_register_axes MMA arm) before render — "
+            f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
+        )
+
+
+@dataclass(frozen=True)
 class WarpTile(ParallelTile):
     """Warp-parallel tile — one coord tuple = one warp (32 lanes).
 
@@ -1632,6 +1662,7 @@ __all__ = [
     "ThreadTile",
     "RegisterTile",
     "WarpTile",
+    "AtomTile",
     "SerialTileBase",
     "SerialTile",
     "StridedTile",

@@ -79,6 +79,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
+    AtomTile,
     GridTile,
     RegisterTile,
     SerialTile,
@@ -97,6 +98,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     FN,
     SPLITK,
     TileParams,
+    WarpTileParams,
     enumerate_cartesian,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -113,8 +115,11 @@ class Role(enum.Enum):
 
     ``WARP`` is reserved for the MMA fragment-factorization consumer plan
     (``plans/mma-fragment-factorization.md``) and the warp-specialized TMA
-    refactor — no rule in this pass emits it today. ``_layer_kind_for`` /
-    ``_wrap_tower`` recognise the role so consumer plans can flip a tier
+    refactor — ``tile/085_warp_specialize.py`` emits it today by rewriting a
+    post-080 ``ThreadTile``; once M3 of the MMA plan lands the planner emits
+    it directly for warp-tier matmul rows. ``ATOM`` is reserved for the MMA
+    plan's hardware-atomic cell tier (``AtomTile``). ``_layer_kind_for`` /
+    ``_wrap_tower`` recognise both roles so consumer plans can flip a tier
     without revisiting the tower-building mechanics.
     """
 
@@ -122,6 +127,7 @@ class Role(enum.Enum):
     THREAD = "thread"
     REGISTER = "register"
     WARP = "warp"
+    ATOM = "atom"
     STAGE_INNER = "stage_inner"
     SERIAL_OUTER = "serial_outer"
     PIPELINE = "pipeline"
@@ -366,7 +372,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
         kind = _layer_kind_for(role)
         # Parallel kinds group consecutive same-kind axes; serial kinds always
         # start a fresh group (each serial layer is its own SerialTile).
-        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register", "warp"):
+        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register", "warp", "atom"):
             groups[-1][1].append(axis)
             groups[-1][2].append(role)
         else:
@@ -390,10 +396,19 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "warp":
             # Warp-cooperative tier (consumer plans flip a tier to
-            # ``Role.WARP``). No rule emits this today — the case wires
-            # the tower builder so MMA / WS-refactor downstreams land
-            # without revisiting ``_wrap_tower`` mechanics.
+            # ``Role.WARP``). ``tile/085_warp_specialize.py`` emits it
+            # today by rewriting a post-080 ThreadTile; once the MMA plan's
+            # M3 lands the planner emits it directly for warp-tier matmul.
             current = (WarpTile(axes=tuple(axes), body=Body(current)),)
+        elif kind == "atom":
+            # Hardware-atomic cell tier (MMA fragment factorization). Marker
+            # for the per-cell tensor-core extent; consumed by the MMA cell
+            # materializer (``kernel/010_split_register_axes`` MMA arm), so
+            # no AtomTile reaches kernel render. No rule emits this today —
+            # the case wires the tower builder so M3 of
+            # ``plans/mma-fragment-factorization.md`` lands without
+            # revisiting ``_wrap_tower`` mechanics.
+            current = (AtomTile(axes=tuple(axes), body=Body(current)),)
         else:  # serial — one axis per layer
             ax = axes[0]
             role = roles[0]
@@ -417,6 +432,8 @@ def _layer_kind_for(role: Role | None) -> str:
         return "register"
     if role is Role.WARP:
         return "warp"
+    if role is Role.ATOM:
+        return "atom"
     return "serial"
 
 
@@ -660,7 +677,17 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     prologue runs inside the ``M_r`` REGISTER scope but *outside* the
     ``N_r`` register tower — softmax stats are per-seq-q-row (per M_r),
     independent of the output N. σ_outer + σ_k are applied uniformly so
-    the prologue's M-axis references resolve to the in-scope ``M_r``."""
+    the prologue's M-axis references resolve to the in-scope ``M_r``.
+
+    The warp-tier MMA builder lands here in M3 of
+    ``plans/mma-fragment-factorization.md``. At M1 no ``WarpTileParams`` row
+    ever reaches this function (the warp enumerator returns []) — the
+    isinstance guard documents the dispatch point and would surface a
+    plumbing bug as a clear ``NotImplementedError`` rather than an
+    ``AttributeError`` from a missing ``.bn`` field on the warp row.
+    """
+    if isinstance(params, WarpTileParams):
+        raise NotImplementedError("warp-tier _build_split_body lands in M3 of plans/mma-fragment-factorization.md")
     sigma_map: dict[str, object] = {}
 
     # source_axis: every sub-axis points back to the original Axis it was
