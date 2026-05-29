@@ -94,6 +94,120 @@ def test_worker_exits_after_context_corruption() -> None:
         proc.wait(timeout=5)
 
 
+def test_kill_idempotent_when_no_proc() -> None:
+    """``_kill()`` on a worker that was never spawned must be a silent no-op."""
+    from deplodock.compiler.backend.cuda.program import _BenchWorker
+
+    w = _BenchWorker()
+    assert w._proc is None
+    w._kill()
+    assert w._proc is None
+    w._kill()  # repeated calls stay no-ops
+    assert w._proc is None
+
+
+def test_kill_releases_already_dead_subprocess() -> None:
+    """A worker subprocess that exited on its own (e.g. dirty-context path) is
+    still attached to ``self._proc``; ``_kill()`` must release it without
+    raising even though ``kill()`` on a reaped pid would normally surface a
+    ``ProcessLookupError``."""
+    from deplodock.compiler.backend.cuda.program import _BenchWorker
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.exit(0)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.wait(timeout=5) == 0
+
+    w = _BenchWorker()
+    w._proc = proc
+    w._kill()
+    assert w._proc is None
+
+
+def test_bench_retries_after_broken_pipe_on_first_write(monkeypatch) -> None:
+    """The dirty-context exit path can race the parent's ``poll()`` check: by
+    the time we write the next request, the worker's stdin has been closed
+    but ``poll()`` may not yet show the exit. The first ``stdin.write``
+    then raises ``BrokenPipeError``. ``bench()`` must respawn and retry the
+    send once before surfacing the failure."""
+    from deplodock.compiler.backend import BenchmarkResult
+    from deplodock.compiler.backend.cuda import program as P
+
+    spawn_count = 0
+
+    class _FakeStdin:
+        def __init__(self, *, fail_first: bool) -> None:
+            self._fail_first = fail_first
+            self._writes = 0
+
+        def write(self, data: bytes) -> int:
+            self._writes += 1
+            if self._fail_first and self._writes == 1:
+                raise BrokenPipeError(32, "Broken pipe")
+            return len(data)
+
+        def flush(self) -> None:
+            pass
+
+    class _FakeStderr:
+        def read(self) -> bytes:
+            return b""
+
+    class _FakeProc:
+        def __init__(self, *, fail_first_write: bool) -> None:
+            self.pid = 1000 + (0 if fail_first_write else 1)
+            self.stdin = _FakeStdin(fail_first=fail_first_write)
+            self.stdout = type("S", (), {"fileno": lambda self: -1})()
+            self.stderr = _FakeStderr()
+            self._alive = True
+
+        def poll(self) -> int | None:
+            return None if self._alive else 0
+
+        def kill(self) -> None:
+            self._alive = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    procs = [_FakeProc(fail_first_write=True), _FakeProc(fail_first_write=False)]
+
+    def fake_spawn(self: P._BenchWorker) -> None:
+        nonlocal spawn_count
+        self._proc = procs[spawn_count]
+        spawn_count += 1
+
+    # Construct the wire-format response the second proc "writes" back so the
+    # recv loop pickle-loads a real BenchmarkResult.
+    response_body = pickle.dumps(
+        {"ok": True, "result": BenchmarkResult(time_ms=42.0, num_launches=0)},
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+    response_wire = len(response_body).to_bytes(8, "little") + response_body
+    read_pos = [0]
+
+    def fake_select(rlist, wlist, xlist, timeout):  # noqa: ARG001
+        return rlist, [], []
+
+    def fake_read(fd: int, n: int) -> bytes:  # noqa: ARG001
+        chunk = response_wire[read_pos[0] : read_pos[0] + n]
+        read_pos[0] += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(P._BenchWorker, "_spawn", fake_spawn)
+    monkeypatch.setattr(P.select, "select", fake_select)
+    monkeypatch.setattr(P._os, "read", fake_read)
+
+    w = P._BenchWorker()
+    result = w.bench(graph=None, wall_timeout_s=5.0)
+
+    assert spawn_count == 2, "BrokenPipeError on first write must trigger one respawn"
+    assert result.time_ms == 42.0
+
+
 def test_worker_survives_benign_error() -> None:
     # A failure that never touches CUDA (e.g. an NVRTC compile error) leaves the
     # context healthy — the worker must stay alive and keep serving so the

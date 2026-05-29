@@ -896,7 +896,11 @@ class _BenchWorker:
             try:
                 self._proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                pass
+                # Process is in uninterruptible-kernel state (rare —
+                # NVRTC stuck in a driver call). Nothing more we can do;
+                # init will reap once the syscall returns. Release the
+                # Python handle so the next bench respawns.
+                logger.warning("[bench-worker] pid=%s did not reap within 2s of SIGKILL", self._proc.pid)
         except ProcessLookupError:
             pass
         self._proc = None
@@ -905,19 +909,30 @@ class _BenchWorker:
         self._kill()
 
     def bench(self, graph: Graph, *, wall_timeout_s: float, **kwargs) -> BenchmarkResult:
-        if self._proc is None or self._proc.poll() is not None:
-            self._spawn()
-        assert self._proc is not None  # for type narrowing
-        proc = self._proc
-
         request = pickle.dumps({"graph": graph, "kwargs": kwargs}, protocol=pickle.HIGHEST_PROTOCOL)
-        try:
-            proc.stdin.write(len(request).to_bytes(8, "little"))
-            proc.stdin.write(request)
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            self._kill()
-            raise RuntimeError(f"bench worker died during request send: {exc}") from exc
+        # A previous worker may have exited between our last interaction
+        # and this request — most commonly through the dirty-context exit
+        # path in ``_bench_worker.main``. ``poll()`` has a brief window
+        # where it still reports the worker as alive (the kernel hasn't
+        # reaped yet), so the first stdin write can hit ``BrokenPipeError``
+        # even though our state says "worker is up". Treat that as a
+        # stale-worker race: respawn and retry once. A second write
+        # failure on a fresh worker is a real bug and surfaces.
+        for attempt in (0, 1):
+            if self._proc is None or self._proc.poll() is not None:
+                self._spawn()
+            assert self._proc is not None  # for type narrowing
+            proc = self._proc
+            try:
+                proc.stdin.write(len(request).to_bytes(8, "little"))
+                proc.stdin.write(request)
+                proc.stdin.flush()
+                break
+            except (BrokenPipeError, OSError) as exc:
+                self._kill()
+                if attempt == 1:
+                    raise RuntimeError(f"bench worker died during request send: {exc}") from exc
+                logger.info("[bench-worker] stale worker on send (%s) — respawning", exc)
 
         deadline = _time_module.perf_counter() + wall_timeout_s
         out_fd = proc.stdout.fileno()
