@@ -85,6 +85,23 @@ worker probes its context (`_context_dirty` — a cheap `deviceSynchronize`) and
 request. Benign failures (NVRTC compile errors, cleaned-up OOM) leave the
 context healthy and keep the worker alive, so they pay no respawn cost.
 
+The dirty-exit path can race the parent's `poll()` check: by the time the
+parent writes the next request, the worker's stdin has been closed but
+`poll()` may not yet show the exit. `_BenchWorker.bench` therefore wraps the
+send in a single-retry loop — a `BrokenPipeError` on the first write triggers
+a respawn + one resend before surfacing as `bench worker died during request
+send`. Phase A of the tune-stabilization work; see
+`tests/compiler/backend/test_bench_worker_recovery.py`.
+
+`iter_once` (the per-iter sample loop) rejects a `cp.cuda.get_elapsed_time`
+reading of `<= 0.0` as `bench_fail` instead of accepting it as a 0µs sample.
+CUDA event timing has sub-µs resolution and any real launch consumes at least
+one device cycle — a 0.0 reading means a degenerate kernel (BM=1×BN=128 with
+the M tile fully masked, a kernel fused into a no-op, an event-pair quirk)
+that would otherwise lock in as the autotune DB's unbeatable best. Phase B
+of the same work; the existing worker → parent → `record_perf(bench_fail)`
+path carries the failure unchanged.
+
 `run_program_debug(...)` snapshots every non-input buffer after each
 launch — consumed by `--dump-dir` runs.
 

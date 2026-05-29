@@ -273,7 +273,11 @@ opposite structure, so `search/two_level.py` splits them:
   `InputOp`; the root op is shared **by reference**, so its body — and thus `op_cache_key` — is byte-for-byte the
   full-graph op's. Lowering-only (never re-running `loop/fusion`) is what keeps that body untouched. Because the inner
   tree holds one op, MCTS explores only that op's forks with `patience` as the op's own budget — `Σ_k n_k` benches,
-  never the product.
+  never the product. **Leaves are deduped by `op_cache_key`** before iteration: 24 RMSNorm LoopOps across 24 layers
+  collapse to one work unit, and the outer `total_us` accumulates `best * multiplicity` so the reward stays
+  multiplicity-weighted (bit-for-bit the same as per-node iteration). `OpResult.multiplicity` carries the count;
+  positions = `sum(r.multiplicity for r in reward.per_op)`. The progress denominator is the deduped count, so
+  Qwen3-Embedding-0.6B's ~14 unique kernels show as 14/14 not 14/337.
 
 **Separability + the structural handoff.** Op-variant forks are separable: every multi-option fork is an in-place `Op`
 rebind that leaves the graph unchanged, so whole-graph time is `Σ_k t_k`. Results key structurally (`op_cache_key` =
