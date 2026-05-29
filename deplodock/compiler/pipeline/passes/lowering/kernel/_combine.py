@@ -23,9 +23,8 @@ from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StridedTile
 
 
 def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
-    """All ``Accum``s sitting at the body level of the first nested reduce
-    ``SerialTile`` / ``StridedTile`` subtree, keyed by Accum name, looking
-    through transparent ``RegisterTile`` / ``Cond`` wrappers.
+    """All ``Accum``s at the immediate body level of the first nested
+    reduce ``SerialTile`` / ``StridedTile`` subtree, keyed by Accum name.
 
     Used by the materializer when a non-reduce outer tile wraps a deeper
     reduce — e.g. the cooperative-K shape ``SerialTile(K_o, "serial_outer",
@@ -33,16 +32,11 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
     by the partition planner's σ-split, possibly with F-replicated sibling
     Accums from ``010_split_register_axes``.
 
-    The walk-through of ``RegisterTile`` / ``Cond`` wrappers here is
-    defence in depth — real planner output never wraps ``Accum`` inside
-    ``RegisterTile`` at K_i body level (the outer ``RegisterTile(N_r)``
-    wraps the ``SerialTile(K_o)`` from outside in the per-cell shape).
-
     Returns ``{}`` when no reduce-with-Accum subtree is found, preserving
     the existing "stray Combine raises" safety net."""
     for s in stmts:
         if isinstance(s, (SerialTile, StridedTile)) and s.is_reduce:
-            accums = _accums_through_wrappers(s.body)
+            accums = {a.name: a for a in s.body if isinstance(a, Accum)}
             if accums:
                 return accums
         if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
@@ -50,23 +44,6 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
             if found:
                 return found
     return {}
-
-
-def _accums_through_wrappers(body) -> dict[str, Accum]:
-    """``Accum`` stmts at this body level, descending through transparent
-    ``RegisterTile`` / ``Cond`` wrappers. Matches the structure produced
-    by the blocked builder, where Accum sits inside ``RegisterTile(N_r)``
-    rather than directly in the K_i body."""
-    out: dict[str, Accum] = {}
-    for s in body:
-        if isinstance(s, Accum):
-            out[s.name] = s
-        elif isinstance(s, RegisterTile):
-            out.update(_accums_through_wrappers(s.body))
-        elif isinstance(s, Cond):
-            out.update(_accums_through_wrappers(s.body))
-            out.update(_accums_through_wrappers(s.else_body))
-    return out
 
 
 def single_thread_var(thread_axes: tuple[Axis, ...]) -> str:
