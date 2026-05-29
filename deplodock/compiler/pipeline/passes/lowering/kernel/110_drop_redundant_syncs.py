@@ -95,7 +95,7 @@ def rewrite(root: Node) -> Graph | None:
     for s in op.body:
         if isinstance(s, GridTile):
             new_children = [clean_thread_tile(c) if isinstance(c, ThreadTile) else c for c in s.body]
-            new_body.append(GridTile(axes=s.axes, body=Body(new_children)))
+            new_body.append(GridTile(axes=s.axes, body=Body(new_children), swizzle_group_m=s.swizzle_group_m))
         elif isinstance(s, ThreadTile):
             new_body.append(clean_thread_tile(s))
         else:

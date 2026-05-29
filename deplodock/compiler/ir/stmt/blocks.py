@@ -182,6 +182,54 @@ def _render_grid_axis_decode(axes: tuple[Axis, ...], idx_expr: str, ctx: RenderC
     return [pad + line for line in reversed(decoded)]
 
 
+def _render_swizzled_grid_decode(axes: tuple[Axis, ...], idx_expr: str, group_m: int, ctx: RenderCtx) -> list[str]:
+    """Emit a Triton-canonical CTA-swizzle decode of ``idx_expr`` for a
+    matmul-shape grid (``axes`` ending in ``(M_b, N_b)``, optionally
+    preceded by ``K_s``).
+
+    Consecutive CTA IDs walk down M in groups of ``group_m`` before
+    stepping N, so each row-group of CTAs shares A's row tile in L2.
+    The runtime ``gsize_m = min(group_m, num_m - first_m)`` clamp makes
+    a non-divisor ``num_m`` collapse to standard decode on the tail
+    group, and any matmul with ``num_m <= group_m`` (tiny / tall-skinny)
+    is a runtime no-op.
+
+    Falls back to the row-major decode when there are fewer than two
+    axes — the swizzle pass should have skipped, but the renderer stays
+    self-contained.
+    """
+    if len(axes) < 2:
+        return _render_grid_axis_decode(axes, idx_expr, ctx)
+    pad = _pad(ctx.indent)
+    m_axis, n_axis = axes[-2], axes[-1]
+    outer_axes = axes[:-2]  # K_s when SPLITK>1, otherwise empty
+    num_m = _extent_c(m_axis, ctx)
+    num_n = _extent_c(n_axis, ctx)
+    lines: list[str] = ["// CTA swizzle: walk GROUP_M tiles down M before stepping N (L2 A-row reuse)."]
+    if outer_axes:
+        # Peel the outer block axes (K_s etc.) off the linear CTA ID first
+        # so the swizzle only re-decodes the M_b/N_b tail.
+        outer_stride = " * ".join((num_m, num_n))  # M_b * N_b
+        # Emit outer decodes against (idx_expr / outer_stride) using the
+        # standard row-major helper, then re-decode the (m_b, n_b) tail
+        # below with the swizzle.
+        outer_quotient = f"({idx_expr} / ({outer_stride}))"
+        for ax_line in _render_grid_axis_decode(outer_axes, outer_quotient, ctx):
+            lines.append(ax_line.lstrip())
+        lines.append(f"int bid = {idx_expr} % ({outer_stride});")
+    else:
+        lines.append(f"int bid = {idx_expr};")
+    lines.append(f"int num_m = {num_m};")
+    lines.append(f"int num_n = {num_n};")
+    lines.append(f"int gsz = {group_m} * num_n;")
+    lines.append("int gid = bid / gsz;")
+    lines.append(f"int first_m = gid * {group_m};")
+    lines.append(f"int gsize_m = ({group_m} < num_m - first_m) ? {group_m} : (num_m - first_m);")
+    lines.append(f"int {m_axis.name} = first_m + ((bid % gsz) % gsize_m);")
+    lines.append(f"int {n_axis.name} = (bid % gsz) / gsize_m;")
+    return [pad + ln for ln in lines]
+
+
 def _render_thread_axis_decode(axes: tuple[Axis, ...], ctx: RenderCtx) -> list[str]:
     """Emit ``int <axis> = (tid / stride) % extent;`` per axis."""
     pad = _pad(ctx.indent)

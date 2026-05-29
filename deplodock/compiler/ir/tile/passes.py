@@ -136,7 +136,7 @@ def _parallel_simplify(s: ParallelTile, ctx: SimplifyCtx) -> Stmt:
 def _(s: GridTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(axis_fn(ax) for ax in s.axes)
     new_body = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
-    return GridTile(axes=new_axes, body=new_body)
+    return GridTile(axes=new_axes, body=new_body, swizzle_group_m=s.swizzle_group_m)
 
 
 @simplify.register

@@ -115,7 +115,7 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
                 new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
-        return GridTile(axes=top.axes, body=Body(new_outer))
+        return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
     if isinstance(top, ThreadTile):
         return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
