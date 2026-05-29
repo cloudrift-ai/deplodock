@@ -125,10 +125,12 @@ def test_inner_reward_is_separable_not_a_product() -> None:
 
     assert backend.calls == n1 + n2, f"expected separable {n1 + n2} benches, got {backend.calls}"
     assert backend.calls < n1 * n2, "separable sum must be below the cross-product"
-    # Every kernel measured; total is the sum of the per-op bests.
+    # Every kernel measured; total is the sum of the per-op bests. Two distinct
+    # structural keys → two ``per_op`` entries, each at ``multiplicity=1``.
     assert reward.ok
     assert len(reward.per_op) == 2
     assert all(r.best_us is not None for r in reward.per_op)
+    assert all(r.multiplicity == 1 for r in reward.per_op)
     assert reward.total_us == pytest.approx(sum(r.best_us for r in reward.per_op))
 
 
@@ -167,8 +169,11 @@ def test_inner_reward_deepens_only_under_tuned() -> None:
 
 
 def test_inner_reward_shares_identical_kernel() -> None:
-    """Two identical kernels in one terminal are tuned once — the second is
-    a DB hit on the same op_cache_key."""
+    """Two identical kernels in one terminal collapse to a single ``per_op``
+    entry under one ``op_cache_key`` with ``multiplicity=2``. The inner
+    search runs once; the outer total still costs 2× the shared best so the
+    outer MCTS reward stays bit-for-bit identical to the per-node-iterated
+    formulation."""
     fused = _fuse(_two_identical_matmuls())
     loops = _loop_ids(fused)
     assert len(loops) == 2
@@ -181,9 +186,9 @@ def test_inner_reward_shares_identical_kernel() -> None:
     reward = inner_reward(fused, ctx=Context.from_target((8, 0)), db=SearchDB(), backend=backend, patience=_PATIENCE)
 
     assert backend.calls == single, "shared kernel must bench once, not twice"
-    assert len(reward.per_op) == 2
-    assert reward.per_op[0].best_us == pytest.approx(reward.per_op[1].best_us)
-    # Total sums the (shared) best twice — both kernels still cost time.
+    assert len(reward.per_op) == 1, "identical kernels collapse to one per_op entry"
+    assert reward.per_op[0].multiplicity == 2, "both node positions are counted"
+    # Total weights the shared best by its multiplicity — both kernels still cost time.
     assert reward.total_us == pytest.approx(2 * reward.per_op[0].best_us)
 
 

@@ -75,12 +75,21 @@ _FAIL_US = 1e12
 
 @dataclass
 class OpResult:
-    """One kernel's inner-search outcome, for the per-op summary."""
+    """One unique kernel's inner-search outcome, for the per-op summary.
+
+    ``multiplicity`` is the number of structurally-identical ``LoopOp`` nodes
+    in the fused graph that share this ``op_key`` — 24 for a 24-layer
+    RMSNorm, 1 for a singleton. The outer reward's ``total_us`` weights
+    ``best_us`` by ``multiplicity`` so the Σ across ``per_op`` equals the
+    whole-graph latency (every node position counts, even though dedup
+    means we only run the inner search and DB lookup once per key).
+    """
 
     name: str
     op_key: str
     best_us: float | None
     benched: bool  # True when the inner search ran; False when skipped (terminated)
+    multiplicity: int = 1
 
 
 @dataclass
@@ -136,9 +145,21 @@ def inner_reward(
     is summed. Benches scale as ``Σ_k n_k`` (per op), never the product.
 
     ``progress`` (a duck-typed :class:`~deplodock.commands.tune_progress.TuneProgress`,
-    or ``None``) drives the CLI progress bar: one op leaf ticked per kernel, the
-    live tail updated per benched variant. Kept duck-typed so this module carries
-    no dependency on ``commands/``."""
+    or ``None``) drives the CLI progress bar: one op leaf ticked per *unique*
+    kernel (24-layer RMSNorm = 1 tick, not 24), the live tail updated per
+    benched variant. Kept duck-typed so this module carries no dependency on
+    ``commands/``.
+
+    Leaves are deduped by ``op_cache_key`` before iteration. The inner search
+    keys every DB write on the structural key, so iterating per occurrence
+    (337 LoopOp nodes on Qwen3-Embedding-0.6B) only differs from per-unique-key
+    iteration (~14) by an O(positions) ``db.terminated`` / ``best_per_op_time``
+    cache lookup — and gives the user a misleading progress denominator.
+    Multiplicity is preserved: ``total_us`` weights each unique kernel's best
+    by its node count, so the outer MCTS reward is bit-for-bit identical to
+    the per-node-iterated total."""
+    from collections import OrderedDict  # noqa: PLC0415
+
     from deplodock.compiler.pipeline.pipeline import variant_label  # noqa: PLC0415
 
     ctx_key = ctx.structural_key()
@@ -146,13 +167,23 @@ def inner_reward(
     total = 0.0
     ok = True
     per_op: list[OpResult] = []
-    # The tunable op leaves (skip ops with no cache key — never benched). Counted
-    # up front so the progress bar's denominator is correct before the first tick.
-    leaves = [(nid, op) for nid, op in _kernel_nodes(fused_graph) if op_cache_key(op) is not None]
-    if progress is not None:
-        progress.start_terminal(len(leaves))
-    for nid, op in leaves:
+    # Group structurally-identical LoopOps under one ``op_cache_key`` —
+    # insertion order = first occurrence (drives the progress tail name).
+    # Ops with no cache key are unreachable through the bench path so they
+    # don't enter the dedup map at all (matches the previous filter).
+    unique: OrderedDict[str, tuple[str, object, int]] = OrderedDict()
+    for nid, op in _kernel_nodes(fused_graph):
         key = op_cache_key(op)
+        if key is None:
+            continue
+        if key in unique:
+            rep_nid, rep_op, count = unique[key]
+            unique[key] = (rep_nid, rep_op, count + 1)
+        else:
+            unique[key] = (nid, op, 1)
+    if progress is not None:
+        progress.start_terminal(len(unique))
+    for key, (nid, op, count) in unique.items():
         name = getattr(op, "name", None) or nid
         if progress is not None:
             progress.op_start(name)
@@ -187,12 +218,14 @@ def inner_reward(
             db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
             benched = True
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
-        per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched))
+        per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
+        # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
+        # 24 × best, matching the per-node total before dedup.
         if best is None:
             ok = False
-            total += _FAIL_US
+            total += _FAIL_US * count
         else:
-            total += best
+            total += best * count
         if progress is not None:
             progress.op_done(name)
     return InnerReward(total_us=total, ok=ok, per_op=per_op)
@@ -237,7 +270,14 @@ def run_two_level_tune(
         reward = inner_reward(fused.graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=ucb_c, progress=progress)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(stats, "ok" if reward.ok else "bench_fail")
-        logger.info("[tune] fused terminal #%d: Σ per-op = %.2f us (%d kernels)", n_terminals, reward.total_us, len(reward.per_op))
+        positions = sum(r.multiplicity for r in reward.per_op)
+        logger.info(
+            "[tune] fused terminal #%d: Σ per-op = %.2f us (%d unique kernels, %d positions)",
+            n_terminals,
+            reward.total_us,
+            len(reward.per_op),
+            positions,
+        )
         if best_reward is None or (reward.ok and reward.total_us < best_reward.total_us):
             best_fused, best_reward = fused.graph, reward
 
