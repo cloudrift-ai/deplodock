@@ -402,12 +402,6 @@ def _layer_kind_for(role: Role | None) -> str:
     return "serial"
 
 
-class _BuildSkipped(Exception):
-    """Raised by ``_build_split_body`` when the body's shape doesn't match —
-    today only ``_replace_k_loops`` raises this, when ``target_names``
-    doesn't find any K-axis Loop in the body to rewrite."""
-
-
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
@@ -601,7 +595,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
     fresh body) — happen here, lazily, from the chosen Fork leaf's
     ``expand`` thunk.
 
-    ``_BuildSkipped`` is shape-determined (raised only when
+    The ``RuleSkipped`` catch is shape-determined (raised only when
     ``_replace_k_loops`` can't find any K-axis Loops in the body, which
     depends on ``shape.target_names`` matching the body's axis names, not
     on params). If it ever fires here, the shape was misclassified at
@@ -610,8 +604,8 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
     """
     try:
         chain_body = _build_split_body(plan.shape, params)
-    except _BuildSkipped as exc:
-        raise AssertionError(f"shape-level _BuildSkipped fired at materialize time for kernel {plan.kernel_name!r}: {exc}") from exc
+    except RuleSkipped as exc:
+        raise AssertionError(f"shape-level RuleSkipped fired at materialize time for kernel {plan.kernel_name!r}: {exc}") from exc
     knobs = {
         **plan.base_knobs,
         BN.name: params.bn,
@@ -777,7 +771,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
             K_o_ext=K_o_ext,
         )
         if n_replaced == 0:
-            raise _BuildSkipped("K reduce not found in body")
+            raise RuleSkipped("K reduce not found in body")
         # SPLITK > 1 with a linear residual epilogue (matmul_add) is gated
         # post-planner by ``015_gate_splitk_residual``, which finds the
         # K_s axis in the wrapped GridTile and hoists the linear epilogue
