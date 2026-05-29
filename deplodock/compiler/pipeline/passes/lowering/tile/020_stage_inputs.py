@@ -6,16 +6,16 @@ consumer subtree containing the rewritten Loads. Producer cooperative
 entries (cache axes, origin, source-dim mapping); no producer body is
 stored on the Stage.
 
-Runs *before* ``006a_register_tile_planned`` (pre-register-tile: there
+Runs *before* ``010_split_register_axes`` (pre-register-tile: there
 is exactly one Load per ``(buffer, access-pattern)`` rather than F×F
 duplicates). REGISTER axes in scope join cache axes via the
 ``register_axes`` channel — the slab spans ``BM·FM × BK`` (and similar)
 with stride-1 Affine addressing, instead of ``BM × BK`` with
-TemplateAddressing as it would post-006a. Stages emit wrapping the K_o
-body; their cache-axis iteration vars shadow the outer REGISTER Loops,
-and ``006a_register_tile_planned`` treats Stages as opaque (no
-recursion into their producer-side state — only the consumer ``body``
-descends).
+TemplateAddressing as it would post-replicate. Stages emit wrapping
+the K_o body; their cache-axis iteration vars shadow the outer
+REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
+(no recursion into their producer-side state — only the consumer
+``body`` descends).
 
 **Pipeline:**
 

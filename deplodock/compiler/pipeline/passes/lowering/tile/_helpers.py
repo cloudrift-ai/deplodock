@@ -55,8 +55,9 @@ def thread_tile_of(outer: ParallelTile) -> ThreadTile:
     The cooperative form (``GridTile`` wrapping ``ThreadTile``) puts the
     per-thread scope one level deeper; the pointwise form (standalone
     ``ThreadTile``) IS the per-thread scope. Downstream passes that operate
-    on the per-thread scope (``020_stage_inputs``, ``006a``, ...) call this
-    helper instead of branching on the outer flavor.
+    on the per-thread scope (``020_stage_inputs``,
+    ``010_split_register_axes``, ...) call this helper instead of branching
+    on the outer flavor.
     """
     if isinstance(outer, ThreadTile):
         return outer

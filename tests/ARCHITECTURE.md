@@ -71,7 +71,7 @@ tests/
 │   │   ├── test_launch_geometry_rules.py / test_masked_tile.py
 │   │   ├── test_stage_inputs_classify.py
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
-│   │   ├── test_lowering_blocked_gemm.py       # register-blocked GEMM nest
+│   │   ├── test_lowering_blocked_gemm.py       # FN > 1 matmul accuracy (per-cell + replicator)
 │   │   ├── test_knob_pinning.py                # DEPLODOCK_KNOBS regression configs
 │   │   ├── test_tile_naming.py                 # provenance-driven kernel naming
 │   │   └── test_pipeline_semantics.py          # full pass chain vs numpy

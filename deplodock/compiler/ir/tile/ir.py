@@ -683,14 +683,15 @@ class ThreadTile(ParallelTile):
 
 @dataclass(frozen=True)
 class RegisterTile(ParallelTile):
-    """Per-thread register-cell tile. Body replicated F× per axis by 006a.
+    """Per-thread register-cell tile. Body replicated F× per axis by
+    ``010_split_register_axes``.
 
     Replaces ``Loop(role=REGISTER)``. The ``axes`` tuple carries one or
     more register axes (typically M_r / N_r for matmul); the planner
-    chooses the extents (``FM`` / ``FN`` knobs). After the 006a
-    register-tile pass runs, every ``RegisterTile`` is consumed: the
-    body is fully unrolled, SSA names get per-cell suffixes, and the
-    ``RegisterTile`` wrapper disappears.
+    chooses the extents (``FM`` / ``FN`` knobs). After the
+    ``010_split_register_axes`` pass runs, every ``RegisterTile`` is
+    consumed: the body is fully unrolled, SSA names get per-cell
+    suffixes, and the ``RegisterTile`` wrapper disappears.
     """
 
     def render(self, ctx: RenderCtx) -> list[str]:

@@ -39,13 +39,11 @@ def rewrite(root: Node) -> Graph | None:
     tt = thread_tile_of(outer)
 
     # Body-global keep set per register axis. Computed once over the entire
-    # ThreadTile body so sibling RegisterTile(axis) towers (the blocked-GEMM
-    # nest emits three: Init / K-reduce-Accum / Write) agree on which SSA
-    # names carry the per-cell ``_<i>`` suffix. Without this, each tower's
-    # local keep-analysis would run independently — the Init tower doesn't
-    # reference N_r, so ``acc`` would stay one name there, while the Accum
-    # tower produces ``acc_0..N-1`` — a naming mismatch the consumer Write
-    # would inherit.
+    # ThreadTile body so any sibling/cousin RegisterTile(axis) bodies agree
+    # on which SSA names carry the per-cell ``_<i>`` suffix. Defence in
+    # depth for hand-built fixtures — the per-cell shape the planner emits
+    # today has at most one RegisterTile(axis) per scope, so the body-local
+    # keep would suffice.
     global_keep = _collect_body_global_keep(tt.body)
     new_body, factors = _replicate_register_tiles(tt.body, global_keep=global_keep)
     if not factors:
@@ -78,10 +76,11 @@ def _replicate_register_tiles(body: Body, *, global_keep: dict[str, dict[str, bo
 
     ``global_keep`` is the body-global keep map (axis → name → True/False)
     computed at the TileOp body level. It's threaded into every per-axis
-    ``_replicate_along_axis`` call so sibling RegisterTile(axis) towers
-    agree on which names get the per-cell ``_<i>`` suffix — the local
-    fold inside one tower can't see that a name is register-tiled by
-    another sibling tower's body.
+    ``_replicate_along_axis`` call so any sibling/cousin RegisterTile(axis)
+    bodies agree on which names get the per-cell ``_<i>`` suffix. Real
+    planner output emits one RegisterTile(axis) per scope; the global keep
+    only matters for hand-built fixtures with sibling towers sharing an
+    axis.
     """
     out: list[Stmt] = []
     factors: list[int] = []
@@ -119,8 +118,8 @@ def _collect_body_global_keep(body: Body) -> dict[str, dict[str, bool]]:
     """For every register axis appearing in any ``RegisterTile`` within
     ``body``, compute the body-global keep set — which SSA names defined
     anywhere in ``body`` transitively reference that axis. Used to align
-    replicator suffixing across sibling/cousin RegisterTile(axis) towers
-    (the blocked-GEMM nest's three towers, SDPA-prologue+matmul, etc.).
+    replicator suffixing across sibling/cousin RegisterTile(axis) bodies
+    (defence in depth for hand-built fixtures).
     """
     axes: set[str] = set()
     for s in body.iter():
@@ -134,7 +133,7 @@ def _global_keep_for_axis(body: Body, axis: str) -> dict[str, bool]:
     """Body-global keep set for ``axis``: which SSA names defined anywhere
     in ``body`` transitively reference ``axis`` (and therefore must carry
     the per-cell ``_<i>`` suffix at replicate time, regardless of which
-    sibling RegisterTile(axis) tower defines them).
+    sibling RegisterTile(axis) body defines them).
 
     Mirrors the per-body fold in :func:`_replicate_along_axis`, but
     exempts ``axis`` from ``bound`` so a RegisterTile(axis) wrapper
@@ -144,9 +143,9 @@ def _global_keep_for_axis(body: Body, axis: str) -> dict[str, bool]:
     enclosing-wrapper-bound axes pass through unaffected (they aren't
     ``axis`` by construction).
 
-    Multiple defs of the same name (e.g. an Accum's name re-defined in
-    every sibling tower) OR together — keep[name]=True iff ANY definer
-    reads ``axis``.
+    Multiple defs of the same name (e.g. across hand-built sibling
+    RegisterTile bodies sharing a name) OR together — keep[name]=True
+    iff ANY definer reads ``axis``.
     """
 
     def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
@@ -221,10 +220,11 @@ def _replicate_along_axis(
 
     ``extra_keep`` is the body-global keep map for ``axis`` (see
     :func:`_global_keep_for_axis`): names True there must be suffixed
-    regardless of the local body's def-use, so an ``Init(acc)`` /
-    ``Write(C, acc)`` tower aligned with an ``Accum(acc, …N_r…)`` sibling
-    tower replicates and renames consistently (acc → acc_0..N-1) in all
-    three. OR-merged into the locally-derived keep."""
+    regardless of the local body's def-use, so sibling RegisterTile(axis)
+    bodies that share a name (e.g. hand-built fixtures where an
+    ``Init(acc)`` body sits alongside an ``Accum(acc, …N_r…)`` body)
+    replicate and rename consistently. OR-merged into the locally-derived
+    keep."""
 
     def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
         # Stage / StageBundle cache-axis Vars are smem-local — they don't vary
@@ -247,9 +247,9 @@ def _replicate_along_axis(
 
     deps = body.fold(fn)
     keep: dict[str, bool] = {n: axis in deps[id(s)] for s in body.iter() for n in s.defines()}
-    # Merge in body-global keep entries (the per-tower local fold can't see
-    # that a name register-tiled by a sibling tower must also be suffixed
-    # here). OR-merge: a name keep=True globally stays True locally.
+    # Merge in body-global keep entries (the per-body local fold can't see
+    # that a name register-tiled by a sibling RegisterTile must also be
+    # suffixed here). OR-merge: a name keep=True globally stays True locally.
     if extra_keep is not None:
         for n, v in extra_keep.items():
             if v:
@@ -310,7 +310,7 @@ def _replicate_along_axis(
                 # REGISTER axis. Stage's source-side state (cache_axes, origin)
                 # stays untouched — the per-source Vars are smem-local and
                 # the cache-axis 'bound' mask in the fold guard above prevents
-                # 006a from tagging them for replication.
+                # 010_split_register_axes from tagging them for replication.
                 out.append(s.with_bodies(tuple(go(child) for child in nested)))
             elif _needs_replication(s, axis, deps, keep):
                 for i in range(factor):

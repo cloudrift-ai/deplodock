@@ -31,14 +31,12 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
     reduce — e.g. the cooperative-K shape ``SerialTile(K_o, "serial_outer",
     body=[SerialTile(K_i, "stage_inner", reduce, [Accum, ...])])`` produced
     by the partition planner's σ-split, possibly with F-replicated sibling
-    Accums from ``006a_register_tile_planned``.
+    Accums from ``010_split_register_axes``.
 
-    The blocked-GEMM builder
-    (``010_partition_loops::_build_register_blocked_body``) wraps the
-    N-dep K_i tail in ``RegisterTile(N_r, [Load b, Assign, Accum])`` —
-    walking through the ``RegisterTile`` here is the analogue of the
-    same change to ``SerialTileBase.is_reduce`` (Phase 2): both let the
-    cooperative-K materializer fire when BR > 1 takes the blocked path.
+    The walk-through of ``RegisterTile`` / ``Cond`` wrappers here is
+    defence in depth — real planner output never wraps ``Accum`` inside
+    ``RegisterTile`` at K_i body level (the outer ``RegisterTile(N_r)``
+    wraps the ``SerialTile(K_o)`` from outside in the per-cell shape).
 
     Returns ``{}`` when no reduce-with-Accum subtree is found, preserving
     the existing "stray Combine raises" safety net."""

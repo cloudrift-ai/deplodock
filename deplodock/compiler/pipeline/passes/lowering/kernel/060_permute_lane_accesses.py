@@ -7,8 +7,9 @@ fp32 staged buffer, ``V = 8`` for fp16. The hardware constant (the
 looked up via ``match.graph.nodes[stage.buf].output.dtype.nbytes`` so
 fp16 matmuls don't waste half the LDS.128 bandwidth.
 
-After ``006a_register_tile_planned`` commits the canonical ``(THREAD-outer | RF-inner)``
-ordering on the N axis, body Loads on the B operand stage read column
+After ``010_split_register_axes`` commits the canonical
+``(THREAD-outer | RF-inner)`` ordering on the N axis, body Loads on the
+B operand stage read column
 ``Var(lane) * FN + c`` for ``c=0..FN-1``. Two regimes:
 
 * ``FN <= V`` (canonical default): lane ``l`` reads the contiguous strip
