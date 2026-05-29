@@ -121,6 +121,46 @@ axis filter becomes structurally identical to per-cell layout. Verify:
   bug at `010_partition_loops.py:932–934`) — fix it here if it breaks, or document why it doesn't
   trigger at FN=1.
 
+> **Investigation note (2026-05-28).** Phase 2 was attempted on `feature/dedup-replicated-pass`
+> and reverted; the blocker is deeper than the plan body suggests.
+>
+> The structural claim "blocked-FN=1 == per-cell after size-1 filter" is true **only after**
+> `lowering/kernel/010_split_register_axes` unwraps the `RegisterTile(N_r=1)` wrappers — i.e. at
+> Kernel-IR stage. But the staging passes that fail at FN=1 (`020_stage_inputs` →
+> `040_use_ring_buffers` → `060_use_async_copy` → `070_pad_smem`) all run **earlier**, in
+> `lowering/tile/`, where the blocked path still has the per-tower `RegisterTile(N_r)` wrappers
+> visible. So `SerialTile(K_i).is_reduce` returns `False` (the `Accum` is nested inside
+> `RegisterTile`, not at the immediate body), and `020_stage_inputs` recurses past K_i instead of
+> forming a Stage. **Result on Phase 2 gate flip:** plain-matmul FN=1 produces no `StageBundle`
+> at all → `test_lowering_accuracy.py::test_double_buffer_matmul_accuracy` /
+> `test_async_copy_matmul_accuracy` / `test_pad_smem_matmul_accuracy` all fail (9 cases).
+>
+> Cross-check: the **existing FN > 1 blocked path** has the same bug. Running the FN=3 blocked
+> shape with `STAGE=111` produces zero `StageBundle`s — the blocked path has never staged its
+> matmul K_i. The existing blocked-gemm tests pass because they only assert CUDA accuracy
+> (kernel runs slower without smem caching but still correct), not Stage formation.
+>
+> **Naive is_reduce fix breaks the fused-prologue case.** Changing `SerialTileBase.is_reduce` to
+> walk through `RegisterTile` / `Cond` (so K_i with nested Accum is recognised as a reduce)
+> makes plain-matmul FN=1 stage correctly, but breaks
+> `test_fused_rmsnorm_linear_blocked_prologue`: the fused RMSNorm + linear case has prologue's
+> mean-reduce K_i and matmul's K_i as siblings inside `SerialTile(M_r, plain)`, both reading the
+> same input `x`. Today's "bug" — matmul K_i not being a reduce — is **load-bearing**: it keeps
+> matmul K_i out of staging so the prologue's `x_smem` covers both reads. With the fix, both
+> reduces stage → two `x_smem` allocations → smem regression detected by the test.
+>
+> **Clean Phase 2 fix scope.** Needs either:
+> - **Stage-merging across sibling K-towers**: 020 (or a follow-up tile pass) detects that two
+>   Stages targeting the same buffer with overlapping (or subset) cache-axis sets can share one
+>   smem slab. Then the is_reduce-walks-through fix becomes safe.
+> - **Planner-side knowledge**: when the fused prologue + matmul share an input, mark the matmul
+>   K_i such that 020 skips staging it (relies on the prologue Stage). Per-cell path doesn't
+>   need this because the matmul Load lives at the prologue's K_i scope post-CSE — sharing
+>   happens via SSA, not via Stage merge.
+>
+> Both options require non-trivial design + perf verification on GPU hardware. Phase 1's dedup
+> pass is in place and observationally a no-op, so it ships cleanly on its own.
+
 ### Phase 3 — Remove SPLITK > 1 disqualifier (matmul_add path)
 
 Flip the planner's gate so SPLITK>1 matmul shapes go through the blocked builder. Two integration
