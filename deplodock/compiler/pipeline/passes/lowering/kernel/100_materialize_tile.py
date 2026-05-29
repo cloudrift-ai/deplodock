@@ -440,9 +440,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # matched SerialTile.axis (post-normalize canonical names like
         # ``a2`` rather than the WS-pass-time ``k_outer``).
         wired_producer = _wire_producer_wait(ws.producer_body, empty_mbar, bc)
-        wired_consumer = _wire_consumer_arrive(
-            ws.consumer_body, empty_mbar, bc, first_consumer_tid, n_consumer_threads
-        )
+        wired_consumer = _wire_consumer_arrive(ws.consumer_body, empty_mbar, bc, first_consumer_tid, n_consumer_threads)
 
         # Materialize each branch. Consumer-side AsyncWaits route their
         # trailing fence through the named ``bar.sync 1, n_consumer``

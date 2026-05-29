@@ -195,6 +195,4 @@ def test_ws1_tile_body_contains_no_kernel_ir(monkeypatch):
     assert isinstance(result, TileOp)
     forbidden = (Smem, Sync, MbarrierInit, MbarrierWait, MbarrierArrive, SetMaxNReg)
     for stmt in result.body.iter():
-        assert not isinstance(stmt, forbidden), (
-            f"Tile-IR pass leaked Kernel-IR type {type(stmt).__name__} into TileOp body"
-        )
+        assert not isinstance(stmt, forbidden), f"Tile-IR pass leaked Kernel-IR type {type(stmt).__name__} into TileOp body"

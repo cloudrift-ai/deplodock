@@ -90,11 +90,7 @@ def _tile_op_with_ws(
     ``normalize_body`` will canonicalize it to ``a2``; the materializer
     reads the canonical name off the matched ``SerialTile.axis``."""
     k_axis = Axis("k_outer", 8)
-    cons_body = (
-        Body((AsyncWait(keep=1, phase=Var("k_outer") % Literal(2, "int")),))
-        if consumer_has_async_wait
-        else Body(())
-    )
+    cons_body = Body((AsyncWait(keep=1, phase=Var("k_outer") % Literal(2, "int")),)) if consumer_has_async_wait else Body(())
     producer_body = Body((SerialTile(axis=k_axis, body=Body(()), kind="serial_outer"),))
     consumer_body = Body((SerialTile(axis=k_axis, body=cons_body, kind="serial_outer"),))
     ws = WarpSpecialize(
@@ -133,10 +129,7 @@ def test_materializer_emits_empty_mbar_prologue():
     assert smem.extents == (2,)
     assert smem.dtype == "unsigned long long"
     # Init Cond gated on tid==0 holds MbarrierInit per slot.
-    init_conds = [
-        s for s in items
-        if isinstance(s, Cond) and any(isinstance(c, MbarrierInit) for c in s.body)
-    ]
+    init_conds = [s for s in items if isinstance(s, Cond) and any(isinstance(c, MbarrierInit) for c in s.body)]
     assert len(init_conds) >= 1, "missing single-thread MbarrierInit prologue"
     init_cond = init_conds[0]
     inits = [c for c in init_cond.body if isinstance(c, MbarrierInit)]
@@ -157,11 +150,7 @@ def test_materializer_wraps_branches_in_setmaxnreg_cond():
     consumer branch."""
     kernel = _materialize(_tile_op_with_ws())
     top = kernel.body[0]
-    role_conds = [
-        s for s in top.body
-        if isinstance(s, Cond)
-        and any(isinstance(c, SetMaxNReg) for c in s.body)
-    ]
+    role_conds = [s for s in top.body if isinstance(s, Cond) and any(isinstance(c, SetMaxNReg) for c in s.body)]
     assert len(role_conds) == 1, f"expected exactly one role-split Cond, got {len(role_conds)}"
     cond = role_conds[0]
     # Producer branch leads with SetMaxNReg(24, "dec").
