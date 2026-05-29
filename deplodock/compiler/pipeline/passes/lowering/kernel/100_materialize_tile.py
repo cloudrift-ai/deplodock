@@ -42,9 +42,11 @@ from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     CpAsyncWait,
     KernelOp,
+    MbarrierArrive,
     MbarrierArriveExpectTx,
     MbarrierInit,
     MbarrierWait,
+    SetMaxNReg,
     Smem,
     Sync,
     TmaDescriptor,
@@ -64,6 +66,7 @@ from deplodock.compiler.ir.tile.ir import (
     StridedTile,
     ThreadTile,
     TileOp,
+    WarpSpecialize,
 )
 from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
@@ -213,7 +216,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
             out.append(s)
         return out
 
-    def emit_async_wait(stmt: AsyncWait) -> list[Stmt]:
+    def emit_async_wait(stmt: AsyncWait, *, ws_consumer: WarpSpecialize | None = None) -> list[Stmt]:
         # TMA path: wait carries the explicit consumer-side phase + slot
         # set by 015_pipeline_k_outer. The wait targets its pipeline-unit
         # group's mbar (each group has its own mbar with arrive count
@@ -226,11 +229,22 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # (BM=16, BN=16 + stage) where the inner-loop schedule makes
         # the reorder profitable; on larger tiles the schedule is
         # dense enough that no useful hoist is possible.
-        # AsyncWait.barrier_id / barrier_count let the caller (085 for WS
-        # kernels) route the trailing CTA fence to a named barrier
-        # (``bar.sync N, count``) instead of ``__syncthreads()``. Default
-        # 0 keeps every legacy emission on ``__syncthreads()``.
-        trailing_sync = Sync(barrier_id=stmt.barrier_id, count=stmt.barrier_count)
+        # The trailing fence routes to a named ``bar.sync`` when we're
+        # inside a WarpSpecialize consumer subtree (``__syncthreads()``
+        # is CUDA UB on the warp-divergent producer/consumer branch).
+        # ``ws_consumer`` is threaded in by ``emit_warp_specialize`` and
+        # carries the producer thread count, from which the materializer
+        # derives the consumer participant count for ``bar.sync N, M``.
+        if ws_consumer is not None:
+            outer_ext = thread_axes[0].extent.as_static()
+            inner_prod = 1
+            for ax in thread_axes[1:]:
+                inner_prod *= ax.extent.as_static()
+            extension = ws_consumer.n_producer_threads // inner_prod
+            n_cons = (outer_ext - extension) * inner_prod
+            trailing_sync = Sync(barrier_id=1, count=n_cons)
+        else:
+            trailing_sync = Sync()
         if stmt.phase is not None and tma.has_tma:
             gid = tma.wait_group.get(id(stmt))
             if gid is not None:
@@ -382,32 +396,162 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
                 )
         return out
 
-    def _process_stmt(stmt: Stmt) -> list[Stmt]:
+    def emit_warp_specialize(ws: WarpSpecialize) -> list[Stmt]:
+        """Lower a Tile-IR ``WarpSpecialize`` into the full mbarrier
+        handshake: empty-mbarrier ring + per-K_o ``MbarrierWait`` /
+        ``MbarrierArrive`` pairs + named ``bar.sync`` consumer fences +
+        ``SetMaxNReg`` register-budget redistribution + producer /
+        consumer ``Cond`` wrapper.
+
+        Geometry (predicate, consumer thread count, first-consumer tid)
+        is derived from the enclosing ``ThreadTile.axes`` and
+        ``ws.n_producer_threads`` — the WS pass doesn't carry them.
+        """
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+        outer = thread_axes[0]
+        outer_extent = outer.extent.as_static()
+        inner_product = 1
+        for ax in thread_axes[1:]:
+            inner_product *= ax.extent.as_static()
+        if ws.n_producer_threads % inner_product != 0:
+            raise ValueError(
+                f"WarpSpecialize: n_producer_threads ({ws.n_producer_threads}) "
+                f"must be divisible by inner thread-axes product ({inner_product})"
+            )
+        extension = ws.n_producer_threads // inner_product
+        n_consumer_threads = (outer_extent - extension) * inner_product
+        first_consumer_tid = ws.n_producer_threads
+        bc = ws.ring_depth
+        empty_mbar = "tma_mbar_empty"
+
+        # Empty-mbarrier prologue: Smem + per-slot MbarrierInit (single-
+        # thread gated) + Sync. Init count = 1 — exactly one consumer
+        # thread arrives per slot release.
+        empty_decl = Smem(name=empty_mbar, extents=(bc,), dtype="unsigned long long")
+        empty_inits = tuple(MbarrierInit(mbar=empty_mbar, count=1, slot=Literal(s, "int")) for s in range(bc))
+        init_cond = Cond(
+            cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")),
+            body=empty_inits,
+        )
+
+        # Wire producer-side wait + consumer-side arrive into each
+        # branch's serial_outer K_o body. Each helper reads k_var off the
+        # matched SerialTile.axis (post-normalize canonical names like
+        # ``a2`` rather than the WS-pass-time ``k_outer``).
+        wired_producer = _wire_producer_wait(ws.producer_body, empty_mbar, bc)
+        wired_consumer = _wire_consumer_arrive(ws.consumer_body, empty_mbar, bc, first_consumer_tid, n_consumer_threads)
+
+        # Materialize each branch. Consumer-side AsyncWaits route their
+        # trailing fence through the named ``bar.sync 1, n_consumer``
+        # path — pass ws_consumer=ws into emit_async_wait via the ews
+        # plumbing.
+        def cons_ews(stmt: AsyncWait) -> list[Stmt]:
+            return emit_async_wait(stmt, ws_consumer=ws)
+
+        prod_out: list[Stmt] = []
+        for s in wired_producer:
+            prod_out.extend(_process_stmt(s))
+        cons_out: list[Stmt] = []
+        for s in wired_consumer:
+            cons_out.extend(_process_stmt(s, ews=cons_ews))
+
+        ws_cond = Cond(
+            cond=BinaryExpr("<", Var(outer.name), Literal(extension, "int")),
+            body=Body((SetMaxNReg(24, "dec"), *prod_out)),
+            else_body=Body((SetMaxNReg(240, "inc"), *cons_out)),
+        )
+        return [empty_decl, init_cond, Sync(), ws_cond]
+
+    def _wire_producer_wait(stmts, empty_mbar: str, bc: int):
+        """Prepend a ``MbarrierWait(empty[slot], phase)`` inside each
+        top-level ``SerialTile(serial_outer)``, gated by ``Cond(K_o >=
+        bc-1)`` so the first ``bc-1`` iters skip (those slots were
+        unfilled by the prologue). The K_o axis name is read off the
+        matched ``SerialTile.axis`` (canonical post-normalize)."""
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, SerialTile) and s.kind == "serial_outer":
+                k_var = s.axis.name
+                k_plus_1 = Var(k_var) + Literal(1, "int")
+                slot_expr = k_plus_1 % Literal(bc, "int")
+                phase_expr = (k_plus_1 / Literal(bc, "int") - Literal(1, "int")) % Literal(2, "int")
+                wait_cond = Cond(
+                    cond=BinaryExpr(">=", Var(k_var), Literal(bc - 1, "int")),
+                    body=(MbarrierWait(mbar=empty_mbar, phase=phase_expr, slot=slot_expr),),
+                )
+                new_inner = Body((wait_cond, *s.body))
+                out.append(s.with_bodies((new_inner,)))
+            else:
+                out.append(s)
+        return out
+
+    def _wire_consumer_arrive(stmts, empty_mbar: str, bc: int, first_cons_tid: int, n_cons: int):
+        """Recursively descend stmts; inside every
+        ``SerialTile(serial_outer)``, append a named
+        ``Sync(barrier_id=1, count=n_cons)`` + a single-thread
+        ``MbarrierArrive``. The Sync is critical: without it the chosen
+        arriving thread (``threadIdx.x == first_cons_tid``) can race
+        ahead of slower consumers still reading the slot's smem; the
+        arrive then flips the empty mbarrier and the producer is free
+        to overwrite the slot mid-read."""
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+
+        def _augment(stmt: Stmt) -> Stmt:
+            if isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
+                k_var = stmt.axis.name
+                slot_expr = Var(k_var) % Literal(bc, "int")
+                barrier_sync = Sync(barrier_id=1, count=n_cons)
+                arrive_cond = Cond(
+                    cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(first_cons_tid, "int")),
+                    body=(MbarrierArrive(mbar=empty_mbar, slot=slot_expr),),
+                )
+                return stmt.with_bodies((Body((*stmt.body, barrier_sync, arrive_cond)),))
+            nested = stmt.nested()
+            if nested:
+                return stmt.with_bodies(tuple(Body(tuple(_augment(c) for c in b)) for b in nested))
+            return stmt
+
+        return [_augment(s) for s in stmts]
+
+    def _process_stmt(stmt: Stmt, *, ews=None) -> list[Stmt]:
         """Materialize one body Stmt — bundles inline their producer code
-        then recursively process their consumer body."""
+        then recursively process their consumer body.
+
+        ``ews`` overrides the per-walk ``emit_async_wait`` flavor — used
+        by ``emit_warp_specialize`` to thread a ``ws_consumer`` context
+        through the consumer subtree so AsyncWaits route their trailing
+        fence to the named ``bar.sync``."""
+        if ews is None:
+            ews = emit_async_wait
+        if isinstance(stmt, WarpSpecialize):
+            return list(emit_warp_specialize(stmt))
         if isinstance(stmt, StageBundle):
             out_local: list[Stmt] = list(filter_emit(emit_bundle_producer(stmt)))
             for inner in stmt.body:
-                out_local.extend(_process_stmt(inner))
+                out_local.extend(_process_stmt(inner, ews=ews))
             return out_local
         if isinstance(stmt, AsyncWait):
-            return list(emit_async_wait(stmt))
+            return list(ews(stmt))
         if isinstance(stmt, Cond):
-            # 085_warp_specialize wraps producer + consumer subtrees in
-            # a top-level ``Cond(warp_role_check, prod, cons)`` — both
-            # branches may contain StageBundles / AsyncWaits / SerialTiles
-            # that need recursive processing.
+            # Top-level Cond wrapping StageBundles / AsyncWaits — both
+            # branches may contain stmts that need recursive processing.
+            # (Pre-WarpSpecialize 085 emitted bare role-split Conds here;
+            # left in place because user-emitted Conds and other rules
+            # may still reach this point.)
             from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
             body_out: list[Stmt] = []
             for inner in stmt.body:
-                body_out.extend(_process_stmt(inner))
+                body_out.extend(_process_stmt(inner, ews=ews))
             else_out: list[Stmt] = []
             for inner in stmt.else_body:
-                else_out.extend(_process_stmt(inner))
+                else_out.extend(_process_stmt(inner, ews=ews))
             return [Cond(cond=stmt.cond, body=Body(tuple(body_out)), else_body=Body(tuple(else_out)))]
         if isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
-            single = _emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, emit_async_wait)
+            single = _emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, ews)
             extra: list[Stmt] = []
             if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
                 accums_in_scope = {a.name: a for a in stmt.body if isinstance(a, Accum)}

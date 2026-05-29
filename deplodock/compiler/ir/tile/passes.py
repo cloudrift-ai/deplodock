@@ -33,6 +33,7 @@ from deplodock.compiler.ir.tile.ir import (
     StageBundle,
     StridedTile,
     ThreadTile,
+    WarpSpecialize,
 )
 
 
@@ -74,8 +75,6 @@ def _(s: AsyncWait, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         keep=s.keep,
         phase=sigma.apply(s.phase) if s.phase is not None else None,
         slot=sigma.apply(s.slot) if s.slot is not None else None,
-        barrier_id=s.barrier_id,
-        barrier_count=s.barrier_count,
     )
 
 
@@ -85,8 +84,26 @@ def _(s: AsyncWait, ctx: SimplifyCtx) -> Stmt:
         keep=s.keep,
         phase=s.phase.simplify(ctx) if s.phase is not None else None,
         slot=s.slot.simplify(ctx) if s.slot is not None else None,
-        barrier_id=s.barrier_id,
-        barrier_count=s.barrier_count,
+    )
+
+
+@rewrite.register
+def _(s: WarpSpecialize, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return WarpSpecialize(
+        producer_body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.producer_body),
+        consumer_body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.consumer_body),
+        ring_depth=s.ring_depth,
+        n_producer_threads=s.n_producer_threads,
+    )
+
+
+@simplify.register
+def _(s: WarpSpecialize, ctx: SimplifyCtx) -> Stmt:
+    return WarpSpecialize(
+        producer_body=tuple(simplify(c, ctx) for c in s.producer_body),
+        consumer_body=tuple(simplify(c, ctx) for c in s.consumer_body),
+        ring_depth=s.ring_depth,
+        n_producer_threads=s.n_producer_threads,
     )
 
 

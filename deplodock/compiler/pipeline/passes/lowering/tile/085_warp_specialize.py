@@ -20,31 +20,22 @@ The structural rewrite (WS=1 only):
    new_extent)`` which the σ shifts back to ``[0, original_extent)``
    inside the consumer body — every Load/Write index, every Loop bound,
    every cooperative-thread reference stays correct.
-3. **Allocate the empty mbarrier ring** (``Smem`` +
-   per-slot ``MbarrierInit`` inside a single-thread ``Cond``,
-   followed by ``Sync``) at the top of the new ThreadTile body. Init
-   count = 1 — exactly one consumer thread arrives per slot release.
-4. **Split the body by role** into producer / consumer subtrees:
-   - Producer subtree keeps ``StageBundle``s; inside each
-     ``SerialTile(serial_outer)`` it inserts ``MbarrierWait(empty[..],
-     phase=..)`` before the issue, gated by ``Cond(K_o >= bc-1, ...)``
-     so the first ``bc-1`` iters skip (those slots were unfilled by
-     prologue).
+3. **Split the body by role** into producer / consumer subtrees:
+   - Producer subtree keeps ``StageBundle``s.
    - Consumer subtree keeps ``AsyncWait`` + reduce ``SerialTile`` +
-     output ``Write``s; inside each ``SerialTile(serial_outer)`` it
-     appends ``MbarrierArrive(empty[slot])`` after the reduce, gated
-     by ``Cond(thread_idx == n_producer_threads, ...)`` so exactly one
-     consumer thread arrives. Consumer-side ``AsyncWait``s carry
-     ``barrier_id=1, barrier_count=n_consumer_threads`` so the
-     materializer's lowered trailing ``Sync`` is a named ``bar.sync``
-     (``__syncthreads`` is CUDA UB on the warp-divergent ``Cond``).
-5. **Wrap producer + consumer in ``Cond(inner_axis < extension, ...,
-   ...)``** with ``SetMaxNReg(24, "dec")`` and ``SetMaxNReg(240,
-   "inc")`` at the top of each branch.
+     output ``Write``s.
+4. **Package as a single Tile-IR ``WarpSpecialize`` Stmt** carrying the
+   role bodies, ring depth (= TMA buffer_count), and producer thread
+   count. The materializer (``100_materialize_tile.emit_warp_specialize``)
+   expands this into the empty-mbarrier ring, per-K_o handshake,
+   producer/consumer ``Cond`` wrapper, and ``SetMaxNReg`` register-
+   budget framing — none of which appear at Tile level.
 
-The materializer (``100_materialize_tile``) sees standard tile IR plus
-the new Cond / Smem / MbarrierInit / MbarrierArrive / SetMaxNReg
-primitives in the body and lowers each 1:1 without any WS-awareness.
+This pass stays inside the Tile-IR dialect — no ``from
+deplodock.compiler.ir.kernel.ir import …``. The boundary mirrors what
+``080_pipeline_stages`` already does for ``AsyncWait``: declare
+scheduling intent at Tile level, materializer fills in the hardware
+primitives.
 
 Eligibility:
 
@@ -63,17 +54,13 @@ Eligibility:
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
-from deplodock.compiler.ir.kernel.ir import MbarrierArrive, MbarrierInit, MbarrierWait, SetMaxNReg, Smem, Sync
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Stmt
+from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
-    AsyncWait,
     GridTile,
     RegisterTile,
     SerialTile,
@@ -81,6 +68,7 @@ from deplodock.compiler.ir.tile.ir import (
     StagePolicy,
     ThreadTile,
     TileOp,
+    WarpSpecialize,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -218,78 +206,6 @@ def _split_by_role(stmts: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
     return producer, consumer
 
 
-def _wire_producer_wait(stmts: list[Stmt], empty_mbar: str, bc: int) -> list[Stmt]:
-    """Inside each producer K_o body, prepend a ``MbarrierWait`` on the
-    empty mbarrier slot, gated by ``Cond(K_o >= bc-1)`` (first ``bc-1``
-    iters fill slots that weren't touched by the prologue)."""
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, SerialTile) and s.kind == "serial_outer":
-            k_var = s.axis.name
-            k_plus_1 = Var(k_var) + Literal(1, "int")
-            slot_expr = k_plus_1 % Literal(bc, "int")
-            phase_expr = (k_plus_1 / Literal(bc, "int") - Literal(1, "int")) % Literal(2, "int")
-            wait_cond = Cond(
-                cond=BinaryExpr(">=", Var(k_var), Literal(bc - 1, "int")),
-                body=(MbarrierWait(mbar=empty_mbar, phase=phase_expr, slot=slot_expr),),
-            )
-            new_inner = Body((wait_cond, *s.body))
-            out.append(s.with_bodies((new_inner,)))
-        else:
-            out.append(s)
-    return out
-
-
-def _wire_consumer_arrive(stmts: list[Stmt], empty_mbar: str, bc: int, first_consumer_tid: int, n_consumer_threads: int) -> list[Stmt]:
-    """Recursively walk the consumer subtree; inside each
-    ``SerialTile(serial_outer)`` body, append a named-barrier ``Sync``
-    + a single-thread ``MbarrierArrive`` on the empty-mbar slot.
-
-    The Sync is critical: without it, the chosen arriving thread
-    (``threadIdx.x == first_consumer_tid``) can race ahead of slower
-    consumer threads still reading the slot's smem. The arrive flips
-    the empty mbarrier → producer can refill the slot → racing reads
-    see corrupted data. The named ``bar.sync barrier_id=1,
-    n_consumer_threads`` blocks all consumer threads at the loop's
-    tail before the arrive, so the slot's reads are all finished by
-    the time the producer is free to refill.
-
-    Recursion descends into any wrapper (e.g. ``RegisterTile`` around
-    the K_o loop in blocked matmul); the K_o loop itself isn't
-    recursed into."""
-
-    def _augment(stmt: Stmt) -> Stmt:
-        if isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
-            k_var = stmt.axis.name
-            slot_expr = Var(k_var) % Literal(bc, "int")
-            barrier_sync = Sync(barrier_id=1, count=n_consumer_threads)
-            arrive_cond = Cond(
-                cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(first_consumer_tid, "int")),
-                body=(MbarrierArrive(mbar=empty_mbar, slot=slot_expr),),
-            )
-            return stmt.with_bodies((Body((*stmt.body, barrier_sync, arrive_cond)),))
-        nested = stmt.nested()
-        if nested:
-            return stmt.with_bodies(tuple(Body(tuple(_augment(c) for c in b)) for b in nested))
-        return stmt
-
-    return [_augment(s) for s in stmts]
-
-
-def _stamp_async_wait_barrier(body: Body, count: int) -> Body:
-    """Recursively stamp ``barrier_id=1, barrier_count=count`` onto every
-    ``AsyncWait`` in the body. The materializer's lowered trailing
-    ``Sync`` then becomes a named ``bar.sync`` instead of the default
-    ``__syncthreads()`` (UB on the warp-divergent consumer Cond)."""
-
-    def _xform(s: Stmt) -> Stmt:
-        if isinstance(s, AsyncWait):
-            return replace(s, barrier_id=1, barrier_count=count)
-        return s
-
-    return body.map(_xform)
-
-
 def _apply_sigma(body: Body, sigma: Sigma) -> Body:
     """Apply ``sigma`` to every Stmt in ``body`` — substitutes the
     extended-axis Var with its shifted form throughout. ``Stmt.rewrite``
@@ -300,23 +216,22 @@ def _apply_sigma(body: Body, sigma: Sigma) -> Body:
 
 
 def _ws_transform(op: TileOp) -> TileOp:
-    """Build the WS=1 TileOp by structurally rewriting ``op``'s body."""
+    """Build the WS=1 TileOp by structurally rewriting ``op``'s body.
+
+    Output shape: the extended ThreadTile holds a single
+    ``WarpSpecialize`` carrying the two role bodies. The materializer
+    fabricates the mbarrier ring, handshake, register-budget framing,
+    and producer/consumer Cond wrapper from this marker."""
     tt = _find_thread_tile(op.body)
     assert tt is not None  # _eligible enforces
 
     outer = tt.axes[0]
-    outer_extent = outer.extent.as_static()
     inner_product = 1
     for ax in tt.axes[1:]:
         inner_product *= ax.extent.as_static()
     extension = _N_PRODUCER_THREADS // inner_product
     extended_outer = Axis(name=outer.name, extent=outer.extent + Literal(extension, "int"))
     new_axes = (extended_outer, *tt.axes[1:])
-
-    # Consumer threads = original total (we extended by exactly the
-    # producer count, so the consumer range still spans the original
-    # axis product). Used for the named-barrier participant count.
-    n_consumer_threads = outer_extent * inner_product
 
     # Sigma to shift the extended outer axis back into [0, outer_extent)
     # inside the consumer body. Producer threads have outer-axis values
@@ -325,42 +240,24 @@ def _ws_transform(op: TileOp) -> TileOp:
     sigma = Sigma({outer.name: Var(outer.name) - Literal(extension, "int")})
 
     bc = _first_buffer_count(op.body)
-    empty_mbar = "tma_mbar_empty"
-
-    # Empty mbarrier prologue: Smem + per-slot MbarrierInit (single-thread
-    # gated) + Sync. Placed at the top of the new ThreadTile body so the
-    # materializer's regular flow picks up the Smem decl and the
-    # MbarrierInit Conds + Sync render as-is.
-    empty_decl = Smem(name=empty_mbar, extents=(bc,), dtype="unsigned long long")
-    empty_inits = tuple(MbarrierInit(mbar=empty_mbar, count=1, slot=Literal(s, "int")) for s in range(bc))
-    init_cond = Cond(cond=BinaryExpr("==", Builtin("thread_idx.x"), Literal(0, "int")), body=empty_inits)
 
     # Split the original ThreadTile body into producer / consumer halves.
     prod_stmts, cons_stmts = _split_by_role(tuple(tt.body))
 
-    # Wire empty-mbarrier wait/arrive into the role-specific K_o bodies.
-    prod_stmts = _wire_producer_wait(prod_stmts, empty_mbar, bc)
-    # First consumer thread = extension * inner_product = _N_PRODUCER_THREADS.
-    cons_stmts = _wire_consumer_arrive(cons_stmts, empty_mbar, bc, _N_PRODUCER_THREADS, n_consumer_threads)
-
     # Apply the σ-shift to the consumer subtree (every Load/Write index,
-    # Loop bound, Accum ref), then stamp consumer-side AsyncWaits with
-    # the named-barrier params.
+    # Loop bound, Accum ref). Producer stays unshifted because producer
+    # threads have outer ∈ [0, extension) — exactly the pre-extension
+    # zero-based range.
     cons_body = _apply_sigma(Body(tuple(cons_stmts)), sigma)
-    cons_body = _stamp_async_wait_barrier(cons_body, count=n_consumer_threads)
 
-    # Wrap producer + consumer in Cond(outer < extension, prod, σ(cons))
-    # with SetMaxNReg framing each branch. The outermost axis controls
-    # producer/consumer membership; row-major decode places producer
-    # threads (outer ∈ [0, extension)) at contiguous tid [0, n_producer).
-    ws_cond = Cond(
-        cond=BinaryExpr("<", Var(outer.name), Literal(extension, "int")),
-        body=Body((SetMaxNReg(24, "dec"), *prod_stmts)),
-        else_body=Body((SetMaxNReg(240, "inc"), *cons_body)),
+    ws = WarpSpecialize(
+        producer_body=Body(tuple(prod_stmts)),
+        consumer_body=cons_body,
+        ring_depth=bc,
+        n_producer_threads=_N_PRODUCER_THREADS,
     )
 
-    new_tt_body = Body((empty_decl, init_cond, Sync(), ws_cond))
-    new_tt = ThreadTile(axes=new_axes, body=new_tt_body)
+    new_tt = ThreadTile(axes=new_axes, body=Body((ws,)))
 
     # Rewrap in GridTile if needed.
     new_outer: list[Stmt] = []
