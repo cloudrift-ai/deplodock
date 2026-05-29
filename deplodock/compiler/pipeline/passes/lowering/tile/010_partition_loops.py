@@ -41,6 +41,55 @@ FM=FN=1, BK=16, SPLITK=1, BR=1):
                                         Accum(acc, a*b)
                                 Write(C[m_b·16 + m_t, n_b·16 + n_t], acc)
 
+Warp-tier (MMA) variant — emitted by ``_build_split_body_warp`` when the
+planner picks a :class:`WarpTileParams` row (only fires when
+``DEPLODOCK_MMA=1`` and ``is_atom_eligible`` passes; see
+``plans/mma-fragment-factorization.md``). The output-axis factorization
+gains a WARP tier between BLOCK and REGISTER and an ATOM tier inside
+REGISTER carrying the hardware cell shape:
+
+    N → N_b·(W_n·F_n·A_n) + N_w·(F_n·A_n) + N_r·A_n + N_a
+          BLOCK    WARP             REGISTER          ATOM
+
+K stride per ``K_i`` step is the atom's K dim (e.g. 16 for
+``wmma_m16n16k16_f16``) rather than 1 — each ``K_i`` iteration consumes
+``atom_k`` K-elements via one ``mma.sync`` instruction.
+
+Example (matmul A[M=128,K=128] @ B[K=128,N=128] with WN=WM=2, FM=FN=2,
+BK=2, SPLITK=1, ATOM_KIND="wmma_m16n16k16_f16" → cell shape (16,16,16),
+``F16`` operands, ``F32`` accumulator):
+
+    Output (σ_outer maps m/n through 4 tiers; σ_k stride = atom_k = 16;
+    M_a / N_a Vars stay OUT of σ — the fragment-lane offset is owned by
+    the WMMA instruction, not the body indices):
+        for m_b in 0..2 BLOCK:
+            for n_b in 0..2 BLOCK:
+                for m_w in 0..2 WARP:
+                    for n_w in 0..2 WARP:
+                        for m_r in 0..2 REGISTER:
+                            for n_r in 0..2 REGISTER:
+                                for m_a in 0..16 ATOM:    # structural marker;
+                                    for n_a in 0..16 ATOM:    # absent from σ
+                                        Init(acc)
+                                        for k_o in 0..4 SERIAL_OUTER:
+                                            for k_i in 0..2 STAGE_INNER reduce:
+                                                a = load A[m_b·64 + m_w·32 + m_r·16, k_o·32 + k_i·16]
+                                                b = load B[k_o·32 + k_i·16, n_b·64 + n_w·32 + n_r·16]
+                                                Accum(acc, a*b)
+                                        Write(C[m_b·64 + m_w·32 + m_r·16, n_b·64 + n_w·32 + n_r·16], acc)
+
+The ``AtomTile(m_a, n_a)`` wrapper + its enclosed matmul-cell body
+(``Init + K_o/K_i reduce + Write``) is consumed in the kernel pass
+chain by ``kernel/005_lower_atom_tile``, which pattern-matches this
+shape and rewrites it into an Mma* fragment chain
+(``MmaFragment`` × 3 + ``MmaFill`` + per-K_i ``MmaLoad`` × 2 +
+``MmaSync`` + final ``MmaStore``). The ``RegisterTile`` wrapper stays;
+``kernel/010_split_register_axes`` replicates the Mma* chain per
+``(m_r, n_r)`` cell, giving each cell its own fragment SSA names
+(``c_frag_0_0`` / ``c_frag_0_1`` / …). After both kernel passes, the
+``mma.sync`` instructions fire ``WM·WN·FM·FN·K_o·K_i = 64`` times per
+CTA on this shape.
+
 For cooperative-K reduce (e.g. sum K=512 with BR=256, BK=2), K_c appears as
 a THREAD axis above the BLOCK level and σ_k extends to
 ``k = k_o·512 + k_i·256 + k_c``; the materializer emits the cross-thread
