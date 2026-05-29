@@ -78,6 +78,7 @@ tests/
 │   ├── pipeline/                       # pipeline-level tests (knob, dump, rule_diff)
 │   │   ├── test_knob.py / test_rule_diff.py
 │   │   ├── test_dump.py                        # _graph_to_dot + CompilerDump repro
+│   │   ├── test_dedup_replicated.py            # Kernel-IR 011 CSE pass (Load + Assign)
 │   │   └── search/ — DB, slice, thunk_forks, two_level, greedy_db_lookup, tune_accuracy
 │   ├── backend/                        # backend code-emission + dispatch
 │   │   ├── test_dtype_cuda.py / test_dtype_numpy.py
