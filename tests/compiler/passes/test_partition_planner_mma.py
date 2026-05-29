@@ -295,12 +295,11 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
 
 
 def test_planner_scalar_only_when_mma_disabled(monkeypatch):
-    """With ``DEPLODOCK_MMA`` unset (default OFF), the planner emits only
-    scalar variants even on an F16 matmul. The result is byte-identical
-    to today's scalar-only path."""
+    """With ``DEPLODOCK_MMA=0`` set explicitly, the planner emits only
+    scalar variants. (Default is now ON; setting ``0`` is the opt-out.)"""
     from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import ScalarTileParams, WarpTileParams
 
-    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
 
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op

@@ -90,7 +90,7 @@ def _wmma_eligible_factory(
     cell_m, cell_n, cell_k = cell_shape
 
     def predicate(loop_op: LoopOp, ctx: Context, graph: Graph) -> bool:
-        from deplodock.compiler.ir.stmt import Load, Loop, StridedLoop  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, StridedLoop  # noqa: PLC0415
 
         if ctx.compute_capability < min_cc:
             return False
@@ -107,6 +107,31 @@ def _wmma_eligible_factory(
                 node = graph.nodes.get(load.input)
                 if node is None or node.output.dtype != operand_dtype:
                     return False
+            # Body purity: ``kernel/005_lower_atom_tile`` only handles the
+            # canonical ``[Load a, Load b, Assign(multiply, a, b), Accum]``
+            # shape — extra Assigns (e.g. constant-folded pre-scaling like
+            # ``a * 0.1`` from torch's per-input scale) would be silently
+            # dropped by the MmaLoad emit. Until the MMA emit handles
+            # in-cell scaling, gate those kernels off so the scalar path
+            # picks them up correctly.
+            top_level = list(k_loop.body)
+            n_loads = sum(1 for s in top_level if isinstance(s, Load))
+            n_assigns = sum(1 for s in top_level if isinstance(s, Assign))
+            n_accums = sum(1 for s in top_level if isinstance(s, Accum))
+            # Pure matmul cell: 2 Loads, 1 Assign (the multiply), 1 Accum.
+            if not (n_loads == 2 and n_assigns == 1 and n_accums == 1):
+                return False
+            # Verify the Assign feeds the Accum and reads only the two Loads.
+            loads = [s for s in top_level if isinstance(s, Load)]
+            assigns = [s for s in top_level if isinstance(s, Assign)]
+            accums = [s for s in top_level if isinstance(s, Accum)]
+            multiply = assigns[0]
+            accum = accums[0]
+            load_names = {ld.names[0] for ld in loads if ld.names}
+            if set(multiply.args) != load_names:
+                return False
+            if accum.value != multiply.name:
+                return False
         # Each output free-axis extent must divide cleanly. The body's outer
         # free Loops contribute the M (outer) / N (inner) extents the planner
         # will partition into output cells; gate the outermost-to-inner
@@ -198,7 +223,7 @@ ATOM_REGISTRY: dict[str, AtomSpec] = {
         operand_dtypes={"a": F16, "b": F16, "c": F32},
         instruction="wmma",
         group_size=32,
-        eligibility=_wmma_m16n16k16_f16_eligible,
+        eligibility=_wmma_eligible_factory(cell_shape=(16, 16, 16), operand_dtype=F16, min_cc=(7, 0)),
     ),
     "wmma_m16n16k16_bf16": AtomSpec(
         shape=(16, 16, 16),

@@ -1,23 +1,25 @@
-"""Offline kernel compilation via the ``nvcc`` binary (ptxas), as a faster
-drop-in for cupy's in-process NVRTC path.
+"""Offline kernel compilation via the ``nvcc`` binary (ptxas).
 
-cupy's cold compile goes NVRTC → PTX → **driver JIT** (PTX→SASS), which is both
-slow and globally serialized across processes. ``nvcc --cubin`` runs **offline
-ptxas** instead: ~3x faster on the complex tile-search kernels that dominate
-autotune, GPU-free for the compile step, and the cubin loads with no driver
-JIT (~25ms). Same SASS quality → identical kernel output + latency (validated).
+cupy's NVRTC path was the v1 default, but its bundled cu13 toolkit is
+missing ``crt/mma.h`` (the WMMA helper header) — every kernel using
+``wmma::*`` fails to compile through NVRTC. The system ``nvcc`` toolkit
+ships the full ``crt/`` directory, so we use ``nvcc --cubin`` exclusively
+now. Bonus: it's ~3× faster than cold NVRTC on the complex tile-search
+kernels that dominate autotune, GPU-free for the compile step, and the
+cubin loads with no driver JIT (~25 ms).
 
 The two halves are split on purpose:
 
 - :func:`compile_to_cubin` — ``nvcc --cubin`` into a content-addressed disk
   cache. GPU-free and independent per kernel, so a compile **pool** can warm
   the cache off the GPU (the planned next step).
-- :func:`load_function` — ensure the cubin exists, then ``RawModule`` load it
+- :func:`load_function` — ensure the cubin exists, then ``RawModule``-load it
   on the GPU. This is all the bench worker needs once the cache is warm.
 
-Falls back to ``cp.RawKernel`` (NVRTC) when ``nvcc`` is absent or a compile
-fails, so correctness never depends on the toolkit being installed. Set
-``DEPLODOCK_NO_NVCC=1`` to force the cupy path.
+``nvcc`` is required — there is no NVRTC fallback. Install the CUDA
+toolkit (``nvcc`` on ``$PATH`` or under ``$CUDA_HOME``/``$CUDA_PATH``)
+or set ``DEPLODOCK_NO_NVCC=1`` and accept the resulting hard error on
+any kernel that needs ``<mma.h>``.
 """
 
 from __future__ import annotations
@@ -148,21 +150,29 @@ def compile_to_cubin(source: str, name: str, *, arch: str) -> Path:
     return out
 
 
-def load_function(source: str, name: str, options, *, uses_tma: bool):
+def load_function(source: str, name: str, options, *, uses_tma: bool):  # noqa: ARG001 — options kept for call-site compat
     """Compile (via nvcc, cached) + ``RawModule``-load ``name``, returning a
     cupy ``Function`` usable exactly like a ``RawKernel`` at launch (callable,
     and ``max_dynamic_shared_size_bytes`` is settable for the >48KB smem path).
 
-    Falls back to ``cp.RawKernel`` (lazy NVRTC) when nvcc is unavailable or the
-    compile fails — so this is always safe to drop in for ``cp.RawKernel``."""
+    Raises ``RuntimeError`` if ``nvcc`` is unavailable — the NVRTC fallback
+    was dropped because cupy's bundled cu13 toolkit lacks ``crt/mma.h``, so
+    any WMMA kernel would have silently failed to compile through it. ``nvcc``
+    is now a hard dependency.
+    """
     import cupy as cp  # noqa: PLC0415
 
     if nvcc_path() is None:
-        return cp.RawKernel(source, name, options=tuple(options))
+        raise RuntimeError(
+            "nvcc unavailable — deplodock requires the CUDA toolkit's "
+            "nvcc binary on PATH / under $CUDA_HOME (NVRTC fallback was "
+            "dropped because cupy's bundled toolkit lacks crt/mma.h, "
+            "breaking the WMMA path)"
+        )
     try:
         cubin = compile_to_cubin(source, name, arch=device_arch(uses_tma))
-        return cp.RawModule(path=str(cubin)).get_function(name)
-    except Exception as exc:  # noqa: BLE001 — any nvcc/load failure → safe NVRTC fallback
-        detail = exc.stderr.decode(errors="replace")[-400:] if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else exc
-        logger.warning("nvcc compile failed for kernel %r — falling back to NVRTC (%s)", name, detail)
-        return cp.RawKernel(source, name, options=tuple(options))
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace") if exc.stderr else "(no stderr)"
+        logger.error("nvcc compile failed for kernel %r:\n%s", name, detail)
+        raise RuntimeError(f"nvcc compile failed for kernel {name!r}: {detail[-400:]}") from exc
+    return cp.RawModule(path=str(cubin)).get_function(name)

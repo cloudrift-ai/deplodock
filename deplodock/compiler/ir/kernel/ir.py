@@ -619,7 +619,18 @@ class MmaFill(Stmt):
         return [f"{indent}MmaFill({self.frag}, {self.value})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        return [f"{_pad(ctx.indent)}wmma::fill_fragment({self.frag}, {self.value!r}f);"]
+        # The fragment's element dtype was registered by ``MmaFragment.render``;
+        # look it up so the fill value matches WMMA's template parameter
+        # (``wmma::fill_fragment<T>`` requires the value to be ``T``, so an
+        # f16 accumulator needs ``__float2half(...)`` not a bare ``float``).
+        frag_dt = ctx.ssa_dtypes.get(self.frag, "f32")
+        if frag_dt == "f16":
+            value_expr = f"__float2half({self.value!r}f)"
+        elif frag_dt == "bf16":
+            value_expr = f"__float2bfloat16({self.value!r}f)"
+        else:
+            value_expr = f"{self.value!r}f"
+        return [f"{_pad(ctx.indent)}wmma::fill_fragment({self.frag}, {value_expr});"]
 
 
 @dataclass(frozen=True)
