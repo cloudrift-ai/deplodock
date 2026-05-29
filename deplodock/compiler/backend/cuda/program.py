@@ -630,7 +630,21 @@ class CompiledProgram:
                 _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
             stops[i].record()
             _wait_for_event(stops[i], _KERNEL_TIMEOUT_MS * b, launch.kernel_name)
-            dts[i] = cp.cuda.get_elapsed_time(starts[i], stops[i]) / b
+            elapsed_ms = cp.cuda.get_elapsed_time(starts[i], stops[i])
+            # CUDA event timing has sub-µs resolution and a real launch must
+            # consume at least one device cycle — a 0.0 reading means the
+            # launch was a no-op (degenerate grid like BM=1×BN=128 with the
+            # M tile entirely masked out, or a kernel that was fused into
+            # nothing). Pinning a 0µs "win" in the autotune DB would lock
+            # that variant in as the unbeatable best across re-runs. Treat
+            # as bench_fail instead — the existing worker → parent → DB
+            # path then records a normal sentinel row.
+            if elapsed_ms <= 0.0:
+                raise RuntimeError(
+                    f"kernel {launch.kernel_name!r} reported {elapsed_ms:.3f}ms elapsed — "
+                    "degenerate / no-op launch, variant marked bench_fail"
+                )
+            dts[i] = elapsed_ms / b
             if per_launch_hook is not None:
                 per_launch_hook(i, launch)
         return dts

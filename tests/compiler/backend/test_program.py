@@ -52,3 +52,37 @@ def test_benchmark_program_returns_timing():
     assert result.num_launches == 1
     assert result.per_launch is not None
     assert len(result.per_launch) == 1
+
+
+@requires_cuda
+def test_iter_once_raises_on_zero_elapsed(monkeypatch):
+    """A 0.0ms CUDA event reading means the launch was a degenerate
+    no-op (e.g. an all-masked-out grid in a BM=1×BN=128 register tile).
+    ``iter_once`` must surface this as a bench_fail RuntimeError so the
+    autotune DB never pins a 0µs "win" as the unbeatable best."""
+    import cupy as cp
+    import pytest
+
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+
+    monkeypatch.setattr(cp.cuda, "get_elapsed_time", lambda start, stop: 0.0)
+
+    with gpu_lock():
+        prog = CompiledProgram.build(_make_add_graph(8))
+        with pytest.raises(RuntimeError, match="reported 0.000ms elapsed"):
+            prog.iter_once()
+
+
+@requires_cuda
+def test_benchmark_program_propagates_zero_elapsed_as_bench_fail(monkeypatch):
+    """End-to-end: a 0.0ms reading inside ``benchmark_program`` must
+    bubble up as a RuntimeError, never silently produce a sample of 0.0
+    that ``_samples_to_result`` would record as the kernel's median."""
+    import cupy as cp
+    import pytest
+
+    monkeypatch.setattr(cp.cuda, "get_elapsed_time", lambda start, stop: 0.0)
+
+    with pytest.raises(RuntimeError, match="reported 0.000ms elapsed"):
+        benchmark_program(_make_add_graph(1024), warmup=2, num_iters=5)
