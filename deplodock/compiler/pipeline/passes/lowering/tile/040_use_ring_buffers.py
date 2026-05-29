@@ -32,24 +32,51 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import SerialTile, StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
-_BUFFER_COUNT = 2
+# Ring-buffer depth fork. 2 = classic double-buffer (compute current slot while
+# the next async copy fills the other). 3-4 = multi-stage pipeline (CUTLASS-style)
+# — only viable when the per-stage smem footprint × N fits ``max_dynamic_smem``;
+# variants that don't fit are pruned at fork time. Same value flows to
+# ``StageBundle.buffer_count`` and downstream ``pipeline_stages`` reads it from
+# the bundle (no separate PIPE knob — ring depth and pipeline depth are coupled
+# by construction in CUTLASS-style multistage matmul).
+BUFCNT = Knob(
+    "BUFCNT",
+    KnobType.INT,
+    hints=(2, 3, 4),
+    help="Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops",
+)
 
 
-def rewrite(ctx: Context, root: Node) -> TileOp | None:
+def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     body = root.op.body
+    if BUFCNT.name in root.op.knobs:
+        raise RuleSkipped("ring buffers already applied (idempotence via knob)")
     if any(isinstance(s, StageBundle) and s.policy != StagePolicy.SYNC for s in body.iter()):
         raise RuleSkipped("double-buffer already applied (non-SYNC bundle present)")
 
-    new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem)
-    if not changed:
-        raise RuleSkipped("no K-outer StageBundle eligible for double-buffering")
-    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
+    candidates = BUFCNT.narrow(BUFCNT.hints)
+    variants: list[TileOp] = []
+    for buf_count in candidates:
+        new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem, buffer_count=buf_count)
+        if not changed:
+            continue
+        variants.append(
+            TileOp(
+                body=new_body,
+                name=root.op.name,
+                knobs={**root.op.knobs, BUFCNT.name: buf_count},
+            )
+        )
+    if not variants:
+        raise RuleSkipped("no K-outer StageBundle fits any BUFCNT candidate")
+    return variants
 
 
-def _walk(body: Body, *, smem_budget: int) -> tuple[Body, bool]:
+def _walk(body: Body, *, smem_budget: int, buffer_count: int) -> tuple[Body, bool]:
     """Recursive descent: visit every wrapper looking for ``SerialTile(serial_outer)``
     whose body holds an eligible SYNC bundle — promote and stop descending into
     the promoted subtree (no further serial_outer is expected below the bundle
@@ -58,7 +85,7 @@ def _walk(body: Body, *, smem_budget: int) -> tuple[Body, bool]:
     changed = False
     for s in body:
         if isinstance(s, SerialTile) and s.kind == "serial_outer":
-            promoted = _maybe_promote_kouter(s, smem_budget=smem_budget)
+            promoted = _maybe_promote_kouter(s, smem_budget=smem_budget, buffer_count=buffer_count)
             if promoted is not None:
                 out.append(promoted)
                 changed = True
@@ -68,7 +95,7 @@ def _walk(body: Body, *, smem_budget: int) -> tuple[Body, bool]:
             new_bodies = []
             sub_changed = False
             for b in nested:
-                nb, c = _walk(b, smem_budget=smem_budget)
+                nb, c = _walk(b, smem_budget=smem_budget, buffer_count=buffer_count)
                 new_bodies.append(nb)
                 sub_changed = sub_changed or c
             if sub_changed:
@@ -78,11 +105,11 @@ def _walk(body: Body, *, smem_budget: int) -> tuple[Body, bool]:
     return Body(tuple(out)), changed
 
 
-def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int) -> SerialTile | None:
-    # Ring buffers need ≥2 K iterations to prologue + steady-state. Symbolic
-    # K can be either — defer the promotion (no per-iter overlap) rather than
-    # speculatively allocating a multi-buffer slab.
-    if not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < 2:
+def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count: int) -> SerialTile | None:
+    # Ring buffers need ≥``buffer_count`` K iterations to prologue + steady-state.
+    # Symbolic K can be either — defer the promotion (no per-iter overlap) rather
+    # than speculatively allocating a multi-buffer slab.
+    if not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < buffer_count:
         return None
     promote_ids: set[int] = set()
     total_bytes = 0
@@ -96,14 +123,14 @@ def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int) -> SerialTile
         if not _accums_independent_in(s.body):
             return None
         promote_ids.add(id(s))
-        # SYNC bundle: smem_bytes has no buffer factor; we'll apply ×_BUFFER_COUNT.
+        # SYNC bundle: smem_bytes has no buffer factor; we'll apply ×buffer_count.
         total_bytes += s.smem_bytes
     if not promote_ids:
         return None
-    if _BUFFER_COUNT * total_bytes > smem_budget:
+    if buffer_count * total_bytes > smem_budget:
         return None
 
-    phase = Var(kouter.axis.name) % Literal(_BUFFER_COUNT, "int")
+    phase = Var(kouter.axis.name) % Literal(buffer_count, "int")
     new_kouter_body: list[Stmt] = []
     for s in kouter.body:
         if isinstance(s, StageBundle) and id(s) in promote_ids:
@@ -114,7 +141,7 @@ def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int) -> SerialTile
                     stages=s.stages,
                     body=new_inner,
                     policy=StagePolicy.BUFFERED,
-                    buffer_count=_BUFFER_COUNT,
+                    buffer_count=buffer_count,
                     phase=phase,
                 )
             )

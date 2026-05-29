@@ -8,32 +8,48 @@ Input shape (post 030 / 040 / 050):
         ])
     ])
 
-Output shape (depth-2 pipeline):
+Output shape (depth-``N`` pipeline, where ``N = bundle.buffer_count``):
 
-    # Prologue — issue chunk 0
-    AsyncBufferedStage(σ_first(sources), pipeline_depth=2, body=Body(()))
+    # Prologue — issue chunks 0..N-2 (N-1 outstanding)
+    AsyncBufferedStage(σ_{0}(sources),   pipeline_depth=N, body=Body(()))
+    AsyncBufferedStage(σ_{1}(sources),   pipeline_depth=N, body=Body(()))
+    ...
+    AsyncBufferedStage(σ_{N-2}(sources), pipeline_depth=N, body=Body(()))
 
-    # Steady state — issue chunk K_o+1 while waiting on chunk K_o
-    SerialTile(K_o in 0..K-1, kind="serial_outer", body=[
-        AsyncBufferedStage(σ_next(sources), pipeline_depth=2, body=Body(())),
-        AsyncWait(keep=1),  # leave the just-issued chunk in flight
-        SerialTile(K_i, kind="stage_inner", reduce, body=[<reduce stmts>]),
-        AsyncWait(keep=1),  # CTA-wide barrier before next iter overwrites
-                            # the slot this iter consumed (see cp.async
-                            # branch comment in _try_pipeline).
+    # Steady state — for k in 0..K-N: issue chunk k+N-1, wait for ≤ N-1
+    # in-flight (drains chunk k), consume chunk k.
+    SerialTile(K_o in 0..K-N+1, kind="serial_outer", body=[
+        AsyncBufferedStage(σ_{k+N-1}(sources), pipeline_depth=N, body=Body(())),
+        AsyncWait(keep=N-1),                 # chunk k is done
+        SerialTile(K_i, kind="stage_inner", reduce, body=[<reduce σ_k>]),
+        AsyncWait(keep=N-1),                 # CTA-wide barrier so the next iter
+                                             # doesn't overwrite the slot we just
+                                             # consumed.
     ])
 
-    # Epilogue — drain final chunk, consume it
-    AsyncWait(keep=0)
-    SerialTile(K_i, kind="stage_inner", reduce, body=[<reduce stmts σ_last>])
+    # Epilogue — drain the N-1 chunks left in flight
+    AsyncWait(keep=N-2); consume σ_{K-N+1}
+    AsyncWait(keep=N-3); consume σ_{K-N+2}
+    ...
+    AsyncWait(keep=0);   consume σ_{K-1}
+
+For ``N == 2`` this collapses to the classical double-buffer prologue/
+main/epilogue. For ``N >= 3`` it is the CUTLASS-style multistage shape:
+N-1 outstanding TMA / cp.async copies amortize the per-K-step memory
+latency under compute.
 
 Issue-only stages in the prologue and main-loop body carry
-``pipeline_depth = 2``, which suppresses the implicit-wait at the wrap
+``pipeline_depth = N``, which suppresses the implicit-wait at the wrap
 boundary that ``_emit_stage`` would otherwise emit for
 ``pipeline_depth == 1``. Explicit ``AsyncWait`` Stmts carry the
 schedule information (``keep`` for cp.async, ``phase`` + ``slot`` for
 TMA) so the materializer's ``emit_async_wait`` dispatch lowers them to
 the correct ``CpAsyncWait`` / ``MbarrierWait`` primitives.
+
+``buffer_count`` is set upstream by ``040_use_ring_buffers`` (its ``BUFCNT``
+knob) — we just inherit it here. Coupling buffer_count and pipeline_depth
+by construction matches the CUTLASS multistage model (one smem slot per
+in-flight chunk).
 
 Eligibility:
 
@@ -43,7 +59,8 @@ Eligibility:
   Stages branch is gone.
 - The stage's body contains a ``SerialTile(stage_inner, reduce)``
   consumer.
-- ``K_o.extent >= 2`` (need prologue + ≥ 1 steady-state iter).
+- ``K_o.extent >= bundle.buffer_count`` (need ``N-1`` prologue chunks +
+  ≥ 1 steady-state iter).
 - ``pipeline_depth == 1`` on the stage (idempotence: already-pipelined
   stages skip).
 """
@@ -51,6 +68,7 @@ Eligibility:
 from __future__ import annotations
 
 from dataclasses import replace as _replace
+from typing import Any
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
@@ -68,8 +86,6 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
-
-_PIPELINE_DEPTH = 2
 
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:
@@ -106,8 +122,8 @@ def _walk(body: Body) -> tuple[Body, bool]:
 
 
 def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
-    # Pipelining peels a static last iteration into a separate epilogue (sigma_last
-    # references ``n - 1``). Symbolic K can't be peeled at compile time — defer.
+    # Pipelining peels static iterations into prologue / epilogue (each carries
+    # a literal k index). Symbolic K can't be peeled at compile time — defer.
     if not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < 2:
         return None
     if len(kouter.body) != 1:
@@ -141,63 +157,77 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
 
     n = kouter.axis.extent.as_static()
     k_var = kouter.axis.name
-    sigma_first = Sigma({k_var: Literal(0, "int")})
-    sigma_next = Sigma({k_var: Var(k_var) + Literal(1, "int")})
-    sigma_last = Sigma({k_var: Literal(n - 1, "int")})
-
-    is_tma = bundle.policy == StagePolicy.TMA
     buffer_count = bundle.buffer_count
+    # The classical depth-2 schedule needs n >= 2 (1 prologue + ≥ 1 main).
+    # Depth-N needs n >= N (N-1 prologue + ≥ 1 main + N-1 epilogue overlap).
+    if n < buffer_count:
+        return None
+    is_tma = bundle.policy == StagePolicy.TMA
+    pipeline_depth = buffer_count
 
     def _issue_only(sigma: Sigma) -> StageBundle:
         rewritten = bundle.rewrite(_id, sigma)
         # Issue-only copy used in prologue / steady-state issue carries
         # empty body so the materializer skips the wrap-boundary wait
         # and emits just the producer scaffolding.
-        return _replace(rewritten, body=Body(()), pipeline_depth=_PIPELINE_DEPTH)
+        return _replace(rewritten, body=Body(()), pipeline_depth=pipeline_depth)
 
-    # Prologue: issue chunk 0.
-    prologue: list[Stmt] = [_issue_only(sigma_first)]
+    def _sigma_at(k_expr: Any) -> Sigma:  # noqa: ANN401 — Expr | int union locally
+        return Sigma({k_var: k_expr if not isinstance(k_expr, int) else Literal(k_expr, "int")})
 
-    # Steady state: issue chunk K_o+1, wait on K_o, consume K_o.
-    next_issue = _issue_only(sigma_next)
+    # Prologue: issue chunks 0..pipeline_depth-2 (N-1 outstanding).
+    prologue: list[Stmt] = [_issue_only(_sigma_at(i)) for i in range(pipeline_depth - 1)]
+
+    # Steady state: for k in 0..n-pipeline_depth, issue chunk k+N-1, then wait
+    # for ≤ N-1 in-flight (which drains chunk k), then consume chunk k.
+    sigma_consume = Sigma({k_var: Var(k_var)})
+    sigma_issue_next = _sigma_at(Var(k_var) + Literal(pipeline_depth - 1, "int"))
+    next_issue = _issue_only(sigma_issue_next)
+    keep = pipeline_depth - 1
     if is_tma:
         # Per-slot mbarrier semantics: each ring slot has its own mbar
         # that alternates parity 0,1,0,1... over successive uses.
         body_slot = Var(k_var) % Literal(buffer_count, "int")
         body_phase = (Var(k_var) / Literal(buffer_count, "int")) % Literal(2, "int")
         main_body_stmts: tuple[Stmt, ...] = (
-            AsyncWait(keep=1, phase=body_phase, slot=body_slot),
-            *bundle.body,
+            AsyncWait(keep=keep, phase=body_phase, slot=body_slot),
+            *(c.rewrite(_id, sigma_consume) for c in bundle.body),
             next_issue,
         )
     else:
-        # cp.async: ISSUE → WAIT(keep=1) → CONSUME → WAIT(keep=1). The
-        # trailing wait's paired __syncthreads prevents next-iter's
-        # cp.async issue from overwriting the slot this iter just read.
+        # cp.async: ISSUE → WAIT(keep=N-1) → CONSUME → WAIT(keep=N-1). The
+        # trailing wait's paired __syncthreads prevents next-iter's cp.async
+        # issue from overwriting the slot this iter just read.
         main_body_stmts = (
             next_issue,
-            AsyncWait(keep=1),
-            *bundle.body,
-            AsyncWait(keep=1),
+            AsyncWait(keep=keep),
+            *(c.rewrite(_id, sigma_consume) for c in bundle.body),
+            AsyncWait(keep=keep),
         )
 
+    main_extent = n - (pipeline_depth - 1)
     main_loop = SerialTile(
-        axis=Axis(k_var, n - 1),
+        axis=Axis(k_var, main_extent),
         body=Body(main_body_stmts),
         kind="serial_outer",
         unroll=kouter.unroll,
     )
 
-    # Epilogue: drain final chunk, run last consumer.
+    # Epilogue: drain the remaining N-1 chunks (k = main_extent .. n-1).
     epilogue: list[Stmt] = []
-    if is_tma:
-        last_k = n - 1
-        epi_slot = Literal(last_k % buffer_count, "int")
-        epi_phase = Literal((last_k // buffer_count) % 2, "int")
-        epilogue.append(AsyncWait(keep=0, phase=epi_phase, slot=epi_slot))
-    else:
-        epilogue.append(AsyncWait(keep=0))
-    epilogue.extend(c.rewrite(_id, sigma_last) for c in bundle.body)
+    for offset in range(pipeline_depth - 1):
+        k_idx = main_extent + offset
+        sigma_k = _sigma_at(k_idx)
+        # After consuming k_idx, (pipeline_depth - 2 - offset) chunks remain
+        # in flight; wait until only that many are still outstanding.
+        remaining_keep = pipeline_depth - 2 - offset
+        if is_tma:
+            epi_slot = Literal(k_idx % buffer_count, "int")
+            epi_phase = Literal((k_idx // buffer_count) % 2, "int")
+            epilogue.append(AsyncWait(keep=remaining_keep, phase=epi_phase, slot=epi_slot))
+        else:
+            epilogue.append(AsyncWait(keep=remaining_keep))
+        epilogue.extend(c.rewrite(_id, sigma_k) for c in bundle.body)
 
     return [*prologue, main_loop, *epilogue]
 
