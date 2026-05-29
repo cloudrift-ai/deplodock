@@ -564,15 +564,60 @@ def _classify(
     if n_bytes > slab_cap:
         return None
 
+    # Per-source-dim composite check: a Source is AffineAddressing when each
+    # source dim ``d`` is reached by a clean composite of its cache axes — i.e.
+    # the cache axes mapping to ``d`` form a positional product matching
+    # ``load.index[d] = origin[d] + ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}``,
+    # where the cache axes are ordered most-to-least significant (leftmost
+    # mapping to ``d`` carries the largest stride). This admits two patterns:
+    #
+    # - Single-axis-per-dim with stride 1 (the existing matmul case): one cache
+    #   axis maps to ``d`` with extent matching ``load.index[d] - origin[d]``.
+    # - Multi-axis-per-dim with composite strides (the BN_thread × FN_register
+    #   matmul-N case): cache axes ``(a_thread, a_reg)`` mapping to N reconstruct
+    #   ``load.index[N] = origin + a_thread·FN + a_reg`` — composite stride
+    #   ``FN`` for the thread axis, stride ``1`` for the register axis.
+    #
+    # Multi-axis-per-dim is opt-in via ``DEPLODOCK_AFFINE_COLLAPSE=1``: the
+    # composite construction relies on a guess about the axis ordering inside
+    # ``load.index[d]`` (most-significant first), and SDPA-style fused mask /
+    # softmax indices break the pretty-comparison heuristic in subtle ways.
+    # Default behavior preserves the legacy per-axis unit-stride check so
+    # admitted-affine cases stay byte-identical with prior commits; the flag
+    # opts in to TMA-friendly multi-axis collapse for matmul cases where
+    # the user has confirmed the pattern fits.
+    enable_collapse = os.environ.get("DEPLODOCK_AFFINE_COLLAPSE", "").strip().lower() in {"1", "true", "yes", "on"}
     needs_template = False
-    for ax in cache_axes:
-        d = var_to_dim[ax.name]
-        unit_sigma = Sigma({n: Literal(1 if n == ax.name else 0, "int") for n in candidate_names})
-        actual = sorted(t.pretty() for t in _flatten_add(unit_sigma.reduce(load.index[d], ctx)))
-        expected = sorted(t.pretty() for t in _flatten_add((origin[d] + Literal(1, "int")).simplify(ctx)))
-        if actual != expected:
-            needs_template = True
-            break
+    if not enable_collapse:
+        # Legacy per-axis unit-stride check.
+        for ax in cache_axes:
+            d = var_to_dim[ax.name]
+            unit_sigma = Sigma({n: Literal(1 if n == ax.name else 0, "int") for n in candidate_names})
+            actual = sorted(t.pretty() for t in _flatten_add(unit_sigma.reduce(load.index[d], ctx)))
+            expected = sorted(t.pretty() for t in _flatten_add((origin[d] + Literal(1, "int")).simplify(ctx)))
+            if actual != expected:
+                needs_template = True
+                break
+    else:
+        for d in sorted(set(var_to_dim.values())):
+            axes_for_dim = tuple(ax for ax in cache_axes if var_to_dim[ax.name] == d)
+            # Composite: ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1.
+            # Walked right-to-left so each axis's coef is the product of the
+            # extents of axes to its right (within the same source dim).
+            composite: Expr = Literal(0, "int")
+            suffix_product = 1
+            for ax in reversed(axes_for_dim):
+                term: Expr = Var(ax.name) if suffix_product == 1 else BinaryExpr("*", Var(ax.name), Literal(suffix_product, "int"))
+                composite = term if isinstance(composite, Literal) and composite.value == 0 else BinaryExpr("+", composite, term)
+                suffix_product *= ax.extent.as_static()
+            # Substitute every OTHER cache var (mapping to a different source dim)
+            # with 0 so ``load.index[d]`` reduces to its d-only contribution.
+            other_zeros = {n: Literal(0, "int") for n in candidate_names if var_to_dim.get(n) != d}
+            actual = sorted(t.pretty() for t in _flatten_add(Sigma(other_zeros).reduce(load.index[d], ctx)))
+            expected = sorted(t.pretty() for t in _flatten_add((origin[d] + composite).simplify(ctx)))
+            if actual != expected:
+                needs_template = True
+                break
     template = tuple(load.index) if needs_template else None
 
     return _Slab(

@@ -13,7 +13,7 @@ The leading-underscore module name keeps the pass loader (which globs
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import Stage, StagePolicy, TemplateAddressing
@@ -85,7 +85,26 @@ def emit_stage(
             cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in cache_axes})
             source_index = tuple(cache_sigma.apply(e) for e in addressing.exprs)
         else:
-            decoded_per_dim = {dim: coord_for[ax.name] for ax, dim in zip(cache_axes, addressing.dims, strict=True)}
+            # Per source dim: composite-decode the cache axes mapping to it.
+            # ``020_stage_inputs`` admits multi-axis-per-dim AffineAddressing
+            # for the matmul ``(BN_thread, FN_register)`` collapse (and the M
+            # analogue); the legacy ``{dim: coord_for[ax.name] for …}`` dict
+            # comprehension silently OVERWROTE the entry when two axes shared
+            # a dim, keeping only the last axis's decoded coord and producing
+            # wrong gmem addresses on the cp.async path. Accumulate instead,
+            # each cache axis weighted by its composite stride (product of
+            # extents of subsequent cache axes that ALSO map to its dim) —
+            # mirrors the materializer's ``box_per_dim`` collapse on the TMA
+            # path and the composite-stride check in ``_derive_slab``.
+            dims_tuple = addressing.dims
+            decoded_per_dim: dict[int, Expr] = {}
+            for i, (ax, d) in enumerate(zip(cache_axes, dims_tuple, strict=True)):
+                stride = 1
+                for j in range(i + 1, len(cache_axes)):
+                    if dims_tuple[j] == d:
+                        stride *= cache_axes[j].extent.as_static()
+                term: Expr = coord_for[ax.name] if stride == 1 else BinaryExpr("*", coord_for[ax.name], Literal(stride, "int"))
+                decoded_per_dim[d] = term if d not in decoded_per_dim else BinaryExpr("+", decoded_per_dim[d], term)
             source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(src.origin))
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).

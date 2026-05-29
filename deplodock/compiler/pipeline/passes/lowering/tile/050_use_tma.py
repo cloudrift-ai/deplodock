@@ -254,7 +254,14 @@ def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> boo
     if not src_shape or len(src_shape) > _MAX_RANK or len(src.origin) > _MAX_RANK:
         return False
     dims = src.addressing.dims
-    if not dims or len(set(dims)) != len(dims) or list(dims) != sorted(dims):
+    # Allow consecutive duplicates: cache axes ``(a_thread, a_reg)`` mapping to
+    # the same source dim ``d`` represent a collapse — the materializer's
+    # ``box_per_dim[d] *= ax.extent`` already produces the correct contiguous
+    # TMA box (e.g. dims ``(0, 1, 1)`` with extents ``(32, 32, 4)`` → box
+    # ``(32, 128)``). The legacy strictly-unique check rejected this and forced
+    # FN>1 / FM>1 matmul tiles onto cp.async even when the composite was
+    # exactly the natural 2D box TMA describes.
+    if not dims or list(dims) != sorted(dims):
         return False
     src_rank = len(src_shape)
     if dims[-1] != src_rank - 1:
@@ -265,7 +272,17 @@ def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> boo
     for d in range(dims[0], src_rank):
         if d not in dims_set and src_shape[d] != 1:
             return False
-    inner_extent = cache_axes[-1].extent.as_static()
+    # Inner extent for alignment checks is the COLLAPSED box width at the
+    # last source dim — product of the extents of every cache axis mapping
+    # to ``dims[-1]``. Mirrors the materializer's ``box_per_dim`` collapse so
+    # a tile with cache ``(a3=32, a5=4)`` both mapping to dim 1 gets the
+    # right 128-cell inner extent (vs the legacy ``cache_axes[-1].extent`` =
+    # 4 that always failed the 128 B alignment gate for collapse cases).
+    inner_dim = dims[-1]
+    inner_extent = 1
+    for d, ax in zip(dims, cache_axes, strict=True):
+        if d == inner_dim:
+            inner_extent *= ax.extent.as_static()
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
     src_inner = src_shape[-1]

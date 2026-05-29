@@ -238,15 +238,30 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 extents = src.alloc_extents
                 smem_dtype = smem_cuda_dtype(src)
                 if is_tma:
-                    # Round the slot's inner extent up to make the slot bytes
-                    # a multiple of 128 B. Keeps every ring slot 128 B-aligned
-                    # from a 128 B-aligned base, regardless of the TMA box's
-                    # natural bytes. The unused tail of each slot is benign
-                    # (TMA only writes box bytes; reads index 0..box-1).
+                    # Round the slot's inner BOX EXTENT up to make the slot
+                    # bytes a multiple of 128 B. The check is on the
+                    # COLLAPSED inner box (product of cache_axes mapping to
+                    # the innermost source dim), not just ``extents[-1]`` —
+                    # for the multi-axis collapse case (e.g. cache
+                    # ``(BK=32, BN_thread=32, FN_reg=4)`` mapping to dims
+                    # ``(0, 1, 1)``), the natural flat layout already packs
+                    # each K row as ``BN_thread × FN_reg = 128`` cells =
+                    # 512 B, well 128 B-aligned; padding the last axis (4 →
+                    # 32) would 8x the smem with zero correctness gain.
+                    # Only pad when the collapsed inner is genuinely
+                    # sub-128 B — single-axis ``BN=16`` etc.
                     inner_per_align = _TMA_ALIGN_BYTES // BYTES_PER_ELEM
-                    inner = extents[-1]
-                    if inner % inner_per_align != 0:
-                        padded_inner = (inner + inner_per_align - 1) // inner_per_align * inner_per_align
+                    addressing = src.addressing
+                    if isinstance(addressing, AffineAddressing):
+                        inner_dim = addressing.dims[-1]
+                        collapsed_inner = 1
+                        for d, ax in zip(addressing.dims, src.cache_axes, strict=True):
+                            if d == inner_dim:
+                                collapsed_inner *= ax.extent.as_static()
+                    else:
+                        collapsed_inner = extents[-1]
+                    if collapsed_inner % inner_per_align != 0:
+                        padded_inner = (extents[-1] + inner_per_align - 1) // inner_per_align * inner_per_align
                         extents = (*extents[:-1], padded_inner)
                 if buf_count > 1:
                     extents = (buf_count, *extents)
