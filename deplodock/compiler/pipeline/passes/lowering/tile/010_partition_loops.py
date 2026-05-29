@@ -88,6 +88,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.pipeline.pipeline import Fork
@@ -232,7 +233,22 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     if len(plan.params) == 1:
         return _materialize(plan, plan.params[0])
 
-    return _build_fork_tree_lazy(plan, ctx)
+    # Hierarchical Fork tree over (BR, (BM,BN), (FM,FN), (BK,SPLITK)). The
+    # builder collapses single-key levels (e.g. pointwise's BR=1 layer),
+    # sorts siblings by max-propagated score descending, and defers
+    # ``_materialize`` to each leaf's ``expand`` thunk so greedy compile
+    # only builds one variant per LoopOp. See ``pipeline/fork_tree.py``.
+    return build_fork_tree(
+        params=plan.params,
+        levels=[
+            Level((BR.name,), lambda p: (p.br,)),
+            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
+            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
+            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+        ],
+        materialize=lambda p: _materialize(plan, p),
+        score=lambda p: _score_variant(plan, p, ctx),
+    )
 
 
 def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
@@ -245,91 +261,6 @@ def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
     if lazy is not None:
         return lazy
     return _materialize(plan, params).score(ctx)
-
-
-def _build_fork_tree_lazy(plan: _Plan, ctx: Context) -> Fork | list[Fork]:
-    """Convert ``plan.params`` into the hierarchical Fork tree.
-
-    Grouping order (outermost first): BR → (BM,BN) → (FM,FN) → (BK,SPLITK).
-    A level is skipped (Fork wrapper omitted) when every variant in the
-    enclosing group shares the same knob values at that level, so the
-    common case (all variants have BR=1) doesn't add a useless 1-child
-    Fork layer.
-
-    **Sibling ordering** is by max-propagated :func:`_score_variant`
-    descending — same yardstick :meth:`TileOp.score` would use post-
-    materialization, routed through :meth:`TileOp.lazy_score` (the lazy
-    cousin of ``score`` exposed on the Op base) so we don't have to
-    build every TileOp just to rank them. Leaf Fork ``expand`` thunks
-    defer ``_materialize(plan, params)`` until the search actually
-    resolves that leaf — greedy compile only fires one per LoopOp.
-
-    Returns a single ``Fork`` when the top-level group collapses to one
-    branch (engine still routes through the fork-spawn path since
-    ``isinstance(option, Fork)``), otherwise the ``list[Fork]`` of
-    siblings.
-    """
-    leaf_score: dict[int, float] = {id(p): _score_variant(plan, p, ctx) for p in plan.params}
-
-    def _sorted(forks: list[Fork]) -> list[Fork]:
-        return sorted(forks, key=lambda f: -f.score)
-
-    def _leaf_forks(group: list[TileParams]) -> list[Fork]:
-        out = [
-            Fork(
-                knobs={BK.name: p.bk, SPLITK.name: p.splitk},
-                expand=(lambda p=p: [_materialize(plan, p)]),
-                score=leaf_score[id(p)],
-                is_leaf=True,
-            )
-            for p in group
-        ]
-        return _sorted(out)
-
-    def _group_level(
-        group: list[TileParams],
-        knob_names: tuple[str, ...],
-        knob_getters: tuple,
-        child_builder,
-    ) -> list[Fork]:
-        """Build sibling Forks for one level, keyed by ``knob_names``,
-        sorted by max-propagated score descending. ``knob_getters`` reads
-        the matching field off ``TileParams`` (the planner's source of
-        truth pre-materialization)."""
-        keyed: dict[tuple, list[TileParams]] = {}
-        for p in group:
-            key = tuple(g(p) for g in knob_getters)
-            keyed.setdefault(key, []).append(p)
-        if len(keyed) == 1:
-            return child_builder(next(iter(keyed.values())))
-        siblings: list[Fork] = []
-        for key, subgroup in keyed.items():
-            children = child_builder(subgroup)
-            if not children:
-                continue
-            siblings.append(
-                Fork(
-                    knobs=dict(zip(knob_names, key, strict=True)),
-                    expand=(lambda c=children: list(c)),
-                    score=max(c.score for c in children),
-                    is_leaf=False,
-                )
-            )
-        return _sorted(siblings)
-
-    def _fmfn_level(group: list[TileParams]) -> list[Fork]:
-        return _group_level(group, (FM.name, FN.name), (lambda p: p.fm, lambda p: p.fn), _leaf_forks)
-
-    def _bmbn_level(group: list[TileParams]) -> list[Fork]:
-        return _group_level(group, (BM.name, BN.name), (lambda p: p.bm, lambda p: p.bn), _fmfn_level)
-
-    def _br_level(group: list[TileParams]) -> list[Fork]:
-        return _group_level(group, (BR.name,), (lambda p: p.br,), _bmbn_level)
-
-    top = _br_level(list(plan.params))
-    if len(top) == 1:
-        return top[0]
-    return top
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
