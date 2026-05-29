@@ -27,6 +27,7 @@ from deplodock.compiler.ir.tile.ir import (
     SwizzleMode,
     ThreadTile,
     TileOp,
+    WarpSpecialize,
 )
 from deplodock.compiler.pipeline import RuleSkipped
 from deplodock.compiler.pipeline.pipeline import Fork
@@ -151,3 +152,49 @@ def test_env_pin_zero_returns_bare_tileop(monkeypatch):
     result = _run_rule(op)
     assert isinstance(result, TileOp)
     assert result.knobs["WS"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Boundary checks — Tile pass emits only Tile IR
+# ---------------------------------------------------------------------------
+
+
+def test_ws1_emits_warp_specialize_stmt(monkeypatch):
+    """WS=1 path produces a TileOp whose ThreadTile body contains a single
+    ``WarpSpecialize`` Stmt — not a hand-rolled Cond/Smem/MbarrierInit
+    tree. The materializer is responsible for the lowering."""
+    monkeypatch.setenv("DEPLODOCK_WS", "1")
+    op = _tile_op_tma_pipelined()
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    # Walk to the ThreadTile inside the body.
+    tt = next(s for s in result.body if isinstance(s, ThreadTile))
+    body = list(tt.body)
+    assert len(body) == 1, f"expected single WarpSpecialize in ThreadTile body, got {len(body)}"
+    assert isinstance(body[0], WarpSpecialize)
+
+
+def test_ws1_tile_body_contains_no_kernel_ir(monkeypatch):
+    """No Kernel-IR types (Smem / Sync / MbarrierInit / MbarrierWait /
+    MbarrierArrive / SetMaxNReg) appear anywhere inside the WS=1
+    TileOp body. The layering boundary is intact."""
+    # Local imports here — the check enforces that Kernel-IR types do
+    # not appear in the body, but we still need the types to assert.
+    from deplodock.compiler.ir.kernel.ir import (
+        MbarrierArrive,
+        MbarrierInit,
+        MbarrierWait,
+        SetMaxNReg,
+        Smem,
+        Sync,
+    )
+
+    monkeypatch.setenv("DEPLODOCK_WS", "1")
+    op = _tile_op_tma_pipelined()
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    forbidden = (Smem, Sync, MbarrierInit, MbarrierWait, MbarrierArrive, SetMaxNReg)
+    for stmt in result.body.iter():
+        assert not isinstance(stmt, forbidden), (
+            f"Tile-IR pass leaked Kernel-IR type {type(stmt).__name__} into TileOp body"
+        )
