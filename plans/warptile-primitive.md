@@ -21,8 +21,9 @@ independently.
 
 ### Why a separate primitive, not a `ThreadTile` flag
 
-`ThreadTile.render` (`ir/tile/ir.py:528–558`) computes per-CTA threads = `prod(axes.extent)`. A WMMA tower with warp
-axes on `ThreadTile` would launch 32× too few threads. The fix is either (a) a `ThreadTile.is_warp_indexed: bool` flag
+`ThreadTile.render` (`ir/tile/ir.py:651`, class at `:635`) computes per-CTA threads = `prod(axes.extent)`. A WMMA tower
+with warp axes on `ThreadTile` would launch 32× too few threads. The fix is either (a) a `ThreadTile.is_warp_indexed:
+bool` flag
 that triggers a ×32 in two render sites under an `if`, or (b) a new flavor. Option (a) smuggles non-obvious behaviour
 into a widely-used type; option (b) keeps the invariant "flavor *type* encodes the binding decision" that the rest of
 the tile-IR follows. Option (b) — `WarpTile` — is the choice here.
@@ -47,16 +48,16 @@ the tile-IR follows. Option (b) — `WarpTile` — is the choice here.
    yet. Raise `NotImplementedError` from that render branch with a clear message.
 
 3. **`WarpTile` and `ThreadTile` are mutually exclusive inside one `TileOp.body`.** Both bind `threadIdx`; mixing them
-   re-binds the same coord at two scopes. `TileOp.__post_init__` (`ir/tile/ir.py:1109–1117`) currently enforces "at
-   most one outer `GridTile`/`ThreadTile`"; extend to include `WarpTile`. The MMA case is `GridTile > WarpTile > …`;
-   scalar is `GridTile > ThreadTile > …`; pointwise is standalone `ThreadTile`. Never `ThreadTile > WarpTile` or
-   `WarpTile > ThreadTile` nested.
+   re-binds the same coord at two scopes. `TileOp.__post_init__` (`ir/tile/ir.py:1258`, the `n_tiles` check at
+   `:1264`) currently enforces "at most one outer `GridTile`/`ThreadTile`"; extend to include `WarpTile`. The MMA case
+   is `GridTile > WarpTile > …`; scalar is `GridTile > ThreadTile > …`; pointwise is standalone `ThreadTile`. Never
+   `ThreadTile > WarpTile` or `WarpTile > ThreadTile` nested.
 
 4. **`_launch_bounds_for` reads `prod(warp_extents) × 32` from a `WarpTile`.** Sits beside the existing `ThreadTile`
-   branch in `ir/kernel/render.py:286–307`. The render-target `_BLOCK_SIZE = 256` fallback stays for the
-   no-`GridTile` standalone case.
+   branch in `ir/kernel/render.py:296`. The render-target `_BLOCK_SIZE = 256` fallback stays for the no-`GridTile`
+   standalone case.
 
-5. **`_build_linear_tid` gains a `WarpTile` arm.** Today (`100_materialize_tile.py:470–489`) it returns a row-major
+5. **`_build_linear_tid` gains a `WarpTile` arm.** Today (`100_materialize_tile.py:636`) it returns a row-major
    `Var`-flatten of `ThreadTile.axes`. For `WarpTile`, the equivalent is a flatten of the warp axes for the warp_id
    piece; lane is implicit. Callers that need a single linear thread id keep using `threadIdx.x` directly (it's a
    builtin).
@@ -66,11 +67,11 @@ the tile-IR follows. Option (b) — `WarpTile` — is the choice here.
    downstream plans can flip a tier without revisiting the wrap-tower mechanics. Goldens stay byte-identical because
    no `TileParams` requests `Role.WARP` yet.
 
-7. **Helpers generalize from `ThreadTile` to "the inner `ParallelTile`."** `tile/_helpers.py::single_tile` and
-   `thread_tile_of` (lines 52–110) hardcode `GridTile`/`ThreadTile`. Extend to recognise `WarpTile` everywhere they
-   recognise `ThreadTile` — either by listing it in the `isinstance` tuple or by switching to `ParallelTile`. The
-   `thread_tile_of` name becomes a misnomer; rename to `parallel_tile_of` and re-export the old name as an alias to
-   avoid breaking in-flight imports.
+7. **Helpers generalize from `ThreadTile` to "the inner `ParallelTile`."** `tile/_helpers.py` has `thread_tile_of`
+   (`:52`), `replace_thread_tile_body` (`:71`), and `single_tile` (`:93`) — all hardcode `GridTile`/`ThreadTile`.
+   Extend to recognise `WarpTile` everywhere they recognise `ThreadTile` — either by listing it in the `isinstance`
+   tuple or by switching to `ParallelTile`. The `thread_tile_of` name becomes a misnomer; rename to
+   `parallel_tile_of` and re-export the old name as an alias to avoid breaking in-flight imports.
 
 ## M1 — Add `WarpTile` to Tile IR (no emitter)
 
@@ -107,22 +108,25 @@ decode. Test independently using hand-built IR — no upstream emitter needed.
 
 - `deplodock/compiler/ir/kernel/render.py::_launch_bounds_for`: add a `WarpTile` branch that returns
   `prod(child.axes.extent) * 32`. Mirrors today's `ThreadTile` branch.
-- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py`:
-  - `_materialize_top` (`:95–121`): add `WarpTile` arm. Walks `GridTile.body` for a `WarpTile` child and calls a new
+- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py` (current file size: 675 lines):
+  - `_materialize_top` (`:96`): add `WarpTile` arm. Walks `GridTile.body` for a `WarpTile` child and calls a new
     `_materialize_warp` parallel to `_materialize`.
-  - `_materialize_warp` (new, parallel to `_materialize` `:129–436`): same structure but `tid_expr` is a warp-id
-    flatten over `WarpTile.axes`; `n_threads = prod(extents) * 32`. The cooperative `Accum` combine path passes
-    `n_threads` and the warp's `tid_var` to `emit_combine` — verify `_combine.single_thread_var` handles a
+  - `_materialize_warp` (new, parallel to `_materialize` which spans `:129–603`): same structure but `tid_expr` is a
+    warp-id flatten over `WarpTile.axes`; `n_threads = prod(extents) * 32`. The cooperative `Accum` combine path
+    passes `n_threads` and the warp's `tid_var` to `emit_combine` — verify `_combine.single_thread_var` handles a
     `WarpTile`-derived var the same way (today it walks `thread_axes`; for the warp case it'd walk warp axes — the
     semantics are "the one thread that owns the accumulator broadcast slot," still index 0 of whatever the local
     binding-tier coord is).
-  - `_build_linear_tid` (`:470–489`): no change — callers that need it stay on the thread-axes flatten. Add a sibling
+  - `_build_linear_tid` (`:636`): no change — callers that need it stay on the thread-axes flatten. Add a sibling
     `_build_warp_id_expr` for `WarpTile`'s warp_id flatten.
-- `deplodock/compiler/ir/tile/ir.py::TileOp._launch_geometry` (`:1120–1138`): extend so the second tuple becomes
-  whichever inner `ParallelTile` axes are present (`ThreadTile.axes` or `WarpTile.axes`). Document that the **kind**
-  of inner tile matters to callers — return a 3-tuple `(block_axes, inner_axes, inner_kind: Literal["thread",
-  "warp"])`, or expose two named accessors `_thread_axes()` / `_warp_axes()`. Pick the lighter touch — likely the
-  accessor split is cleaner than a tuple length change since existing callers pattern-match on a 2-tuple.
+  - `_emit_loop` (`:605`): handles `RegisterTile` passthrough at the dispatch site (`:553`). No change for WarpTile
+    yet — it doesn't appear inside `_emit_loop`'s recurse targets at scalar.
+- `deplodock/compiler/ir/tile/ir.py::TileOp._launch_geometry` (`:1269`, returns 2-tuple `(block_axes, thread_axes)`):
+  extend so the second tuple becomes whichever inner `ParallelTile` axes are present (`ThreadTile.axes` or
+  `WarpTile.axes`). Document that the **kind** of inner tile matters to callers — return a 3-tuple `(block_axes,
+  inner_axes, inner_kind: Literal["thread", "warp"])`, or expose two named accessors `_thread_axes()` /
+  `_warp_axes()`. Pick the lighter touch — likely the accessor split is cleaner than a tuple length change since
+  existing callers pattern-match on a 2-tuple.
 
 **Files.**
 
@@ -142,12 +146,16 @@ assert no compile error. No existing golden moves because nothing emits `WarpTil
 **Why.** Wire the primitive into the planner's tower-builder so downstream plans (MMA, WS-refactor) can flip a tier
 to `Role.WARP` without touching `_wrap_tower`'s mechanics.
 
-**Change.** In `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py`:
+**Change.** In `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` (current file size:
+979 lines):
 
-- `class Role` (`:99–112`): add `WARP = "warp"`.
-- `_layer_kind_for` (`:567–574`): `Role.WARP → "warp"`.
-- `_wrap_tower` grouping (`:526–563`): add a `"warp"` case beside `"grid" / "thread" / "register"` that wraps in
-  `WarpTile(axes, body)`. WARP groups consecutive same-kind axes the same way the other parallel kinds do.
+- `class Role` (`:106–119`, members `BLOCK / THREAD / REGISTER / STAGE_INNER / SERIAL_OUTER / PIPELINE`): add
+  `WARP = "warp"`.
+- `_layer_kind_for` (`:395`): `Role.WARP → "warp"`.
+- `_wrap_tower` (`:311`) grouping (the for-loop around `:354–392` that builds the typed-flavor tower from
+  `groups`): add a `"warp"` case beside `"grid" / "thread" / "register"` that wraps in `WarpTile(axes, body)`. WARP
+  groups consecutive same-kind axes the same way the other parallel kinds do. The non-BLOCK size-1 filter at `:345`
+  needs no change — it already drops any non-BLOCK extent-1 axis regardless of role.
 - No call site emits `Role.WARP` in this plan.
 
 **Files.**
@@ -165,16 +173,16 @@ silent passthrough or a crash when a consumer first emits a `WarpTile`.
 
 **Change.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/_helpers.py`:
-  - `single_tile` (`:93–110`): match `(GridTile, ThreadTile, WarpTile)`.
-  - Rename `thread_tile_of` → `parallel_tile_of`; recognise `WarpTile` everywhere `ThreadTile` is recognised. Keep
-    `thread_tile_of` as a deprecated alias that calls `parallel_tile_of` (one release of overlap; remove after the
-    MMA + WS consumers ship). Same for `replace_thread_tile_body` → `replace_parallel_tile_body`.
+- `deplodock/compiler/pipeline/passes/lowering/tile/_helpers.py` (current file size: 164 lines):
+  - `single_tile` (`:93`): match `(GridTile, ThreadTile, WarpTile)`.
+  - Rename `thread_tile_of` (`:52`) → `parallel_tile_of`; recognise `WarpTile` everywhere `ThreadTile` is recognised.
+    Keep `thread_tile_of` as a deprecated alias that calls `parallel_tile_of` (one release of overlap; remove after
+    the MMA + WS consumers ship). Same for `replace_thread_tile_body` (`:71`) → `replace_parallel_tile_body`.
 - Audit pass — read every rule under `pipeline/passes/lowering/tile/` and `pipeline/passes/lowering/kernel/`:
   - Any `isinstance(s, ThreadTile)` that should be "the inner parallel tile" becomes `isinstance(s, (ThreadTile,
-    WarpTile))` or `isinstance(s, ParallelTile)`.
+    WarpTile))` or `isinstance(s, ParallelTile)` (defined at `ir/tile/ir.py:546`).
   - Any `isinstance(s, GridTile)` / `isinstance(s, RegisterTile)` stays as-is — those are tier-specific.
-- `deplodock/compiler/pipeline/passes/lowering/tile/085_warp_specialize.py::_find_thread_tile` (`:111+`): not in
+- `deplodock/compiler/pipeline/passes/lowering/tile/085_warp_specialize.py::_find_thread_tile` (`:99`): not in
   this plan's scope to refactor, but verify the pass doesn't misclassify a downstream-emitted `WarpTile` as a target.
   Today no pass emits `WarpTile`, so a defensive `isinstance(s, ThreadTile)` (not `WarpTile`) keeps WS scoped to the
   scalar-tower input it expects.

@@ -702,6 +702,55 @@ class RegisterTile(ParallelTile):
 
 
 @dataclass(frozen=True)
+class WarpTile(ParallelTile):
+    """Warp-parallel tile — one coord tuple = one warp (32 lanes).
+
+    The body executes once per warp coord; the 32 lanes inside the warp
+    execute it collectively (cooperative MMA, lane-aware shuffles, etc.).
+    Materialization rules / consumers — MMA fragment factorization
+    (``plans/mma-fragment-factorization.md``), warp-specialized TMA
+    pipelining refactor — emit ``WarpTile`` *inside* an outer
+    ``GridTile`` to bind warps to a CTA. The cooperative form is the
+    only one supported in v1; a standalone top-level ``WarpTile``
+    (pointwise-style "one warp per output cell") has no consumer today.
+
+    Rendering binds ``warp_id = threadIdx.x / 32`` (the row-major decode
+    over the warp axes uses ``warp_id`` as the linear index), and
+    unconditionally exposes ``lane = threadIdx.x & 31`` — the body
+    presumes a lane is available (that's the entire reason a warp coord
+    exists). Launch-bounds wiring (``_launch_bounds_for`` /
+    ``_launch_geometry``) multiplies the warp-axis product by 32.
+
+    Mutual exclusion with ``ThreadTile`` inside one ``TileOp.body`` is
+    enforced by ``TileOp.__post_init__`` — both bind ``threadIdx`` and
+    mixing would re-bind the same coord at two scopes.
+    """
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return WarpTile(axes=self.axes, body=body)
+
+    def _pretty_label(self) -> str:
+        return "warp"
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Cooperative form (inside ``GridTile``): ``warp_id`` decl + row-
+        major warp-axis decode against ``warp_id`` + unconditional ``lane``
+        decl + body. Standalone (no enclosing ``GridTile``) is not
+        supported in v1 — pointwise kernels use ``ThreadTile`` and a
+        top-level ``WarpTile`` has no consumer yet.
+        """
+        if not ctx.inside_grid_tile:
+            raise NotImplementedError("WarpTile outside GridTile not supported in v1")
+        pad = _pad(ctx.indent)
+        out: list[str] = [f"{pad}int warp_id = threadIdx.x / 32;"]
+        out.extend(_render_grid_axis_decode(self.axes, "warp_id", ctx))
+        out.append(f"{pad}int lane = threadIdx.x & 31;")
+        out.extend(_render_body(self.body, ctx))
+        return out
+
+
+@dataclass(frozen=True)
 class SerialTileBase(Stmt):
     """Abstract base for serial-iteration tile flavors. One axis, one body."""
 
@@ -1236,9 +1285,18 @@ class TileOp(BodyOp):
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
-        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile)))
+        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile, WarpTile)))
         if n_tiles > 1:
-            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile, got {n_tiles}")
+            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile/WarpTile, got {n_tiles}")
+        # ThreadTile and WarpTile both bind threadIdx; mixing them inside one
+        # body re-binds the same coord at two scopes. The outer-tile check
+        # above already catches them at top level; this catches the
+        # cooperative form (GridTile wrapping a ThreadTile and a WarpTile
+        # sibling, or one of them nesting inside the other).
+        has_thread = any(isinstance(s, ThreadTile) for s in self.body.iter())
+        has_warp = any(isinstance(s, WarpTile) for s in self.body.iter())
+        if has_thread and has_warp:
+            raise ValueError("TileOp.body cannot contain both a ThreadTile and a WarpTile (both bind threadIdx)")
         self._seed_io_placeholders()
 
     def _launch_geometry(self) -> tuple[tuple[Axis, ...], tuple[Axis, ...]]:
@@ -1512,6 +1570,7 @@ __all__ = [
     "GridTile",
     "ThreadTile",
     "RegisterTile",
+    "WarpTile",
     "SerialTileBase",
     "SerialTile",
     "StridedTile",

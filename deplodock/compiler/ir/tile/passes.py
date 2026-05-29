@@ -34,6 +34,7 @@ from deplodock.compiler.ir.tile.ir import (
     StridedTile,
     ThreadTile,
     WarpSpecialize,
+    WarpTile,
 )
 
 
@@ -161,6 +162,16 @@ def _(s: RegisterTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: RegisterTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
+def _(s: WarpTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: WarpTile, ctx: SimplifyCtx) -> Stmt:
     return _parallel_simplify(s, ctx)
 
 
