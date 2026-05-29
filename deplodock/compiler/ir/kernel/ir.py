@@ -520,6 +520,186 @@ class WarpShuffle(Stmt):
         return out
 
 
+# ---------------------------------------------------------------------------
+# MMA fragment Stmts — tensor-core hardware primitives per
+# plans/mma-fragment-factorization.md M4. Emitted by the MMA cell
+# materializer (kernel/010_split_register_axes MMA arm) and rendered as
+# wmma::* intrinsics (NVRTC ships <mma.h>; see plan's NVRTC probe).
+#
+# Future async kinds (wgmma, NVFP4) add sibling Stmts (MmaIssue / MmaWait /
+# MmaScaledSync) rather than overloading these.
+# ---------------------------------------------------------------------------
+
+
+def _wmma_matrix_tag(role: str) -> str:
+    """Map an MMA operand role to its ``wmma::matrix_a/b/accumulator`` tag."""
+    if role == "a":
+        return "wmma::matrix_a"
+    if role == "b":
+        return "wmma::matrix_b"
+    if role == "c":
+        return "wmma::accumulator"
+    raise ValueError(f"MmaFragment: unsupported role {role!r}; expected 'a', 'b', or 'c'")
+
+
+def _wmma_dtype(dtype: DataType) -> str:
+    """CUDA C dtype name for ``wmma::fragment``'s template parameter."""
+    if dtype.name == "f16":
+        return "half"
+    if dtype.name == "f32":
+        return "float"
+    if dtype.name == "bf16":
+        return "__nv_bfloat16"
+    raise ValueError(f"MmaFragment: unsupported dtype {dtype.name!r}")
+
+
+@dataclass(frozen=True)
+class MmaFragment(Stmt):
+    """Declare a ``wmma::fragment<...> name;`` register block.
+
+    One per matmul operand role (``"a"`` / ``"b"`` / ``"c"``). ``shape``
+    is the MMA cell ``(M, N, K)``; ``dtype`` is the per-operand element
+    dtype from :data:`_atom.ATOM_REGISTRY[kind].operand_dtypes`. The
+    fragment's data lives in registers, distributed across the warp's
+    32 lanes — accessed only through ``MmaLoad`` / ``MmaSync`` /
+    ``MmaStore``. ``name`` is a fresh SSA binding visible in the
+    enclosing scope.
+    """
+
+    name: str
+    role: str  # "a" / "b" / "c"
+    shape: tuple[int, int, int]
+    dtype: DataType
+    layout: str = "row_major"  # "row_major" / "col_major"; ignored for accumulator role
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        m, n, k = self.shape
+        return [f"{indent}MmaFragment {self.role}:{self.dtype.name} {self.name} ({m}x{n}x{k}, {self.layout})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        m, n, k = self.shape
+        tag = _wmma_matrix_tag(self.role)
+        elem = _wmma_dtype(self.dtype)
+        ctx.ssa_dtypes[self.name] = self.dtype.name
+        if self.role == "c":
+            # Accumulator fragments are layout-free in the type signature.
+            return [f"{_pad(ctx.indent)}wmma::fragment<{tag}, {m}, {n}, {k}, {elem}> {self.name};"]
+        return [f"{_pad(ctx.indent)}wmma::fragment<{tag}, {m}, {n}, {k}, {elem}, wmma::{self.layout}> {self.name};"]
+
+
+@dataclass(frozen=True)
+class MmaFill(Stmt):
+    """``wmma::fill_fragment(frag, value);`` — zero the accumulator (or
+    init to ``Accum``'s identity)."""
+
+    frag: str
+    value: float = 0.0
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}MmaFill({self.frag}, {self.value})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f"{_pad(ctx.indent)}wmma::fill_fragment({self.frag}, {self.value!r}f);"]
+
+
+@dataclass(frozen=True)
+class MmaLoad(Stmt):
+    """``wmma::load_matrix_sync(frag, &<buffer>[offset], ldm);``
+
+    Loads one fragment from a contiguous source buffer (smem or gmem).
+    ``src_buffer`` names the buffer (string — resolved through
+    ``ctx.buffer_dtypes`` / ``ctx.shapes``). ``src_index`` is the
+    multidim offset (Expr tuple) — the base of the fragment's M×K (a) /
+    K×N (b) / M×N (c) tile. ``ldm`` is the leading-dimension stride
+    *in elements* (not bytes). All 32 lanes of the warp must reach this
+    Stmt with identical arguments.
+    """
+
+    frag: str
+    src_buffer: str
+    src_index: tuple
+    ldm: int
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.src_buffer,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(e.pretty() for e in self.src_index)
+        return [f"{indent}MmaLoad {self.frag} <- {self.src_buffer}[{idx}], ldm={self.ldm}"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+
+        flat = render_index(self.src_buffer, self.src_index, ctx)
+        return [f"{_pad(ctx.indent)}wmma::load_matrix_sync({self.frag}, &{self.src_buffer}[{flat}], {self.ldm});"]
+
+
+@dataclass(frozen=True)
+class MmaSync(Stmt):
+    """``wmma::mma_sync(c, a, b, c);`` — one tensor-core MMA instruction.
+
+    Synchronous semantics (WMMA): every lane participates; the result
+    lands in ``c_frag``'s distributed registers. Hopper+ async variants
+    (``wgmma_*``) get their own ``MmaIssue`` / ``MmaWait`` Stmts.
+    """
+
+    c_frag: str
+    a_frag: str
+    b_frag: str
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.c_frag, self.a_frag, self.b_frag)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}MmaSync {self.c_frag} += {self.a_frag} @ {self.b_frag}"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f"{_pad(ctx.indent)}wmma::mma_sync({self.c_frag}, {self.a_frag}, {self.b_frag}, {self.c_frag});"]
+
+
+@dataclass(frozen=True)
+class MmaStore(Stmt):
+    """``wmma::store_matrix_sync(&<buffer>[offset], frag, ldm, layout);``
+
+    Stores one accumulator fragment to gmem or smem. ``dst_buffer`` /
+    ``dst_index`` mirror :class:`MmaLoad`. ``layout`` is the destination
+    memory layout (``"row_major"`` / ``"col_major"``).
+    """
+
+    dst_buffer: str
+    dst_index: tuple
+    frag: str
+    ldm: int
+    layout: str = "row_major"
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(e.pretty() for e in self.dst_index)
+        return [f"{indent}MmaStore {self.dst_buffer}[{idx}] <- {self.frag}, ldm={self.ldm} ({self.layout})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+
+        flat = render_index(self.dst_buffer, self.dst_index, ctx)
+        return [
+            f"{_pad(ctx.indent)}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {self.frag}, {self.ldm}, wmma::mem_{self.layout});",
+        ]
+
+
 def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: str = "f32") -> str:
     """Render a 2-arg combine for ``ElementwiseImpl`` reduce ops at ``dt``.
 
