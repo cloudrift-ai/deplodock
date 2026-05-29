@@ -95,6 +95,7 @@ def _(s: WarpSpecialize, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         consumer_body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.consumer_body),
         ring_depth=s.ring_depth,
         n_producer_threads=s.n_producer_threads,
+        consumer_thread_axes=tuple(axis_fn(ax) for ax in s.consumer_thread_axes),
     )
 
 
@@ -105,6 +106,7 @@ def _(s: WarpSpecialize, ctx: SimplifyCtx) -> Stmt:
         consumer_body=tuple(simplify(c, ctx) for c in s.consumer_body),
         ring_depth=s.ring_depth,
         n_producer_threads=s.n_producer_threads,
+        consumer_thread_axes=s.consumer_thread_axes,
     )
 
 

@@ -97,8 +97,15 @@ Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.WARP` (→ `WarpTile`) is wired through `_layer_kind_for` /
 `_wrap_tower` but no rule in this pass emits it — the MMA
 fragment-factorization consumer plan (`plans/mma-fragment-factorization.md`)
-and the warp-specialize refactor flip a tier when they ship, without
-revisiting the tower mechanics.
+will flip a tier when it ships, without revisiting the tower
+mechanics. `085_warp_specialize` already emits `WarpTile(role)` (one
+role axis = total CTA warps) wrapping `WarpSpecialize` directly,
+bypassing the planner's tower builder — its role split is structural
+(`Cond(role < n_producer_warps, …)`), not the σ-shifted extended
+`ThreadTile` the pre-refactor shape used. The materializer drops a
+`ThreadTile(tid_offset=n_producer_threads, …)` inside the consumer
+branch so the original consumer thread axes decode against
+`threadIdx.x - n_producer_threads`.
 
 The tree-building algorithm itself (group params by per-level knob keys,
 collapse single-key levels, sort siblings by max-propagated score, defer

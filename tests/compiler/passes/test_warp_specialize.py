@@ -28,6 +28,7 @@ from deplodock.compiler.ir.tile.ir import (
     ThreadTile,
     TileOp,
     WarpSpecialize,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import RuleSkipped
 from deplodock.compiler.pipeline.pipeline import Fork
@@ -160,18 +161,29 @@ def test_env_pin_zero_returns_bare_tileop(monkeypatch):
 
 
 def test_ws1_emits_warp_specialize_stmt(monkeypatch):
-    """WS=1 path produces a TileOp whose ThreadTile body contains a single
-    ``WarpSpecialize`` Stmt — not a hand-rolled Cond/Smem/MbarrierInit
-    tree. The materializer is responsible for the lowering."""
+    """WS=1 path produces a TileOp whose **WarpTile** body contains a
+    single ``WarpSpecialize`` Stmt — not a hand-rolled
+    Cond/Smem/MbarrierInit tree. The materializer is responsible for the
+    lowering. Post-refactor (M6 of ``plans/warptile-primitive.md``) the
+    inner tile is a ``WarpTile`` carrying a single role axis, not the
+    extended ``ThreadTile`` the previous shape used."""
     monkeypatch.setenv("DEPLODOCK_WS", "1")
     op = _tile_op_tma_pipelined()
     result = _run_rule(op)
     assert isinstance(result, TileOp)
-    # Walk to the ThreadTile inside the body.
-    tt = next(s for s in result.body if isinstance(s, ThreadTile))
-    body = list(tt.body)
-    assert len(body) == 1, f"expected single WarpSpecialize in ThreadTile body, got {len(body)}"
-    assert isinstance(body[0], WarpSpecialize)
+    # The inner tile is now a WarpTile (role-binding); no ThreadTile in
+    # the rewritten body.
+    assert not any(isinstance(s, ThreadTile) for s in result.body.iter()), "ThreadTile should be gone from WS=1 output"
+    wt = next(s for s in result.body if isinstance(s, WarpTile))
+    assert len(wt.axes) == 1, f"WarpTile should carry one role axis, got {len(wt.axes)}"
+    body = list(wt.body)
+    assert len(body) == 1, f"expected single WarpSpecialize in WarpTile body, got {len(body)}"
+    ws = body[0]
+    assert isinstance(ws, WarpSpecialize)
+    # consumer_thread_axes carries the original ThreadTile axes (unshifted).
+    assert tuple(ax.extent.as_static() for ax in ws.consumer_thread_axes) == (16, 16)
+    # Role axis extent = (n_consumer + n_producer) / 32 = (256 + 32) / 32 = 9.
+    assert wt.axes[0].extent.as_static() == 9
 
 
 def test_ws1_tile_body_contains_no_kernel_ir(monkeypatch):

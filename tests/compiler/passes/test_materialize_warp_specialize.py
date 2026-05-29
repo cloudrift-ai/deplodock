@@ -6,7 +6,8 @@ the 085 pass) and run the materializer. Check that:
 - the prologue has ``Smem("tma_mbar_empty", ...) + Cond(tid==0, [MbarrierInit
   per slot]) + Sync()``;
 - producer / consumer subtrees are wrapped in
-  ``Cond(outer < extension, [SetMaxNReg(24,"dec"), ...], [SetMaxNReg(240,"inc"), ...])``;
+  ``Cond(role < N_producer_warps, [SetMaxNReg(24,"dec"), ...],
+        [SetMaxNReg(240,"inc"), ThreadTile(tid_offset=n_producer, ...)])``;
 - producer-side ``SerialTile(serial_outer)`` matching ``serial_axis_name``
   gets a ``MbarrierWait`` prepended inside a ``Cond(K_o >= bc-1)`` guard;
 - consumer-side ``SerialTile(serial_outer)`` matching ``serial_axis_name``
@@ -16,6 +17,12 @@ the 085 pass) and run the materializer. Check that:
   ``Sync(barrier_id=1, count=n_cons)`` trailing fence;
 - ``AsyncWait`` outside any ``WarpSpecialize`` lowers with default
   ``Sync(barrier_id=0)``.
+
+Post-M6 (``plans/warptile-primitive.md``): the input TileOp now wraps
+``WarpSpecialize`` in a ``WarpTile(role)`` rather than the pre-refactor
+extended ``ThreadTile``; the σ-shift on the consumer subtree is gone; a
+nested ``ThreadTile(tid_offset=n_producer_threads, …)`` is what the
+materializer emits inside the consumer ``Cond.else_body``.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from __future__ import annotations
 import importlib
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
@@ -42,6 +50,7 @@ from deplodock.compiler.ir.tile.ir import (
     ThreadTile,
     TileOp,
     WarpSpecialize,
+    WarpTile,
 )
 from deplodock.compiler.tensor import Tensor
 
@@ -77,32 +86,38 @@ def _tile_op_with_ws(
     n_producer_threads: int = 32,
     consumer_has_async_wait: bool = True,
 ) -> TileOp:
-    """ThreadTile holding a single WarpSpecialize. Producer side has a
-    K_o ``SerialTile(serial_outer)`` (no children); consumer side has a
-    K_o ``SerialTile(serial_outer)`` optionally containing an
+    """WarpTile(role) holding a single WarpSpecialize. Producer side has
+    a K_o ``SerialTile(serial_outer)`` (no children); consumer side has
+    a K_o ``SerialTile(serial_outer)`` optionally containing an
     AsyncWait.
 
-    Inner thread-axis extent 16 → extension = 32 // 16 = 2. The OUTER
-    thread axis is the *post-extension* extent (the WS pass extends the
-    ThreadTile before emitting WarpSpecialize, so the materializer sees
-    the extended shape). Setting outer=6 yields consumer=(6-2)*16=64
-    threads. The bodies use axis name ``k_outer`` but TileOp's
-    ``normalize_body`` will canonicalize it to ``a2``; the materializer
-    reads the canonical name off the matched ``SerialTile.axis``."""
+    Geometry: consumer_thread_axes = (m_i=4, n_i=16) → n_consumer =
+    64. n_producer = 32. Total = 96 → 3 warps. Role axis extent = 3,
+    n_producer_warps = 32 / 32 = 1. The materializer's role-split
+    predicate becomes ``role < 1``. The bodies use axis name
+    ``k_outer`` but TileOp's ``normalize_body`` canonicalises it to
+    ``a<N>``; the materializer reads the canonical name off the
+    matched ``SerialTile.axis``."""
     k_axis = Axis("k_outer", 8)
     cons_body = Body((AsyncWait(keep=1, phase=Var("k_outer") % Literal(2, "int")),)) if consumer_has_async_wait else Body(())
     producer_body = Body((SerialTile(axis=k_axis, body=Body(()), kind="serial_outer"),))
     consumer_body = Body((SerialTile(axis=k_axis, body=cons_body, kind="serial_outer"),))
+    consumer_thread_axes = (Axis("m_i", 4), Axis("n_i", 16))
     ws = WarpSpecialize(
         producer_body=producer_body,
         consumer_body=consumer_body,
         ring_depth=ring_depth,
         n_producer_threads=n_producer_threads,
+        consumer_thread_axes=consumer_thread_axes,
     )
+    n_consumer = 1
+    for ax in consumer_thread_axes:
+        n_consumer *= ax.extent.as_static()
+    total_warps = (n_consumer + n_producer_threads) // 32
     body = Body(
         (
-            ThreadTile(
-                axes=(Axis("m_i", 6), Axis("n_i", 16)),
+            WarpTile(
+                axes=(Axis("ws_role", Dim(total_warps)),),
                 body=Body((ws,)),
             ),
         )
@@ -116,13 +131,13 @@ def _tile_op_with_ws(
 
 
 def test_materializer_emits_empty_mbar_prologue():
-    """The first three stmts of the materialized ThreadTile body are the
+    """The first three stmts of the materialized WarpTile body are the
     empty-mbarrier Smem decl, an init Cond gated on ``threadIdx.x==0``,
     and a CTA-wide Sync."""
     kernel = _materialize(_tile_op_with_ws(ring_depth=2))
-    # Outer is a ThreadTile; descend to its body.
+    # Outer is a WarpTile; descend to its body.
     top = kernel.body[0]
-    assert isinstance(top, ThreadTile)
+    assert isinstance(top, WarpTile)
     items = list(top.body)
     # First Smem named tma_mbar_empty.
     smem = next(s for s in items if isinstance(s, Smem) and s.name == "tma_mbar_empty")
@@ -147,7 +162,9 @@ def test_materializer_emits_empty_mbar_prologue():
 def test_materializer_wraps_branches_in_setmaxnreg_cond():
     """The role-split Cond has SetMaxNReg(24,"dec") at the head of the
     producer branch and SetMaxNReg(240,"inc") at the head of the
-    consumer branch."""
+    consumer branch. The consumer's body second stmt is the nested
+    ``ThreadTile(tid_offset=n_producer_threads, …)`` that re-decodes
+    consumer-relative tid into the consumer thread axes."""
     kernel = _materialize(_tile_op_with_ws())
     top = kernel.body[0]
     role_conds = [s for s in top.body if isinstance(s, Cond) and any(isinstance(c, SetMaxNReg) for c in s.body)]
@@ -158,11 +175,16 @@ def test_materializer_wraps_branches_in_setmaxnreg_cond():
     assert isinstance(prod_head, SetMaxNReg)
     assert prod_head.count == 24
     assert prod_head.direction == "dec"
-    # Consumer branch leads with SetMaxNReg(240, "inc").
+    # Consumer branch leads with SetMaxNReg(240, "inc"), followed by a
+    # ThreadTile carrying the consumer thread axes + tid_offset.
     cons_head = cond.else_body[0]
     assert isinstance(cons_head, SetMaxNReg)
     assert cons_head.count == 240
     assert cons_head.direction == "inc"
+    cons_decode = cond.else_body[1]
+    assert isinstance(cons_decode, ThreadTile)
+    assert cons_decode.tid_offset == 32
+    assert tuple(ax.extent.as_static() for ax in cons_decode.axes) == (4, 16)
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +194,12 @@ def test_materializer_wraps_branches_in_setmaxnreg_cond():
 
 def test_producer_serial_outer_gets_mbarrier_wait():
     """Inside the producer branch's ``SerialTile(serial_outer)``, the
-    head stmt is a ``Cond(K_o >= bc-1, [MbarrierWait(...)])``."""
+    head stmt is a ``Cond(K_o >= bc-1, [MbarrierWait(...)])``.
+
+    Producer branch is NOT wrapped in a consumer-decode ThreadTile —
+    producer warps don't need the inner-thread-axis decode (they only
+    use ``threadIdx.x`` directly for the TMA issuer cond and
+    ``lane`` / ``warp_id`` exposed by the enclosing WarpTile)."""
     kernel = _materialize(_tile_op_with_ws(ring_depth=2))
     top = kernel.body[0]
     role_cond = next(s for s in top.body if isinstance(s, Cond) and any(isinstance(c, SetMaxNReg) for c in s.body))
@@ -191,22 +218,22 @@ def test_producer_serial_outer_gets_mbarrier_wait():
 
 
 def test_consumer_serial_outer_gets_named_sync_and_arrive():
-    """Inside the consumer branch's ``SerialTile(serial_outer)``, the
-    tail two stmts are a named ``Sync(barrier_id=1, count=n_cons)`` and
-    a ``Cond(tid == n_producer, [MbarrierArrive])``."""
+    """Inside the consumer branch's ``SerialTile(serial_outer)`` (which
+    now lives inside the consumer-decode ``ThreadTile``), the tail two
+    stmts are a named ``Sync(barrier_id=1, count=n_cons)`` and a
+    ``Cond(tid == n_producer, [MbarrierArrive])``."""
     kernel = _materialize(_tile_op_with_ws(n_producer_threads=32, consumer_has_async_wait=False))
     top = kernel.body[0]
     role_cond = next(s for s in top.body if isinstance(s, Cond) and any(isinstance(c, SetMaxNReg) for c in s.body))
-    cons_loop = next(s for s in role_cond.else_body if isinstance(s, SerialTile) and s.kind == "serial_outer")
+    cons_decode = next(s for s in role_cond.else_body if isinstance(s, ThreadTile))
+    cons_loop = next(s for s in cons_decode.body if isinstance(s, SerialTile) and s.kind == "serial_outer")
     # Last two stmts: named Sync then single-thread MbarrierArrive Cond.
     tail = list(cons_loop.body)[-2:]
     assert len(tail) == 2
     sync, arrive_cond = tail
     assert isinstance(sync, Sync)
     assert sync.barrier_id == 1
-    # n_cons = (outer_extent - extension) * inner_product. With
-    # n_producer_threads=32, inner_product=16, outer_extent gets
-    # extended to 4+2=6, so n_cons = (6-2)*16 = 64.
+    # n_cons = product(consumer_thread_axes.extent) = 4 * 16 = 64.
     assert sync.count == 64
     assert isinstance(arrive_cond, Cond)
     arrive = next(c for c in arrive_cond.body if isinstance(c, MbarrierArrive))

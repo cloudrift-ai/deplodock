@@ -179,21 +179,30 @@ class AsyncWait(Stmt):
 
 @dataclass(frozen=True)
 class WarpSpecialize(Stmt):
-    """Producer/consumer warp split inside a TMA-pipelined ThreadTile.
+    """Producer/consumer warp split inside a TMA-pipelined kernel.
 
     Fields:
 
-    - ``producer_body`` — stmts run by producer threads (TMA-issue
+    - ``producer_body`` — stmts run by producer warp(s) (TMA-issue
       ``StageBundle`` scaffolding inside ``SerialTile(serial_outer)``).
-    - ``consumer_body`` — stmts run by consumer threads (``AsyncWait`` +
-      reduce loop + output ``Write``). Already σ-shifted by the pass so
-      every reference to the extended thread axis sees the original
-      ``[0, n_consumer_threads)`` range.
+    - ``consumer_body`` — stmts run by consumer warps (``AsyncWait`` +
+      reduce loop + output ``Write``). Indices reference the **original**
+      thread-axis names directly — no σ-shift. The materializer emits the
+      consumer-relative ``threadIdx.x - n_producer_threads`` decode at
+      the head of the consumer branch (see :class:`ThreadTile.tid_offset`).
     - ``ring_depth`` — empty-mbarrier slot count (== TMA buffer_count).
-    - ``n_producer_threads`` — for SetMaxNReg accounting (producers get
-      a small budget so consumers can claim the rest) and for deriving
-      the producer/consumer ``Cond`` predicate from the enclosing
-      ThreadTile.
+    - ``n_producer_threads`` — number of threads in the producer warp(s).
+      Today only ``32`` (one producer warp) is emitted; ``SetMaxNReg``
+      accounting and the ``Cond(role < n_producer_warps, …)`` predicate
+      both derive from this.
+    - ``consumer_thread_axes`` — axes describing the consumer-side
+      per-thread coord structure (the original ``ThreadTile.axes`` the
+      input kernel carried). The materializer feeds these into a nested
+      ``ThreadTile(tid_offset=n_producer_threads, …)`` so consumer
+      threads see ``threadIdx.x - n_producer_threads`` decoded back into
+      these axis names. ``()`` is the legacy / pre-refactor shape, kept
+      for back-compat with any caller that doesn't track the axes yet —
+      the new materializer arm raises if it's empty when expected.
 
     The K_o axis the WS pass aligned scheduling against is identified by
     the materializer structurally — the (single) ``SerialTile(serial_outer)``
@@ -201,9 +210,10 @@ class WarpSpecialize(Stmt):
     ``normalize_body``'s canonical rename pass (which renames Axis but
     can't see a plain string field).
 
-    Other quantities (``predicate``, ``n_consumer_threads``, slot/phase
-    exprs, mbar name) are derivable from these fields plus the enclosing
-    ThreadTile.axes and are reconstructed at materialize time.
+    Other quantities (``role`` predicate, ``n_consumer_threads``,
+    slot/phase exprs, mbar name) are derivable from these fields plus
+    the enclosing ``WarpTile.axes`` (the role axis) and are reconstructed
+    at materialize time.
 
     Nested ``WarpSpecialize`` is rejected at construction.
     """
@@ -212,6 +222,7 @@ class WarpSpecialize(Stmt):
     consumer_body: Body
     ring_depth: int
     n_producer_threads: int
+    consumer_thread_axes: tuple[Axis, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.producer_body, Body):
@@ -222,6 +233,8 @@ class WarpSpecialize(Stmt):
             raise ValueError(f"WarpSpecialize: ring_depth must be >= 1, got {self.ring_depth}")
         if self.n_producer_threads < 1:
             raise ValueError(f"WarpSpecialize: n_producer_threads must be >= 1, got {self.n_producer_threads}")
+        if not isinstance(self.consumer_thread_axes, tuple):
+            object.__setattr__(self, "consumer_thread_axes", tuple(self.consumer_thread_axes))
         # Nesting check — a WS inside another WS would require the
         # materializer to track a stack of ws_consumer contexts; today
         # 085 guards via the WS knob on the parent TileOp, but assert at
@@ -642,34 +655,54 @@ class ThreadTile(ParallelTile):
     cooperativity is derived at materialize / render time from
     ``Accum.axes ∩ ThreadTile.axes`` — see
     ``ir/tile/escape_analysis.py``.
+
+    ``tid_offset`` (default ``0``) shifts the linear thread index the
+    cooperative-form decode is computed against — the per-axis decls
+    use ``(threadIdx.x - tid_offset)`` instead of plain ``threadIdx.x``.
+    Non-zero values are emitted by the warp-specialize materializer to
+    drop a ``ThreadTile(consumer_thread_axes, tid_offset=n_producer_threads, …)``
+    inside the consumer ``Cond.else_body``, so the original consumer-side
+    thread axes decode against a consumer-relative tid in ``[0,
+    n_consumer_threads)``. The field carries no semantic meaning outside
+    that materializer-emitted nesting; planner-emitted ``ThreadTile``s
+    keep the default ``0``.
     """
+
+    tid_offset: int = 0
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return ThreadTile(axes=self.axes, body=body)
+        return ThreadTile(axes=self.axes, body=body, tid_offset=self.tid_offset)
 
     def _pretty_label(self) -> str:
+        if self.tid_offset:
+            return f"thread offset={self.tid_offset}"
         return "thread"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Two render forms picked by ``ctx.inside_grid_tile``.
 
-        - **Cooperative** (inside ``GridTile``): emit ``threadIdx.x`` axis
-          decode + optional ``lane`` / ``warp`` helper decls + body. No
-          extra brace level — the surrounding ``__global__`` provides one.
+        - **Cooperative** (inside ``GridTile``): emit ``threadIdx.x``
+          axis decode (optionally offset by ``tid_offset`` — used by the
+          warp-specialize consumer arm) + optional ``lane`` / ``warp``
+          helper decls + body. No extra brace level — the surrounding
+          ``__global__`` provides one.
         - **Standalone** (pointwise — no enclosing ``GridTile``): flatten
           all axes into a linear ``tid``; bounds-guard against the product
           of extents.
         """
         pad = _pad(ctx.indent)
         if ctx.inside_grid_tile:
-            out = list(_render_grid_axis_decode(self.axes, "threadIdx.x", ctx))
+            idx_expr = "threadIdx.x" if self.tid_offset == 0 else f"(threadIdx.x - {self.tid_offset})"
+            out = list(_render_grid_axis_decode(self.axes, idx_expr, ctx))
             if _body_uses_lane_warp(self.body):
                 out.append(f"{pad}int lane = threadIdx.x & 31;")
                 out.append(f"{pad}int warp = threadIdx.x >> 5;")
             out.extend(_render_body(self.body, ctx))
             return out
 
+        if self.tid_offset:
+            raise NotImplementedError("standalone ThreadTile with non-zero tid_offset not supported")
         inner = ctx.child()
         n_threads = 1
         for ax in self.axes:

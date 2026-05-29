@@ -124,7 +124,7 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
-    if isinstance(top, ThreadTile):
+    if isinstance(top, (ThreadTile, WarpTile)):
         return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
@@ -258,15 +258,14 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         # inside a WarpSpecialize consumer subtree (``__syncthreads()``
         # is CUDA UB on the warp-divergent producer/consumer branch).
         # ``ws_consumer`` is threaded in by ``emit_warp_specialize`` and
-        # carries the producer thread count, from which the materializer
-        # derives the consumer participant count for ``bar.sync N, M``.
+        # carries the consumer-thread-axis structure, from which the
+        # materializer derives the consumer participant count for
+        # ``bar.sync N, M`` — product of the WarpSpecialize's
+        # ``consumer_thread_axes.extent``.
         if ws_consumer is not None:
-            outer_ext = thread_axes[0].extent.as_static()
-            inner_prod = 1
-            for ax in thread_axes[1:]:
-                inner_prod *= ax.extent.as_static()
-            extension = ws_consumer.n_producer_threads // inner_prod
-            n_cons = (outer_ext - extension) * inner_prod
+            n_cons = 1
+            for ax in ws_consumer.consumer_thread_axes:
+                n_cons *= ax.extent.as_static()
             trailing_sync = Sync(barrier_id=1, count=n_cons)
         else:
             trailing_sync = Sync()
@@ -428,24 +427,34 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         ``SetMaxNReg`` register-budget redistribution + producer /
         consumer ``Cond`` wrapper.
 
-        Geometry (predicate, consumer thread count, first-consumer tid)
-        is derived from the enclosing ``ThreadTile.axes`` and
-        ``ws.n_producer_threads`` — the WS pass doesn't carry them.
+        Post-WarpTile-refactor shape:
+
+        - The enclosing ``WarpTile`` carries a single ``role`` axis (warp-
+          granularity coord ∈ ``[0, total_warps)``). We read its name from
+          ``thread_axes[0]`` (``_materialize`` passes the WarpTile.axes
+          through to its caller-named ``thread_axes`` slot).
+        - The role-split ``Cond`` predicate is ``Var(role) <
+          n_producer_warps`` — structural, no arithmetic shift.
+        - The consumer branch wraps the materialized stmts in a
+          ``ThreadTile(consumer_thread_axes, tid_offset=n_producer_threads)``
+          so the renderer emits ``int <axis> = ((threadIdx.x - n_producer)
+          / stride) % extent`` per consumer axis. The consumer body
+          references the original axis Vars unshifted; the nested
+          ThreadTile rebinds them to the consumer-relative tid range.
         """
         from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
-        outer = thread_axes[0]
-        outer_extent = outer.extent.as_static()
-        inner_product = 1
-        for ax in thread_axes[1:]:
-            inner_product *= ax.extent.as_static()
-        if ws.n_producer_threads % inner_product != 0:
-            raise ValueError(
-                f"WarpSpecialize: n_producer_threads ({ws.n_producer_threads}) "
-                f"must be divisible by inner thread-axes product ({inner_product})"
-            )
-        extension = ws.n_producer_threads // inner_product
-        n_consumer_threads = (outer_extent - extension) * inner_product
+        # Role axis = the single axis on the enclosing WarpTile.
+        role = thread_axes[0]
+        consumer_thread_axes = ws.consumer_thread_axes
+        if not consumer_thread_axes:
+            raise ValueError("WarpSpecialize.consumer_thread_axes must be non-empty for the WarpTile-based materializer arm")
+        n_consumer_threads = 1
+        for ax in consumer_thread_axes:
+            n_consumer_threads *= ax.extent.as_static()
+        if ws.n_producer_threads % warp_size != 0:
+            raise ValueError(f"WarpSpecialize: n_producer_threads ({ws.n_producer_threads}) must be a multiple of warp_size ({warp_size})")
+        n_producer_warps = ws.n_producer_threads // warp_size
         first_consumer_tid = ws.n_producer_threads
         bc = ws.ring_depth
         empty_mbar = "tma_mbar_empty"
@@ -481,10 +490,20 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         for s in wired_consumer:
             cons_out.extend(_process_stmt(s, ews=cons_ews))
 
+        # Consumer-side body wraps in a tid-offset ThreadTile so the
+        # original consumer thread axes decode against
+        # ``(threadIdx.x - n_producer_threads)``. The renderer emits
+        # ``int <axis> = ...`` per axis at the head of the else_body.
+        consumer_decode = ThreadTile(
+            axes=consumer_thread_axes,
+            body=Body(tuple(cons_out)),
+            tid_offset=ws.n_producer_threads,
+        )
+
         ws_cond = Cond(
-            cond=BinaryExpr("<", Var(outer.name), Literal(extension, "int")),
+            cond=BinaryExpr("<", Var(role.name), Literal(n_producer_warps, "int")),
             body=Body((SetMaxNReg(24, "dec"), *prod_out)),
-            else_body=Body((SetMaxNReg(240, "inc"), *cons_out)),
+            else_body=Body((SetMaxNReg(240, "inc"), consumer_decode)),
         )
         return [empty_decl, init_cond, Sync(), ws_cond]
 
