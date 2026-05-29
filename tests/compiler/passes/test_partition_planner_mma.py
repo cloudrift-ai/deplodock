@@ -1,0 +1,173 @@
+"""Tests for the MMA fragment-factorization planner wiring.
+
+Covers ``_atom.is_atom_eligible`` per Design decision 4 of
+``plans/mma-fragment-factorization.md``. M2 ships the WMMA F16 entry +
+the eligibility dispatcher; M3 will extend coverage to fork enumeration.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from deplodock.compiler.context import Context
+from deplodock.compiler.dtype import F16, F32
+from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from deplodock.compiler.ir.stmt import Accum, Assign
+from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
+    _ATOM_KINDS_V1,
+    ATOM_REGISTRY,
+    is_atom_eligible,
+)
+
+
+def _input(g: Graph, name: str, shape: tuple, *, dtype) -> str:
+    """Add a typed input tensor — dtype lookup at planner time goes
+    through ``graph.nodes[buf].output.dtype``, so the test fixture has
+    to stamp the dtype on the input Tensor."""
+    return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape, dtype=dtype), node_id=name)
+
+
+def _ctx(*, cc: tuple[int, int] = (8, 0)) -> Context:
+    """Test ``Context`` with arbitrary compute capability. ``warp_size`` and
+    ``max_dynamic_smem`` defaults are fine — the WMMA eligibility only
+    reads ``compute_capability``."""
+    return Context(compute_capability=cc)
+
+
+def _matmul_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
+    """Build a plain matmul LoopOp ``C[M,N] = sum_k A[M,K] * B[K,N]``."""
+    i = Axis("i", M)
+    j = Axis("j", N)
+    k = Axis("k", K)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _pointwise_loop_op() -> LoopOp:
+    """Build a pointwise (relu) LoopOp — no reduce, ineligible for any
+    matmul atom kind."""
+    i = Axis("i", 64)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Load(name="x_v", input="x", index=(Var("i"),)),
+                    Assign(name="r", op=ElementwiseImpl("maximum"), args=("x_v", "x_v")),
+                    Write(output="o", index=(Var("i"),), value="r"),
+                ),
+            ),
+        ),
+    )
+
+
+def _matmul_graph(*, M: int = 64, N: int = 64, K: int = 64, dtype=F16) -> Graph:
+    """Build a graph wrapping the matmul LoopOp with typed inputs."""
+    g = Graph()
+    _input(g, "a", (M, K), dtype=dtype)
+    _input(g, "b", (K, N), dtype=dtype)
+    op = _matmul_loop_op(M=M, N=N, K=K)
+    g.add_node(op=op, inputs=["a", "b"], output=Tensor("c", (M, N), dtype=F32), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+    return g
+
+
+def test_wmma_eligibility_fires_on_f16_matmul():
+    """A TinyLlama-shape matmul (M=N=K=64, all multiples of 16) with F16
+    inputs and a sm_75 target satisfies every WMMA F16 gate."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    assert is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(7, 5)), graph=g)
+
+
+def test_wmma_eligibility_rejects_f32_loads():
+    """F32 operands fall through the per-Load dtype check."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F32)
+    loop_op = g.nodes["c"].op
+    assert not is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(7, 5)), graph=g)
+
+
+def test_wmma_eligibility_rejects_pre_volta():
+    """WMMA F16 needs sm_70+. Pascal (sm_60) fails the cc gate."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    assert not is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(6, 0)), graph=g)
+
+
+def test_wmma_eligibility_rejects_non_matmul():
+    """A pointwise LoopOp has no matmul-reduce — ineligible for any MMA
+    kind."""
+    g = Graph()
+    _input(g, "x", (64,), dtype=F16)
+    op = _pointwise_loop_op()
+    g.add_node(op=op, inputs=["x"], output=Tensor("o", (64,), dtype=F16), node_id="o")
+    g.inputs = ["x"]
+    g.outputs = ["o"]
+    assert not is_atom_eligible("wmma_m16n16k16_f16", op, _ctx(cc=(8, 0)), graph=g)
+
+
+def test_wmma_eligibility_rejects_indivisible_extents():
+    """An output extent that isn't a multiple of 16 (e.g. M=63) can't
+    cover with M16N16K16 cells. Defer the per-BR check; gate the bare
+    16 here."""
+    g = _matmul_graph(M=63, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    assert not is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(8, 0)), graph=g)
+
+
+def test_unregistered_kind_raises():
+    """The dispatcher has no fallback — an unknown kind surfaces a
+    ``KeyError`` rather than silently returning False. "scalar" is the
+    canonical example: it's the *absence* of an atom (modelled by
+    ``ScalarTileParams``), not a registered kind."""
+    g = _matmul_graph(dtype=F16)
+    loop_op = g.nodes["c"].op
+    with pytest.raises(KeyError):
+        is_atom_eligible("scalar", loop_op, _ctx(), graph=g)
+
+
+def test_v1_atom_kinds_priority_order():
+    """The priority-ordered kinds tuple is the source of truth for the
+    planner's enumeration. M2 ships just WMMA square F16."""
+    assert _ATOM_KINDS_V1 == ("wmma_m16n16k16_f16",)
+    for kind in _ATOM_KINDS_V1:
+        assert kind in ATOM_REGISTRY
+
+
+def test_registry_spec_shape_and_group_size():
+    """Sanity-check the seeded spec — its shape drives M/N/K divisibility
+    and its group_size drives the warp-tier launch geometry math."""
+    spec = ATOM_REGISTRY["wmma_m16n16k16_f16"]
+    assert spec.shape == (16, 16, 16)
+    assert spec.group_size == 32
+    assert spec.instruction == "wmma"
+    assert spec.operand_dtypes["a"] == F16
+    assert spec.operand_dtypes["b"] == F16
+    assert spec.operand_dtypes["c"] == F32
