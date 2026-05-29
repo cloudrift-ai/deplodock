@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Stmt, Write
-from deplodock.compiler.ir.tile.ir import RegisterTile
 
 
 def stmt_contains_accum(stmt: Stmt) -> bool:
@@ -115,28 +114,6 @@ def gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) -> 
               body=[Load(r), Assign(v=acc+r), Write(out, v)],
               else_body=[Write(out, acc)])]
 
-    Blocked-builder input shape — the matmul_add epilogue lives inside the
-    Write-tower ``RegisterTile(N_r)``, separated from the reduce tower by
-    the planner's three-tower layout::
-
-        [RegisterTile(N_r, [Init]),
-         <reduce tower with Accum nested in RegisterTile(N_r)>,
-         RegisterTile(N_r, [Load(r), Assign(v=acc+r), Write(out, v)])]
-
-    Output shape (the Cond moves INSIDE the Write tower)::
-
-        [RegisterTile(N_r, [Init]),
-         <reduce tower>,
-         RegisterTile(N_r,
-             [Cond(K_s == 0,
-                   body=[Load(r), Assign(v=acc+r), Write(out, v)],
-                   else_body=[Write(out, acc)])])]
-
-    The kernel-IR replicator (``010_split_register_axes``) then unrolls
-    each ``RegisterTile(N_r)`` per cell — the Cond's predicate is K_s-only
-    and replicates verbatim, the body/else_body Loads / Assigns / Writes
-    pick up the per-cell SSA suffix as usual.
-
     Both Writes lower to ``atomicAdd`` under SPLITK > 1, so the final
     output is ``sum_i acc_i + r`` — the residual added exactly once.
     Returns ``stmts`` unchanged when no linear epilogue is present (also:
@@ -167,41 +144,15 @@ def gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) -> 
     if acc_name is None:
         return stmts
 
-    # Blocked path: the epilogue is a single ``RegisterTile(N_r, [Load,
-    # Assign, Write])`` (the planner's Write tower). Recurse into the
-    # tower body and emit the Cond there; the surrounding RegisterTile
-    # stays untouched so the replicator can still unroll it per cell.
-    if len(epilogue) == 1 and isinstance(epilogue[0], RegisterTile):
-        rt = epilogue[0]
-        gated = _gate_linear_chain(tuple(rt.body), acc_name, k_s_name)
-        if gated is None:
-            return stmts
-        return reduce_part + (RegisterTile(axes=rt.axes, body=Body(gated)),)
-
-    # Per-cell flat epilogue.
-    gated = _gate_linear_chain(epilogue, acc_name, k_s_name)
-    if gated is None:
-        return stmts
-    return reduce_part + gated
-
-
-def _gate_linear_chain(stmts: tuple[Stmt, ...], acc_name: str, k_s_name: str) -> tuple[Stmt, ...] | None:
-    """Apply the K_s == 0 ``Cond`` wrap to a flat ``[Load*, Assign*, Write]``
-    chain that's structurally linear in ``acc_name``.
-
-    Returns ``(cond,)`` — a single-element tuple holding the wrapped
-    chain — or ``None`` if the chain doesn't match the linear-residual
-    shape (no Write, vector Write, multi-Write, non-linear Assign chain).
-    The caller splices the result into the surrounding sibling list."""
-    writes = [s for s in stmts if isinstance(s, Write)]
+    writes = [s for s in epilogue if isinstance(s, Write)]
     if len(writes) != 1:
-        return None
+        return stmts
     write = writes[0]
     if write.is_vector:
-        return None
-    assigns_by_name = {s.name: s for s in stmts if isinstance(s, Assign)}
+        return stmts
+    assigns_by_name = {s.name: s for s in epilogue if isinstance(s, Assign)}
     if not is_linear_in_accum(write.value, acc_name, assigns_by_name):
-        return None
+        return stmts
     write_acc = Write(
         output=write.output,
         index=write.index,
@@ -210,7 +161,7 @@ def _gate_linear_chain(stmts: tuple[Stmt, ...], acc_name: str, k_s_name: str) ->
     )
     cond = Cond(
         cond=BinaryExpr("==", Var(k_s_name), Literal(0, "int")),
-        body=Body(stmts),
+        body=Body(epilogue),
         else_body=Body((write_acc,)),
     )
-    return (cond,)
+    return reduce_part + (cond,)
