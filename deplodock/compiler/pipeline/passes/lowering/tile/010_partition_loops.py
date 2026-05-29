@@ -79,7 +79,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
@@ -91,6 +91,7 @@ from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
 from deplodock.compiler.pipeline.pipeline import Fork
 
 
@@ -584,142 +585,6 @@ def _build_register_blocked_body(
     return tuple(out)
 
 
-def _stmt_contains_accum(stmt: Stmt) -> bool:
-    """True if ``stmt`` is or transitively contains an ``Accum``."""
-    if isinstance(stmt, Accum):
-        return True
-    for body in stmt.nested():
-        for s in body:
-            if _stmt_contains_accum(s):
-                return True
-    return False
-
-
-def _find_first_accum_name(stmts: tuple[Stmt, ...]) -> str | None:
-    """Return the first Accum's ``name`` found anywhere in ``stmts``,
-    or None if no Accum exists. Used by the SPLITK matmul-add lowering
-    to spell the else-branch ``Write(out, acc_name)``."""
-    for s in stmts:
-        if isinstance(s, Accum):
-            return s.name
-        for body in s.nested():
-            n = _find_first_accum_name(tuple(body))
-            if n is not None:
-                return n
-    return None
-
-
-def _is_linear_in_accum(value_name: str, acc_name: str, assigns_by_name: dict[str, Assign]) -> bool:
-    """True iff ``value_name`` is computed from ``acc_name`` via a chain of
-    ``add`` Assigns (any number of external Load arguments allowed).
-
-    Recurses through the SSA chain of Assigns that produces ``value_name``.
-    At each ``Assign``, requires ``op == "add"`` and that at least one arg
-    transitively traces back to ``acc_name``. Bare Var args that are not
-    in ``assigns_by_name`` and not ``acc_name`` are treated as external
-    loads (residuals) — allowed under linearity. A non-``add`` Assign or
-    a chain that never reaches ``acc_name`` returns False."""
-    if value_name == acc_name:
-        return True
-    a = assigns_by_name.get(value_name)
-    if a is None:
-        return False
-    if a.op.name != "add":
-        return False
-    return any(arg == acc_name or _is_linear_in_accum(arg, acc_name, assigns_by_name) for arg in a.args)
-
-
-def _has_nonlinear_post_reduce_epilogue(stmts: tuple[Stmt, ...]) -> bool:
-    """True iff ``stmts`` has any post-reduce epilogue that is NOT a linear
-    add chain over the Accum.
-
-    Used by ``_split_kernel_fully`` to decide ``force_splitk_one`` for
-    matmul-shape kernels: linear epilogues (``matmul_add``) are handled by
-    ``_gate_linear_epilogue_on_k_s_zero`` in ``_build_split_body``;
-    non-linear ones (e.g. ``v = acc * r``) must run at SPLITK=1."""
-    epilogue = tuple(s for s in stmts if not _stmt_contains_accum(s))
-    if not epilogue:
-        return False
-    writes = [s for s in epilogue if isinstance(s, Write)]
-    if len(writes) != 1:
-        return True
-    write = writes[0]
-    if write.is_vector:
-        return True
-    acc_name = _find_first_accum_name(stmts)
-    if acc_name is None:
-        return True
-    assigns_by_name = {s.name: s for s in epilogue if isinstance(s, Assign)}
-    return not _is_linear_in_accum(write.value, acc_name, assigns_by_name)
-
-
-def _gate_linear_epilogue_on_k_s_zero(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]:
-    """Rewrite ``stmts`` so the linear post-reduce epilogue runs only on
-    the ``K_s == 0`` CTA, with the other CTAs atomic-adding the bare
-    Accum.
-
-    Input shape (matmul_add after ``_replace_k_loops``)::
-
-        [Load(r), <reduce tower>, Assign(v=acc+r), Write(out, v)]
-
-    Output shape::
-
-        [<reduce tower>,
-         Cond(K_s == 0,
-              body=[Load(r), Assign(v=acc+r), Write(out, v)],
-              else_body=[Write(out, acc)])]
-
-    Both Writes lower to ``atomicAdd`` under SPLITK > 1, so the final
-    output is ``sum_i acc_i + r`` — the residual added exactly once.
-    Returns ``stmts`` unchanged when no linear epilogue is present.
-
-    **Partition is positional, not set-based.** When the K-loop is fully
-    unrolled (BK=1 + K_o_ext=1, i.e. ``_wrap_tower`` drops both K_o and
-    K_i as size-1) the Loads / Assigns that *feed* the Accum end up as
-    siblings of the Accum at this level. Those are reduce-body stmts,
-    not epilogue — they must stay with the Accum, not get moved into
-    the Cond (which would leave the Accum referencing values defined
-    inside a scope it no longer dominates). Split at the position of
-    the last Accum-bearing stmt: ``[:cut+1]`` is the reduce body that
-    the Cond skips over; ``[cut+1:]`` is the true post-reduce epilogue.
-    """
-    last_accum_idx = -1
-    for i, s in enumerate(stmts):
-        if _stmt_contains_accum(s):
-            last_accum_idx = i
-    if last_accum_idx < 0:
-        return stmts
-    reduce_part = stmts[: last_accum_idx + 1]
-    epilogue = stmts[last_accum_idx + 1 :]
-    if not epilogue:
-        return stmts
-    writes = [s for s in epilogue if isinstance(s, Write)]
-    if len(writes) != 1:
-        return stmts
-    write = writes[0]
-    if write.is_vector:
-        return stmts
-    acc_name = _find_first_accum_name(stmts)
-    if acc_name is None:
-        return stmts
-    assigns_by_name = {s.name: s for s in epilogue if isinstance(s, Assign)}
-    if not _is_linear_in_accum(write.value, acc_name, assigns_by_name):
-        return stmts
-
-    write_acc = Write(
-        output=write.output,
-        index=write.index,
-        value=acc_name,
-        value_dtype=write.value_dtype,
-    )
-    cond = Cond(
-        cond=BinaryExpr("==", Var(k_s_name), Literal(0, "int")),
-        body=Body(epilogue),
-        else_body=Body((write_acc,)),
-    )
-    return reduce_part + (cond,)
-
-
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
@@ -816,7 +681,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> _Pl
         # so ``sum_i acc_i + r = c·sum_k a_k + r``. Non-linear epilogues
         # (e.g. ``v = acc * r``) fall through here and force splitk=1.
         multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
-        has_nonlinear_epilogue = _has_nonlinear_post_reduce_epilogue(outer_n.body)
+        has_nonlinear_epilogue = has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
         # A fused prologue (SDPA P@V: softmax max/sum) carries a per-M-row
         # reduction whose accumulators must reset per register cell. Masking a
@@ -1388,13 +1253,13 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         )
         if n_replaced == 0:
             raise _BuildSkipped("K reduce not found in body")
-        # SPLITK > 1 with a linear residual epilogue (matmul_add):
-        # hoist ``Load(r) + Assign(v=acc+r) + Write(v)`` behind
-        # ``Cond(K_s == 0)`` so the residual is added exactly once across
-        # the K_s CTAs (other K_s atomic-add the bare Accum). No-op for
-        # plain matmul / non-SPLITK / non-linear epilogues.
-        if K_s is not None:
-            new_inner = _gate_linear_epilogue_on_k_s_zero(new_inner, K_s.name)
+        # SPLITK > 1 with a linear residual epilogue (matmul_add) is gated
+        # post-planner by ``015_gate_splitk_residual``, which finds the
+        # K_s axis in the wrapped GridTile and hoists the linear epilogue
+        # under ``Cond(K_s == 0)`` so the residual is added exactly once
+        # across the K_s CTAs. We only have to keep ``force_splitk_one``
+        # at enumeration time so non-linear epilogues don't even reach
+        # the gate pass.
     else:
         new_inner = inner_after_outer
 
@@ -1409,9 +1274,10 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # K-reduce (mean / softmax stats) still runs once at the M_r scope; the
     # blocked transform only touches the matmul body's K_i.
     # The blocked builder declines (returns None) on shapes it can't yet
-    # handle — SPLITK > 1 (``_gate_linear_epilogue_on_k_s_zero``'s Cond
-    # wrap and 020_stage_inputs's slab-shape inference for the inner-
-    # RegisterTile Load haven't been generalised yet), BR > 1's
+    # handle — SPLITK > 1 (the K_s == 0 Cond wrap from
+    # ``015_gate_splitk_residual`` and 020_stage_inputs's slab-shape
+    # inference for the inner-RegisterTile Load haven't been generalised
+    # yet), BR > 1's
     # cooperative-K combine, M-mask, and F_N = 1 (no register-tile benefit
     # anyway, and the downstream staging passes get the wrong slab geometry
     # on the inner N_r=1 wrap) — the per-cell legacy path below picks up
