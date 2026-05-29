@@ -232,13 +232,9 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # The trailing fence routes to a named ``bar.sync`` when we're
         # inside a WarpSpecialize consumer subtree (``__syncthreads()``
         # is CUDA UB on the warp-divergent producer/consumer branch).
-        # Two channels supply the params, in priority order:
-        #
-        #   1. ``ws_consumer`` (preferred) — derive participants from
-        #      the WS context the materializer threads into the consumer
-        #      subtree walk. Used by ``emit_warp_specialize``.
-        #   2. ``stmt.barrier_id`` / ``stmt.barrier_count`` (legacy) —
-        #      085 stamps these for backward compat; deleted in C4.
+        # ``ws_consumer`` is threaded in by ``emit_warp_specialize`` and
+        # carries the producer thread count, from which the materializer
+        # derives the consumer participant count for ``bar.sync N, M``.
         if ws_consumer is not None:
             outer_ext = thread_axes[0].extent.as_static()
             inner_prod = 1
@@ -248,7 +244,7 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
             n_cons = (outer_ext - extension) * inner_prod
             trailing_sync = Sync(barrier_id=1, count=n_cons)
         else:
-            trailing_sync = Sync(barrier_id=stmt.barrier_id, count=stmt.barrier_count)
+            trailing_sync = Sync()
         if stmt.phase is not None and tma.has_tma:
             gid = tma.wait_group.get(id(stmt))
             if gid is not None:

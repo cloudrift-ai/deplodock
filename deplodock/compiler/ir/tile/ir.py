@@ -123,20 +123,19 @@ class AsyncWait(Stmt):
       the consumer-side ``MbarrierWait``. ``phase = (K_o / bc) % 2``
       tracks how many times the slot has been reused; ``slot = K_o % bc``
       picks the ring slot to wait on.
-    - ``barrier_id`` / ``barrier_count`` — named-barrier params for the
-      trailing CTA-fence ``Sync`` that the materializer emits after the
-      ``MbarrierWait``. Default 0 → ``__syncthreads()``. Set by
-      ``085_warp_specialize`` on consumer-side AsyncWaits (with a
-      non-zero ``barrier_id`` and ``barrier_count == n_consumer_threads``)
-      because ``__syncthreads()`` inside the WS consumer's ``Cond``
-      branch is CUDA UB on the warp-divergent condition.
+
+    The trailing CTA-fence ``Sync`` after the materializer's
+    ``MbarrierWait`` / ``CpAsyncWait`` defaults to ``__syncthreads()``.
+    Inside a WS consumer subtree it routes to a named ``bar.sync N, M``
+    instead — the materializer derives the named-barrier params from
+    the enclosing ``WarpSpecialize`` context, not from fields on this
+    Stmt. (``__syncthreads()`` is CUDA UB on the warp-divergent
+    producer/consumer branch.)
     """
 
     keep: int = 0
     phase: Expr | None = None
     slot: Expr | None = None
-    barrier_id: int = 0
-    barrier_count: int | None = None
 
     def exprs(self) -> tuple[Expr, ...]:
         out: tuple[Expr, ...] = ()
@@ -152,8 +151,6 @@ class AsyncWait(Stmt):
             extra += f", phase={self.phase.pretty()}"
         if self.slot is not None:
             extra += f", slot={self.slot.pretty()}"
-        if self.barrier_id != 0:
-            extra += f", bar={self.barrier_id}/{self.barrier_count}"
         return [f"{indent}AsyncWait(keep={self.keep}{extra})"]
 
 
