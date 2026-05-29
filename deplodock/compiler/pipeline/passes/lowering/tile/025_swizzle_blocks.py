@@ -28,7 +28,7 @@ axis identities, unaffected by a later swizzle stamp) and before
 ``025_unify_sibling_stages``. The exact position inside the lowering
 chain doesn't matter as long as no later pass rebuilds the GridTile
 without propagating ``swizzle_group_m`` — every such rebuilder in the
-codebase (``tile/_helpers.replace_thread_tile_body``,
+codebase (``tile/_helpers.replace_parallel_tile_body``,
 ``tile/085_warp_specialize``, ``kernel/100_materialize_tile``,
 ``kernel/110_drop_redundant_syncs``, ``ir/tile/passes`` Sigma rewrite)
 threads the field through.

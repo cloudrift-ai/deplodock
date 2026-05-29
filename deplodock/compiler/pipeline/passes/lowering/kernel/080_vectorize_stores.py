@@ -39,7 +39,7 @@ from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.stmt import Body, Cond, Stmt, Write
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, Stage, StageBundle, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, Stage, StageBundle, StridedTile, ThreadTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -90,7 +90,7 @@ def _vectorize_body(top: TileOp, body: Body, atomic_write_ids: frozenset[int]) -
                     else_body=_vectorize_body(top, s.else_body, atomic_write_ids),
                 )
             )
-        elif isinstance(s, (GridTile, ThreadTile)):
+        elif isinstance(s, (GridTile, ThreadTile, WarpTile)):
             descended.append(s.with_bodies((_vectorize_body(top, s.body, atomic_write_ids),)))
         else:
             descended.append(s)

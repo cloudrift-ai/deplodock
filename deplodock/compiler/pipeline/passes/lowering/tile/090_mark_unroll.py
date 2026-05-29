@@ -23,7 +23,7 @@ from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -59,7 +59,7 @@ def _walk_stmt(s: Stmt) -> tuple[Stmt, bool]:
         if new_body != s.body:
             return replace(s, body=new_body), inner_changed
         return s, False
-    if isinstance(s, (GridTile, ThreadTile, RegisterTile)):
+    if isinstance(s, (GridTile, ThreadTile, RegisterTile, WarpTile)):
         new_body, c = _walk_body(s.body)
         if c:
             return s.with_bodies((new_body,)), True

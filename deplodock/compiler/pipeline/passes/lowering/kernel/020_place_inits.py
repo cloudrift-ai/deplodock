@@ -40,6 +40,7 @@ from deplodock.compiler.ir.tile.ir import (
     StridedTile,
     ThreadTile,
     TileOp,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -93,7 +94,10 @@ def _place_inits_in_body(body: tuple, accumulating_dtype: DataType, selecting_dt
     """
 
     def _open_scope(stmts: tuple) -> tuple:
-        # Find the deepest ThreadTile / GridTile and recurse into its body.
+        # Find the deepest inner ParallelTile (ThreadTile or WarpTile) and
+        # recurse into its body. WarpTile is treated the same as ThreadTile
+        # at this scope: both bind the per-binding-tier coord that scopes
+        # Init placement.
         out: list[Stmt] = []
         opened = False
         for s in stmts:
@@ -101,7 +105,7 @@ def _place_inits_in_body(body: tuple, accumulating_dtype: DataType, selecting_dt
                 new_inner = _open_scope(tuple(s.body))
                 out.append(s.with_bodies((new_inner,)))
                 opened = True
-            elif isinstance(s, ThreadTile):
+            elif isinstance(s, (ThreadTile, WarpTile)):
                 new_inner = _place_inits_in_scope(tuple(s.body), accumulating_dtype, selecting_dtype)
                 out.append(s.with_bodies((new_inner,)))
                 opened = True

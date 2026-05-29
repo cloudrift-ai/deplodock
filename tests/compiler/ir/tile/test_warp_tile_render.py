@@ -121,3 +121,71 @@ def test_warp_kernel_nvrtc_compiles():
     # below triggers PTX compilation and surfaces any syntax error.
     raw = cp.RawKernel(src, "k_warp_smoke")
     _ = raw.kernel  # forces compile
+
+
+# ---------------------------------------------------------------------------
+# Full-pipeline integration: TileOp through the materializer to a KernelOp,
+# then render. Confirms no downstream pass crashes on the WarpTile flavor —
+# the M4 audit's safety net.
+# ---------------------------------------------------------------------------
+
+import importlib  # noqa: E402
+
+from deplodock.compiler.context import Context  # noqa: E402
+from deplodock.compiler.graph import Graph  # noqa: E402
+from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: E402
+from deplodock.compiler.ir.tile.ir import TileOp  # noqa: E402
+from deplodock.compiler.tensor import Tensor  # noqa: E402
+
+
+_mat = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
+
+
+def _materialize(tile_op: TileOp) -> KernelOp:
+    g = Graph()
+    g.add_node(op=tile_op, inputs=[], output=Tensor(tile_op.name, ()), node_id="op")
+    node = g.nodes["op"]
+    ctx = Context(compute_capability="sm_80")
+    result = _mat.rewrite(ctx, node)
+    assert isinstance(result, KernelOp), f"expected KernelOp, got {type(result).__name__}"
+    return result
+
+
+def test_warp_tileop_through_materializer_keeps_warp_tile_wrapper():
+    """A TileOp with ``GridTile > WarpTile > body`` materializes into a
+    ``KernelOp`` with the same outer structure — the WarpTile wrapper
+    survives so kernel render emits the ``warp_id`` / ``lane`` decode."""
+    M_b = Axis("m_b", 4)
+    M_w = Axis("m_w", 2)
+    load = Load(name="one", input="one_const", index=())
+    write = Write(output="C", index=(Var("m_b"), Var("m_w")), value="one")
+    warp = WarpTile(axes=(M_w,), body=Body((load, write)))
+    grid = GridTile(axes=(M_b,), body=Body((warp,)))
+    tile_op = TileOp(body=Body((grid,)), name="k_warp_pipeline")
+    kop = _materialize(tile_op)
+    # The body's outermost is still a GridTile wrapping a WarpTile.
+    assert isinstance(kop.body[0], GridTile)
+    inner = kop.body[0].body[0]
+    assert isinstance(inner, WarpTile)
+
+
+def test_warp_tileop_renders_through_materializer():
+    """End-to-end: TileOp → KernelOp via materializer → CUDA via render.
+    Sanity-checks all the M4 downstream-pass-audit work hasn't broken
+    the rendered output for the WarpTile shape."""
+    M_b = Axis("m_b", 4)
+    M_w = Axis("m_w", 2)
+    load = Load(name="one", input="one_const", index=())
+    write = Write(output="C", index=(Var("m_b"), Var("m_w")), value="one")
+    warp = WarpTile(axes=(M_w,), body=Body((load, write)))
+    grid = GridTile(axes=(M_b,), body=Body((warp,)))
+    tile_op = TileOp(body=Body((grid,)), name="k_warp_pipeline_render")
+    kop = _materialize(tile_op)
+    src = render_kernelop(kop, shapes={"C": (4, 2)}, literal_constants=_LITERALS)
+    assert "__launch_bounds__(64)" in src
+    assert "int warp_id = threadIdx.x / 32;" in src
+    assert "int lane = threadIdx.x & 31;" in src
+    # ``TileOp.__post_init__`` runs ``normalize_body`` which canonicalises
+    # axis names (m_b → a0, m_w → a1). The block-axis decode renders the
+    # canonical name regardless.
+    assert "= blockIdx.x;" in src

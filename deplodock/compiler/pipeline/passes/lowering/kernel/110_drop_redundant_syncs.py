@@ -30,7 +30,7 @@ from deplodock.compiler.ir.kernel.ir import (
     WarpShuffle,
 )
 from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile
+from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -84,20 +84,22 @@ def rewrite(root: Node) -> Graph | None:
     op: KernelOp = root.op
     changed = False
 
-    def clean_thread_tile(tt: ThreadTile) -> ThreadTile:
+    def clean_parallel_tile(tt: ThreadTile | WarpTile) -> ThreadTile | WarpTile:
         nonlocal changed
         deduped = _drop_redundant_syncs(tuple(tt.body))
         if list(deduped) != list(tt.body):
             changed = True
+        if isinstance(tt, WarpTile):
+            return WarpTile(axes=tt.axes, body=Body(deduped))
         return ThreadTile(axes=tt.axes, body=Body(deduped))
 
     new_body: list[Stmt] = []
     for s in op.body:
         if isinstance(s, GridTile):
-            new_children = [clean_thread_tile(c) if isinstance(c, ThreadTile) else c for c in s.body]
+            new_children = [clean_parallel_tile(c) if isinstance(c, (ThreadTile, WarpTile)) else c for c in s.body]
             new_body.append(GridTile(axes=s.axes, body=Body(new_children), swizzle_group_m=s.swizzle_group_m))
-        elif isinstance(s, ThreadTile):
-            new_body.append(clean_thread_tile(s))
+        elif isinstance(s, (ThreadTile, WarpTile)):
+            new_body.append(clean_parallel_tile(s))
         else:
             new_body.append(s)
 
