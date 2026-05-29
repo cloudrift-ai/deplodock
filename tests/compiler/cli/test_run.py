@@ -54,6 +54,14 @@ def test_run_code_matmul_accuracy(run_cli, dtype):
 
 
 @requires_cuda
+def test_run_code_target_override(run_cli):
+    """``--target sm_80`` gates lowering to the cp.async path (no TMA); the kernel still runs
+    on the live device and must match eager, so ``rc == 0`` is the accuracy assertion."""
+    rc, _, stderr = run_cli("run", "--code", "torch.matmul(torch.randn(256, 256), torch.randn(256, 256))", "--target", "sm_80")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
 def test_run_code_rmsnorm_blockify(run_cli, dtype):
     """Wide hidden + ≥16 rows triggers blockify on the row axis. Regression
     test: cooperative load step must match the actual thread count, not

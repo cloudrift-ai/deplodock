@@ -88,15 +88,19 @@ def register_run_command(subparsers):
         ),
     )
     from deplodock.commands.compile import add_nvcc_args
+    from deplodock.compiler.target import add_target_arg
 
     add_nvcc_args(parser)
+    add_target_arg(parser)
     parser.set_defaults(func=handle_run)
 
 
 def handle_run(args):
     from deplodock.commands.compile import apply_nvcc_flags
+    from deplodock.compiler.target import apply_target_arg
 
     apply_nvcc_flags(args, default="")  # run uses nvcc default -O3 (representative codegen)
+    apply_target_arg(args)  # --target sm_NN gates TMA / cp.async like the target GPU would
     verbose = getattr(args, "verbose", 0)
     if verbose == 0:
         logging.getLogger().setLevel(logging.WARNING)
