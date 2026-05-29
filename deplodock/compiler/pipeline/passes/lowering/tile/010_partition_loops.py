@@ -932,13 +932,20 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # handle — SPLITK > 1 (the K_s == 0 Cond wrap from
     # ``015_gate_splitk_residual`` and 020_stage_inputs's slab-shape
     # inference for the inner-RegisterTile Load haven't been generalised
-    # yet), BR > 1's
-    # cooperative-K combine, M-mask, and F_N = 1 (no register-tile benefit
-    # anyway, and the downstream staging passes get the wrong slab geometry
-    # on the inner N_r=1 wrap) — the per-cell legacy path below picks up
-    # those cases.
+    # yet), BR > 1's cooperative-K combine, M-mask — the per-cell legacy
+    # path below picks up those cases.
+    #
+    # FN == 1 is no longer disqualified: the blocked builder degenerates
+    # to three sibling ``RegisterTile(N_r=1)`` towers; the replicator
+    # (``lowering/kernel/010_split_register_axes``) unwraps each (one cell,
+    # σ ``N_r → 0``), so the end-state IR is structurally identical to
+    # the legacy per-cell layout. ``SerialTileBase.is_reduce`` walks
+    # through the per-tower ``RegisterTile`` wrappers so the staging
+    # passes see K_i as a reduce; ``025_unify_sibling_stages`` then drops
+    # any redundant matmul Stage that would re-stage a buffer already
+    # staged in a prior sibling scope (the fused-RMSNorm + linear case).
     reg_blocked = False
-    if params.splitk == 1 and params.br == 1 and params.fn > 1 and shape.k_loop is not None and m_bound is None:
+    if params.splitk == 1 and params.br == 1 and shape.k_loop is not None and m_bound is None:
         if n_bound is not None:
             # Masked N: wrap each tower's leaf body in its own Cond. The
             # replicator (010_split_register_axes) replicates the Cond per

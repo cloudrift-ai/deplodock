@@ -121,8 +121,36 @@ axis filter becomes structurally identical to per-cell layout. Verify:
   bug at `010_partition_loops.py:932–934`) — fix it here if it breaks, or document why it doesn't
   trigger at FN=1.
 
-> **Investigation note (2026-05-28).** Phase 2 was attempted on `feature/dedup-replicated-pass`
-> and reverted; the blocker is deeper than the plan body suggests.
+> **Phase 2 landed (2026-05-28).** The full FN=1 gate flip + all dependencies are on
+> `feature/dedup-replicated-pass`. End state: `make test` 1387 passed; plain matmul FN=1 now
+> stages both operands, gets the `BUFFERED`/`ASYNC`/pad promotions; the fused-RMSNorm + linear
+> blocked-prologue case still emits one `x_smem` decl.
+>
+> The fix needed three coordinated changes:
+> 1. **`SerialTileBase.is_reduce` walks through transparent wrappers** (`RegisterTile` / `Cond`).
+>    The blocked-GEMM nest nests the K-reduce `Accum` inside `RegisterTile(N_r)`, which had
+>    historically hidden it from every downstream pass that checks `s.is_reduce` (`020_stage_inputs`,
+>    `040_use_ring_buffers`, `080_pipeline_stages`, `030_hoist_invariant_compute`,
+>    `100_materialize_tile`, kernel `_combine.py`).
+> 2. **`020_stage_inputs` walks Load collection through `RegisterTile`** (with unit-axis
+>    substitution to 0). Without this, only the N-invariant cone Load (`Load a`) reaches the
+>    staging candidate set on the blocked path; the N-dependent inner Load (`Load b`) stays
+>    behind the `RegisterTile` wrapper. Pre-substituting unit axes (FN=1 / FM=1) on the way out
+>    matches the kernel-IR replicator's eventual `σ axis → 0` and keeps the slab geometry +
+>    producer cooperative-load addressing identical to the per-cell FN=1 layout.
+> 3. **New pass `025_unify_sibling_stages`** drops every `Source` whose `buf` is already staged
+>    by an earlier sibling scope and rewrites its consumer Loads back to gmem (rebuilding the
+>    original index from `Source.origin` + `cache_dims`, or copying `template_index` verbatim).
+>    The matmul's K_i — now visible as a reduce per (1) and contributing Sources per (2) — would
+>    otherwise re-stage `x` in the fused-prologue case and emit a second `__shared__ float
+>    x_smem_1`. With `025` it drops cleanly and matmul reads `x` from gmem the same way the
+>    legacy per-cell path did, while plain-matmul (no prior staging of `a`/`b`) keeps its single
+>    Stage and goes through `BUFFERED → ASYNC` / TMA promotion as usual.
+>
+> The architectural insight that motivated this plan — *per-cell + dedup = blocked* — still
+> holds for the kernel-IR side (Phase 1's `011_dedup_replicated.py`). Phase 2 demonstrates that
+> the *tile-IR* side also requires the staging machinery to walk through `RegisterTile`. Both
+> together let blocked-FN=1 take the same code paths as per-cell-FN=1 without smem regressions.
 >
 > The structural claim "blocked-FN=1 == per-cell after size-1 filter" is true **only after**
 > `lowering/kernel/010_split_register_axes` unwraps the `RegisterTile(N_r=1)` wrappers — i.e. at
