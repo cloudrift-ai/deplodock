@@ -158,6 +158,100 @@ class AsyncWait(Stmt):
 
 
 # ---------------------------------------------------------------------------
+# WarpSpecialize — producer/consumer split for TMA-pipelined kernels
+# ---------------------------------------------------------------------------
+#
+# Tile-IR marker that the materializer (``100_materialize_tile``) lowers
+# into the full mbarrier handshake: empty-mbarrier ring (``Smem`` +
+# per-slot ``MbarrierInit``), per-K_o ``MbarrierWait`` / ``MbarrierArrive``
+# pairs, named ``bar.sync`` consumer fences, ``SetMaxNReg`` register
+# budget redistribution, and the producer/consumer ``Cond`` wrapper.
+#
+# The pass that emits this (``085_warp_specialize``) keeps all Tile-IR
+# vocabulary — no ``from deplodock.compiler.ir.kernel.ir import …``.
+# Companion to 080's ``AsyncWait``: where ``AsyncWait`` lets the pass
+# declare "wait for an async chunk, materializer picks the primitive",
+# ``WarpSpecialize`` lets the pass declare "split this ThreadTile body
+# into producer and consumer roles, materializer wires the rest".
+
+
+@dataclass(frozen=True)
+class WarpSpecialize(Stmt):
+    """Producer/consumer warp split inside a TMA-pipelined ThreadTile.
+
+    Fields:
+
+    - ``producer_body`` — stmts run by producer threads (TMA-issue
+      ``StageBundle`` scaffolding inside ``SerialTile(serial_outer)``).
+    - ``consumer_body`` — stmts run by consumer threads (``AsyncWait`` +
+      reduce loop + output ``Write``). Already σ-shifted by the pass so
+      every reference to the extended thread axis sees the original
+      ``[0, n_consumer_threads)`` range.
+    - ``ring_depth`` — empty-mbarrier slot count (== TMA buffer_count).
+    - ``n_producer_threads`` — for SetMaxNReg accounting (producers get
+      a small budget so consumers can claim the rest) and for deriving
+      the producer/consumer ``Cond`` predicate from the enclosing
+      ThreadTile.
+
+    The K_o axis the WS pass aligned scheduling against is identified by
+    the materializer structurally — the (single) ``SerialTile(serial_outer)``
+    in each branch. Carrying the axis *name* would break under
+    ``normalize_body``'s canonical rename pass (which renames Axis but
+    can't see a plain string field).
+
+    Other quantities (``predicate``, ``n_consumer_threads``, slot/phase
+    exprs, mbar name) are derivable from these fields plus the enclosing
+    ThreadTile.axes and are reconstructed at materialize time.
+
+    Nested ``WarpSpecialize`` is rejected at construction.
+    """
+
+    producer_body: Body
+    consumer_body: Body
+    ring_depth: int
+    n_producer_threads: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.producer_body, Body):
+            object.__setattr__(self, "producer_body", Body.coerce(self.producer_body))
+        if not isinstance(self.consumer_body, Body):
+            object.__setattr__(self, "consumer_body", Body.coerce(self.consumer_body))
+        if self.ring_depth < 1:
+            raise ValueError(f"WarpSpecialize: ring_depth must be >= 1, got {self.ring_depth}")
+        if self.n_producer_threads < 1:
+            raise ValueError(f"WarpSpecialize: n_producer_threads must be >= 1, got {self.n_producer_threads}")
+        # Nesting check — a WS inside another WS would require the
+        # materializer to track a stack of ws_consumer contexts; today
+        # 085 guards via the WS knob on the parent TileOp, but assert at
+        # the IR level so other rules can't sneak one in.
+        for body in (self.producer_body, self.consumer_body):
+            for s in body.iter():
+                if isinstance(s, WarpSpecialize):
+                    raise ValueError("WarpSpecialize cannot nest")
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.producer_body, self.consumer_body)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        if len(bodies) != 2:
+            raise ValueError(f"WarpSpecialize.with_bodies: expected 2 bodies, got {len(bodies)}")
+        producer_body, consumer_body = bodies
+        return replace(self, producer_body=producer_body, consumer_body=consumer_body)
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return ()
+
+    def pretty(self, indent: str = "") -> list[str]:
+        head = f"{indent}warp_specialize(ring={self.ring_depth}, n_prod={self.n_producer_threads}):"
+        producer_lines = [f"{indent}{INDENT}producer:", *pretty_body(self.producer_body, indent + INDENT * 2)]
+        consumer_lines = [f"{indent}{INDENT}consumer:", *pretty_body(self.consumer_body, indent + INDENT * 2)]
+        return [head, *producer_lines, *consumer_lines]
+
+
+# ---------------------------------------------------------------------------
 # Stage primitives: Source + CacheDim + AffineAddressing/TemplateAddressing
 # ---------------------------------------------------------------------------
 
