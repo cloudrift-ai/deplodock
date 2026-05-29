@@ -41,6 +41,25 @@ context available in one place.
 Runs after ``040_demote_to_write_dtype`` so the demote pass sees the
 original scalar Loads (the demote analysis is on Assigns, not Loads,
 so order is mostly independent; this is the conservative ordering).
+
+## Observed impact (RTX 5090, nvcc 13.0)
+
+Like ``095_interleave_loads``, this is an IR-legibility pass more than a
+perf lever in practice. On a 2048x2048 fp32 SGEMM at the optimal tile
+(``FM=FN=8``, ``BK=16``) the measured delta between vectorized and scalar
+Loads is **zero** at every opt level (``-Xcicc -O0`` through ``-O3``,
+``-Xptxas -O0``): nvcc re-coalesces the runs of consecutive scalar smem
+Loads into ``LDS.128`` on its own, and a well-tiled matmul is FMA-bound, so
+the LDS transaction width is not the bottleneck. (Memory coalescing is still
+a real win on hand-written kernels where you control the loads and the
+toolchain will not fix uncoalesced access — but as an IR pass layered on top
+of nvcc it is redundant with the back-end's own load coalescing.)
+
+The pass folds the runs anyway so ``--ir kernel`` / ``--ir cuda`` show one
+wide ``Load`` instead of N scalar ones, matching the hand-written SGEMM
+shape. ``VECTORIZE_LOADS`` is *not* a search dimension — only ``True`` is
+enumerated, so the autotuner never forks on it. ``DEPLODOCK_VECTORIZE_LOADS=0``
+remains a manual override for inspecting the scalar-load form.
 """
 
 from __future__ import annotations
@@ -53,13 +72,26 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
 _TARGET = CudaRenderTarget()
 
+VECTORIZE_LOADS = Knob(
+    "VECTORIZE_LOADS",
+    KnobType.BOOL,
+    hints=(True,),  # on by default; not a search dimension — manual override only via the env var
+    help="Fold runs of consecutive scalar Loads into one wide vector Load (float4 / __half2).",
+)
+
 
 def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
+    # Only ``True`` is enumerated, so the autotuner never forks on this knob;
+    # ``DEPLODOCK_VECTORIZE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
+    # pin authoritatively, even when it is not in the candidate set).
+    if not VECTORIZE_LOADS.narrow((True,))[0]:
+        raise RuleSkipped("VECTORIZE_LOADS=0 pinned")
     top: TileOp = root.op
     new_body = _vectorize_body(top, top.body)
     if new_body == top.body:

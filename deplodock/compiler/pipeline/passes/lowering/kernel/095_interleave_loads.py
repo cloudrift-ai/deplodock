@@ -64,18 +64,24 @@ materializer runs after (it lowers the body to KernelOp; sinking has
 to happen at TileOp / Loop level where the per-stmt SSA mutation is
 still cheap).
 
-A note on observed impact (RTX 5090, ptxas 13.0): the IR-level
-transformation produces visibly cleaner CUDA source (each smem load
-adjacent to its first FMA-consumer rather than 12-up-front-then-32-
-FMAs), but the measured perf delta across the BM/BN/FM/FN sweep is
-near zero (±1 %) — ptxas's instruction scheduler is already
-reordering across the flat 12-LDS + 32-FFMA window. The pass stays
-on by default for source-level legibility (the dumped ``cuda.kernels``
-artifacts now match the article's hand-written shape), and so future
-codegen / SASS-level tooling has a more semantically-grounded IR to
-read. ``DEPLODOCK_INTERLEAVE_LOADS=0`` disables the pass if the
-flat-LDS layout ever measures faster than the sunk layout on a
-specific workload.
+A note on observed impact (RTX 5090, nvcc 13.0). The IR-level transform
+produces visibly cleaner CUDA source (each smem load adjacent to its
+first FMA-consumer rather than all-loads-up-front-then-the-FMAs). On a
+2048x2048 fp32 SGEMM at the deployable opt level (``-Xcicc -O2`` / ``-O3``)
+and the *optimal* wide tile (``FM=FN=8``, a 64-cell register tile) it is a
+small but consistent **~2 %** win: ~431 us sunk vs ~440 us flat, reproduced
+across ``-O2``, ``-O3``, and the default. The effect is tile- and
+opt-level-dependent: at ``-Xcicc -O0`` the unoptimized path prefers the flat
+layout (~5 % slower sunk), at ``-O1`` it is neutral, and on narrow tiles
+(e.g. ``FN=4``) it washes out as the toolchain reschedules across the flat
+LDS+FFMA window. So on the configuration you would actually ship it earns
+~2 %, which (with the source-level legibility) is why the pass is **on by
+default**.
+
+``INTERLEAVE_LOADS`` is therefore *not* a search dimension — only ``True`` is
+enumerated, so the autotuner never forks on it and the knob set stays small.
+``DEPLODOCK_INTERLEAVE_LOADS=0`` remains as a manual override for inspecting
+the flat layout or for a workload where it measures faster.
 
 Idempotent — a body already in interleaved form is a no-op.
 """
@@ -95,14 +101,16 @@ PATTERN = [Pattern("root", TileOp)]
 INTERLEAVE_LOADS = Knob(
     "INTERLEAVE_LOADS",
     KnobType.BOOL,
-    hints=(True, False),
+    hints=(True,),  # on by default; not a search dimension — manual override only via the env var
     help="Sink each Load to just before its first SSA-consumer in flat compute blocks.",
 )
 
 
 def rewrite(root: Node) -> TileOp | None:
-    enabled = INTERLEAVE_LOADS.narrow((True, False))[0]
-    if not enabled:
+    # Only ``True`` is enumerated, so the autotuner never forks on this knob;
+    # ``DEPLODOCK_INTERLEAVE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
+    # pin authoritatively, even when it is not in the candidate set).
+    if not INTERLEAVE_LOADS.narrow((True,))[0]:
         raise RuleSkipped("INTERLEAVE_LOADS=0 pinned")
     # Touch ``config`` so the import isn't optimized out — keeps the knob's
     # env read on the standard path (the env var → knob_raw path).
