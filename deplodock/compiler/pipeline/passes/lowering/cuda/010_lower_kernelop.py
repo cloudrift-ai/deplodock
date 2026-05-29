@@ -16,7 +16,7 @@ from deplodock.compiler.ir.cuda.ir import GridDimSpec
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile
+from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.tensor import Tensor
 
@@ -133,6 +133,13 @@ def _launch_geometry(
             for child in s.body:
                 if isinstance(child, ThreadTile):
                     block_spec = _axes_spec(child.axes)
+                    break
+                if isinstance(child, WarpTile):
+                    # Warp-cooperative kernel: each warp coord owns 32
+                    # threads (one warp). The block dimension is the
+                    # row-major-flattened warp-axis product × 32.
+                    warp_spec = _axes_spec(child.axes)
+                    block_spec = (*warp_spec, 32)
                     break
             return (grid_spec, (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen)
         if isinstance(s, ThreadTile):

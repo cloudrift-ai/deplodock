@@ -1,5 +1,5 @@
 """Warp specialization — emit a WS=0/1 Fork and (for WS=1) rewrite
-the ThreadTile body into the warp-specialized shape.
+the ThreadTile body into a ``WarpTile(role) > WarpSpecialize`` shape.
 
 Pattern-matches a ``TileOp`` whose body contains a TMA ``StageBundle``
 with ``pipeline_depth == 2`` inside a ``SerialTile(serial_outer)`` —
@@ -9,27 +9,33 @@ kernel. Emits a 2-child ``Fork``: ``WS=0`` returns the input unchanged,
 
 The structural rewrite (WS=1 only):
 
-1. **Extend the inner thread axis** by ``n_producer_threads /
-   inner_extent`` slots so the new axis range covers both producer
-   warps (first ``extension`` rows) and consumer warps (remaining rows).
-   Total CTA threads = product of (extended) ThreadTile axis extents,
-   which the kernel renderer picks up automatically for ``__launch_bounds__``.
-2. **σ-shift the consumer subtree** so every reference to the extended
-   axis sees its original (pre-extension) range. Producer threads have
-   axis values in ``[0, extension)``; consumer threads in ``[extension,
-   new_extent)`` which the σ shifts back to ``[0, original_extent)``
-   inside the consumer body — every Load/Write index, every Loop bound,
-   every cooperative-thread reference stays correct.
-3. **Split the body by role** into producer / consumer subtrees:
+1. **Replace the inner ``ThreadTile`` with a ``WarpTile``** whose single
+   ``role`` axis has extent equal to total CTA warps
+   (``n_producer_warps + n_consumer_warps``). Producer warps own
+   ``role ∈ [0, n_producer_warps)``; consumer warps own
+   ``role ∈ [n_producer_warps, total_warps)``. Total CTA threads =
+   ``role.extent × 32``, which the kernel renderer picks up
+   automatically for ``__launch_bounds__`` (see
+   ``ir/kernel/render._launch_bounds_for``'s ``WarpTile`` branch).
+2. **Split the body by role** into producer / consumer subtrees:
    - Producer subtree keeps ``StageBundle``s.
    - Consumer subtree keeps ``AsyncWait`` + reduce ``SerialTile`` +
      output ``Write``s.
+3. **Carry the original ``ThreadTile.axes``** on the ``WarpSpecialize``
+   Stmt as ``consumer_thread_axes``. The consumer body keeps its
+   references to those axis Vars *unshifted* — the materializer drops a
+   ``ThreadTile(consumer_thread_axes, tid_offset=n_producer_threads, …)``
+   inside the consumer ``Cond.else_body`` so consumer threads decode
+   ``threadIdx.x - n_producer_threads`` back into the original axis
+   range ``[0, n_consumer_threads)``. No σ-shift on the consumer subtree.
 4. **Package as a single Tile-IR ``WarpSpecialize`` Stmt** carrying the
-   role bodies, ring depth (= TMA buffer_count), and producer thread
-   count. The materializer (``100_materialize_tile.emit_warp_specialize``)
-   expands this into the empty-mbarrier ring, per-K_o handshake,
-   producer/consumer ``Cond`` wrapper, and ``SetMaxNReg`` register-
-   budget framing — none of which appear at Tile level.
+   role bodies, ring depth (= TMA buffer_count), producer thread count,
+   and ``consumer_thread_axes``. The materializer
+   (``100_materialize_tile.emit_warp_specialize``) expands this into the
+   empty-mbarrier ring, per-K_o handshake, producer/consumer ``Cond``
+   wrapper, ``SetMaxNReg`` register-budget framing, and the
+   consumer-side ``ThreadTile(tid_offset=…)`` decode — none of which
+   appear at Tile level.
 
 This pass stays inside the Tile-IR dialect — no ``from
 deplodock.compiler.ir.kernel.ir import …``. The boundary mirrors what
@@ -43,10 +49,14 @@ Eligibility:
   only buys schedule overlap on a depth-2 ring).
 - No cooperative ``Accum`` in the body — SDPA cooperative reductions
   need per-thread index remap that doesn't compose cleanly with the
-  σ-shift; deferred.
+  role-split decode; deferred.
 - ``n_producer_threads`` divides the inner thread-axis extent. Today
   only ``producer_warps=1`` (32 threads) is emitted, so the inner
   axis extent must divide 32 (any power-of-two 1..32 inclusive).
+- Total CTA threads (``prod(thread_axes.extent) + n_producer_threads``)
+  must be a multiple of 32 so the ``WarpTile`` role axis has integer
+  extent. Pre-extension matmul tiles satisfy this by construction
+  (``BM × BN`` is always a multiple of 32 for matmul shapes).
 
 ``DEPLODOCK_WS=0`` / ``DEPLODOCK_WS=1`` env pins narrow the fork via
 ``WS.narrow``.
@@ -55,10 +65,9 @@ Eligibility:
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
     GridTile,
@@ -69,6 +78,7 @@ from deplodock.compiler.ir.tile.ir import (
     ThreadTile,
     TileOp,
     WarpSpecialize,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -99,7 +109,12 @@ _N_PRODUCER_THREADS = _PRODUCER_WARPS * _WARP_SIZE
 def _find_thread_tile(body: Body) -> ThreadTile | None:
     """Locate the (single) ThreadTile in a TileOp body — either directly
     at the top level (pointwise shape) or nested inside a GridTile
-    (cooperative shape)."""
+    (cooperative shape).
+
+    Defensive: matches ``ThreadTile`` only (not ``WarpTile``). The pass
+    rewrites a scalar-tower input into the warp-tower output; if a
+    downstream emitter later produces a ``WarpTile``-bearing TileOp,
+    this pass will see no ThreadTile and skip cleanly."""
     for s in body:
         if isinstance(s, ThreadTile):
             return s
@@ -132,25 +147,30 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
     tt = _find_thread_tile(op.body)
     if tt is None:
         return False, "no ThreadTile in body"
-    outer = tt.axes[0]
-    if not outer.extent.is_static:
-        return False, "ThreadTile outer axis has symbolic extent"
-    # Extend the OUTERMOST axis by ``extension = n_producer_threads /
-    # inner_product``. The linear thread decode is row-major
-    # (outer = tid / inner_product; inner = tid % inner_product), so
-    # extending the outermost axis keeps producer threads contiguous
-    # as ``tid ∈ [0, n_producer_threads)`` — i.e. a single warp 0 for
-    # n_producer_threads=32. Extending an inner axis instead would
-    # scatter producer threads (tid 0, 1, BN, BN+1, ...) which breaks
-    # the warp-specialization invariant. The inner-axes product must
-    # divide n_producer_threads for the extension to be integer.
+    for ax in tt.axes:
+        if not ax.extent.is_static:
+            return False, "ThreadTile axis has symbolic extent"
+    consumer_threads = 1
+    for ax in tt.axes:
+        consumer_threads *= ax.extent.as_static()
+    # Inner-axis divisibility: ``n_producer_threads`` must split cleanly
+    # across the inner-axes product so the per-warp coord can replace
+    # the σ-arithmetic the old shape relied on. The historical extension
+    # arithmetic (extending the outer axis by ``n_producer_threads /
+    # inner_product``) needs the same divisibility — keeping it makes
+    # eligibility match the prior pass exactly even though the rewrite
+    # shape changed.
     inner_product = 1
     for ax in tt.axes[1:]:
-        if not ax.extent.is_static:
-            return False, "ThreadTile inner axis has symbolic extent"
         inner_product *= ax.extent.as_static()
     if _N_PRODUCER_THREADS % inner_product != 0:
         return False, (f"producer_threads ({_N_PRODUCER_THREADS}) must be divisible by inner thread-axes product ({inner_product})")
+    # Total CTA threads must be a multiple of warp_size so the role axis
+    # has integer extent. Matmul shapes satisfy this by construction;
+    # check explicitly for the corner cases.
+    total_threads = consumer_threads + _N_PRODUCER_THREADS
+    if total_threads % _WARP_SIZE != 0:
+        return False, f"total CTA threads ({total_threads}) not divisible by warp_size={_WARP_SIZE}"
     return True, ""
 
 
@@ -206,66 +226,59 @@ def _split_by_role(stmts: tuple[Stmt, ...]) -> tuple[list[Stmt], list[Stmt]]:
     return producer, consumer
 
 
-def _apply_sigma(body: Body, sigma: Sigma) -> Body:
-    """Apply ``sigma`` to every Stmt in ``body`` — substitutes the
-    extended-axis Var with its shifted form throughout. ``Stmt.rewrite``
-    on wrapper stmts (SerialTile, Cond, Loop, …) recursively rewrites
-    their bodies, so we only iterate the top level — using ``Body.map``
-    here would double-apply σ at every nesting level."""
-    return Body(tuple(s.rewrite(lambda n: n, sigma) for s in body))
-
-
 def _ws_transform(op: TileOp) -> TileOp:
     """Build the WS=1 TileOp by structurally rewriting ``op``'s body.
 
-    Output shape: the extended ThreadTile holds a single
-    ``WarpSpecialize`` carrying the two role bodies. The materializer
-    fabricates the mbarrier ring, handshake, register-budget framing,
-    and producer/consumer Cond wrapper from this marker."""
+    Output shape:
+
+        GridTile(M_b, N_b, …)
+          WarpTile(role: extent = total_warps)
+            WarpSpecialize(producer_body, consumer_body, ring_depth,
+                           n_producer_threads, consumer_thread_axes)
+
+    The materializer fabricates the mbarrier ring, role-split ``Cond``,
+    register-budget framing, and the consumer-side ``ThreadTile(tid_offset
+    = n_producer_threads, …)`` decode from this marker. The consumer
+    body's references to the original thread-axis Vars survive
+    unchanged — no σ-shift at the Tile-IR level (the decode in the
+    materializer's nested ``ThreadTile`` rebinds them to the consumer-
+    relative range)."""
     tt = _find_thread_tile(op.body)
     assert tt is not None  # _eligible enforces
 
-    outer = tt.axes[0]
-    inner_product = 1
-    for ax in tt.axes[1:]:
-        inner_product *= ax.extent.as_static()
-    extension = _N_PRODUCER_THREADS // inner_product
-    extended_outer = Axis(name=outer.name, extent=outer.extent + Literal(extension, "int"))
-    new_axes = (extended_outer, *tt.axes[1:])
-
-    # Sigma to shift the extended outer axis back into [0, outer_extent)
-    # inside the consumer body. Producer threads have outer-axis values
-    # in [0, extension); they never enter the consumer branch so the
-    # negative shift never appears in their executed code.
-    sigma = Sigma({outer.name: Var(outer.name) - Literal(extension, "int")})
+    consumer_threads = 1
+    for ax in tt.axes:
+        consumer_threads *= ax.extent.as_static()
+    total_warps = (consumer_threads + _N_PRODUCER_THREADS) // _WARP_SIZE
+    # Synthesise the role axis as a fresh name — ``normalize_body``
+    # canonicalises it to ``a<N>`` during ``TileOp.__post_init__`` so the
+    # placeholder name only matters for pretty-print of the un-normalized
+    # form.
+    role_axis = Axis(name="ws_role", extent=Dim(total_warps))
 
     bc = _first_buffer_count(op.body)
 
     # Split the original ThreadTile body into producer / consumer halves.
     prod_stmts, cons_stmts = _split_by_role(tuple(tt.body))
 
-    # Apply the σ-shift to the consumer subtree (every Load/Write index,
-    # Loop bound, Accum ref). Producer stays unshifted because producer
-    # threads have outer ∈ [0, extension) — exactly the pre-extension
-    # zero-based range.
-    cons_body = _apply_sigma(Body(tuple(cons_stmts)), sigma)
-
     ws = WarpSpecialize(
         producer_body=Body(tuple(prod_stmts)),
-        consumer_body=cons_body,
+        consumer_body=Body(tuple(cons_stmts)),
         ring_depth=bc,
         n_producer_threads=_N_PRODUCER_THREADS,
+        consumer_thread_axes=tt.axes,
     )
 
-    new_tt = ThreadTile(axes=new_axes, body=Body((ws,)))
+    new_warp_tile = WarpTile(axes=(role_axis,), body=Body((ws,)))
 
-    # Rewrap in GridTile if needed.
+    # Replace the inner ThreadTile with the new WarpTile, preserving the
+    # GridTile wrapper (if any).
     new_outer: list[Stmt] = []
     for s in op.body:
         if isinstance(s, ThreadTile):
-            new_outer.append(new_tt)
+            new_outer.append(new_warp_tile)
         elif isinstance(s, GridTile):
-            new_children = [new_tt if isinstance(c, ThreadTile) else c for c in s.body]
+            new_children = [new_warp_tile if isinstance(c, ThreadTile) else c for c in s.body]
             new_outer.append(GridTile(axes=s.axes, body=Body(new_children), swizzle_group_m=s.swizzle_group_m))
         else:
             new_outer.append(s)

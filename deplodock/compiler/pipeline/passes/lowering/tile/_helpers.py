@@ -1,9 +1,13 @@
 """Shared utilities for ``lowering/tile`` rules.
 
-- :func:`single_tile` — extract the unique ``Tile`` from a ``TileOp.body``,
-  raising ``RuleSkipped`` if there isn't exactly one. Eliminates the
+- :func:`single_tile` — extract the unique outer ``GridTile`` /
+  ``ThreadTile`` / ``WarpTile`` from a ``TileOp.body``, raising
+  ``RuleSkipped`` if there isn't exactly one. Eliminates the
   identical 5-line preamble at the top of nearly every rule in this
   directory.
+- :func:`parallel_tile_of` — return the per-binding-tier inner scope
+  (ThreadTile or WarpTile) for an outer ``GridTile`` / ``ThreadTile`` /
+  ``WarpTile``. ``thread_tile_of`` is kept as a deprecated alias.
 - :func:`is_matmul_reduce` — predicate on a reduce ``Loop``: body has
   ≥2 distinct K-indexed buffer Loads + at least one ``Accum``. The
   multiply between the two K-indexed Loads is implicit (the only way
@@ -30,7 +34,7 @@ from __future__ import annotations
 import logging
 
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, StridedLoop
-from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile
+from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import RuleSkipped
 
 _logger = logging.getLogger(__name__)
@@ -49,51 +53,81 @@ def accums_independent(body: Body) -> bool:
 from deplodock.compiler.target import compute_capability  # noqa: E402,F401
 
 
-def thread_tile_of(outer: ParallelTile) -> ThreadTile:
-    """Return the per-thread scope for an outer ``GridTile`` / ``ThreadTile``.
+def parallel_tile_of(outer: ParallelTile) -> ThreadTile | WarpTile:
+    """Return the per-binding-tier inner scope for an outer
+    ``GridTile`` / ``ThreadTile`` / ``WarpTile``.
 
-    The cooperative form (``GridTile`` wrapping ``ThreadTile``) puts the
-    per-thread scope one level deeper; the pointwise form (standalone
-    ``ThreadTile``) IS the per-thread scope. Downstream passes that operate
-    on the per-thread scope (``020_stage_inputs``,
-    ``010_split_register_axes``, ...) call this helper instead of branching
-    on the outer flavor.
+    The cooperative form (``GridTile`` wrapping ``ThreadTile`` /
+    ``WarpTile``) puts the per-tier scope one level deeper; the
+    pointwise form (standalone ``ThreadTile``) IS the per-thread scope.
+    Downstream passes that operate on the per-binding-tier scope
+    (``020_stage_inputs``, ``010_split_register_axes``, ...) call this
+    helper instead of branching on the outer flavor.
+
+    Renamed from ``thread_tile_of`` to reflect the addition of
+    ``WarpTile`` (which is also a valid per-tier scope under the same
+    outer ``GridTile`` shape). ``thread_tile_of`` is kept as a
+    deprecation-warning alias.
     """
-    if isinstance(outer, ThreadTile):
+    if isinstance(outer, (ThreadTile, WarpTile)):
         return outer
     if isinstance(outer, GridTile):
         for child in outer.body:
-            if isinstance(child, ThreadTile):
+            if isinstance(child, (ThreadTile, WarpTile)):
                 return child
-        raise RuleSkipped("GridTile without an inner ThreadTile")
-    raise TypeError(f"thread_tile_of: expected GridTile/ThreadTile, got {type(outer).__name__}")
+        raise RuleSkipped("GridTile without an inner ThreadTile/WarpTile")
+    raise TypeError(f"parallel_tile_of: expected GridTile/ThreadTile/WarpTile, got {type(outer).__name__}")
 
 
-def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
-    """Rebuild ``outer`` with the per-thread scope's body replaced.
+def thread_tile_of(outer: ParallelTile) -> ThreadTile | WarpTile:
+    """Deprecated alias for :func:`parallel_tile_of`. Kept for the
+    transition until in-flight MMA / WS-refactor consumers drop their
+    legacy import. Emits a ``DeprecationWarning`` via the module logger
+    so call sites surface in test logs.
+    """
+    _logger.warning("thread_tile_of is deprecated; use parallel_tile_of", stacklevel=2)
+    return parallel_tile_of(outer)
+
+
+def replace_parallel_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
+    """Rebuild ``outer`` with the per-binding-tier scope's body replaced.
 
     Preserves the GridTile wrapper (if any). Cooperativity is recovered
     from ``Accum.axes`` at materialize / render time so no per-tile tag
     needs propagating here.
+
+    Renamed from ``replace_thread_tile_body`` to reflect ``WarpTile``
+    support. ``replace_thread_tile_body`` is kept as a deprecation-
+    warning alias.
     """
     new_body = Body.coerce(new_body) if not isinstance(new_body, Body) else new_body
     if isinstance(outer, ThreadTile):
         return ThreadTile(axes=outer.axes, body=new_body)
+    if isinstance(outer, WarpTile):
+        return WarpTile(axes=outer.axes, body=new_body)
     if isinstance(outer, GridTile):
-        # Locate the ThreadTile child and rebuild it.
+        # Locate the inner per-tier scope (ThreadTile or WarpTile) and rebuild it.
         new_outer_body: list = []
         for child in outer.body:
             if isinstance(child, ThreadTile):
                 new_outer_body.append(ThreadTile(axes=child.axes, body=new_body))
+            elif isinstance(child, WarpTile):
+                new_outer_body.append(WarpTile(axes=child.axes, body=new_body))
             else:
                 new_outer_body.append(child)
         return GridTile(axes=outer.axes, body=Body(new_outer_body), swizzle_group_m=outer.swizzle_group_m)
-    raise TypeError(f"replace_thread_tile_body: expected GridTile/ThreadTile, got {type(outer).__name__}")
+    raise TypeError(f"replace_parallel_tile_body: expected GridTile/ThreadTile/WarpTile, got {type(outer).__name__}")
+
+
+def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
+    """Deprecated alias for :func:`replace_parallel_tile_body`."""
+    _logger.warning("replace_thread_tile_body is deprecated; use replace_parallel_tile_body", stacklevel=2)
+    return replace_parallel_tile_body(outer, new_body)
 
 
 def single_tile(body: Body) -> tuple[int, ParallelTile]:
-    """Locate the (sole) outermost ``GridTile`` / ``ThreadTile`` in a
-    TileOp body.
+    """Locate the (sole) outermost ``GridTile`` / ``ThreadTile`` /
+    ``WarpTile`` in a TileOp body.
 
     ``TileOp.__post_init__`` enforces *at most* one outer tile, so this
     only needs to handle the zero-tile case — which happens for the
@@ -102,11 +136,12 @@ def single_tile(body: Body) -> tuple[int, ParallelTile]:
     ``RuleSkipped`` in that case so the rule cleanly bails.
 
     Returns the outermost tile flavor regardless of cooperative shape
-    (``GridTile`` wrapping a ``ThreadTile``, or a standalone ``ThreadTile``).
-    Callers that need the per-thread scope navigate via ``tile.body``.
+    (``GridTile`` wrapping a ``ThreadTile`` / ``WarpTile``, or a standalone
+    ``ThreadTile``). Callers that need the per-binding-tier scope navigate
+    via :func:`parallel_tile_of` (or ``tile.body``).
     """
     for i, s in enumerate(body):
-        if isinstance(s, (GridTile, ThreadTile)):
+        if isinstance(s, (GridTile, ThreadTile, WarpTile)):
             return (i, s)
     raise RuleSkipped("TileOp has no outer ParallelTile (degenerate single-thread body)")
 

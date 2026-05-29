@@ -67,6 +67,7 @@ from deplodock.compiler.ir.tile.ir import (
     StagePolicy,
     ThreadTile,
     TileOp,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -131,7 +132,7 @@ def _plan_pad(body: Body) -> dict[int, dict[str, tuple[int, ...]]] | None:
 
 def _plan_walk(body: Body, plan: dict[int, dict[str, tuple[int, ...]]], *, thread_axes: tuple[Axis, ...]) -> None:
     for s in body:
-        if isinstance(s, ThreadTile):
+        if isinstance(s, (ThreadTile, WarpTile)):
             _plan_walk(s.body, plan, thread_axes=s.axes)
             continue
         # Pad applies to BUFFERED / ASYNC bundles; SYNC has no buffer

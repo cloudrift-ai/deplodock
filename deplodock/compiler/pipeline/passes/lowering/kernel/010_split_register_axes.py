@@ -28,7 +28,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import RegisterTile, Stage, StageBundle, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import replace_thread_tile_body, single_tile, thread_tile_of
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -36,7 +36,7 @@ PATTERN = [Pattern("root", TileOp)]
 def rewrite(root: Node) -> Graph | None:
     body = root.op.body
     idx, outer = single_tile(body)
-    tt = thread_tile_of(outer)
+    tt = parallel_tile_of(outer)
 
     new_body, factors = _replicate_register_tiles(tt.body)
     if not factors:
@@ -52,7 +52,7 @@ def rewrite(root: Node) -> Graph | None:
         knobs["FM"] = factors[0]
     if len(factors) >= 2 and "FN" not in knobs:
         knobs["FN"] = factors[1]
-    rebuilt = replace_thread_tile_body(outer, new_body)
+    rebuilt = replace_parallel_tile_body(outer, new_body)
     return TileOp(body=body[:idx] + (rebuilt,) + body[idx + 1 :], name=root.op.name, knobs=knobs)
 
 

@@ -41,11 +41,17 @@ materializer branches into one factorization with a per-cell dispatch on `ATOM_K
 >   consumes `RegisterTile` and replicates its body per cell, before `100_materialize_tile.py`). Several docstrings/
 >   comments still say "006a" — stale. **This pass, not the materializer, is where the scalar per-cell `Init`/`Accum`
 >   chain is produced.**
-> - **The planner emits a lazy Fork tree, not a flat cartesian.** `rewrite` returns `Graph | None | TileOp | Fork |
->   list[Fork]`; `_build_fork_tree_lazy` (in `010_partition_loops.py`) nests
->   `_group_level → _bmbn_level → _fmfn_level → _br_level → _leaf_forks`. Each fork is an *op fork* (graph-preserving,
->   separable — see `autotune_no_graph_forks` memory) consumed by the two-level tuner. M3 (below) extends this tree
->   with a top-level **binding-tier fork** above the existing levels, with a per-tier subtree.
+> - **The planner emits a lazy Fork tree via a generic builder.** `rewrite` returns `Graph | None | TileOp | Fork |
+>   list[Fork]`; construction is delegated to `build_fork_tree(*, params, levels, materialize, score)` in
+>   `pipeline/fork_tree.py` (~128 lines, generic over the row type `P`). The planner passes a flat list of
+>   `Level((knob_names,), key)` entries — today, four of them: `BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`. The builder
+>   sorts siblings by max-propagated `-score` and **collapses single-value levels automatically** (no 1-child wrapper).
+>   Each fork is an *op fork* (graph-preserving, separable — see `autotune_no_graph_forks` memory) consumed by the
+>   two-level tuner. M3 (below) builds **two subtrees** with disjoint `levels` schemas — one per row type — and returns
+>   them as sibling Forks, since the warp subtree's level keys (ATOM_KIND, WM, WN) and the scalar subtree's (BR, BM,
+>   BN) don't share a schema. Earlier drafts of this plan referenced `_build_fork_tree_lazy` / `_group_level` /
+>   `_bmbn_level` / `_fmfn_level` / `_br_level` — those named-level functions have been **deleted**; the docstring at
+>   `010_partition_loops.py:417` referencing `_build_fork_tree_lazy` is stale.
 > - **`TileParams` + the seven planner `Knob`s + the priority functions + `enumerate_cartesian` + the impl
 >   cartesian live in `pipeline/passes/lowering/tile/_enumeration.py`** (a sibling `_`-prefixed module the rule loader
 >   skips). `010_partition_loops.py` imports them. Earlier drafts of this plan pointed at `010_partition_loops.py` for
@@ -235,9 +241,10 @@ patience stop and `_priority_matmul` ordering (MMA variants ranked first when el
     - `_enumerate_cartesian_impl` splits into `_enumerate_scalar_matmul_impl` and `_enumerate_warp_matmul_impl` —
       divisibility (`E_M % (bm·fm)` vs `E_M % (wm·fm·atom_m)`) and per-CTA thread budget (`bn·bm·br` vs
       `wn·wm·32·br`) differ enough that one parameterized impl would be more `if`s than shared algorithm.
-    - The fork tree (M3) gets a top-level binding-tier branch above the existing `_group_level → _bmbn_level → …`
-      stack — scalar subtree keeps today's level structure; warp subtree has its own (`ATOM_KIND > GROUP > WMWN >
-      FMFN > LEAF`). Only matmul forks the tier — `reduce` and `pointwise` stay thread-only.
+    - The fork tree (M3) calls `build_fork_tree(..., levels=[...])` twice with disjoint per-tier `levels` schemas
+      and returns sibling Forks. Scalar levels = today's four (`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`); warp levels
+      = `ATOM_KIND → (WM,WN) → (FM,FN) → (BK,SPLITK)`. Only matmul forks the tier — `reduce` and `pointwise` stay
+      thread-only.
     - The matmul layer builder in `_build_split_body` dispatches on `isinstance(params, ScalarTileParams |
       WarpTileParams)` and emits the tier-specific layers list. Neither tier emits placeholder extent-1 layers for
       the other tier's roles.
@@ -293,13 +300,16 @@ shrinks proportionally. If it hasn't, M1 ships them inline.
     `"reduce"` / `"pointwise"`. The single-string forms keep working as aliases (`"matmul"` → `("matmul", "thread")`)
     so call sites in `010_partition_loops.py` don't churn at M1.
 - `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py`:
-  - Extend `class Role`: add `WARP` (if not already landed) and `ATOM`.
-  - Extend `_layer_kind_for`: `Role.WARP → "warp"`, `Role.ATOM → "atom"`.
-  - Extend `_wrap_tower`'s grouping: `"warp" → WarpTile(...)` and `"atom" → AtomTile(...)` cases beside `"grid" /
-    "thread" / "register"`. Both group like the other parallel kinds (consecutive same-kind axes coalesce).
-  - `_build_split_body`: dispatch the matmul branch on `isinstance(params, ScalarTileParams | WarpTileParams)` —
-    scalar branch is today's code, unchanged; warp branch is stubbed (`raise _BuildSkipped("warp tier wired in M3")`).
-    Scalar's `layers` list doesn't reference `Role.ATOM` or `Role.WARP`.
+  - Extend `class Role` (currently lines 106–119, members `BLOCK / THREAD / REGISTER / STAGE_INNER / SERIAL_OUTER /
+    PIPELINE`): add `WARP` (if not already landed via the WarpTile primitive plan) and `ATOM`.
+  - Extend `_layer_kind_for` (line 395): `Role.WARP → "warp"`, `Role.ATOM → "atom"`.
+  - Extend `_wrap_tower` (line 311) grouping: `"warp" → WarpTile(...)` and `"atom" → AtomTile(...)` cases beside
+    `"grid" / "thread" / "register"`. Both group like the other parallel kinds (consecutive same-kind axes coalesce).
+    The non-BLOCK size-1 filter at line 345 is unchanged.
+  - `_build_split_body` (line 638): dispatch the matmul branch on `isinstance(params, ScalarTileParams |
+    WarpTileParams)` — scalar branch is today's code at lines ~835–880 (both the prologue-bearing and
+    no-prologue tower constructors), unchanged; warp branch is stubbed (`raise _BuildSkipped("warp tier wired in
+    M3")`). Scalar's `layers` list doesn't reference `Role.ATOM` or `Role.WARP`.
 
 **Files.**
 
@@ -364,22 +374,49 @@ siblings-to-scalar in the fork tree; the materializer then routes them through M
     `atom_kind=kind`.
   - `_priority_matmul_warp`: real implementation per Design decision 11. Threads = `wn·wm·32`. Cells-per-cell-owner
     cap = `min(fm·fn·atom_m·atom_n, 64)` (bigger cap than scalar's 32 — MMA amortizes K-loop overhead better).
-  - `enumerate_cartesian("matmul")` callers in `010_partition_loops.py` (at lines ~646, 683, 694 today) now call
-    both `("matmul", "thread")` and `("matmul", "warp", atom_kinds=eligible)` and concatenate. When `eligible == ()`
-    the warp call returns `[]` cleanly — no special-casing needed at the call site.
+  - `enumerate_cartesian` callers in `010_partition_loops.py` are at lines **510 (`priority_mode="matmul"`), 547
+    (`"reduce"`), 558 (`"pointwise"`)**. The matmul call site now calls both `("matmul", "thread")` and
+    `("matmul", "warp", atom_kinds=eligible)` and concatenates. When `eligible == ()` the warp call returns `[]`
+    cleanly — no special-casing needed at the call site. `reduce` and `pointwise` are untouched (thread-only).
 - `_build_split_body` warp branch (formerly stubbed in M1): real layer builder per the "What `_build_split_body`
   actually looks like" snippet you'll find in the planner discussion above. Emits a layers list with `Role.ATOM` (3
   innermost entries) + `Role.REGISTER` (N_r, M_r) + `Role.WARP` (N_w, M_w) + `Role.BLOCK` (N_b, M_b, K_s).
   No `Role.THREAD` entries. K-σ extended with `+ K_a`.
-- `_build_fork_tree_lazy`: add a top-level binding-tier branch. When `eligible == ()`, the tree is identical to
-  today's (scalar only). When `eligible != ()`, the tree top is a fork whose children are:
-  - scalar subtree: today's `_group_level → _bmbn_level → _fmfn_level → _br_level → _leaf_forks` chain over the
-    `ScalarTileParams` rows.
-  - warp subtree: `_kind_level → _group_level → _wmwn_level → _fmfn_level → _leaf_forks` chain over the
-    `WarpTileParams` rows. `_wmwn_level` parallels `_bmbn_level` but groups by `(wm, wn)`. No `_br_level` (BR=1).
-  Inner forks share `_fmfn_level` and `_leaf_forks` because FM/FN/leaf have the same shape in both row types — but
-  the wrapper closures call the right priority function per row type. `_priority_matmul_warp` should outscore
-  `_priority_matmul_thread` at the top level so the tuner drills the warp subtree first.
+- Fork tree construction in `rewrite()`: today the planner calls `build_fork_tree(params, levels=[…], materialize,
+  score)` once with a single `TileParams` row type and four levels (`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`). Under
+  M3, call it **twice** — once per row type — with disjoint level schemas:
+  ```python
+  scalar_subtree = build_fork_tree(
+      params=plan.scalar_params,                    # tuple[ScalarTileParams, ...]
+      levels=[
+          Level((BR.name,),               lambda p: (p.br,)),
+          Level((BM.name, BN.name),       lambda p: (p.bm, p.bn)),
+          Level((FM.name, FN.name),       lambda p: (p.fm, p.fn)),
+          Level((BK.name, SPLITK.name),   lambda p: (p.bk, p.splitk)),
+      ],
+      materialize=lambda p: _materialize(plan, p),
+      score=lambda p: _score_variant(plan, p, ctx),
+  )
+  warp_subtree = build_fork_tree(
+      params=plan.warp_params,                      # tuple[WarpTileParams, ...]
+      levels=[
+          Level((ATOM_KIND.name,),        lambda p: (p.atom_kind,)),
+          Level((WM.name, WN.name),       lambda p: (p.wm, p.wn)),
+          Level((FM.name, FN.name),       lambda p: (p.fm, p.fn)),
+          Level((BK.name, SPLITK.name),   lambda p: (p.bk, p.splitk)),
+      ],
+      materialize=lambda p: _materialize(plan, p),
+      score=lambda p: _score_variant(plan, p, ctx),
+  )
+  ```
+  `build_fork_tree` already collapses single-value levels, so when `eligible == ()` (no warp params) the call
+  returns `[]` and the planner returns `scalar_subtree` unchanged (byte-identical to today). When both subtrees are
+  non-empty, return `[*warp_subtree, *scalar_subtree]` — the engine treats sibling Forks as a top-level fork
+  decision. `_priority_matmul_warp` is constructed to outscore `_priority_matmul_thread` so the
+  `-score`-sorted siblings drill warp-first.
+- `_Plan` (in `010_partition_loops.py`) gains a per-tier field split: `scalar_params: tuple[ScalarTileParams, ...]`
+  and `warp_params: tuple[WarpTileParams, ...]`, replacing today's flat `params`. `_plan_kernel` populates both;
+  callers that consumed `plan.params` get migrated (search: ~7 references today).
 - `ir/kernel/render.py::_launch_bounds_for`: see WarpTile primitive plan M2 — if not already landed, add the
   `WarpTile` branch returning `prod(warp_extents) * 32`. Idempotent if shipped.
 - `kernel/100_materialize_tile.py`: `_materialize_warp` arm (also from the WarpTile primitive plan M2) — idempotent.
@@ -443,7 +480,8 @@ scalar `Init`/`Accum`. This is where correctness can silently break.
 
 - The **scalar per-cell `Init`/`Accum` chain is produced in `kernel/010_split_register_axes.py`**
   (`_replicate_register_tiles`), *before* `100_materialize_tile.py`. The materializer currently passes `RegisterTile`
-  through (`100_materialize_tile.py:387`) because by then 010 has consumed it.
+  through (`100_materialize_tile.py:553`, inside `_materialize`'s `_process_stmt`) because by then 010 has consumed
+  it.
 - **Recommended:** for `ATOM_KIND != "scalar"`, have `010_split_register_axes` route to a new
   `_replicate_mma_cells` helper that, per `(register_m, register_n)` cell, emits `MmaFragment` a/b/c decls + `MmaLoad`s
   + `MmaSync` (instead of scalar replicated `Init`/`Accum`), and the C-fragment `MmaStore` after the K loop. The
@@ -478,9 +516,15 @@ scalar `Init`/`Accum`. This is where correctness can silently break.
 
 - `deplodock/compiler/pipeline/passes/lowering/kernel/010_split_register_axes.py` (~120 lines: `_replicate_mma_cells`
   + dispatch)
-- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py` (~10 lines: treat Mma Stmts as opaque
-  leaves if any handling is needed)
-- `deplodock/config.py` (~4 lines: `DEPLODOCK_MMA` accessor)
+- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py` (~12 lines: treat Mma Stmts as opaque
+  leaves if any handling is needed; **and one-line invariant fix at `:93`**: change
+  `KernelOp(body=new_body, name=root.op.name)` → `KernelOp(body=new_body, name=root.op.name, knobs=root.op.knobs)`
+  so `ATOM_KIND` survives materialize for any downstream KernelOp-keyed introspection. `knobs` is declared on the
+  base `Op` (`ir/base.py:62`) with a default `{}`, so the current materialize silently drops `TileOp.knobs` — not a
+  bug for *this* plan (M5/M7 all run on TileOp pre-materialize), but a fragile invariant any future MMA-related work
+  would trip on. Fix it here while we're in the file.)
+- `deplodock/config.py` (~4 lines: `DEPLODOCK_MMA` accessor — use the existing `knob_var` / `knob_raw` pattern at
+  `:49–62`, not a bare `os.environ.get`).
 
 **Verification.** (a) Golden IR: a small synthetic f16 matmul (M=N=K=64) with `ATOM_KIND="wmma_m16n16k16_f16"` produces
 a body with the expected `MmaFragment` decl count and `MmaSync` chain length; assert structurally against a pretty-print.
@@ -649,6 +693,14 @@ incompletely. "Every matmul has an atom kind; scalar is `(1,1,1)`" should be fir
     rows don't have the field — but worth a regression assert.
   - A downstream pass introspects flavor type with an `assert isinstance(s, ThreadTile)` (rather than `(ThreadTile,
     WarpTile)`) and a future warp-emitting consumer trips it. Caught by the M1 Design-decision-9 audit.
+- **`KernelOp.knobs` silently empty post-materialize.** `100_materialize_tile.py:93` returns
+  `KernelOp(body=new_body, name=root.op.name)` — `knobs` is inherited from `Op` (`ir/base.py:62`) with a default
+  `{}`, so the TileOp's knobs are dropped. None of this plan's MMA-aware passes (M5 dispatch, M7 skip guards, M1
+  audit) are affected — they all run on TileOp pre-materialize where `op.knobs["ATOM_KIND"]` is intact. But the
+  invariant is fragile: any future pass that needs to introspect ATOM_KIND on a KernelOp (a debug analyzer, a
+  KernelOp-level perf-key derivation) silently sees no atom kind. M5's checklist includes the one-line fix to
+  forward `knobs` at the materialize boundary; verify with a unit test
+  (`KernelOp(...).knobs == TileOp(...).knobs` after materialize).
 
 ## Future extensions (out of scope)
 
@@ -686,10 +738,12 @@ dispatch (`spec.instruction`) is the single extension point for new codegen path
   (`ScalarTileParams` | `WarpTileParams`), `BN`/`BM`/`BR` vs `WN`/`WM`/`ATOM_KIND` knob bundles, per-tier priority
   functions (`_priority_matmul_thread` / `_priority_matmul_warp`), per-tier `_enumerate_*_matmul_impl`,
   dispatch-grid `priority_mode`.
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` — factorization, top-level binding-tier
-  fork (`_kind_level` + `_wmwn_level` for the warp subtree), planner `Role` (internal) gains `WARP` + `ATOM`,
-  `_layer_kind_for` / `_wrap_tower` grouping, `_build_split_body` sum-type dispatch. Docstring loop-nest examples
-  for both scalar and warp modes (see M10).
+- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` — factorization, per-tier
+  `build_fork_tree` invocations + sibling-Fork return (M3), planner `Role` (internal) gains `WARP` + `ATOM`,
+  `_layer_kind_for` / `_wrap_tower` grouping, `_build_split_body` sum-type dispatch, `_Plan.scalar_params` /
+  `_Plan.warp_params` field split. Docstring loop-nest examples for both scalar and warp modes (see M10).
+- `deplodock/compiler/pipeline/fork_tree.py` — the generic `build_fork_tree[P](*, params, levels, materialize,
+  score)` builder + `Level[P]` dataclass. Read-only for this plan; M3 calls it twice with disjoint level schemas.
 - `deplodock/compiler/pipeline/passes/lowering/tile/_helpers.py` — `is_matmul_reduce`, `compute_capability`.
 - `deplodock/compiler/ir/kernel/ir.py` — `MmaFragment` / `MmaLoad` / `MmaSync` / `MmaStore`.
 - `deplodock/compiler/pipeline/passes/lowering/kernel/010_split_register_axes.py` — per-cell replication; MMA-cell

@@ -62,7 +62,7 @@ from __future__ import annotations
 from deplodock.compiler.dtype import F16, F16x2
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Pack, Stmt, Unpack
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -91,7 +91,7 @@ def _pack_body_recursive(body: Body) -> tuple[Body, bool]:
             ne, de = _pack_body_recursive(s.else_body)
             did_any = did_any or db or de
             descended.append(Cond(cond=s.cond, body=nb, else_body=ne))
-        elif isinstance(s, (GridTile, ThreadTile)):
+        elif isinstance(s, (GridTile, ThreadTile, WarpTile)):
             nb, db = _pack_body_recursive(s.body)
             did_any = did_any or db
             descended.append(s.with_bodies((nb,)))

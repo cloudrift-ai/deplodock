@@ -179,21 +179,30 @@ class AsyncWait(Stmt):
 
 @dataclass(frozen=True)
 class WarpSpecialize(Stmt):
-    """Producer/consumer warp split inside a TMA-pipelined ThreadTile.
+    """Producer/consumer warp split inside a TMA-pipelined kernel.
 
     Fields:
 
-    - ``producer_body`` — stmts run by producer threads (TMA-issue
+    - ``producer_body`` — stmts run by producer warp(s) (TMA-issue
       ``StageBundle`` scaffolding inside ``SerialTile(serial_outer)``).
-    - ``consumer_body`` — stmts run by consumer threads (``AsyncWait`` +
-      reduce loop + output ``Write``). Already σ-shifted by the pass so
-      every reference to the extended thread axis sees the original
-      ``[0, n_consumer_threads)`` range.
+    - ``consumer_body`` — stmts run by consumer warps (``AsyncWait`` +
+      reduce loop + output ``Write``). Indices reference the **original**
+      thread-axis names directly — no σ-shift. The materializer emits the
+      consumer-relative ``threadIdx.x - n_producer_threads`` decode at
+      the head of the consumer branch (see :class:`ThreadTile.tid_offset`).
     - ``ring_depth`` — empty-mbarrier slot count (== TMA buffer_count).
-    - ``n_producer_threads`` — for SetMaxNReg accounting (producers get
-      a small budget so consumers can claim the rest) and for deriving
-      the producer/consumer ``Cond`` predicate from the enclosing
-      ThreadTile.
+    - ``n_producer_threads`` — number of threads in the producer warp(s).
+      Today only ``32`` (one producer warp) is emitted; ``SetMaxNReg``
+      accounting and the ``Cond(role < n_producer_warps, …)`` predicate
+      both derive from this.
+    - ``consumer_thread_axes`` — axes describing the consumer-side
+      per-thread coord structure (the original ``ThreadTile.axes`` the
+      input kernel carried). The materializer feeds these into a nested
+      ``ThreadTile(tid_offset=n_producer_threads, …)`` so consumer
+      threads see ``threadIdx.x - n_producer_threads`` decoded back into
+      these axis names. ``()`` is the legacy / pre-refactor shape, kept
+      for back-compat with any caller that doesn't track the axes yet —
+      the new materializer arm raises if it's empty when expected.
 
     The K_o axis the WS pass aligned scheduling against is identified by
     the materializer structurally — the (single) ``SerialTile(serial_outer)``
@@ -201,9 +210,10 @@ class WarpSpecialize(Stmt):
     ``normalize_body``'s canonical rename pass (which renames Axis but
     can't see a plain string field).
 
-    Other quantities (``predicate``, ``n_consumer_threads``, slot/phase
-    exprs, mbar name) are derivable from these fields plus the enclosing
-    ThreadTile.axes and are reconstructed at materialize time.
+    Other quantities (``role`` predicate, ``n_consumer_threads``,
+    slot/phase exprs, mbar name) are derivable from these fields plus
+    the enclosing ``WarpTile.axes`` (the role axis) and are reconstructed
+    at materialize time.
 
     Nested ``WarpSpecialize`` is rejected at construction.
     """
@@ -212,6 +222,7 @@ class WarpSpecialize(Stmt):
     consumer_body: Body
     ring_depth: int
     n_producer_threads: int
+    consumer_thread_axes: tuple[Axis, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.producer_body, Body):
@@ -222,6 +233,8 @@ class WarpSpecialize(Stmt):
             raise ValueError(f"WarpSpecialize: ring_depth must be >= 1, got {self.ring_depth}")
         if self.n_producer_threads < 1:
             raise ValueError(f"WarpSpecialize: n_producer_threads must be >= 1, got {self.n_producer_threads}")
+        if not isinstance(self.consumer_thread_axes, tuple):
+            object.__setattr__(self, "consumer_thread_axes", tuple(self.consumer_thread_axes))
         # Nesting check — a WS inside another WS would require the
         # materializer to track a stack of ws_consumer contexts; today
         # 085 guards via the WS knob on the parent TileOp, but assert at
@@ -524,9 +537,9 @@ def _render_tile_bracket(
 # ---------------------------------------------------------------------------
 #
 # Each tile flavor's *type* encodes its binding decision (block-grid /
-# threadIdx / register / serial / strided). Together with the wrap-body
-# ``Stage`` family, these are the only block-structured Stmts allowed
-# inside a ``TileOp.body`` post-``001_launch_geometry``. ``Loop`` /
+# threadIdx / warp-id / register / serial / strided). Together with the
+# wrap-body ``Stage`` family, these are the only block-structured Stmts
+# allowed inside a ``TileOp.body`` post-``001_launch_geometry``. ``Loop`` /
 # ``StridedLoop`` / ``Tile`` survive in Loop IR (``LoopOp.body``) and as
 # transient inputs to ``001_launch_geometry``, but downstream Tile-IR
 # passes and Tile→Kernel materialization only see the new flavors.
@@ -534,9 +547,12 @@ def _render_tile_bracket(
 # Shape contract (mirrors ``Stage``'s wrap-body):
 #
 # - ``ParallelTile`` subclasses (``GridTile`` / ``ThreadTile`` /
-#   ``RegisterTile``) carry ``axes: tuple[Axis, ...]`` + ``body: Body``.
-#   The body executes once per coord tuple; coords are implicit from the
-#   binding (``blockIdx`` / ``threadIdx`` / per-thread register cell).
+#   ``WarpTile`` / ``RegisterTile``) carry ``axes: tuple[Axis, ...]`` +
+#   ``body: Body``. The body executes once per coord tuple; coords are
+#   implicit from the binding (``blockIdx`` / ``threadIdx`` /
+#   ``threadIdx.x / 32`` / per-thread register cell). ``ThreadTile`` and
+#   ``WarpTile`` are mutually exclusive inside one ``TileOp.body``
+#   (``TileOp.__post_init__`` rejects mixes) — both bind ``threadIdx``.
 # - ``SerialTileBase`` subclasses (``SerialTile`` / ``StridedTile``)
 #   carry ``axis: Axis`` + ``body: Body`` and run sequentially. Reduce
 #   semantics are derived: ``is_reduce`` iff the body contains ``Accum``.
@@ -639,34 +655,54 @@ class ThreadTile(ParallelTile):
     cooperativity is derived at materialize / render time from
     ``Accum.axes ∩ ThreadTile.axes`` — see
     ``ir/tile/escape_analysis.py``.
+
+    ``tid_offset`` (default ``0``) shifts the linear thread index the
+    cooperative-form decode is computed against — the per-axis decls
+    use ``(threadIdx.x - tid_offset)`` instead of plain ``threadIdx.x``.
+    Non-zero values are emitted by the warp-specialize materializer to
+    drop a ``ThreadTile(consumer_thread_axes, tid_offset=n_producer_threads, …)``
+    inside the consumer ``Cond.else_body``, so the original consumer-side
+    thread axes decode against a consumer-relative tid in ``[0,
+    n_consumer_threads)``. The field carries no semantic meaning outside
+    that materializer-emitted nesting; planner-emitted ``ThreadTile``s
+    keep the default ``0``.
     """
+
+    tid_offset: int = 0
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return ThreadTile(axes=self.axes, body=body)
+        return ThreadTile(axes=self.axes, body=body, tid_offset=self.tid_offset)
 
     def _pretty_label(self) -> str:
+        if self.tid_offset:
+            return f"thread offset={self.tid_offset}"
         return "thread"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Two render forms picked by ``ctx.inside_grid_tile``.
 
-        - **Cooperative** (inside ``GridTile``): emit ``threadIdx.x`` axis
-          decode + optional ``lane`` / ``warp`` helper decls + body. No
-          extra brace level — the surrounding ``__global__`` provides one.
+        - **Cooperative** (inside ``GridTile``): emit ``threadIdx.x``
+          axis decode (optionally offset by ``tid_offset`` — used by the
+          warp-specialize consumer arm) + optional ``lane`` / ``warp``
+          helper decls + body. No extra brace level — the surrounding
+          ``__global__`` provides one.
         - **Standalone** (pointwise — no enclosing ``GridTile``): flatten
           all axes into a linear ``tid``; bounds-guard against the product
           of extents.
         """
         pad = _pad(ctx.indent)
         if ctx.inside_grid_tile:
-            out = list(_render_grid_axis_decode(self.axes, "threadIdx.x", ctx))
+            idx_expr = "threadIdx.x" if self.tid_offset == 0 else f"(threadIdx.x - {self.tid_offset})"
+            out = list(_render_grid_axis_decode(self.axes, idx_expr, ctx))
             if _body_uses_lane_warp(self.body):
                 out.append(f"{pad}int lane = threadIdx.x & 31;")
                 out.append(f"{pad}int warp = threadIdx.x >> 5;")
             out.extend(_render_body(self.body, ctx))
             return out
 
+        if self.tid_offset:
+            raise NotImplementedError("standalone ThreadTile with non-zero tid_offset not supported")
         inner = ctx.child()
         n_threads = 1
         for ax in self.axes:
@@ -699,6 +735,55 @@ class RegisterTile(ParallelTile):
             "RegisterTile must be consumed by 006a_register_tile_planned before render — "
             f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
         )
+
+
+@dataclass(frozen=True)
+class WarpTile(ParallelTile):
+    """Warp-parallel tile — one coord tuple = one warp (32 lanes).
+
+    The body executes once per warp coord; the 32 lanes inside the warp
+    execute it collectively (cooperative MMA, lane-aware shuffles, etc.).
+    Materialization rules / consumers — MMA fragment factorization
+    (``plans/mma-fragment-factorization.md``), warp-specialized TMA
+    pipelining refactor — emit ``WarpTile`` *inside* an outer
+    ``GridTile`` to bind warps to a CTA. The cooperative form is the
+    only one supported in v1; a standalone top-level ``WarpTile``
+    (pointwise-style "one warp per output cell") has no consumer today.
+
+    Rendering binds ``warp_id = threadIdx.x / 32`` (the row-major decode
+    over the warp axes uses ``warp_id`` as the linear index), and
+    unconditionally exposes ``lane = threadIdx.x & 31`` — the body
+    presumes a lane is available (that's the entire reason a warp coord
+    exists). Launch-bounds wiring (``_launch_bounds_for`` /
+    ``_launch_geometry``) multiplies the warp-axis product by 32.
+
+    Mutual exclusion with ``ThreadTile`` inside one ``TileOp.body`` is
+    enforced by ``TileOp.__post_init__`` — both bind ``threadIdx`` and
+    mixing would re-bind the same coord at two scopes.
+    """
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return WarpTile(axes=self.axes, body=body)
+
+    def _pretty_label(self) -> str:
+        return "warp"
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Cooperative form (inside ``GridTile``): ``warp_id`` decl + row-
+        major warp-axis decode against ``warp_id`` + unconditional ``lane``
+        decl + body. Standalone (no enclosing ``GridTile``) is not
+        supported in v1 — pointwise kernels use ``ThreadTile`` and a
+        top-level ``WarpTile`` has no consumer yet.
+        """
+        if not ctx.inside_grid_tile:
+            raise NotImplementedError("WarpTile outside GridTile not supported in v1")
+        pad = _pad(ctx.indent)
+        out: list[str] = [f"{pad}int warp_id = threadIdx.x / 32;"]
+        out.extend(_render_grid_axis_decode(self.axes, "warp_id", ctx))
+        out.append(f"{pad}int lane = threadIdx.x & 31;")
+        out.extend(_render_body(self.body, ctx))
+        return out
 
 
 @dataclass(frozen=True)
@@ -1236,16 +1321,27 @@ class TileOp(BodyOp):
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
-        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile)))
+        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile, WarpTile)))
         if n_tiles > 1:
-            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile, got {n_tiles}")
+            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile/WarpTile, got {n_tiles}")
+        # ThreadTile and WarpTile both bind threadIdx; mixing them inside one
+        # body re-binds the same coord at two scopes. The outer-tile check
+        # above already catches them at top level; this catches the
+        # cooperative form (GridTile wrapping a ThreadTile and a WarpTile
+        # sibling, or one of them nesting inside the other).
+        has_thread = any(isinstance(s, ThreadTile) for s in self.body.iter())
+        has_warp = any(isinstance(s, WarpTile) for s in self.body.iter())
+        if has_thread and has_warp:
+            raise ValueError("TileOp.body cannot contain both a ThreadTile and a WarpTile (both bind threadIdx)")
         self._seed_io_placeholders()
 
     def _launch_geometry(self) -> tuple[tuple[Axis, ...], tuple[Axis, ...]]:
         """``(block_axes, thread_axes)`` for the outermost tile flavor.
 
         Returns ``((), ())`` if no ``GridTile``/``ThreadTile`` is present
-        (e.g. a degenerate body). For ``GridTile`` wrapping a ``ThreadTile``,
+        (e.g. a degenerate body, or a warp-cooperative body whose inner
+        tile is a ``WarpTile`` rather than a ``ThreadTile`` — see
+        :meth:`_warp_axes`). For ``GridTile`` wrapping a ``ThreadTile``,
         the block axes come from the GridTile and thread axes from the
         inner ThreadTile. For a standalone ``ThreadTile`` (pointwise), the
         block set is empty.
@@ -1260,6 +1356,29 @@ class TileOp(BodyOp):
             if isinstance(s, ThreadTile):
                 return (), s.axes
         return (), ()
+
+    def _warp_axes(self) -> tuple[Axis, ...]:
+        """Inner-``WarpTile`` axes, or ``()`` if no ``WarpTile`` is present.
+
+        Companion accessor to :meth:`_launch_geometry`. Warp-cooperative
+        bodies (``GridTile > WarpTile > …``, today emitted only by the
+        MMA-fragment-factorization consumer plan) bind 32 lanes per warp
+        coord — callers that compute per-CTA thread budgets must add
+        ``prod(_warp_axes().extent) * 32`` on top of the (typically empty)
+        thread-axes product. ``ThreadTile`` and ``WarpTile`` are mutually
+        exclusive inside one body (``__post_init__`` rejects mixes), so
+        either this returns ``()`` or :meth:`_launch_geometry`'s
+        ``thread_axes`` does.
+        """
+        for s in self.body:
+            if isinstance(s, GridTile):
+                for child in s.body:
+                    if isinstance(child, WarpTile):
+                        return child.axes
+                return ()
+            if isinstance(s, WarpTile):
+                return s.axes
+        return ()
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would
@@ -1512,6 +1631,7 @@ __all__ = [
     "GridTile",
     "ThreadTile",
     "RegisterTile",
+    "WarpTile",
     "SerialTileBase",
     "SerialTile",
     "StridedTile",

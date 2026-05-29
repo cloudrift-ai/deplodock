@@ -75,9 +75,9 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
-    replace_thread_tile_body,
+    parallel_tile_of,
+    replace_parallel_tile_body,
     single_tile,
-    thread_tile_of,
 )
 
 PATTERN = [Pattern("root", TileOp)]
@@ -158,7 +158,7 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
 
 def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
     idx, outer = single_tile(body)
-    tt = thread_tile_of(outer)
+    tt = parallel_tile_of(outer)
     if any(isinstance(s, Stage) for s in tt.body.iter()):
         return []
     if not tt.axes:
@@ -265,7 +265,7 @@ def _maybe_rewrite(
     body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None, warp_size: int
 ) -> Body | None:
     idx, outer = single_tile(body)
-    tt = thread_tile_of(outer)
+    tt = parallel_tile_of(outer)
     if not tt.axes:
         if allowed_bufs is None:
             raise RuleSkipped("ThreadTile has no axes — no reuse to stage")
@@ -299,7 +299,7 @@ def _maybe_rewrite(
         if allowed_bufs is None:
             raise RuleSkipped("no Load qualifies for staging")
         return body
-    rebuilt = replace_thread_tile_body(outer, new_tile_body)
+    rebuilt = replace_parallel_tile_body(outer, new_tile_body)
     return body[:idx] + (rebuilt,) + body[idx + 1 :]
 
 

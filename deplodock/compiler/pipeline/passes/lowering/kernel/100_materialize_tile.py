@@ -67,6 +67,7 @@ from deplodock.compiler.ir.tile.ir import (
     ThreadTile,
     TileOp,
     WarpSpecialize,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
@@ -86,7 +87,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
     new_body: list[Stmt] = []
     for s in root.op.body:
-        if isinstance(s, (GridTile, ThreadTile)):
+        if isinstance(s, (GridTile, ThreadTile, WarpTile)):
             new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
         else:
             new_body.append(s)
@@ -96,12 +97,19 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
 def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
-    Two shapes are possible coming out of ``001_launch_geometry``:
+    Three shapes are possible coming out of ``001_launch_geometry`` /
+    downstream emitters:
 
     - ``GridTile(... body=[ThreadTile(... body=actual)])``: cooperative
       kernel (matmul / fused-reduce). The ThreadTile's body is what
       ``_materialize`` walks; the GridTile wrapper preserved unchanged
       so kernel render emits the ``blockIdx`` decode.
+    - ``GridTile(... body=[WarpTile(... body=actual)])``: warp-cooperative
+      kernel (MMA fragment factorization, future consumer). ``_materialize``
+      walks the WarpTile body with a warp-id flatten tid_expr and
+      ``n_threads = prod(warp_extents) * 32``; the rebuilt wrapper stays
+      a ``WarpTile`` so the kernel renderer emits the ``warp_id`` /
+      ``lane`` decode.
     - ``ThreadTile(... body=actual)``: pointwise/standalone. Materialize
       the body directly; the kernel renderer's linear-tid path handles
       launch geometry from the ThreadTile's extents.
@@ -111,12 +119,12 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     if isinstance(top, GridTile):
         new_outer: list[Stmt] = []
         for child in top.body:
-            if isinstance(child, ThreadTile):
+            if isinstance(child, (ThreadTile, WarpTile)):
                 new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
-    if isinstance(top, ThreadTile):
+    if isinstance(top, (ThreadTile, WarpTile)):
         return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
@@ -126,10 +134,22 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
-    """Materialize a ThreadTile body. The ThreadTile carries the per-CTA
-    thread axes directly (no BoundAxis filtering needed); strategies set
-    this up — this pass commits no axis decisions of its own.
+def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> Stmt:
+    """Materialize a ``ThreadTile`` or ``WarpTile`` body. The inner tile
+    carries the per-CTA scope axes directly (no BoundAxis filtering
+    needed); strategies set this up — this pass commits no axis
+    decisions of its own.
+
+    Two flavors:
+
+    - ``ThreadTile`` (one coord = one thread): ``tid_expr`` is the row-
+      major flatten of ``axes``; ``n_threads = prod(extents)``.
+    - ``WarpTile`` (one coord = one warp, 32 lanes): ``tid_expr`` is the
+      row-major flatten of warp axes (the ``warp_id`` value); ``n_threads
+      = prod(extents) * 32``. Cooperative scaffolding (Stage loads, Accum
+      combines) that wants per-CTA thread cooperation must address all
+      threads — those code paths are reserved for the follow-up MMA
+      consumer plan and do not fire on M2-shaped (Write-only) bodies.
 
     Strategies that need single-thread Writes (e.g. cooperative scalar
     output) wrap them in ``Cond(thread_var == 0)`` themselves —
@@ -142,9 +162,14 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     body = blk.body
     thread_axes = axes
     if not thread_axes:
-        raise ValueError("ThreadTile must have at least one axis")
-    tid_expr = _build_linear_tid(thread_axes)
-    n_threads = 1
+        raise ValueError(f"{type(blk).__name__} must have at least one axis")
+    is_warp = isinstance(blk, WarpTile)
+    if is_warp:
+        tid_expr = _build_warp_id_expr(thread_axes)
+        n_threads = 32
+    else:
+        tid_expr = _build_linear_tid(thread_axes)
+        n_threads = 1
     for ax in thread_axes:
         n_threads *= ax.extent.as_static()
 
@@ -233,15 +258,14 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         # inside a WarpSpecialize consumer subtree (``__syncthreads()``
         # is CUDA UB on the warp-divergent producer/consumer branch).
         # ``ws_consumer`` is threaded in by ``emit_warp_specialize`` and
-        # carries the producer thread count, from which the materializer
-        # derives the consumer participant count for ``bar.sync N, M``.
+        # carries the consumer-thread-axis structure, from which the
+        # materializer derives the consumer participant count for
+        # ``bar.sync N, M`` — product of the WarpSpecialize's
+        # ``consumer_thread_axes.extent``.
         if ws_consumer is not None:
-            outer_ext = thread_axes[0].extent.as_static()
-            inner_prod = 1
-            for ax in thread_axes[1:]:
-                inner_prod *= ax.extent.as_static()
-            extension = ws_consumer.n_producer_threads // inner_prod
-            n_cons = (outer_ext - extension) * inner_prod
+            n_cons = 1
+            for ax in ws_consumer.consumer_thread_axes:
+                n_cons *= ax.extent.as_static()
             trailing_sync = Sync(barrier_id=1, count=n_cons)
         else:
             trailing_sync = Sync()
@@ -403,24 +427,34 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         ``SetMaxNReg`` register-budget redistribution + producer /
         consumer ``Cond`` wrapper.
 
-        Geometry (predicate, consumer thread count, first-consumer tid)
-        is derived from the enclosing ``ThreadTile.axes`` and
-        ``ws.n_producer_threads`` — the WS pass doesn't carry them.
+        Post-WarpTile-refactor shape:
+
+        - The enclosing ``WarpTile`` carries a single ``role`` axis (warp-
+          granularity coord ∈ ``[0, total_warps)``). We read its name from
+          ``thread_axes[0]`` (``_materialize`` passes the WarpTile.axes
+          through to its caller-named ``thread_axes`` slot).
+        - The role-split ``Cond`` predicate is ``Var(role) <
+          n_producer_warps`` — structural, no arithmetic shift.
+        - The consumer branch wraps the materialized stmts in a
+          ``ThreadTile(consumer_thread_axes, tid_offset=n_producer_threads)``
+          so the renderer emits ``int <axis> = ((threadIdx.x - n_producer)
+          / stride) % extent`` per consumer axis. The consumer body
+          references the original axis Vars unshifted; the nested
+          ThreadTile rebinds them to the consumer-relative tid range.
         """
         from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
-        outer = thread_axes[0]
-        outer_extent = outer.extent.as_static()
-        inner_product = 1
-        for ax in thread_axes[1:]:
-            inner_product *= ax.extent.as_static()
-        if ws.n_producer_threads % inner_product != 0:
-            raise ValueError(
-                f"WarpSpecialize: n_producer_threads ({ws.n_producer_threads}) "
-                f"must be divisible by inner thread-axes product ({inner_product})"
-            )
-        extension = ws.n_producer_threads // inner_product
-        n_consumer_threads = (outer_extent - extension) * inner_product
+        # Role axis = the single axis on the enclosing WarpTile.
+        role = thread_axes[0]
+        consumer_thread_axes = ws.consumer_thread_axes
+        if not consumer_thread_axes:
+            raise ValueError("WarpSpecialize.consumer_thread_axes must be non-empty for the WarpTile-based materializer arm")
+        n_consumer_threads = 1
+        for ax in consumer_thread_axes:
+            n_consumer_threads *= ax.extent.as_static()
+        if ws.n_producer_threads % warp_size != 0:
+            raise ValueError(f"WarpSpecialize: n_producer_threads ({ws.n_producer_threads}) must be a multiple of warp_size ({warp_size})")
+        n_producer_warps = ws.n_producer_threads // warp_size
         first_consumer_tid = ws.n_producer_threads
         bc = ws.ring_depth
         empty_mbar = "tma_mbar_empty"
@@ -456,10 +490,20 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
         for s in wired_consumer:
             cons_out.extend(_process_stmt(s, ews=cons_ews))
 
+        # Consumer-side body wraps in a tid-offset ThreadTile so the
+        # original consumer thread axes decode against
+        # ``(threadIdx.x - n_producer_threads)``. The renderer emits
+        # ``int <axis> = ...`` per axis at the head of the else_body.
+        consumer_decode = ThreadTile(
+            axes=consumer_thread_axes,
+            body=Body(tuple(cons_out)),
+            tid_offset=ws.n_producer_threads,
+        )
+
         ws_cond = Cond(
-            cond=BinaryExpr("<", Var(outer.name), Literal(extension, "int")),
+            cond=BinaryExpr("<", Var(role.name), Literal(n_producer_warps, "int")),
             body=Body((SetMaxNReg(24, "dec"), *prod_out)),
-            else_body=Body((SetMaxNReg(240, "inc"), *cons_out)),
+            else_body=Body((SetMaxNReg(240, "inc"), consumer_decode)),
         )
         return [empty_decl, init_cond, Sync(), ws_cond]
 
@@ -598,7 +642,11 @@ def _materialize(blk: ThreadTile, *, warp_size: int, escape=None) -> Stmt:
     if compute_stage_prologue:
         new_body = compute_stage_prologue + new_body
     # Redundant-Sync cleanup runs as the separate Kernel-IR pass
-    # ``110_drop_redundant_syncs`` after this lowering.
+    # ``110_drop_redundant_syncs`` after this lowering. The inner-tile
+    # flavor is preserved so kernel render emits the matching coord
+    # decode (threadIdx vs warp_id + lane).
+    if is_warp:
+        return WarpTile(axes=axes, body=new_body)
     return ThreadTile(axes=axes, body=new_body)
 
 
@@ -653,6 +701,21 @@ def _build_linear_tid(thread_axes: tuple[Axis, ...]):
     for p in parts[1:]:
         expr = p + expr
     return expr
+
+
+def _build_warp_id_expr(warp_axes: tuple[Axis, ...]):
+    """Linear row-major warp index from the WARP axes — the warp granularity
+    counterpart of :func:`_build_linear_tid`.
+
+    Single-axis → ``Var(name)``; multi-axis → ``m_w * N_w + n_w`` (row-
+    major). Lane is implicit — the renderer emits ``int lane = threadIdx.x &
+    31;`` unconditionally inside ``WarpTile.render``. Callers that need
+    a single linear *thread* id keep using ``threadIdx.x`` directly (it's
+    a builtin).
+    """
+    # Same row-major flatten as _build_linear_tid; share the implementation
+    # to keep the warp-axis decode and thread-axis decode shapes aligned.
+    return _build_linear_tid(warp_axes)
 
 
 # ---------------------------------------------------------------------------

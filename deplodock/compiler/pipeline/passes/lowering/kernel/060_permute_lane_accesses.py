@@ -77,9 +77,9 @@ from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
-    replace_thread_tile_body,
+    parallel_tile_of,
+    replace_parallel_tile_body,
     single_tile,
-    thread_tile_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,7 +100,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
 
 def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:
     idx, outer = single_tile(body)
-    tile = thread_tile_of(outer)
+    tile = parallel_tile_of(outer)
 
     thread_axes = tile.axes
     if len(thread_axes) < 2:
@@ -124,7 +124,7 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:
 
     chunk_stride = vec_elems * lane_ext
     new_body = _rewrite_body(tile.body, lane.name, F, chunk_stride, vec_elems=vec_elems)
-    new_tile = replace_thread_tile_body(outer, new_body)
+    new_tile = replace_parallel_tile_body(outer, new_body)
     logger.debug(
         "chunk N register-tile on lane=%s F=%d -> stride=%d, chunks=%d (chunk_stride=%d, BN=%d)",
         lane.name,
