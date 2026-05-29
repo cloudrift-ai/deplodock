@@ -41,14 +41,18 @@ def _ctx() -> Context:
 
 def _eligible_source(*, name: str, buf: str) -> Source:
     """A Source meeting every TMA-eligibility check: 2D affine
-    addressing on dims (0, 1), 16 B-aligned box/source inner, source
-    rank ≤ 5, source inner ≥ 2× box inner."""
+    addressing on dims (0, 1), 128 B-aligned box/source inner (NVIDIA's
+    recommended box-inner alignment — anything smaller would survive the
+    hardware-minimum 16 B alignment but get padded to 128 B by
+    ``100_materialize_tile``, and that pad mis-matches the contiguous
+    box write at runtime), source rank ≤ 5, source inner ≥ 2× box
+    inner."""
     return Source(
         name=name,
         buf=buf,
         cache_dims=(
             CacheDim(axis=Axis(f"{name}_m", 16), source_dim=0),
-            CacheDim(axis=Axis(f"{name}_k", 16), source_dim=1),
+            CacheDim(axis=Axis(f"{name}_k", 32), source_dim=1),
         ),
         origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
     )
