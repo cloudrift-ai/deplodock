@@ -45,18 +45,8 @@ _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 # axis for materializer's _single_thread_var).
 _BR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
-# Cap on per-thread cell-product. NVRTC / cicc compile time explodes past 32
-# on the heavier fused kernels (linear+mean+reduce, sdpa-prologue matmul),
-# blowing past the autotune's 2.0 s compile-budget. ``_priority_matmul`` /
-# ``_priority_pointwise`` both already cap their cells/thread rank at 32
-# (matmul: ``min(fm*fn, 32)``; pointwise: ``-(fm*fn)`` — fewer wins), so the
-# tied / preferred variants never need fm·fn > 32. Keeping the enumeration
-# at the same cap aligns the candidate set with the priority intent and
-# stops MCTS exploration from drilling into compile-bomb tails after
-# patience on the actually-preferred variants exhausts. Raising back to 128
-# silently re-introduces the compile-budget failures on Qwen3-Embedding-
-# class fused matmul kernels.
-_MAX_CELLS_PER_THREAD: int = 32
+# Cap on per-thread cell-product. NVRTC compile time explodes past this.
+_MAX_CELLS_PER_THREAD: int = 128
 
 BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
 BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")

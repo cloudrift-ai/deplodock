@@ -215,7 +215,12 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     cuda_ops = [n.op for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
     assert cuda_ops, "expected a CudaOp in the lowered graph"
     cuda_src = "\n".join(op.kernel_source for op in cuda_ops)
-    x_smem_decls = cuda_src.count("__shared__ float x_smem")
+    # Match ``__shared__`` plus the buffer name, with or without an
+    # ``__align__(N)`` directive in between — the materializer stamps
+    # ``__align__(128)`` on TMA-targeted slabs so the regex tolerates either form.
+    import re as _re  # noqa: PLC0415
+
+    x_smem_decls = len(_re.findall(r"__shared__\s+(?:__align__\([0-9]+\)\s+)?float\s+x_smem\b", cuda_src))
     assert x_smem_decls == 1, (
         f"expected 1 ``__shared__ float x_smem`` decl (per-cell shares the staging); "
         f"got {x_smem_decls} — a regression opening its own smem context inside RegisterTile(N_r) "
