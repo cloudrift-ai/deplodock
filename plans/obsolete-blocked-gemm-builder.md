@@ -189,7 +189,7 @@ axis filter becomes structurally identical to per-cell layout. Verify:
 > Both options require non-trivial design + perf verification on GPU hardware. Phase 1's dedup
 > pass is in place and observationally a no-op, so it ships cleanly on its own.
 
-### Phase 3 — Remove SPLITK > 1 disqualifier (matmul_add path)
+### Phase 3 — Remove SPLITK > 1 disqualifier (matmul_add path) ✓ LANDED 2026-05-28
 
 Flip the planner's gate so SPLITK>1 matmul shapes go through the blocked builder. Two integration
 points needed:
@@ -200,10 +200,21 @@ points needed:
 - `020_stage_inputs` slab-shape inference for the SPLITK-inner-RegisterTile case (the planner
   notes this as the actual blocker at `010_partition_loops.py:932–934`).
 
-Verify: `test_matmul_with_bias` / `test_linear_with_bias` (the SPLITK+linear-residual e2e tests
-that caught PR #169's bug) still pass.
+> **Landed (2026-05-28).** Two coordinated changes:
+> 1. `_build_register_blocked_body` now groups adjacent `Load` / `Assign` / `Write` siblings into
+>    one `RegisterTile(N_r)` epilogue tower instead of bailing on the first non-Init/Write/
+>    SerialTile/Cond stmt. The `matmul_add` residual chain `[Load(r), Assign(v=acc+r), Write(v)]`
+>    wraps into one per-cell tower — same shape as the legacy per-cell path after the replicator
+>    runs.
+> 2. `gate_linear_epilogue_on_k_s_zero` recognises both per-cell flat and blocked Write-tower
+>    shapes. The chain-matching logic factored into `_gate_linear_chain`; the blocked case emits
+>    `RegisterTile(N_r, [Cond(K_s==0, …)])` so the replicator unrolls the Cond per cell.
+>
+> 020's staging walk needed no further work — Phase 2's
+> `_iter_loads_through_register` already pulls the residual `Load(r)` into the staging candidate
+> set, and `is_reduce` walks through to the K-tower's nested `Accum`.
 
-### Phase 4 — Remove remaining disqualifiers (BR > 1, M-mask, fused prologue)
+### Phase 4 — Remove remaining disqualifiers (BR > 1, M-mask, fused prologue) ✓ LANDED 2026-05-28
 
 Each is its own integration step against a downstream pass. Most likely order:
 - **BR > 1** (cooperative-K): cooperative combine emission needs to fire after the Write tower.
@@ -212,6 +223,28 @@ Each is its own integration step against a downstream pass. Most likely order:
 
 Each step: flip one gate condition, run full suite, run perf parity vs blocked output, ship as
 its own PR if it touches a downstream pass.
+
+> **Landed (2026-05-28).** Phase 4a (BR > 1): the cooperative-K materializer's
+> `find_nested_reduce_accums` walks through transparent `RegisterTile` / `Cond` wrappers so the
+> K_i `Accum` is located even when the blocked builder nests it inside `RegisterTile(N_r)`. The
+> existing combine emission at the outer SerialTile then fires at the M_r scope, between K_o and
+> the Write tower — same physical placement as the per-cell legacy path.
+>
+> Phase 4b (M-mask): the planner already wrapped `new_inner` in `Cond(M < m_bound, body=…)` after
+> the blocked builder; that Cond sits between the M_r `RegisterTile` and the three sibling N_r
+> towers. The replicator's σ `M_r → cell_idx` lands per-cell constant comparisons; the K-tower
+> runs once per M_r cell as the blocked design intended. No further work needed beyond removing
+> the `m_bound is None` clause from the gate.
+>
+> Phase 4c (fused prologue): the planner already routed fused-prologue + blocked output through
+> the existing `if reg_blocked: matmul_tower = new_inner` branch (line 1080-1093). Removing the
+> last gate clause exposed it; SDPA P@V now uses the blocked layout naturally. The full attention
+> chain tests and tune-accuracy SDPA cases still pass without modification.
+>
+> All five disqualifiers are gone. The blocked builder is now the **unconditional** matmul code
+> path (`if shape.k_loop is not None: …`). The dedup pass (Phase 1) is in place as the future
+> mechanism by which per-cell layout will produce identical CUDA once Phase 5 deletes the
+> blocked builder.
 
 ### Phase 5 — Delete the blocked builder
 

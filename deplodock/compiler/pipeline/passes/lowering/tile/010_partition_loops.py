@@ -963,9 +963,10 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # matmul K-loop — exactly the blocked-nest target. The prologue's own
     # K-reduce (mean / softmax stats) still runs once at the M_r scope; the
     # blocked transform only touches the matmul body's K_i.
-    # The blocked builder declines (returns None) on shapes it can't yet
-    # handle — BR > 1's cooperative-K combine, M-mask — the per-cell legacy
-    # path below picks up those cases.
+    # The blocked builder still bails on shapes it can't yet handle (it
+    # declines from inside ``_build_register_blocked_body`` and the
+    # caller falls back to the per-cell legacy path); the gate below is
+    # the planner's first cut.
     #
     # FN == 1 is no longer disqualified: the blocked builder degenerates
     # to three sibling ``RegisterTile(N_r=1)`` towers; the replicator
@@ -984,8 +985,24 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # Write tower body. The 020 staging walk (Phase 2) sees the K-tower's
     # nested Accum via ``is_reduce`` and the residual ``Load(r)`` via
     # ``_iter_loads_through_register`` so neither input goes unstaged.
+    #
+    # BR > 1 is no longer disqualified: the cooperative-K materializer's
+    # ``find_nested_reduce_accums`` walks through ``RegisterTile`` to
+    # locate the K_i ``Accum`` even when it's wrapped in the per-cell
+    # ``RegisterTile(N_r)`` of the blocked nest, so cross-thread combine
+    # emits at the same M_r scope as the per-cell path (between K_o and
+    # the Write tower).
+    #
+    # M-mask is no longer disqualified: the M-overhang Cond
+    # ``Cond(M < m_bound, body=…)`` still wraps ``new_inner`` after the
+    # blocked builder runs (see the ``if m_bound is not None`` block
+    # below); in the blocked-tower shape that Cond sits between the M_r
+    # RegisterTile (added by ``_wrap_tower``) and the three sibling N_r
+    # towers. The replicator's σ ``M_r → cell_idx`` lands a per-M_r-cell
+    # constant comparison and the K-tower naturally runs once per M_r
+    # cell (the blocked builder shares it across N_r cells only).
     reg_blocked = False
-    if params.br == 1 and shape.k_loop is not None and m_bound is None:
+    if shape.k_loop is not None:
         if n_bound is not None:
             # Masked N: wrap each tower's leaf body in its own Cond. The
             # replicator (010_split_register_axes) replicates the Cond per
