@@ -1,0 +1,210 @@
+"""Sink Loads in flat compute blocks to just before their first consumer.
+
+After ``010_split_register_axes`` fully unrolls the register tile, the
+inner K-loop body emits the matmul cells as a flat sequence:
+
+    for a_BK in 0..BK:
+        Load in0  ← B[k, c0]      # FN B-loads
+        Load in1  ← B[k, c1]
+        Load in2  ← B[k, c2]
+        Load in3  ← B[k, c3]
+        Load in4  ← A[r0, k]      # FM A-loads
+        Load in5  ← A[r1, k]
+        ...
+        Load in11 ← A[r7, k]
+        Assign v0  = in0 * in4    # 32 FMAs
+        Assign v1  = in0 * in5
+        ...
+        Assign v31 = in3 * in11
+        Accum  acc0  <- v0        # 32 accumulates
+        ...
+        Accum  acc31 <- v31
+
+Every Load is hoisted to the top of the block — ptxas has to figure
+out load/FMA scheduling across the entire 32-FMA cluster. The article
+SGEMM hand-emits each A-load RIGHT BEFORE its consumer FMAs:
+
+    for a_BK in 0..BK:
+        Load b0..b3                         # B-cells, used by every row
+        Load a0
+        v_0 = b0·a0; v_4 = b1·a0; v_8 = b2·a0; v_12 = b3·a0
+        Load a1
+        v_1 = b0·a1; v_5 = b1·a1; v_9 = b2·a1; v_13 = b3·a1
+        ...
+
+which lets ptxas place the LDS adjacent to its consumer FMA without
+needing to reschedule across the whole block — the article's
+diagnostic blamed the load-FMA scheduling distance for the 5 % gap
+against cuBLAS's clustered-LDS template.
+
+This pass approximates that pattern via a peephole "sink each Load to
+just before its first consumer" reorder on every body that holds a
+Load + Assign cluster. ``Stmt.defines`` / ``Stmt.deps`` carry the SSA
+dependency information; we walk forward, identify each Load's first
+consumer position, and re-emit:
+
+- Loads with NO consumer in the body stay at the top in original order
+  (they're consumed in a sibling / outer scope; sinking them would
+  cross the body boundary).
+- Loads with consumers in the body get placed immediately before their
+  first consumer.
+- Non-Load stmts keep their relative order — no semantic reorder of
+  Assigns / Accums.
+
+The result is the article's load-FMA-load-FMA interleave when the
+underlying iteration order is FM-major; on the (currently default)
+FN-major emission the pass still delivers a "B-loads-at-top + sunk
+A-loads" pattern that closes most of the LDS-to-consumer-distance gap
+because the first consumer of each A-load lands adjacent to its load.
+
+The pass is wired between ``050_vectorize_loads`` and
+``100_materialize_tile``: vectorization runs first (otherwise sunk
+Loads break the consecutive-Load run vectorize_loads needs) and the
+materializer runs after (it lowers the body to KernelOp; sinking has
+to happen at TileOp / Loop level where the per-stmt SSA mutation is
+still cheap).
+
+A note on observed impact (RTX 5090, ptxas 13.0): the IR-level
+transformation produces visibly cleaner CUDA source (each smem load
+adjacent to its first FMA-consumer rather than 12-up-front-then-32-
+FMAs), but the measured perf delta across the BM/BN/FM/FN sweep is
+near zero (±1 %) — ptxas's instruction scheduler is already
+reordering across the flat 12-LDS + 32-FFMA window. The pass stays
+on by default for source-level legibility (the dumped ``cuda.kernels``
+artifacts now match the article's hand-written shape), and so future
+codegen / SASS-level tooling has a more semantically-grounded IR to
+read. ``DEPLODOCK_INTERLEAVE_LOADS=0`` disables the pass if the
+flat-LDS layout ever measures faster than the sunk layout on a
+specific workload.
+
+Idempotent — a body already in interleaved form is a no-op.
+"""
+
+from __future__ import annotations
+
+from deplodock import config
+from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.stmt import Body, Stmt
+from deplodock.compiler.ir.stmt.leaves import Assign, Load
+from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
+
+PATTERN = [Pattern("root", TileOp)]
+
+INTERLEAVE_LOADS = Knob(
+    "INTERLEAVE_LOADS",
+    KnobType.BOOL,
+    hints=(True, False),
+    help="Sink each Load to just before its first SSA-consumer in flat compute blocks.",
+)
+
+
+def rewrite(root: Node) -> TileOp | None:
+    enabled = INTERLEAVE_LOADS.narrow((True, False))[0]
+    if not enabled:
+        raise RuleSkipped("INTERLEAVE_LOADS=0 pinned")
+    # Touch ``config`` so the import isn't optimized out — keeps the knob's
+    # env read on the standard path (the env var → knob_raw path).
+    _ = config.knob_raw(INTERLEAVE_LOADS.name)
+
+    new_body, changed = _walk(root.op.body)
+    if not changed:
+        raise RuleSkipped("no Load+Assign cluster benefits from sinking")
+    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
+
+
+def _walk(body: Body) -> tuple[Body, bool]:
+    """Recurse into block stmts' nested bodies first, then check
+    whether this body has a Load + Assign cluster of its own — if so,
+    apply the sink-loads peephole."""
+    new_stmts: list[Stmt] = []
+    nested_changed = False
+    for s in body:
+        nested = s.nested()
+        if nested:
+            new_bodies = []
+            sub_changed = False
+            for b in nested:
+                nb, c = _walk(b)
+                new_bodies.append(nb)
+                sub_changed = sub_changed or c
+            if sub_changed:
+                s = s.with_bodies(tuple(new_bodies))
+                nested_changed = True
+        new_stmts.append(s)
+    rebuilt = Body(tuple(new_stmts))
+    if not _has_load_and_assign(rebuilt):
+        return rebuilt, nested_changed
+    sunk = _sink_loads(rebuilt)
+    return sunk, nested_changed or tuple(sunk) != tuple(rebuilt)
+
+
+def _has_load_and_assign(body: Body) -> bool:
+    has_load = False
+    has_assign = False
+    for s in body:
+        if isinstance(s, Load):
+            has_load = True
+        elif isinstance(s, Assign):
+            has_assign = True
+        if has_load and has_assign:
+            return True
+    return False
+
+
+def _sink_loads(body: Body) -> Body:
+    """Re-emit ``body`` with each Load placed just before its first
+    consumer. Preserves the relative order of all non-Load stmts and
+    the original order of Loads that share the same first-consumer
+    position."""
+    stmts = tuple(body)
+    if not stmts:
+        return body
+
+    # For each Load index, find its first consumer position (or None).
+    # A consumer is any stmt downstream whose ``deps()`` references an
+    # SSA name this Load ``defines()``.
+    first_consumer: dict[int, int | None] = {}
+    for i, s in enumerate(stmts):
+        if not isinstance(s, Load):
+            continue
+        names = frozenset(s.defines())
+        first_consumer[i] = None
+        for j in range(i + 1, len(stmts)):
+            if names.intersection(stmts[j].deps()):
+                first_consumer[i] = j
+                break
+
+    emitted: set[int] = set()
+    out: list[Stmt] = []
+
+    # Loads with no consumer in this body stay at the top (consumed by
+    # a sibling / outer scope; sinking them would cross boundaries).
+    for i, s in enumerate(stmts):
+        if isinstance(s, Load) and first_consumer.get(i) is None:
+            out.append(s)
+            emitted.add(i)
+
+    # Walk non-Load stmts in original order. Before each, emit any
+    # pending Loads whose first consumer is this position.
+    for j, sj in enumerate(stmts):
+        if isinstance(sj, Load):
+            continue
+        for i, si in enumerate(stmts):
+            if i in emitted or not isinstance(si, Load):
+                continue
+            if first_consumer.get(i) == j:
+                out.append(si)
+                emitted.add(i)
+        out.append(sj)
+
+    # Safety: emit any unclaimed Loads at the end (shouldn't fire, but
+    # guarantees we never drop a stmt).
+    for i, si in enumerate(stmts):
+        if isinstance(si, Load) and i not in emitted:
+            out.append(si)
+            emitted.add(i)
+
+    assert len(out) == len(stmts), f"sink_loads dropped stmts: {len(out)} vs {len(stmts)}"
+    return Body(tuple(out))

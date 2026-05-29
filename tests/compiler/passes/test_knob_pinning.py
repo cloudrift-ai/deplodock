@@ -242,6 +242,15 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
         {"DEPLODOCK_AFFINE_COLLAPSE": "1"},
     ),
+    # 095_interleave_loads opt-out — flat-LDS layout (every Load at
+    # the top of the cluster). Locks in that disabling the pass via
+    # env still produces correct output, so a future re-enabling of
+    # the legacy path stays safe.
+    (
+        "interleave_loads_disabled",
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
+        {"DEPLODOCK_AFFINE_COLLAPSE": "1", "DEPLODOCK_INTERLEAVE_LOADS": "0"},
+    ),
 )
 
 
