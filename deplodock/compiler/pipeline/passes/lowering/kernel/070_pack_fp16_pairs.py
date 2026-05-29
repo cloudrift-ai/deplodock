@@ -70,6 +70,11 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(root: Node) -> Graph | None:
     top = root.op
+    if top.knobs.get("ATOM_KIND"):
+        # MMA path: the C-fragment IS the accumulator (no scalar f16
+        # Accum/Init pair to fuse into __half2). Skip per
+        # plans/mma-fragment-factorization.md M7.
+        raise RuleSkipped("MMA kernel — no scalar f16 Accum/Init to pair")
     new_body, did = _pack_body_recursive(top.body)
     if not did:
         raise RuleSkipped("no f16 Accum/Init groups to pair")

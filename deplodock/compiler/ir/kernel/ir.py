@@ -596,12 +596,23 @@ class MmaFragment(Stmt):
 @dataclass(frozen=True)
 class MmaFill(Stmt):
     """``wmma::fill_fragment(frag, value);`` — zero the accumulator (or
-    init to ``Accum``'s identity)."""
+    init to ``Accum``'s identity).
+
+    The fragment is *modified* by this Stmt (it writes the fill value into
+    every lane of the warp-distributed fragment register block). Treated
+    as a definition in the SSA sense for the per-cell replicator, mirroring
+    how ``Init`` defines its target accumulator — without this, the
+    replicator would leave a single MmaFill alongside per-cell MmaLoads
+    that each read the same fragment SSA name.
+    """
 
     frag: str
     value: float = 0.0
 
     def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def defines(self) -> tuple[str, ...]:
         return (self.frag,)
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -620,30 +631,42 @@ class MmaLoad(Stmt):
     ``ctx.buffer_dtypes`` / ``ctx.shapes``). ``src_index`` is the
     multidim offset (Expr tuple) — the base of the fragment's M×K (a) /
     K×N (b) / M×N (c) tile. ``ldm`` is the leading-dimension stride
-    *in elements* (not bytes). All 32 lanes of the warp must reach this
-    Stmt with identical arguments.
+    *in elements*; ``0`` means "resolve at render time from the source
+    buffer's last shape dim" — the typical case for row-major buffers
+    where ldm equals the inner extent. All 32 lanes of the warp must
+    reach this Stmt with identical arguments.
     """
 
     frag: str
     src_buffer: str
     src_index: tuple
-    ldm: int
+    ldm: int = 0
 
     def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def defines(self) -> tuple[str, ...]:
+        # MmaLoad writes the fragment's distributed register block — treat
+        # as a definition for the per-cell replicator's SSA def-use walk.
         return (self.frag,)
 
     def external_reads(self) -> tuple[str, ...]:
         return (self.src_buffer,)
 
+    def exprs(self) -> tuple[Expr, ...]:
+        return tuple(self.src_index)
+
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.src_index)
-        return [f"{indent}MmaLoad {self.frag} <- {self.src_buffer}[{idx}], ldm={self.ldm}"]
+        ldm = self.ldm or "auto"
+        return [f"{indent}MmaLoad {self.frag} <- {self.src_buffer}[{idx}], ldm={ldm}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
 
         flat = render_index(self.src_buffer, self.src_index, ctx)
-        return [f"{_pad(ctx.indent)}wmma::load_matrix_sync({self.frag}, &{self.src_buffer}[{flat}], {self.ldm});"]
+        ldm = self.ldm if self.ldm else _resolve_ldm(self.src_buffer, ctx)
+        return [f"{_pad(ctx.indent)}wmma::load_matrix_sync({self.frag}, &{self.src_buffer}[{flat}], {ldm});"]
 
 
 @dataclass(frozen=True)
@@ -661,6 +684,11 @@ class MmaSync(Stmt):
 
     def deps(self) -> tuple[str, ...]:
         return (self.c_frag, self.a_frag, self.b_frag)
+
+    def defines(self) -> tuple[str, ...]:
+        # ``mma_sync`` updates c_frag in-place (``c += a @ b``) — treat as a
+        # definition like :class:`Accum` does for its scalar accumulator.
+        return (self.c_frag,)
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}MmaSync {self.c_frag} += {self.a_frag} @ {self.b_frag}"]
@@ -681,23 +709,47 @@ class MmaStore(Stmt):
     dst_buffer: str
     dst_index: tuple
     frag: str
-    ldm: int
+    ldm: int = 0
     layout: str = "row_major"
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
 
+    def external_writes(self) -> tuple[str, ...]:
+        return (self.dst_buffer,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return tuple(self.dst_index)
+
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.dst_index)
-        return [f"{indent}MmaStore {self.dst_buffer}[{idx}] <- {self.frag}, ldm={self.ldm} ({self.layout})"]
+        ldm = self.ldm or "auto"
+        return [f"{indent}MmaStore {self.dst_buffer}[{idx}] <- {self.frag}, ldm={ldm} ({self.layout})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
 
         flat = render_index(self.dst_buffer, self.dst_index, ctx)
+        ldm = self.ldm if self.ldm else _resolve_ldm(self.dst_buffer, ctx)
         return [
-            f"{_pad(ctx.indent)}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {self.frag}, {self.ldm}, wmma::mem_{self.layout});",
+            f"{_pad(ctx.indent)}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {self.frag}, {ldm}, wmma::mem_{self.layout});",
         ]
+
+
+def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int:
+    """Look up the row-major leading-dimension stride (= inner extent)
+    for ``buffer`` from the kernel render context. Used by
+    :class:`MmaLoad` / :class:`MmaStore` when ``ldm == 0`` (auto).
+    Accepts both raw int extents and :class:`Dim` extents (Tensor.shape)
+    — for symbolic dims, takes ``.as_static()`` (M9 generalizes to
+    runtime-resolved ldm via a kernel-arg int)."""
+    shape = ctx.shapes.get(buffer)
+    if shape is None:
+        raise ValueError(f"MmaLoad/MmaStore: buffer {buffer!r} not in ctx.shapes (no shape registered)")
+    last = shape[-1]
+    if hasattr(last, "as_static"):
+        return last.as_static()
+    return int(last)
 
 
 def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: str = "f32") -> str:
@@ -1004,3 +1056,47 @@ def _(s: WarpShuffle, rename, sigma, axis_fn):
     # ``name`` is the SSA output; ``value`` is the SSA input — both pass
     # through ``rename`` so the SSA canonicalizer can renumber them.
     return WarpShuffle(name=rename(s.name), value=rename(s.value), op=s.op, length=s.length)
+
+
+# --- MMA fragment rewrites -------------------------------------------------
+#
+# Per-cell replication in ``010_split_register_axes`` calls ``s.rewrite(...)``
+# on every body Stmt; the dedup pass and ``100_materialize_tile`` do too.
+# Each Mma* Stmt routes its SSA fragment names through ``rename`` and its
+# Expr-typed offset fields through ``sigma.apply``.
+
+
+@_rewrite.register
+def _(s: MmaFragment, rename, sigma, axis_fn):
+    return MmaFragment(name=rename(s.name), role=s.role, shape=s.shape, dtype=s.dtype, layout=s.layout)
+
+
+@_rewrite.register
+def _(s: MmaFill, rename, sigma, axis_fn):
+    return MmaFill(frag=rename(s.frag), value=s.value)
+
+
+@_rewrite.register
+def _(s: MmaLoad, rename, sigma, axis_fn):
+    return MmaLoad(
+        frag=rename(s.frag),
+        src_buffer=s.src_buffer,
+        src_index=tuple(sigma.apply(e) for e in s.src_index),
+        ldm=s.ldm,
+    )
+
+
+@_rewrite.register
+def _(s: MmaSync, rename, sigma, axis_fn):
+    return MmaSync(c_frag=rename(s.c_frag), a_frag=rename(s.a_frag), b_frag=rename(s.b_frag))
+
+
+@_rewrite.register
+def _(s: MmaStore, rename, sigma, axis_fn):
+    return MmaStore(
+        dst_buffer=s.dst_buffer,
+        dst_index=tuple(sigma.apply(e) for e in s.dst_index),
+        frag=rename(s.frag),
+        ldm=s.ldm,
+        layout=s.layout,
+    )

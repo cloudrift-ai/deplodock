@@ -526,7 +526,12 @@ def _enumerate_warp_matmul_impl(
     out: list[WarpTileParams] = []
     seen: set[WarpTileParams] = set()
     bk_choices = _BK_CANDIDATES
-    splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
+    # v1: MMA + SPLITK > 1 needs atomic-add on MmaStore (cross-CTA
+    # accumulation), which isn't wired yet. Force SPLITK=1 so each output
+    # cell is written by exactly one CTA. force_splitk_one is honoured
+    # but otherwise redundant here. M9 / future plan can enable
+    # split-K MMA once atomic MmaStore lands.
+    splitk_choices: tuple[int, ...] = (1,)
     for kind in atom_kinds:
         spec = atom_spec(kind)
         atom_m, atom_n, atom_k = spec.shape

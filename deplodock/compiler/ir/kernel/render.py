@@ -253,7 +253,15 @@ def render_kernelop(
     sig_dtypes = [_dtype_for(n) for n in kernel_op.inputs if n not in literals]
     sig_dtypes.extend(_dtype_for(n) for n in kernel_op.outputs)
     includes = "".join(f"#include {h}\n" for h in cuda_includes(sig_dtypes))
-    return f'{includes}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text}) {{\n{body_text}\n}}\n'
+    # MMA fragment Stmts need <mma.h> + ``using namespace nvcuda;``. NVRTC
+    # ships <mma.h> (verified via the M3 probe), so the intrinsic path
+    # works directly; no PTX-prelude fallback needed for v1.
+    from deplodock.compiler.ir.kernel.ir import MmaFragment  # noqa: PLC0415
+
+    uses_mma = any(isinstance(s, MmaFragment) for s in kernel_op.body.iter())
+    mma_prelude = "#include <mma.h>\nusing namespace nvcuda;\n" if uses_mma else ""
+    header = f'{includes}{mma_prelude}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text})'
+    return f"{header} {{\n{body_text}\n}}\n"
 
 
 def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], int]:

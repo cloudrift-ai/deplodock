@@ -16,6 +16,15 @@ in the usual way.
 When no REGISTER tags are present (non-matmul kernels), the pass
 skips. Stamps ``FM`` / ``FN`` so the planner-stamped values persist
 and the rule is idempotent on a second visit.
+
+For MMA kernels (``plans/mma-fragment-factorization.md``), the sibling
+``005_lower_atom_tile`` pass has already replaced the AtomTile-wrapped
+matmul body with an Mma* fragment chain by the time this pass runs.
+This pass then sees the same ``RegisterTile`` wrapper as in the scalar
+path and replicates the Mma* chain per (M_r, N_r) cell — the
+``Mma*.rewrite(...)`` registrations in ``ir/kernel/ir.py`` thread
+``rename`` through fragment SSA names so each cell gets its own
+``c_frag_<i>_<j>`` etc.
 """
 
 from __future__ import annotations
