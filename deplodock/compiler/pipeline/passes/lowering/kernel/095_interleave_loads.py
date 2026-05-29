@@ -76,7 +76,22 @@ layout (~5 % slower sunk), at ``-O1`` it is neutral, and on narrow tiles
 (e.g. ``FN=4``) it washes out as the toolchain reschedules across the flat
 LDS+FFMA window. So on the configuration you would actually ship it earns
 ~2 %, which (with the source-level legibility) is why the pass is **on by
-default**.
+default**. Deliberately-bad register-pressured tiles (128- to 512-cell grids)
+do not change the picture: at deployable ``-O`` they stay in the ±2 % noise
+band, and the only flicker of a win is a *noisy* ~3-4 % at ``-Xcicc -O0`` on a
+moderately-pressured tile — gone by ``-O1`` and absent once the tile is large
+enough to be spill-bound.
+
+``cuobjdump`` shows why. The interleaved and hoisted forms carry the *same
+instruction mix* at every level; at ``-Xptxas -O2`` / ``-O3`` ptxas reschedules
+both to nearly the same SASS (a ~120-line cosmetic reorder of ~424
+instructions), and only at ``-Xptxas -O0`` does the source order survive (the
+unscheduled ~1096-instruction SASS keeps the loads where the source put them).
+So, as with vectorization, the only flag that makes the transform change the
+SASS is ``-Xptxas -O0``, which is never deployable. ptxas hoists loads early
+and reorders by its own latency heuristics, so the source-emitted order is at
+most a tie-breaker at ``-O2`` + (mechanism:
+https://forums.developer.nvidia.com/t/ptx-instructions-are-reordered/197973 ).
 
 ``INTERLEAVE_LOADS`` is therefore *not* a search dimension — only ``True`` is
 enumerated, so the autotuner never forks on it and the knob set stays small.

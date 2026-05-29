@@ -42,24 +42,41 @@ Runs after ``040_demote_to_write_dtype`` so the demote pass sees the
 original scalar Loads (the demote analysis is on Assigns, not Loads,
 so order is mostly independent; this is the conservative ordering).
 
-## Observed impact (RTX 5090, nvcc 13.0)
+## Observed impact (RTX 5090, nvcc/ptxas 13.0)
 
-Like ``095_interleave_loads``, this is an IR-legibility pass more than a
-perf lever in practice. On a 2048x2048 fp32 SGEMM at the optimal tile
-(``FM=FN=8``, ``BK=16``) the measured delta between vectorized and scalar
-Loads is **zero** at every opt level (``-Xcicc -O0`` through ``-O3``,
-``-Xptxas -O0``): nvcc re-coalesces the runs of consecutive scalar smem
-Loads into ``LDS.128`` on its own, and a well-tiled matmul is FMA-bound, so
-the LDS transaction width is not the bottleneck. (Memory coalescing is still
-a real win on hand-written kernels where you control the loads and the
-toolchain will not fix uncoalesced access — but as an IR pass layered on top
-of nvcc it is redundant with the back-end's own load coalescing.)
+Like ``095_interleave_loads``, this is an IR-legibility pass, not a perf
+lever — and ``cuobjdump`` says exactly why. The vectorized and scalar source
+forms compile to **identical SASS** at every deployable opt level: the
+scalar-source kernel shows the same two ``LDS.128`` as the ``float4`` source.
+ptxas does its own load coalescing once it knows the static smem layout and
+16-byte alignment, so a manual ``float4`` only re-states an alignment it can
+already prove. Measured latency is therefore **0 %** across the whole
+tile-intensity spectrum (load-bound ``FM=1, FN=4`` through compute-bound
+``FM=FN=8``).
+
+What flag makes the pass change the SASS? Only ``-Xptxas -O0`` — the one level
+that disables the coalescer. There the scalar source stays scalar (0
+``LDS.128``) while the ``float4`` source keeps its 2; from ``-O1`` up both
+coalesce to the same SASS:
+
+    -Xptxas -O   scalar-source LDS.128   float4-source LDS.128
+    -O0          0                       2
+    -O1/-O2/-O3  2                       2
+
+``-O0`` is never deployable, and even there the load width is not this matmul's
+bottleneck, so the latency is unchanged regardless. Manual coalescing is still
+a real win on hand-written kernels where ptxas *cannot* prove alignment, where
+the access chain has gaps, or where pointers may alias without
+``const __restrict__`` — none of which a statically-shaped tile hits.
+(Mechanism: ptxas auto-vectorizes scalar ``ld.shared`` runs once alignment is
+known — https://github.com/JuliaGPU/CUDA.jl/issues/68 ; the cast is purely an
+alignment promise — https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/ .)
 
 The pass folds the runs anyway so ``--ir kernel`` / ``--ir cuda`` show one
-wide ``Load`` instead of N scalar ones, matching the hand-written SGEMM
-shape. ``VECTORIZE_LOADS`` is *not* a search dimension — only ``True`` is
-enumerated, so the autotuner never forks on it. ``DEPLODOCK_VECTORIZE_LOADS=0``
-remains a manual override for inspecting the scalar-load form.
+wide ``Load`` matching the hand-written SGEMM shape. ``VECTORIZE_LOADS`` is
+*not* a search dimension — only ``True`` is enumerated, so the autotuner never
+forks on it. ``DEPLODOCK_VECTORIZE_LOADS=0`` is a manual override for the
+scalar-load form.
 """
 
 from __future__ import annotations
