@@ -314,6 +314,11 @@ directly (no separate AST class).
 | `Smem`             | `__shared__` array allocation (name + dtype + extents).           |
 | `Sync`             | `__syncthreads()` barrier.                                        |
 | `TreeHalve`        | Cross-thread tree reduction over a smem buffer.                   |
+| `MmaFragment`      | `wmma::fragment<...>` register block decl (one per operand role `"a"`/`"b"`/`"c"`). Carries the cell shape `(M, N, K)` + dtype + layout (`"row_major"`/`"col_major"`, ignored for the accumulator role). Emitted by the MMA cell lowering pass (`kernel/005_lower_atom_tile`). |
+| `MmaFill`          | `wmma::fill_fragment(frag, value)` — zero the C fragment.         |
+| `MmaLoad`          | `wmma::load_matrix_sync(frag, &buf[offset], ldm)` — load one fragment from gmem/smem. `ldm=0` (auto) resolves to `ctx.shapes[buffer][-1]` at render. |
+| `MmaSync`          | `wmma::mma_sync(c, a, b, c)` — one tensor-core MMA. Synchronous (WMMA); future async Hopper / Blackwell kinds add sibling `MmaIssue`/`MmaWait` Stmts. |
+| `MmaStore`         | `wmma::store_matrix_sync(&buf[offset], frag, ldm, layout)`.       |
 | Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`
