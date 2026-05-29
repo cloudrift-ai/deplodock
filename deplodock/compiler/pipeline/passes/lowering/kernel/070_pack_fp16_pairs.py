@@ -70,11 +70,16 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(root: Node) -> Graph | None:
     top = root.op
-    if top.knobs.get("ATOM_KIND"):
-        # MMA path: the C-fragment IS the accumulator (no scalar f16
-        # Accum/Init pair to fuse into __half2). Skip per
-        # plans/mma-fragment-factorization.md M7.
-        raise RuleSkipped("MMA kernel — no scalar f16 Accum/Init to pair")
+    # The pass fires on MMA TileOps too: the MMA cell's C fragment is the
+    # accumulator (no scalar f16 Accum/Init to pair *there*), but a
+    # fused-prologue matmul (SDPA P@V) carries softmax max/sum/reciprocal
+    # as scalar f16 Accum/Init siblings outside the MMA cell — those
+    # still benefit from __half2 packing. ``_pack_body_recursive`` walks
+    # past Mma* Stmts unchanged (they're neither Accum nor Init), so the
+    # MMA cell stays intact; only the prologue/epilogue pairs at any
+    # scope. When nothing is pairable, the natural ``did=False`` path
+    # raises RuleSkipped — no special-case guard needed for MMA-only
+    # kernels (plain matmul).
     new_body, did = _pack_body_recursive(top.body)
     if not did:
         raise RuleSkipped("no f16 Accum/Init groups to pair")
