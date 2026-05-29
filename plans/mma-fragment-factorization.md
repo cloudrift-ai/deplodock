@@ -42,9 +42,14 @@ materializer branches into one factorization with a per-cell dispatch on `ATOM_K
 >   comments still say "006a" — stale. **This pass, not the materializer, is where the scalar per-cell `Init`/`Accum`
 >   chain is produced.**
 > - **The planner emits a lazy Fork tree, not a flat cartesian.** `rewrite` returns `Graph | None | TileOp | Fork |
->   list[Fork]`; `_build_fork_tree_lazy` nests `_group_level → _bmbn_level → _fmfn_level → _br_level → _leaf_forks`.
->   Each fork is an *op fork* (graph-preserving, separable — see `autotune_no_graph_forks` memory) consumed by the
->   two-level tuner. An `ATOM_KIND` dimension is a new **fork level**, not an outer cartesian loop.
+>   list[Fork]`; `_build_fork_tree_lazy` (in `010_partition_loops.py`) nests
+>   `_group_level → _bmbn_level → _fmfn_level → _br_level → _leaf_forks`. Each fork is an *op fork* (graph-preserving,
+>   separable — see `autotune_no_graph_forks` memory) consumed by the two-level tuner. M3 (below) extends this tree
+>   with a top-level **binding-tier fork** above the existing levels, with a per-tier subtree.
+> - **`TileParams` + the seven planner `Knob`s + the priority functions + `enumerate_cartesian` + the impl
+>   cartesian live in `pipeline/passes/lowering/tile/_enumeration.py`** (a sibling `_`-prefixed module the rule loader
+>   skips). `010_partition_loops.py` imports them. Earlier drafts of this plan pointed at `010_partition_loops.py` for
+>   the enumerator — wrong location; M3 lands in `_enumeration.py`.
 > - **`Context` has `compute_capability: tuple[int, int]`** (e.g. `(8, 0)`) plus `warp_size: int = 32` — **no
 >   `ctx.arch` int**. Eligibility uses `ctx.compute_capability >= (7, 0)`. `_helpers.py` re-exports
 >   `compute_capability()` (a tuple) from `compiler.target`.
@@ -79,14 +84,14 @@ N → N_b · (GROUP_N · CELL_N · ATOM_N) + N_g · (CELL_N · ATOM_N) + N_c · 
 ```
 
 - `N_b` — `GridTile` (today's `N_b`, `Role.BLOCK`).
-- `N_g` — the **new** warp tier. Scalar collapses it (`GROUP_N = 1`, no warp tile); MMA makes it the per-N warp count.
-  In the current model this is **not** a binding — it is either a new `WarpTile` flavor or a repurposing of the
-  `ThreadTile` axes with an implicit ×32 lane dimension (see Design decision 3 — open).
+- `N_g` — the **new** warp tier, materialized by a `WarpTile` flavor (`plans/warptile-primitive.md`). Scalar **does not
+  emit this layer at all** (its layer builder doesn't add a `Role.WARP` entry); MMA emits it with the per-N warp count.
 - `N_c` — `RegisterTile`, replication count. Today's `FN` for scalar; the MMA cell count per warp.
   `010_split_register_axes` replicates the body per cell regardless of what the body contains.
-- `N_a` — the hardware-atomic extent. For scalar `ATOM_N = 1` (dropped by `_wrap_tower`'s size-1 filter, so the scalar
-  tower is structurally unchanged). For MMA `ATOM_N = 16`. The materializer never iterates it; it dispatches on
-  `ATOM_KIND` and emits one scalar or fragment instruction per cell.
+- `N_a` — the hardware-atomic extent. Scalar **does not emit ATOM layers at all** (its layer builder doesn't add a
+  `Role.ATOM` entry — see Design decision 2 and 6 for why this is cleaner than "emit extent-1 and rely on the size-1
+  filter to drop it"). For MMA `ATOM_N = 16`. The materializer never iterates it; it dispatches on `ATOM_KIND` and
+  emits one fragment instruction per cell.
 
 K side: today's `K_o · (br · bk) + K_i · br + K_c` factorization gains an inner ATOM_K extent. Scalar `bk` = today's
 `bk` × 1; MMA effective K-chunk = `bk × 16` (WMMA K dim). A `FRAG_K`-style count (MMA-only) controls how many `mma.sync`
@@ -146,11 +151,14 @@ patience stop and `_priority_matmul` ordering (MMA variants ranked first when el
    `"atom"`; render is `NotImplementedError("AtomTile must be consumed by the MMA materializer")` — matches how
    `RegisterTile.render` raises today (consumed before kernel render).
 
-   The scalar no-op holds because `_wrap_tower`'s existing size-1 filter (`010_partition_loops.py:517`) drops any
-   non-BLOCK extent-1 axis. Scalar's `ATOM_KIND="scalar"` has `atom_shape=(1,1,1)`, so the three ATOM layers (N_a / M_a
-   / K_a) are filtered out before tile construction — no `AtomTile` is ever instantiated, the scalar tower is
-   structurally unchanged, and goldens stay byte-identical. **M1 explicitly verifies the filter fires for `Role.ATOM`**
-   (it should — the filter's condition is "non-BLOCK", not a role allowlist — but confirm in the no-op test).
+   **The scalar no-op holds because the scalar layer builder doesn't emit `Role.ATOM` entries at all.** Under the
+   sum-type `TileParams` (Design decision 11 below), the matmul body-builder dispatches on the row type:
+   `ScalarTileParams` → a layers list with `THREAD`/`REGISTER`/`BLOCK` only; `WarpTileParams` → a layers list with
+   `ATOM`/`REGISTER`/`WARP`/`BLOCK`. The two builders import disjoint knob bundles. The size-1 filter in `_wrap_tower`
+   is **not** the mechanism for tier exclusion — it is a normalization safety net for genuine knob=1 collapses
+   (`FM=1`, `BR=1`, degenerate `BN=BM=1` corners). It still runs and still catches those. Following the same
+   convention today's planner uses for REGISTER/THREAD (pointwise/reduce don't emit them, they aren't emitted
+   extent-1 then filtered) keeps the model uniform: a role enters `layers` iff its tier is structurally present.
 
    The trade is that for MMA kernels, `AtomTile` is a new structural Stmt every tile / kernel pass must either
    recognise or pass through. Most passes already `with_bodies`-recurse opaquely through wrappers; the M1 audit (see
@@ -186,11 +194,12 @@ patience stop and `_priority_matmul` ordering (MMA variants ranked first when el
    broadest arch support, simplest lane mapping). BF16 + skewed WMMA shapes land in M9. NVFP4/MXFP4/wgmma wait for their
    own plans.
 
-6. **Scalar path is a no-op refactor.** M1 plumbs `ATOM_KIND` end-to-end with `"scalar"` as the only registered kind.
-   Existing golden IR tests must pass byte-identical post-normalization — `ATOM_KIND="scalar"` is elided by
-   `format_tuning_knobs`, and the three extent-1 ATOM layers the planner adds (N_a / M_a / K_a) are dropped by
-   `_wrap_tower`'s non-BLOCK size-1 filter, so no `AtomTile` is instantiated and the emitted tower is structurally
-   unchanged. If anything in M1 changes a golden, that's a bug, not a re-bless.
+6. **Scalar path is a no-op refactor.** M1 lands the sum-type `TileParams` split with the existing scalar
+   `Knob` bundle on `ScalarTileParams` and an empty `ATOM_REGISTRY` warp branch (only `"scalar"` registered yet —
+   which is itself thread-tier, so the warp branch enumerates zero rows). Existing golden IR tests must pass
+   byte-identical: every existing matmul produces a `ScalarTileParams` row, the scalar layer builder is structurally
+   identical to today's, and there's no `Role.ATOM` / `Role.WARP` to appear anywhere. If anything in M1 changes a
+   golden, that's a bug, not a re-bless.
 
 7. **`pack_fp16_pairs` interaction.** For MMA kernels there are no scalar f16 `Init`/`Accum` to pair — the C-fragment IS
    the accumulator. Skip when `ATOM_KIND != "scalar"` (M7).
@@ -213,67 +222,101 @@ patience stop and `_priority_matmul` ordering (MMA variants ranked first when el
     reachable, fall back to a raw-PTX `mma.sync` + `ldmatrix` prelude (analogous to `_TMA_PRELUDE`). The IR Stmt
     abstraction (`MmaLoad` / `MmaSync` / `MmaStore`) is the same either way; only the `render()` body text differs.
 
+11. **`TileParams` is a sum type: `ScalarTileParams | WarpTileParams`.** Thread-tier and warp-tier matmul rows carry
+    disjoint knob bundles (no shared "binding-tier-discriminator" flag with half the fields ignored per tier). The
+    sum type forces every reader — `_priority_*`, the layer builder, the perf-row key, the materializer dispatch —
+    to discriminate at the type level, which catches a class of "I read `p.bn` on a warp row and got 0" bugs at the
+    type checker. Concretely (in `_enumeration.py`):
+    - `ScalarTileParams(bn, bm, fm, fn, bk, splitk, br, overhang)` — today's row, unchanged.
+    - `WarpTileParams(wn, wm, fm, fn, bk, splitk, atom_kind, overhang)` — new. `BR` not carried (MMA gates BR=1).
+    - `BN`/`BM`/`BR` `Knob`s are scalar-tier only; new `WN`/`WM`/`ATOM_KIND` `Knob`s are warp-tier only;
+      `FM`/`FN`/`BK`/`SPLITK` are shared (same arithmetic role in both tiers).
+    - `_priority_matmul_thread` and `_priority_matmul_warp` are separate functions, each pure on its row type.
+    - `_enumerate_cartesian_impl` splits into `_enumerate_scalar_matmul_impl` and `_enumerate_warp_matmul_impl` —
+      divisibility (`E_M % (bm·fm)` vs `E_M % (wm·fm·atom_m)`) and per-CTA thread budget (`bn·bm·br` vs
+      `wn·wm·32·br`) differ enough that one parameterized impl would be more `if`s than shared algorithm.
+    - The fork tree (M3) gets a top-level binding-tier branch above the existing `_group_level → _bmbn_level → …`
+      stack — scalar subtree keeps today's level structure; warp subtree has its own (`ATOM_KIND > GROUP > WMWN >
+      FMFN > LEAF`). Only matmul forks the tier — `reduce` and `pointwise` stay thread-only.
+    - The matmul layer builder in `_build_split_body` dispatches on `isinstance(params, ScalarTileParams |
+      WarpTileParams)` and emits the tier-specific layers list. Neither tier emits placeholder extent-1 layers for
+      the other tier's roles.
+
 ---
 
 **Prerequisite landed:** `Axis.source_axis` is in place (`ir/axis.py` — every split sub-axis back-points to its parent
 via `Axis.split`, `compare=False`/`hash=False` so Var-rename invariance holds). The MMA enumerator can use it for
 BLOCK·GROUP·CELL·ATOM grouping without name-suffix matching.
 
-## M1 — `AtomTile` flavor + `ATOM_KIND` registry, scalar no-op
+## M1 — `AtomTile` / `WarpTile` flavors + `ATOM_KIND` registry + `TileParams` sum-type split, scalar no-op
 
-**Why.** Establish the unified-factorization scaffolding (new flavor, new planner Role, registry) without changing any
-emitted CUDA. Scalar kernels exit the planner with `ATOM_KIND="scalar"` and three extent-1 ATOM layers (N_a / M_a /
-K_a) that `_wrap_tower`'s non-BLOCK size-1 filter drops before any `AtomTile` is instantiated — so no `AtomTile` ever
-reaches a downstream pass. **Pick warp tier 3a here**: a `WarpTile` stub is the natural sibling of `AtomTile` and
-keeps the tower flavor-typed end-to-end, but at scalar it's unused (scalar never emits a `WarpTile`) so the
-implementation can stay minimal — extents + render `NotImplementedError` until M3/M5. If anything in M1 changes a
-golden, the scaffolding is wrong; fix before proceeding.
+**Why.** Establish the unified-factorization scaffolding (new flavors, new planner Roles, registry, sum-typed rows)
+without changing any emitted CUDA. Scalar kernels still produce `ScalarTileParams` rows; the scalar layer builder
+doesn't reference WARP/ATOM at all. The warp branch is wired up but has zero registered MMA kinds yet, so it
+enumerates no rows. **Pick warp tier 3a here**: `WarpTile` lands as a real flavor (see `plans/warptile-primitive.md`
+— this milestone subsumes M1/M2/M3 of that plan if it hasn't shipped first). If anything in M1 changes a golden,
+the scaffolding is wrong; fix before proceeding.
+
+**Prerequisite handling.** If `plans/warptile-primitive.md` has shipped, this milestone consumes its primitives
+(`WarpTile` + `Role.WARP` + `_layer_kind_for("warp")` + `_wrap_tower` "warp" case + launch-bounds/tid wiring) and
+shrinks proportionally. If it hasn't, M1 ships them inline.
 
 **Change.**
 
 - New file `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py`: define `AtomSpec` (frozen dataclass:
   `shape: tuple[int, int, int]`, `operand_dtypes: Mapping[str, DataType]`, `instruction: str`, `group_size: int`) and
-  `ATOM_REGISTRY: dict[str, AtomSpec]` seeded with one entry
-  `"scalar" → AtomSpec((1,1,1), {"a":…,"b":…,"c":F32}, "fma", 1)`.
-  Public helpers `atom_spec(kind)`, `atom_shape(kind)`, `atom_group_size(kind)`. Prefixed `_` so the rule loader skips
-  it (`engine._load_rules` filters `startswith("_")`) — same convention as `_helpers.py`.
+  `ATOM_REGISTRY: dict[str, AtomSpec]` — **seeded empty** at M1 (M2 adds `"wmma_m16n16k16_f16"`). Helpers
+  `atom_spec(kind)`, `atom_shape(kind)`, `atom_group_size(kind)`. Prefixed `_` so the rule loader skips it
+  (`engine._load_rules` filters `startswith("_")`). The `"scalar"` "kind" is **not** in the registry — scalar is the
+  absence of an atom, represented by the `ScalarTileParams` row type, not by a registered kind.
 - `deplodock/compiler/ir/tile/ir.py`: add `AtomTile(ParallelTile)` beside `RegisterTile`. Same shape (`axes`, `body`),
   pretty-label `"atom"`, `render` raises `NotImplementedError("AtomTile must be consumed by the MMA materializer …")`
-  matching `RegisterTile.render`'s pattern. Also add `WarpTile(ParallelTile)` stub (pretty-label `"warp"`,
-  `NotImplementedError` render) — unused at scalar, slot for M3. Export both from `__all__`.
-- `deplodock/compiler/pipeline/knob.py`: add `STR` to `KnobType` (parse = identity, pretty = `str()`). In
-  `format_tuning_knobs`, elide `ATOM_KIND="scalar"` (default-elision — extend the marker-drop loop with a per-knob
-  default check, or special-case the `"scalar"` value).
+  matching `RegisterTile.render`'s pattern. Also add `WarpTile(ParallelTile)` (if not already landed by the WarpTile
+  primitive plan) — see that plan for the render contract. Export both from `__all__`.
+- `deplodock/compiler/pipeline/knob.py`: add `STR` to `KnobType` (parse = identity, pretty = `str()`).
+- `deplodock/compiler/pipeline/passes/lowering/tile/_enumeration.py` — **the load-bearing change of M1**:
+  - Split `TileParams` into a sum type per Design decision 11:
+    `ScalarTileParams(bn, bm, fm, fn, bk, splitk, br=1, overhang=())` (today's row, unchanged) and
+    `WarpTileParams(wn, wm, fm, fn, bk, splitk, atom_kind, overhang=())`. Type alias
+    `TileParams = ScalarTileParams | WarpTileParams` so importers downstream don't churn.
+  - Move existing `BN`/`BM`/`BR` `Knob`s to a clearly-scalar-tier section; add `WN`/`WM`/`ATOM_KIND` `Knob`s
+    (warp-tier, all `STR`/`INT` as appropriate); leave `FM`/`FN`/`BK`/`SPLITK` shared.
+  - `format_tuning_knobs` (in `knob.py`): default-elide `ATOM_KIND` when not present (warp-only — never appears on
+    scalar rows). No "drop scalar" special case needed because the scalar row type doesn't carry the field.
+  - `_priority_matmul` → renamed `_priority_matmul_thread` (operates on `ScalarTileParams`). Add stub
+    `_priority_matmul_warp` (operates on `WarpTileParams`) — fully wired in M3; at M1 it can be the same shape as the
+    thread variant since no warp rows enumerate yet.
+  - `_enumerate_cartesian_impl` → `_enumerate_scalar_matmul_impl` (today's impl, unchanged in M1 modulo the row
+    type). Add stub `_enumerate_warp_matmul_impl` that returns `[]` at M1 (the warp branch is plumbed but enumerates
+    nothing until M3 wires the atom kinds).
+  - `enumerate_cartesian` dispatch: extend `priority_mode` to accept `("matmul", "thread")` / `("matmul", "warp")` /
+    `"reduce"` / `"pointwise"`. The single-string forms keep working as aliases (`"matmul"` → `("matmul", "thread")`)
+    so call sites in `010_partition_loops.py` don't churn at M1.
 - `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py`:
-  - Declare the knob as a module-level constant beside `BN`/`BM`/… (the registry walk harvests it):
-    `ATOM_KIND = Knob("ATOM_KIND", KnobType.STR, hints=("scalar",), help="Hardware MMA atom kind …")`.
-  - Extend `class Role`: add `WARP = "warp"` and `ATOM = "atom"`.
+  - Extend `class Role`: add `WARP` (if not already landed) and `ATOM`.
   - Extend `_layer_kind_for`: `Role.WARP → "warp"`, `Role.ATOM → "atom"`.
-  - Extend `_wrap_tower`'s grouping (around line 540): add `"warp" → WarpTile(...)` and `"atom" → AtomTile(...)` cases
-    beside `"grid" / "thread" / "register"`. WARP/ATOM both group like the other parallel kinds (consecutive same-kind
-    axes coalesce into one tile).
-  - In `_build_split_body`'s matmul tower (around lines 1430–1475), prepend the ATOM layers to the innermost-first
-    `layers` list: `[(K_a, Role.ATOM), (M_a, Role.ATOM), (N_a, Role.ATOM), (N_r, Role.REGISTER), …]` (axes synthesized
-    with extents from `atom_shape(kind)`). Scalar → all three are extent 1 and get dropped by the size-1 filter. Also
-    extend `_build_k_sigma` to include `+ K_a` in the σ for the K reduce. No WarpTile layer at scalar (warp group is
-    size 1 → no `Role.WARP` layer emitted).
-  - `TileParams` gains an `atom_kind: str = "scalar"` field (frozen — keeps de-dup working). `_materialize` /
-    `_score_variant` thread it through.
+  - Extend `_wrap_tower`'s grouping: `"warp" → WarpTile(...)` and `"atom" → AtomTile(...)` cases beside `"grid" /
+    "thread" / "register"`. Both group like the other parallel kinds (consecutive same-kind axes coalesce).
+  - `_build_split_body`: dispatch the matmul branch on `isinstance(params, ScalarTileParams | WarpTileParams)` —
+    scalar branch is today's code, unchanged; warp branch is stubbed (`raise _BuildSkipped("warp tier wired in M3")`).
+    Scalar's `layers` list doesn't reference `Role.ATOM` or `Role.WARP`.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` (~40 lines, new)
-- `deplodock/compiler/ir/tile/ir.py` (~50 lines: `AtomTile` + `WarpTile` stubs + exports)
-- `deplodock/compiler/pipeline/knob.py` (~15 lines: `KnobType.STR` + default elision)
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` (~50 lines: knob const + Role.WARP /
-  Role.ATOM + `_layer_kind_for` + `_wrap_tower` grouping + atom-layer prepend + σ_k + `TileParams` field)
+- `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` (~30 lines, new — registry empty)
+- `deplodock/compiler/ir/tile/ir.py` (~25 lines if `WarpTile` already landed via the primitive plan, ~75 if not)
+- `deplodock/compiler/pipeline/knob.py` (~15 lines: `KnobType.STR` + warp-knob elision)
+- `deplodock/compiler/pipeline/passes/lowering/tile/_enumeration.py` (~120 lines: sum-type split, knob bundle split,
+  per-tier priority/impl stubs, dispatch-grid `priority_mode`)
+- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` (~25 lines: Role.WARP / Role.ATOM +
+  `_layer_kind_for` + `_wrap_tower` grouping + `_build_split_body` dispatch stub)
 
 **Verification.** `make test` byte-clean — no golden bless. Spot-check one matmul kernel's lowered CUDA dump under
-`DEPLODOCK_DUMP_DIR` against a pre-M1 snapshot: identical. **Explicit size-1-drop test**: build a `LoopOp`, run the
-planner, assert the emitted `TileOp.body` contains zero `AtomTile` / `WarpTile` instances (recursive walk). Confirm
-`ATOM_KIND` does not appear in any `perf`-context key or rendered knob string for scalar variants (else -O1/-O3 rows
-and pre-M1 cache rows split spuriously). Run the Design-decision-9 audit (one pass per rule in the tile + kernel
-chains) and add `AtomTile` / `WarpTile` passthrough branches to any that introspect flavor types.
+`DEPLODOCK_DUMP_DIR` against a pre-M1 snapshot: identical. **Explicit tier-absence test**: build a `LoopOp`, run the
+planner, assert (a) every emitted row is a `ScalarTileParams`, (b) the emitted `TileOp.body` contains zero `AtomTile`
+/ `WarpTile` instances (recursive walk), (c) no `layers` entry has `Role.WARP` or `Role.ATOM`. Run the
+Design-decision-9 audit (one pass per rule in the tile + kernel chains) and add `AtomTile` / `WarpTile` passthrough
+branches to any that introspect flavor types.
 
 ## M2 — Per-kind eligibility predicate
 
@@ -299,50 +342,65 @@ output).
 + a TinyLlama-shape matmul `LoopOp` with f16 Loads → `is_atom_eligible("wmma_m16n16k16_f16", …)` True; same with f32 →
 False; `(6, 0)` (Pascal) → False; a softmax `LoopOp` → False. `is_atom_eligible("scalar", …)` always True.
 
-## M3 — Extend the planner fork tree over `ATOM_KIND`
+## M3 — Wire the warp-matmul subtree end-to-end
 
-**Why.** Wire eligible atom-kind candidates into variant enumeration so the tuner sees scalar and MMA configs as
-siblings of one op fork — consistent with the two-level tuner (`autotune_no_graph_forks`,
-`project_two_level_tuning`).
+**Why.** M1 plumbed the sum type with the warp branch stubbed to return `[]` and `_build_split_body`'s warp
+dispatch raising `_BuildSkipped`. M3 fills both: the warp enumerator produces real `WarpTileParams` rows, the warp
+layer builder emits the `WarpTile + AtomTile` tower, the fork tree gains its top-level binding-tier branch with the
+warp subtree under it, and the materializer learns the `WarpTile` arm. After M3 the planner emits MMA variants
+siblings-to-scalar in the fork tree; the materializer then routes them through M5's MMA dispatch.
 
-**Change.** In `010_partition_loops.py`:
+**Change.**
 
-- `_plan_kernel`: compute the eligible kinds (`[k for k in _ATOM_KINDS_V1 if is_atom_eligible(k, loop_op, ctx)]`) once
-  per matmul kernel and stash on the `_Plan` / `KernelShape`.
-- `_enumerate_cartesian_impl` (the inner enumerator, ~line 1111): for each base `(bm, bn, fm, fn, bk, splitk, br)`
-  variant, emit one `TileParams` per eligible kind, applying the kind's divisibility (`E_M % (bn_c·fn·atom_n) == 0`,
-  etc.) and the warp-tier constraint: `group_size > 1` means BN/BM enumerate warp counts (e.g. `(1, 2, 4, 8)`), not
-  per-element thread widths. Stamp `atom_kind` on each `TileParams`.
-- `_build_fork_tree_lazy` (~line 251): add an `ATOM_KIND` fork **level** (outermost or just-inside `_group_level`, so
-  MMA vs scalar is an early, cheap drill decision). Mirror the existing `_group_level / _bmbn_level / _fmfn_level /
-  _br_level` structure with a `_kind_level`.
-- `_priority_matmul` (~line 952): rank MMA variants strictly above scalar when both are present (MMA amortizes K-loop
-  overhead far better). Keep the existing thread-count-near-256 tiebreaker.
-- `_build_split_body` matmul tower (lines 1430–1475) for `atom_kind != "scalar"`: ATOM layers from M1 now carry the
-  kind's shape (e.g. `atom_n=atom_m=atom_k=16` for WMMA-square) instead of all 1s, so `_wrap_tower`'s size-1 filter no
-  longer drops them and an `AtomTile(axes=(N_a, M_a, K_a), body=…)` lands at the inner-most position. The THREAD
-  layers' role swaps to `Role.WARP` (so `_wrap_tower` builds a `WarpTile` instead of a `ThreadTile`); `N_t`/`M_t`
-  carry warp-count extents, and the per-CTA thread count is `prod(warp_extents) * 32` — see M3 wiring of
-  `_launch_bounds_for` / `_build_linear_tid` below.
-- `ir/kernel/render.py::_launch_bounds_for`: when the outermost tile is a `GridTile` whose body contains a `WarpTile`
-  (no inner `ThreadTile`), compute `warps * 32`. When it contains a `ThreadTile` (scalar path), preserve today's
-  behaviour. Touches one branch.
-- `kernel/100_materialize_tile.py::_build_linear_tid` + `_materialize_top` / `_materialize`: add a `WarpTile` arm
-  parallel to the existing `ThreadTile` arm. Thread index becomes `warp_id * 32 + lane_id` over the warp-tile axes.
+- `_plan_kernel` (in `010_partition_loops.py`): compute the eligible kinds `eligible = [k for k in _ATOM_KINDS_V1 if
+  is_atom_eligible(k, loop_op, ctx)]` once per matmul kernel and stash on the `_Plan` / `KernelShape`. Scalar is not
+  in this list — scalar is the absence of an atom kind, modelled by `ScalarTileParams`. `eligible` only contains MMA
+  kinds.
+- `_enumeration.py`:
+  - `_enumerate_warp_matmul_impl`: real cartesian, parallel to today's scalar impl but with the warp divisibility +
+    budget formulae from Design decision 11 (`E_M % (wm·fm·atom_m) == 0`; `wn·wm·32 ≤ ctx.max_threads_per_cta`).
+    Candidate tuples: `wn_choices = wm_choices = _TUNE_WARP_AXIS_CHOICES = (1, 2, 4, 8)`; FM/FN as divisors of the
+    cell budget; BK/SPLITK as today; no BR (forced 1). For each eligible atom kind, emit one row stamped with
+    `atom_kind=kind`.
+  - `_priority_matmul_warp`: real implementation per Design decision 11. Threads = `wn·wm·32`. Cells-per-cell-owner
+    cap = `min(fm·fn·atom_m·atom_n, 64)` (bigger cap than scalar's 32 — MMA amortizes K-loop overhead better).
+  - `enumerate_cartesian("matmul")` callers in `010_partition_loops.py` (at lines ~646, 683, 694 today) now call
+    both `("matmul", "thread")` and `("matmul", "warp", atom_kinds=eligible)` and concatenate. When `eligible == ()`
+    the warp call returns `[]` cleanly — no special-casing needed at the call site.
+- `_build_split_body` warp branch (formerly stubbed in M1): real layer builder per the "What `_build_split_body`
+  actually looks like" snippet you'll find in the planner discussion above. Emits a layers list with `Role.ATOM` (3
+  innermost entries) + `Role.REGISTER` (N_r, M_r) + `Role.WARP` (N_w, M_w) + `Role.BLOCK` (N_b, M_b, K_s).
+  No `Role.THREAD` entries. K-σ extended with `+ K_a`.
+- `_build_fork_tree_lazy`: add a top-level binding-tier branch. When `eligible == ()`, the tree is identical to
+  today's (scalar only). When `eligible != ()`, the tree top is a fork whose children are:
+  - scalar subtree: today's `_group_level → _bmbn_level → _fmfn_level → _br_level → _leaf_forks` chain over the
+    `ScalarTileParams` rows.
+  - warp subtree: `_kind_level → _group_level → _wmwn_level → _fmfn_level → _leaf_forks` chain over the
+    `WarpTileParams` rows. `_wmwn_level` parallels `_bmbn_level` but groups by `(wm, wn)`. No `_br_level` (BR=1).
+  Inner forks share `_fmfn_level` and `_leaf_forks` because FM/FN/leaf have the same shape in both row types — but
+  the wrapper closures call the right priority function per row type. `_priority_matmul_warp` should outscore
+  `_priority_matmul_thread` at the top level so the tuner drills the warp subtree first.
+- `ir/kernel/render.py::_launch_bounds_for`: see WarpTile primitive plan M2 — if not already landed, add the
+  `WarpTile` branch returning `prod(warp_extents) * 32`. Idempotent if shipped.
+- `kernel/100_materialize_tile.py`: `_materialize_warp` arm (also from the WarpTile primitive plan M2) — idempotent.
 
 **Files.**
 
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` (~60 lines)
-- `deplodock/compiler/ir/kernel/render.py` (~10 lines: `_launch_bounds_for` `WarpTile` branch)
-- `deplodock/compiler/pipeline/passes/lowering/kernel/100_materialize_tile.py` (~30 lines: `WarpTile` materialization
-  arm + linear-tid math)
+- `deplodock/compiler/pipeline/passes/lowering/tile/_enumeration.py` (~80 lines: real `_enumerate_warp_matmul_impl`,
+  `_priority_matmul_warp`, `_TUNE_WARP_AXIS_CHOICES`, dispatch updates)
+- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` (~70 lines: `_plan_kernel` eligible-kinds
+  hook, real warp `_build_split_body` branch, `_kind_level` + `_wmwn_level` in the fork tree)
+- `deplodock/compiler/ir/kernel/render.py` and `kernel/100_materialize_tile.py` — empty if the WarpTile primitive
+  plan landed; otherwise see that plan's M2 for the line counts (~12 + ~80 respectively).
 
-**Verification.** Unit test (same file as M2): an eligible TinyLlama matmul `LoopOp` → enumerated `TileParams` include
-≥1 with `atom_kind="wmma_m16n16k16_f16"`; a non-eligible (f32) matmul → none; a pointwise kernel → no `ATOM_KIND` knob
-stamped (defaults to `"scalar"`). Fork-tree shape: assert the kind level appears and MMA leaves sort before scalar.
-Tower-shape test: materialize one MMA variant; assert the body contains exactly one `WarpTile` wrapping the cell
-tower and one `AtomTile` at the innermost position, both with the expected axis extents. `_launch_bounds_for` reports
-`warps × 32` on that variant.
+**Verification.** Unit test `tests/compiler/passes/test_partition_planner_mma.py` extensions: an eligible TinyLlama
+matmul `LoopOp` → enumerated rows include ≥1 `WarpTileParams(atom_kind="wmma_m16n16k16_f16", …)`; a non-eligible
+(f32) matmul → zero `WarpTileParams` rows, only `ScalarTileParams`; a pointwise kernel → zero `WarpTileParams` rows
+(pointwise mode doesn't dispatch the warp tier). Fork-tree shape: when `eligible != ()` the tree's top is a 2-child
+fork with warp first; when `eligible == ()` the tree top is the unchanged scalar-only chain (assert the *shape* is
+identical to a pre-M3 run on the same kernel). Tower-shape test: materialize one warp variant; assert the body
+contains exactly one `WarpTile` wrapping the cell tower and one `AtomTile` at the innermost position, both with the
+expected axis extents. `_launch_bounds_for` reports `warps × 32`.
 
 ## M4 — Kernel-IR Stmts: `MmaFragment`, `MmaLoad`, `MmaSync`, `MmaStore`
 
@@ -530,22 +588,32 @@ incompletely. "Every matmul has an atom kind; scalar is `(1,1,1)`" should be fir
 
 **Change.**
 
+- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` **module docstring**: the docstring
+  currently shows one loop-nest example for the scalar matmul tower (`for m_b … for n_b … for m_t … for n_t … for
+  m_r … for n_r … for k_o … for k_i …`). Extend it with a **second loop-nest example for the warp/MMA mode** —
+  same bracket-pretty-print style as `ir/tile/ir.py`'s convention, showing the `grid > warp > register > atom` tower
+  with the `MmaFragment` / `MmaLoad` / `MmaSync` body. A reader landing on this module sees both modes side by side
+  and can map any concrete kernel to the right factorization without cross-referencing the plans.
 - `deplodock/compiler/pipeline/ARCHITECTURE.md`: extend the partition-planner factorization description (the
-  `A → A_b·(T·R) + A_t·R + A_r` block) to `BLOCK · GROUP · CELL · ATOM`; document `ATOM_KIND` in the knob table; describe
-  the `ATOM_REGISTRY` model and current entries. Update the `lowering/kernel/` order line (~line 349) to note the
-  `split_register_axes` MMA-cell branch and the `pack_fp16_pairs` / `permute_lane_accesses` MMA skips.
+  `A → A_b·(T·R) + A_t·R + A_r` block) to `BLOCK · GROUP · CELL · ATOM`; document `ATOM_KIND` in the knob table;
+  describe the `ATOM_REGISTRY` model and current entries. Update the `lowering/kernel/` order line (~line 349) to
+  note the `split_register_axes` MMA-cell branch and the `pack_fp16_pairs` / `permute_lane_accesses` MMA skips.
 - `deplodock/compiler/ir/ARCHITECTURE.md`: add the four new Kernel-IR Stmts to the kernel-dialect table (~line 296+);
   add `WarpTile` and `AtomTile` to the Tile-IR flavor list (~line 54) — both Stmts the planner emits but the MMA
   materializer consumes (analogous to today's `RegisterTile`).
 - `CLAUDE.md`: nothing needed — README stays example-driven; `make tune-kernels` already exercises the path.
-- Wrap all markdown at ~120 chars (CLAUDE.md doc convention).
+- Wrap all markdown at ~120 chars (CLAUDE.md doc convention). Python module docstrings wrap at the project's
+  140-char Python limit.
 
 **Files.**
 
+- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` (~40 lines: warp-mode loop-nest example
+  in the module docstring, side-by-side with today's scalar example)
 - `deplodock/compiler/pipeline/ARCHITECTURE.md` (~15 lines)
 - `deplodock/compiler/ir/ARCHITECTURE.md` (~12 lines)
 
-**Verification.** `make lint` clean. Spot-read the changed sections.
+**Verification.** `make lint` clean. Spot-read both docstring examples and confirm they match the actual emitted
+`TileOp.body` for one scalar test case and one MMA test case (paste each from a fresh dump).
 
 ---
 
@@ -572,14 +640,15 @@ incompletely. "Every matmul has an atom kind; scalar is `(1,1,1)`" should be fir
 - **fp16 accumulator dtype.** WMMA's C-fragment is fp32 even with f16 A/B; most scalar matmuls already accumulate in
   f32, so drift should match or improve. If a test relied on a scalar f16 accumulator dtype it may need re-blessing —
   audit during M8.
-- **Scalar no-op regression.** M1's whole purpose is byte-identical scalar output. The two ways this breaks:
-  - `ATOM_KIND` leaks into a rendered knob string / `perf` context key (fix `format_tuning_knobs` elision and the
-    `perf` key derivation if it doesn't already filter via the same renderer).
-  - An extent-1 ATOM layer survives `_wrap_tower`'s size-1 filter and an `AtomTile(axes=(extent=1,…))` reaches a
-    downstream pass that doesn't know it. The filter currently drops *any non-BLOCK extent-1 axis* regardless of
-    role, so this should work for `Role.ATOM` for free; M1's explicit assertion ("zero `AtomTile` instances in any
-    scalar variant's body") is the catch. Same risk for the no-op `WarpTile` (warp count 1 → no `Role.WARP` layer
-    emitted, so no `WarpTile` exists either).
+- **Scalar no-op regression.** M1's whole purpose is byte-identical scalar output. Under the sum-type
+  `TileParams` (Design decision 11) the primary guarantee is **structural**: the scalar layer builder is
+  `ScalarTileParams`-typed and physically cannot reference `Role.ATOM` / `Role.WARP` — those names aren't even in
+  scope of the function. The verification assertion ("every emitted row is a `ScalarTileParams`; zero `AtomTile` /
+  `WarpTile` instances in any body") catches a violation immediately. Two residual ways this could still break:
+  - `ATOM_KIND` leaks into a rendered knob string / `perf` context key on a scalar row. Shouldn't happen — scalar
+    rows don't have the field — but worth a regression assert.
+  - A downstream pass introspects flavor type with an `assert isinstance(s, ThreadTile)` (rather than `(ThreadTile,
+    WarpTile)`) and a future warp-emitting consumer trips it. Caught by the M1 Design-decision-9 audit.
 
 ## Future extensions (out of scope)
 
@@ -613,8 +682,14 @@ dispatch (`spec.instruction`) is the single extension point for new codegen path
 - `deplodock/compiler/ir/tile/ir.py` — tile flavors; add `WarpTile` and `AtomTile` (new `ParallelTile` subclasses,
   consumed by the MMA materializer like `RegisterTile`).
 - `deplodock/compiler/pipeline/passes/lowering/tile/_atom.py` — `AtomSpec`, `ATOM_REGISTRY`, `is_atom_eligible` (new).
-- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` — factorization, fork tree, `ATOM_KIND`
-  knob, planner `Role` (internal) gains `WARP` + `ATOM`, `_layer_kind_for` / `_wrap_tower` grouping, `_priority_matmul`.
+- `deplodock/compiler/pipeline/passes/lowering/tile/_enumeration.py` — sum-type `TileParams` split
+  (`ScalarTileParams` | `WarpTileParams`), `BN`/`BM`/`BR` vs `WN`/`WM`/`ATOM_KIND` knob bundles, per-tier priority
+  functions (`_priority_matmul_thread` / `_priority_matmul_warp`), per-tier `_enumerate_*_matmul_impl`,
+  dispatch-grid `priority_mode`.
+- `deplodock/compiler/pipeline/passes/lowering/tile/010_partition_loops.py` — factorization, top-level binding-tier
+  fork (`_kind_level` + `_wmwn_level` for the warp subtree), planner `Role` (internal) gains `WARP` + `ATOM`,
+  `_layer_kind_for` / `_wrap_tower` grouping, `_build_split_body` sum-type dispatch. Docstring loop-nest examples
+  for both scalar and warp modes (see M10).
 - `deplodock/compiler/pipeline/passes/lowering/tile/_helpers.py` — `is_matmul_reduce`, `compute_capability`.
 - `deplodock/compiler/ir/kernel/ir.py` — `MmaFragment` / `MmaLoad` / `MmaSync` / `MmaStore`.
 - `deplodock/compiler/pipeline/passes/lowering/kernel/010_split_register_axes.py` — per-cell replication; MMA-cell

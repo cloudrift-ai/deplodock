@@ -23,19 +23,28 @@ from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StridedTile
 
 
 def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
-    """All ``Accum``s sitting at the immediate-body level of the first
-    nested reduce ``SerialTile`` / ``StridedTile`` subtree, keyed by
-    Accum name. Used by the materializer when a non-reduce outer tile
-    wraps a deeper reduce — e.g. the cooperative-K shape
-    ``SerialTile(K_o, "serial_outer", body=[SerialTile(K_i, "stage_inner",
-    reduce, [Accum, ...])])`` produced by the partition planner's σ-split,
-    possibly with F-replicated sibling Accums from
-    ``006a_register_tile_planned``. Returns ``{}`` when no reduce-with-
-    immediate-Accum is found, preserving the existing "stray Combine
-    raises" safety net."""
+    """All ``Accum``s sitting at the body level of the first nested reduce
+    ``SerialTile`` / ``StridedTile`` subtree, keyed by Accum name, looking
+    through transparent ``RegisterTile`` / ``Cond`` wrappers.
+
+    Used by the materializer when a non-reduce outer tile wraps a deeper
+    reduce — e.g. the cooperative-K shape ``SerialTile(K_o, "serial_outer",
+    body=[SerialTile(K_i, "stage_inner", reduce, [Accum, ...])])`` produced
+    by the partition planner's σ-split, possibly with F-replicated sibling
+    Accums from ``006a_register_tile_planned``.
+
+    The blocked-GEMM builder
+    (``010_partition_loops::_build_register_blocked_body``) wraps the
+    N-dep K_i tail in ``RegisterTile(N_r, [Load b, Assign, Accum])`` —
+    walking through the ``RegisterTile`` here is the analogue of the
+    same change to ``SerialTileBase.is_reduce`` (Phase 2): both let the
+    cooperative-K materializer fire when BR > 1 takes the blocked path.
+
+    Returns ``{}`` when no reduce-with-Accum subtree is found, preserving
+    the existing "stray Combine raises" safety net."""
     for s in stmts:
         if isinstance(s, (SerialTile, StridedTile)) and s.is_reduce:
-            accums = {a.name: a for a in s.body if isinstance(a, Accum)}
+            accums = _accums_through_wrappers(s.body)
             if accums:
                 return accums
         if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
@@ -43,6 +52,23 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
             if found:
                 return found
     return {}
+
+
+def _accums_through_wrappers(body) -> dict[str, Accum]:
+    """``Accum`` stmts at this body level, descending through transparent
+    ``RegisterTile`` / ``Cond`` wrappers. Matches the structure produced
+    by the blocked builder, where Accum sits inside ``RegisterTile(N_r)``
+    rather than directly in the K_i body."""
+    out: dict[str, Accum] = {}
+    for s in body:
+        if isinstance(s, Accum):
+            out[s.name] = s
+        elif isinstance(s, RegisterTile):
+            out.update(_accums_through_wrappers(s.body))
+        elif isinstance(s, Cond):
+            out.update(_accums_through_wrappers(s.body))
+            out.update(_accums_through_wrappers(s.else_body))
+    return out
 
 
 def single_thread_var(thread_axes: tuple[Axis, ...]) -> str:
