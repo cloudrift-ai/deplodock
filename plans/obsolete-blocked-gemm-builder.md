@@ -246,7 +246,7 @@ its own PR if it touches a downstream pass.
 > mechanism by which per-cell layout will produce identical CUDA once Phase 5 deletes the
 > blocked builder.
 
-### Phase 5 — Delete the blocked builder
+### Phase 5 — Delete the blocked builder ✓ LANDED 2026-05-28
 
 With all five disqualifiers removed, the blocked code path is the unconditional matmul path.
 Delete the `if` gate. Then delete `_build_register_blocked_body`, `_split_k_tower_for_block`,
@@ -257,6 +257,34 @@ and `tests/compiler/passes/test_lowering_blocked_gemm.py` — these assert pre-r
 blocked-tower shape, which won't exist anymore. Rewrite to assert post-CSE codegen shape (count
 of Loads / vectorized widths in the final CUDA) or delete if redundant with the new pass's unit
 tests.
+
+> **Landed (2026-05-28).** Deleted `_build_register_blocked_body`, `_split_k_tower_for_block`,
+> `_classify_n_dep`, the `if shape.k_loop is not None: blocked_inner = …` gate, and all
+> `if reg_blocked: …` / `if not reg_blocked:` branches. Net: 247 lines removed from
+> `010_partition_loops.py` (979 → 720). `_BuildSkipped` stays — `_replace_k_loops` still raises it.
+>
+> **The architectural insight was correct — and stronger than the plan stated.** The kernel-IR
+> replicator (`010_split_register_axes`) already does per-stmt dependency-tracked replication via
+> `_needs_replication` + the `keep[name]` SSA propagation. For a stmt that doesn't transitively
+> depend on the replication axis (`Load a` for N_r in a matmul: the index has `m, k` but not `n_r`),
+> it stays as one copy; only N-dep stmts (`Load b`, the `Accum`) multiply F_N×. So the per-cell
+> layout's `RegisterTile(N_r, body=K-tower)` *automatically* lowers to the same structural shape
+> the deleted blocked builder used to hand-roll — one K-loop with N-invariant cone Loads kept once
+> and N-dependent tail Loads replicated. The fused RMSNorm + linear `cu_lines == 286` invariant is
+> preserved exactly, no smem regression, no kernel-size regression.
+>
+> Phase 1's `011_dedup_replicated` is still valuable as a defense-in-depth backstop: it CSE-folds
+> any duplicates the replicator's dep-analysis happens to miss (accidentally-identical Assign
+> chains, gather indices whose SSA chain the analyser doesn't fully track). On the matmul cases
+> in `test_lowering_blocked_gemm.py` it's effectively a no-op because the replicator is already
+> minimal.
+>
+> **Tests.** `test_planner_emits_register_blocked_structure` rewritten as
+> `test_replicator_keeps_n_invariant_loads_once`: instead of asserting the deleted three-tower
+> shape pre-replicator, it asserts the equivalent post-replicator invariant — `Load a` count == FM
+> (M-replicated, N-invariant) and `Load b` count == FN (N-replicated, M-invariant), NOT FM·FN.
+> `test_lowering_blocked_gemm.py`'s four end-to-end accuracy + kernel-size tests pass unchanged
+> (they were checking output correctness + line count, not the pre-replicator IR shape).
 
 ## Critical files
 
