@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.dtype import F16, F32, DataType
+from deplodock.compiler.dtype import BF16, F16, F32, DataType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 
 if TYPE_CHECKING:
@@ -65,6 +65,65 @@ class AtomSpec:
     instruction: str
     group_size: int
     eligibility: Callable[[LoopOp, Context, Graph], bool]
+
+
+def _wmma_eligible_factory(
+    *,
+    cell_shape: tuple[int, int, int],
+    operand_dtype: DataType,
+    min_cc: tuple[int, int],
+) -> Callable[[LoopOp, Context, Graph], bool]:
+    """Build a WMMA eligibility predicate for a given cell shape + operand
+    dtype + min cc gate. Parametrising the predicate lets the M9 entries
+    (bf16, skewed F16) reuse the same shape gate without copying the body.
+
+    The predicate checks:
+
+    - At least one matmul-reduce in the body (``is_matmul_reduce``).
+    - Every K-indexed Load resolves to ``operand_dtype`` via
+      ``graph.nodes[buf].output.dtype``.
+    - ``ctx.compute_capability >= min_cc``.
+    - K extent divisible by ``cell_shape[2]``.
+    - Each output extent divisible by the corresponding cell dim
+      (M by ``cell_shape[0]``, N by ``cell_shape[1]``).
+    """
+    cell_m, cell_n, cell_k = cell_shape
+
+    def predicate(loop_op: LoopOp, ctx: Context, graph: Graph) -> bool:
+        from deplodock.compiler.ir.stmt import Load, Loop, StridedLoop  # noqa: PLC0415
+
+        if ctx.compute_capability < min_cc:
+            return False
+        matmul_reduces = [lp for lp in loop_op.body.iter_of_type(Loop, StridedLoop) if lp.is_reduce and is_matmul_reduce(lp)]
+        if not matmul_reduces:
+            return False
+        for k_loop in matmul_reduces:
+            K_name = k_loop.axis.name
+            if k_loop.axis.extent.is_static and k_loop.axis.extent.as_static() % cell_k != 0:
+                return False
+            for load in k_loop.body.iter_of_type(Load):
+                if K_name not in {v for e in load.index for v in e.free_vars()}:
+                    continue
+                node = graph.nodes.get(load.input)
+                if node is None or node.output.dtype != operand_dtype:
+                    return False
+        # Each output free-axis extent must divide cleanly. The body's outer
+        # free Loops contribute the M (outer) / N (inner) extents the planner
+        # will partition into output cells; gate the outermost-to-inner
+        # static free axes against (cell_m, cell_n) in their order of
+        # appearance.
+        free_extents = [
+            lp.axis.extent.as_static()
+            for lp in loop_op.body.iter_of_type(Loop, StridedLoop)
+            if not lp.is_reduce and lp.axis.extent.is_static
+        ]
+        cell_dims = (cell_m, cell_n)
+        for ext, cell in zip(reversed(free_extents), reversed(cell_dims), strict=False):
+            if ext > 1 and ext % cell != 0:
+                return False
+        return True
+
+    return predicate
 
 
 def _wmma_m16n16k16_f16_eligible(loop_op: LoopOp, ctx: Context, graph: Graph) -> bool:
@@ -130,9 +189,9 @@ def _wmma_m16n16k16_f16_eligible(loop_op: LoopOp, ctx: Context, graph: Graph) ->
     return True
 
 
-# Seeded at M2 with the WMMA square F16 cell (sm_70+ Volta+, broadest
-# arch coverage of the WMMA kinds). M9 adds bf16 + skewed shapes
-# (m8n32k16, m32n8k16) for skinny attention projections.
+# Seeded at M2 with the WMMA square F16 cell (sm_70+ Volta+). M9 extends
+# with bf16 (Ampere+) + skewed shapes (m8n32k16, m32n8k16) for skinny
+# attention projections.
 ATOM_REGISTRY: dict[str, AtomSpec] = {
     "wmma_m16n16k16_f16": AtomSpec(
         shape=(16, 16, 16),
@@ -141,13 +200,41 @@ ATOM_REGISTRY: dict[str, AtomSpec] = {
         group_size=32,
         eligibility=_wmma_m16n16k16_f16_eligible,
     ),
+    "wmma_m16n16k16_bf16": AtomSpec(
+        shape=(16, 16, 16),
+        operand_dtypes={"a": BF16, "b": BF16, "c": F32},
+        instruction="wmma",
+        group_size=32,
+        eligibility=_wmma_eligible_factory(cell_shape=(16, 16, 16), operand_dtype=BF16, min_cc=(8, 0)),
+    ),
+    "wmma_m8n32k16_f16": AtomSpec(
+        shape=(8, 32, 16),
+        operand_dtypes={"a": F16, "b": F16, "c": F32},
+        instruction="wmma",
+        group_size=32,
+        eligibility=_wmma_eligible_factory(cell_shape=(8, 32, 16), operand_dtype=F16, min_cc=(7, 0)),
+    ),
+    "wmma_m32n8k16_f16": AtomSpec(
+        shape=(32, 8, 16),
+        operand_dtypes={"a": F16, "b": F16, "c": F32},
+        instruction="wmma",
+        group_size=32,
+        eligibility=_wmma_eligible_factory(cell_shape=(32, 8, 16), operand_dtype=F16, min_cc=(7, 0)),
+    ),
 }
 
 
-# Module-level priority-ordered tuple of MMA kinds enumerated at M2. M9
-# extends this to ``_ATOM_KINDS_V2``. Scalar is not in this list — scalar
-# is the absence of an atom (modelled by :class:`ScalarTileParams`).
-_ATOM_KINDS_V1: tuple[str, ...] = ("wmma_m16n16k16_f16",)
+# Module-level priority-ordered tuple of MMA kinds the planner enumerates.
+# Square F16 first (broadest arch coverage); then bf16 square (Ampere+);
+# then skewed F16 shapes (m8n32k16 for tall-N attention projections,
+# m32n8k16 for tall-M skinny outputs). Scalar is not in this list —
+# scalar is the absence of an atom (modelled by :class:`ScalarTileParams`).
+_ATOM_KINDS_V1: tuple[str, ...] = (
+    "wmma_m16n16k16_f16",
+    "wmma_m16n16k16_bf16",
+    "wmma_m8n32k16_f16",
+    "wmma_m32n8k16_f16",
+)
 
 
 def atom_spec(kind: str) -> AtomSpec:

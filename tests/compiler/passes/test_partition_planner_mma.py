@@ -159,8 +159,14 @@ def test_unregistered_kind_raises():
 
 def test_v1_atom_kinds_priority_order():
     """The priority-ordered kinds tuple is the source of truth for the
-    planner's enumeration. M2 ships just WMMA square F16."""
-    assert _ATOM_KINDS_V1 == ("wmma_m16n16k16_f16",)
+    planner's enumeration. M2 shipped WMMA square F16; M9 extends with
+    bf16 (Ampere+) and skewed F16 shapes for skinny matmuls."""
+    assert _ATOM_KINDS_V1 == (
+        "wmma_m16n16k16_f16",
+        "wmma_m16n16k16_bf16",
+        "wmma_m8n32k16_f16",
+        "wmma_m32n8k16_f16",
+    )
     for kind in _ATOM_KINDS_V1:
         assert kind in ATOM_REGISTRY
 
