@@ -11,13 +11,12 @@ were deleted in the same refactor.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum, Init
+from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
@@ -117,68 +116,6 @@ def test_006a_replicates_register_tagged_body_loop():
         assert "a_reg" not in vars_in_index, f"unreplicated a_reg in Write: {w.index}"
     # FM gets stamped from the outermost (and only) RegisterTile axis extent.
     assert new_tile_op.knobs.get("FM") == 4
-
-
-def test_006a_sibling_register_tile_towers_share_keep():
-    """The blocked-GEMM nest emits three sibling ``RegisterTile(N_r)``
-    towers (Init / K-reduce-Accum / Write) at the same ThreadTile level.
-    Each tower's local keep-analysis is incomplete — the Init tower
-    doesn't itself reference N_r, so a per-body fold would keep ``acc``
-    one name there, while the Accum tower would produce ``acc_0..F-1``.
-    Body-global keep aligns the three towers: ``acc`` is keep=True
-    everywhere because some sibling's Accum reads N_r → all three
-    towers replicate consistently to ``acc_0..F-1``.
-    """
-    n_outer = Axis("n_outer", 8)
-    n_reg = Axis("n_reg", 4)
-    k = Axis("k", 16)
-
-    init_tower = RegisterTile(axes=(n_reg,), body=(Init(name="acc", op=ElementwiseImpl("add"), dtype=F32),))
-    reduce_tower = Loop(
-        axis=k,
-        body=(
-            Load(name="w", input="w", index=(Var("k"), Var("n_outer"), Var("n_reg"))),
-            RegisterTile(axes=(n_reg,), body=(Accum(name="acc", value="w", op=ElementwiseImpl("add")),)),
-        ),
-    )
-    write_tower = RegisterTile(
-        axes=(n_reg,),
-        body=(Write(output="o", index=(Var("n_outer"), Var("n_reg")), value="acc"),),
-    )
-    tile = ThreadTile(
-        axes=(n_outer,),
-        body=(init_tower, reduce_tower, write_tower),
-    )
-    tile_op = TileOp(body=(tile,), name="t")
-
-    g = Graph()
-    _input(g, "w", (16, 8, 4))
-    g.add_node(op=tile_op, inputs=["w"], output=Tensor("o", (8, 4)), node_id="o")
-    g.inputs = ["w"]
-    g.outputs = ["o"]
-
-    out = Pipeline.build(KERNEL_PASSES, select={"split_register_axes"}).run(g)
-    new_tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    new_thread = next(s for s in new_tile_op.body if isinstance(s, ThreadTile))
-
-    assert not any(isinstance(s, RegisterTile) for s in new_thread.body.iter()), "RegisterTile should be fully unwrapped"
-
-    # All four init / write / accum cells should reference a per-cell ``acc<i>``
-    # — body-global keep saw the Accum's N_r dep and propagated. (Post-replicate
-    # ``rename_ssa_sequential`` canonicalizes ``acc_0..3`` → ``acc0..3``.)
-    inits = [s for s in new_thread.body if isinstance(s, Init)]
-    init_names = {s.name for s in inits}
-    assert len(init_names) == 4 and all(n.startswith("acc") for n in init_names), init_names
-    writes = [s for s in new_thread.body if isinstance(s, Write)]
-    write_values = {w.value for w in writes}
-    assert len(write_values) == 4 and all(n.startswith("acc") for n in write_values), write_values
-    # The Init / Accum / Write towers must align on the SAME per-cell name
-    # — that's the whole point of body-global keep. If the Init tower kept
-    # ``acc`` as one name (local fold), the rendered kernel would have one
-    # init with four uses → name collision.
-    accums = [s for s in new_thread.body.iter() if isinstance(s, Accum)]
-    accum_names = {a.name for a in accums}
-    assert init_names == write_values == accum_names, (init_names, write_values, accum_names)
 
 
 def test_replicator_keeps_n_invariant_loads_once():
