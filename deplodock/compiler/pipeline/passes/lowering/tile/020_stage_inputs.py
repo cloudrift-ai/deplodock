@@ -50,7 +50,6 @@ sharing the same index ⇒ temporal reuse).
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
 from typing import NamedTuple
 
 from deplodock.compiler.context import Context
@@ -58,7 +57,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     CacheDim,
@@ -84,55 +83,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 PATTERN = [Pattern("root", TileOp)]
 
 STAGE = Knob("STAGE", KnobType.BINMASK, help="Bitmask over ranked candidate buffers (char i = buffer i)")
-
-
-def _iter_loads_through_register(body: Body, register_axes: tuple[Axis, ...] = ()) -> Iterator[tuple[Load, tuple[Axis, ...]]]:
-    """Walk ``body`` collecting every ``Load`` together with the
-    ``RegisterTile`` axes layered between it and the caller's scope.
-
-    The blocked-GEMM nest (``010_partition_loops::_build_register_blocked_body``)
-    wraps the N-dependent K_i tail in ``RegisterTile(N_r)`` while leaving
-    the N-invariant cone (e.g. ``Load a[m, k]``) at the K_i body root.
-    The legacy walker iterated ``s.body`` direct children only, so the
-    N-dependent ``Load b[k, n]`` was never collected and the matmul
-    body ended up staging just half its operands. Walking through
-    ``RegisterTile`` here threads the cell axes into the per-Load
-    ``register_axes`` channel; ``_classify`` then includes them in the
-    candidate axis set so the slab geometry covers the per-cell access
-    pattern. ``Cond`` is transparent for the same reason —
-    ``015_gate_splitk_residual`` and the masked-N path wrap per-cell
-    leaves in a ``Cond`` that doesn't affect addressing.
-
-    Size-1 ``RegisterTile`` axes are eagerly substituted to 0 in the
-    yielded Load's index (matching the kernel-IR replicator
-    ``010_split_register_axes``'s eventual ``σ axis → 0`` for a
-    single-cell unroll) and dropped from the threaded ``register_axes``
-    tuple. Without this, 020's downstream ``_classify`` builds an origin
-    expression that still references the unit axis (which never appears
-    as a cache var because the slab has no unit dim), and the
-    materializer's cooperative-load emit then references an unbound axis
-    name in the gmem index — NVRTC reports ``asm operand must have
-    scalar type`` because the SSA name is undefined at producer scope.
-    Substituting up-front makes blocked-FN=1 share both slab geometry
-    and producer-side addressing with the per-cell FN=1 path (which
-    never wrapped the inner Load in ``RegisterTile`` at all)."""
-    for s in body:
-        if isinstance(s, Load):
-            yield s, register_axes
-        elif isinstance(s, RegisterTile):
-            unit_axes = tuple(ax for ax in s.axes if ax.extent.is_static and ax.extent.as_static() == 1)
-            non_unit = tuple(ax for ax in s.axes if ax not in unit_axes)
-            new_register_axes = register_axes + non_unit
-            if unit_axes:
-                sub = Sigma({ax.name: Literal(0, "int") for ax in unit_axes})
-                for load, axes in _iter_loads_through_register(s.body, new_register_axes):
-                    new_index = tuple(sub.reduce(e, SimplifyCtx({})) for e in load.index)
-                    yield Load(names=load.names, input=load.input, index=new_index, dtype=load.dtype), axes
-            else:
-                yield from _iter_loads_through_register(s.body, new_register_axes)
-        elif isinstance(s, Cond):
-            yield from _iter_loads_through_register(s.body, register_axes)
-            yield from _iter_loads_through_register(s.else_body, register_axes)
 
 
 def _tile_is_cooperative(tt: ThreadTile) -> bool:
@@ -283,8 +233,9 @@ def _collect_candidates(
             continue
         if isinstance(s, (SerialTile, StridedTile)):
             scope_axes = (*in_scope_axes, s.axis)
-            for stmt, extra_reg in _iter_loads_through_register(s.body):
-                loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes + extra_reg))
+            for stmt in s.body:
+                if isinstance(stmt, Load):
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes))
     for buf, items in loads_by_buf.items():
         if block_axis_names and all(_load_free_vars(load).isdisjoint(block_axis_names) for load, _, _, _ in items):
             continue
@@ -440,9 +391,10 @@ def _process_scope(
         if isinstance(s, (SerialTile, StridedTile)):
             scope_axes = (*in_scope_axes, s.axis)
             had_load = False
-            for stmt, extra_reg in _iter_loads_through_register(s.body):
-                loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes + extra_reg))
-                had_load = True
+            for stmt in s.body:
+                if isinstance(stmt, Load):
+                    loads_by_buf.setdefault(stmt.input, []).append((stmt, s.axis, scope_axes, register_axes))
+                    had_load = True
             rewritten_inner.append(s)
             if had_load:
                 stmt_contains_loads_idx.append(len(rewritten_inner) - 1)
