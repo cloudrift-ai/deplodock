@@ -84,6 +84,7 @@ from deplodock.compiler.ir.tile.ir import (
     SerialTile,
     ThreadTile,
     TileOp,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
@@ -109,11 +110,18 @@ class Role(enum.Enum):
     Drives which tile-flavor the layer becomes when the planner builds the
     tower. Not part of the IR — never reaches downstream passes (which
     discriminate on tile-flavor type instead).
+
+    ``WARP`` is reserved for the MMA fragment-factorization consumer plan
+    (``plans/mma-fragment-factorization.md``) and the warp-specialized TMA
+    refactor — no rule in this pass emits it today. ``_layer_kind_for`` /
+    ``_wrap_tower`` recognise the role so consumer plans can flip a tier
+    without revisiting the tower-building mechanics.
     """
 
     BLOCK = "block"
     THREAD = "thread"
     REGISTER = "register"
+    WARP = "warp"
     STAGE_INNER = "stage_inner"
     SERIAL_OUTER = "serial_outer"
     PIPELINE = "pipeline"
@@ -326,6 +334,8 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
       recovered at materialize time from ``Accum.axes ∩ ThreadTile.axes``
       (see ``escape_analysis``).
     - ``REGISTER`` → ``RegisterTile.axes``.
+    - ``WARP`` → ``WarpTile.axes``. Reserved for the MMA / WS-refactor
+      consumer plans; no rule in this pass emits it today.
     - ``SERIAL_OUTER`` / ``STAGE_INNER`` / ``PIPELINE`` → ``SerialTile(kind=…)``.
     - Untagged (``None``) → ``SerialTile(kind="plain")``.
 
@@ -356,7 +366,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
         kind = _layer_kind_for(role)
         # Parallel kinds group consecutive same-kind axes; serial kinds always
         # start a fresh group (each serial layer is its own SerialTile).
-        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register"):
+        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register", "warp"):
             groups[-1][1].append(axis)
             groups[-1][2].append(role)
         else:
@@ -378,6 +388,12 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
             current = (ThreadTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "register":
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
+        elif kind == "warp":
+            # Warp-cooperative tier (consumer plans flip a tier to
+            # ``Role.WARP``). No rule emits this today — the case wires
+            # the tower builder so MMA / WS-refactor downstreams land
+            # without revisiting ``_wrap_tower`` mechanics.
+            current = (WarpTile(axes=tuple(axes), body=Body(current)),)
         else:  # serial — one axis per layer
             ax = axes[0]
             role = roles[0]
@@ -399,6 +415,8 @@ def _layer_kind_for(role: Role | None) -> str:
         return "thread"
     if role is Role.REGISTER:
         return "register"
+    if role is Role.WARP:
+        return "warp"
     return "serial"
 
 
