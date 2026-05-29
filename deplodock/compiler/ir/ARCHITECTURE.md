@@ -268,9 +268,14 @@ parallel coord: `GridTile` (one coord = one CTA, lifts to `blockIdx`),
 collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 `ThreadTile` and `WarpTile` are mutually exclusive inside one
 `TileOp.body` — both bind `threadIdx`. `RegisterTile` (per-thread
-register cell) is consumed before kernel render; downstream consumer
-plans (MMA fragment factorization, warp-specialize refactor) emit
-`WarpTile` to drive warp-cooperative codegen.
+register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
+one fragment) are both consumed before kernel render: `RegisterTile` by
+`kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
+the MMA arm of the same pass (its presence is the structural "this
+matmul factorizes through tensor cores" signal, paired with the
+`ATOM_KIND` knob on the enclosing `TileOp`). Downstream consumer plans
+(MMA fragment factorization, warp-specialize refactor) emit `WarpTile`
+to drive warp-cooperative codegen.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative
@@ -309,6 +314,11 @@ directly (no separate AST class).
 | `Smem`             | `__shared__` array allocation (name + dtype + extents).           |
 | `Sync`             | `__syncthreads()` barrier.                                        |
 | `TreeHalve`        | Cross-thread tree reduction over a smem buffer.                   |
+| `MmaFragment`      | `wmma::fragment<...>` register block decl (one per operand role `"a"`/`"b"`/`"c"`). Carries the cell shape `(M, N, K)` + dtype + layout (`"row_major"`/`"col_major"`, ignored for the accumulator role). Emitted by the MMA cell lowering pass (`kernel/005_lower_atom_tile`). |
+| `MmaFill`          | `wmma::fill_fragment(frag, value)` — zero the C fragment.         |
+| `MmaLoad`          | `wmma::load_matrix_sync(frag, &buf[offset], ldm)` — load one fragment from gmem/smem. `ldm=0` (auto) resolves to `ctx.shapes[buffer][-1]` at render. |
+| `MmaSync`          | `wmma::mma_sync(c, a, b, c)` — one tensor-core MMA. Synchronous (WMMA); future async Hopper / Blackwell kinds add sibling `MmaIssue`/`MmaWait` Stmts. |
+| `MmaStore`         | `wmma::store_matrix_sync(&buf[offset], frag, ldm, layout)`.       |
 | Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`

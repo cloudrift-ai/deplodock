@@ -41,6 +41,55 @@ FM=FN=1, BK=16, SPLITK=1, BR=1):
                                         Accum(acc, a*b)
                                 Write(C[m_b·16 + m_t, n_b·16 + n_t], acc)
 
+Warp-tier (MMA) variant — emitted by ``_build_split_body_warp`` when the
+planner picks a :class:`WarpTileParams` row (only fires when
+``DEPLODOCK_MMA=1`` and ``is_atom_eligible`` passes; see
+``plans/mma-fragment-factorization.md``). The output-axis factorization
+gains a WARP tier between BLOCK and REGISTER and an ATOM tier inside
+REGISTER carrying the hardware cell shape:
+
+    N → N_b·(W_n·F_n·A_n) + N_w·(F_n·A_n) + N_r·A_n + N_a
+          BLOCK    WARP             REGISTER          ATOM
+
+K stride per ``K_i`` step is the atom's K dim (e.g. 16 for
+``wmma_m16n16k16_f16``) rather than 1 — each ``K_i`` iteration consumes
+``atom_k`` K-elements via one ``mma.sync`` instruction.
+
+Example (matmul A[M=128,K=128] @ B[K=128,N=128] with WN=WM=2, FM=FN=2,
+BK=2, SPLITK=1, ATOM_KIND="wmma_m16n16k16_f16" → cell shape (16,16,16),
+``F16`` operands, ``F32`` accumulator):
+
+    Output (σ_outer maps m/n through 4 tiers; σ_k stride = atom_k = 16;
+    M_a / N_a Vars stay OUT of σ — the fragment-lane offset is owned by
+    the WMMA instruction, not the body indices):
+        for m_b in 0..2 BLOCK:
+            for n_b in 0..2 BLOCK:
+                for m_w in 0..2 WARP:
+                    for n_w in 0..2 WARP:
+                        for m_r in 0..2 REGISTER:
+                            for n_r in 0..2 REGISTER:
+                                for m_a in 0..16 ATOM:    # structural marker;
+                                    for n_a in 0..16 ATOM:    # absent from σ
+                                        Init(acc)
+                                        for k_o in 0..4 SERIAL_OUTER:
+                                            for k_i in 0..2 STAGE_INNER reduce:
+                                                a = load A[m_b·64 + m_w·32 + m_r·16, k_o·32 + k_i·16]
+                                                b = load B[k_o·32 + k_i·16, n_b·64 + n_w·32 + n_r·16]
+                                                Accum(acc, a*b)
+                                        Write(C[m_b·64 + m_w·32 + m_r·16, n_b·64 + n_w·32 + n_r·16], acc)
+
+The ``AtomTile(m_a, n_a)`` wrapper + its enclosed matmul-cell body
+(``Init + K_o/K_i reduce + Write``) is consumed in the kernel pass
+chain by ``kernel/005_lower_atom_tile``, which pattern-matches this
+shape and rewrites it into an Mma* fragment chain
+(``MmaFragment`` × 3 + ``MmaFill`` + per-K_i ``MmaLoad`` × 2 +
+``MmaSync`` + final ``MmaStore``). The ``RegisterTile`` wrapper stays;
+``kernel/010_split_register_axes`` replicates the Mma* chain per
+``(m_r, n_r)`` cell, giving each cell its own fragment SSA names
+(``c_frag_0_0`` / ``c_frag_0_1`` / …). After both kernel passes, the
+``mma.sync`` instructions fire ``WM·WN·FM·FN·K_o·K_i = 64`` times per
+CTA on this shape.
+
 For cooperative-K reduce (e.g. sum K=512 with BR=256, BK=2), K_c appears as
 a THREAD axis above the BLOCK level and σ_k extends to
 ``k = k_o·512 + k_i·256 + k_c``; the materializer emits the cross-thread
@@ -79,6 +128,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
+    AtomTile,
     GridTile,
     RegisterTile,
     SerialTile,
@@ -89,6 +139,7 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
+    ATOM_KIND,
     BK,
     BM,
     BN,
@@ -96,7 +147,11 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     FM,
     FN,
     SPLITK,
+    WM,
+    WN,
+    ScalarTileParams,
     TileParams,
+    WarpTileParams,
     enumerate_cartesian,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -113,8 +168,11 @@ class Role(enum.Enum):
 
     ``WARP`` is reserved for the MMA fragment-factorization consumer plan
     (``plans/mma-fragment-factorization.md``) and the warp-specialized TMA
-    refactor — no rule in this pass emits it today. ``_layer_kind_for`` /
-    ``_wrap_tower`` recognise the role so consumer plans can flip a tier
+    refactor — ``tile/085_warp_specialize.py`` emits it today by rewriting a
+    post-080 ``ThreadTile``; once M3 of the MMA plan lands the planner emits
+    it directly for warp-tier matmul rows. ``ATOM`` is reserved for the MMA
+    plan's hardware-atomic cell tier (``AtomTile``). ``_layer_kind_for`` /
+    ``_wrap_tower`` recognise both roles so consumer plans can flip a tier
     without revisiting the tower-building mechanics.
     """
 
@@ -122,6 +180,7 @@ class Role(enum.Enum):
     THREAD = "thread"
     REGISTER = "register"
     WARP = "warp"
+    ATOM = "atom"
     STAGE_INNER = "stage_inner"
     SERIAL_OUTER = "serial_outer"
     PIPELINE = "pipeline"
@@ -195,29 +254,59 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     kernel_name = loop_op.name
     # Idempotence is structural: once the planner has built a TileOp, the
     # rule pattern (LoopOp) no longer matches.
-    plan = _plan_kernel(loop_op, ctx, kernel_name=kernel_name)
+    plan = _plan_kernel(loop_op, ctx, kernel_name=kernel_name, graph=match.graph)
     if plan is None:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
     if len(plan.params) == 1:
         return _materialize(plan, plan.params[0])
 
-    # Hierarchical Fork tree over (BR, (BM,BN), (FM,FN), (BK,SPLITK)). The
-    # builder collapses single-key levels (e.g. pointwise's BR=1 layer),
-    # sorts siblings by max-propagated score descending, and defers
-    # ``_materialize`` to each leaf's ``expand`` thunk so greedy compile
-    # only builds one variant per LoopOp. See ``pipeline/fork_tree.py``.
-    return build_fork_tree(
-        params=plan.params,
-        levels=[
-            Level((BR.name,), lambda p: (p.br,)),
-            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
-            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
-            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
-        ],
-        materialize=lambda p: _materialize(plan, p),
-        score=lambda p: _score_variant(plan, p, ctx),
-    )
+    # Per Design decision 11 of plans/mma-fragment-factorization.md, scalar
+    # and warp tiers carry disjoint knob bundles → disjoint fork-tree level
+    # schemas. Split params by row type and emit one subtree per non-empty
+    # tier. Warp-tier siblings sort first (matmul priority puts MMA above
+    # scalar by construction). When only scalar params exist (the today's
+    # default with DEPLODOCK_MMA=off), the second call returns ``[]`` and
+    # the result is byte-identical to the pre-M3 single call.
+    scalar_params = tuple(p for p in plan.params if isinstance(p, ScalarTileParams))
+    warp_params = tuple(p for p in plan.params if isinstance(p, WarpTileParams))
+
+    def _build_scalar_subtree() -> Fork | list[Fork]:
+        return build_fork_tree(
+            params=scalar_params,
+            levels=[
+                Level((BR.name,), lambda p: (p.br,)),
+                Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
+                Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
+                Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+            ],
+            materialize=lambda p: _materialize(plan, p),
+            score=lambda p: _score_variant(plan, p, ctx),
+        )
+
+    def _build_warp_subtree() -> Fork | list[Fork]:
+        return build_fork_tree(
+            params=warp_params,
+            levels=[
+                Level((ATOM_KIND.name,), lambda p: (p.atom_kind,)),
+                Level((WM.name, WN.name), lambda p: (p.wm, p.wn)),
+                Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
+                Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+            ],
+            materialize=lambda p: _materialize(plan, p),
+            score=lambda p: _score_variant(plan, p, ctx),
+        )
+
+    if not warp_params:
+        return _build_scalar_subtree()
+    if not scalar_params:
+        return _build_warp_subtree()
+    # Both tiers present — concatenate as sibling Forks.
+    scalar_tree = _build_scalar_subtree()
+    warp_tree = _build_warp_subtree()
+    scalar_list = [scalar_tree] if isinstance(scalar_tree, Fork) else list(scalar_tree)
+    warp_list = [warp_tree] if isinstance(warp_tree, Fork) else list(warp_tree)
+    return [*warp_list, *scalar_list]
 
 
 def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
@@ -349,10 +438,14 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
     """
     inner_body = tuple(inner)
     # Drop size-1 axes that aren't launch-geometry markers; substitute
-    # ``Var(axis.name) → Literal(0, "int")`` in the inner body.
+    # ``Var(axis.name) → Literal(0, "int")`` in the inner body. BLOCK axes
+    # signal grid launch geometry; WARP / ATOM axes signal warp-
+    # cooperative MMA codegen — both survive at extent 1 so the
+    # materializer can read the cell shape / warp count off the tower.
+    _STRUCTURAL_ROLES = (Role.BLOCK, Role.WARP, Role.ATOM)
     filtered: list[tuple[Axis, Role | None]] = []
     for axis, role in layers:
-        if axis.extent.is_static and axis.extent.as_static() == 1 and role is not Role.BLOCK:
+        if axis.extent.is_static and axis.extent.as_static() == 1 and role not in _STRUCTURAL_ROLES:
             sub = Sigma({axis.name: Literal(0, "int")})
             inner_body = tuple(c.rewrite(_identity_rename, sub) for c in inner_body)
             continue
@@ -366,7 +459,7 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
         kind = _layer_kind_for(role)
         # Parallel kinds group consecutive same-kind axes; serial kinds always
         # start a fresh group (each serial layer is its own SerialTile).
-        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register", "warp"):
+        if groups and groups[-1][0] == kind and kind in ("grid", "thread", "register", "warp", "atom"):
             groups[-1][1].append(axis)
             groups[-1][2].append(role)
         else:
@@ -390,10 +483,19 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "warp":
             # Warp-cooperative tier (consumer plans flip a tier to
-            # ``Role.WARP``). No rule emits this today — the case wires
-            # the tower builder so MMA / WS-refactor downstreams land
-            # without revisiting ``_wrap_tower`` mechanics.
+            # ``Role.WARP``). ``tile/085_warp_specialize.py`` emits it
+            # today by rewriting a post-080 ThreadTile; once the MMA plan's
+            # M3 lands the planner emits it directly for warp-tier matmul.
             current = (WarpTile(axes=tuple(axes), body=Body(current)),)
+        elif kind == "atom":
+            # Hardware-atomic cell tier (MMA fragment factorization). Marker
+            # for the per-cell tensor-core extent; consumed by the MMA cell
+            # materializer (``kernel/010_split_register_axes`` MMA arm), so
+            # no AtomTile reaches kernel render. No rule emits this today —
+            # the case wires the tower builder so M3 of
+            # ``plans/mma-fragment-factorization.md`` lands without
+            # revisiting ``_wrap_tower`` mechanics.
+            current = (AtomTile(axes=tuple(axes), body=Body(current)),)
         else:  # serial — one axis per layer
             ax = axes[0]
             role = roles[0]
@@ -417,10 +519,12 @@ def _layer_kind_for(role: Role | None) -> str:
         return "register"
     if role is Role.WARP:
         return "warp"
+    if role is Role.ATOM:
+        return "atom"
     return "serial"
 
 
-def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> _Plan | None:
+def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph: Graph | None = None) -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
     candidate ``TileParams`` but doesn't materialize any TileOp — the
@@ -537,6 +641,28 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "") -> _Pl
             m_forced_mask=m_symbolic and mask_ok,
             n_forced_mask=n_symbolic and mask_ok,
         )
+        # Warp-tier MMA: only when DEPLODOCK_MMA is on, no prologue (M9
+        # extension), static M/N/K, and the per-kind eligibility predicate
+        # fires. Each eligible kind gets one WarpTileParams row per
+        # (wn, wm, fm, fn, bk, splitk); we concatenate them onto the scalar
+        # param list — the fork tree in :func:`rewrite` splits the rows by
+        # type and emits sibling subtrees with disjoint level schemas.
+        from deplodock import config  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile._atom import _ATOM_KINDS_V1, is_atom_eligible  # noqa: PLC0415
+
+        if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
+            eligible = tuple(k for k in _ATOM_KINDS_V1 if is_atom_eligible(k, loop_op, ctx, graph=graph))
+            if eligible:
+                warp_combos = enumerate_cartesian(
+                    E_M=E_M,
+                    E_N=E_N,
+                    E_K=E_K,
+                    ctx=ctx,
+                    priority_mode=("matmul", "warp"),
+                    force_splitk_one=force_splitk_one,
+                    atom_kinds=eligible,
+                )
+                param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
@@ -624,16 +750,28 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
         chain_body = _build_split_body(plan.shape, params)
     except RuleSkipped as exc:
         raise AssertionError(f"shape-level RuleSkipped fired at materialize time for kernel {plan.kernel_name!r}: {exc}") from exc
-    knobs = {
-        **plan.base_knobs,
-        BN.name: params.bn,
-        BM.name: params.bm,
-        FM.name: params.fm,
-        FN.name: params.fn,
-        BK.name: params.bk,
-        SPLITK.name: params.splitk,
-        BR.name: params.br,
-    }
+    if isinstance(params, WarpTileParams):
+        knobs = {
+            **plan.base_knobs,
+            WN.name: params.wn,
+            WM.name: params.wm,
+            FM.name: params.fm,
+            FN.name: params.fn,
+            BK.name: params.bk,
+            SPLITK.name: params.splitk,
+            ATOM_KIND.name: params.atom_kind,
+        }
+    else:
+        knobs = {
+            **plan.base_knobs,
+            BN.name: params.bn,
+            BM.name: params.bm,
+            FM.name: params.fm,
+            FN.name: params.fn,
+            BK.name: params.bk,
+            SPLITK.name: params.splitk,
+            BR.name: params.br,
+        }
     # Drop leading stmts whose SSA name is *also* defined inside ``chain_body``.
     # A pre-loop invariant (e.g. ``v0 = reciprocal(1024)``) used only by a
     # post-reduce stmt gets pulled into the thread scope by the body builder as
@@ -660,7 +798,17 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     prologue runs inside the ``M_r`` REGISTER scope but *outside* the
     ``N_r`` register tower — softmax stats are per-seq-q-row (per M_r),
     independent of the output N. σ_outer + σ_k are applied uniformly so
-    the prologue's M-axis references resolve to the in-scope ``M_r``."""
+    the prologue's M-axis references resolve to the in-scope ``M_r``.
+
+    The warp-tier MMA builder lands here in M3 of
+    ``plans/mma-fragment-factorization.md``. At M1 no ``WarpTileParams`` row
+    ever reaches this function (the warp enumerator returns []) — the
+    isinstance dispatch routes warp-tier rows to
+    :func:`_build_split_body_warp` (M3); the rest of this function handles
+    the scalar tier.
+    """
+    if isinstance(params, WarpTileParams):
+        return _build_split_body_warp(shape, params)
     sigma_map: dict[str, object] = {}
 
     # source_axis: every sub-axis points back to the original Axis it was
@@ -891,6 +1039,113 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     return _wrap_tower(layers, new_inner)
 
 
+def _build_split_body_warp(shape: KernelShape, params: WarpTileParams) -> tuple[Stmt, ...]:
+    """σ-split + tower wrap for the warp-tier MMA matmul path.
+
+    Mirrors :func:`_build_split_body` but with the 4-level output-axis
+    factorization ``A_b · (W · F · A_atom) + A_w · (F · A_atom) + A_r ·
+    A_atom + A_a`` (BLOCK > WARP > REGISTER > ATOM) and the
+    ``atom_k``-strided K iteration. The body inside the AtomTile retains
+    its Load+Accum shape; the MMA cell materializer
+    (``kernel/010_split_register_axes`` MMA arm, M5) sees the AtomTile +
+    the matmul-reduce body and rewrites it into the ``MmaFragment`` +
+    ``MmaLoad`` + ``MmaSync`` chain.
+
+    No prologue / masked tile support at M3 (matches the warp enumerator,
+    which rejects non-divisor extents). Symbolic axes / cooperative-K
+    are gated off by construction (the eligibility predicate refuses
+    them; ``BR=1`` is enforced in :class:`WarpTileParams`).
+
+    The ``M_a`` / ``N_a`` Vars *do not appear* in ``σ_outer`` — the
+    in-fragment lane offset is owned by the WMMA instruction, not the
+    body indices. The materializer reads ``AtomTile.axes`` extents to
+    know the fragment shape and emits one ``MmaSync`` per (M_r, N_r)
+    cell.
+    """
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
+
+    spec = atom_spec(params.atom_kind)
+    atom_m, atom_n, atom_k = spec.shape
+
+    sigma_map: dict[str, object] = {}
+
+    # ---- N axis: A_b · (W_n · F_n · A_n) + A_w · (F_n · A_n) + A_r · A_n + A_a
+    N_axis = shape.outer_n.axis
+    N_name = N_axis.name
+    N_src = N_axis.source_axis or N_axis
+    n_per_block = params.wn * params.fn * atom_n
+    E_N = N_axis.extent.as_static()
+    N_b = Axis(f"{N_name}_b", E_N // n_per_block, source_axis=N_src)
+    N_w = Axis(f"{N_name}_w", params.wn, source_axis=N_src)
+    N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
+    N_a = Axis(f"{N_name}_a", atom_n, source_axis=N_src)
+    sigma_map[N_name] = (
+        Var(N_b.name) * Literal(n_per_block, "int")
+        + Var(N_w.name) * Literal(params.fn * atom_n, "int")
+        + Var(N_r.name) * Literal(atom_n, "int")
+    )
+
+    # ---- M axis (symmetric to N).
+    assert shape.outer_m is not None, "warp-tier matmul requires an outer M axis"
+    M_axis = shape.outer_m.axis
+    M_name = M_axis.name
+    M_src = M_axis.source_axis or M_axis
+    m_per_block = params.wm * params.fm * atom_m
+    E_M = M_axis.extent.as_static()
+    M_b = Axis(f"{M_name}_b", E_M // m_per_block, source_axis=M_src)
+    M_w = Axis(f"{M_name}_w", params.wm, source_axis=M_src)
+    M_r = Axis(f"{M_name}_r", params.fm, source_axis=M_src)
+    M_a = Axis(f"{M_name}_a", atom_m, source_axis=M_src)
+    sigma_map[M_name] = (
+        Var(M_b.name) * Literal(m_per_block, "int")
+        + Var(M_w.name) * Literal(params.fm * atom_m, "int")
+        + Var(M_r.name) * Literal(atom_m, "int")
+    )
+
+    sigma_outer = Sigma(sigma_map)
+
+    # ---- K axis: K_s · K_o · bk · atom_k + K_o · bk · atom_k + K_i · atom_k.
+    assert shape.k_loop is not None, "warp-tier matmul requires a K reduce"
+    K_axis = shape.k_loop.axis
+    K_src = K_axis.source_axis or K_axis
+    E_K = K_axis.extent.as_static()
+    K_o_ext = E_K // (params.splitk * params.bk * atom_k)
+    K_s = Axis(f"{K_axis.name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None
+
+    # σ-rewrite the matmul body's outer axes (M/N), then expand the K reduce
+    # into a K_o > K_i serial tower with K_i stride = atom_k.
+    inner_after_outer = tuple(s.rewrite(_identity_rename, sigma_outer) for s in shape.outer_n.body)
+    new_inner, n_replaced = _replace_k_loops(
+        inner_after_outer,
+        target_names=shape.target_names,
+        K_canonical_name=K_axis.name,
+        K_s=K_s,
+        K_c=None,
+        br=1,
+        bk=params.bk,
+        K_o_ext=K_o_ext,
+        atom_k=atom_k,
+    )
+    if n_replaced == 0:
+        raise RuleSkipped("K reduce not found in body")
+
+    # ---- Tower: AtomTile(M_a, N_a) > RegisterTile(M_r, N_r) >
+    # WarpTile(M_w, N_w) > GridTile(M_b, N_b, K_s?). Layers innermost-first.
+    layers: list[tuple[Axis, Role | None]] = []
+    layers.append((N_a, Role.ATOM))
+    layers.append((M_a, Role.ATOM))
+    layers.append((N_r, Role.REGISTER))
+    layers.append((M_r, Role.REGISTER))
+    layers.append((N_w, Role.WARP))
+    layers.append((M_w, Role.WARP))
+    layers.append((N_b, Role.BLOCK))
+    layers.append((M_b, Role.BLOCK))
+    if K_s is not None:
+        layers.append((K_s, Role.BLOCK))
+    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
+    return _wrap_tower(layers, new_inner)
+
+
 def _replace_k_loops(
     stmts: tuple[Stmt, ...],
     *,
@@ -901,6 +1156,7 @@ def _replace_k_loops(
     br: int,
     bk: int,
     K_o_ext: int,
+    atom_k: int = 1,
 ) -> tuple[tuple[Stmt, ...], int]:
     """Replace every ``Loop`` whose axis name is in ``target_names`` with a
     ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, σ(body)))`` tower.
@@ -923,7 +1179,7 @@ def _replace_k_loops(
             K_src = s.axis.source_axis or s.axis
             K_o = Axis(f"{K_canonical_name}_o", K_o_ext, source_axis=K_src)
             K_i = Axis(f"{K_canonical_name}_i", bk, source_axis=K_src)
-            sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk)
+            sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk, atom_k=atom_k)
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             tower = _wrap_tower([(K_i, Role.STAGE_INNER), (K_o, Role.SERIAL_OUTER)], new_body)
             if not s.is_reduce and K_s is not None:
@@ -940,7 +1196,15 @@ def _replace_k_loops(
             continue
         if isinstance(s, (Loop, StridedLoop)):
             inner, r = _replace_k_loops(
-                s.body, target_names=target_names, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
+                s.body,
+                target_names=target_names,
+                K_canonical_name=K_canonical_name,
+                K_s=K_s,
+                K_c=K_c,
+                br=br,
+                bk=bk,
+                K_o_ext=K_o_ext,
+                atom_k=atom_k,
             )
             if r:
                 out.append(replace(s, body=inner))
@@ -948,7 +1212,15 @@ def _replace_k_loops(
                 continue
         if isinstance(s, Cond):
             inner_b, rb = _replace_k_loops(
-                s.body, target_names=target_names, K_canonical_name=K_canonical_name, K_s=K_s, K_c=K_c, br=br, bk=bk, K_o_ext=K_o_ext
+                s.body,
+                target_names=target_names,
+                K_canonical_name=K_canonical_name,
+                K_s=K_s,
+                K_c=K_c,
+                br=br,
+                bk=bk,
+                K_o_ext=K_o_ext,
+                atom_k=atom_k,
             )
             inner_e, re_ = _replace_k_loops(
                 s.else_body,
@@ -959,6 +1231,7 @@ def _replace_k_loops(
                 br=br,
                 bk=bk,
                 K_o_ext=K_o_ext,
+                atom_k=atom_k,
             )
             if rb or re_:
                 out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
@@ -977,15 +1250,26 @@ def _build_k_sigma(
     K_o_ext: int,
     br: int,
     bk: int,
+    atom_k: int = 1,
 ) -> Sigma:
-    """σ for ``K = K_s·(K_o_ext·br·bk) + K_o·(br·bk) + K_i·br + K_c``.
-    K_s / K_c terms collapse when those axes are None (SPLITK=1 / BR=1);
-    when K_c is absent, K_i loses its ``·br`` stride."""
-    inner_expr = Var(K_o.name) * Literal(br * bk, "int")
+    """σ for ``K = K_s·(K_o_ext·br·bk·atom_k) + K_o·(br·bk·atom_k) +
+    K_i·br·atom_k + K_c·atom_k`` (in the most general form). K_s / K_c
+    terms collapse when those axes are None (SPLITK=1 / BR=1); when K_c
+    is absent, K_i loses its ``·br`` stride. ``atom_k`` (the WMMA K
+    dimension; default 1 for scalar) extends every per-K-step factor —
+    one K_i step covers ``atom_k`` K-elements when MMA is in play, so
+    the inner body's K-indexed Loads see ``K_o·bk·atom_k + K_i·atom_k``
+    instead of ``K_o·bk + K_i``."""
+    inner_expr = Var(K_o.name) * Literal(br * bk * atom_k, "int")
     if K_c is not None:
-        inner_expr = inner_expr + Var(K_i.name) * Literal(br, "int") + Var(K_c.name)
+        if atom_k > 1:
+            inner_expr = inner_expr + Var(K_i.name) * Literal(br * atom_k, "int") + Var(K_c.name) * Literal(atom_k, "int")
+        else:
+            inner_expr = inner_expr + Var(K_i.name) * Literal(br, "int") + Var(K_c.name)
+    elif atom_k > 1:
+        inner_expr = inner_expr + Var(K_i.name) * Literal(atom_k, "int")
     else:
         inner_expr = inner_expr + Var(K_i.name)
     if K_s is not None:
-        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk, "int") + inner_expr
+        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk * atom_k, "int") + inner_expr
     return Sigma({K_name: inner_expr})

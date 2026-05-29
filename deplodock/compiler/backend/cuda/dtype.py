@@ -20,6 +20,7 @@ from deplodock.compiler.dtype import DataType
 _CUDA_NAME: dict[DataType, str] = {
     _dtype.F32: "float",
     _dtype.F16: "__half",
+    _dtype.BF16: "__nv_bfloat16",
     _dtype.F16x2: "__half2",
     _dtype.I32: "int",
     _dtype.I64: "long long",
@@ -43,6 +44,7 @@ def canonical_from_cuda_name(name: str) -> str | None:
 _CUDA_INCLUDE: dict[DataType, str | None] = {
     _dtype.F32: None,
     _dtype.F16: "<cuda_fp16.h>",
+    _dtype.BF16: "<cuda_bf16.h>",
     _dtype.F16x2: "<cuda_fp16.h>",
 }
 

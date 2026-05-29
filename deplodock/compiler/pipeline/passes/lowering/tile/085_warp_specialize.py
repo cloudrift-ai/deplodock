@@ -7,6 +7,19 @@ i.e. the post-``080_pipeline_stages`` shape of a pipelined matmul
 kernel. Emits a 2-child ``Fork``: ``WS=0`` returns the input unchanged,
 ``WS=1`` returns a rewritten ``TileOp``.
 
+**MMA interaction** (see ``plans/mma-fragment-factorization.md`` M11).
+The warp-tier MMA path (planner-emitted ``WarpTile`` + ``AtomTile`` +
+fragment chain) bypasses this pass: ``_find_thread_tile`` returns ``None``
+on a body whose binding tier is already a ``WarpTile`` (the MMA cell
+materializer in ``kernel/005_lower_atom_tile`` consumes the AtomTile but
+preserves the WarpTile wrapper). For v1, MMA + WS is out of scope; 085
+silently skipping MMA kernels is the desired behaviour. The M11 followup
+splits ``_ws_transform`` into a ThreadTile arm (today's body) and a
+WarpTile arm (which would consume the planner-emitted warp tier
+directly, no fresh tier synthesis) once MMA + WS is a validated combined
+target — the WarpTile arm would only need the producer/consumer body
+split, since the warp axes are already in scope.
+
 The structural rewrite (WS=1 only):
 
 1. **Replace the inner ``ThreadTile`` with a ``WarpTile``** whose single
@@ -112,9 +125,14 @@ def _find_thread_tile(body: Body) -> ThreadTile | None:
     (cooperative shape).
 
     Defensive: matches ``ThreadTile`` only (not ``WarpTile``). The pass
-    rewrites a scalar-tower input into the warp-tower output; if a
-    downstream emitter later produces a ``WarpTile``-bearing TileOp,
-    this pass will see no ThreadTile and skip cleanly."""
+    rewrites a scalar-tower input into the warp-tower output; a MMA path
+    TileOp (warp-tier matmul with planner-emitted ``WarpTile``) sees no
+    ThreadTile and skips cleanly — by design, since MMA + WS is out of
+    scope for v1 (see ``plans/mma-fragment-factorization.md`` M11 and
+    Failure modes). When MMA + WS is a validated combined target, this
+    helper splits into ``_find_thread_or_warp_tile`` and ``_ws_transform``
+    grows a WarpTile arm that consumes the existing warp tier instead of
+    synthesising one."""
     for s in body:
         if isinstance(s, ThreadTile):
             return s

@@ -89,6 +89,11 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     knobs = root.op.knobs
+    if knobs.get("ATOM_KIND"):
+        # MMA path: WMMA uses ``load_matrix_sync`` with its own swizzled
+        # access — the per-thread LDS.128 permute doesn't apply. Skip per
+        # plans/mma-fragment-factorization.md M7.
+        raise RuleSkipped("MMA kernel — load_matrix_sync handles its own swizzling")
     if "FN" not in knobs:
         raise RuleSkipped("no FN knob on TileOp (split_register_axes hasn't run)")
     F = int(knobs["FN"])

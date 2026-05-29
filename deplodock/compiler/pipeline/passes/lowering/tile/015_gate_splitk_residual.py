@@ -96,6 +96,13 @@ def _walk_apply_gate(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:
     op: TileOp = root.op
+    if op.knobs.get("ATOM_KIND"):
+        # MMA path: accumulation flows through the C fragment (one
+        # per cell), not through scalar Init/Accum stmts; the
+        # linear-residual gate has no surface to hoist here. SplitK on
+        # MMA still relies on the codegen-derived atomic-Write rewrite
+        # (see plans/mma-fragment-factorization.md M5 / Failure modes).
+        raise RuleSkipped("MMA TileOp — split-K residual gate doesn't apply to fragment-accum bodies")
     k_s_name = _find_split_k_axis_name(op)
     if k_s_name is None:
         raise RuleSkipped("no split-K axis (SPLITK = 1)")

@@ -119,6 +119,14 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     """
     if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
+    if root.op.knobs.get("ATOM_KIND"):
+        # MMA path (plans/mma-fragment-factorization.md): the warp-tier
+        # WMMA cell materializer in kernel/010_split_register_axes reads
+        # operands directly from gmem via wmma::load_matrix_sync in v1.
+        # Smem-staged WMMA is a perf follow-up (the layout / swizzle
+        # interplay is non-trivial); skipping staging here keeps the v1
+        # path correct end-to-end.
+        raise RuleSkipped("MMA path bypasses smem staging in v1")
     budget = ctx.max_dynamic_smem
     variants = _enumerate_variants(root.op.body, slab_cap=budget, scope_budget=budget, parent_op=root.op, warp_size=ctx.warp_size)
     if not variants:
