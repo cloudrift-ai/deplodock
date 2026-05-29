@@ -1,13 +1,13 @@
-"""CUDA accuracy regressions for the register-blocked GEMM nest.
+"""CUDA accuracy regressions for matmul shapes with FN > 1.
 
-The blocked-GEMM nest (planner default for matmul shapes with FN > 1
-under SPLITK=1 / BR=1 / no M-mask) splits the N_r register-tile around
-the K-reduce so N-invariant compute runs once per K step and is shared
-across the F_N cells. The split intersects with the smem vectorize /
-fp16 pack / fused-prologue gate machinery in ways that produced CUDA
+Each test pins the autotune knob bundle that used to fault on the
+register-blocked GEMM builder's path (deleted in
+``plans/obsolete-blocked-gemm-builder.md`` phase 5) and confirms the
+per-cell shape + Kernel-IR replicator + ``dedup_replicated`` pipeline
+reproduces the same accuracy. The pinned shapes exercise the smem
+vectorize / fp16 pack / fused-prologue intersections that produced CUDA
 runtime hangs and silently-wrong vector reads on specific autotune
-variants. Each test below pins the failing knob bundle via env and
-checks the CUDA-compiled kernel matches a NumpyBackend reference.
+variants.
 
 Skipped without CUDA.
 """
@@ -69,13 +69,13 @@ def _pin_knobs(monkeypatch, **knobs) -> None:
 def test_blocked_matmul_postmul_fn3_no_misalign(monkeypatch):
     """``BK=64 BM=32 BN=32 BR=1 FM=1 FN=3 SPLITK=1 STAGE=111`` on a matmul
     chained into a post-multiply previously hung the kernel ("did not
-    complete within 1000 ms"). Root cause: the blocked-GEMM nest emits
-    multi-dim staged smem ``[K, N_t, N_r]`` with FN=3 innermost.
-    ``050_vectorize_loads`` packed two cells into one ``float2``
-    reinterpret_cast on a last-dim constant-anchor alignment check that
-    didn't see the stride-3 base address ``a3 · FN`` — half the threads
-    read at byte 12, not 8-byte aligned for float2, and the device
-    stalled on the misaligned access (no exception, just stuck).
+    complete within 1000 ms"). Root cause: the per-cell + replicator
+    pipeline produces multi-dim staged smem ``[K, N_t, N_r]`` with FN=3
+    innermost. ``050_vectorize_loads`` packed two cells into one
+    ``float2`` reinterpret_cast on a last-dim constant-anchor alignment
+    check that didn't see the stride-3 base address ``a3 · FN`` — half
+    the threads read at byte 12, not 8-byte aligned for float2, and the
+    device stalled on the misaligned access (no exception, just stuck).
 
     The fix walks back into the Source's innermost cache-axis extent
     and refuses to vectorize when it isn't a multiple of the pack count.
@@ -112,23 +112,21 @@ def test_blocked_matmul_postmul_fn3_no_misalign(monkeypatch):
 
 @requires_cuda
 def test_blocked_matmul_fp16_odd_stride_n_no_misalign(monkeypatch):
-    """fp16 matmul where the blocked-GEMM nest stages a smem slab whose
-    innermost cache-axis extent is odd (FN=3 here) used to fault with
-    ``CUDA_ERROR_MISALIGNED_ADDRESS`` because ``050_vectorize_loads``
-    treated ``n=2 fp16`` (``__half2``) as a freebie: the TYPE is 4-byte
-    aligned, but reinterpreting an fp16 pointer at an odd-element offset
-    still misses the alignment. Two cells off an FN=3 base land at
-    consecutive odd offsets — half the threads read at byte 6, not
-    4-byte-aligned for ``__half2``. The fix walks back into the Source's
-    innermost cache-axis extent and refuses to vectorize when it isn't a
-    multiple of n.
+    """fp16 matmul whose staged smem slab has an odd innermost cache-axis
+    extent (FN=3 here) used to fault with ``CUDA_ERROR_MISALIGNED_ADDRESS``
+    because ``050_vectorize_loads`` treated ``n=2 fp16`` (``__half2``) as
+    a freebie: the TYPE is 4-byte aligned, but reinterpreting an fp16
+    pointer at an odd-element offset still misses the alignment. Two
+    cells off an FN=3 base land at consecutive odd offsets — half the
+    threads read at byte 6, not 4-byte-aligned for ``__half2``. The fix
+    walks back into the Source's innermost cache-axis extent and refuses
+    to vectorize when it isn't a multiple of n.
 
     Shape: M=32, K=64, N=96 (clean divisor 96 = BN·FN under BN=32 FN=3).
-    The pinned (BK=64 BM=32 BN=32 FM=1 FN=3 SPLITK=1 BR=1 STAGE=111)
-    is the blocked variant from the FN=3 hang reproducer in
-    ``370e6090`` — only the matmul-chained-into-mul gives the planner
-    a STAGE=111 enumeration, so the test multiplies the matmul output
-    by a scalar broadcast.
+    The pinned (BK=64 BM=32 BN=32 FM=1 FN=3 SPLITK=1 BR=1 STAGE=111) is
+    the variant from the FN=3 hang reproducer in ``370e6090`` — only the
+    matmul-chained-into-mul gives the planner a STAGE=111 enumeration,
+    so the test multiplies the matmul output by a scalar broadcast.
     """
     from deplodock.compiler import dtype as _dt  # noqa: PLC0415
 
@@ -163,26 +161,25 @@ def test_blocked_matmul_fp16_odd_stride_n_no_misalign(monkeypatch):
 @requires_cuda
 def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     """Fused RMSNorm + linear at lm_head-style knobs (FN=32, BK=64,
-    SPLITK=1, BR=1, FM=1) used to hit the 2 s NVRTC compile budget
-    because the planner's blocked-GEMM nest was gated by
-    ``not shape.prologue``. The fused RMSNorm reduce IS a prologue, so
-    blocking didn't fire and each of the 32 register cells re-emitted
-    the per-K-element normalization ``v_k = x[m,k] · inv_rms ·
-    norm_weight[k]`` inside its own unrolled K loop — ~3.7 s to compile
-    a ~530-line function with 32 live accumulators.
+    SPLITK=1, BR=1, FM=1) used to hit the 2 s NVRTC compile budget on
+    the legacy per-cell path, because the old blocked-GEMM builder
+    excluded fused-prologue shapes. Without it, each of the 32 register
+    cells re-emitted the per-K-element normalization
+    ``v_k = x[m,k] · inv_rms · norm_weight[k]`` inside its own unrolled
+    K loop — ~3.7 s to compile a ~530-line function with 32 live
+    accumulators.
 
-    M5 drops the prologue exclusion: the prologue itself (mean reduce +
-    rsqrt) still runs once at the M_r scope, but the matmul body inside
-    it goes through the blocked nest. The kernel structure has
-    ``v6 = norm_weight · v5`` computed once per K iter, then per-cell
-    Conds doing weight Load + multiply + Accum into persistent acc_i
-    registers — compiles in budget and runs correctly.
+    The current per-cell + replicator + ``dedup_replicated`` pipeline
+    folds the N-invariant prologue chain back into one body-level copy
+    (mean reduce + rsqrt + ``v6 = norm_weight · v5`` computed once per K
+    iter), with per-cell weight Load + multiply + Accum into persistent
+    acc_i registers — compiles in budget and runs correctly.
 
     Shape: M=2 (tiny batch — fp32 keeps the accumulator drift small),
     K=1024 (RMSNorm normalization range), N=4096 (BN=128 · FN=32 clean
-    divisor — picks the blocked variant from the failing tune log
-    without needing the full lm_head vocab=151669, which would also
-    work but compiles slower in this CI-friendly test).
+    divisor — matches the failing tune log without needing the full
+    lm_head vocab=151669, which would also work but compiles slower in
+    this CI-friendly test).
     """
     _pin_knobs(monkeypatch, BK=64, BM=1, BN=128, BR=1, FM=1, FN=32, SPLITK=1)
 
@@ -204,14 +201,12 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     # Compute reference BEFORE backend.compile (which mutates ops in place).
     ref = _reference(g, inputs)["o"]
 
-    # Structural check: with M5 in place, the planner emits ONE smem
-    # allocation for the RMSNorm input (``x_smem``) — both the mean
-    # reduce and the matmul body share it. Without M5, the legacy
-    # prologue path wraps the matmul body in its own RegisterTile(N_r),
-    # which forces a SECOND smem allocation (``x_smem_1``) because the
-    # blocked Loads inside the per-cell scope come from a different
-    # staging context. Detect the regression by counting distinct smem
-    # decls for the x buffer.
+    # Structural check: the per-cell + replicator + dedup pipeline emits
+    # ONE smem allocation for the RMSNorm input (``x_smem``) — both the
+    # mean reduce and the matmul body share it. A regression that wraps
+    # the matmul body in its own RegisterTile(N_r) at a different staging
+    # context would force a SECOND smem allocation (``x_smem_1``). Detect
+    # by counting distinct smem decls for the x buffer.
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
@@ -222,23 +217,23 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     cuda_src = "\n".join(op.kernel_source for op in cuda_ops)
     x_smem_decls = cuda_src.count("__shared__ float x_smem")
     assert x_smem_decls == 1, (
-        f"expected 1 ``__shared__ float x_smem`` decl (blocked-prologue shares the staging); "
-        f"got {x_smem_decls} — the legacy per-cell path opens its own smem context inside RegisterTile(N_r), "
-        f"forcing a second allocation."
+        f"expected 1 ``__shared__ float x_smem`` decl (per-cell shares the staging); "
+        f"got {x_smem_decls} — a regression opening its own smem context inside RegisterTile(N_r) "
+        f"would force a second allocation."
     )
 
-    # Kernel-size check: legacy path duplicates the prologue chain inside
-    # each register cell's scope. With FN=32 and a ~5-stmt v_k chain
-    # (Load x, mul by inv_rms, Load norm_weight, mul, ...), the legacy
-    # path's body lands at ~330 lines; the blocked path's body at ~210.
-    # The renderer prepends the TMA prelude (~75 lines of mbarrier /
-    # cp_async_bulk_tensor helpers) when TMA descriptors are present, so
-    # the blocked+TMA total is ~286 and the legacy+TMA regression would
+    # Kernel-size check: a regression that duplicates the prologue chain
+    # inside each register cell's scope inflates the body. With FN=32 and
+    # a ~5-stmt v_k chain (Load x, mul by inv_rms, Load norm_weight,
+    # mul, ...), the duplicated body lands at ~330 lines; the deduped
+    # body at ~210. The renderer prepends the TMA prelude (~75 lines of
+    # mbarrier / cp_async_bulk_tensor helpers) when TMA descriptors are
+    # present, so the deduped+TMA total is ~286 and a regression would
     # land ~406. Threshold at 360 catches the regression with margin.
     cu_lines = cuda_src.count("\n")
     assert cu_lines < 360, (
-        f"rendered kernel is {cu_lines} lines — the blocked-prologue path should produce ~286 with TMA prelude; "
-        f"a regression to the legacy per-cell path inflates it to ~400+ via duplicated v_k chains."
+        f"rendered kernel is {cu_lines} lines — should produce ~286 with TMA prelude; "
+        f"a regression that fails to dedup the N-invariant prologue chain inflates it to ~400+."
     )
 
     out = backend.run(compiled, input_data=inputs)[0].outputs["o"]
@@ -261,12 +256,11 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     ids=["fn8_no_mr", "fm2_fn2_mr", "fn3_clean"],
 )
 def test_blocked_matmul_default_accuracy(monkeypatch, m, k, n, fm, fn):
-    """The M3 commit dropped the REG_BLOCK knob and made blocking the
-    planner's default for any matmul with FN > 1 (and SPLITK=1, BR=1,
-    no M-mask). This parametrized matrix covers the structural shapes
-    blocking touches: pure FN-only (no M_r), FM+FN (M_r register-tiled
-    too), and the FN=3 clean-divisor case (innermost cache-axis extent
-    not a multiple of 2 — exercises the vectorize alignment guard).
+    """Sanity matrix for FN > 1 matmul shapes (SPLITK=1, BR=1, no
+    M-mask) — covers pure FN-only (no M_r), FM+FN (M_r register-tiled
+    too), and FN=3 clean-divisor (innermost cache-axis extent not a
+    multiple of 2 — exercises the vectorize alignment guard). These are
+    the shapes the deleted blocked-GEMM builder used to specialize.
     """
     bn = max(1, n // fn) if (n % (n // fn) == 0 and (n // fn) <= 256) else n // fn
     bm = max(1, m // fm)

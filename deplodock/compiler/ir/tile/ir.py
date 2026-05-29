@@ -683,14 +683,15 @@ class ThreadTile(ParallelTile):
 
 @dataclass(frozen=True)
 class RegisterTile(ParallelTile):
-    """Per-thread register-cell tile. Body replicated F× per axis by 006a.
+    """Per-thread register-cell tile. Body replicated F× per axis by
+    ``010_split_register_axes``.
 
     Replaces ``Loop(role=REGISTER)``. The ``axes`` tuple carries one or
     more register axes (typically M_r / N_r for matmul); the planner
-    chooses the extents (``FM`` / ``FN`` knobs). After the 006a
-    register-tile pass runs, every ``RegisterTile`` is consumed: the
-    body is fully unrolled, SSA names get per-cell suffixes, and the
-    ``RegisterTile`` wrapper disappears.
+    chooses the extents (``FM`` / ``FN`` knobs). After the
+    ``010_split_register_axes`` pass runs, every ``RegisterTile`` is
+    consumed: the body is fully unrolled, SSA names get per-cell
+    suffixes, and the ``RegisterTile`` wrapper disappears.
     """
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -722,34 +723,8 @@ class SerialTileBase(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A serial tile is a reduce iff its body contains an ``Accum`` —
-        directly, or wrapped in transparent ``RegisterTile`` / ``Cond``
-        blocks. The matmul-block builder
-        (``010_partition_loops::_build_register_blocked_body``) emits
-        per-cell ``RegisterTile(N_r)`` around the K-reduce ``Accum``; the
-        masked-N path wraps each cell's leaf in a ``Cond``. Without
-        looking through, downstream passes (``020_stage_inputs``,
-        ``040_use_ring_buffers``, ``080_pipeline_stages``,
-        ``030_hoist_invariant_compute``) misclassify the wrapping
-        ``SerialTile(K_i)`` as non-reduce and skip staging / promotion."""
-        return any(_contains_accum_transparent(s) for s in self.body)
-
-
-def _contains_accum_transparent(s: Stmt) -> bool:
-    """``Accum`` directly, or inside a transparent reduce wrapper.
-
-    ``RegisterTile`` is transparent because the K-reduce accumulator
-    survives across replicated cells (each cell carries its own Accum
-    that reduces over the same K axis). ``Cond`` is transparent because
-    the masked-N path predicates per-cell work without altering the
-    enclosing reduce semantics. See :meth:`SerialTileBase.is_reduce`."""
-    if isinstance(s, Accum):
-        return True
-    if isinstance(s, RegisterTile):
-        return any(_contains_accum_transparent(c) for c in s.body)
-    if isinstance(s, Cond):
-        return any(_contains_accum_transparent(c) for c in s.body) or any(_contains_accum_transparent(c) for c in s.else_body)
-    return False
+        """A serial tile is a reduce iff its immediate body contains an ``Accum``."""
+        return any(isinstance(s, Accum) for s in self.body)
 
 
 @dataclass(frozen=True)

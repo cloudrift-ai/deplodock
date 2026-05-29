@@ -102,56 +102,32 @@ should reuse the builder; one-shot flat forks (e.g.
 `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element list) stay
 inline.
 
-**Register-blocked GEMM nest.** For matmul-shape kernels (`shape.k_loop is
-not None`, `params.fn > 1`, SPLITK = 1, BR = 1, no M-mask, no fused
-prologue), the planner emits the textbook blocked GEMM nest rather than
-wrapping the entire `{Init, K-reduce, Write}` in one outer
-`RegisterTile(N_r)`. The N_r register tile splits *around* the K-reduce:
+**FN > 1 lowering.** The partition planner always emits the per-cell
+shape — one `RegisterTile(N_r)` wrapping the whole
+`{Init, K-reduce, Write}` body, regardless of FN / SPLITK / BR / prologue
+shape:
 
     M_r REGISTER:
-      RegisterTile(N_r) { Init(acc) }            # per-cell accumulators
-      K_o SERIAL_OUTER:
-        K_i STAGE_INNER (reduce):
-          <N-invariant cone>                     # M-axis Loads, RMSNorm
-                                                 # prologue, … — runs ONCE
-                                                 # per K iter
-          RegisterTile(N_r) { Load b, Accum }    # F_N per-cell FMAs into
-                                                 # the persistent acc_i
-      RegisterTile(N_r) { Write(C, acc) }        # per-cell writes
-
-`_build_register_blocked_body` partitions the σ-rewritten K_i body by
-N-dependence (a single `body.fold` over Expr free_vars ∪ SSA def-use,
-exempting `N_r` from `bound` so RegisterTile wrappers don't mask
-references) into the N-invariant cone (no transitive `N_r` ref) and the
-N-dependent tail (everything else, including the Accum). The cone stays
-at K_i body scope; the tail wraps in `RegisterTile(N_r)`. The masked-N
-variant (e.g. lm_head with non-divisor vocab) wraps each tower's leaf
-body in its own per-cell `Cond(pred(N_r) < extent)` so the replicator
-σ-folds the predicate per cell; the matmul_add `K_s == 0` linear-epilogue
-Cond likewise gets wrapped in `RegisterTile(N_r)` so its inner Load /
-Assign / Write replicate per cell while the outer K_s predicate stays
-single. Init stays unconditional regardless — declaring `acc_i` inside a
-Cond would scope-bind it to the if-block; the K-tower's Accum and the
-Write tower (both Cond-wrapped per cell) would reference an `acc_i`
-that's no longer in scope.
-
-Shapes the blocked builder declines (returns `None`) — SDPA P@V's fused
-prologue, SPLITK > 1, BR > 1, M-overhang, F_N = 1 — fall back to the
-legacy per-cell branch in `_build_split_body` (one `RegisterTile(N_r)`
-wrapping the whole `{Init, K-reduce, Write}` body). Generalising the
-blocked nest to those shapes is follow-up work; the legacy branch is the
-safety net.
+      RegisterTile(N_r):
+        Init(acc)
+        K_o SERIAL_OUTER:
+          K_i STAGE_INNER (reduce):
+            <body>                               # M-axis Loads, prologue,
+                                                 # Load b, Accum — replicated
+                                                 # per cell by the Kernel-IR
+                                                 # replicator
+        Write(C, acc)
 
 The Kernel-IR replicator (`lowering/kernel/010_split_register_axes`)
-computes a body-global keep set for each register axis present in the
-ThreadTile body before recursing into the per-axis replication. Without
-the global keep, each sibling tower's local keep-analysis would run
-independently and the Init tower (no N_r reference in its body) would
-keep `acc` as one name while the Accum tower produced `acc_0..F-1` — a
-naming mismatch the Write tower would inherit. The global keep is also
-what lets the masked-N per-tower `Cond` survive: its predicate references
-`N_r`, the replicator descends into Cond.body, and the per-cell σ
-substitution lines up the suffixes across all three towers.
+walks the body and per-cell duplicates only statements that transitively
+depend on the register axis (dep-tracked via Expr free vars + SSA
+def-use); N-invariant statements (e.g. Load `a[m, k]`, the RMSNorm
+prologue chain) stay single-copy. `dedup_replicated`
+(`lowering/kernel/011_dedup_replicated`) then runs as content-agnostic
+defense in depth: structurally identical Loads and Assigns left over
+after replication CSE-fold into one — the same effect the deleted
+register-blocked GEMM builder used to get from its hand-written
+N-invariant-cone partition (see `plans/obsolete-blocked-gemm-builder.md`).
 
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
@@ -381,7 +357,7 @@ recipe.
 | `BM`          | INT      | `010_partition_loops`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
 | `STAGE`       | BINMASK  | `020_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one wrap-body Stage with per-source Source entries. |
 | `FM`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul M (output row) axis; per-thread cell-grid height.           |
-| `FN`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. With `FN > 1` and the simple-shape constraints (no prologue, SPLITK = 1, BR = 1, no M-overhang), the planner emits the register-blocked GEMM nest — three sibling `RegisterTile(N_r)` towers sharing an N-invariant cone inside the K loop. |
+| `FN`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. The planner emits one outer `RegisterTile(N_r)` around `{Init, K-reduce, Write}`; the Kernel-IR replicator + `dedup_replicated` pass produce the textbook blocked-GEMM shape (N-invariant Loads kept single-copy, N-dependent Accums replicated). |
 | `BR`          | INT      | `010_partition_loops`        | Cooperative-K thread count (1 = pure serial chunked reduce); BR > 1 routes through the cooperative reduce path with cross-thread combine. |
 | `TMA_SWIZZLE`     | BOOL     | `050_use_tma`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
 | `HOIST_COMPUTE`   | BOOL     | `030_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
@@ -419,7 +395,7 @@ prior sibling scope and reverts its consumer Loads back to gmem — keeps the fu
 single-allocation invariant when the matmul-side K_i, now visible as a reduce through transparent
 `RegisterTile` wrappers, would otherwise re-stage `x`) → `hoist_invariant_compute` → `use_ring_buffers` →
 `use_tma` → `use_async_copy` → `pad_smem` → `pipeline_stages` → `mark_unroll`. Coordination (split-K atomic-writes, cooperative-K Combine emission, broadcast-write guards) is no longer a separate pass: the materializer / Kernel-IR render derives those decisions from `ir/tile/escape_analysis.py` queries against the tile body. Cooperativity is derived from `Accum.axes ∩ ThreadTile.axes`; atomic writes from enclosing `GridTile.axes` vs `Write.index`. `015_gate_splitk_residual` reuses the same `Body.coordination.atomic_axes` signal to identify the split-K block axis without any axis-naming convention or role tag — when SPLITK > 1, it wraps a `matmul_add`-shape linear residual epilogue under `Cond(K_s == 0, ...)` so the residual is atomic-added exactly once across the K_s CTAs (rewrite + predicates live in sibling `_splitk_residual.py`, shared with `010_partition_loops`'s `force_splitk_one` enumeration-time gate). The partition planner's knob globals + per-mode candidate tuples + the pruned `(BN, BM, FM, FN, BK, SPLITK, BR)` cartesian generator + per-mode priority/score functions live in sibling `_enumeration.py` — `010_partition_loops.py` imports the `enumerate_cartesian` entry point and the `TileParams` cartesian element; tests can hit `_enumeration` directly without routing through `_plan_kernel`. `split_register_axes` / `permute_lane_accesses` used to live here but moved to `lowering/kernel/` once dtype-aware analytical passes consolidated there (see `plans/stamp-ssa-dtypes-and-reorder.md`); they still pattern-match `TileOp` because they run pre-materialize. |
-| `lowering/kernel/`         | Pre-materialize dtype-aware analytical passes plus the final `TileOp → KernelOp` lowering. Order: `split_register_axes` (replicates REGISTER-tagged bodies per-cell) → `dedup_replicated` (CSE-folds duplicate Loads / Assigns the replicator emits across per-cell copies — content-agnostic loop-invariant code motion that subsumes the legacy `010_partition_loops` blocked-GEMM builder's five disqualifier gates; see `plans/obsolete-blocked-gemm-builder.md`) → `place_inits` (places explicit `Init` Stmts at correct accumulator scope) → `stamp_types` (single body walk populating `Load.dtype` / `Assign.dtype` / `Write.value_dtype` / `Source.dtype` from `graph.nodes[buf].output.dtype`) → `demote_to_write_dtype` (folds f16-only chains feeding f16 Writes) → `vectorize_loads` (widens consecutive scalar Loads into LDS.128 / `__half2`) → `permute_lane_accesses` (chunks the N register tile into LDS.128-sized strips to remove bank conflicts on `FN > V`) → `pack_fp16_pairs` (pairs scalar `__half` Inits/Accums into `__half2`) → `vectorize_stores` (widens consecutive scalar Writes) → `flatten_wrap_stages` (007a: flattens wrap-body `Stage(... body=[consumer])` into `[Stage(empty), *consumer]` so the materializer walks producer scaffolding then consumer siblings) → `materialize_tile` (purely-mechanical Tile → Kernel lowering; Smem decls read `Source.dtype` directly; its emit logic lives in sibling `_`-prefixed helper modules `_stage_expand` / `_combine` / `_tma_groups`, which the pass loader skips) → `drop_redundant_syncs` (Kernel-IR peephole collapsing back-to-back / leading `Sync`s at the tile-body level). Passes 000–007 and `flatten_wrap_stages` (007a) pattern-match `TileOp`; `materialize_tile` (008) consumes `TileOp` and produces the `KernelOp`; `drop_redundant_syncs` (009) rewrites `KernelOp → KernelOp`. |
+| `lowering/kernel/`         | Pre-materialize dtype-aware analytical passes plus the final `TileOp → KernelOp` lowering. Order: `split_register_axes` (replicates REGISTER-tagged bodies per-cell, with dep-tracked single-copy preservation of axis-invariant statements) → `dedup_replicated` (content-agnostic CSE: structurally identical Loads / Assigns left over after replication fold into one — the same shape the deleted blocked-GEMM builder used to produce by hand-partitioning N-invariant cones; see `plans/obsolete-blocked-gemm-builder.md`) → `place_inits` (places explicit `Init` Stmts at correct accumulator scope) → `stamp_types` (single body walk populating `Load.dtype` / `Assign.dtype` / `Write.value_dtype` / `Source.dtype` from `graph.nodes[buf].output.dtype`) → `demote_to_write_dtype` (folds f16-only chains feeding f16 Writes) → `vectorize_loads` (widens consecutive scalar Loads into LDS.128 / `__half2`) → `permute_lane_accesses` (chunks the N register tile into LDS.128-sized strips to remove bank conflicts on `FN > V`) → `pack_fp16_pairs` (pairs scalar `__half` Inits/Accums into `__half2`) → `vectorize_stores` (widens consecutive scalar Writes) → `flatten_wrap_stages` (007a: flattens wrap-body `Stage(... body=[consumer])` into `[Stage(empty), *consumer]` so the materializer walks producer scaffolding then consumer siblings) → `materialize_tile` (purely-mechanical Tile → Kernel lowering; Smem decls read `Source.dtype` directly; its emit logic lives in sibling `_`-prefixed helper modules `_stage_expand` / `_combine` / `_tma_groups`, which the pass loader skips) → `drop_redundant_syncs` (Kernel-IR peephole collapsing back-to-back / leading `Sync`s at the tile-body level). Passes 000–007 and `flatten_wrap_stages` (007a) pattern-match `TileOp`; `materialize_tile` (008) consumes `TileOp` and produces the `KernelOp`; `drop_redundant_syncs` (009) rewrites `KernelOp → KernelOp`. |
 | `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 
 See `ir/ARCHITECTURE.md` for what each IR dialect looks like.

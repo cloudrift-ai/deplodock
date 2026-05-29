@@ -2,16 +2,20 @@
 
 After ``010_split_register_axes`` unwraps each ``RegisterTile`` and
 replicates its body F× per axis, two ``Load``s or ``Assign``s from
-independent N-cells that originally referenced the same N-invariant
+independent cells that originally referenced the same axis-invariant
 value end up structurally identical at the same scope. Folding them
-to a single occurrence is exactly what the legacy register-blocked
-GEMM builder in ``010_partition_loops`` was hand-rolling out of the
-Tile structure: lift the N-invariant cone, share it across F_N cells.
-The blocked builder gates on five disqualifiers (FN==1, SPLITK>1, BR>1,
-M-mask, fused prologue) — content-agnostic CSE here covers all of
-them uniformly, plus accidental dedup opportunities the structural
-classifier wouldn't catch (identical user compute, dtype-stamped
-Assign equality, etc.).
+to a single occurrence is content-agnostic CSE — what the deleted
+register-blocked GEMM builder used to get by hand-partitioning
+N-invariant cones (see ``plans/obsolete-blocked-gemm-builder.md``).
+
+Empirically (sweep over the compiler test suite under
+``DEPLODOCK_LOG_DEDUP=1``; see ``plans/post-blocked-builder-cleanup.md``
+step 8) most FN > 1 matmul kernels fold nothing — 020_stage_inputs
+already deduplicates N-invariant Loads upstream. The pass earns its
+keep on reduce/norm kernels: RMSNorm's mean reduce, softmax's
+sum/max chain, and reshape-then-linear fusions all show measured folds
+(per-kernel: ~2 Loads or Assigns; one reshape-linear-mean-reduce shape
+folds 16 Loads). Defence in depth: cheap to run, occasionally meaningful.
 
 Two folds, interleaved in source order per scope:
 

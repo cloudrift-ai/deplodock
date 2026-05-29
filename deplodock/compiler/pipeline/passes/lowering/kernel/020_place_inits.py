@@ -160,9 +160,9 @@ def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
     ``K_o`` is crossable for Init placement and the Init lands at the
     surrounding ``ThreadTile`` body head.
 
-    ``RegisterTile`` is transparent for Init scoping: 006a will replicate
-    Accums across register cells, but at placement time the inner Accums
-    are still single statements. We descend into ``RegisterTile.body``
+    ``RegisterTile`` is transparent for Init scoping: ``010_split_register_axes``
+    will replicate Accums across register cells, but at placement time the inner
+    Accums are still single statements. We descend into ``RegisterTile.body``
     unconditionally."""
     out: list[Accum] = []
     if isinstance(stmt, Accum):
