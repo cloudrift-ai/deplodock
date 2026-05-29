@@ -104,13 +104,32 @@ class Candidate:
                 emit(format_skipped(display_name(rule.pass_.name if rule.pass_ else None, rule.name), match.root_node_id, exc.reason))
             self._advance_if_last(match)
             return None
-        options = list(result) if isinstance(result, (list, tuple)) else [result]
+        raw_options = list(result) if isinstance(result, (list, tuple)) else [result]
         # ``Fork`` options pass through unconditionally — they're deferred
         # expansions with no graph to validate yet. Concrete ``Op`` leaves
         # still get the per-ctx validate filter; ``Graph`` splices are
         # validated at splice time, not here.
-        options = [o for o in options if not isinstance(o, Op) or o.validate(self.ctx)]
+        options = [o for o in raw_options if not isinstance(o, Op) or o.validate(self.ctx)]
         if not options:
+            # Silent-skip used to hide validation-filtered rewrites — most
+            # commonly the ``KernelOp.validate`` smem-cap check after
+            # ``100_materialize_tile`` produces a kernel that exceeds
+            # ``ctx.max_dynamic_smem``. Surface a debug-level "filtered"
+            # line so a user who pinned an over-budget tile shape via
+            # knobs sees *why* lowering didn't complete instead of having
+            # to instrument the engine.
+            if raw_options and _logger.isEnabledFor(logging.DEBUG):
+                rejected = [o for o in raw_options if isinstance(o, Op)]
+                reasons = [_validate_reason(o, self.ctx) for o in rejected]
+                emit(
+                    format_skipped(
+                        display_name(rule.pass_.name if rule.pass_ else None, rule.name),
+                        match.root_node_id,
+                        f"all {len(rejected)} option(s) failed validate(ctx): {'; '.join(filter(None, reasons))}"
+                        if reasons
+                        else "all options failed validate(ctx)",
+                    )
+                )
             self._advance_if_last(match)
             return None
         if len(options) > 1 or isinstance(options[0], Fork):
@@ -452,3 +471,44 @@ def _build_rewrite_kwargs(rule, match: Match, ctx: Context | None) -> dict:
                 kwargs[pname] = None
             input_slot += 1
     return kwargs
+
+
+def _validate_reason(op: Op, ctx: Context) -> str:
+    """Best-effort introspection of *why* ``op.validate(ctx)`` returned
+    ``False``. Returns a short reason like ``smem 106496 > cap 101376``
+    when the op exposes the right introspection hooks (``KernelOp``
+    today). Empty string when no reason can be derived — the caller
+    treats that as a generic ``validate(ctx)=False`` line."""
+    # Best-effort: keep the import local so a missing kernel-IR module
+    # (e.g. minimal harness in tests) doesn't break the engine itself.
+    try:
+        from math import prod  # noqa: PLC0415
+
+        from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+    except ImportError:
+        return ""
+    if not isinstance(op, KernelOp):
+        return ""
+    reasons: list[str] = []
+    for s in op.body:
+        if isinstance(s, GridTile):
+            ctas = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
+            # _MAX_CTAS lives next to KernelOp.validate; keep the compare local.
+            for child in s.body:
+                if isinstance(child, ThreadTile):
+                    threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in child.axes)
+                    if threads > ctx.max_threads_per_cta:
+                        reasons.append(f"threads {threads} > max_threads_per_cta {ctx.max_threads_per_cta}")
+            _ = ctas  # _MAX_CTAS comparison kept inside validate
+        elif isinstance(s, ThreadTile):
+            threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
+            if threads > ctx.max_threads_per_cta:
+                reasons.append(f"threads {threads} > max_threads_per_cta {ctx.max_threads_per_cta}")
+    try:
+        smem = op.smem_bytes()
+        if smem > ctx.max_dynamic_smem:
+            reasons.append(f"smem {smem} > max_dynamic_smem {ctx.max_dynamic_smem}")
+    except Exception:  # noqa: BLE001 — best-effort introspection
+        pass
+    return "; ".join(reasons)
