@@ -92,6 +92,16 @@ formula from cheap inputs (knob bundle + planner shape) so siblings rank
 without anyone instantiating a TileOp. The branch tree's `Fork.score`
 propagates max from leaves, matching MCTS's max-Q semantics.
 
+The tree-building algorithm itself (group params by per-level knob keys,
+collapse single-key levels, sort siblings by max-propagated score, defer
+leaf materialization to `expand` thunks) lives in `pipeline/fork_tree.py`
+as the reusable `Level` + `build_fork_tree` pair — `partition_loops`
+supplies the four `Level`s + `materialize=` + `score=` callables and
+forwards the result. Future rules with multi-level knob-cartesian forks
+should reuse the builder; one-shot flat forks (e.g.
+`lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element list) stay
+inline.
+
 **Register-blocked GEMM nest.** For matmul-shape kernels (`shape.k_loop is
 not None`, `params.fn > 1`, SPLITK = 1, BR = 1, no M-mask, no fused
 prologue), the planner emits the textbook blocked GEMM nest rather than

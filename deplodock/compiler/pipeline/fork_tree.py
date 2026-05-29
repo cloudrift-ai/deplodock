@@ -1,0 +1,128 @@
+"""Hierarchical Fork-tree builder shared by pipeline rules that enumerate a
+knob cartesian.
+
+Converts a flat list of variant params into a Fork tree where each ``Level``
+groups siblings by a (sub)tuple of knob values, sorts siblings by max-
+propagated child score, and collapses levels whose key has a single distinct
+value across the group. The LAST level is the leaf level: its grouping
+produces one leaf Fork per param (no branch wrapper) — knobs stamped onto
+the leaf, ``expand`` thunk yields ``materialize(p)`` once the search engine
+resolves that leaf.
+
+Use this when a rule produces ≥2 hierarchical levels of knob bundling with
+score-propagated ranking (today: ``passes/lowering/tile/010_partition_loops``).
+For flat 2-element forks with no hierarchy (e.g.
+``passes/lowering/tile/085_warp_specialize``) a bare ``[Fork(...), Fork(...)]``
+list comp is shorter and clearer — don't reach for this builder.
+
+The engine in ``pipeline.py`` consumes ``fork.knobs`` flat (it doesn't walk
+ancestors), so the LAST level's knob_names land on each leaf as the
+DB-matchable knob delta. Earlier levels' knobs sit on the branch Forks
+themselves.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from deplodock.compiler.pipeline.pipeline import Fork
+
+if TYPE_CHECKING:
+    from deplodock.compiler.graph import Graph
+    from deplodock.compiler.ir.base import Op
+
+
+@dataclass(frozen=True)
+class Level[P]:
+    """One grouping level in the Fork tree.
+
+    ``knob_names`` and ``key`` must agree in arity: ``key(p)`` returns a
+    tuple of the same length as ``knob_names``, in matching order. Across
+    all Levels the ``knob_names`` should partition the knob set the caller
+    wants Forks to pin (no duplicates; collapsed-constant knobs may be
+    absent — they're pinned by the materialized leaf Op itself).
+    """
+
+    knob_names: tuple[str, ...]
+    key: Callable[[P], tuple]
+
+
+def build_fork_tree[P](
+    *,
+    params: Sequence[P],
+    levels: Sequence[Level[P]],
+    materialize: Callable[[P], Op | Graph],
+    score: Callable[[P], float],
+) -> Fork | list[Fork]:
+    """Group ``params`` into a Fork tree per ``levels`` (outermost first).
+
+    The LAST level is the leaf level: each param becomes one leaf Fork
+    (``is_leaf=True``), knobs stamped from ``level.key(p)``, ``expand``
+    thunk yields ``[materialize(p)]``. Earlier levels emit branch Forks
+    keyed by ``level.key`` over the enclosing subgroup; siblings sort by
+    ``-score`` (max-of-children propagates upward); levels whose key has a
+    single distinct value across the group are collapsed (no 1-child branch
+    wrapper). Returns a single ``Fork`` when the top level collapses to one
+    branch (engine still routes through fork-spawn since
+    ``isinstance(option, Fork)``), otherwise the top-level ``list[Fork]``.
+
+    ``score(p)`` is called exactly once per param at builder entry; the
+    returned value is reused for both the leaf's own score and any branch
+    ``max(child scores)`` propagation.
+    """
+    if not params:
+        return []
+    if not levels:
+        raise ValueError("build_fork_tree: at least one Level required")
+    leaf_score = {id(p): score(p) for p in params}
+    leaf_level = levels[-1]
+    branch_levels = levels[:-1]
+
+    def _sorted(forks: list[Fork]) -> list[Fork]:
+        return sorted(forks, key=lambda f: -f.score)
+
+    def _leaves(group: list[P]) -> list[Fork]:
+        # Default-arg capture (``p=p``) avoids the late-binding closure
+        # trap — without it every thunk would see the final loop var.
+        return _sorted(
+            [
+                Fork(
+                    knobs=dict(zip(leaf_level.knob_names, leaf_level.key(p), strict=True)),
+                    expand=(lambda p=p: [materialize(p)]),
+                    score=leaf_score[id(p)],
+                    is_leaf=True,
+                )
+                for p in group
+            ]
+        )
+
+    def _branch(group: list[P], depth: int) -> list[Fork]:
+        if depth == len(branch_levels):
+            return _leaves(group)
+        level = branch_levels[depth]
+        keyed: dict[tuple, list[P]] = {}
+        for p in group:
+            keyed.setdefault(level.key(p), []).append(p)
+        # Single-value collapse: the level adds no choice, so skip the
+        # 1-child Fork wrapper and recurse straight into the next level.
+        if len(keyed) == 1:
+            return _branch(next(iter(keyed.values())), depth + 1)
+        siblings: list[Fork] = []
+        for key, sub in keyed.items():
+            children = _branch(sub, depth + 1)
+            if not children:
+                continue
+            siblings.append(
+                Fork(
+                    knobs=dict(zip(level.knob_names, key, strict=True)),
+                    expand=(lambda c=children: list(c)),
+                    score=max(c.score for c in children),
+                    is_leaf=False,
+                )
+            )
+        return _sorted(siblings)
+
+    top = _branch(list(params), 0)
+    return top[0] if len(top) == 1 else top

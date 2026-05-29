@@ -26,12 +26,32 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
 from deplodock.compiler.pipeline.pipeline import Fork
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
-_build_fork_tree_lazy = _planner._build_fork_tree_lazy
 _plan_kernel = _planner._plan_kernel
 _materialize = _planner._materialize
+_score_variant = _planner._score_variant
+BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN, _planner.BK, _planner.SPLITK)
+
+
+def _build_fork_tree_lazy(plan, ctx: Context) -> Fork | list[Fork]:
+    """Mirror the planner's own call site in ``rewrite()`` — builds the same
+    Fork tree from a ``_Plan`` + ``ctx`` via the shared
+    ``pipeline/fork_tree.py`` builder, with the planner's canonical level
+    layout. Single source of truth for the test assertions below."""
+    return build_fork_tree(
+        params=plan.params,
+        levels=[
+            Level((BR.name,), lambda p: (p.br,)),
+            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
+            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
+            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+        ],
+        materialize=lambda p: _materialize(plan, p),
+        score=lambda p: _score_variant(plan, p, ctx),
+    )
 
 
 def _ctx() -> Context:
