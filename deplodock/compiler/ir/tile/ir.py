@@ -1303,7 +1303,9 @@ class TileOp(BodyOp):
         """``(block_axes, thread_axes)`` for the outermost tile flavor.
 
         Returns ``((), ())`` if no ``GridTile``/``ThreadTile`` is present
-        (e.g. a degenerate body). For ``GridTile`` wrapping a ``ThreadTile``,
+        (e.g. a degenerate body, or a warp-cooperative body whose inner
+        tile is a ``WarpTile`` rather than a ``ThreadTile`` — see
+        :meth:`_warp_axes`). For ``GridTile`` wrapping a ``ThreadTile``,
         the block axes come from the GridTile and thread axes from the
         inner ThreadTile. For a standalone ``ThreadTile`` (pointwise), the
         block set is empty.
@@ -1318,6 +1320,29 @@ class TileOp(BodyOp):
             if isinstance(s, ThreadTile):
                 return (), s.axes
         return (), ()
+
+    def _warp_axes(self) -> tuple[Axis, ...]:
+        """Inner-``WarpTile`` axes, or ``()`` if no ``WarpTile`` is present.
+
+        Companion accessor to :meth:`_launch_geometry`. Warp-cooperative
+        bodies (``GridTile > WarpTile > …``, today emitted only by the
+        MMA-fragment-factorization consumer plan) bind 32 lanes per warp
+        coord — callers that compute per-CTA thread budgets must add
+        ``prod(_warp_axes().extent) * 32`` on top of the (typically empty)
+        thread-axes product. ``ThreadTile`` and ``WarpTile`` are mutually
+        exclusive inside one body (``__post_init__`` rejects mixes), so
+        either this returns ``()`` or :meth:`_launch_geometry`'s
+        ``thread_axes`` does.
+        """
+        for s in self.body:
+            if isinstance(s, GridTile):
+                for child in s.body:
+                    if isinstance(child, WarpTile):
+                        return child.axes
+                return ()
+            if isinstance(s, WarpTile):
+                return s.axes
+        return ()
 
     def validate(self, ctx) -> bool:
         """Reject post-register-tile variants whose launch geometry would

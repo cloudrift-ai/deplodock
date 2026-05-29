@@ -297,11 +297,12 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
     """Derive ``__launch_bounds__`` from the outermost tile flavor.
 
     - ``GridTile`` (cooperative): launch bounds = product of inner
-      ``ThreadTile`` axis extents (per-CTA thread count).
+      ``ThreadTile`` axis extents (per-CTA thread count), or — for a
+      ``WarpTile`` inner — ``prod(warp_extents) * 32`` (32 lanes per warp).
     - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
       since launch is flattened across blockIdx + threadIdx.
     """
-    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
 
     for s in kernel_op.body:
         if isinstance(s, GridTile):
@@ -311,6 +312,11 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
                     for ax in child.axes:
                         bsize *= ax.extent.as_static()
                     return max(bsize, 1)
+                if isinstance(child, WarpTile):
+                    bsize = 32
+                    for ax in child.axes:
+                        bsize *= ax.extent.as_static()
+                    return max(bsize, 32)
             return _BLOCK_SIZE
         if isinstance(s, ThreadTile):
             return _BLOCK_SIZE
