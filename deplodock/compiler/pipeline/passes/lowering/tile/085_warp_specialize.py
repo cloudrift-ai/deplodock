@@ -266,7 +266,7 @@ def _ws_transform(op: TileOp) -> TileOp:
             new_outer.append(new_tt)
         elif isinstance(s, GridTile):
             new_children = [new_tt if isinstance(c, ThreadTile) else c for c in s.body]
-            new_outer.append(GridTile(axes=s.axes, body=Body(new_children)))
+            new_outer.append(GridTile(axes=s.axes, body=Body(new_children), swizzle_group_m=s.swizzle_group_m))
         else:
             new_outer.append(s)
 

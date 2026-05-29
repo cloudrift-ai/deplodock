@@ -1,0 +1,94 @@
+"""Default-on CTA swizzle for matmul-shape grids.
+
+For each ``GridTile(axes=(K_s?, M_b, N_b))`` produced by the partition
+planner, stamp ``swizzle_group_m = config.group_m()`` (default 8).
+Renderer-only transform: ``GridTile.axes`` are untouched, only the
+field changes. ``GridTile.render`` reads it and emits a Triton-canonical
+``blockIdx.x`` decode (``ir/stmt/blocks._render_swizzled_grid_decode``)
+so consecutive CTAs walk down M in groups of ``GROUP_M`` before stepping
+N. A row-group of CTAs then shares A's row tile in L2 — the headline
+optimisation from the CloudRift RTX 5090 SGEMM blog (DRAM throughput
+32 % → 8.5 % on a 4096³ SGEMM).
+
+Idempotent (skip if ``swizzle_group_m != 1`` already), matmul-shape
+only (skip if the two innermost axes lack the planner's ``_b`` suffix),
+and the runtime ``min(GROUP_M, num_m - first_m)`` clamp self-disables
+on tiny / tall-skinny matmuls so no extra eligibility plumbing is
+needed. ``DEPLODOCK_GROUP_M=1`` is the global escape hatch.
+
+Downstream passes (``020_stage_inputs``, ``040_use_ring_buffers``,
+``050_use_tma``, ``080_pipeline_stages``, ``085_warp_specialize``,
+``090_mark_unroll``, the kernel-IR materialiser) all key on
+``GridTile.axes`` *identity* and on K_o / K_i, never on the rendered
+RHS of ``int m_b = …;`` — so the body's σ rewrites pick up the swizzled
+values via plain CUDA scoping, with no σ change needed.
+
+Slot rationale: runs after ``020_stage_inputs`` (smem staging reads
+axis identities, unaffected by a later swizzle stamp) and before
+``025_unify_sibling_stages``. The exact position inside the lowering
+chain doesn't matter as long as no later pass rebuilds the GridTile
+without propagating ``swizzle_group_m`` — every such rebuilder in the
+codebase (``tile/_helpers.replace_thread_tile_body``,
+``tile/085_warp_specialize``, ``kernel/100_materialize_tile``,
+``kernel/110_drop_redundant_syncs``, ``ir/tile/passes`` Sigma rewrite)
+threads the field through.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+from deplodock import config
+from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.stmt import Body, Stmt
+from deplodock.compiler.ir.tile.ir import GridTile, TileOp
+from deplodock.compiler.pipeline import Pattern, RuleSkipped
+
+PATTERN = [Pattern("root", TileOp)]
+
+
+def rewrite(root: Node) -> TileOp | None:
+    group_m = config.group_m()
+    if group_m == 1:
+        raise RuleSkipped("DEPLODOCK_GROUP_M=1 disables CTA swizzle")
+    op: TileOp = root.op
+    if not _is_matmul(op):
+        raise RuleSkipped("not a matmul-priority TileOp (BK <= 1 or BR > 1) — no L2 A-row reuse story")
+    new_body, changed = _stamp_top_grid(op.body, group_m)
+    if not changed:
+        raise RuleSkipped("no eligible top-level GridTile (single-block-axis grid, or already swizzled)")
+    return TileOp(body=new_body, name=op.name, knobs=op.knobs)
+
+
+def _is_matmul(op: TileOp) -> bool:
+    """Matmul-priority recognition via ``TileOp.knobs`` stamped by the
+    partition planner.
+
+    The planner stamps ``BK`` / ``BR`` for every kernel: matmul kernels
+    have ``BK > 1`` (per-stage K-chunk) and ``BR == 1`` (no cooperative
+    thread reduction). Pointwise kernels stamp ``BK == 1`` (no K loop);
+    cooperative-reduce kernels stamp ``BR > 1``. SDPA's fused-prologue
+    matmul matches this signature too — out of scope for the first cut,
+    so we additionally require ``SPLITK == 1`` since the planner forces
+    SPLITK to 1 there (see ``enumerate_cartesian``'s
+    ``force_splitk_one``).
+    """
+    bk = op.knobs.get("BK", 1)
+    br = op.knobs.get("BR", 1)
+    return bk > 1 and br == 1
+
+
+def _stamp_top_grid(body: Body, group_m: int) -> tuple[Body, bool]:
+    """Walk the TileOp body, find the (at most one) outer ``GridTile``,
+    and stamp ``swizzle_group_m`` if it has ≥ 2 axes and isn't already
+    swizzled. The planner emits matmul GridTiles with ``(M_b, N_b)`` or
+    ``(K_s, M_b, N_b)`` — len ≥ 2 covers both."""
+    out: list[Stmt] = []
+    changed = False
+    for s in body:
+        if isinstance(s, GridTile) and len(s.axes) >= 2 and s.swizzle_group_m == 1:
+            out.append(replace(s, swizzle_group_m=group_m))
+            changed = True
+            continue
+        out.append(s)
+    return Body(tuple(out)), changed

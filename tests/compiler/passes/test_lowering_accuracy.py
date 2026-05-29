@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 
 from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
+from deplodock.compiler.ir.tile.ir import GridTile, StageBundle, StagePolicy, TileOp
 
 from ..conftest import matmul_graph, requires_cuda
 
@@ -219,6 +219,49 @@ def test_pad_smem_matmul_accuracy(case, monkeypatch):
         assert any(p and any(p) for p in pads.values()), f"PAD_SMEM=true produced no padded source: {pads}"
     else:
         assert all(not p or not any(p) for p in pads.values()), f"PAD_SMEM=false leaked pad: {pads}"
+
+    inputs = _random_inputs(m, k, n)
+    ref = _reference(matmul_graph(m, k, n), inputs)
+    out = _run_cuda(matmul_graph(m, k, n), inputs)
+    _assert_close(out, ref)
+
+
+# ---------- 025_swizzle_blocks (CTA swizzle correctness) ----------
+
+
+_SWIZZLE_CASES = (
+    # Small grid (4×4 tiles): all four GROUP_M values exercise the runtime
+    # min-clamp tail at least once.
+    ((128, 128, 128), _BASE_KNOBS),
+    # 8×8 tile grid → group_m=8 is a single full group, group_m=4 fills two
+    # rows of groups, group_m=2 four.
+    ((128, 128, 128), {**_BASE_KNOBS, "BN": 16, "BM": 16}),
+)
+
+
+@requires_cuda
+@pytest.mark.parametrize("group_m", [1, 2, 4, 8])
+@pytest.mark.parametrize("case", _SWIZZLE_CASES, ids=_id)
+def test_swizzle_blocks_matmul_accuracy(case, group_m, monkeypatch):
+    """Pin DEPLODOCK_GROUP_M across {1, 2, 4, 8}; assert the lowered TileOp
+    carries the requested swizzle factor on its outer GridTile and that
+    the rendered CUDA kernel produces matmul outputs that match the
+    numpy reference.
+
+    Swizzle is a renderer-only transform — a bug in the Triton arithmetic
+    would silently corrupt outputs without breaking any IR-level test, so
+    this sweep across group_m values is the load-bearing safety net."""
+    (m, k, n), knobs = case
+    _set_knobs(monkeypatch, knobs)
+    monkeypatch.setenv("DEPLODOCK_GROUP_M", str(group_m))
+
+    op = _tile_op(matmul_graph(m, k, n))
+    assert op is not None
+    grids = [s for s in op.body.iter() if isinstance(s, GridTile)]
+    assert grids, "matmul TileOp must contain a top-level GridTile"
+    assert all(g.swizzle_group_m == group_m for g in grids), (
+        f"GridTile.swizzle_group_m mismatch: got {[g.swizzle_group_m for g in grids]} expected {group_m}"
+    )
 
     inputs = _random_inputs(m, k, n)
     ref = _reference(matmul_graph(m, k, n), inputs)

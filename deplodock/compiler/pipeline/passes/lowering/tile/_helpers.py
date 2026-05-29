@@ -86,7 +86,7 @@ def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
                 new_outer_body.append(ThreadTile(axes=child.axes, body=new_body))
             else:
                 new_outer_body.append(child)
-        return GridTile(axes=outer.axes, body=Body(new_outer_body))
+        return GridTile(axes=outer.axes, body=Body(new_outer_body), swizzle_group_m=outer.swizzle_group_m)
     raise TypeError(f"replace_thread_tile_body: expected GridTile/ThreadTile, got {type(outer).__name__}")
 
 

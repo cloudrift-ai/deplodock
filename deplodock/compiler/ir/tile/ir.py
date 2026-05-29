@@ -84,7 +84,12 @@ from deplodock.compiler.ir.stmt import (
 # render methods. Local import below to keep top-of-file imports tidy.
 from deplodock.compiler.ir.stmt import render_body as _render_body  # noqa: E402
 from deplodock.compiler.ir.stmt.base import RenderCtx, _pad
-from deplodock.compiler.ir.stmt.blocks import _body_uses_lane_warp, _render_grid_axis_decode, _render_thread_axis_decode
+from deplodock.compiler.ir.stmt.blocks import (
+    _body_uses_lane_warp,
+    _render_grid_axis_decode,
+    _render_swizzled_grid_decode,
+    _render_thread_axis_decode,
+)
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
@@ -591,20 +596,36 @@ class GridTile(ParallelTile):
     Replaces ``Tile`` with ``BIND_BLOCK`` axes. Split-K is derived at
     codegen time from ``escape_analysis.atomic_axes`` (Write index vs
     enclosing block axes) — no per-tile metadata required.
+
+    ``swizzle_group_m`` selects an L2-friendly CTA-ID remap for matmul-shape
+    grids (axes ending in ``(M_b, N_b)``): consecutive CTAs walk down M
+    in groups of ``swizzle_group_m`` before stepping N, so a row-group of
+    CTAs shares A's row tile in L2 (Triton/CUTLASS/cuBLAS convention).
+    ``swizzle_group_m == 1`` (the default) keeps the row-major decode and
+    is a structural no-op; the swizzled path is stamped by
+    ``tile/025_swizzle_blocks.py`` on matmul-shape GridTiles. The field
+    feeds ``_pretty_label`` so the structural digest tracks it.
     """
+
+    swizzle_group_m: int = 1
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return GridTile(axes=self.axes, body=body)
+        return GridTile(axes=self.axes, body=body, swizzle_group_m=self.swizzle_group_m)
 
     def _pretty_label(self) -> str:
-        return "grid"
+        if self.swizzle_group_m == 1:
+            return "grid"
+        return f"grid swizzle_M={self.swizzle_group_m}"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Emit ``blockIdx.x`` axis decode + body. The inner ``ThreadTile``
         renders its threadIdx decode under ``ctx.inside_grid_tile=True``,
         so no per-CTA bounds guard is needed at this level."""
-        out = list(_render_grid_axis_decode(self.axes, "blockIdx.x", ctx))
+        if self.swizzle_group_m != 1:
+            out = list(_render_swizzled_grid_decode(self.axes, "blockIdx.x", self.swizzle_group_m, ctx))
+        else:
+            out = list(_render_grid_axis_decode(self.axes, "blockIdx.x", ctx))
         inner_ctx = replace(ctx, inside_grid_tile=True)
         out.extend(_render_body(self.body, inner_ctx))
         return out
