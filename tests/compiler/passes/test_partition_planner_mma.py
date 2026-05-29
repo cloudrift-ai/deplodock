@@ -22,6 +22,10 @@ from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
     ATOM_REGISTRY,
     is_atom_eligible,
 )
+from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
+    WarpTileParams,
+    _enumerate_warp_matmul_impl,
+)
 
 
 def _input(g: Graph, name: str, shape: tuple, *, dtype) -> str:
@@ -171,3 +175,72 @@ def test_registry_spec_shape_and_group_size():
     assert spec.operand_dtypes["a"] == F16
     assert spec.operand_dtypes["b"] == F16
     assert spec.operand_dtypes["c"] == F32
+
+
+# --- Warp-tier enumerator (M3) ---------------------------------------
+
+
+def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("wmma_m16n16k16_f16",)) -> list[WarpTileParams]:
+    return _enumerate_warp_matmul_impl(
+        E_M=M,
+        E_N=N,
+        E_K=K,
+        ctx=_ctx(cc=(8, 0)),
+        force_splitk_one=False,
+        atom_kinds=kinds,
+        m_axis_name="m",
+        n_axis_name="n",
+        m_forced_mask=False,
+        n_forced_mask=False,
+    )
+
+
+def test_warp_enumerator_empty_when_no_kinds():
+    """Empty atom_kinds (the default at M1) → no rows."""
+    assert _enum_warp(M=64, N=64, K=64, kinds=()) == []
+
+
+def test_warp_enumerator_emits_rows_for_aligned_matmul():
+    """A 64×64×64 matmul aligned to the 16×16×16 atom shape yields ≥1
+    warp-tier variant."""
+    rows = _enum_warp(M=64, N=64, K=64)
+    assert rows, "expected ≥1 row for a 64-square WMMA-aligned matmul"
+    assert all(r.atom_kind == "wmma_m16n16k16_f16" for r in rows)
+    # Every row's WM·WN·32 must fit in the per-CTA thread budget (1024).
+    assert all(r.wm * r.wn * 32 <= 1024 for r in rows)
+
+
+def test_warp_enumerator_rejects_indivisible_extents():
+    """Non-divisor M / N / K (vs the 16×16×16 atom shape) — no rows."""
+    assert _enum_warp(M=63, N=64, K=64) == []
+    assert _enum_warp(M=64, N=63, K=64) == []
+    assert _enum_warp(M=64, N=64, K=15) == []
+
+
+def test_warp_enumerator_priority_orders_by_cells():
+    """Higher cells-per-warp-cell ranks first (cap=64). The first row
+    should have ``min(fm·fn, 64) >= `` the last row's."""
+    rows = _enum_warp(M=128, N=128, K=128)
+    assert len(rows) >= 2
+    first_score = min(rows[0].fm * rows[0].fn, 64)
+    last_score = min(rows[-1].fm * rows[-1].fn, 64)
+    assert first_score >= last_score
+
+
+def test_warp_enumerator_force_splitk_one():
+    """``force_splitk_one`` clamps SPLITK choices to (1,) — every emitted
+    row has splitk=1."""
+    rows = _enumerate_warp_matmul_impl(
+        E_M=64,
+        E_N=64,
+        E_K=64,
+        ctx=_ctx(cc=(8, 0)),
+        force_splitk_one=True,
+        atom_kinds=("wmma_m16n16k16_f16",),
+        m_axis_name="m",
+        n_axis_name="n",
+        m_forced_mask=False,
+        n_forced_mask=False,
+    )
+    assert rows
+    assert all(r.splitk == 1 for r in rows)

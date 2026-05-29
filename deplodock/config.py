@@ -129,6 +129,17 @@ def nvcc_flags() -> str:
     return _str(NVCC_FLAGS)
 
 
+def mma_enabled() -> bool:
+    """``DEPLODOCK_MMA`` — enable the MMA fragment-factorization planner.
+
+    Default OFF at M3 / M4 (the planner emits no MMA variants, the existing
+    scalar path runs byte-identical). M5 of
+    ``plans/mma-fragment-factorization.md`` flips the default ON once the
+    materializer dispatch is wired and validated end-to-end.
+    """
+    return _bool("DEPLODOCK_MMA", default=False)
+
+
 def debug_enabled() -> bool:
     """``DEPLODOCK_DEBUG`` — per-launch debug dump path in the CUDA backend."""
     return _bool(DEBUG)

@@ -489,17 +489,20 @@ def _enumerate_cartesian_impl(
     return ordered
 
 
+_MAX_CELLS_PER_WARP_CELL: int = 64  # cells-per-cell-owner cap for the warp tier
+
+
 def _enumerate_warp_matmul_impl(
     *,
-    E_M: int,  # noqa: ARG001
-    E_N: int,  # noqa: ARG001
-    E_K: int,  # noqa: ARG001
-    ctx: Context,  # noqa: ARG001
-    force_splitk_one: bool,  # noqa: ARG001
+    E_M: int,
+    E_N: int,
+    E_K: int,
+    ctx: Context,
+    force_splitk_one: bool,
     atom_kinds: tuple[str, ...],
-    m_axis_name: str | None,  # noqa: ARG001
+    m_axis_name: str | None,  # noqa: ARG001 — overhang plumbing for M9 (skewed shapes)
     n_axis_name: str | None,  # noqa: ARG001
-    m_forced_mask: bool,  # noqa: ARG001
+    m_forced_mask: bool,  # noqa: ARG001 — symbolic-axis masking for warp tier lands in M9
     n_forced_mask: bool,  # noqa: ARG001
 ) -> list[WarpTileParams]:
     """Pure cartesian enumeration for the warp tier — produces
@@ -509,18 +512,79 @@ def _enumerate_warp_matmul_impl(
     ``plans/mma-fragment-factorization.md``):
     ``E_M % (wm·fm·atom_m) == 0`` / ``wn·wm·32 ≤ max_threads_per_cta``.
 
-    At M1 the implementation is a stub returning ``[]`` — the warp branch is
-    plumbed end-to-end (the planner calls this, the priority function exists,
-    the row type exists) but no atom kinds are registered yet
-    (``ATOM_REGISTRY`` is empty in :mod:`_atom`), so ``atom_kinds`` is always
-    empty in practice and the loop body never runs. M3 fleshes this out into
-    a real cartesian (one row per eligible ``atom_kind``) and the planner's
-    matmul branch starts emitting both scalar and warp variants as siblings.
+    No mask / overhang support at M3 — the warp tier rejects non-divisor
+    extents instead of register-tiling a per-cell guard. Symbolic axes
+    fall through here too (M9 extends with masked tiles for skewed
+    matmul-shapes). BR is forced to 1 (MMA + cooperative-K is incompatible
+    in v1; see Failure modes).
     """
     if not atom_kinds:
         return []
-    # M3 will iterate ``atom_kinds`` × ``_TUNE_WARP_AXIS_CHOICES`` × FM/FN
-    # divisor lists × BK/SPLITK candidates, gated on ``E_M % (wm·fm·atom_m)``
-    # / ``wn·wm·32 ≤ ctx.max_threads_per_cta``, and sort by
-    # ``_priority_matmul_warp`` (max-cells-per-cell-owner cap=64).
-    return []
+
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
+
+    out: list[WarpTileParams] = []
+    seen: set[WarpTileParams] = set()
+    bk_choices = _BK_CANDIDATES
+    splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
+    for kind in atom_kinds:
+        spec = atom_spec(kind)
+        atom_m, atom_n, atom_k = spec.shape
+        if E_M % atom_m != 0 or E_N % atom_n != 0 or E_K % atom_k != 0:
+            # Outer divisibility — the eligibility predicate already enforced
+            # this for the kind it gated, but a different kind in the same
+            # registry could disagree (M9 introduces skewed shapes), so
+            # double-check structurally here.
+            continue
+        # Per-axis cell counts available after the atom cell is fixed.
+        cells_M = E_M // atom_m
+        cells_N = E_N // atom_n
+        # K iterations consumed by one mma_sync. Total K cells = E_K / atom_k;
+        # BK below is the inner stage_inner trip count (number of mma_syncs
+        # per K_o iteration).
+        k_cells_total = E_K // atom_k
+        for wm in _TUNE_WARP_AXIS_CHOICES:
+            if cells_M % wm != 0:
+                continue
+            for wn in _TUNE_WARP_AXIS_CHOICES:
+                if cells_N % wn != 0:
+                    continue
+                threads = wn * wm * 32
+                if threads > ctx.max_threads_per_cta:
+                    continue
+                cells_M_per_warp = cells_M // wm
+                cells_N_per_warp = cells_N // wn
+                fm_candidates = _divisors_up_to(cells_M_per_warp, _MAX_CELLS_PER_WARP_CELL)
+                fm_candidates = FM.narrow(fm_candidates)
+                for fm in fm_candidates:
+                    fn_cap = _MAX_CELLS_PER_WARP_CELL // fm if fm > 0 else _MAX_CELLS_PER_WARP_CELL
+                    fn_candidates = _divisors_up_to(cells_N_per_warp, fn_cap)
+                    fn_candidates = FN.narrow(fn_candidates)
+                    for fn in fn_candidates:
+                        for bk in bk_choices:
+                            # ``bk`` is the inner stage_inner trip count
+                            # (mma_syncs per K_o iter); each iter consumes
+                            # ``atom_k`` K-elements. ``k_cells_total`` must
+                            # divide cleanly by ``bk``.
+                            if bk < 1 or k_cells_total % bk != 0:
+                                continue
+                            k_o_total = k_cells_total // bk
+                            for splitk in splitk_choices:
+                                if splitk < 1 or k_o_total % splitk != 0:
+                                    continue
+                                row = WarpTileParams(
+                                    wn=wn,
+                                    wm=wm,
+                                    fm=fm,
+                                    fn=fn,
+                                    bk=bk,
+                                    splitk=splitk,
+                                    atom_kind=kind,
+                                )
+                                if row in seen:
+                                    continue
+                                seen.add(row)
+                                out.append(row)
+
+    out.sort(key=_priority_matmul_warp, reverse=True)
+    return out
