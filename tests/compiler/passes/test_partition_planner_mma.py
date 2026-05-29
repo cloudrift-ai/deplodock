@@ -244,3 +244,61 @@ def test_warp_enumerator_force_splitk_one():
     )
     assert rows
     assert all(r.splitk == 1 for r in rows)
+
+
+# --- Planner end-to-end (M3) -----------------------------------------
+
+
+_planner = __import__("importlib").import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
+
+
+def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
+    """With ``DEPLODOCK_MMA=1`` and an F16 64×64×64 matmul on sm_80, the
+    planner emits at least one TileOp variant whose body contains a
+    ``WarpTile`` wrapping an ``AtomTile``."""
+    from deplodock.compiler.ir.tile.ir import AtomTile, GridTile, TileOp, WarpTile
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
+
+    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
+    assert plan is not None
+    assert plan.params, "expected ≥1 enumerated variant"
+    warp_rows = [p for p in plan.params if isinstance(p, WarpTileParams)]
+    assert warp_rows, "expected ≥1 WarpTileParams row when DEPLODOCK_MMA=1"
+
+    # Materialize the first warp row and verify the tower shape.
+    tile_op = _planner._materialize(plan, warp_rows[0])
+    assert isinstance(tile_op, TileOp)
+    found_warp = False
+    found_atom = False
+    for s in tile_op.body.iter():
+        if isinstance(s, WarpTile):
+            found_warp = True
+        if isinstance(s, AtomTile):
+            found_atom = True
+    assert found_warp, "warp variant body must contain a WarpTile"
+    assert found_atom, "warp variant body must contain an AtomTile"
+    # GridTile should still be the outermost tier.
+    assert any(isinstance(s, GridTile) for s in tile_op.body), "warp variant must keep the GridTile outer wrapper"
+    # Knobs reflect the warp tier.
+    assert tile_op.knobs["ATOM_KIND"] == "wmma_m16n16k16_f16"
+    assert "BR" not in tile_op.knobs  # warp tier doesn't carry BR
+
+
+def test_planner_scalar_only_when_mma_disabled(monkeypatch):
+    """With ``DEPLODOCK_MMA`` unset (default OFF), the planner emits only
+    scalar variants even on an F16 matmul. The result is byte-identical
+    to today's scalar-only path."""
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import ScalarTileParams, WarpTileParams
+
+    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
+
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
+    assert plan is not None
+    assert all(isinstance(p, ScalarTileParams) for p in plan.params)
+    assert not any(isinstance(p, WarpTileParams) for p in plan.params)

@@ -1490,17 +1490,22 @@ class TileOp(BodyOp):
     def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004
         """Lazy scorer (see :meth:`Op.lazy_score`). Returns ``None`` unless
         called with both ``shapes`` (a :class:`KernelShape` from the
-        partition planner) and ``params`` (a :class:`TileParams` variant).
-        Computes the same value :meth:`score` would on the materialized
-        TileOp, but without running ``_build_split_body`` or
-        ``TileOp.__post_init__`` — lets the planner rank dozens of
-        variants per LoopOp in microseconds instead of milliseconds each.
+        partition planner) and ``params`` (a :class:`TileParams` variant —
+        :class:`ScalarTileParams` or :class:`WarpTileParams`). Computes the
+        same value :meth:`score` would on the materialized TileOp, but
+        without running ``_build_split_body`` or ``TileOp.__post_init__`` —
+        lets the planner rank dozens of variants per LoopOp in microseconds
+        instead of milliseconds each.
 
         Launch geometry the planner will produce (mirrors ``_wrap_tower``):
-            - block axes: ``[K_s?, M_b?, N_b]`` with extents
-              ``[SPLITK, ceil(E_M/(BM·FM)), ceil(E_N/(BN·FN))]``
-            - thread axes: ``[K_c?, M_t?, N_t]`` with extents
-              ``[BR, BM, BN]``
+            - scalar tier: block axes ``[K_s?, M_b?, N_b]`` extent
+              ``[SPLITK, ceil(E_M/(BM·FM)), ceil(E_N/(BN·FN))]``; thread axes
+              ``[K_c?, M_t?, N_t]`` extent ``[BR, BM, BN]``.
+            - warp tier (MMA): block axes ``[K_s?, M_b?, N_b]`` extent
+              ``[SPLITK, ceil(E_M/(WM·FM·atom_m)), ceil(E_N/(WN·FN·atom_n))]``;
+              "thread" axes (warps × lanes) extent
+              ``[WN·32, WM]`` so ``prod() = wn·wm·32`` matches the per-CTA
+              thread count the materializer sets up.
 
         Symbolic outer M/N axes contribute extent 1 to the block-extent
         product (matches what :meth:`score` does with non-static
@@ -1508,20 +1513,33 @@ class TileOp(BodyOp):
         """
         if shapes is None or params is None:
             return None
-        # Lazy-import to avoid circulars (KernelShape / TileParams live in
-        # the planner module, which depends on this IR module).
+        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_shape  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
+
         shape = shapes
         p = params
 
         m_symbolic = shape.outer_m is not None and not shape.outer_m.axis.extent.is_static
         n_symbolic = not shape.outer_n.axis.extent.is_static
 
-        thread_extents: list[int] = []
-        if p.br > 1:
-            thread_extents.append(p.br)
-        if shape.outer_m is not None:
-            thread_extents.append(p.bm)
-        thread_extents.append(p.bn)
+        is_warp = isinstance(p, WarpTileParams)
+        if is_warp:
+            atom_m, atom_n, _ = atom_shape(p.atom_kind)
+            per_m = p.wm * p.fm * atom_m
+            per_n = p.wn * p.fn * atom_n
+            # "Thread axes" for the warp tier = warps × lanes. Use a
+            # 2-element decomposition that products to wn·wm·32 so the
+            # score_tile_geometry occupancy / coalescing math still works.
+            thread_extents: list[int] = [p.wn * 32, p.wm]
+        else:
+            per_m = p.bm * p.fm
+            per_n = p.bn * p.fn
+            thread_extents = []
+            if p.br > 1:
+                thread_extents.append(p.br)
+            if shape.outer_m is not None:
+                thread_extents.append(p.bm)
+            thread_extents.append(p.bn)
 
         block_extents: list[int] = []
         if p.splitk > 1:
@@ -1531,12 +1549,12 @@ class TileOp(BodyOp):
                 block_extents.append(1)
             else:
                 E_M = shape.outer_m.axis.extent.as_static()
-                block_extents.append(max(1, E_M // (p.bm * p.fm)))
+                block_extents.append(max(1, E_M // per_m))
         if n_symbolic:
             block_extents.append(1)
         else:
             E_N = shape.outer_n.axis.extent.as_static()
-            block_extents.append(max(1, E_N // (p.bn * p.fn)))
+            block_extents.append(max(1, E_N // per_n))
 
         # Planner always stamps FM/FN — score keys off ``"FM" in knobs``.
         score_knobs = {"FM": p.fm, "FN": p.fn, "SPLITK": p.splitk}
@@ -1571,14 +1589,27 @@ class TileOp(BodyOp):
         with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
         """
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_shape  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         thread_extent: dict[str, int] = {}
-        if params.br > 1 and shape.k_loop is not None:
-            thread_extent[shape.k_loop.axis.name] = params.br
-        if shape.outer_m is not None and params.bm > 1:
-            thread_extent[shape.outer_m.axis.name] = params.bm
-        if params.bn > 1:
-            thread_extent[shape.outer_n.axis.name] = params.bn
+        if isinstance(params, WarpTileParams):
+            # Warp-tier: the "thread" axes are warps × lanes. Treat the
+            # WN × 32 contribution as the inner-stride coalescer along N,
+            # mirroring the scalar BN role.
+            atom_m, atom_n, _ = atom_shape(params.atom_kind)
+            if shape.outer_m is not None and params.wm > 1:
+                thread_extent[shape.outer_m.axis.name] = params.wm * atom_m
+            n_extent = params.wn * atom_n
+            if n_extent > 1:
+                thread_extent[shape.outer_n.axis.name] = n_extent
+        else:
+            if params.br > 1 and shape.k_loop is not None:
+                thread_extent[shape.k_loop.axis.name] = params.br
+            if shape.outer_m is not None and params.bm > 1:
+                thread_extent[shape.outer_m.axis.name] = params.bm
+            if params.bn > 1:
+                thread_extent[shape.outer_n.axis.name] = params.bn
         if not thread_extent:
             return 0
 
