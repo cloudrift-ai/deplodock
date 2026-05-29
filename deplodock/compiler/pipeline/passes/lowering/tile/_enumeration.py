@@ -154,12 +154,42 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 
 
 def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
-    # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
-    # threads near 256, larger BK, smaller SPLITK. Final tiebreaker prefers
-    # clean-divisor variants over masked (negative len so fewer-overhang wins
-    # under reverse-sorted enumeration).
+    # Two-regime ordering keyed on per-CTA macro tile area (BM·FM × BN·FN cells).
+    # cuBLAS's SGEMM uses fat macro tiles (e.g. 256×128) with small BK (≤ 16) and
+    # a multi-stage ring buffer to amortize gmem latency under FMA. Skinny tiles
+    # (≤ 128×128 macro) instead amortize K-loop overhead by maxing BK and running
+    # one fat K-chunk per kernel iter.
+    #
+    # The legacy single-regime tuple `(cells_clamped, threads_near_256, +bk,
+    # -splitk, -overhang)` ranks `+bk`, which pushes every BK=8 variant behind
+    # every BK=64 variant — the autotuner's patience exhausts on BK=64 leaves
+    # before the BK=8 + fat-tile region is reached (DB evidence: at 2048³ fp32
+    # 197 of 197 explored variants are BK=64).
+    #
+    # Fat-tile regime (macro area ≥ 8192 cells, i.e. 128×64 and up): rank by
+    # an explicit BK preference {16, 8, 32, 4, 64, 2, 1} that puts the cuBLAS-
+    # useful band first. BK=1/2 collapse the inner reduce to a degenerate one-
+    # or two-step loop with no benefit from staging or ring-buffering — and the
+    # -O1/-O3 ranking inversion makes them look artificially good during tuning
+    # (BK=1 at fat tiles ranks first by -O1 latency, then 1.5× worse at -O3).
+    # Skinny regime keeps BK descending (large BK amortizes K-loop overhead for
+    # small CTAs).
     threads = p.bn * p.bm
-    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
+    macro_area = p.bm * p.fm * p.bn * p.fn
+    fat_tile = macro_area >= 8192
+    if fat_tile:
+        _BK_FAT_PREF = {16: 6, 8: 5, 32: 4, 64: 3, 4: 2, 2: 1, 1: 0}
+        bk_key = _BK_FAT_PREF.get(p.bk, -1)
+    else:
+        bk_key = p.bk
+    return (
+        int(fat_tile),  # fat-tile variants surface first
+        min(p.fm * p.fn, 32),  # cells/thread, NVRTC-capped at 32
+        -abs(256 - threads),  # threads near 256
+        bk_key,  # cuBLAS-band BK first in fat regime, large BK otherwise
+        -p.splitk,
+        -len(p.overhang),
+    )
 
 
 def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
