@@ -170,10 +170,28 @@ FROM perf p ORDER BY p.latency_us_median LIMIT 10;
   hit the SPLITK=1 skip before this gate; symbolic M/N skip cleanly. Atomic-free split-K for
   hint-driven dynamic shapes is a future-work item.
 
-## Milestones (one branch, milestone commits)
+## Milestones
 
 1. **Factor `find_split_k_axis_name` into `_splitk_residual.py`** — pure refactor; 1013 tests pass.
+   **Done** (commit `2e6fbab3`).
 2. **Add `017_atomic_free_splitk.py` + 8 unit tests** — pass fires correctly, fork variants emit,
-   atomic-free Writes resolve to empty `atomic_axes`. `make test` green (1021 tests).
-3. **End-to-end accuracy + perf** — run the verification recipe at 2048³ fp32, confirm accuracy
-   and latency targets; re-tune to confirm the autotuner picks the True branch under patience 100.
+   atomic-free Writes resolve to empty `atomic_axes`. `make test` green (1021 tests). **Done**
+   (commit `b58df8f9`).
+3. **End-to-end accuracy + perf** — **partially done; perf goal blocked.**
+   - Atomic-free path is end-to-end correct at `BUFCNT=1` on 2048³ fp32: PASSes accuracy vs eager;
+     deplodock runs matmul + reduce in two launches; reduce is 15 µs / 2.7% of total (as predicted
+     by the bandwidth model).
+   - **Blocking bug at `BUFCNT >= 2`**: `080_pipeline_stages` fires and its rule.txt records the
+     correct pipelined form (prologue1 + prologue2 + main-with-bundle + epilogue1 + epilogue2 — 3
+     `StageBundle`s), but the end-of-stage tile-IR snapshot for the matmul half of the atomic-free
+     fragment carries only the **first** bundle (the K_o-inner steady-state bundle and prologue2 are
+     gone). The legacy atomic path at the same knobs keeps all 3 bundles intact, so the loss is
+     specific to the atomic-free path's TileOp shape (the Write has K_s in the index → empty
+     `atomic_axes`, vs `{K_s}` for the atomic path). With only one prologue bundle alive, the K_o
+     loop reads stale / uninitialised smem from slots 1 + 2 on most iterations, producing the
+     observed `mean_diff ≈ 75` vs reference at SPLITK=4 BUFCNT=3.
+   - The perf target (~350 µs → ~1.30× cuBLAS) requires `BUFCNT >= 2` + ASYNC pipelining. Needs a
+     follow-up debug session to find what's dropping the bundles between 080's commit and the
+     stage-end snapshot. Likely candidates: a normalize-body pass that doesn't see the atomic-free
+     Write's K_s-in-index as a structural marker; a fork resolution that picks a pre-080 candidate
+     when the atomic-free TileOp's structural key differs.
