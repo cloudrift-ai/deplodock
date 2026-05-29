@@ -50,12 +50,32 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
-_TUNE_AXIS_CHOICES: tuple[int, ...] = (1, 16, 32, 64, 128, 256)
+# Power-of-2 axis choices (default). When ``DEPLODOCK_WIDE_FM_FN=1`` is
+# set, the planner switches to ``_TUNE_AXIS_CHOICES_WIDE`` / ``_TUNE_F_CHOICES_WIDE``
+# below — these add the non-power-of-2 midpoints (``BM=8`` for the
+# article's 256-thread ``8×32`` layout; ``FM/FN=6, 10, 12, 14, 20, 24,
+# 26, 28, 40, 48, 96`` for register-budget-bound matmul tiles). The
+# wider set is opt-in because the greedy search doesn't backtrack
+# when ``materialize_tile``'s ``validate(ctx)`` filter drops an over-
+# budget kernel — for fused multi-input kernels (linear + rmsnorm,
+# gated MLP, …) the planner's matmul-shaped smem proxy can't predict
+# which wider variants will validate, so surfacing them changes the
+# greedy pick to one that may silent-skip downstream and leave a
+# ``TileOp`` in the lowered graph. Pinning ``WIDE_FM_FN=1`` is paired
+# with autotuner runs (``deplodock tune ... --patience 100``) that
+# explore the wider space + persist the winners to DB — subsequent
+# greedy compiles read the DB pick and don't hit the silent-skip path.
+_TUNE_AXIS_CHOICES_NARROW: tuple[int, ...] = (1, 16, 32, 64, 128, 256)
+_TUNE_AXIS_CHOICES_WIDE: tuple[int, ...] = (1, 8, 16, 32, 64, 128, 256)
+_TUNE_F_CHOICES_NARROW: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+_TUNE_F_CHOICES_WIDE: tuple[int, ...] = (1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 26, 28, 32, 40, 48, 64, 96, 128)
+_WIDE = os.environ.get("DEPLODOCK_WIDE_FM_FN", "").strip().lower() in {"1", "true", "yes", "on"}
+_TUNE_AXIS_CHOICES: tuple[int, ...] = _TUNE_AXIS_CHOICES_WIDE if _WIDE else _TUNE_AXIS_CHOICES_NARROW
+_TUNE_F_CHOICES: tuple[int, ...] = _TUNE_F_CHOICES_WIDE if _WIDE else _TUNE_F_CHOICES_NARROW
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 # Cooperative-K thread count. v1: BR > 1 requires BN = BM = 1 (single THREAD
 # axis for materializer's _single_thread_var).
 _BR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 # Cap on per-thread cell-product. NVRTC compile time explodes past this.
 _MAX_CELLS_PER_THREAD: int = 128
 
@@ -473,7 +493,13 @@ def _enumerate_cartesian_impl(
                 # / BN·FN doesn't divide E_M / E_N, so the masking guard
                 # is needed — we admit the value and flip overhang for
                 # that variant.
-                if m_overhang:
+                # ``DEPLODOCK_WIDE_FM_FN=1`` opts into the non-divisor
+                # FM/FN sweep (the same flag that broadens the axis-choice
+                # tuples above) — masking-eligible kernels get every
+                # ``_TUNE_F_CHOICES`` value, not just divisors of
+                # ``E_M // bm_c``, so register-budget-bound tiles like the
+                # article's FM=26 (non-divisor of 256) are enumerated.
+                if m_overhang or (_WIDE and m_maskable):
                     fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD)
                 else:
                     fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
@@ -488,7 +514,7 @@ def _enumerate_cartesian_impl(
                     if fm_nondiv and not m_maskable:
                         continue
                     fm_overhang = m_overhang or fm_nondiv
-                    if n_overhang:
+                    if n_overhang or (_WIDE and n_maskable):
                         fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD // fm)
                     else:
                         fn_candidates = _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm)

@@ -171,8 +171,12 @@ def test_replicator_keeps_n_invariant_loads_once():
 
     plan = planner._plan_kernel(loop_op, Context(compute_capability="sm_80"), kernel_name="k_blk")
     assert plan is not None
-    candidates = [p for p in plan.params if p.fn > 1 and p.splitk == 1 and p.br == 1]
-    assert candidates, "no FN > 1 variants enumerated for matmul"
+    # Need BOTH FM > 1 and FN > 1 to exercise the blocked-layout invariant
+    # (``a + b < a·b``); a single-axis register tile (FM=1 or FN=1) trivially
+    # satisfies the equality. The planner's priority surfaces wide tiles
+    # first, so the densest FM>1·FN>1 row sits a few candidates in.
+    candidates = [p for p in plan.params if p.fm > 1 and p.fn > 1 and p.splitk == 1 and p.br == 1]
+    assert candidates, "no FM > 1, FN > 1 variants enumerated for matmul"
     chosen = candidates[0]
     tile_op = planner._materialize(plan, chosen)
 
