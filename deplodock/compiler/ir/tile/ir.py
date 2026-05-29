@@ -524,9 +524,9 @@ def _render_tile_bracket(
 # ---------------------------------------------------------------------------
 #
 # Each tile flavor's *type* encodes its binding decision (block-grid /
-# threadIdx / register / serial / strided). Together with the wrap-body
-# ``Stage`` family, these are the only block-structured Stmts allowed
-# inside a ``TileOp.body`` post-``001_launch_geometry``. ``Loop`` /
+# threadIdx / warp-id / register / serial / strided). Together with the
+# wrap-body ``Stage`` family, these are the only block-structured Stmts
+# allowed inside a ``TileOp.body`` post-``001_launch_geometry``. ``Loop`` /
 # ``StridedLoop`` / ``Tile`` survive in Loop IR (``LoopOp.body``) and as
 # transient inputs to ``001_launch_geometry``, but downstream Tile-IR
 # passes and Tile→Kernel materialization only see the new flavors.
@@ -534,9 +534,12 @@ def _render_tile_bracket(
 # Shape contract (mirrors ``Stage``'s wrap-body):
 #
 # - ``ParallelTile`` subclasses (``GridTile`` / ``ThreadTile`` /
-#   ``RegisterTile``) carry ``axes: tuple[Axis, ...]`` + ``body: Body``.
-#   The body executes once per coord tuple; coords are implicit from the
-#   binding (``blockIdx`` / ``threadIdx`` / per-thread register cell).
+#   ``WarpTile`` / ``RegisterTile``) carry ``axes: tuple[Axis, ...]`` +
+#   ``body: Body``. The body executes once per coord tuple; coords are
+#   implicit from the binding (``blockIdx`` / ``threadIdx`` /
+#   ``threadIdx.x / 32`` / per-thread register cell). ``ThreadTile`` and
+#   ``WarpTile`` are mutually exclusive inside one ``TileOp.body``
+#   (``TileOp.__post_init__`` rejects mixes) — both bind ``threadIdx``.
 # - ``SerialTileBase`` subclasses (``SerialTile`` / ``StridedTile``)
 #   carry ``axis: Axis`` + ``body: Body`` and run sequentially. Reduce
 #   semantics are derived: ``is_reduce`` iff the body contains ``Accum``.

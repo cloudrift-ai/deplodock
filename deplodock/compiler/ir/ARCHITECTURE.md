@@ -51,8 +51,8 @@ along different lowering paths still dedup in the tuning cache.
 
 **Stmt subclasses are `@dataclass(frozen=True)`** — every concrete Loop-IR
 / Tile-IR / Kernel-IR statement (`Loop`, `Cond`, leaves, `GridTile`,
-`ThreadTile`, `Stage`, `StageBundle`, `Smem`, `Sync`, `CpAsyncCopy`,
-`TmaDescriptor`, …) is immutable + hashable. `Body` is a `tuple[Stmt, ...]`
+`ThreadTile`, `WarpTile`, `Stage`, `StageBundle`, `Smem`, `Sync`,
+`CpAsyncCopy`, `TmaDescriptor`, …) is immutable + hashable. `Body` is a `tuple[Stmt, ...]`
 subclass, so a full body tree hashes structurally end-to-end. This makes
 `Body.structural_key()` and any other bodies-as-cache-keys path work
 without a try/except fallback for unhashable stmts. To "edit" a frozen
@@ -260,6 +260,17 @@ this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
 and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
 ``Accum.axes`` carries the names of the loops being reduced over and is
 the source of truth for cooperativity.
+
+**Binding-tier tile flavors.** Three `ParallelTile` subclasses bind a
+parallel coord: `GridTile` (one coord = one CTA, lifts to `blockIdx`),
+`ThreadTile` (one coord = one thread, lifts to `threadIdx`), and
+`WarpTile` (one coord = one warp; the body presumes 32 lanes execute it
+collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
+`ThreadTile` and `WarpTile` are mutually exclusive inside one
+`TileOp.body` — both bind `threadIdx`. `RegisterTile` (per-thread
+register cell) is consumed before kernel render; downstream consumer
+plans (MMA fragment factorization, warp-specialize refactor) emit
+`WarpTile` to drive warp-cooperative codegen.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative

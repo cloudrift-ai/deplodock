@@ -133,10 +133,8 @@ import importlib  # noqa: E402
 
 from deplodock.compiler.context import Context  # noqa: E402
 from deplodock.compiler.graph import Graph  # noqa: E402
-from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: E402
 from deplodock.compiler.ir.tile.ir import TileOp  # noqa: E402
 from deplodock.compiler.tensor import Tensor  # noqa: E402
-
 
 _mat = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
 

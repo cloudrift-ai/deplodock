@@ -14,7 +14,7 @@ import importlib
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Body, Write
+from deplodock.compiler.ir.stmt import Write
 from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")

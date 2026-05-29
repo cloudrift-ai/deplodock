@@ -92,6 +92,14 @@ formula from cheap inputs (knob bundle + planner shape) so siblings rank
 without anyone instantiating a TileOp. The branch tree's `Fork.score`
 propagates max from leaves, matching MCTS's max-Q semantics.
 
+Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
+`Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
+`Role.WARP` (→ `WarpTile`) is wired through `_layer_kind_for` /
+`_wrap_tower` but no rule in this pass emits it — the MMA
+fragment-factorization consumer plan (`plans/mma-fragment-factorization.md`)
+and the warp-specialize refactor flip a tier when they ship, without
+revisiting the tower mechanics.
+
 The tree-building algorithm itself (group params by per-level knob keys,
 collapse single-key levels, sort siblings by max-propagated score, defer
 leaf materialization to `expand` thunks) lives in `pipeline/fork_tree.py`
