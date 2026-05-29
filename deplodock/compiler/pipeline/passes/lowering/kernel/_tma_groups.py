@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.stmt import Cond, Stmt
-from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy
+from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy, WarpSpecialize
 
 
 def _is_tma_bundle(s) -> bool:
@@ -153,12 +153,19 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
                 # its body so inner K_o loops still get discovered.
                 _walk(tuple(stmt.body))
                 continue
+            if isinstance(stmt, WarpSpecialize):
+                # 085_warp_specialize packs producer (TMA bundles) and
+                # consumer (AsyncWaits, reduce) into the two branches of
+                # a WarpSpecialize marker. Recurse with shared state so
+                # the bundles in producer_body and the AsyncWaits in
+                # consumer_body join the same pipeline-unit group.
+                _walk(tuple(stmt.producer_body))
+                _walk(tuple(stmt.consumer_body))
+                continue
             if isinstance(stmt, Cond):
-                # Warp-specialized output from 085_warp_specialize wraps
-                # producer + consumer subtrees in a Cond. Treat both
-                # branches as transparent: recurse with shared state so
-                # bundles in the producer branch + AsyncWaits in the
-                # consumer branch all join the same logical group.
+                # Pre-WarpSpecialize 085 emitted producer/consumer as a
+                # bare Cond; left in place for any other rule that may
+                # emit a Cond around StageBundles / AsyncWaits.
                 _walk(tuple(stmt.body))
                 _walk(tuple(stmt.else_body))
                 continue
