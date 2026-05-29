@@ -78,7 +78,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
@@ -482,26 +482,51 @@ def _build_register_blocked_body(
 ) -> tuple[Stmt, ...] | None:
     """Apply the register-blocked GEMM nest to ``new_inner`` (the σ-rewritten
     matmul body sitting inside ``M_r`` REGISTER, before the outer N_r wrap).
-    Replaces the existing per-cell ``[Init, K-tower, Write]`` flat structure
-    with three sibling RegisterTile(N_r) towers separated by the (now shared)
-    K-loop:
+    Replaces the existing per-cell ``[Init, K-tower, ..., Write]`` flat
+    structure with sibling RegisterTile(N_r) towers separated by the
+    (now shared) K-loop:
 
     - ``Init(acc)`` → ``RegisterTile(N_r, [Init(acc)])`` (per-cell accumulators).
     - K-tower (SerialTile K_o > SerialTile K_i) → K_i body split into N-invariant
       cone + ``RegisterTile(N_r, [N-dep tail])`` — the cone (e.g. fused RMSNorm
       prologue, M-axis Loads) runs once per K iteration, the tail runs F_N×.
     - ``Write(C, acc)`` → ``RegisterTile(N_r, [Write(C, acc)])`` (per-cell writes).
+    - Adjacent ``Load`` / ``Assign`` / ``Write`` siblings (matmul_add's
+      ``[Load(r), Assign(v=acc+r), Write(v)]`` residual epilogue) are
+      grouped into ONE ``RegisterTile(N_r)`` so the replicator emits a
+      contiguous per-cell ``[Load r_i, Assign v_i, Write _i]`` block —
+      same code shape as the per-cell legacy path. Grouping keeps the
+      epilogue's intermediate SSA values (``r_i``, ``v_i``) within one
+      per-cell scope; wrapping each stmt in its own RegisterTile would
+      still be correct, but the replicator would emit a wide register
+      window with every ``r_i`` live until its ``Assign v_i`` consumer.
 
     ``leaf_cond`` wraps each tower's leaf body in a per-cell Cond (the masked-N
     boundary guard). The replicator (010_split_register_axes) replicates each
     Cond per cell using σ N_r → i, producing F_N concrete-i guarded leaves.
 
     Returns ``None`` when the shape doesn't fit (no K_i found, empty N-dep
-    tail, or unexpected outer-scope stmts — Cond from a prior masked wrap,
-    epilogue compute, etc.) so the caller falls back to per-cell.
+    tail, or unexpected outer-scope stmts — vectorized Writes, unknown
+    block stmts, etc.) so the caller falls back to per-cell.
     """
     out: list[Stmt] = []
     n_replaced = 0
+    pending: list[Stmt] = []
+
+    def flush_pending() -> None:
+        """Emit any accumulated Load / Assign chain as one epilogue tower.
+
+        Conservatively requires the chain to terminate in a Write — a
+        dangling Load/Assign group with no consumer Write is the
+        unrecognised-stmt path and signals the per-cell fallback."""
+        if not pending:
+            return
+        leaf_body: tuple[Stmt, ...] = tuple(pending)
+        if leaf_cond is not None:
+            leaf_body = leaf_cond(leaf_body)
+        out.append(RegisterTile(axes=(n_r,), body=Body(leaf_body)))
+        pending.clear()
+
     for s in new_inner:
         if isinstance(s, Init):
             # Init must be unconditional: it declares the per-cell accumulator
@@ -510,13 +535,18 @@ def _build_register_blocked_body(
             # Write tower (both Cond-wrapped per cell) would reference an
             # ``acc_i`` that's no longer in scope. OOB cells initialize a
             # dead register, which is harmless.
+            flush_pending()
             out.append(RegisterTile(axes=(n_r,), body=Body((s,))))
+        elif isinstance(s, (Load, Assign)):
+            # Part of an epilogue / prologue chain (matmul_add residual:
+            # ``Load(r)``, ``Assign(v=acc+r)``). Defer until the closing
+            # ``Write`` so the entire chain lands in one RegisterTile.
+            pending.append(s)
         elif isinstance(s, Write):
-            leaf_body: tuple[Stmt, ...] = (s,)
-            if leaf_cond is not None:
-                leaf_body = leaf_cond(leaf_body)
-            out.append(RegisterTile(axes=(n_r,), body=Body(leaf_body)))
+            pending.append(s)
+            flush_pending()
         elif isinstance(s, SerialTile):
+            flush_pending()
             new_s, r = _split_k_tower_for_block(s, n_axis_name, n_r, leaf_cond)
             out.append(new_s)
             n_replaced += r
@@ -527,12 +557,17 @@ def _build_register_blocked_body(
             # into Cond.body / Cond.else_body and replicates the inner Loads
             # / Assigns / Writes per cell (Cond's own predicate is K_s-only
             # so it doesn't itself get replicated, just its content).
+            flush_pending()
             out.append(RegisterTile(axes=(n_r,), body=Body((s,))))
         else:
             # Unrecognised outer-scope stmt. Fall back to the per-cell legacy
             # path so the kernel still lowers (the planner-fallback branch in
             # ``_build_split_body`` picks up).
             return None
+    if pending:
+        # Trailing Load / Assign without a closing Write — likely a partial
+        # epilogue we don't yet recognise. Bail to per-cell.
+        return None
     if n_replaced == 0:
         return None
     return tuple(out)
@@ -929,10 +964,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # K-reduce (mean / softmax stats) still runs once at the M_r scope; the
     # blocked transform only touches the matmul body's K_i.
     # The blocked builder declines (returns None) on shapes it can't yet
-    # handle — SPLITK > 1 (the K_s == 0 Cond wrap from
-    # ``015_gate_splitk_residual`` and 020_stage_inputs's slab-shape
-    # inference for the inner-RegisterTile Load haven't been generalised
-    # yet), BR > 1's cooperative-K combine, M-mask — the per-cell legacy
+    # handle — BR > 1's cooperative-K combine, M-mask — the per-cell legacy
     # path below picks up those cases.
     #
     # FN == 1 is no longer disqualified: the blocked builder degenerates
@@ -944,8 +976,16 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # passes see K_i as a reduce; ``025_unify_sibling_stages`` then drops
     # any redundant matmul Stage that would re-stage a buffer already
     # staged in a prior sibling scope (the fused-RMSNorm + linear case).
+    #
+    # SPLITK > 1 is no longer disqualified: the blocked builder now groups
+    # the matmul_add residual epilogue (Load(r) + Assign(v=acc+r) + Write)
+    # into one ``RegisterTile(N_r)`` Write tower; ``015_gate_splitk_residual``
+    # detects this shape and emits the ``Cond(K_s == 0)`` wrap inside the
+    # Write tower body. The 020 staging walk (Phase 2) sees the K-tower's
+    # nested Accum via ``is_reduce`` and the residual ``Load(r)`` via
+    # ``_iter_loads_through_register`` so neither input goes unstaged.
     reg_blocked = False
-    if params.splitk == 1 and params.br == 1 and shape.k_loop is not None and m_bound is None:
+    if params.br == 1 and shape.k_loop is not None and m_bound is None:
         if n_bound is not None:
             # Masked N: wrap each tower's leaf body in its own Cond. The
             # replicator (010_split_register_axes) replicates the Cond per
