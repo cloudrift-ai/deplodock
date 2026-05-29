@@ -217,15 +217,40 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         if not isinstance(stmt, StageBundle):
             continue
         buf_count = stmt.buffer_count if stmt.policy != StagePolicy.SYNC else 1
+        # TMA destinations need 128-byte alignment per NVIDIA's TMA programming
+        # guide — ``cp.async.bulk.tensor`` against a misaligned smem dst raises
+        # ``Misaligned shared or local address`` mid-kernel (compute-sanitizer
+        # surfaces it; the in-flight TMA never completes, the consumer
+        # mbarrier.wait spins forever, and the bench watchdog times out at
+        # 1000 ms with the kernel pinned ``bench_fail``). Two things needed
+        # together — base alignment AND slot-stride padding — when the ring
+        # buffer's natural slot stride is < 128 B (BK·sizeof < 128 on FP32 →
+        # BK < 32). The per-stage TMA emit later (``emit_tma_stage`` →
+        # ``_TMA_ALIGN_BYTES``) sets ``align=128`` on its own Smem, but
+        # ``filter_emit`` drops it as a name-dup of this pre-emit; without
+        # both, the second slot lands at a 64 B offset from a 128 B base —
+        # silently misaligned for cp.async.bulk.tensor.
+        is_tma = stmt.policy == StagePolicy.TMA
         for member in stmt.stages:
             for src in member.sources:
                 if src.name in declared_smem:
                     continue
                 extents = src.alloc_extents
+                smem_dtype = smem_cuda_dtype(src)
+                if is_tma:
+                    # Round the slot's inner extent up to make the slot bytes
+                    # a multiple of 128 B. Keeps every ring slot 128 B-aligned
+                    # from a 128 B-aligned base, regardless of the TMA box's
+                    # natural bytes. The unused tail of each slot is benign
+                    # (TMA only writes box bytes; reads index 0..box-1).
+                    inner_per_align = _TMA_ALIGN_BYTES // BYTES_PER_ELEM
+                    inner = extents[-1]
+                    if inner % inner_per_align != 0:
+                        padded_inner = (inner + inner_per_align - 1) // inner_per_align * inner_per_align
+                        extents = (*extents[:-1], padded_inner)
                 if buf_count > 1:
                     extents = (buf_count, *extents)
-                smem_dtype = smem_cuda_dtype(src)
-                smem_align = 16 if smem_dtype == "__half" else 0
+                smem_align = _TMA_ALIGN_BYTES if is_tma else (16 if smem_dtype == "__half" else 0)
                 compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
                 declared_smem.add(src.name)
 
