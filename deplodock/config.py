@@ -143,6 +143,20 @@ def mma_enabled() -> bool:
     return _bool("DEPLODOCK_MMA", default=True)
 
 
+def mma_stage_probe() -> bool:
+    """``DEPLODOCK_MMA_STAGE_PROBE`` — opt-in smem staging for the MMA path.
+
+    Default OFF: the MMA fragment factorization path bypasses
+    ``020_stage_inputs`` (operands loaded directly from gmem via
+    ``wmma::load_matrix_sync``). Setting this to ``1`` enables
+    cooperative-load staging through smem for MMA operands — the work
+    sequence in ``plans/mma-smem-staging.md``. Probe-gated so the staged
+    correctness pieces (M2-M5) can land independently before the default
+    flips ON in M6.
+    """
+    return _bool("DEPLODOCK_MMA_STAGE_PROBE", default=False)
+
+
 def debug_enabled() -> bool:
     """``DEPLODOCK_DEBUG`` — per-launch debug dump path in the CUDA backend."""
     return _bool(DEBUG)
