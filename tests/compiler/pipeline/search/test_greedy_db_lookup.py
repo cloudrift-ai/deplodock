@@ -97,9 +97,22 @@ def _record_pair(out: dict[str, tuple[str, str, dict]], op: Op) -> None:
 @pytest.fixture(scope="module")
 def _option_zero_knobs() -> dict:
     """Greedy/heuristic ordering picks option 0; one pipeline run is
-    enough to capture its ``(BN, BM)``."""
-    out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
-    return {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
+    enough to capture its ``(BN, BM)``.
+
+    Pins the compute target inside the fixture so the per-test autouse
+    sm_80 setup is honored here too — without that the fixture would
+    capture the live device's compute capability (e.g. sm_120) and the
+    TMA-eligibility scoring bonus would pick a different greedy variant
+    than the tests' sm_80 context produces, throwing the equality
+    assertion off."""
+    from deplodock.compiler import target as target_mod
+
+    target_mod.set_target((8, 0))
+    try:
+        out = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
+        return {k: _final_tile_op(out).knobs.get(k) for k in ("BN", "BM")}
+    finally:
+        target_mod.set_target(None)
 
 
 @pytest.fixture(scope="module")
@@ -111,23 +124,33 @@ def _blockify_variants() -> list[tuple[str, str, dict]]:
     in the rule emits) by recording the greedy ``run_pipeline`` result
     first; the autotune sweep then appends alternatives. This is stable
     across changes to the MCTS walk order, which can shift if e.g.
-    ``op_cache_key`` partitions the search frontier differently."""
-    out: dict[str, tuple[str, str, dict]] = {}
-    greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
-    _record_pair(out, _final_tile_op(greedy))
-    search = TuningSearch(patience=10**6)
-    option_zero_entry = next(iter(out.values())) if out else None
-    option_zero = option_zero_entry[2] if option_zero_entry is not None else None
-    option_zero_pk = option_zero_entry[0] if option_zero_entry is not None else None
-    for cand in Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()):
-        _record_pair(out, _final_tile_op(cand.graph))
-        # The only consumer (test_seeded_lowering_overrides_option_zero) just
-        # needs one variant whose knobs differ from option-0 AND whose
-        # parent_key matches option-0's parent (so DB seeds resolve during
-        # greedy replay). Stop once we have it.
-        if option_zero is not None and any(v[2] != option_zero and v[0] == option_zero_pk for v in out.values()):
-            break
-    return list(out.values())
+    ``op_cache_key`` partitions the search frontier differently.
+
+    Pins target sm_80 (see :func:`_option_zero_knobs`) — without it the
+    fixture would key on the live device's cc and downstream assertions
+    that compare against the autouse sm_80 tests would mismatch."""
+    from deplodock.compiler import target as target_mod
+
+    target_mod.set_target((8, 0))
+    try:
+        out: dict[str, tuple[str, str, dict]] = {}
+        greedy = Pipeline.build(TILE_PASSES).run(_make_matmul(), db=SearchDB())
+        _record_pair(out, _final_tile_op(greedy))
+        search = TuningSearch(patience=10**6)
+        option_zero_entry = next(iter(out.values())) if out else None
+        option_zero = option_zero_entry[2] if option_zero_entry is not None else None
+        option_zero_pk = option_zero_entry[0] if option_zero_entry is not None else None
+        for cand in Pipeline.build(TILE_PASSES).tune(_make_matmul(), search=search, db=SearchDB()):
+            _record_pair(out, _final_tile_op(cand.graph))
+            # The only consumer (test_seeded_lowering_overrides_option_zero)
+            # just needs one variant whose knobs differ from option-0 AND whose
+            # parent_key matches option-0's parent (so DB seeds resolve during
+            # greedy replay). Stop once we have it.
+            if option_zero is not None and any(v[2] != option_zero and v[0] == option_zero_pk for v in out.values()):
+                break
+        return list(out.values())
+    finally:
+        target_mod.set_target(None)
 
 
 def test_baseline_picks_option_zero(_option_zero_knobs: dict) -> None:

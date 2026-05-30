@@ -221,16 +221,27 @@ def _n_decode_coeffs(tile_op):
     return t_coeff, r_coeff
 
 
-def test_masked_n_uses_interleaved_thread_minor_decode(recording_dump):
+def test_masked_n_uses_interleaved_thread_minor_decode(recording_dump, monkeypatch):
     """A masked (non-divisor) N tile must decode thread-minor: the N register
     cell strides by BN so consecutive threads map to consecutive columns
     (coalesced global weight loads). Regression guard for the lm_head
     1024→vocab projection (94 ms → 3.5 ms). Shape picked so BN≠FN — otherwise
     blocked and interleaved share the same coefficient and can't be told
-    apart."""
+    apart.
+
+    Pinned via ``DEPLODOCK_KNOBS`` to BN=256, FN=8 so the test asserts the
+    register-decode rewrite property independent of which masked variant the
+    planner's prior happens to rank first — the smem-fit + TMA-eligibility
+    signals can reasonably prefer narrower BN at this shape, but the
+    register-decode logic must still emit a thread-minor stride at BN=256.
+    """
+    # ``DEPLODOCK_KNOBS`` would be too late (``apply_knobs_env`` runs at module
+    # import); set the individual per-knob env vars that ``Knob.narrow`` reads.
+    for k, v in (("BN", "256"), ("FN", "8"), ("BM", "1"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     g = Graph()
     _input(g, "a", (32, 256))
-    _input(g, "b", (256, 8191))  # N=8191: no divisor → masked; planner picks BN=256, FN=8
+    _input(g, "b", (256, 8191))  # N=8191: no divisor → masked
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (32, 8191)), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
 

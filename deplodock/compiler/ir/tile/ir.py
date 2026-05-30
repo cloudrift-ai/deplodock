@@ -1319,6 +1319,7 @@ def score_tile_geometry(
     coalescing_inner_extent: int,
     smem_cap_bytes: int | None = None,
     n_staged_inputs: int = 2,
+    compute_capability: tuple[int, int] | None = None,
 ) -> float:
     """Pure-formula scoring shared by :meth:`TileOp.score` and the partition
     planner. Takes the launch-geometry summary the score depends on (already
@@ -1395,8 +1396,15 @@ def score_tile_geometry(
         score -= min((ctas - 2048) / 4096.0, 2.5)
 
     splitk = int(knobs.get("SPLITK", 1))
-    if splitk > 4:
-        score -= min((splitk - 4) / 4.0, 1.0)
+    if splitk > 1:
+        # Cross-CTA reduce via atomic-add costs gmem RMW (the partials need to
+        # round-trip through L2 between CTAs); pure-matmul kernels almost
+        # always prefer SPLITK=1 unless they're starved for CTAs. The earlier
+        # gate at SPLITK > 4 missed this — at 2048³ a (FM=20 FN=6 SPLITK=2)
+        # variant outscored the golden's SPLITK=1 by 0.5 (the extra CTAs lifted
+        # it into the "ctas ≥ target" bonus band), so greedy picked the
+        # atomic-cost variant and ran ~3.5× slower.
+        score -= 0.4 * min(splitk - 1, 4)
 
     if has_stages:
         score += 1.0
@@ -1444,11 +1452,41 @@ def score_tile_geometry(
             # masked QK^T at 166 KB) for the two regimes.
             base_slab = (macro_m + macro_n) * bk * BYTES_PER_ELEM
             input_scale = max(1, n_staged_inputs) / 2
-            slab_bytes = int(base_slab * input_scale * 17 // 10)  # ×1.7 safety
+            # Safety multiplier is aspect-conditional: PAD_SMEM padding adds
+            # ~1 cell per row, so wide stripes (macro_n=512 on macro_m=4 at
+            # SDPA QK^T) inflate the actual ``smem_bytes()`` ~1.6× past the
+            # base slab, but well-balanced macros (golden's 208×128 at 2048³
+            # matmul fp32, aspect 1.6) inflate only ~1.1×. Empirically pick
+            # ×1.7 for aspect > 4, ×1.1 otherwise — without this split the
+            # tighter 1.7× kills the balanced golden tile (which actually fits
+            # at 92 KB < 99 KB cap) while the looser 1.1× lets the wide-N
+            # stripe through (actual 105 KB fails the cap).
+            aspect = max(macro_m, macro_n) / max(1, min(macro_m, macro_n))
+            safety_num, safety_den = (17, 10) if aspect > 4 else (11, 10)
+            slab_bytes = int(base_slab * input_scale * safety_num // safety_den)
             if slab_bytes > smem_cap_bytes:
                 score -= 4.0
             elif 2 * slab_bytes > smem_cap_bytes:
                 score -= 2.5
+
+    # TMA-eligibility bonus (matmul on sm_90+). ``050_use_tma`` promotes the
+    # K-outer BUFFERED bundle to TMA when every source's inner box extent is
+    # ≥128 B aligned; for a 2-input matmul that means ``BK·sizeof(elem) ≥ 128``
+    # (A's K-inner, stride-1) AND ``BN·FN·sizeof(elem) ≥ 128`` (B's N-inner,
+    # stride-1). Without this bonus the prior is BK-independent so MCTS would
+    # measure the (BM, BN, FM, FN, BK=16) leaf first (insertion order tie-
+    # break) and exhaust patience before ever benching the (BK=32) sibling —
+    # which is the very leaf TMA fires on, and which at 2048³ fp32 runs ~290 us
+    # vs ~347 us cp.async (-O3) and ~371 us vs ~3.5 ms (-O1). +1.0 is large
+    # enough to outweigh the +0.5 cells gradient between two cell-budget
+    # neighbours, so the BK=32 sibling outranks its BK=16 cousin at scoring
+    # time and MCTS visits it first.
+    if "FM" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0):
+        bk = int(knobs.get("BK", 1))
+        bn = int(knobs.get("BN", 1))
+        fn = int(knobs.get("FN", 1))
+        if bk * BYTES_PER_ELEM >= 128 and bn * fn * BYTES_PER_ELEM >= 128:
+            score += 1.0
 
     return score
 
@@ -1599,14 +1637,16 @@ class TileOp(BodyOp):
 
     def score(self, ctx) -> float:
         cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
+        cc = getattr(ctx, "compute_capability", None) if ctx is not None else None
         cache = self.__dict__.setdefault("_score_by_cap", {})
-        if cap in cache:
-            return cache[cap]
-        val = self._compute_score(cap)
-        cache[cap] = val
+        key = (cap, cc)
+        if key in cache:
+            return cache[key]
+        val = self._compute_score(cap, cc)
+        cache[key] = val
         return val
 
-    def _compute_score(self, smem_cap: int | None) -> float:
+    def _compute_score(self, smem_cap: int | None, compute_capability: tuple[int, int] | None = None) -> float:
         """Score formula — keyed on the live geometry and the ctx-supplied
         ``smem_cap`` (so the macro-tile fit signal in :func:`score_tile_geometry`
         gets a real cap to compare against). Memoized by cap on ``self`` so
@@ -1634,6 +1674,7 @@ class TileOp(BodyOp):
             has_stages=has_stages,
             coalescing_inner_extent=self._coalescing_inner_extent(thread_axes),
             smem_cap_bytes=smem_cap,
+            compute_capability=compute_capability,
         )
 
     @staticmethod
@@ -1726,6 +1767,7 @@ class TileOp(BodyOp):
         coalescing = TileOp._coalescing_inner_extent_from_writes(shape, p)
 
         smem_cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
+        cc = getattr(ctx, "compute_capability", None) if ctx is not None else None
         # Count distinct input buffers the loop body reads — score_tile_geometry's
         # slab estimate is per-A+B (2 inputs); kernels that fuse more (SDPA-with-
         # mask + RoPE = 4-6 inputs; gated MLP = 3 inputs) need the slab estimate
@@ -1740,6 +1782,7 @@ class TileOp(BodyOp):
             coalescing_inner_extent=coalescing,
             smem_cap_bytes=smem_cap,
             n_staged_inputs=n_staged,
+            compute_capability=cc,
         )
 
     @staticmethod

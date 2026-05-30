@@ -95,10 +95,12 @@ class TuningSearch(Search):
         *,
         patience: int = 20,
         ucb_c: float = DEFAULT_UCB_C,
+        max_visits: int | None = None,
     ) -> None:
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
         self._patience = patience
+        self._max_visits = max_visits
         self._best_reward = 0.0
         self._visits_at_best = 0
         self.stop_reason: str | None = None
@@ -160,6 +162,10 @@ class TuningSearch(Search):
         visits = self.tree.root.visits
         if visits == 0:
             return False
+        if self._max_visits is not None and visits >= self._max_visits:
+            best_us = 1.0 / self._best_reward if self._best_reward > 0 else float("inf")
+            self.stop_reason = f"max_visits ({visits} reached, best {best_us:.2f} us)"
+            return True
         if self.tree.best_reward > self._best_reward:
             self._best_reward = self.tree.best_reward
             self._visits_at_best = visits

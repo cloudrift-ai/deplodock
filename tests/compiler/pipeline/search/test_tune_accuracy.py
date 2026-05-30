@@ -139,10 +139,18 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     db_path = tmp_path / "tune.db"
     db = SearchDB(path=db_path)
     tune_backend = CudaBackend(bench_wall_timeout_s=30.0)
-    # Drain the iterator. ``patience=5`` is plenty for these small
-    # shapes — the search exhausts the queue or stops on stagnation
-    # well before that for a 16x64 matmul.
-    candidates = list(Pipeline.build(CUDA_PASSES).tune(graph, search=TuningSearch(patience=5), backend=tune_backend, db=db))
+    # Drain the iterator. ``max_visits=4`` is what dominates the test's
+    # wall time — the test verifies tuned output matches the rule default,
+    # not that the search exhausts the variant space. Each MCTS visit
+    # is one full kernel compile (~3 s NVRTC), so the cap dominates;
+    # ``patience=3`` is a no-op below the cap but kept for cases where
+    # MCTS hits a local minimum sooner. The hard visits cap matters
+    # whenever a scoring change adds new high-prior siblings (TMA-
+    # eligibility bonus, SPLITK penalty) and patience alone would let
+    # MCTS keep finding new "best"s deeper into the variant tree.
+    candidates = list(Pipeline.build(CUDA_PASSES).tune(
+        graph, search=TuningSearch(patience=3, max_visits=4), backend=tune_backend, db=db,
+    ))
     assert candidates, "tune produced no terminal candidates"
 
     # Tuned re-run: same graph + inputs, but compile reads from the DB
