@@ -26,9 +26,10 @@ from __future__ import annotations
 
 from deplodock.compiler.dtype import F16, F32, DataType
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import MmaFill, MmaFragment, MmaLoad, MmaStore, MmaSync
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt, Write
-from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import AffineAddressing, AtomTile, SerialTile, Source, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import AtomSpec, atom_spec
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
@@ -59,7 +60,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     # (F32 acc).
     c_dtype_override = _resolve_c_dtype(root, spec.operand_dtypes["c"])
 
-    lowered, found = _lower_atom_tiles(tt.body, spec=spec, c_dtype_override=c_dtype_override)
+    lowered, found = _lower_atom_tiles(tt.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources={})
     if not found:
         # Could happen on a second visit (AtomTile already consumed).
         raise RuleSkipped("no AtomTile in body — already lowered")
@@ -94,31 +95,59 @@ def _resolve_c_dtype(root: Node, spec_c_dtype: DataType) -> DataType:
     return spec_c_dtype
 
 
-def _lower_atom_tiles(body: Body, *, spec: AtomSpec, c_dtype_override: DataType) -> tuple[Body, bool]:
+def _lower_atom_tiles(
+    body: Body,
+    *,
+    spec: AtomSpec,
+    c_dtype_override: DataType,
+    smem_sources: dict[str, Source],
+) -> tuple[Body, bool]:
     """Walk ``body``; for each ``AtomTile`` encountered, rewrite its
     interior matmul-shape body into an Mma* fragment chain and strip
     the AtomTile wrapper. Recurses into non-AtomTile block stmts so a
     deep-nested AtomTile (under RegisterTile / SerialTile / Cond / ...)
-    is reached. Returns ``(new_body, found_any)``."""
+    is reached. Returns ``(new_body, found_any)``.
+
+    ``smem_sources`` is a flat ``smem_name → Source`` map of Sources
+    in-scope from enclosing ``StageBundle``s. When ``_atom_body_to_mma``
+    encounters a Load reading from a staged smem buffer, it rebuilds
+    ``src_index`` via the Source's ``AffineAddressing.source_index`` so
+    the MMA fragment lands on the correct (block-scaled) slab offset.
+    M2-M5 of ``plans/mma-smem-staging.md``.
+    """
     out: list[Stmt] = []
     found = False
     for s in body:
         if isinstance(s, AtomTile):
-            new_stmts = _atom_body_to_mma(s.body, spec=spec, c_dtype_override=c_dtype_override)
+            new_stmts = _atom_body_to_mma(s.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources=smem_sources)
             out.extend(new_stmts)
             found = True
             continue
-        if isinstance(s, (Stage, StageBundle)):
-            # MMA TileOps bypass staging in v1 (skip guard at
-            # tile/020_stage_inputs); a Stage here would mean the guard
-            # failed. Pass through defensively.
-            out.append(s)
+        if isinstance(s, StageBundle):
+            # Register every Source in the bundle so child AtomTile
+            # Loads reading from this slab can resolve the addressing.
+            # Bundles can nest (cooperative-K + outer staging); we copy
+            # the dict so a child bundle's additions don't leak out to
+            # sibling subtrees.
+            inner_sources = dict(smem_sources)
+            for stage in s.stages:
+                for src in stage.sources:
+                    inner_sources[src.name] = src
+            new_bundle_body, body_found = _lower_atom_tiles(
+                s.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources=inner_sources
+            )
+            # ``StageBundle.with_bodies`` expects ``(stages_body, body)`` —
+            # stages stay byte-clean (no AtomTile lives inside producer
+            # Sources), we only rebuild the consumer body.
+            new_stages_body = Body(s.stages)
+            out.append(s.with_bodies((new_stages_body, new_bundle_body)))
+            found = found or body_found
             continue
         if s.nested():
             new_bodies: list[Body] = []
             any_lowered = False
             for sub in s.nested():
-                new_sub, sub_found = _lower_atom_tiles(sub, spec=spec, c_dtype_override=c_dtype_override)
+                new_sub, sub_found = _lower_atom_tiles(sub, spec=spec, c_dtype_override=c_dtype_override, smem_sources=smem_sources)
                 new_bodies.append(new_sub)
                 any_lowered = any_lowered or sub_found
             found = found or any_lowered
@@ -128,7 +157,13 @@ def _lower_atom_tiles(body: Body, *, spec: AtomSpec, c_dtype_override: DataType)
     return Body(out), found
 
 
-def _atom_body_to_mma(body: Body, *, spec: AtomSpec, c_dtype_override: DataType) -> tuple[Stmt, ...]:
+def _atom_body_to_mma(
+    body: Body,
+    *,
+    spec: AtomSpec,
+    c_dtype_override: DataType,
+    smem_sources: dict[str, Source],
+) -> tuple[Stmt, ...]:
     """Pattern-match the AtomTile's interior matmul body and rewrite it
     to an Mma* fragment chain.
 
@@ -159,28 +194,46 @@ def _atom_body_to_mma(body: Body, *, spec: AtomSpec, c_dtype_override: DataType)
     # Find the Write + the inner reduce SerialTile (K_i). K_o and K_i may
     # both be size-1 filtered by ``_wrap_tower``, in which case the matmul
     # body sits *directly* inside the AtomTile (no SerialTile wrapper).
+    # M5: a ``StageBundle`` between the AtomTile and the K-loop is the
+    # MMA-staged shape — look inside its body to find the K-loop, and
+    # capture the bundle so the lowered Mma chain re-wraps in it.
     write_stmt: Write | None = None
     reduce_st: SerialTile | None = None
     outer_st: SerialTile | None = None
+    enclosing_bundle: StageBundle | None = None
     flat_loads: list[Load] = []
     flat_accum: Accum | None = None
 
+    def _walk(stmt) -> None:
+        nonlocal reduce_st, outer_st, flat_accum
+        if isinstance(stmt, SerialTile):
+            if any(isinstance(c, SerialTile) and c.is_reduce for c in stmt.body):
+                outer_st = stmt
+                reduce_st = next(c for c in stmt.body if isinstance(c, SerialTile) and c.is_reduce)
+            elif stmt.is_reduce:
+                reduce_st = stmt
+        elif isinstance(stmt, Load):
+            flat_loads.append(stmt)
+        elif isinstance(stmt, Accum):
+            flat_accum = stmt
+
+    # Local copy so a bundle nested inside the AtomTile's body contributes
+    # its Sources to the lookup `_mma_src_index` consults below — without
+    # leaking back to siblings.
+    bundle_sources = dict(smem_sources)
     for s in body:
         if isinstance(s, Write):
             write_stmt = s
             continue
-        if isinstance(s, SerialTile):
-            if any(isinstance(c, SerialTile) and c.is_reduce for c in s.body):
-                outer_st = s
-                reduce_st = next(c for c in s.body if isinstance(c, SerialTile) and c.is_reduce)
-            elif s.is_reduce:
-                reduce_st = s
-        # Body shape C: degenerate (both K loops filtered) — matmul body
-        # sits directly inside the AtomTile.
-        elif isinstance(s, Load):
-            flat_loads.append(s)
-        elif isinstance(s, Accum):
-            flat_accum = s
+        if isinstance(s, StageBundle):
+            enclosing_bundle = s
+            for stage in s.stages:
+                for src in stage.sources:
+                    bundle_sources[src.name] = src
+            for inner in s.body:
+                _walk(inner)
+            continue
+        _walk(s)
 
     if write_stmt is None:
         raise RuleSkipped("AtomTile body unrecognised — no Write")
@@ -257,9 +310,11 @@ def _atom_body_to_mma(body: Body, *, spec: AtomSpec, c_dtype_override: DataType)
     a_frag = f"{a_load.names[0]}_frag"
     b_frag = f"{b_load.names[0]}_frag"
 
+    a_src_index = _mma_src_index(a_load, bundle_sources)
+    b_src_index = _mma_src_index(b_load, bundle_sources)
     inner: tuple[Stmt, ...] = (
-        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_load.index, ldm=0),
-        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_load.index, ldm=0),
+        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, ldm=0),
+        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, ldm=0),
         MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
     )
     if reduce_st is not None:
@@ -276,6 +331,14 @@ def _atom_body_to_mma(body: Body, *, spec: AtomSpec, c_dtype_override: DataType)
         # Mma* chain inline.
         k_loop_stmts = inner
 
+    # M5: when the K-loop came from inside a ``StageBundle``, re-wrap so
+    # the smem allocation + cooperative producer survive the lowering.
+    # ``StageBundle.with_bodies`` takes ``(stages_body, body)``; stages
+    # stay byte-clean, body becomes the new Mma chain.
+    if enclosing_bundle is not None:
+        rewrapped = enclosing_bundle.with_bodies((Body(enclosing_bundle.stages), Body(k_loop_stmts)))
+        k_loop_stmts = (rewrapped,)
+
     fragments: tuple[Stmt, ...] = (
         MmaFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
         MmaFragment(name=a_frag, role="a", shape=spec.shape, dtype=a_dtype),
@@ -287,3 +350,41 @@ def _atom_body_to_mma(body: Body, *, spec: AtomSpec, c_dtype_override: DataType)
         *k_loop_stmts,
         MmaStore(dst_buffer=write_stmt.output, dst_index=write_stmt.index, frag=c_frag, ldm=0),
     )
+
+
+def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
+    """Choose the right ``src_index`` for an MMA fragment Load.
+
+    Unstaged (load.input is the gmem buffer): use the gmem ``load.index``
+    verbatim — pre-M5 behavior.
+
+    Staged (load.input is an smem name registered by an enclosing
+    ``StageBundle``): the consumer Load index is the bare cache-coord
+    tuple (``020_stage_inputs`` rewrites ``smem_index = tuple(Var(ax.name)
+    for ax in cache_axes)``). The slab itself is block-scaled per
+    ``Source.alloc_extents``; the MMA fragment must read from the
+    block-scaled coordinate. ``AffineAddressing.source_index`` threads
+    ``block`` through the composite-stride decode so the resulting Expr
+    is ``cache_var · block · stride_of_inner_axes`` per cache axis,
+    relative to a zero origin (the slab is its own anchor). ``ldm``
+    auto-resolves at render time via ``ctx.shapes[smem_name][-1]`` — the
+    block-scaled inner extent.
+    """
+    src = smem_sources.get(load.input)
+    if src is None:
+        return load.index
+    if not isinstance(src.addressing, AffineAddressing):
+        # Template-addressed Sources don't carry the block multiplier;
+        # the cache vars in load.index decode verbatim through
+        # ``addressing.exprs``, which the kernel renderer already
+        # handles via the standard Load path. Fall back to the gmem-
+        # style passthrough — same as the pre-M5 defensive branch.
+        return load.index
+    cache_axes = src.cache_axes
+    coord_for = {ax.name: Var(ax.name) for ax in cache_axes}
+    # ``origin=(Literal(0),) * source_rank``: the smem slab is its own
+    # anchor (no CTA-relative offset baked in); the cooperative producer
+    # already absorbed ``src.origin`` when filling the slab.
+    source_rank = len(src.origin)
+    zero_origin = tuple(Literal(0, "int") for _ in range(source_rank))
+    return src.addressing.source_index(cache_axes, coord_for, zero_origin)

@@ -90,10 +90,11 @@ def _has_stage_bundle(graph: Graph) -> bool:
 @pytest.mark.parametrize("probe_on", [False, True])
 def test_pipeline_runs_to_tile_under_probe(monkeypatch, probe_on):
     """Pipeline runs cleanly through ``lowering/tile`` with the probe in
-    either state. Probe-OFF guarantees no ``StageBundle`` (the gate skips
-    staging on ATOM_KIND). Probe-ON today still produces no StageBundle
-    because ``_classify`` rejects the atom-strided σ — M3 lands that.
-    The shared assertion: no crash, ATOM_KIND variant still selected.
+    either state. Probe-OFF skips staging on ATOM_KIND (no
+    ``StageBundle``). Probe-ON exercises the M3 / M5 path: 020's
+    ``_classify`` stamps ``AffineAddressing.block`` on the atom-strided
+    σ and admits the eligible operand(s) — at least one ``StageBundle``
+    appears in the post-tile body.
     """
     if probe_on:
         monkeypatch.setenv("DEPLODOCK_MMA_STAGE_PROBE", "1")
@@ -105,7 +106,7 @@ def test_pipeline_runs_to_tile_under_probe(monkeypatch, probe_on):
     out = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["c"].op
     assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16"
-    # M3+ will flip this assertion under probe_on=True — for now both
-    # modes stay free of StageBundle, the test pins that "probe ON
-    # doesn't crash" today.
-    assert not _has_stage_bundle(out)
+    if probe_on:
+        assert _has_stage_bundle(out), "expected at least one StageBundle when probe is ON"
+    else:
+        assert not _has_stage_bundle(out)

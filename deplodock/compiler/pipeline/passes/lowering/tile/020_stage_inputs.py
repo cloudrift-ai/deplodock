@@ -62,6 +62,7 @@ from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
+    AtomTile,
     CacheDim,
     GridTile,
     RegisterTile,
@@ -74,6 +75,7 @@ from deplodock.compiler.ir.tile.ir import (
     TemplateAddressing,
     ThreadTile,
     TileOp,
+    WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -202,6 +204,12 @@ def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
     n_thread = 1
     for ax in tt.axes:
         n_thread *= ax.extent.as_static()
+    # WarpTile axes count warps, not lanes; multiply by warp width to get
+    # the CTA thread count the cooperative load actually has to fan out
+    # across (one cooperative slab fill per CTA, all 4 × 32 = 128 lanes
+    # participate even though the per-warp WMMA atom is the consumer).
+    if isinstance(tt, WarpTile):
+        n_thread *= warp_size
     if n_thread <= warp_size:
         return []
     block_axes = outer.axes if isinstance(outer, GridTile) else ()
@@ -253,6 +261,26 @@ def _collect_candidates(
                 slab_cap=slab_cap,
                 is_cooperative=is_cooperative,
                 register_axes=new_register_axes,
+            )
+            continue
+        if isinstance(s, AtomTile):
+            # MMA fragment-shape wrapper: ``005_lower_atom_tile`` consumes
+            # this and re-emits the body as an Mma* chain whose
+            # ``MmaLoad``s read from the smem slab we're about to admit
+            # here. ``AtomTile.axes`` parameterize the WMMA instruction
+            # shape, not loop iteration — they appear in the σ as
+            # ``cache_var * atom_M``-style stride multipliers and become
+            # ``AffineAddressing.block`` factors, so they don't get
+            # added to ``register_axes``.
+            _collect_candidates(
+                s,
+                thread_axes,
+                in_scope_axes,
+                block_axis_names,
+                found,
+                slab_cap=slab_cap,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
             )
             continue
         if isinstance(s, Cond):
@@ -334,6 +362,11 @@ def _maybe_rewrite(
     n_thread = 1
     for ax in tt.axes:
         n_thread *= ax.extent.as_static()
+    # Same WarpTile → CTA-thread expansion as `_candidate_buffers`. Keeps
+    # the two preflight checks in lockstep so an MMA matmul body that
+    # _candidate_buffers admits doesn't bail later inside _maybe_rewrite.
+    if isinstance(tt, WarpTile):
+        n_thread *= warp_size
     if n_thread <= warp_size:
         if allowed_bufs is None:
             raise RuleSkipped(f"warp-only cooperative tile (n_threads={n_thread} ≤ {warp_size}); register-resident, no smem stage")
@@ -572,6 +605,25 @@ def _process_scope(
                 allowed_bufs=allowed_bufs,
                 is_cooperative=is_cooperative,
                 register_axes=new_register_axes,
+                atom_kind=atom_kind,
+            )
+            rewritten_inner.append(s.with_bodies((new_body,)))
+            continue
+        elif isinstance(s, AtomTile):
+            # MMA fragment wrapper — walk transparently; ``register_axes``
+            # stays untouched (atom dims are baked into the σ literal
+            # multipliers and become ``AffineAddressing.block``).
+            new_body = _process_scope(
+                s,
+                thread_axes,
+                in_scope_axes,
+                block_axis_names,
+                used_names,
+                slab_cap=slab_cap,
+                scope_budget=scope_budget,
+                allowed_bufs=allowed_bufs,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
                 atom_kind=atom_kind,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
