@@ -57,7 +57,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     CacheDim,
@@ -227,16 +227,13 @@ def _collect_candidates(
                 register_axes=new_register_axes,
             )
             continue
-        if isinstance(s, Cond) and os.environ.get("DEPLODOCK_MASKED_TILE_HOIST", "").strip().lower() in {"1", "true", "yes", "on"}:
+        if isinstance(s, Cond):
             # Masked-tile boundary guard wrapping the K-loop chain (FM/FN
             # × BM/BN non-divisor of E_M/E_N → per-cell ``if (row < M)``).
-            # Opt-in via ``DEPLODOCK_AFFINE_COLLAPSE=1`` (same flag as the
-            # multi-axis cache collapse — both are article-reproduction
-            # features that bypass conservative defaults). Treat as
-            # transparent for candidate scanning — the cooperative load
-            # that ``_process_scope`` later emits will be hoisted ABOVE
-            # the Cond at rewrite time so all threads participate
-            # regardless of which cells the mask excludes.
+            # Treat as transparent for candidate scanning — the
+            # cooperative load that ``_process_scope`` later emits will
+            # be hoisted ABOVE the Cond at rewrite time so all threads
+            # participate regardless of which cells the mask excludes.
             _collect_candidates(
                 s,
                 thread_axes,
@@ -332,28 +329,110 @@ def _maybe_rewrite(
     return body[:idx] + (rebuilt,) + body[idx + 1 :]
 
 
-def _cond_is_sole_compute_stmt(cond: Cond, scope_body: Body) -> bool:
-    """Pre-descent gate for the masked-tile hoist.
+def _collect_smem_names(stmt: Stmt) -> set[str]:
+    """Names defined as ``Source`` slabs across every ``StageBundle`` in
+    ``stmt``'s subtree. Loads on these names are smem reads, dimensioned
+    to the per-cell cache extents — they cannot go OOB regardless of the
+    cell's position in the output grid, so ``_guard_unsafe_loads`` skips
+    them."""
+    names: set[str] = set()
+    if isinstance(stmt, StageBundle):
+        for stage in stmt.stages:
+            for src in stage.sources:
+                names.add(src.name)
+    for body in stmt.nested():
+        for s in body:
+            names |= _collect_smem_names(s)
+    return names
 
-    Returns ``True`` iff ``cond`` is the sole compute-bearing stmt in
-    ``scope_body`` — every other stmt is either an ``Init`` /
-    ``Assign`` / ``Accum`` / ``Load`` / ``Write`` that doesn't itself
-    introduce a K-loop or a ``SerialTile`` / ``StridedTile`` /
-    ``RegisterTile`` / ``GridTile`` / ``ThreadTile`` / ``StageBundle``
-    that would compete with the hoisted K-pipeline for staging
-    resources inside the enclosing register-tile replication.
 
-    The article matmul masked-tile pattern has ``[Cond[K-loop, Write]]``
-    at the RegisterTile body level (no sibling K-loops or stages); the
-    qwen lmhead RMSNorm + linear fusion has ``[RMSNorm-K-loop, ...,
-    Cond[linear-K-loop, Write]]`` and fails this gate."""
-    sibling_block_types = (SerialTile, StridedTile, RegisterTile, GridTile, ThreadTile, StageBundle, Stage)
-    for sib in scope_body:
-        if sib is cond:
+def _guard_unsafe_loads(stmt: Stmt, predicate, gated_vars: frozenset[str], smem_names: frozenset[str] | None = None) -> Stmt:
+    """Walk ``stmt`` recursively. For each leaf body containing a direct
+    gmem ``Load`` whose index references any var in ``gated_vars`` (i.e.,
+    a Load that would read OOB on threads where ``predicate`` is False),
+    wrap the Load + its forward SSA cone in ``Cond(predicate, body=cone)``.
+
+    Smem Loads (``Load.input`` ∈ ``smem_names`` collected from every
+    StageBundle in the hoist subtree) are skipped — the smem slab is
+    sized to per-cell cache extents, so reads at register-tile coords
+    are always in-bounds even when the cell is masked.
+
+    ``Accum`` targets cross the inner Cond boundary by Cond's SSA rules
+    (matching ``Loop``'s reduce semantics) — so masked threads skip the
+    Load + their cell's FMA + their cell's Accum increment, leaving the
+    accumulator at its zero-initialised value. The downstream ``Write`` is
+    still guarded by the outer boundary Cond, so the zero (or whatever
+    state the accumulator landed in) is never emitted.
+
+    Body shape rewrite, when a leaf body has any unsafe Load:
+        before: [safe_stmt, unsafe_load, dependent_assign, dependent_accum, …]
+        after:  [safe_stmt, Cond(pred, [unsafe_load, dependent_assign,
+                                       dependent_accum])]
+    """
+    if smem_names is None:
+        smem_names = frozenset(_collect_smem_names(stmt))
+    nested = stmt.nested()
+    if not nested:
+        return stmt
+    new_bodies = []
+    for body in nested:
+        new_bodies.append(_guard_unsafe_loads_in_body(body, predicate, gated_vars, smem_names))
+    return stmt.with_bodies(tuple(new_bodies))
+
+
+def _guard_unsafe_loads_in_body(body: Body, predicate, gated_vars: frozenset[str], smem_names: frozenset[str]) -> Body:
+    """Apply the per-Load guard inside ``body`` and recurse into nested
+    bodies of any block stmts that aren't leaf bodies themselves."""
+    stmts = list(body)
+    # First recurse into each stmt's nested bodies (descent first so
+    # leaf-level guards are placed at the right scope).
+    stmts = [_guard_unsafe_loads(s, predicate, gated_vars, smem_names) for s in stmts]
+
+    # Find unsafe gmem Loads at THIS body level (smem Loads skip the
+    # check — smem extents already match the per-cell cache shape).
+    unsafe_idxs: list[int] = []
+    for i, s in enumerate(stmts):
+        if not isinstance(s, Load):
             continue
-        if isinstance(sib, sibling_block_types):
-            return False
-    return True
+        if s.input in smem_names:
+            continue
+        load_vars: set[str] = set()
+        for e in s.index:
+            load_vars |= e.free_vars()
+        if load_vars & gated_vars:
+            unsafe_idxs.append(i)
+    if not unsafe_idxs:
+        return Body(tuple(stmts))
+
+    # Compute forward SSA cone seeded by the unsafe Loads' defined names.
+    # A stmt joins the cone when any of its ``deps()`` is already in the
+    # cone's defined-names set. Iterate to fixpoint.
+    cone_names: set[str] = set()
+    cone_idxs: set[int] = set(unsafe_idxs)
+    for i in unsafe_idxs:
+        cone_names.update(stmts[i].defines())
+    changed = True
+    while changed:
+        changed = False
+        for i, s in enumerate(stmts):
+            if i in cone_idxs:
+                continue
+            if any(d in cone_names for d in s.deps()):
+                cone_idxs.add(i)
+                cone_names.update(s.defines())
+                changed = True
+
+    # Wrap the contiguous range covering all cone stmts in a Cond.
+    # The cone is typically contiguous for matmul-style bodies (Load
+    # immediately followed by its consumer ``Assign`` + ``Accum``).
+    # Non-cone stmts that happen to sit between the first and last cone
+    # index come along for the ride — they're scoped to the inner Cond
+    # too. Acceptable: those middle stmts have no gated-axis deps (else
+    # they'd be in the cone), so wrapping them is a no-op semantically.
+    lo, hi = min(cone_idxs), max(cone_idxs)
+    cone_stmts = tuple(stmts[lo : hi + 1])
+    wrapped = Cond(cond=predicate, body=Body(cone_stmts))
+    return Body((*stmts[:lo], wrapped, *stmts[hi + 1 :]))
 
 
 def _contains_stage_bundle(body: Body) -> bool:
@@ -475,25 +554,7 @@ def _process_scope(
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
-        elif (
-            isinstance(s, Cond)
-            and os.environ.get("DEPLODOCK_MASKED_TILE_HOIST", "").strip().lower() in {"1", "true", "yes", "on"}
-            # Pre-descent gate: the hoist is only safe to apply when the
-            # Cond is the SOLE non-trivial stmt in its enclosing scope.
-            # In a fused kernel (e.g. RMSNorm reduce + linear matmul
-            # share one RegisterTile body, where the RMSNorm K-loop sits
-            # outside the Cond and the linear K-loop inside it), the
-            # outer scope's other Loads / SerialTiles get their own
-            # staging pass — and the hoisted linear K-pipeline races
-            # them on shared smem / mbarrier resources inside the
-            # per-register-cell replication that ``010_split_register_axes``
-            # produces. Caught by
-            # ``test_qwen_lmhead_variant_compiles_within_budget`` hanging
-            # at the 1 s watchdog. The simple article-matmul case has
-            # exactly ``[Cond[K-loop, Write]]`` in the RegisterTile body
-            # (no sibling K-loops), so this check passes there.
-            and _cond_is_sole_compute_stmt(s, scope.body)
-        ):
+        elif isinstance(s, Cond):
             # Masked-tile boundary guard. Stage transparently through
             # the Cond, then HOIST the cooperative-load + K-pipeline
             # above the Cond — the cooperative load must run for every
@@ -541,42 +602,41 @@ def _process_scope(
                     hoisted.append(sub)
                 else:
                     inside_cond.append(sub)
-            # Safety gate: only hoist when the Cond matches the simple
-            # masked-matmul boundary-guard pattern that we know how to
-            # split correctly — i.e.
-            #
-            # 1. the Cond's body picked up at least one cooperative-load
-            #    ``StageBundle`` during the descent (otherwise there's
-            #    nothing to hoist and the original Cond stays correct);
-            # 2. the descent produced exactly one K-pipeline stmt + one
-            #    Write at top level (the canonical masked-matmul
-            #    pattern: ``[K-outer SerialTile, Write]``). Multi-K /
-            #    multi-Write structures mean a fused kernel (e.g.
-            #    RMSNorm reduce + linear matmul share one Cond),
-            #    where hoisting decouples downstream computes from
-            #    upstream gated reductions and the un-gated downstream
-            #    K-loop reads junk accumulator state from masked-row
-            #    threads — caught by
-            #    ``test_qwen_lmhead_variant_compiles_within_budget``
-            #    timing out at the 1 s watchdog;
-            # 3. the predicate is a ``<`` comparison (boundary guard
-            #    against a tile extent), not an ``==`` invariant-compute
-            #    guard from ``030_hoist_invariant_compute`` — hoisting
-            #    inside an invariant guard would re-execute the
-            #    cooperative load on threads the guard meant to skip,
-            #    breaking the mbarrier completion contract.
-            n_k_pipeline = sum(1 for h in hoisted if _is_k_pipeline_stmt(h))
-            n_writes = sum(1 for h in inside_cond if isinstance(h, Write))
-            if not (
-                _contains_stage_bundle(Body(tuple(hoisted)))
-                and n_k_pipeline == 1
-                and n_writes == 1
-                and len(inside_cond) == n_writes  # only Writes inside Cond, no other stmts
-                and isinstance(s.cond, BinaryExpr)
-                and s.cond.op == "<"
-            ):
+            # Only hoist when the descent actually produced a
+            # StageBundle somewhere inside the hoist set and the
+            # predicate is a ``<`` boundary guard (not ``==`` from
+            # ``030_hoist_invariant_compute``'s invariant-compute
+            # guard — hoisting inside those would re-execute the
+            # cooperative load on threads the guard meant to skip).
+            # Multi-K / fused kernels (e.g., qwen lmhead's RMSNorm +
+            # linear chain) are safe because the un-staged ``Load``s
+            # that depend on the gated axis get wrapped in their own
+            # boundary Cond by ``_guard_unsafe_loads`` below, so masked
+            # threads skip the OOB gmem read instead of faulting on it.
+            if not (_contains_stage_bundle(Body(tuple(hoisted))) and isinstance(s.cond, BinaryExpr) and s.cond.op == "<"):
                 rewritten_inner.append(s)
                 continue
+            # Per-Load guard (B2 from the multi-bundle fix): for each
+            # un-staged ``Load`` in the hoisted body whose index
+            # depends on a var the boundary predicate gates, wrap the
+            # Load + its forward SSA cone (the chain of ``Assign``s
+            # / ``Accum``s that consume the loaded value) in an
+            # inner ``Cond(s.cond, body=cone)``. ``Accum`` targets
+            # cross the Cond boundary by Cond's existing SSA rules
+            # (matching ``Loop``), so the reduction's accumulator is
+            # visible after the inner Cond closes. Staged Loads
+            # (smem reads of names like ``x_smem`` whose indices use
+            # cache axes, not gated vars) don't reference the gated
+            # vars and so don't trip the guard. Direct gmem Loads on
+            # buffers whose index references the gated coord (e.g.,
+            # ``wl[(a1*4096 + a6*64 + a2) * 1024 + …]`` for the qwen
+            # linear matmul) are the ones that would fault on OOB
+            # without this — caught by
+            # ``test_qwen_lmhead_variant_compiles_within_budget``
+            # crashing with ``CUDA_ERROR_ILLEGAL_ADDRESS`` and
+            # marked as a kernel timeout.
+            gated_vars = frozenset(s.cond.free_vars())
+            hoisted = [_guard_unsafe_loads(h, s.cond, gated_vars) for h in hoisted]
             rewritten_inner.extend(hoisted)
             if inside_cond or s.else_body:
                 rewritten_inner.append(Cond(cond=s.cond, body=Body(tuple(inside_cond)), else_body=s.else_body))

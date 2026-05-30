@@ -218,25 +218,46 @@ def _build_2d_matmul_graph(dims: dict):
     return g, {"a": (M, K), "b": (K, N)}, ("c", (M, N))
 
 
-# (label, knobs, env extras). The label is what shows up in the test
-# id; ``env`` carries non-knob DEPLODOCK_* vars (today: the
-# ``INTERLEAVE_LOADS`` opt-out and the masked-tile ``MASKED_TILE_HOIST``
-# opt-in for the article's overhang case).
-_ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
+# (label, dims, knobs, env extras). The label is what shows up in
+# the test id; ``dims`` is the M/K/N for the matmul; ``knobs`` is the
+# per-knob ``DEPLODOCK_<K>`` pin set; ``env`` carries non-knob
+# ``DEPLODOCK_*`` vars (today: the ``INTERLEAVE_LOADS`` opt-out).
+#
+# **Default dims.** ``_ARTICLE_DIMS`` (2048³) is the article's hero
+# shape. Variants that exercise the cp.async + masked path use a
+# smaller ``_CPASYNC_DIMS`` (512³) — the per-launch wall-clock
+# watchdog in ``program.py`` is 1 s, and the 2048³ cp.async masked-M
+# kernel hovers around that threshold under parallel-xdist
+# contention. 512³ still triggers masked-M with FM=26 (208 × 2 cells
+# leaves 96-row overhang) and is well inside the watchdog.
+#
+# **Staging-mode coverage.** Each masked-tile config (FM=26 → 208-row
+# overhang, FN=26 → 832-col overhang) runs through both the TMA path
+# (``USE_TMA=1``) and the cp.async path (``USE_TMA=0
+# USE_ASYNC_COPY=1``) so a regression in either transport's
+# interaction with the masked-tile boundary-Cond hoist (B2 per-Load
+# guard in ``020_stage_inputs._guard_unsafe_loads``) trips a test.
+# The sync double-buffer (``USE_ASYNC_COPY=0 PIPELINE_STAGES=1``) and
+# the unstaged (``BUFCNT=1``) paths are not covered here — they
+# currently emit misaligned addresses on the 2048³ shape regardless
+# of mask, a pre-existing alignment bug to track separately.
+_CPASYNC_DIMS = {"M": 512, "K": 512, "N": 512}
+_ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     # cab3c83e: BM=8 outside _TUNE_AXIS_CHOICES — pin must be honored.
-    ("bm8_pin_outside_hints", {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
     # cab3c83e: FM=26 non-divisor of E_M/BM=256 — overhang/masked tile.
-    ("fm26_overhang_masked", {"BM": 8, "BN": 32, "FM": 26, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    ("fm26_overhang_masked", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
     # 8940dc25: USE_TMA=1 forces TMA on the matmul A+B bundle that the
     # eligibility check used to reject as multi-source. Tile sized so
     # ``KernelOp.validate``'s smem cap (~99 KB on sm_120) is honored.
-    ("multisrc_tma_fm1_fn1", {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1}, {}),
+    ("multisrc_tma_fm1_fn1", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1}, {}),
     # FN=4 multi-axis cache on N. Multi-axis-per-source-dim is now
     # admitted as ``AffineAddressing`` unconditionally (the old
     # ``DEPLODOCK_AFFINE_COLLAPSE`` opt-in was retired once the unify-
     # pass revert path was fixed to round-trip composite strides).
     (
         "multi_axis_affine_fn4",
+        _ARTICLE_DIMS,
         {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
         {},
     ),
@@ -244,6 +265,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
     # FM×FN > 1 register tile, with multi-source TMA on A and B.
     (
         "multi_axis_affine_fm4_fn4",
+        _ARTICLE_DIMS,
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
         {},
     ),
@@ -253,33 +275,77 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
     # the legacy path stays safe.
     (
         "interleave_loads_disabled",
+        _ARTICLE_DIMS,
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
     # Article's EXACT tile: ``BM=8 BN=32 FM=26 FN=4 BK=32`` produces a
     # 208×128 masked-M tile (M=2048 not a multiple of 208 → ceil-div
     # grid + per-row boundary Cond on the Write). Exercises the
-    # masked-tile boundary Cond hoist in ``020_stage_inputs`` that
-    # ``DEPLODOCK_MASKED_TILE_HOIST=1`` enables — without the hoist
-    # the Cond blocks the cooperative-load StageBundle, falling back
-    # to a per-thread gmem-load kernel ~6× slower than the article.
-    # With the hoist + multi-source TMA + multi-axis composite
-    # (default on), this config lowers to a kernel structurally
-    # byte-equivalent to ``_lower_matmul_tma_db``'s TM=26 emit
-    # (104 cells/thread, 255 registers, 17 % occupancy) and benches
-    # at ~97 % of cuBLAS on RTX 5090.
+    # masked-tile boundary Cond hoist in ``020_stage_inputs``: every
+    # masked cell's K-pipeline runs (TMA elects a single issuer
+    # thread; cp.async needs all threads to fetch their lane) and the
+    # B2 per-Load guard (``_guard_unsafe_loads``) wraps the still-
+    # un-staged gmem Loads that depend on the gated coord so masked
+    # threads skip the OOB read. With multi-source TMA + multi-axis
+    # composite (default on), this config lowers to a kernel
+    # structurally byte-equivalent to ``_lower_matmul_tma_db``'s
+    # TM=26 emit (104 cells/thread, 255 registers, 17 % occupancy)
+    # and benches at ~97 % of cuBLAS on RTX 5090.
     (
-        "article_exact_fm26_masked",
+        "article_exact_fm26_masked_tma",
+        _ARTICLE_DIMS,
         {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
-        {"DEPLODOCK_MASKED_TILE_HOIST": "1"},
+        {},
+    ),
+    # Same masked-M tile (FM=26 overhang) but routed through the
+    # cp.async path (``USE_TMA=0`` skips 050_use_tma; ``USE_ASYNC_COPY=1``
+    # promotes the BUFFERED bundle to ASYNC; ``PIPELINE_STAGES=1``
+    # software-pipelines into prologue/main/epilogue). Verifies the
+    # hoist's per-Load guard interacts correctly with cp.async's
+    # cooperative-load semantics (all threads issue gmem reads via
+    # cp.async.ca, then mbarrier waits on commit) — TMA's
+    # OOB_FILL_NAN_REQUEST_ZERO_FMA fills OOB rows with zeros, while
+    # cp.async has no equivalent hardware OOB handling, so the
+    # per-Load Cond is the only thing keeping masked threads from
+    # faulting at the overhang. 512³ shape: smaller dims keep the
+    # kernel comfortably inside ``program.py``'s 1 s per-launch
+    # watchdog under parallel-xdist contention; 208 × 2 cells +
+    # 96-row overhang still exercises the masked-M code path.
+    (
+        "fm26_masked_cpasync",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {},
+    ),
+    # Symmetric coverage: ``FN=26 FM=4`` → masked-N overhang on
+    # 512³ (832-col tile, N=512 < 832 → 1 cell with 320-col
+    # overhang). Boundary Cond gates the N coord. cp.async path
+    # only — TMA is not eligible for masked-N at this shape
+    # (multi-axis cache on N collides with the TMA box-copy gating).
+    (
+        "fn26_masked_cpasync",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {},
+    ),
+    # Non-masked baseline on the cp.async path (FM=4 FN=4 divides
+    # both 2048 and 512). Anchors that the cp.async lowering
+    # produces correct results on the un-gated path too, so a
+    # regression isolated to masked-tile codegen versus a regression
+    # in cp.async in general can be told apart.
+    (
+        "fm4_fn4_cpasync",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {},
     ),
 )
 
 
 def _run_with_knobs_and_env(graph, inputs, out_name: str, knobs: dict, env: dict, monkeypatch) -> np.ndarray:
     """Variant of ``_run_with_knobs`` that also stamps extra env vars
-    (used for opt-in / opt-out flags like ``DEPLODOCK_MASKED_TILE_HOIST``
-    or ``DEPLODOCK_INTERLEAVE_LOADS``)."""
+    (used for opt-out flags like ``DEPLODOCK_INTERLEAVE_LOADS``)."""
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     return _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)
@@ -287,20 +353,23 @@ def _run_with_knobs_and_env(graph, inputs, out_name: str, knobs: dict, env: dict
 
 @requires_cuda
 @pytest.mark.parametrize(
-    ("label", "knobs", "env"),
+    ("label", "dims", "knobs", "env"),
     _ARTICLE_REPRODUCTION,
     ids=lambda v: v if isinstance(v, str) else "",
 )
-def test_article_reproduction_configs(label: str, knobs: dict, env: dict, monkeypatch):  # noqa: ARG001 — ``label`` is the test id
+def test_article_reproduction_configs(label: str, dims: dict, knobs: dict, env: dict, monkeypatch):  # noqa: ARG001 — ``label`` is the test id
     """End-to-end accuracy regression for the configurations surfaced
     while reproducing the article's TMA SGEMM kernel via knob pinning.
     Each row exercises one previously-broken code path; a failure here
     indicates a regression in: (a) ``Knob.narrow`` authoritative pin
     semantics, (b) ``_enumerate_cartesian``'s per-(fm,fn) overhang
     handling, (c) ``050_use_tma`` multi-source-split + 128 B inner
-    alignment, or (d) ``020_stage_inputs._derive_slab`` composite-stride
-    affine collapse + ``_stage_expand`` decode."""
-    graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(_ARTICLE_DIMS)
+    alignment, (d) ``020_stage_inputs._derive_slab`` composite-stride
+    affine collapse + ``_stage_expand`` decode, or (e) the masked-tile
+    boundary-Cond hoist (``_process_scope`` Cond branch) + B2
+    per-Load guard (``_guard_unsafe_loads``) interaction with the
+    selected transport (TMA / cp.async)."""
+    graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
     inputs = _random_inputs(input_shapes, seed=42)
     ref = _reference(graph, inputs, out_name)
     forced = _run_with_knobs_and_env(graph, inputs, out_name, knobs, env, monkeypatch)
