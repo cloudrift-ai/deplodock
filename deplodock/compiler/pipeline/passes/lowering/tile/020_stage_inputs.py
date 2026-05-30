@@ -108,6 +108,12 @@ class _Slab(NamedTuple):
     slab_dims: tuple[int, ...]
     template: tuple[Expr, ...] | None
     n_bytes: int
+    # Per-cache-axis structural block multiplier extracted from σ literal
+    # coefficients. ``()`` = all-1s (the scalar / pre-M3 case); a non-
+    # trivial tuple aligns with ``cache_axes`` and records the per-axis
+    # factor (e.g. ``atom_M`` / ``atom_K`` for an MMA-strided load). Fed
+    # straight into ``AffineAddressing.block`` at Source construction.
+    block: tuple[int, ...] = ()
 
 
 def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
@@ -132,7 +138,15 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         # deletes this branch entirely.
         raise RuleSkipped("MMA path bypasses smem staging (probe off)")
     budget = ctx.max_dynamic_smem
-    variants = _enumerate_variants(root.op.body, slab_cap=budget, scope_budget=budget, parent_op=root.op, warp_size=ctx.warp_size)
+    atom_kind = root.op.knobs.get("ATOM_KIND")
+    variants = _enumerate_variants(
+        root.op.body,
+        slab_cap=budget,
+        scope_budget=budget,
+        parent_op=root.op,
+        warp_size=ctx.warp_size,
+        atom_kind=atom_kind,
+    )
     if not variants:
         raise RuleSkipped("no Load qualifies for staging")
     return variants
@@ -145,7 +159,15 @@ def _forced_stage_mask(n: int) -> int | None:
     return STAGE.parse(raw, width=n)
 
 
-def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_op: TileOp, warp_size: int) -> list[TileOp]:
+def _enumerate_variants(
+    body: Body,
+    *,
+    slab_cap: int,
+    scope_budget: int,
+    parent_op: TileOp,
+    warp_size: int,
+    atom_kind: str | None = None,
+) -> list[TileOp]:
     candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
         return []
@@ -160,7 +182,9 @@ def _enumerate_variants(body: Body, *, slab_cap: int, scope_budget: int, parent_
     variants: list[TileOp] = []
     for mask in masks:
         allow = frozenset(b for i, b in enumerate(bufs_ranked) if mask & (1 << i))
-        new_body = _maybe_rewrite(body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow, warp_size=warp_size)
+        new_body = _maybe_rewrite(
+            body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow, warp_size=warp_size, atom_kind=atom_kind
+        )
         if new_body is None:
             continue
         knobs = {**parent_op.knobs, STAGE.name: STAGE.pretty(mask, width=n)}
@@ -292,7 +316,13 @@ def _collect_candidates(
 
 
 def _maybe_rewrite(
-    body: Body, *, slab_cap: int, scope_budget: int, allowed_bufs: frozenset[str] | None = None, warp_size: int
+    body: Body,
+    *,
+    slab_cap: int,
+    scope_budget: int,
+    allowed_bufs: frozenset[str] | None = None,
+    warp_size: int,
+    atom_kind: str | None = None,
 ) -> Body | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
@@ -324,6 +354,7 @@ def _maybe_rewrite(
         scope_budget=scope_budget,
         allowed_bufs=allowed_bufs,
         is_cooperative=is_cooperative,
+        atom_kind=atom_kind,
     )
     if new_tile_body == tt.body:
         if allowed_bufs is None:
@@ -498,6 +529,7 @@ def _process_scope(
     allowed_bufs: frozenset[str] | None = None,
     is_cooperative: bool = False,
     register_axes: tuple[Axis, ...] = (),
+    atom_kind: str | None = None,
 ) -> Body:
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
@@ -540,6 +572,7 @@ def _process_scope(
                 allowed_bufs=allowed_bufs,
                 is_cooperative=is_cooperative,
                 register_axes=new_register_axes,
+                atom_kind=atom_kind,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -555,6 +588,7 @@ def _process_scope(
                 allowed_bufs=allowed_bufs,
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
+                atom_kind=atom_kind,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -588,6 +622,7 @@ def _process_scope(
                 allowed_bufs=allowed_bufs,
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
+                atom_kind=atom_kind,
             )
             # The staged StageBundle lives INSIDE the K-outer SerialTile
             # (one level below ``new_body``'s top level) — same as the
@@ -661,7 +696,13 @@ def _process_scope(
     if allowed_bufs is not None:
         loads_by_buf = {b: items for b, items in loads_by_buf.items() if b in allowed_bufs}
     sources, name_rewrites = _build_sources(
-        loads_by_buf, thread_axes, block_axis_names, used_names, slab_cap=slab_cap, scope_budget=scope_budget
+        loads_by_buf,
+        thread_axes,
+        block_axis_names,
+        used_names,
+        slab_cap=slab_cap,
+        scope_budget=scope_budget,
+        atom_kind=atom_kind,
     )
     if not sources:
         return tuple(rewritten_inner)
@@ -698,6 +739,7 @@ def _build_sources(
     *,
     slab_cap: int,
     scope_budget: int,
+    atom_kind: str | None = None,
 ) -> tuple[list[Source], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by index equality; per partition, derive
     slab geometry; admit Sources under budget. Returns (sources,
@@ -730,6 +772,7 @@ def _build_sources(
                 slab_cap=slab_cap,
                 extra_candidates=rep_extra,
                 allow_no_fan_in=allow_no_fan_in,
+                atom_kind=atom_kind,
             )
             if slab is None:
                 continue
@@ -743,11 +786,17 @@ def _build_sources(
             # ``__post_init__`` builds the affine default when ``addressing`` is
             # omitted, but stamping it explicitly here keeps the IR's stored
             # field stable across pretty-printer / serialization roundtrips.
+            # ``slab.block`` is non-empty when ``_classify`` extracted a non-
+            # unit literal coefficient on at least one cache var (MMA atom σ
+            # is the M3-driving case); it folds into ``AffineAddressing.block``.
             addressing: AffineAddressing | TemplateAddressing
             if slab.template is not None:
                 addressing = TemplateAddressing(exprs=slab.template)
             else:
-                addressing = AffineAddressing(dims=tuple(cd.source_dim for cd in cache_dims))
+                addressing = AffineAddressing(
+                    dims=tuple(cd.source_dim for cd in cache_dims),
+                    block=slab.block,
+                )
             src = Source(
                 name=smem_name,
                 buf=buf,
@@ -786,6 +835,7 @@ def _classify(
     slab_cap: int,
     extra_candidates: tuple[Axis, ...] = (),
     allow_no_fan_in: bool = False,
+    atom_kind: str | None = None,
 ) -> _Slab | None:
     candidates = (*thread_axes, reduce_axis, *extra_candidates)
     ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes if ax.extent.is_static})
@@ -852,27 +902,117 @@ def _classify(
     # template), and the SDPA-style false-positive that motivated the
     # gate was an unrelated bug in the unify-pass revert path
     # (overwriting per-dim entries instead of composite-decoding).
+    # Two-tier affine recognition:
+    #
+    # 1. **Legacy coef-1 composite** (block=(1,…,1)): the σ output reduces
+    #    exactly to ``origin[d] + ax_0·(e_1·e_2·…) + … + ax_{k-1}·1``. Covers
+    #    scalar matmul / RMSNorm / softmax; the byte-clean gate for M2.
+    # 2. **Block-stamped composite**: enabled only when ``atom_kind`` is
+    #    set on the parent TileOp (MMA fragment factorization path). The σ
+    #    output reduces to ``origin[d] + ax_0·(e_1·b_1·…·b_0) + … +
+    #    ax_{k-1}·b_{k-1}`` where ``b_i`` is the per-axis literal stride
+    #    factor (e.g. ``atom_M`` = 16). The slab grows by ``b_i`` per axis
+    #    so the WMMA fragment load can read a full ``atom_M × atom_K`` cell.
+    #
+    # For scalar paths, tier 2 is skipped — a non-1 coef on the cache var
+    # (typically from a register-axis sitting between origin and cache,
+    # e.g. ``a3·4 + a5`` where a5 is a per-thread var) means the slab
+    # would need extra positions filled by some axis that ISN'T part of
+    # the cooperative iteration. That's exactly what TemplateAddressing
+    # is for; admitting it as affine-with-block would mis-size the slab
+    # and let the cooperative load under-fill it.
     needs_template = False
+    block_per_axis: dict[str, int] = {}
     for d in sorted(set(var_to_dim.values())):
         axes_for_dim = tuple(ax for ax in cache_axes if var_to_dim[ax.name] == d)
-        # Composite: ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1.
-        # Walked right-to-left so each axis's coef is the product of the
-        # extents of axes to its right (within the same source dim).
-        composite: Expr = Literal(0, "int")
+        other_zeros = {n: Literal(0, "int") for n in candidate_names if var_to_dim.get(n) != d}
+        actual = sorted(t.pretty() for t in _flatten_add(Sigma(other_zeros).reduce(load.index[d], ctx)))
+        # Tier 1: try coef-1 composite first. Same shape as the pre-M3
+        # check; admits scalar matmul byte-identically.
+        composite_unit: Expr = Literal(0, "int")
         suffix_product = 1
         for ax in reversed(axes_for_dim):
             term: Expr = Var(ax.name) if suffix_product == 1 else BinaryExpr("*", Var(ax.name), Literal(suffix_product, "int"))
-            composite = term if isinstance(composite, Literal) and composite.value == 0 else BinaryExpr("+", composite, term)
+            composite_unit = (
+                term if isinstance(composite_unit, Literal) and composite_unit.value == 0 else BinaryExpr("+", composite_unit, term)
+            )
             suffix_product *= ax.extent.as_static()
-        # Substitute every OTHER cache var (mapping to a different source dim)
-        # with 0 so ``load.index[d]`` reduces to its d-only contribution.
-        other_zeros = {n: Literal(0, "int") for n in candidate_names if var_to_dim.get(n) != d}
-        actual = sorted(t.pretty() for t in _flatten_add(Sigma(other_zeros).reduce(load.index[d], ctx)))
-        expected = sorted(t.pretty() for t in _flatten_add((origin[d] + composite).simplify(ctx)))
-        if actual != expected:
+        expected_unit = sorted(t.pretty() for t in _flatten_add((origin[d] + composite_unit).simplify(ctx)))
+        if actual == expected_unit:
+            continue
+        # Tier 2: try block-stamped composite, only under ATOM_KIND. Per-
+        # axis coef probe: zero every cache var EXCEPT the one we're
+        # probing, σ-reduce, pluck the literal multiplier on ``Var(ax)``
+        # via ``_extract_var_coef``.
+        if atom_kind is None:
             needs_template = True
             break
+        axis_coefs: dict[str, int] = {}
+        for ax in axes_for_dim:
+            probe_zeros = {n: Literal(0, "int") for n in candidate_names if n != ax.name}
+            coef = _extract_var_coef(Sigma(probe_zeros).reduce(load.index[d], ctx), ax.name)
+            if coef is None or coef < 1:
+                needs_template = True
+                break
+            axis_coefs[ax.name] = coef
+        if needs_template:
+            break
+        # Solve for per-axis block: walk right-to-left, each axis's σ coef
+        # equals ``suffix_product_so_far × block_ax``.
+        derived_block: dict[str, int] = {}
+        suffix_product = 1
+        for ax in reversed(axes_for_dim):
+            coef = axis_coefs[ax.name]
+            if suffix_product == 0 or coef % suffix_product != 0:
+                needs_template = True
+                break
+            block_ax = coef // suffix_product
+            if block_ax < 1:
+                needs_template = True
+                break
+            derived_block[ax.name] = block_ax
+            suffix_product *= ax.extent.as_static() * block_ax
+        if needs_template:
+            break
+        composite_blocked: Expr = Literal(0, "int")
+        suffix_product = 1
+        for ax in reversed(axes_for_dim):
+            stride = suffix_product * derived_block[ax.name]
+            term = Var(ax.name) if stride == 1 else BinaryExpr("*", Var(ax.name), Literal(stride, "int"))
+            composite_blocked = (
+                term
+                if isinstance(composite_blocked, Literal) and composite_blocked.value == 0
+                else BinaryExpr("+", composite_blocked, term)
+            )
+            suffix_product *= ax.extent.as_static() * derived_block[ax.name]
+        expected_blocked = sorted(t.pretty() for t in _flatten_add((origin[d] + composite_blocked).simplify(ctx)))
+        if actual != expected_blocked:
+            needs_template = True
+            break
+        block_per_axis.update(derived_block)
     template = tuple(load.index) if needs_template else None
+    # Build the slab.block tuple aligned to cache_axes ordering. Default to
+    # ``()`` when every derived block is 1 — keeps the affine path byte-
+    # identical to pre-M3 for scalar matmul.
+    if template is None and block_per_axis:
+        block_tuple = tuple(block_per_axis.get(ax.name, 1) for ax in cache_axes)
+        if all(b == 1 for b in block_tuple):
+            block_tuple = ()
+    else:
+        block_tuple = ()
+    # Re-check the budget against the block-scaled slab size: the σ stride
+    # bakes a per-axis multiplier (atom_M = 16 for MMA m16n16k16) that
+    # multiplies the actual smem footprint. The pre-block ``n_bytes``
+    # check above passes anything that fits under ``slab_cap`` ignoring
+    # the multiplier; a 16×16 MMA slab grows 256× and would otherwise
+    # silently overflow.
+    if block_tuple:
+        block_product = 1
+        for b in block_tuple:
+            block_product *= b
+        n_bytes *= block_product
+        if n_bytes > slab_cap:
+            return None
 
     return _Slab(
         origin=origin,
@@ -880,6 +1020,7 @@ def _classify(
         slab_dims=slab_dims,
         template=template,
         n_bytes=n_bytes,
+        block=block_tuple,
     )
 
 
@@ -894,6 +1035,49 @@ def _flatten_add(e: Expr) -> list[Expr]:
     if isinstance(e, BinaryExpr) and e.op == "+":
         return _flatten_add(e.left) + _flatten_add(e.right)
     return [e]
+
+
+def _extract_var_coef(sig: Expr, var_name: str) -> int | None:
+    """Return the literal multiplier on ``Var(var_name)`` in a flat-affine
+    σ expression, or ``None`` if it doesn't appear / has an unrecognized
+    shape.
+
+    Walks the additive terms of ``sig``. For each term:
+
+    - ``Var(var_name)`` → coef contribution 1.
+    - ``Var(var_name) * Literal(c)`` or ``Literal(c) * Var(var_name)`` →
+      coef contribution ``c``.
+    - Term doesn't reference ``var_name`` → ignored (it's part of the
+      origin / outer-axis carry).
+    - Anything else (``Var(var_name)`` nested in a non-affine form,
+      e.g. divide / modulo / multi-var product) → return None.
+
+    Sums the contributions across additive terms. M3's `_classify` calls
+    this on the σ output with every other cache var pinned to 0; the
+    expected shape is a single ``Var * Literal`` term plus an origin
+    that may carry free outer-axis vars (e.g. the per-CTA K_o anchor).
+    """
+    total = 0
+    found = False
+    for term in _flatten_add(sig):
+        if var_name not in term.free_vars():
+            continue
+        if isinstance(term, Var) and term.name == var_name:
+            total += 1
+            found = True
+            continue
+        if isinstance(term, BinaryExpr) and term.op == "*":
+            left, right = term.left, term.right
+            if isinstance(left, Var) and left.name == var_name and isinstance(right, Literal) and isinstance(right.value, int):
+                total += right.value
+                found = True
+                continue
+            if isinstance(right, Var) and right.name == var_name and isinstance(left, Literal) and isinstance(left.value, int):
+                total += left.value
+                found = True
+                continue
+        return None
+    return total if found else None
 
 
 def _gen_name(buf: str, used: set[str]) -> str:
