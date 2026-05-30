@@ -26,6 +26,7 @@ Idempotence: any K_o whose bundles are already non-SYNC is left alone.
 
 from __future__ import annotations
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Literal, Var
@@ -59,10 +60,22 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         raise RuleSkipped("double-buffer already applied (non-SYNC bundle present)")
 
     candidates = BUFCNT.narrow(BUFCNT.hints)
+    # Pin detection: if the user pinned ``DEPLODOCK_BUFCNT=N`` (or
+    # ``DEPLODOCK_KNOBS=BUFCNT=N``), a silent fall-through to SYNC when
+    # ``N`` doesn't fit the smem cap drops every downstream transport
+    # promotion (060_use_async_copy, 050_use_tma, 080_pipeline_stages
+    # all gate on a BUFFERED/ASYNC/TMA bundle) — kernel runs as plain
+    # SYNC with no staging benefit, looks ~50 % slower than the auto
+    # variant. Surface the constraint instead of swallowing it.
+    pinned = config.knob_raw(BUFCNT.name) is not None
     variants: list[TileOp] = []
+    fail_reasons: list[str] = []
     for buf_count in candidates:
         new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem, buffer_count=buf_count)
         if not changed:
+            fail_reasons.append(
+                f"BUFCNT={buf_count} not promotable (smem cap {ctx.max_dynamic_smem} B / K_o extent / SYNC bundle eligibility)"
+            )
             continue
         variants.append(
             TileOp(
@@ -72,7 +85,10 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
             )
         )
     if not variants:
-        raise RuleSkipped("no K-outer StageBundle fits any BUFCNT candidate")
+        msg = "; ".join(fail_reasons) if fail_reasons else "no candidate fit"
+        if pinned:
+            raise ValueError(f"DEPLODOCK_BUFCNT={candidates[0]} pinned but cannot fire: {msg}")
+        raise RuleSkipped(f"no K-outer StageBundle fits any BUFCNT candidate ({msg})")
     return variants
 
 
