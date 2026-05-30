@@ -53,7 +53,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp, affine_decode_per_dim
+from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TemplateAddressing, TileOp, affine_decode_per_dim
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -161,8 +161,8 @@ def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     """Build the gmem ``Load.index`` that 020 would have emitted had it
     not promoted this Source to smem. ``cache_dims`` carries the
     affine mapping (``origin[d] + composite-stride decode`` over each
-    cache axis mapping to dim ``d``); ``template_index`` is the
-    verbatim non-affine form when 020 set it. Inverse of 020's
+    cache axis mapping to dim ``d``); ``TemplateAddressing.exprs`` is
+    the verbatim non-affine form when 020 set it. Inverse of 020's
     ``smem_index = tuple(Var(ax.name) for ax in cache_axes)``.
 
     For multi-axis-per-source-dim (the ``DEPLODOCK_AFFINE_COLLAPSE=1``
@@ -176,8 +176,8 @@ def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     σ-replicated address loses its per-cell offset — caught by
     ``test_full_self_attn_tinyllama`` (SDPA P@V matmul reading
     ``linear_1_reduce`` with ``a4 * 2`` dropped from the M coord)."""
-    if src.template_index is not None:
-        return src.template_index
+    if isinstance(src.addressing, TemplateAddressing):
+        return src.addressing.exprs
     coord_for = {cd.axis.name: Var(cd.axis.name) for cd in src.cache_dims}
     decoded = affine_decode_per_dim(
         src.cache_axes,

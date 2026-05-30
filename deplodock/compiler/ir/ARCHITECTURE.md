@@ -281,9 +281,11 @@ to drive warp-cooperative codegen.
 the *consumer* subtree using the staged smem. The producer (cooperative
 `Load+Write` per source) is synthesized at materialize time from
 `Stage.sources` — each `Source` carries `name` (smem buffer), `buf`
-(gmem operand), `cache_dims`, `origin`, and optional `pad` /
-`template_index`. Multi-source Stages (e.g. matmul A+B) load both
-behind one sync boundary; sibling Stages exist only when scopes differ.
+(gmem operand), `cache_dims`, `origin`, optional `pad`, and a stored
+`addressing` of type `AffineAddressing | TemplateAddressing` describing
+how cache vars decode into source-buffer indices. Multi-source Stages
+(e.g. matmul A+B) load both behind one sync boundary; sibling Stages
+exist only when scopes differ.
 
 | Symbol             | Role                                                              |
 |--------------------|-------------------------------------------------------------------|
@@ -294,10 +296,10 @@ behind one sync boundary; sibling Stages exist only when scopes differ.
 | `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async` per source; emits `CpAsyncCopy`+`CpAsyncCommit`. `pipeline_depth>1` marks the stage for temporal pipelining (prologue/main/epilogue), expanded by the bucket-10 pass. |
 | `TmaBufferedStage`    | `BufferedStage` subtype using TMA (`cp.async.bulk.tensor` + mbarrier). `pipeline_depth>1` for pipelining; `swizzle` for shared-memory swizzle pattern. |
 | `ComputeStage`        | `Stage` subtype for hoisted invariant compute. Carries a separate `compute: Body` (per-thread compute reading sibling-stage smem, writing this stage's smem). `external_reads()` returns `()` so 015 / tuning don't classify sibling-smem reads as gmem dependencies. |
-| `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `template_index`. Each Stage carries one or more. |
+| `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `addressing`, `dtype`. Each Stage carries one or more. |
 | `CacheDim`            | One cache (smem) axis paired with the source-buffer dim it maps to. `Source.cache_dims` is a tuple of these.                          |
-| `AffineAddressing`    | Property-derived addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. |
-| `TemplateAddressing`  | Property-derived addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views. |
+| `AffineAddressing`    | Stored addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. Optional per-cache-dim `block` multiplier grows the slab and producer iteration range by `block[i]` per cache dim (e.g. MMA atom factor); default `()` keeps coef-1 semantics. |
+| `TemplateAddressing`  | Stored addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views and any other case where `origin + decoded` can't reconstruct the load. |
 | `AsyncWait`           | Explicit wait carrier for pipelined async / TMA schedules. Emitted by `080_pipeline_stages` between issue / consume halves of each steady-state K_o iter and at the epilogue drain. ``keep`` is the cp.async ``wait_group`` arg; ``phase`` / ``slot`` are TMA mbarrier-test args. Sync-style (``pipeline_depth==1``) stages don't carry one — the materializer emits an implicit wait at the wrap boundary. |
 
 ## `kernel/`

@@ -61,6 +61,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
+    AffineAddressing,
     CacheDim,
     GridTile,
     RegisterTile,
@@ -70,6 +71,7 @@ from deplodock.compiler.ir.tile.ir import (
     StageBundle,
     StagePolicy,
     StridedTile,
+    TemplateAddressing,
     ThreadTile,
     TileOp,
 )
@@ -735,13 +737,24 @@ def _build_sources(
                 continue
             smem_name = _gen_name(buf, used_names)
             cache_dims = tuple(CacheDim(axis=ax, source_dim=d) for ax, d in zip(slab.cache_axes, slab.slab_dims, strict=True))
+            # Pick addressing eagerly: template when ``_classify`` flagged a
+            # collapsed-reshape (slab.template is the verbatim source-dim Exprs),
+            # affine otherwise (dims pulled off cache_dims). Source's
+            # ``__post_init__`` builds the affine default when ``addressing`` is
+            # omitted, but stamping it explicitly here keeps the IR's stored
+            # field stable across pretty-printer / serialization roundtrips.
+            addressing: AffineAddressing | TemplateAddressing
+            if slab.template is not None:
+                addressing = TemplateAddressing(exprs=slab.template)
+            else:
+                addressing = AffineAddressing(dims=tuple(cd.source_dim for cd in cache_dims))
             src = Source(
                 name=smem_name,
                 buf=buf,
                 cache_dims=cache_dims,
                 origin=slab.origin,
                 pad=(),
-                template_index=slab.template,
+                addressing=addressing,
             )
             sources.append(src)
             used_bytes += slab.n_bytes
