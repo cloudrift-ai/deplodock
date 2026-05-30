@@ -26,8 +26,46 @@ both files import from one source of truth without going through
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Stmt, Write
+
+if TYPE_CHECKING:
+    from deplodock.compiler.ir.tile.ir import TileOp
+
+
+def find_split_k_axis_name(op: TileOp) -> str | None:
+    """Return the split-K block axis name from the TileOp's coordination.
+
+    Uses the same structural derivation the materializer + Kernel-IR
+    render rely on for ``atomicAdd`` emission: ``Body.coordination``
+    (``deplodock/compiler/ir/stmt/body.py:603``) classifies a Write's
+    ``atomic_axes`` as the block axes NOT in the Write's index — which
+    is the mathematical definition of split-K (block coord doesn't pick
+    an output cell, so the CTAs at that coord all race on the same
+    cell and need an atomic add). Same signal `010_lower_kernelop` uses
+    to pick atomicAdd vs plain store; reading it here keeps both the
+    residual gate (``015_gate_splitk_residual``) and the atomic-free
+    rewrite (``017_atomic_free_splitk``) in lockstep with codegen
+    without a redundant axis-tag or a name-suffix convention.
+
+    Returns ``None`` when no Write has an atomic axis (the SPLITK = 1
+    case — every block axis appears in every Write.index). For matmul
+    with SPLITK > 1 there's exactly one split-K axis (``K_s``); we
+    return its name for callers to use as the Cond predicate / index
+    prepend.
+    """
+    coord = op.body.coordination
+    for write in coord.writes:
+        atomic = coord.atomic_axes(write)
+        if atomic:
+            # Single split-K axis per kernel by planner construction; if
+            # multiple ever appear (e.g. nested split-K), pick any — the
+            # callers would need a per-axis pass anyway, and that shape
+            # isn't emitted today.
+            return next(iter(atomic))
+    return None
 
 
 def stmt_contains_accum(stmt: Stmt) -> bool:

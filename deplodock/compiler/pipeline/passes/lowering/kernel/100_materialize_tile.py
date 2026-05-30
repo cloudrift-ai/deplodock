@@ -238,15 +238,30 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 extents = src.alloc_extents
                 smem_dtype = smem_cuda_dtype(src)
                 if is_tma:
-                    # Round the slot's inner extent up to make the slot bytes
-                    # a multiple of 128 B. Keeps every ring slot 128 B-aligned
-                    # from a 128 B-aligned base, regardless of the TMA box's
-                    # natural bytes. The unused tail of each slot is benign
-                    # (TMA only writes box bytes; reads index 0..box-1).
+                    # Round the slot's inner BOX EXTENT up to make the slot
+                    # bytes a multiple of 128 B. The check is on the
+                    # COLLAPSED inner box (product of cache_axes mapping to
+                    # the innermost source dim), not just ``extents[-1]`` —
+                    # for the multi-axis collapse case (e.g. cache
+                    # ``(BK=32, BN_thread=32, FN_reg=4)`` mapping to dims
+                    # ``(0, 1, 1)``), the natural flat layout already packs
+                    # each K row as ``BN_thread × FN_reg = 128`` cells =
+                    # 512 B, well 128 B-aligned; padding the last axis (4 →
+                    # 32) would 8x the smem with zero correctness gain.
+                    # Only pad when the collapsed inner is genuinely
+                    # sub-128 B — single-axis ``BN=16`` etc.
                     inner_per_align = _TMA_ALIGN_BYTES // BYTES_PER_ELEM
-                    inner = extents[-1]
-                    if inner % inner_per_align != 0:
-                        padded_inner = (inner + inner_per_align - 1) // inner_per_align * inner_per_align
+                    addressing = src.addressing
+                    if isinstance(addressing, AffineAddressing):
+                        inner_dim = addressing.dims[-1]
+                        collapsed_inner = 1
+                        for d, ax in zip(addressing.dims, src.cache_axes, strict=True):
+                            if d == inner_dim:
+                                collapsed_inner *= ax.extent.as_static()
+                    else:
+                        collapsed_inner = extents[-1]
+                    if collapsed_inner % inner_per_align != 0:
+                        padded_inner = (extents[-1] + inner_per_align - 1) // inner_per_align * inner_per_align
                         extents = (*extents[:-1], padded_inner)
                 if buf_count > 1:
                     extents = (buf_count, *extents)
@@ -406,13 +421,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
             Smem(name=src.name, extents=full_extents, align=align, dtype=smem_dtype),
             cond,
         ]
-        # Implicit wait at the wrap boundary for unpipelined bundles
-        # (pipeline_depth == 1). The bundle wrapping this stage carries
-        # the phase / buffer_count / pipeline_depth.
-        if bundle.pipeline_depth == 1:
-            mbar_phase = _mbar_wait_phase(bundle.phase, bundle.buffer_count)
-            out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=bundle.phase))
-            out.append(Sync())
+        # No trailing wait here — for unpipelined multi-stage bundles
+        # the mbarrier is shared across stages with ``arrive_count = N``,
+        # so a wait emitted between stages would block forever (only one
+        # arrive has happened by then). ``emit_bundle_producer`` emits
+        # one wait+sync after ALL stages in the bundle for the
+        # unpipelined case.
         return out
 
     def emit_bundle_producer(bundle: StageBundle) -> list[Stmt]:
@@ -424,6 +438,13 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         - ``bundle.policy == TMA`` → TMA box copy.
         - otherwise (SYNC / BUFFERED / ASYNC) → cooperative
           ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC).
+
+        For unpipelined TMA bundles (``pipeline_depth == 1``) with
+        multiple stages, the per-stage mbarrier is shared with
+        ``arrive_count = N`` (one per stage), so a single trailing
+        ``MbarrierWait`` after every stage has arrived/issued is what
+        flips the phase. Emitting the wait inside ``emit_tma_stage``
+        would deadlock between stages (only one arrive has happened).
         """
         out: list[Stmt] = []
         for member in bundle.stages:
@@ -443,6 +464,17 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                         pipeline_depth=bundle.pipeline_depth,
                     )
                 )
+        # Unpipelined TMA: trailing wait+sync once after all stages
+        # arrived (mbarrier ``arrive_count = N`` is met).
+        if bundle.policy == StagePolicy.TMA and bundle.pipeline_depth == 1:
+            tma_members = [m for m in bundle.stages if m.compute is None]
+            if tma_members:
+                first_src = tma_members[0].sources[0]
+                gid = tma.stage_group[first_src.name]
+                mbar_name = tma.mbar_name(gid)
+                mbar_phase = _mbar_wait_phase(bundle.phase, bundle.buffer_count)
+                out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=bundle.phase))
+                out.append(Sync())
         return out
 
     def emit_warp_specialize(ws: WarpSpecialize) -> list[Stmt]:

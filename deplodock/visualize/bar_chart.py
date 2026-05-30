@@ -112,9 +112,14 @@ def _option(chart: BarChart, *, theme_name: str) -> dict:
         series.append(s)
 
     default_margin = (
-        {"left": 200, "right": 50, "top": 70, "bottom": 60} if is_horizontal else {"left": 70, "right": 40, "top": 70, "bottom": 90}
+        {"left": 200, "right": 50, "top": 90, "bottom": 60} if is_horizontal else {"left": 70, "right": 40, "top": 90, "bottom": 90}
     )
     margin = {**default_margin, **chart.margin}
+
+    # A single-series chart has nothing to disambiguate — the title carries the
+    # series name — so the legend is redundant noise. Hide it (and the band of
+    # top space it would occupy is reclaimed by the larger top margin above).
+    show_legend = len(chart.bars) > 1
 
     return {
         "backgroundColor": "transparent",
@@ -129,6 +134,7 @@ def _option(chart: BarChart, *, theme_name: str) -> dict:
         },
         "grid": {**margin, "containLabel": False},
         "legend": {
+            "show": show_legend,
             "top": 36,
             "textStyle": {"color": t["fg"]},
             "data": [b.name for b in chart.bars],

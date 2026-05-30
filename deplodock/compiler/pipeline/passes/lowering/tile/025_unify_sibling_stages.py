@@ -14,22 +14,36 @@ load anyway. The cleanest answer is to **stop staging the later
 consumer** and let it read from gmem — exactly what the legacy
 non-blocked path did (which is what those tests pin).
 
-This pass walks the TileOp body top-down, maintaining a set of ``buf``
-names already staged at any prior scope. When it visits a
-``StageBundle``, every ``Source`` whose ``buf`` is already in the set
-is dropped and the consumer ``Load``s inside the bundle body that
-referenced that Source's slab name are rewritten back to read from
-gmem at the original index (reconstructed from ``Source.origin`` +
-``cache_dims``, or directly from ``Source.template_index`` when the
-addressing was template). If every Source in a Stage gets dropped the
-Stage is removed; if every Stage in the bundle goes the bundle is
-unwrapped (its body inlined at the parent scope).
+This pass walks the TileOp body top-down, maintaining a set of
+``(buf, phase)`` pairs already staged at any prior scope — keyed on the
+pair, not bare ``buf``, so the unification is slot-aware. SYNC bundles
+all carry ``phase = None`` and still unify against each other (the
+sibling-reduce case 020 emits). Bundles produced by ``080_pipeline_stages``
+carry distinct ``phase`` exprs per ring slot — prologue 0 →
+``Literal(0)``, prologue 1 → ``Literal(1)``, steady-state issue →
+``Var(K_o) + N-1`` — so each occupies a separate key and they don't
+collapse even though they share the gmem buffer name. Without the
+phase part of the key, a post-pipelining re-scan of the tile dialect
+(triggered by any concurrent graph-changing rule, e.g.
+``017_atomic_free_splitk`` adding a sibling reduce kernel that wakes
+the cursor back up) would silently drop the prologue + steady-state
+issues and the K_o loop would read undefined smem on most iterations.
+
+When it visits a ``StageBundle``, every ``Source`` whose
+``(buf, bundle.phase)`` is already in the set is dropped and the
+consumer ``Load``s inside the bundle body that referenced that Source's
+slab name are rewritten back to read from gmem at the original index
+(reconstructed from ``Source.origin`` + ``cache_dims``, or directly
+from ``Source.template_index`` when the addressing was template). If
+every Source in a Stage gets dropped the Stage is removed; if every
+Stage in the bundle goes the bundle is unwrapped (its body inlined at
+the parent scope).
 
 Runs between ``020_stage_inputs`` and ``030_hoist_invariant_compute``
 so every subsequent pass (ring-buffer / TMA promotion / pad / pipeline)
 sees only the surviving Stages and operates on a clean shape.
 
-Idempotent — a body with no buf-overlap raises ``RuleSkipped``.
+Idempotent — a body with no ``(buf, phase)``-overlap raises ``RuleSkipped``.
 """
 
 from __future__ import annotations
@@ -39,7 +53,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp, affine_decode_per_dim
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -55,10 +69,17 @@ def rewrite(root: Node) -> Graph | None:
 
 @dataclass
 class _State:
-    """Top-down walk state: bufs ever staged anywhere we've already
-    visited, and a flag the rule entry uses to decide ``RuleSkipped``."""
+    """Top-down walk state: ``(buf, phase)`` pairs ever staged anywhere
+    we've already visited, and a flag the rule entry uses to decide
+    ``RuleSkipped``.
 
-    bufs_staged: set[str]
+    The key is the pair, not bare ``buf``, so pipelined sibling bundles
+    that share the gmem buffer but rotate ring slots (each carries its
+    own ``StageBundle.phase``) don't collapse. SYNC bundles all carry
+    ``phase = None`` and still unify across siblings as 020 intended.
+    """
+
+    bufs_staged: set[tuple[str, Expr | None]]
     dropped_any: bool = False
 
     def __init__(self) -> None:
@@ -93,8 +114,14 @@ def _walk(body: Body, *, state: _State) -> Body:
 
 def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, Body]:
     """Partition the bundle's Sources into kept (first occurrence of each
-    buf) and dropped (subsequent). Rewrite the bundle body's Loads
-    targeting dropped slabs back to gmem.
+    ``(buf, phase)`` pair) and dropped (subsequent). Rewrite the bundle
+    body's Loads targeting dropped slabs back to gmem.
+
+    The bundle's ``phase`` is part of the key so post-pipelining sibling
+    bundles (distinct phases, same gmem buffer) don't collapse — each
+    holds a different ring slot at runtime. SYNC bundles share
+    ``phase = None`` and still unify, preserving the original
+    sibling-reduce-tower folding 020 needs.
 
     Returns ``(rebuilt_bundle, Body(()))`` when at least one Source
     survives — the caller appends the bundle to its sibling list.
@@ -104,14 +131,16 @@ def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, B
     needed)."""
     revert: dict[str, Source] = {}
     new_stages: list[Stage] = []
+    phase = bundle.phase
     for stage in bundle.stages:
         kept_sources: list[Source] = []
         for src in stage.sources:
-            if src.buf in state.bufs_staged:
+            key = (src.buf, phase)
+            if key in state.bufs_staged:
                 revert[src.name] = src
                 state.dropped_any = True
                 continue
-            state.bufs_staged.add(src.buf)
+            state.bufs_staged.add(key)
             kept_sources.append(src)
         if kept_sources:
             new_stages.append(replace(stage, sources=tuple(kept_sources)))
@@ -131,13 +160,31 @@ def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, B
 def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     """Build the gmem ``Load.index`` that 020 would have emitted had it
     not promoted this Source to smem. ``cache_dims`` carries the
-    affine mapping (``origin[d] + Var(axis_name)`` for each cache dim);
-    ``template_index`` is the verbatim non-affine form when 020 set it.
-    Inverse of 020's ``smem_index = tuple(Var(ax.name) for ax in cache_axes)``."""
+    affine mapping (``origin[d] + composite-stride decode`` over each
+    cache axis mapping to dim ``d``); ``template_index`` is the
+    verbatim non-affine form when 020 set it. Inverse of 020's
+    ``smem_index = tuple(Var(ax.name) for ax in cache_axes)``.
+
+    For multi-axis-per-source-dim (the ``DEPLODOCK_AFFINE_COLLAPSE=1``
+    BN_thread × FN_register matmul collapse), the per-dim decode is
+    ``ax_0 · ∏ subsequent extents + … + ax_{k-1}`` — same composite
+    formula ``_stage_expand`` uses for the producer cooperative load
+    and ``_source_decl_line`` uses for the IR pretty-print. Without
+    the composite stride, two axes sharing a source dim would have
+    their decodes collapse to ``ax_0 + ax_1`` (stride 1 each), and
+    when the unify pass reverts a multi-axis Load back to gmem the
+    σ-replicated address loses its per-cell offset — caught by
+    ``test_full_self_attn_tinyllama`` (SDPA P@V matmul reading
+    ``linear_1_reduce`` with ``a4 * 2`` dropped from the M coord)."""
     if src.template_index is not None:
         return src.template_index
-    cache_var_by_dim = {cd.source_dim: Var(cd.axis.name) for cd in src.cache_dims}
-    return tuple((o + cache_var_by_dim[d]) if d in cache_var_by_dim else o for d, o in enumerate(src.origin))
+    coord_for = {cd.axis.name: Var(cd.axis.name) for cd in src.cache_dims}
+    decoded = affine_decode_per_dim(
+        src.cache_axes,
+        tuple(cd.source_dim for cd in src.cache_dims),
+        coord_for,
+    )
+    return tuple((o + decoded[d]) if d in decoded else o for d, o in enumerate(src.origin))
 
 
 def _revert_loads(body: Body, revert: dict[str, Source]) -> Body:

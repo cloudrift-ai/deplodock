@@ -40,6 +40,7 @@ from deplodock.compiler.ir.tile.ir import (
     StridedTile,
     ThreadTile,
     TileOp,
+    WarpSpecialize,
     WarpTile,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
@@ -106,8 +107,27 @@ def _place_inits_in_body(body: tuple, accumulating_dtype: DataType, selecting_dt
                 out.append(s.with_bodies((new_inner,)))
                 opened = True
             elif isinstance(s, (ThreadTile, WarpTile)):
-                new_inner = _place_inits_in_scope(tuple(s.body), accumulating_dtype, selecting_dtype)
-                out.append(s.with_bodies((new_inner,)))
+                inner = tuple(s.body)
+                if len(inner) == 1 and isinstance(inner[0], WarpSpecialize):
+                    # Warp-specialized body: the consumer half owns the
+                    # reduce loop and its Accums; the producer half only
+                    # issues TMA loads and has no accumulator. Place Inits at
+                    # the consumer_body head — the per-consumer-thread scope
+                    # just above the K loop, exactly where a non-specialized
+                    # ThreadTile would get them, shifted into the consumer
+                    # arm. Placing them at the WarpTile body head instead
+                    # would hoist the Init above the role split (producer
+                    # threads run a dead Init) and — because that scope sits
+                    # outside the consumer K loop the renderer can't tie the
+                    # explicit Init to — the default per-loop init still
+                    # fires inside the loop, resetting the accumulators every
+                    # K chunk (the WS=1 accuracy bug).
+                    ws = inner[0]
+                    new_cons = _place_inits_in_scope(tuple(ws.consumer_body), accumulating_dtype, selecting_dtype)
+                    out.append(s.with_bodies(((replace(ws, consumer_body=new_cons),),)))
+                else:
+                    new_inner = _place_inits_in_scope(tuple(s.body), accumulating_dtype, selecting_dtype)
+                    out.append(s.with_bodies((new_inner,)))
                 opened = True
             else:
                 out.append(s)

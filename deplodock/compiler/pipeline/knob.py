@@ -96,7 +96,7 @@ class Knob:
         return str(value)
 
     def narrow(self, candidates: Iterable[Any]) -> tuple:
-        """Intersect ``candidates`` with the env pin ``DEPLODOCK_<NAME>``.
+        """Override ``candidates`` with the env pin ``DEPLODOCK_<NAME>``.
 
         Folds env-driven pinning into the same iteration that produces
         hint-driven candidates, so callers don't enumerate-then-filter:
@@ -104,11 +104,14 @@ class Knob:
             bn_choices = BN.narrow(_TUNE_AXIS_CHOICES)  # 1-tuple if pinned
 
         Returns ``tuple(candidates)`` unchanged when the env var is
-        absent; a 1-tuple ``(pinned,)`` when the pin matches a candidate;
-        ``()`` when the pin doesn't match anything in ``candidates``.
-        Callers that need a peer-kernel fallback (empty after structural
-        gates → invalid pin for *this* shape → re-enumerate without
-        pins) implement that policy rule-side.
+        absent; otherwise a 1-tuple ``(pinned,)`` — *authoritative*,
+        even if ``pinned`` is not in ``candidates``. Hints are guidance,
+        not constraint: the user knows what they're doing. Downstream
+        structural gates (divisibility, threads-per-CTA budget, etc.)
+        still apply, so a structurally invalid pin yields an empty
+        enumeration; callers that need a peer-kernel fallback (empty
+        after structural gates → invalid pin for *this* shape →
+        re-enumerate without pins) implement that policy rule-side.
 
         ``BINMASK`` isn't supported — it would need ``width``, and no
         rule enumerates BINMASK candidates today."""
@@ -118,7 +121,7 @@ class Knob:
         if self.type is KnobType.BINMASK:
             raise ValueError(f"Knob.narrow not supported for BINMASK ({self.name!r})")
         pinned = self.parse(raw)
-        return tuple(c for c in candidates if c == pinned)
+        return (pinned,)
 
 
 # --- Registry --------------------------------------------------------------

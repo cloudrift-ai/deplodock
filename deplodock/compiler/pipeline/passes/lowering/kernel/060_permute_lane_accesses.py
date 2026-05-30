@@ -61,6 +61,25 @@ Skips when:
   Captures the ``FN <= V`` no-op case and any non-canonical shape.
 * Bank-conflict analysis (reusing ``070_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
+
+OBSOLETE under the current pipeline — kept as documentation, never fires.
+``020_stage_inputs``'s affine-collapse staging (made unconditional once the
+legacy ``DEPLODOCK_AFFINE_COLLAPSE`` gate was removed) caches the operand
+slab with the register tier folded in and the lane axis at *unit stride* in
+smem, so the warp's 32 lanes already cover 32 distinct banks — the stride-``FN``
+conflict this pass rewrites no longer arises. Two independent consequences,
+both fatal to firing:
+
+* The composite-stride staging collapses the M/N thread structure into one
+  axis, so ``_maybe_rewrite`` hits ``need >=2 THREAD axes`` and skips.
+* Even if it ran, the bank-conflict analyzer reports ``max_way == 1`` (zero
+  conflicts) on the affine layout across ``FN = 8, 16, 32`` and fp32 / fp16 —
+  there is nothing to fix.
+
+So affine-collapse subsumes this read-time permute by fixing the layout one
+stage earlier. The pass (and its ``PERMUTE_LANES`` knob) are retained as a
+record of the technique and in case a future non-affine staging path
+reintroduces the conflict; on today's default pipeline it is dead weight.
 """
 
 from __future__ import annotations
@@ -68,6 +87,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace as dc_replace
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
@@ -75,6 +95,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     parallel_tile_of,
@@ -86,8 +107,24 @@ logger = logging.getLogger(__name__)
 
 PATTERN = [Pattern("root", TileOp)]
 
+# Default on: spread each lane's ``FN/V`` LDS.128 chunks across the N-tile to
+# break the stride-``FN`` bank conflict that appears at ``FN > V`` (e.g. FN=8 at
+# fp32). Not a search dimension — only ``True`` is enumerated, so the autotuner
+# never forks on it; ``DEPLODOCK_PERMUTE_LANES=0`` pins it off for an A/B against
+# the conflicted contiguous-strip layout.
+PERMUTE_LANES = Knob(
+    "PERMUTE_LANES",
+    KnobType.BOOL,
+    hints=(True,),
+    help="Spread each lane's LDS.128 chunks across the N-tile to break the FN>V stride-FN bank conflict.",
+)
+
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
+    if not PERMUTE_LANES.narrow((True,))[0]:
+        raise RuleSkipped("PERMUTE_LANES=0 pinned")
+    # Touch ``config`` so the env read stays on the standard knob_raw path.
+    _ = config.knob_raw(PERMUTE_LANES.name)
     knobs = root.op.knobs
     if knobs.get("ATOM_KIND"):
         # MMA path: WMMA uses ``load_matrix_sync`` with its own swizzled

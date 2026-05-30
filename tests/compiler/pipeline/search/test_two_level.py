@@ -123,7 +123,15 @@ def test_inner_reward_is_separable_not_a_product() -> None:
     db = SearchDB()
     reward = inner_reward(fused, ctx=Context.from_target((8, 0)), db=db, backend=backend, patience=_PATIENCE)
 
-    assert backend.calls == n1 + n2, f"expected separable {n1 + n2} benches, got {backend.calls}"
+    # Separability: the shared run must not blow up to the cross-product
+    # (n1 * n2 — the old whole-graph SP-MCTS bug this test guards against).
+    # Per-op sharing through the DB (op_effort table) is allowed — once an op
+    # is tuned to the requested patience, re-runs are idempotent. So with two
+    # kernels whose structural keys partially overlap (e.g. both end up
+    # picking a SPLITK=1 + BUFCNT=2 path after scoring), the shared count can
+    # drop below n1 + n2 without violating separability.
+    assert backend.calls <= n1 + n2, f"expected ≤ {n1 + n2} (separable) benches, got {backend.calls}"
+    assert backend.calls > max(n1, n2), f"shared run skipped too much: {backend.calls} ≤ max(n1, n2)={max(n1, n2)}"
     assert backend.calls < n1 * n2, "separable sum must be below the cross-product"
     # Every kernel measured; total is the sum of the per-op bests. Two distinct
     # structural keys → two ``per_op`` entries, each at ``multiplicity=1``.

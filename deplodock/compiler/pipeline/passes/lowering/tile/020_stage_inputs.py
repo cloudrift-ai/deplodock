@@ -57,7 +57,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     CacheDim,
@@ -227,6 +227,24 @@ def _collect_candidates(
                 register_axes=new_register_axes,
             )
             continue
+        if isinstance(s, Cond):
+            # Masked-tile boundary guard wrapping the K-loop chain (FM/FN
+            # × BM/BN non-divisor of E_M/E_N → per-cell ``if (row < M)``).
+            # Treat as transparent for candidate scanning — the
+            # cooperative load that ``_process_scope`` later emits will
+            # be hoisted ABOVE the Cond at rewrite time so all threads
+            # participate regardless of which cells the mask excludes.
+            _collect_candidates(
+                s,
+                thread_axes,
+                in_scope_axes,
+                block_axis_names,
+                found,
+                slab_cap=slab_cap,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
+            )
+            continue
         if isinstance(s, SerialTile) and not s.is_reduce:
             _collect_candidates(
                 s,
@@ -309,6 +327,146 @@ def _maybe_rewrite(
         return body
     rebuilt = replace_parallel_tile_body(outer, new_tile_body)
     return body[:idx] + (rebuilt,) + body[idx + 1 :]
+
+
+def _collect_smem_names(stmt: Stmt) -> set[str]:
+    """Names defined as ``Source`` slabs across every ``StageBundle`` in
+    ``stmt``'s subtree. Loads on these names are smem reads, dimensioned
+    to the per-cell cache extents — they cannot go OOB regardless of the
+    cell's position in the output grid, so ``_guard_unsafe_loads`` skips
+    them."""
+    names: set[str] = set()
+    if isinstance(stmt, StageBundle):
+        for stage in stmt.stages:
+            for src in stage.sources:
+                names.add(src.name)
+    for body in stmt.nested():
+        for s in body:
+            names |= _collect_smem_names(s)
+    return names
+
+
+def _guard_unsafe_loads(stmt: Stmt, predicate, gated_vars: frozenset[str], smem_names: frozenset[str] | None = None) -> Stmt:
+    """Walk ``stmt`` recursively. For each leaf body containing a direct
+    gmem ``Load`` whose index references any var in ``gated_vars`` (i.e.,
+    a Load that would read OOB on threads where ``predicate`` is False),
+    wrap the Load + its forward SSA cone in ``Cond(predicate, body=cone)``.
+
+    Smem Loads (``Load.input`` ∈ ``smem_names`` collected from every
+    StageBundle in the hoist subtree) are skipped — the smem slab is
+    sized to per-cell cache extents, so reads at register-tile coords
+    are always in-bounds even when the cell is masked.
+
+    ``Accum`` targets cross the inner Cond boundary by Cond's SSA rules
+    (matching ``Loop``'s reduce semantics) — so masked threads skip the
+    Load + their cell's FMA + their cell's Accum increment, leaving the
+    accumulator at its zero-initialised value. The downstream ``Write`` is
+    still guarded by the outer boundary Cond, so the zero (or whatever
+    state the accumulator landed in) is never emitted.
+
+    Body shape rewrite, when a leaf body has any unsafe Load:
+        before: [safe_stmt, unsafe_load, dependent_assign, dependent_accum, …]
+        after:  [safe_stmt, Cond(pred, [unsafe_load, dependent_assign,
+                                       dependent_accum])]
+    """
+    if smem_names is None:
+        smem_names = frozenset(_collect_smem_names(stmt))
+    nested = stmt.nested()
+    if not nested:
+        return stmt
+    new_bodies = []
+    for body in nested:
+        new_bodies.append(_guard_unsafe_loads_in_body(body, predicate, gated_vars, smem_names))
+    return stmt.with_bodies(tuple(new_bodies))
+
+
+def _guard_unsafe_loads_in_body(body: Body, predicate, gated_vars: frozenset[str], smem_names: frozenset[str]) -> Body:
+    """Apply the per-Load guard inside ``body`` and recurse into nested
+    bodies of any block stmts that aren't leaf bodies themselves."""
+    stmts = list(body)
+    # First recurse into each stmt's nested bodies (descent first so
+    # leaf-level guards are placed at the right scope).
+    stmts = [_guard_unsafe_loads(s, predicate, gated_vars, smem_names) for s in stmts]
+
+    # Find unsafe gmem Loads at THIS body level (smem Loads skip the
+    # check — smem extents already match the per-cell cache shape).
+    unsafe_idxs: list[int] = []
+    for i, s in enumerate(stmts):
+        if not isinstance(s, Load):
+            continue
+        if s.input in smem_names:
+            continue
+        load_vars: set[str] = set()
+        for e in s.index:
+            load_vars |= e.free_vars()
+        if load_vars & gated_vars:
+            unsafe_idxs.append(i)
+    if not unsafe_idxs:
+        return Body(tuple(stmts))
+
+    # Compute forward SSA cone seeded by the unsafe Loads' defined names.
+    # A stmt joins the cone when any of its ``deps()`` is already in the
+    # cone's defined-names set. Iterate to fixpoint.
+    cone_names: set[str] = set()
+    cone_idxs: set[int] = set(unsafe_idxs)
+    for i in unsafe_idxs:
+        cone_names.update(stmts[i].defines())
+    changed = True
+    while changed:
+        changed = False
+        for i, s in enumerate(stmts):
+            if i in cone_idxs:
+                continue
+            if any(d in cone_names for d in s.deps()):
+                cone_idxs.add(i)
+                cone_names.update(s.defines())
+                changed = True
+
+    # Wrap the contiguous range covering all cone stmts in a Cond.
+    # The cone is typically contiguous for matmul-style bodies (Load
+    # immediately followed by its consumer ``Assign`` + ``Accum``).
+    # Non-cone stmts that happen to sit between the first and last cone
+    # index come along for the ride — they're scoped to the inner Cond
+    # too. Acceptable: those middle stmts have no gated-axis deps (else
+    # they'd be in the cone), so wrapping them is a no-op semantically.
+    lo, hi = min(cone_idxs), max(cone_idxs)
+    cone_stmts = tuple(stmts[lo : hi + 1])
+    wrapped = Cond(cond=predicate, body=Body(cone_stmts))
+    return Body((*stmts[:lo], wrapped, *stmts[hi + 1 :]))
+
+
+def _contains_stage_bundle(body: Body) -> bool:
+    """Recursive: ``True`` iff any stmt inside ``body`` (at any nesting
+    depth) is a ``StageBundle``. Used by the masked-tile Cond hoist to
+    decide whether to split the Cond — only worth doing when the inner
+    body actually picked up a cooperative-load bundle to hoist."""
+    for s in body:
+        if isinstance(s, StageBundle):
+            return True
+        for nb in s.nested():
+            if _contains_stage_bundle(nb):
+                return True
+    return False
+
+
+def _is_k_pipeline_stmt(stmt: Stmt) -> bool:
+    """Identify the stmts the masked-tile Cond hoist should pull above
+    the boundary guard. The K-pipeline structure stage_inputs produces
+    inside a Cond is a single ``SerialTile`` (K-outer) whose body
+    contains a ``StageBundle`` (the cooperative load). After downstream
+    pipelining (080) that may also expand to one prologue ``StageBundle``
+    + the K-outer + a trailing ``AsyncWait`` / tail ``SerialTile``;
+    matching ``StageBundle``-bearing stmts (recursively) plus bare
+    ``StageBundle`` siblings covers both shapes. Everything else —
+    ``Write`` outputs, ``Cond(a0==0)`` invariant-compute guards from
+    ``030_hoist_invariant_compute``, constant init ``Assign``s — stays
+    inside the original Cond so the boundary predicate keeps guarding
+    output emission."""
+    if isinstance(stmt, StageBundle):
+        return True
+    if isinstance(stmt, (SerialTile, StridedTile)) and _contains_stage_bundle(stmt.body):
+        return True
+    return False
 
 
 def _peel_to_stage_inner(outer):
@@ -395,6 +553,93 @@ def _process_scope(
                 register_axes=register_axes,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
+            continue
+        elif isinstance(s, Cond):
+            # Masked-tile boundary guard. Stage transparently through
+            # the Cond, then HOIST the cooperative-load + K-pipeline
+            # above the Cond — the cooperative load must run for every
+            # thread regardless of which output cells the mask excludes
+            # (TMA elects a single issuer thread; cp.async needs all
+            # 256 threads to fetch their lane; with the load inside the
+            # Cond the elected thread might be in if-false and the
+            # consumer mbarriers would never complete). The Cond's
+            # per-cell guard now wraps only the surviving Write — the
+            # K-loop's per-iter Accum runs unconditionally per thread
+            # (a few extra FMAs on masked-row accumulators are benign;
+            # the Write that emits them is still guarded below).
+            #
+            # Split point: ``Write`` (and anything after it). Everything
+            # before the first Write — StageBundle prologue, K-pipeline
+            # SerialTile (with its steady-state StageBundle inside),
+            # epilogue AsyncWait + K-tail — gets hoisted; the Write
+            # itself stays inside the Cond.
+            new_body = _process_scope(
+                s,
+                thread_axes,
+                in_scope_axes,
+                block_axis_names,
+                used_names,
+                slab_cap=slab_cap,
+                scope_budget=scope_budget,
+                allowed_bufs=allowed_bufs,
+                is_cooperative=is_cooperative,
+                register_axes=register_axes,
+            )
+            # The staged StageBundle lives INSIDE the K-outer SerialTile
+            # (one level below ``new_body``'s top level) — same as the
+            # unmasked path, where the bundle wraps the K-inner inside
+            # the K-outer body. Hoist *just* the K-pipeline stmts
+            # (SerialTile / StageBundle whose subtree contains a
+            # StageBundle, plus their direct sibling AsyncWait /
+            # post-K-tail SerialTile) above the Cond; everything else
+            # (Writes, ``Cond(a0==0)`` invariant-compute guards,
+            # constant init Assigns) stays inside the original Cond so
+            # the boundary predicate keeps guarding output emission.
+            hoisted: list[Stmt] = []
+            inside_cond: list[Stmt] = []
+            for sub in new_body:
+                if _is_k_pipeline_stmt(sub):
+                    hoisted.append(sub)
+                else:
+                    inside_cond.append(sub)
+            # Only hoist when the descent actually produced a
+            # StageBundle somewhere inside the hoist set and the
+            # predicate is a ``<`` boundary guard (not ``==`` from
+            # ``030_hoist_invariant_compute``'s invariant-compute
+            # guard — hoisting inside those would re-execute the
+            # cooperative load on threads the guard meant to skip).
+            # Multi-K / fused kernels (e.g., qwen lmhead's RMSNorm +
+            # linear chain) are safe because the un-staged ``Load``s
+            # that depend on the gated axis get wrapped in their own
+            # boundary Cond by ``_guard_unsafe_loads`` below, so masked
+            # threads skip the OOB gmem read instead of faulting on it.
+            if not (_contains_stage_bundle(Body(tuple(hoisted))) and isinstance(s.cond, BinaryExpr) and s.cond.op == "<"):
+                rewritten_inner.append(s)
+                continue
+            # Per-Load guard (B2 from the multi-bundle fix): for each
+            # un-staged ``Load`` in the hoisted body whose index
+            # depends on a var the boundary predicate gates, wrap the
+            # Load + its forward SSA cone (the chain of ``Assign``s
+            # / ``Accum``s that consume the loaded value) in an
+            # inner ``Cond(s.cond, body=cone)``. ``Accum`` targets
+            # cross the Cond boundary by Cond's existing SSA rules
+            # (matching ``Loop``), so the reduction's accumulator is
+            # visible after the inner Cond closes. Staged Loads
+            # (smem reads of names like ``x_smem`` whose indices use
+            # cache axes, not gated vars) don't reference the gated
+            # vars and so don't trip the guard. Direct gmem Loads on
+            # buffers whose index references the gated coord (e.g.,
+            # ``wl[(a1*4096 + a6*64 + a2) * 1024 + …]`` for the qwen
+            # linear matmul) are the ones that would fault on OOB
+            # without this — caught by
+            # ``test_qwen_lmhead_variant_compiles_within_budget``
+            # crashing with ``CUDA_ERROR_ILLEGAL_ADDRESS`` and
+            # marked as a kernel timeout.
+            gated_vars = frozenset(s.cond.free_vars())
+            hoisted = [_guard_unsafe_loads(h, s.cond, gated_vars) for h in hoisted]
+            rewritten_inner.extend(hoisted)
+            if inside_cond or s.else_body:
+                rewritten_inner.append(Cond(cond=s.cond, body=Body(tuple(inside_cond)), else_body=s.else_body))
             continue
         if isinstance(s, (SerialTile, StridedTile)):
             scope_axes = (*in_scope_axes, s.axis)
@@ -564,12 +809,51 @@ def _classify(
     if n_bytes > slab_cap:
         return None
 
+    # Per-source-dim composite check: a Source is AffineAddressing when
+    # each source dim ``d`` is reached by a clean composite of its cache
+    # axes — i.e. the cache axes mapping to ``d`` form a positional
+    # product matching
+    # ``load.index[d] = origin[d] + ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}``,
+    # where the cache axes are ordered most-to-least significant (leftmost
+    # mapping to ``d`` carries the largest stride). Admits two patterns:
+    #
+    # - Single-axis-per-dim with stride 1 (the legacy matmul case): one
+    #   cache axis maps to ``d``, composite collapses to ``ax_0·1``.
+    # - Multi-axis-per-dim with composite strides (the
+    #   ``BN_thread × FN_register`` matmul-N case): cache axes
+    #   ``(a_thread, a_reg)`` mapping to N reconstruct
+    #   ``load.index[N] = origin + a_thread·FN + a_reg`` — composite
+    #   stride ``FN`` for the thread axis, ``1`` for the register axis.
+    #
+    # The matching source-index reconstruction lives in
+    # ``ir.tile.ir.affine_decode_per_dim`` and is shared across every
+    # post-staging consumer (``_stage_expand``,
+    # ``025_unify_sibling_stages._reconstruct_global_index``,
+    # ``_source_decl_line``) — together they guarantee the composite
+    # stride round-trips through smem-stage → revert-to-gmem → cuda
+    # emission. The legacy ``DEPLODOCK_AFFINE_COLLAPSE`` opt-in gate
+    # was removed: the per-axis unit-stride check it defaulted to was
+    # strictly less powerful (rejected every multi-axis case as
+    # template), and the SDPA-style false-positive that motivated the
+    # gate was an unrelated bug in the unify-pass revert path
+    # (overwriting per-dim entries instead of composite-decoding).
     needs_template = False
-    for ax in cache_axes:
-        d = var_to_dim[ax.name]
-        unit_sigma = Sigma({n: Literal(1 if n == ax.name else 0, "int") for n in candidate_names})
-        actual = sorted(t.pretty() for t in _flatten_add(unit_sigma.reduce(load.index[d], ctx)))
-        expected = sorted(t.pretty() for t in _flatten_add((origin[d] + Literal(1, "int")).simplify(ctx)))
+    for d in sorted(set(var_to_dim.values())):
+        axes_for_dim = tuple(ax for ax in cache_axes if var_to_dim[ax.name] == d)
+        # Composite: ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1.
+        # Walked right-to-left so each axis's coef is the product of the
+        # extents of axes to its right (within the same source dim).
+        composite: Expr = Literal(0, "int")
+        suffix_product = 1
+        for ax in reversed(axes_for_dim):
+            term: Expr = Var(ax.name) if suffix_product == 1 else BinaryExpr("*", Var(ax.name), Literal(suffix_product, "int"))
+            composite = term if isinstance(composite, Literal) and composite.value == 0 else BinaryExpr("+", composite, term)
+            suffix_product *= ax.extent.as_static()
+        # Substitute every OTHER cache var (mapping to a different source dim)
+        # with 0 so ``load.index[d]`` reduces to its d-only contribution.
+        other_zeros = {n: Literal(0, "int") for n in candidate_names if var_to_dim.get(n) != d}
+        actual = sorted(t.pretty() for t in _flatten_add(Sigma(other_zeros).reduce(load.index[d], ctx)))
+        expected = sorted(t.pretty() for t in _flatten_add((origin[d] + composite).simplify(ctx)))
         if actual != expected:
             needs_template = True
             break

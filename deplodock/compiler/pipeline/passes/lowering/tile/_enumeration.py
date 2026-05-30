@@ -50,12 +50,24 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
-_TUNE_AXIS_CHOICES: tuple[int, ...] = (1, 16, 32, 64, 128, 256)
+# Axis-extent + per-cell-owner cell-count candidate tuples for the matmul /
+# pointwise / reduce planner. These include the non-power-of-2 midpoints
+# (``BM=8`` for the article's 256-thread ``8×32`` layout; ``FM/FN=6, 10, 12,
+# 14, 20, 24, 26, 28, 40, 48, 96`` for register-budget-bound matmul tiles)
+# that used to sit behind ``DEPLODOCK_WIDE_FM_FN=1``. Greedy now surfaces
+# them by default — the score signals introduced alongside this (smem-fit
+# safety + TMA-eligibility bonus + SPLITK penalty in
+# ``score_tile_geometry``, plus the ``LoweringError`` that ``pipeline.py``
+# raises when a chosen variant fails ``validate(ctx)``) keep greedy from
+# silently picking a wider variant whose downstream lowering doesn't
+# validate; the wider candidate set just adds 18 % more leaves to the
+# enumeration cartesian for a couple of extra seconds of autotune wall.
+_TUNE_AXIS_CHOICES: tuple[int, ...] = (1, 8, 16, 32, 64, 128, 256)
+_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 26, 28, 32, 40, 48, 64, 96, 128)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
 # Cooperative-K thread count. v1: BR > 1 requires BN = BM = 1 (single THREAD
 # axis for materializer's _single_thread_var).
 _BR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-_TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
 # Cap on per-thread cell-product. NVRTC compile time explodes past this.
 _MAX_CELLS_PER_THREAD: int = 128
 
@@ -154,12 +166,36 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 
 
 def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
-    # High cells/thread (amortize K-loop) capped at 32 (NVRTC compile time),
-    # threads near 256, larger BK, smaller SPLITK. Final tiebreaker prefers
-    # clean-divisor variants over masked (negative len so fewer-overhang wins
-    # under reverse-sorted enumeration).
+    # Tiebreaker for the enumeration sort. The Fork-tree builder re-sorts
+    # each level by ``score_tile_geometry`` (the MCTS prior) — see
+    # ``compiler/pipeline/fork_tree.py`` — so this ordering only affects
+    # ties within a score band.
+    #
+    # Fat-tile regime (macro area ≥ 8192 cells): keep the explicit BK
+    # preference but flatten ``{16, 32, 8}`` to a near-tie — earlier tuning
+    # runs at 2048³ showed the golden's BK=32 was never visited under
+    # patience 200 because BK=16 alone (rank 6) drained the budget. The
+    # cuBLAS-band preference (16 first) was a per-shape coincidence, not a
+    # universal truth. BK=64 still demotes (cooperative-load granularity
+    # too coarse for fp32 lanes), BK=1/2 stay last (the K-loop collapses
+    # to ≤2 steps; the -O1/-O3 ranking inversion makes them look
+    # artificially fast during tuning).
     threads = p.bn * p.bm
-    return (min(p.fm * p.fn, 32), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
+    macro_area = p.bm * p.fm * p.bn * p.fn
+    fat_tile = macro_area >= 8192
+    if fat_tile:
+        _BK_FAT_PREF = {16: 5, 32: 5, 8: 4, 64: 3, 4: 2, 2: 1, 1: 0}
+        bk_key = _BK_FAT_PREF.get(p.bk, -1)
+    else:
+        bk_key = p.bk
+    return (
+        int(fat_tile),  # fat-tile variants surface first
+        min(p.fm * p.fn, 128),  # cells/thread, capped at the register-tile sweet spot
+        -abs(256 - threads),  # threads near 256
+        bk_key,  # cuBLAS-band BK tier, then large BK otherwise
+        -p.splitk,
+        -len(p.overhang),
+    )
 
 
 def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
@@ -321,6 +357,17 @@ def enumerate_cartesian(
     # reduce) via ``m_forced_mask`` / ``n_forced_mask``, tuned at its hint.
     allow_masked = mode_kind in ("pointwise", "matmul")
 
+    # Non-divisor FM/FN candidates (e.g. the article's FM=26 at 2048³) get
+    # admitted on masking-eligible axes via the wider ``_TUNE_F_CHOICES``
+    # sweep — but only for pure-matmul kernels. The fused-prologue path
+    # (SDPA P@V, gated-MLP, anything that sets ``force_splitk_one``) feeds
+    # the matmul accumulator through a softmax-style scale per row, and a
+    # non-divisor FN over a masked register tile leaves some cells partially
+    # scaled (an accuracy bug — SDPA per-head fails the eager-tolerance
+    # check). Restrict to clean divisors in those cases. Pointwise stays
+    # divisor-sweepable too; only plain matmul gets the wider sweep.
+    allow_nondivisor_f_on_mask = mode_kind == "matmul" and not force_splitk_one
+
     def _run(apply_pins: bool) -> list[TileParams]:
         return _enumerate_cartesian_impl(
             E_M=E_M,
@@ -338,6 +385,7 @@ def enumerate_cartesian(
             priority_fn=priority_fn,
             allow_empty_threads=allow_empty_threads,
             allow_masked=allow_masked,
+            allow_nondivisor_f_on_mask=allow_nondivisor_f_on_mask,
             m_axis_name=m_axis_name,
             n_axis_name=n_axis_name,
             m_forced_mask=m_forced_mask,
@@ -367,6 +415,7 @@ def _enumerate_cartesian_impl(
     priority_fn: Callable[[ScalarTileParams], tuple[int, ...]],
     allow_empty_threads: bool = False,
     allow_masked: bool = False,
+    allow_nondivisor_f_on_mask: bool = True,
     m_axis_name: str | None = None,
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
@@ -436,20 +485,47 @@ def _enumerate_cartesian_impl(
                 # leaves a fractional last tile), so any choice up to
                 # _MAX_CELLS_PER_THREAD is admissible — the per-cell guard
                 # in the masked Cond handles partial coverage.
-                if m_overhang:
+                #
+                # A pin (``fm_narrow`` returns a 1-tuple authoritatively;
+                # see ``Knob.narrow``) may force a non-divisor FM/FN even
+                # when BM/BN cleanly divides E_M/E_N. In that case BM·FM
+                # / BN·FN doesn't divide E_M / E_N, so the masking guard
+                # is needed — we admit the value and flip overhang for
+                # that variant.
+                # Masking-eligible kernels also enumerate every
+                # ``_TUNE_F_CHOICES`` value, not just divisors of
+                # ``E_M // bm_c``, so register-budget-bound tiles like the
+                # article's FM=26 (non-divisor of 256) surface in the search.
+                # Fused-prologue kernels (``allow_nondivisor_f_on_mask=False``)
+                # opt out — see the comment in :func:`enumerate_cartesian`.
+                if m_overhang or (allow_nondivisor_f_on_mask and m_maskable):
                     fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD)
                 else:
                     fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
                 if fm_narrow is not None:
                     fm_candidates = fm_narrow(fm_candidates)
                 for fm in fm_candidates:
-                    if n_overhang:
+                    if fm < 1 or fm > _MAX_CELLS_PER_THREAD:
+                        continue
+                    # Pinned FM may violate BM·FM | E_M; force masking when
+                    # admissible (allow_masked + named axis).
+                    fm_nondiv = E_M % (bm_c * fm) != 0
+                    if fm_nondiv and not m_maskable:
+                        continue
+                    fm_overhang = m_overhang or fm_nondiv
+                    if n_overhang or (allow_nondivisor_f_on_mask and n_maskable):
                         fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD // fm)
                     else:
                         fn_candidates = _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm)
                     if fn_narrow is not None:
                         fn_candidates = fn_narrow(fn_candidates)
                     for fn in fn_candidates:
+                        if fn < 1 or fm * fn > _MAX_CELLS_PER_THREAD:
+                            continue
+                        fn_nondiv = E_N % (bn_c * fn) != 0
+                        if fn_nondiv and not n_maskable:
+                            continue
+                        fn_overhang = n_overhang or fn_nondiv
                         for bk in bk_choices:
                             if per_thread_K % bk != 0:
                                 continue
@@ -466,9 +542,9 @@ def _enumerate_cartesian_impl(
                                 if k_o_total % splitk != 0:
                                     continue
                                 overhang_axes: tuple[str, ...] = ()
-                                if n_overhang and n_axis_name is not None:
+                                if fn_overhang and n_axis_name is not None:
                                     overhang_axes = (*overhang_axes, n_axis_name)
-                                if m_overhang and m_axis_name is not None:
+                                if fm_overhang and m_axis_name is not None:
                                     overhang_axes = (*overhang_axes, m_axis_name)
                                 params = ScalarTileParams(
                                     bn=bn_c,

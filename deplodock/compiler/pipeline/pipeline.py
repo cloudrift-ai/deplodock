@@ -128,6 +128,21 @@ class RuleSkipped(Exception):
         self.reason = reason
 
 
+class LoweringError(Exception):
+    """Raised by :meth:`Pipeline.run` when a deterministic (greedy)
+    compile finishes with a node left un-lowered because every option of
+    its only lowering rule failed ``validate(ctx)`` — e.g. a tile shape
+    whose materialized kernel exceeds the device smem cap.
+
+    This converts the old silent leak (an un-lowered ``TileOp`` surviving
+    every pass until ``CudaBackend`` raises the cryptic ``non-CudaOp``
+    ``TypeError``) into an actionable, early error that names the node,
+    the pass that declined it, and the ``validate`` reason. The
+    fork-pruning path under ``tune`` is unaffected: there the dropped
+    branch is a legitimate dead end and sibling branches carry other
+    shapes, so no sink is installed and nothing is raised."""
+
+
 @dataclass(frozen=True)
 class Fork:
     """A deferred fork option in the search tree.
@@ -518,10 +533,26 @@ class Pipeline:
         measurements across runs.
 
         For exhaustive autotuning, call :meth:`tune` directly with
-        :class:`TuningSearch` and iterate every yielded candidate."""
+        :class:`TuningSearch` and iterate every yielded candidate.
+
+        Installs a per-run ``_lowering_rejections`` sink so
+        :func:`Candidate.try_rewrite` records any rewrite whose every
+        option failed ``validate(ctx)``. After the single terminal
+        settles, :func:`_raise_on_unlowered` turns a recorded rejection
+        that left its node un-lowered into a loud :class:`LoweringError`
+        instead of a downstream ``CudaBackend`` mystery."""
         from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
 
-        return next(self.tune(graph, search=GreedySearch(db=db), ctx=ctx, backend=backend, db=db)).graph
+        # ``Pipeline`` is a frozen dataclass — stash the per-run sink via
+        # ``object.__setattr__`` (it's transient engine state, not a field).
+        rejections: list[tuple[str, str, str]] = []
+        object.__setattr__(self, "_lowering_rejections", rejections)
+        try:
+            cand = next(self.tune(graph, search=GreedySearch(db=db), ctx=ctx, backend=backend, db=db))
+        finally:
+            object.__setattr__(self, "_lowering_rejections", None)
+        _raise_on_unlowered(cand.graph, rejections, cand.ctx)
+        return cand.graph
 
     def tune(
         self,
@@ -584,6 +615,42 @@ class Pipeline:
             search.observe(stats, status)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
+
+
+def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ctx: Context) -> None:
+    """Fail a greedy compile loudly when a recorded ``validate(ctx)``
+    rejection (see :func:`Candidate.try_rewrite`) left its node un-lowered.
+
+    ``rejections`` is ``[(node_id, pass_label, reason), ...]``. A node is
+    "stuck" iff it still holds a pre-final dialect op (``LoopOp`` /
+    ``TileOp``) at the terminal — if a later rule lowered it anyway the
+    op is a ``CudaOp`` and we stay silent (the rejection was a harmless
+    intermediate filter). Only nodes with a recorded rejection are
+    checked, so partial pipelines that legitimately terminate at the loop
+    / tile stage (no lowering pass to drop anything) never trip this."""
+    if not rejections:
+        return
+    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+
+    # Last recorded reason / pass wins (the final pass that tried to lower it).
+    reason_by_node: dict[str, str] = {}
+    pass_by_node: dict[str, str] = {}
+    for nid, pass_label, reason in rejections:
+        reason_by_node[nid] = reason
+        pass_by_node[nid] = pass_label
+
+    stuck = [nid for nid in reason_by_node if (node := graph.nodes.get(nid)) is not None and isinstance(node.op, (LoopOp, TileOp))]
+    if not stuck:
+        return
+    lines = [f"  - {nid!r}: {pass_by_node[nid]} rejected its only lowering — {reason_by_node[nid]}" for nid in stuck]
+    raise LoweringError(
+        f"compile: {len(stuck)} node(s) left un-lowered — the chosen tile shape produced a kernel that "
+        f"failed validate(ctx) and the deterministic compile had no fallback:\n"
+        + "\n".join(lines)
+        + "\nPin a fitting tile via DEPLODOCK_KNOBS, raise the smem budget, or adjust tile-geometry "
+        "scoring so an in-budget variant ranks first."
+    )
 
 
 def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match | None:
@@ -897,4 +964,4 @@ def _bench_terminal(cand, *, backend, db):
     return agg or _point_stats(0.0), status
 
 
-__all__ = ["Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]
+__all__ = ["LoweringError", "Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]

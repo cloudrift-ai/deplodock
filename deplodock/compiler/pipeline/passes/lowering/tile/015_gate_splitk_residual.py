@@ -31,40 +31,12 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import gate_linear_epilogue_on_k_s_zero
+from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import (
+    find_split_k_axis_name,
+    gate_linear_epilogue_on_k_s_zero,
+)
 
 PATTERN = [Pattern("root", TileOp)]
-
-
-def _find_split_k_axis_name(op: TileOp) -> str | None:
-    """Return the split-K block axis name from the TileOp's coordination.
-
-    Uses the same structural derivation the materializer + Kernel-IR
-    render rely on for ``atomicAdd`` emission: ``Body.coordination``
-    (``deplodock/compiler/ir/stmt/body.py:603``) classifies a Write's
-    ``atomic_axes`` as the block axes NOT in the Write's index — which
-    is the mathematical definition of split-K (block coord doesn't pick
-    an output cell, so the CTAs at that coord all race on the same
-    cell and need an atomic add). Same signal `010_lower_kernelop` uses
-    to pick atomicAdd vs plain store; reading it here keeps the gate
-    pass and codegen in lockstep without a redundant axis-tag or a
-    name-suffix convention.
-
-    Returns ``None`` when no Write has an atomic axis (the SPLITK = 1
-    case — every block axis appears in every Write.index). For matmul
-    with SPLITK > 1 there's exactly one split-K axis (``K_s``); we
-    return its name as ``k_s_name`` for the Cond predicate.
-    """
-    coord = op.body.coordination
-    for write in coord.writes:
-        atomic = coord.atomic_axes(write)
-        if atomic:
-            # Single split-K axis per kernel by planner construction; if
-            # multiple ever appear (e.g. nested split-K), pick any — the
-            # gate would need a per-axis pass anyway, and that shape isn't
-            # emitted today.
-            return next(iter(atomic))
-    return None
 
 
 def _walk_apply_gate(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]:
@@ -103,7 +75,7 @@ def rewrite(ctx: Context, root: Node) -> TileOp | None:
         # MMA still relies on the codegen-derived atomic-Write rewrite
         # (see plans/mma-fragment-factorization.md M5 / Failure modes).
         raise RuleSkipped("MMA TileOp — split-K residual gate doesn't apply to fragment-accum bodies")
-    k_s_name = _find_split_k_axis_name(op)
+    k_s_name = find_split_k_axis_name(op)
     if k_s_name is None:
         raise RuleSkipped("no split-K axis (SPLITK = 1)")
     new_body = _walk_apply_gate(tuple(op.body), k_s_name)

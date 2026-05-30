@@ -104,13 +104,40 @@ class Candidate:
                 emit(format_skipped(display_name(rule.pass_.name if rule.pass_ else None, rule.name), match.root_node_id, exc.reason))
             self._advance_if_last(match)
             return None
-        options = list(result) if isinstance(result, (list, tuple)) else [result]
+        raw_options = list(result) if isinstance(result, (list, tuple)) else [result]
         # ``Fork`` options pass through unconditionally — they're deferred
         # expansions with no graph to validate yet. Concrete ``Op`` leaves
         # still get the per-ctx validate filter; ``Graph`` splices are
         # validated at splice time, not here.
-        options = [o for o in options if not isinstance(o, Op) or o.validate(self.ctx)]
+        options = [o for o in raw_options if not isinstance(o, Op) or o.validate(self.ctx)]
         if not options:
+            # Validation-filtered rewrite: the rule produced output but
+            # every option failed ``validate(ctx)`` — most commonly the
+            # ``KernelOp.validate`` smem-cap check after
+            # ``100_materialize_tile`` produces a kernel that exceeds
+            # ``ctx.max_dynamic_smem``. In a *fork* this is legitimate
+            # pruning (sibling branches carry other tile shapes), but in a
+            # deterministic single-path compile it leaves the node
+            # un-lowered with no recourse — so we both (a) emit a debug
+            # "filtered" line and (b) record the rejection into the
+            # pipeline's optional sink. ``Pipeline.run`` (greedy) reads the
+            # sink after the terminal settles and raises a loud
+            # ``LoweringError`` if any recorded node is still un-lowered,
+            # turning the old "CudaBackend: non-CudaOp TileOp" mystery into
+            # an actionable error. The sink is absent under ``tune`` so the
+            # fork-pruning path keeps its zero-overhead silent behavior.
+            sink = getattr(match.pipeline, "_lowering_rejections", None)
+            if raw_options and (sink is not None or _logger.isEnabledFor(logging.DEBUG)):
+                rejected = [o for o in raw_options if isinstance(o, Op)]
+                reasons = [r for r in (_validate_reason(o, self.ctx) for o in rejected) if r]
+                reason_str = "; ".join(reasons) if reasons else "validate(ctx)=False"
+                pass_label = display_name(rule.pass_.name if rule.pass_ else None, rule.name)
+                if sink is not None:
+                    sink.append((match.root_node_id, pass_label, reason_str))
+                if _logger.isEnabledFor(logging.DEBUG):
+                    emit(
+                        format_skipped(pass_label, match.root_node_id, f"all {len(rejected)} option(s) failed validate(ctx): {reason_str}")
+                    )
             self._advance_if_last(match)
             return None
         if len(options) > 1 or isinstance(options[0], Fork):
@@ -452,3 +479,44 @@ def _build_rewrite_kwargs(rule, match: Match, ctx: Context | None) -> dict:
                 kwargs[pname] = None
             input_slot += 1
     return kwargs
+
+
+def _validate_reason(op: Op, ctx: Context) -> str:
+    """Best-effort introspection of *why* ``op.validate(ctx)`` returned
+    ``False``. Returns a short reason like ``smem 106496 > cap 101376``
+    when the op exposes the right introspection hooks (``KernelOp``
+    today). Empty string when no reason can be derived — the caller
+    treats that as a generic ``validate(ctx)=False`` line."""
+    # Best-effort: keep the import local so a missing kernel-IR module
+    # (e.g. minimal harness in tests) doesn't break the engine itself.
+    try:
+        from math import prod  # noqa: PLC0415
+
+        from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+    except ImportError:
+        return ""
+    if not isinstance(op, KernelOp):
+        return ""
+    reasons: list[str] = []
+    for s in op.body:
+        if isinstance(s, GridTile):
+            ctas = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
+            # _MAX_CTAS lives next to KernelOp.validate; keep the compare local.
+            for child in s.body:
+                if isinstance(child, ThreadTile):
+                    threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in child.axes)
+                    if threads > ctx.max_threads_per_cta:
+                        reasons.append(f"threads {threads} > max_threads_per_cta {ctx.max_threads_per_cta}")
+            _ = ctas  # _MAX_CTAS comparison kept inside validate
+        elif isinstance(s, ThreadTile):
+            threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
+            if threads > ctx.max_threads_per_cta:
+                reasons.append(f"threads {threads} > max_threads_per_cta {ctx.max_threads_per_cta}")
+    try:
+        smem = op.smem_bytes()
+        if smem > ctx.max_dynamic_smem:
+            reasons.append(f"smem {smem} > max_dynamic_smem {ctx.max_dynamic_smem}")
+    except Exception:  # noqa: BLE001 — best-effort introspection
+        pass
+    return "; ".join(reasons)

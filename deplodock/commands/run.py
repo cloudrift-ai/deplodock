@@ -88,15 +88,19 @@ def register_run_command(subparsers):
         ),
     )
     from deplodock.commands.compile import add_nvcc_args
+    from deplodock.compiler.target import add_target_arg
 
     add_nvcc_args(parser)
+    add_target_arg(parser)
     parser.set_defaults(func=handle_run)
 
 
 def handle_run(args):
     from deplodock.commands.compile import apply_nvcc_flags
+    from deplodock.compiler.target import apply_target_arg
 
     apply_nvcc_flags(args, default="")  # run uses nvcc default -O3 (representative codegen)
+    apply_target_arg(args)  # --target sm_NN gates TMA / cp.async like the target GPU would
     verbose = getattr(args, "verbose", 0)
     if verbose == 0:
         logging.getLogger().setLevel(logging.WARNING)
@@ -197,6 +201,31 @@ def handle_run(args):
     backends = _resolve_backends(args.bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup, backends=backends)
 
+    # Release the torch GPU state and reset the persisting-L2 window
+    # before the deplodock bench. The eager-accuracy comparison +
+    # ``--bench-backends eager`` warmup leave allocated tensors in
+    # torch's caching allocator AND cuBLAS-installed
+    # ``cudaAccessPolicyWindow`` carveouts in L2; together they steal
+    # L2 bandwidth from our cp.async-staged kernels and inflate
+    # measured latency by ~4× on the article tile (observed:
+    # cp.async + pipeline reads 1660 µs with the state live, 330 µs
+    # after release; same cubin SHA1, ~3 GHz SM clock both runs).
+    # Only safe when no torch backends are in ``torch_fns`` — the
+    # closures there reference ``cuda_module`` / ``cuda_args``; for
+    # eager/tcompile + deplodock the state has to stay alive and the
+    # comparison absorbs the slowdown intrinsically.
+    if not torch_fns:
+        # ``_bench_interleaved`` only dereferences ``cuda_module`` /
+        # ``cuda_args`` / ``cuda_kwargs`` when ``torch_fns`` has
+        # entries — replace them with ``None`` placeholders so the
+        # actual tensors drop out of scope and ``empty_cache`` can
+        # reclaim their pool blocks.
+        cuda_module = cuda_args = cuda_kwargs = None
+        del module, example_args, example_kwargs
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        _reset_persisting_l2_cache()
+
     # GPU serialization is handled inside ``CudaBackend.benchmark`` (and
     # every other GPU entry point) via ``gpu_lock()`` — no need to wrap
     # the whole bench block here. Print/dump are pure CPU work.
@@ -223,6 +252,54 @@ def handle_run(args):
     _print_kernel_stats(compiled, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+def _reset_persisting_l2_cache() -> None:
+    """Drop every persisting-L2 carveout on the current CUDA context.
+
+    Wraps ``cudaCtxResetPersistingL2Cache`` (CUDA 11+). cuBLAS, cuDNN,
+    and other libraries can install ``cudaAccessPolicyWindow`` hints
+    that pin specific gmem regions in L2 across kernel launches; once
+    set, the carveout persists until the context tears down (it is NOT
+    released by ``torch.cuda.empty_cache`` or stream sync). That eats
+    L2 bandwidth from later cp.async-staged kernels — the article
+    matmul drops from 1660 µs to 330 µs after the reset. Best-effort:
+    silently skipped if the runtime symbol isn't resolvable (CUDA < 11,
+    non-Linux, etc.); a non-zero return is logged at DEBUG so the
+    bench path doesn't fail loud on driver quirks.
+
+    Loads ``libcudart`` from the already-mapped image so the call
+    targets the SAME runtime torch + cupy are using (the system
+    ``libcudart.so`` may belong to a different CUDA install and would
+    operate on a different driver context — its reset returns success
+    but doesn't touch our context's L2 carveout). Walks
+    ``/proc/self/maps`` for the first mapped ``libcudart.so.*`` path.
+    """
+    import ctypes
+
+    libpath = None
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                parts = line.rstrip().split(None, 5)
+                if len(parts) < 6:
+                    continue
+                p = parts[-1]
+                if "libcudart.so" in p and p.startswith("/"):
+                    libpath = p
+                    break
+    except OSError:
+        pass
+
+    try:
+        cudart = ctypes.CDLL(libpath) if libpath else ctypes.CDLL("libcudart.so")
+        cudart.cudaCtxResetPersistingL2Cache.restype = ctypes.c_int
+        cudart.cudaCtxResetPersistingL2Cache.argtypes = []
+        err = cudart.cudaCtxResetPersistingL2Cache()
+        if err != 0:
+            logger.debug("cudaCtxResetPersistingL2Cache returned %d (continuing)", err)
+    except (OSError, AttributeError) as e:
+        logger.debug("cudaCtxResetPersistingL2Cache unavailable: %s", e)
 
 
 def _resolve_dynamic_shapes(args) -> dict | None:

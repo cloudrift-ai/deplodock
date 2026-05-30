@@ -41,6 +41,42 @@ context available in one place.
 Runs after ``040_demote_to_write_dtype`` so the demote pass sees the
 original scalar Loads (the demote analysis is on Assigns, not Loads,
 so order is mostly independent; this is the conservative ordering).
+
+## Observed impact (RTX 5090, nvcc/ptxas 13.0)
+
+Like ``095_interleave_loads``, this is an IR-legibility pass, not a perf
+lever — and ``cuobjdump`` says exactly why. The vectorized and scalar source
+forms compile to **identical SASS** at every deployable opt level: the
+scalar-source kernel shows the same two ``LDS.128`` as the ``float4`` source.
+ptxas does its own load coalescing once it knows the static smem layout and
+16-byte alignment, so a manual ``float4`` only re-states an alignment it can
+already prove. Measured latency is therefore **0 %** across the whole
+tile-intensity spectrum (load-bound ``FM=1, FN=4`` through compute-bound
+``FM=FN=8``).
+
+What flag makes the pass change the SASS? Only ``-Xptxas -O0`` — the one level
+that disables the coalescer. There the scalar source stays scalar (0
+``LDS.128``) while the ``float4`` source keeps its 2; from ``-O1`` up both
+coalesce to the same SASS:
+
+    -Xptxas -O   scalar-source LDS.128   float4-source LDS.128
+    -O0          0                       2
+    -O1/-O2/-O3  2                       2
+
+``-O0`` is never deployable, and even there the load width is not this matmul's
+bottleneck, so the latency is unchanged regardless. Manual coalescing is still
+a real win on hand-written kernels where ptxas *cannot* prove alignment, where
+the access chain has gaps, or where pointers may alias without
+``const __restrict__`` — none of which a statically-shaped tile hits.
+(Mechanism: ptxas auto-vectorizes scalar ``ld.shared`` runs once alignment is
+known — https://github.com/JuliaGPU/CUDA.jl/issues/68 ; the cast is purely an
+alignment promise — https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/ .)
+
+The pass folds the runs anyway so ``--ir kernel`` / ``--ir cuda`` show one
+wide ``Load`` matching the hand-written SGEMM shape. ``VECTORIZE_LOADS`` is
+*not* a search dimension — only ``True`` is enumerated, so the autotuner never
+forks on it. ``DEPLODOCK_VECTORIZE_LOADS=0`` is a manual override for the
+scalar-load form.
 """
 
 from __future__ import annotations
@@ -53,13 +89,26 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
 _TARGET = CudaRenderTarget()
 
+VECTORIZE_LOADS = Knob(
+    "VECTORIZE_LOADS",
+    KnobType.BOOL,
+    hints=(True,),  # on by default; not a search dimension — manual override only via the env var
+    help="Fold runs of consecutive scalar Loads into one wide vector Load (float4 / __half2).",
+)
+
 
 def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
+    # Only ``True`` is enumerated, so the autotuner never forks on this knob;
+    # ``DEPLODOCK_VECTORIZE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
+    # pin authoritatively, even when it is not in the candidate set).
+    if not VECTORIZE_LOADS.narrow((True,))[0]:
+        raise RuleSkipped("VECTORIZE_LOADS=0 pinned")
     top: TileOp = root.op
     new_body = _vectorize_body(top, top.body)
     if new_body == top.body:
@@ -201,9 +250,20 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         # innermost slot (= the byte stride from the cell-offset Load
         # group's base to its neighbour group isn't n-aligned), refuse to
         # vectorize.
+        #
+        # Use ``alloc_extents`` (padded), not raw ``cache_axes`` extents:
+        # ``070_pad_smem`` may add a +1 bank-conflict-breaking pad on the
+        # inner axis (e.g. FN=4 cell + pad=1 → padded inner extent 5).
+        # The stride from the N-thread dim then becomes 5 floats = 20
+        # bytes per thread, so a float4 reinterpret_cast at ``base = a3 *
+        # 5`` is misaligned for ``a3 % 4 != 0`` — causes
+        # CUDA_ERROR_MISALIGNED_ADDRESS (silent on cp.async + pipelined
+        # because that path's interleave hides the run from this pass;
+        # surfaces as a hang on the BUFFERED / unpipelined paths that
+        # do see a contiguous Load run here).
         source = _find_source(top.body, input_name)
         if source is not None and len(source.cache_dims) >= 2:
-            inner_extent = source.cache_axes[-1].extent.as_static()
+            inner_extent = source.alloc_extents[-1]
             if inner_extent % n != 0:
                 return None
 

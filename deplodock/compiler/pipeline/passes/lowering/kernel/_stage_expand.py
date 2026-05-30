@@ -85,7 +85,13 @@ def emit_stage(
             cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in cache_axes})
             source_index = tuple(cache_sigma.apply(e) for e in addressing.exprs)
         else:
-            decoded_per_dim = {dim: coord_for[ax.name] for ax, dim in zip(cache_axes, addressing.dims, strict=True)}
+            # Per source dim: composite-decode the cache axes mapping to
+            # it (see ``affine_decode_per_dim`` for the multi-axis
+            # composite-stride formula shared across producers, the
+            # unify-pass gmem revert, and the IR pretty-print).
+            from deplodock.compiler.ir.tile.ir import affine_decode_per_dim  # noqa: PLC0415
+
+            decoded_per_dim = affine_decode_per_dim(cache_axes, addressing.dims, coord_for)
             source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(src.origin))
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).

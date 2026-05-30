@@ -164,7 +164,16 @@ the producing Op class. The base implementation returns `None` (no
 lazy estimate available); callers fall back to constructing the op
 and calling `score(ctx)`. `TileOp.lazy_score` is the reference
 implementation — it consumes `KernelShape` + `TileParams` from the
-partition planner and replicates `TileOp.score`'s formula byte-for-byte.
+partition planner and matches `TileOp.score`'s formula
+( `score_tile_geometry`) on the launch-geometry + cells + coalescing
+keys. The smem-fit penalty needs the count of input buffers the kernel
+will stage, which `lazy_score` derives from `KernelShape` (walking
+`outer_m` / `extra_outer` / `prologue` for distinct `Load.input`); the
+post-materialization path defaults to 2 (plain A+B) when no shape is
+available, so the two scores can disagree by up to the smem-fit
+penalty's ±2.5 on SDPA-with-mask / RoPE-fused kernels. That asymmetry
+is acceptable because only the planner-time scorer drives sibling
+ordering; the post-materialization score is a sanity metric.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
@@ -189,6 +198,18 @@ The return type discriminates the rewrite flavor:
 
 Raise `RuleSkipped(reason)` to decline a match — the engine logs the
 reason at DEBUG and moves on.
+
+A rewrite that *returns* an op which fails `Op.validate(ctx)` (e.g. a
+`100_materialize_tile` `KernelOp` whose smem exceeds `ctx.max_dynamic_smem`)
+is filtered by `Candidate.try_rewrite` — correct as **fork pruning** (sibling
+branches carry other tile shapes) but fatal in a single-path greedy compile,
+where it leaves the node un-lowered. `Pipeline.run` installs a transient
+`_lowering_rejections` sink that records each such drop `(node, pass, reason)`;
+after the terminal settles, `_raise_on_unlowered` raises a loud `LoweringError`
+naming any still-un-lowered node (its op is still a `LoopOp`/`TileOp`) instead
+of letting it leak to `CudaBackend` as a cryptic `non-CudaOp` `TypeError`. The
+sink is absent under `tune`, so the fork-pruning path stays silent and a
+validate-dropped branch is a graceful dead end.
 
 Files starting with `_` (e.g. `_broadcast.py`) are **not** loaded as
 rules — they're shared helpers for the pass's rule modules.
@@ -372,6 +393,13 @@ Pinning replaces tuner choice: the rule sees the env value and emits exactly tha
 reproducing a tune-time variant from CI logs, A/B-comparing two configs, or pinning a known-good config in a Makefile
 recipe.
 
+Pinning is **authoritative** — an env value outside the knob's hint tuple is honored, not silently dropped. `Knob.narrow`
+returns `(pinned,)` regardless of hint membership; downstream structural gates (divisibility, threads-per-CTA budget,
+TMA eligibility, …) still apply, so a structurally invalid pin yields an empty enumeration and the per-call-site
+fallback (`_enumeration._run(apply_pins=False)`) takes over. This lets a tile shape that the planner wouldn't reach
+on its own — e.g. the article's BM=8, FM=26, fat 208×128 matmul tile — be explored manually, while peer kernels with
+incompatible divisibility still get a sensible default.
+
 **Registered knobs.** All knobs in `passes/lowering/tile/*.py`:
 
 | Knob          | Type     | Owning rule                  | What it controls                                                                                  |
@@ -420,7 +448,7 @@ prior sibling scope and reverts its consumer Loads back to gmem — keeps the fu
 single-allocation invariant when the matmul-side K_i, now visible as a reduce through transparent
 `RegisterTile` wrappers, would otherwise re-stage `x`) → `hoist_invariant_compute` → `use_ring_buffers` →
 `use_tma` → `use_async_copy` → `pad_smem` → `pipeline_stages` → `mark_unroll`. Coordination (split-K atomic-writes, cooperative-K Combine emission, broadcast-write guards) is no longer a separate pass: the materializer / Kernel-IR render derives those decisions from `ir/tile/escape_analysis.py` queries against the tile body. Cooperativity is derived from `Accum.axes ∩ ThreadTile.axes`; atomic writes from enclosing `GridTile.axes` vs `Write.index`. `015_gate_splitk_residual` reuses the same `Body.coordination.atomic_axes` signal to identify the split-K block axis without any axis-naming convention or role tag — when SPLITK > 1, it wraps a `matmul_add`-shape linear residual epilogue under `Cond(K_s == 0, ...)` so the residual is atomic-added exactly once across the K_s CTAs (rewrite + predicates live in sibling `_splitk_residual.py`, shared with `010_partition_loops`'s `force_splitk_one` enumeration-time gate). The partition planner's knob globals + per-mode candidate tuples + the pruned `(BN, BM, FM, FN, BK, SPLITK, BR)` cartesian generator + per-mode priority/score functions live in sibling `_enumeration.py` — `010_partition_loops.py` imports the `enumerate_cartesian` entry point and the `TileParams` cartesian element; tests can hit `_enumeration` directly without routing through `_plan_kernel`. `split_register_axes` / `permute_lane_accesses` used to live here but moved to `lowering/kernel/` once dtype-aware analytical passes consolidated there (see `plans/stamp-ssa-dtypes-and-reorder.md`); they still pattern-match `TileOp` because they run pre-materialize. |
-| `lowering/kernel/`         | Pre-materialize dtype-aware analytical passes plus the final `TileOp → KernelOp` lowering. Order: `lower_atom_tile` (MMA-only: rewrites the `RegisterTile > AtomTile > matmul-cell-body` shape — emitted by the warp-tier matmul planner — into an `MmaFragment` + `MmaFill` + per-K_i `MmaLoad`+`MmaSync` chain plus final `MmaStore`; strips the AtomTile wrapper. Scalar TileOps skip; see `plans/mma-fragment-factorization.md`) → `split_register_axes` (replicates REGISTER-tagged bodies per-cell, with dep-tracked single-copy preservation of axis-invariant statements — for MMA kernels, replicates the Mma* chain per (M_r, N_r) cell, threading per-cell fragment SSA renames via the `Mma*.rewrite.register` handlers) → `dedup_replicated` (content-agnostic CSE: structurally identical Loads / Assigns left over after replication fold into one — the same shape the deleted blocked-GEMM builder used to produce by hand-partitioning N-invariant cones; see `plans/obsolete-blocked-gemm-builder.md`) → `place_inits` (places explicit `Init` Stmts at correct accumulator scope) → `stamp_types` (single body walk populating `Load.dtype` / `Assign.dtype` / `Write.value_dtype` / `Source.dtype` from `graph.nodes[buf].output.dtype`) → `demote_to_write_dtype` (folds f16-only chains feeding f16 Writes) → `vectorize_loads` (widens consecutive scalar Loads into LDS.128 / `__half2`) → `permute_lane_accesses` (chunks the N register tile into LDS.128-sized strips to remove bank conflicts on `FN > V`; skipped for MMA — `load_matrix_sync` handles its own swizzling) → `pack_fp16_pairs` (pairs scalar `__half` Inits/Accums into `__half2`; skipped for MMA — the C fragment IS the accumulator) → `vectorize_stores` (widens consecutive scalar Writes) → `flatten_wrap_stages` (flattens wrap-body `Stage(... body=[consumer])` into `[Stage(empty), *consumer]` so the materializer walks producer scaffolding then consumer siblings) → `materialize_tile` (purely-mechanical Tile → Kernel lowering; Smem decls read `Source.dtype` directly; its emit logic lives in sibling `_`-prefixed helper modules `_stage_expand` / `_combine` / `_tma_groups`, which the pass loader skips) → `drop_redundant_syncs` (Kernel-IR peephole collapsing back-to-back / leading `Sync`s at the tile-body level). All passes through `flatten_wrap_stages` pattern-match `TileOp`; `materialize_tile` consumes `TileOp` and produces the `KernelOp`; `drop_redundant_syncs` rewrites `KernelOp → KernelOp`. |
+| `lowering/kernel/`         | Pre-materialize dtype-aware analytical passes plus the final `TileOp → KernelOp` lowering. Order: `lower_atom_tile` (MMA-only: rewrites the `RegisterTile > AtomTile > matmul-cell-body` shape — emitted by the warp-tier matmul planner — into an `MmaFragment` + `MmaFill` + per-K_i `MmaLoad`+`MmaSync` chain plus final `MmaStore`; strips the AtomTile wrapper. Scalar TileOps skip; see `plans/mma-fragment-factorization.md`) → `split_register_axes` (replicates REGISTER-tagged bodies per-cell, with dep-tracked single-copy preservation of axis-invariant statements — for MMA kernels, replicates the Mma* chain per (M_r, N_r) cell, threading per-cell fragment SSA renames via the `Mma*.rewrite.register` handlers) → `dedup_replicated` (content-agnostic CSE: structurally identical Loads / Assigns left over after replication fold into one — the same shape the deleted blocked-GEMM builder used to produce by hand-partitioning N-invariant cones; see `plans/obsolete-blocked-gemm-builder.md`) → `place_inits` (places explicit `Init` Stmts at correct accumulator scope — descends into a `WarpTile`-wrapped `WarpSpecialize` to land the Init at the **consumer_body head**, above the consumer K loop and inside the role split; placing it higher would let the renderer's default per-loop init fire inside the loop and reset the accumulator every K chunk) → `stamp_types` (single body walk populating `Load.dtype` / `Assign.dtype` / `Write.value_dtype` / `Source.dtype` from `graph.nodes[buf].output.dtype`) → `demote_to_write_dtype` (folds f16-only chains feeding f16 Writes) → `vectorize_loads` (widens consecutive scalar Loads into LDS.128 / `__half2`) → `permute_lane_accesses` (chunks the N register tile into LDS.128-sized strips to remove bank conflicts on `FN > V`; skipped for MMA — `load_matrix_sync` handles its own swizzling) → `pack_fp16_pairs` (pairs scalar `__half` Inits/Accums into `__half2`; skipped for MMA — the C fragment IS the accumulator) → `vectorize_stores` (widens consecutive scalar Writes) → `flatten_wrap_stages` (flattens wrap-body `Stage(... body=[consumer])` into `[Stage(empty), *consumer]` so the materializer walks producer scaffolding then consumer siblings) → `materialize_tile` (purely-mechanical Tile → Kernel lowering; Smem decls read `Source.dtype` directly; its emit logic lives in sibling `_`-prefixed helper modules `_stage_expand` / `_combine` / `_tma_groups`, which the pass loader skips) → `drop_redundant_syncs` (Kernel-IR peephole collapsing back-to-back / leading `Sync`s at the tile-body level). All passes through `flatten_wrap_stages` pattern-match `TileOp`; `materialize_tile` consumes `TileOp` and produces the `KernelOp`; `drop_redundant_syncs` rewrites `KernelOp → KernelOp`. |
 | `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 
 See `ir/ARCHITECTURE.md` for what each IR dialect looks like.

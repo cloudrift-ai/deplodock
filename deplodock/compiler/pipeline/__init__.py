@@ -20,6 +20,7 @@
 
 from deplodock.compiler.pipeline.dump import CompilerDump
 from deplodock.compiler.pipeline.pipeline import (
+    LoweringError,
     Match,
     Pass,
     Pattern,
@@ -50,6 +51,7 @@ __all__ = [
     "GreedySearch",
     "KERNEL_PASSES",
     "LOOP_PASSES",
+    "LoweringError",
     "Match",
     "Pass",
     "Pattern",

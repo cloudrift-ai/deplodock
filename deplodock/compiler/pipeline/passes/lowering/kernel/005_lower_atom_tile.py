@@ -24,11 +24,12 @@ a second visit the pattern doesn't match and the pass skips.
 
 from __future__ import annotations
 
+from deplodock.compiler.dtype import F16, F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.kernel.ir import MmaFill, MmaFragment, MmaLoad, MmaStore, MmaSync
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, Stage, StageBundle, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import AtomSpec, atom_spec
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     parallel_tile_of,
@@ -39,7 +40,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 PATTERN = [Pattern("root", TileOp)]
 
 
-def rewrite(root: Node) -> Graph | None:
+def rewrite(match: Match, root: Node) -> Graph | None:
     op = root.op
     atom_kind = op.knobs.get("ATOM_KIND")
     if not atom_kind:
@@ -49,7 +50,16 @@ def rewrite(root: Node) -> Graph | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
 
-    lowered, found = _lower_atom_tiles(tt.body, spec=spec)
+    # The c-fragment dtype tracks the output buffer's dtype so the emitted
+    # ``wmma::store_matrix_sync(out_ptr, c_frag, ...)`` has a matching
+    # overload. WMMA supports ``__half`` and ``float`` accumulators on
+    # sm_70+; for F16 outputs we use F16 accumulation (slightly less
+    # precision than F32 acc + downconvert via smem scratch, but
+    # significantly simpler and fast). F32 outputs keep the spec default
+    # (F32 acc).
+    c_dtype_override = _resolve_c_dtype(root, spec.operand_dtypes["c"])
+
+    lowered, found = _lower_atom_tiles(tt.body, spec=spec, c_dtype_override=c_dtype_override)
     if not found:
         # Could happen on a second visit (AtomTile already consumed).
         raise RuleSkipped("no AtomTile in body — already lowered")
@@ -58,7 +68,33 @@ def rewrite(root: Node) -> Graph | None:
     return TileOp(body=body[:idx] + (rebuilt,) + body[idx + 1 :], name=op.name, knobs=op.knobs)
 
 
-def _lower_atom_tiles(body: Body, *, spec: AtomSpec) -> tuple[Body, bool]:
+def _resolve_c_dtype(root: Node, spec_c_dtype: DataType) -> DataType:
+    """Pick the c-fragment dtype for the WMMA accumulator. WMMA's
+    ``store_matrix_sync`` requires the destination pointer's element type
+    to match the fragment's element type — so if the output buffer is
+    ``__half*``, the C fragment must be ``__half``-accumulator (not
+    ``float``-accumulator). Otherwise NVCC fails to find a matching overload.
+
+    Strategy: read the matmul TileOp's output tensor dtype directly.
+    F16 output → F16 c-frag (sm_70+ supports both half and float WMMA
+    accumulators). F32 output → F32 c-frag (canonical higher-precision).
+    Other dtypes fall through to the registry's default.
+
+    Tradeoff: F16 accumulator has ~3-4 ulp drift per accumulation step vs
+    F32. For real-world matmuls (small K, fp16 operands at small dynamic
+    range) it stays within fp16 tolerance. A future plan can add the
+    "F32 acc + smem-scratch fp32→fp16 cooperative downconvert" path for
+    kernels needing the precision.
+    """
+    out_dtype = root.output.dtype
+    if out_dtype == F16:
+        return F16
+    if out_dtype == F32:
+        return F32
+    return spec_c_dtype
+
+
+def _lower_atom_tiles(body: Body, *, spec: AtomSpec, c_dtype_override: DataType) -> tuple[Body, bool]:
     """Walk ``body``; for each ``AtomTile`` encountered, rewrite its
     interior matmul-shape body into an Mma* fragment chain and strip
     the AtomTile wrapper. Recurses into non-AtomTile block stmts so a
@@ -68,7 +104,7 @@ def _lower_atom_tiles(body: Body, *, spec: AtomSpec) -> tuple[Body, bool]:
     found = False
     for s in body:
         if isinstance(s, AtomTile):
-            new_stmts = _atom_body_to_mma(s.body, spec=spec)
+            new_stmts = _atom_body_to_mma(s.body, spec=spec, c_dtype_override=c_dtype_override)
             out.extend(new_stmts)
             found = True
             continue
@@ -82,7 +118,7 @@ def _lower_atom_tiles(body: Body, *, spec: AtomSpec) -> tuple[Body, bool]:
             new_bodies: list[Body] = []
             any_lowered = False
             for sub in s.nested():
-                new_sub, sub_found = _lower_atom_tiles(sub, spec=spec)
+                new_sub, sub_found = _lower_atom_tiles(sub, spec=spec, c_dtype_override=c_dtype_override)
                 new_bodies.append(new_sub)
                 any_lowered = any_lowered or sub_found
             found = found or any_lowered
@@ -92,7 +128,7 @@ def _lower_atom_tiles(body: Body, *, spec: AtomSpec) -> tuple[Body, bool]:
     return Body(out), found
 
 
-def _atom_body_to_mma(body: Body, *, spec: AtomSpec) -> tuple[Stmt, ...]:
+def _atom_body_to_mma(body: Body, *, spec: AtomSpec, c_dtype_override: DataType) -> tuple[Stmt, ...]:
     """Pattern-match the AtomTile's interior matmul body and rewrite it
     to an Mma* fragment chain.
 
@@ -211,7 +247,11 @@ def _atom_body_to_mma(body: Body, *, spec: AtomSpec) -> tuple[Stmt, ...]:
 
     a_dtype = spec.operand_dtypes["a"]
     b_dtype = spec.operand_dtypes["b"]
-    c_dtype = spec.operand_dtypes["c"]
+    # c_dtype tracks the destination buffer dtype so ``wmma::store_matrix_sync``
+    # has a matching overload (the WMMA accumulator type must equal the
+    # destination pointer's element type). Falls back to the spec's default
+    # (F32) for non-F16/F32 outputs.
+    c_dtype = c_dtype_override
 
     c_frag = f"{accum.name}_frag"
     a_frag = f"{a_load.names[0]}_frag"
