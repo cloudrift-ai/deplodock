@@ -68,6 +68,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace as dc_replace
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
@@ -75,6 +76,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     parallel_tile_of,
@@ -86,8 +88,24 @@ logger = logging.getLogger(__name__)
 
 PATTERN = [Pattern("root", TileOp)]
 
+# Default on: spread each lane's ``FN/V`` LDS.128 chunks across the N-tile to
+# break the stride-``FN`` bank conflict that appears at ``FN > V`` (e.g. FN=8 at
+# fp32). Not a search dimension — only ``True`` is enumerated, so the autotuner
+# never forks on it; ``DEPLODOCK_PERMUTE_LANES=0`` pins it off for an A/B against
+# the conflicted contiguous-strip layout.
+PERMUTE_LANES = Knob(
+    "PERMUTE_LANES",
+    KnobType.BOOL,
+    hints=(True,),
+    help="Spread each lane's LDS.128 chunks across the N-tile to break the FN>V stride-FN bank conflict.",
+)
+
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
+    if not PERMUTE_LANES.narrow((True,))[0]:
+        raise RuleSkipped("PERMUTE_LANES=0 pinned")
+    # Touch ``config`` so the env read stays on the standard knob_raw path.
+    _ = config.knob_raw(PERMUTE_LANES.name)
     knobs = root.op.knobs
     if knobs.get("ATOM_KIND"):
         # MMA path: WMMA uses ``load_matrix_sync`` with its own swizzled
