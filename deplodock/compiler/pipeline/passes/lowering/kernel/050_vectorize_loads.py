@@ -250,9 +250,20 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         # innermost slot (= the byte stride from the cell-offset Load
         # group's base to its neighbour group isn't n-aligned), refuse to
         # vectorize.
+        #
+        # Use ``alloc_extents`` (padded), not raw ``cache_axes`` extents:
+        # ``070_pad_smem`` may add a +1 bank-conflict-breaking pad on the
+        # inner axis (e.g. FN=4 cell + pad=1 → padded inner extent 5).
+        # The stride from the N-thread dim then becomes 5 floats = 20
+        # bytes per thread, so a float4 reinterpret_cast at ``base = a3 *
+        # 5`` is misaligned for ``a3 % 4 != 0`` — causes
+        # CUDA_ERROR_MISALIGNED_ADDRESS (silent on cp.async + pipelined
+        # because that path's interleave hides the run from this pass;
+        # surfaces as a hang on the BUFFERED / unpipelined paths that
+        # do see a contiguous Load run here).
         source = _find_source(top.body, input_name)
         if source is not None and len(source.cache_dims) >= 2:
-            inner_extent = source.cache_axes[-1].extent.as_static()
+            inner_extent = source.alloc_extents[-1]
             if inner_extent % n != 0:
                 return None
 

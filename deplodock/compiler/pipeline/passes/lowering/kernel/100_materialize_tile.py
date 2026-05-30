@@ -421,13 +421,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
             Smem(name=src.name, extents=full_extents, align=align, dtype=smem_dtype),
             cond,
         ]
-        # Implicit wait at the wrap boundary for unpipelined bundles
-        # (pipeline_depth == 1). The bundle wrapping this stage carries
-        # the phase / buffer_count / pipeline_depth.
-        if bundle.pipeline_depth == 1:
-            mbar_phase = _mbar_wait_phase(bundle.phase, bundle.buffer_count)
-            out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=bundle.phase))
-            out.append(Sync())
+        # No trailing wait here — for unpipelined multi-stage bundles
+        # the mbarrier is shared across stages with ``arrive_count = N``,
+        # so a wait emitted between stages would block forever (only one
+        # arrive has happened by then). ``emit_bundle_producer`` emits
+        # one wait+sync after ALL stages in the bundle for the
+        # unpipelined case.
         return out
 
     def emit_bundle_producer(bundle: StageBundle) -> list[Stmt]:
@@ -439,6 +438,13 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         - ``bundle.policy == TMA`` → TMA box copy.
         - otherwise (SYNC / BUFFERED / ASYNC) → cooperative
           ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC).
+
+        For unpipelined TMA bundles (``pipeline_depth == 1``) with
+        multiple stages, the per-stage mbarrier is shared with
+        ``arrive_count = N`` (one per stage), so a single trailing
+        ``MbarrierWait`` after every stage has arrived/issued is what
+        flips the phase. Emitting the wait inside ``emit_tma_stage``
+        would deadlock between stages (only one arrive has happened).
         """
         out: list[Stmt] = []
         for member in bundle.stages:
@@ -458,6 +464,17 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                         pipeline_depth=bundle.pipeline_depth,
                     )
                 )
+        # Unpipelined TMA: trailing wait+sync once after all stages
+        # arrived (mbarrier ``arrive_count = N`` is met).
+        if bundle.policy == StagePolicy.TMA and bundle.pipeline_depth == 1:
+            tma_members = [m for m in bundle.stages if m.compute is None]
+            if tma_members:
+                first_src = tma_members[0].sources[0]
+                gid = tma.stage_group[first_src.name]
+                mbar_name = tma.mbar_name(gid)
+                mbar_phase = _mbar_wait_phase(bundle.phase, bundle.buffer_count)
+                out.append(MbarrierWait(mbar=mbar_name, phase=mbar_phase, slot=bundle.phase))
+                out.append(Sync())
         return out
 
     def emit_warp_specialize(ws: WarpSpecialize) -> list[Stmt]:

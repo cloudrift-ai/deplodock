@@ -232,15 +232,28 @@ def _build_2d_matmul_graph(dims: dict):
 # leaves 96-row overhang) and is well inside the watchdog.
 #
 # **Staging-mode coverage.** Each masked-tile config (FM=26 → 208-row
-# overhang, FN=26 → 832-col overhang) runs through both the TMA path
-# (``USE_TMA=1``) and the cp.async path (``USE_TMA=0
-# USE_ASYNC_COPY=1``) so a regression in either transport's
-# interaction with the masked-tile boundary-Cond hoist (B2 per-Load
-# guard in ``020_stage_inputs._guard_unsafe_loads``) trips a test.
-# The sync double-buffer (``USE_ASYNC_COPY=0 PIPELINE_STAGES=1``) and
-# the unstaged (``BUFCNT=1``) paths are not covered here — they
-# currently emit misaligned addresses on the 2048³ shape regardless
-# of mask, a pre-existing alignment bug to track separately.
+# overhang, FN=26 → 832-col overhang) runs through every staging
+# transport × pipelining combination that the article-tile knobs can
+# select, so a regression in any of them trips a test:
+#
+#   - TMA pipelined (``USE_TMA=1 PIPELINE_STAGES=1``)
+#   - TMA depth-1 (``USE_TMA=1 PIPELINE_STAGES=0``)
+#   - cp.async pipelined (``USE_TMA=0 USE_ASYNC_COPY=1 PIPELINE_STAGES=1``)
+#   - cp.async depth-1 (``USE_TMA=0 USE_ASYNC_COPY=1 PIPELINE_STAGES=0``)
+#   - sync double-buffered (``USE_TMA=0 USE_ASYNC_COPY=0 PIPELINE_STAGES=1``)
+#   - sync depth-1 (``USE_TMA=0 USE_ASYNC_COPY=0 PIPELINE_STAGES=0``)
+#
+# The B2 per-Load guard (``020_stage_inputs._guard_unsafe_loads``)
+# handles the masked-tile branch on the TMA + cp.async + sync paths.
+# The depth-1 / sync variants additionally exercise:
+#
+#   - ``050_vectorize_loads``' padded-stride alignment check (using
+#     ``Source.alloc_extents[-1]`` so ``070_pad_smem``'s +1 pad
+#     doesn't slip a misaligned ``float4`` reinterpret_cast past).
+#   - ``100_materialize_tile.emit_bundle_producer``'s single
+#     trailing wait on unpipelined multi-stage TMA bundles (mbarrier
+#     ``arrive_count = len(stages)`` requires waiting once after ALL
+#     stages arrive, not once per stage).
 _CPASYNC_DIMS = {"M": 512, "K": 512, "N": 512}
 _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     # cab3c83e: BM=8 outside _TUNE_AXIS_CHOICES — pin must be honored.
@@ -338,6 +351,55 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
         "fm4_fn4_cpasync",
         _CPASYNC_DIMS,
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {},
+    ),
+    # Depth-1 staging coverage (``PIPELINE_STAGES=0`` keeps the bundle
+    # at ``pipeline_depth=1``, skipping ``080_pipeline_stages``'s
+    # prologue/main/epilogue peel). These three configs previously hung
+    # with ``CUDA_ERROR_MISALIGNED_ADDRESS`` on the article tile due to
+    # two bugs:
+    #
+    # 1. ``050_vectorize_loads`` collapsed 4 consecutive smem reads into
+    #    a ``float4 reinterpret_cast`` based on the unpadded inner
+    #    extent (FN=4 → 4-aligned), missing that ``070_pad_smem``'s
+    #    bank-conflict ``pad=1`` makes the per-thread stride 5 floats =
+    #    20 bytes — misaligned for any thread with ``a3 % 4 != 0``.
+    #    Fix: check ``Source.alloc_extents[-1]`` (padded), not
+    #    ``cache_axes[-1].extent``.
+    #
+    # 2. The unpipelined TMA emit (``100_materialize_tile.emit_tma_stage``)
+    #    placed a trailing ``MbarrierWait`` after EVERY stage in a
+    #    multi-source bundle. Mbarrier ``arrive_count`` is ``len(stages)
+    #    = 2`` so the wait between stage 1 (arrived) and stage 2 (not
+    #    yet arrived) blocks forever. Fix: move the wait+sync out of
+    #    ``emit_tma_stage`` and emit it ONCE in ``emit_bundle_producer``
+    #    after every member has issued its arrive.
+    #
+    # The cp.async/sync depth-1 paths hit bug 1; TMA depth-1 hits both.
+    # Smaller dims (``_CPASYNC_DIMS``) match the cp.async tests' watchdog
+    # margin.
+    (
+        "fm26_masked_tma_no_pipe",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
+        {},
+    ),
+    (
+        "fm26_masked_cpasync_no_pipe",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
+        {},
+    ),
+    (
+        "fm26_masked_sync_db",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 0, "PIPELINE_STAGES": 1},
+        {},
+    ),
+    (
+        "fm26_masked_sync_no_pipe",
+        _CPASYNC_DIMS,
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 0, "PIPELINE_STAGES": 0},
         {},
     ),
 )
