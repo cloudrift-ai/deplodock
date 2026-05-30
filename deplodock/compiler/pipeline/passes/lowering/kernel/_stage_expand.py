@@ -13,7 +13,7 @@ The leading-underscore module name keeps the pass loader (which globs
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Literal, Var
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, StagePolicy, TemplateAddressing

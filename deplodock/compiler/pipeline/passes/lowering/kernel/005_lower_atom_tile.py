@@ -1,13 +1,27 @@
 """Lower AtomTile to MMA fragment Stmts — M5 of
-``plans/mma-fragment-factorization.md``.
+``plans/mma-fragment-factorization.md`` plus M5 of
+``plans/mma-smem-staging.md``.
 
 Runs *before* ``010_split_register_axes`` in the kernel chain. Pattern-
 matches the warp-tier matmul shape the partition planner emits
-(``RegisterTile > AtomTile > matmul-cell-body``), replaces the cell
-body with an ``MmaFragment`` + ``MmaFill`` + per-K_i ``MmaLoad`` /
-``MmaSync`` chain plus a final ``MmaStore``, and strips the AtomTile
-wrapper (its axes encoded the cell shape, which is now baked into the
-Mma* Stmts' ``shape`` field).
+(``RegisterTile > AtomTile > matmul-cell-body`` for the unstaged path,
+``RegisterTile > AtomTile > StageBundle > matmul-cell-body`` once
+smem-staging is on), replaces the cell body with an ``MmaFragment`` +
+``MmaFill`` + per-K_i ``MmaLoad`` / ``MmaSync`` chain plus a final
+``MmaStore``, and strips the AtomTile wrapper (its axes encoded the
+cell shape, which is now baked into the Mma* Stmts' ``shape`` field).
+When a ``StageBundle`` lives inside the AtomTile body, the lowered
+Mma chain is re-wrapped in the same bundle so the smem allocation and
+cooperative producer survive.
+
+For staged operands, ``MmaLoad.src_index`` is rebuilt to match the
+slab's cache-axis rank: one coord per cache axis, each
+``Var(ax) * block[i]``. ``MmaLoad.ldm`` is computed from the inner
+source-dim's slab extent product so multi-axis-per-source-dim slabs
+(N-side FN-fan-out is the common case) feed the right row stride into
+``wmma::load_matrix_sync`` — the auto path would have picked the
+trailing alloc extent, which collapses to a per-cell width when N
+splits across warp + register cache axes.
 
 The ``RegisterTile`` wrapper is left in place — ``010_split_register_axes``
 runs next and replicates the Mma* chain per (M_r, N_r) cell. Each

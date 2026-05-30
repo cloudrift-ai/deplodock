@@ -37,14 +37,35 @@ REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
 - For each cache var, find which source dim its Var appears in. Zero
   dims = fan-in axis; one dim = cache axis at that dim; multiple dims =
   bail (collapsed-reshape that can't be additively split).
-- Coefficient-1 check: substitute the var → 1 (others → 0) and compare
-  to ``origin[d] + 1``. If any axis fails, fall back to
-  ``template_index`` carrying the original Load index.
+- Two-tier affine recognition (``plans/mma-smem-staging.md``):
+
+  1. **Coefficient-1 composite**: substitute the var → 1 (others → 0)
+     and compare to ``origin[d] + 1``. Admits scalar paths (matmul,
+     RMSNorm, softmax) byte-clean; stamps
+     ``AffineAddressing(dims=..., block=())``.
+  2. **Block-stamped composite** (only when parent has ``ATOM_KIND``):
+     extract the literal coefficient on each cache var, divide out the
+     running ``extent · block`` suffix product, and stamp
+     ``AffineAddressing(dims=..., block=(c_0, c_1, ...))``. The slab
+     grows by ``block[i]`` per cache dim so the WMMA fragment-load can
+     read a full ``atom_M × atom_K`` cell.
+
+  Scalar paths that hit a non-1 σ coef fall through to template — the
+  block path is gated on ATOM_KIND so a register-axis sitting between
+  origin and cache doesn't get misread as a block multiplier.
 
 **Reuse.** A Load qualifies for staging iff at least one bound axis
 doesn't appear in its index (fan-in). When every bound axis appears,
 no fan-in, skip — unless ``allow_no_fan_in`` is set (≥ 2 sibling Loads
 sharing the same index ⇒ temporal reuse).
+
+**WarpTile / AtomTile passthrough.** When the parallel-tile is a
+WarpTile (MMA path), ``n_thread`` is multiplied by ``warp_size`` so the
+cooperative-load fan-out covers all CTA lanes, not just the warp
+count. ``_collect_candidates`` and ``_process_scope`` recurse
+transparently into ``AtomTile`` — its axes parameterize the WMMA
+instruction shape and contribute as ``block`` multipliers rather than
+register iteration.
 """
 
 from __future__ import annotations
