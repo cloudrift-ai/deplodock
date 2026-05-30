@@ -61,6 +61,25 @@ Skips when:
   Captures the ``FN <= V`` no-op case and any non-canonical shape.
 * Bank-conflict analysis (reusing ``070_pad_smem``'s analyzer) says
   ``post < pre`` doesn't hold.
+
+OBSOLETE under the current pipeline — kept as documentation, never fires.
+``020_stage_inputs``'s affine-collapse staging (made unconditional once the
+legacy ``DEPLODOCK_AFFINE_COLLAPSE`` gate was removed) caches the operand
+slab with the register tier folded in and the lane axis at *unit stride* in
+smem, so the warp's 32 lanes already cover 32 distinct banks — the stride-``FN``
+conflict this pass rewrites no longer arises. Two independent consequences,
+both fatal to firing:
+
+* The composite-stride staging collapses the M/N thread structure into one
+  axis, so ``_maybe_rewrite`` hits ``need >=2 THREAD axes`` and skips.
+* Even if it ran, the bank-conflict analyzer reports ``max_way == 1`` (zero
+  conflicts) on the affine layout across ``FN = 8, 16, 32`` and fp32 / fp16 —
+  there is nothing to fix.
+
+So affine-collapse subsumes this read-time permute by fixing the layout one
+stage earlier. The pass (and its ``PERMUTE_LANES`` knob) are retained as a
+record of the technique and in case a future non-affine staging path
+reintroduces the conflict; on today's default pipeline it is dead weight.
 """
 
 from __future__ import annotations
