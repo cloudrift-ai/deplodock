@@ -190,6 +190,18 @@ The return type discriminates the rewrite flavor:
 Raise `RuleSkipped(reason)` to decline a match — the engine logs the
 reason at DEBUG and moves on.
 
+A rewrite that *returns* an op which fails `Op.validate(ctx)` (e.g. a
+`100_materialize_tile` `KernelOp` whose smem exceeds `ctx.max_dynamic_smem`)
+is filtered by `Candidate.try_rewrite` — correct as **fork pruning** (sibling
+branches carry other tile shapes) but fatal in a single-path greedy compile,
+where it leaves the node un-lowered. `Pipeline.run` installs a transient
+`_lowering_rejections` sink that records each such drop `(node, pass, reason)`;
+after the terminal settles, `_raise_on_unlowered` raises a loud `LoweringError`
+naming any still-un-lowered node (its op is still a `LoopOp`/`TileOp`) instead
+of letting it leak to `CudaBackend` as a cryptic `non-CudaOp` `TypeError`. The
+sink is absent under `tune`, so the fork-pruning path stays silent and a
+validate-dropped branch is a graceful dead end.
+
 Files starting with `_` (e.g. `_broadcast.py`) are **not** loaded as
 rules — they're shared helpers for the pass's rule modules.
 

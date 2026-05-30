@@ -111,25 +111,33 @@ class Candidate:
         # validated at splice time, not here.
         options = [o for o in raw_options if not isinstance(o, Op) or o.validate(self.ctx)]
         if not options:
-            # Silent-skip used to hide validation-filtered rewrites — most
-            # commonly the ``KernelOp.validate`` smem-cap check after
+            # Validation-filtered rewrite: the rule produced output but
+            # every option failed ``validate(ctx)`` — most commonly the
+            # ``KernelOp.validate`` smem-cap check after
             # ``100_materialize_tile`` produces a kernel that exceeds
-            # ``ctx.max_dynamic_smem``. Surface a debug-level "filtered"
-            # line so a user who pinned an over-budget tile shape via
-            # knobs sees *why* lowering didn't complete instead of having
-            # to instrument the engine.
-            if raw_options and _logger.isEnabledFor(logging.DEBUG):
+            # ``ctx.max_dynamic_smem``. In a *fork* this is legitimate
+            # pruning (sibling branches carry other tile shapes), but in a
+            # deterministic single-path compile it leaves the node
+            # un-lowered with no recourse — so we both (a) emit a debug
+            # "filtered" line and (b) record the rejection into the
+            # pipeline's optional sink. ``Pipeline.run`` (greedy) reads the
+            # sink after the terminal settles and raises a loud
+            # ``LoweringError`` if any recorded node is still un-lowered,
+            # turning the old "CudaBackend: non-CudaOp TileOp" mystery into
+            # an actionable error. The sink is absent under ``tune`` so the
+            # fork-pruning path keeps its zero-overhead silent behavior.
+            sink = getattr(match.pipeline, "_lowering_rejections", None)
+            if raw_options and (sink is not None or _logger.isEnabledFor(logging.DEBUG)):
                 rejected = [o for o in raw_options if isinstance(o, Op)]
-                reasons = [_validate_reason(o, self.ctx) for o in rejected]
-                emit(
-                    format_skipped(
-                        display_name(rule.pass_.name if rule.pass_ else None, rule.name),
-                        match.root_node_id,
-                        f"all {len(rejected)} option(s) failed validate(ctx): {'; '.join(filter(None, reasons))}"
-                        if reasons
-                        else "all options failed validate(ctx)",
+                reasons = [r for r in (_validate_reason(o, self.ctx) for o in rejected) if r]
+                reason_str = "; ".join(reasons) if reasons else "validate(ctx)=False"
+                pass_label = display_name(rule.pass_.name if rule.pass_ else None, rule.name)
+                if sink is not None:
+                    sink.append((match.root_node_id, pass_label, reason_str))
+                if _logger.isEnabledFor(logging.DEBUG):
+                    emit(
+                        format_skipped(pass_label, match.root_node_id, f"all {len(rejected)} option(s) failed validate(ctx): {reason_str}")
                     )
-                )
             self._advance_if_last(match)
             return None
         if len(options) > 1 or isinstance(options[0], Fork):
