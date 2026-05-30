@@ -184,14 +184,16 @@ def test_gated_mlp_single_cta_f_replicated(knobs: dict, monkeypatch):
 #   eligibility split of multi-source Stages into N single-source
 #   Stages so the materializer's N-stages-per-bundle TMA emit path
 #   handles them.
-# - ``FN=4`` (multi-axis collapse): the cache decomposition
-#   ``(BN_thread × FN_register)`` makes B's addressing
+# - ``FN=4`` (multi-axis composite): the cache decomposition
+#   ``(BN_thread × FN_register)`` used to mark B's addressing
 #   ``TemplateAddressing``, ineligible for TMA's affine box copy.
-#   Fixed via the new ``DEPLODOCK_AFFINE_COLLAPSE=1`` opt-in in
-#   ``020_stage_inputs._derive_slab``: composite-stride detection
-#   admits multi-axis-per-source-dim as ``AffineAddressing`` so the
-#   materializer's existing ``box_per_dim`` collapse can emit a
-#   2D TMA box of ``(BK, BN_total)``.
+#   Fixed via the composite-stride check in
+#   ``020_stage_inputs._derive_slab`` (admits multi-axis-per-
+#   source-dim as ``AffineAddressing``) + the shared
+#   ``affine_decode_per_dim`` helper used by every post-staging
+#   consumer (``_stage_expand``, ``025_unify_sibling_stages``,
+#   ``_source_decl_line``) so the composite stride round-trips
+#   through smem-stage → revert-to-gmem → cuda emission.
 
 # 2048×2048 matmul = the article's hero shape. We compare against a
 # numpy reference at this size rather than the smaller (32, 128, 64)
@@ -217,8 +219,9 @@ def _build_2d_matmul_graph(dims: dict):
 
 
 # (label, knobs, env extras). The label is what shows up in the test
-# id; ``env`` carries non-knob DEPLODOCK_* vars (today only the
-# ``AFFINE_COLLAPSE`` opt-in for the multi-axis-per-dim cases).
+# id; ``env`` carries non-knob DEPLODOCK_* vars (today: the
+# ``INTERLEAVE_LOADS`` opt-out and the masked-tile ``MASKED_TILE_HOIST``
+# opt-in for the article's overhang case).
 _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
     # cab3c83e: BM=8 outside _TUNE_AXIS_CHOICES — pin must be honored.
     ("bm8_pin_outside_hints", {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
@@ -228,19 +231,21 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
     # eligibility check used to reject as multi-source. Tile sized so
     # ``KernelOp.validate``'s smem cap (~99 KB on sm_120) is honored.
     ("multisrc_tma_fm1_fn1", {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1}, {}),
-    # Affine-collapse opt-in: FN=4 multi-axis cache on N. With the flag
-    # off this falls back to cp.async (FN>1 → TemplateAddressing).
+    # FN=4 multi-axis cache on N. Multi-axis-per-source-dim is now
+    # admitted as ``AffineAddressing`` unconditionally (the old
+    # ``DEPLODOCK_AFFINE_COLLAPSE`` opt-in was retired once the unify-
+    # pass revert path was fixed to round-trip composite strides).
     (
-        "affine_collapse_fn4",
+        "multi_axis_affine_fn4",
         {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
-        {"DEPLODOCK_AFFINE_COLLAPSE": "1"},
+        {},
     ),
-    # Affine-collapse on BOTH axes: FM=4 and FN=4 — the article's
+    # Multi-axis collapse on BOTH axes: FM=4 and FN=4 — the article's
     # FM×FN > 1 register tile, with multi-source TMA on A and B.
     (
-        "affine_collapse_fm4_fn4",
+        "multi_axis_affine_fm4_fn4",
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
-        {"DEPLODOCK_AFFINE_COLLAPSE": "1"},
+        {},
     ),
     # 095_interleave_loads opt-out — flat-LDS layout (every Load at
     # the top of the cluster). Locks in that disabling the pass via
@@ -249,33 +254,32 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict], ...] = (
     (
         "interleave_loads_disabled",
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
-        {"DEPLODOCK_AFFINE_COLLAPSE": "1", "DEPLODOCK_INTERLEAVE_LOADS": "0"},
+        {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
     # Article's EXACT tile: ``BM=8 BN=32 FM=26 FN=4 BK=32`` produces a
     # 208×128 masked-M tile (M=2048 not a multiple of 208 → ceil-div
-    # grid + per-row boundary Cond on the Write). Exercises (1) the
+    # grid + per-row boundary Cond on the Write). Exercises the
     # masked-tile boundary Cond hoist in ``020_stage_inputs`` that
-    # ``DEPLODOCK_AFFINE_COLLAPSE=1`` enables — without it the Cond
-    # blocks the cooperative-load StageBundle, falling back to a
-    # per-thread gmem-load kernel ~6× slower than the article. With
-    # the hoist + multi-source TMA + multi-axis collapse on, this
-    # config lowers to a kernel structurally byte-equivalent to
-    # ``_lower_matmul_tma_db``'s TM=26 emit (104 cells/thread, 255
-    # registers, 17 % occupancy) and benches at ~97 % of cuBLAS on
-    # RTX 5090. A regression here means one of the article-repro
-    # commits in the ``feature/run-target-flag`` chain has stopped
-    # threading through.
+    # ``DEPLODOCK_MASKED_TILE_HOIST=1`` enables — without the hoist
+    # the Cond blocks the cooperative-load StageBundle, falling back
+    # to a per-thread gmem-load kernel ~6× slower than the article.
+    # With the hoist + multi-source TMA + multi-axis composite
+    # (default on), this config lowers to a kernel structurally
+    # byte-equivalent to ``_lower_matmul_tma_db``'s TM=26 emit
+    # (104 cells/thread, 255 registers, 17 % occupancy) and benches
+    # at ~97 % of cuBLAS on RTX 5090.
     (
         "article_exact_fm26_masked",
         {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
-        {"DEPLODOCK_AFFINE_COLLAPSE": "1"},
+        {"DEPLODOCK_MASKED_TILE_HOIST": "1"},
     ),
 )
 
 
 def _run_with_knobs_and_env(graph, inputs, out_name: str, knobs: dict, env: dict, monkeypatch) -> np.ndarray:
     """Variant of ``_run_with_knobs`` that also stamps extra env vars
-    (used here for ``DEPLODOCK_AFFINE_COLLAPSE``)."""
+    (used for opt-in / opt-out flags like ``DEPLODOCK_MASKED_TILE_HOIST``
+    or ``DEPLODOCK_INTERLEAVE_LOADS``)."""
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     return _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)

@@ -57,7 +57,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     CacheDim,
@@ -227,7 +227,7 @@ def _collect_candidates(
                 register_axes=new_register_axes,
             )
             continue
-        if isinstance(s, Cond) and os.environ.get("DEPLODOCK_AFFINE_COLLAPSE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        if isinstance(s, Cond) and os.environ.get("DEPLODOCK_MASKED_TILE_HOIST", "").strip().lower() in {"1", "true", "yes", "on"}:
             # Masked-tile boundary guard wrapping the K-loop chain (FM/FN
             # × BM/BN non-divisor of E_M/E_N → per-cell ``if (row < M)``).
             # Opt-in via ``DEPLODOCK_AFFINE_COLLAPSE=1`` (same flag as the
@@ -330,6 +330,30 @@ def _maybe_rewrite(
         return body
     rebuilt = replace_parallel_tile_body(outer, new_tile_body)
     return body[:idx] + (rebuilt,) + body[idx + 1 :]
+
+
+def _cond_is_sole_compute_stmt(cond: Cond, scope_body: Body) -> bool:
+    """Pre-descent gate for the masked-tile hoist.
+
+    Returns ``True`` iff ``cond`` is the sole compute-bearing stmt in
+    ``scope_body`` — every other stmt is either an ``Init`` /
+    ``Assign`` / ``Accum`` / ``Load`` / ``Write`` that doesn't itself
+    introduce a K-loop or a ``SerialTile`` / ``StridedTile`` /
+    ``RegisterTile`` / ``GridTile`` / ``ThreadTile`` / ``StageBundle``
+    that would compete with the hoisted K-pipeline for staging
+    resources inside the enclosing register-tile replication.
+
+    The article matmul masked-tile pattern has ``[Cond[K-loop, Write]]``
+    at the RegisterTile body level (no sibling K-loops or stages); the
+    qwen lmhead RMSNorm + linear fusion has ``[RMSNorm-K-loop, ...,
+    Cond[linear-K-loop, Write]]`` and fails this gate."""
+    sibling_block_types = (SerialTile, StridedTile, RegisterTile, GridTile, ThreadTile, StageBundle, Stage)
+    for sib in scope_body:
+        if sib is cond:
+            continue
+        if isinstance(sib, sibling_block_types):
+            return False
+    return True
 
 
 def _contains_stage_bundle(body: Body) -> bool:
@@ -451,7 +475,25 @@ def _process_scope(
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
-        elif isinstance(s, Cond) and os.environ.get("DEPLODOCK_AFFINE_COLLAPSE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        elif (
+            isinstance(s, Cond)
+            and os.environ.get("DEPLODOCK_MASKED_TILE_HOIST", "").strip().lower() in {"1", "true", "yes", "on"}
+            # Pre-descent gate: the hoist is only safe to apply when the
+            # Cond is the SOLE non-trivial stmt in its enclosing scope.
+            # In a fused kernel (e.g. RMSNorm reduce + linear matmul
+            # share one RegisterTile body, where the RMSNorm K-loop sits
+            # outside the Cond and the linear K-loop inside it), the
+            # outer scope's other Loads / SerialTiles get their own
+            # staging pass — and the hoisted linear K-pipeline races
+            # them on shared smem / mbarrier resources inside the
+            # per-register-cell replication that ``010_split_register_axes``
+            # produces. Caught by
+            # ``test_qwen_lmhead_variant_compiles_within_budget`` hanging
+            # at the 1 s watchdog. The simple article-matmul case has
+            # exactly ``[Cond[K-loop, Write]]`` in the RegisterTile body
+            # (no sibling K-loops), so this check passes there.
+            and _cond_is_sole_compute_stmt(s, scope.body)
+        ):
             # Masked-tile boundary guard. Stage transparently through
             # the Cond, then HOIST the cooperative-load + K-pipeline
             # above the Cond — the cooperative load must run for every
@@ -499,11 +541,40 @@ def _process_scope(
                     hoisted.append(sub)
                 else:
                     inside_cond.append(sub)
-            # Only hoist when the descent actually produced a
-            # StageBundle anywhere inside ``hoisted`` (any nesting depth)
-            # — otherwise the Cond's contents are unchanged and we emit
-            # it as-is to avoid splitting a body that didn't benefit.
-            if not _contains_stage_bundle(Body(tuple(hoisted))):
+            # Safety gate: only hoist when the Cond matches the simple
+            # masked-matmul boundary-guard pattern that we know how to
+            # split correctly — i.e.
+            #
+            # 1. the Cond's body picked up at least one cooperative-load
+            #    ``StageBundle`` during the descent (otherwise there's
+            #    nothing to hoist and the original Cond stays correct);
+            # 2. the descent produced exactly one K-pipeline stmt + one
+            #    Write at top level (the canonical masked-matmul
+            #    pattern: ``[K-outer SerialTile, Write]``). Multi-K /
+            #    multi-Write structures mean a fused kernel (e.g.
+            #    RMSNorm reduce + linear matmul share one Cond),
+            #    where hoisting decouples downstream computes from
+            #    upstream gated reductions and the un-gated downstream
+            #    K-loop reads junk accumulator state from masked-row
+            #    threads — caught by
+            #    ``test_qwen_lmhead_variant_compiles_within_budget``
+            #    timing out at the 1 s watchdog;
+            # 3. the predicate is a ``<`` comparison (boundary guard
+            #    against a tile extent), not an ``==`` invariant-compute
+            #    guard from ``030_hoist_invariant_compute`` — hoisting
+            #    inside an invariant guard would re-execute the
+            #    cooperative load on threads the guard meant to skip,
+            #    breaking the mbarrier completion contract.
+            n_k_pipeline = sum(1 for h in hoisted if _is_k_pipeline_stmt(h))
+            n_writes = sum(1 for h in inside_cond if isinstance(h, Write))
+            if not (
+                _contains_stage_bundle(Body(tuple(hoisted)))
+                and n_k_pipeline == 1
+                and n_writes == 1
+                and len(inside_cond) == n_writes  # only Writes inside Cond, no other stmts
+                and isinstance(s.cond, BinaryExpr)
+                and s.cond.op == "<"
+            ):
                 rewritten_inner.append(s)
                 continue
             rewritten_inner.extend(hoisted)
@@ -678,60 +749,54 @@ def _classify(
     if n_bytes > slab_cap:
         return None
 
-    # Per-source-dim composite check: a Source is AffineAddressing when each
-    # source dim ``d`` is reached by a clean composite of its cache axes — i.e.
-    # the cache axes mapping to ``d`` form a positional product matching
+    # Per-source-dim composite check: a Source is AffineAddressing when
+    # each source dim ``d`` is reached by a clean composite of its cache
+    # axes — i.e. the cache axes mapping to ``d`` form a positional
+    # product matching
     # ``load.index[d] = origin[d] + ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}``,
     # where the cache axes are ordered most-to-least significant (leftmost
-    # mapping to ``d`` carries the largest stride). This admits two patterns:
+    # mapping to ``d`` carries the largest stride). Admits two patterns:
     #
-    # - Single-axis-per-dim with stride 1 (the existing matmul case): one cache
-    #   axis maps to ``d`` with extent matching ``load.index[d] - origin[d]``.
-    # - Multi-axis-per-dim with composite strides (the BN_thread × FN_register
-    #   matmul-N case): cache axes ``(a_thread, a_reg)`` mapping to N reconstruct
-    #   ``load.index[N] = origin + a_thread·FN + a_reg`` — composite stride
-    #   ``FN`` for the thread axis, stride ``1`` for the register axis.
+    # - Single-axis-per-dim with stride 1 (the legacy matmul case): one
+    #   cache axis maps to ``d``, composite collapses to ``ax_0·1``.
+    # - Multi-axis-per-dim with composite strides (the
+    #   ``BN_thread × FN_register`` matmul-N case): cache axes
+    #   ``(a_thread, a_reg)`` mapping to N reconstruct
+    #   ``load.index[N] = origin + a_thread·FN + a_reg`` — composite
+    #   stride ``FN`` for the thread axis, ``1`` for the register axis.
     #
-    # Multi-axis-per-dim is opt-in via ``DEPLODOCK_AFFINE_COLLAPSE=1``: the
-    # composite construction relies on a guess about the axis ordering inside
-    # ``load.index[d]`` (most-significant first), and SDPA-style fused mask /
-    # softmax indices break the pretty-comparison heuristic in subtle ways.
-    # Default behavior preserves the legacy per-axis unit-stride check so
-    # admitted-affine cases stay byte-identical with prior commits; the flag
-    # opts in to TMA-friendly multi-axis collapse for matmul cases where
-    # the user has confirmed the pattern fits.
-    enable_collapse = os.environ.get("DEPLODOCK_AFFINE_COLLAPSE", "").strip().lower() in {"1", "true", "yes", "on"}
+    # The matching source-index reconstruction lives in
+    # ``ir.tile.ir.affine_decode_per_dim`` and is shared across every
+    # post-staging consumer (``_stage_expand``,
+    # ``025_unify_sibling_stages._reconstruct_global_index``,
+    # ``_source_decl_line``) — together they guarantee the composite
+    # stride round-trips through smem-stage → revert-to-gmem → cuda
+    # emission. The legacy ``DEPLODOCK_AFFINE_COLLAPSE`` opt-in gate
+    # was removed: the per-axis unit-stride check it defaulted to was
+    # strictly less powerful (rejected every multi-axis case as
+    # template), and the SDPA-style false-positive that motivated the
+    # gate was an unrelated bug in the unify-pass revert path
+    # (overwriting per-dim entries instead of composite-decoding).
     needs_template = False
-    if not enable_collapse:
-        # Legacy per-axis unit-stride check.
-        for ax in cache_axes:
-            d = var_to_dim[ax.name]
-            unit_sigma = Sigma({n: Literal(1 if n == ax.name else 0, "int") for n in candidate_names})
-            actual = sorted(t.pretty() for t in _flatten_add(unit_sigma.reduce(load.index[d], ctx)))
-            expected = sorted(t.pretty() for t in _flatten_add((origin[d] + Literal(1, "int")).simplify(ctx)))
-            if actual != expected:
-                needs_template = True
-                break
-    else:
-        for d in sorted(set(var_to_dim.values())):
-            axes_for_dim = tuple(ax for ax in cache_axes if var_to_dim[ax.name] == d)
-            # Composite: ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1.
-            # Walked right-to-left so each axis's coef is the product of the
-            # extents of axes to its right (within the same source dim).
-            composite: Expr = Literal(0, "int")
-            suffix_product = 1
-            for ax in reversed(axes_for_dim):
-                term: Expr = Var(ax.name) if suffix_product == 1 else BinaryExpr("*", Var(ax.name), Literal(suffix_product, "int"))
-                composite = term if isinstance(composite, Literal) and composite.value == 0 else BinaryExpr("+", composite, term)
-                suffix_product *= ax.extent.as_static()
-            # Substitute every OTHER cache var (mapping to a different source dim)
-            # with 0 so ``load.index[d]`` reduces to its d-only contribution.
-            other_zeros = {n: Literal(0, "int") for n in candidate_names if var_to_dim.get(n) != d}
-            actual = sorted(t.pretty() for t in _flatten_add(Sigma(other_zeros).reduce(load.index[d], ctx)))
-            expected = sorted(t.pretty() for t in _flatten_add((origin[d] + composite).simplify(ctx)))
-            if actual != expected:
-                needs_template = True
-                break
+    for d in sorted(set(var_to_dim.values())):
+        axes_for_dim = tuple(ax for ax in cache_axes if var_to_dim[ax.name] == d)
+        # Composite: ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1.
+        # Walked right-to-left so each axis's coef is the product of the
+        # extents of axes to its right (within the same source dim).
+        composite: Expr = Literal(0, "int")
+        suffix_product = 1
+        for ax in reversed(axes_for_dim):
+            term: Expr = Var(ax.name) if suffix_product == 1 else BinaryExpr("*", Var(ax.name), Literal(suffix_product, "int"))
+            composite = term if isinstance(composite, Literal) and composite.value == 0 else BinaryExpr("+", composite, term)
+            suffix_product *= ax.extent.as_static()
+        # Substitute every OTHER cache var (mapping to a different source dim)
+        # with 0 so ``load.index[d]`` reduces to its d-only contribution.
+        other_zeros = {n: Literal(0, "int") for n in candidate_names if var_to_dim.get(n) != d}
+        actual = sorted(t.pretty() for t in _flatten_add(Sigma(other_zeros).reduce(load.index[d], ctx)))
+        expected = sorted(t.pretty() for t in _flatten_add((origin[d] + composite).simplify(ctx)))
+        if actual != expected:
+            needs_template = True
+            break
     template = tuple(load.index) if needs_template else None
 
     return _Slab(

@@ -393,6 +393,46 @@ class Source:
         return replace(self, pad=pad)
 
 
+def affine_decode_per_dim(
+    cache_axes: tuple[Axis, ...],
+    dims: tuple[int, ...],
+    coord_for: dict[str, Expr],
+) -> dict[int, Expr]:
+    """Reconstruct the per-source-dim coord contribution from a set of
+    cache axes that map to those source dims.
+
+    For each source dim ``d``, the axes mapping to ``d`` form a composite
+    in most-significant-first order: ``ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1``
+    where ``e_i`` is ``cache_axes[i].extent``. Each axis's coord (an Expr
+    from ``coord_for[ax.name]``) is scaled by the product of the extents
+    of the subsequent cache axes that ALSO map to dim ``d``, then summed
+    per dim.
+
+    Single-axis-per-dim collapses to a no-op (``stride = 1``, so the
+    coord is added verbatim). Multi-axis-per-dim (matmul N-side
+    ``BN_thread × FN_register`` collapse, M-side analogue) gets the
+    composite stride that mirrors the original ``load.index[d]`` shape
+    ``020_stage_inputs._derive_slab`` admitted as ``AffineAddressing``.
+
+    The previous shape — ``dict(zip(dims, coord_for))`` — silently
+    OVERWROTE the entry when two cache axes shared a dim, keeping only
+    the last axis's coord and producing wrong gmem addresses on every
+    consumer that reconstructed source indices (``_stage_expand``,
+    ``025_unify_sibling_stages._reconstruct_global_index``,
+    ``_source_decl_line``). Centralising the math here keeps the
+    composite-stride formula consistent across all three sites.
+    """
+    out: dict[int, Expr] = {}
+    for i, (ax, d) in enumerate(zip(cache_axes, dims, strict=True)):
+        stride = 1
+        for j in range(i + 1, len(cache_axes)):
+            if dims[j] == d:
+                stride *= cache_axes[j].extent.as_static()
+        term: Expr = coord_for[ax.name] if stride == 1 else BinaryExpr("*", coord_for[ax.name], Literal(stride, "int"))
+        out[d] = term if d not in out else BinaryExpr("+", out[d], term)
+    return out
+
+
 def trivial_stage_body(
     name: str,
     buf: str,
@@ -409,7 +449,8 @@ def trivial_stage_body(
     """
     cache_index = tuple(Var(ax.name) for ax in axes)
     if isinstance(addressing, AffineAddressing):
-        decoded: dict[int, Expr] = dict(zip(addressing.dims, cache_index, strict=True))
+        coord_for = {ax.name: cache_index[i] for i, ax in enumerate(axes)}
+        decoded = affine_decode_per_dim(axes, addressing.dims, coord_for)
         src_index = tuple(o if d not in decoded else o + decoded[d] for d, o in enumerate(origin))
     else:
         src_index = addressing.exprs
@@ -452,15 +493,21 @@ def _source_decl_line(src: Source) -> str:
     if src.template_index is not None:
         idx = ", ".join(e.pretty() for e in src.template_index)
     else:
-        decoded: dict[int, str] = {}
-        for ax, cd in zip(src.cache_axes, src.cache_dims, strict=True):
-            existing = decoded.get(cd.source_dim, "")
-            decoded[cd.source_dim] = (existing + " + " if existing else "") + ax.name
+        # Composite-stride decode (see ``affine_decode_per_dim``): for
+        # multi-axis-per-source-dim, the i-th axis carries the product
+        # of subsequent same-dim extents as its stride. Single-axis-
+        # per-dim collapses to stride 1 = bare ``ax.name``.
+        coord_for = {ax.name: Var(ax.name) for ax in src.cache_axes}
+        decoded_exprs = affine_decode_per_dim(
+            src.cache_axes,
+            tuple(cd.source_dim for cd in src.cache_dims),
+            coord_for,
+        )
         parts: list[str] = []
         for d, origin_expr in enumerate(src.origin):
             o = origin_expr.pretty()
-            if d in decoded:
-                parts.append(f"{o} + {decoded[d]}")
+            if d in decoded_exprs:
+                parts.append(f"{o} + {decoded_exprs[d].pretty()}")
             else:
                 parts.append(o)
         idx = ", ".join(parts)

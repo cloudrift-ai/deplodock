@@ -53,7 +53,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp, affine_decode_per_dim
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -160,13 +160,31 @@ def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, B
 def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     """Build the gmem ``Load.index`` that 020 would have emitted had it
     not promoted this Source to smem. ``cache_dims`` carries the
-    affine mapping (``origin[d] + Var(axis_name)`` for each cache dim);
-    ``template_index`` is the verbatim non-affine form when 020 set it.
-    Inverse of 020's ``smem_index = tuple(Var(ax.name) for ax in cache_axes)``."""
+    affine mapping (``origin[d] + composite-stride decode`` over each
+    cache axis mapping to dim ``d``); ``template_index`` is the
+    verbatim non-affine form when 020 set it. Inverse of 020's
+    ``smem_index = tuple(Var(ax.name) for ax in cache_axes)``.
+
+    For multi-axis-per-source-dim (the ``DEPLODOCK_AFFINE_COLLAPSE=1``
+    BN_thread × FN_register matmul collapse), the per-dim decode is
+    ``ax_0 · ∏ subsequent extents + … + ax_{k-1}`` — same composite
+    formula ``_stage_expand`` uses for the producer cooperative load
+    and ``_source_decl_line`` uses for the IR pretty-print. Without
+    the composite stride, two axes sharing a source dim would have
+    their decodes collapse to ``ax_0 + ax_1`` (stride 1 each), and
+    when the unify pass reverts a multi-axis Load back to gmem the
+    σ-replicated address loses its per-cell offset — caught by
+    ``test_full_self_attn_tinyllama`` (SDPA P@V matmul reading
+    ``linear_1_reduce`` with ``a4 * 2`` dropped from the M coord)."""
     if src.template_index is not None:
         return src.template_index
-    cache_var_by_dim = {cd.source_dim: Var(cd.axis.name) for cd in src.cache_dims}
-    return tuple((o + cache_var_by_dim[d]) if d in cache_var_by_dim else o for d, o in enumerate(src.origin))
+    coord_for = {cd.axis.name: Var(cd.axis.name) for cd in src.cache_dims}
+    decoded = affine_decode_per_dim(
+        src.cache_axes,
+        tuple(cd.source_dim for cd in src.cache_dims),
+        coord_for,
+    )
+    return tuple((o + decoded[d]) if d in decoded else o for d, o in enumerate(src.origin))
 
 
 def _revert_loads(body: Body, revert: dict[str, Source]) -> Body:
