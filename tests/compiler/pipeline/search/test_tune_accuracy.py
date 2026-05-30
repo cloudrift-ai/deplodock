@@ -148,9 +148,14 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     # whenever a scoring change adds new high-prior siblings (TMA-
     # eligibility bonus, SPLITK penalty) and patience alone would let
     # MCTS keep finding new "best"s deeper into the variant tree.
-    candidates = list(Pipeline.build(CUDA_PASSES).tune(
-        graph, search=TuningSearch(patience=3, max_visits=4), backend=tune_backend, db=db,
-    ))
+    candidates = list(
+        Pipeline.build(CUDA_PASSES).tune(
+            graph,
+            search=TuningSearch(patience=3, max_visits=4),
+            backend=tune_backend,
+            db=db,
+        )
+    )
     assert candidates, "tune produced no terminal candidates"
 
     # Tuned re-run: same graph + inputs, but compile reads from the DB

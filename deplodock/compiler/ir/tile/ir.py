@@ -1756,8 +1756,12 @@ class TileOp(BodyOp):
             score_knobs = {"FM": p.fm, "FN": p.fn, "SPLITK": p.splitk, "BK": p.bk}
         else:
             score_knobs = {
-                "FM": p.fm, "FN": p.fn, "SPLITK": p.splitk,
-                "BM": p.bm, "BN": p.bn, "BK": p.bk,
+                "FM": p.fm,
+                "FN": p.fn,
+                "SPLITK": p.splitk,
+                "BM": p.bm,
+                "BN": p.bn,
+                "BK": p.bk,
             }
 
         # Stages are added by later passes (020_stage_inputs); the planner's
