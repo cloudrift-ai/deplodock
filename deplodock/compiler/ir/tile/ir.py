@@ -1451,7 +1451,21 @@ def score_tile_geometry(
             # at 105 KB) and ``test_full_self_attn_tinyllama_seq512`` (4-input
             # masked QK^T at 166 KB) for the two regimes.
             base_slab = (macro_m + macro_n) * bk * BYTES_PER_ELEM
-            input_scale = max(1, n_staged_inputs) / 2
+            # ``base_slab`` already counts two staged buffers (A's
+            # ``macro_m × BK`` + B's ``BK × macro_n``); each extra staged
+            # source (gated MLP's three matmul operands, SDPA-with-RoPE,
+            # …) typically lands at ~the larger of A / B in shape, so an
+            # extra 0.75× per buffer beyond the second matches the actual
+            # ``smem_bytes()`` within 5 % on the tinyllama gated-MLP fused
+            # ``mul_8`` (102 KB actual vs 105 KB predicted at n=3).
+            extra = max(0, n_staged_inputs - 2)
+            input_scale = 1.0 + 0.75 * extra
+            # ``smem_bytes()`` doesn't include the slot-header (~64 B per
+            # source per buffer for TMA mbarriers, swizzle bookkeeping, etc.)
+            # or the slab-rounded alignment to TMA's 128 B box-stride. On the
+            # 99 KB sm_120 cap that overhead is ~3 KB on a 2-source matmul, so
+            # treat the cap as 97 % of the live value to keep the score honest.
+            effective_cap = smem_cap_bytes - smem_cap_bytes // 32  # ≈ 97%
             # Safety multiplier is aspect-conditional: PAD_SMEM padding adds
             # ~1 cell per row, so wide stripes (macro_n=512 on macro_m=4 at
             # SDPA QK^T) inflate the actual ``smem_bytes()`` ~1.6× past the
@@ -1464,9 +1478,9 @@ def score_tile_geometry(
             aspect = max(macro_m, macro_n) / max(1, min(macro_m, macro_n))
             safety_num, safety_den = (17, 10) if aspect > 4 else (11, 10)
             slab_bytes = int(base_slab * input_scale * safety_num // safety_den)
-            if slab_bytes > smem_cap_bytes:
+            if slab_bytes > effective_cap:
                 score -= 4.0
-            elif 2 * slab_bytes > smem_cap_bytes:
+            elif 2 * slab_bytes > effective_cap:
                 score -= 2.5
 
     # TMA-eligibility bonus (matmul on sm_90+). ``050_use_tma`` promotes the
@@ -1667,6 +1681,15 @@ class TileOp(BodyOp):
         if not thread_extents:
             return 0.0
         has_stages = any(isinstance(s, _Stage) for s in self.body.iter())
+        # Match the planner-time count by walking the materialized body's
+        # Load.input set — so the smem-fit signal in score_tile_geometry sees
+        # the same ``n_staged_inputs`` here as it did in ``lazy_score`` for
+        # the pre-materialization version. Without this, fused-prologue or
+        # multi-input matmul kernels score differently between the two paths
+        # and ``test_lazy_score_matches_tile_op_score`` mismatches.
+        n_staged = len({s.input for s in self.body.iter() if isinstance(s, Load)})
+        if n_staged == 0:
+            n_staged = 2
         return score_tile_geometry(
             thread_extents=thread_extents,
             block_extents=block_extents,
@@ -1674,6 +1697,7 @@ class TileOp(BodyOp):
             has_stages=has_stages,
             coalescing_inner_extent=self._coalescing_inner_extent(thread_axes),
             smem_cap_bytes=smem_cap,
+            n_staged_inputs=n_staged,
             compute_capability=compute_capability,
         )
 
@@ -1732,6 +1756,12 @@ class TileOp(BodyOp):
                 thread_extents.append(p.bm)
             thread_extents.append(p.bn)
 
+        # ceil-div, not floor — when ``per_m > E_M`` (or ``per_n > E_N``) the
+        # materializer still emits 1 CTA (with a masked Cond), and when
+        # ``per_m`` doesn't divide ``E_M`` it emits ⌈E_M / per_m⌉ CTAs with the
+        # last one masked. Mirror that here so the post-materialization
+        # ``_compute_score`` (which reads the GridTile's actual axis extents)
+        # sees the same block_extents as ``lazy_score`` does pre-materialize.
         block_extents: list[int] = []
         if p.splitk > 1:
             block_extents.append(p.splitk)
@@ -1740,12 +1770,12 @@ class TileOp(BodyOp):
                 block_extents.append(1)
             else:
                 E_M = shape.outer_m.axis.extent.as_static()
-                block_extents.append(max(1, E_M // per_m))
+                block_extents.append(max(1, (E_M + per_m - 1) // per_m))
         if n_symbolic:
             block_extents.append(1)
         else:
             E_N = shape.outer_n.axis.extent.as_static()
-            block_extents.append(max(1, E_N // per_n))
+            block_extents.append(max(1, (E_N + per_n - 1) // per_n))
 
         # Planner always stamps FM/FN — score keys off ``"FM" in knobs``.
         # BM/BN/BK go in too so the macro-aspect + smem-fit signals see the

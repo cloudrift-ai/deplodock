@@ -25,10 +25,22 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
 
 
-def test_planner_admits_non_divisor_n_with_real_extent(recording_dump):
+def test_planner_admits_non_divisor_n_with_real_extent(recording_dump, monkeypatch):
     """N=47 has no divisor in ``_TUNE_AXIS_CHOICES`` other than 1. The planner
     should still emit a TileOp whose N block axis carries ``real_extent=47``
-    and whose body contains a ``Cond`` masking OOB lanes."""
+    and whose body contains a ``Cond`` masking OOB lanes.
+
+    The greedy prior may pick a tile that masks on M instead (M=256 with a
+    non-divisor FM also gets admitted under the wider F-choice set), but the
+    test is checking the N-masking path. Pin BN to force it.
+    """
+    # Pin (BN, FN) so the planner masks only N — pick BN*FN that doesn't
+    # divide 47 (always, since 47 is prime — but make the masked-cell count
+    # small). Pin (BM, FM) so BM*FM divides 256 cleanly, avoiding an extra
+    # M-mask Cond that would land first in body iteration order and trip the
+    # 'first Cond' lookup below.
+    for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "32"), ("SPLITK", "1")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     g = Graph()
     _input(g, "a", (256, 64))
     _input(g, "b", (64, 47))

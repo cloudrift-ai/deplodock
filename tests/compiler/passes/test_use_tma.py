@@ -207,6 +207,15 @@ def test_force_tma_succeeds_on_eligible_default_matmul(monkeypatch):
 
     monkeypatch.setenv("DEPLODOCK_USE_TMA", "1")
     monkeypatch.setenv("DEPLODOCK_BK", "32")
+    # Pin BN/FN to clean divisors of 2048 so the planner doesn't pick a
+    # masked tile (overhang tiles use TemplateAddressing, not AffineAddressing,
+    # which ``050_use_tma._stage_eligible`` rejects). The test is about the
+    # staging-chain promotion succeeding when the geometry is TMA-eligible,
+    # not about the planner's overhang-tile heuristic.
+    monkeypatch.setenv("DEPLODOCK_BN", "32")
+    monkeypatch.setenv("DEPLODOCK_FN", "4")
+    monkeypatch.setenv("DEPLODOCK_BM", "8")
+    monkeypatch.setenv("DEPLODOCK_FM", "16")
     M = K = N = 2048
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")

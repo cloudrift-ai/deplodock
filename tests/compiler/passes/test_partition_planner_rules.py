@@ -173,10 +173,14 @@ def test_replicator_keeps_n_invariant_loads_once():
     assert plan is not None
     # Need BOTH FM > 1 and FN > 1 to exercise the blocked-layout invariant
     # (``a + b < a·b``); a single-axis register tile (FM=1 or FN=1) trivially
-    # satisfies the equality. The planner's priority surfaces wide tiles
-    # first, so the densest FM>1·FN>1 row sits a few candidates in.
-    candidates = [p for p in plan.params if p.fm > 1 and p.fn > 1 and p.splitk == 1 and p.br == 1]
-    assert candidates, "no FM > 1, FN > 1 variants enumerated for matmul"
+    # satisfies the equality, and (FM=2, FN=2) is the degenerate ``a·b == a+b``
+    # boundary. Pin to (FM=4, FN=4) so the strict ``<`` assertion fires and
+    # the test stays decoupled from sibling-ordering changes in the prior.
+    candidates = [
+        p for p in plan.params
+        if p.fm == 4 and p.fn == 4 and p.splitk == 1 and p.br == 1
+    ]
+    assert candidates, "no FM=4, FN=4 variant enumerated for matmul"
     chosen = candidates[0]
     tile_op = planner._materialize(plan, chosen)
 
