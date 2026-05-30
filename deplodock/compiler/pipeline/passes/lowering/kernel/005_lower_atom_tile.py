@@ -310,11 +310,11 @@ def _atom_body_to_mma(
     a_frag = f"{a_load.names[0]}_frag"
     b_frag = f"{b_load.names[0]}_frag"
 
-    a_src_index = _mma_src_index(a_load, bundle_sources)
-    b_src_index = _mma_src_index(b_load, bundle_sources)
+    a_src_index, a_ldm = _mma_src_index(a_load, bundle_sources)
+    b_src_index, b_ldm = _mma_src_index(b_load, bundle_sources)
     inner: tuple[Stmt, ...] = (
-        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, ldm=0),
-        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, ldm=0),
+        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, ldm=a_ldm),
+        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, ldm=b_ldm),
         MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
     )
     if reduce_st is not None:
@@ -372,19 +372,44 @@ def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
     """
     src = smem_sources.get(load.input)
     if src is None:
-        return load.index
+        # Unstaged: gmem-direct WMMA load. ``ldm=0`` triggers the
+        # render-time ``ctx.shapes[gmem_buf][-1]`` lookup, which is the
+        # gmem tensor's inner extent — correct for the rank-2 gmem
+        # operand.
+        return load.index, 0
     if not isinstance(src.addressing, AffineAddressing):
         # Template-addressed Sources don't carry the block multiplier;
         # the cache vars in load.index decode verbatim through
         # ``addressing.exprs``, which the kernel renderer already
         # handles via the standard Load path. Fall back to the gmem-
         # style passthrough — same as the pre-M5 defensive branch.
-        return load.index
+        return load.index, 0
+    # The smem slab is rank == len(cache_axes); render_index expects an
+    # index tuple of the SAME rank so its row-major flatten lines up
+    # with ``Source.alloc_extents``. The per-cache-axis slab coord is
+    # ``Var(ax) * block_ax`` (scalar paths have block=() → bare Var).
     cache_axes = src.cache_axes
-    coord_for = {ax.name: Var(ax.name) for ax in cache_axes}
-    # ``origin=(Literal(0),) * source_rank``: the smem slab is its own
-    # anchor (no CTA-relative offset baked in); the cooperative producer
-    # already absorbed ``src.origin`` when filling the slab.
-    source_rank = len(src.origin)
-    zero_origin = tuple(Literal(0, "int") for _ in range(source_rank))
-    return src.addressing.source_index(cache_axes, coord_for, zero_origin)
+    block = src.addressing.block
+    dims = src.addressing.dims
+    out: list = []
+    for i, ax in enumerate(cache_axes):
+        b = block[i] if block else 1
+        if b == 1:
+            out.append(Var(ax.name))
+        else:
+            out.append(Var(ax.name) * Literal(b, "int"))
+    # ldm for WMMA row_major matrix_a / matrix_b is the row stride along
+    # the leading source dim — equivalently, the product of slab dims
+    # for the *inner* source dim (dim 1 here). The auto-ldm path picks
+    # ``ctx.shapes[name][-1]`` which collapses to the last alloc extent,
+    # wrong when several cache axes share a source dim (e.g. an MMA
+    # matmul whose N-side splits into warp + register cells). Compute
+    # explicitly: ldm = ∏ alloc_extents[i] for i where dims[i] is the
+    # inner source dim.
+    alloc_extents = src.alloc_extents
+    ldm_dim = max(dims) if dims else 0
+    ldm = 1
+    for i, d in enumerate(dims):
+        if d == ldm_dim:
+            ldm *= alloc_extents[i]
+    return tuple(out), ldm

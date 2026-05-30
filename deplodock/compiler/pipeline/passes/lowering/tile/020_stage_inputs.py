@@ -52,7 +52,6 @@ from __future__ import annotations
 import os
 from typing import NamedTuple
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
@@ -130,15 +129,6 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     """
     if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
-    if root.op.knobs.get("ATOM_KIND") and not config.mma_stage_probe():
-        # MMA path (plans/mma-fragment-factorization.md): the warp-tier
-        # WMMA cell materializer in kernel/010_split_register_axes reads
-        # operands directly from gmem via wmma::load_matrix_sync. Staged
-        # WMMA is a perf follow-up landing in milestones of
-        # plans/mma-smem-staging.md; opt in with
-        # ``DEPLODOCK_MMA_STAGE_PROBE=1`` while M2-M5 stabilize, then M6
-        # deletes this branch entirely.
-        raise RuleSkipped("MMA path bypasses smem staging (probe off)")
     budget = ctx.max_dynamic_smem
     atom_kind = root.op.knobs.get("ATOM_KIND")
     variants = _enumerate_variants(

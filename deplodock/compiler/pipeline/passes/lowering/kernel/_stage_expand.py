@@ -104,15 +104,16 @@ def emit_stage(
             cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in cache_axes})
             source_index = tuple(cache_sigma.apply(e) for e in addressing.exprs)
         elif is_blocked:
-            # Per-source-dim: collapse decoded coords onto their source
-            # dim (sum same-dim contributions); add origin. No block
-            # multiplier — already absorbed by the iter range.
-            dim_contributions: dict[int, Expr] = {}
-            for ax, cd in zip(cache_axes, addressing.dims, strict=False):
-                term = coord_for[ax.name]
-                dim_contributions[cd] = term if cd not in dim_contributions else dim_contributions[cd] + term
+            # Per-source-dim: row-major composite over the slab-coord
+            # cache vars (block already absorbed by the iter range; the
+            # composite stride here is the *block-scaled* extents).
+            # ``affine_decode_per_dim`` with ``block=()`` and the
+            # block-scaled axes does exactly that.
+            from deplodock.compiler.ir.tile.ir import affine_decode_per_dim as _decode  # noqa: PLC0415
+
+            decoded_per_dim = _decode(scaled_axes, addressing.dims, coord_for)
             source_index = tuple(
-                src.origin[d] + dim_contributions[d] if d in dim_contributions else src.origin[d] for d in range(len(src.origin))
+                src.origin[d] + decoded_per_dim[d] if d in decoded_per_dim else src.origin[d] for d in range(len(src.origin))
             )
         else:
             # Per source dim: composite-decode the cache axes mapping to

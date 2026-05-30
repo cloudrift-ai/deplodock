@@ -1,17 +1,18 @@
-"""M1 of ``plans/mma-smem-staging.md`` — probe-gate plumbing.
+"""MMA staging by default — M6 of ``plans/mma-smem-staging.md``.
 
-Verifies the ``DEPLODOCK_MMA_STAGE_PROBE`` env var flips the
-``ATOM_KIND`` skip in ``020_stage_inputs.rewrite``. The probe-on
-behavior of actually emitting a ``StageBundle`` is M3-dependent
-(``_classify`` must recognize the atom σ first); these tests only
-pin the gate.
+After M6 the ``ATOM_KIND`` skip in ``020_stage_inputs`` is gone and
+MMA matmuls stage through smem unconditionally. This test pins that
+invariant: a small MMA matmul produces at least one ``StageBundle``
+post-tile-lowering. End-to-end correctness is covered by
+``test_matmul_mma.py``.
+
+The file name dates from M1 (when the gate was probe-toggled). The
+probe env var was removed in M6; the test name is preserved so anyone
+chasing the milestone history finds it here.
 """
 
 from __future__ import annotations
 
-import pytest
-
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Tensor
@@ -22,16 +23,6 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import StageBundle
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-
-
-def test_mma_stage_probe_reads_env(monkeypatch):
-    """``config.mma_stage_probe`` reflects the env var, default OFF."""
-    monkeypatch.delenv("DEPLODOCK_MMA_STAGE_PROBE", raising=False)
-    assert config.mma_stage_probe() is False
-    monkeypatch.setenv("DEPLODOCK_MMA_STAGE_PROBE", "1")
-    assert config.mma_stage_probe() is True
-    monkeypatch.setenv("DEPLODOCK_MMA_STAGE_PROBE", "0")
-    assert config.mma_stage_probe() is False
 
 
 def _mma_matmul_graph(*, M: int = 64, N: int = 64, K: int = 64) -> Graph:
@@ -87,26 +78,14 @@ def _has_stage_bundle(graph: Graph) -> bool:
     return False
 
 
-@pytest.mark.parametrize("probe_on", [False, True])
-def test_pipeline_runs_to_tile_under_probe(monkeypatch, probe_on):
-    """Pipeline runs cleanly through ``lowering/tile`` with the probe in
-    either state. Probe-OFF skips staging on ATOM_KIND (no
-    ``StageBundle``). Probe-ON exercises the M3 / M5 path: 020's
-    ``_classify`` stamps ``AffineAddressing.block`` on the atom-strided
-    σ and admits the eligible operand(s) — at least one ``StageBundle``
-    appears in the post-tile body.
-    """
-    if probe_on:
-        monkeypatch.setenv("DEPLODOCK_MMA_STAGE_PROBE", "1")
-    else:
-        monkeypatch.delenv("DEPLODOCK_MMA_STAGE_PROBE", raising=False)
+def test_mma_matmul_stages_through_smem(monkeypatch):
+    """An MMA-eligible F16×F16 matmul produces at least one StageBundle
+    in the post-tile body. Pins the M6 invariant: the ATOM_KIND skip
+    block in 020_stage_inputs is gone, so the staging admission path
+    runs for every warp-tier MMA TileOp."""
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
-
     g = _mma_matmul_graph()
     out = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["c"].op
     assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16"
-    if probe_on:
-        assert _has_stage_bundle(out), "expected at least one StageBundle when probe is ON"
-    else:
-        assert not _has_stage_bundle(out)
+    assert _has_stage_bundle(out)
