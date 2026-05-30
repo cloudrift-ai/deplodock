@@ -25,6 +25,7 @@ left alone — already promoted past sync transport.
 
 from __future__ import annotations
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
@@ -35,14 +36,32 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
 _MIN_CAPABILITY = (8, 0)
 
+# Default on (sm_80+): promote double-buffered bundles to cp.async. Mirrors
+# ``USE_TMA`` in ``050_use_tma`` so the transport can be controlled explicitly.
+# ``DEPLODOCK_USE_ASYNC_COPY=0`` keeps the synchronous double-buffer — useful for
+# A/B-benching sync-staged vs cp.async vs TMA on the same shape.
+USE_ASYNC_COPY = Knob(
+    "USE_ASYNC_COPY",
+    KnobType.BOOL,
+    hints=(True, False),
+    help="Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). 0 = keep synchronous double-buffer.",
+)
+
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:
-    if ctx.compute_capability < _MIN_CAPABILITY:
+    # Arch-gated default: cp.async needs sm_80+. Narrow the full hint tuple on
+    # supported arch, ``(False,)`` otherwise; an explicit ``=0`` pin is honoured
+    # at any arch.
+    candidates = USE_ASYNC_COPY.hints if ctx.compute_capability >= _MIN_CAPABILITY else (False,)
+    if not USE_ASYNC_COPY.narrow(candidates)[0]:
+        if config.knob_raw(USE_ASYNC_COPY.name) is not None:
+            raise RuleSkipped("USE_ASYNC_COPY=0 pinned")
         raise RuleSkipped(f"cp.async requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
 
     body = root.op.body

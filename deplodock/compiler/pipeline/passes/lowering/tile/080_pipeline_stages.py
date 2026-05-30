@@ -84,11 +84,25 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
+# Default on: software-pipeline the async-staged K-outer loop into
+# prologue/main/epilogue (issue chunk k+N-1 while consuming chunk k). Mirrors
+# ``USE_TMA`` / ``USE_ASYNC_COPY`` so the pipeline can be controlled explicitly.
+# ``DEPLODOCK_PIPELINE_STAGES=0`` keeps the simple depth-1 async-staged loop.
+PIPELINE_STAGES = Knob(
+    "PIPELINE_STAGES",
+    KnobType.BOOL,
+    hints=(True, False),
+    help="Software-pipeline async-staged K-outer loops into prologue/main/epilogue. 0 = keep the depth-1 staged loop.",
+)
 
-def rewrite(ctx: Context, root: Node) -> TileOp | None:
+
+def rewrite(ctx: Context, root: Node) -> TileOp | None:  # noqa: ARG001 — ctx required by rule dispatch signature
+    if not PIPELINE_STAGES.narrow(PIPELINE_STAGES.hints)[0]:
+        raise RuleSkipped("PIPELINE_STAGES=0 pinned")
     body = root.op.body
     new_body, changed = _walk(body)
     if not changed:
