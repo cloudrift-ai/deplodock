@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field, replace
-from functools import cached_property
 from typing import Literal as _Lit
 
 from deplodock.compiler.dtype import DataType
@@ -1318,6 +1317,8 @@ def score_tile_geometry(
     knobs: dict,
     has_stages: bool,
     coalescing_inner_extent: int,
+    smem_cap_bytes: int | None = None,
+    n_staged_inputs: int = 2,
 ) -> float:
     """Pure-formula scoring shared by :meth:`TileOp.score` and the partition
     planner. Takes the launch-geometry summary the score depends on (already
@@ -1326,11 +1327,23 @@ def score_tile_geometry(
     the same yardstick a fully-built ``TileOp`` would use.
 
     ``coalescing_inner_extent`` is the summed extent of thread axes that
-    appear in any Write's inner-stride dim (0 when none align)."""
+    appear in any Write's inner-stride dim (0 when none align).
+
+    Cell budget knee is at 128 (the NVRTC per-thread cell cap and a sane
+    upper bound for fp32 register-tile matmul where 255 regs/thread fits
+    ~100 accumulators + working state). The earlier knee at 64 mis-ranked
+    matmul shapes whose optimal tile sits in the register-bound 80–110
+    cells/thread regime — at 2048³ the article's golden tile (``BM=8 BN=32
+    FM=26 FN=4`` — 104 cells, 275 us) was 30× faster than the 32-cell
+    greedy default the old prior picked.
+
+    ``smem_cap_bytes`` is accepted for forward compatibility with planners
+    that want to plumb the live device's smem budget for tile-fit checks,
+    but isn't read by the formula today; callers may pass ``None``."""
     from math import prod  # noqa: PLC0415
 
     target_threads = 256
-    target_ctas = 256
+    target_ctas = 128
     score = 0.0
     if not thread_extents:
         return 0.0
@@ -1358,8 +1371,21 @@ def score_tile_geometry(
 
     if cells == 1:
         score -= 1.0
-    elif cells > 64:
-        score -= min((cells - 64) / 64.0, 1.0)
+    elif cells <= 128:
+        # Reward register-tile budget gradually up to 128 cells (NVRTC cap +
+        # fp32 register-tile sweet spot). Without this gradient every
+        # cells-in-[16,128] variant tied at the same MCTS score and the
+        # search burned patience on equally-scored siblings instead of
+        # descending into the register-bound regime where matmul wins live.
+        # Capped at +0.5 — small enough that ctas/coalescing/threads stay
+        # the dominant signals on tile-shape choice, but big enough to break
+        # ties toward the cells=104 golden region (vs the cells=32 default
+        # the original priors picked at 2048³, 30× slower).
+        score += (cells / 128.0) * 0.5
+    else:
+        # Past the NVRTC + fp32-register-tile knee, register pressure causes
+        # spill or compile slowdown; penalize cap-0.5.
+        score -= min((cells - 128) / 128.0, 0.5)
 
     if ctas < target_ctas:
         score -= (target_ctas - ctas) / target_ctas
@@ -1380,7 +1406,86 @@ def score_tile_geometry(
     if coalescing_inner_extent > 0:
         score += min(coalescing_inner_extent / 32, 1.0)
 
+    # Smem-fit signal (matmul only — "FM" in knobs gates the matmul path).
+    # Estimate the per-iter SYNC slab size from the planner's knob shape and
+    # penalize macros that won't fit a double-buffered ring (BUFCNT=2).
+    # Without that ring, the K-loop transport (cp.async, TMA) won't promote
+    # and the kernel runs SYNC + no overlap — typically 5-20× slower than
+    # the double-buffered variant. At 2048³ on sm_120 (99 KB cap) the prior
+    # greedy picked a 256×32 stripe whose 96 KB SYNC slab grew to 192 KB at
+    # BUFCNT=2 (skipped), running at 8.1 ms; the BUFCNT-fit-aware greedy
+    # picks a 128×256 / 256×128 macro that double-buffers and runs ~360 us.
+    # ``BYTES_PER_ELEM=4`` matches the slab bookkeeping the tile-IR uses
+    # today (fp32 assumption; fp16 over-counts by 2× but the signal is still
+    # in the right direction).
+    if "FM" in knobs and smem_cap_bytes is not None:
+        macro_m = int(knobs.get("BM", 1)) * int(knobs.get("FM", 1))
+        macro_n = int(knobs.get("BN", 1)) * int(knobs.get("FN", 1))
+        bk = int(knobs.get("BK", 1))
+        if bk > 0 and macro_m > 0 and macro_n > 0:
+            # Bare ``(macro_m + macro_n) * BK * 4 B`` is the per-slot slab
+            # for an A+B matmul. Three things bloat the actual materialized
+            # smem past this estimate:
+            #   1. ``PAD_SMEM`` row padding to dodge bank conflicts (~30 %
+            #      at BK=16 with wide N);
+            #   2. Multi-bundle ring — prologue StageBundle + K_o StageBundle
+            #      share storage but the materializer over-allocates the
+            #      worst-case slot;
+            #   3. Extra-input fusion — SDPA-with-RoPE / SDPA-with-mask /
+            #      gated MLP kernels stage 3-4 source tensors instead of 2,
+            #      so the slab scales with ``n_staged_inputs``.
+            # Empirically the validated ``smem_bytes()`` is ~1.7× the naive
+            # doubled-slab at 2 inputs, and ~3× at 4 inputs. Scale the
+            # estimate accordingly. The penalty has to outweigh the +1.0
+            # coalesce + +0.5 ctas bonus a wide-N stripe earns; otherwise the
+            # planner picks that stripe and the materializer's validate trips.
+            # See ``test_run_code_sdpa_tinyllama_per_head`` (2-input QK^T
+            # at 105 KB) and ``test_full_self_attn_tinyllama_seq512`` (4-input
+            # masked QK^T at 166 KB) for the two regimes.
+            base_slab = (macro_m + macro_n) * bk * BYTES_PER_ELEM
+            input_scale = max(1, n_staged_inputs) / 2
+            slab_bytes = int(base_slab * input_scale * 17 // 10)  # ×1.7 safety
+            if slab_bytes > smem_cap_bytes:
+                score -= 4.0
+            elif 2 * slab_bytes > smem_cap_bytes:
+                score -= 2.5
+
     return score
+
+
+def _count_loop_input_buffers(shape) -> int:
+    """Number of distinct ``Load.input`` references in the kernel's outer
+    body — a planner-time stand-in for "how many source tensors will be
+    staged into smem". Used by :meth:`TileOp.lazy_score` to scale the
+    matmul slab estimate in :func:`score_tile_geometry`. The plain matmul
+    has 2 (A + B); SDPA-with-RoPE / SDPA-with-mask kernels fuse 3-6
+    sources into the matmul-with-prologue path.
+
+    Walks ``outer_m`` (nests ``outer_n``), every ``extra_outer`` sibling
+    (the multi-reduce shape stashes max / sum loops here), and the
+    prologue stmts (softmax max / sum / reciprocal Loads). Constants
+    (broadcast scalars like a softmax scale or mask-fill value) inflate
+    the count but read from gmem the same way at score time, so counting
+    them too is conservative — scaling the slab a bit too much only
+    nudges the planner toward smaller tiles, which is the safe side.
+    """
+    inputs: set[str] = set()
+
+    def _walk(body) -> None:
+        for stmt in body.iter():
+            if isinstance(stmt, Load):
+                inputs.add(stmt.input)
+
+    if shape.outer_m is not None:
+        _walk(shape.outer_m.body)
+    else:
+        _walk(shape.outer_n.body)
+    for loop in shape.extra_outer:
+        _walk(loop.body)
+    for stmt in shape.prologue:
+        if isinstance(stmt, Load):
+            inputs.add(stmt.input)
+    return len(inputs)
 
 
 @dataclass
@@ -1492,28 +1597,25 @@ class TileOp(BodyOp):
         threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes)
         return threads <= ctx.max_threads_per_cta
 
-    def score(self, ctx) -> float:  # noqa: ARG002 — ctx reserved for cc-specific tuning
-        return self._cached_score
+    def score(self, ctx) -> float:
+        cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
+        cache = self.__dict__.setdefault("_score_by_cap", {})
+        if cap in cache:
+            return cache[cap]
+        val = self._compute_score(cap)
+        cache[cap] = val
+        return val
 
-    @cached_property
-    def _cached_score(self) -> float:
-        """Cached score — ``score(ctx)`` delegates here. ``ctx`` is unused
-        by the formula today (see :meth:`score`'s ARG002 noqa), so the
-        value is a pure function of ``self`` and is safe to memoize:
-        ``self.body`` is frozen after ``__post_init__`` (it's a ``Body``
-        which is a ``tuple[Stmt, ...]`` subclass, every Stmt is itself
-        a frozen dataclass), and ``self.knobs`` is set by
-        ``Candidate.apply`` BEFORE the op is installed on the graph
-        node — so by the time anyone reads ``score`` the inputs are
-        stable.
-
-        Why this matters: ``Candidate.score`` (the MCTS prior) walks
-        every node in the graph and calls ``op.score(ctx)``. Sibling
-        ``SearchNode``s share the same inner ``Candidate``, so the same
-        TileOp instance is scored from every sibling's ``inner.score()``
-        call. Without this cache each TileOp re-walked its body for
-        coalescing analysis on every visit; on Qwen3 0.6B with ~150
-        TileOps in the graph that was the dominant tune-mode cost.
+    def _compute_score(self, smem_cap: int | None) -> float:
+        """Score formula — keyed on the live geometry and the ctx-supplied
+        ``smem_cap`` (so the macro-tile fit signal in :func:`score_tile_geometry`
+        gets a real cap to compare against). Memoized by cap on ``self`` so
+        repeated MCTS sibling scoring stays cheap — without that cache,
+        ``Candidate.score`` re-walks every body Stmt for coalescing analysis
+        on every visit; on Qwen3 0.6B with ~150 TileOps in the graph that
+        was the dominant tune-mode cost. Per-cap caching is sound because
+        :class:`Context` is frozen and the score is a pure function of
+        ``(self, cap)``.
         """
         from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
 
@@ -1531,10 +1633,11 @@ class TileOp(BodyOp):
             knobs=self.knobs,
             has_stages=has_stages,
             coalescing_inner_extent=self._coalescing_inner_extent(thread_axes),
+            smem_cap_bytes=smem_cap,
         )
 
     @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004
+    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004 — knobs reserved for symmetry with Op.lazy_score
         """Lazy scorer (see :meth:`Op.lazy_score`). Returns ``None`` unless
         called with both ``shapes`` (a :class:`KernelShape` from the
         partition planner) and ``params`` (a :class:`TileParams` variant —
@@ -1604,7 +1707,17 @@ class TileOp(BodyOp):
             block_extents.append(max(1, E_N // per_n))
 
         # Planner always stamps FM/FN — score keys off ``"FM" in knobs``.
-        score_knobs = {"FM": p.fm, "FN": p.fn, "SPLITK": p.splitk}
+        # BM/BN/BK go in too so the macro-aspect + smem-fit signals see the
+        # planner's tile shape (post-materialization ``_cached_score`` reads
+        # ``self.knobs`` which already carries these; without them here the
+        # lazy_score path would silently fall back to BM=BN=1 defaults).
+        if is_warp:
+            score_knobs = {"FM": p.fm, "FN": p.fn, "SPLITK": p.splitk, "BK": p.bk}
+        else:
+            score_knobs = {
+                "FM": p.fm, "FN": p.fn, "SPLITK": p.splitk,
+                "BM": p.bm, "BN": p.bn, "BK": p.bk,
+            }
 
         # Stages are added by later passes (020_stage_inputs); the planner's
         # output never contains them at this point.
@@ -1612,12 +1725,21 @@ class TileOp(BodyOp):
 
         coalescing = TileOp._coalescing_inner_extent_from_writes(shape, p)
 
+        smem_cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
+        # Count distinct input buffers the loop body reads — score_tile_geometry's
+        # slab estimate is per-A+B (2 inputs); kernels that fuse more (SDPA-with-
+        # mask + RoPE = 4-6 inputs; gated MLP = 3 inputs) need the slab estimate
+        # bumped to match the per-iter smem footprint.
+        n_staged = _count_loop_input_buffers(shape)
+
         return score_tile_geometry(
             thread_extents=thread_extents,
             block_extents=block_extents,
             knobs=score_knobs,
             has_stages=has_stages,
             coalescing_inner_extent=coalescing,
+            smem_cap_bytes=smem_cap,
+            n_staged_inputs=n_staged,
         )
 
     @staticmethod

@@ -164,7 +164,16 @@ the producing Op class. The base implementation returns `None` (no
 lazy estimate available); callers fall back to constructing the op
 and calling `score(ctx)`. `TileOp.lazy_score` is the reference
 implementation — it consumes `KernelShape` + `TileParams` from the
-partition planner and replicates `TileOp.score`'s formula byte-for-byte.
+partition planner and matches `TileOp.score`'s formula
+( `score_tile_geometry`) on the launch-geometry + cells + coalescing
+keys. The smem-fit penalty needs the count of input buffers the kernel
+will stage, which `lazy_score` derives from `KernelShape` (walking
+`outer_m` / `extra_outer` / `prologue` for distinct `Load.input`); the
+post-materialization path defaults to 2 (plain A+B) when no shape is
+available, so the two scores can disagree by up to the smem-fit
+penalty's ±2.5 on SDPA-with-mask / RoPE-fused kernels. That asymmetry
+is acceptable because only the planner-time scorer drives sibling
+ordering; the post-materialization score is a sanity metric.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate

@@ -174,39 +174,33 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 
 
 def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
-    # Two-regime ordering keyed on per-CTA macro tile area (BM·FM × BN·FN cells).
-    # cuBLAS's SGEMM uses fat macro tiles (e.g. 256×128) with small BK (≤ 16) and
-    # a multi-stage ring buffer to amortize gmem latency under FMA. Skinny tiles
-    # (≤ 128×128 macro) instead amortize K-loop overhead by maxing BK and running
-    # one fat K-chunk per kernel iter.
+    # Tiebreaker for the enumeration sort. The Fork-tree builder re-sorts
+    # each level by ``score_tile_geometry`` (the MCTS prior) — see
+    # ``compiler/pipeline/fork_tree.py`` — so this ordering only affects
+    # ties within a score band.
     #
-    # The legacy single-regime tuple `(cells_clamped, threads_near_256, +bk,
-    # -splitk, -overhang)` ranks `+bk`, which pushes every BK=8 variant behind
-    # every BK=64 variant — the autotuner's patience exhausts on BK=64 leaves
-    # before the BK=8 + fat-tile region is reached (DB evidence: at 2048³ fp32
-    # 197 of 197 explored variants are BK=64).
-    #
-    # Fat-tile regime (macro area ≥ 8192 cells, i.e. 128×64 and up): rank by
-    # an explicit BK preference {16, 8, 32, 4, 64, 2, 1} that puts the cuBLAS-
-    # useful band first. BK=1/2 collapse the inner reduce to a degenerate one-
-    # or two-step loop with no benefit from staging or ring-buffering — and the
-    # -O1/-O3 ranking inversion makes them look artificially good during tuning
-    # (BK=1 at fat tiles ranks first by -O1 latency, then 1.5× worse at -O3).
-    # Skinny regime keeps BK descending (large BK amortizes K-loop overhead for
-    # small CTAs).
+    # Fat-tile regime (macro area ≥ 8192 cells): keep the explicit BK
+    # preference but flatten ``{16, 32, 8}`` to a near-tie — earlier tuning
+    # runs at 2048³ showed the golden's BK=32 was never visited under
+    # patience 200 because BK=16 alone (rank 6) drained the budget. The
+    # cuBLAS-band preference (16 first) was a per-shape coincidence, not a
+    # universal truth. BK=64 still demotes (cooperative-load granularity
+    # too coarse for fp32 lanes), BK=1/2 stay last (the K-loop collapses
+    # to ≤2 steps; the -O1/-O3 ranking inversion makes them look
+    # artificially fast during tuning).
     threads = p.bn * p.bm
     macro_area = p.bm * p.fm * p.bn * p.fn
     fat_tile = macro_area >= 8192
     if fat_tile:
-        _BK_FAT_PREF = {16: 6, 8: 5, 32: 4, 64: 3, 4: 2, 2: 1, 1: 0}
+        _BK_FAT_PREF = {16: 5, 32: 5, 8: 4, 64: 3, 4: 2, 2: 1, 1: 0}
         bk_key = _BK_FAT_PREF.get(p.bk, -1)
     else:
         bk_key = p.bk
     return (
         int(fat_tile),  # fat-tile variants surface first
-        min(p.fm * p.fn, 32),  # cells/thread, NVRTC-capped at 32
+        min(p.fm * p.fn, 128),  # cells/thread, capped at the register-tile sweet spot
         -abs(256 - threads),  # threads near 256
-        bk_key,  # cuBLAS-band BK first in fat regime, large BK otherwise
+        bk_key,  # cuBLAS-band BK tier, then large BK otherwise
         -p.splitk,
         -len(p.overhang),
     )
