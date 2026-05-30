@@ -53,7 +53,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TemplateAddressing, TileOp, affine_decode_per_dim
+from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TemplateAddressing, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -179,12 +179,11 @@ def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     if isinstance(src.addressing, TemplateAddressing):
         return src.addressing.exprs
     coord_for = {cd.axis.name: Var(cd.axis.name) for cd in src.cache_dims}
-    decoded = affine_decode_per_dim(
-        src.cache_axes,
-        tuple(cd.source_dim for cd in src.cache_dims),
-        coord_for,
-    )
-    return tuple((o + decoded[d]) if d in decoded else o for d, o in enumerate(src.origin))
+    # AffineAddressing.source_index threads ``block`` through the per-dim
+    # composite stride so MMA-strided sources revert to the same gmem σ
+    # the planner emitted. Scalar paths keep block=() and behave
+    # identically to the legacy decode call.
+    return src.addressing.source_index(src.cache_axes, coord_for, src.origin)
 
 
 def _revert_loads(body: Body, revert: dict[str, Source]) -> Body:
