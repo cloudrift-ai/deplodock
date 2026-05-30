@@ -176,10 +176,7 @@ def test_replicator_keeps_n_invariant_loads_once():
     # satisfies the equality, and (FM=2, FN=2) is the degenerate ``a·b == a+b``
     # boundary. Pin to (FM=4, FN=4) so the strict ``<`` assertion fires and
     # the test stays decoupled from sibling-ordering changes in the prior.
-    candidates = [
-        p for p in plan.params
-        if p.fm == 4 and p.fn == 4 and p.splitk == 1 and p.br == 1
-    ]
+    candidates = [p for p in plan.params if p.fm == 4 and p.fn == 4 and p.splitk == 1 and p.br == 1]
     assert candidates, "no FM=4, FN=4 variant enumerated for matmul"
     chosen = candidates[0]
     tile_op = planner._materialize(plan, chosen)
