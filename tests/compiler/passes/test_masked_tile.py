@@ -265,6 +265,72 @@ def test_masked_n_uses_interleaved_thread_minor_decode(recording_dump, monkeypat
     assert r_coeff is not None and r_coeff > 1, f"register cell should stride by BN>1, got t={t_coeff} r={r_coeff}"
 
 
+def test_masked_n_clamps_cooperative_load_index(recording_dump, monkeypatch):
+    """A masked (non-divisor) N tile that stages its weight must clamp the
+    cooperative gmem read to the buffer bounds.
+
+    Regression for ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked linear-projection
+    kernels (e.g. TinyLlama q/k/v at N=256 tiled 192-wide, or lm_head): the
+    output store is guarded by the boundary ``Cond``, but
+    ``021_hoist_staged_loads_above_mask`` lifts the cooperative load above
+    that guard so it runs for every thread — including the overhang columns
+    past the real N extent. Without a clamp the producer reads 1+ element
+    past the weight buffer. ``021`` now stamps ``Source.gmem_extents`` on the
+    hoisted affine sources and ``_stage_expand.emit_stage`` clamps each gmem
+    index dim to ``[0, extent)``.
+
+    Asserts the rendered weight read carries the clamp ternary
+    (``... < 47 ? ... : 46``) — the N source dim clamped to its extent.
+    """
+    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+
+    # Pin a masked-N tile with a K-loop big enough to stage the weight.
+    for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    g = Graph()
+    # K=2048 so the weight stages (the K-loop reduction makes smem pay); N=47
+    # is prime → masked, tiled at BN·FN=32 → the boundary tile spans [32, 64).
+    _input(g, "a", (256, 2048))
+    _input(g, "b", (2048, 47))
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (256, 47)), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    kop = out.nodes["o"].op
+    tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
+    src = render_kernelop(kop, tensors=tensors)
+
+    # The weight 'b' [2048, 47] is the masked-N operand. Its staged cooperative
+    # load must clamp the N coord to < 47 (the extent), falling back to 46.
+    # The clamp renders as ``(<n-expr> < 47) ? (<n-expr>) : (46)``.
+    assert "&b[" in src, f"weight 'b' should be staged (cooperative load present):\n{src}"
+    assert "< 47) ?" in src, f"masked cooperative load missing N-extent clamp ternary:\n{src}"
+    assert ": (46)" in src, f"masked clamp should fall back to extent-1 (46):\n{src}"
+
+
+def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatch):
+    """A clean-divisor N tile never overhangs, so ``021`` leaves
+    ``Source.gmem_extents`` unset and the cooperative load carries no clamp
+    ternary — no perf cost on the common (non-masked) staging path."""
+    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+
+    for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    g = Graph()
+    _input(g, "a", (256, 2048))
+    _input(g, "b", (2048, 64))  # N=64: clean divisor → not masked
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (256, 64)), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    kop = out.nodes["o"].op
+    tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
+    src = render_kernelop(kop, tensors=tensors)
+    # Clean divisor → no masked boundary Cond → 021 doesn't fire → no
+    # gmem_extents stamped → no clamp ternary referencing the N extent (64).
+    assert "< 64) ?" not in src, f"clean-divisor tile should not clamp the cooperative load:\n{src}"
+
+
 def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
     """A clean-divisor N tile keeps the blocked (thread-major) decode so a
     thread's FN cells stay contiguous (vectorizable / smem-conflict-free):
