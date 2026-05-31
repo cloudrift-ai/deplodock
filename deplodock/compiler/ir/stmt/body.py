@@ -506,7 +506,7 @@ class Body(tuple[Stmt, ...]):
         # generically via ``Stmt.local_decls`` so no kernel-IR import
         # is needed.
         from deplodock.compiler.ir.stmt.leaves import Accum, Write  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+        from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, ThreadTile  # noqa: PLC0415
 
         block_axes: set[str] = set()
         thread_axes: set[str] = set()
@@ -516,7 +516,13 @@ class Body(tuple[Stmt, ...]):
 
         for s in self.iter():
             staging_buffers.update(s.local_decls())
-            if isinstance(s, GridTile):
+            # PersistentTile (Stream-K) binds the same block axes as a GridTile —
+            # just decoded from a per-CTA work-loop variable instead of
+            # blockIdx. Counting its axes here is what makes split-K's atomicAdd
+            # survive the persistent rewrite: a split-K K_s axis missing from the
+            # output Write's index ⇒ atomic_axes={K_s} ⇒ atomicAdd into the
+            # (pre-zeroed) output, exactly as for a GridTile split-K.
+            if isinstance(s, (GridTile, PersistentTile)):
                 block_axes.update(ax.name for ax in s.axes)
             elif isinstance(s, ThreadTile):
                 thread_axes.update(ax.name for ax in s.axes)
