@@ -23,7 +23,8 @@ correctness, or performance below what the request implies. These rules OVERRIDE
   exists, name the blocker — not a vague "this is hard."
 - **Don't interrupt work.** User knows when to pause the work and review the changes. Do not stop and interrupt the work
   for a review, or to split the work in multiple sessions. Do not split the work into multiple PRs — users knows exactly
-  how big of a chunk to request.
+  how big of a chunk to request. Do not request user to review the work — user knows exactly when to review. Do not
+  introduce any other checkpoints that interrupt your work.
 
 Take as much time as you need to implement the full scope of the request. Don't negotiate scope reduction even if you
 risk running out of context or afraid of failure due to other reasons.
