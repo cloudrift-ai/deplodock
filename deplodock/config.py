@@ -50,8 +50,8 @@ def knob_var(name: str) -> str:
     """The ``DEPLODOCK_<NAME>`` env-var key for a knob named ``name``.
 
     Sole place the knob-name → env-var join lives. Used by
-    :class:`~deplodock.compiler.pipeline.knob.Knob` (via ``Knob.env``), the
-    ``DEPLODOCK_KNOBS`` splat, and ``compiler/tuning.py``'s literal knob reads."""
+    :class:`~deplodock.compiler.pipeline.knob.Knob` (via ``Knob.env``) and the
+    ``DEPLODOCK_KNOBS`` splat."""
     return f"{PREFIX}{name.upper()}"
 
 
@@ -188,36 +188,12 @@ def ncu_child() -> bool:
     return _bool(NCU_CHILD)
 
 
-def tma_swizzle_enabled() -> bool:
-    """``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes."""
-    return _bool(knob_var("tma_swizzle"))
-
-
-# Allowed values for the CTA-swizzle group size. ``1`` is the no-op (row-major
-# decode); ``8`` is the Triton/CUTLASS default the swizzle pass stamps.
-_GROUP_M_ALLOWED = (1, 2, 4, 8, 16)
-_GROUP_M_DEFAULT = 8
-
-
-def group_m() -> int:
-    """``DEPLODOCK_GROUP_M`` — CTA-swizzle row-group size used by
-    ``compiler/pipeline/passes/lowering/tile/025_swizzle_blocks.py``.
-
-    ``1`` disables the swizzle (renderer falls back to row-major decode).
-    Unset → ``8`` (Triton/CUTLASS default). Garbage and out-of-set values
-    raise ``ValueError`` so a typo doesn't silently degrade matmul perf.
-    Reads :func:`knob_var` so it shares the ``DEPLODOCK_KNOBS`` splat path
-    with the rest of the planner knobs."""
-    raw = knob_raw("GROUP_M")
-    if raw is None or raw == "":
-        return _GROUP_M_DEFAULT
-    try:
-        v = int(raw)
-    except ValueError as e:
-        raise ValueError(f"DEPLODOCK_GROUP_M must be one of {_GROUP_M_ALLOWED}, got {raw!r}") from e
-    if v not in _GROUP_M_ALLOWED:
-        raise ValueError(f"DEPLODOCK_GROUP_M must be one of {_GROUP_M_ALLOWED}, got {v}")
-    return v
+# Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) and
+# ``DEPLODOCK_TMA_SWIZZLE`` (TMA hardware-swizzle opt-in) used to live here as
+# bespoke getters. They are now real ``Knob`` descriptors in their owning rules
+# (``025_swizzle_blocks.py`` / ``compiler/tuning.py``) so they show up in
+# ``deplodock knobs`` and read through the descriptor's env path. Env access
+# still routes through this module's ``knob_raw`` / ``int_env`` primitives.
 
 
 # --- Setters (write os.environ so subprocesses inherit) --------------------
