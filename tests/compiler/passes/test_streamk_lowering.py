@@ -18,7 +18,7 @@ from deplodock.compiler.ir.cuda.ir import STREAMK_NUM_SMS
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.kernel.ir import KernelOp
 from deplodock.compiler.ir.stmt import Body, Load, Write
-from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, RegisterTile, ThreadTile, TileOp
+from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, ThreadTile, TileOp
 
 lower = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.cuda.010_lower_kernelop")
 program = importlib.import_module("deplodock.compiler.backend.cuda.program")
@@ -88,14 +88,16 @@ def test_streamk_ranges_two_waves():
     assert ends[-1] == 340
 
 
-def _matmul_tileop(m_b: int, n_b: int) -> TileOp:
-    # Write indexes both block axes (m_b, n_b) so coordination sees no atomic
-    # axis — a plain non-split matmul (find_split_k_axis_name → None).
+def _matmul_tileop(m_b: int, n_b: int, k_blocks: int = 4) -> TileOp:
+    # A minimal matmul shape: a serial_outer chunked-K loop (so _k_blocks finds
+    # it) feeding an accumulator, then a Write indexing both block axes (so
+    # coordination sees no atomic axis — plain non-split matmul). No AsyncWait →
+    # not pipelined, so the adaptive transform applies.
+    from deplodock.compiler.ir.tile.ir import Accum, SerialTile
+
+    kloop = SerialTile(axis=Axis("k_o", k_blocks), body=Body((Accum(name="acc", value="v"),)), kind="serial_outer")
     write = Write(output="C", index=(Var("m_b"), Var("n_b")), value="acc")
-    inner = ThreadTile(
-        axes=(Axis("m_t", 16), Axis("n_t", 16)),
-        body=Body((RegisterTile(axes=(Axis("m_r", 1),), body=Body((write,))),)),
-    )
+    inner = ThreadTile(axes=(Axis("m_t", 16), Axis("n_t", 16)), body=Body((kloop, write)))
     grid = GridTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)))
     return TileOp(body=Body((grid,)), name="k_matmul", knobs={"FM": 1, "FN": 1, "BM": 16, "BN": 16})
 

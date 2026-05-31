@@ -67,7 +67,11 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
     seen_atomic: set[str] = set()
     output_set = set(root.op.outputs)
     for s in escape.writes:
-        if escape.atomic_axes(s) and s.output in output_set and s.output not in seen_atomic:
+        # Atomic via the structural block-axis signal (legacy split-K) OR the
+        # explicit ``Write.atomic`` flag (Stream-K boundary partials, gated by a
+        # runtime branch the coordination rule can't see). Either way the output
+        # must be pre-zeroed so per-CTA partials accumulate from zero.
+        if (escape.atomic_axes(s) or s.atomic) and s.output in output_set and s.output not in seen_atomic:
             seen_atomic.add(s.output)
             atomic_outputs.append(s.output)
     # Stream-K work-range arrays are two ``const int*`` params slotted after the
