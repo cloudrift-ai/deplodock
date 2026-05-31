@@ -1799,9 +1799,9 @@ class TileOp(BodyOp):
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
-        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile, WarpTile)))
+        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, PersistentTile, ThreadTile, WarpTile)))
         if n_tiles > 1:
-            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile/WarpTile, got {n_tiles}")
+            raise ValueError(f"TileOp.body must contain at most one outer GridTile/PersistentTile/ThreadTile/WarpTile, got {n_tiles}")
         # ThreadTile and WarpTile both bind threadIdx; mixing them inside one
         # body re-binds the same coord at two scopes. The outer-tile check
         # above already catches them at top level; this catches the
@@ -1825,7 +1825,7 @@ class TileOp(BodyOp):
         block set is empty.
         """
         for s in self.body:
-            if isinstance(s, GridTile):
+            if isinstance(s, (GridTile, PersistentTile)):
                 block_axes = s.axes
                 for child in s.body:
                     if isinstance(child, ThreadTile):
@@ -1849,7 +1849,7 @@ class TileOp(BodyOp):
         ``thread_axes`` does.
         """
         for s in self.body:
-            if isinstance(s, GridTile):
+            if isinstance(s, (GridTile, PersistentTile)):
                 for child in s.body:
                     if isinstance(child, WarpTile):
                         return child.axes

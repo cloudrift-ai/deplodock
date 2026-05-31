@@ -316,10 +316,13 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
     - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
       since launch is flattened across blockIdx + threadIdx.
     """
-    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, ThreadTile, WarpTile  # noqa: PLC0415
 
     for s in kernel_op.body:
-        if isinstance(s, GridTile):
+        # PersistentTile (Stream-K) carries the same inner ThreadTile as a
+        # GridTile — the per-CTA thread count is identical; only the grid
+        # (num_sms vs tile count) differs, which launch bounds don't encode.
+        if isinstance(s, (GridTile, PersistentTile)):
             for child in s.body:
                 if isinstance(child, ThreadTile):
                     bsize = 1

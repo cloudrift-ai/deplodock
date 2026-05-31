@@ -1,0 +1,91 @@
+"""Persistent-CTA Stream-K matmul scheduling (atomic variant) — wrapper swap.
+
+Forks a matmul ``GridTile`` into a ``PersistentTile``: instead of one CTA per
+output tile (``M_blocks · N_blocks`` CTAs, a fractional last wave that idles the
+tail SMs), launch exactly ``num_sms`` CTAs and have each walk a contiguous range
+of tile-work units. This kills the wave-quantization tail at compute-bound
+matmul sizes (see ``plans/persistent-cta-streamk.md``).
+
+**Why this runs as a late KERNEL pass (098), not at tile-018 as the plan
+sketched.** This is the *atomic* variant: the rewrite is a pure launch-geometry
+swap of the outer wrapper — every scheduling decision (smem, ring buffers, TMA,
+cp.async, pipelining, swizzle, register-tile flattening, Init placement) is
+already baked into the ``GridTile.body`` by the tile passes (020–090) AND the
+kernel passes (005–095: register-axis split, sibling-cell fuse, Init hoist,
+vectorize, interleave). Running before those ``GridTile``-keyed kernel passes
+(register-tile flattening, ``020_place_inits``, …) would leave them skipping the
+``PersistentTile`` body, so the inner ``RegisterTile`` would reach
+``100_materialize`` unflattened and ``partition_tma_groups`` would miss the
+staged loads. Running here — after 095_interleave_loads, just before
+100_materialize — the body is fully lowered and flat; we carry it verbatim and
+teach only the materializer + launch-bounds about ``PersistentTile``. Smem decls
+hoisted into the body land inside the per-CTA work loop, which is legal CUDA
+(static alloc, reused per tile); ``Sync`` / mbarrier ops fire per-K-iteration, so
+re-entering the K-loop per tile is correct.
+
+**M3 scope — full tiles, one owner per tile, no atomics.** Each work unit is a
+whole output tile (full K-loop), so every tile is written by exactly one CTA and
+the output ``Write`` stays a plain store. The K-split boundary handling (work in
+MAC units, partial K-loops, ``atomicAdd`` into a pre-zeroed output) lands in M4.
+
+Mutually exclusive with split-K (both split the K reduction across CTAs): the
+rule self-skips when a split-K axis is present. Swizzle (``swizzle_group_m``) is
+dropped by the swap for now — persistent CTAs walk tiles in work-range order, so
+the L2 swizzle story differs; revisit when tuning the schedule.
+"""
+
+from __future__ import annotations
+
+from deplodock.compiler.context import Context
+from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, TileOp
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import STREAMK
+from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import find_split_k_axis_name
+
+PATTERN = [Pattern("root", TileOp)]
+
+
+def _outer_grid(op: TileOp) -> GridTile | None:
+    """The single outermost ``GridTile`` of ``op``, or ``None``."""
+    for s in op.body:
+        if isinstance(s, GridTile):
+            return s
+    return None
+
+
+def rewrite(ctx: Context, match: Match, root) -> list[TileOp] | None:  # noqa: ARG001 — match required by dispatch
+    op: TileOp = root.op
+    if STREAMK.name in op.knobs:
+        raise RuleSkipped("STREAMK already pinned (idempotence)")
+    # Compile-time shape gate: Stream-K needs a live SM count to size the grid.
+    if ctx.num_sms <= 0:
+        raise RuleSkipped("no live SM count — Stream-K is a live-device perf fork")
+    grid = _outer_grid(op)
+    if grid is None:
+        raise RuleSkipped("no outer GridTile (pointwise / already persistent)")
+    # Matmul register-tile shape: a 2-D block grid carrying the FM cell knob.
+    # Pointwise / cooperative-reduce kernels don't qualify (single block axis or
+    # no FM), and masking the wave tail there isn't the lever.
+    if len(grid.axes) < 2 or "FM" not in op.knobs:
+        raise RuleSkipped("not a 2-D matmul block grid")
+    if find_split_k_axis_name(op) is not None:
+        raise RuleSkipped("split-K present — mutually exclusive with Stream-K")
+
+    candidates = STREAMK.narrow(STREAMK.hints)
+    if not candidates:
+        raise RuleSkipped("STREAMK pin matches no candidate")
+
+    variants: list[TileOp] = []
+    for use_streamk in candidates:
+        if not use_streamk:
+            # Off: structurally identical, tagged so the cache key + idempotence
+            # distinguish it. False first → greedy default keeps the GridTile.
+            variants.append(TileOp(body=op.body, name=op.name, knobs={**op.knobs, STREAMK.name: False}))
+            continue
+        # On: swap the GridTile wrapper for a PersistentTile carrying the same
+        # block axes + body. Launch geometry (grid = num_sms) and the two
+        # work-range arrays are derived downstream in 010_lower_kernelop.
+        persistent = PersistentTile(axes=grid.axes, body=grid.body)
+        new_body = tuple(persistent if s is grid else s for s in op.body)
+        variants.append(TileOp(body=new_body, name=op.name, knobs={**op.knobs, STREAMK.name: True}))
+    return variants

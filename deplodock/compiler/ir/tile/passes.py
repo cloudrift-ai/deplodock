@@ -28,6 +28,7 @@ from deplodock.compiler.ir.tile.ir import (
     AtomTile,
     GridTile,
     ParallelTile,
+    PersistentTile,
     RegisterTile,
     SerialTile,
     Stage,
@@ -145,6 +146,18 @@ def _(s: GridTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: GridTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
+def _(s: PersistentTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # _parallel_rewrite uses dataclasses.replace, preserving work_start /
+    # work_end / work_var.
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: PersistentTile, ctx: SimplifyCtx) -> Stmt:
     return _parallel_simplify(s, ctx)
 
 
