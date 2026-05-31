@@ -771,6 +771,14 @@ class GridTile(ParallelTile):
         return out
 
 
+# Reserved decode-variable names the *adaptive* (Stream-K Phase B) PersistentTile
+# render binds at the top of each MAC-segment iteration; the body's partial
+# K-loop (a ``StridedTile`` with ``start``/``stop``) and its full-vs-partial
+# write branch reference these by name.
+STREAMK_K_LO = "streamk_k_lo"
+STREAMK_K_HI = "streamk_k_hi"
+
+
 @dataclass(frozen=True)
 class PersistentTile(ParallelTile):
     """Persistent-CTA grid for Stream-K matmul scheduling.
@@ -806,13 +814,31 @@ class PersistentTile(ParallelTile):
     work_start: str = "streamk_work_start"
     work_end: str = "streamk_work_end"
     work_var: str = "tile_iter"
+    # ``None`` ⇒ tile-parallel walk (one whole tile per work unit, perf-neutral).
+    # An int ``K_blocks`` (the K-loop trip count) ⇒ the **adaptive** Stream-K walk:
+    # work units are ``(tile, K-chunk)`` MAC units, a CTA walks a contiguous slice
+    # tile-segment by tile-segment, runs a runtime-bounded partial K-loop over
+    # ``[streamk_k_lo, streamk_k_hi)``, and writes full tiles directly / boundary
+    # partials to scratch. Mirrors ``kernel/_streamk.cta_segments``.
+    k_blocks: int | None = None
+
+    @property
+    def adaptive(self) -> bool:
+        return self.k_blocks is not None
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return PersistentTile(axes=self.axes, body=body, work_start=self.work_start, work_end=self.work_end, work_var=self.work_var)
+        return PersistentTile(
+            axes=self.axes,
+            body=body,
+            work_start=self.work_start,
+            work_end=self.work_end,
+            work_var=self.work_var,
+            k_blocks=self.k_blocks,
+        )
 
     def _pretty_label(self) -> str:
-        return "persistent[num_sms]"
+        return f"persistent[num_sms] streamk K_blocks={self.k_blocks}" if self.adaptive else "persistent[num_sms]"
 
     def deps(self) -> tuple[str, ...]:
         # The two work-range arrays are read at the top of every CTA; declaring
@@ -820,13 +846,17 @@ class PersistentTile(ParallelTile):
         return (self.work_start, self.work_end)
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """Per-CTA work-range loop + row-major block-axis decode + body.
+        """Per-CTA work-range loop + block-axis decode + body.
 
-        The inner ``ThreadTile`` renders its threadIdx decode under
-        ``inside_grid_tile=True`` (cooperative form, no linear-tid guard) — the
-        surrounding ``__global__`` supplies the thread context; the work-range
-        ``for`` supplies the brace level the body indents under.
+        Tile-parallel: a ``for`` over tile-work units, row-major block decode off
+        the loop var. Adaptive (Stream-K): a ``while`` over a MAC-unit slice,
+        decoding ``(tile, k_lo, k_hi)`` per segment (``kernel/_streamk`` walk) and
+        advancing by the segment length. The inner ``ThreadTile`` renders its
+        threadIdx decode under ``inside_grid_tile=True`` (cooperative form, no
+        linear-tid guard); the work loop supplies the brace level.
         """
+        if self.adaptive:
+            return self._render_adaptive(ctx)
         pad = _pad(ctx.indent)
         out = [
             f"{pad}int __wbeg = {self.work_start}[blockIdx.x];",
@@ -836,6 +866,41 @@ class PersistentTile(ParallelTile):
         inner = replace(ctx.child(), inside_grid_tile=True)
         out.extend(_render_grid_axis_decode(self.axes, self.work_var, inner))
         out.extend(_render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
+
+    def _render_adaptive(self, ctx: RenderCtx) -> list[str]:
+        """Emit the adaptive MAC-segment walk (``kernel/_streamk.cta_segments``):
+
+        int __mac = work_start[blockIdx.x]; int __wend = work_end[blockIdx.x];
+        while (__mac < __wend) {
+            int __tile = __mac / K_blocks;
+            int streamk_k_lo = __mac % K_blocks;
+            <row-major block-axis decode from __tile>   // binds M_b, N_b
+            int __tile_end = __mac - streamk_k_lo + K_blocks;
+            int __seg_end = (__wend < __tile_end) ? __wend : __tile_end;
+            int streamk_k_hi = streamk_k_lo + (__seg_end - __mac);
+            <body>      // partial K-loop over [k_lo,k_hi); full→output / partial→scratch
+            __mac = __seg_end;
+        }
+        """
+        kb = self.k_blocks
+        pad = _pad(ctx.indent)
+        out = [
+            f"{pad}int __mac = {self.work_start}[blockIdx.x];",
+            f"{pad}int __wend = {self.work_end}[blockIdx.x];",
+            f"{pad}while (__mac < __wend) {{",
+        ]
+        inner = replace(ctx.child(), inside_grid_tile=True)
+        ipad = _pad(inner.indent)
+        out.append(f"{ipad}int __tile = __mac / {kb};")
+        out.append(f"{ipad}int {STREAMK_K_LO} = __mac % {kb};")
+        out.extend(_render_grid_axis_decode(self.axes, "__tile", inner))
+        out.append(f"{ipad}int __tile_end = __mac - {STREAMK_K_LO} + {kb};")
+        out.append(f"{ipad}int __seg_end = (__wend < __tile_end) ? __wend : __tile_end;")
+        out.append(f"{ipad}int {STREAMK_K_HI} = {STREAMK_K_LO} + (__seg_end - __mac);")
+        out.extend(_render_body(self.body, inner))
+        out.append(f"{ipad}__mac = __seg_end;")
         out.append(f"{pad}}}")
         return out
 
@@ -2208,6 +2273,8 @@ __all__ = [
     "ParallelTile",
     "GridTile",
     "PersistentTile",
+    "STREAMK_K_LO",
+    "STREAMK_K_HI",
     "ThreadTile",
     "RegisterTile",
     "WarpTile",

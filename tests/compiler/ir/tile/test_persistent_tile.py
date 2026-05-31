@@ -147,3 +147,77 @@ def test_strided_with_bodies_preserves_stop():
 def test_strided_runtime_stop_round_trips():
     st = _strided(stop=Var("k_hi"))
     assert _eval_stmt(repr(st)) == st
+
+
+# ---------------------------------------------------------------------------
+# Adaptive PersistentTile render (Stream-K Phase B3a): the MAC-segment walk
+# that implements kernel/_streamk.cta_segments in CUDA — a while-loop over the
+# CTA's MAC slice, per-segment decode of (tile, k_lo, k_hi), a runtime-bounded
+# partial K-loop, and a full-vs-partial write branch.
+# ---------------------------------------------------------------------------
+
+
+def _adaptive(k_blocks=4):
+    from deplodock.compiler.ir.expr import BinaryExpr
+    from deplodock.compiler.ir.tile.ir import STREAMK_K_HI, STREAMK_K_LO, Cond, StridedTile
+
+    kloop = StridedTile(
+        axis=Axis("k_o", k_blocks),
+        body=Body((Accum(name="acc", value="v"),)),
+        start=Var(STREAMK_K_LO),
+        step=Literal(1, "int"),
+        stop=Var(STREAMK_K_HI),
+    )
+    is_full = BinaryExpr(
+        "&&",
+        BinaryExpr("==", Var(STREAMK_K_LO), Literal(0, "int")),
+        BinaryExpr("==", Var(STREAMK_K_HI), Literal(k_blocks, "int")),
+    )
+    branch = Cond(
+        cond=is_full,
+        body=Body((Write(output="C", index=(Var("m_b"), Var("n_b")), value="acc"),)),
+        else_body=Body((Write(output="scratch", index=(Var("m_b"), Var("n_b")), value="acc"),)),
+    )
+    inner = ThreadTile(axes=(Axis("m_t", 16), Axis("n_t", 16)), body=Body((kloop, branch)))
+    return PersistentTile(axes=(Axis("m_b", 8), Axis("n_b", 4)), body=Body((inner,)), k_blocks=k_blocks)
+
+
+def test_adaptive_renders_mac_segment_walk():
+    src = "\n".join(_adaptive(k_blocks=4).render(RenderCtx(indent=0)))
+    # MAC-walk over the CTA's slice, advancing by segment length.
+    assert "int __mac = streamk_work_start[blockIdx.x];" in src
+    assert "while (__mac < __wend) {" in src
+    assert "__mac = __seg_end;" in src
+    # Per-segment decode (kernel/_streamk: tile_id = mac//K_blocks, k_lo = mac%K_blocks).
+    assert "int __tile = __mac / 4;" in src
+    assert "int streamk_k_lo = __mac % 4;" in src
+    assert "int __tile_end = __mac - streamk_k_lo + 4;" in src
+    assert "int __seg_end = (__wend < __tile_end) ? __wend : __tile_end;" in src
+    assert "int streamk_k_hi = streamk_k_lo + (__seg_end - __mac);" in src
+    # Block axes decode off __tile (not blockIdx, not a fixed tile_iter).
+    assert "int m_b = __tile / (4);" in src
+    assert "int n_b = __tile % 4;" in src
+
+
+def test_adaptive_partial_k_loop_and_write_branch():
+    src = "\n".join(_adaptive(k_blocks=4).render(RenderCtx(indent=0)))
+    # Runtime-bounded partial K-loop over [k_lo, k_hi).
+    assert "for (int k_o = streamk_k_lo; k_o < streamk_k_hi; k_o += 1) {" in src
+    # Full tile → output; boundary partial → scratch.
+    assert "if (streamk_k_lo == 0 && streamk_k_hi == 4) {" in src
+    assert "C[m_b + n_b] = acc;" in src
+    assert "scratch[m_b + n_b] = acc;" in src
+
+
+def test_adaptive_property_and_default_is_tile_parallel():
+    assert _adaptive().adaptive is True
+    assert _persistent().adaptive is False  # k_blocks=None default
+    # tile-parallel render keeps the plain for-loop, no MAC-walk.
+    assert "while (__mac" not in _render(_persistent())
+
+
+def test_adaptive_with_bodies_and_round_trip_preserve_k_blocks():
+    pt = _adaptive(k_blocks=8)
+    pt2 = pt.with_bodies((pt.body,))
+    assert pt2.k_blocks == 8 and pt2.adaptive
+    assert _eval_stmt(repr(pt)).k_blocks == 8

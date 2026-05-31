@@ -151,9 +151,11 @@ def _launch_geometry(
             # Stream-K: grid = num_sms (live, resolved via STREAMK_NUM_SMS at
             # launch). Block threads come from the inner ThreadTile, exactly as
             # for a GridTile. Total work units = product of the persistent
-            # block-axis extents (the tile grid the CTAs partition). Today all
-            # static (matmul M_b·N_b); a symbolic axis here would need a runtime
-            # unit count, out of scope until dynamic-shape Stream-K.
+            # block-axis extents (the tile grid the CTAs partition), times
+            # ``k_blocks`` in adaptive mode (units are (tile, K-chunk) MAC units,
+            # not whole tiles). Today all static (matmul M_b·N_b[·K_blocks]); a
+            # symbolic axis here would need a runtime unit count, out of scope
+            # until dynamic-shape Stream-K.
             from math import prod  # noqa: PLC0415
 
             block_spec: GridDimSpec = (1,)
@@ -162,6 +164,8 @@ def _launch_geometry(
                     block_spec = _axes_spec(child.axes)
                     break
             total_units = max(prod(a.extent.as_static() for a in s.axes), 1)
+            if s.k_blocks is not None:
+                total_units *= s.k_blocks
             streamk: StreamKMeta = (s.work_start, s.work_end, total_units)
             return ((STREAMK_NUM_SMS,), (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen), streamk
         if isinstance(s, GridTile):
