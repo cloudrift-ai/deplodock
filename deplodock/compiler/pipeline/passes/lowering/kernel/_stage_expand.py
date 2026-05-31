@@ -16,7 +16,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import Stage, StagePolicy, TemplateAddressing
+from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, StagePolicy, TemplateAddressing
 
 
 def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | None
@@ -66,33 +66,63 @@ def emit_stage(
         cache_axes = src.cache_axes
         if not cache_axes:
             raise ValueError(f"Source {src.name!r} has no cache axes")
-        extents = tuple(ax.extent.as_static() for ax in cache_axes)
         padded_extents = src.alloc_extents
+        # M3+: a blocked source's slab is sized by ``alloc_extents`` (cache
+        # extent × per-axis block factor). The cooperative producer must
+        # fill *every* slab position, so the flat-iter axis spans the
+        # block-scaled total and the per-axis decode resolves into
+        # ``0..alloc_extent_i`` (raw slab coords) rather than the bare
+        # cache-extent range. Source-side stride collapses to 1 once the
+        # iteration covers the full block, so we bypass
+        # ``AffineAddressing.source_index`` for the producer and emit
+        # ``origin + slab_coord`` directly.
+        addressing = src.addressing
+        is_blocked = isinstance(addressing, AffineAddressing) and bool(addressing.block)
+        if is_blocked:
+            iter_extents = tuple(ax.extent.as_static() * b for ax, b in zip(cache_axes, addressing.block, strict=True))
+        else:
+            iter_extents = tuple(ax.extent.as_static() for ax in cache_axes)
         total = 1
-        for e in extents:
+        for e in iter_extents:
             total *= e
         iter_axis = Axis(name=f"{src.name}_flat", extent=total)
-        if len(cache_axes) == 1:
+        if is_blocked:
+            # Block-aware flat decode: each cache axis is treated as if
+            # its extent were the block-scaled value, so the decoded
+            # coords land in the raw slab range.
+            scaled_axes = tuple(Axis(name=ax.name, extent=e) for ax, e in zip(cache_axes, iter_extents, strict=True))
+            coord_for = flat_decode(scaled_axes, iter_axis.name) if len(scaled_axes) > 1 else {scaled_axes[0].name: Var(iter_axis.name)}
+        elif len(cache_axes) == 1:
             coord_for = {cache_axes[0].name: Var(iter_axis.name)}
         else:
             coord_for = flat_decode(cache_axes, iter_axis.name)
         smem_index = tuple(coord_for[ax.name] for ax in cache_axes)
         # Per-source source-index reconstruction.
-        addressing = src.addressing
         if isinstance(addressing, TemplateAddressing):
             from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
 
             cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in cache_axes})
             source_index = tuple(cache_sigma.apply(e) for e in addressing.exprs)
+        elif is_blocked:
+            # Per-source-dim: row-major composite over the slab-coord
+            # cache vars (block already absorbed by the iter range; the
+            # composite stride here is the *block-scaled* extents).
+            # ``affine_decode_per_dim`` with ``block=()`` and the
+            # block-scaled axes does exactly that.
+            from deplodock.compiler.ir.tile.ir import affine_decode_per_dim as _decode  # noqa: PLC0415
+
+            decoded_per_dim = _decode(scaled_axes, addressing.dims, coord_for)
+            source_index = tuple(
+                src.origin[d] + decoded_per_dim[d] if d in decoded_per_dim else src.origin[d] for d in range(len(src.origin))
+            )
         else:
             # Per source dim: composite-decode the cache axes mapping to
-            # it (see ``affine_decode_per_dim`` for the multi-axis
-            # composite-stride formula shared across producers, the
-            # unify-pass gmem revert, and the IR pretty-print).
-            from deplodock.compiler.ir.tile.ir import affine_decode_per_dim  # noqa: PLC0415
-
-            decoded_per_dim = affine_decode_per_dim(cache_axes, addressing.dims, coord_for)
-            source_index = tuple(o if d not in decoded_per_dim else o + decoded_per_dim[d] for d, o in enumerate(src.origin))
+            # it. ``AffineAddressing.source_index`` threads
+            # ``addressing.block`` through ``affine_decode_per_dim`` so
+            # MMA atom-strided slabs (block != ()) get the right per-axis
+            # stride. Scalar paths keep block=(), behavior identical to
+            # pre-M4.
+            source_index = addressing.source_index(cache_axes, coord_for, src.origin)
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).
         if is_buffered:

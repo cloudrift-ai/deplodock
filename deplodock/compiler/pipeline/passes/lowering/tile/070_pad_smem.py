@@ -62,6 +62,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
+    AffineAddressing,
     Source,
     StageBundle,
     StagePolicy,
@@ -150,6 +151,15 @@ def _plan_for_bundle(bundle: StageBundle, plan: dict[int, dict[str, tuple[int, .
     for stage in bundle.stages:
         for src in stage.sources:
             if src.pad and any(src.pad):
+                continue
+            # M7: a +1 pad on the inner cache axis breaks WMMA's
+            # ``ldmatrix`` 16-byte alignment, so block-stamped Sources
+            # (MMA atom-strided σ) must skip padding entirely. A future
+            # MMA-friendly swizzle (XOR-style row shuffle matching
+            # ldmatrix.x4) is the right answer; until then, leave the
+            # bundle un-padded.
+            addressing = src.addressing
+            if isinstance(addressing, AffineAddressing) and addressing.block:
                 continue
             loads = [s for s in bundle.body.iter() if isinstance(s, Load) and s.input == src.name]
             if not loads:

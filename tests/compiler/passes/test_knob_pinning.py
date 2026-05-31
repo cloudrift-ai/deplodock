@@ -166,6 +166,63 @@ def test_gated_mlp_single_cta_f_replicated(knobs: dict, monkeypatch):
     _assert_match(forced, ref)
 
 
+# Staged MMA regression for ``plans/mma-smem-staging.md`` M5. These
+# shapes pick a K-split (K_o > 1) under the planner's natural priors,
+# placing a SerialTile(K_o) between the AtomTile and the StageBundle
+# (which wraps SerialTile(K_i) > loads). The buggy pre-fix shape
+# emitted the lowered Mma chain with the bundle hoisted ABOVE K_o, but
+# the bundle's ``Source.origin`` references the K_o coord (e.g.
+# ``a[a0*16, a5*1024]``), so the kernel failed to compile with
+# ``identifier 'a5' is undefined``.
+#
+# ``test_matmul_mma``'s 16/64/128/256 squares all naturally pick
+# K_o = 1 (full K fits in one stage); we need an asymmetric M/N/K
+# shape with large K to force the K-split.
+_MMA_K_SPLIT_SHAPES: tuple[tuple[int, int, int], ...] = (
+    # (M, N, K). 2048³ matches the original reproducer from the
+    # ``deplodock run --bench`` investigation; smaller shapes fit
+    # K fully in one stage and the regression doesn't surface.
+    (2048, 2048, 2048),
+)
+
+
+@requires_cuda
+@pytest.mark.parametrize(("M", "N", "K"), _MMA_K_SPLIT_SHAPES, ids=lambda v: f"{v[0]}x{v[1]}x{v[2]}" if isinstance(v, tuple) else str(v))
+def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
+    """MMA-staged matmul with K_o > 1 — surfaces the
+    ``005_lower_atom_tile`` body-walk regression where the StageBundle
+    sits inside a K_o SerialTile inside the AtomTile. The lowered Mma
+    chain re-wraps with the bundle BETWEEN K_o and K_i so the producer
+    ``Source.origin`` (which references the K_o coord) renders in scope.
+    """
+    import numpy as np
+
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+
+    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=F16), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (K, N), dtype=F16), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("c", (M, N), dtype=F16), node_id="c")
+    g.inputs, g.outputs = ["a", "b"], ["c"]
+
+    rng = np.random.default_rng(0)
+    inputs = {
+        "a": (rng.standard_normal((M, K), dtype=np.float32) * 0.1).astype(np.float16),
+        "b": (rng.standard_normal((K, N), dtype=np.float32) * 0.1).astype(np.float16),
+    }
+    ref = (inputs["a"].astype(np.float32) @ inputs["b"].astype(np.float32)).astype(np.float16)
+    forced = _run_with_knobs(g, inputs, "c", {}, monkeypatch)
+    # Looser tolerance for fp16 acc on K=2048: the drift bound is
+    # ~K · max · f16-eps, and the 0.05-of-peak default isn't enough.
+    peak = float(np.max(np.abs(ref.astype(np.float32))))
+    atol = max(5e-1, 0.1 * peak)
+    np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
+
+
 # Regressions for the article-reproduction work (see plans + git log
 # for ``cab3c83e``, ``8940dc25``, the affine-collapse commit). Each row
 # pins a configuration that used to fail before a specific fix:

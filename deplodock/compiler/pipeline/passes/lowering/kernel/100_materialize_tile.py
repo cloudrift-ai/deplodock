@@ -165,7 +165,15 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         raise ValueError(f"{type(blk).__name__} must have at least one axis")
     is_warp = isinstance(blk, WarpTile)
     if is_warp:
-        tid_expr = _build_warp_id_expr(thread_axes)
+        # WarpTile-context cooperative loads need the per-LANE thread id so
+        # every lane in every warp picks a distinct slab position. Using
+        # the warp_id-only form fanned only one writer per warp and left
+        # 31/32 of the slab uninitialized (caught when M5's
+        # ``DEPLODOCK_MMA_STAGE_PROBE=1`` flipped on a staged-MMA matmul).
+        # ``Builtin("thread_idx.x")`` renders via ``ctx.builtins`` to the
+        # CUDA ``threadIdx.x`` spelling and stays opaque to numerical
+        # simplifiers.
+        tid_expr = Builtin("thread_idx.x")
         n_threads = 32
     else:
         tid_expr = _build_linear_tid(thread_axes)

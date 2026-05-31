@@ -283,9 +283,51 @@ class AffineAddressing:
 
     Common case (matmul, RMSNorm, softmax). Materialize reconstructs
     addresses without symbolic substitution.
+
+    ``block`` is a per-cache-dim structural multiplier. Default ``()``
+    means "all-1s, every cache var contributes coef-1 to its source dim"
+    — byte-identical to pre-M2 semantics. A non-trivial ``block`` (set
+    by ``020_stage_inputs._classify`` when the σ literal coefficient on
+    a cache var is > 1, e.g. the MMA ``atom_M`` / ``atom_K`` factor)
+    grows the slab and producer iteration range by ``block[i]`` per
+    cache dim while keeping the consumer cache vars at their original
+    extent. ``affine_decode_per_dim`` (M4) folds ``block[j]`` into the
+    composite stride so the per-source-dim index reconstruction matches
+    the planner's σ output.
     """
 
     dims: tuple[int, ...]
+    block: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.block:
+            return
+        if len(self.block) != len(self.dims):
+            raise ValueError(f"AffineAddressing.block length {len(self.block)} != dims length {len(self.dims)}")
+        for i, b in enumerate(self.block):
+            if not isinstance(b, int) or b < 1:
+                raise ValueError(f"AffineAddressing.block[{i}] must be int >= 1, got {b!r}")
+
+    def source_index(
+        self,
+        cache_axes: tuple[Axis, ...],
+        coord_for: dict[str, Expr],
+        origin: tuple[Expr, ...],
+    ) -> tuple[Expr, ...]:
+        """Build the per-source-dim index expression ``origin[d] + decoded[d]``
+        for the affine reconstruction.
+
+        Thin wrapper around :func:`affine_decode_per_dim` that threads
+        ``self.block`` through. Returns a tuple of length ``len(origin)``
+        with one Expr per source dim. Source dims not swept by any cache
+        axis carry only the origin term. This is the single source of
+        truth for ``_stage_expand`` (cooperative producer),
+        ``025_unify_sibling_stages._reconstruct_global_index``
+        (revert-to-gmem), and M5's ``005_lower_atom_tile`` (MMA fragment
+        load): each calls it with the appropriate ``coord_for`` mapping.
+        """
+        decoded = affine_decode_per_dim(cache_axes, self.dims, coord_for, block=self.block)
+        return tuple((origin_d + decoded[d]) if d in decoded else origin_d for d, origin_d in enumerate(origin))
 
 
 @dataclass(frozen=True)
@@ -331,16 +373,21 @@ class Source:
       slab layout in smem and how cache vars decode into source dims.
     - ``origin`` — per-source-dim CTA-uniform anchor. The cooperative
       load reads ``buf[origin[d] + cache_var(d)]`` (affine) or
-      ``buf[template_index[d]]`` (template).
+      ``buf[addressing.exprs[d]]`` (template).
     - ``pad`` — per-cache-axis bank-conflict-breaking pad. Empty = no
       pad. Padding affects smem allocation, not the cooperative-load
       iteration extent.
-    - ``addressing`` — affine when every cache axis appears coef-1 in
-      exactly one source dim; template when the consumer's original
-      Load was a collapsed-reshape and ``origin + decoded`` can't
-      reconstruct it. ``cache_dims`` carries the affine mapping (which
-      source_dim each cache axis maps to); ``template_index`` carries
-      the verbatim source-dim Exprs for the template case.
+    - ``addressing`` — stored ``AffineAddressing | TemplateAddressing``.
+      Affine when every cache axis appears coef-1 (``block=()``) or
+      coef-block (e.g. atom-strided MMA) in exactly one source dim;
+      template when the consumer's original Load was a collapsed-reshape
+      and ``origin + decoded`` can't reconstruct it. Defaults to
+      ``AffineAddressing(dims=tuple(cd.source_dim for cd in cache_dims))``
+      when omitted, so legacy construction sites that didn't specify
+      addressing keep their semantics. Pre-M2 this was a derived
+      property of ``cache_dims`` + ``template_index``; the refactor
+      collapses both addressing-mode payloads into the addressing object
+      so ``Source`` stays focused on slab identity / gmem anchor.
     - ``dtype`` — source buffer's element dtype. Stamped by
       ``030_stamp_types`` from ``graph.nodes[buf].output.dtype`` so smem
       allocation (``smem_bytes`` / ``alloc_extents``) and downstream
@@ -354,23 +401,42 @@ class Source:
     cache_dims: tuple[CacheDim, ...]
     origin: tuple[Expr, ...]
     pad: tuple[int, ...] = ()
-    template_index: tuple[Expr, ...] | None = None
+    addressing: AffineAddressing | TemplateAddressing | None = None
     dtype: DataType | None = None
+
+    def __post_init__(self) -> None:
+        # Default addressing: affine with dims pulled off cache_dims. The
+        # field is typed Optional only so the default sentinel can be
+        # ``None`` (a tuple-of-int default would require a frozen factory
+        # for the dims, which is awkward). Frozen-set via object.__setattr__.
+        if self.addressing is None:
+            object.__setattr__(
+                self,
+                "addressing",
+                AffineAddressing(dims=tuple(cd.source_dim for cd in self.cache_dims)),
+            )
 
     @property
     def cache_axes(self) -> tuple[Axis, ...]:
         return tuple(cd.axis for cd in self.cache_dims)
 
     @property
-    def addressing(self) -> AffineAddressing | TemplateAddressing:
-        if self.template_index is not None:
-            return TemplateAddressing(exprs=self.template_index)
-        return AffineAddressing(dims=tuple(cd.source_dim for cd in self.cache_dims))
-
-    @property
     def alloc_extents(self) -> tuple[int, ...]:
-        """Per-cache-axis smem allocation extent: cache extent + pad."""
+        """Per-cache-axis smem allocation extent: cache extent × block + pad.
+
+        For affine addressing with empty ``block``, returns the bare
+        cache extents (pre-M2 behavior). For affine with non-trivial
+        ``block`` (M3+ stamps it on atom-strided σ), each extent is
+        multiplied by ``block[i]`` so the slab holds the full per-cell
+        micro-tile. Pad is added last so a future MMA-friendly swizzle
+        could request padded slabs without re-deriving the block math.
+        """
         extents = tuple(ax.extent.as_static() for ax in self.cache_axes)
+        block: tuple[int, ...] = ()
+        if isinstance(self.addressing, AffineAddressing):
+            block = self.addressing.block
+        if block:
+            extents = tuple(e * b for e, b in zip(extents, block, strict=True))
         if not self.pad:
             return extents
         return tuple(e + p for e, p in zip(extents, self.pad, strict=True))
@@ -396,22 +462,28 @@ def affine_decode_per_dim(
     cache_axes: tuple[Axis, ...],
     dims: tuple[int, ...],
     coord_for: dict[str, Expr],
+    block: tuple[int, ...] = (),
 ) -> dict[int, Expr]:
     """Reconstruct the per-source-dim coord contribution from a set of
     cache axes that map to those source dims.
 
     For each source dim ``d``, the axes mapping to ``d`` form a composite
-    in most-significant-first order: ``ax_0·(e_1·e_2·…) + ax_1·(e_2·…) + … + ax_{k-1}·1``
-    where ``e_i`` is ``cache_axes[i].extent``. Each axis's coord (an Expr
-    from ``coord_for[ax.name]``) is scaled by the product of the extents
-    of the subsequent cache axes that ALSO map to dim ``d``, then summed
-    per dim.
+    in most-significant-first order: ``ax_0·(e_1·b_1·e_2·b_2·…·b_0) + … + ax_{k-1}·b_{k-1}``
+    where ``e_i`` is ``cache_axes[i].extent`` and ``b_i`` is ``block[i]``
+    (defaulting to 1 when ``block=()``). Each axis's coord (an Expr from
+    ``coord_for[ax.name]``) is scaled by the product of ``e_j · b_j`` for
+    the subsequent cache axes that ALSO map to dim ``d``, times its own
+    ``b_i``, then summed per dim.
 
-    Single-axis-per-dim collapses to a no-op (``stride = 1``, so the
-    coord is added verbatim). Multi-axis-per-dim (matmul N-side
-    ``BN_thread × FN_register`` collapse, M-side analogue) gets the
-    composite stride that mirrors the original ``load.index[d]`` shape
-    ``020_stage_inputs._derive_slab`` admitted as ``AffineAddressing``.
+    Single-axis-per-dim with ``block=()`` collapses to a no-op
+    (``stride = 1``, coord added verbatim). Multi-axis-per-dim (matmul
+    N-side ``BN_thread × FN_register`` collapse) gets the composite
+    stride that mirrors the original ``load.index[d]`` shape.
+    Non-trivial ``block`` (e.g. WMMA ``(1, atom_M, 1, atom_K)``) folds
+    each axis's atom multiplier into its own stride — the slab is sized
+    ``extent · block`` per axis, and the per-axis decode reads from
+    ``cache_var · block · stride_of_inner_axes`` so the σ output of an
+    atom-strided gmem Load round-trips through smem-stage and back.
 
     The previous shape — ``dict(zip(dims, coord_for))`` — silently
     OVERWROTE the entry when two cache axes shared a dim, keeping only
@@ -422,11 +494,15 @@ def affine_decode_per_dim(
     composite-stride formula consistent across all three sites.
     """
     out: dict[int, Expr] = {}
+    use_block = bool(block)
     for i, (ax, d) in enumerate(zip(cache_axes, dims, strict=True)):
         stride = 1
         for j in range(i + 1, len(cache_axes)):
             if dims[j] == d:
-                stride *= cache_axes[j].extent.as_static()
+                inner_factor = block[j] if use_block else 1
+                stride *= cache_axes[j].extent.as_static() * inner_factor
+        if use_block:
+            stride *= block[i]
         term: Expr = coord_for[ax.name] if stride == 1 else BinaryExpr("*", coord_for[ax.name], Literal(stride, "int"))
         out[d] = term if d not in out else BinaryExpr("+", out[d], term)
     return out
@@ -449,8 +525,7 @@ def trivial_stage_body(
     cache_index = tuple(Var(ax.name) for ax in axes)
     if isinstance(addressing, AffineAddressing):
         coord_for = {ax.name: cache_index[i] for i, ax in enumerate(axes)}
-        decoded = affine_decode_per_dim(axes, addressing.dims, coord_for)
-        src_index = tuple(o if d not in decoded else o + decoded[d] for d, o in enumerate(origin))
+        src_index = addressing.source_index(axes, coord_for, origin)
     else:
         src_index = addressing.exprs
     load_name = f"{name}__src"
@@ -472,8 +547,8 @@ def _source_pretty(src: Source) -> str:
     origin = ", ".join(e.pretty() for e in src.origin)
     pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
     tpl = ""
-    if src.template_index is not None:
-        tpl = " template=[" + ", ".join(e.pretty() for e in src.template_index) + "]"
+    if isinstance(src.addressing, TemplateAddressing):
+        tpl = " template=[" + ", ".join(e.pretty() for e in src.addressing.exprs) + "]"
     return f"{src.name}<-{src.buf}(origin=({origin}), slab=({cache})){pad}{tpl}"
 
 
@@ -481,35 +556,25 @@ def _source_decl_line(src: Source) -> str:
     """Render one ``Source`` as ``shared <name>[<cache_axes>] = <buf>[<source_index>];``.
 
     Cache axes show their extents (``a5:64, a3:16``). The source index
-    prefers the literal ``template_index`` when set (preserves explicit
-    stride math like ``a3*16 + a6``); otherwise reconstructs from
-    ``origin + decoded`` per affine addressing semantics.
+    prefers the literal ``TemplateAddressing.exprs`` when set (preserves
+    explicit stride math like ``a3*16 + a6``); otherwise reconstructs
+    from ``origin + decoded`` per affine addressing semantics.
 
     Trailing ``pad`` and stage-flavor suffixes are NOT appended here — the
     Stage subclasses prepend / postfix those at the call site.
     """
     cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in src.cache_axes)
-    if src.template_index is not None:
-        idx = ", ".join(e.pretty() for e in src.template_index)
+    if isinstance(src.addressing, TemplateAddressing):
+        idx = ", ".join(e.pretty() for e in src.addressing.exprs)
     else:
-        # Composite-stride decode (see ``affine_decode_per_dim``): for
-        # multi-axis-per-source-dim, the i-th axis carries the product
-        # of subsequent same-dim extents as its stride. Single-axis-
-        # per-dim collapses to stride 1 = bare ``ax.name``.
+        # Composite-stride decode via ``AffineAddressing.source_index``:
+        # for multi-axis-per-source-dim, the i-th axis carries the
+        # product of subsequent same-dim ``extent · block`` as its
+        # stride. Single-axis-per-dim with ``block=()`` collapses to
+        # stride 1 = bare ``ax.name``.
         coord_for = {ax.name: Var(ax.name) for ax in src.cache_axes}
-        decoded_exprs = affine_decode_per_dim(
-            src.cache_axes,
-            tuple(cd.source_dim for cd in src.cache_dims),
-            coord_for,
-        )
-        parts: list[str] = []
-        for d, origin_expr in enumerate(src.origin):
-            o = origin_expr.pretty()
-            if d in decoded_exprs:
-                parts.append(f"{o} + {decoded_exprs[d].pretty()}")
-            else:
-                parts.append(o)
-        idx = ", ".join(parts)
+        full_index = src.addressing.source_index(src.cache_axes, coord_for, src.origin)
+        idx = ", ".join(e.pretty() for e in full_index)
     pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
     return f"shared {src.name}[{cache}] = {src.buf}[{idx}]{pad}"
 
@@ -1138,8 +1203,8 @@ class Stage(Stmt):
         out: tuple[Expr, ...] = ()
         for s in self.sources:
             out = (*out, *s.origin)
-            if s.template_index is not None:
-                out = (*out, *s.template_index)
+            if isinstance(s.addressing, TemplateAddressing):
+                out = (*out, *s.addressing.exprs)
         return out
 
     @property
