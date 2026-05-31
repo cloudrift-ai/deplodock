@@ -53,6 +53,15 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
+from .conftest import requires_cuda
+
+# Route every test in this module to the single ``cuda`` xdist_group
+# (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
+# skipif reason) so they run sequentially on one worker — scattering CUDA
+# tests across xdist workers exhausts the single-GPU device context. The
+# per-test ``_supports_wmma`` skipif still gates the sm_70+ arch requirement.
+pytestmark = [requires_cuda]
+
 
 def _has_cuda() -> bool:
     try:
@@ -131,8 +140,14 @@ def pin_staged_pipelined(monkeypatch):
     cp.async MMA path: square WMMA atom (sm_70+), WM=WN=2 warps,
     FM=FN=4 register cells, BK=2 K-stage_inner trip count → the picker
     lands on the buffered-async path that ``080_pipeline_stages``
-    double-buffers via cp.async."""
+    double-buffers via cp.async.
+
+    ``DEPLODOCK_TMA=0`` keeps this test focused on the cp.async lever
+    even on sm_90+ where ``050_use_tma`` would otherwise promote the
+    bundle (post-block-aware eligibility fix); the TMA path has its own
+    test suite."""
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_TMA", "0")
     monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "wmma_m16n16k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")

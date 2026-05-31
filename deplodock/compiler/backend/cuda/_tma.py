@@ -28,8 +28,30 @@ import numpy as np
 CU_TENSOR_MAP_SIZE = 128
 
 # Enum values from CUDA driver header `cuda.h` (v12.0+).
-# CUtensorMapDataType
-CU_TENSOR_MAP_DATA_TYPE_FLOAT32 = 2
+# CUtensorMapDataType — ordering tracks the enum decl in `cuda.h`, not the
+# misnamed pre-fp16 constant the legacy code used (which mapped FLOAT32 to
+# the value 2, actually UINT32; happened to round-trip for fp32 because both
+# widths are 4 B but lied about fp16 element width). Real values are:
+CU_TENSOR_MAP_DATA_TYPE_UINT8 = 0
+CU_TENSOR_MAP_DATA_TYPE_UINT16 = 1
+CU_TENSOR_MAP_DATA_TYPE_UINT32 = 2
+CU_TENSOR_MAP_DATA_TYPE_INT32 = 3
+CU_TENSOR_MAP_DATA_TYPE_UINT64 = 4
+CU_TENSOR_MAP_DATA_TYPE_INT64 = 5
+CU_TENSOR_MAP_DATA_TYPE_FLOAT16 = 6
+CU_TENSOR_MAP_DATA_TYPE_FLOAT32 = 7
+CU_TENSOR_MAP_DATA_TYPE_FLOAT64 = 8
+CU_TENSOR_MAP_DATA_TYPE_BFLOAT16 = 9
+# Map numpy itemsize → reasonable CUtensorMapDataType. Fp16 / bf16 disambiguate
+# in the caller (numpy stores both as 2-byte but TMA cares about the float
+# encoding for OOB-fill semantics; with ``OOB_FILL_NONE`` the value is
+# unused at copy time, so this map is sufficient).
+_DTYPE_BY_ITEMSIZE = {
+    1: CU_TENSOR_MAP_DATA_TYPE_UINT8,
+    2: CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    4: CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+    8: CU_TENSOR_MAP_DATA_TYPE_FLOAT64,
+}
 # CUtensorMapInterleave
 CU_TENSOR_MAP_INTERLEAVE_NONE = 0
 # CUtensorMapSwizzle
@@ -120,9 +142,10 @@ def encode_tiled(
         strides_ptr = None
 
     desc_buf = (ctypes.c_uint8 * CU_TENSOR_MAP_SIZE)()
+    data_type = _DTYPE_BY_ITEMSIZE.get(elem_size, CU_TENSOR_MAP_DATA_TYPE_FLOAT32)
     res = _encode_fn()(
         ctypes.cast(desc_buf, ctypes.c_void_p),
-        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        data_type,
         rank,
         ctypes.c_void_p(int(global_address)),
         global_dim,

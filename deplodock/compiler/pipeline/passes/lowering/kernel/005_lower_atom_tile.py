@@ -67,7 +67,7 @@ a second visit the pattern doesn't match and the pass skips.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F16, F32, DataType
+from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import MmaFill, MmaFragment, MmaLoad, MmaStore, MmaSync
@@ -101,13 +101,11 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
 
-    # The c-fragment dtype tracks the output buffer's dtype so the emitted
-    # ``wmma::store_matrix_sync(out_ptr, c_frag, ...)`` has a matching
-    # overload. WMMA supports ``__half`` and ``float`` accumulators on
-    # sm_70+; for F16 outputs we use F16 accumulation (slightly less
-    # precision than F32 acc + downconvert via smem scratch, but
-    # significantly simpler and fast). F32 outputs keep the spec default
-    # (F32 acc).
+    # Accumulate in fp32 (the spec's c dtype) regardless of output buffer
+    # dtype — matches cuBLAS / PyTorch fp16-GEMM precision. When the output
+    # buffer is narrower (``__half*`` / ``__nv_bfloat16*``), ``MmaStore``
+    # emits an epilogue downconvert so ``store_matrix_sync``'s element-type
+    # match still holds. See ``_resolve_c_dtype`` + ``MmaStore`` docstrings.
     c_dtype_override = _resolve_c_dtype(root, spec.operand_dtypes["c"])
 
     lowered, found = _lower_atom_tiles(tt.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources={})
@@ -119,29 +117,25 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     return TileOp(body=body[:idx] + (rebuilt,) + body[idx + 1 :], name=op.name, knobs=op.knobs)
 
 
-def _resolve_c_dtype(root: Node, spec_c_dtype: DataType) -> DataType:
-    """Pick the c-fragment dtype for the WMMA accumulator. WMMA's
-    ``store_matrix_sync`` requires the destination pointer's element type
-    to match the fragment's element type — so if the output buffer is
-    ``__half*``, the C fragment must be ``__half``-accumulator (not
-    ``float``-accumulator). Otherwise NVCC fails to find a matching overload.
+def _resolve_c_dtype(root: Node, spec_c_dtype: DataType) -> DataType:  # noqa: ARG001
+    """Pick the c-fragment dtype for the WMMA accumulator.
 
-    Strategy: read the matmul TileOp's output tensor dtype directly.
-    F16 output → F16 c-frag (sm_70+ supports both half and float WMMA
-    accumulators). F32 output → F32 c-frag (canonical higher-precision).
-    Other dtypes fall through to the registry's default.
+    **Always accumulate in fp32** (the spec's c dtype — F32 for every
+    registered WMMA kind). This matches cuBLAS / PyTorch fp16-GEMM
+    precision: fp16 accumulation drifts ~3-4 ulp per step, which over a
+    long K reduction (2048+) compounds into multi-percent error. The
+    previous F16-output → F16-accumulator path was ~2× faster on GeForce
+    (where the fp32-accumulate tensor pipe is rate-limited) but only
+    passed the loose fp16 accuracy gate, not a real precision bar.
 
-    Tradeoff: F16 accumulator has ~3-4 ulp drift per accumulation step vs
-    F32. For real-world matmuls (small K, fp16 operands at small dynamic
-    range) it stays within fp16 tolerance. A future plan can add the
-    "F32 acc + smem-scratch fp32→fp16 cooperative downconvert" path for
-    kernels needing the precision.
+    WMMA's ``store_matrix_sync`` requires the destination pointer's element
+    type to match the fragment's element type, so an fp32 accumulator
+    can't store straight into a ``__half*`` buffer. :class:`MmaStore`
+    handles that with an epilogue downconvert (declare a dst-dtype
+    fragment, element-wise ``__float2half`` / ``__float2bfloat16``, then
+    store) — see its docstring. ``root`` is no longer read (the dtype no
+    longer tracks the output buffer) but kept for call-site stability.
     """
-    out_dtype = root.output.dtype
-    if out_dtype == F16:
-        return F16
-    if out_dtype == F32:
-        return F32
     return spec_c_dtype
 
 
@@ -273,6 +267,7 @@ def _atom_body_to_mma(
             a_frag=a_frag,
             b_frag=b_frag,
             smem_sources=bundle_sources,
+            shape=spec.shape,
         )
         return (*fragments, MmaFill(frag=c_frag, value=0.0), *transformed)
 
@@ -283,7 +278,7 @@ def _atom_body_to_mma(
         MmaLoad(frag=a_frag, src_buffer=sample_a_load.input, src_index=a_src_index, ldm=a_ldm),
         MmaLoad(frag=b_frag, src_buffer=sample_b_load.input, src_index=b_src_index, ldm=b_ldm),
         MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
-        MmaStore(dst_buffer=write_stmt.output, dst_index=write_stmt.index, frag=c_frag, ldm=0),
+        MmaStore(dst_buffer=write_stmt.output, dst_index=write_stmt.index, frag=c_frag, ldm=0, shape=spec.shape),
     )
     return (*fragments, MmaFill(frag=c_frag, value=0.0), *chain)
 
@@ -438,6 +433,7 @@ def _transform_walk(
     a_frag: str,
     b_frag: str,
     smem_sources: dict[str, Source],
+    shape: tuple[int, int, int],
 ) -> tuple[Stmt, ...]:
     """Recursively rewrite ``body`` in place. Replaces:
 
@@ -457,7 +453,7 @@ def _transform_walk(
     out: list[Stmt] = []
     for s in body:
         if isinstance(s, Write):
-            out.append(MmaStore(dst_buffer=s.output, dst_index=s.index, frag=c_frag, ldm=0))
+            out.append(MmaStore(dst_buffer=s.output, dst_index=s.index, frag=c_frag, ldm=0, shape=shape))
             continue
         if isinstance(s, SerialTile) and s.is_reduce:
             chain = _build_mma_chain(
@@ -480,14 +476,15 @@ def _transform_walk(
             for stage in s.stages:
                 for src in stage.sources:
                     inner_sources[src.name] = src
-            new_body = _transform_walk(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=inner_sources)
+            new_body = _transform_walk(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=inner_sources, shape=shape)
             # Stages stay byte-clean — no Mma rewrite happens inside a
             # producer scope.
             out.append(s.with_bodies((Body(s.stages), Body(new_body))))
             continue
         if s.nested():
             new_bodies = tuple(
-                Body(_transform_walk(sub, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources)) for sub in s.nested()
+                Body(_transform_walk(sub, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources, shape=shape))
+                for sub in s.nested()
             )
             out.append(s.with_bodies(new_bodies))
             continue

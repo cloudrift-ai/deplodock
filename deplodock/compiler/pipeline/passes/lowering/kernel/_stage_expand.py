@@ -13,10 +13,57 @@ The leading-underscore module name keeps the pass loader (which globs
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, StagePolicy, TemplateAddressing
+
+
+def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int, ...] | None) -> tuple[Expr, ...]:
+    """Clamp each cooperative-load gmem index dim to ``[0, extent)``.
+
+    Set only by ``021_hoist_staged_loads_above_mask`` for sources whose
+    cooperative load was hoisted above a masked-tile boundary ``Cond``. A
+    masked output axis tiles past the real extent (N=256 tiled at 192 → the
+    boundary tile spans [192, 384)), so the producer's gmem read overruns the
+    buffer for the overhang columns — the original cause of the
+    ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked linear-projection kernels. The
+    overhang slab slots get the clamped (duplicate) value, which is harmless:
+    they feed masked output cells that the boundary ``Cond`` never writes.
+
+    Two index shapes occur, both handled:
+
+    - **Per-dim (affine)**: ``source_index`` has one coord per gmem dim, so
+      each is clamped to ``[0, extent_d)`` via ``idx < extent ? idx :
+      extent-1``. Only the masked dim's ternary survives constant-folding; the
+      clean dims clamp against their own extent (no-op at runtime).
+    - **Collapsed (template / reshape)**: ``source_index`` is a single
+      pre-flattened ``row*N + col`` expression while ``gmem_extents`` is
+      multi-dim. Clamp the flat index to ``[0, ∏ extents)`` — this kills the
+      only true OOB (the boundary tile's last row reading past the buffer
+      end). An overhang column that wraps into the next row is in-bounds and
+      harmless (it feeds a masked-out output cell).
+
+    On clean-divisor tiles ``gmem_extents`` is ``None`` and the index passes
+    through untouched — no perf cost on the common path."""
+    if gmem_extents is None:
+        return source_index
+    if len(source_index) == len(gmem_extents):
+        out: list[Expr] = []
+        for idx, ext in zip(source_index, gmem_extents, strict=True):
+            cond = BinaryExpr("<", idx, Literal(ext, "int"))
+            out.append(TernaryExpr(cond=cond, if_true=idx, if_false=Literal(ext - 1, "int")))
+        return tuple(out)
+    if len(source_index) == 1:
+        total = 1
+        for e in gmem_extents:
+            total *= e
+        idx = source_index[0]
+        cond = BinaryExpr("<", idx, Literal(total, "int"))
+        return (TernaryExpr(cond=cond, if_true=idx, if_false=Literal(total - 1, "int")),)
+    # Unexpected rank shape (multi-dim source_index that doesn't match the
+    # buffer rank) — leave untouched rather than mis-clamp.
+    return source_index
 
 
 def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | None
@@ -123,6 +170,12 @@ def emit_stage(
             # stride. Scalar paths keep block=(), behavior identical to
             # pre-M4.
             source_index = addressing.source_index(cache_axes, coord_for, src.origin)
+        # Masked-tile overhang clamp: when ``021_hoist_staged_loads_above_mask``
+        # hoisted this cooperative load above a boundary ``Cond``, the gmem
+        # read can overrun the buffer for the overhang columns. Clamp each
+        # source dim to its gmem extent so the producer never reads OOB
+        # (no-op / None on clean-divisor tiles).
+        source_index = _clamp_source_index(source_index, getattr(src, "gmem_extents", None))
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).
         if is_buffered:

@@ -56,12 +56,15 @@ rewrite a focused one.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import BinaryExpr
 from deplodock.compiler.ir.stmt import Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     SerialTile,
+    Stage,
     StageBundle,
     StridedTile,
     TileOp,
@@ -76,13 +79,34 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     K-pipeline above the Cond. Deterministic single-variant pass; raises
     ``RuleSkipped`` when no Cond in the body matches both preconditions.
     """
-    new_body = root.op.body.map(_lift_if_match)
+    input_shapes = _static_input_shapes(root.op)
+
+    def lift(s: Stmt) -> Stmt | tuple[Stmt, ...]:
+        return _lift_if_match(s, input_shapes)
+
+    new_body = root.op.body.map(lift)
     if new_body == root.op.body:
         raise RuleSkipped("no masked-tile Cond > StageBundle to lift")
     return [TileOp(body=new_body, name=root.op.name, knobs=root.op.knobs)]
 
 
-def _lift_if_match(s: Stmt) -> Stmt | tuple[Stmt, ...]:
+def _static_input_shapes(op) -> dict[str, tuple[int, ...]]:  # noqa: ANN001 — TileOp
+    """``{gmem buffer name → static per-dim shape}`` for every kernel input,
+    used to stamp ``Source.gmem_extents`` so the hoisted cooperative load can
+    clamp its gmem read to the buffer bounds. Buffers with any symbolic
+    (non-static) dim are skipped — a runtime-extent clamp is M9 follow-up;
+    today only static-shaped weights hit the masked-overhang path."""
+    shapes: dict[str, tuple[int, ...]] = {}
+    for buf, tensor in op.inputs.items():
+        dims = getattr(tensor, "shape", None)
+        if dims is None:
+            continue
+        if all(getattr(d, "is_static", False) for d in dims):
+            shapes[buf] = tuple(d.as_static() for d in dims)
+    return shapes
+
+
+def _lift_if_match(s: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt | tuple[Stmt, ...]:
     """``Body.map`` callback. ``s`` arrives with its nested bodies already
     rewritten (post-order), so any Cond nested inside this one has had its
     own lift applied. Returns ``s`` verbatim when the preconditions don't
@@ -104,10 +128,47 @@ def _lift_if_match(s: Stmt) -> Stmt | tuple[Stmt, ...]:
         return s
     gated_vars = frozenset(s.cond.free_vars())
     hoisted = [_guard_unsafe_loads(h, s.cond, gated_vars) for h in hoisted]
+    # Stamp ``gmem_extents`` on every cooperative-load Source being hoisted
+    # above the boundary: now that the producer runs for all threads
+    # (including the overhang past the masked extent), its gmem read must be
+    # clamped to the buffer bounds or it reads OOB. ``_stage_expand.emit_stage``
+    # applies the clamp at materialize. See the Source.gmem_extents docstring.
+    hoisted = [_stamp_gmem_extents(h, input_shapes) for h in hoisted]
     out: list[Stmt] = list(hoisted)
     if inside or s.else_body:
         out.append(Cond(cond=s.cond, body=Body(tuple(inside)), else_body=s.else_body))
     return tuple(out)
+
+
+def _stamp_gmem_extents(stmt: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt:
+    """Recursively rewrite ``stmt`` so every ``StageBundle`` Source whose
+    ``buf`` is a static-shaped kernel input carries ``gmem_extents``. Only
+    transport Sources (``Stage.compute is None``) get stamped — a
+    hoisted-compute stage reads sibling smem, not gmem. Both affine and
+    template (reshape) addressings are stamped: a masked weight's smem slab
+    is often template-addressed (the very case that overruns).
+    ``_stage_expand._clamp_source_index`` handles both index shapes — per-dim
+    when the ``source_index`` rank matches ``gmem_extents``, and a single
+    flat ``< ∏extents`` clamp when the template collapsed the index to one
+    dim — so the OOB is caught either way."""
+    if isinstance(stmt, StageBundle):
+        new_stages: list[Stage] = []
+        for stage in stmt.stages:
+            if stage.compute is not None:
+                new_stages.append(stage)
+                continue
+            new_sources = tuple(
+                replace(src, gmem_extents=input_shapes[src.buf]) if src.buf in input_shapes and src.gmem_extents is None else src
+                for src in stage.sources
+            )
+            new_stages.append(replace(stage, sources=new_sources))
+        new_body = Body(tuple(_stamp_gmem_extents(s, input_shapes) for s in stmt.body))
+        return replace(stmt, stages=tuple(new_stages), body=new_body)
+    nested = stmt.nested()
+    if not nested:
+        return stmt
+    new_bodies = tuple(Body(tuple(_stamp_gmem_extents(s, input_shapes) for s in body)) for body in nested)
+    return stmt.with_bodies(new_bodies)
 
 
 def _is_k_pipeline_stmt(stmt: Stmt) -> bool:
