@@ -46,7 +46,7 @@ schedule information (``keep`` for cp.async, ``phase`` + ``slot`` for
 TMA) so the materializer's ``emit_async_wait`` dispatch lowers them to
 the correct ``CpAsyncWait`` / ``MbarrierWait`` primitives.
 
-``buffer_count`` is set upstream by ``040_use_ring_buffers`` (its ``BUFCNT``
+``buffer_count`` is set upstream by ``040_use_ring_buffers`` (its ``BUFFER_COUNT``
 knob) — we just inherit it here. Coupling buffer_count and pipeline_depth
 by construction matches the CUTLASS multistage model (one smem slot per
 in-flight chunk).
@@ -90,7 +90,7 @@ PATTERN = [Pattern("root", TileOp)]
 
 # Default on: software-pipeline the async-staged K-outer loop into
 # prologue/main/epilogue (issue chunk k+N-1 while consuming chunk k). Mirrors
-# ``USE_TMA`` / ``USE_ASYNC_COPY`` so the pipeline can be controlled explicitly.
+# ``TMA`` / ``ASYNC_COPY`` so the pipeline can be controlled explicitly.
 # ``DEPLODOCK_PIPELINE_STAGES=0`` keeps the simple depth-1 async-staged loop.
 PIPELINE_STAGES = Knob(
     "PIPELINE_STAGES",

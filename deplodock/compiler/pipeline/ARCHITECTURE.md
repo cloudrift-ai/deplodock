@@ -412,10 +412,19 @@ incompatible divisibility still get a sensible default.
 | `FM`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul M (output row) axis; per-thread cell-grid height.           |
 | `FN`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. The planner emits one outer `RegisterTile(N_r)` around `{Init, K-reduce, Write}`; the Kernel-IR replicator + `dedup_replicated` pass produce the textbook blocked-GEMM shape (N-invariant Loads kept single-copy, N-dependent Accums replicated). |
 | `BR`          | INT      | `010_partition_loops`        | Cooperative-K thread count (1 = pure serial chunked reduce); BR > 1 routes through the cooperative reduce path with cross-thread combine. |
+| `WN`          | INT      | `010_partition_loops`        | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only).               |
+| `WM`          | INT      | `010_partition_loops`        | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only).                   |
+| `ATOM_KIND`   | STR      | `010_partition_loops`        | Hardware matmul atom kind (MMA / wgmma / ...); see `passes/lowering/tile/_atom.py`.               |
 | `TMA_SWIZZLE`     | BOOL     | `050_use_tma`                       | Enable TMA hardware-swizzle modes (B128 / B64 / B32); default off.                                |
 | `HOIST_COMPUTE`   | BOOL     | `030_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → ComputeStage + transports. Autotune fork.             |
 | `PAD_SMEM`        | BOOL     | `070_pad_smem`                       | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork. |
 | `GROUP_M`         | INT      | `025_swizzle_blocks`                | L2-friendly CTA-swizzle row-group size (Triton/CUTLASS convention). Default `8`; `1` is the global escape hatch (row-major decode). Stamped on the outer matmul GridTile's `swizzle_group_m` field; the renderer emits a Triton-canonical `blockIdx.x` remap so groups of `GROUP_M` CTAs walk down M before stepping N, sharing A's row tile in L2. Self-disabling on tiny / tall-skinny matmuls via the runtime `min(GROUP_M, num_m - first_m)` clamp. |
+| `BUFFER_COUNT`    | INT      | `040_use_ring_buffers`              | Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops. `2` = classic double-buffer; `3`/`4` = CUTLASS-style multistage (pruned when the per-stage smem × N exceeds the cap). |
+| `TMA`             | BOOL     | `050_use_tma`                       | Promote BUFFERED/ASYNC bundles to TMA. `1` = force (hard-fail on ineligibility), `0` = skip the pass. Default on for Hopper+. |
+| `ASYNC_COPY`      | BOOL     | `060_use_async_copy`                | Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). `0` = keep the synchronous double-buffer. Default on for sm_80+. |
+| `PIPELINE_STAGES` | BOOL     | `080_pipeline_stages`               | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop. |
+| `WARP_SPECIALIZE` | BOOL     | `085_warp_specialize`               | Warp-specialize TMA staging: producer warps issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings. |
+| `ATOMIC_FREE_SPLITK` | BOOL  | `017_atomic_free_splitk`            | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered

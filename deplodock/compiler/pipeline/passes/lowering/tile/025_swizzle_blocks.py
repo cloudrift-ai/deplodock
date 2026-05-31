@@ -1,7 +1,7 @@
 """Default-on CTA swizzle for matmul-shape grids.
 
 For each ``GridTile(axes=(K_s?, M_b, N_b))`` produced by the partition
-planner, stamp ``swizzle_group_m = config.group_m()`` (default 8).
+planner, stamp ``swizzle_group_m = _group_m()`` (default 8, from the ``GROUP_M`` knob).
 Renderer-only transform: ``GridTile.axes`` are untouched, only the
 field changes. ``GridTile.render`` reads it and emits a Triton-canonical
 ``blockIdx.x`` decode (``ir/stmt/blocks._render_swizzled_grid_decode``)
@@ -43,12 +43,41 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import GridTile, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
+# CTA-swizzle row-group size. ``1`` is the no-op (row-major decode); ``8`` is
+# the Triton/CUTLASS default this pass stamps. Hints double as the allowed-value
+# set: an out-of-set or garbage pin raises ``ValueError`` (see ``_group_m``) so
+# a typo doesn't silently degrade matmul perf.
+GROUP_M = Knob(
+    "GROUP_M",
+    KnobType.INT,
+    hints=(1, 2, 4, 8, 16),
+    help="CTA-swizzle row-group size (1 = disable; renderer falls back to row-major decode)",
+)
+_GROUP_M_DEFAULT = 8
+
+
+def _group_m() -> int:
+    """Resolve ``DEPLODOCK_GROUP_M`` → group size. Unset → ``8``. Garbage or
+    out-of-``hints`` values raise ``ValueError``. Reads through the descriptor's
+    env path so it shares the ``DEPLODOCK_KNOBS`` splat with the other knobs."""
+    raw = config.knob_raw(GROUP_M.name)
+    if raw is None or raw == "":
+        return _GROUP_M_DEFAULT
+    try:
+        v = int(raw)
+    except ValueError as e:
+        raise ValueError(f"DEPLODOCK_GROUP_M must be one of {GROUP_M.hints}, got {raw!r}") from e
+    if v not in GROUP_M.hints:
+        raise ValueError(f"DEPLODOCK_GROUP_M must be one of {GROUP_M.hints}, got {v}")
+    return v
+
 
 def rewrite(root: Node) -> TileOp | None:
-    group_m = config.group_m()
+    group_m = _group_m()
     if group_m == 1:
         raise RuleSkipped("DEPLODOCK_GROUP_M=1 disables CTA swizzle")
     op: TileOp = root.op

@@ -168,8 +168,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         # WarpTile-context cooperative loads need the per-LANE thread id so
         # every lane in every warp picks a distinct slab position. Using
         # the warp_id-only form fanned only one writer per warp and left
-        # 31/32 of the slab uninitialized (caught when M5's
-        # ``DEPLODOCK_MMA_STAGE_PROBE=1`` flipped on a staged-MMA matmul).
+        # 31/32 of the slab uninitialized (caught while probing a staged-MMA matmul).
         # ``Builtin("thread_idx.x")`` renders via ``ctx.builtins`` to the
         # CUDA ``threadIdx.x`` spelling and stays opaque to numerical
         # simplifiers.

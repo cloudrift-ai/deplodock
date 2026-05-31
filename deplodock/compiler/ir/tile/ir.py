@@ -1504,12 +1504,12 @@ def score_tile_geometry(
 
     # Smem-fit signal (matmul only — "FM" in knobs gates the matmul path).
     # Estimate the per-iter SYNC slab size from the planner's knob shape and
-    # penalize macros that won't fit a double-buffered ring (BUFCNT=2).
+    # penalize macros that won't fit a double-buffered ring (BUFFER_COUNT=2).
     # Without that ring, the K-loop transport (cp.async, TMA) won't promote
     # and the kernel runs SYNC + no overlap — typically 5-20× slower than
     # the double-buffered variant. At 2048³ on sm_120 (99 KB cap) the prior
     # greedy picked a 256×32 stripe whose 96 KB SYNC slab grew to 192 KB at
-    # BUFCNT=2 (skipped), running at 8.1 ms; the BUFCNT-fit-aware greedy
+    # BUFFER_COUNT=2 (skipped), running at 8.1 ms; the BUFFER_COUNT-fit-aware greedy
     # picks a 128×256 / 256×128 macro that double-buffers and runs ~360 us.
     # ``BYTES_PER_ELEM=4`` matches the slab bookkeeping the tile-IR uses
     # today (fp32 assumption; fp16 over-counts by 2× but the signal is still

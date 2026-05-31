@@ -8,9 +8,9 @@ to a single occurrence is content-agnostic CSE — what the deleted
 register-blocked GEMM builder used to get by hand-partitioning
 N-invariant cones (see ``plans/obsolete-blocked-gemm-builder.md``).
 
-Empirically (sweep over the compiler test suite under
-``DEPLODOCK_LOG_DEDUP=1``; see ``plans/post-blocked-builder-cleanup.md``
-step 8) most FN > 1 matmul kernels fold nothing — 020_stage_inputs
+Empirically (sweep over the compiler test suite; see
+``plans/post-blocked-builder-cleanup.md`` step 8) most FN > 1 matmul
+kernels fold nothing — 020_stage_inputs
 already deduplicates N-invariant Loads upstream. The pass earns its
 keep on reduce/norm kernels: RMSNorm's mean reduce, softmax's
 sum/max chain, and reshape-then-linear fusions all show measured folds
