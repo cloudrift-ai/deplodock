@@ -23,6 +23,16 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
+from .conftest import requires_cuda
+
+# Route every test in this module to the single ``cuda`` xdist_group
+# (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
+# skipif reason) so they run sequentially on one worker — the host has one
+# GPU and scattering CUDA tests across workers exhausts the device context.
+# The per-test ``_supports_wmma`` skipif still gates the sm_70+ arch
+# requirement on top of this.
+pytestmark = [requires_cuda]
+
 
 def _has_cuda() -> bool:
     try:
@@ -136,13 +146,23 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     src = render_kernelop(kop, tensors=tensors)
     assert "wmma::mma_sync" in src
     assert "#include <mma.h>" in src
-    # Accumulator dtype tracks output dtype (the fix for the F32→__half
-    # store_matrix_sync overload-resolution failure).
+    # Accumulation is ALWAYS fp32 (matches cuBLAS / PyTorch fp16-GEMM
+    # precision; fp16 accumulate over a long K loses ~3-4 ulp per step).
+    # The ``mma_sync`` target fragment is declared ``float``, then for a
+    # narrower output buffer ``MmaStore`` downconverts via an epilogue
+    # (``__float2half`` element-wise into a half ``store_matrix_sync``
+    # fragment). For F32 output no downconvert is emitted.
+    assert "wmma::accumulator, 16, 16, 16, float" in src, "accumulator must be fp32"
+    assert ".num_elements" in src if out_dtype == F16 else True
     if out_dtype == F16:
-        assert "wmma::accumulator, 16, 16, 16, half" in src
-        assert "__float2half" in src  # MmaFill cast
+        # Downconvert epilogue present (fp32 acc → __half store fragment).
+        assert "__float2half" in src
+        assert "wmma::accumulator, 16, 16, 16, half" in src  # the store-side downconvert fragment
     else:
-        assert "wmma::accumulator, 16, 16, 16, float" in src
+        # F32 output stores the accumulator directly — no half fragment,
+        # no downconvert loop.
+        assert "__float2half" not in src
+        assert "wmma::accumulator, 16, 16, 16, half" not in src
 
     cap = cp.cuda.Device().compute_capability
     cubin_path = compile_to_cubin(src, kop.name, arch=f"sm_{cap}")

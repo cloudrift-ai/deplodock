@@ -715,6 +715,22 @@ class MmaStore(Stmt):
     Stores one accumulator fragment to gmem or smem. ``dst_buffer`` /
     ``dst_index`` mirror :class:`MmaLoad`. ``layout`` is the destination
     memory layout (``"row_major"`` / ``"col_major"``).
+
+    **fp32-accumulate downconvert.** WMMA's ``store_matrix_sync`` requires
+    the accumulator fragment's element type to match the destination
+    pointer's element type — so an ``fp32`` accumulator can't be stored
+    directly into a ``__half*`` buffer. The lowering accumulates in fp32
+    by default (matching cuBLAS / PyTorch fp16-GEMM precision; fp16
+    accumulate over a long K loses ~3-4 ulp per step). When the fragment
+    dtype (``ctx.ssa_dtypes[frag]``) differs from the destination buffer
+    dtype (``ctx.buffer_dtypes[dst_buffer]``), :meth:`render` emits an
+    epilogue downconvert: declare a destination-dtype accumulator
+    fragment, element-wise convert ``frag.x[i]`` into it, then
+    ``store_matrix_sync`` that. ``shape`` carries the atom cell ``(M, N, K)``
+    so the converted fragment can be declared with matching template args.
+    ``None`` keeps the legacy same-dtype direct-store path (used by tests
+    that build MmaStore by hand and by genuine fp32-output kernels where
+    no conversion is needed).
     """
 
     dst_buffer: str
@@ -722,6 +738,7 @@ class MmaStore(Stmt):
     frag: str
     ldm: int = 0
     layout: str = "row_major"
+    shape: tuple[int, int, int] | None = None
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -742,8 +759,24 @@ class MmaStore(Stmt):
 
         flat = render_index(self.dst_buffer, self.dst_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.dst_buffer, ctx)
+        frag_dt = ctx.ssa_dtypes.get(self.frag, "f32")
+        dst_dt = ctx.buffer_dtypes.get(self.dst_buffer, "f32")
+        pad = _pad(ctx.indent)
+        # Same-dtype (incl. fp32→fp32, or a legacy hand-built MmaStore with
+        # no shape): direct store, no conversion.
+        if frag_dt == dst_dt or self.shape is None:
+            return [f"{pad}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {self.frag}, {ldm}, wmma::mem_{self.layout});"]
+        # fp32 accumulator → narrower destination (fp16 / bf16): declare a
+        # destination-dtype accumulator fragment, convert element-wise, store.
+        m, n, k = self.shape
+        dst_elem = {"f16": "half", "bf16": "__nv_bfloat16", "f32": "float"}.get(dst_dt, "half")
+        conv = {"f16": "__float2half", "bf16": "__float2bfloat16"}.get(dst_dt, "__float2half")
+        out_frag = f"{self.frag}_st"
         return [
-            f"{_pad(ctx.indent)}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {self.frag}, {ldm}, wmma::mem_{self.layout});",
+            f"{pad}wmma::fragment<wmma::accumulator, {m}, {n}, {k}, {dst_elem}> {out_frag};",
+            f"{pad}#pragma unroll",
+            f"{pad}for (int _t = 0; _t < {self.frag}.num_elements; _t++) {out_frag}.x[_t] = {conv}({self.frag}.x[_t]);",
+            f"{pad}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {out_frag}, {ldm}, wmma::mem_{self.layout});",
         ]
 
 
@@ -1110,4 +1143,5 @@ def _(s: MmaStore, rename, sigma, axis_fn):
         frag=rename(s.frag),
         ldm=s.ldm,
         layout=s.layout,
+        shape=s.shape,
     )

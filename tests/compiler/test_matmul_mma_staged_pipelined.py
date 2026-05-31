@@ -53,6 +53,15 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
+from .conftest import requires_cuda
+
+# Route every test in this module to the single ``cuda`` xdist_group
+# (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
+# skipif reason) so they run sequentially on one worker — scattering CUDA
+# tests across xdist workers exhausts the single-GPU device context. The
+# per-test ``_supports_wmma`` skipif still gates the sm_70+ arch requirement.
+pytestmark = [requires_cuda]
+
 
 def _has_cuda() -> bool:
     try:
