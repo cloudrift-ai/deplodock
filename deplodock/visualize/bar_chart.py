@@ -112,7 +112,7 @@ def _option(chart: BarChart, *, theme_name: str) -> dict:
         series.append(s)
 
     default_margin = (
-        {"left": 200, "right": 50, "top": 90, "bottom": 60} if is_horizontal else {"left": 70, "right": 40, "top": 90, "bottom": 90}
+        {"left": 200, "right": 50, "top": 90, "bottom": 44} if is_horizontal else {"left": 70, "right": 40, "top": 90, "bottom": 56}
     )
     margin = {**default_margin, **chart.margin}
 
@@ -135,7 +135,7 @@ def _option(chart: BarChart, *, theme_name: str) -> dict:
         "grid": {**margin, "containLabel": False},
         "legend": {
             "show": show_legend,
-            "top": 36,
+            "top": 54,
             "textStyle": {"color": t["fg"]},
             "data": [b.name for b in chart.bars],
             "icon": "rect",
