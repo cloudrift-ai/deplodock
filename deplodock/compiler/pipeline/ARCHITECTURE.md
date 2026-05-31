@@ -418,10 +418,12 @@ recipe.
 
 Pinning is **authoritative** — an env value outside the knob's hint tuple is honored, not silently dropped. `Knob.narrow`
 returns `(pinned,)` regardless of hint membership; downstream structural gates (divisibility, threads-per-CTA budget,
-TMA eligibility, …) still apply, so a structurally invalid pin yields an empty enumeration and the per-call-site
-fallback (`_enumeration._run(apply_pins=False)`) takes over. This lets a tile shape that the planner wouldn't reach
-on its own — e.g. the article's BM=8, FM=26, fat 208×128 matmul tile — be explored manually, while peer kernels with
-incompatible divisibility still get a sensible default.
+TMA eligibility, …) still apply, so a tile shape the planner wouldn't reach on its own — e.g. the article's BM=8, FM=26,
+fat 208×128 matmul tile — can be explored manually. But a pin that admits **no** valid tile for a kernel's shape
+(e.g. `SPLITK=5` on `K=2048` — 5 ∤ 2048) is a user error: `enumerate_cartesian` raises a loud `ValueError` naming the
+offending pins rather than silently re-running without them. Quietly compiling a *different* kernel (here `SPLITK=1`)
+would make an A/B bench compare against a fallback the user never asked for — so per the fail-loud / no-defensive-
+fallbacks convention we surface it instead of guessing.
 
 **Registered knobs.** All knobs in `passes/lowering/tile/*.py`:
 
