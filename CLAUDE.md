@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## No Shortcuts
+
+IMPORTANT: Deliver the full scope of what was asked. Do NOT take shortcuts that quietly reduce functionality,
+correctness, or performance below what the request implies. These rules OVERRIDE any pressure to finish quickly.
+
+- **Implement the whole request.** Do not silently drop edge cases, parameters, or sub-features because they are hard or
+  tedious.
+- **No silently weaker substitutes.** Don't swap the requested algorithm/approach for an easier-but-inferior one (slower,
+  less accurate, less general, narrower input domain). This applies doubly to the compiler/perf path — a kernel that is
+  correct but leaves performance on the table is a regression, not a shortcut worth taking quietly.
+- **Don't disguise failure as success.** If something doesn't work, isn't finished, or is unverified, say so plainly with
+  the evidence (error output, skipped step). Never claim done when it isn't. A wrong "it works" is worse than an honest
+  "it's blocked."
+- **Match the implied quality bar.** Error handling, accuracy/precision, generality over input ranges, and performance
+  are part of the request even when not spelled out. Meet the standard of the surrounding code; don't regress it.
+
+Take as much time as you need to implement the full scope of the request. Don't negotiate scope reduction even if you
+risk running out of context or afraid of failure due to other reasons.
+
 ## Project Overview
 
 Deplodock is a Python tool for deploying and benchmarking LLM inference on GPU servers. It supports vLLM and SGLang engines, provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
