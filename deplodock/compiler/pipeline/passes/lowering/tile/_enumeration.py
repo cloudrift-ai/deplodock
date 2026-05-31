@@ -89,6 +89,12 @@ FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells 
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul N (output) axis")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
+# Persistent-CTA Stream-K scheduling. Off by default; forked by
+# ``tile/018_persistent_streamk`` on a matmul whose tile-grid lands near the
+# device SM count (wave tail on the critical path). Mutually exclusive with
+# SPLITK > 1 — both split the K reduction across CTAs (the rule self-skips
+# when a split-K axis is already present).
+STREAMK = Knob("STREAMK", KnobType.BOOL, hints=(False, True), help="Persistent-CTA Stream-K matmul scheduling (1 = on)")
 
 _PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR, WN, WM, ATOM_KIND)
 

@@ -84,6 +84,14 @@ class Context:
     # pick the per-thread N-chunk width that keeps each LDS.128 phase
     # bank-conflict-free.
     lds128_bytes: int = 16
+    # Live device SM count (``MultiProcessorCount``), 0 when no CUDA device.
+    # Read by the Stream-K rule (``tile/018_persistent_streamk``) as a
+    # *compile-time shape gate* — fork persistent-CTA scheduling only when a
+    # matmul's tile-grid count lands near (or below) a small multiple of this,
+    # where the wave tail is on the critical path. Not baked into codegen: the
+    # launch re-queries the live device for the actual grid + work-range arrays
+    # so a cached Stream-K kernel runs on any SM count.
+    num_sms: int = 0
     # Identifies which backend's perf rows this compile should consult
     # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
     # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the
@@ -133,7 +141,7 @@ class Context:
         the launch. Without this distinction, ``--target sm_90`` on an
         sm_86 box would request 227 KB on a 99 KB device.
         """
-        from deplodock.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
+        from deplodock.compiler.target import compute_capability, live_compute_capability, live_num_sms  # noqa: PLC0415
 
         cap = compute_capability()
         live = live_compute_capability()
@@ -143,4 +151,4 @@ class Context:
             smem = _max_dynamic_smem_for(cap)
         else:
             smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
-        return cls(compute_capability=cap, max_dynamic_smem=smem, compile_flags=_env_compile_flags())
+        return cls(compute_capability=cap, max_dynamic_smem=smem, num_sms=live_num_sms(), compile_flags=_env_compile_flags())
