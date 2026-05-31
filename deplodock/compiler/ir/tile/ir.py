@@ -1437,6 +1437,29 @@ def score_tile_geometry(
 
     if cells == 1:
         score -= 1.0
+    elif "ATOM_KIND" in knobs:
+        # Tensor-core MMA (warp-tier WMMA path): the per-lane register
+        # budget is dominated by accumulator fragments (one ~4-reg/lane
+        # frag per FM·FN cell, half acc on consumer / fp32 acc on
+        # datacenter) plus the operand frags loaded per K-iter. On
+        # sm_8x / sm_9x / sm_12x with the 255-reg/lane cap, ``cells ≈
+        # 16`` is the 2-blocks/SM occupancy knee; past ~24 the per-lane
+        # reg footprint spills to local memory (measured at 173 regs/
+        # thread on a 2048² fp16 sweep — see ``plans/mma-warp-scoring.md``
+        # and the warp-tier section of ``compiler/pipeline/ARCHITECTURE.md``).
+        # The pre-2026 cells-up-to-128 reward (tuned for scalar f32
+        # matmul where 104-cell golden tiles win) pushed the MMA picker
+        # to FM=1 FN=32, 3.0× slower than cuBLAS instead of 0.91×.
+        sweet = 16
+        score += 0.5 - min(abs(cells - sweet) / sweet, 0.5)
+        # Square per-warp tile reuses operands equally — each A frag
+        # used ``FN`` times per K-iter, each B frag used ``FM`` times.
+        # Skewed shapes (FM=1, FN=N) waste one operand's reuse and
+        # inflate the per-K-iter fragment-load count linearly.
+        fm = max(1, int(knobs.get("FM", 1)))
+        fn = max(1, int(knobs.get("FN", 1)))
+        aspect = abs(fm - fn) / max(fm, fn)  # 0 = square, 1 = fully skewed
+        score -= aspect * 0.25
     elif cells <= 128:
         # Reward register-tile budget gradually up to 128 cells (NVRTC cap +
         # fp32 register-tile sweet spot). Without this gradient every
@@ -1562,9 +1585,25 @@ def score_tile_geometry(
     # time and MCTS visits it first.
     if "FM" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0):
         bk = int(knobs.get("BK", 1))
-        bn = int(knobs.get("BN", 1))
         fn = int(knobs.get("FN", 1))
-        if bk * BYTES_PER_ELEM >= 128 and bn * fn * BYTES_PER_ELEM >= 128:
+        # The N-side inner stride in elements differs by tier: scalar
+        # carries ``BN`` (per-thread N tile) explicitly; warp-tier MMA
+        # has no ``BN`` knob — its equivalent is ``WN · FN · atom_N``.
+        # Defaulting to 1 (the pre-2026 shape) under-counted the warp
+        # tier by ``WN · atom_N`` (typically 32-128×) and made the
+        # bonus fire for ``FN=32`` but not ``FN=4`` even though both
+        # comfortably clear the 128 B TMA alignment — a 1.0 spurious
+        # advantage that pushed the picker to the FM=1 FN=32 spill
+        # corner (see ``plans/mma-warp-scoring.md`` for the 2048² fp16
+        # sweep).
+        if "ATOM_KIND" in knobs:
+            from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
+
+            _atom_n = atom_spec(str(knobs["ATOM_KIND"])).shape[1]
+            n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
+        else:
+            n_stride_elems = int(knobs.get("BN", 1)) * fn
+        if bk * BYTES_PER_ELEM >= 128 and n_stride_elems * BYTES_PER_ELEM >= 128:
             score += 1.0
 
     return score
@@ -1848,7 +1887,23 @@ class TileOp(BodyOp):
         # ``self.knobs`` which already carries these; without them here the
         # lazy_score path would silently fall back to BM=BN=1 defaults).
         if is_warp:
-            score_knobs = {"FM": p.fm, "FN": p.fn, "SPLITK": p.splitk, "BK": p.bk}
+            # ATOM_KIND / WM / WN feed the warp-tier branch of
+            # ``score_tile_geometry``: the cells-sweet-spot prior keys off
+            # ``ATOM_KIND in knobs``, the aspect-ratio prior reads FM/FN
+            # (already here), and the TMA-bonus's N-stride calc uses
+            # ``WN · FN · atom_N``. Omitting them silently routed the warp
+            # tier through the scalar branch and over-counted the TMA
+            # bonus for skewed shapes — exactly the FM=1 FN=32 regression
+            # ``plans/mma-warp-scoring.md`` chases.
+            score_knobs = {
+                "FM": p.fm,
+                "FN": p.fn,
+                "SPLITK": p.splitk,
+                "BK": p.bk,
+                "WM": p.wm,
+                "WN": p.wn,
+                "ATOM_KIND": p.atom_kind,
+            }
         else:
             score_knobs = {
                 "FM": p.fm,

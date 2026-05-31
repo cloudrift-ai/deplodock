@@ -199,15 +199,34 @@ def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
 
 
 def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
-    # Warp-tier ranking parallels the thread-tier priority but reads warp-tier
-    # fields. Threads = ``wn × wm × 32`` (warps × lanes-per-warp). Cells-per-
-    # cell-owner cap = 64 (looser than the thread tier's 32 — MMA amortizes
-    # K-loop overhead better, so bigger register tiles stay profitable).
-    # Stub-quality for M1: no warp rows enumerate yet (the warp impl returns
-    # []), so this function is never called. M3 wires the warp impl and this
-    # priority drives the fork tree's sibling ordering.
+    # Warp-tier ranking for tensor-core MMA matmul (fp16 / bf16 with f32
+    # accumulator, ``wmma_m16n16k16_*`` atom). The pre-2026 prior rewarded
+    # ``min(fm*fn, 64)`` monotonically — pushed the picker toward
+    # ``FM=1 FN=32`` (32 N-cells per warp, max A-frag reuse) but that
+    # shape exploded the per-lane register budget: 32 acc frags + 32 B
+    # frags + 1 A frag ≈ 4·(32+32+1) = 260 regs/lane, past the 255-reg
+    # spill cap — measured at 173 regs/thread on sm_120 with cuBLAS at
+    # 3.0× (see ``plans/mma-warp-scoring.md`` for the 2048² fp16 sweep).
+    #
+    # New prior reads off two empirical knees:
+    #
+    # 1. **Cells-per-warp sweet spot ≈ 16** (FM·FN). 16 acc frags at
+    #    ~4 regs/lane each is ~64 regs + ~30 regs of frag-load + ~30 regs
+    #    addressing overhead = ~120-130 regs/lane → 2 blocks/SM occupancy
+    #    on sm_8x/9x/12x without spilling. ``-abs(cells - 16)`` peaks
+    #    sharply at the sweet spot.
+    # 2. **Square per-warp tile** (FM == FN). Each A frag is reused
+    #    ``FN`` times across the per-K-iter MMA chain; each B frag
+    #    ``FM`` times. Square aspect ⇒ balanced reuse on both operands;
+    #    skewed (e.g. 1×32, 32×1) wastes one operand's reuse. Tiebreaker
+    #    inside the cells-band.
+    #
+    # Threads near 256 keep last among the primary signals — under the
+    # warp tier this is ``WM·WN`` (warp count), 256 / 32 = 8 warps;
+    # secondary because cell shape dominates the perf landscape.
     threads = p.wn * p.wm * 32
-    return (min(p.fm * p.fn, 64), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
+    cells = p.fm * p.fn
+    return (-abs(cells - 16), -abs(p.fm - p.fn), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
 
 
 def _priority_pointwise(p: ScalarTileParams) -> tuple[int, ...]:

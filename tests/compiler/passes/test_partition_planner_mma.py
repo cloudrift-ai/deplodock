@@ -223,14 +223,18 @@ def test_warp_enumerator_rejects_indivisible_extents():
     assert _enum_warp(M=64, N=64, K=15) == []
 
 
-def test_warp_enumerator_priority_orders_by_cells():
-    """Higher cells-per-warp-cell ranks first (cap=64). The first row
-    should have ``min(fm·fn, 64) >= `` the last row's."""
+def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
+    """Cells-near-16 ranks first; cells-far-from-16 ranks last. The
+    register-budget sweet spot for ``wmma_m16n16k16_*`` on sm_8x/9x/12x
+    is FM·FN ≈ 16 (~120 regs/lane → 2 blocks/SM occupancy). The
+    pre-2026 prior rewarded ``min(fm·fn, 64)`` monotonically and
+    pushed the picker to FM=1 FN=32 cells=32 — 3.0× slower than cuBLAS
+    on 2048² fp16. See ``plans/mma-warp-scoring.md``."""
     rows = _enum_warp(M=128, N=128, K=128)
     assert len(rows) >= 2
-    first_score = min(rows[0].fm * rows[0].fn, 64)
-    last_score = min(rows[-1].fm * rows[-1].fn, 64)
-    assert first_score >= last_score
+    first_dist = abs(rows[0].fm * rows[0].fn - 16)
+    last_dist = abs(rows[-1].fm * rows[-1].fn - 16)
+    assert first_dist <= last_dist
 
 
 def test_warp_enumerator_force_splitk_one():
