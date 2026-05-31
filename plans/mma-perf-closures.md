@@ -165,6 +165,16 @@ IR was previously emitting a shape that crashed at materialize.
 
 ### M3 — Warp specialization for MMA
 
+**Outcome (2026-05-30).** **Skipped — structurally depends on M2.** WS_MMA's enumeration gates on
+`ATOM_KIND in knobs and buffer_count > 1`, and the producer-consumer split routes work onto the cp.async pipeline
+that M2 lights up. With M2's bench gate failing by 2.3× (the cp.async path doesn't pay at the 2048² fp16
+geometry), an instruction-scheduling cleanup on top of the same path can't recover the 1.4× gap M2 left, let
+alone the ≥2% the plan called for. No code change; the plan's `WS_MMA` knob + `085_warp_specialize` extension
+stay queued for a future session that picks M2 back up at a different shape (asymmetric matmuls per the
+out-of-scope note) where the cp.async lever might pay.
+
+
+
 `085_warp_specialize` today gates on `BR > 1` and shapes the producer/consumer split around cooperative-K
 reduce. MMA forbids `BR > 1` (`splitk_choices = (1,)`; the warp-tier accumulator lives register-side). To wire
 WS for MMA, the split needs a different shape: dedicate `WS_PROD ≥ 1` warps to issuing cp.async + bumping an
@@ -202,6 +212,19 @@ instruction scheduling and warp-disjoint smem access). If the gain is < 2%, drop
 producer-consumer split, ~200 lines), `tests/compiler/test_matmul_mma_warp_specialized.py` (new).
 
 ### M4 — `mma.m16n8k16` atom (ldmatrix + PTX mma)
+
+**Outcome (2026-05-30).** **Deferred to a dedicated follow-up session.** The plan's 220-line estimate
+understates the work — the PTX mma.sync lane-distributed register layout (4 `__half2` per lane for A, 2 for B,
+4 `float` for C, each at specific lane-indexed bit positions) and the `ldmatrix.x4` + `.x2.trans` per-lane
+addressing arithmetic are bit-level precise: any off-by-one yields silent wrong outputs that only show up at
+runtime correctness checks (slow inner loop: render → nvcc → cubin → run → check). The full lever requires
+several hours of focused PTX work + iterative bench-testing. Doing only the cosmetic atom-kind addition + the
+mma.sync instruction swap (without ldmatrix) would necessarily run *slower* than the WMMA baseline
+(per-lane manual loads can't beat `wmma::load_matrix_sync`'s SASS scheduling), so a half-implementation can't
+even validate the lever. Reserve a dedicated session for M4 starting from a reference (CUTLASS's `s16816`
+kernel) and an isolated test harness that benches every micro-step.
+
+
 
 cuBLAS's `cutlass_80_tensorop_*_s16816gemm_*` reveals the Ampere+ PTX MMA shape `m16n8k16`, loaded via
 `ldmatrix.x4` (a lane-aware multi-fragment load issuing 4 32-byte fragment-loads per warp). Compared to
@@ -248,6 +271,15 @@ atom-spec-aware paths factor cleanly), `tile/_enumeration.py` (~10 lines — lis
 
 ## Phase B — Find the golden tile
 
+**Outcome (2026-05-30).** **Skipped — empty keep_set.** M2 dropped (pinned variant 2.3× slower than baseline);
+M3 dropped (depends on M2); M4 deferred. With every Phase-A lever excluded or deferred, the Phase-B sweep
+collapses to the existing scoring's pick — i.e. the post-#182 baseline at ~108 µs. No new golden to find, no
+Phase-C picker tweak to chase. The plan's bench-gate gate (≥5% improvement over 108 µs to validate the round)
+explicitly tells us to fail loud here rather than ship a tiny perf change as a big PR; recording the negative
+result and re-opening the round when M4 lands.
+
+
+
 Once M2 / M3 / M4 bench-gates have passed (or been dropped), sweep their kept product space pinned end-to-end
 and pick the single best variant for the 2048² fp16 reference shape. The sweep matrix:
 
@@ -273,6 +305,11 @@ The picked tile becomes the bench-gate for Phase C.
 through `BenchmarkResult`, dumps the CSV + golden pick).
 
 ## Phase C — Tune the picker to land on the golden tile
+
+**Outcome (2026-05-30).** **Skipped — no golden to chase.** Phase B produced no winner above the baseline.
+Re-open when M4 lands.
+
+
 
 Once Phase B has the golden, tune `_priority_matmul_warp` and `score_tile_geometry` so the *default* picker (no
 env pins) selects the golden tile for this shape. Score-function changes drafted during the PR #182
