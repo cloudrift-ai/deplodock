@@ -285,16 +285,28 @@ def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> boo
         if d not in dims_set and src_shape[d] != 1:
             return False
     # Inner extent for alignment checks is the COLLAPSED box width at the
-    # last source dim — product of the extents of every cache axis mapping
-    # to ``dims[-1]``. Mirrors the materializer's ``box_per_dim`` collapse so
-    # a tile with cache ``(a3=32, a5=4)`` both mapping to dim 1 gets the
-    # right 128-cell inner extent (vs the legacy ``cache_axes[-1].extent`` =
-    # 4 that always failed the 128 B alignment gate for collapse cases).
+    # last source dim — product of the (cache_extent × block) of every cache
+    # axis mapping to ``dims[-1]``. Mirrors the materializer's ``box_per_dim``
+    # collapse so a tile with cache ``(a3=32, a5=4)`` both mapping to dim 1
+    # gets the right 128-cell inner extent (vs the legacy
+    # ``cache_axes[-1].extent`` = 4 that always failed the 128 B alignment
+    # gate for collapse cases).
+    #
+    # The per-axis ``AffineAddressing.block`` multiplier encodes per-cell
+    # strides (e.g. ``atom_n = 16`` for square WMMA on the N side) — without
+    # it, warp-tier MMA slabs whose cache axes are warp/cell-granular
+    # (``WN × FN`` per the inner dim) report ``inner_extent = WN·FN`` of
+    # ~4-8 elements when the actual slab inner width is
+    # ``WN·FN·atom_n`` of 64-128 elements. Pre-fix the warp tier was
+    # silently TMA-ineligible at every shape; the gmem-direct WMMA was the
+    # only path the picker could land on.
     inner_dim = dims[-1]
+    block = src.addressing.block
     inner_extent = 1
-    for d, ax in zip(dims, cache_axes, strict=True):
+    for i, (d, ax) in enumerate(zip(dims, cache_axes, strict=True)):
         if d == inner_dim:
-            inner_extent *= ax.extent.as_static()
+            b = block[i] if block else 1
+            inner_extent *= ax.extent.as_static() * b
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
     src_inner = src_shape[-1]

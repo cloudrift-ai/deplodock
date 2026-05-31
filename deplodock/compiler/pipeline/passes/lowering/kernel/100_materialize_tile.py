@@ -261,10 +261,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                     addressing = src.addressing
                     if isinstance(addressing, AffineAddressing):
                         inner_dim = addressing.dims[-1]
+                        block = addressing.block
                         collapsed_inner = 1
-                        for d, ax in zip(addressing.dims, src.cache_axes, strict=True):
+                        for i, (d, ax) in enumerate(zip(addressing.dims, src.cache_axes, strict=True)):
                             if d == inner_dim:
-                                collapsed_inner *= ax.extent.as_static()
+                                b = block[i] if block else 1
+                                collapsed_inner *= ax.extent.as_static() * b
                     else:
                         collapsed_inner = extents[-1]
                     if collapsed_inner % inner_per_align != 0:
@@ -337,15 +339,22 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         # by 020_stage_inputs and survives every downstream rewrite.
         gid = tma.stage_group[src.name]
         mbar_name = tma.mbar_name(gid)
-        # Box extents per source dim: product of cache extents that map
-        # to that dim (multiple cache axes can sweep the same source dim
-        # — e.g. an outer-block axis and a per-thread fragment axis both
-        # decoded into the M dim of a matmul slab). Source dims not
-        # covered by any cache axis get extent 1.
+        # Box extents per source dim: product of (cache_extent × block) of
+        # every cache axis mapping to that dim (multiple cache axes can sweep
+        # the same source dim — e.g. an outer-block axis and a per-thread
+        # fragment axis both decoded into the M dim of a matmul slab). The
+        # per-axis ``AffineAddressing.block`` multiplier encodes per-cell
+        # strides (e.g. ``atom_n = 16`` for square WMMA), which the eligibility
+        # check at 050_use_tma.py:_stage_eligible already mirrors. Without
+        # threading block through here the TMA descriptor's box width would
+        # under-report the actual slab inner width for warp-tier MMA slabs.
+        # Source dims not covered by any cache axis get extent 1.
         dims = addressing.dims
+        block = addressing.block
         box_per_dim: dict[int, int] = {}
-        for d, ax in zip(dims, src.cache_axes, strict=True):
-            box_per_dim[d] = box_per_dim.get(d, 1) * ax.extent.as_static()
+        for i, (d, ax) in enumerate(zip(dims, src.cache_axes, strict=True)):
+            b = block[i] if block else 1
+            box_per_dim[d] = box_per_dim.get(d, 1) * ax.extent.as_static() * b
         full_box = tuple(box_per_dim.get(d, 1) for d in range(len(src.origin)))
         # Drop *gap* inert dims (``box == 1`` AND ``origin`` is literal
         # 0) between the first and last swept source dims. Leading
@@ -391,10 +400,20 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 mbar_prologue.append(MbarrierInit(mbar=mbar_name, count=tma.arrive_count(gid), slot=Literal(s, "int")))
         # Use the stamped source dtype's byte count so TMA arrive-expect
         # bytes match the actual copy size on fp16 inputs (legacy
-        # ``BYTES_PER_ELEM`` over-counted fp16 by 2x).
+        # ``BYTES_PER_ELEM`` over-counted fp16 by 2x). Multiply through the
+        # per-axis ``AffineAddressing.block`` multiplier for the same reason
+        # ``box_per_dim`` does — without it, warp-tier WMMA slabs report a
+        # ``slab_bytes`` of ``∏ cache_extents`` (e.g. 2·2·4 = 16 elements =
+        # 32 B for fp16) while the actual TMA box delivers
+        # ``∏ cache_extents · ∏ block`` (e.g. 32·128 = 4096 elements =
+        # 8192 B). The mbarrier's ``arrive.expect_tx`` would then expect
+        # 32 B and never satisfy the actual ``complete_tx::bytes`` payload,
+        # hanging the consumer's ``mbarrier.wait``.
         slab_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
-        for ax in src.cache_axes:
-            slab_bytes *= ax.extent.as_static()
+        block = addressing.block
+        for i, ax in enumerate(src.cache_axes):
+            b = block[i] if block else 1
+            slab_bytes *= ax.extent.as_static() * b
         # Smem allocation: leading phase dim + cache extents (with pad).
         # buffer_count / phase live on the StageBundle now (collapsed Stage
         # hierarchy — Stage.{buffer_count,phase,swizzle} are no longer
