@@ -108,25 +108,20 @@ def test_adaptive_streamk_lowers_mac_walk_and_atomic_boundary(monkeypatch):
 
 
 @requires_cuda
-def test_streamk_skipped_on_pipelined_staging(monkeypatch):
-    """Adaptive Stream-K is gated off on async/TMA/pipelined staging (the
-    default) until B5 — re-bounding a prefetch-prologue K-loop to [k_lo,k_hi)
-    isn't correct yet. So STREAMK on default staging produces a plain kernel."""
+def test_pinned_streamk_on_pipelined_staging_fails_loudly(monkeypatch):
+    """Pinning STREAMK=1 where it can't apply (default async/TMA/pipelined
+    staging, B5 pending) is a user error — raise, don't silently compile a
+    non-Stream-K kernel (fail-loud convention)."""
     monkeypatch.setenv("DEPLODOCK_STREAMK", "1")  # default staging → pipelined
-    lowered = Pipeline.build(CUDA_PASSES).run(_matmul_graph(512, 512, 512))
-    ops = [n.op for n in lowered.nodes.values() if isinstance(n.op, CudaOp)]
-    assert ops
-    assert not any(op.streamk_work_arrays for op in ops), "Stream-K must not fire on a pipelined K-loop yet"
+    with pytest.raises(ValueError, match="SYNC/BUFFERED staging"):
+        Pipeline.build(CUDA_PASSES).run(_matmul_graph(512, 512, 512))
 
 
 @requires_cuda
 def test_streamk_is_mutually_exclusive_with_splitk(monkeypatch):
-    """Stream-K supplies its own K-split (adaptively), so it must not compose with
-    fixed split-K. With both pinned, the rewrite self-skips — no PersistentTile,
-    no work-range arrays."""
+    """Stream-K supplies its own K-split, so it can't compose with fixed split-K.
+    Pinning both is a user error — fail loudly rather than silently dropping one."""
     _pin_adaptive(monkeypatch)
     monkeypatch.setenv("DEPLODOCK_SPLITK", "4")
-    lowered = Pipeline.build(CUDA_PASSES).run(_matmul_graph(512, 512, 512))
-    ops = [n.op for n in lowered.nodes.values() if isinstance(n.op, CudaOp)]
-    assert ops
-    assert not any(op.streamk_work_arrays for op in ops), "Stream-K must not fire alongside split-K"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Pipeline.build(CUDA_PASSES).run(_matmul_graph(512, 512, 512))

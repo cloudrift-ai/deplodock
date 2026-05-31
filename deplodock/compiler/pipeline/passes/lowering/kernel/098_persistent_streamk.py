@@ -98,37 +98,53 @@ def rewrite(ctx: Context, match: Match, root) -> list[TileOp] | None:  # noqa: A
     op: TileOp = root.op
     if STREAMK.name in op.knobs:
         raise RuleSkipped("STREAMK already pinned (idempotence)")
+
+    # When STREAMK is explicitly pinned ON, every "can't apply" below is a user
+    # error — fail loudly rather than silently compiling a non-Stream-K kernel
+    # (the fail-loud / no-defensive-fallbacks convention). When it's not pinned,
+    # these are just autotune-fork eligibility gates → RuleSkipped (the fork
+    # simply isn't offered for this shape).
+    raw = config.knob_raw(STREAMK.name)
+    pinned_on = raw is not None and bool(STREAMK.parse(raw))
+
+    def _cant(reason: str, hint: str = "") -> None:
+        if pinned_on:
+            raise ValueError(f"DEPLODOCK_STREAMK=1 pinned but cannot be applied here: {reason}.{(' ' + hint) if hint else ''}")
+        raise RuleSkipped(reason)
+
     # Compile-time shape gate: Stream-K needs a live SM count to size the grid.
     if ctx.num_sms <= 0:
-        raise RuleSkipped("no live SM count — Stream-K is a live-device perf fork")
+        _cant("no live SM count", "Stream-K is a live-device perf fork; run on a GPU.")
     grid = _outer_grid(op)
     if grid is None:
-        raise RuleSkipped("no outer GridTile (pointwise / already persistent)")
+        _cant("no outer GridTile (pointwise / cooperative-reduce kernel)", "Stream-K applies to matmul.")
     # Matmul register-tile shape: a 2-D block grid (M_b, N_b) carrying the FM
     # cell knob. Pointwise / cooperative-reduce kernels don't qualify.
     if len(grid.axes) < 2 or "FM" not in op.knobs:
-        raise RuleSkipped("not a matmul block grid")
-    # Mutually exclusive with split-K: Stream-K does its own K-split (adaptively,
-    # in Phase B). A K_s axis already splits the K reduction across CTAs — the two
-    # never combine. (This is why the plan gates "STREAMK ⇒ SPLITK=1".)
+        _cant("not a matmul block grid")
+    # Mutually exclusive with split-K: Stream-K does its own K-split. A K_s axis
+    # already splits the K reduction across CTAs — the two never combine.
     if find_split_k_axis_name(op) is not None:
-        raise RuleSkipped("split-K present — Stream-K supplies its own K-split, the two are exclusive")
+        _cant("split-K is active", "STREAMK and SPLITK both split K and are mutually exclusive — unset SPLITK.")
     # Adaptive Stream-K needs the chunked-K outer loop to re-bound; without one
     # (degenerate single-chunk matmul) there's nothing to split.
     k_blocks = _k_blocks(grid)
     if k_blocks is None or k_blocks < 2:
-        raise RuleSkipped("no multi-chunk K loop to split adaptively")
+        _cant("only one K chunk (nothing to split)", "lower BK so K / BK >= 2.")
     # B3b scope: the runtime-bounded K-loop is correct for SYNC / BUFFERED-ring
     # staging (load-barrier-compute each iteration). Async/TMA prefetch and
     # temporal pipelining have a prologue that assumes the K-loop starts at 0 —
     # re-bounding to [k_lo, k_hi) breaks that. Defer those to B5.
     if _is_pipelined(grid):
-        raise RuleSkipped("async/TMA/pipelined K-loop — runtime-bounded prologue is B5")
+        _cant(
+            "the K-loop uses async/TMA prefetch or temporal pipelining",
+            "Stream-K currently needs SYNC/BUFFERED staging — set TMA=0,ASYNC_COPY=0,PIPELINE_STAGES=0 (async/TMA support is pending).",
+        )
 
     # Wave-tail shape gate (autotune only): fork Stream-K just where the launch
     # is in the few-wave regime its tail dominates. An explicit env pin is
     # authoritative (A/B benching at any shape) and skips the gate.
-    if config.knob_raw(STREAMK.name) is None and all(ax.extent.is_static for ax in grid.axes):
+    if not pinned_on and all(ax.extent.is_static for ax in grid.axes):
         total_ctas = prod(ax.extent.as_static() for ax in grid.axes)
         if total_ctas > _MAX_WAVES_FOR_STREAMK * ctx.num_sms:
             raise RuleSkipped(f"{total_ctas} CTAs / {ctx.num_sms} SMs — waves saturated, tail negligible")

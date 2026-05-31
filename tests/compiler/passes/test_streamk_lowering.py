@@ -141,3 +141,27 @@ def test_streamk_ranges_ragged_tail():
     covered = np.concatenate([np.arange(s, e) for s, e in zip(starts.tolist(), ends.tolist(), strict=True)])
     assert covered.tolist() == list(range(175))
     assert int(ends.max()) == 175
+
+
+def test_streamk_pinned_inapplicable_fails_loudly(monkeypatch):
+    """Pinning STREAMK where it can't apply (here: a single K chunk, nothing to
+    split) raises — not a silent skip that yields a non-Stream-K kernel."""
+    import pytest
+
+    monkeypatch.setenv("DEPLODOCK_STREAMK", "1")
+    node = _StubNode(_matmul_tileop(13, 13, k_blocks=1))
+    with pytest.raises(ValueError, match="only one K chunk"):
+        streamk.rewrite(_ctx(), None, node)
+
+
+def test_streamk_unpinned_inapplicable_silently_skips(monkeypatch):
+    """Without a pin, the same inapplicable shape is just a fork-eligibility
+    miss → RuleSkipped (the autotuner simply isn't offered Stream-K here)."""
+    import pytest
+
+    from deplodock.compiler.pipeline import RuleSkipped
+
+    monkeypatch.delenv("DEPLODOCK_STREAMK", raising=False)
+    node = _StubNode(_matmul_tileop(13, 13, k_blocks=1))
+    with pytest.raises(RuleSkipped):
+        streamk.rewrite(_ctx(), None, node)
