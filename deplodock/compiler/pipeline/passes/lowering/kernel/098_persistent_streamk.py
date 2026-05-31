@@ -131,14 +131,17 @@ def rewrite(ctx: Context, match: Match, root) -> list[TileOp] | None:  # noqa: A
     k_blocks = _k_blocks(grid)
     if k_blocks is None or k_blocks < 2:
         _cant("only one K chunk (nothing to split)", "lower BK so K / BK >= 2.")
-    # B3b scope: the runtime-bounded K-loop is correct for SYNC / BUFFERED-ring
-    # staging (load-barrier-compute each iteration). Async/TMA prefetch and
-    # temporal pipelining have a prologue that assumes the K-loop starts at 0 —
-    # re-bounding to [k_lo, k_hi) breaks that. Defer those to B5.
+    # The runtime-bounded K-loop is correct for any staging whose load sits
+    # *inside* a single K-loop iteration — SYNC, BUFFERED ring, and cp.async ring
+    # (load-then-wait per iteration). *Temporal pipelining* (080_pipeline_stages)
+    # and TMA split the loop into a prologue that prefetches chunk 0 + a steady
+    # body + an epilogue, with slot/phase constants baked for [0, K_blocks) — so
+    # re-bounding to [k_lo, k_hi) breaks the prologue. Those stay gated (their
+    # explicit AsyncWait / pipeline-kind loop is the tell).
     if _is_pipelined(grid):
         _cant(
-            "the K-loop uses async/TMA prefetch or temporal pipelining",
-            "Stream-K currently needs SYNC/BUFFERED staging — set TMA=0,ASYNC_COPY=0,PIPELINE_STAGES=0 (async/TMA support is pending).",
+            "the K-loop is temporally pipelined (prologue/steady/epilogue) or uses TMA",
+            "Stream-K needs the load inside the K-loop — set TMA=0,PIPELINE_STAGES=0 (cp.async ring is fine; pipelined/TMA pending).",
         )
 
     # Wave-tail shape gate (autotune only): fork Stream-K just where the launch
@@ -185,11 +188,13 @@ def _k_blocks(grid: GridTile) -> int | None:
 
 
 def _is_pipelined(grid: GridTile) -> bool:
-    """True if the K-loop uses async/TMA prefetch (``AsyncWait`` present) or
-    temporal pipelining (a ``pipeline``-kind serial loop) — staging whose
-    prologue assumes the K-loop starts at chunk 0, incompatible with a
-    runtime-bounded ``[k_lo, k_hi)`` loop until B5. SYNC / BUFFERED rings (no
-    AsyncWait) are fine."""
+    """True if the K-loop is temporally pipelined — a ``pipeline``-kind serial
+    loop, or an explicit ``AsyncWait`` (emitted by 080_pipeline_stages / TMA when
+    the loop is split into a chunk-0 prologue + steady + epilogue). That prologue
+    bakes slot/phase constants for ``[0, K_blocks)``, incompatible with a
+    runtime-bounded ``[k_lo, k_hi)`` loop (pending). SYNC, BUFFERED, and cp.async
+    rings keep the load *inside* a single K-loop iteration (no prologue, no
+    AsyncWait at this stage) and are fine to re-bound."""
     for s in grid.body.iter():
         if isinstance(s, AsyncWait):
             return True

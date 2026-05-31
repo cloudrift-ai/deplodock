@@ -5,9 +5,10 @@ the result against a numpy reference. Each CTA walks a contiguous slice of
 ``M_blocks·N_blocks·K_blocks`` MAC units, runs a runtime-bounded partial K-loop
 over its ``[k_lo, k_hi)`` sub-range, writes full tiles directly and combines
 boundary partials via ``atomicAdd`` into the pre-zeroed output — the real
-wave-tail mechanism (mid-tile K-splitting). Gated to SYNC / BUFFERED-ring staging
-until B5 (the async/TMA/pipelined prologue assumes a contiguous-from-0 K-loop);
-the structural test pins that gate.
+wave-tail mechanism (mid-tile K-splitting). Supported on SYNC / BUFFERED and
+cp.async (non-pipelined) staging; temporal pipelining (TMA / PIPELINE_STAGES)
+stays gated (its chunk-0 prologue assumes a contiguous-from-0 K-loop), and pinning
+STREAMK there fails loudly — pinned by the structural / fail-loud tests.
 """
 
 from __future__ import annotations
@@ -40,29 +41,36 @@ def _matmul_graph(m: int, k: int, n: int) -> Graph:
     return g
 
 
-# Adaptive Stream-K is gated to SYNC / BUFFERED-ring staging (no TMA / async /
-# pipeline) until B5 — the runtime-bounded K-loop has no contiguous-from-0
-# prefetch state to break. Pinned as individual knobs (not DEPLODOCK_KNOBS,
-# which only the CLI splat expands) so the raw Pipeline path sees them too.
-_ADAPTIVE_KNOBS = {
-    "BM": "8",
-    "BN": "16",
-    "FM": "1",
-    "FN": "1",
-    "BK": "32",
-    "STREAMK": "1",
-    "TMA": "0",
-    "ASYNC_COPY": "0",
-    "PIPELINE_STAGES": "0",
-}
+# Adaptive Stream-K supports any staging whose load sits *inside* a single K-loop
+# iteration — SYNC, BUFFERED ring, and cp.async ring. Temporal pipelining (TMA /
+# PIPELINE_STAGES) splits the loop into a chunk-0 prologue + steady + epilogue and
+# stays gated (pending). Pinned as individual knobs (not DEPLODOCK_KNOBS, which
+# only the CLI splat expands) so the raw Pipeline path sees them too.
+def _staging_knobs(async_copy: str) -> dict:
+    return {
+        "BM": "8",
+        "BN": "16",
+        "FM": "1",
+        "FN": "1",
+        "BK": "32",
+        "STREAMK": "1",
+        "TMA": "0",
+        "ASYNC_COPY": async_copy,
+        "PIPELINE_STAGES": "0",
+    }
 
 
-def _pin_adaptive(monkeypatch):
-    for k, v in _ADAPTIVE_KNOBS.items():
+def _pin(monkeypatch, knobs: dict):
+    for k, v in knobs.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
 
 
+def _pin_adaptive(monkeypatch):
+    _pin(monkeypatch, _staging_knobs(async_copy="0"))
+
+
 @requires_cuda
+@pytest.mark.parametrize("async_copy", ["0", "1"], ids=["sync", "async"])
 @pytest.mark.parametrize(
     "m,k,n",
     [
@@ -72,11 +80,12 @@ def _pin_adaptive(monkeypatch):
         (1024, 512, 1024),  # multi-wave: many MAC units per CTA
     ],
 )
-def test_adaptive_streamk_matches_numpy(m, k, n, monkeypatch):
+def test_adaptive_streamk_matches_numpy(m, k, n, async_copy, monkeypatch):
     """Real Phase-B adaptive Stream-K: CTAs walk MAC units, run partial K-loops
     over [k_lo, k_hi), and combine boundary partials via atomicAdd into the
-    pre-zeroed output. Mid-tile splitting — the actual wave-tail mechanism."""
-    _pin_adaptive(monkeypatch)
+    pre-zeroed output. Mid-tile splitting — the actual wave-tail mechanism.
+    Covered on both SYNC/BUFFERED and cp.async (non-pipelined) staging."""
+    _pin(monkeypatch, _staging_knobs(async_copy))
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     rng = np.random.default_rng(2)
@@ -112,8 +121,8 @@ def test_pinned_streamk_on_pipelined_staging_fails_loudly(monkeypatch):
     """Pinning STREAMK=1 where it can't apply (default async/TMA/pipelined
     staging, B5 pending) is a user error — raise, don't silently compile a
     non-Stream-K kernel (fail-loud convention)."""
-    monkeypatch.setenv("DEPLODOCK_STREAMK", "1")  # default staging → pipelined
-    with pytest.raises(ValueError, match="SYNC/BUFFERED staging"):
+    monkeypatch.setenv("DEPLODOCK_STREAMK", "1")  # default staging → pipelined / TMA
+    with pytest.raises(ValueError, match="temporally pipelined|pipelined/TMA support is pending"):
         Pipeline.build(CUDA_PASSES).run(_matmul_graph(512, 512, 512))
 
 
