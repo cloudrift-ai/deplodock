@@ -217,36 +217,48 @@ def _atom_body_to_mma(
     enclosing_bundle: StageBundle | None = None
     flat_loads: list[Load] = []
     flat_accum: Accum | None = None
-
-    def _walk(stmt) -> None:
-        nonlocal reduce_st, outer_st, flat_accum
-        if isinstance(stmt, SerialTile):
-            if any(isinstance(c, SerialTile) and c.is_reduce for c in stmt.body):
-                outer_st = stmt
-                reduce_st = next(c for c in stmt.body if isinstance(c, SerialTile) and c.is_reduce)
-            elif stmt.is_reduce:
-                reduce_st = stmt
-        elif isinstance(stmt, Load):
-            flat_loads.append(stmt)
-        elif isinstance(stmt, Accum):
-            flat_accum = stmt
-
     # Local copy so a bundle nested inside the AtomTile's body contributes
     # its Sources to the lookup `_mma_src_index` consults below — without
     # leaking back to siblings.
     bundle_sources = dict(smem_sources)
-    for s in body:
-        if isinstance(s, Write):
-            write_stmt = s
-            continue
-        if isinstance(s, StageBundle):
-            enclosing_bundle = s
-            for stage in s.stages:
+
+    def _walk(stmt) -> None:
+        nonlocal write_stmt, reduce_st, outer_st, flat_accum, enclosing_bundle
+        if isinstance(stmt, Write):
+            write_stmt = stmt
+            return
+        if isinstance(stmt, StageBundle):
+            enclosing_bundle = stmt
+            for stage in stmt.stages:
                 for src in stage.sources:
                     bundle_sources[src.name] = src
-            for inner in s.body:
+            for inner in stmt.body:
                 _walk(inner)
-            continue
+            return
+        if isinstance(stmt, SerialTile):
+            # Direct K_o > K_i shape (no staging between): record outer +
+            # reduce in one shot.
+            if any(isinstance(c, SerialTile) and c.is_reduce for c in stmt.body):
+                outer_st = stmt
+                reduce_st = next(c for c in stmt.body if isinstance(c, SerialTile) and c.is_reduce)
+                return
+            if stmt.is_reduce:
+                reduce_st = stmt
+                return
+            # Non-reduce serial: K_o wrapping a StageBundle that wraps
+            # the K_i SerialTile (the M5-staged shape). Recurse through.
+            outer_st = stmt
+            for inner in stmt.body:
+                _walk(inner)
+            return
+        if isinstance(stmt, Load):
+            flat_loads.append(stmt)
+            return
+        if isinstance(stmt, Accum):
+            flat_accum = stmt
+            return
+
+    for s in body:
         _walk(s)
 
     if write_stmt is None:
@@ -336,22 +348,30 @@ def _atom_body_to_mma(
         # Mma* chain. The reduce SerialTile loses the ``reduce`` flag
         # (no more Accum inside); its kind stays the same.
         new_reduce_st = SerialTile(axis=reduce_st.axis, body=Body(inner), kind=reduce_st.kind)
-        if outer_st is not None:
-            k_loop_stmts: tuple[Stmt, ...] = (SerialTile(axis=outer_st.axis, body=Body((new_reduce_st,)), kind=outer_st.kind),)
+        # M5: re-wrap with the StageBundle BETWEEN K_o and K_i — the
+        # bundle's ``Source.origin`` may reference the K_o loop var
+        # (e.g. ``a[a0*16, K_o*1024]``) so the producer must fire inside
+        # K_o's scope. The structural shape we restore is exactly what
+        # 020_stage_inputs emitted:
+        # ``SerialTile(K_o) > StageBundle > SerialTile(K_i) > Mma chain``.
+        if enclosing_bundle is not None:
+            staged_inner = enclosing_bundle.with_bodies((Body(enclosing_bundle.stages), Body((new_reduce_st,))))
+            inner_for_outer: tuple[Stmt, ...] = (staged_inner,)
         else:
-            k_loop_stmts = (new_reduce_st,)
+            inner_for_outer = (new_reduce_st,)
+        if outer_st is not None:
+            k_loop_stmts: tuple[Stmt, ...] = (SerialTile(axis=outer_st.axis, body=Body(inner_for_outer), kind=outer_st.kind),)
+        else:
+            k_loop_stmts = inner_for_outer
     else:
         # Body shape C: single-iter K, no SerialTile wrapper. Emit the
-        # Mma* chain inline.
-        k_loop_stmts = inner
-
-    # M5: when the K-loop came from inside a ``StageBundle``, re-wrap so
-    # the smem allocation + cooperative producer survive the lowering.
-    # ``StageBundle.with_bodies`` takes ``(stages_body, body)``; stages
-    # stay byte-clean, body becomes the new Mma chain.
-    if enclosing_bundle is not None:
-        rewrapped = enclosing_bundle.with_bodies((Body(enclosing_bundle.stages), Body(k_loop_stmts)))
-        k_loop_stmts = (rewrapped,)
+        # Mma* chain inline (with the bundle re-wrap if applicable —
+        # origin can still reference outer scope vars, but no K_o is
+        # present so the bundle sits at the AtomTile level).
+        if enclosing_bundle is not None:
+            k_loop_stmts = (enclosing_bundle.with_bodies((Body(enclosing_bundle.stages), Body(inner))),)
+        else:
+            k_loop_stmts = inner
 
     fragments: tuple[Stmt, ...] = (
         MmaFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
