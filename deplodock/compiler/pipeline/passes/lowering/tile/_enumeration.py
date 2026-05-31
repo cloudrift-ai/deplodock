@@ -198,7 +198,7 @@ def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
     )
 
 
-def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
+def _priority_matmul_warp(p: WarpTileParams, *, ctx: Context | None = None) -> tuple[int, ...]:
     # Warp-tier ranking for tensor-core MMA matmul (fp16 / bf16 with f32
     # accumulator, ``wmma_m16n16k16_*`` atom). The pre-2026 prior rewarded
     # ``min(fm*fn, 64)`` monotonically — pushed the picker toward
@@ -208,7 +208,7 @@ def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
     # spill cap — measured at 173 regs/thread on sm_120 with cuBLAS at
     # 3.0× (see ``plans/mma-warp-scoring.md`` for the 2048² fp16 sweep).
     #
-    # New prior reads off two empirical knees:
+    # Primary priors (apply on every arch):
     #
     # 1. **Cells-per-warp sweet spot ≈ 16** (FM·FN). 16 acc frags at
     #    ~4 regs/lane each is ~64 regs + ~30 regs of frag-load + ~30 regs
@@ -221,11 +221,51 @@ def _priority_matmul_warp(p: WarpTileParams) -> tuple[int, ...]:
     #    skewed (e.g. 1×32, 32×1) wastes one operand's reuse. Tiebreaker
     #    inside the cells-band.
     #
-    # Threads near 256 keep last among the primary signals — under the
-    # warp tier this is ``WM·WN`` (warp count), 256 / 32 = 8 warps;
-    # secondary because cell shape dominates the perf landscape.
+    # Per-arch tertiary priors:
+    #
+    # **Non-TMA arches (sm_70 / sm_80)**: ``cp.async``-staged WMMA pays
+    # per-K_o overhead in cooperative-load instructions, so larger BK
+    # (fewer K_o iters) amortizes best and threads-near-256 (8 warps)
+    # keeps the per-warp cooperative slice dense. The pre-2026 tuple
+    # ``(... -abs(256-threads), bk, ...)`` is kept verbatim for these
+    # arches — Phase B sweeps on sm_80 / sm_90 confirmed the same shape.
+    #
+    # **TMA arches (sm_90+, currently sm_90 Hopper + sm_120 Blackwell)**:
+    # the TMA-staged WMMA path beats the gmem-direct baseline by ~15% at
+    # 2048² fp16 when ``BK ≤ 4`` admits ``buffer_count >= 2`` promotion
+    # and ``050_use_tma`` fires. The K_o overhead is one mbarrier handshake
+    # from one issuer thread (vs cooperative cp.async with 128 threads),
+    # so smaller BK is fine and the dominant cost is warp-tier
+    # mma-issue throughput — which **4 warps × 128 threads** saturates
+    # without competing for tensor cores. Empirical sweep at 2048² fp16
+    # on RTX 5090 (sm_120):
+    #
+    #     Rank  WM WN FM FN  cells  threads  µs
+    #         1   1  4  4  4    16     128   84   ← golden
+    #         2   1  4  8  2    16     128   88
+    #         3   1  2  8  4    32      64   89
+    #         4   2  2  4  4    16     128   91   (square M/N split)
+    #         5   4  1  4  4    16     128   94
+    #         ... (256-thread variants land at 106+ µs)
+    #
+    # Encode this as: ``-abs(threads - 128)`` (favor 4-warp CTAs over
+    # 8 or 2) tied with ``-abs(bk - 2)`` (favor BK=2; BK=3 / BK=4 weaken
+    # but stay nearby; BK=64 lands the gmem-direct path which loses ~24%).
+    # Tertiary tiebreaker ``-p.bk`` resolves the (FM=4 FN=4 BK=2) vs
+    # (FM=4 FN=4 BK=64) tie toward the smaller, TMA-firing BK.
     threads = p.wn * p.wm * 32
     cells = p.fm * p.fn
+    tma_capable = ctx is not None and ctx.compute_capability >= (9, 0)
+    if tma_capable:
+        return (
+            -abs(cells - 16),
+            -abs(p.fm - p.fn),
+            -abs(p.bk - 2),
+            -abs(threads - 128),
+            -p.bk,
+            -p.splitk,
+            -len(p.overhang),
+        )
     return (-abs(cells - 16), -abs(p.fm - p.fn), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
 
 
@@ -697,5 +737,5 @@ def _enumerate_warp_matmul_impl(
                                 seen.add(row)
                                 out.append(row)
 
-    out.sort(key=_priority_matmul_warp, reverse=True)
+    out.sort(key=lambda p: _priority_matmul_warp(p, ctx=ctx), reverse=True)
     return out

@@ -237,6 +237,31 @@ def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
     assert first_dist <= last_dist
 
 
+# --- Warp-tier scoring on TMA-capable hardware ----------------------
+
+
+def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
+    """On TMA-capable arches (sm_90+) ``_priority_matmul_warp`` lifts
+    ``BK ≈ 2`` (and tied 128-thread CTAs) above the sm_80-era larger-BK
+    + 256-thread preference. Bench-validated at 2048² fp16 on RTX 5090:
+    ``WM=1 WN=4 FM=FN=4 BK=2`` runs 84 µs vs ``WM=1 WN=8 FM=FN=4 BK=32``
+    at 108 µs — TMA-pipelined beats gmem-direct by ~22 %.
+    """
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
+
+    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom_kind="wmma_m16n16k16_f16")
+    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom_kind="wmma_m16n16k16_f16")
+    # On sm_90+ the gold tile must outscore the gmem-direct sibling.
+    gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
+    baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
+    assert gold_score > baseline_score, f"gold {gold_score!r} should beat baseline {baseline_score!r} on sm_90"
+    # The same call on sm_80 (no TMA) should KEEP preferring large BK and
+    # 256-thread CTAs — the pre-2026 behavior is unchanged off-Hopper.
+    gold_score_80 = _priority_matmul_warp(gold, ctx=_ctx(cc=(8, 0)))
+    baseline_score_80 = _priority_matmul_warp(baseline, ctx=_ctx(cc=(8, 0)))
+    assert baseline_score_80 > gold_score_80, "non-TMA arches must retain the legacy 256-thread + large-BK prior"
+
+
 # --- Warp-tier knob narrow (M1, plans/mma-perf-closures.md) ----------
 
 

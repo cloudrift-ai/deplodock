@@ -1408,7 +1408,18 @@ def score_tile_geometry(
     but isn't read by the formula today; callers may pass ``None``."""
     from math import prod  # noqa: PLC0415
 
-    target_threads = 256
+    # Warp-tier MMA on TMA-capable HW (sm_90+) hits its perf sweet spot at
+    # 4 warps × 128 threads with the mma chain saturating the tensor cores
+    # while TMA off-warps the gmem loads. The pre-2026 ``target_threads =
+    # 256`` was tuned for scalar matmul + gmem-direct WMMA where larger
+    # warp counts amortized cooperative-load instructions; with TMA those
+    # loads cost one mbarrier handshake from one issuer thread, so 256
+    # threads buys nothing and competes for tensor-core throughput.
+    # Empirical sweep at 2048² fp16 on sm_120 (RTX 5090): top 5 TMA-
+    # firing variants all sit at threads=128; the 256-thread variants
+    # land at 106+ µs vs 84 µs for the 128-thread golden tile.
+    tma_capable_warp = "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0)
+    target_threads = 128 if tma_capable_warp else 256
     target_ctas = 128
     score = 0.0
     if not thread_extents:
@@ -1601,10 +1612,29 @@ def score_tile_geometry(
 
             _atom_n = atom_spec(str(knobs["ATOM_KIND"])).shape[1]
             n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
+            # Warp-tier MMA: the actual TMA-pipelined band on sm_90+ /
+            # sm_120 is ``BK ≤ 4`` (BK=2 is the empirical sweet spot —
+            # 84 µs at 2048² fp16 on RTX 5090; BK ≥ 8 falls back to
+            # SYNC because the 040_use_ring_buffers smem budget rejects
+            # buffer_count >= 2 promotion at that slab size). The pre-
+            # 2026 condition ``bk * BYTES_PER_ELEM >= 128`` was the
+            # legacy K-side alignment check copied from the scalar
+            # tier; it gated the bonus *out* of every TMA-firing warp
+            # variant (BK=2 → 8 B << 128 B) while firing for the
+            # gmem-direct BK=64 baseline that loses to TMA by ~24 %.
+            # Fire bonus when N-side TMA-aligned AND BK is in the
+            # TMA-firing band.
+            if n_stride_elems * BYTES_PER_ELEM >= 128 and bk <= 4:
+                score += 1.0
         else:
             n_stride_elems = int(knobs.get("BN", 1)) * fn
-        if bk * BYTES_PER_ELEM >= 128 and n_stride_elems * BYTES_PER_ELEM >= 128:
-            score += 1.0
+            # Scalar tier: legacy condition kept verbatim. ``bk *
+            # BYTES_PER_ELEM >= 128`` corresponds to the K-side per-
+            # warp slab fitting the TMA descriptor's 128 B inner-row
+            # alignment — meaningful for the scalar matmul path where
+            # the K dim is the cooperative-load inner extent.
+            if bk * BYTES_PER_ELEM >= 128 and n_stride_elems * BYTES_PER_ELEM >= 128:
+                score += 1.0
 
     return score
 

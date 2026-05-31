@@ -136,6 +136,26 @@ def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
+def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
+    """With ``DEPLODOCK_MMA=1`` defaulted ON and *no* warp-tier pins, the
+    picker on sm_90+ must land on the empirical golden tile for 2048² fp16:
+    ``WM=1 WN=4 FM=4 FN=4 BK=2``. Measured 84 µs vs eager's 98 µs (1.17×)
+    on RTX 5090; previous gmem-direct baseline ran 108 µs (0.92×).
+
+    The change to ``score_tile_geometry`` (target_threads=128 on TMA-capable
+    warp tier + TMA bonus restricted to BK ≤ 4) is what lands this variant.
+    """
+    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    g, kop, _ = _compile_and_render(M=2048, N=2048, K=2048, out_dtype=F16)
+    assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16"
+    assert int(kop.knobs.get("WM", 0)) == 1, f"expected WM=1, got {kop.knobs.get('WM')}"
+    assert int(kop.knobs.get("WN", 0)) == 4, f"expected WN=4, got {kop.knobs.get('WN')}"
+    assert int(kop.knobs.get("FM", 0)) == 4, f"expected FM=4, got {kop.knobs.get('FM')}"
+    assert int(kop.knobs.get("FN", 0)) == 4, f"expected FN=4, got {kop.knobs.get('FN')}"
+    assert int(kop.knobs.get("BK", 0)) == 2, f"expected BK=2, got {kop.knobs.get('BK')}"
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
 def test_tma_wmma_path_emits_bulk_tensor_ptx(pin_tma_wmma):
     """At a shape large enough to clear both the 128-byte alignment gate
     and the ``src_inner ≥ 2 × inner_extent`` size gate, the WMMA staged
