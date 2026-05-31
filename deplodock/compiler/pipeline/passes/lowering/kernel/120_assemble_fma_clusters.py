@@ -41,8 +41,9 @@ targets) and is a no-op everywhere else.
 from __future__ import annotations
 
 from deplodock import config
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.kernel.ir import FmaCluster, KernelOp
+from deplodock.compiler.ir.kernel.ir import FmaCluster, KernelOp, Smem
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Stmt
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -65,13 +66,26 @@ def rewrite(root: Node) -> KernelOp | None:
         raise RuleSkipped("FMA_CLUSTER=0 pinned")
     _ = config.knob_raw(FMA_CLUSTER.name)  # keep the env-read on the standard path
 
-    new_body, changed = _walk(root.op.body)
+    f32_bufs = _f32_buffers(root.op)
+    new_body, changed = _walk(root.op.body, f32_bufs)
     if not changed:
         raise RuleSkipped("no matmul outer-product cell to assemble")
     return KernelOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
-def _walk(body: Body) -> tuple[Body, bool]:
+def _f32_buffers(kernel_op: KernelOp) -> frozenset[str]:
+    """Names of buffers provably f32: ``__shared__`` decls with C-type ``float``
+    plus kernel inputs/outputs whose ``Tensor`` dtype is F32. The inline-PTX
+    emitter is f32-only, so the cluster fires only when *every* operand buffer
+    is in this set (a half / bf16 operand would be a constraint type-mismatch)."""
+    bufs = {s.name for s in kernel_op.body.iter_of_type(Smem) if s.dtype == "float"}
+    for name, tensor in {**kernel_op.inputs, **kernel_op.outputs}.items():
+        if tensor.dtype == F32:
+            bufs.add(name)
+    return frozenset(bufs)
+
+
+def _walk(body: Body, f32_bufs: frozenset[str]) -> tuple[Body, bool]:
     """Recurse into nested bodies; when a body is a pure outer-product cell,
     replace it with a single ``FmaCluster``."""
     new_stmts: list[Stmt] = []
@@ -82,7 +96,7 @@ def _walk(body: Body) -> tuple[Body, bool]:
             new_bodies = []
             sub_changed = False
             for b in nested:
-                nb, c = _walk(b)
+                nb, c = _walk(b, f32_bufs)
                 new_bodies.append(nb)
                 sub_changed = sub_changed or c
             if sub_changed:
@@ -90,16 +104,17 @@ def _walk(body: Body) -> tuple[Body, bool]:
                 changed = True
         new_stmts.append(s)
     rebuilt = Body(tuple(new_stmts))
-    cluster = _match_outer_product(rebuilt)
+    cluster = _match_outer_product(rebuilt, f32_bufs)
     if cluster is not None:
         return Body((cluster,)), True
     return rebuilt, changed
 
 
-def _match_outer_product(body: Body) -> FmaCluster | None:
+def _match_outer_product(body: Body, f32_bufs: frozenset[str]) -> FmaCluster | None:
     """Return a ``FmaCluster`` if ``body`` is exactly a clean A×B outer-product
-    cell (Loads + multiply Assigns + add Accums, products = full cross product),
-    else ``None``. Conservative: any other statement kind aborts the match."""
+    cell (Loads + multiply Assigns + add Accums, products = full cross product)
+    over f32 operand buffers, else ``None``. Conservative: any other statement
+    kind, or any non-f32 operand buffer, aborts the match."""
     stmts = tuple(body)
     loads: list[Load] = []
     muls: list[Assign] = []
@@ -116,6 +131,15 @@ def _match_outer_product(body: Body) -> FmaCluster | None:
 
     # Need a real cluster (≥ 2 cells) backed by matching products + accumulators.
     if len(muls) < 2 or len(muls) != len(accums) or not loads:
+        return None
+
+    # f32-only: the inline-PTX emitter is ``fma.rn.f32`` with ``"+f"`` / ``"f"``
+    # (float-register) constraints. Operand C type lives on the *buffer* (loads
+    # are dtype-None; the type comes from the Smem decl / input Tensor), so gate
+    # on every operand buffer being provably f32. fp16 / bf16 cells (operands
+    # declared ``__half`` etc.) would be a constraint type-mismatch — they stay
+    # on the plain-C path (and target the WMMA tensor-core lowering anyway).
+    if any(ld.input not in f32_bufs for ld in loads):
         return None
 
     name_buf: dict[str, str] = {n: ld.input for ld in loads for n in ld.names}

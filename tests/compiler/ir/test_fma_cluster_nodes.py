@@ -96,6 +96,45 @@ def test_repr_eval_round_trip_in_stmt_scope():
     assert back == c and hash(back) == hash(c)
 
 
+def test_render_emits_b_inner_inline_ptx():
+    """``render`` emits the operand Loads as C then one ``asm volatile`` of
+    ``fm*fn`` ``fma.rn.f32`` in B_INNER order (n outer, m inner). Operand slots:
+    accumulators (``+f``, slots ``0..n_acc-1``, row-major ``acc[m*fn+n]``), then
+    A operands (``f``, ``n_acc+m``), then B operands (``f``, ``n_acc+fm+n``).
+    Holding b[n] in one slot across the inner m-run is what pins it to port Rb."""
+    from deplodock.compiler.ir.stmt import RenderCtx
+
+    # 2×3 cell: a0,a1 (A) × b0,b1,b2 (B) → 6 accumulators.
+    body = (
+        Load(names=("a0",), input="a_smem", index=(Var("k"), Var("r0"))),
+        Load(names=("a1",), input="a_smem", index=(Var("k"), Var("r1"))),
+        Load(names=("b0",), input="b_smem", index=(Var("k"), Var("c0"))),
+        Load(names=("b1",), input="b_smem", index=(Var("k"), Var("c1"))),
+        Load(names=("b2",), input="b_smem", index=(Var("k"), Var("c2"))),
+    )
+    c = FmaCluster(
+        body=body,
+        a_names=("a0", "a1"),
+        b_names=("b0", "b1", "b2"),
+        acc_names=tuple(f"acc{m * 3 + n}" for m in range(2) for n in range(3)),
+        fm=2,
+        fn=3,
+    )
+    lines = c.render(RenderCtx(shapes={"a_smem": (64, 8), "b_smem": (64, 8)}))
+    text = "\n".join(lines)
+    fmas = [ln.strip() for ln in lines if "fma.rn.f32" in ln]
+    assert len(fmas) == 6
+    # B_INNER walk: n=0 → m=0,1 ; n=1 → m=0,1 ; n=2 → m=0,1. n_acc=6, fm=2.
+    # acc_slot=m*3+n, a_slot=6+m, b_slot=6+2+n.
+    assert fmas[0] == '"fma.rn.f32 %0, %6, %8, %0;\\n"'  # (m=0,n=0): acc0, a0, b0
+    assert fmas[1] == '"fma.rn.f32 %3, %7, %8, %3;\\n"'  # (m=1,n=0): acc3, a1, b0 — b0 still %8 → Rb reuse
+    assert fmas[2] == '"fma.rn.f32 %1, %6, %9, %1;\\n"'  # (m=0,n=1): acc1, a0, b1
+    # constraint lists: 6 in/out accumulators, then 2 A + 3 B read-only inputs.
+    assert '"+f"(acc0)' in text and '"+f"(acc5)' in text
+    assert '"f"(a0)' in text and '"f"(b2)' in text
+    assert "asm volatile(" in text and text.rstrip().endswith(");")
+
+
 def test_graph_json_body_round_trip():
     """Full ``Graph.to_dict`` → ``from_dict`` round-trip with the node inside a
     ``KernelOp`` body — the path ``deplodock run --ir <dump>`` exercises."""

@@ -56,7 +56,6 @@ from deplodock.compiler.ir.stmt import (
     Write,
     _pad,
 )
-from deplodock.compiler.ir.stmt import render_body as _render_body
 from deplodock.compiler.ir.stmt.ir import BodyOp
 from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
@@ -235,22 +234,21 @@ class FmaCluster(Stmt):
     to cuBLAS (see ``plans/inline-fma-cluster.md``).
 
     ``body`` is the original matched cell (the ``Load`` / ``Assign(multiply)``
-    / ``Accum(add)`` statements, in their source order). It is the
-    *structural payload* and the round-trip carrier:
+    / ``Accum(add)`` statements, in their source order). It is the structural
+    payload: :meth:`render` emits the cell's operand ``Load``s as plain C, then
+    a single inline-PTX ``asm volatile`` block of ``fm * fn`` ``fma.rn.f32``
+    instructions in the ``B_INNER`` operand order — each B operand held in the
+    PTX ``Rb`` source port for ``fm`` consecutive FFMAs so ptxas's ``.reuse``
+    peephole fires (the ``multiply`` + ``add`` statements in ``body`` are
+    subsumed by the fused FFMAs and not re-emitted). ``nested`` still exposes
+    ``body`` so buffer-read aggregation / SSA analysis sees the loads; ``body``
+    also backs diagnostics that want the pre-asm cell.
 
-    - **M2 (this milestone):** :meth:`render` emits ``body`` verbatim, so a
-      ``FMA_CLUSTER=1`` kernel is byte-for-byte identical to ``FMA_CLUSTER=0``
-      (the assembly pass is a behavior-neutral round-trip). The node is
-      otherwise transparent — :meth:`nested` exposes ``body`` so buffer-read
-      aggregation / SSA analysis sees the loads.
-    - **M3:** :meth:`render` switches to the inline-PTX emission driven by
-      ``a_names`` / ``b_names`` / ``acc_names`` (the row/col/cell SSA views).
-      The ``FMA_CLUSTER=0`` readability path comes from *skipping the pass*
-      entirely (no cluster node, plain C), so M3 may keep ``body`` for
-      diagnostics only.
+    The ``FMA_CLUSTER=0`` readability path comes from *skipping the assembly
+    pass* entirely (no cluster node, plain-C ``Load + Accum`` body).
 
     ``acc_names`` indexes row-major as ``acc_names[m * fn + n]`` over the
-    ``fm × fn`` cell.
+    ``fm × fn`` cell; ``a_names[m]`` / ``b_names[n]`` are the row/col operands.
     """
 
     body: tuple[Stmt, ...]  # original matched cell stmts, in source order
@@ -296,9 +294,35 @@ class FmaCluster(Stmt):
         return [f"{indent}fma_cluster[{self.fm}x{self.fn} {self.policy}] {self.acc_names[:1]}... += a @ b"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        # M2 placeholder: re-emit the carried cell verbatim (behavior-neutral
-        # round-trip). M3 replaces this with the inline-PTX asm block.
-        return _render_body(self.body, ctx)
+        pad = _pad(ctx.indent)
+        # 1. The cell's operand Loads stay plain C (vectorization + smem/global
+        #    addressing handled by the existing Load render). The multiply +
+        #    Accum statements are subsumed by the fused FFMAs below.
+        out: list[str] = []
+        for s in self.body:
+            if isinstance(s, Load):
+                out.extend(s.render(ctx))
+        # 2. One asm block: fm*fn fma.rn.f32 in B_INNER order. Operand slots are
+        #    the accumulators (``+f`` in/out, slots 0..n_acc-1) then the read-only
+        #    A then B operands (``f``). acc[m,n] = acc_names[m*fn+n]; a[m] sits at
+        #    slot n_acc+m, b[n] at n_acc+fm+n. Holding b[n] in one slot across the
+        #    inner m-run keeps it in port Rb so ptxas marks ``.reuse``.
+        n_acc = len(self.acc_names)
+        asm_lines: list[str] = []
+        for n in range(self.fn):
+            for m in range(self.fm):
+                acc_slot = m * self.fn + n
+                a_slot = n_acc + m
+                b_slot = n_acc + self.fm + n
+                asm_lines.append(f'"fma.rn.f32 %{acc_slot}, %{a_slot}, %{b_slot}, %{acc_slot};\\n"')
+        outs = ", ".join(f'"+f"({a})' for a in self.acc_names)
+        ins = ", ".join(f'"f"({x})' for x in (*self.a_names, *self.b_names))
+        out.append(f"{pad}asm volatile(")
+        out.extend(f"{pad}    {ln}" for ln in asm_lines)
+        out.append(f"{pad}    : {outs}")
+        out.append(f"{pad}    : {ins}")
+        out.append(f"{pad});")
+        return out
 
 
 @dataclass(frozen=True)
