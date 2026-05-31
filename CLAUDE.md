@@ -22,7 +22,8 @@ correctness, or performance below what the request implies. These rules OVERRIDE
   understands the complexity from the plan; restating it just pollutes context and manufactures worry. If a real blocker
   exists, name the blocker — not a vague "this is hard."
 - **Don't interrupt work.** User knows when to pause the work and review the changes. Do not stop and interrupt the work
-  for a review, or to split the work in multiple sessions.
+  for a review, or to split the work in multiple sessions. Do not split the work into multiple PRs — users knows exactly
+  how big of a chunk to request.
 
 Take as much time as you need to implement the full scope of the request. Don't negotiate scope reduction even if you
 risk running out of context or afraid of failure due to other reasons.
