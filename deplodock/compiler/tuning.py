@@ -31,13 +31,9 @@ Env vars:
 - ``DEPLODOCK_BK`` — K-split size (subject to ``K % BK == 0 and K > BK``).
   Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
-- ``DEPLODOCK_TMA_SWIZZLE`` — opt in to TMA hardware-swizzle modes
-  (``SWIZZLE_{128,64,32}B``). ``=1`` enables; default off. Stages whose
-  inner box-dim byte size matches a swizzle width pick the matching
-  mode in ``050_use_tma``; the materializer pairs each swizzled stage
-  with body-Load XOR decoding and a 1024-byte (B128) / 512-byte (B64)
-  / 256-byte (B32) smem alignment so the swizzle pattern lines up with
-  the buffer base.
+
+(``DEPLODOCK_TMA_SWIZZLE`` — the TMA hardware-swizzle opt-in — is a
+``Knob`` owned by ``050_use_tma``, not a matmul-tile heuristic.)
 
 ## API
 
@@ -53,7 +49,6 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import BK, BM, BN, FM, FN, SPLITK
 
 if TYPE_CHECKING:
@@ -330,26 +325,6 @@ def _default_tile(output_extents: tuple[int, ...], body_info: BodyInfo) -> tuple
     if cls == "default-large":
         return _TILE_SHAPE_DEFAULT_LARGE, _F_PER_AXIS_DEFAULT_LARGE
     return _TILE_SHAPE_DEFAULT, _F_PER_AXIS_DEFAULT
-
-
-# --- TMA gates ---------------------------------------------------------
-
-# TMA hardware-swizzle opt-in. Hints ``(False, True)`` so the default (first
-# candidate) is off — the swizzle only fires when the inner box-dim byte size
-# matches a swizzle width AND the user pins ``DEPLODOCK_TMA_SWIZZLE=1``.
-TMA_SWIZZLE = Knob(
-    "TMA_SWIZZLE",
-    KnobType.BOOL,
-    hints=(False, True),
-    help="Opt in to TMA hardware-swizzle modes (SWIZZLE_{128,64,32}B). Off by default.",
-)
-
-
-def _tma_swizzle_enabled() -> bool:
-    """TMA hardware-swizzle gate. Off by default — only fires when the
-    inner box-dim byte size matches a swizzle width AND ``DEPLODOCK_TMA_SWIZZLE``
-    opts in."""
-    return TMA_SWIZZLE.narrow(TMA_SWIZZLE.hints)[0]
 
 
 # --- Heuristics (pure numeric) -----------------------------------------

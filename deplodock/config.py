@@ -191,7 +191,7 @@ def ncu_child() -> bool:
 # Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) and
 # ``DEPLODOCK_TMA_SWIZZLE`` (TMA hardware-swizzle opt-in) used to live here as
 # bespoke getters. They are now real ``Knob`` descriptors in their owning rules
-# (``025_swizzle_blocks.py`` / ``compiler/tuning.py``) so they show up in
+# (``025_swizzle_blocks.py`` / ``050_use_tma.py``) so they show up in
 # ``deplodock knobs`` and read through the descriptor's env path. Env access
 # still routes through this module's ``knob_raw`` / ``int_env`` primitives.
 

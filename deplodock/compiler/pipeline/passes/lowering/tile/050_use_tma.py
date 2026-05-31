@@ -100,6 +100,18 @@ TMA = Knob(
     help="Promote BUFFERED/ASYNC bundles to TMA. 1 = force (hard-fail on ineligibility), 0 = skip pass.",
 )
 
+# TMA hardware-swizzle opt-in. Hints ``(False, True)`` so the default (first
+# candidate) is off — the swizzle only fires when a stage's inner box-dim byte
+# size matches a swizzle width AND the user pins ``DEPLODOCK_TMA_SWIZZLE=1``.
+# The SwizzleMode selection (currently stubbed to NONE) lives in this rule, so
+# the knob is declared here even though no live code reads it yet.
+TMA_SWIZZLE = Knob(
+    "TMA_SWIZZLE",
+    KnobType.BOOL,
+    hints=(False, True),
+    help="Opt in to TMA hardware-swizzle modes (SWIZZLE_{128,64,32}B). Off by default.",
+)
+
 
 def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # Arch-gated default: only Hopper+ offers TMA at all. Hand narrow the
