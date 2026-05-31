@@ -83,18 +83,18 @@ _TMA_ALIGN_BYTES = 128
 # >= 1 phase dim on the smem slab; promoting SYNC would break that.
 _PROMOTABLE = frozenset({StagePolicy.BUFFERED, StagePolicy.ASYNC})
 
-# USE_TMA knob — hints ``(True, False)`` so the *first* candidate is True
+# TMA knob — hints ``(True, False)`` so the *first* candidate is True
 # (the preferred policy on Hopper+). On sm < 9.0 the rule hands ``(False,)``
 # alone to narrow, so the False candidate wins without the user ever pinning.
-# When ``DEPLODOCK_USE_TMA=1`` is set, narrow returns ``(True,)`` even on
+# When ``DEPLODOCK_TMA=1`` is set, narrow returns ``(True,)`` even on
 # unsupported arch (a pin is authoritative — the user knows what they're
 # doing); the downstream eligibility checks then raise ``ValueError`` rather
 # than the silent ``RuleSkipped`` fallback that used to mask the article's
-# matmul A+B case. ``DEPLODOCK_USE_TMA=0`` skips the pass so
+# matmul A+B case. ``DEPLODOCK_TMA=0`` skips the pass so
 # ``060_use_async_copy`` promotes BUFFERED → ASYNC — useful when A/B-benching
 # cp.async vs TMA on the same shape.
-USE_TMA = Knob(
-    "USE_TMA",
+TMA = Knob(
+    "TMA",
     KnobType.BOOL,
     hints=(True, False),
     help="Promote BUFFERED/ASYNC bundles to TMA. 1 = force (hard-fail on ineligibility), 0 = skip pass.",
@@ -105,21 +105,21 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # Arch-gated default: only Hopper+ offers TMA at all. Hand narrow the
     # full ``(True, False)`` hint tuple on supported arch, ``(False,)`` alone
     # otherwise — the first remaining candidate wins by priority order.
-    candidates = USE_TMA.hints if ctx.compute_capability >= _MIN_CAPABILITY else (False,)
-    use_tma = USE_TMA.narrow(candidates)[0]
-    pinned = config.knob_raw(USE_TMA.name) is not None
+    candidates = TMA.hints if ctx.compute_capability >= _MIN_CAPABILITY else (False,)
+    use_tma = TMA.narrow(candidates)[0]
+    pinned = config.knob_raw(TMA.name) is not None
 
     if not use_tma:
         if pinned:
-            raise RuleSkipped("USE_TMA=0 pinned")
+            raise RuleSkipped("TMA=0 pinned")
         if ctx.compute_capability < _MIN_CAPABILITY:
             raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
-        raise RuleSkipped("USE_TMA defaulted off")
+        raise RuleSkipped("TMA defaulted off")
 
     def _fail(msg: str) -> None:
         """Raise ``ValueError`` when explicitly pinned on, ``RuleSkipped`` otherwise."""
         if pinned:
-            raise ValueError(f"DEPLODOCK_USE_TMA=1 but TMA cannot fire: {msg}")
+            raise ValueError(f"DEPLODOCK_TMA=1 but TMA cannot fire: {msg}")
         raise RuleSkipped(msg)
 
     # TMA descriptors bake the source shape statically into the cuTensorMap; bail

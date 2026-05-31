@@ -236,7 +236,7 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
 #   with overhang. ``_enumerate_cartesian`` skipped non-divisor FM
 #   when ``m_overhang`` was off; same commit added per-(fm,fn)
 #   overhang flip + masked-tile codegen.
-# - ``USE_TMA=1`` + multi-source A+B (matmul): ``050_use_tma``
+# - ``TMA=1`` + multi-source A+B (matmul): ``050_use_tma``
 #   rejected multi-source bundles. Fixed in ``8940dc25``: pre-
 #   eligibility split of multi-source Stages into N single-source
 #   Stages so the materializer's N-stages-per-bundle TMA emit path
@@ -293,12 +293,12 @@ def _build_2d_matmul_graph(dims: dict):
 # transport × pipelining combination that the article-tile knobs can
 # select, so a regression in any of them trips a test:
 #
-#   - TMA pipelined (``USE_TMA=1 PIPELINE_STAGES=1``)
-#   - TMA depth-1 (``USE_TMA=1 PIPELINE_STAGES=0``)
-#   - cp.async pipelined (``USE_TMA=0 USE_ASYNC_COPY=1 PIPELINE_STAGES=1``)
-#   - cp.async depth-1 (``USE_TMA=0 USE_ASYNC_COPY=1 PIPELINE_STAGES=0``)
-#   - sync double-buffered (``USE_TMA=0 USE_ASYNC_COPY=0 PIPELINE_STAGES=1``)
-#   - sync depth-1 (``USE_TMA=0 USE_ASYNC_COPY=0 PIPELINE_STAGES=0``)
+#   - TMA pipelined (``TMA=1 PIPELINE_STAGES=1``)
+#   - TMA depth-1 (``TMA=1 PIPELINE_STAGES=0``)
+#   - cp.async pipelined (``TMA=0 ASYNC_COPY=1 PIPELINE_STAGES=1``)
+#   - cp.async depth-1 (``TMA=0 ASYNC_COPY=1 PIPELINE_STAGES=0``)
+#   - sync double-buffered (``TMA=0 ASYNC_COPY=0 PIPELINE_STAGES=1``)
+#   - sync depth-1 (``TMA=0 ASYNC_COPY=0 PIPELINE_STAGES=0``)
 #
 # The B2 per-Load guard (``021_hoist_staged_loads_above_mask._guard_unsafe_loads``)
 # handles the masked-tile branch on the TMA + cp.async + sync paths.
@@ -317,10 +317,10 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
     # cab3c83e: FM=26 non-divisor of E_M/BM=256 — overhang/masked tile.
     ("fm26_overhang_masked", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # 8940dc25: USE_TMA=1 forces TMA on the matmul A+B bundle that the
+    # 8940dc25: TMA=1 forces TMA on the matmul A+B bundle that the
     # eligibility check used to reject as multi-source. Tile sized so
     # ``KernelOp.validate``'s smem cap (~99 KB on sm_120) is honored.
-    ("multisrc_tma_fm1_fn1", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1}, {}),
+    ("multisrc_tma_fm1_fn1", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
     # FN=4 multi-axis cache on N. Multi-axis-per-source-dim is now
     # admitted as ``AffineAddressing`` unconditionally (the old
     # ``DEPLODOCK_AFFINE_COLLAPSE`` opt-in was retired once the unify-
@@ -328,7 +328,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "multi_axis_affine_fn4",
         _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
+        {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
         {},
     ),
     # Multi-axis collapse on BOTH axes: FM=4 and FN=4 — the article's
@@ -336,7 +336,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "multi_axis_affine_fm4_fn4",
         _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
         {},
     ),
     # 095_interleave_loads opt-out — flat-LDS layout (every Load at
@@ -346,7 +346,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "interleave_loads_disabled",
         _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
     # Article's EXACT tile: ``BM=8 BN=32 FM=26 FN=4 BK=32`` produces a
@@ -365,11 +365,11 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "article_exact_fm26_masked_tma",
         _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1},
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
         {},
     ),
     # Same masked-M tile (FM=26 overhang) but routed through the
-    # cp.async path (``USE_TMA=0`` skips 050_use_tma; ``USE_ASYNC_COPY=1``
+    # cp.async path (``TMA=0`` skips 050_use_tma; ``ASYNC_COPY=1``
     # promotes the BUFFERED bundle to ASYNC; ``PIPELINE_STAGES=1``
     # software-pipelines into prologue/main/epilogue). Verifies the
     # hoist's per-Load guard interacts correctly with cp.async's
@@ -385,7 +385,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "fm26_masked_cpasync",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
         {},
     ),
     # Symmetric coverage: ``FN=26 FM=4`` → masked-N overhang on
@@ -396,7 +396,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "fn26_masked_cpasync",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
         {},
     ),
     # Non-masked baseline on the cp.async path (FM=4 FN=4 divides
@@ -407,7 +407,7 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "fm4_fn4_cpasync",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
         {},
     ),
     # Depth-1 staging coverage (``PIPELINE_STAGES=0`` keeps the bundle
@@ -438,25 +438,25 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     (
         "fm26_masked_tma_no_pipe",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 1, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1, "ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
         {},
     ),
     (
         "fm26_masked_cpasync_no_pipe",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
         {},
     ),
     (
         "fm26_masked_sync_db",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 0, "PIPELINE_STAGES": 1},
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 0, "PIPELINE_STAGES": 1},
         {},
     ),
     (
         "fm26_masked_sync_no_pipe",
         _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "USE_TMA": 0, "USE_ASYNC_COPY": 0, "PIPELINE_STAGES": 0},
+        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 0, "PIPELINE_STAGES": 0},
         {},
     ),
 )

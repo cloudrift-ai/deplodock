@@ -44,8 +44,8 @@ PATTERN = [Pattern("root", TileOp)]
 # ``StageBundle.buffer_count`` and downstream ``pipeline_stages`` reads it from
 # the bundle (no separate PIPE knob — ring depth and pipeline depth are coupled
 # by construction in CUTLASS-style multistage matmul).
-BUFCNT = Knob(
-    "BUFCNT",
+BUFFER_COUNT = Knob(
+    "BUFFER_COUNT",
     KnobType.INT,
     hints=(2, 3, 4),
     help="Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops",
@@ -54,41 +54,41 @@ BUFCNT = Knob(
 
 def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     body = root.op.body
-    if BUFCNT.name in root.op.knobs:
+    if BUFFER_COUNT.name in root.op.knobs:
         raise RuleSkipped("ring buffers already applied (idempotence via knob)")
     if any(isinstance(s, StageBundle) and s.policy != StagePolicy.SYNC for s in body.iter()):
         raise RuleSkipped("double-buffer already applied (non-SYNC bundle present)")
 
-    candidates = BUFCNT.narrow(BUFCNT.hints)
-    # Pin detection: if the user pinned ``DEPLODOCK_BUFCNT=N`` (or
-    # ``DEPLODOCK_KNOBS=BUFCNT=N``), a silent fall-through to SYNC when
+    candidates = BUFFER_COUNT.narrow(BUFFER_COUNT.hints)
+    # Pin detection: if the user pinned ``DEPLODOCK_BUFFER_COUNT=N`` (or
+    # ``DEPLODOCK_KNOBS=BUFFER_COUNT=N``), a silent fall-through to SYNC when
     # ``N`` doesn't fit the smem cap drops every downstream transport
     # promotion (060_use_async_copy, 050_use_tma, 080_pipeline_stages
     # all gate on a BUFFERED/ASYNC/TMA bundle) — kernel runs as plain
     # SYNC with no staging benefit, looks ~50 % slower than the auto
     # variant. Surface the constraint instead of swallowing it.
-    pinned = config.knob_raw(BUFCNT.name) is not None
+    pinned = config.knob_raw(BUFFER_COUNT.name) is not None
     variants: list[TileOp] = []
     fail_reasons: list[str] = []
     for buf_count in candidates:
         new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem, buffer_count=buf_count)
         if not changed:
             fail_reasons.append(
-                f"BUFCNT={buf_count} not promotable (smem cap {ctx.max_dynamic_smem} B / K_o extent / SYNC bundle eligibility)"
+                f"BUFFER_COUNT={buf_count} not promotable (smem cap {ctx.max_dynamic_smem} B / K_o extent / SYNC bundle eligibility)"
             )
             continue
         variants.append(
             TileOp(
                 body=new_body,
                 name=root.op.name,
-                knobs={**root.op.knobs, BUFCNT.name: buf_count},
+                knobs={**root.op.knobs, BUFFER_COUNT.name: buf_count},
             )
         )
     if not variants:
         msg = "; ".join(fail_reasons) if fail_reasons else "no candidate fit"
         if pinned:
-            raise ValueError(f"DEPLODOCK_BUFCNT={candidates[0]} pinned but cannot fire: {msg}")
-        raise RuleSkipped(f"no K-outer StageBundle fits any BUFCNT candidate ({msg})")
+            raise ValueError(f"DEPLODOCK_BUFFER_COUNT={candidates[0]} pinned but cannot fire: {msg}")
+        raise RuleSkipped(f"no K-outer StageBundle fits any BUFFER_COUNT candidate ({msg})")
     return variants
 
 
