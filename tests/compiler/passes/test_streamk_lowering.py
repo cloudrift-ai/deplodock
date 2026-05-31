@@ -31,15 +31,15 @@ class _StubNode:
         self.id = "k"
 
 
-def _persistent_kernelop(m_b: int = 13, n_b: int = 13) -> KernelOp:
-    """``PersistentTile(M_b, N_b) > ThreadTile > Load+Write`` — minimal matmul
-    shape so the lowering derives a real signature (one input ``A``, output
-    ``C``) and persistent launch geometry."""
+def _persistent_kernelop(m_b: int = 13, n_b: int = 13, k_blocks: int = 4) -> KernelOp:
+    """``PersistentTile(M_b, N_b, k_blocks) > ThreadTile > Load+Write`` — minimal
+    adaptive Stream-K shape so the lowering derives a real signature (one input
+    ``A``, output ``C``) and the num_sms / work-range launch geometry."""
     inner = ThreadTile(
         axes=(Axis("m_t", 16), Axis("n_t", 16)),
         body=Body((Load(name="a", input="A", index=(Var("m_t"), Var("n_t"))), Write(output="C", index=(Var("m_t"),), value="a"))),
     )
-    pt = PersistentTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)))
+    pt = PersistentTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)), k_blocks=k_blocks)
     return KernelOp(body=Body((pt,)), name="k_streamk")
 
 
@@ -52,7 +52,7 @@ def test_launch_geometry_grid_is_num_sms():
     assert streamk is not None
     start, end, total = streamk
     assert (start, end) == ("streamk_work_start", "streamk_work_end")
-    assert total == 13 * 13  # product of block-axis extents = tile count
+    assert total == 13 * 13 * 4  # tiles (block-axis product) × K_blocks = MAC units
 
 
 def test_cudaop_threads_work_arrays_through():
@@ -60,14 +60,14 @@ def test_cudaop_threads_work_arrays_through():
     # Work arrays slot after buffers/descriptors in arg_order.
     assert op.arg_order[-2:] == ("streamk_work_start", "streamk_work_end")
     assert op.streamk_work_arrays == ("streamk_work_start", "streamk_work_end")
-    assert op.streamk_total_units == 169
+    assert op.streamk_total_units == 13 * 13 * 4
     assert op.grid == ((STREAMK_NUM_SMS,), (1,), (1,))
     # Signature declares both as const int* pointers.
     assert "const int* __restrict__ streamk_work_start" in op.kernel_source
     assert "const int* __restrict__ streamk_work_end" in op.kernel_source
-    # And the body reads them per-CTA.
+    # And the body walks the per-CTA MAC slice.
     assert "streamk_work_start[blockIdx.x]" in op.kernel_source
-    assert "for (int tile_iter = __wbeg; tile_iter < __wend; tile_iter++)" in op.kernel_source
+    assert "while (__mac < __wend)" in op.kernel_source
 
 
 def test_streamk_ranges_partition_work_one_owner():

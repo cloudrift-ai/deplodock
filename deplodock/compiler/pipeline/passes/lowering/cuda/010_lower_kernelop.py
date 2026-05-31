@@ -167,9 +167,8 @@ def _launch_geometry(
                 if isinstance(child, ThreadTile):
                     block_spec = _axes_spec(child.axes)
                     break
-            total_units = max(prod(a.extent.as_static() for a in s.axes), 1)
-            if s.k_blocks is not None:
-                total_units *= s.k_blocks
+            # MAC units = output tiles (block-axis product) × K-chunks per tile.
+            total_units = max(prod(a.extent.as_static() for a in s.axes), 1) * s.k_blocks
             streamk: StreamKMeta = (s.work_start, s.work_end, total_units)
             return ((STREAMK_NUM_SMS,), (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen), streamk
         if isinstance(s, GridTile):

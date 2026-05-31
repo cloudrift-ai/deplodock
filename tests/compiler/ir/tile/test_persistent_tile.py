@@ -1,13 +1,12 @@
-"""Render + structural tests for the PersistentTile primitive (Stream-K M1).
+"""Render + structural tests for the PersistentTile primitive (adaptive Stream-K).
 
-Hand-builds a minimal matmul-shape ``PersistentTile(M_b, N_b) > ThreadTile``
-and exercises the primitive's contract in isolation: the per-CTA work-range
-loop, the row-major block-axis decode against the loop variable (NOT
-``blockIdx.x``), the cooperative threadIdx decode of the inner ThreadTile, the
-work-range array deps, and the repr/eval round-trip the Graph serializer needs.
+Hand-builds a minimal matmul-shape ``PersistentTile`` and exercises its generic
+contract (deps, frozen identity, repr/eval round-trip, with_bodies). The adaptive
+MAC-segment render is pinned by the ``_adaptive`` tests further down; the
+runtime-bounded K-loop (StridedTile / SerialTile) gets its own tests too.
 
-No upstream pass emits ``PersistentTile`` yet — ``tile/018_persistent_streamk``
-lands in a later milestone; this pins the IR surface the rewrite will target.
+``PersistentTile`` is adaptive-only — it always splits K via the MAC-segment walk
+(``kernel/_streamk``). There is no tile-parallel variant.
 """
 
 from __future__ import annotations
@@ -20,38 +19,15 @@ from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.tile.ir import Accum, PersistentTile, StridedTile, ThreadTile, Write
 
 
-def _persistent(m_b: int = 8, n_b: int = 4) -> PersistentTile:
-    """``PersistentTile(M_b, N_b) > ThreadTile(M_t, N_t) > Write``.
-
-    The inner ThreadTile + Write is a placeholder standing in for the real
-    matmul cell — the milestone's surface is the persistent work-loop and the
-    block-axis decode, not the cooperative cell body.
-    """
-    inner = ThreadTile(axes=(Axis("m_t", 16), Axis("n_t", 16)), body=Body((Write(output="C", index=(), value="acc"),)))
-    return PersistentTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)))
+def _persistent(m_b: int = 8, n_b: int = 4, k_blocks: int = 4) -> PersistentTile:
+    """``PersistentTile(M_b, N_b, k_blocks) > ThreadTile > Write`` — a minimal
+    adaptive Stream-K tile for the generic structural tests."""
+    inner = ThreadTile(axes=(Axis("m_t", 16), Axis("n_t", 16)), body=Body((Write(output="C", index=(Var("m_b"),), value="acc"),)))
+    return PersistentTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)), k_blocks=k_blocks)
 
 
 def _render(pt: PersistentTile) -> str:
     return "\n".join(pt.render(RenderCtx(indent=0)))
-
-
-def test_render_emits_work_range_loop():
-    """Each CTA reads its [start, end) range from the two int32 arrays and
-    walks it with a serial loop — the body indents under the loop's brace."""
-    src = _render(_persistent())
-    assert "int __wbeg = streamk_work_start[blockIdx.x];" in src
-    assert "int __wend = streamk_work_end[blockIdx.x];" in src
-    assert "for (int tile_iter = __wbeg; tile_iter < __wend; tile_iter++) {" in src
-    assert src.strip().endswith("}")
-
-
-def test_block_axes_decode_from_work_var_not_blockidx():
-    """The block axes decode row-major from the work-loop variable, NOT
-    ``blockIdx.x`` — that's the whole point: one CTA computes many tiles."""
-    src = _render(_persistent(m_b=8, n_b=4))
-    assert "int m_b = tile_iter / (4);" in src
-    assert "int n_b = tile_iter % 4;" in src
-    assert "blockIdx.x" not in src.split("for (int tile_iter")[1]  # no blockIdx past the loop head
 
 
 def test_inner_threadtile_renders_cooperative():
@@ -72,19 +48,19 @@ def test_deps_are_the_work_range_arrays():
 def test_with_bodies_preserves_fields():
     pt = PersistentTile(
         axes=(Axis("m_b", 8), Axis("n_b", 4)),
-        body=Body((Write(output="C", index=(), value="acc"),)),
+        body=Body((Write(output="C", index=(Var("m_b"),), value="acc"),)),
+        k_blocks=7,
         work_start="ws",
         work_end="we",
-        work_var="wi",
     )
-    pt2 = pt.with_bodies((Body((Write(output="C", index=(), value="acc2"),)),))
+    pt2 = pt.with_bodies((Body((Write(output="C", index=(Var("m_b"),), value="acc2"),)),))
     assert isinstance(pt2, PersistentTile)
-    assert (pt2.work_start, pt2.work_end, pt2.work_var) == ("ws", "we", "wi")
+    assert (pt2.k_blocks, pt2.work_start, pt2.work_end) == (7, "ws", "we")
 
 
 def test_pretty_label():
-    pt = _persistent()
-    assert any("persistent[num_sms]" in line for line in pt.pretty())
+    pt = _persistent(k_blocks=4)
+    assert any("persistent[num_sms] streamk K_blocks=4" in line for line in pt.pretty())
 
 
 def test_frozen_and_hashable():
@@ -100,7 +76,7 @@ def test_repr_eval_round_trip():
     rebuilt = _eval_stmt(repr(pt))
     assert isinstance(rebuilt, PersistentTile)
     assert rebuilt == pt
-    assert (rebuilt.work_start, rebuilt.work_end, rebuilt.work_var) == (pt.work_start, pt.work_end, pt.work_var)
+    assert (rebuilt.k_blocks, rebuilt.work_start, rebuilt.work_end) == (pt.k_blocks, pt.work_start, pt.work_end)
 
 
 # ---------------------------------------------------------------------------
@@ -209,17 +185,10 @@ def test_adaptive_partial_k_loop_and_write_branch():
     assert "scratch[m_b + n_b] = acc;" in src
 
 
-def test_adaptive_property_and_default_is_tile_parallel():
-    assert _adaptive().adaptive is True
-    assert _persistent().adaptive is False  # k_blocks=None default
-    # tile-parallel render keeps the plain for-loop, no MAC-walk.
-    assert "while (__mac" not in _render(_persistent())
-
-
 def test_adaptive_with_bodies_and_round_trip_preserve_k_blocks():
     pt = _adaptive(k_blocks=8)
     pt2 = pt.with_bodies((pt.body,))
-    assert pt2.k_blocks == 8 and pt2.adaptive
+    assert pt2.k_blocks == 8
     assert _eval_stmt(repr(pt)).k_blocks == 8
 
 

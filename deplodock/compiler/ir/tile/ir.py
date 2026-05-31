@@ -781,64 +781,46 @@ STREAMK_K_HI = "streamk_k_hi"
 
 @dataclass(frozen=True)
 class PersistentTile(ParallelTile):
-    """Persistent-CTA grid for Stream-K matmul scheduling.
+    """Persistent-CTA grid for adaptive Stream-K matmul.
 
     Launches exactly ``num_sms`` CTAs (resolved at launch, not baked — see
-    ``compiler/backend/cuda/program.py``). Each CTA walks a contiguous range
-    ``[work_start[blockIdx.x], work_end[blockIdx.x])`` of tile-work units,
-    supplied as two ``int32[num_sms]`` runtime arrays. The work-loop variable
-    decodes the block axes with the SAME row-major decode ``GridTile`` uses for
-    ``blockIdx.x`` — so the per-CTA body computes a *sequence* of output tiles
-    instead of one ``blockIdx``-fixed tile, killing the wave-quantization tail.
+    ``compiler/backend/cuda/program.py``). Each CTA walks a contiguous slice
+    ``[work_start[blockIdx.x], work_end[blockIdx.x])`` of the
+    ``M_blocks·N_blocks·K_blocks`` **MAC units** (``(tile, K-chunk)`` pairs),
+    supplied as two ``int32[num_sms]`` runtime arrays. Per MAC segment it decodes
+    the tile and K sub-range (the ``kernel/_streamk.cta_segments`` walk), runs the
+    body's runtime-bounded partial K-loop over ``[streamk_k_lo, streamk_k_hi)``,
+    and advances by the segment length — splitting K *only at the boundaries*, so
+    the fractional wave gets filled (the wave-tail win). Replaces the ``GridTile``
+    wrapper, carrying the same block ``axes`` ``(M_b, N_b)``.
 
-    Replaces the ``GridTile`` wrapper (same ``axes`` — the matmul block axes
-    ``(M_b, N_b)``, optionally a split-K ``K_s``). The inner ``ThreadTile`` /
-    K-loop body is unchanged: re-entered per work unit, so its register
-    accumulators re-init and its ``Write`` fires once per tile inside the loop
-    scope. Boundary tiles whose K-reduction is split across CTAs need an
-    ``atomicAdd`` output — derived from ``Body.coordination.atomic_axes`` the
-    same way legacy split-K is (a block axis missing from the Write index), so
-    no per-tile metadata lives here.
+    ``k_blocks`` is the K-loop trip count (``K / BK``). The body's K-loop runs the
+    sub-range and its output ``Write`` branches on full-tile (``k_lo == 0 &&
+    k_hi == K_blocks`` → direct store) vs boundary partial (``atomicAdd`` /
+    combine) — built by ``kernel/098_persistent_streamk``. ``work_start`` /
+    ``work_end`` name the two runtime arrays. Renders::
 
-    ``work_start`` / ``work_end`` name the two runtime arrays; ``work_var`` is
-    the emitted loop variable the axis decode reads. Renders::
-
-        int __wbeg = <work_start>[blockIdx.x];
-        int __wend = <work_end>[blockIdx.x];
-        for (int <work_var> = __wbeg; <work_var> < __wend; <work_var>++) {
-            <row-major axis decode from work_var>
-            <body>
+        int __mac = <work_start>[blockIdx.x];  int __wend = <work_end>[blockIdx.x];
+        while (__mac < __wend) {
+            int __tile = __mac / K_blocks;  int streamk_k_lo = __mac % K_blocks;
+            <row-major block-axis decode from __tile>            // binds M_b, N_b
+            int __seg_end = min(__wend, __mac - streamk_k_lo + K_blocks);
+            int streamk_k_hi = streamk_k_lo + (__seg_end - __mac);
+            <body>                                              // partial K-loop + write branch
+            __mac = __seg_end;
         }
     """
 
+    k_blocks: int = 1
     work_start: str = "streamk_work_start"
     work_end: str = "streamk_work_end"
-    work_var: str = "tile_iter"
-    # ``None`` ⇒ tile-parallel walk (one whole tile per work unit, perf-neutral).
-    # An int ``K_blocks`` (the K-loop trip count) ⇒ the **adaptive** Stream-K walk:
-    # work units are ``(tile, K-chunk)`` MAC units, a CTA walks a contiguous slice
-    # tile-segment by tile-segment, runs a runtime-bounded partial K-loop over
-    # ``[streamk_k_lo, streamk_k_hi)``, and writes full tiles directly / boundary
-    # partials to scratch. Mirrors ``kernel/_streamk.cta_segments``.
-    k_blocks: int | None = None
-
-    @property
-    def adaptive(self) -> bool:
-        return self.k_blocks is not None
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return PersistentTile(
-            axes=self.axes,
-            body=body,
-            work_start=self.work_start,
-            work_end=self.work_end,
-            work_var=self.work_var,
-            k_blocks=self.k_blocks,
-        )
+        return PersistentTile(axes=self.axes, body=body, k_blocks=self.k_blocks, work_start=self.work_start, work_end=self.work_end)
 
     def _pretty_label(self) -> str:
-        return f"persistent[num_sms] streamk K_blocks={self.k_blocks}" if self.adaptive else "persistent[num_sms]"
+        return f"persistent[num_sms] streamk K_blocks={self.k_blocks}"
 
     def deps(self) -> tuple[str, ...]:
         # The two work-range arrays are read at the top of every CTA; declaring
@@ -846,43 +828,11 @@ class PersistentTile(ParallelTile):
         return (self.work_start, self.work_end)
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """Per-CTA work-range loop + block-axis decode + body.
+        """Emit the adaptive MAC-segment walk (``kernel/_streamk.cta_segments``).
 
-        Tile-parallel: a ``for`` over tile-work units, row-major block decode off
-        the loop var. Adaptive (Stream-K): a ``while`` over a MAC-unit slice,
-        decoding ``(tile, k_lo, k_hi)`` per segment (``kernel/_streamk`` walk) and
-        advancing by the segment length. The inner ``ThreadTile`` renders its
-        threadIdx decode under ``inside_grid_tile=True`` (cooperative form, no
-        linear-tid guard); the work loop supplies the brace level.
-        """
-        if self.adaptive:
-            return self._render_adaptive(ctx)
-        pad = _pad(ctx.indent)
-        out = [
-            f"{pad}int __wbeg = {self.work_start}[blockIdx.x];",
-            f"{pad}int __wend = {self.work_end}[blockIdx.x];",
-            f"{pad}for (int {self.work_var} = __wbeg; {self.work_var} < __wend; {self.work_var}++) {{",
-        ]
-        inner = replace(ctx.child(), inside_grid_tile=True)
-        out.extend(_render_grid_axis_decode(self.axes, self.work_var, inner))
-        out.extend(_render_body(self.body, inner))
-        out.append(f"{pad}}}")
-        return out
-
-    def _render_adaptive(self, ctx: RenderCtx) -> list[str]:
-        """Emit the adaptive MAC-segment walk (``kernel/_streamk.cta_segments``):
-
-        int __mac = work_start[blockIdx.x]; int __wend = work_end[blockIdx.x];
-        while (__mac < __wend) {
-            int __tile = __mac / K_blocks;
-            int streamk_k_lo = __mac % K_blocks;
-            <row-major block-axis decode from __tile>   // binds M_b, N_b
-            int __tile_end = __mac - streamk_k_lo + K_blocks;
-            int __seg_end = (__wend < __tile_end) ? __wend : __tile_end;
-            int streamk_k_hi = streamk_k_lo + (__seg_end - __mac);
-            <body>      // partial K-loop over [k_lo,k_hi); full→output / partial→scratch
-            __mac = __seg_end;
-        }
+        The inner ``ThreadTile`` renders its threadIdx decode under
+        ``inside_grid_tile=True`` (cooperative form, no linear-tid guard); the
+        ``while`` loop supplies the brace level the body indents under.
         """
         kb = self.k_blocks
         pad = _pad(ctx.indent)

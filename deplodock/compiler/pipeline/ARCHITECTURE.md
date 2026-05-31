@@ -151,27 +151,30 @@ register-blocked GEMM builder used to get from its hand-written
 N-invariant-cone partition (see `plans/obsolete-blocked-gemm-builder.md`).
 
 **Stream-K (persistent CTAs).** `lowering/kernel/098_persistent_streamk`
-forks a matmul `GridTile` into a `PersistentTile` on the `STREAMK` BOOL
-knob (default off). Instead of one CTA per output tile (a fractional last
-wave that idles the tail SMs), it launches `num_sms` CTAs that each walk a
-contiguous range of the tile grid — killing the wave-quantization tail at
-compute-bound sizes. It runs as a *late kernel pass* (after register-tile
-flattening / Init-hoist / vectorize / interleave, before
-`100_materialize`) so it only swaps the outer wrapper and carries the
-fully-lowered body verbatim — running earlier would let GridTile-keyed
-kernel passes skip the `PersistentTile` body. The grid resolves to the
-live `MultiProcessorCount` at launch (reserved `STREAMK_NUM_SMS` sym name,
-not baked → portable cubin); two `int32[num_sms]` work-range arrays
-(`streamk_work_start/end`, filled by `_streamk_ranges` in the CUDA
-backend) feed the per-CTA loop. Today the rewrite does only this
-*perf-neutral* wrapper swap (full tiles, one owner per tile, plain store):
-rebalancing tile ownership doesn't shorten the `ceil(units/SMs)` critical
-path, so the actual wave-tail win waits on **Phase B** — adaptive mid-tile
-K-splitting with an atomic-free scratch+combine (in progress; see the
-plan). **Mutually exclusive with `SPLITK`**: Stream-K supplies its own
-K-split, so the rule self-skips when a `K_s` axis is present. An
-autotune-only wave-tail shape gate skips the fork once the launch
-saturates `> 8` waves; an explicit `DEPLODOCK_STREAMK=1` pin is
+forks a matmul `GridTile` into an adaptive `PersistentTile` on the `STREAMK`
+BOOL knob (default off). Instead of one CTA per output tile (a fractional
+last wave that idles the tail SMs), it launches `num_sms` CTAs that each
+walk a contiguous slice of the `M_blocks·N_blocks·K_blocks` **MAC units**,
+running a runtime-bounded partial K-loop over their `[k_lo, k_hi)` sub-range
+— splitting K *only at the boundaries* so the fractional wave fills. It runs
+as a *late kernel pass* (after register-tile flattening / Init-hoist /
+vectorize / interleave, before `100_materialize`) so it transforms a
+fully-lowered body — running earlier would let GridTile-keyed kernel passes
+skip the `PersistentTile` body. `_adaptivize` re-bounds the `serial_outer`
+K-loop and wraps the output `Write` in `Cond(k_lo==0 && k_hi==K_blocks)`:
+full-tile owners store directly, boundary partials `atomicAdd`
+(`Write.atomic`) into the pre-zeroed output (`zero_outputs`). The grid
+resolves to the live `MultiProcessorCount` at launch (reserved
+`STREAMK_NUM_SMS` sym name, not baked → portable cubin); two `int32[num_sms]`
+work-range arrays (`streamk_work_start/end`, filled by `_streamk_ranges` in
+the CUDA backend, walked per `kernel/_streamk.cta_segments`) feed the per-CTA
+loop. **Mutually exclusive with `SPLITK`**: Stream-K supplies its own
+K-split, so the rule self-skips when a `K_s` axis is present. **Gated to SYNC
+/ BUFFERED-ring staging**: async/TMA/pipelined K-loops have a prefetch
+prologue assuming a contiguous-from-0 K range (follow-up). The boundary
+combine is `atomicAdd` today; the plan's atomic-free scratch+reduce is the
+next step. An autotune-only wave-tail shape gate skips the fork once the
+launch saturates `> 8` waves; an explicit `DEPLODOCK_STREAMK=1` pin is
 authoritative and bypasses the gate. See `plans/persistent-cta-streamk.md`.
 
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
