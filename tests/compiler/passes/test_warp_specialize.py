@@ -1,7 +1,7 @@
-"""Tests for ``085_warp_specialize`` — the WS Fork-emitting tile-IR pass.
+"""Tests for ``085_warp_specialize`` — the WARP_SPECIALIZE Fork-emitting tile-IR pass.
 
-The pass matches ``TileOp`` and emits a 2-child ``Fork`` (``WS=0`` /
-``WS=1``) when the body contains a TMA ``StageBundle`` with
+The pass matches ``TileOp`` and emits a 2-child ``Fork`` (``WARP_SPECIALIZE=0`` /
+``WARP_SPECIALIZE=1``) when the body contains a TMA ``StageBundle`` with
 ``pipeline_depth == 2`` inside a ``SerialTile(serial_outer)``. Otherwise
 ``RuleSkipped``.
 """
@@ -116,8 +116,8 @@ def test_rule_skipped_on_pointwise():
 
 def test_rule_skipped_when_ws_already_set():
     op = _tile_op_tma_pipelined()
-    op_with_ws = TileOp(body=op.body, name=op.name, knobs={"WS": 1})
-    with pytest.raises(RuleSkipped, match="WS knob already set"):
+    op_with_ws = TileOp(body=op.body, name=op.name, knobs={"WARP_SPECIALIZE": True})
+    with pytest.raises(RuleSkipped, match="WARP_SPECIALIZE knob already set"):
         _run_rule(op_with_ws)
 
 
@@ -126,8 +126,8 @@ def test_emits_two_child_fork_on_tma_pipelined():
     result = _run_rule(op)
     assert isinstance(result, list), f"expected list[Fork], got {type(result).__name__}"
     assert len(result) == 2, f"expected 2 forks, got {len(result)}"
-    knob_values = sorted(f.knobs["WS"] for f in result)
-    assert knob_values == [0, 1]
+    knob_values = sorted(f.knobs["WARP_SPECIALIZE"] for f in result)
+    assert knob_values == [False, True]
     for fork in result:
         assert isinstance(fork, Fork)
         assert fork.is_leaf
@@ -135,24 +135,24 @@ def test_emits_two_child_fork_on_tma_pipelined():
         children = fork.expand()
         assert len(children) == 1
         assert isinstance(children[0], TileOp)
-        assert children[0].knobs["WS"] == fork.knobs["WS"]
+        assert children[0].knobs["WARP_SPECIALIZE"] == fork.knobs["WARP_SPECIALIZE"]
 
 
 def test_env_pin_narrows_to_single_choice(monkeypatch):
-    monkeypatch.setenv("DEPLODOCK_WS", "1")
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
     op = _tile_op_tma_pipelined()
     result = _run_rule(op)
     # Single-choice short-circuit: return a bare TileOp, not a Fork list.
     assert isinstance(result, TileOp)
-    assert result.knobs["WS"] == 1
+    assert result.knobs["WARP_SPECIALIZE"] is True
 
 
 def test_env_pin_zero_returns_bare_tileop(monkeypatch):
-    monkeypatch.setenv("DEPLODOCK_WS", "0")
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "0")
     op = _tile_op_tma_pipelined()
     result = _run_rule(op)
     assert isinstance(result, TileOp)
-    assert result.knobs["WS"] == 0
+    assert result.knobs["WARP_SPECIALIZE"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +167,7 @@ def test_ws1_emits_warp_specialize_stmt(monkeypatch):
     lowering. Post-refactor (M6 of ``plans/warptile-primitive.md``) the
     inner tile is a ``WarpTile`` carrying a single role axis, not the
     extended ``ThreadTile`` the previous shape used."""
-    monkeypatch.setenv("DEPLODOCK_WS", "1")
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
     op = _tile_op_tma_pipelined()
     result = _run_rule(op)
     assert isinstance(result, TileOp)
@@ -201,7 +201,7 @@ def test_ws1_tile_body_contains_no_kernel_ir(monkeypatch):
         Sync,
     )
 
-    monkeypatch.setenv("DEPLODOCK_WS", "1")
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
     op = _tile_op_tma_pipelined()
     result = _run_rule(op)
     assert isinstance(result, TileOp)

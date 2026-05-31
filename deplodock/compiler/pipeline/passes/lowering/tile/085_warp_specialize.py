@@ -71,8 +71,8 @@ Eligibility:
   extent. Pre-extension matmul tiles satisfy this by construction
   (``BM × BN`` is always a multiple of 32 for matmul shapes).
 
-``DEPLODOCK_WS=0`` / ``DEPLODOCK_WS=1`` env pins narrow the fork via
-``WS.narrow``.
+``DEPLODOCK_WARP_SPECIALIZE=0`` / ``DEPLODOCK_WARP_SPECIALIZE=1`` env pins narrow
+the fork via ``WARP_SPECIALIZE.narrow``.
 """
 
 from __future__ import annotations
@@ -100,10 +100,10 @@ from deplodock.compiler.pipeline.pipeline import Fork
 PATTERN = [Pattern("root", TileOp)]
 
 
-WS = Knob(
-    "WS",
+WARP_SPECIALIZE = Knob(
+    "WARP_SPECIALIZE",
     KnobType.BOOL,
-    hints=(0, 1),
+    hints=(False, True),
     help="Warp-specialize TMA staging: producer warps issue TMA, consumer warps wait + reduce",
 )
 
@@ -302,7 +302,7 @@ def _ws_transform(op: TileOp) -> TileOp:
             new_outer.append(s)
 
     new_knobs = dict(op.knobs)
-    new_knobs["WS"] = 1
+    new_knobs[WARP_SPECIALIZE.name] = True
     return TileOp(body=Body(new_outer), name=op.name, knobs=new_knobs)
 
 
@@ -314,21 +314,21 @@ def _ws_transform(op: TileOp) -> TileOp:
 def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
     op: TileOp = root.op
 
-    if "WS" in op.knobs:
-        raise RuleSkipped("WS knob already set")
+    if WARP_SPECIALIZE.name in op.knobs:
+        raise RuleSkipped("WARP_SPECIALIZE knob already set")
 
     ok, reason = _eligible(op)
     if not ok:
         raise RuleSkipped(reason)
 
-    ws_choices = WS.narrow((0, 1))
+    ws_choices = WARP_SPECIALIZE.narrow(WARP_SPECIALIZE.hints)
     if not ws_choices:
-        raise RuleSkipped("DEPLODOCK_WS env pin removed all WS choices")
+        raise RuleSkipped("DEPLODOCK_WARP_SPECIALIZE env pin removed all choices")
 
-    def _stamp(ws: int) -> TileOp:
-        if ws == 0:
+    def _stamp(ws: bool) -> TileOp:
+        if not ws:
             new_knobs = dict(op.knobs)
-            new_knobs["WS"] = 0
+            new_knobs[WARP_SPECIALIZE.name] = False
             return TileOp(body=op.body, name=op.name, knobs=new_knobs)
         return _ws_transform(op)
 
@@ -337,7 +337,7 @@ def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
 
     return [
         Fork(
-            knobs={WS.name: ws},
+            knobs={WARP_SPECIALIZE.name: ws},
             expand=(lambda ws=ws: [_stamp(ws)]),
             score=0.0,
             is_leaf=True,
