@@ -49,12 +49,23 @@ combine in the plan's Phase B) are a separate, larger follow-up.
 
 from __future__ import annotations
 
+from math import prod
+
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import STREAMK
 
 PATTERN = [Pattern("root", TileOp)]
+
+# Above this many waves the launch already amortizes its tail across enough
+# CTAs that the persistent walk can't recover a meaningful fraction — and the
+# Stream-K bookkeeping (work-range loads, atomicAdd contention) would only cost.
+# Below it, the fractional last wave idles a real slice of the SMs. The fork is
+# offered to the autotuner only inside this regime (an explicit DEPLODOCK_STREAMK
+# pin bypasses the gate for A/B benchmarking).
+_MAX_WAVES_FOR_STREAMK = 8
 
 
 def _outer_grid(op: TileOp) -> GridTile | None:
@@ -81,6 +92,14 @@ def rewrite(ctx: Context, match: Match, root) -> list[TileOp] | None:  # noqa: A
     # axis (if present) makes grid.axes 3-D — that's the atomic path, kept.
     if len(grid.axes) < 2 or "FM" not in op.knobs:
         raise RuleSkipped("not a matmul block grid")
+
+    # Wave-tail shape gate (autotune only): fork Stream-K just where the launch
+    # is in the few-wave regime its tail dominates. An explicit env pin is
+    # authoritative (A/B benching at any shape) and skips the gate.
+    if config.knob_raw(STREAMK.name) is None and all(ax.extent.is_static for ax in grid.axes):
+        total_ctas = prod(ax.extent.as_static() for ax in grid.axes)
+        if total_ctas > _MAX_WAVES_FOR_STREAMK * ctx.num_sms:
+            raise RuleSkipped(f"{total_ctas} CTAs / {ctx.num_sms} SMs — waves saturated, tail negligible")
 
     candidates = STREAMK.narrow(STREAMK.hints)
     if not candidates:

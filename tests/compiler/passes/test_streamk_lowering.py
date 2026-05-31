@@ -18,10 +18,11 @@ from deplodock.compiler.ir.cuda.ir import STREAMK_NUM_SMS
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.kernel.ir import KernelOp
 from deplodock.compiler.ir.stmt import Body, Load, Write
-from deplodock.compiler.ir.tile.ir import PersistentTile, ThreadTile
+from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, RegisterTile, ThreadTile, TileOp
 
 lower = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.cuda.010_lower_kernelop")
 program = importlib.import_module("deplodock.compiler.backend.cuda.program")
+streamk = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.098_persistent_streamk")
 
 
 class _StubNode:
@@ -85,6 +86,47 @@ def test_streamk_ranges_two_waves():
     starts, ends = program._streamk_ranges(340, 170)
     assert (ends - starts).tolist() == [2] * 170
     assert ends[-1] == 340
+
+
+def _matmul_tileop(m_b: int, n_b: int) -> TileOp:
+    inner = ThreadTile(
+        axes=(Axis("m_t", 16), Axis("n_t", 16)),
+        body=Body((RegisterTile(axes=(Axis("m_r", 1),), body=Body((Write(output="C", index=(Var("m_t"),), value="acc"),))),)),
+    )
+    grid = GridTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)))
+    return TileOp(body=Body((grid,)), name="k_matmul", knobs={"FM": 1, "FN": 1, "BM": 16, "BN": 16})
+
+
+def _ctx(num_sms: int = 170):
+    from deplodock.compiler.context import Context
+
+    return Context.from_target((12, 0)).__class__(compute_capability=(12, 0), num_sms=num_sms)
+
+
+def test_streamk_fork_offered_in_wave_tail_regime(monkeypatch):
+    monkeypatch.delenv("DEPLODOCK_STREAMK", raising=False)
+    node = _StubNode(_matmul_tileop(13, 13))  # 169 CTAs ≈ 170 SMs → tail regime
+    variants = streamk.rewrite(_ctx(), None, node)
+    knobs = sorted(v.knobs["STREAMK"] for v in variants)
+    assert knobs == [False, True]
+
+
+def test_streamk_fork_skipped_when_waves_saturated(monkeypatch):
+    import pytest
+
+    from deplodock.compiler.pipeline import RuleSkipped
+
+    monkeypatch.delenv("DEPLODOCK_STREAMK", raising=False)
+    node = _StubNode(_matmul_tileop(200, 200))  # 40000 CTAs ≫ 8·170 → saturated
+    with pytest.raises(RuleSkipped, match="saturated"):
+        streamk.rewrite(_ctx(), None, node)
+
+
+def test_streamk_env_pin_bypasses_wave_gate(monkeypatch):
+    monkeypatch.setenv("DEPLODOCK_STREAMK", "1")
+    node = _StubNode(_matmul_tileop(200, 200))  # saturated, but pin is authoritative
+    variants = streamk.rewrite(_ctx(), None, node)
+    assert [v.knobs["STREAMK"] for v in variants] == [True]
 
 
 def test_streamk_ranges_ragged_tail():

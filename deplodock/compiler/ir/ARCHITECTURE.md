@@ -267,7 +267,17 @@ parallel coord: `GridTile` (one coord = one CTA, lifts to `blockIdx`),
 `WarpTile` (one coord = one warp; the body presumes 32 lanes execute it
 collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 `ThreadTile` and `WarpTile` are mutually exclusive inside one
-`TileOp.body` — both bind `threadIdx`. `RegisterTile` (per-thread
+`TileOp.body` — both bind `threadIdx`. `PersistentTile` (Stream-K) is a
+fourth `ParallelTile`: a launch-geometry variant of `GridTile` that
+replaces the `blockIdx` decode with a per-CTA work-range loop
+(`for tile_iter in [work_start[blockIdx.x], work_end[blockIdx.x])`,
+decoding the same block axes off `tile_iter`). It launches `num_sms`
+CTAs that each walk a contiguous slice of the tile grid, killing the
+wave-quantization tail; it carries the GridTile's body verbatim, so the
+swap is done late (`kernel/098_persistent_streamk`) after every
+GridTile-keyed scheduling pass has run. Counted as block-axis-binding by
+`Body.coordination` exactly like `GridTile`, so split-K's atomicAdd
+classification survives the swap (see below). `RegisterTile` (per-thread
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by

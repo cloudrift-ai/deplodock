@@ -150,6 +150,29 @@ after replication CSE-fold into one — the same effect the deleted
 register-blocked GEMM builder used to get from its hand-written
 N-invariant-cone partition (see `plans/obsolete-blocked-gemm-builder.md`).
 
+**Stream-K (persistent CTAs).** `lowering/kernel/098_persistent_streamk`
+forks a matmul `GridTile` into a `PersistentTile` on the `STREAMK` BOOL
+knob (default off). Instead of one CTA per output tile (a fractional last
+wave that idles the tail SMs), it launches `num_sms` CTAs that each walk a
+contiguous range of the tile grid — killing the wave-quantization tail at
+compute-bound sizes. It runs as a *late kernel pass* (after register-tile
+flattening / Init-hoist / vectorize / interleave, before
+`100_materialize`) so it only swaps the outer wrapper and carries the
+fully-lowered body verbatim — running earlier would let GridTile-keyed
+kernel passes skip the `PersistentTile` body. The grid resolves to the
+live `MultiProcessorCount` at launch (reserved `STREAMK_NUM_SMS` sym name,
+not baked → portable cubin); two `int32[num_sms]` work-range arrays
+(`streamk_work_start/end`, filled by `_streamk_ranges` in the CUDA
+backend) feed the per-CTA loop. When the matmul also carries `SPLITK > 1`,
+the persistent grid covers `(K_s, M_b, N_b)` and each unit `atomicAdd`\s
+its split-K partial into the pre-zeroed output — the **atomic-based**
+Stream-K variant, reusing the legacy split-K atomic path (`Body.coordination`
+counts `PersistentTile.axes` as block axes, so `K_s ∉ Write.index` ⇒
+atomicAdd + `zero_outputs`). An autotune-only wave-tail shape gate skips
+the fork once the launch saturates `> 8` waves; an explicit
+`DEPLODOCK_STREAMK=1` pin is authoritative and bypasses the gate. See
+`plans/persistent-cta-streamk.md`.
+
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
 12-pass `normalize_body`) only fire for the variant the search actually

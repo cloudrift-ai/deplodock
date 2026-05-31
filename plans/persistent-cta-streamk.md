@@ -1,5 +1,24 @@
 # Persistent CTA + Stream-K for matmul — kill the wave tail at compute-bound sizes
 
+> **Status (2026-05-31): atomic variant shipped on `feature/persistent-cta-streamk`.** The persistent-CTA scaffolding
+> and the *atomic-based* Stream-K (this plan's atomic alternative to Phase B's atomic-free combine) are implemented and
+> tested end-to-end:
+> - `PersistentTile` IR primitive (`ir/tile/ir.py`) — launches `num_sms` CTAs, each walking a `[work_start, work_end)`
+>   range of tile-work units; decodes the block axes off the loop var instead of `blockIdx`.
+> - `STREAMK` knob + `Context.num_sms` (live `MultiProcessorCount`); grid resolves to the SM count at launch via the
+>   reserved `STREAMK_NUM_SMS` sym name (portable cubin), with two `int32[num_sms]` work-range arrays.
+> - `kernel/098_persistent_streamk` swaps the matmul `GridTile`→`PersistentTile` as a late kernel pass (after all
+>   GridTile-keyed scheduling passes). No split-K → full tiles, one owner, plain store. With `SPLITK > 1` → persists
+>   over `(K_s, M_b, N_b)` and each unit `atomicAdd`s its partial into the pre-zeroed output (reuses the legacy split-K
+>   atomic path; `Body.coordination` counts `PersistentTile.axes` as block axes). Autotune-only wave-tail shape gate;
+>   `DEPLODOCK_STREAMK=1` pin is authoritative.
+> - Verified vs torch/numpy on 256³ / 512³ / 1024³ / 2048³ / non-square shapes (full suite green).
+>
+> **Not yet done:** the adaptive **mid-tile MAC-range** boundaries (Phase B proper — partial K-loops at arbitrary
+> offsets, atomic-free scratch+combine), the Phase A wave-quantized tile pin (M1–M2), swizzle under the persistent walk,
+> and the 2048³ perf bench (atomic-based is expected to ~tie golden per this plan's Split-K note; the win needs the
+> atomic-free combine). The K split here is at fixed `SPLITK` granularity, not adaptive.
+
 **Branch:** `feature/persistent-cta-streamk`
 **Origin:** `plans/matmul-cublas-gap-2026-05-30.md` § "Five new optimization kinds to feature";
 discussion 2026-05-30 ranking against `.reuse` hints and CTA cluster + DSMEM.
