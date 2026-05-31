@@ -612,6 +612,12 @@ class Write(Stmt):
     index: tuple[Expr, ...]
     values: tuple[str, ...]
     value_dtype: DataType | None
+    # Force an ``atomicAdd`` store regardless of the structural atomic-axes
+    # signal. Set explicitly by the Stream-K adaptive rewrite for the
+    # boundary-partial write (a runtime branch, not a missing block axis, so the
+    # ``Body.coordination`` rule can't see it). Default ``False`` → the store
+    # type is decided by ``ctx.atomic_writes`` as before.
+    atomic: bool = False
 
     def __init__(
         self,
@@ -621,6 +627,7 @@ class Write(Stmt):
         *,
         values: tuple[str, ...] | None = None,
         value_dtype: DataType | None = None,
+        atomic: bool = False,
     ) -> None:
         if values is None:
             if value is None:
@@ -638,6 +645,7 @@ class Write(Stmt):
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "values", tuple(values))
         object.__setattr__(self, "value_dtype", value_dtype)
+        object.__setattr__(self, "atomic", atomic)
 
     @property
     def value(self) -> str:
@@ -697,7 +705,7 @@ class Write(Stmt):
             # ``ctx.atomic_writes``, populated by ``render_kernelop``.
             # Standalone-render unit tests that build a bare RenderCtx
             # see an empty dict and get a plain store.
-            is_atomic = bool(ctx.atomic_writes.get(id(self)))
+            is_atomic = self.atomic or bool(ctx.atomic_writes.get(id(self)))
             store = f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});" if is_atomic else f"{pad}{self.output}[{flat}] = {rhs};"
             # Broadcast guard: when the helper says this Write is missing
             # one or more cooperative thread axes from its index, wrap the
@@ -717,6 +725,16 @@ class Write(Stmt):
             src_dt = stamped_value_dt or ctx.ssa_dtypes.get(nm, "f32")
             resolved = _resolve_value(nm, ctx)
             converted.append(resolved if src_dt == out_dt else ctx.target.convert(resolved, src_dt, out_dt))
+        if self.atomic:
+            # Atomic stores can't be packed into one vector transaction — each
+            # element needs its own atomicAdd (the Stream-K boundary-partial
+            # write into a shared output cell).
+            lines = []
+            for k in range(n):
+                idx_k = (*self.index[:-1], BinaryExpr("+", self.index[-1], Literal(k, "int"))) if n > 1 else self.index
+                flat = render_index(self.output, idx_k, ctx)
+                lines.append(f"{pad}atomicAdd(&{self.output}[{flat}], {converted[k]});")
+            return lines
         vec_pair = ctx.target.vector_type(out_dt, n)
         if vec_pair is None:
             # Target doesn't support this width — fall back to scalar
