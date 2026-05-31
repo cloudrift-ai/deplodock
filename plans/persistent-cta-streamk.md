@@ -26,8 +26,30 @@
 > engineering is done, but the perf payoff on this hardware is unproven and the remaining work is substantial with an
 > uncertain ceiling.
 >
-> **Phase B core still open:** adaptive **mid-tile MAC-range** splitting on the **temporally-pipelined / TMA** K-loop —
-> a CTA walks `(tile, k_chunk)` MAC
+> **B5 design (the temporally-pipelined / TMA core — mapped, not yet built).** The materialized TMA pipeline is:
+> `mbarrier_init` (once, kernel scope) → prologue `cp_async_bulk` chunk 0 into slot 0 → steady
+> `for a7 in [0,K_blocks-1): mbarrier_wait_parity(slot=a7%2, phase=(a7/2)%2); compute a7; prefetch a7+1` → epilogue
+> `mbarrier_wait_parity(slot=1, phase=1); compute K_blocks-1`. The slot/phase are baked for a single `[0,K_blocks)` run.
+> To run a per-CTA sub-range `[k_lo,k_hi)` with segment-local index `j = a7-k_lo` (so the slot/phase formulas stay
+> `j%2`, `(j/2)%2`):
+> 1. **Per-segment mbarrier re-init** — each segment restarts the pipeline (j=0, parity 0), so `mbarrier_init` + its
+>    `__syncthreads` must move *inside* the persistent `while` loop. Requires teaching `100_materialize` to place the
+>    init per-segment for the adaptive case (today it's emitted once at kernel scope). **A wrong parity here deadlocks.**
+> 2. **Runtime epilogue slot/phase** — the epilogue waits `slot=(seg_len-1)%2, phase=((seg_len-1)/2)%2` and reads that
+>    smem slot, where `seg_len = k_hi-k_lo` is runtime. `AsyncWait.slot/phase` are already `Expr`, so the IR carries it;
+>    the materializer's epilogue emit + the epilogue compute's smem-slot index must use the runtime value.
+> 3. **TMA-coord chunk offset** — the prologue/steady `cp_async_bulk_tensor` K-coordinate is `chunk*BK`; with
+>    segment-local `j` the real chunk is `k_lo+j`, so the coord needs `+k_lo*BK`. Rewrite the load coord.
+> 4. **Steady bound** `[0, seg_len-1)` (runtime) and **sub-depth segments** (`seg_len < pipeline depth`): the prologue
+>    must guard each pre-fetch with `if (j < seg_len)` so a 1-chunk boundary segment doesn't over-prefetch past `k_hi`.
+>
+> Spans `098` (the transform) + `100_materialize` (per-segment init, runtime epilogue) + the TMA emit. High risk
+> (deadlock). A safer-but-slower alternative: **full tiles keep the unchanged `[0,K_blocks)` TMA pipeline (gated by
+> `is_full`); boundary partials use a simple non-pipelined loop** — the standard Stream-K decomposition, no mbarrier
+> surgery, but needs the partial sync-staged loop synthesized in the pass.
+>
+> **Phase B core (open) — original sketch:** adaptive **mid-tile MAC-range** splitting on the **temporally-pipelined /
+> TMA** K-loop — a CTA walks `(tile, k_chunk)` MAC
 > units, runs a *runtime-bounded* partial K-loop for boundary tiles, writes full tiles directly and boundary partials to
 > a scratch workspace, and an atomic-free combine kernel (reusing `017_atomic_free_splitk`'s reduce skeleton) sums them.
 > This is the only form that beats Split-K (each output cell written once, no atomic tax) and the only one that actually
