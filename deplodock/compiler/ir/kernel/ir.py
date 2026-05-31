@@ -224,6 +224,51 @@ class CpAsyncWait(Stmt):
 
 
 @dataclass(frozen=True)
+class FmaCluster(Stmt):
+    """Per-thread outer-product FFMA cluster. Lowered from
+    :class:`~...tile.ir.FmaClusterTile` by ``100_materialize_tile`` and
+    emitted as a single inline-PTX ``asm volatile`` block by
+    ``kernel/120_emit_inline_fma_cluster`` (M3).
+
+    The operand-ordering ``policy`` pins each source value to a fixed PTX
+    source port across the cluster so ptxas's ``.reuse`` peephole fires —
+    closing the register-file port-pressure gap to cuBLAS (see
+    ``plans/inline-fma-cluster.md``). ``acc_names`` indexes row-major as
+    ``acc_names[m * fn + n]`` over the ``fm × fn`` outer-product cell.
+
+    This node is *lowered, not rendered* until the M3 emit pass ships:
+    :meth:`render` raises so a stray unlowered cluster fails loudly rather
+    than emitting nothing.
+    """
+
+    a_names: tuple[str, ...]  # FM A-operand SSA names (LDS dests)
+    b_names: tuple[str, ...]  # FN B-operand SSA names (LDS dests)
+    acc_names: tuple[str, ...]  # FM*FN accumulator SSA names (in/out)
+    a_addr: Expr  # smem address expression for the A loads
+    b_addr: Expr  # smem address expression for the B loads
+    a_vec: int = 1  # LDS vector width for A (1/2/4)
+    b_vec: int = 1  # LDS vector width for B
+    dtype: DataType = F32
+    policy: str = "B_INNER"  # operand-ordering policy (B_INNER | INTERLEAVED)
+
+    def deps(self) -> tuple[str, ...]:
+        # The accumulators are read-modify-write inputs; A/B operands are
+        # produced by this stmt's own LDS loads, so they're not deps.
+        return self.acc_names
+
+    def defines(self) -> tuple[str, ...]:
+        return (*self.a_names, *self.b_names, *self.acc_names)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        fn = len(self.b_names) or 1
+        fm = len(self.a_names)
+        return [f"{indent}fma_cluster[{fm}x{fn} {self.policy}] {self.acc_names[:1]}... += a @ b"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise NotImplementedError("FmaCluster must be emitted by kernel/120_emit_inline_fma_cluster before render")
+
+
+@dataclass(frozen=True)
 class TmaDescriptor(Stmt):
     """Host-built ``CUtensorMap`` descriptor for a TMA box copy.
 
@@ -966,6 +1011,7 @@ __all__ = [
     "CpAsyncCopy",
     "CpAsyncCommit",
     "CpAsyncWait",
+    "FmaCluster",
     "TmaDescriptor",
     "TmaLoad",
     "MbarrierInit",
@@ -1030,6 +1076,24 @@ def _(s: CpAsyncCopy, rename, sigma, axis_fn):
         smem_index=tuple(sigma.apply(e) for e in s.smem_index),
         src=s.src,
         src_index=tuple(sigma.apply(e) for e in s.src_index),
+    )
+
+
+@_rewrite.register
+def _(s: FmaCluster, rename, sigma, axis_fn):
+    # A/B operand + accumulator SSA names route through ``rename`` (per-cell
+    # replication / SSA canonicalization); the smem address Exprs go through
+    # ``sigma.apply``.
+    return FmaCluster(
+        a_names=tuple(rename(n) for n in s.a_names),
+        b_names=tuple(rename(n) for n in s.b_names),
+        acc_names=tuple(rename(n) for n in s.acc_names),
+        a_addr=sigma.apply(s.a_addr),
+        b_addr=sigma.apply(s.b_addr),
+        a_vec=s.a_vec,
+        b_vec=s.b_vec,
+        dtype=s.dtype,
+        policy=s.policy,
     )
 
 

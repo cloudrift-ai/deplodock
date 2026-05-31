@@ -254,7 +254,7 @@ def _stmt_eval_scope() -> dict:
         TernaryExpr,
         Var,
     )
-    from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
+    from deplodock.compiler.ir.kernel.ir import FmaCluster, Smem, Sync, TreeHalve, WarpShuffle
     from deplodock.compiler.ir.stmt import (
         Accum,
         Assign,
@@ -273,6 +273,7 @@ def _stmt_eval_scope() -> dict:
     from deplodock.compiler.ir.tile.ir import (
         AffineAddressing,
         AsyncWait,
+        FmaClusterTile,
         GridTile,
         RegisterTile,
         SerialTile,
@@ -319,6 +320,8 @@ def _stmt_eval_scope() -> dict:
         "AffineAddressing": AffineAddressing,
         "TemplateAddressing": TemplateAddressing,
         "AsyncWait": AsyncWait,
+        "FmaClusterTile": FmaClusterTile,
+        "FmaCluster": FmaCluster,
         "Smem": Smem,
         "Sync": Sync,
         "TreeHalve": TreeHalve,
