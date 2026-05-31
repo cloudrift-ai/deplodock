@@ -150,6 +150,33 @@ after replication CSE-fold into one — the same effect the deleted
 register-blocked GEMM builder used to get from its hand-written
 N-invariant-cone partition (see `plans/obsolete-blocked-gemm-builder.md`).
 
+**Stream-K (persistent CTAs).** `lowering/kernel/098_persistent_streamk`
+forks a matmul `GridTile` into an adaptive `PersistentTile` on the `STREAMK`
+BOOL knob (default off). Instead of one CTA per output tile (a fractional
+last wave that idles the tail SMs), it launches `num_sms` CTAs that each
+walk a contiguous slice of the `M_blocks·N_blocks·K_blocks` **MAC units**,
+running a runtime-bounded partial K-loop over their `[k_lo, k_hi)` sub-range
+— splitting K *only at the boundaries* so the fractional wave fills. It runs
+as a *late kernel pass* (after register-tile flattening / Init-hoist /
+vectorize / interleave, before `100_materialize`) so it transforms a
+fully-lowered body — running earlier would let GridTile-keyed kernel passes
+skip the `PersistentTile` body. `_adaptivize` re-bounds the `serial_outer`
+K-loop and wraps the output `Write` in `Cond(k_lo==0 && k_hi==K_blocks)`:
+full-tile owners store directly, boundary partials `atomicAdd`
+(`Write.atomic`) into the pre-zeroed output (`zero_outputs`). The grid
+resolves to the live `MultiProcessorCount` at launch (reserved
+`STREAMK_NUM_SMS` sym name, not baked → portable cubin); two `int32[num_sms]`
+work-range arrays (`streamk_work_start/end`, filled by `_streamk_ranges` in
+the CUDA backend, walked per `kernel/_streamk.cta_segments`) feed the per-CTA
+loop. **Mutually exclusive with `SPLITK`**: Stream-K supplies its own
+K-split, so the rule self-skips when a `K_s` axis is present. **Gated to SYNC
+/ BUFFERED-ring staging**: async/TMA/pipelined K-loops have a prefetch
+prologue assuming a contiguous-from-0 K range (follow-up). The boundary
+combine is `atomicAdd` today; the plan's atomic-free scratch+reduce is the
+next step. An autotune-only wave-tail shape gate skips the fork once the
+launch saturates `> 8` waves; an explicit `DEPLODOCK_STREAMK=1` pin is
+authoritative and bypasses the gate. See `plans/persistent-cta-streamk.md`.
+
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
 12-pass `normalize_body`) only fire for the variant the search actually
@@ -395,10 +422,12 @@ recipe.
 
 Pinning is **authoritative** — an env value outside the knob's hint tuple is honored, not silently dropped. `Knob.narrow`
 returns `(pinned,)` regardless of hint membership; downstream structural gates (divisibility, threads-per-CTA budget,
-TMA eligibility, …) still apply, so a structurally invalid pin yields an empty enumeration and the per-call-site
-fallback (`_enumeration._run(apply_pins=False)`) takes over. This lets a tile shape that the planner wouldn't reach
-on its own — e.g. the article's BM=8, FM=26, fat 208×128 matmul tile — be explored manually, while peer kernels with
-incompatible divisibility still get a sensible default.
+TMA eligibility, …) still apply, so a tile shape the planner wouldn't reach on its own — e.g. the article's BM=8, FM=26,
+fat 208×128 matmul tile — can be explored manually. But a pin that admits **no** valid tile for a kernel's shape
+(e.g. `SPLITK=5` on `K=2048` — 5 ∤ 2048) is a user error: `enumerate_cartesian` raises a loud `ValueError` naming the
+offending pins rather than silently re-running without them. Quietly compiling a *different* kernel (here `SPLITK=1`)
+would make an A/B bench compare against a fallback the user never asked for — so per the fail-loud / no-defensive-
+fallbacks convention we surface it instead of guessing.
 
 **Registered knobs.** All knobs in `passes/lowering/tile/*.py`:
 

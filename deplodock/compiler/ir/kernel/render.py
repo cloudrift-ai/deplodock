@@ -162,6 +162,7 @@ def render_kernelop(
     shapes: dict[str, tuple[int, ...]] | None = None,
     literal_constants: dict[str, float] | None = None,
     runtime_args: tuple[str, ...] = (),
+    streamk_work_arrays: tuple[str, str] | tuple[()] = (),
 ) -> str:
     """Render a complete ``extern "C" __global__`` CUDA function for a ``KernelOp``.
 
@@ -230,6 +231,11 @@ def render_kernelop(
     # by-value ``CUtensorMap`` parameters require, so this avoids a
     # CUDA_ERROR_MISALIGNED_ADDRESS at launch.
     sig_parts.extend(f"const CUtensorMap* __restrict__ {n}" for n in desc_names)
+    # Stream-K per-CTA work-range arrays: two ``const int*`` params indexed by
+    # ``blockIdx.x`` inside ``PersistentTile.render``. Placed after buffers /
+    # descriptors (they're pointers) and before the symbolic ``int`` runtime
+    # args, matching ``arg_order`` and the launch arg-pack.
+    sig_parts.extend(f"const int* __restrict__ {n}" for n in streamk_work_arrays)
     # Runtime int args for symbolic axis extents (Dim("seq_len") etc.) come
     # after buffers and TMA descriptors so the launcher can simply tail-append
     # the resolved int values to the kernel-arg pack.
@@ -310,10 +316,13 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
     - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
       since launch is flattened across blockIdx + threadIdx.
     """
-    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, ThreadTile, WarpTile  # noqa: PLC0415
 
     for s in kernel_op.body:
-        if isinstance(s, GridTile):
+        # PersistentTile (Stream-K) carries the same inner ThreadTile as a
+        # GridTile — the per-CTA thread count is identical; only the grid
+        # (num_sms vs tile count) differs, which launch bounds don't encode.
+        if isinstance(s, (GridTile, PersistentTile)):
             for child in s.body:
                 if isinstance(child, ThreadTile):
                     bsize = 1

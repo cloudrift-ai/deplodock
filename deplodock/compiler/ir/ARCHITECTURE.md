@@ -267,7 +267,21 @@ parallel coord: `GridTile` (one coord = one CTA, lifts to `blockIdx`),
 `WarpTile` (one coord = one warp; the body presumes 32 lanes execute it
 collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 `ThreadTile` and `WarpTile` are mutually exclusive inside one
-`TileOp.body` — both bind `threadIdx`. `RegisterTile` (per-thread
+`TileOp.body` — both bind `threadIdx`. `PersistentTile` (adaptive Stream-K)
+is a fourth `ParallelTile`: it launches `num_sms` CTAs that each walk a
+contiguous slice of the `M_blocks·N_blocks·K_blocks` **MAC units**
+(`(tile, K-chunk)` pairs), decoding the tile + K sub-range per segment (the
+`kernel/_streamk.cta_segments` walk) and running the body's runtime-bounded
+partial K-loop over `[streamk_k_lo, streamk_k_hi)` — splitting K only at the
+boundaries so the fractional wave fills (the wave-tail win). It replaces the
+`GridTile` wrapper carrying the same block axes; `k_blocks` (= `K / BK`) drives
+the decode. The swap is done late (`kernel/098_persistent_streamk`) after every
+GridTile-keyed scheduling pass has run, and the body's output `Write` is
+rewritten to branch full-tile (direct store) vs boundary partial
+(`atomicAdd` / combine). Counted as block-axis-binding by `Body.coordination`
+exactly like `GridTile`. (Gated to SYNC / BUFFERED staging today; async/TMA/
+pipelined K-loops are a follow-up — their prefetch prologue assumes a
+contiguous-from-0 K range.) `RegisterTile` (per-thread
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by

@@ -493,3 +493,38 @@ def test_article_reproduction_configs(label: str, dims: dict, knobs: dict, env: 
     ref = _reference(graph, inputs, out_name)
     forced = _run_with_knobs_and_env(graph, inputs, out_name, knobs, env, monkeypatch)
     _assert_match(forced, ref)
+
+
+def test_invalid_splitk_pin_fails_loudly(monkeypatch):
+    """A pinned knob that admits no valid tile for the shape must raise, not
+    silently fall back to an unpinned kernel (fail-loud convention). SPLITK=5
+    can't divide K=2048, so enumeration is empty under the pin — and quietly
+    compiling SPLITK=1 instead would make an A/B bench compare a fallback the
+    user never asked for. No CUDA needed: the error fires at enumeration."""
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import enumerate_cartesian
+
+    monkeypatch.setenv("DEPLODOCK_SPLITK", "5")  # 5 does not divide K=2048
+    with pytest.raises(ValueError, match="no valid matmul tile"):
+        enumerate_cartesian(
+            E_M=2048,
+            E_N=2048,
+            E_K=2048,
+            ctx=Context.from_target((12, 0)),
+            priority_mode="matmul",
+            m_axis_name="m",
+            n_axis_name="n",
+        )
+
+
+def test_valid_splitk_pin_enumerates(monkeypatch):
+    """Control: a divisor SPLITK pin enumerates non-empty (no false positive)."""
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import enumerate_cartesian
+
+    monkeypatch.setenv("DEPLODOCK_SPLITK", "8")  # 8 divides K=2048
+    combos = enumerate_cartesian(
+        E_M=2048, E_N=2048, E_K=2048, ctx=Context.from_target((12, 0)), priority_mode="matmul", m_axis_name="m", n_axis_name="n"
+    )
+    assert combos
+    assert all(c.splitk == 8 for c in combos)

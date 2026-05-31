@@ -58,6 +58,7 @@ from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
     AsyncWait,
     GridTile,
+    PersistentTile,
     RegisterTile,
     SerialTile,
     Stage,
@@ -87,7 +88,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
     new_body: list[Stmt] = []
     for s in root.op.body:
-        if isinstance(s, (GridTile, ThreadTile, WarpTile)):
+        if isinstance(s, (GridTile, PersistentTile, ThreadTile, WarpTile)):
             new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
         else:
             new_body.append(s)
@@ -116,14 +117,19 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     """
     from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
-    if isinstance(top, GridTile):
+    if isinstance(top, (GridTile, PersistentTile)):
+        # PersistentTile (Stream-K) is handled exactly like GridTile: preserve
+        # the wrapper (its render emits the per-CTA work-range loop + block-axis
+        # decode in place of the blockIdx decode) and materialize the inner
+        # ThreadTile/WarpTile body. Smem decls hoisted into that body land
+        # inside the work-range loop — legal CUDA (static alloc, reused per tile).
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, (ThreadTile, WarpTile)):
                 new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
-        return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
+        return top.with_bodies((Body(new_outer),))
     if isinstance(top, (ThreadTile, WarpTile)):
         return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")

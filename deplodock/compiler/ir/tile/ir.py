@@ -771,6 +771,90 @@ class GridTile(ParallelTile):
         return out
 
 
+# Reserved decode-variable names the *adaptive* (Stream-K Phase B) PersistentTile
+# render binds at the top of each MAC-segment iteration; the body's partial
+# K-loop (a ``StridedTile`` with ``start``/``stop``) and its full-vs-partial
+# write branch reference these by name.
+STREAMK_K_LO = "streamk_k_lo"
+STREAMK_K_HI = "streamk_k_hi"
+
+
+@dataclass(frozen=True)
+class PersistentTile(ParallelTile):
+    """Persistent-CTA grid for adaptive Stream-K matmul.
+
+    Launches exactly ``num_sms`` CTAs (resolved at launch, not baked — see
+    ``compiler/backend/cuda/program.py``). Each CTA walks a contiguous slice
+    ``[work_start[blockIdx.x], work_end[blockIdx.x])`` of the
+    ``M_blocks·N_blocks·K_blocks`` **MAC units** (``(tile, K-chunk)`` pairs),
+    supplied as two ``int32[num_sms]`` runtime arrays. Per MAC segment it decodes
+    the tile and K sub-range (the ``kernel/_streamk.cta_segments`` walk), runs the
+    body's runtime-bounded partial K-loop over ``[streamk_k_lo, streamk_k_hi)``,
+    and advances by the segment length — splitting K *only at the boundaries*, so
+    the fractional wave gets filled (the wave-tail win). Replaces the ``GridTile``
+    wrapper, carrying the same block ``axes`` ``(M_b, N_b)``.
+
+    ``k_blocks`` is the K-loop trip count (``K / BK``). The body's K-loop runs the
+    sub-range and its output ``Write`` branches on full-tile (``k_lo == 0 &&
+    k_hi == K_blocks`` → direct store) vs boundary partial (``atomicAdd`` /
+    combine) — built by ``kernel/098_persistent_streamk``. ``work_start`` /
+    ``work_end`` name the two runtime arrays. Renders::
+
+        int __mac = <work_start>[blockIdx.x];  int __wend = <work_end>[blockIdx.x];
+        while (__mac < __wend) {
+            int __tile = __mac / K_blocks;  int streamk_k_lo = __mac % K_blocks;
+            <row-major block-axis decode from __tile>            // binds M_b, N_b
+            int __seg_end = min(__wend, __mac - streamk_k_lo + K_blocks);
+            int streamk_k_hi = streamk_k_lo + (__seg_end - __mac);
+            <body>                                              // partial K-loop + write branch
+            __mac = __seg_end;
+        }
+    """
+
+    k_blocks: int = 1
+    work_start: str = "streamk_work_start"
+    work_end: str = "streamk_work_end"
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return PersistentTile(axes=self.axes, body=body, k_blocks=self.k_blocks, work_start=self.work_start, work_end=self.work_end)
+
+    def _pretty_label(self) -> str:
+        return f"persistent[num_sms] streamk K_blocks={self.k_blocks}"
+
+    def deps(self) -> tuple[str, ...]:
+        # The two work-range arrays are read at the top of every CTA; declaring
+        # them as deps keeps liveness / arg-ordering analyses honest.
+        return (self.work_start, self.work_end)
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Emit the adaptive MAC-segment walk (``kernel/_streamk.cta_segments``).
+
+        The inner ``ThreadTile`` renders its threadIdx decode under
+        ``inside_grid_tile=True`` (cooperative form, no linear-tid guard); the
+        ``while`` loop supplies the brace level the body indents under.
+        """
+        kb = self.k_blocks
+        pad = _pad(ctx.indent)
+        out = [
+            f"{pad}int __mac = {self.work_start}[blockIdx.x];",
+            f"{pad}int __wend = {self.work_end}[blockIdx.x];",
+            f"{pad}while (__mac < __wend) {{",
+        ]
+        inner = replace(ctx.child(), inside_grid_tile=True)
+        ipad = _pad(inner.indent)
+        out.append(f"{ipad}int __tile = __mac / {kb};")
+        out.append(f"{ipad}int {STREAMK_K_LO} = __mac % {kb};")
+        out.extend(_render_grid_axis_decode(self.axes, "__tile", inner))
+        out.append(f"{ipad}int __tile_end = __mac - {STREAMK_K_LO} + {kb};")
+        out.append(f"{ipad}int __seg_end = (__wend < __tile_end) ? __wend : __tile_end;")
+        out.append(f"{ipad}int {STREAMK_K_HI} = {STREAMK_K_LO} + (__seg_end - __mac);")
+        out.extend(_render_body(self.body, inner))
+        out.append(f"{ipad}__mac = __seg_end;")
+        out.append(f"{pad}}}")
+        return out
+
+
 @dataclass(frozen=True)
 class ThreadTile(ParallelTile):
     """Thread-parallel tile. Axes lift to ``threadIdx`` (row-major flatten).
@@ -984,22 +1068,41 @@ class SerialTile(SerialTileBase):
 
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
     time. Set by ``090_mark_unroll``; has no effect on iteration semantics.
+
+    ``lo`` / ``hi`` are optional runtime bounds. ``None`` ⇒ the static
+    ``0..axis.extent`` (every loop today). A runtime ``Expr`` ⇒
+    ``for (axis = lo; axis < hi; axis++)`` — the Stream-K adaptive K-loop runs a
+    per-CTA sub-range ``[lo, hi)`` of the K chunks. Kept on ``SerialTile`` (not
+    swapped to ``StridedTile``) so the staging passes' K_o detection — which
+    keys on the ``SerialTile`` flavor + ``kind`` — still recognizes it.
     """
 
     kind: SerialKind = "plain"
     unroll: bool = False
+    lo: Expr | None = None
+    hi: Expr | None = None
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll)
+        return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll, lo=self.lo, hi=self.hi)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        out: tuple[Expr, ...] = ()
+        if self.lo is not None:
+            out = (*out, self.lo)
+        if self.hi is not None:
+            out = (*out, self.hi)
+        return out
 
     def pretty(self, indent: str = "") -> list[str]:
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}"
+        low = self.lo.pretty() if self.lo is not None else "0"
+        high = self.hi.pretty() if self.hi is not None else self.axis.extent
+        head = f"{indent}for {self.axis.name} in {low}..{high}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Per-Loop accumulator-init prelude (same as ``Loop.render``) +
-        ``for (int axis = 0; axis < extent; axis++) { body }``."""
+        ``for (int axis = (lo|0); axis < (hi|extent); axis++) { body }``."""
         from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
@@ -1019,10 +1122,11 @@ class SerialTile(SerialTileBase):
         # ``Dim.__str__`` returns the bare value (literal for static, symbolic
         # name for ``Dim('seq_len')``) so both static and symbolic SerialTile
         # extents render correctly.
-        extent = str(self.axis.extent)
+        low = self.lo.render(ctx) if self.lo is not None else "0"
+        high = self.hi.render(ctx) if self.hi is not None else str(self.axis.extent)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
+        out.append(f"{pad}for (int {var} = {low}; {var} < {high}; {var}++) {{")
         inner = ctx.child()
         out.extend(_render_body(self.body, inner))
         out.append(f"{pad}}}")
@@ -1042,26 +1146,36 @@ class StridedTile(SerialTileBase):
     start: Expr = field(default_factory=lambda: Literal(0, "int"))
     step: Expr = field(default_factory=lambda: Literal(1, "int"))
     unroll: bool = False
+    # Optional runtime upper bound. ``None`` ⇒ the static ``axis.extent``
+    # (today's cooperative-stride loops). A runtime ``Expr`` ⇒
+    # ``axis < stop`` — the Stream-K adaptive K-loop runs a per-CTA sub-range
+    # ``[start, stop)`` of the K chunks, where both bounds are decoded from the
+    # work-range at runtime. Folded through Sigma rewrites like ``start`` /
+    # ``step`` so var renames thread through.
+    stop: Expr | None = None
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return StridedTile(axis=self.axis, body=body, start=self.start, step=self.step, unroll=self.unroll)
+        return StridedTile(axis=self.axis, body=body, start=self.start, step=self.step, unroll=self.unroll, stop=self.stop)
 
     def exprs(self) -> tuple[Expr, ...]:
         out: tuple[Expr, ...] = (self.start,)
         if isinstance(self.step, Expr):
             out = (*out, self.step)
+        if self.stop is not None:
+            out = (*out, self.stop)
         return out
 
     def pretty(self, indent: str = "") -> list[str]:
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}for {self.axis.name} in {start}..{self.axis.extent}:{step}"
+        upper = self.stop.pretty() if self.stop is not None else self.axis.extent
+        head = f"{indent}for {self.axis.name} in {start}..{upper}:{step}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """``for (int axis = start; axis < extent; axis += step)`` with the
-        same per-Loop accumulator-init prelude as ``SerialTile.render``."""
+        """``for (int axis = start; axis < (stop | extent); axis += step)`` with
+        the same per-Loop accumulator-init prelude as ``SerialTile.render``."""
         from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
@@ -1080,9 +1194,10 @@ class StridedTile(SerialTileBase):
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        upper_str = self.stop.render(ctx) if self.stop is not None else str(self.axis.extent.as_static())
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {upper_str}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(_render_body(self.body, inner))
         out.append(f"{pad}}}")
@@ -1730,9 +1845,9 @@ class TileOp(BodyOp):
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
         self.body = normalized if isinstance(normalized, Body) else Body(normalized)
-        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, ThreadTile, WarpTile)))
+        n_tiles = sum(1 for s in self.body if isinstance(s, (GridTile, PersistentTile, ThreadTile, WarpTile)))
         if n_tiles > 1:
-            raise ValueError(f"TileOp.body must contain at most one outer GridTile/ThreadTile/WarpTile, got {n_tiles}")
+            raise ValueError(f"TileOp.body must contain at most one outer GridTile/PersistentTile/ThreadTile/WarpTile, got {n_tiles}")
         # ThreadTile and WarpTile both bind threadIdx; mixing them inside one
         # body re-binds the same coord at two scopes. The outer-tile check
         # above already catches them at top level; this catches the
@@ -1756,7 +1871,7 @@ class TileOp(BodyOp):
         block set is empty.
         """
         for s in self.body:
-            if isinstance(s, GridTile):
+            if isinstance(s, (GridTile, PersistentTile)):
                 block_axes = s.axes
                 for child in s.body:
                     if isinstance(child, ThreadTile):
@@ -1780,7 +1895,7 @@ class TileOp(BodyOp):
         ``thread_axes`` does.
         """
         for s in self.body:
-            if isinstance(s, GridTile):
+            if isinstance(s, (GridTile, PersistentTile)):
                 for child in s.body:
                     if isinstance(child, WarpTile):
                         return child.axes
@@ -2127,6 +2242,9 @@ __all__ = [
     # Tile-IR statements — typed tile flavor hierarchy
     "ParallelTile",
     "GridTile",
+    "PersistentTile",
+    "STREAMK_K_LO",
+    "STREAMK_K_HI",
     "ThreadTile",
     "RegisterTile",
     "WarpTile",

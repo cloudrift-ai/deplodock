@@ -12,13 +12,16 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
-from deplodock.compiler.ir.cuda.ir import GridDimSpec
+from deplodock.compiler.ir.cuda.ir import STREAMK_NUM_SMS, GridDimSpec
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
+from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.tensor import Tensor
+
+# (work_start_name, work_end_name, total_work_units) for a Stream-K kernel.
+StreamKMeta = tuple[str, str, int]
 
 PATTERN = [Pattern("root", KernelOp)]
 
@@ -38,7 +41,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
 
-    grid, block, runtime_args = _launch_geometry(root.op)
+    grid, block, runtime_args, streamk = _launch_geometry(root.op)
     # TMA descriptors are kernel parameters that come *after* the buffer
     # args (matching the signature emitted by ``render_kernelop``).
     # Collect dedup'd metadata so the backend can encode + bind them.
@@ -64,26 +67,47 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
     seen_atomic: set[str] = set()
     output_set = set(root.op.outputs)
     for s in escape.writes:
-        if escape.atomic_axes(s) and s.output in output_set and s.output not in seen_atomic:
+        # Atomic via the structural block-axis signal (legacy split-K) OR the
+        # explicit ``Write.atomic`` flag (Stream-K boundary partials, gated by a
+        # runtime branch the coordination rule can't see). Either way the output
+        # must be pre-zeroed so per-CTA partials accumulate from zero.
+        if (escape.atomic_axes(s) or s.atomic) and s.output in output_set and s.output not in seen_atomic:
             seen_atomic.add(s.output)
             atomic_outputs.append(s.output)
+    # Stream-K work-range arrays are two ``const int*`` params slotted after the
+    # buffers / TMA descriptors and before the symbolic ``int`` runtime args —
+    # matching ``render_kernelop``'s signature order and the launch arg-pack.
+    streamk_arrays: tuple[str, str] | tuple[()] = (streamk[0], streamk[1]) if streamk else ()
     return CudaOp(
-        kernel_source=render_kernelop(root.op, tensors=tensors, literal_constants=literal_constants, runtime_args=runtime_args),
+        kernel_source=render_kernelop(
+            root.op,
+            tensors=tensors,
+            literal_constants=literal_constants,
+            runtime_args=runtime_args,
+            streamk_work_arrays=streamk_arrays,
+        ),
         kernel_name=root.op.name,
-        arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
+        arg_order=(*runtime_inputs, *root.op.outputs, *desc_names, *streamk_arrays),
         grid=grid,
         block=block,
         smem_bytes=root.op.smem_bytes(),
         tma_descriptors=tuple(descriptors),
         zero_outputs=tuple(atomic_outputs),
         runtime_args=runtime_args,
+        streamk_work_arrays=streamk_arrays,
+        streamk_total_units=streamk[2] if streamk else 0,
     )
 
 
 def _launch_geometry(
     kernel_op: KernelOp,
-) -> tuple[tuple[GridDimSpec, GridDimSpec, GridDimSpec], tuple[GridDimSpec, GridDimSpec, GridDimSpec], tuple[str, ...]]:
-    """Pick (grid_spec, block_spec, runtime_args) from the outermost tile.
+) -> tuple[
+    tuple[GridDimSpec, GridDimSpec, GridDimSpec],
+    tuple[GridDimSpec, GridDimSpec, GridDimSpec],
+    tuple[str, ...],
+    StreamKMeta | None,
+]:
+    """Pick (grid_spec, block_spec, runtime_args, streamk) from the outermost tile.
 
     Symbolic ``Axis.extent`` values flow through as ``str`` entries in the
     grid / block factor tuples; static extents collapse to a single int
@@ -127,9 +151,29 @@ def _launch_geometry(
         return tuple(factors) if factors else (1,)
 
     for s in kernel_op.body:
+        if isinstance(s, PersistentTile):
+            # Stream-K: grid = num_sms (live, resolved via STREAMK_NUM_SMS at
+            # launch). Block threads come from the inner ThreadTile, exactly as
+            # for a GridTile. Total work units = product of the persistent
+            # block-axis extents (the tile grid the CTAs partition), times
+            # ``k_blocks`` in adaptive mode (units are (tile, K-chunk) MAC units,
+            # not whole tiles). Today all static (matmul M_b·N_b[·K_blocks]); a
+            # symbolic axis here would need a runtime unit count, out of scope
+            # until dynamic-shape Stream-K.
+            from math import prod  # noqa: PLC0415
+
+            block_spec: GridDimSpec = (1,)
+            for child in s.body:
+                if isinstance(child, ThreadTile):
+                    block_spec = _axes_spec(child.axes)
+                    break
+            # MAC units = output tiles (block-axis product) × K-chunks per tile.
+            total_units = max(prod(a.extent.as_static() for a in s.axes), 1) * s.k_blocks
+            streamk: StreamKMeta = (s.work_start, s.work_end, total_units)
+            return ((STREAMK_NUM_SMS,), (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen), streamk
         if isinstance(s, GridTile):
             grid_spec = _axes_spec(s.axes)
-            block_spec: GridDimSpec = (1,)
+            block_spec = (1,)
             for child in s.body:
                 if isinstance(child, ThreadTile):
                     block_spec = _axes_spec(child.axes)
@@ -141,14 +185,14 @@ def _launch_geometry(
                     warp_spec = _axes_spec(child.axes)
                     block_spec = (*warp_spec, 32)
                     break
-            return (grid_spec, (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen)
+            return (grid_spec, (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen), None
         if isinstance(s, ThreadTile):
             from math import prod  # noqa: PLC0415
 
             if all(a.extent.is_static for a in s.axes):
                 n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
                 grid = (((n_threads + _BLOCK - 1) // _BLOCK,), (1,), (1,))
-                return grid, ((_BLOCK,), (1,), (1,)), tuple(seen)
+                return grid, ((_BLOCK,), (1,), (1,)), tuple(seen), None
             # Symbolic flattened pointwise: grid = ceil_div(prod(extents), _BLOCK).
             # ``Dim`` arithmetic folds the static factors and carries the
             # symbolic ones; the launch resolver evals the Expr per launch.
@@ -161,8 +205,8 @@ def _launch_geometry(
                     for name in a.extent.expr.free_vars():
                         seen.setdefault(name, None)
             grid_expr = ((nthreads + (_BLOCK - 1)) // _BLOCK).expr
-            return ((grid_expr,), (1,), (1,)), ((_BLOCK,), (1,), (1,)), tuple(seen)
-    return ((1,), (1,), (1,)), ((1,), (1,), (1,)), tuple(seen)
+            return ((grid_expr,), (1,), (1,)), ((_BLOCK,), (1,), (1,)), tuple(seen), None
+    return ((1,), (1,), (1,)), ((1,), (1,), (1,)), tuple(seen), None
 
 
 def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:

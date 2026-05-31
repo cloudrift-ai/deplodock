@@ -37,6 +37,12 @@ class TmaDescMeta:
 _GridFactor = int | str | Expr
 GridDimSpec = tuple[_GridFactor, ...]  # product of factors → one grid dim's extent
 
+# Reserved sym-value name for the device SM count. A Stream-K kernel's grid is
+# ``((STREAMK_NUM_SMS,), (1,), (1,))``; the launch injects the live device's
+# ``MultiProcessorCount`` under this key into ``sym_values`` so ``resolve_dim``
+# resolves the grid to the actual SM count at launch (not baked at compile).
+STREAMK_NUM_SMS = "__num_sms__"
+
 
 @dataclass
 class CudaOp(Op):
@@ -63,6 +69,15 @@ class CudaOp(Op):
     comment: str = ""
     tma_descriptors: tuple[TmaDescMeta, ...] = field(default_factory=tuple)
     runtime_args: tuple[str, ...] = ()
+    # Stream-K persistent-CTA launch. When set, ``(work_start, work_end)`` are
+    # two ``const int*`` kernel params (in ``arg_order`` after the buffers /
+    # descriptors); the launch allocates them as ``int32[num_sms]`` arrays and
+    # fills each CTA's contiguous [start, end) slice of ``streamk_total_units``
+    # tile-work units. The grid is ``num_sms`` (resolved via the reserved
+    # ``STREAMK_NUM_SMS`` sym name, queried live at launch — not baked, so the
+    # cached kernel is portable across SM counts). Empty = ordinary launch.
+    streamk_work_arrays: tuple[str, str] | tuple[()] = ()
+    streamk_total_units: int = 0
 
     def pretty_body(self) -> str:
         return self.kernel_source

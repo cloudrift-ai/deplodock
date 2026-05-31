@@ -115,3 +115,22 @@ def live_compute_capability() -> tuple[int, int]:
     except Exception as e:  # pragma: no cover
         _logger.debug("live_compute_capability query failed (%s)", e)
         return (0, 0)
+
+
+@functools.cache
+def live_num_sms() -> int:
+    """The live CUDA device's SM count (``MultiProcessorCount``).
+
+    Returns ``0`` when cupy is unavailable — callers treat that as "SM
+    count unknown" and self-skip SM-count-gated passes (Stream-K). The
+    value drives the *compile-time* shape gate only; the Stream-K launch
+    re-queries the live device so the cached kernel stays portable across
+    SM counts (the work-range arrays and grid are runtime, not baked).
+    """
+    try:
+        import cupy as cp
+
+        return int(cp.cuda.Device().attributes["MultiProcessorCount"])
+    except Exception as e:  # pragma: no cover
+        _logger.debug("live_num_sms query failed (%s)", e)
+        return 0

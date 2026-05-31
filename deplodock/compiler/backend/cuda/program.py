@@ -135,6 +135,11 @@ class _Launch:
     zero_outputs: tuple[str, ...]
     tma_descriptors: tuple[TmaDescMeta, ...] = ()
     runtime_args: tuple[str, ...] = ()
+    # Stream-K: (work_start_name, work_end_name) + total tile-work units. The
+    # two arrays are allocated as ``int32[num_sms]`` and filled with each CTA's
+    # [start, end) slice at allocate time; empty = ordinary launch.
+    streamk_work_arrays: tuple[str, str] | tuple[()] = ()
+    streamk_total_units: int = 0
 
 
 @dataclass
@@ -193,6 +198,8 @@ def _compile(graph: Graph) -> _Compiled:
                 zero_outputs=tuple(op.zero_outputs),
                 tma_descriptors=tuple(op.tma_descriptors),
                 runtime_args=tuple(getattr(op, "runtime_args", ())),
+                streamk_work_arrays=tuple(getattr(op, "streamk_work_arrays", ())),
+                streamk_total_units=int(getattr(op, "streamk_total_units", 0)),
             )
         )
     return _Compiled(
@@ -302,7 +309,48 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
             else:
                 arr = cp.zeros(shape, dtype=cp_dtype)
             arrays[buf.name] = arr
+    _allocate_streamk_work(compiled, arrays)
     return arrays
+
+
+def _streamk_ranges(total_units: int, num_sms: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-CTA ``(starts, ends)`` int32 arrays partitioning ``total_units``
+    tile-work units across ``num_sms`` CTAs.
+
+    Each CTA ``i`` owns the contiguous slice ``[i·per_cta, (i+1)·per_cta)``
+    clamped to ``total_units`` — so the slices tile the whole range with no
+    overlap (one owner per unit) and trailing CTAs past the work get an empty
+    ``[total, total)`` range (they idle). ``per_cta`` is the ceil-div so the
+    first ``num_sms`` CTAs cover everything in one wave's worth of ranges.
+    """
+    per_cta = -(-total_units // num_sms) if num_sms else total_units  # ceil-div
+    idx = np.arange(num_sms, dtype=np.int64)
+    starts = np.minimum(idx * per_cta, total_units).astype(np.int32)
+    ends = np.minimum((idx + 1) * per_cta, total_units).astype(np.int32)
+    return starts, ends
+
+
+def _allocate_streamk_work(compiled: _Compiled, arrays: dict[str, cp.ndarray]) -> None:
+    """Allocate + fill the per-CTA work-range arrays for every Stream-K launch.
+
+    Launches ``num_sms`` CTAs; each owns a contiguous slice of the kernel's
+    ``streamk_total_units`` tile-work units (see :func:`_streamk_ranges`). The
+    two ``int32[num_sms]`` arrays are indexed by ``blockIdx.x`` in the kernel;
+    this is the *static* tile-unit partition (one owner per tile) — the K-split
+    boundary handling that needs atomics lands in a later milestone.
+    """
+    import cupy as cp
+
+    from deplodock.compiler.target import live_num_sms  # noqa: PLC0415
+
+    num_sms = live_num_sms()
+    for launch in compiled.launches:
+        if not launch.streamk_work_arrays:
+            continue
+        start_name, end_name = launch.streamk_work_arrays
+        starts, ends = _streamk_ranges(launch.streamk_total_units, num_sms)
+        arrays[start_name] = cp.asarray(starts)
+        arrays[end_name] = cp.asarray(ends)
 
 
 def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) -> dict[str, int]:
@@ -322,6 +370,13 @@ def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) ->
             raise ValueError(
                 f"symbolic dim {name!r} reads from input {buf!r}.shape[{dim_idx}] but no array was supplied and the dim carries no hint"
             )
+    # Stream-K kernels resolve their grid (= device SM count) from this reserved
+    # name. Injected unconditionally (cached, cheap); ignored by non-Stream-K
+    # kernels. Queried live so a cached kernel runs on any SM count.
+    from deplodock.compiler.ir.cuda.ir import STREAMK_NUM_SMS  # noqa: PLC0415
+    from deplodock.compiler.target import live_num_sms  # noqa: PLC0415
+
+    env[STREAMK_NUM_SMS] = live_num_sms()
     return env
 
 

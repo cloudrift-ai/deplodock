@@ -89,6 +89,12 @@ FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells 
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul N (output) axis")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
+# Persistent-CTA Stream-K scheduling. Off by default; forked by
+# ``tile/018_persistent_streamk`` on a matmul whose tile-grid lands near the
+# device SM count (wave tail on the critical path). Mutually exclusive with
+# SPLITK > 1 — both split the K reduction across CTAs (the rule self-skips
+# when a split-K axis is already present).
+STREAMK = Knob("STREAMK", KnobType.BOOL, hints=(False, True), help="Persistent-CTA Stream-K matmul scheduling (1 = on)")
 
 _PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR, WN, WM, ATOM_KIND)
 
@@ -328,13 +334,14 @@ def enumerate_cartesian(
     candidate lists via ``Knob.narrow`` here in the wrapper for the five
     static choices, and via ``fm_narrow`` / ``fn_narrow`` callables passed
     into the impl for the per-iteration FM/FN divisor lists. When the
-    pinned enumeration is empty *and* any planner pin is set we retry with
-    every narrow disabled (raw tuples, ``None`` callables): pins are meant
-    to scope the kernel under test, but a graph that fuses peer kernels
-    (SDPA = QK^T + P@V; gated MLP at full-model scale) may have peers where
-    the pin is invalid by divisibility. Without the fallback those peers
-    would ``RuleSkipped`` the planner and leave a ``LoopOp`` in the lowered
-    graph, tripping ``CudaBackend``.
+    pinned enumeration is empty *and* any planner pin is set, we **fail
+    loudly** with a ``ValueError`` naming the offending pins rather than
+    silently re-running without them: a pin that admits no valid tile for
+    this kernel's shape (e.g. ``SPLITK=5`` on ``K=2048`` — 5 ∤ 2048) is a
+    user error, and quietly compiling a *different* kernel (here ``SPLITK=1``)
+    would make an A/B bench compare against a fallback the user never asked
+    for. Per the project's fail-loud / no-defensive-fallbacks convention,
+    surface it instead of guessing.
 
     BN/BM clamped to extent + divisibility-checked. FM/FN as divisors of the
     per-thread remainder (auto-divisibility), capped by ``_MAX_CELLS_PER_THREAD``.
@@ -454,7 +461,16 @@ def enumerate_cartesian(
     result = _run(apply_pins=True)
     if result or not planner_pin_set():
         return result
-    return _run(apply_pins=False)
+    # Pins are set but admit no valid tile for this shape. Fail loudly — do NOT
+    # silently re-run without pins (that would compile a kernel the user didn't
+    # ask for, e.g. an invalid SPLITK quietly becoming SPLITK=1).
+    pins = {k.name: os.environ.get(k.env) for k in _PLANNER_KNOBS if os.environ.get(k.env) is not None}
+    raise ValueError(
+        f"pinned planner knobs {pins} admit no valid {mode_kind} tile for shape "
+        f"E_M={E_M} E_N={E_N} E_K={E_K}. Divisibility constraints: BN/BM must divide the "
+        f"output extents (or be maskable); BK·SPLITK·BR must divide K. Unset the pin or "
+        f"choose a compatible value (e.g. for K={E_K}, SPLITK must be a divisor)."
+    )
 
 
 def _enumerate_cartesian_impl(

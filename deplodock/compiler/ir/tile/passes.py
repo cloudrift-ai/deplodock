@@ -28,6 +28,7 @@ from deplodock.compiler.ir.tile.ir import (
     AtomTile,
     GridTile,
     ParallelTile,
+    PersistentTile,
     RegisterTile,
     SerialTile,
     Stage,
@@ -149,6 +150,18 @@ def _(s: GridTile, ctx: SimplifyCtx) -> Stmt:
 
 
 @rewrite.register
+def _(s: PersistentTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # _parallel_rewrite uses dataclasses.replace, preserving work_start /
+    # work_end / work_var.
+    return _parallel_rewrite(s, rename, sigma, axis_fn)
+
+
+@simplify.register
+def _(s: PersistentTile, ctx: SimplifyCtx) -> Stmt:
+    return _parallel_simplify(s, ctx)
+
+
+@rewrite.register
 def _(s: ThreadTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return _parallel_rewrite(s, rename, sigma, axis_fn)
 
@@ -195,6 +208,8 @@ def _(s: SerialTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         kind=s.kind,
         unroll=s.unroll,
+        lo=sigma.apply(s.lo) if s.lo is not None else None,
+        hi=sigma.apply(s.hi) if s.hi is not None else None,
     )
 
 
@@ -206,6 +221,8 @@ def _(s: SerialTile, ctx: SimplifyCtx) -> Stmt:
         body=tuple(simplify(c, inner) for c in s.body),
         kind=s.kind,
         unroll=s.unroll,
+        lo=s.lo,
+        hi=s.hi,
     )
 
 
@@ -218,6 +235,7 @@ def _(s: StridedTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         start=sigma.apply(s.start),
         step=step,
         unroll=s.unroll,
+        stop=sigma.apply(s.stop) if s.stop is not None else None,
     )
 
 

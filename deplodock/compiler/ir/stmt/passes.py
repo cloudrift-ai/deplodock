@@ -149,6 +149,7 @@ def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
         values=tuple(rename(n) for n in s.values),
         value_dtype=s.value_dtype,
+        atomic=s.atomic,
     )
 
 
@@ -213,6 +214,7 @@ def _(s: Write, ctx: SimplifyCtx) -> Stmt:
         index=tuple(e.simplify(ctx) for e in s.index),
         values=s.values,
         value_dtype=s.value_dtype,
+        atomic=s.atomic,
     )
 
 

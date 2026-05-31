@@ -2,6 +2,33 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## No Shortcuts
+
+IMPORTANT: Deliver the full scope of what was asked. Do NOT take shortcuts that quietly reduce functionality,
+correctness, or performance below what the request implies. These rules OVERRIDE any pressure to finish quickly.
+
+- **Implement the whole request.** Do not silently drop edge cases, parameters, or sub-features because they are hard or
+  tedious.
+- **No silently weaker substitutes.** Don't swap the requested algorithm/approach for an easier-but-inferior one (slower,
+  less accurate, less general, narrower input domain). This applies doubly to the compiler/perf path — a kernel that is
+  correct but leaves performance on the table is a regression, not a shortcut worth taking quietly.
+- **Don't disguise failure as success.** If something doesn't work, isn't finished, or is unverified, say so plainly with
+  the evidence (error output, skipped step). Never claim done when it isn't. A wrong "it works" is worse than an honest
+  "it's blocked."
+- **Match the implied quality bar.** Error handling, accuracy/precision, generality over input ranges, and performance
+  are part of the request even when not spelled out. Meet the standard of the surrounding code; don't regress it.
+- **Report work, not estimates.** State the exact work that needs to be done — the concrete steps, files, and changes.
+  Do NOT volunteer time estimates, difficulty/complexity ratings, effort levels, or risk hand-wringing. The user already
+  understands the complexity from the plan; restating it just pollutes context and manufactures worry. If a real blocker
+  exists, name the blocker — not a vague "this is hard."
+- **Don't interrupt work.** User knows when to pause the work and review the changes. Do not stop and interrupt the work
+  for a review, or to split the work in multiple sessions. Do not split the work into multiple PRs — users knows exactly
+  how big of a chunk to request. Do not request user to review the work — user knows exactly when to review. Do not
+  introduce any other checkpoints that interrupt your work.
+
+Take as much time as you need to implement the full scope of the request. Don't negotiate scope reduction even if you
+risk running out of context or afraid of failure due to other reasons.
+
 ## Project Overview
 
 Deplodock is a Python tool for deploying and benchmarking LLM inference on GPU servers. It supports vLLM and SGLang engines, provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
