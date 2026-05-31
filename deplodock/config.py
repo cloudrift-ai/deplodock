@@ -140,7 +140,7 @@ def mma_enabled() -> bool:
     Set ``DEPLODOCK_MMA=0`` to force the scalar-only path (debug /
     pre-Volta hardware / fallback).
     """
-    return _bool("DEPLODOCK_MMA", default=True)
+    return _bool(knob_var("MMA"), default=True)
 
 
 def debug_enabled() -> bool:
