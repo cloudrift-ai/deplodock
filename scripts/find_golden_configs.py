@@ -47,12 +47,21 @@ _BEGIN = "# --- BEGIN GENERATED (scripts/find_golden_configs.py) ---"
 _END = "# --- END GENERATED ---"
 
 
-def _shape_table() -> list[tuple[str, int, int, int]]:
-    """``(name, M, N, K)`` for every golden shape — all plain 2-D ``(M,K)@(K,N)``."""
-    shapes: list[tuple[str, int, int, int]] = []
-    # Standard squares.
+def _shape_table() -> list[tuple[str, int, int, int, str]]:
+    """``(name, M, N, K, dtype)`` for every golden shape — all plain 2-D ``(M,K)@(K,N)``.
+
+    fp32 shapes ride the thread-tier CUDA-core FMA path (reference pinned to true
+    SGEMM); fp16 squares ride the warp-tier WMMA tensor-core path (reference is the
+    plain fp16 HGEMM — torch's default fp16 matmul, no pin needed). The fp16 ``name``
+    carries a ``.fp16`` suffix so the two never collide in the recorded set."""
+    shapes: list[tuple[str, int, int, int, str]] = []
+    # Standard fp32 squares (CUDA-core FMA).
     for s in (512, 1024, 2048, 4096):
-        shapes.append((f"square.{s}", s, s, s))
+        shapes.append((f"square.{s}", s, s, s, "fp32"))
+    # Standard fp16 squares (WMMA tensor-core). These exercise the warp-tier MMA path
+    # and benchmark deplodock's WMMA kernel against cuBLAS HGEMM.
+    for s in (512, 1024, 2048, 4096):
+        shapes.append((f"square.{s}.fp16", s, s, s, "fp16"))
     # Qwen3-Embedding-0.6B linears at seq 32/128/512 (M = seq; batch=1 squeezes away).
     H, INTER, Q, KV = QWEN3_06B_HIDDEN, QWEN3_06B_INTER, QWEN3_06B_Q_DIM, QWEN3_06B_KV_DIM
     qwen_projs = [
@@ -64,7 +73,7 @@ def _shape_table() -> list[tuple[str, int, int, int]]:
     ]
     for seq in (32, 128, 512):
         for proj, N, K in qwen_projs:
-            shapes.append((f"qwen3_06b.{proj}.s{seq}", seq, N, K))
+            shapes.append((f"qwen3_06b.{proj}.s{seq}", seq, N, K, "fp32"))
     return shapes
 
 
@@ -84,8 +93,11 @@ def _pin_true_fp32() -> None:
 
 
 def _clear_mma_pins() -> None:
-    """fp32 matmul must stay on the thread tier — drop any inherited MMA / warp pins
-    (the matmul-MMA tests set ``DEPLODOCK_MMA=1`` etc.)."""
+    """Drop any inherited MMA / warp pins (the matmul-MMA tests set ``DEPLODOCK_MMA=1``,
+    ``DEPLODOCK_ATOM_KIND`` etc.) so each shape autotunes freely. With the pins gone the
+    ``config.mma_enabled()`` default (ON) governs: fp16 squares enumerate the warp-tier
+    WMMA variants (eligibility fires on F16 loads), fp32 stays scalar thread-tier (the
+    eligibility predicate needs F16 operands, so no MMA fork is even emitted)."""
     for var in ("DEPLODOCK_MMA", "DEPLODOCK_WM", "DEPLODOCK_WN", "DEPLODOCK_ATOM_KIND"):
         os.environ.pop(var, None)
 
@@ -106,7 +118,7 @@ def _extract_knobs(assembled) -> dict:
     return max(cuda_knobs, key=len)
 
 
-def _tune_and_bench(name, M, N, K, *, db_dir, patience, warmup, iters):
+def _tune_and_bench(name, M, N, K, dtype, *, db_dir, patience, warmup, iters):
     """Run the full per-shape pipeline; return a ``MatmulGoldenConfig`` or ``None``."""
     from deplodock.commands.run import bench_full_model_real
     from deplodock.commands.trace import trace_inline_code
@@ -117,7 +129,8 @@ def _tune_and_bench(name, M, N, K, *, db_dir, patience, warmup, iters):
     from deplodock.compiler.target import live_compute_capability
 
     # 1. Trace via the shared snippet so the tuned graph == what a config reproduces.
-    info = trace_inline_code(matmul_snippet(M, N, K))
+    #    fp16 rides the WMMA tensor-core path; fp32 the thread-tier CUDA-core FMA.
+    info = trace_inline_code(matmul_snippet(M, N, K, dtype))
     graph, module, args, kwargs = info["graph"], info["module"], info["args"], info["kwargs"]
 
     # 2. Tune at -O1 (ranking). The opt level folds into the perf-cache key, so it must
@@ -150,6 +163,7 @@ def _tune_and_bench(name, M, N, K, *, db_dir, patience, warmup, iters):
         M=M,
         N=N,
         K=K,
+        dtype=dtype,
         gpu_name=_gpu_name(),
         compute_cap=cap,
         knobs=knobs,
@@ -245,10 +259,10 @@ def main() -> None:
     logger.info("Tuning %d shape(s); isolated DBs under %s", len(shapes), db_dir)
 
     configs: list[MatmulGoldenConfig] = []
-    for name, M, N, K in shapes:
-        logger.info("[%d/%d] %s  (M=%d N=%d K=%d)", len(configs) + 1, len(shapes), name, M, N, K)
+    for name, M, N, K, dtype in shapes:
+        logger.info("[%d/%d] %s  (M=%d N=%d K=%d %s)", len(configs) + 1, len(shapes), name, M, N, K, dtype)
         try:
-            cfg = _tune_and_bench(name, M, N, K, db_dir=db_dir, patience=args.patience, warmup=args.warmup, iters=args.iters)
+            cfg = _tune_and_bench(name, M, N, K, dtype, db_dir=db_dir, patience=args.patience, warmup=args.warmup, iters=args.iters)
         except RuntimeError as exc:
             # A bench watchdog abort dirties the CUDA context unrecoverably — stop, but
             # keep whatever landed so far so the run isn't a total loss.
