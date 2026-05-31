@@ -300,7 +300,7 @@ def _build_2d_matmul_graph(dims: dict):
 #   - sync double-buffered (``USE_TMA=0 USE_ASYNC_COPY=0 PIPELINE_STAGES=1``)
 #   - sync depth-1 (``USE_TMA=0 USE_ASYNC_COPY=0 PIPELINE_STAGES=0``)
 #
-# The B2 per-Load guard (``020_stage_inputs._guard_unsafe_loads``)
+# The B2 per-Load guard (``021_hoist_staged_loads_above_mask._guard_unsafe_loads``)
 # handles the masked-tile branch on the TMA + cp.async + sync paths.
 # The depth-1 / sync variants additionally exercise:
 #
@@ -352,8 +352,8 @@ _ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
     # Article's EXACT tile: ``BM=8 BN=32 FM=26 FN=4 BK=32`` produces a
     # 208×128 masked-M tile (M=2048 not a multiple of 208 → ceil-div
     # grid + per-row boundary Cond on the Write). Exercises the
-    # masked-tile boundary Cond hoist in ``020_stage_inputs``: every
-    # masked cell's K-pipeline runs (TMA elects a single issuer
+    # masked-tile boundary Cond hoist in ``021_hoist_staged_loads_above_mask``:
+    # every masked cell's K-pipeline runs (TMA elects a single issuer
     # thread; cp.async needs all threads to fetch their lane) and the
     # B2 per-Load guard (``_guard_unsafe_loads``) wraps the still-
     # un-staged gmem Loads that depend on the gated coord so masked
@@ -485,7 +485,7 @@ def test_article_reproduction_configs(label: str, dims: dict, knobs: dict, env: 
     handling, (c) ``050_use_tma`` multi-source-split + 128 B inner
     alignment, (d) ``020_stage_inputs._derive_slab`` composite-stride
     affine collapse + ``_stage_expand`` decode, or (e) the masked-tile
-    boundary-Cond hoist (``_process_scope`` Cond branch) + B2
+    boundary-Cond hoist (``021_hoist_staged_loads_above_mask``) + B2
     per-Load guard (``_guard_unsafe_loads``) interaction with the
     selected transport (TMA / cp.async)."""
     graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
