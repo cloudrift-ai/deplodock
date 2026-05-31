@@ -13,7 +13,21 @@
 > - Verified vs torch/numpy on 256³ / 1024×512×1024 / non-square shapes; 2048³ ties golden at 296µs (expected — the
 >   wrapper swap alone is perf-neutral; rebalancing tile ownership doesn't shorten the `ceil(units/SMs)` critical path).
 >
-> **Phase B (in progress — the win):** adaptive **mid-tile MAC-range** splitting — a CTA walks `(tile, k_chunk)` MAC
+> **Phase B (built, correct, but NOT yet a perf win):** adaptive mid-tile K-splitting is implemented end-to-end and
+> verified vs numpy on SYNC / BUFFERED / cp.async (non-pipelined) staging (B1–B3b, B5-part-1). Each CTA walks
+> `M_blocks·N_blocks·K_blocks` MAC units, runs a runtime-bounded partial K-loop, and combines boundary partials via
+> `atomicAdd`. **But on the supported (non-TMA) staging it regresses**: an A/B at a fractional-wave shape (128×K×256,
+> tile 8×16 → 256 CTAs / 170 SMs ≈ 1.5 waves) measured Stream-K *slower* — 18 vs 14µs (K=512), 55 vs 49µs (K=2048).
+> The atomic boundary combine + per-segment bookkeeping cost more than the recovered wave tail at these (memory-bound)
+> sizes — exactly the plan's "Split-K atomicAdd cancels the win" prediction. The actual win needs **both** remaining
+> hard pieces: the atomic-free scratch+combine (B4, skipped) AND the **TMA-staged compute-bound regime** (B5 core,
+> gated), where the tail is a real fraction of a compute-bound critical path. And even there the live 169-CTA A/B
+> *regressed* (323 vs 275µs), so the 2048³/RTX-5090 ceiling looks small. Net: the mechanism is correct and the hard
+> engineering is done, but the perf payoff on this hardware is unproven and the remaining work is substantial with an
+> uncertain ceiling.
+>
+> **Phase B core still open:** adaptive **mid-tile MAC-range** splitting on the **temporally-pipelined / TMA** K-loop —
+> a CTA walks `(tile, k_chunk)` MAC
 > units, runs a *runtime-bounded* partial K-loop for boundary tiles, writes full tiles directly and boundary partials to
 > a scratch workspace, and an atomic-free combine kernel (reusing `017_atomic_free_splitk`'s reduce skeleton) sums them.
 > This is the only form that beats Split-K (each output cell written once, no atomic tax) and the only one that actually
