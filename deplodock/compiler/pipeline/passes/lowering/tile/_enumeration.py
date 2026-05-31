@@ -620,7 +620,18 @@ def _enumerate_warp_matmul_impl(
 
     out: list[WarpTileParams] = []
     seen: set[WarpTileParams] = set()
-    bk_choices = _BK_CANDIDATES
+    # Knob-narrow gate: fold ``DEPLODOCK_<KNOB>`` env pins into the candidate
+    # tuples here at the warp tier, parallel to ``enumerate_cartesian``'s
+    # ``_run(apply_pins=True)`` for the scalar tier. The plan B/C sweep and
+    # any CLI repro (``DEPLODOCK_WM=2 DEPLODOCK_WN=2 DEPLODOCK_BK=2 …``) rely
+    # on this — without it, warp-tier pins silently fall through to the
+    # scalar tier's narrows and the warp tier enumerates the full cartesian
+    # regardless. ``ATOM_KIND`` narrows the caller-supplied ``atom_kinds``
+    # tuple so a pin scopes the picker to a single kind.
+    wm_choices = WM.narrow(_TUNE_WARP_AXIS_CHOICES)
+    wn_choices = WN.narrow(_TUNE_WARP_AXIS_CHOICES)
+    bk_choices = BK.narrow(_BK_CANDIDATES)
+    atom_kinds = ATOM_KIND.narrow(atom_kinds)
     # v1: MMA + SPLITK > 1 needs atomic-add on MmaStore (cross-CTA
     # accumulation), which isn't wired yet. Force SPLITK=1 so each output
     # cell is written by exactly one CTA. force_splitk_one is honoured
@@ -643,10 +654,10 @@ def _enumerate_warp_matmul_impl(
         # BK below is the inner stage_inner trip count (number of mma_syncs
         # per K_o iteration).
         k_cells_total = E_K // atom_k
-        for wm in _TUNE_WARP_AXIS_CHOICES:
+        for wm in wm_choices:
             if cells_M % wm != 0:
                 continue
-            for wn in _TUNE_WARP_AXIS_CHOICES:
+            for wn in wn_choices:
                 if cells_N % wn != 0:
                     continue
                 threads = wn * wm * 32
