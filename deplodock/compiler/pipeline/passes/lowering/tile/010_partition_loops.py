@@ -401,38 +401,6 @@ def _contains_matmul_reduce(stmt: Stmt) -> bool:
     return False
 
 
-def _wrap_write_in_cond(stmts: tuple[Stmt, ...], cond_expr) -> tuple[Stmt, ...]:
-    """Wrap the masked-tile boundary guard around only the ``Write`` (and any
-    post-Write stmts), keeping the K-loop / Accum tower outside the Cond.
-
-    Walks ``stmts`` looking for the first ``Write`` at the top level, or — if
-    a previous wrap pass already moved the Write inside an existing Cond — the
-    first Cond whose body contains a Write. Splits there: stmts before stay
-    outside, the Write (and everything after) goes inside the new Cond. When
-    multiple bounds apply (both M-overhang AND N-overhang), successive calls
-    nest the Conds, equivalent to ``Cond(N): Cond(M): Write``.
-
-    Falls back to wrapping the whole body when no Write is found — preserves
-    the legacy "wrap everything" semantics for kernels whose body shape this
-    helper doesn't recognise (won't happen for matmul / pointwise — both
-    always have a top-level Write — but keeps the rule's invariant when
-    future kernel patterns emit something unexpected).
-    """
-    for i, s in enumerate(stmts):
-        if isinstance(s, Write):
-            pre = stmts[:i]
-            post = stmts[i:]
-            return (*pre, Cond(cond=cond_expr, body=Body(post)))
-        if isinstance(s, Cond) and any(isinstance(x, Write) for x in s.body):
-            # Existing wrap from a sibling bound — nest this Cond inside it
-            # so the inner Write ends up guarded by BOTH predicates.
-            inner = _wrap_write_in_cond(tuple(s.body), cond_expr)
-            new_cond = Cond(cond=s.cond, body=Body(inner), else_body=s.else_body)
-            return (*stmts[:i], new_cond, *stmts[i + 1 :])
-    # No Write at the top level — fall back to wrapping the whole body.
-    return (Cond(cond=cond_expr, body=Body(stmts)),)
-
-
 def _identity_rename(name: str) -> str:
     return name
 
@@ -981,37 +949,20 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         new_inner = inner_after_outer
 
     # Masked tiles: when ceil-div has rounded a block-axis extent up past the
-    # axis bound, wrap the σ-rewritten body's ``Write`` in
-    # ``Cond(decoded_axis_coord < bound)``. ``bound`` is the static
-    # ``real_extent`` (lm_head vocab) or the symbolic ``Var`` (hint-driven
-    # dynamic axis — resolved to the runtime value at launch). The Cond sits
-    # INSIDE the register tower (N_r is in scope for the predicate).
-    #
-    # Critically the Cond wraps **only the Write**, not the preceding
-    # ``K-loop``/``Accum`` tower. The accumulator is a per-thread register;
-    # running the reduce for masked-row threads burns a few FMAs on a junk
-    # accumulator that's never written, but lets ``020_stage_inputs`` walk the
-    # cooperative-load K-loop as a top-level sibling of the Cond — no
-    # boundary-guard descent needed there, no hoist-StageBundle-above-Cond
-    # gymnastics. The earlier wrap-the-whole-body shape blocked staging
-    # (loads buried inside the Cond) and required ``DEPLODOCK_MASKED_TILE_HOIST=1``
-    # to undo the wrap post hoc — and that hoist had real edge cases on fused
-    # kernels (caught by ``test_qwen_lmhead_variant_compiles_within_budget``
-    # hanging at the 1s watchdog when the linear K-loop was decoupled from a
-    # gated upstream RMSNorm reduce). Narrowing at emission time means the
-    # cooperative load stays correctly un-gated and the stage_inputs walker
-    # doesn't need a Cond special case.
-    #
-    # The replicator in ``010_split_register_axes`` handles Conds whose
-    # predicate depends on the replicated axis by σ-substituting per replica
-    # so each replicated body gets a partly-constant-folded predicate
-    # (NVRTC drops always-true copies).
+    # axis bound, wrap the σ-rewritten body in ``Cond(decoded_axis_coord <
+    # bound)``. ``bound`` is the static ``real_extent`` (lm_head vocab) or the
+    # symbolic ``Var`` (hint-driven dynamic axis — resolved to the runtime
+    # value at launch). The Cond sits INSIDE the register tower (N_r is in
+    # scope for the predicate). The replicator in ``010_split_register_axes``
+    # handles Conds whose predicate depends on the replicated axis by
+    # σ-substituting per replica so each replicated body gets a partly-
+    # constant-folded predicate (NVRTC drops always-true copies).
     if n_bound is not None:
         n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
-        new_inner = _wrap_write_in_cond(new_inner, BinaryExpr("<", n_pred, n_bound))
+        new_inner = (Cond(cond=BinaryExpr("<", n_pred, n_bound), body=Body(new_inner)),)
     if m_bound is not None:
         m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
-        new_inner = _wrap_write_in_cond(new_inner, BinaryExpr("<", m_pred, m_bound))
+        new_inner = (Cond(cond=BinaryExpr("<", m_pred, m_bound), body=Body(new_inner)),)
 
     # σ-rewrite + K-replace the prologue when present. The prologue sits
     # inside M_r (so M_r is in scope for σ_outer's M-axis mapping) and
