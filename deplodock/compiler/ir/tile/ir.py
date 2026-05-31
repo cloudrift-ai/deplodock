@@ -772,6 +772,75 @@ class GridTile(ParallelTile):
 
 
 @dataclass(frozen=True)
+class PersistentTile(ParallelTile):
+    """Persistent-CTA grid for Stream-K matmul scheduling.
+
+    Launches exactly ``num_sms`` CTAs (resolved at launch, not baked — see
+    ``compiler/backend/cuda/program.py``). Each CTA walks a contiguous range
+    ``[work_start[blockIdx.x], work_end[blockIdx.x])`` of tile-work units,
+    supplied as two ``int32[num_sms]`` runtime arrays. The work-loop variable
+    decodes the block axes with the SAME row-major decode ``GridTile`` uses for
+    ``blockIdx.x`` — so the per-CTA body computes a *sequence* of output tiles
+    instead of one ``blockIdx``-fixed tile, killing the wave-quantization tail.
+
+    Replaces the ``GridTile`` wrapper (same ``axes`` — the matmul block axes
+    ``(M_b, N_b)``, optionally a split-K ``K_s``). The inner ``ThreadTile`` /
+    K-loop body is unchanged: re-entered per work unit, so its register
+    accumulators re-init and its ``Write`` fires once per tile inside the loop
+    scope. Boundary tiles whose K-reduction is split across CTAs need an
+    ``atomicAdd`` output — derived from ``Body.coordination.atomic_axes`` the
+    same way legacy split-K is (a block axis missing from the Write index), so
+    no per-tile metadata lives here.
+
+    ``work_start`` / ``work_end`` name the two runtime arrays; ``work_var`` is
+    the emitted loop variable the axis decode reads. Renders::
+
+        int __wbeg = <work_start>[blockIdx.x];
+        int __wend = <work_end>[blockIdx.x];
+        for (int <work_var> = __wbeg; <work_var> < __wend; <work_var>++) {
+            <row-major axis decode from work_var>
+            <body>
+        }
+    """
+
+    work_start: str = "streamk_work_start"
+    work_end: str = "streamk_work_end"
+    work_var: str = "tile_iter"
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return PersistentTile(axes=self.axes, body=body, work_start=self.work_start, work_end=self.work_end, work_var=self.work_var)
+
+    def _pretty_label(self) -> str:
+        return "persistent[num_sms]"
+
+    def deps(self) -> tuple[str, ...]:
+        # The two work-range arrays are read at the top of every CTA; declaring
+        # them as deps keeps liveness / arg-ordering analyses honest.
+        return (self.work_start, self.work_end)
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Per-CTA work-range loop + row-major block-axis decode + body.
+
+        The inner ``ThreadTile`` renders its threadIdx decode under
+        ``inside_grid_tile=True`` (cooperative form, no linear-tid guard) — the
+        surrounding ``__global__`` supplies the thread context; the work-range
+        ``for`` supplies the brace level the body indents under.
+        """
+        pad = _pad(ctx.indent)
+        out = [
+            f"{pad}int __wbeg = {self.work_start}[blockIdx.x];",
+            f"{pad}int __wend = {self.work_end}[blockIdx.x];",
+            f"{pad}for (int {self.work_var} = __wbeg; {self.work_var} < __wend; {self.work_var}++) {{",
+        ]
+        inner = replace(ctx.child(), inside_grid_tile=True)
+        out.extend(_render_grid_axis_decode(self.axes, self.work_var, inner))
+        out.extend(_render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
+
+
+@dataclass(frozen=True)
 class ThreadTile(ParallelTile):
     """Thread-parallel tile. Axes lift to ``threadIdx`` (row-major flatten).
 
@@ -2127,6 +2196,7 @@ __all__ = [
     # Tile-IR statements — typed tile flavor hierarchy
     "ParallelTile",
     "GridTile",
+    "PersistentTile",
     "ThreadTile",
     "RegisterTile",
     "WarpTile",

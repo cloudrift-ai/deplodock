@@ -27,6 +27,7 @@ from deplodock.compiler.ir.tile.ir import (
     Load,
     Loop,
     ParallelTile,
+    PersistentTile,
     RegisterTile,
     Select,
     SelectBranch,
@@ -65,6 +66,7 @@ __all__ = [
     # Typed tile flavor hierarchy
     "ParallelTile",
     "GridTile",
+    "PersistentTile",
     "ThreadTile",
     "RegisterTile",
     "SerialTileBase",
