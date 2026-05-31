@@ -64,39 +64,17 @@ def test_streamk_matmul_matches_numpy(m, k, n, monkeypatch):
 
 
 @requires_cuda
-@pytest.mark.parametrize("m,k,n", [(512, 512, 512), (256, 384, 256)])
-def test_streamk_with_splitk_atomic_matches_numpy(m, k, n, monkeypatch):
-    """Atomic-based Stream-K: persistent CTAs over the (K_s, M_b, N_b) grid, each
-    atomicAdd-ing its split-K partial into the pre-zeroed output."""
-    monkeypatch.setenv("DEPLODOCK_STREAMK", "1")
-    monkeypatch.setenv("DEPLODOCK_SPLITK", "4")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-
-    rng = np.random.default_rng(1)
-    a = rng.standard_normal((m, k), dtype=np.float32)
-    b = rng.standard_normal((k, n), dtype=np.float32)
-    be = CudaBackend()
-    out = be.run(be.compile(_matmul_graph(m, k, n)), input_data={"a": a, "b": b})[0].outputs["o"]
-    np.testing.assert_allclose(out.reshape(m, n), a @ b, rtol=3e-3, atol=3e-3)
-
-
-@requires_cuda
-def test_streamk_splitk_lowers_atomic_and_zeroes_output(monkeypatch):
-    """STREAMK + SPLITK persists over (K_s, M_b, N_b) and keeps the split-K
-    atomic path: the output Write is an atomicAdd into a zero-initialized buffer.
-    Without the Body.coordination fix (PersistentTile counted as block axes) the
-    K_s axis would vanish from the atomic analysis and the result would be wrong.
-    """
+def test_streamk_is_mutually_exclusive_with_splitk(monkeypatch):
+    """Stream-K supplies its own K-split (adaptively, in Phase B), so it must not
+    compose with fixed split-K. With both pinned, the persistent rewrite
+    self-skips and the kernel stays a plain split-K GridTile (no PersistentTile,
+    no work-range arrays)."""
     monkeypatch.setenv("DEPLODOCK_STREAMK", "1")
     monkeypatch.setenv("DEPLODOCK_SPLITK", "4")
     lowered = Pipeline.build(CUDA_PASSES).run(_matmul_graph(512, 512, 512))
-    cuda_ops = [n.op for n in lowered.nodes.values() if isinstance(n.op, CudaOp) and n.op.streamk_work_arrays]
-    assert cuda_ops, "no Stream-K CudaOp produced"
-    op = cuda_ops[0]
-    assert "atomicAdd(" in op.kernel_source, "split-K partials must atomicAdd"
-    assert op.zero_outputs, "atomic output must be zero-initialized before accumulation"
-    # 4-way split × the tile grid → K_s factor multiplies the unit count.
-    assert op.streamk_total_units % 4 == 0
+    cuda_ops = [n.op for n in lowered.nodes.values() if isinstance(n.op, CudaOp)]
+    assert cuda_ops
+    assert not any(op.streamk_work_arrays for op in cuda_ops), "Stream-K must not fire alongside split-K"
 
 
 @requires_cuda

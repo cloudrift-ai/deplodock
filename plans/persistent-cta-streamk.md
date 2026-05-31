@@ -1,23 +1,28 @@
 # Persistent CTA + Stream-K for matmul — kill the wave tail at compute-bound sizes
 
-> **Status (2026-05-31): atomic variant shipped on `feature/persistent-cta-streamk`.** The persistent-CTA scaffolding
-> and the *atomic-based* Stream-K (this plan's atomic alternative to Phase B's atomic-free combine) are implemented and
-> tested end-to-end:
+> **Status (2026-05-31): persistent-CTA scaffolding shipped; Phase B (the actual lever) in progress on
+> `feature/persistent-cta-streamk`.**
 > - `PersistentTile` IR primitive (`ir/tile/ir.py`) — launches `num_sms` CTAs, each walking a `[work_start, work_end)`
 >   range of tile-work units; decodes the block axes off the loop var instead of `blockIdx`.
 > - `STREAMK` knob + `Context.num_sms` (live `MultiProcessorCount`); grid resolves to the SM count at launch via the
 >   reserved `STREAMK_NUM_SMS` sym name (portable cubin), with two `int32[num_sms]` work-range arrays.
-> - `kernel/098_persistent_streamk` swaps the matmul `GridTile`→`PersistentTile` as a late kernel pass (after all
->   GridTile-keyed scheduling passes). No split-K → full tiles, one owner, plain store. With `SPLITK > 1` → persists
->   over `(K_s, M_b, N_b)` and each unit `atomicAdd`s its partial into the pre-zeroed output (reuses the legacy split-K
->   atomic path; `Body.coordination` counts `PersistentTile.axes` as block axes). Autotune-only wave-tail shape gate;
->   `DEPLODOCK_STREAMK=1` pin is authoritative.
-> - Verified vs torch/numpy on 256³ / 512³ / 1024³ / 2048³ / non-square shapes (full suite green).
+> - `kernel/098_persistent_streamk` swaps the matmul `GridTile`→`PersistentTile` (late kernel pass, after all
+>   GridTile-keyed scheduling passes). Today it does only the perf-neutral wrapper swap: full tiles, one owner per tile,
+>   plain store. Autotune-only wave-tail shape gate; `DEPLODOCK_STREAMK=1` pin is authoritative. **Mutually exclusive
+>   with `SPLITK`** — Stream-K supplies its own K-split, so the rule self-skips when a `K_s` axis is present.
+> - Verified vs torch/numpy on 256³ / 1024×512×1024 / non-square shapes; 2048³ ties golden at 296µs (expected — the
+>   wrapper swap alone is perf-neutral; rebalancing tile ownership doesn't shorten the `ceil(units/SMs)` critical path).
 >
-> **Not yet done:** the adaptive **mid-tile MAC-range** boundaries (Phase B proper — partial K-loops at arbitrary
-> offsets, atomic-free scratch+combine), the Phase A wave-quantized tile pin (M1–M2), swizzle under the persistent walk,
-> and the 2048³ perf bench (atomic-based is expected to ~tie golden per this plan's Split-K note; the win needs the
-> atomic-free combine). The K split here is at fixed `SPLITK` granularity, not adaptive.
+> **Phase B (in progress — the win):** adaptive **mid-tile MAC-range** splitting — a CTA walks `(tile, k_chunk)` MAC
+> units, runs a *runtime-bounded* partial K-loop for boundary tiles, writes full tiles directly and boundary partials to
+> a scratch workspace, and an atomic-free combine kernel (reusing `017_atomic_free_splitk`'s reduce skeleton) sums them.
+> This is the only form that beats Split-K (each output cell written once, no atomic tax) and the only one that actually
+> fills the fractional wave. The hard part is the runtime-bounded K-loop interacting with the staged/TMA pipeline.
+>
+> **Also deferred:** the Phase A wave-quantized tile pin (M1–M2; note the live 169-CTA A/B *regressed* — the wave tail
+> isn't on the critical path at 2048³ on a 5090, so Phase B's ceiling here is small), and swizzle under the persistent
+> walk. An earlier "atomic-based" composition of `STREAMK + SPLITK` was reverted: it was just Split-K with a
+> perf-neutral persistent wrapper, not the plan's mechanism.
 
 **Branch:** `feature/persistent-cta-streamk`
 **Origin:** `plans/matmul-cublas-gap-2026-05-30.md` § "Five new optimization kinds to feature";

@@ -276,8 +276,10 @@ CTAs that each walk a contiguous slice of the tile grid, killing the
 wave-quantization tail; it carries the GridTile's body verbatim, so the
 swap is done late (`kernel/098_persistent_streamk`) after every
 GridTile-keyed scheduling pass has run. Counted as block-axis-binding by
-`Body.coordination` exactly like `GridTile`, so split-K's atomicAdd
-classification survives the swap (see below). `RegisterTile` (per-thread
+`Body.coordination` exactly like `GridTile`, so atomic-write / broadcast
+analysis treats it uniformly (needed by the Phase-B combine path). The
+wrapper swap alone is perf-neutral; the wave-tail win is Phase B (adaptive
+mid-tile K-split + atomic-free combine). `RegisterTile` (per-thread
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by

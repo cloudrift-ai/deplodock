@@ -23,28 +23,34 @@ hoisted into the body land inside the per-CTA work loop, which is legal CUDA
 (static alloc, reused per tile); ``Sync`` / mbarrier ops fire per-K-iteration, so
 re-entering the K-loop per tile is correct.
 
-**Two work-unit granularities, selected by whether split-K is active:**
+**Current scope: persistent-over-tiles, one owner per tile, no atomics.** Each
+work unit is a whole output tile (full K-loop); the persistent grid covers
+``(M_b, N_b)`` and every tile is written by exactly one CTA, so the output
+``Write`` stays a plain store. This kills the *launch-grid* quantization (no
+fractional CTA wave) but is **perf-neutral** on its own: rebalancing which CTA
+owns which tile doesn't shorten the critical path (``ceil(units / SMs)``
+tile-times either way). The actual wave-tail win needs the K reduction split so
+the *fractional* wave gets filled — that's Phase B below.
 
-- **No split-K (M3): full tiles, one owner per tile, no atomics.** Each work unit
-  is a whole output tile (full K-loop); the persistent grid covers ``(M_b, N_b)``
-  and every tile is written by exactly one CTA, so the output ``Write`` stays a
-  plain store.
-- **With split-K (M4): atomic-based Stream-K.** When the matmul was lowered with
-  ``SPLITK > 1``, its ``GridTile`` already carries a ``K_s`` block axis and the
-  per-``K_s`` partial K-loop, and ``Body.coordination`` already marks the output
-  Write atomic (``K_s`` ∉ the Write index). Persisting over the full
-  ``(K_s, M_b, N_b)`` grid distributes ``SPLITK · M_blocks · N_blocks`` work units
-  across ``num_sms`` CTAs — every unit ``atomicAdd``\\s its partial into the
-  pre-zeroed output (``zero_outputs``, wired by 010_lower_kernelop from the same
-  ``atomic_axes`` signal). This is the atomic variant of the plan: the K split is
-  at fixed ``SPLITK`` granularity rather than adaptive mid-tile MAC ranges, so it
-  reuses the legacy split-K atomic path verbatim and just swaps the grid for a
-  balanced persistent walk that kills the wave-quantization tail.
+**Mutually exclusive with split-K.** Stream-K's win comes from splitting the K
+reduction across CTAs — the same job ``SPLITK`` does. The plan's Stream-K does it
+*adaptively* (only the boundary tiles, at mid-tile MAC offsets sized to fill the
+fractional wave), which *replaces* fixed Split-K rather than composing with it.
+So this rule self-skips when a split-K ``K_s`` axis is already present; the two
+never combine.
+
+**Phase B (in progress — the actual lever).** Adaptive mid-tile MAC-range
+splitting: a CTA walks a contiguous range of ``(tile, k_chunk)`` MAC units, runs
+a *runtime-bounded* partial K-loop for the boundary tiles it shares, writes full
+tiles directly and boundary partials to a scratch workspace, and a tiny combine
+kernel (atomic-free, reusing ``017_atomic_free_splitk``'s reduce skeleton) sums
+the partials. That is the only form that beats Split-K (each output cell written
+once → no atomic tax) and targets the wave tail. Not yet implemented; today the
+rule only does the perf-neutral wrapper swap above.
 
 Swizzle (``swizzle_group_m``) is dropped by the swap for now — persistent CTAs
 walk tiles in work-range order, so the L2 swizzle story differs; revisit when
-tuning the schedule. Adaptive mid-tile MAC-range boundaries (the atomic-free
-combine in the plan's Phase B) are a separate, larger follow-up.
+tuning the schedule.
 """
 
 from __future__ import annotations
@@ -56,6 +62,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.ir.tile.ir import GridTile, PersistentTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import STREAMK
+from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import find_split_k_axis_name
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -86,12 +93,15 @@ def rewrite(ctx: Context, match: Match, root) -> list[TileOp] | None:  # noqa: A
     grid = _outer_grid(op)
     if grid is None:
         raise RuleSkipped("no outer GridTile (pointwise / already persistent)")
-    # Matmul register-tile shape: a 2-D+ block grid carrying the FM cell knob.
-    # Pointwise / cooperative-reduce kernels don't qualify (single block axis or
-    # no FM), and masking the wave tail there isn't the lever. A split-K K_s
-    # axis (if present) makes grid.axes 3-D — that's the atomic path, kept.
+    # Matmul register-tile shape: a 2-D block grid (M_b, N_b) carrying the FM
+    # cell knob. Pointwise / cooperative-reduce kernels don't qualify.
     if len(grid.axes) < 2 or "FM" not in op.knobs:
         raise RuleSkipped("not a matmul block grid")
+    # Mutually exclusive with split-K: Stream-K does its own K-split (adaptively,
+    # in Phase B). A K_s axis already splits the K reduction across CTAs — the two
+    # never combine. (This is why the plan gates "STREAMK ⇒ SPLITK=1".)
+    if find_split_k_axis_name(op) is not None:
+        raise RuleSkipped("split-K present — Stream-K supplies its own K-split, the two are exclusive")
 
     # Wave-tail shape gate (autotune only): fork Stream-K just where the launch
     # is in the few-wave regime its tail dominates. An explicit env pin is

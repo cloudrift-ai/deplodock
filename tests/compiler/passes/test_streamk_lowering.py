@@ -89,9 +89,12 @@ def test_streamk_ranges_two_waves():
 
 
 def _matmul_tileop(m_b: int, n_b: int) -> TileOp:
+    # Write indexes both block axes (m_b, n_b) so coordination sees no atomic
+    # axis — a plain non-split matmul (find_split_k_axis_name → None).
+    write = Write(output="C", index=(Var("m_b"), Var("n_b")), value="acc")
     inner = ThreadTile(
         axes=(Axis("m_t", 16), Axis("n_t", 16)),
-        body=Body((RegisterTile(axes=(Axis("m_r", 1),), body=Body((Write(output="C", index=(Var("m_t"),), value="acc"),))),)),
+        body=Body((RegisterTile(axes=(Axis("m_r", 1),), body=Body((write,))),)),
     )
     grid = GridTile(axes=(Axis("m_b", m_b), Axis("n_b", n_b)), body=Body((inner,)))
     return TileOp(body=Body((grid,)), name="k_matmul", knobs={"FM": 1, "FN": 1, "BM": 16, "BN": 16})

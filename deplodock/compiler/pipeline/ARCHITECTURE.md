@@ -163,15 +163,16 @@ kernel passes skip the `PersistentTile` body. The grid resolves to the
 live `MultiProcessorCount` at launch (reserved `STREAMK_NUM_SMS` sym name,
 not baked → portable cubin); two `int32[num_sms]` work-range arrays
 (`streamk_work_start/end`, filled by `_streamk_ranges` in the CUDA
-backend) feed the per-CTA loop. When the matmul also carries `SPLITK > 1`,
-the persistent grid covers `(K_s, M_b, N_b)` and each unit `atomicAdd`\s
-its split-K partial into the pre-zeroed output — the **atomic-based**
-Stream-K variant, reusing the legacy split-K atomic path (`Body.coordination`
-counts `PersistentTile.axes` as block axes, so `K_s ∉ Write.index` ⇒
-atomicAdd + `zero_outputs`). An autotune-only wave-tail shape gate skips
-the fork once the launch saturates `> 8` waves; an explicit
-`DEPLODOCK_STREAMK=1` pin is authoritative and bypasses the gate. See
-`plans/persistent-cta-streamk.md`.
+backend) feed the per-CTA loop. Today the rewrite does only this
+*perf-neutral* wrapper swap (full tiles, one owner per tile, plain store):
+rebalancing tile ownership doesn't shorten the `ceil(units/SMs)` critical
+path, so the actual wave-tail win waits on **Phase B** — adaptive mid-tile
+K-splitting with an atomic-free scratch+combine (in progress; see the
+plan). **Mutually exclusive with `SPLITK`**: Stream-K supplies its own
+K-split, so the rule self-skips when a `K_s` axis is present. An
+autotune-only wave-tail shape gate skips the fork once the launch
+saturates `> 8` waves; an explicit `DEPLODOCK_STREAMK=1` pin is
+authoritative and bypasses the gate. See `plans/persistent-cta-streamk.md`.
 
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
