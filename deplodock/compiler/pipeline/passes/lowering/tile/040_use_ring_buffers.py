@@ -68,10 +68,19 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # SYNC with no staging benefit, looks ~50 % slower than the auto
     # variant. Surface the constraint instead of swallowing it.
     pinned = config.knob_raw(BUFFER_COUNT.name) is not None
+    # Real per-buffer element bytes, keyed by gmem source name. At this tile-stage
+    # ``Source.dtype`` is unstamped (``030_stamp_types`` is a downstream kernel
+    # pass), so ``Source.smem_bytes`` falls back to the fp32-assuming
+    # ``BYTES_PER_ELEM=4`` and 2×-over-counts fp16 slabs — which wrongly prunes
+    # BUFFER_COUNT 3-4 for fp16 matmul tiles that actually fit (e.g. a 64×256 fp16
+    # tile is 20 KB/stage real, fits depth 4 at 80 KB, but the over-count reports
+    # 40 KB/stage → 160 KB and rejects). Pull the true dtype off the TileOp's input
+    # tensors so the budget check matches the materializer's real allocation.
+    input_nbytes = {buf: t.dtype.nbytes for buf, t in root.op.inputs.items() if getattr(t, "dtype", None) is not None}
     variants: list[TileOp] = []
     fail_reasons: list[str] = []
     for buf_count in candidates:
-        new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem, buffer_count=buf_count)
+        new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem, buffer_count=buf_count, input_nbytes=input_nbytes)
         if not changed:
             fail_reasons.append(
                 f"BUFFER_COUNT={buf_count} not promotable (smem cap {ctx.max_dynamic_smem} B / K_o extent / SYNC bundle eligibility)"
@@ -92,7 +101,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     return variants
 
 
-def _walk(body: Body, *, smem_budget: int, buffer_count: int) -> tuple[Body, bool]:
+def _walk(body: Body, *, smem_budget: int, buffer_count: int, input_nbytes: dict[str, int]) -> tuple[Body, bool]:
     """Recursive descent: visit every wrapper looking for ``SerialTile(serial_outer)``
     whose body holds an eligible SYNC bundle — promote and stop descending into
     the promoted subtree (no further serial_outer is expected below the bundle
@@ -101,7 +110,7 @@ def _walk(body: Body, *, smem_budget: int, buffer_count: int) -> tuple[Body, boo
     changed = False
     for s in body:
         if isinstance(s, SerialTile) and s.kind == "serial_outer":
-            promoted = _maybe_promote_kouter(s, smem_budget=smem_budget, buffer_count=buffer_count)
+            promoted = _maybe_promote_kouter(s, smem_budget=smem_budget, buffer_count=buffer_count, input_nbytes=input_nbytes)
             if promoted is not None:
                 out.append(promoted)
                 changed = True
@@ -111,7 +120,7 @@ def _walk(body: Body, *, smem_budget: int, buffer_count: int) -> tuple[Body, boo
             new_bodies = []
             sub_changed = False
             for b in nested:
-                nb, c = _walk(b, smem_budget=smem_budget, buffer_count=buffer_count)
+                nb, c = _walk(b, smem_budget=smem_budget, buffer_count=buffer_count, input_nbytes=input_nbytes)
                 new_bodies.append(nb)
                 sub_changed = sub_changed or c
             if sub_changed:
@@ -121,7 +130,7 @@ def _walk(body: Body, *, smem_budget: int, buffer_count: int) -> tuple[Body, boo
     return Body(tuple(out)), changed
 
 
-def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count: int) -> SerialTile | None:
+def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count: int, input_nbytes: dict[str, int]) -> SerialTile | None:
     # Ring buffers need ≥``buffer_count`` K iterations to prologue + steady-state.
     # Symbolic K can be either — defer the promotion (no per-iter overlap) rather
     # than speculatively allocating a multi-buffer slab.
@@ -140,7 +149,11 @@ def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count:
             return None
         promote_ids.add(id(s))
         # SYNC bundle: smem_bytes has no buffer factor; we'll apply ×buffer_count.
-        total_bytes += s.smem_bytes
+        # Use the real per-source dtype (off the TileOp inputs) instead of the
+        # unstamped ``Source.smem_bytes`` fp32 fallback — see ``input_nbytes``
+        # note in ``rewrite``. Falls back to the property when a source's buf
+        # isn't a known input (intermediate / handwritten test fixture).
+        total_bytes += _bundle_real_bytes(s, input_nbytes)
     if not promote_ids:
         return None
     if buffer_count * total_bytes > smem_budget:
@@ -169,6 +182,27 @@ def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count:
         kind=kouter.kind,
         unroll=kouter.unroll,
     )
+
+
+def _bundle_real_bytes(bundle: StageBundle, input_nbytes: dict[str, int]) -> int:
+    """Single-slot smem bytes of ``bundle``, using the real per-source dtype
+    bytes from ``input_nbytes`` (keyed by gmem source name) where known. Each
+    source's element count is ``prod(alloc_extents)``; multiply by the true
+    dtype byte width (2 for fp16) instead of the unstamped fp32 fallback that
+    ``Source.smem_bytes`` uses pre-``030_stamp_types``. Sources whose ``buf``
+    isn't a known input fall back to the property (still fp32-safe)."""
+    total = 0
+    for stage in bundle.stages:
+        for src in stage.sources:
+            nbytes = input_nbytes.get(src.buf)
+            if nbytes is None:
+                total += src.smem_bytes
+                continue
+            count = 1
+            for e in src.alloc_extents:
+                count *= e
+            total += count * nbytes
+    return total
 
 
 def _has_stage_inner_reduce(body: Body) -> bool:
