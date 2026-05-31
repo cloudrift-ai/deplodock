@@ -237,6 +237,48 @@ def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
     assert first_dist <= last_dist
 
 
+# --- Warp-tier knob narrow (M1, plans/mma-perf-closures.md) ----------
+
+
+def test_warp_enumerator_wm_narrow(monkeypatch):
+    """``DEPLODOCK_WM=2`` pin narrows the warp tier to ``wm=2`` only.
+    Without this plumbing the impl iterates the full
+    ``_TUNE_WARP_AXIS_CHOICES`` regardless and the CLI bench gate of
+    every Phase A milestone fails to land on the targeted variant."""
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    rows = _enum_warp(M=128, N=128, K=128)
+    assert rows, "WM=2 should leave at least one variant at 128-square"
+    assert all(r.wm == 2 for r in rows)
+
+
+def test_warp_enumerator_wn_narrow(monkeypatch):
+    """``DEPLODOCK_WN=2`` pin narrows the warp tier to ``wn=2`` only."""
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+    rows = _enum_warp(M=128, N=128, K=128)
+    assert rows
+    assert all(r.wn == 2 for r in rows)
+
+
+def test_warp_enumerator_bk_narrow(monkeypatch):
+    """``DEPLODOCK_BK=2`` pin narrows the warp tier to ``bk=2`` only.
+    M2's staged-MMA bench gate pins ``BK=2`` so the picker lands on the
+    pipelined-async variant."""
+    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    rows = _enum_warp(M=128, N=128, K=128)
+    assert rows
+    assert all(r.bk == 2 for r in rows)
+
+
+def test_warp_enumerator_atom_kind_narrow(monkeypatch):
+    """``DEPLODOCK_ATOM_KIND=wmma_m16n16k16_f16`` pins the kind even
+    when the caller passes a multi-kind tuple. M4's PTX-MMA bench
+    gate uses this to pin ``mma_m16n8k16_f16`` against the WMMA baseline."""
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "wmma_m16n16k16_f16")
+    rows = _enum_warp(M=128, N=128, K=128, kinds=("wmma_m16n16k16_f16", "wmma_m16n16k16_bf16"))
+    assert rows
+    assert all(r.atom_kind == "wmma_m16n16k16_f16" for r in rows)
+
+
 def test_warp_enumerator_force_splitk_one():
     """``force_splitk_one`` clamps SPLITK choices to (1,) — every emitted
     row has splitk=1."""
