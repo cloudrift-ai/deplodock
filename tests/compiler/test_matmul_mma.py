@@ -101,10 +101,6 @@ def _np_dtype(dt: DataType):
     return {F16: np.float16, F32: np.float32}[dt]
 
 
-def _cp_dtype(dt: DataType, cp):
-    return {F16: cp.float16, F32: cp.float32}[dt]
-
-
 # Default-on MMA matches `config.mma_enabled()` (per
 # `plans/mma-fragment-factorization.md` post-M5). The pin is still set
 # in tests so the fixture is robust against env-var clobbering during
@@ -130,9 +126,6 @@ def _cp_dtype(dt: DataType, cp):
 def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: DataType, monkeypatch):
     """An F16×F16 matmul compiled via the MMA path agrees with the f32
     reference within fp16 tolerance — for both F16 and F32 output dtypes."""
-    import cupy as cp
-
-    from deplodock.compiler.backend.cuda.nvcc import compile_to_cubin
     from deplodock.compiler.ir.kernel.render import render_kernelop
 
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
@@ -164,33 +157,25 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
         assert "__float2half" not in src
         assert "wmma::accumulator, 16, 16, 16, half" not in src
 
-    cap = cp.cuda.Device().compute_capability
-    cubin_path = compile_to_cubin(src, kop.name, arch=f"sm_{cap}")
-    mod = cp.RawModule(path=str(cubin_path))
-    k = mod.get_function(kop.name)
+    # Launch through the real backend (``CudaBackend.run`` → ``run_program``)
+    # rather than a hand-rolled ``RawModule`` call. The warp-tier picker may
+    # land on a TMA-staged variant (signature ``…, const CUtensorMap* a_desc,
+    # b_desc``); a 3-arg cubin launch then passes garbage descriptor pointers
+    # and segfaults. The backend's ``_prebuild_descriptors`` binds every
+    # ``CUtensorMap`` and opts into dynamic smem, so any geometry — TMA or
+    # gmem-direct — launches correctly. The render+source asserts above still
+    # cover the KERNEL-stage IR; this only fixes the execution path.
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(42)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
     b = (np.random.randn(K, N) * 0.1).astype(np.float16)
-    a_cp = cp.asarray(a)
-    b_cp = cp.asarray(b)
-    c_cp = cp.zeros((M, N), dtype=_cp_dtype(out_dtype, cp))
-
-    # Derive launch geometry from the knobs.
-    knobs = kop.knobs
-    wm, wn = int(knobs["WM"]), int(knobs["WN"])
-    fm, fn = int(knobs["FM"]), int(knobs["FN"])
-    splitk = int(knobs.get("SPLITK", 1))
-    atom_m = atom_n = 16  # wmma_m16n16k16_f16
-    m_b = max(1, M // (wm * fm * atom_m))
-    n_b = max(1, N // (wn * fn * atom_n))
-    grid_x = m_b * n_b * splitk
-    threads_per_cta = wm * wn * 32
-
-    k((grid_x,), (threads_per_cta,), (a_cp, b_cp, c_cp))
+    be = CudaBackend()
+    g_run = be.compile(_matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype))
+    run_result, _ = be.run(g_run, input_data={"a": a, "b": b})
 
     expected = a.astype(np.float32) @ b.astype(np.float32)
-    result = c_cp.get().astype(np.float32)
+    result = run_result.outputs["c"].astype(np.float32)
     diff = np.abs(result - expected).max()
     # F32 acc: tight tolerance (≤1e-2). F16 acc: looser (~ K · max-prod-mag · f16-eps);
     # for our 0.1-scale inputs and K ≤ 256, ~5e-2 covers the worst-case drift.

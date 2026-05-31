@@ -1649,6 +1649,34 @@ def score_tile_geometry(
             if bk * BYTES_PER_ELEM >= 128 and n_stride_elems * BYTES_PER_ELEM >= 128:
                 score += 1.0
 
+    # Tile pipelinability (warp-tier MMA on TMA-capable HW). A deeper TMA/cp.async
+    # ring hides the load latency (`long_scoreboard` ≈ 4 → 0.18 at depth 3,
+    # measured 2048² fp16 RTX 5090, ~15 % faster) — but only pays when the deeper
+    # slab still leaves ≥ 2 CTA-blocks resident on one SM. So reward tiles whose
+    # per-stage smem is small enough to pipeline ≥ 3 deep at 2 blocks/SM, steering
+    # the greedy tile pick away from the fat cells≈16 tile (e.g. 64×256, 20 KB/
+    # stage → stuck at depth 2, 133 µs) toward a tile that pipelines (128×128,
+    # 16 KB/stage → depth 3 at 2 blocks, 113 µs). The matching depth choice is
+    # made in ``040_use_ring_buffers`` (it orders the buffer-count variants so
+    # greedy's option-0 is the deepest that keeps 2 blocks). Gated to the warp
+    # tier + sm_90+ (scalar / pre-Hopper keep the prior); BK ≥ 2 so a degenerate
+    # single-K-iter tile (tiny per-stage slab, no real chunked-K reuse) doesn't
+    # earn the bonus. Keyed only off planner knobs (WM/WN/FM/FN/BK) so lazy_score
+    # and the post-materialization score agree (the lazy/eager parity check).
+    # See project_cublas_gap_ncu_2026-05-31 memory.
+    if "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
+        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
+
+        atom_m, atom_n, atom_k = atom_spec(str(knobs["ATOM_KIND"])).shape
+        bm = int(knobs.get("WM", 1)) * int(knobs.get("FM", 1)) * atom_m
+        bn = int(knobs.get("WN", 1)) * int(knobs.get("FN", 1)) * atom_n
+        bk_k = int(knobs.get("BK", 1))
+        per_stage = (bm + bn) * bk_k * atom_k * 2  # fp16/bf16 = 2 B
+        if per_stage > 0 and bk_k >= 2:
+            max_depth_2block = smem_cap_bytes // (2 * per_stage)
+            if max_depth_2block >= 3:
+                score += 0.8
+
     return score
 
 

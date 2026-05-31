@@ -77,7 +77,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # 40 KB/stage → 160 KB and rejects). Pull the true dtype off the TileOp's input
     # tensors so the budget check matches the materializer's real allocation.
     input_nbytes = {buf: t.dtype.nbytes for buf, t in root.op.inputs.items() if getattr(t, "dtype", None) is not None}
-    variants: list[TileOp] = []
+    variants: list[tuple[int, TileOp]] = []
     fail_reasons: list[str] = []
     for buf_count in candidates:
         new_body, changed = _walk(body, smem_budget=ctx.max_dynamic_smem, buffer_count=buf_count, input_nbytes=input_nbytes)
@@ -87,10 +87,13 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
             )
             continue
         variants.append(
-            TileOp(
-                body=new_body,
-                name=root.op.name,
-                knobs={**root.op.knobs, BUFFER_COUNT.name: buf_count},
+            (
+                buf_count,
+                TileOp(
+                    body=new_body,
+                    name=root.op.name,
+                    knobs={**root.op.knobs, BUFFER_COUNT.name: buf_count},
+                ),
             )
         )
     if not variants:
@@ -98,7 +101,53 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         if pinned:
             raise ValueError(f"DEPLODOCK_BUFFER_COUNT={candidates[0]} pinned but cannot fire: {msg}")
         raise RuleSkipped(f"no K-outer StageBundle fits any BUFFER_COUNT candidate ({msg})")
-    return variants
+
+    # Occupancy-optimal ordering for the GREEDY default. ``GreedySearch`` keeps
+    # only option-0 of a rule's fork and drops the rest (it does NOT re-score the
+    # buffer variants), so the *order* here is what greedy picks at an untuned
+    # site. A deeper ring hides the TMA/cp.async load latency, but only pays when
+    # the deeper slab still leaves ≥ 2 CTA-blocks resident on one SM — past that
+    # the kernel drops to 1 block/SM and runs slower (measured 2048² fp16: 128×128
+    # depth 3 = 113 µs at 2 blocks vs depth 4 = 141 µs at 1 block). So front-load
+    # the deepest depth that keeps 2 blocks; if none do (a fat tile where even
+    # depth 2 is already 1 block), keep the shallowest first to preserve occupancy.
+    # The autotuner still sees every variant — this only fixes the greedy prior.
+    #
+    # Gate to single-staged-bundle kernels — a pure GEMM, where the ring slab IS
+    # the kernel's entire dynamic-smem footprint, so the ``keeps_two`` test below
+    # is exact. A fused multi-matmul kernel (SDPA chains QK then P@V → two
+    # ``StageBundle``s) also allocates an intermediate cross-bundle workspace
+    # whose smem *dominates* the materialized footprint (measured: per-stage ring
+    # ≈ 2 KB but the depth-3 kernel materializes ≈ 104 KB of workspace + rings).
+    # No ring-byte budget can predict that, so front-loading a deep ring there can
+    # pick a depth whose materialized smem overflows the cap — and greedy keeps
+    # only option-0 with no fallback, so the deterministic compile hard-errors
+    # (``100_materialize_tile rejected its only lowering``). Multi-bundle kernels
+    # keep the shallow-first default (the pre-occupancy order, which always fit
+    # downstream); the autotuner still explores their deeper rings (it tolerates a
+    # variant that fails ``validate``, unlike the no-fallback greedy default).
+    per_stage = _kouter_sync_bytes(body, input_nbytes)
+    n_bundles = sum(1 for s in body.iter() if isinstance(s, StageBundle))
+    if per_stage > 0 and n_bundles == 1:
+
+        def _occ_key(bc: int) -> tuple[int, int]:
+            keeps_two = 2 * bc * per_stage <= ctx.max_dynamic_smem
+            # keeps-2-blocks first (deepest among them); then 1-block (shallowest).
+            return (0, -bc) if keeps_two else (1, bc)
+
+        variants.sort(key=lambda bv: _occ_key(bv[0]))
+    return [v for _, v in variants]
+
+
+def _kouter_sync_bytes(body: Body, input_nbytes: dict[str, int]) -> int:
+    """Single-slot real-dtype smem bytes of the first ``SerialTile(serial_outer)``
+    SYNC bundle eligible for promotion — the per-stage footprint a ring multiplies
+    by ``buffer_count``. Used to order the buffer-count variants by occupancy. 0
+    when no eligible bundle is found (caller skips the reorder)."""
+    for s in body.iter():
+        if isinstance(s, StageBundle) and s.policy == StagePolicy.SYNC:
+            return _bundle_real_bytes(s, input_nbytes)
+    return 0
 
 
 def _walk(body: Body, *, smem_budget: int, buffer_count: int, input_nbytes: dict[str, int]) -> tuple[Body, bool]:

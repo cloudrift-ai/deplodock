@@ -148,20 +148,27 @@ def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
 def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
     """With ``DEPLODOCK_MMA=1`` defaulted ON and *no* warp-tier pins, the
     picker on sm_90+ must land on the empirical golden tile for 2048² fp16:
-    ``WM=1 WN=4 FM=4 FN=4 BK=2``. Measured 84 µs vs eager's 98 µs (1.17×)
-    on RTX 5090; previous gmem-direct baseline ran 108 µs (0.92×).
+    the square ``WM=2 WN=2 FM=4 FN=4 BK=2`` (128×128 tile) with a depth-3
+    ring (``BUFFER_COUNT=3``). Measured 115 µs vs the previous WM=1/WN=4
+    64×256 / depth-2 pick's 133 µs (≈ 13 % faster, RTX 5090) — the deeper
+    pipeline hides the TMA load latency, and the smaller square tile keeps
+    2 CTA-blocks resident so the depth-3 ring still fits.
 
-    The change to ``score_tile_geometry`` (target_threads=128 on TMA-capable
-    warp tier + TMA bonus restricted to BK ≤ 4) is what lands this variant.
+    Two co-operating priors land this: ``score_tile_geometry``'s small-BK
+    pipelinability term (favours the square 128×128 whose per-stage smem
+    admits a depth-3 ring at 2 blocks/SM) and ``040_use_ring_buffers``'s
+    occupancy-ordered BUFFER_COUNT variants (front-loads the deepest depth
+    that keeps 2 blocks for the greedy default).
     """
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
-    g, kop, _ = _compile_and_render(M=2048, N=2048, K=2048, out_dtype=F16)
+    _, kop, _ = _compile_and_render(M=2048, N=2048, K=2048, out_dtype=F16)
     assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16"
-    assert int(kop.knobs.get("WM", 0)) == 1, f"expected WM=1, got {kop.knobs.get('WM')}"
-    assert int(kop.knobs.get("WN", 0)) == 4, f"expected WN=4, got {kop.knobs.get('WN')}"
+    assert int(kop.knobs.get("WM", 0)) == 2, f"expected WM=2, got {kop.knobs.get('WM')}"
+    assert int(kop.knobs.get("WN", 0)) == 2, f"expected WN=2, got {kop.knobs.get('WN')}"
     assert int(kop.knobs.get("FM", 0)) == 4, f"expected FM=4, got {kop.knobs.get('FM')}"
     assert int(kop.knobs.get("FN", 0)) == 4, f"expected FN=4, got {kop.knobs.get('FN')}"
     assert int(kop.knobs.get("BK", 0)) == 2, f"expected BK=2, got {kop.knobs.get('BK')}"
+    assert int(kop.knobs.get("BUFFER_COUNT", 0)) == 3, f"expected BUFFER_COUNT=3, got {kop.knobs.get('BUFFER_COUNT')}"
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
@@ -181,7 +188,7 @@ def test_tma_wmma_path_emits_bulk_tensor_ptx(pin_tma_wmma):
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
-@pytest.mark.parametrize("M,N,K", [(256, 256, 128), (512, 512, 128)])
+@pytest.mark.parametrize("M,N,K", [(256, 256, 128), (512, 512, 128), (256, 256, 64)])
 def test_tma_wmma_matches_f32_reference(pin_tma_wmma, M: int, N: int, K: int):
     """The TMA-staged WMMA path produces output that matches the f32
     reference within fp16 tolerance.
@@ -190,40 +197,32 @@ def test_tma_wmma_matches_f32_reference(pin_tma_wmma, M: int, N: int, K: int):
     = 6`` mapped via ``_DTYPE_BY_ITEMSIZE``) is exercised here — pre-fix
     the descriptor hardcoded ``FLOAT32 = 2`` (actually UINT32 in the
     driver enum), and the TMA hardware misinterpreted fp16 byte strides
-    so the per-K_o copy delivered the wrong slot's data."""
-    import cupy as cp
+    so the per-K_o copy delivered the wrong slot's data.
 
-    from deplodock.compiler.backend.cuda.nvcc import compile_to_cubin  # noqa: PLC0415
-
-    g, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
+    ``256×256×64`` pins the exact square-warp geometry the default picker
+    lands on at that skewed shape (WM=WN=2, FM=FN=4, BK=2 → 128×128 tile,
+    K_o=2). A 3-arg ``RawModule`` launch of this TMA-staged kernel passes
+    garbage descriptor pointers and segfaults — the regression that motivated
+    routing the launch through the backend, which binds every ``CUtensorMap``
+    via ``_prebuild_descriptors``."""
+    _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
     assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16"
     assert "cp.async.bulk.tensor" in src  # smoke-check the TMA path actually fired
 
-    cap = cp.cuda.Device().compute_capability
-    cubin_path = compile_to_cubin(src, kop.name, arch=f"sm_{cap}")
-    mod = cp.RawModule(path=str(cubin_path))
-    k = mod.get_function(kop.name)
+    # Launch through the real backend so ``_prebuild_descriptors`` binds the
+    # per-operand ``CUtensorMap`` args (a hand-rolled cubin launch can't) and
+    # opts into the dynamic-smem allowance. Recompile from a fresh loop graph
+    # via the full ``CUDA_PASSES`` pipeline under the same pinned env.
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(42)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
     b = (np.random.randn(K, N) * 0.1).astype(np.float16)
-    a_cp = cp.asarray(a)
-    b_cp = cp.asarray(b)
-    c_cp = cp.zeros((M, N), dtype=cp.float32)
+    be = CudaBackend()
+    g_run = be.compile(_matmul_graph(M=M, N=N, K=K, out_dtype=F32))
+    run_result, _ = be.run(g_run, input_data={"a": a, "b": b})
 
-    knobs = kop.knobs
-    wm, wn = int(knobs["WM"]), int(knobs["WN"])
-    fm, fn = int(knobs["FM"]), int(knobs["FN"])
-    splitk = int(knobs.get("SPLITK", 1))
-    atom_m = atom_n = 16
-    m_b = max(1, M // (wm * fm * atom_m))
-    n_b = max(1, N // (wn * fn * atom_n))
-    grid_x = m_b * n_b * splitk
-    threads_per_cta = wm * wn * 32
-    # TMA kernels take an extra descriptor argument per gmem operand; the
-    # backend resolves these at launch via ``encode_tiled`` (see
-    # ``backend/cuda/program.py``). End-to-end correctness is validated
-    # through ``deplodock run --code …`` in the bench harness; the raw
-    # cubin path here can't bind the descriptors directly. Skip the in-
-    # test launch and rely on the source / promotion assertions above.
-    _ = (k, a_cp, b_cp, c_cp, grid_x, threads_per_cta)
+    expected = a.astype(np.float32) @ b.astype(np.float32)
+    result = run_result.outputs["c"].astype(np.float32)
+    diff = np.abs(result - expected).max()
+    assert diff < 1e-2, f"M={M} N={N} K={K} max-abs-err {diff}"

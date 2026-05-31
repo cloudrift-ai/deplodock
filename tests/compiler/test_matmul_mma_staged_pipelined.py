@@ -145,7 +145,14 @@ def pin_staged_pipelined(monkeypatch):
     ``DEPLODOCK_TMA=0`` keeps this test focused on the cp.async lever
     even on sm_90+ where ``050_use_tma`` would otherwise promote the
     bundle (post-block-aware eligibility fix); the TMA path has its own
-    test suite."""
+    test suite.
+
+    ``DEPLODOCK_BUFFER_COUNT=2`` pins the classic double-buffer ring so
+    these tests exercise the ``% 2`` modular-phase addressing they were
+    written against. Without the pin, ``040_use_ring_buffers``'s
+    occupancy-ordered greedy default now front-loads a depth-3 ring for
+    this 128×128 tile, whose ``080_pipeline_stages`` unroll emits explicit
+    per-slot offsets instead of the ``a7 % 2`` phase Expr."""
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
     monkeypatch.setenv("DEPLODOCK_TMA", "0")
     monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "wmma_m16n16k16_f16")
@@ -154,6 +161,7 @@ def pin_staged_pipelined(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_FM", "4")
     monkeypatch.setenv("DEPLODOCK_FN", "4")
     monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("DEPLODOCK_BUFFER_COUNT", "2")
 
 
 def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
