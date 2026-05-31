@@ -780,6 +780,220 @@ class MmaStore(Stmt):
         ]
 
 
+# ---------------------------------------------------------------------------
+# Modern warp-level MMA: ``mma.sync.aligned`` + ``ldmatrix`` (the ``s16816``
+# path cuBLAS / CUTLASS use). Distinct from the legacy ``nvcuda::wmma`` nodes
+# above: where ``MmaFragment`` is an *opaque* fragment whose lane distribution
+# the compiler hides, mma.sync operands are *explicit per-thread register
+# arrays* with a PTX-fixed lane→element layout, referenced positionally inside
+# inline PTX. That's a different operand model, not a flag on the WMMA nodes —
+# so it gets its own Stmt family (``RegFragment`` / ``LdmatrixLoad`` /
+# ``MmaSyncPtx`` / ``RegStore``), rendered via the ``_MMA_SYNC_PRELUDE`` helper
+# wrappers (pure PTX — NVRTC-clean, no ``<mma.h>``). Emitted by
+# ``kernel/005_lower_atom_tile`` for an ``instruction="mma_sync"`` AtomSpec.
+# ---------------------------------------------------------------------------
+
+# fp32→narrow downconvert spelling, shared with :class:`MmaStore`'s epilogue.
+_NARROW_CONVERT = {"f16": "__float2half", "bf16": "__float2bfloat16"}
+
+
+def _mma_sync_nregs(role: str, shape: tuple[int, int, int]) -> int:
+    """Per-lane register count for an mma.sync operand of cell ``shape``.
+
+    ``a`` (M×K f16) and ``b`` (K×N f16) pack two halfs per 32-bit register;
+    ``c`` (M×N f32) holds one float per register. For ``m16n8k16``:
+    ``a[4]`` (256 halfs / 32 lanes / 2), ``b[2]`` (128 / 32 / 2), ``c[4]``
+    (128 f32 / 32)."""
+    m, n, k = shape
+    if role == "a":
+        return (m * k) // 64
+    if role == "b":
+        return (k * n) // 64
+    if role == "c":
+        return (m * n) // 32
+    raise ValueError(f"mma.sync: unsupported role {role!r}; expected 'a', 'b', or 'c'")
+
+
+@dataclass(frozen=True)
+class RegFragment(Stmt):
+    """Declare an mma.sync per-thread register array.
+
+    Unlike the opaque ``wmma::fragment``, mma.sync multiplicands are
+    explicit per-lane register arrays — ``unsigned a[4]`` / ``unsigned
+    b[2]`` (f16, two halfs per 32-bit reg) — and the accumulator is
+    ``float c[4]`` (f32). ``shape`` is the cell ``(M, N, K)``; the count
+    derives from ``shape`` + ``role`` via :func:`_mma_sync_nregs`. The
+    ``c`` array is zero-initialised at declaration, so the mma.sync path
+    needs no separate ``MmaFill``."""
+
+    name: str
+    role: str  # "a" / "b" / "c"
+    shape: tuple[int, int, int]
+    dtype: DataType
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        m, n, k = self.shape
+        return [f"{indent}RegFragment {self.role}:{self.dtype.name} {self.name}[{_mma_sync_nregs(self.role, self.shape)}] ({m}x{n}x{k})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        n_regs = _mma_sync_nregs(self.role, self.shape)
+        ctx.ssa_dtypes[self.name] = self.dtype.name
+        if self.role == "c":
+            zeros = ", ".join(["0.0f"] * n_regs)
+            return [f"{_pad(ctx.indent)}float {self.name}[{n_regs}] = {{{zeros}}};"]
+        return [f"{_pad(ctx.indent)}unsigned {self.name}[{n_regs}];"]
+
+
+@dataclass(frozen=True)
+class LdmatrixLoad(Stmt):
+    """``ldmatrix.sync.aligned.m8n8.x{2,4}[.trans].b16`` — load one operand
+    fragment from smem into a per-thread register array.
+
+    ``frag`` is the destination :class:`RegFragment`; ``src_buffer`` /
+    ``src_index`` are the cell's smem tile base (the same ``(buffer,
+    base-offset)`` ``_mma_src_index`` computes for the WMMA path); ``ldm``
+    is the smem row stride in elements. Each lane derives its own row
+    address from its warp lane id (``threadIdx.x & 31``): the 16×K ``a``
+    tile uses ``x4`` (``row = lane%16``, K-col block ``(lane/16)*8``); the
+    K×8 ``b`` tile uses ``x2.trans`` (``row = lane%16``) so a row-major
+    smem slab feeds the mma's col-major B operand. ldmatrix is **smem
+    only** — the mma.sync path never loads from gmem (``005_lower_atom_tile``
+    requires a staged source)."""
+
+    frag: str
+    src_buffer: str
+    src_index: tuple
+    role: str  # "a" → x4; "b" → x2.trans
+    ldm: int = 0
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.src_buffer,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return tuple(self.src_index)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(e.pretty() for e in self.src_index)
+        variant = "x4" if self.role == "a" else "x2.trans"
+        return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}, ldm={self.ldm or 'auto'})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+
+        flat = render_index(self.src_buffer, self.src_index, ctx)
+        ldm = self.ldm if self.ldm else _resolve_ldm(self.src_buffer, ctx)
+        lane = "(threadIdx.x & 31)"
+        if self.role == "a":
+            # 16×16 A: x4 — lane addresses M-row (lane%16), K-col block (lane/16)*8.
+            addr = f"&{self.src_buffer}[{flat} + ({lane} % 16) * {ldm} + ({lane} / 16) * 8]"
+            return [f"{_pad(ctx.indent)}dpl_ldmatrix_x4({self.frag}, {addr});"]
+        # 16×8 B: x2.trans — lane addresses K-row (lane%16); .trans yields col-major.
+        addr = f"&{self.src_buffer}[{flat} + ({lane} % 16) * {ldm}]"
+        return [f"{_pad(ctx.indent)}dpl_ldmatrix_x2_trans({self.frag}, {addr});"]
+
+
+@dataclass(frozen=True)
+class MmaSyncPtx(Stmt):
+    """``mma.sync.aligned.m{M}n{N}k{K}.row.col.f32.f16.f16.f32`` — one
+    tensor-core MMA via inline PTX (the ``s16816`` instruction).
+
+    ``c_frag`` is the f32 accumulator array (both input and output —
+    ``d = a·b + c``); ``a_frag`` / ``b_frag`` are the f16 multiplicand
+    arrays filled by :class:`LdmatrixLoad`. ``shape`` spells the M/N/K.
+    f16 operands + f32 accumulate (the only registered ``mma_sync`` kind
+    today); a future bf16 kind would carry an operand-dtype tag."""
+
+    c_frag: str
+    a_frag: str
+    b_frag: str
+    shape: tuple[int, int, int]
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.c_frag, self.a_frag, self.b_frag)
+
+    def defines(self) -> tuple[str, ...]:
+        # Accumulates into c_frag in place — a definition, like MmaSync.
+        return (self.c_frag,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        m, n, k = self.shape
+        return [f"{indent}MmaSyncPtx {self.c_frag} += {self.a_frag} @ {self.b_frag} (m{m}n{n}k{k})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        m, n, k = self.shape
+        # ``c`` is passed for both the ``d`` (out) and ``c`` (in) operands.
+        return [f"{_pad(ctx.indent)}dpl_mma_m{m}n{n}k{k}_f16({self.c_frag}, {self.a_frag}, {self.b_frag}, {self.c_frag});"]
+
+
+@dataclass(frozen=True)
+class RegStore(Stmt):
+    """Store an mma.sync f32 accumulator array to the output buffer with a
+    per-lane epilogue downconvert.
+
+    mma.sync has no ``store_matrix_sync`` — each lane owns 4 elements of
+    the M×N=16×8 C tile (rows ``g`` / ``g+8`` with ``g = lane/4``, cols
+    ``(lane%4)*2 + {0,1}``) and writes them directly. ``frag`` is the f32
+    ``float c[4]``; when the destination buffer is narrower (``__half*``)
+    each value is converted via ``__float2half`` (mirrors
+    :class:`MmaStore`'s downconvert). ``ldm`` is the output row stride
+    (N) — ``0`` auto-resolves from the buffer's inner extent."""
+
+    dst_buffer: str
+    dst_index: tuple
+    frag: str
+    shape: tuple[int, int, int]
+    ldm: int = 0
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def external_writes(self) -> tuple[str, ...]:
+        return (self.dst_buffer,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return tuple(self.dst_index)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        idx = ", ".join(e.pretty() for e in self.dst_index)
+        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag} (ldm={self.ldm or 'auto'})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+
+        flat = render_index(self.dst_buffer, self.dst_index, ctx)
+        ldm = self.ldm if self.ldm else _resolve_ldm(self.dst_buffer, ctx)
+        dst_dt = ctx.buffer_dtypes.get(self.dst_buffer, "f32")
+        conv = _NARROW_CONVERT.get(dst_dt)
+        pad = _pad(ctx.indent)
+        lane = "(threadIdx.x & 31)"
+
+        def _v(i: int) -> str:
+            return f"{self.frag}[{i}]" if conv is None else f"{conv}({self.frag}[{i}])"
+
+        # C is 16×8: lane owns (row g, col 2t+{0,1}) and (row g+8, …) with
+        # g = lane/4, t = lane%4. ldm strides over N (the output row width).
+        # The ``{ }`` block scopes _g/_t so sibling RegStores don't collide.
+        return [
+            f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {_v(0)};",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {_v(1)};",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {_v(2)};",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {_v(3)}; }}",
+        ]
+
+
 def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int:
     """Look up the row-major leading-dimension stride (= inner extent)
     for ``buffer`` from the kernel render context. Used by
@@ -1144,4 +1358,39 @@ def _(s: MmaStore, rename, sigma, axis_fn):
         ldm=s.ldm,
         layout=s.layout,
         shape=s.shape,
+    )
+
+
+# --- mma.sync (s16816) register-array rewrites -----------------------------
+
+
+@_rewrite.register
+def _(s: RegFragment, rename, sigma, axis_fn):
+    return RegFragment(name=rename(s.name), role=s.role, shape=s.shape, dtype=s.dtype)
+
+
+@_rewrite.register
+def _(s: LdmatrixLoad, rename, sigma, axis_fn):
+    return LdmatrixLoad(
+        frag=rename(s.frag),
+        src_buffer=s.src_buffer,
+        src_index=tuple(sigma.apply(e) for e in s.src_index),
+        role=s.role,
+        ldm=s.ldm,
+    )
+
+
+@_rewrite.register
+def _(s: MmaSyncPtx, rename, sigma, axis_fn):
+    return MmaSyncPtx(c_frag=rename(s.c_frag), a_frag=rename(s.a_frag), b_frag=rename(s.b_frag), shape=s.shape)
+
+
+@_rewrite.register
+def _(s: RegStore, rename, sigma, axis_fn):
+    return RegStore(
+        dst_buffer=s.dst_buffer,
+        dst_index=tuple(sigma.apply(e) for e in s.dst_index),
+        frag=rename(s.frag),
+        shape=s.shape,
+        ldm=s.ldm,
     )

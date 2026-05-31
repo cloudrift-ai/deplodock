@@ -321,6 +321,10 @@ directly (no separate AST class).
 | `MmaLoad`          | `wmma::load_matrix_sync(frag, &buf[offset], ldm)` — load one fragment from gmem/smem. `ldm=0` (auto) resolves to `ctx.shapes[buffer][-1]` at render. |
 | `MmaSync`          | `wmma::mma_sync(c, a, b, c)` — one tensor-core MMA. Synchronous (WMMA); future async Hopper / Blackwell kinds add sibling `MmaIssue`/`MmaWait` Stmts. |
 | `MmaStore`         | `wmma::store_matrix_sync(&buf[offset], frag, ldm, layout)`.       |
+| `RegFragment`      | mma.sync (s16816) per-thread register array decl: `unsigned a[4]`/`b[2]` (f16, 2 halfs/reg) or `float c[4]` (f32 acc, zero-init). The explicit-register counterpart to `MmaFragment`'s opaque `wmma::fragment`. |
+| `LdmatrixLoad`     | `ldmatrix.sync.aligned.m8n8.x{4,trans}.b16` — load one operand from smem into a `RegFragment` (smem-only). `role="a"` → x4; `role="b"` → x2.trans. Each lane derives its own row address from `threadIdx.x & 31`. |
+| `MmaSyncPtx`       | `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` — one s16816 MMA via inline PTX (`c += a @ b`). The mma.sync counterpart to `MmaSync`. |
+| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. |
 | Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`

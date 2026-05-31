@@ -166,6 +166,7 @@ def test_v1_atom_kinds_priority_order():
         "wmma_m16n16k16_bf16",
         "wmma_m8n32k16_f16",
         "wmma_m32n8k16_f16",
+        "mma_m16n8k16_f16",
     )
     for kind in _ATOM_KINDS_V1:
         assert kind in ATOM_REGISTRY

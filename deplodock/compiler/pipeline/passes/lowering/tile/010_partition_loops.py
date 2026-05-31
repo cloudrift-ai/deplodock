@@ -648,10 +648,25 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # param list — the fork tree in :func:`rewrite` splits the rows by
         # type and emits sibling subtrees with disjoint level schemas.
         from deplodock import config  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import _ATOM_KINDS_V1, is_atom_eligible  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile._atom import (  # noqa: PLC0415
+            _ATOM_KINDS_V1,
+            ATOM_REGISTRY,
+            atom_spec,
+            is_atom_eligible,
+        )
 
         if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
             eligible = tuple(k for k in _ATOM_KINDS_V1 if is_atom_eligible(k, loop_op, ctx, graph=graph))
+            # ``mma_sync`` kinds (the s16816 ldmatrix + mma.sync path) are
+            # opt-in until perf-promoted: auto-enumerate them only when
+            # ``DEPLODOCK_ATOM_KIND`` explicitly pins one (functional bring-up
+            # and the perf bench gate). Otherwise the WMMA siblings stay the
+            # default pick — a first-cut mma.sync kernel must not silently
+            # regress every fp16 matmul before M6 confirms it's faster.
+            pinned_atom = config.knob_raw("ATOM_KIND")
+            pin_is_mma_sync = pinned_atom in ATOM_REGISTRY and atom_spec(pinned_atom).instruction == "mma_sync"
+            if not pin_is_mma_sync:
+                eligible = tuple(k for k in eligible if atom_spec(k).instruction != "mma_sync")
             if eligible:
                 warp_combos = enumerate_cartesian(
                     E_M=E_M,

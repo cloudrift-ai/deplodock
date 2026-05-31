@@ -246,6 +246,23 @@ ATOM_REGISTRY: dict[str, AtomSpec] = {
         group_size=32,
         eligibility=_wmma_eligible_factory(cell_shape=(32, 8, 16), operand_dtype=F16, min_cc=(7, 0)),
     ),
+    # Modern warp-level MMA: ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` (the
+    # ``s16816`` cell cuBLAS/CUTLASS use). f16 operands, f32 accumulate, sm_80+
+    # (the m16n8k16 f16.f16.f32 op is Ampere+). Distinguished from WMMA by
+    # ``instruction="mma_sync"``: ``kernel/005_lower_atom_tile`` branches on it to
+    # emit the RegFragment/LdmatrixLoad/MmaSyncPtx/RegStore chain instead of the
+    # opaque ``wmma::fragment`` one. Unlike WMMA this path has **no gmem-direct
+    # load** (ldmatrix is smem→register only) — the lowering requires a staged
+    # smem source and RuleSkips an unstaged leaf, so the WMMA sibling row covers
+    # the gmem-direct shape. Not yet in ``_ATOM_KINDS_V1`` — added once the
+    # lower→render path emits valid PTX (see ``plans/`` mma-sync milestones).
+    "mma_m16n8k16_f16": AtomSpec(
+        shape=(16, 8, 16),
+        operand_dtypes={"a": F16, "b": F16, "c": F32},
+        instruction="mma_sync",
+        group_size=32,
+        eligibility=_wmma_eligible_factory(cell_shape=(16, 8, 16), operand_dtype=F16, min_cc=(8, 0)),
+    ),
 }
 
 
@@ -254,11 +271,16 @@ ATOM_REGISTRY: dict[str, AtomSpec] = {
 # then skewed F16 shapes (m8n32k16 for tall-N attention projections,
 # m32n8k16 for tall-M skinny outputs). Scalar is not in this list —
 # scalar is the absence of an atom (modelled by :class:`ScalarTileParams`).
+# ``mma_m16n8k16_f16`` is appended (not first) while it earns its place:
+# functional milestones validate correctness against the WMMA baseline, and
+# it's promoted ahead of WMMA only once the perf bench confirms it's faster
+# (the s16816 path is the cuBLAS-parity lever — see ``plans/`` mma-sync work).
 _ATOM_KINDS_V1: tuple[str, ...] = (
     "wmma_m16n16k16_f16",
     "wmma_m16n16k16_bf16",
     "wmma_m8n32k16_f16",
     "wmma_m32n8k16_f16",
+    "mma_m16n8k16_f16",
 )
 
 

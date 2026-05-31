@@ -71,6 +71,17 @@ def _supports_tma() -> bool:
     return int(cap) >= 90
 
 
+def _supports_mma_sync() -> bool:
+    """The s16816 ``mma.sync.aligned.m16n8k16.f16.f16.f32`` op + ``ldmatrix``
+    need sm_80+ (Ampere and later)."""
+    if not _has_cuda():
+        return False
+    import cupy as cp
+
+    cap = cp.cuda.Device().compute_capability
+    return int(cap) >= 80
+
+
 def _matmul_loop_op(*, M: int, N: int, K: int) -> LoopOp:
     i = Axis("i", M)
     j = Axis("j", N)
@@ -226,3 +237,68 @@ def test_tma_wmma_matches_f32_reference(pin_tma_wmma, M: int, N: int, K: int):
     result = run_result.outputs["c"].astype(np.float32)
     diff = np.abs(result - expected).max()
     assert diff < 1e-2, f"M={M} N={N} K={K} max-abs-err {diff}"
+
+
+# --- mma.sync (s16816) path: ldmatrix + mma.sync.aligned.m16n8k16 -----------
+
+
+@pytest.fixture
+def pin_mma_sync(monkeypatch):
+    """Pin the modern warp-level MMA atom + a staged 128×128 warp tile.
+
+    ``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` opts the s16816 path into the
+    enumeration (it's appended to ``_ATOM_KINDS_V1`` but not auto-selected
+    until perf-promoted). ``WM=2 FM=4`` → M-tile 128 (``2·4·atom_m=16``);
+    ``WN=2 FN=8`` → N-tile 128 (``2·8·atom_n=8``); ``BK=2`` → 32-element
+    K-stage. ``DEPLODOCK_TMA=1`` lets the staged bundle promote to TMA on
+    sm_90+ (ldmatrix still reads from the staged smem slab either way)."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_TMA", "1")
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+    monkeypatch.setenv("DEPLODOCK_FM", "4")
+    monkeypatch.setenv("DEPLODOCK_FN", "8")
+    monkeypatch.setenv("DEPLODOCK_BK", "2")
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs sm_80+ (Ampere+)")
+def test_mma_sync_path_emits_ldmatrix_and_mma_ptx(pin_mma_sync):
+    """The pinned mma.sync atom lowers to ``ldmatrix`` + ``mma.sync.aligned``
+    inline PTX (the s16816 path) and emits zero ``nvcuda::wmma`` intrinsics —
+    a clean swap of the tensor-core instruction family, not a mix."""
+    _, kop, src = _compile_and_render(M=256, N=256, K=128, out_dtype=F16)
+    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert "ldmatrix.sync.aligned" in src, "mma.sync operands must load via ldmatrix"
+    assert "mma.sync.aligned.m16n8k16" in src, "the s16816 mma.sync instruction must be emitted"
+    assert "wmma::" not in src, "the mma.sync path must not mix in legacy wmma intrinsics"
+    # f32 accumulate → f16 output goes through the per-lane __float2half epilogue.
+    assert "__float2half" in src, "f16 output needs the fp32→fp16 downconvert epilogue"
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs sm_80+ (Ampere+)")
+@pytest.mark.parametrize("M,N,K,out_dtype", [(256, 256, 128, F32), (128, 256, 128, F32), (256, 256, 128, F16)])
+def test_mma_sync_matches_reference(pin_mma_sync, M: int, N: int, K: int, out_dtype: DataType):
+    """The s16816 path matches the f32 reference within fp16 tolerance —
+    guards the ldmatrix per-lane address map, the B-operand ``.trans``, and
+    the per-lane ``RegStore`` epilogue (a wrong lane map / trans flag yields
+    a plausible-but-wrong result that this catches). f32 output exercises the
+    direct ``RegStore`` path; f16 output exercises the ``__float2half``
+    downconvert."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=out_dtype)
+    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert "mma.sync.aligned.m16n8k16" in src
+
+    np.random.seed(7)
+    a = (np.random.randn(M, K) * 0.1).astype(np.float16)
+    b = (np.random.randn(K, N) * 0.1).astype(np.float16)
+    be = CudaBackend()
+    g_run = be.compile(_matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype))
+    run_result, _ = be.run(g_run, input_data={"a": a, "b": b})
+
+    expected = a.astype(np.float32) @ b.astype(np.float32)
+    result = run_result.outputs["c"].astype(np.float32)
+    diff = np.abs(result - expected).max()
+    assert diff < 1e-2, f"M={M} N={N} K={K} out={out_dtype.name} max-abs-err {diff}"

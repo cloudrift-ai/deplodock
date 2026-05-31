@@ -70,7 +70,17 @@ from __future__ import annotations
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.kernel.ir import MmaFill, MmaFragment, MmaLoad, MmaStore, MmaSync
+from deplodock.compiler.ir.kernel.ir import (
+    LdmatrixLoad,
+    MmaFill,
+    MmaFragment,
+    MmaLoad,
+    MmaStore,
+    MmaSync,
+    MmaSyncPtx,
+    RegFragment,
+    RegStore,
+)
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
@@ -89,6 +99,74 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
 )
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+# --- Per-instruction leaf emitters -----------------------------------------
+#
+# The transform-walk skeleton (``_atom_body_to_mma`` / ``_transform_walk`` /
+# ``_build_mma_chain``) is shared across instruction families; only these leaf
+# factories differ. ``spec.instruction == "wmma"`` → opaque ``nvcuda::wmma``
+# nodes; ``"mma_sync"`` → the ``ldmatrix`` + ``mma.sync.aligned`` register-array
+# nodes (the s16816 path). The mma.sync path has no gmem-direct load — its
+# operands MUST be staged smem (``_emit_chain`` RuleSkips an unstaged leaf).
+
+
+def _emit_fragments(spec: AtomSpec, *, c_frag: str, a_frag: str, b_frag: str, c_dtype: DataType) -> tuple[Stmt, ...]:
+    """Fragment / register-array declarations + accumulator zero-init.
+
+    WMMA returns three ``MmaFragment`` decls plus a trailing ``MmaFill``;
+    mma.sync returns three ``RegFragment`` decls (the ``c`` array is
+    zero-initialised at declaration, so no separate fill)."""
+    if spec.instruction == "mma_sync":
+        return (
+            RegFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
+            RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
+            RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
+        )
+    return (
+        MmaFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
+        MmaFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
+        MmaFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
+        MmaFill(frag=c_frag, value=0.0),
+    )
+
+
+def _emit_chain(
+    spec: AtomSpec,
+    *,
+    a_load: Load,
+    b_load: Load,
+    a_frag: str,
+    b_frag: str,
+    c_frag: str,
+    smem_sources: dict[str, Source],
+) -> tuple[Stmt, ...]:
+    """The per-reduce ``load a + load b + mma`` chain for one K-step."""
+    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
+    b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
+    if spec.instruction == "mma_sync":
+        # ldmatrix is smem→register only — both operands must be staged.
+        # The WMMA sibling row covers the gmem-direct shape, so RuleSkipping
+        # here just drops the mma.sync variant, never the whole lowering.
+        if a_load.input not in smem_sources or b_load.input not in smem_sources:
+            raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
+        return (
+            LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm),
+            LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm),
+            MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape),
+        )
+    return (
+        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, ldm=a_ldm),
+        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, ldm=b_ldm),
+        MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
+    )
+
+
+def _emit_store(spec: AtomSpec, *, dst_buffer: str, dst_index: tuple, c_frag: str) -> Stmt:
+    """The accumulator → output store (with epilogue downconvert)."""
+    if spec.instruction == "mma_sync":
+        return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape)
+    return MmaStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, ldm=0, shape=spec.shape)
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -250,15 +328,9 @@ def _atom_body_to_mma(
     a_frag = f"{sample_a_load.names[0]}_frag"
     b_frag = f"{sample_b_load.names[0]}_frag"
 
-    a_dtype = spec.operand_dtypes["a"]
-    b_dtype = spec.operand_dtypes["b"]
-    c_dtype = c_dtype_override
-
-    fragments: tuple[Stmt, ...] = (
-        MmaFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
-        MmaFragment(name=a_frag, role="a", shape=spec.shape, dtype=a_dtype),
-        MmaFragment(name=b_frag, role="b", shape=spec.shape, dtype=b_dtype),
-    )
+    # Fragment / register-array decls (+ fill for WMMA; mma.sync zero-inits
+    # its ``c`` array in the decl, so ``_emit_fragments`` carries the right head).
+    fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=c_dtype_override)
 
     if has_reduce:
         transformed = _transform_walk(
@@ -267,20 +339,16 @@ def _atom_body_to_mma(
             a_frag=a_frag,
             b_frag=b_frag,
             smem_sources=bundle_sources,
-            shape=spec.shape,
+            spec=spec,
         )
-        return (*fragments, MmaFill(frag=c_frag, value=0.0), *transformed)
+        return (*fragments, *transformed)
 
-    # Shape C: K filtered, inline Mma chain + MmaStore.
-    a_src_index, a_ldm = _mma_src_index(sample_a_load, bundle_sources)
-    b_src_index, b_ldm = _mma_src_index(sample_b_load, bundle_sources)
-    chain: tuple[Stmt, ...] = (
-        MmaLoad(frag=a_frag, src_buffer=sample_a_load.input, src_index=a_src_index, ldm=a_ldm),
-        MmaLoad(frag=b_frag, src_buffer=sample_b_load.input, src_index=b_src_index, ldm=b_ldm),
-        MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
-        MmaStore(dst_buffer=write_stmt.output, dst_index=write_stmt.index, frag=c_frag, ldm=0, shape=spec.shape),
+    # Shape C: K filtered, inline Mma chain + store.
+    chain = _emit_chain(
+        spec, a_load=sample_a_load, b_load=sample_b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=bundle_sources
     )
-    return (*fragments, MmaFill(frag=c_frag, value=0.0), *chain)
+    store = _emit_store(spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag)
+    return (*fragments, *chain, store)
 
 
 def _iter_bundles(body: Body):
@@ -433,7 +501,7 @@ def _transform_walk(
     a_frag: str,
     b_frag: str,
     smem_sources: dict[str, Source],
-    shape: tuple[int, int, int],
+    spec: AtomSpec,
 ) -> tuple[Stmt, ...]:
     """Recursively rewrite ``body`` in place. Replaces:
 
@@ -453,7 +521,7 @@ def _transform_walk(
     out: list[Stmt] = []
     for s in body:
         if isinstance(s, Write):
-            out.append(MmaStore(dst_buffer=s.output, dst_index=s.index, frag=c_frag, ldm=0, shape=shape))
+            out.append(_emit_store(spec, dst_buffer=s.output, dst_index=s.index, c_frag=c_frag))
             continue
         if isinstance(s, SerialTile) and s.is_reduce:
             chain = _build_mma_chain(
@@ -463,6 +531,7 @@ def _transform_walk(
                 a_frag=a_frag,
                 b_frag=b_frag,
                 smem_sources=smem_sources,
+                spec=spec,
             )
             # ``SerialTile.is_reduce`` is a derived property (True iff the
             # body contains an Accum). The Mma chain has no Accum — c_frag
@@ -476,14 +545,14 @@ def _transform_walk(
             for stage in s.stages:
                 for src in stage.sources:
                     inner_sources[src.name] = src
-            new_body = _transform_walk(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=inner_sources, shape=shape)
+            new_body = _transform_walk(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=inner_sources, spec=spec)
             # Stages stay byte-clean — no Mma rewrite happens inside a
             # producer scope.
             out.append(s.with_bodies((Body(s.stages), Body(new_body))))
             continue
         if s.nested():
             new_bodies = tuple(
-                Body(_transform_walk(sub, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources, shape=shape))
+                Body(_transform_walk(sub, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources, spec=spec))
                 for sub in s.nested()
             )
             out.append(s.with_bodies(new_bodies))
@@ -501,11 +570,13 @@ def _build_mma_chain(
     a_frag: str,
     b_frag: str,
     smem_sources: dict[str, Source],
+    spec: AtomSpec,
 ) -> tuple[Stmt, ...]:
-    """Build the per-reduce ``MmaLoad a + MmaLoad b + MmaSync`` chain
-    that replaces a reduce SerialTile's body. Re-classifies A/B from
-    this reduce site's Loads — shape D has prologue/inner/epilogue
-    reduces with the same K name and the classification is stable.
+    """Build the per-reduce ``load a + load b + mma`` chain that replaces a
+    reduce SerialTile's body. Re-classifies A/B from this reduce site's
+    Loads — shape D has prologue/inner/epilogue reduces with the same K
+    name and the classification is stable. The instruction-specific node
+    choice (WMMA vs mma.sync) is delegated to :func:`_emit_chain`.
     """
     loads = [s for s in reduce_body if isinstance(s, Load)]
     if len(loads) != 2:
@@ -513,13 +584,7 @@ def _build_mma_chain(
     a_load, b_load = _classify_ab(loads, k_name=k_name, smem_sources=smem_sources, write=None)
     if a_load is None or b_load is None:
         raise RuleSkipped("reduce SerialTile Loads didn't match A=[M,K], B=[K,N] shape")
-    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
-    b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
-    return (
-        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, ldm=a_ldm),
-        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, ldm=b_ldm),
-        MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
-    )
+    return _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=smem_sources)
 
 
 def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
