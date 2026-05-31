@@ -194,8 +194,13 @@ def test_resolve_symbolic_falls_back_to_hint_without_inputs():
         symbolic_bindings={"seq_len": ("x", 1)},
         symbolic_hints=hints,
     )
-    # No input_data → fall back to the hint.
-    assert _resolve_symbolic(compiled, {}) == {"seq_len": DEFAULT_SEQ_HINT}
+    # No input_data → fall back to the hint. (``_resolve_symbolic`` also injects
+    # the reserved Stream-K ``__num_sms__`` key for grid resolution — ignore it.)
+    from deplodock.compiler.ir.cuda.ir import STREAMK_NUM_SMS
+
+    env = _resolve_symbolic(compiled, {})
+    assert env["seq_len"] == DEFAULT_SEQ_HINT
+    assert set(env) - {STREAMK_NUM_SMS} == {"seq_len"}
 
 
 def _n_write_index(tile_op):
