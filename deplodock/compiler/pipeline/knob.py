@@ -58,6 +58,19 @@ class Knob:
     def env(self) -> str:
         return config.knob_var(self.name)
 
+    def read_int(self, default: int) -> int:
+        """Read this knob's ``DEPLODOCK_<NAME>`` env pin as an int (empty /
+        unset / unparseable → ``default``).
+
+        The heuristic-default path in ``compiler/tuning.py`` uses this to read
+        the matmul tile knobs (``BN`` / ``BM`` / ``FM`` / ``FN`` / ``BK`` /
+        ``SPLITK``) through their canonical descriptors rather than re-spelling
+        the names as bare strings — a rename of the constant now fails loudly
+        instead of silently reading a dead env var. ``INT`` knobs only."""
+        if self.type is not KnobType.INT:
+            raise ValueError(f"Knob.read_int only valid for INT knobs ({self.name!r} is {self.type})")
+        return config.int_env(self.env, default)
+
     def parse(self, raw: str, *, width: int | None = None) -> Any:
         """Decode an env-string value per ``type``. ``width`` is required
         for ``BINMASK`` (number of candidate buffers in the current tile).
