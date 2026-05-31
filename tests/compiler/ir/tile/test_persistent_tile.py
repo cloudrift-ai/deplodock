@@ -14,9 +14,10 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import _eval_stmt
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt.base import RenderCtx
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.tile.ir import PersistentTile, ThreadTile, Write
+from deplodock.compiler.ir.tile.ir import Accum, PersistentTile, StridedTile, ThreadTile, Write
 
 
 def _persistent(m_b: int = 8, n_b: int = 4) -> PersistentTile:
@@ -100,3 +101,49 @@ def test_repr_eval_round_trip():
     assert isinstance(rebuilt, PersistentTile)
     assert rebuilt == pt
     assert (rebuilt.work_start, rebuilt.work_end, rebuilt.work_var) == (pt.work_start, pt.work_end, pt.work_var)
+
+
+# ---------------------------------------------------------------------------
+# Runtime-bounded StridedTile (Stream-K Phase B keystone): the adaptive K-loop
+# runs a per-CTA sub-range [k_lo, k_hi) of the K chunks, both bounds runtime.
+# ---------------------------------------------------------------------------
+
+
+def _strided(stop=None):
+    return StridedTile(
+        axis=Axis("k_o", 16),
+        body=Body((Accum(name="acc", value="v"),)),
+        start=Var("k_lo"),
+        step=Literal(1, "int"),
+        stop=stop,
+    )
+
+
+def test_strided_runtime_stop_renders_dynamic_upper_bound():
+    src = "\n".join(_strided(stop=Var("k_hi")).render(RenderCtx(indent=0)))
+    assert "for (int k_o = k_lo; k_o < k_hi; k_o += 1) {" in src
+    assert "float acc = 0.0f;" in src  # accumulator init prelude still fires
+
+
+def test_strided_stop_none_falls_back_to_static_extent():
+    src = "\n".join(_strided(stop=None).render(RenderCtx(indent=0)))
+    assert "for (int k_o = k_lo; k_o < 16; k_o += 1) {" in src
+
+
+def test_strided_exprs_include_stop_for_rewrites():
+    st = _strided(stop=Var("k_hi"))
+    names = {v for e in st.exprs() for v in e.free_vars()}
+    assert {"k_lo", "k_hi"} <= names
+
+
+def test_strided_with_bodies_preserves_stop():
+    st = _strided(stop=Var("k_hi"))
+    st2 = st.with_bodies((Body((Accum(name="acc", value="w"),)),))
+    assert isinstance(st2, StridedTile)
+    assert st2.stop == Var("k_hi")
+    assert st2.start == Var("k_lo")
+
+
+def test_strided_runtime_stop_round_trips():
+    st = _strided(stop=Var("k_hi"))
+    assert _eval_stmt(repr(st)) == st

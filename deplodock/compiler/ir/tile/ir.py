@@ -1111,26 +1111,36 @@ class StridedTile(SerialTileBase):
     start: Expr = field(default_factory=lambda: Literal(0, "int"))
     step: Expr = field(default_factory=lambda: Literal(1, "int"))
     unroll: bool = False
+    # Optional runtime upper bound. ``None`` ⇒ the static ``axis.extent``
+    # (today's cooperative-stride loops). A runtime ``Expr`` ⇒
+    # ``axis < stop`` — the Stream-K adaptive K-loop runs a per-CTA sub-range
+    # ``[start, stop)`` of the K chunks, where both bounds are decoded from the
+    # work-range at runtime. Folded through Sigma rewrites like ``start`` /
+    # ``step`` so var renames thread through.
+    stop: Expr | None = None
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return StridedTile(axis=self.axis, body=body, start=self.start, step=self.step, unroll=self.unroll)
+        return StridedTile(axis=self.axis, body=body, start=self.start, step=self.step, unroll=self.unroll, stop=self.stop)
 
     def exprs(self) -> tuple[Expr, ...]:
         out: tuple[Expr, ...] = (self.start,)
         if isinstance(self.step, Expr):
             out = (*out, self.step)
+        if self.stop is not None:
+            out = (*out, self.stop)
         return out
 
     def pretty(self, indent: str = "") -> list[str]:
         start = self.start.pretty()
         step = self.step.pretty() if isinstance(self.step, Expr) else self.step
-        head = f"{indent}for {self.axis.name} in {start}..{self.axis.extent}:{step}"
+        upper = self.stop.pretty() if self.stop is not None else self.axis.extent
+        head = f"{indent}for {self.axis.name} in {start}..{upper}:{step}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """``for (int axis = start; axis < extent; axis += step)`` with the
-        same per-Loop accumulator-init prelude as ``SerialTile.render``."""
+        """``for (int axis = start; axis < (stop | extent); axis += step)`` with
+        the same per-Loop accumulator-init prelude as ``SerialTile.render``."""
         from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
@@ -1149,9 +1159,10 @@ class StridedTile(SerialTileBase):
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        upper_str = self.stop.render(ctx) if self.stop is not None else str(self.axis.extent.as_static())
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {upper_str}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(_render_body(self.body, inner))
         out.append(f"{pad}}}")

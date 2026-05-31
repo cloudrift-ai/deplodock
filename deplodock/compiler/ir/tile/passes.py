@@ -231,6 +231,7 @@ def _(s: StridedTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         start=sigma.apply(s.start),
         step=step,
         unroll=s.unroll,
+        stop=sigma.apply(s.stop) if s.stop is not None else None,
     )
 
 
