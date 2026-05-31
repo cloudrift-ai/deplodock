@@ -1118,22 +1118,41 @@ class SerialTile(SerialTileBase):
 
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
     time. Set by ``090_mark_unroll``; has no effect on iteration semantics.
+
+    ``lo`` / ``hi`` are optional runtime bounds. ``None`` ⇒ the static
+    ``0..axis.extent`` (every loop today). A runtime ``Expr`` ⇒
+    ``for (axis = lo; axis < hi; axis++)`` — the Stream-K adaptive K-loop runs a
+    per-CTA sub-range ``[lo, hi)`` of the K chunks. Kept on ``SerialTile`` (not
+    swapped to ``StridedTile``) so the staging passes' K_o detection — which
+    keys on the ``SerialTile`` flavor + ``kind`` — still recognizes it.
     """
 
     kind: SerialKind = "plain"
     unroll: bool = False
+    lo: Expr | None = None
+    hi: Expr | None = None
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll)
+        return SerialTile(axis=self.axis, body=body, kind=self.kind, unroll=self.unroll, lo=self.lo, hi=self.hi)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        out: tuple[Expr, ...] = ()
+        if self.lo is not None:
+            out = (*out, self.lo)
+        if self.hi is not None:
+            out = (*out, self.hi)
+        return out
 
     def pretty(self, indent: str = "") -> list[str]:
-        head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}"
+        low = self.lo.pretty() if self.lo is not None else "0"
+        high = self.hi.pretty() if self.hi is not None else self.axis.extent
+        head = f"{indent}for {self.axis.name} in {low}..{high}"
         return [head, *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Per-Loop accumulator-init prelude (same as ``Loop.render``) +
-        ``for (int axis = 0; axis < extent; axis++) { body }``."""
+        ``for (int axis = (lo|0); axis < (hi|extent); axis++) { body }``."""
         from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
@@ -1153,10 +1172,11 @@ class SerialTile(SerialTileBase):
         # ``Dim.__str__`` returns the bare value (literal for static, symbolic
         # name for ``Dim('seq_len')``) so both static and symbolic SerialTile
         # extents render correctly.
-        extent = str(self.axis.extent)
+        low = self.lo.render(ctx) if self.lo is not None else "0"
+        high = self.hi.render(ctx) if self.hi is not None else str(self.axis.extent)
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")
+        out.append(f"{pad}for (int {var} = {low}; {var} < {high}; {var}++) {{")
         inner = ctx.child()
         out.extend(_render_body(self.body, inner))
         out.append(f"{pad}}}")

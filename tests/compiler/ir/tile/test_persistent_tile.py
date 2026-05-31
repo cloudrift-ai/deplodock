@@ -221,3 +221,29 @@ def test_adaptive_with_bodies_and_round_trip_preserve_k_blocks():
     pt2 = pt.with_bodies((pt.body,))
     assert pt2.k_blocks == 8 and pt2.adaptive
     assert _eval_stmt(repr(pt)).k_blocks == 8
+
+
+def test_serialtile_runtime_bounds_render_and_preserve_kind():
+    """The K-loop carries runtime [lo, hi) bounds but stays a SerialTile with its
+    kind — so staging / K_o detection (which keys on the flavor + kind) still
+    recognizes it. None bounds → the static 0..extent."""
+    from deplodock.compiler.ir.tile.ir import STREAMK_K_HI, STREAMK_K_LO, Accum, SerialTile
+
+    bounded = SerialTile(
+        axis=Axis("k_o", 4),
+        body=Body((Accum(name="acc", value="v"),)),
+        kind="serial_outer",
+        lo=Var(STREAMK_K_LO),
+        hi=Var(STREAMK_K_HI),
+    )
+    src = "\n".join(bounded.render(RenderCtx(indent=0)))
+    assert "for (int k_o = streamk_k_lo; k_o < streamk_k_hi; k_o++) {" in src
+    assert bounded.kind == "serial_outer"
+    assert {v for e in bounded.exprs() for v in e.free_vars()} == {"streamk_k_lo", "streamk_k_hi"}
+
+    plain = SerialTile(axis=Axis("k_o", 4), body=Body((Accum(name="acc", value="v"),)), kind="serial_outer")
+    assert "for (int k_o = 0; k_o < 4; k_o++) {" in "\n".join(plain.render(RenderCtx(indent=0)))
+    assert _eval_stmt(repr(bounded)) == bounded
+    # with_bodies preserves the bounds + kind.
+    rebound = bounded.with_bodies((bounded.body,))
+    assert (rebound.lo, rebound.hi, rebound.kind) == (bounded.lo, bounded.hi, "serial_outer")

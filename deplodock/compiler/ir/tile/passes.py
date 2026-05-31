@@ -208,6 +208,8 @@ def _(s: SerialTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         kind=s.kind,
         unroll=s.unroll,
+        lo=sigma.apply(s.lo) if s.lo is not None else None,
+        hi=sigma.apply(s.hi) if s.hi is not None else None,
     )
 
 
@@ -219,6 +221,8 @@ def _(s: SerialTile, ctx: SimplifyCtx) -> Stmt:
         body=tuple(simplify(c, inner) for c in s.body),
         kind=s.kind,
         unroll=s.unroll,
+        lo=s.lo,
+        hi=s.hi,
     )
 
 
