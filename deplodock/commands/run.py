@@ -367,6 +367,13 @@ def _print_kernel_stats(graph, bench):
         for dim in graph.nodes[nid].output.shape:
             if isinstance(dim.expr, Var) and dim.hint is not None:
                 sym_env.setdefault(dim.expr.name, dim.hint)
+    # Stream-K grids resolve to the live SM count via this reserved name (see
+    # backend/cuda/program.py); supply it so the stats display can print the
+    # persistent grid (= num_sms) instead of raising on the missing key.
+    from deplodock.compiler.ir.cuda.ir import STREAMK_NUM_SMS  # noqa: PLC0415
+    from deplodock.compiler.target import live_num_sms  # noqa: PLC0415
+
+    sym_env.setdefault(STREAMK_NUM_SMS, live_num_sms())
 
     print()
     print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}")
