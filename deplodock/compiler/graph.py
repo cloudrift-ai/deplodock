@@ -273,7 +273,6 @@ def _stmt_eval_scope() -> dict:
     from deplodock.compiler.ir.tile.ir import (
         AffineAddressing,
         AsyncWait,
-        FmaClusterTile,
         GridTile,
         RegisterTile,
         SerialTile,
@@ -320,7 +319,6 @@ def _stmt_eval_scope() -> dict:
         "AffineAddressing": AffineAddressing,
         "TemplateAddressing": TemplateAddressing,
         "AsyncWait": AsyncWait,
-        "FmaClusterTile": FmaClusterTile,
         "FmaCluster": FmaCluster,
         "Smem": Smem,
         "Sync": Sync,

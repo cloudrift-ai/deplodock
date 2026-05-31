@@ -50,7 +50,7 @@ import enum
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
-from deplodock.compiler.dtype import F32, DataType
+from deplodock.compiler.dtype import DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -1089,45 +1089,6 @@ class StridedTile(SerialTileBase):
         return out
 
 
-@dataclass(frozen=True)
-class FmaClusterTile(Stmt):
-    """Outer-product FFMA cluster, lifted from a matmul-cell tile body by
-    ``lowering/tile/099_assemble_fma_clusters``.
-
-    Replaces the nested ``SerialTile`` K-reduce whose body is the canonical
-    matmul cell (``Load A``, ``Load B``, ``Assign(multiply)``,
-    ``Accum(add)``) wrapped by the ``RegisterTile`` register axes. The
-    threading dimensions (``fm`` register rows × ``fn`` register cols ×
-    ``bk`` K-reduce extent) are still implicit — ``100_materialize_tile``
-    unfolds them per thread when lowering to :class:`~...kernel.ir.FmaCluster`.
-
-    This node is *lowered, not rendered*: :meth:`render` raises. It exists
-    only between the assembly pass and materialize. The ``FMA_CLUSTER`` knob
-    (default ``True``, a readability switch) gates whether the assembly pass
-    constructs it at all — with the knob off the matmul cell stays as the
-    flat ``Load + Accum`` form all the way to render.
-    """
-
-    fm: int  # output rows per thread (register-tile M extent)
-    fn: int  # output cols per thread (register-tile N extent)
-    bk: int  # K-reduce extent inside the cluster
-    a_axis: Axis  # M-dimension register axis
-    b_axis: Axis  # N-dimension register axis
-    k_axis: Axis  # the K reduce axis
-    a_smem: str  # source smem buffer for A operands
-    b_smem: str  # source smem buffer for B operands
-    a_index: tuple[Expr, ...]  # (m, k) → a_smem index expression
-    b_index: tuple[Expr, ...]  # (k, n) → b_smem index expression
-    acc_base: str  # output accumulator base SSA name
-    dtype: DataType = F32
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}fma_cluster[{self.fm}x{self.fn} bk={self.bk}] {self.acc_base} += {self.a_smem} @ {self.b_smem}"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        raise NotImplementedError("FmaClusterTile must be lowered to FmaCluster by 100_materialize_tile before render")
-
-
 # ---------------------------------------------------------------------------
 # Stage + StageBundle — single-policy bundles of cooperative stages
 # ---------------------------------------------------------------------------
@@ -2146,7 +2107,6 @@ __all__ = [
     "SerialTile",
     "StridedTile",
     "SerialKind",
-    "FmaClusterTile",
     "Stage",
     "StageBundle",
     "StagePolicy",

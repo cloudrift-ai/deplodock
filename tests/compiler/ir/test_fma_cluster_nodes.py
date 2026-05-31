@@ -1,106 +1,105 @@
-"""M1 of ``plans/inline-fma-cluster.md``: the two FFMA-cluster IR nodes.
+"""The ``FmaCluster`` kernel-IR node (plans/inline-fma-cluster.md, M1+M2).
 
-``FmaClusterTile`` (tile-IR, pre-threading) and ``FmaCluster`` (kernel-IR,
-post-threading) are inert in M1 — no pass constructs them, and ``render()``
-raises because they're lowered/emitted in later milestones. These tests pin
-the contract M2/M3 build on: frozen-dataclass hashability + equality, the
+``FmaCluster`` wraps a flat per-thread matmul cell (``Load`` A/B,
+``Assign(multiply)``, ``Accum(add)``) assembled by
+``kernel/120_assemble_fma_clusters``. It carries the matched cell in ``body``
+(the round-trip / M2-placeholder payload — render re-emits it verbatim) plus
+the A/B/acc SSA-name views the M3 inline-PTX emitter will drive from.
+
+These tests pin the node contract: frozen-dataclass hashability/equality, the
 ``repr`` → eval round-trip the JSON serializer relies on, a full
-``Graph.to_dict`` → ``from_dict`` body round-trip, and the render guard.
+``Graph.to_dict`` → ``from_dict`` body round-trip, and the transparent
+structural surface (``nested`` / ``defines`` / ``deps`` / ``external_reads``
+derive from the carried cell).
 """
 
 from __future__ import annotations
 
-import pytest
-
-from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor, _stmt_eval_scope
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.kernel.ir import FmaCluster, KernelOp
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile.ir import FmaClusterTile, TileOp
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load
+
+MUL = ElementwiseImpl("multiply")
+ADD = ElementwiseImpl("add")
 
 
-def _axis(name: str, extent: int) -> Axis:
-    return Axis(name=name, extent=Dim(extent))
-
-
-def _cluster_tile() -> FmaClusterTile:
-    return FmaClusterTile(
-        fm=26,
-        fn=4,
-        bk=32,
-        a_axis=_axis("m", 26),
-        b_axis=_axis("n", 4),
-        k_axis=_axis("k", 32),
-        a_smem="a_smem",
-        b_smem="b_smem",
-        a_index=(Var("m"), Var("k")),
-        b_index=(Var("k"), Var("n")),
-        acc_base="acc",
+def _cell_body() -> tuple:
+    """A canonical FM=2, FN=1 outer-product cell (one K-iteration)."""
+    return (
+        Load(names=("a0",), input="a_smem", index=(Var("k"), Var("m0"))),
+        Load(names=("a1",), input="a_smem", index=(Var("k"), Var("m1"))),
+        Load(names=("b0",), input="b_smem", index=(Var("k"), Var("n0"))),
+        Assign(name="v0", op=MUL, args=("a0", "b0")),
+        Assign(name="v1", op=MUL, args=("a1", "b0")),
+        Accum(name="acc0", value="v0", op=ADD),
+        Accum(name="acc1", value="v1", op=ADD),
     )
 
 
 def _cluster() -> FmaCluster:
     return FmaCluster(
-        a_names=("a0", "a1", "a2"),
-        b_names=("b0", "b1"),
-        acc_names=tuple(f"acc{i}" for i in range(6)),
-        a_addr=Var("a_smem_addr"),
-        b_addr=Var("b_smem_addr"),
-        a_vec=4,
-        b_vec=2,
+        body=_cell_body(),
+        a_names=("a0", "a1"),
+        b_names=("b0",),
+        acc_names=("acc0", "acc1"),
+        fm=2,
+        fn=1,
     )
 
 
-def test_nodes_are_frozen_hashable_and_equal():
-    """Both nodes are ``@dataclass(frozen=True)`` per ``feedback_stmt_hashable``:
-    hashable, structurally equal, and immutable."""
-    for node in (_cluster_tile(), _cluster()):
-        assert hash(node) == hash(node)
-        # A distinct-but-equal rebuild compares equal and hashes equal.
-        rebuilt = type(node)(**{f: getattr(node, f) for f in node.__dataclass_fields__})
-        assert rebuilt == node
-        assert hash(rebuilt) == hash(node)
-        with pytest.raises((AttributeError, TypeError)):
-            node.fm = 1  # type: ignore[misc]  # frozen
+def test_frozen_hashable_and_equal():
+    c = _cluster()
+    assert hash(c) == hash(_cluster())
+    assert c == _cluster()
+    rebuilt = FmaCluster(**{f: getattr(c, f) for f in c.__dataclass_fields__})
+    assert rebuilt == c and hash(rebuilt) == hash(c)
 
 
-def test_defaults_on_fma_cluster():
+def test_defaults():
     c = _cluster()
     assert c.dtype is F32
     assert c.policy == "B_INNER"
 
 
+def test_structural_surface_derives_from_body():
+    """``nested`` exposes the cell so analysis sees it; ``defines`` / ``deps`` /
+    ``external_reads`` aggregate the carried leaves. ``defines`` covers every
+    SSA name the cell binds (operands, products, accumulators); ``deps`` is the
+    bound index axis Vars the loads reference (``k`` / ``m*`` / ``n*``) — the
+    accumulator loop-carry is implicit, so cell-internal SSA never leaks; the
+    smem buffers are external reads."""
+    c = _cluster()
+    (nested,) = c.nested()
+    assert tuple(nested) == _cell_body()
+    assert set(c.defines()) == {"a0", "a1", "b0", "v0", "v1", "acc0", "acc1"}
+    deps = set(c.deps())
+    assert deps == {"k", "m0", "m1", "n0"}
+    assert deps.isdisjoint(c.defines())  # nothing the cell binds leaks as a dep
+    assert set(c.external_reads()) == {"a_smem", "b_smem"}
+
+
+def test_with_bodies_round_trips_the_cell():
+    c = _cluster()
+    rebuilt = c.with_bodies((Body(c.body),))
+    assert rebuilt == c
+
+
 def test_repr_eval_round_trip_in_stmt_scope():
     """Op bodies serialize via ``repr`` and reload via ``eval`` in
-    ``_stmt_eval_scope``. Both new nodes must round-trip there — the scope was
-    extended to carry them (regression guard against forgetting that wiring)."""
+    ``_stmt_eval_scope`` — ``FmaCluster`` was added to that scope."""
     scope = dict(_stmt_eval_scope())
-    for node in (_cluster_tile(), _cluster()):
-        back = eval(repr(node), scope)  # noqa: S307 — trusted IR repr, sandboxed scope
-        assert back == node
-        assert hash(back) == hash(node)
+    c = _cluster()
+    back = eval(repr(c), scope)  # noqa: S307 — trusted IR repr, sandboxed scope
+    assert back == c and hash(back) == hash(c)
 
 
 def test_graph_json_body_round_trip():
-    """Full ``Graph.to_dict`` → ``from_dict`` round-trip with each node living
-    inside an op body — the path ``deplodock run --ir <dump>`` exercises."""
+    """Full ``Graph.to_dict`` → ``from_dict`` round-trip with the node inside a
+    ``KernelOp`` body — the path ``deplodock run --ir <dump>`` exercises."""
     g = Graph()
-    g.add_node(TileOp(body=Body((_cluster_tile(),)), name="k_tile"), [], Tensor("t", (26, 4)), node_id="t")
-    g.add_node(KernelOp(body=Body((_cluster(),)), name="k_kernel"), [], Tensor("k", (3, 2)), node_id="k")
-
-    loaded = Graph.from_dict(g.to_dict())
-    (tile_stmt,) = loaded.nodes["t"].op.body
-    (kernel_stmt,) = loaded.nodes["k"].op.body
-    assert tile_stmt == _cluster_tile()
-    assert kernel_stmt == _cluster()
-
-
-def test_render_raises_until_lowered():
-    """Both nodes are lowered/emitted before render; a stray unlowered node
-    must fail loudly rather than silently emit nothing."""
-    for node in (_cluster_tile(), _cluster()):
-        with pytest.raises(NotImplementedError):
-            node.render(None)  # type: ignore[arg-type]
+    g.add_node(KernelOp(body=Body((_cluster(),)), name="k_kernel"), [], Tensor("k", (2, 1)), node_id="k")
+    (stmt,) = Graph.from_dict(g.to_dict()).nodes["k"].op.body
+    assert stmt == _cluster()

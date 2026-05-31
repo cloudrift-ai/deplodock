@@ -429,6 +429,8 @@ def simulate_graph(
 
 
 def _analyze_kernel(kernel_op, Smem, stage_filter, k_iter: int, warp_id: int) -> list[BankConflictResult]:
+    from deplodock.compiler.ir.kernel.ir import FmaCluster  # noqa: PLC0415 — local import, mirrors simulate_graph
+
     body = kernel_op.body
     smem_decls = {s.name: s for s in body.iter_of_type(Smem) if stage_filter is None or s.name in stage_filter}
     if not smem_decls:
@@ -467,6 +469,10 @@ def _analyze_kernel(kernel_op, Smem, stage_filter, k_iter: int, warp_id: int) ->
             elif isinstance(s, Cond):
                 walk(s.body, encl)
                 walk(s.else_body, encl)
+            elif isinstance(s, FmaCluster):
+                # Transparent wrapper around the matmul cell — its smem A/B
+                # Loads are exactly what we model. Descend, binding no new axis.
+                walk(s.body, encl)
 
     walk(body, ())
 

@@ -26,7 +26,6 @@ from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rew
 from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
     AtomTile,
-    FmaClusterTile,
     GridTile,
     ParallelTile,
     RegisterTile,
@@ -87,44 +86,6 @@ def _(s: AsyncWait, ctx: SimplifyCtx) -> Stmt:
         keep=s.keep,
         phase=s.phase.simplify(ctx) if s.phase is not None else None,
         slot=s.slot.simplify(ctx) if s.slot is not None else None,
-    )
-
-
-@rewrite.register
-def _(s: FmaClusterTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    # ``a_smem`` / ``b_smem`` are buffer names (not SSA) → pass through, like
-    # ``Load.input``. ``acc_base`` is the accumulator SSA root → ``rename``.
-    return FmaClusterTile(
-        fm=s.fm,
-        fn=s.fn,
-        bk=s.bk,
-        a_axis=axis_fn(s.a_axis),
-        b_axis=axis_fn(s.b_axis),
-        k_axis=axis_fn(s.k_axis),
-        a_smem=s.a_smem,
-        b_smem=s.b_smem,
-        a_index=tuple(sigma.apply(e) for e in s.a_index),
-        b_index=tuple(sigma.apply(e) for e in s.b_index),
-        acc_base=rename(s.acc_base),
-        dtype=s.dtype,
-    )
-
-
-@simplify.register
-def _(s: FmaClusterTile, ctx: SimplifyCtx) -> Stmt:
-    return FmaClusterTile(
-        fm=s.fm,
-        fn=s.fn,
-        bk=s.bk,
-        a_axis=s.a_axis,
-        b_axis=s.b_axis,
-        k_axis=s.k_axis,
-        a_smem=s.a_smem,
-        b_smem=s.b_smem,
-        a_index=tuple(e.simplify(ctx) for e in s.a_index),
-        b_index=tuple(e.simplify(ctx) for e in s.b_index),
-        acc_base=s.acc_base,
-        dtype=s.dtype,
     )
 
 

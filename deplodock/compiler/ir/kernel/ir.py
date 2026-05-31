@@ -42,6 +42,7 @@ from deplodock.compiler.ir.expr import (
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -55,6 +56,7 @@ from deplodock.compiler.ir.stmt import (
     Write,
     _pad,
 )
+from deplodock.compiler.ir.stmt import render_body as _render_body
 from deplodock.compiler.ir.stmt.ir import BodyOp
 from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
@@ -225,47 +227,78 @@ class CpAsyncWait(Stmt):
 
 @dataclass(frozen=True)
 class FmaCluster(Stmt):
-    """Per-thread outer-product FFMA cluster. Lowered from
-    :class:`~...tile.ir.FmaClusterTile` by ``100_materialize_tile`` and
-    emitted as a single inline-PTX ``asm volatile`` block by
-    ``kernel/120_emit_inline_fma_cluster`` (M3).
+    """Per-thread outer-product FFMA cluster. Assembled from a flat matmul
+    cell by ``kernel/120_assemble_fma_clusters`` (post-materialize) and, in
+    M3, emitted as a single inline-PTX ``asm volatile`` block whose operand
+    ordering pins each source value to a fixed PTX source port so ptxas's
+    ``.reuse`` peephole fires — closing the register-file port-pressure gap
+    to cuBLAS (see ``plans/inline-fma-cluster.md``).
 
-    The operand-ordering ``policy`` pins each source value to a fixed PTX
-    source port across the cluster so ptxas's ``.reuse`` peephole fires —
-    closing the register-file port-pressure gap to cuBLAS (see
-    ``plans/inline-fma-cluster.md``). ``acc_names`` indexes row-major as
-    ``acc_names[m * fn + n]`` over the ``fm × fn`` outer-product cell.
+    ``body`` is the original matched cell (the ``Load`` / ``Assign(multiply)``
+    / ``Accum(add)`` statements, in their source order). It is the
+    *structural payload* and the round-trip carrier:
 
-    This node is *lowered, not rendered* until the M3 emit pass ships:
-    :meth:`render` raises so a stray unlowered cluster fails loudly rather
-    than emitting nothing.
+    - **M2 (this milestone):** :meth:`render` emits ``body`` verbatim, so a
+      ``FMA_CLUSTER=1`` kernel is byte-for-byte identical to ``FMA_CLUSTER=0``
+      (the assembly pass is a behavior-neutral round-trip). The node is
+      otherwise transparent — :meth:`nested` exposes ``body`` so buffer-read
+      aggregation / SSA analysis sees the loads.
+    - **M3:** :meth:`render` switches to the inline-PTX emission driven by
+      ``a_names`` / ``b_names`` / ``acc_names`` (the row/col/cell SSA views).
+      The ``FMA_CLUSTER=0`` readability path comes from *skipping the pass*
+      entirely (no cluster node, plain C), so M3 may keep ``body`` for
+      diagnostics only.
+
+    ``acc_names`` indexes row-major as ``acc_names[m * fn + n]`` over the
+    ``fm × fn`` cell.
     """
 
-    a_names: tuple[str, ...]  # FM A-operand SSA names (LDS dests)
-    b_names: tuple[str, ...]  # FN B-operand SSA names (LDS dests)
-    acc_names: tuple[str, ...]  # FM*FN accumulator SSA names (in/out)
-    a_addr: Expr  # smem address expression for the A loads
-    b_addr: Expr  # smem address expression for the B loads
-    a_vec: int = 1  # LDS vector width for A (1/2/4)
-    b_vec: int = 1  # LDS vector width for B
+    body: tuple[Stmt, ...]  # original matched cell stmts, in source order
+    a_names: tuple[str, ...]  # FM A-operand SSA names (one per register row)
+    b_names: tuple[str, ...]  # FN B-operand SSA names (one per register col)
+    acc_names: tuple[str, ...]  # FM*FN accumulator SSA names, row-major
+    fm: int  # register rows (== len(a_names))
+    fn: int  # register cols (== len(b_names))
     dtype: DataType = F32
     policy: str = "B_INNER"  # operand-ordering policy (B_INNER | INTERLEAVED)
 
     def deps(self) -> tuple[str, ...]:
-        # The accumulators are read-modify-write inputs; A/B operands are
-        # produced by this stmt's own LDS loads, so they're not deps.
-        return self.acc_names
+        # SSA names read but not defined inside ``body`` — the accumulators
+        # (read-modify-write) plus any operand whose Load lives in an outer
+        # scope. Derived from the carried body so it stays correct under any
+        # cell shape.
+        defined = {n for s in self.body for n in s.defines()}
+        return tuple(dict.fromkeys(n for s in self.body for n in s.deps() if n not in defined))
 
     def defines(self) -> tuple[str, ...]:
-        return (*self.a_names, *self.b_names, *self.acc_names)
+        return tuple(dict.fromkeys(n for s in self.body for n in s.defines()))
+
+    def external_reads(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(n for s in self.body for n in s.external_reads()))
+
+    def nested(self) -> tuple[Body, ...]:
+        return (Body(self.body),)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return FmaCluster(
+            body=tuple(body),
+            a_names=self.a_names,
+            b_names=self.b_names,
+            acc_names=self.acc_names,
+            fm=self.fm,
+            fn=self.fn,
+            dtype=self.dtype,
+            policy=self.policy,
+        )
 
     def pretty(self, indent: str = "") -> list[str]:
-        fn = len(self.b_names) or 1
-        fm = len(self.a_names)
-        return [f"{indent}fma_cluster[{fm}x{fn} {self.policy}] {self.acc_names[:1]}... += a @ b"]
+        return [f"{indent}fma_cluster[{self.fm}x{self.fn} {self.policy}] {self.acc_names[:1]}... += a @ b"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        raise NotImplementedError("FmaCluster must be emitted by kernel/120_emit_inline_fma_cluster before render")
+        # M2 placeholder: re-emit the carried cell verbatim (behavior-neutral
+        # round-trip). M3 replaces this with the inline-PTX asm block.
+        return _render_body(self.body, ctx)
 
 
 @dataclass(frozen=True)
@@ -1081,17 +1114,16 @@ def _(s: CpAsyncCopy, rename, sigma, axis_fn):
 
 @_rewrite.register
 def _(s: FmaCluster, rename, sigma, axis_fn):
-    # A/B operand + accumulator SSA names route through ``rename`` (per-cell
-    # replication / SSA canonicalization); the smem address Exprs go through
-    # ``sigma.apply``.
+    # Recurse into the carried cell (its Loads/Assigns/Accums route their own
+    # SSA names + Exprs through the registered handlers), then map the name
+    # views through ``rename`` so they stay consistent with the rewritten body.
     return FmaCluster(
+        body=tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.body),
         a_names=tuple(rename(n) for n in s.a_names),
         b_names=tuple(rename(n) for n in s.b_names),
         acc_names=tuple(rename(n) for n in s.acc_names),
-        a_addr=sigma.apply(s.a_addr),
-        b_addr=sigma.apply(s.b_addr),
-        a_vec=s.a_vec,
-        b_vec=s.b_vec,
+        fm=s.fm,
+        fn=s.fn,
         dtype=s.dtype,
         policy=s.policy,
     )
