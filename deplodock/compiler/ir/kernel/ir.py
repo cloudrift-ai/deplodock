@@ -227,11 +227,13 @@ class CpAsyncWait(Stmt):
 @dataclass(frozen=True)
 class FmaCluster(Stmt):
     """Per-thread outer-product FFMA cluster. Assembled from a flat matmul
-    cell by ``kernel/120_assemble_fma_clusters`` (post-materialize) and, in
-    M3, emitted as a single inline-PTX ``asm volatile`` block whose operand
-    ordering pins each source value to a fixed PTX source port so ptxas's
-    ``.reuse`` peephole fires — closing the register-file port-pressure gap
-    to cuBLAS (see ``plans/inline-fma-cluster.md``).
+    cell by ``kernel/120_assemble_fma_clusters`` (post-materialize) and emitted
+    as a single inline-PTX ``asm volatile`` block whose operand ordering is
+    *intended* to pin each source value to a fixed PTX source port so ptxas's
+    ``.reuse`` peephole fires. In practice ptxas does not honor that ordering on
+    sm_120 (it reallocates + commutes the FFMA operands), so the cluster is
+    **off by default** — no measured ``.reuse`` / latency gain (see
+    ``plans/inline-fma-cluster.md`` M4); opt in with ``DEPLODOCK_FMA_CLUSTER=1``.
 
     ``body`` is the original matched cell (the ``Load`` / ``Assign(multiply)``
     / ``Accum(add)`` statements, in their source order). It is the structural

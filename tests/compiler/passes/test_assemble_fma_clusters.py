@@ -79,7 +79,7 @@ def test_detects_clean_outer_product():
     assert cluster.body == cell
 
 
-def test_rewrite_wraps_kloop_body_in_cluster():
+def _matmul_kernel_op() -> KernelOp:
     # f32 Smem decls make a_smem / b_smem provably-f32 operand buffers (the
     # render is f32-only, so the pass gates on this).
     body = Body(
@@ -89,13 +89,25 @@ def test_rewrite_wraps_kloop_body_in_cluster():
             _kloop(_outer_product_cell(fm=2, fn=2)),
         )
     )
-    op = KernelOp(body=body, name="k_matmul", knobs={})
-    rewritten = _mod.rewrite(_FakeNode(op))
+    return KernelOp(body=body, name="k_matmul", knobs={})
+
+
+def test_rewrite_wraps_kloop_body_in_cluster(monkeypatch):
+    monkeypatch.setenv("DEPLODOCK_FMA_CLUSTER", "1")  # opt in — off by default (M4)
+    rewritten = _mod.rewrite(_FakeNode(_matmul_kernel_op()))
     kloop = rewritten.body[-1]
     assert isinstance(kloop, SerialTile)
     (cluster,) = kloop.body
     assert isinstance(cluster, FmaCluster)
     assert (cluster.fm, cluster.fn) == (2, 2)
+
+
+def test_off_by_default(monkeypatch):
+    """The knob is off by default (M4: no measured gain on sm_120) — a matmul
+    cell that *would* cluster is skipped unless DEPLODOCK_FMA_CLUSTER=1."""
+    monkeypatch.delenv("DEPLODOCK_FMA_CLUSTER", raising=False)
+    with pytest.raises(RuleSkipped):
+        _mod.rewrite(_FakeNode(_matmul_kernel_op()))
 
 
 def test_masked_cell_not_matched():
@@ -116,7 +128,8 @@ def test_single_cell_not_matched():
     assert _mod._match_outer_product(Body(_outer_product_cell(fm=1, fn=1)), F32_BUFS) is None
 
 
-def test_no_cell_raises_rule_skipped():
+def test_no_cell_raises_rule_skipped(monkeypatch):
+    monkeypatch.setenv("DEPLODOCK_FMA_CLUSTER", "1")  # enabled, so we exercise the no-cell path
     op = KernelOp(body=Body((Load(names=("x",), input="buf", index=(Var("i"),)),)), name="k_plain", knobs={})
     with pytest.raises(RuleSkipped):
         _mod.rewrite(_FakeNode(op))
@@ -143,39 +156,39 @@ def _count_clusters(graph) -> int:
 
 
 def test_end_to_end_emits_inline_ptx(monkeypatch):
-    """On a 512³ fp32 matmul (a shape whose tiling yields the clean cell), the
-    cluster fires under the default ``FMA_CLUSTER=1`` and renders a single
-    inline-PTX ``asm volatile`` block of ``fma.rn.f32`` per cell, while
-    ``FMA_CLUSTER=0`` skips the pass and keeps the plain-C ``Load + Accum``
-    body (no inline PTX, no cluster node). Pinned to sm_80 so the tiling
-    (hence the cell shape) is deterministic regardless of the live device."""
+    """On a 512³ fp32 matmul (a shape whose tiling yields the clean cell), opting
+    in with ``DEPLODOCK_FMA_CLUSTER=1`` makes the cluster fire and render a single
+    inline-PTX ``asm volatile`` block of ``fma.rn.f32`` per cell, while the
+    default (off) keeps the plain-C ``Load + Accum`` body (no inline PTX, no
+    cluster node). Pinned to sm_80 so the tiling (hence the cell shape) is
+    deterministic regardless of the live device."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.cuda import CudaOp
     from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
     monkeypatch.setenv("DEPLODOCK_COMPUTE_CAPABILITY", "8.0")
 
-    # Non-vacuity: the cluster actually fires at the kernel stage under default.
-    kern_on = Pipeline.build(KERNEL_PASSES).run(_matmul_graph(512))
-    assert _count_clusters(kern_on) > 0, "expected the matmul cell to assemble into FmaCluster(s)"
-
-    monkeypatch.setenv("DEPLODOCK_FMA_CLUSTER", "0")
+    # Default (off): no cluster.
+    monkeypatch.delenv("DEPLODOCK_FMA_CLUSTER", raising=False)
     kern_off = Pipeline.build(KERNEL_PASSES).run(_matmul_graph(512))
-    assert _count_clusters(kern_off) == 0, "FMA_CLUSTER=0 must skip the assembly pass"
-    monkeypatch.delenv("DEPLODOCK_FMA_CLUSTER")
+    assert _count_clusters(kern_off) == 0, "off by default — no cluster"
 
-    def _src(knob_off: bool) -> str:
-        if knob_off:
-            monkeypatch.setenv("DEPLODOCK_FMA_CLUSTER", "0")
+    # Opt in: the cluster fires.
+    monkeypatch.setenv("DEPLODOCK_FMA_CLUSTER", "1")
+    kern_on = Pipeline.build(KERNEL_PASSES).run(_matmul_graph(512))
+    assert _count_clusters(kern_on) > 0, "DEPLODOCK_FMA_CLUSTER=1 must assemble FmaCluster(s)"
+
+    def _src(enabled: bool) -> str:
+        if enabled:
+            monkeypatch.setenv("DEPLODOCK_FMA_CLUSTER", "1")
         else:
             monkeypatch.delenv("DEPLODOCK_FMA_CLUSTER", raising=False)
         compiled = CudaBackend().compile(_matmul_graph(512))
         ops = [n.op for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
         return "\n".join(op.kernel_source for op in ops)
 
-    src_on = _src(knob_off=False)
-    src_off = _src(knob_off=True)
+    src_on = _src(enabled=True)
+    src_off = _src(enabled=False)
     assert "asm volatile(" in src_on and "fma.rn.f32" in src_on, "cluster must emit an inline-PTX FFMA block"
-    assert "fma.rn.f32" not in src_off, "FMA_CLUSTER=0 keeps plain-C body — no inline PTX"
-    # The plain-C body multiplies into temporaries; the asm path fuses them away.
+    assert "fma.rn.f32" not in src_off, "default keeps plain-C body — no inline PTX"
     assert src_on.count("fma.rn.f32") >= _count_clusters(kern_on), "one FFMA group per cluster, at least"

@@ -23,19 +23,22 @@ This pass recognizes that cell — a body of *only* ``Load`` / ``Assign(multiply
 a single :class:`~deplodock.compiler.ir.kernel.ir.FmaCluster`. The K-loop stays;
 its body becomes one cluster node.
 
-This is the first milestone (M2) of ``plans/inline-fma-cluster.md``. Here the
-cluster is a **behavior-neutral round-trip**: ``FmaCluster.render`` re-emits the
-carried cell verbatim, so a ``FMA_CLUSTER=1`` kernel is identical to
-``FMA_CLUSTER=0`` (which simply skips this pass). M3 switches the render to a
-single inline-PTX ``asm volatile`` block whose operand ordering pins each
-source value to a fixed PTX port, so ptxas's ``.reuse`` peephole fires — closing
-the register-file port-pressure gap to cuBLAS.
+``FmaCluster.render`` emits one inline-PTX ``asm volatile`` block (``fm*fn``
+``fma.rn.f32`` in ``B_INNER`` operand order) whose ordering is *meant* to pin
+each source value to a fixed PTX port so ptxas's ``.reuse`` peephole fires.
+
+**Off by default (opt in with ``DEPLODOCK_FMA_CLUSTER=1``).** SASS measurement
+on sm_120 (RTX 5090, ``plans/inline-fma-cluster.md`` M4) showed ptxas does *not*
+honor the operand-port discipline — it reallocates registers and commutes the
+FFMA ``a``/``b`` operands, so ``.reuse`` density moved only 0.762 → 0.777 (the
+0.96 the 26×4 B_INNER shape predicts never materialized) and the 2048³ wall-clock
+was unchanged (279 µs, 0.96× cuBLAS, identical on vs off). The machinery is
+correct and accuracy-verified; it is kept behind the knob as an experiment /
+readability switch, not a default-on optimization.
 
 The detector is deliberately conservative: any cell that carries a ``Cond``
-(masked-tile boundary guard), a nested loop, an ``Init``, or whose products are
-not a clean A×B outer product is left untouched — no cluster, no regression. So
-the pass only fires on the clean both-operands-tiled cell (the shape the plan
-targets) and is a no-op everywhere else.
+(masked-tile boundary guard), a nested loop, an ``Init``, a non-f32 operand
+buffer, or whose products are not a clean A×B outer product is left untouched.
 """
 
 from __future__ import annotations
@@ -53,17 +56,23 @@ PATTERN = [Pattern("root", KernelOp)]
 FMA_CLUSTER = Knob(
     "FMA_CLUSTER",
     KnobType.BOOL,
-    hints=(True,),  # on by default; not a search dimension yet (M8). DEPLODOCK_FMA_CLUSTER=0 pins off.
+    hints=(False,),  # OFF by default — opt in with DEPLODOCK_FMA_CLUSTER=1. See note below.
     help=(
-        "Assemble the matmul outer-product cell into an inline-PTX FmaCluster. "
-        "Off (=0) keeps the plain-C Load+Accum body — a readability switch for inspecting the kernel."
+        "Assemble the matmul outer-product cell into an inline-PTX FmaCluster (one asm volatile "
+        "FFMA block, B_INNER operand order). Opt-in (=1). SASS measurement on sm_120 (RTX 5090) "
+        "showed ptxas does not honor the operand-port ordering — .reuse density 0.762 -> 0.777 and "
+        "2048^3 wall-clock unchanged (279 us, 0.96x cuBLAS) — so it is off by default; kept as an "
+        "experiment / readability switch. See plans/inline-fma-cluster.md M4."
     ),
 )
 
 
 def rewrite(root: Node) -> KernelOp | None:
-    if not FMA_CLUSTER.narrow((True,))[0]:
-        raise RuleSkipped("FMA_CLUSTER=0 pinned")
+    # Off by default: the inline-PTX cluster showed no measured .reuse / latency
+    # gain on sm_120 (M4). ``DEPLODOCK_FMA_CLUSTER=1`` opts in (env pin honored
+    # authoritatively even though only ``False`` is enumerated).
+    if not FMA_CLUSTER.narrow((False,))[0]:
+        raise RuleSkipped("FMA_CLUSTER disabled (default)")
     _ = config.knob_raw(FMA_CLUSTER.name)  # keep the env-read on the standard path
 
     f32_bufs = _f32_buffers(root.op)
