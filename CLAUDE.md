@@ -17,6 +17,10 @@ correctness, or performance below what the request implies. These rules OVERRIDE
   "it's blocked."
 - **Match the implied quality bar.** Error handling, accuracy/precision, generality over input ranges, and performance
   are part of the request even when not spelled out. Meet the standard of the surrounding code; don't regress it.
+- **Report work, not estimates.** State the exact work that needs to be done — the concrete steps, files, and changes.
+  Do NOT volunteer time estimates, difficulty/complexity ratings, effort levels, or risk hand-wringing. The user already
+  understands the complexity from the plan; restating it just pollutes context and manufactures worry. If a real blocker
+  exists, name the blocker — not a vague "this is hard."
 
 Take as much time as you need to implement the full scope of the request. Don't negotiate scope reduction even if you
 risk running out of context or afraid of failure due to other reasons.
