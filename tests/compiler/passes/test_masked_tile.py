@@ -10,6 +10,7 @@ itself (not just descend into its body) to avoid leaving dangling Var refs.
 
 from __future__ import annotations
 
+from deplodock.compiler.context import Context
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
@@ -295,7 +296,10 @@ def test_masked_n_clamps_cooperative_load_index(recording_dump, monkeypatch):
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (256, 47)), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
 
-    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    # Pin a concrete sm_80 target so the smem budget is deterministic and the
+    # weight stages regardless of the runner (the CPU-only CI host has no GPU
+    # to probe, so the default Context's budget wouldn't admit staging).
+    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["o"].op
     tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
@@ -322,7 +326,7 @@ def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatc
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (256, 64)), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
 
-    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["o"].op
     tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
