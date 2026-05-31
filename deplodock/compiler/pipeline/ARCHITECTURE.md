@@ -14,7 +14,8 @@ pipeline/
 │   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf + op_effort
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
-│   └── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
+│   ├── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
+│   └── golden_configs.py  # GoldenConfig / MatmulGoldenConfig: autotuned knobs + cuBLAS-ratio per shape, fp32 (CUDA-core) + fp16 (WMMA) (a tuning-prior ground truth)
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
