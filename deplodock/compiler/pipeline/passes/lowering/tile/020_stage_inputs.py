@@ -160,6 +160,12 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
     atom_kind = root.op.knobs.get("ATOM_KIND")
+    # Per-buffer bytes-per-elem so ``_classify``'s slab-cap check sizes
+    # fp16 slabs at 2 B/elem instead of the BYTES_PER_ELEM=4 hardcoded
+    # over-count. Without this the half-precision MMA path rejects every
+    # admissable staged variant (the block-scaled slab gets over-counted
+    # 2× and trips ``slab_cap``).
+    bytes_per_elem = {buf: int(t.dtype.nbytes) for buf, t in root.op.inputs.items() if t.dtype is not None}
     variants = _enumerate_variants(
         root.op.body,
         slab_cap=budget,
@@ -167,6 +173,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         parent_op=root.op,
         warp_size=ctx.warp_size,
         atom_kind=atom_kind,
+        bytes_per_elem=bytes_per_elem,
     )
     if not variants:
         raise RuleSkipped("no Load qualifies for staging")
@@ -188,6 +195,7 @@ def _enumerate_variants(
     parent_op: TileOp,
     warp_size: int,
     atom_kind: str | None = None,
+    bytes_per_elem: dict[str, int] | None = None,
 ) -> list[TileOp]:
     candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
@@ -204,7 +212,13 @@ def _enumerate_variants(
     for mask in masks:
         allow = frozenset(b for i, b in enumerate(bufs_ranked) if mask & (1 << i))
         new_body = _maybe_rewrite(
-            body, slab_cap=slab_cap, scope_budget=scope_budget, allowed_bufs=allow, warp_size=warp_size, atom_kind=atom_kind
+            body,
+            slab_cap=slab_cap,
+            scope_budget=scope_budget,
+            allowed_bufs=allow,
+            warp_size=warp_size,
+            atom_kind=atom_kind,
+            bytes_per_elem=bytes_per_elem,
         )
         if new_body is None:
             continue
@@ -370,6 +384,7 @@ def _maybe_rewrite(
     allowed_bufs: frozenset[str] | None = None,
     warp_size: int,
     atom_kind: str | None = None,
+    bytes_per_elem: dict[str, int] | None = None,
 ) -> Body | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
@@ -407,6 +422,7 @@ def _maybe_rewrite(
         allowed_bufs=allowed_bufs,
         is_cooperative=is_cooperative,
         atom_kind=atom_kind,
+        bytes_per_elem=bytes_per_elem,
     )
     if new_tile_body == tt.body:
         if allowed_bufs is None:
@@ -442,6 +458,7 @@ def _process_scope(
     is_cooperative: bool = False,
     register_axes: tuple[Axis, ...] = (),
     atom_kind: str | None = None,
+    bytes_per_elem: dict[str, int] | None = None,
 ) -> Body:
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
@@ -485,6 +502,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=new_register_axes,
                 atom_kind=atom_kind,
+                bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -504,6 +522,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -520,6 +539,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
             continue
@@ -544,6 +564,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(Cond(cond=s.cond, body=Body(new_body), else_body=s.else_body))
             continue
@@ -570,6 +591,7 @@ def _process_scope(
         slab_cap=slab_cap,
         scope_budget=scope_budget,
         atom_kind=atom_kind,
+        bytes_per_elem=bytes_per_elem,
     )
     if not sources:
         return tuple(rewritten_inner)
@@ -607,6 +629,7 @@ def _build_sources(
     slab_cap: int,
     scope_budget: int,
     atom_kind: str | None = None,
+    bytes_per_elem: dict[str, int] | None = None,
 ) -> tuple[list[Source], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by index equality; per partition, derive
     slab geometry; admit Sources under budget. Returns (sources,
@@ -640,6 +663,7 @@ def _build_sources(
                 extra_candidates=rep_extra,
                 allow_no_fan_in=allow_no_fan_in,
                 atom_kind=atom_kind,
+                bytes_per_elem=(bytes_per_elem or {}).get(rep_load.input, BYTES_PER_ELEM) if bytes_per_elem else BYTES_PER_ELEM,
             )
             if slab is None:
                 continue
@@ -703,6 +727,7 @@ def _classify(
     extra_candidates: tuple[Axis, ...] = (),
     allow_no_fan_in: bool = False,
     atom_kind: str | None = None,
+    bytes_per_elem: int = BYTES_PER_ELEM,
 ) -> _Slab | None:
     candidates = (*thread_axes, reduce_axis, *extra_candidates)
     ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes if ax.extent.is_static})
@@ -735,7 +760,14 @@ def _classify(
     # seq_len-bearing loads but the load still works via direct global access.
     if any(not ax.extent.is_static for ax in cache_axes):
         return None
-    n_bytes = BYTES_PER_ELEM
+    # Per-buffer dtype size from ``parent_op.inputs`` plumbed through
+    # the rewrite chain — fp16 was previously over-counted 2× because
+    # the slab-cap check assumed fp32 (BYTES_PER_ELEM=4). For an MMA
+    # matmul with K=2048 and a 64×64 block-scaled A slab, the actual
+    # fp16 footprint is 8 KB; the legacy check rejected at 16 KB and
+    # locked out the staged variant on shapes where the picker would
+    # otherwise have admitted it.
+    n_bytes = bytes_per_elem
     for ax in cache_axes:
         n_bytes *= ax.extent.as_static()
     if n_bytes > slab_cap:
