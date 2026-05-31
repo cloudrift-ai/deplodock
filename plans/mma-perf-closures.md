@@ -153,6 +153,16 @@ pay for this shape — record the measured number and exclude the staged variant
 `tests/compiler/test_matmul_mma_staged_pipelined.py` (new — pins the buffered shape; greps the rendered C for
 `cp.async` and matching MmaLoad src_index ranks; runs the f32 reference comparison at fp16 tolerance).
 
+**Outcome (2026-05-30, sm_120 RTX 5090).** Codegen fix landed: the pipelined IR now compiles cleanly (verified at
+128² / 256²). Bench gate **FAILED — drop the lever**. Pinned `DEPLODOCK_ATOM_KIND=wmma_m16n16k16_f16 WM=WN=2
+FM=FN=4 BK=2` runs 2048² fp16 at ~249 µs vs the post-#182 baseline of ~108 µs (2.3× slower). Sweeping BK pinned
+at the same WM/WN/FM/FN: BK=1 → 109 µs, **BK=2 → 249 µs**, BK=4 → 254 µs, BK=8 → 170 µs, BK=16 → 107 µs, BK=32 →
+107 µs. The double-buffered cp.async path is structurally correct but pays an instruction-scheduling /
+syncthreads overhead that outweighs the K-load overlap at this geometry; the BK=16/32 single-bundle SYNC variant
+already matches baseline (the picker can find it from the existing scoring). Per the phase-A decision rule,
+**M2's staged-pipelined variant is excluded from the Phase B golden search**; the codegen fix stays because the
+IR was previously emitting a shape that crashed at materialize.
+
 ### M3 — Warp specialization for MMA
 
 `085_warp_specialize` today gates on `BR > 1` and shapes the producer/consumer split around cooperative-K
