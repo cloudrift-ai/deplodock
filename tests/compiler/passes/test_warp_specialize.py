@@ -101,6 +101,36 @@ def _tile_op_tma_pipelined() -> TileOp:
     return TileOp(body=body, name="k_tma_pipelined")
 
 
+def _tile_op_warp_tma_pipelined() -> TileOp:
+    """Warp-tier shape: ``WarpTile(WM,WN)`` consumer tower (the planner-emitted
+    MMA matmul shape) wrapping a ``SerialTile(serial_outer)`` with a TMA
+    StageBundle (pipeline_depth=2). WS=1 must consume the existing warp tier
+    (``consumer_is_warp=True``) rather than synthesise one."""
+    k_outer = Axis("k_outer", 8)
+    src = Source(
+        name="a_smem",
+        buf="a",
+        cache_dims=(
+            CacheDim(axis=Axis("a_c0", 16), source_dim=0),
+            CacheDim(axis=Axis("a_c1", 16), source_dim=1),
+        ),
+        origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
+    )
+    tma_bundle = StageBundle(
+        stages=(Stage(sources=(src,)),),
+        body=Body(()),
+        policy=StagePolicy.TMA,
+        buffer_count=2,
+        phase=Var("k_outer") % Literal(2, "int"),
+        pipeline_depth=2,
+        swizzle=SwizzleMode.NONE,
+    )
+    outer_loop = SerialTile(axis=k_outer, body=Body((tma_bundle,)), kind="serial_outer")
+    # WM×WN = 2×2 = 4 consumer warps.
+    body = Body((WarpTile(axes=(Axis("wm", 2), Axis("wn", 2)), body=Body((outer_loop,))),))
+    return TileOp(body=body, name="k_warp_tma_pipelined")
+
+
 def _run_rule(op: TileOp):
     g = Graph()
     g.add_node(op=op, inputs=[], output=Tensor(op.name, ()), node_id="op")
@@ -167,6 +197,34 @@ def test_env_pin_zero_returns_bare_tileop(monkeypatch):
     result = _run_rule(op)
     assert isinstance(result, TileOp)
     assert result.knobs["WARP_SPECIALIZE"] is False
+
+
+def test_warp_tier_ws1_sets_consumer_is_warp(monkeypatch):
+    """A warp-tier (``WarpTile`` consumer) input rewrites to a
+    ``WarpSpecialize`` with ``consumer_is_warp=True``, the WM×WN warp axes as
+    ``consumer_thread_axes``, and a role-axis extent of ``WM·WN + 1`` producer
+    warp (= 5). The producer/consumer split keeps the warp axes in scope."""
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
+    op = _tile_op_warp_tma_pipelined()
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    assert not any(isinstance(s, ThreadTile) for s in result.body.iter()), "warp-tier WS must not introduce a ThreadTile"
+    wt = next(s for s in result.body if isinstance(s, WarpTile))
+    ws = next(s for s in wt.body if isinstance(s, WarpSpecialize))
+    assert ws.consumer_is_warp is True
+    # Warp axes carried through (extents 2×2), role extent = 4 consumer + 1 producer.
+    assert tuple(ax.extent.as_static() for ax in ws.consumer_thread_axes) == (2, 2)
+    assert wt.axes[0].extent.as_static() == 5
+
+
+def test_warp_tier_pinned_ws1_eligible_does_not_raise(monkeypatch):
+    """The loud-fail guard must NOT trip for the warp tier — it is now an
+    honorable pin (regression: previously MMA kernels were ineligible)."""
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
+    op = _tile_op_warp_tma_pipelined()
+    result = _run_rule(op)  # must not raise
+    assert isinstance(result, TileOp)
+    assert result.knobs["WARP_SPECIALIZE"] is True
 
 
 # ---------------------------------------------------------------------------

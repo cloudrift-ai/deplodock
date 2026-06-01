@@ -194,14 +194,15 @@ class WarpSpecialize(Stmt):
       Today only ``32`` (one producer warp) is emitted; ``SetMaxNReg``
       accounting and the ``Cond(role < n_producer_warps, …)`` predicate
       both derive from this.
-    - ``consumer_thread_axes`` — axes describing the consumer-side
-      per-thread coord structure (the original ``ThreadTile.axes`` the
-      input kernel carried). The materializer feeds these into a nested
-      ``ThreadTile(tid_offset=n_producer_threads, …)`` so consumer
-      threads see ``threadIdx.x - n_producer_threads`` decoded back into
-      these axis names. ``()`` is the legacy / pre-refactor shape, kept
-      for back-compat with any caller that doesn't track the axes yet —
-      the new materializer arm raises if it's empty when expected.
+    - ``consumer_thread_axes`` — axes describing the consumer-side coord
+      structure (the original ``ThreadTile.axes`` for the scalar tier, or the
+      ``WarpTile.axes`` WM×WN warp coords for the warp-tier MMA tower — see
+      ``consumer_is_warp``). The materializer feeds these into a nested
+      ``ThreadTile`` / ``WarpTile`` carrying ``tid_offset=n_producer_threads``
+      so consumer threads decode ``threadIdx.x - n_producer_threads`` back into
+      these axis names. ``()`` is the legacy / pre-refactor shape, kept for
+      back-compat with any caller that doesn't track the axes yet — the new
+      materializer arm raises if it's empty when expected.
 
     The K_o axis the WS pass aligned scheduling against is identified by
     the materializer structurally — the (single) ``SerialTile(serial_outer)``
@@ -222,6 +223,14 @@ class WarpSpecialize(Stmt):
     ring_depth: int
     n_producer_threads: int
     consumer_thread_axes: tuple[Axis, ...] = ()
+    # When True the consumer axes are *warp*-granularity (the warp-tier MMA
+    # tower: ``consumer_thread_axes`` are the WM×WN warp axes, 32 lanes each),
+    # so the materializer wraps the consumer body in
+    # ``WarpTile(tid_offset=n_producer_threads)`` — ``warp_id = (threadIdx.x -
+    # n_producer_threads) / 32`` — rather than a thread-granularity
+    # ``ThreadTile``. Default False keeps the scalar (pointwise / cooperative-
+    # reduce) WS path unchanged.
+    consumer_is_warp: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.producer_body, Body):
