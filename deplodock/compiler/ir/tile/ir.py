@@ -969,14 +969,24 @@ class WarpTile(ParallelTile):
     Mutual exclusion with ``ThreadTile`` inside one ``TileOp.body`` is
     enforced by ``TileOp.__post_init__`` — both bind ``threadIdx`` and
     mixing would re-bind the same coord at two scopes.
+
+    ``tid_offset`` (default ``0``, must be a multiple of 32) shifts the warp
+    decode: ``warp_id = (threadIdx.x - tid_offset) / 32``. Used by the
+    warp-specialized consumer branch — ``085_warp_specialize`` wraps the
+    warp-tier MMA consumer in ``WarpTile(tid_offset = n_producer_threads)`` so
+    its warps decode against the *consumer* warp range ``[n_producer_warps,
+    total_warps)``. ``lane`` is unaffected (the offset is whole warps, so
+    ``(threadIdx.x - 32k) & 31 == threadIdx.x & 31``).
     """
+
+    tid_offset: int = 0
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return WarpTile(axes=self.axes, body=body)
+        return WarpTile(axes=self.axes, body=body, tid_offset=self.tid_offset)
 
     def _pretty_label(self) -> str:
-        return "warp"
+        return "warp" if not self.tid_offset else f"warp offset={self.tid_offset}"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Cooperative form (inside ``GridTile``): ``warp_id`` decl + row-
@@ -988,7 +998,8 @@ class WarpTile(ParallelTile):
         if not ctx.inside_grid_tile:
             raise NotImplementedError("WarpTile outside GridTile not supported in v1")
         pad = _pad(ctx.indent)
-        out: list[str] = [f"{pad}int warp_id = threadIdx.x / 32;"]
+        tid = "threadIdx.x" if self.tid_offset == 0 else f"(threadIdx.x - {self.tid_offset})"
+        out: list[str] = [f"{pad}int warp_id = {tid} / 32;"]
         out.extend(_render_grid_axis_decode(self.axes, "warp_id", ctx))
         out.append(f"{pad}int lane = threadIdx.x & 31;")
         out.extend(_render_body(self.body, ctx))
