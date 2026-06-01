@@ -16,9 +16,14 @@ winner at ``-O3`` against cuBLAS, and rewrites the region between the
 ``BEGIN/END GENERATED`` sentinels below. For the **fp32** configs the reference is
 pinned to **true fp32** (``allow_tf32 = False``) so the ratio compares deplodock's
 CUDA-core FMA kernel against a real SGEMM, not the ~5-10x faster TF32 tensor-core
-path. The **fp16** squares (``*.fp16``) instead ride the warp-tier WMMA path and
-compare against cuBLAS HGEMM (torch's default fp16 matmul) — same tensor-core
-hardware on both sides, so the ratio is an apples-to-apples WMMA-vs-cuBLAS number.
+path. The **fp16** squares (``*.fp16``) instead ride the warp-tier tensor-core path
+and compare against cuBLAS HGEMM (torch's default fp16 matmul) — same tensor-core
+hardware on both sides, so the ratio is apples-to-apples vs cuBLAS. On sm_90+ the
+autotuner lands these on the swizzled s16816 ``mma_m16n8k16_f16`` (ldmatrix +
+mma.sync) atom rather than ``nvcuda::wmma`` — the swizzled smem slab kills the
+shared-load bank conflicts WMMA can't (it reads smem opaquely), so mma.sync is the
+faster fp16 GEMM (e.g. 2048²: 107 µs / 0.93× vs WMMA 130 µs / 0.87×). See
+plans/mma-sync-smem-swizzle.md.
 """
 
 from __future__ import annotations
@@ -497,17 +502,17 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
         knobs={
-            "WN": 4,
-            "WM": 1,
-            "FM": 1,
+            "WN": 2,
+            "WM": 2,
+            "FM": 2,
             "FN": 2,
             "BK": 2,
             "SPLITK": 1,
-            "ATOM_KIND": "wmma_m32n8k16_f16",
+            "ATOM_KIND": "mma_m16n8k16_f16",
             "STAGE": "11",
             "BUFFER_COUNT": 4,
         },
-        deplodock_us=8.2,
+        deplodock_us=6.1,
         cublas_us=6.2,
     ),
     MatmulGoldenConfig(
@@ -519,18 +524,18 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
         knobs={
-            "WN": 4,
-            "WM": 1,
-            "FM": 2,
+            "WN": 2,
+            "WM": 8,
+            "FM": 1,
             "FN": 2,
             "BK": 2,
             "SPLITK": 1,
-            "ATOM_KIND": "wmma_m16n16k16_f16",
+            "ATOM_KIND": "mma_m16n8k16_f16",
             "STAGE": "11",
             "BUFFER_COUNT": 4,
         },
-        deplodock_us=26.6,
-        cublas_us=17.7,
+        deplodock_us=20.5,
+        cublas_us=14.7,
     ),
     MatmulGoldenConfig(
         name="square.2048.fp16",
@@ -541,18 +546,18 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
         knobs={
-            "WN": 2,
+            "WN": 4,
             "WM": 2,
             "FM": 4,
             "FN": 4,
             "BK": 2,
             "SPLITK": 1,
-            "ATOM_KIND": "wmma_m16n16k16_f16",
+            "ATOM_KIND": "mma_m16n8k16_f16",
             "STAGE": "11",
             "BUFFER_COUNT": 3,
         },
-        deplodock_us=130.0,
-        cublas_us=113.4,
+        deplodock_us=106.7,
+        cublas_us=99.2,
     ),
     MatmulGoldenConfig(
         name="square.4096.fp16",
@@ -563,18 +568,18 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
         knobs={
-            "WN": 2,
+            "WN": 4,
             "WM": 2,
             "FM": 4,
             "FN": 4,
             "BK": 2,
             "SPLITK": 1,
-            "ATOM_KIND": "wmma_m16n16k16_f16",
+            "ATOM_KIND": "mma_m16n8k16_f16",
             "STAGE": "11",
             "BUFFER_COUNT": 3,
         },
-        deplodock_us=833.2,
-        cublas_us=759.6,
+        deplodock_us=701.2,
+        cublas_us=663.3,
     ),
 ]
 # --- END GENERATED ---
