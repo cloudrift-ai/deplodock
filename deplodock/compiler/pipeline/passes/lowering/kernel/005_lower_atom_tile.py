@@ -72,11 +72,6 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     LdmatrixLoad,
-    MmaFill,
-    MmaFragment,
-    MmaLoad,
-    MmaStore,
-    MmaSync,
     MmaSyncPtx,
     RegFragment,
     RegStore,
@@ -104,30 +99,20 @@ PATTERN = [Pattern("root", TileOp)]
 # --- Per-instruction leaf emitters -----------------------------------------
 #
 # The transform-walk skeleton (``_atom_body_to_mma`` / ``_transform_walk`` /
-# ``_build_mma_chain``) is shared across instruction families; only these leaf
-# factories differ. ``spec.instruction == "wmma"`` → opaque ``nvcuda::wmma``
-# nodes; ``"mma_sync"`` → the ``ldmatrix`` + ``mma.sync.aligned`` register-array
-# nodes (the s16816 path). The mma.sync path has no gmem-direct load — its
-# operands MUST be staged smem (``_emit_chain`` RuleSkips an unstaged leaf).
+# ``_build_mma_chain``) builds the ``ldmatrix`` + ``mma.sync.aligned``
+# register-array chain (the s16816 path) — the sole tensor-core family
+# (``instruction="mma_sync"``). The mma.sync path has no gmem-direct load: its
+# operands MUST be staged smem (``_emit_chain`` RuleSkips an unstaged leaf,
+# which prunes the variant so the scalar tier covers that shape).
 
 
 def _emit_fragments(spec: AtomSpec, *, c_frag: str, a_frag: str, b_frag: str, c_dtype: DataType) -> tuple[Stmt, ...]:
-    """Fragment / register-array declarations + accumulator zero-init.
-
-    WMMA returns three ``MmaFragment`` decls plus a trailing ``MmaFill``;
-    mma.sync returns three ``RegFragment`` decls (the ``c`` array is
-    zero-initialised at declaration, so no separate fill)."""
-    if spec.instruction == "mma_sync":
-        return (
-            RegFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
-            RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
-            RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
-        )
+    """Register-array declarations. Three ``RegFragment`` decls; the ``c``
+    array is zero-initialised at declaration, so there's no separate fill."""
     return (
-        MmaFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
-        MmaFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
-        MmaFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
-        MmaFill(frag=c_frag, value=0.0),
+        RegFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
+        RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
+        RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
     )
 
 
@@ -141,37 +126,28 @@ def _emit_chain(
     c_frag: str,
     smem_sources: dict[str, Source],
 ) -> tuple[Stmt, ...]:
-    """The per-reduce ``load a + load b + mma`` chain for one K-step."""
+    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
     a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
     b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
-    if spec.instruction == "mma_sync":
-        # ldmatrix is smem→register only — both operands must be staged.
-        # The WMMA sibling row covers the gmem-direct shape, so RuleSkipping
-        # here just drops the mma.sync variant, never the whole lowering.
-        if a_load.input not in smem_sources or b_load.input not in smem_sources:
-            raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
-        # Thread the per-Source TMA swizzle mode (S3 of
-        # plans/mma-sync-smem-swizzle.md) so the ldmatrix consumer applies the
-        # matching per-lane chunk XOR. NONE when the source wasn't swizzled.
-        a_swz = smem_sources[a_load.input].swizzle.value
-        b_swz = smem_sources[b_load.input].swizzle.value
-        return (
-            LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
-            LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
-            MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape),
-        )
+    # ldmatrix is smem→register only — both operands must be staged. RuleSkipping
+    # here drops this warp-tier variant so the scalar tier covers the shape.
+    if a_load.input not in smem_sources or b_load.input not in smem_sources:
+        raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
+    # Thread the per-Source TMA swizzle mode (S3 of
+    # plans/mma-sync-smem-swizzle.md) so the ldmatrix consumer applies the
+    # matching per-lane chunk XOR. NONE when the source wasn't swizzled.
+    a_swz = smem_sources[a_load.input].swizzle.value
+    b_swz = smem_sources[b_load.input].swizzle.value
     return (
-        MmaLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, ldm=a_ldm),
-        MmaLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, ldm=b_ldm),
-        MmaSync(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag),
+        LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
+        LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
+        MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtypes["a"].name),
     )
 
 
 def _emit_store(spec: AtomSpec, *, dst_buffer: str, dst_index: tuple, c_frag: str) -> Stmt:
     """The accumulator → output store (with epilogue downconvert)."""
-    if spec.instruction == "mma_sync":
-        return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape)
-    return MmaStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, ldm=0, shape=spec.shape)
+    return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape)
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:

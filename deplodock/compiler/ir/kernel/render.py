@@ -123,14 +123,14 @@ static __device__ __forceinline__ void cp_async_bulk_tensor_5d(
 
 """
 
-# Modern warp-level MMA prelude (the ``s16816`` path). Pure inline PTX —
-# ``ldmatrix`` + ``mma.sync.aligned`` — so NVRTC needs no header (unlike the
-# ``nvcuda::wmma`` path's ``<mma.h>``). ``__forceinline__`` wrappers keep the
-# kernel body reading as ``dpl_mma_m16n8k16_f16(c, a, b, c)`` rather than raw
-# asm; same SASS. The ``a``/``b`` operands are ``unsigned`` 32-bit register
-# arrays (two packed f16 each); ``c``/``d`` are ``float`` (f32 accumulate).
-# Lane→element layout is the PTX-fixed mma.m16n8k16 fragment map (see the
-# ``LdmatrixLoad`` / ``RegStore`` address arithmetic in ``ir/kernel/ir.py``).
+# Warp-level MMA prelude (the ``s16816`` path) — the sole tensor-core path.
+# Pure inline PTX (``ldmatrix`` + ``mma.sync.aligned``), so NVRTC needs no
+# ``<mma.h>``. ``__forceinline__`` wrappers keep the kernel body reading as
+# ``dpl_mma_m16n8k16_{f16,bf16}(c, a, b, c)`` rather than raw asm; same SASS.
+# The ``a``/``b`` operands are ``unsigned`` 32-bit register arrays (two packed
+# 16-bit elems each); ``c``/``d`` are ``float`` (f32 accumulate). Lane→element
+# layout is the PTX-fixed mma.m16n8k16 fragment map (see the ``LdmatrixLoad`` /
+# ``RegStore`` address arithmetic in ``ir/kernel/ir.py``).
 _MMA_SYNC_PRELUDE = """\
 static __device__ __forceinline__ void dpl_ldmatrix_x4(unsigned* r, const void* smem) {
     unsigned addr = __cvta_generic_to_shared(smem);
@@ -146,6 +146,14 @@ static __device__ __forceinline__ void dpl_ldmatrix_x2_trans(unsigned* r, const 
 
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+                   "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+static __device__ __forceinline__ void dpl_mma_m16n8k16_bf16(float* d, const unsigned* a, const unsigned* b, const float* c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"
                  : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
@@ -284,18 +292,14 @@ def render_kernelop(
     sig_dtypes = [_dtype_for(n) for n in kernel_op.inputs if n not in literals]
     sig_dtypes.extend(_dtype_for(n) for n in kernel_op.outputs)
     includes = "".join(f"#include {h}\n" for h in cuda_includes(sig_dtypes))
-    # MMA fragment Stmts need <mma.h> + ``using namespace nvcuda;``. NVRTC
-    # ships <mma.h> (verified via the M3 probe), so the intrinsic path
-    # works directly; no PTX-prelude fallback needed for v1.
-    from deplodock.compiler.ir.kernel.ir import MmaFragment, MmaSyncPtx  # noqa: PLC0415
+    # The mma.sync (s16816) tensor-core path is pure inline PTX — its
+    # ldmatrix / mma.sync wrappers are emitted in ``_MMA_SYNC_PRELUDE``, so
+    # NVRTC needs no ``<mma.h>`` (the legacy ``nvcuda::wmma`` family is gone).
+    from deplodock.compiler.ir.kernel.ir import MmaSyncPtx  # noqa: PLC0415
 
-    uses_mma = any(isinstance(s, MmaFragment) for s in kernel_op.body.iter())
-    mma_prelude = "#include <mma.h>\nusing namespace nvcuda;\n" if uses_mma else ""
-    # The mma.sync (s16816) path is pure PTX — its ldmatrix/mma.sync wrappers,
-    # not <mma.h>. A kernel may use either family (or, in a fused graph, both).
     uses_mma_sync = any(isinstance(s, MmaSyncPtx) for s in kernel_op.body.iter())
     mma_sync_prelude = _MMA_SYNC_PRELUDE if uses_mma_sync else ""
-    header = f'{includes}{mma_prelude}{mma_sync_prelude}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text})'
+    header = f'{includes}{mma_sync_prelude}{prelude}extern "C" __global__{launch_bounds} void {kernel_op.name}({params_text})'
     return f"{header} {{\n{body_text}\n}}\n"
 
 

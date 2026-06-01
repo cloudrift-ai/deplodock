@@ -188,12 +188,6 @@ class Role(enum.Enum):
 
 PATTERN = [Pattern("root", LoopOp)]
 
-# Minimum per-axis extent for auto-enumerating the mma.sync (s16816) atom as a
-# tunable candidate (see the gate in ``_plan_kernel``). Below this the TMA +
-# swizzle setup doesn't amortise and the static scorer would mis-rank it; a pin
-# still forces it at any size. Covers every recorded fp16 square golden (≥ 512).
-_MMA_SYNC_MIN_EXTENT = 256
-
 
 @dataclass(frozen=True)
 class KernelShape:
@@ -663,32 +657,22 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
 
         if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
             eligible = tuple(k for k in _ATOM_KINDS_V1 if is_atom_eligible(k, loop_op, ctx, graph=graph))
-            # ``mma_sync`` kinds (the s16816 ldmatrix + mma.sync path) become a
-            # candidate the AUTOTUNER measures on TMA-capable arch (sm_90+) for
-            # large matmuls, where the swizzled ldmatrix slab (S0–S3 of
-            # plans/mma-sync-smem-swizzle.md) makes it the faster fp16 matmul
-            # (0.93× vs WMMA 0.87× on 2048² fp16, RTX 5090) — WMMA can't
-            # swizzle, so it's permanently conflict-bound. Gates:
-            #
-            # - **sm_90+**: on sm_80-89 mma_sync has no TMA and falls back to
-            #   slower cp.async staging, so keep it pin-only there.
-            # - **large tiles only** (every extent ≥ ``_MMA_SYNC_MIN_EXTENT``):
-            #   the TMA-pipeline + swizzle setup only amortises on big GEMMs.
-            #   On small tiles the static scorer (which doesn't model TMA
-            #   latency) would mis-rank the leaner 16×8 atom ABOVE WMMA and the
-            #   greedy default would regress — so don't even enumerate it there.
-            #
-            # The greedy (DB-less) default stays WMMA at every size — the static
-            # score can't see runtime perf, so it never prefers mma_sync among
-            # large-tile siblings (verified: 2048² greedy picks WMMA). mma_sync
-            # only wins through the MEASURED autotune path (the recorded fp16
-            # goldens). A ``DEPLODOCK_ATOM_KIND`` pin still forces it at any
-            # size / arch (bring-up + A-B benching).
+            # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
+            # tensor-core family (WMMA was removed; the swizzled slab beats it —
+            # S0–S4 of plans/mma-sync-smem-swizzle.md). It auto-enumerates
+            # alongside the scalar register-tile tier on **sm_90+** (the
+            # swizzled-TMA fast path needs Hopper+; on sm_80-89 mma.sync would
+            # fall back to slower cp.async staging, so keep it pin-only there).
+            # The greedy/DB-less picker and the autotuner choose mma.sync vs
+            # scalar per shape. Shapes mma.sync can't serve fall to scalar:
+            # non-divisible extents (filtered by ``is_atom_eligible``) and
+            # single-warp tiles (pruned below — ``020_stage_inputs`` skips
+            # staging at one warp and ldmatrix is smem→register only, so an
+            # unstaged AtomTile can't lower). A ``DEPLODOCK_ATOM_KIND`` pin
+            # forces the kind at any size / arch (bring-up + A-B benching).
             pinned_atom = config.knob_raw("ATOM_KIND")
             pin_is_mma_sync = pinned_atom in ATOM_REGISTRY and atom_spec(pinned_atom).instruction == "mma_sync"
-            big_tile = min(E_M, E_N, E_K) >= _MMA_SYNC_MIN_EXTENT
-            mma_sync_default = ctx.compute_capability >= (9, 0) and big_tile
-            if not pin_is_mma_sync and not mma_sync_default:
+            if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
                 eligible = tuple(k for k in eligible if atom_spec(k).instruction != "mma_sync")
             if eligible:
                 warp_combos = enumerate_cartesian(
@@ -701,12 +685,11 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     atom_kinds=eligible,
                 )
                 # Drop single-warp (WM·WN == 1) mma.sync variants: ldmatrix is
-                # smem→register only, so the mma.sync path REQUIRES staged
-                # operands, but ``020_stage_inputs`` skips staging when the CTA
-                # is one warp (``n_thread <= warp_size``). WMMA survives that
-                # (it has a gmem-direct fallback); mma.sync would leave an
-                # unstaged AtomTile that crashes at render. Single-warp tiles
-                # are never the perf pick anyway, so pruning them is free.
+                # smem→register only, so mma.sync REQUIRES staged operands, but
+                # ``020_stage_inputs`` skips staging when the CTA is one warp
+                # (``n_thread <= warp_size``) — an unstaged AtomTile would crash
+                # at render. The scalar tier covers those tiny tiles. Single-warp
+                # is never the perf pick anyway, so pruning is free.
                 warp_combos = [p for p in warp_combos if not (atom_spec(p.atom_kind).instruction == "mma_sync" and p.wm * p.wn == 1)]
                 param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
