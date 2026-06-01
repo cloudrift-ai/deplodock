@@ -155,12 +155,20 @@ class Sync(Stmt):
 
 @dataclass(frozen=True)
 class CpAsyncCopy(Stmt):
-    """Issue one ``cp.async.cg.shared.global`` instruction.
+    """Issue one ``cp.async.{ca,cg}.shared.global`` instruction.
 
     Replaces the per-thread ``Load(reg) + Write(smem)`` pair in cooperative
-    loads on sm_80+. The hardware copies 4 bytes (one fp32) directly from
-    global to shared without a register staging slot, freeing one thread
-    register and removing the LDG → STS dependency.
+    loads on sm_80+. The hardware copies ``nbytes`` (one contiguous vector of
+    ``nbytes / sizeof(dtype)`` elements) directly from global to shared without
+    a register staging slot, freeing the thread register and removing the
+    LDG → STS dependency.
+
+    ``nbytes`` ∈ {4, 8, 16} (the cp.async copy sizes). 16-byte copies use the
+    ``.cg`` (cache-global, bypass-L1) qualifier — the streaming form CUTLASS /
+    cuBLAS use, requiring 16-byte-aligned smem + global addresses — and 4/8-byte
+    copies use ``.ca``. ``smem_index`` / ``src_index`` address the *start* of
+    the contiguous chunk; ``_stage_expand`` picks the widest legal ``nbytes`` so
+    e.g. an fp16 tile stages 8 halves per ``cp.async``.
 
     Renders to inline PTX. The asm reads the smem address via
     ``cvta.to.shared.u32`` and the global pointer as a 64-bit value;
@@ -171,6 +179,7 @@ class CpAsyncCopy(Stmt):
     smem_index: tuple
     src: str  # source global buffer name
     src_index: tuple
+    nbytes: int = 4  # bytes per cp.async (4/8/16); 16 ⇒ .cg, else .ca
 
     def external_reads(self) -> tuple[str, ...]:
         return (self.src,)
@@ -178,7 +187,7 @@ class CpAsyncCopy(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         smem_idx = ", ".join(e.pretty() for e in self.smem_index)
         src_idx = ", ".join(e.pretty() for e in self.src_index)
-        return [f"{indent}cp.async {self.smem}[{smem_idx}] <- {self.src}[{src_idx}]"]
+        return [f"{indent}cp.async[{self.nbytes}B] {self.smem}[{smem_idx}] <- {self.src}[{src_idx}]"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index
@@ -186,7 +195,11 @@ class CpAsyncCopy(Stmt):
         smem_flat = render_index(self.smem, self.smem_index, ctx)
         src_flat = render_index(self.src, self.src_index, ctx)
         pad = _pad(ctx.indent)
-        asm = f'asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\\n" :: "r"(_smem_addr), "l"(&{self.src}[{src_flat}]) : "memory");'
+        qual = "cg" if self.nbytes == 16 else "ca"  # .cg is 16-byte-only (bypass L1)
+        asm = (
+            f'asm volatile("cp.async.{qual}.shared.global [%0], [%1], {self.nbytes};\\n" '
+            f':: "r"(_smem_addr), "l"(&{self.src}[{src_flat}]) : "memory");'
+        )
         return [
             f"{pad}{{",
             f"{pad}    unsigned int _smem_addr = __cvta_generic_to_shared(&{self.smem}[{smem_flat}]);",
@@ -1026,6 +1039,7 @@ def _(s: CpAsyncCopy, rename, sigma, axis_fn):
         smem_index=tuple(sigma.apply(e) for e in s.smem_index),
         src=s.src,
         src_index=tuple(sigma.apply(e) for e in s.src_index),
+        nbytes=s.nbytes,
     )
 
 

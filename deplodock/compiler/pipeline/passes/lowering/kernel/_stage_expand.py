@@ -19,6 +19,41 @@ from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, StagePolicy, TemplateAddressing
 
 
+def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | None) -> int:
+    """Elements per ``cp.async`` for a cooperative stage load — the widest
+    contiguous vector whose byte size is a legal cp.async width (4 / 8 / 16).
+
+    Returns ``V`` (elements/thread), or ``0`` when no cp.async is safe (fp16/bf16
+    that isn't vector-contiguous — cp.async's min copy is 4 B = 2 halves, so a
+    half tile can't fall back to a 1-element copy and must use the sync path).
+    fp32 keeps a scalar 4-byte copy (``V = 1``) when not vectorizable.
+
+    Safe wide vectorization needs: (a) the inner (last) cache/slab axis maps
+    **stride-1 to the gmem inner dim** — ``dims[-1] == last source dim`` — so the
+    inner slab run is row-major-contiguous in *both* smem and gmem (the per-axis
+    ``block`` atom-stride is irrelevant here: the cooperative load walks raw slab
+    coords and the inner slab dim is always the row-major fastest one);
+    (b) ``V`` divides the inner alloc extent (a chunk never straddles a padded
+    row, so ``PAD_SMEM``'s ``+1`` disables wide cp.async); and (c) the gmem inner
+    stride is ``V``-aligned, so each row's chunk start stays ``V*elem``-byte
+    aligned (cp.async faults on a misaligned 16-byte copy). Only
+    ``AffineAddressing`` is analyzed; anything else is treated non-contiguous."""
+    if elem_size not in (2, 4) or not padded_extents:
+        return 1 if elem_size == 4 else 0
+    inner = int(padded_extents[-1])
+    contiguous = isinstance(addressing, AffineAddressing) and bool(addressing.dims) and addressing.dims[-1] == n_origin_dims - 1
+    if not contiguous:
+        return 1 if elem_size == 4 else 0
+    for nbytes in (16, 8, 4):
+        v = nbytes // elem_size
+        if v < 1 or inner % v != 0:
+            continue
+        if gmem_inner is not None and gmem_inner % v != 0:
+            continue  # row stride not V-aligned → chunk start would misalign
+        return v
+    return 1 if elem_size == 4 else 0
+
+
 def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int, ...] | None) -> tuple[Expr, ...]:
     """Clamp each cooperative-load gmem index dim to ``[0, extent)``.
 
@@ -187,17 +222,33 @@ def emit_stage(
         smem_align = 16 if smem_dtype == "__half" else 0
         full_extents = (buffer_count, *padded_extents) if is_buffered else padded_extents
 
-        # cp.async path (sm_80+): fp32 only — fp16 falls through to sync
-        # path because cp.async.ca's 4-byte size isn't a clean fit for
-        # per-thread stride-1 __half writes.
-        if is_async and smem_dtype == "float":
+        # cp.async path (sm_80+): each thread copies a contiguous ``V``-element
+        # vector (``V*elem_size`` ∈ {4,8,16} B) gmem→smem in one instruction.
+        # ``_cp_async_width`` picks the widest safe V, so an fp16 tile streams 8
+        # halves as one 16-byte ``cp.async.cg`` (the CUTLASS / cuBLAS shape).
+        # The chunk loop covers ``total // V`` chunk indices; ``σ(iter → iter*V)``
+        # rewrites the per-element decode to the chunk-start coords (the inner
+        # slab decode ``(iter*V) % inner`` folds to ``V * (iter % (inner/V))`` —
+        # a V-aligned, contiguous chunk). V=0 ⇒ no legal cp.async (fp16
+        # non-contiguous) → sync path; V=1 ⇒ fp32's scalar 4-byte copy.
+        elem_size = {"float": 4, "__half": 2, "__nv_bfloat16": 2}.get(smem_dtype, 0)
+        gmem_inner = src.gmem_extents[-1] if getattr(src, "gmem_extents", None) else None
+        cp_v = _cp_async_width(elem_size, padded_extents, addressing, len(src.origin), gmem_inner) if is_async else 0
+        if cp_v >= 1:
+            nbytes = cp_v * elem_size
+            if cp_v > 1:
+                from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
+
+                scale = _Sigma({iter_axis.name: Var(iter_axis.name) * Literal(cp_v, "int")})
+                smem_index = tuple(scale.apply(e) for e in smem_index)
+                source_index = tuple(scale.apply(e) for e in source_index)
             cooperative_load = StridedLoop(
-                axis=iter_axis,
+                axis=Axis(name=iter_axis.name, extent=total // cp_v),
                 start=tid_expr,
                 step=Literal(n_threads, "int"),
-                body=(CpAsyncCopy(smem=src.name, smem_index=smem_index, src=src.buf, src_index=source_index),),
+                body=(CpAsyncCopy(smem=src.name, smem_index=smem_index, src=src.buf, src_index=source_index, nbytes=nbytes),),
             )
-            body_out.append(Smem(name=src.name, extents=full_extents, dtype=smem_dtype, align=smem_align))
+            body_out.append(Smem(name=src.name, extents=full_extents, dtype=smem_dtype, align=max(smem_align, nbytes)))
             body_out.append(cooperative_load)
             continue
 

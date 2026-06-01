@@ -250,6 +250,25 @@ def test_staged_pipelined_phase_prefix_renders(pin_staged_pipelined):
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+def test_cp_async_fp16_vectorized_16byte(pin_staged_pipelined):
+    """The fp16 staged matmul issues real **16-byte** ``cp.async.cg`` cooperative
+    loads (8 halves/thread) — the CUTLASS / cuBLAS shape — not the old degenerate
+    fallback (scalar ``Load``+``Write`` sync staging wrapped in vestigial
+    ``commit_group`` / ``wait_group`` that waited on nothing). The fp16 path used
+    to bail to sync because ``CpAsyncCopy`` hardcoded a 4-byte (one-fp32) copy;
+    it now vectorizes. The chunk offset ``8 * (flat % 8)`` also exercises the
+    ``(flat*8) % 64 → 8*(flat%8)`` simplifier fix — without it the chunks would
+    overlap and the kernel hangs / corrupts."""
+    _, _, src = _compile_and_render(M=128, N=128, K=128, out_dtype=F32)
+    # Real vectorized cp.async, not scalar sync staging.
+    assert "cp.async.cg.shared.global" in src, "fp16 stage should use cp.async.cg (16-byte vectorized copy)"
+    assert ", 16;" in src, "expected 16-byte cp.async copies"
+    # The degenerate path wrote one __half per thread via a register staging
+    # temp (``<smem>_v``); the vectorized cp.async must not.
+    assert "_smem_v = " not in src, "fp16 stage fell back to scalar Load+Write sync staging"
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_staged_pipelined_ab_classification(pin_staged_pipelined):
     """A vs B classification via ``Source.cache_dims`` — the cache axis
     whose ``axis.name == K_name`` has ``source_dim == 1`` for A (K is the
