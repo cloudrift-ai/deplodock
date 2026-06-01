@@ -655,6 +655,29 @@ async def test_wait_for_status_retries_network_error(mock_get, mock_sleep):
     assert info is not None
 
 
+@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+async def test_create_instance_appends_extra_public_keys(mock_rent, mock_wait, mock_terminate, tmp_path):
+    """extra_public_keys are installed alongside the key from ssh_key_path."""
+    key_file = tmp_path / "id_ed25519.pub"
+    key_file.write_text("ssh-ed25519 AAAA own@host\n")
+
+    mock_rent.return_value = {"instance_ids": ["inst-1"]}
+    mock_wait.return_value = {"instance_id": "inst-1"}
+
+    await create_instance(
+        API_KEY,
+        "rtx49-7c-kn.1",
+        str(key_file),
+        api_url=API_URL,
+        extra_public_keys=["ssh-ed25519 BBBB bob@host"],
+    )
+
+    # _rent_instance(api_key, instance_type, ssh_public_keys, ...)
+    assert mock_rent.await_args.args[2] == ["ssh-ed25519 AAAA own@host", "ssh-ed25519 BBBB bob@host"]
+
+
 # ── create_instance HTTP-code classification ────────────────────
 
 

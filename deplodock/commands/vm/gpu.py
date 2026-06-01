@@ -17,7 +17,7 @@ import os
 import sys
 
 from deplodock.benchmark.config import load_config
-from deplodock.provisioning.cloud import provision_cloud_vm
+from deplodock.provisioning.cloud import provision_cloud_vm, read_public_key_files
 from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,12 @@ def handle_create(args):
 
 async def _handle_create(args):
     ssh_key = os.path.expanduser(args.ssh_key)
+
+    try:
+        extra_authorized_keys = read_public_key_files(args.authorized_key)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
     providers_config = None
     if args.config and os.path.exists(args.config):
@@ -54,6 +60,7 @@ async def _handle_create(args):
             server_name=args.name,
             dry_run=args.dry_run,
             provider=args.provider,
+            extra_authorized_keys=extra_authorized_keys,
         )
     except (CapacityExhausted, TerminalProvisionError) as exc:
         logger.error(f"{exc}")
@@ -75,6 +82,13 @@ def register_create_target(subparsers):
     parser.add_argument("--gpu", required=True, help="GPU name from hardware table (e.g. 'NVIDIA H200 141GB')")
     parser.add_argument("--gpu-count", type=int, default=1, help="Number of GPUs (default: 1)")
     parser.add_argument("--ssh-key", default="~/.ssh/id_ed25519", help="SSH private key path")
+    parser.add_argument(
+        "--authorized-key",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Extra SSH public key file to install in the VM's authorized_keys (repeatable)",
+    )
     parser.add_argument("--name", default=None, help="Server name prefix used in the VM hostname")
     parser.add_argument(
         "--provider",

@@ -11,6 +11,7 @@ from deplodock.deploy import (
 )
 from deplodock.provisioning.cloud import (
     provision_cloud_vm,
+    read_public_key_files,
 )
 from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
@@ -35,6 +36,12 @@ async def _handle_cloud(args):
     hf_token = args.hf_token or os.environ.get("HF_TOKEN", "")
     register_secret(hf_token)
 
+    try:
+        extra_authorized_keys = read_public_key_files(args.authorized_key)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error(str(exc))
+        sys.exit(1)
+
     providers_config = None
     if args.billing_exempt or args.network:
         providers_config = {"cloudrift": {}}
@@ -51,6 +58,7 @@ async def _handle_cloud(args):
         server_name=args.name,
         dry_run=args.dry_run,
         provider=args.provider,
+        extra_authorized_keys=extra_authorized_keys,
     )
     if conn is None:
         logger.error("Error: VM provisioning failed.")
@@ -83,6 +91,13 @@ def register_cloud_target(subparsers):
     parser.add_argument("--recipe", required=True, help="Path to recipe directory")
     parser.add_argument("--name", default="cloud-deploy", help="VM name prefix (default: cloud-deploy)")
     parser.add_argument("--ssh-key", default="~/.ssh/id_ed25519", help="SSH private key path")
+    parser.add_argument(
+        "--authorized-key",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Extra SSH public key file to install in the VM's authorized_keys (repeatable)",
+    )
     parser.add_argument("--hf-token", default=None, help="HuggingFace token (default: $HF_TOKEN)")
     parser.add_argument("--model-dir", default="/hf_models", help="Model cache directory")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")

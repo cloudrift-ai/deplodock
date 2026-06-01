@@ -354,6 +354,7 @@ async def create_instance(
     ssh_private_key_path=None,
     billing_exempt=False,
     network=None,
+    extra_public_keys=None,
 ):
     """Create a CloudRift VM instance.
 
@@ -361,6 +362,9 @@ async def create_instance(
         image_url: VM image URL. If ``None``, auto-picks ROCm for ``mi*`` instance
             types and NVIDIA otherwise via :func:`select_image_url`.
         ssh_key_path: path to the SSH **public** key file.
+        extra_public_keys: optional list of additional SSH public key strings to
+            install in the VM's authorized_keys alongside the key from
+            ``ssh_key_path`` (e.g. ["ssh-ed25519 AAAA bob@host"]).
         fail_statuses: optional set of statuses that trigger immediate failure
             (e.g. {"Inactive"}).
         wait_ssh: if True, wait for SSH connectivity after Active status.
@@ -383,11 +387,13 @@ async def create_instance(
         with open(ssh_key_path) as f:
             public_key = f.read().strip()
 
+    public_keys = [public_key, *(extra_public_keys or [])]
+
     try:
         result = await _rent_instance(
             api_key,
             instance_type,
-            [public_key],
+            public_keys,
             image_url=image_url,
             ports=ports,
             api_url=api_url,
