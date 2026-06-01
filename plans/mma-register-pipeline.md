@@ -118,12 +118,24 @@ hides the boundary bubble — which is why the gap looks smaller there and masks
 worth ~1.5µs (107→105.6 BC=3, 125→121.5 BC=4) — but it's load-bearing for the smem-ring WAR on small tiles, so it would need
 a tile-size gate (or a compiler-only `asm volatile("":::"memory")` fence) and is a separate change.
 
-**M2 status — designed, not yet landed (correctness hazard to resolve first).** The lever is clear: overlap tile *t+1*'s
-first `ldmatrix` with tile *t*'s `mma` via a loop-carried `__rp1` buffer. But the clean version moves the next slot's
-`AsyncWait` one iteration earlier, which interacts with the smem-ring WAR safety the per-iteration `__syncthreads` guards —
-a rushed re-pipelining risks a nondeterministic race the accuracy oracle can pass by luck. M2 must re-derive the K_o-ring
-synchronization carefully (keep the mbarrier ring intact, double-buffer only the register fragments) — that's the focused
-follow-up, validated at the BC=4 pinned config against the 99µs cuBLAS target.
+**M2 status — attempted, architecturally blocked by the SSA-based IR (NOT shippable as a kernel pass).** The lever is
+right (overlap tile *t+1*'s first `ldmatrix` with tile *t*'s `mma` via a loop-carried `__rp1` buffer), and a WAR-safe
+schedule exists (move the next slot's wait to the iteration bottom — one `AsyncWait`+`Sync` per iteration, so the smem-ring
+guard is preserved; prime iteration 0 with a `Cond(K_o==0)` *inside* the loop so the TMA-group partitioner doesn't split
+the ring). The transform was implemented and produced exactly that shape. **But it computes wrong results
+(`max_diff ≈ 24-32`, not 0).** Root cause: a loop-carried register buffer writes `__rp1` in *both* the prime and the
+prefetch and reads it between — that **violates SSA** (single-assignment). `normalize_body` runs `topo_sort_siblings` on
+**every `TileOp`/`LoopOp` construction**; it's an SSA def→use topological sort that reorders the `mma` (consumer of `__rp1`)
+*after* the prefetch (producer), because it can't know `__rp1` is loop-carried (the `mma` wants the *previous* iteration's
+write). A single loop body cannot express "read the previous iteration's register value" without phi-node / loop-carried-
+register support the IR doesn't have; even unroll-by-2 keeps the read-then-rewrite WAR within the unrolled body. This is
+exactly why M1 (within-tile) is SSA-clean and correct while the cross-K_o carry is not.
+
+cuBLAS does this in hand-written PTX with no SSA constraint (its 232 vs our 166 regs = the loop-carried operand buffers).
+Matching it here needs **IR-level loop-carried register support** (a phi / `LoopCarried` construct that `normalize`,
+`topo_sort_siblings`, and the materializer all understand) — a frontend/IR change well beyond a lowering pass. Until then
+the gap to cuBLAS (0.93× at BC=3 / the BC=4 regression) stays open via this lever. M0+M1 (the knob + within-tile
+double-buffer, off by default, autotuner-measured) remain as correct, landed infrastructure.
 
 ## Milestones (each independently validatable; gate on accuracy + ncu, not pytest loops)
 
