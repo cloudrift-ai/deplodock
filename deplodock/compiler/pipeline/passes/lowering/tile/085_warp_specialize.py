@@ -77,6 +77,7 @@ the fork via ``WARP_SPECIALIZE.narrow``.
 
 from __future__ import annotations
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Node
@@ -319,6 +320,15 @@ def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
 
     ok, reason = _eligible(op)
     if not ok:
+        # Fail loudly if the user explicitly pinned ``DEPLODOCK_WARP_SPECIALIZE=1``
+        # but the kernel can't be warp-specialized (e.g. a warp-tier MMA matmul
+        # — ``no ThreadTile in body``, WS+MMA is out of v1 scope). Silently
+        # RuleSkipping would hand back the *non-WS* kernel with no signal, so a
+        # pinned-but-unhonorable knob raises — same policy as the BUFFER_COUNT /
+        # TMA pins.
+        pin = config.knob_raw(WARP_SPECIALIZE.name)
+        if pin is not None and WARP_SPECIALIZE.parse(pin):
+            raise ValueError(f"DEPLODOCK_WARP_SPECIALIZE=1 pinned but warp specialization cannot fire: {reason}")
         raise RuleSkipped(reason)
 
     ws_choices = WARP_SPECIALIZE.narrow(WARP_SPECIALIZE.hints)

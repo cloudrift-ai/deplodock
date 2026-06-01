@@ -114,6 +114,20 @@ def test_rule_skipped_on_pointwise():
         _run_rule(op)
 
 
+def test_pinned_ws1_on_ineligible_fails_loudly(monkeypatch):
+    """A pinned ``DEPLODOCK_WARP_SPECIALIZE=1`` that can't be honored must
+    **raise**, not silently RuleSkip into the non-WS kernel. (The motivating
+    case is a warp-tier MMA matmul — ``no ThreadTile in body`` — but any
+    ineligible op exercises it; the pointwise op has no TMA bundle.) A
+    pinned-but-unhonorable knob erroring matches the BUFFER_COUNT / TMA pin
+    policy, instead of handing back a kernel the pin never shaped. Without the
+    pin the same op RuleSkips cleanly (see ``test_rule_skipped_on_pointwise``)."""
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
+    op = _tile_op_pointwise()
+    with pytest.raises(ValueError, match="WARP_SPECIALIZE=1 pinned but warp specialization cannot fire"):
+        _run_rule(op)
+
+
 def test_rule_skipped_when_ws_already_set():
     op = _tile_op_tma_pipelined()
     op_with_ws = TileOp(body=op.body, name=op.name, knobs={"WARP_SPECIALIZE": True})
