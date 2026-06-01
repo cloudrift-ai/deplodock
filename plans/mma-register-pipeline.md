@@ -78,6 +78,53 @@ the same shape one tier down, on the `RegFragment` chain instead of the `StageBu
 - **Correctness is the precise oracle.** Any peeling / buffer-rotation bug shows up instantly as `max_diff > 0` on the
   accuracy check — iterate on-GPU against it, smallest reproducing shape first.
 
+## Findings (RTX 5090, sm_120, 2048² fp16 — measured during implementation)
+
+**M0 (landed) + M1 (landed)** — `REG_PIPELINE` knob + the new kernel pass `kernel/013_pipeline_mma_regs.py`. The pass is an
+op-fork (`list[TileOp]`, one per polarity) mirroring `HOIST_COMPUTE` / `PAD_SMEM` — **not** wired into the
+`010_partition_loops` level schema (that was the plan's initial guess; the op-fork is self-contained, lower-risk, and the
+inner per-op search explores it identically — confirmed: a bounded `tune` run measures 8 on / 8 off `perf` rows). Default
+**off**, byte-identical when off. M1 peels the `K_i` reduce into a double-buffered prologue/steady/epilogue (`__rp1` twin
+operand frags; accumulator stays single). Accuracy `max_diff = 0` across 256²–2048², f32 out, rectangular.
+
+**M1 is perf-neutral-to-negative**, and `ncu` says why: the within-tile `K_i` boundary lives in **one basic block**, where
+ptxas already overlaps loads/compute (same lesson as `095_interleave_loads`). Batching all 16 `ldmatrix` up-front just adds
+LSU pressure — `short_scoreboard` *rises* 0.43→0.91, `barrier` dips 0.82→0.74, `wait` (mma pipeline) stays dominant. At the
+cuBLAS-optimal pinned config M1 regresses 107→110µs (BC=3) / 125→129µs (BC=4). So the within-tile lever is the wrong one;
+the bubble is the **cross-K_o (smem-tile) boundary**.
+
+**The cuBLAS gap is the register-pipelined inner schedule — proven by an apples-to-apples profile at BC=4** (the
+`cutlass_80_tensorop_f16_s16816gemm_128x128_32x4` config cuBLAS actually runs — confirmed via `ncu` kernel name; identical
+128×128 tile, K-tile 32, 4 stages, 256 CTAs, 128 threads):
+
+| 2048² fp16, BUFFER_COUNT=4 | ours | cuBLAS |
+|---|---|---|
+| theoretical + achieved occupancy | 8.33% (1 block/SM) | 8.33% (1 block/SM) |
+| occupancy limiter | shared mem (~64 KB) | shared mem (~64 KB) |
+| **registers / thread** | **166** | **232** |
+| `barrier` stall (per issue active) | 0.40 | 0.05 |
+| tensor-pipe active | 42% | 47% |
+| latency | 125µs | 99µs |
+
+Same geometry, smem, **and occupancy** — the only difference is the **~66 extra regs/thread cuBLAS spends on operand
+double-buffering** (register pipelining), which keeps the mma pipeline fed across the K-step boundary (barrier 0.05, pipe
+47%). Ours drains at every `MbarrierWait` boundary (barrier 0.40, pipe 42%). Because BC=4 is **shared-mem-bound at 1
+block/SM**, registers 166→255 are **free** (occupancy can't drop) — exactly why cuBLAS picks BC=4 + 232 regs, and why this
+is the right config for M2. Our best OFF config is BC=3 (107µs / 0.93×, 2 blocks/SM at 17% occ, where the 2nd block partly
+hides the boundary bubble — which is why the gap looks smaller there and masks the lever).
+
+**Orthogonal finding (not REG_PIPELINE):** the trailing `__syncthreads()` after each TMA `MbarrierWait`
+(`100_materialize_tile.emit_async_wait`) is a compiler fence; dropping it on the large 128×128 tile is accuracy-clean and
+worth ~1.5µs (107→105.6 BC=3, 125→121.5 BC=4) — but it's load-bearing for the smem-ring WAR on small tiles, so it would need
+a tile-size gate (or a compiler-only `asm volatile("":::"memory")` fence) and is a separate change.
+
+**M2 status — designed, not yet landed (correctness hazard to resolve first).** The lever is clear: overlap tile *t+1*'s
+first `ldmatrix` with tile *t*'s `mma` via a loop-carried `__rp1` buffer. But the clean version moves the next slot's
+`AsyncWait` one iteration earlier, which interacts with the smem-ring WAR safety the per-iteration `__syncthreads` guards —
+a rushed re-pipelining risks a nondeterministic race the accuracy oracle can pass by luck. M2 must re-derive the K_o-ring
+synchronization carefully (keep the mbarrier ring intact, double-buffer only the register fragments) — that's the focused
+follow-up, validated at the BC=4 pinned config against the 99µs cuBLAS target.
+
 ## Milestones (each independently validatable; gate on accuracy + ncu, not pytest loops)
 
 **M0 — knob + pass skeleton (no behavior change).** Add the `REG_PIPELINE` knob + a new kernel pass
