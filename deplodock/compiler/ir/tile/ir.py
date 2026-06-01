@@ -274,6 +274,60 @@ class WarpSpecialize(Stmt):
 BYTES_PER_ELEM = 4
 
 
+class SwizzleMode(enum.Enum):
+    """TMA shared-memory swizzle pattern.
+
+    Picked by the lowering pass from inner-dim byte stride; consumed by
+    the backend's ``cuTensorMapEncodeTiled`` call. Only meaningful when
+    ``StageBundle.policy == StagePolicy.TMA``.
+
+    Defined here (above ``Source``) so it can be a ``Source.swizzle`` field
+    default. The per-operand swizzle mode lives on the ``Source`` (S0 of
+    plans/mma-sync-smem-swizzle.md), not only on the bundle, because A
+    (64 B inner → ``B64``) and B (128 B inner → ``B128``) share one
+    StageBundle but need distinct modes.
+    """
+
+    NONE = "NONE"
+    B32 = "B32"
+    B64 = "B64"
+    B128 = "B128"
+
+
+# TMA hardware-swizzle atom widths in bytes, widest-first. The widest atom
+# that divides a source's inner-row byte span wins (best conflict spread).
+_SWIZZLE_BY_BYTES: tuple[tuple[int, SwizzleMode], ...] = (
+    (128, SwizzleMode.B128),
+    (64, SwizzleMode.B64),
+    (32, SwizzleMode.B32),
+)
+
+
+def pick_swizzle_atom(inner_elems: int, elem_bytes: int) -> tuple[int, SwizzleMode]:
+    """Pick the TMA swizzle atom for a source whose collapsed inner-row span
+    is ``inner_elems`` elements of ``elem_bytes`` bytes each.
+
+    Returns ``(atom_elems, mode)`` where ``atom_elems`` is the swizzle atom
+    width in *elements* (the innermost descriptor-box dim after the S1
+    reshape) and ``mode`` the matching :class:`SwizzleMode`. The widest atom
+    in ``{128, 64, 32}`` B that (a) is ``<=`` the inner span and (b) divides
+    it evenly wins — so a 256 B inner (128 fp16 elems) picks ``B128`` (64
+    elems, split ``[2, 64]``) and a 64 B inner (32 fp16 elems) picks ``B64``
+    (32 elems, no split). Returns ``(inner_elems, NONE)`` when no atom fits
+    (the descriptor keeps the unswizzled collapsed box).
+
+    Shared by ``kernel/100_materialize_tile`` (S1 box reshape) and
+    ``tile/050_use_tma`` (S2 per-source mode pick) so the two agree on the
+    atom width — see plans/mma-sync-smem-swizzle.md.
+    """
+    inner_bytes = inner_elems * elem_bytes
+    for wb, mode in _SWIZZLE_BY_BYTES:
+        we = wb // elem_bytes
+        if we >= 1 and we <= inner_elems and inner_elems % we == 0 and inner_bytes % wb == 0:
+            return we, mode
+    return inner_elems, SwizzleMode.NONE
+
+
 @dataclass(frozen=True)
 class AffineAddressing:
     """Affine slab addressing: each cache axis ``i``'s decoded coord is
@@ -416,6 +470,7 @@ class Source:
     addressing: AffineAddressing | TemplateAddressing | None = None
     dtype: DataType | None = None
     gmem_extents: tuple[int, ...] | None = None
+    swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:
         # Default addressing: affine with dims pulled off cache_dims. The
@@ -1137,20 +1192,6 @@ class StagePolicy(enum.Enum):
     BUFFERED = "buffered"
     ASYNC = "async"
     TMA = "tma"
-
-
-class SwizzleMode(enum.Enum):
-    """TMA shared-memory swizzle pattern.
-
-    Picked by the lowering pass from inner-dim byte stride; consumed by
-    the backend's ``cuTensorMapEncodeTiled`` call. Only meaningful when
-    ``StageBundle.policy == StagePolicy.TMA``.
-    """
-
-    NONE = "NONE"
-    B32 = "B32"
-    B64 = "B64"
-    B128 = "B128"
 
 
 @dataclass(frozen=True)

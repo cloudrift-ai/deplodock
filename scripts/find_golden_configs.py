@@ -51,15 +51,17 @@ def _shape_table() -> list[tuple[str, int, int, int, str]]:
     """``(name, M, N, K, dtype)`` for every golden shape — all plain 2-D ``(M,K)@(K,N)``.
 
     fp32 shapes ride the thread-tier CUDA-core FMA path (reference pinned to true
-    SGEMM); fp16 squares ride the warp-tier WMMA tensor-core path (reference is the
-    plain fp16 HGEMM — torch's default fp16 matmul, no pin needed). The fp16 ``name``
-    carries a ``.fp16`` suffix so the two never collide in the recorded set."""
+    SGEMM); fp16 squares ride the warp-tier tensor-core path (reference is the plain
+    fp16 HGEMM — torch's default fp16 matmul, no pin needed). On sm_90+ the autotuner
+    lands the fp16 squares on the swizzled s16816 ``mma_m16n8k16_f16`` atom (faster
+    than ``nvcuda::wmma``). The fp16 ``name`` carries a ``.fp16`` suffix so the two
+    never collide in the recorded set."""
     shapes: list[tuple[str, int, int, int, str]] = []
     # Standard fp32 squares (CUDA-core FMA).
     for s in (512, 1024, 2048, 4096):
         shapes.append((f"square.{s}", s, s, s, "fp32"))
-    # Standard fp16 squares (WMMA tensor-core). These exercise the warp-tier MMA path
-    # and benchmark deplodock's WMMA kernel against cuBLAS HGEMM.
+    # Standard fp16 squares (warp-tier tensor-core). These exercise the warp-tier MMA
+    # path and benchmark deplodock's tensor-core kernel against cuBLAS HGEMM.
     for s in (512, 1024, 2048, 4096):
         shapes.append((f"square.{s}.fp16", s, s, s, "fp16"))
     # Qwen3-Embedding-0.6B linears at seq 32/128/512 (M = seq; batch=1 squeezes away).

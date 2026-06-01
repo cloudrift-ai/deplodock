@@ -48,7 +48,7 @@ def test_classify_unit_stride_load_emits_empty_block():
 
 
 def test_classify_atom_strided_load_stamps_block():
-    """σ output ``m_w·1024 + m_r·16`` (an MMA ``wmma_m16n16k16_f16``
+    """σ output ``m_w·1024 + m_r·16`` (an MMA ``mma_m16n8k16_f16``
     A-side stride for ``WM=1, FM=4, atom_M=16`` packed as multi-axis-
     per-dim) → block ``(16, 16)`` on cache axes ``(m_w, m_r)``. Walks
     right-to-left: coef(m_r)=16 / suffix=1 → block_m_r=16, suffix
@@ -76,7 +76,7 @@ def test_classify_atom_strided_load_stamps_block():
         reduce_axis=k,
         scope_axes=(tid_fan, m_w, m_r, k),
         slab_cap=1 << 30,
-        atom_kind="wmma_m16n16k16_f16",
+        atom_kind="mma_m16n8k16_f16",
     )
     assert slab is not None
     # cache_axes are sorted by source-dim; both m_w and m_r are on dim 0,
@@ -141,6 +141,6 @@ def test_classify_block_exceeds_budget_drops_slab():
         # Generous enough for unblocked but tight against the 16× × 16×
         # scaling: unblocked footprint 2 KB × 256 = 512 KB.
         slab_cap=64 * 1024,
-        atom_kind="wmma_m16n16k16_f16",
+        atom_kind="mma_m16n8k16_f16",
     )
     assert slab is None

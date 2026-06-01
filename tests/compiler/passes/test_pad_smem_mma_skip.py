@@ -1,7 +1,8 @@
 """M7 of ``plans/mma-smem-staging.md`` — pad_smem skips blocked Sources.
 
-``070_pad_smem``'s ``+1`` pad on the inner cache axis breaks WMMA's
-``ldmatrix`` 16-byte alignment requirement. The fix is structural: any
+``070_pad_smem``'s ``+1`` pad on the inner cache axis breaks the
+``mma.sync`` path's ``ldmatrix`` 16-byte alignment requirement. The fix is
+structural: any
 ``AffineAddressing`` whose ``block`` tuple is non-empty represents an
 MMA atom-strided slab and must stay un-padded.
 """

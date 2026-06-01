@@ -1,12 +1,12 @@
 """End-to-end MMA matmul correctness — M8 of
 ``plans/mma-fragment-factorization.md``.
 
-Verifies the WMMA F16 path produces correct output across realistic
-shapes + both output dtypes (F32 accumulator-direct-store, F16 acc
-with __half store). Pins ``DEPLODOCK_MMA=1`` and lets the planner pick
-the best-scoring warp-tier variant; compiles via ``nvcc --cubin`` (NVRTC
-fails to compile WMMA — cupy's bundled cu13 lacks ``crt/mma.h``) and
-compares against the f32 matmul reference within fp16 tolerance.
+Verifies the s16816 ``mma.sync`` F16 path produces correct output across
+realistic shapes + both output dtypes (F32 accumulator-direct-store, F16
+acc with __half2 store). Pins the warp-tier ``mma_m16n8k16_f16`` atom +
+a multi-warp 128×128 tile (single-warp mma.sync is pruned — ldmatrix is
+smem→register only) and compares against the f32 matmul reference within
+fp16 tolerance.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from .conftest import requires_cuda
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
 # skipif reason) so they run sequentially on one worker — the host has one
 # GPU and scattering CUDA tests across workers exhausts the device context.
-# The per-test ``_supports_wmma`` skipif still gates the sm_70+ arch
+# The per-test ``_supports_mma_sync`` skipif still gates the sm_80+ arch
 # requirement on top of this.
 pytestmark = [requires_cuda]
 
@@ -43,13 +43,15 @@ def _has_cuda() -> bool:
         return False
 
 
-def _supports_wmma() -> bool:
+def _supports_mma_sync() -> bool:
+    """The s16816 ``mma.sync.aligned.m16n8k16`` op + ``ldmatrix`` need
+    sm_80+ (Ampere and later)."""
     if not _has_cuda():
         return False
     import cupy as cp
 
     cap = cp.cuda.Device().compute_capability
-    return int(cap) >= 70
+    return int(cap) >= 80
 
 
 def _matmul_loop_op(*, M: int, N: int, K: int) -> LoopOp:
@@ -105,57 +107,56 @@ def _np_dtype(dt: DataType):
 # `plans/mma-fragment-factorization.md` post-M5). The pin is still set
 # in tests so the fixture is robust against env-var clobbering during
 # parallel pytest runs (xdist).
-@pytest.mark.skipif(not _supports_wmma(), reason="WMMA needs CUDA + sm_70+")
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize(
     ("M", "N", "K", "out_dtype"),
     [
-        (16, 16, 16, F32),
-        (64, 64, 64, F32),
         (128, 128, 128, F32),
-        # F16-output cases — the v1 store-bug fix lives here. The accumulator
-        # type tracks the output dtype so wmma::store_matrix_sync's overload
-        # resolution succeeds (no F32 acc → __half* mismatch).
-        (16, 16, 16, F16),
-        (64, 64, 64, F16),
+        (256, 256, 128, F32),
+        # F16-output cases — the per-lane __half2 epilogue downconverts the
+        # fp32 accumulator into the narrower output buffer.
         (128, 128, 128, F16),
+        (256, 256, 128, F16),
         # Skewed shape catches asymmetric N_b × WN × FN arithmetic — both dtypes.
-        (256, 256, 64, F32),
-        (256, 256, 64, F16),
+        (128, 256, 128, F32),
+        (128, 256, 128, F16),
     ],
 )
 def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: DataType, monkeypatch):
-    """An F16×F16 matmul compiled via the MMA path agrees with the f32
-    reference within fp16 tolerance — for both F16 and F32 output dtypes."""
+    """An F16×F16 matmul compiled via the mma.sync path agrees with the f32
+    reference within fp16 tolerance — for both F16 and F32 output dtypes.
+
+    Pins the warp-tier ``mma_m16n8k16_f16`` atom + a multi-warp 128×128
+    tile (``WM=2 WN=2 FM=4 FN=8 BK=2`` — N-tile = WN·FN·atom_n = 2·8·8 = 128,
+    M-tile = WM·FM·atom_m = 2·4·16 = 128). Single-warp mma.sync is pruned
+    (ldmatrix is smem→register only), so the pin forces the staged path."""
     from deplodock.compiler.ir.kernel.render import render_kernelop
 
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+    monkeypatch.setenv("DEPLODOCK_FM", "4")
+    monkeypatch.setenv("DEPLODOCK_FN", "8")
+    monkeypatch.setenv("DEPLODOCK_BK", "2")
 
     g = _matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16", "expected warp-tier MMA variant"
+    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16", "expected warp-tier mma.sync variant"
 
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
-    assert "wmma::mma_sync" in src
-    assert "#include <mma.h>" in src
+    assert "mma.sync.aligned.m16n8k16" in src, "the s16816 mma.sync instruction must be emitted"
+    assert "ldmatrix.sync.aligned" in src, "mma.sync operands must load via ldmatrix"
+    assert "wmma::" not in src, "the mma.sync path must not mix in legacy wmma intrinsics"
     # Accumulation is ALWAYS fp32 (matches cuBLAS / PyTorch fp16-GEMM
-    # precision; fp16 accumulate over a long K loses ~3-4 ulp per step).
-    # The ``mma_sync`` target fragment is declared ``float``, then for a
-    # narrower output buffer ``MmaStore`` downconverts via an epilogue
-    # (``__float2half`` element-wise into a half ``store_matrix_sync``
-    # fragment). For F32 output no downconvert is emitted.
-    assert "wmma::accumulator, 16, 16, 16, float" in src, "accumulator must be fp32"
-    assert ".num_elements" in src if out_dtype == F16 else True
+    # precision). For an F16 output buffer the per-lane epilogue downconverts
+    # the fp32 accumulator via the vectorized ``__floats2half2_rn`` store.
     if out_dtype == F16:
-        # Downconvert epilogue present (fp32 acc → __half store fragment).
-        assert "__float2half" in src
-        assert "wmma::accumulator, 16, 16, 16, half" in src  # the store-side downconvert fragment
+        assert "__floats2half2_rn" in src, "f16 output needs the fp32→fp16 __half2 downconvert epilogue"
     else:
-        # F32 output stores the accumulator directly — no half fragment,
-        # no downconvert loop.
-        assert "__float2half" not in src
-        assert "wmma::accumulator, 16, 16, 16, half" not in src
+        assert "__floats2half2_rn" not in src
 
     # Launch through the real backend (``CudaBackend.run`` → ``run_program``)
     # rather than a hand-rolled ``RawModule`` call. The warp-tier picker may
@@ -183,27 +184,29 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     assert diff < tol, f"M={M} N={N} K={K} out={out_dtype.name} max-abs-err {diff}"
 
 
-@pytest.mark.skipif(not _supports_wmma(), reason="WMMA needs CUDA + sm_70+")
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_mma_default_on_picks_warp_variant(monkeypatch):
     """With DEPLODOCK_MMA defaulted ON (config.mma_enabled defaults True),
-    a no-env run of an MMA-eligible F16 matmul still emits the warp variant.
-    Guards against accidental default flips and confirms priority ordering
-    (warp variants outrank scalar in the fork tree)."""
+    a no-env run of an MMA-eligible multi-warp F16 matmul still emits the
+    warp variant. Guards against accidental default flips and confirms
+    priority ordering (warp variants outrank scalar in the fork tree).
+    mma.sync auto-enumerates on sm_90+; the 128² shape is multi-warp so it
+    survives the single-warp prune."""
     monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
 
-    g = _matmul_graph(M=64, N=64, K=64, out_dtype=F16)
+    g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16", "MMA should be on by default"
+    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16", "MMA should be on by default"
 
 
-@pytest.mark.skipif(not _supports_wmma(), reason="WMMA needs CUDA + sm_70+")
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_mma_disabled_falls_back_to_scalar(monkeypatch):
     """When DEPLODOCK_MMA=0 is set explicitly, the planner drops the
     warp-tier branch and emits only scalar register-tile variants."""
     monkeypatch.setenv("DEPLODOCK_MMA", "0")
 
-    g = _matmul_graph(M=64, N=64, K=64, out_dtype=F16)
+    g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
     assert kop.knobs.get("ATOM_KIND") is None, "MMA variant should not be emitted when DEPLODOCK_MMA=0"

@@ -3,8 +3,14 @@
 For each ``StageBundle`` with ``policy in {BUFFERED, ASYNC}`` (i.e.
 ring-buffered cooperative-load OR cp.async) inside a
 ``SerialTile(serial_outer)``, switch ``policy`` to ``TMA`` (keeping
-``buffer_count`` / ``phase`` / ``pipeline_depth``; ``swizzle`` stays
-NONE) when every member ``Stage`` is TMA-eligible. Running on
+``buffer_count`` / ``phase`` / ``pipeline_depth``; the *bundle*
+``swizzle`` stays NONE) when every member ``Stage`` is TMA-eligible.
+On the mma.sync atom (``_is_mma_sync_kernel``) the per-``Source``
+swizzle mode is stamped instead (``_stamp_source_swizzle``: A=B64 /
+B=B128 from the inner-row byte span) — the bundle stays NONE because A
+and B share it but need distinct modes; the materializer reads
+``src.swizzle`` into each TmaDescriptor (S2 of
+plans/mma-sync-smem-swizzle.md). Running on
 BUFFERED directly (the post-``040_use_ring_buffers`` state) means the
 rule fires before ``060_use_async_copy`` would promote to ASYNC —
 otherwise the file ordering (050 < 060) leaves 050 staring at SYNC /
@@ -55,11 +61,13 @@ from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     SerialTile,
+    Source,
     Stage,
     StageBundle,
     StagePolicy,
     SwizzleMode,
     TileOp,
+    pick_swizzle_atom,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -160,18 +168,39 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
 
-    new_body, changed = _walk(body)
+    # Per-source swizzle (S2 of plans/mma-sync-smem-swizzle.md) is stamped
+    # only on mma.sync kernels — their explicit-ldmatrix consumer can read a
+    # swizzled slab; WMMA's opaque ``load_matrix_sync`` cannot, so its sources
+    # stay NONE. The atom kind rides on the TileOp knobs.
+    swizzle = _is_mma_sync_kernel(root.op.knobs.get("ATOM_KIND"))
+    # Per-buffer element byte width from the graph. The tile-stage ``Source``
+    # has no ``dtype`` yet (``030_stamp_types`` is a kernel pass that runs AFTER
+    # this), so ``src.dtype`` would fall back to the fp32 ``BYTES_PER_ELEM`` and
+    # mis-pick the swizzle atom (a 32-elem fp16 inner = 64 B → B64, but read as
+    # 4 B/elem = 128 B → wrongly B128, whose box the descriptor can't satisfy →
+    # TMA deadlock). Read the true element size off the gmem node here.
+    dtype_bytes = {nid: node.output.dtype.nbytes for nid, node in match.graph.nodes.items()}
+    new_body, changed = _walk(body, swizzle=swizzle, dtype_bytes=dtype_bytes)
     if not changed:
         _fail("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
 
 
-def _walk(body: Body) -> tuple[Body, bool]:
+def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
+    """True iff ``atom_kind`` names an ``instruction="mma_sync"`` AtomSpec."""
+    if not atom_kind:
+        return False
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY, atom_spec  # noqa: PLC0415
+
+    return atom_kind in ATOM_REGISTRY and atom_spec(atom_kind).instruction == "mma_sync"
+
+
+def _walk(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:
     out: list[Stmt] = []
     changed = False
     for s in body:
         if isinstance(s, SerialTile) and s.kind == "serial_outer":
-            new_kouter_body, sub = _promote_in_kouter(s.body)
+            new_kouter_body, sub = _promote_in_kouter(s.body, swizzle=swizzle, dtype_bytes=dtype_bytes)
             if sub:
                 s = SerialTile(axis=s.axis, body=new_kouter_body, kind=s.kind, unroll=s.unroll)
                 changed = True
@@ -182,7 +211,7 @@ def _walk(body: Body) -> tuple[Body, bool]:
             new_bodies = []
             sub_changed = False
             for b in nested:
-                nb, c = _walk(b)
+                nb, c = _walk(b, swizzle=swizzle, dtype_bytes=dtype_bytes)
                 new_bodies.append(nb)
                 sub_changed = sub_changed or c
             if sub_changed:
@@ -192,12 +221,12 @@ def _walk(body: Body) -> tuple[Body, bool]:
     return Body(tuple(out)), changed
 
 
-def _promote_in_kouter(body: Body) -> tuple[Body, bool]:
+def _promote_in_kouter(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:
     out: list[Stmt] = []
     changed = False
     for s in body:
         if isinstance(s, StageBundle) and s.policy in _PROMOTABLE:
-            out.append(_promote(s))
+            out.append(_promote(s, swizzle=swizzle, dtype_bytes=dtype_bytes))
             changed = True
         else:
             out.append(s)
@@ -229,16 +258,70 @@ def _split_multi_source_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
     return tuple(out)
 
 
-def _promote(bundle: StageBundle) -> StageBundle:
+def _promote(bundle: StageBundle, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> StageBundle:
+    stages = _split_multi_source_stages(bundle.stages)
+    if swizzle:
+        stages = tuple(_stamp_source_swizzle(stage, dtype_bytes or {}) for stage in stages)
     return StageBundle(
-        stages=_split_multi_source_stages(bundle.stages),
+        stages=stages,
         body=bundle.body,
         policy=StagePolicy.TMA,
         buffer_count=bundle.buffer_count,
         phase=bundle.phase,
         pipeline_depth=bundle.pipeline_depth,
+        # Bundle-level swizzle stays NONE — the mode is per-Source (A=B64,
+        # B=B128) because A and B share this bundle (S2 of
+        # plans/mma-sync-smem-swizzle.md). The materializer reads
+        # ``src.swizzle`` into each TmaDescriptor.
         swizzle=SwizzleMode.NONE,
     )
+
+
+def _source_inner_elems(src: Source) -> int:
+    """Collapsed inner-row element span of ``src``'s slab — the product of
+    ``(cache_extent × block)`` over every cache axis mapping to the innermost
+    *source* dim.
+
+    The inner source dim is ``max(dims)`` — the highest (contiguous, fastest-
+    varying) source-buffer dim swept by any cache axis — NOT ``dims[-1]``. The
+    cache axes are stored in slab-layout order, which for the mma.sync A
+    operand puts the K (contiguous) axis FIRST and the M axes last, so
+    ``dims = (1, 0, 0)`` and ``dims[-1]`` would pick the M dim (128 elems →
+    wrongly B128) instead of K (32 elems → B64). Keying on ``max(dims)``
+    matches the materializer's ``box[-1] = full_box[max(kept)]`` so S2's mode
+    pick agrees with S1's box reshape (a disagreement makes the descriptor's
+    swizzle mode claim a width its box doesn't have → TMA copy deadlock)."""
+    addressing = src.addressing
+    assert isinstance(addressing, AffineAddressing)
+    dims = addressing.dims
+    block = addressing.block
+    inner_dim = max(dims)
+    inner = 1
+    for i, (d, ax) in enumerate(zip(dims, src.cache_axes, strict=True)):
+        if d == inner_dim:
+            b = block[i] if block else 1
+            inner *= ax.extent.as_static() * b
+    return inner
+
+
+def _stamp_source_swizzle(stage: Stage, dtype_bytes: dict[str, int]) -> Stage:
+    """Stamp each source's :class:`SwizzleMode` from its inner-row byte span.
+
+    ``dtype_bytes`` maps gmem buffer name → element byte width (from the graph
+    node, since the tile-stage ``Source.dtype`` isn't populated yet). Only
+    affine single-source transport stages can swizzle (the box reshape needs
+    ``AffineAddressing``); compute / template sources are left NONE."""
+    if stage.compute is not None:
+        return stage
+    new_sources = []
+    for src in stage.sources:
+        if not isinstance(src.addressing, AffineAddressing):
+            new_sources.append(src)
+            continue
+        elem_bytes = dtype_bytes.get(src.buf, BYTES_PER_ELEM)
+        _, mode = pick_swizzle_atom(_source_inner_elems(src), elem_bytes)
+        new_sources.append(replace(src, swizzle=mode))
+    return stage.replace_sources(tuple(new_sources))
 
 
 def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]]) -> bool:

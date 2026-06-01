@@ -183,7 +183,7 @@ def test_mma_path_skipped(monkeypatch):
     """``ATOM_KIND`` set (MMA path) → skip; MMA SPLITK stays on the
     codegen-derived atomic rewrite."""
     monkeypatch.delenv("DEPLODOCK_ATOMIC_FREE_SPLITK", raising=False)
-    op = _matmul_tileop(knobs={"ATOM_KIND": "wmma_m16n16k16_f16"})
+    op = _matmul_tileop(knobs={"ATOM_KIND": "mma_m16n8k16_f16"})
     with pytest.raises(RuleSkipped, match="MMA TileOp"):
         _rewrite(op)
 

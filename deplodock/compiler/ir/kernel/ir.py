@@ -521,56 +521,51 @@ class WarpShuffle(Stmt):
 
 
 # ---------------------------------------------------------------------------
-# MMA fragment Stmts — tensor-core hardware primitives per
-# plans/mma-fragment-factorization.md M4. Emitted by the MMA cell
-# materializer (kernel/010_split_register_axes MMA arm) and rendered as
-# wmma::* intrinsics (NVRTC ships <mma.h>; see plan's NVRTC probe).
-#
-# Future async kinds (wgmma, NVFP4) add sibling Stmts (MmaIssue / MmaWait /
-# MmaScaledSync) rather than overloading these.
+# Warp-level MMA: ``mma.sync.aligned`` + ``ldmatrix`` (the ``s16816`` path
+# cuBLAS / CUTLASS use) — the sole tensor-core Stmt family. Operands are
+# *explicit per-thread register arrays* with a PTX-fixed lane→element layout,
+# referenced positionally inside inline PTX (``RegFragment`` / ``LdmatrixLoad``
+# / ``MmaSyncPtx`` / ``RegStore``), rendered via the ``_MMA_SYNC_PRELUDE``
+# helper wrappers (pure PTX — NVRTC-clean, no ``<mma.h>``). Emitted by
+# ``kernel/005_lower_atom_tile`` for an ``instruction="mma_sync"`` AtomSpec.
+# (The opaque ``nvcuda::wmma`` node family was removed — the swizzled mma.sync
+# slab beat it; see plans/mma-sync-smem-swizzle.md.)
 # ---------------------------------------------------------------------------
 
 
-def _wmma_matrix_tag(role: str) -> str:
-    """Map an MMA operand role to its ``wmma::matrix_a/b/accumulator`` tag."""
+def _mma_sync_nregs(role: str, shape: tuple[int, int, int]) -> int:
+    """Per-lane register count for an mma.sync operand of cell ``shape``.
+
+    ``a`` (M×K f16) and ``b`` (K×N f16) pack two halfs per 32-bit register;
+    ``c`` (M×N f32) holds one float per register. For ``m16n8k16``:
+    ``a[4]`` (256 halfs / 32 lanes / 2), ``b[2]`` (128 / 32 / 2), ``c[4]``
+    (128 f32 / 32)."""
+    m, n, k = shape
     if role == "a":
-        return "wmma::matrix_a"
+        return (m * k) // 64
     if role == "b":
-        return "wmma::matrix_b"
+        return (k * n) // 64
     if role == "c":
-        return "wmma::accumulator"
-    raise ValueError(f"MmaFragment: unsupported role {role!r}; expected 'a', 'b', or 'c'")
-
-
-def _wmma_dtype(dtype: DataType) -> str:
-    """CUDA C dtype name for ``wmma::fragment``'s template parameter."""
-    if dtype.name == "f16":
-        return "half"
-    if dtype.name == "f32":
-        return "float"
-    if dtype.name == "bf16":
-        return "__nv_bfloat16"
-    raise ValueError(f"MmaFragment: unsupported dtype {dtype.name!r}")
+        return (m * n) // 32
+    raise ValueError(f"mma.sync: unsupported role {role!r}; expected 'a', 'b', or 'c'")
 
 
 @dataclass(frozen=True)
-class MmaFragment(Stmt):
-    """Declare a ``wmma::fragment<...> name;`` register block.
+class RegFragment(Stmt):
+    """Declare an mma.sync per-thread register array.
 
-    One per matmul operand role (``"a"`` / ``"b"`` / ``"c"``). ``shape``
-    is the MMA cell ``(M, N, K)``; ``dtype`` is the per-operand element
-    dtype from :data:`_atom.ATOM_REGISTRY[kind].operand_dtypes`. The
-    fragment's data lives in registers, distributed across the warp's
-    32 lanes — accessed only through ``MmaLoad`` / ``MmaSync`` /
-    ``MmaStore``. ``name`` is a fresh SSA binding visible in the
-    enclosing scope.
-    """
+    Unlike the opaque ``wmma::fragment``, mma.sync multiplicands are
+    explicit per-lane register arrays — ``unsigned a[4]`` / ``unsigned
+    b[2]`` (f16, two halfs per 32-bit reg) — and the accumulator is
+    ``float c[4]`` (f32). ``shape`` is the cell ``(M, N, K)``; the count
+    derives from ``shape`` + ``role`` via :func:`_mma_sync_nregs`. The
+    ``c`` array is zero-initialised at declaration, so the mma.sync path
+    needs no separate ``MmaFill``."""
 
     name: str
     role: str  # "a" / "b" / "c"
     shape: tuple[int, int, int]
     dtype: DataType
-    layout: str = "row_major"  # "row_major" / "col_major"; ignored for accumulator role
 
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
@@ -580,85 +575,66 @@ class MmaFragment(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         m, n, k = self.shape
-        return [f"{indent}MmaFragment {self.role}:{self.dtype.name} {self.name} ({m}x{n}x{k}, {self.layout})"]
+        return [f"{indent}RegFragment {self.role}:{self.dtype.name} {self.name}[{_mma_sync_nregs(self.role, self.shape)}] ({m}x{n}x{k})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        m, n, k = self.shape
-        tag = _wmma_matrix_tag(self.role)
-        elem = _wmma_dtype(self.dtype)
+        n_regs = _mma_sync_nregs(self.role, self.shape)
         ctx.ssa_dtypes[self.name] = self.dtype.name
         if self.role == "c":
-            # Accumulator fragments are layout-free in the type signature.
-            return [f"{_pad(ctx.indent)}wmma::fragment<{tag}, {m}, {n}, {k}, {elem}> {self.name};"]
-        return [f"{_pad(ctx.indent)}wmma::fragment<{tag}, {m}, {n}, {k}, {elem}, wmma::{self.layout}> {self.name};"]
+            zeros = ", ".join(["0.0f"] * n_regs)
+            return [f"{_pad(ctx.indent)}float {self.name}[{n_regs}] = {{{zeros}}};"]
+        return [f"{_pad(ctx.indent)}unsigned {self.name}[{n_regs}];"]
+
+
+# Per-lane fp16 element XOR matching the TMA hardware smem swizzle (S3 of
+# plans/mma-sync-smem-swizzle.md). The producer (cuTensorMapEncodeTiled with
+# SWIZZLE_{128,64,32}B) permutes 16-byte (8-fp16) chunks within each swizzle
+# row by the row-index-mod-2^B; the ldmatrix consumer must apply the same
+# permutation to its per-lane element offset. All three modes are CUTLASS
+# ``Swizzle<B,4,3>`` (M=4 → 16-byte base, S=3 → 8-row tile), differing ONLY in
+# B (3/2/1 XORed bits). In bytes the swizzle is
+# ``off ^= ((off >> (M+S)) & (2^B-1)) << M`` = ``((off >> 7) & mask) << 4``;
+# halving to fp16 elements turns ``>> 7`` into ``>> 6`` and ``<< 4`` into
+# ``<< 3`` — so the element shift is 6 for EVERY mode (a per-mode shift of
+# 6/5/4 silently corrupts B64/B32 while leaving B128 correct, which is easy to
+# miss since B128 dominates). Only the row mask changes: 0x7 / 0x3 / 0x1. The
+# 8-row × atom period divides the slab + slot strides, so the XOR is correct
+# measured from the buffer base. Maps mode → (element shift, row mask); the
+# chunk delta is always ``<< 3``.
+_LDMATRIX_SWIZZLE_XOR: dict[str, tuple[int, int]] = {
+    "B128": (6, 0x7),
+    "B64": (6, 0x3),
+    "B32": (6, 0x1),
+}
 
 
 @dataclass(frozen=True)
-class MmaFill(Stmt):
-    """``wmma::fill_fragment(frag, value);`` — zero the accumulator (or
-    init to ``Accum``'s identity).
+class LdmatrixLoad(Stmt):
+    """``ldmatrix.sync.aligned.m8n8.x{2,4}[.trans].b16`` — load one operand
+    fragment from smem into a per-thread register array.
 
-    The fragment is *modified* by this Stmt (it writes the fill value into
-    every lane of the warp-distributed fragment register block). Treated
-    as a definition in the SSA sense for the per-cell replicator, mirroring
-    how ``Init`` defines its target accumulator — without this, the
-    replicator would leave a single MmaFill alongside per-cell MmaLoads
-    that each read the same fragment SSA name.
-    """
-
-    frag: str
-    value: float = 0.0
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}MmaFill({self.frag}, {self.value})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        # The fragment's element dtype was registered by ``MmaFragment.render``;
-        # look it up so the fill value matches WMMA's template parameter
-        # (``wmma::fill_fragment<T>`` requires the value to be ``T``, so an
-        # f16 accumulator needs ``__float2half(...)`` not a bare ``float``).
-        frag_dt = ctx.ssa_dtypes.get(self.frag, "f32")
-        if frag_dt == "f16":
-            value_expr = f"__float2half({self.value!r}f)"
-        elif frag_dt == "bf16":
-            value_expr = f"__float2bfloat16({self.value!r}f)"
-        else:
-            value_expr = f"{self.value!r}f"
-        return [f"{_pad(ctx.indent)}wmma::fill_fragment({self.frag}, {value_expr});"]
-
-
-@dataclass(frozen=True)
-class MmaLoad(Stmt):
-    """``wmma::load_matrix_sync(frag, &<buffer>[offset], ldm);``
-
-    Loads one fragment from a contiguous source buffer (smem or gmem).
-    ``src_buffer`` names the buffer (string — resolved through
-    ``ctx.buffer_dtypes`` / ``ctx.shapes``). ``src_index`` is the
-    multidim offset (Expr tuple) — the base of the fragment's M×K (a) /
-    K×N (b) / M×N (c) tile. ``ldm`` is the leading-dimension stride
-    *in elements*; ``0`` means "resolve at render time from the source
-    buffer's last shape dim" — the typical case for row-major buffers
-    where ldm equals the inner extent. All 32 lanes of the warp must
-    reach this Stmt with identical arguments.
-    """
+    ``frag`` is the destination :class:`RegFragment`; ``src_buffer`` /
+    ``src_index`` are the cell's smem tile base (the same ``(buffer,
+    base-offset)`` ``_mma_src_index`` computes for the WMMA path); ``ldm``
+    is the smem row stride in elements. Each lane derives its own row
+    address from its warp lane id (``threadIdx.x & 31``): the 16×K ``a``
+    tile uses ``x4`` (``row = lane%16``, K-col block ``(lane/16)*8``); the
+    K×8 ``b`` tile uses ``x2.trans`` (``row = lane%16``) so a row-major
+    smem slab feeds the mma's col-major B operand. ldmatrix is **smem
+    only** — the mma.sync path never loads from gmem (``005_lower_atom_tile``
+    requires a staged source)."""
 
     frag: str
     src_buffer: str
     src_index: tuple
+    role: str  # "a" → x4; "b" → x2.trans
     ldm: int = 0
+    swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
 
     def defines(self) -> tuple[str, ...]:
-        # MmaLoad writes the fragment's distributed register block — treat
-        # as a definition for the per-cell replicator's SSA def-use walk.
         return (self.frag,)
 
     def external_reads(self) -> tuple[str, ...]:
@@ -669,76 +645,88 @@ class MmaLoad(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.src_index)
-        ldm = self.ldm or "auto"
-        return [f"{indent}MmaLoad {self.frag} <- {self.src_buffer}[{idx}], ldm={ldm}"]
+        variant = "x4" if self.role == "a" else "x2.trans"
+        return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}, ldm={self.ldm or 'auto'})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
 
         flat = render_index(self.src_buffer, self.src_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.src_buffer, ctx)
-        return [f"{_pad(ctx.indent)}wmma::load_matrix_sync({self.frag}, &{self.src_buffer}[{flat}], {ldm});"]
+        lane = "(threadIdx.x & 31)"
+        if self.role == "a":
+            # 16×16 A: x4 — lane addresses M-row (lane%16), K-col block (lane/16)*8.
+            elem = f"{flat} + ({lane} % 16) * {ldm} + ({lane} / 16) * 8"
+            addr = self._swizzled_addr(elem)
+            return [f"{_pad(ctx.indent)}dpl_ldmatrix_x4({self.frag}, {addr});"]
+        # 16×8 B: x2.trans — lane addresses K-row (lane%16); .trans yields col-major.
+        elem = f"{flat} + ({lane} % 16) * {ldm}"
+        addr = self._swizzled_addr(elem)
+        return [f"{_pad(ctx.indent)}dpl_ldmatrix_x2_trans({self.frag}, {addr});"]
+
+    def _swizzled_addr(self, elem: str) -> str:
+        params = _LDMATRIX_SWIZZLE_XOR.get(self.swizzle)
+        if params is None:
+            return f"&{self.src_buffer}[{elem}]"
+        shift, mask = params
+        # ``e ^ (((e >> shift) & mask) << 3)`` reproduces the TMA chunk swizzle.
+        return f"&{self.src_buffer}[({elem}) ^ (((({elem}) >> {shift}) & {mask}) << 3)]"
 
 
 @dataclass(frozen=True)
-class MmaSync(Stmt):
-    """``wmma::mma_sync(c, a, b, c);`` — one tensor-core MMA instruction.
+class MmaSyncPtx(Stmt):
+    """``mma.sync.aligned.m{M}n{N}k{K}.row.col.f32.{ab}.{ab}.f32`` — one
+    tensor-core MMA via inline PTX (the ``s16816`` instruction).
 
-    Synchronous semantics (WMMA): every lane participates; the result
-    lands in ``c_frag``'s distributed registers. Hopper+ async variants
-    (``wgmma_*``) get their own ``MmaIssue`` / ``MmaWait`` Stmts.
-    """
+    ``c_frag`` is the f32 accumulator array (both input and output —
+    ``d = a·b + c``); ``a_frag`` / ``b_frag`` are the 16-bit multiplicand
+    arrays filled by :class:`LdmatrixLoad`. ``shape`` spells the M/N/K.
+    ``ab_dtype`` (``"f16"`` / ``"bf16"``) tags the operand element type —
+    f16 and bf16 share the same fragment layout + ldmatrix path and differ
+    only in the PTX instruction's dtype field, so the render just picks the
+    matching ``dpl_mma_…`` wrapper. The accumulate is always f32."""
 
     c_frag: str
     a_frag: str
     b_frag: str
+    shape: tuple[int, int, int]
+    ab_dtype: str = "f16"
 
     def deps(self) -> tuple[str, ...]:
         return (self.c_frag, self.a_frag, self.b_frag)
 
     def defines(self) -> tuple[str, ...]:
-        # ``mma_sync`` updates c_frag in-place (``c += a @ b``) — treat as a
-        # definition like :class:`Accum` does for its scalar accumulator.
+        # Accumulates into c_frag in place — a definition, like MmaSync.
         return (self.c_frag,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}MmaSync {self.c_frag} += {self.a_frag} @ {self.b_frag}"]
+        m, n, k = self.shape
+        return [f"{indent}MmaSyncPtx {self.c_frag} += {self.a_frag} @ {self.b_frag} (m{m}n{n}k{k} {self.ab_dtype})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        return [f"{_pad(ctx.indent)}wmma::mma_sync({self.c_frag}, {self.a_frag}, {self.b_frag}, {self.c_frag});"]
+        m, n, k = self.shape
+        # ``c`` is passed for both the ``d`` (out) and ``c`` (in) operands.
+        return [f"{_pad(ctx.indent)}dpl_mma_m{m}n{n}k{k}_{self.ab_dtype}({self.c_frag}, {self.a_frag}, {self.b_frag}, {self.c_frag});"]
 
 
 @dataclass(frozen=True)
-class MmaStore(Stmt):
-    """``wmma::store_matrix_sync(&<buffer>[offset], frag, ldm, layout);``
+class RegStore(Stmt):
+    """Store an mma.sync f32 accumulator array to the output buffer with a
+    per-lane epilogue downconvert.
 
-    Stores one accumulator fragment to gmem or smem. ``dst_buffer`` /
-    ``dst_index`` mirror :class:`MmaLoad`. ``layout`` is the destination
-    memory layout (``"row_major"`` / ``"col_major"``).
-
-    **fp32-accumulate downconvert.** WMMA's ``store_matrix_sync`` requires
-    the accumulator fragment's element type to match the destination
-    pointer's element type — so an ``fp32`` accumulator can't be stored
-    directly into a ``__half*`` buffer. The lowering accumulates in fp32
-    by default (matching cuBLAS / PyTorch fp16-GEMM precision; fp16
-    accumulate over a long K loses ~3-4 ulp per step). When the fragment
-    dtype (``ctx.ssa_dtypes[frag]``) differs from the destination buffer
-    dtype (``ctx.buffer_dtypes[dst_buffer]``), :meth:`render` emits an
-    epilogue downconvert: declare a destination-dtype accumulator
-    fragment, element-wise convert ``frag.x[i]`` into it, then
-    ``store_matrix_sync`` that. ``shape`` carries the atom cell ``(M, N, K)``
-    so the converted fragment can be declared with matching template args.
-    ``None`` keeps the legacy same-dtype direct-store path (used by tests
-    that build MmaStore by hand and by genuine fp32-output kernels where
-    no conversion is needed).
-    """
+    mma.sync has no ``store_matrix_sync`` — each lane owns 4 elements of
+    the M×N=16×8 C tile (rows ``g`` / ``g+8`` with ``g = lane/4``, cols
+    ``(lane%4)*2 + {0,1}``) and writes them directly. ``frag`` is the f32
+    ``float c[4]``; when the destination buffer is narrower (``__half*``)
+    each value is converted via ``__float2half`` (mirrors
+    :class:`MmaStore`'s downconvert). ``ldm`` is the output row stride
+    (N) — ``0`` auto-resolves from the buffer's inner extent."""
 
     dst_buffer: str
     dst_index: tuple
     frag: str
+    shape: tuple[int, int, int]
     ldm: int = 0
-    layout: str = "row_major"
-    shape: tuple[int, int, int] | None = None
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -751,32 +739,40 @@ class MmaStore(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.dst_index)
-        ldm = self.ldm or "auto"
-        return [f"{indent}MmaStore {self.dst_buffer}[{idx}] <- {self.frag}, ldm={ldm} ({self.layout})"]
+        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag} (ldm={self.ldm or 'auto'})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
 
         flat = render_index(self.dst_buffer, self.dst_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.dst_buffer, ctx)
-        frag_dt = ctx.ssa_dtypes.get(self.frag, "f32")
         dst_dt = ctx.buffer_dtypes.get(self.dst_buffer, "f32")
         pad = _pad(ctx.indent)
-        # Same-dtype (incl. fp32→fp32, or a legacy hand-built MmaStore with
-        # no shape): direct store, no conversion.
-        if frag_dt == dst_dt or self.shape is None:
-            return [f"{pad}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {self.frag}, {ldm}, wmma::mem_{self.layout});"]
-        # fp32 accumulator → narrower destination (fp16 / bf16): declare a
-        # destination-dtype accumulator fragment, convert element-wise, store.
-        m, n, k = self.shape
-        dst_elem = {"f16": "half", "bf16": "__nv_bfloat16", "f32": "float"}.get(dst_dt, "half")
-        conv = {"f16": "__float2half", "bf16": "__float2bfloat16"}.get(dst_dt, "__float2half")
-        out_frag = f"{self.frag}_st"
+        lane = "(threadIdx.x & 31)"
+        # C is 16×8: lane owns (row g, cols 2t,2t+1) and (row g+8, cols 2t,2t+1)
+        # with g = lane/4, t = lane%4. The two cols per row are CONTIGUOUS, so
+        # each row's pair is one vectorized 4-byte store (``__half2`` / ``float2``)
+        # rather than two scalar stores — halves the epilogue store count and
+        # the address arithmetic. ldm strides over N (the output row width). The
+        # base ``flat`` is tile-aligned and ``2t`` is even, so the pair is
+        # 4-/8-byte aligned. The ``{ }`` block scopes _g/_t per RegStore.
+        vec2 = {"f16": "__half2", "bf16": "__nv_bfloat162", "f32": "float2"}.get(dst_dt)
+        if vec2 is not None:
+            packer = {"f16": "__floats2half2_rn", "bf16": "__floats2bfloat162_rn", "f32": "make_float2"}[dst_dt]
+            lo = f"{flat} + _g * {ldm} + _t * 2"
+            hi = f"{flat} + (_g + 8) * {ldm} + _t * 2"
+            return [
+                f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{lo}]) = {packer}({self.frag}[0], {self.frag}[1]);",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{hi}]) = {packer}({self.frag}[2], {self.frag}[3]); }}",
+            ]
+        # Fallback: per-element scalar stores (dtypes without a 2-vector packer).
         return [
-            f"{pad}wmma::fragment<wmma::accumulator, {m}, {n}, {k}, {dst_elem}> {out_frag};",
-            f"{pad}#pragma unroll",
-            f"{pad}for (int _t = 0; _t < {self.frag}.num_elements; _t++) {out_frag}.x[_t] = {conv}({self.frag}.x[_t]);",
-            f"{pad}wmma::store_matrix_sync(&{self.dst_buffer}[{flat}], {out_frag}, {ldm}, wmma::mem_{self.layout});",
+            f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {self.frag}[0];",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {self.frag}[1];",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {self.frag}[2];",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {self.frag}[3]; }}",
         ]
 
 
@@ -1110,38 +1106,37 @@ def _(s: WarpShuffle, rename, sigma, axis_fn):
 # Expr-typed offset fields through ``sigma.apply``.
 
 
-@_rewrite.register
-def _(s: MmaFragment, rename, sigma, axis_fn):
-    return MmaFragment(name=rename(s.name), role=s.role, shape=s.shape, dtype=s.dtype, layout=s.layout)
+# --- mma.sync (s16816) register-array rewrites -----------------------------
 
 
 @_rewrite.register
-def _(s: MmaFill, rename, sigma, axis_fn):
-    return MmaFill(frag=rename(s.frag), value=s.value)
+def _(s: RegFragment, rename, sigma, axis_fn):
+    return RegFragment(name=rename(s.name), role=s.role, shape=s.shape, dtype=s.dtype)
 
 
 @_rewrite.register
-def _(s: MmaLoad, rename, sigma, axis_fn):
-    return MmaLoad(
+def _(s: LdmatrixLoad, rename, sigma, axis_fn):
+    return LdmatrixLoad(
         frag=rename(s.frag),
         src_buffer=s.src_buffer,
         src_index=tuple(sigma.apply(e) for e in s.src_index),
+        role=s.role,
         ldm=s.ldm,
+        swizzle=s.swizzle,
     )
 
 
 @_rewrite.register
-def _(s: MmaSync, rename, sigma, axis_fn):
-    return MmaSync(c_frag=rename(s.c_frag), a_frag=rename(s.a_frag), b_frag=rename(s.b_frag))
+def _(s: MmaSyncPtx, rename, sigma, axis_fn):
+    return MmaSyncPtx(c_frag=rename(s.c_frag), a_frag=rename(s.a_frag), b_frag=rename(s.b_frag), shape=s.shape, ab_dtype=s.ab_dtype)
 
 
 @_rewrite.register
-def _(s: MmaStore, rename, sigma, axis_fn):
-    return MmaStore(
+def _(s: RegStore, rename, sigma, axis_fn):
+    return RegStore(
         dst_buffer=s.dst_buffer,
         dst_index=tuple(sigma.apply(e) for e in s.dst_index),
         frag=rename(s.frag),
-        ldm=s.ldm,
-        layout=s.layout,
         shape=s.shape,
+        ldm=s.ldm,
     )

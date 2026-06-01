@@ -14,10 +14,10 @@ consumed by the MMA materializer``.
 The M2 fix replaces the rebuild path with a **transform walk** that
 preserves every structural Stmt (StageBundle wraps, AsyncWait, K_o
 SerialTile, prologue/epilogue) and only rewrites reduce SerialTiles
-(body → Mma chain, ``is_reduce`` cleared) and Write (→ MmaStore). Two
-sub-fixes ride alongside:
+(body → ldmatrix + mma.sync chain, ``is_reduce`` cleared) and Write
+(→ RegStore). Two sub-fixes ride alongside:
 
-- **MmaLoad src_index phase prefix** — buffered slabs are
+- **LdmatrixLoad src_index phase prefix** — buffered slabs are
   ``[phase, *cache_axes]``-shaped; the consumer Load index in the IR
   carries the leading phase. ``_mma_src_index`` splices the prefix back
   in front of the computed cache coords so the fragment reads the right
@@ -59,7 +59,7 @@ from .conftest import requires_cuda
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
 # skipif reason) so they run sequentially on one worker — scattering CUDA
 # tests across xdist workers exhausts the single-GPU device context. The
-# per-test ``_supports_wmma`` skipif still gates the sm_70+ arch requirement.
+# per-test ``_supports_mma_sync`` skipif still gates the sm_80+ arch requirement.
 pytestmark = [requires_cuda]
 
 
@@ -72,13 +72,15 @@ def _has_cuda() -> bool:
         return False
 
 
-def _supports_wmma() -> bool:
+def _supports_mma_sync() -> bool:
+    """The s16816 ``mma.sync.aligned.m16n8k16`` op + ``ldmatrix`` need
+    sm_80+ (Ampere and later)."""
     if not _has_cuda():
         return False
     import cupy as cp
 
     cap = cp.cuda.Device().compute_capability
-    return int(cap) >= 70
+    return int(cap) >= 80
 
 
 def _matmul_loop_op(*, M: int, N: int, K: int) -> LoopOp:
@@ -137,10 +139,11 @@ def _cp_dtype(dt: DataType, cp):
 @pytest.fixture
 def pin_staged_pipelined(monkeypatch):
     """Pin the warp-tier knob set that exercises the staged + pipelined
-    cp.async MMA path: square WMMA atom (sm_70+), WM=WN=2 warps,
-    FM=FN=4 register cells, BK=2 K-stage_inner trip count → the picker
-    lands on the buffered-async path that ``080_pipeline_stages``
-    double-buffers via cp.async.
+    cp.async MMA path: s16816 mma.sync atom (sm_80+), WM=WN=2 warps,
+    FM=4 / FN=8 register cells (FN doubled vs the old WMMA pin since
+    atom_n=8, not 16, preserving the 128×128 tile), BK=2 K-stage_inner
+    trip count → the picker lands on the buffered-async path that
+    ``080_pipeline_stages`` double-buffers via cp.async.
 
     ``DEPLODOCK_TMA=0`` keeps this test focused on the cp.async lever
     even on sm_90+ where ``050_use_tma`` would otherwise promote the
@@ -155,11 +158,11 @@ def pin_staged_pipelined(monkeypatch):
     per-slot offsets instead of the ``a7 % 2`` phase Expr."""
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
     monkeypatch.setenv("DEPLODOCK_TMA", "0")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "wmma_m16n16k16_f16")
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "4")
+    monkeypatch.setenv("DEPLODOCK_FN", "8")
     monkeypatch.setenv("DEPLODOCK_BK", "2")
     monkeypatch.setenv("DEPLODOCK_BUFFER_COUNT", "2")
 
@@ -175,7 +178,7 @@ def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
     return g, kop, src
 
 
-@pytest.mark.skipif(not _supports_wmma(), reason="WMMA needs CUDA + sm_70+")
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("M,N,K", [(128, 128, 128), (256, 256, 128)])
 def test_staged_pipelined_matches_f32_reference(pin_staged_pipelined, M: int, N: int, K: int):
     """The staged + pipelined MMA path produces output that matches the
@@ -187,11 +190,11 @@ def test_staged_pipelined_matches_f32_reference(pin_staged_pipelined, M: int, N:
     from deplodock.compiler.backend.cuda.nvcc import compile_to_cubin  # noqa: PLC0415
 
     g, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
-    assert kop.knobs.get("ATOM_KIND") == "wmma_m16n16k16_f16"
+    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
     # The pinned BK=2 with buffer_count >= 2 must produce the cp.async-staged
     # pipelined MMA path — verified at the C source.
     assert "cp.async.commit_group" in src
-    assert "wmma::mma_sync" in src
+    assert "mma.sync.aligned.m16n8k16" in src
     assert "cp.async.wait_group" in src
 
     cap = cp.cuda.Device().compute_capability
@@ -210,7 +213,7 @@ def test_staged_pipelined_matches_f32_reference(pin_staged_pipelined, M: int, N:
     wm, wn = int(knobs["WM"]), int(knobs["WN"])
     fm, fn = int(knobs["FM"]), int(knobs["FN"])
     splitk = int(knobs.get("SPLITK", 1))
-    atom_m = atom_n = 16  # wmma_m16n16k16_f16
+    atom_m, atom_n = 16, 8  # mma_m16n8k16_f16
     m_b = max(1, M // (wm * fm * atom_m))
     n_b = max(1, N // (wn * fn * atom_n))
     grid_x = m_b * n_b * splitk
@@ -224,53 +227,54 @@ def test_staged_pipelined_matches_f32_reference(pin_staged_pipelined, M: int, N:
     assert diff < 1e-2, f"M={M} N={N} K={K} max-abs-err {diff}"
 
 
-@pytest.mark.skipif(not _supports_wmma(), reason="WMMA needs CUDA + sm_70+")
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_staged_pipelined_phase_prefix_renders(pin_staged_pipelined):
-    """The buffered-slab phase prefix lands on every ``wmma::load_matrix_sync``
-    offset (``[phase * stride + cache_coords]``). Pre-M2 ``_mma_src_index``
-    dropped the leading phase Expr; the load addressed slot 0 every iter,
-    racing with cp.async's writes to slot 1 → garbled output."""
+    """The buffered-slab phase prefix lands on every ``ldmatrix`` load offset
+    (``[phase * stride + cache_coords]``). Pre-M2 ``_mma_src_index`` dropped
+    the leading phase Expr; the load addressed slot 0 every iter, racing with
+    cp.async's writes to slot 1 → garbled output. The A operand loads through
+    ``dpl_ldmatrix_x4(in0_frag, &a_smem[...])`` and the B operand through
+    ``dpl_ldmatrix_x2_trans(in1_frag, &b_smem[...])``."""
     _, _, src = _compile_and_render(M=128, N=128, K=128, out_dtype=F32)
     # ``a7 % 2`` is the inner-K_o reduce's phase Expr (``a7`` is the K_o
-    # axis after axis renumbering); ``1`` (literal) is the epilogue's
-    # last-slot read. Both must appear in the rendered load offsets.
-    a_loads = re.findall(r"wmma::load_matrix_sync\(\w+, &a_smem\[([^\]]+)\]", src)
-    b_loads = re.findall(r"wmma::load_matrix_sync\(\w+, &b_smem\[([^\]]+)\]", src)
-    assert a_loads, "expected ≥1 a_smem load"
-    assert b_loads, "expected ≥1 b_smem load"
+    # axis after axis renumbering). It must appear in the rendered ldmatrix
+    # load offsets for both operand slabs.
+    a_loads = re.findall(r"dpl_ldmatrix_\w+\(\w+, &a_smem\[([^\]]+)\]", src)
+    b_loads = re.findall(r"dpl_ldmatrix_\w+\(\w+, &b_smem\[([^\]]+)\]", src)
+    assert a_loads, "expected ≥1 a_smem ldmatrix load"
+    assert b_loads, "expected ≥1 b_smem ldmatrix load"
     # At least one inner-loop load addresses the buffered slot via a
     # ``% 2`` phase factor on a_smem.
     assert any("% 2" in o for o in a_loads), f"a_smem loads missing phase prefix: {a_loads}"
     assert any("% 2" in o for o in b_loads), f"b_smem loads missing phase prefix: {b_loads}"
 
 
-@pytest.mark.skipif(not _supports_wmma(), reason="WMMA needs CUDA + sm_70+")
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_staged_pipelined_ab_classification(pin_staged_pipelined):
     """A vs B classification via ``Source.cache_dims`` — the cache axis
     whose ``axis.name == K_name`` has ``source_dim == 1`` for A (K is the
     inner gmem dim) or ``0`` for B (K is the outer gmem dim). Pre-M2 the
     classification used ``K_name in load.index[-1]`` which for staged
     slabs misses (K sits in the middle of the slab-coord tuple).
-    Smoke-test: the rendered ``mma_sync`` arguments end up as
-    ``mma_sync(c, a, b, c)`` with ``a`` referring to ``in1_frag`` (the
-    A operand loaded from ``a_smem``) and ``b`` to ``in0_frag`` (the B
-    operand loaded from ``b_smem``) — i.e. no swap."""
+    Smoke-test: the rendered ``dpl_mma_m16n8k16_f16(acc, a, b, acc)`` call
+    has ``a`` referring to the A operand fragment loaded from ``a_smem`` and
+    ``b`` to the B operand fragment loaded from ``b_smem`` — i.e. no swap."""
     _, _, src = _compile_and_render(M=128, N=128, K=128, out_dtype=F32)
-    # Find the first mma_sync call.
-    m = re.search(r"wmma::mma_sync\((\w+),\s*(\w+),\s*(\w+),\s*\1\)", src)
-    assert m is not None, "expected at least one mma_sync"
+    # Find the first mma.sync call: dpl_mma_m16n8k16_f16(acc, a, b, acc).
+    m = re.search(r"dpl_mma_m16n8k16_f16\((\w+),\s*(\w+),\s*(\w+),\s*\1\)", src)
+    assert m is not None, "expected at least one dpl_mma_m16n8k16_f16 call"
     _, a_arg, b_arg = m.groups()
     # The fragment SSA naming is order-dependent (pulled from the Load's
     # ``names[0]``), so we don't pin specific names. Instead verify the
-    # round-trip: find the wmma::load_matrix_sync that defined ``a_arg``
-    # and check it reads from ``a_smem`` (M-side gmem buffer); same for
-    # ``b_arg`` and ``b_smem``. Pre-M2 the classification keyed off
-    # ``K_name in load.index[-1]`` which for staged slabs misses (K sits
-    # in the middle of the slab-coord tuple), swapping A↔B and yielding
-    # ``mma_sync(c, b_frag, a_frag, c)`` — the K↔M↔N matmul indexing
-    # collapses to wrong output.
-    a_load_m = re.search(rf"wmma::load_matrix_sync\({re.escape(a_arg)}, &(\w+)\[", src)
-    b_load_m = re.search(rf"wmma::load_matrix_sync\({re.escape(b_arg)}, &(\w+)\[", src)
+    # round-trip: find the ldmatrix load that defined ``a_arg`` and check it
+    # reads from ``a_smem`` (M-side gmem buffer); same for ``b_arg`` and
+    # ``b_smem``. Pre-M2 the classification keyed off ``K_name in
+    # load.index[-1]`` which for staged slabs misses (K sits in the middle
+    # of the slab-coord tuple), swapping A↔B and yielding
+    # ``dpl_mma_m16n8k16_f16(acc, b_frag, a_frag, acc)`` — the K↔M↔N matmul
+    # indexing collapses to wrong output.
+    a_load_m = re.search(rf"dpl_ldmatrix_\w+\({re.escape(a_arg)}, &(\w+)\[", src)
+    b_load_m = re.search(rf"dpl_ldmatrix_\w+\({re.escape(b_arg)}, &(\w+)\[", src)
     assert a_load_m is not None and b_load_m is not None
     assert a_load_m.group(1) == "a_smem", f"a operand should load from a_smem, got {a_load_m.group(1)}"
     assert b_load_m.group(1) == "b_smem", f"b operand should load from b_smem, got {b_load_m.group(1)}"

@@ -103,29 +103,30 @@ def _matmul_graph(*, M: int = 64, N: int = 64, K: int = 64, dtype=F16) -> Graph:
     return g
 
 
-def test_wmma_eligibility_fires_on_f16_matmul():
-    """A TinyLlama-shape matmul (M=N=K=64, all multiples of 16) with F16
-    inputs and a sm_75 target satisfies every WMMA F16 gate."""
+def test_mma_eligibility_fires_on_f16_matmul():
+    """A TinyLlama-shape matmul (M=N=K=64; M%16==0, N%8==0, K%16==0) with
+    F16 inputs and a sm_80 target satisfies every mma.sync F16 gate."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    assert is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(7, 5)), graph=g)
+    assert is_atom_eligible("mma_m16n8k16_f16", loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
-def test_wmma_eligibility_rejects_f32_loads():
+def test_mma_eligibility_rejects_f32_loads():
     """F32 operands fall through the per-Load dtype check."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F32)
     loop_op = g.nodes["c"].op
-    assert not is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(7, 5)), graph=g)
+    assert not is_atom_eligible("mma_m16n8k16_f16", loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
-def test_wmma_eligibility_rejects_pre_volta():
-    """WMMA F16 needs sm_70+. Pascal (sm_60) fails the cc gate."""
+def test_mma_eligibility_rejects_pre_ampere():
+    """mma.sync.m16n8k16 needs sm_80+ (Ampere). Volta (sm_70) fails the cc
+    gate (min_cc=(8, 0))."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    assert not is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(6, 0)), graph=g)
+    assert not is_atom_eligible("mma_m16n8k16_f16", loop_op, _ctx(cc=(7, 0)), graph=g)
 
 
-def test_wmma_eligibility_rejects_non_matmul():
+def test_mma_eligibility_rejects_non_matmul():
     """A pointwise LoopOp has no matmul-reduce — ineligible for any MMA
     kind."""
     g = Graph()
@@ -134,16 +135,15 @@ def test_wmma_eligibility_rejects_non_matmul():
     g.add_node(op=op, inputs=["x"], output=Tensor("o", (64,), dtype=F16), node_id="o")
     g.inputs = ["x"]
     g.outputs = ["o"]
-    assert not is_atom_eligible("wmma_m16n16k16_f16", op, _ctx(cc=(8, 0)), graph=g)
+    assert not is_atom_eligible("mma_m16n8k16_f16", op, _ctx(cc=(8, 0)), graph=g)
 
 
-def test_wmma_eligibility_rejects_indivisible_extents():
-    """An output extent that isn't a multiple of 16 (e.g. M=63) can't
-    cover with M16N16K16 cells. Defer the per-BR check; gate the bare
-    16 here."""
+def test_mma_eligibility_rejects_indivisible_extents():
+    """An output extent that isn't a multiple of the atom dim (e.g. M=63,
+    not a multiple of 16) can't cover with m16n8k16 cells."""
     g = _matmul_graph(M=63, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    assert not is_atom_eligible("wmma_m16n16k16_f16", loop_op, _ctx(cc=(8, 0)), graph=g)
+    assert not is_atom_eligible("mma_m16n8k16_f16", loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
 def test_unregistered_kind_raises():
@@ -159,13 +159,11 @@ def test_unregistered_kind_raises():
 
 def test_v1_atom_kinds_priority_order():
     """The priority-ordered kinds tuple is the source of truth for the
-    planner's enumeration. M2 shipped WMMA square F16; M9 extends with
-    bf16 (Ampere+) and skewed F16 shapes for skinny matmuls."""
+    planner's enumeration. The s16816 ``mma.sync`` path is now the sole
+    tensor-core family (legacy WMMA removed): f16 first, then bf16."""
     assert _ATOM_KINDS_V1 == (
-        "wmma_m16n16k16_f16",
-        "wmma_m16n16k16_bf16",
-        "wmma_m8n32k16_f16",
-        "wmma_m32n8k16_f16",
+        "mma_m16n8k16_f16",
+        "mma_m16n8k16_bf16",
     )
     for kind in _ATOM_KINDS_V1:
         assert kind in ATOM_REGISTRY
@@ -174,10 +172,10 @@ def test_v1_atom_kinds_priority_order():
 def test_registry_spec_shape_and_group_size():
     """Sanity-check the seeded spec — its shape drives M/N/K divisibility
     and its group_size drives the warp-tier launch geometry math."""
-    spec = ATOM_REGISTRY["wmma_m16n16k16_f16"]
-    assert spec.shape == (16, 16, 16)
+    spec = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    assert spec.shape == (16, 8, 16)
     assert spec.group_size == 32
-    assert spec.instruction == "wmma"
+    assert spec.instruction == "mma_sync"
     assert spec.operand_dtypes["a"] == F16
     assert spec.operand_dtypes["b"] == F16
     assert spec.operand_dtypes["c"] == F32
@@ -186,7 +184,7 @@ def test_registry_spec_shape_and_group_size():
 # --- Warp-tier enumerator (M3) ---------------------------------------
 
 
-def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("wmma_m16n16k16_f16",)) -> list[WarpTileParams]:
+def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("mma_m16n8k16_f16",)) -> list[WarpTileParams]:
     return _enumerate_warp_matmul_impl(
         E_M=M,
         E_N=N,
@@ -207,25 +205,26 @@ def test_warp_enumerator_empty_when_no_kinds():
 
 
 def test_warp_enumerator_emits_rows_for_aligned_matmul():
-    """A 64×64×64 matmul aligned to the 16×16×16 atom shape yields ≥1
-    warp-tier variant."""
+    """A 64×64×64 matmul aligned to the 16×8×16 atom shape yields ≥1
+    warp-tier variant (M%16==0, N%8==0, K%16==0)."""
     rows = _enum_warp(M=64, N=64, K=64)
-    assert rows, "expected ≥1 row for a 64-square WMMA-aligned matmul"
-    assert all(r.atom_kind == "wmma_m16n16k16_f16" for r in rows)
+    assert rows, "expected ≥1 row for a 64-square mma.sync-aligned matmul"
+    assert all(r.atom_kind == "mma_m16n8k16_f16" for r in rows)
     # Every row's WM·WN·32 must fit in the per-CTA thread budget (1024).
     assert all(r.wm * r.wn * 32 <= 1024 for r in rows)
 
 
 def test_warp_enumerator_rejects_indivisible_extents():
-    """Non-divisor M / N / K (vs the 16×16×16 atom shape) — no rows."""
+    """Non-divisor M / N / K (vs the 16×8×16 atom shape) — no rows.
+    M must divide 16, N must divide 8, K must divide 16."""
     assert _enum_warp(M=63, N=64, K=64) == []
-    assert _enum_warp(M=64, N=63, K=64) == []
+    assert _enum_warp(M=64, N=60, K=64) == []
     assert _enum_warp(M=64, N=64, K=15) == []
 
 
 def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
     """Cells-near-16 ranks first; cells-far-from-16 ranks last. The
-    register-budget sweet spot for ``wmma_m16n16k16_*`` on sm_8x/9x/12x
+    register-budget sweet spot for ``mma_m16n8k16_*`` on sm_8x/9x/12x
     is FM·FN ≈ 16 (~120 regs/lane → 2 blocks/SM occupancy). The
     pre-2026 prior rewarded ``min(fm·fn, 64)`` monotonically and
     pushed the picker to FM=1 FN=32 cells=32 — 3.0× slower than cuBLAS
@@ -249,8 +248,8 @@ def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
     """
     from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
 
-    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom_kind="wmma_m16n16k16_f16")
-    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom_kind="wmma_m16n16k16_f16")
+    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom_kind="mma_m16n8k16_f16")
+    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom_kind="mma_m16n8k16_f16")
     # On sm_90+ the gold tile must outscore the gmem-direct sibling.
     gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
     baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
@@ -295,13 +294,13 @@ def test_warp_enumerator_bk_narrow(monkeypatch):
 
 
 def test_warp_enumerator_atom_kind_narrow(monkeypatch):
-    """``DEPLODOCK_ATOM_KIND=wmma_m16n16k16_f16`` pins the kind even
-    when the caller passes a multi-kind tuple. M4's PTX-MMA bench
-    gate uses this to pin ``mma_m16n8k16_f16`` against the WMMA baseline."""
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "wmma_m16n16k16_f16")
-    rows = _enum_warp(M=128, N=128, K=128, kinds=("wmma_m16n16k16_f16", "wmma_m16n16k16_bf16"))
+    """``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` pins the kind even
+    when the caller passes a multi-kind tuple — scopes the picker to a
+    single tensor-core family."""
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
     assert rows
-    assert all(r.atom_kind == "wmma_m16n16k16_f16" for r in rows)
+    assert all(r.atom_kind == "mma_m16n8k16_f16" for r in rows)
 
 
 def test_warp_enumerator_force_splitk_one():
@@ -313,7 +312,7 @@ def test_warp_enumerator_force_splitk_one():
         E_K=64,
         ctx=_ctx(cc=(8, 0)),
         force_splitk_one=True,
-        atom_kinds=("wmma_m16n16k16_f16",),
+        atom_kinds=("mma_m16n8k16_f16",),
         m_axis_name="m",
         n_axis_name="n",
         m_forced_mask=False,
@@ -330,17 +329,21 @@ _planner = __import__("importlib").import_module("deplodock.compiler.pipeline.pa
 
 
 def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
-    """With ``DEPLODOCK_MMA=1`` and an F16 64×64×64 matmul on sm_80, the
-    planner emits at least one TileOp variant whose body contains a
-    ``WarpTile`` wrapping an ``AtomTile``."""
+    """With ``DEPLODOCK_MMA=1`` and an F16 64×64×64 matmul, the planner
+    emits at least one TileOp variant whose body contains a ``WarpTile``
+    wrapping an ``AtomTile``. mma.sync auto-enumerates on sm_90+, so target
+    sm_90 here; the single-warp variant is pruned (ldmatrix needs staged
+    smem) so a multi-warp pin (WM=WN=2) keeps the tower."""
     from deplodock.compiler.ir.tile.ir import AtomTile, GridTile, TileOp, WarpTile
     from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
 
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
 
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
+    plan = _planner._plan_kernel(loop_op, _ctx(cc=(9, 0)), kernel_name="c", graph=g)
     assert plan is not None
     assert plan.params, "expected ≥1 enumerated variant"
     warp_rows = [p for p in plan.params if isinstance(p, WarpTileParams)]
@@ -361,7 +364,7 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     # GridTile should still be the outermost tier.
     assert any(isinstance(s, GridTile) for s in tile_op.body), "warp variant must keep the GridTile outer wrapper"
     # Knobs reflect the warp tier.
-    assert tile_op.knobs["ATOM_KIND"] == "wmma_m16n16k16_f16"
+    assert tile_op.knobs["ATOM_KIND"] == "mma_m16n8k16_f16"
     assert "BR" not in tile_op.knobs  # warp tier doesn't carry BR
 
 
