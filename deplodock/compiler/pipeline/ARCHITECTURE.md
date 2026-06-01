@@ -112,7 +112,21 @@ bypassing the planner's tower builder — its role split is structural
 `ThreadTile` the pre-refactor shape used. The materializer drops a
 `ThreadTile(tid_offset=n_producer_threads, …)` inside the consumer
 branch so the original consumer thread axes decode against
-`threadIdx.x - n_producer_threads`.
+`threadIdx.x - n_producer_threads`. The pass handles **both** consumer
+tiers: a scalar `ThreadTile` (pointwise / cooperative-reduce) and the
+warp-tier MMA tower's existing `WarpTile` (WM×WN warp coords). For the
+warp tier it consumes the planner-emitted `WarpTile` directly — no fresh
+tier synthesis — and stamps `WarpSpecialize.consumer_is_warp=True`, so the
+materializer wraps the consumer in a `WarpTile(tid_offset)` decode
+(`warp_id = (threadIdx.x − n_producer_threads) / 32`) and scales every
+consumer `bar.sync` participant count by 32 (warp axes count warps, not
+threads). `005_lower_atom_tile` harvests the producer body's hoisted
+`StageBundle` Sources before lowering the consumer `AtomTile` so the MMA
+Loads resolve their smem addressing across the producer/consumer split.
+Validated `max_diff=0` across 256²–2048²; ~no latency change vs WS=0 on
+GeForce s16816 (its cuBLAS gap is the SASS mma schedule below the IR, not
+producer/consumer overlap), so the autotuner normally picks WS=0 — the warp
+arm is for parity / investigation and Hopper-class parts.
 
 The tree-building algorithm itself (group params by per-level knob keys,
 collapse single-key levels, sort siblings by max-propagated score, defer
@@ -424,7 +438,7 @@ incompatible divisibility still get a sensible default.
 | `TMA`             | BOOL     | `050_use_tma`                       | Promote BUFFERED/ASYNC bundles to TMA. `1` = force (hard-fail on ineligibility), `0` = skip the pass. Default on for Hopper+. |
 | `ASYNC_COPY`      | BOOL     | `060_use_async_copy`                | Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). `0` = keep the synchronous double-buffer. Default on for sm_80+. |
 | `PIPELINE_STAGES` | BOOL     | `080_pipeline_stages`               | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop. |
-| `WARP_SPECIALIZE` | BOOL     | `085_warp_specialize`               | Warp-specialize TMA staging: producer warps issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings. |
+| `WARP_SPECIALIZE` | BOOL     | `085_warp_specialize`               | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `BUFFER_COUNT=2` on the warp tier to keep it eligible). Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is ranked first for the warp tier. |
 | `REG_PIPELINE`    | BOOL     | `kernel/013_pipeline_mma_regs`      | Cross-K_o operand prefetch on the TMA-pipelined mma.sync matmul: load each K_o tile's first substep one iteration ahead into a loop-carried `__rp1` buffer (the slot wait is *moved* to the iteration bottom, so the Sync count / smem-ring WAR guard is unchanged; iteration 0 is primed under `Cond(K_o==0)`). Keeps the next tile's first `mma` from draining the tensor pipe at the boundary. Measured autotune fork, **off** by default (no-op off the TMA path); `1` forces it on. Marginal on this GPU (mma-pipeline-bound) — see `plans/mma-register-pipeline.md`. `__rp1` names are excluded from `topo_sort_siblings` (loop-carried, not SSA). |
 | `ATOMIC_FREE_SPLITK` | BOOL  | `017_atomic_free_splitk`            | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). |
 

@@ -334,6 +334,11 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
             n_cons = 1
             for ax in ws_consumer.consumer_thread_axes:
                 n_cons *= ax.extent.as_static()
+            # Warp-tier consumer axes count *warps* (32 lanes each), so the
+            # ``bar.sync`` participant count must be warps × warp_size — a bare
+            # warp count is not a multiple of 32 and ptxas rejects it.
+            if ws_consumer.consumer_is_warp:
+                n_cons *= warp_size
             trailing_sync = Sync(barrier_id=1, count=n_cons)
         else:
             trailing_sync = Sync()
@@ -577,6 +582,10 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
         n_consumer_threads = 1
         for ax in consumer_thread_axes:
             n_consumer_threads *= ax.extent.as_static()
+        # Warp-tier consumer axes count *warps* (32 lanes each), so the named
+        # ``bar.sync N, count`` participant count is warps × warp_size.
+        if ws.consumer_is_warp:
+            n_consumer_threads *= warp_size
         if ws.n_producer_threads % warp_size != 0:
             raise ValueError(f"WarpSpecialize: n_producer_threads ({ws.n_producer_threads}) must be a multiple of warp_size ({warp_size})")
         n_producer_warps = ws.n_producer_threads // warp_size
@@ -615,11 +624,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
         for s in wired_consumer:
             cons_out.extend(_process_stmt(s, ews=cons_ews))
 
-        # Consumer-side body wraps in a tid-offset ThreadTile so the
-        # original consumer thread axes decode against
-        # ``(threadIdx.x - n_producer_threads)``. The renderer emits
-        # ``int <axis> = ...`` per axis at the head of the else_body.
-        consumer_decode = ThreadTile(
+        # Consumer-side body wraps in a tid-offset tile so the original consumer
+        # axes decode against ``(threadIdx.x - n_producer_threads)``. The
+        # warp-tier MMA consumer uses a ``WarpTile`` (``warp_id = (threadIdx.x -
+        # off) / 32`` + ``lane``), the scalar path a ``ThreadTile``.
+        decode_cls = WarpTile if ws.consumer_is_warp else ThreadTile
+        consumer_decode = decode_cls(
             axes=consumer_thread_axes,
             body=Body(tuple(cons_out)),
             tid_offset=ws.n_producer_threads,

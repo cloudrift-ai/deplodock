@@ -84,6 +84,7 @@ from deplodock.compiler.ir.tile.ir import (
     Source,
     StageBundle,
     TileOp,
+    WarpSpecialize,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import AtomSpec, atom_spec
@@ -245,6 +246,25 @@ def _lower_atom_tiles(
             new_stages_body = Body(s.stages)
             out.append(s.with_bodies((new_stages_body, new_bundle_body)))
             found = found or body_found
+            continue
+        if isinstance(s, WarpSpecialize):
+            # Warp-tier WS hoisted the staging ``StageBundle`` into the
+            # producer body, away from the consumer ``AtomTile`` that reads
+            # its slab. Harvest the producer's Sources into scope so the
+            # consumer Loads resolve their smem addressing (the producer body
+            # holds only TMA-issue scaffolding — no AtomTile). The producer
+            # body is left untouched.
+            ws_sources = dict(smem_sources)
+            for st in s.producer_body.iter():
+                if isinstance(st, StageBundle):
+                    for stage in st.stages:
+                        for src in stage.sources:
+                            ws_sources[src.name] = src
+            new_consumer, cons_found = _lower_atom_tiles(
+                s.consumer_body, spec=spec, c_dtype_override=c_dtype_override, smem_sources=ws_sources
+            )
+            out.append(s.with_bodies((s.producer_body, new_consumer)))
+            found = found or cons_found
             continue
         if s.nested():
             new_bodies: list[Body] = []
