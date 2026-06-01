@@ -250,6 +250,25 @@ def test_staged_pipelined_phase_prefix_renders(pin_staged_pipelined):
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+def test_cp_async_fp16_vectorized_16byte(pin_staged_pipelined):
+    """The fp16 staged matmul issues real **16-byte** ``cp.async.cg`` cooperative
+    loads (8 halves/thread) — the CUTLASS / cuBLAS shape — not the old degenerate
+    fallback (scalar ``Load``+``Write`` sync staging wrapped in vestigial
+    ``commit_group`` / ``wait_group`` that waited on nothing). The fp16 path used
+    to bail to sync because ``CpAsyncCopy`` hardcoded a 4-byte (one-fp32) copy;
+    it now vectorizes. The chunk offset ``8 * (flat % 8)`` also exercises the
+    ``(flat*8) % 64 → 8*(flat%8)`` simplifier fix — without it the chunks would
+    overlap and the kernel hangs / corrupts."""
+    _, _, src = _compile_and_render(M=128, N=128, K=128, out_dtype=F32)
+    # Real vectorized cp.async, not scalar sync staging.
+    assert "cp.async.cg.shared.global" in src, "fp16 stage should use cp.async.cg (16-byte vectorized copy)"
+    assert ", 16;" in src, "expected 16-byte cp.async copies"
+    # The degenerate path wrote one __half per thread via a register staging
+    # temp (``<smem>_v``); the vectorized cp.async must not.
+    assert "_smem_v = " not in src, "fp16 stage fell back to scalar Load+Write sync staging"
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_staged_pipelined_ab_classification(pin_staged_pipelined):
     """A vs B classification via ``Source.cache_dims`` — the cache axis
     whose ``axis.name == K_name`` has ``source_dim == 1`` for A (K is the
@@ -278,3 +297,65 @@ def test_staged_pipelined_ab_classification(pin_staged_pipelined):
     assert a_load_m is not None and b_load_m is not None
     assert a_load_m.group(1) == "a_smem", f"a operand should load from a_smem, got {a_load_m.group(1)}"
     assert b_load_m.group(1) == "b_smem", f"b operand should load from b_smem, got {b_load_m.group(1)}"
+
+
+# ---------------------------------------------------------------------------
+# REG_PIPELINE — register-tier operand double-buffer (plans/mma-register-pipeline.md)
+# ---------------------------------------------------------------------------
+
+
+def _supports_tma() -> bool:
+    """``REG_PIPELINE``'s cross-K_o prefetch only fires on the TMA-pipelined K_o
+    loop (the ``080``-pipelined ring with per-slot mbarrier waits), which needs
+    sm_90+. On sm_80 the cp.async path has no phase/slot wait to relocate."""
+    if not _has_cuda():
+        return False
+    import cupy as cp
+
+    return int(cp.cuda.Device().compute_capability) >= 90
+
+
+@pytest.fixture
+def pin_reg_pipeline_tma(monkeypatch):
+    """Same warp-tier tile as :func:`pin_staged_pipelined`, but TMA left **on**
+    (sm_90+) so ``080`` produces the TMA-pipelined K_o loop that
+    ``REG_PIPELINE`` prefetches across. (``REG_PIPELINE`` is a no-op on the
+    cp.async path that ``DEPLODOCK_TMA=0`` forces.)"""
+    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+    monkeypatch.setenv("DEPLODOCK_FM", "4")
+    monkeypatch.setenv("DEPLODOCK_FN", "8")
+    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("DEPLODOCK_BUFFER_COUNT", "4")
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="REG_PIPELINE cross-K_o prefetch needs the TMA path (sm_90+)")
+def test_reg_pipeline_off_no_buffer(pin_reg_pipeline_tma):
+    """``REG_PIPELINE`` defaults off — no ``__rp1`` second-operand buffer appears
+    (the knob is a measured fork, never forced on, so the greedy / DB-less path
+    stays unchanged)."""
+    _, _, src_off = _compile_and_render(M=256, N=256, K=256, out_dtype=F32)
+    assert "__rp1" not in src_off, "REG_PIPELINE-off kernel must not declare a second operand buffer"
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="REG_PIPELINE cross-K_o prefetch needs the TMA path (sm_90+)")
+def test_reg_pipeline_cross_ko_prefetch_shape(pin_reg_pipeline_tma, monkeypatch):
+    """With ``REG_PIPELINE=1`` the TMA-pipelined K_o loop gains the cross-K_o
+    prefetch: a ``__rp1`` second operand buffer declared + loaded via ldmatrix,
+    an iteration-0 prime guarded by ``== 0``, and the accumulator left single-
+    buffered (never aliased)."""
+    monkeypatch.setenv("DEPLODOCK_REG_PIPELINE", "1")
+    _, kop, src = _compile_and_render(M=256, N=256, K=256, out_dtype=F32)
+    assert kop.knobs.get("REG_PIPELINE") is True
+    assert "__rp1" in src, "REG_PIPELINE-on kernel must declare a second operand buffer"
+    rp1_ldm = re.findall(r"dpl_ldmatrix_\w+\((\w*__rp1)\b", src)
+    assert rp1_ldm, "expected ldmatrix loads into the __rp1 prefetch buffer"
+    # Iteration-0 prime: a `== 0` guarded block seeds the buffer.
+    assert re.search(r"if\s*\([^)]*==\s*0\)", src), "expected the iteration-0 prime guard"
+    # The accumulator is never double-buffered — no acc fragment carries the suffix.
+    assert not re.search(r"acc\w*__rp1", src), "accumulator must stay single-buffered"
+    # End-to-end ``max_diff = 0`` accuracy is validated via ``deplodock run`` on
+    # the live device — a raw cubin launch can't supply the host-built TMA
+    # descriptor this path needs, so the unit test asserts shape only.

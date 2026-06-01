@@ -161,6 +161,14 @@ Pure `body → body` passes run from `LoopOp.__post_init__` so every
 constructed `LoopOp` (including intermediate fusion results) is
 canonicalized before validation:
 
+- `topo_sort_siblings` — stable Kahn reorder so SSA defs precede their uses
+  within each body (fixes splicer-produced use-before-def). Names containing
+  `_LOOP_CARRIED_MARK` (`__rp1`, the register-pipeline operand buffers of
+  `kernel/013_pipeline_mma_regs`) are **excluded** from the def-use graph: they
+  are loop-carried (read at the top of a K_o iteration, rewritten by the
+  prefetch at the bottom), not single-assignment, so the topo edge would wrongly
+  sink the read below the rewrite — the stable tiebreak preserves their source
+  order instead.
 - `drop_size_one_free_axes` — inline extent-1 free Loops.
 - `canonicalize_free_axis_order` — sort outer free Loops by axis name.
 - `eliminate_copy_aliases` — drop `y = copy(x)` Assigns.
@@ -293,7 +301,7 @@ exist only when scopes differ.
 | `Tile`                | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).                                                                     |
 | `Stage`               | Wrap-body cooperative stage. ``sources: tuple[Source, ...]`` carries per-operand smem layouts; ``body`` is the consumer subtree. Materialize emits leading `Sync` + per-source cooperative `Load+Write` + trailing `Sync` + materialized consumer body. |
 | `BufferedStage`       | `Stage` subtype with `buffer_count >= 2` rotating slabs selected by `phase`. Sync transport, ping-pong slabs (no leading `Sync`).    |
-| `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async` per source; emits `CpAsyncCopy`+`CpAsyncCommit`. `pipeline_depth>1` marks the stage for temporal pipelining (prologue/main/epilogue), expanded by the bucket-10 pass. |
+| `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async` per source; emits `CpAsyncCopy`+`CpAsyncCommit`. The cooperative load is **vectorized** — `_stage_expand._cp_async_width` picks the widest legal copy (`CpAsyncCopy.nbytes` ∈ {4,8,16}; 16⇒`cp.async.cg`) so a contiguous fp16 tile streams 8 halves per `cp.async` (the CUTLASS/cuBLAS shape), gated on inner-axis stride-1 contiguity + alloc/gmem-stride alignment (fp16 needs ≥4B, so non-contiguous fp16 falls back to the scalar sync load). `pipeline_depth>1` marks the stage for temporal pipelining (prologue/main/epilogue), expanded by the bucket-10 pass. |
 | `TmaBufferedStage`    | `BufferedStage` subtype using TMA (`cp.async.bulk.tensor` + mbarrier). `pipeline_depth>1` for pipelining; `swizzle` for shared-memory swizzle pattern. |
 | `ComputeStage`        | `Stage` subtype for hoisted invariant compute. Carries a separate `compute: Body` (per-thread compute reading sibling-stage smem, writing this stage's smem). `external_reads()` returns `()` so 015 / tuning don't classify sibling-smem reads as gmem dependencies. |
 | `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `addressing`, `dtype`. Each Stage carries one or more. |
