@@ -200,68 +200,48 @@ def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
 
 def _priority_matmul_warp(p: WarpTileParams, *, ctx: Context | None = None) -> tuple[int, ...]:
     # Warp-tier ranking for tensor-core MMA matmul (fp16 / bf16 with f32
-    # accumulator, ``wmma_m16n16k16_*`` atom). The pre-2026 prior rewarded
-    # ``min(fm*fn, 64)`` monotonically — pushed the picker toward
-    # ``FM=1 FN=32`` (32 N-cells per warp, max A-frag reuse) but that
-    # shape exploded the per-lane register budget: 32 acc frags + 32 B
-    # frags + 1 A frag ≈ 4·(32+32+1) = 260 regs/lane, past the 255-reg
-    # spill cap — measured at 173 regs/thread on sm_120 with cuBLAS at
-    # 3.0× (see ``plans/mma-warp-scoring.md`` for the 2048² fp16 sweep).
-    #
-    # Primary priors (apply on every arch):
-    #
-    # 1. **Cells-per-warp sweet spot ≈ 16** (FM·FN). 16 acc frags at
-    #    ~4 regs/lane each is ~64 regs + ~30 regs of frag-load + ~30 regs
-    #    addressing overhead = ~120-130 regs/lane → 2 blocks/SM occupancy
-    #    on sm_8x/9x/12x without spilling. ``-abs(cells - 16)`` peaks
-    #    sharply at the sweet spot.
-    # 2. **Square per-warp tile** (FM == FN). Each A frag is reused
-    #    ``FN`` times across the per-K-iter MMA chain; each B frag
-    #    ``FM`` times. Square aspect ⇒ balanced reuse on both operands;
-    #    skewed (e.g. 1×32, 32×1) wastes one operand's reuse. Tiebreaker
-    #    inside the cells-band.
-    #
-    # Per-arch tertiary priors:
+    # accumulator, swizzled s16816 ``mma_m16n8k16_*`` atom on sm_90+).
     #
     # **Non-TMA arches (sm_70 / sm_80)**: ``cp.async``-staged WMMA pays
     # per-K_o overhead in cooperative-load instructions, so larger BK
     # (fewer K_o iters) amortizes best and threads-near-256 (8 warps)
-    # keeps the per-warp cooperative slice dense. The pre-2026 tuple
-    # ``(... -abs(256-threads), bk, ...)`` is kept verbatim for these
-    # arches — Phase B sweeps on sm_80 / sm_90 confirmed the same shape.
+    # keeps the per-warp cooperative slice dense. Ranked on cells≈16 +
+    # square FM/FN, kept verbatim (sweeps on sm_80 / sm_90 confirmed).
     #
-    # **TMA arches (sm_90+, currently sm_90 Hopper + sm_120 Blackwell)**:
-    # the TMA-staged WMMA path beats the gmem-direct baseline by ~15% at
-    # 2048² fp16 when ``BK ≤ 4`` admits ``buffer_count >= 2`` promotion
-    # and ``050_use_tma`` fires. The K_o overhead is one mbarrier handshake
-    # from one issuer thread (vs cooperative cp.async with 128 threads),
-    # so smaller BK is fine and the dominant cost is warp-tier
-    # mma-issue throughput — which **4 warps × 128 threads** saturates
-    # without competing for tensor cores. Empirical sweep at 2048² fp16
-    # on RTX 5090 (sm_120):
+    # **TMA arches (sm_90+, sm_90 Hopper + sm_120 Blackwell)**: a 2026 pinned
+    # sweep on RTX 5090 (sm_120) over 1024² / 2048² / 4096² fp16 (each tile
+    # paired with ``WARP_SPECIALIZE`` — see ``085_warp_specialize``) found the
+    # winner is a **square 64×64 output tile on a 4-warp CTA** with WS on,
+    # *not* the cells≈16 / 128×128 shape the pre-2026 prior favored. 2048²:
     #
-    #     Rank  WM WN FM FN  cells  threads  µs
-    #         1   1  4  4  4    16     128   84   ← golden
-    #         2   1  4  8  2    16     128   88
-    #         3   1  2  8  4    32      64   89
-    #         4   2  2  4  4    16     128   91   (square M/N split)
-    #         5   4  1  4  4    16     128   94
-    #         ... (256-thread variants land at 106+ µs)
+    #     WM WN FM FN  out-tile  warps  WS  µs    (cuBLAS/eager ≈ 99)
+    #      2  2  2  4   64×64       4    1   94   ← winner (1.05× cuBLAS)
+    #      1  4  4  2   64×64       4    1   94     (same tile, WM/WN swap)
+    #      2  4  2  2   64×64       8    1   97
+    #      1  4  4  4   64×128      4    1  102
+    #      2  4  4  4  128×128      8    1  111     (old prior's pick)
+    #      2  2  2  4   64×64       4    0  110-115 (WS off — ~17% worse)
+    #      1  4  2  4   32×128      4    1  142-155 (skewed same-area tile)
     #
-    # Encode this as: ``-abs(threads - 128)`` (favor 4-warp CTAs over
-    # 8 or 2) tied with ``-abs(bk - 2)`` (favor BK=2; BK=3 / BK=4 weaken
-    # but stay nearby; BK=64 lands the gmem-direct path which loses ~24%).
-    # Tertiary tiebreaker ``-p.bk`` resolves the (FM=4 FN=4 BK=2) vs
-    # (FM=4 FN=4 BK=64) tie toward the smaller, TMA-firing BK.
+    # The 64×64 tile keeps per-lane registers low (≈48-66 vs 166 at 128×128)
+    # so 4 such CTAs and WS's extra producer warp fit; skewed same-area tiles
+    # (32×128 / 128×32) lose operand reuse and run 50% slower. Encode as:
+    # target a 64×64 output tile (``area``), break ties toward a square tile
+    # (``|m_tile − n_tile|``), a 4-warp CTA, a balanced warp grid, then BK=2.
+    # (Same-tile warp splits — WM2 WN2 vs WM1 WN4, both 64×64 — are perf-equal;
+    # which one wins the residual tie is not load-bearing.)
     threads = p.wn * p.wm * 32
     cells = p.fm * p.fn
     tma_capable = ctx is not None and ctx.compute_capability >= (9, 0)
     if tma_capable:
+        m_tile = p.wm * p.fm * 16
+        n_tile = p.wn * p.fn * 8
         return (
-            -abs(cells - 16),
-            -abs(p.fm - p.fn),
+            -abs(m_tile * n_tile - 64 * 64),  # 64×64 output tile (4096 elems/CTA)
+            -abs(m_tile - n_tile),  # square tile beats skewed same-area
+            -abs(threads - 128),  # 4-warp CTA
+            -abs(p.wm - p.wn),  # balanced warp grid (avoid WN1/WM1 skew)
             -abs(p.bk - 2),
-            -abs(threads - 128),
             -p.bk,
             -p.splitk,
             -len(p.overhang),

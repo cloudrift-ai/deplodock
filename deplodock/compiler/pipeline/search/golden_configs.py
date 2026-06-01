@@ -22,8 +22,12 @@ hardware on both sides, so the ratio is apples-to-apples vs cuBLAS. On sm_90+ th
 autotuner lands these on the swizzled s16816 ``mma_m16n8k16_f16`` (ldmatrix +
 mma.sync) atom rather than ``nvcuda::wmma`` — the swizzled smem slab kills the
 shared-load bank conflicts WMMA can't (it reads smem opaquely), so mma.sync is the
-faster fp16 GEMM (e.g. 2048²: 107 µs / 0.93× vs WMMA 130 µs / 0.87×). See
-plans/mma-sync-smem-swizzle.md.
+faster fp16 GEMM. On sm_120 the warp-tier prior + greedy now land on a square
+**64×64 output tile on a 4-warp CTA with WARP_SPECIALIZE=1** (producer warp issues
+TMA, consumer warps run the mma chain), measured at / above cuBLAS across the
+squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See
+plans/mma-sync-smem-swizzle.md and the warp-tier block in
+``compiler/ir/tile/ir.py:score_tile_geometry``.
 """
 
 from __future__ import annotations
@@ -524,18 +528,18 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
         knobs={
-            "WN": 2,
-            "WM": 8,
-            "FM": 1,
+            "WN": 4,
+            "WM": 1,
+            "FM": 4,
             "FN": 2,
             "BK": 2,
             "SPLITK": 1,
             "ATOM_KIND": "mma_m16n8k16_f16",
-            "STAGE": "11",
-            "BUFFER_COUNT": 4,
+            "BUFFER_COUNT": 2,
+            "WARP_SPECIALIZE": True,
         },
-        deplodock_us=20.5,
-        cublas_us=14.7,
+        deplodock_us=18.5,
+        cublas_us=17.0,
     ),
     MatmulGoldenConfig(
         name="square.2048.fp16",
@@ -547,17 +551,17 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         compute_cap=(12, 0),
         knobs={
             "WN": 4,
-            "WM": 2,
+            "WM": 1,
             "FM": 4,
-            "FN": 4,
+            "FN": 2,
             "BK": 2,
             "SPLITK": 1,
             "ATOM_KIND": "mma_m16n8k16_f16",
-            "STAGE": "11",
-            "BUFFER_COUNT": 3,
+            "BUFFER_COUNT": 2,
+            "WARP_SPECIALIZE": True,
         },
         deplodock_us=106.7,
-        cublas_us=99.2,
+        cublas_us=113.0,
     ),
     MatmulGoldenConfig(
         name="square.4096.fp16",
@@ -569,17 +573,17 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         compute_cap=(12, 0),
         knobs={
             "WN": 4,
-            "WM": 2,
+            "WM": 1,
             "FM": 4,
-            "FN": 4,
+            "FN": 2,
             "BK": 2,
             "SPLITK": 1,
             "ATOM_KIND": "mma_m16n8k16_f16",
-            "STAGE": "11",
-            "BUFFER_COUNT": 3,
+            "BUFFER_COUNT": 2,
+            "WARP_SPECIALIZE": True,
         },
-        deplodock_us=701.2,
-        cublas_us=663.3,
+        deplodock_us=746.3,
+        cublas_us=765.0,
     ),
 ]
 # --- END GENERATED ---

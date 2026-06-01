@@ -126,6 +126,19 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # keep the shallow-first default (the pre-occupancy order, which always fit
     # downstream); the autotuner still explores their deeper rings (it tolerates a
     # variant that fails ``validate``, unlike the no-fallback greedy default).
+    # Warp-tier mma.sync override: depth-2 unlocks ``WARP_SPECIALIZE`` (085
+    # requires ``pipeline_depth == 2``), and WS + depth-2 is the measured greedy
+    # optimum for the fp16 tensor-core path (2048²: 94 µs / 1.05× cuBLAS vs
+    # 115 µs for the deeper-ring no-WS kernel; depth-2 *without* WS is no worse
+    # than depth-4). So front-load depth-2 for the greedy default on these
+    # tiles, ahead of the occupancy ordering below (which front-loads the
+    # deepest 2-block ring — right for scalar / 128×128, but here it picks a
+    # depth that disqualifies the better WS kernel). The autotuner still sees
+    # every depth.
+    if "ATOM_KIND" in root.op.knobs:
+        variants.sort(key=lambda bv: (bv[0] != 2, bv[0]))
+        return [v for _, v in variants]
+
     per_stage = _kouter_sync_bytes(body, input_nbytes)
     n_bundles = sum(1 for s in body.iter() if isinstance(s, StageBundle))
     if per_stage > 0 and n_bundles == 1:

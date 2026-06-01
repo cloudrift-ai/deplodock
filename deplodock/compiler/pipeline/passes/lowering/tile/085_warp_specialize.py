@@ -392,12 +392,27 @@ def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
     if len(ws_choices) == 1:
         return _stamp(ws_choices[0])
 
+    # Prior (rank-only — the MCTS still measures both). For the warp-tier MMA
+    # tower, WS=1 is a measured win (≈17% at 64×64, neutral at 128×128 — see
+    # the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``), so rank
+    # the WS=1 fork first and the greedy/first-guess path takes it. The scalar
+    # (pointwise / coop-reduce) tier has no such consensus, so it stays neutral
+    # (0.0) and greedy follows the hint order.
+    _, is_warp = _find_consumer_tile(op.body)
+
+    def _ws_score(ws: bool) -> float:
+        return 1.0 if (ws and is_warp) else 0.0
+
+    # Order matters for the greedy default (``GreedySearch`` keeps fork option-0
+    # by *order*, not score), score matters for the MCTS UCB prior. Put the
+    # higher-scored choice first so both paths prefer WS=1 on the warp tier.
+    ordered = sorted(ws_choices, key=_ws_score, reverse=True)
     return [
         Fork(
             knobs={WARP_SPECIALIZE.name: ws},
             expand=(lambda ws=ws: [_stamp(ws)]),
-            score=0.0,
+            score=_ws_score(ws),
             is_leaf=True,
         )
-        for ws in ws_choices
+        for ws in ordered
     ]

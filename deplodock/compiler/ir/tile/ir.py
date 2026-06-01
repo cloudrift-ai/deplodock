@@ -1489,9 +1489,9 @@ def score_tile_geometry(
     # warp counts amortized cooperative-load instructions; with TMA those
     # loads cost one mbarrier handshake from one issuer thread, so 256
     # threads buys nothing and competes for tensor-core throughput.
-    # Empirical sweep at 2048² fp16 on sm_120 (RTX 5090): top 5 TMA-
-    # firing variants all sit at threads=128; the 256-thread variants
-    # land at 106+ µs vs 84 µs for the 128-thread golden tile.
+    # Empirical sweep at 2048² fp16 on sm_120 (RTX 5090): the 4-warp / 128-
+    # thread 64×64 tile (+WS) wins at 94 µs; 8-warp/256-thread variants land
+    # at 106+ µs. See the warp-tier MMA block below for the tile-shape reward.
     tma_capable_warp = "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0)
     target_threads = 128 if tma_capable_warp else 256
     target_ctas = 128
@@ -1523,28 +1523,27 @@ def score_tile_geometry(
     if cells == 1:
         score -= 1.0
     elif "ATOM_KIND" in knobs:
-        # Tensor-core MMA (warp-tier WMMA path): the per-lane register
-        # budget is dominated by accumulator fragments (one ~4-reg/lane
-        # frag per FM·FN cell, half acc on consumer / fp32 acc on
-        # datacenter) plus the operand frags loaded per K-iter. On
-        # sm_8x / sm_9x / sm_12x with the 255-reg/lane cap, ``cells ≈
-        # 16`` is the 2-blocks/SM occupancy knee; past ~24 the per-lane
-        # reg footprint spills to local memory (measured at 173 regs/
-        # thread on a 2048² fp16 sweep — see ``plans/mma-warp-scoring.md``
-        # and the warp-tier section of ``compiler/pipeline/ARCHITECTURE.md``).
-        # The pre-2026 cells-up-to-128 reward (tuned for scalar f32
-        # matmul where 104-cell golden tiles win) pushed the MMA picker
-        # to FM=1 FN=32, 3.0× slower than cuBLAS instead of 0.91×.
-        sweet = 16
-        score += 0.5 - min(abs(cells - sweet) / sweet, 0.5)
-        # Square per-warp tile reuses operands equally — each A frag
-        # used ``FN`` times per K-iter, each B frag used ``FM`` times.
-        # Skewed shapes (FM=1, FN=N) waste one operand's reuse and
-        # inflate the per-K-iter fragment-load count linearly.
+        # Tensor-core MMA (warp-tier mma.sync path). The measured perf sweet
+        # spot (2026 pinned sweep on RTX 5090 over 1024²/2048²/4096² fp16, each
+        # tile paired with WARP_SPECIALIZE) is a **square 64×64 OUTPUT tile on
+        # a 4-warp CTA** — *not* the cells≈16 / 128×128 shape the pre-2026
+        # prior rewarded. A 64×64 tile keeps per-lane registers low (≈48-66 vs
+        # 166 at 128×128) so 4 such CTAs plus WS's extra producer warp fit, and
+        # the mma chain still has enough operand reuse to feed the tensor cores
+        # (smaller tiles go smem-bandwidth-bound). 2048² fp16: 64×64 + WS=1
+        # lands 94 µs / 1.05× cuBLAS vs 111 µs for the old 128×128 pick.
+        # Skewed same-area tiles (32×128) lose operand reuse and run ~50%
+        # slower, so reward a square OUTPUT tile, not just square FM/FN.
+        # Mirrors ``_enumeration._priority_matmul_warp``.
         fm = max(1, int(knobs.get("FM", 1)))
         fn = max(1, int(knobs.get("FN", 1)))
-        aspect = abs(fm - fn) / max(fm, fn)  # 0 = square, 1 = fully skewed
-        score -= aspect * 0.25
+        wm = max(1, int(knobs.get("WM", 1)))
+        wn = max(1, int(knobs.get("WN", 1)))
+        m_tile = wm * fm * 16
+        n_tile = wn * fn * 8
+        score += 0.5 - min(abs(m_tile * n_tile - 64 * 64) / (64 * 64), 0.5)
+        aspect = abs(m_tile - n_tile) / max(m_tile, n_tile)  # 0 = square output tile
+        score -= aspect * 0.5
     elif cells <= 128:
         # Reward register-tile budget gradually up to 128 cells (NVRTC cap +
         # fp32 register-tile sweet spot). Without this gradient every
