@@ -161,6 +161,14 @@ Pure `body → body` passes run from `LoopOp.__post_init__` so every
 constructed `LoopOp` (including intermediate fusion results) is
 canonicalized before validation:
 
+- `topo_sort_siblings` — stable Kahn reorder so SSA defs precede their uses
+  within each body (fixes splicer-produced use-before-def). Names containing
+  `_LOOP_CARRIED_MARK` (`__rp1`, the register-pipeline operand buffers of
+  `kernel/013_pipeline_mma_regs`) are **excluded** from the def-use graph: they
+  are loop-carried (read at the top of a K_o iteration, rewritten by the
+  prefetch at the bottom), not single-assignment, so the topo edge would wrongly
+  sink the read below the rewrite — the stable tiebreak preserves their source
+  order instead.
 - `drop_size_one_free_axes` — inline extent-1 free Loops.
 - `canonicalize_free_axis_order` — sort outer free Loops by axis name.
 - `eliminate_copy_aliases` — drop `y = copy(x)` Assigns.
