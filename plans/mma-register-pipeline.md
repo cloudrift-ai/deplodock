@@ -141,6 +141,15 @@ cuBLAS: the kernel is **mma-pipeline-throughput-bound** (`wait` ≈ 3.1 dominate
 it where it marginally helps. Closing the last ~7% to cuBLAS needs a better **mma instruction schedule** (interleaving
 independent mma chains to hide the tensor-pipe latency), a different lever than load prefetching.
 
+**The barrier is NOT the bottleneck (proven — do not invest in barrier removal).** Two independent experiments confirm it:
+(1) dropping the per-iteration `__syncthreads` (the smem-ring WAR guard) drives the barrier stall to ~0 but is only ~2-4%
+at settled thermal **and races** (64×64 tile → `max_diff=57`); (2) enabling `WARP_SPECIALIZE=1` at BC=2 (the only depth WS
+supports) drives the barrier stall to **0.06** (cuBLAS-level, from ~0.6) yet leaves latency **unchanged** (111.9→112.4µs) —
+the dedicated producer warp does no mma, dropping tensor-pipe util 37%→33.5%, which cancels the barrier win, and the
+dominant `wait` (3.28) is untouched. So neither a non-WS empty-mbarrier protocol nor warp specialization closes the gap:
+the kernel is **mma-pipeline-bound**, and the only lever left is the mma instruction schedule (or the GeForce fp32-accumulate
+tensor-pipe rate limit). Barrier-removal work is therefore **deprioritized**.
+
 ## Milestones (each independently validatable; gate on accuracy + ncu, not pytest loops)
 
 **M0 — knob + pass skeleton (no behavior change).** Add the `REG_PIPELINE` knob + a new kernel pass
