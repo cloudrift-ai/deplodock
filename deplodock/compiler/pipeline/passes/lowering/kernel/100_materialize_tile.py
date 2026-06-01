@@ -68,6 +68,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     WarpSpecialize,
     WarpTile,
+    pick_swizzle_atom,
 )
 from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
@@ -85,16 +86,34 @@ _TMA_ALIGN_BYTES = 128
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
+    # Swizzle-atom box reshape (S1 of plans/mma-sync-smem-swizzle.md) is gated
+    # to the mma.sync atom: only its explicit-ldmatrix consumer can read a
+    # swizzled slab, so only its TMA descriptors get the rank+1 swizzle-atom
+    # box. WMMA / cp.async / SDPA TMA sources keep the legacy collapsed box
+    # (zero blast radius for the default path).
+    mma_sync = _is_mma_sync_kernel(root.op.knobs.get("ATOM_KIND"))
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile, WarpTile)):
-            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
+            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape, mma_sync=mma_sync))
         else:
             new_body.append(s)
     return KernelOp(body=new_body, name=root.op.name)
 
 
-def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
+def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
+    """True iff ``atom_kind`` names an ``instruction="mma_sync"`` AtomSpec
+    (the s16816 ldmatrix path). Returns False for WMMA / unset kinds."""
+    if not atom_kind:
+        return False
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY, atom_spec  # noqa: PLC0415
+
+    if atom_kind not in ATOM_REGISTRY:
+        return False
+    return atom_spec(atom_kind).instruction == "mma_sync"
+
+
+def _materialize_top(top: Stmt, *, warp_size: int, escape=None, mma_sync: bool = False) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
     Three shapes are possible coming out of ``001_launch_geometry`` /
@@ -120,12 +139,12 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, (ThreadTile, WarpTile)):
-                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
+                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape, mma_sync=mma_sync))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
     if isinstance(top, (ThreadTile, WarpTile)):
-        return _materialize(top, warp_size=warp_size, escape=escape)
+        return _materialize(top, warp_size=warp_size, escape=escape, mma_sync=mma_sync)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
@@ -134,7 +153,7 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> Stmt:
+def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma_sync: bool = False) -> Stmt:
     """Materialize a ``ThreadTile`` or ``WarpTile`` body. The inner tile
     carries the per-CTA scope axes directly (no BoundAxis filtering
     needed); strategies set this up — this pass commits no axis
@@ -375,6 +394,24 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         )
         box = tuple(full_box[d] for d in kept)
         coords = tuple(src.origin[d] for d in kept)
+        # Swizzle-atom box reshape (S1 of plans/mma-sync-smem-swizzle.md):
+        # split the innermost box dim down to the swizzle atom width so the
+        # descriptor's innermost dim in bytes equals the swizzle width (TMA
+        # rejects swizzle when the inner box-dim byte span exceeds the atom).
+        # Only fires for the mma.sync kernel (gated by ``mma_sync``). The box
+        # rank grows by one; the runtime ``_collapse_inert_dims`` already
+        # reconstructs the matching rank+1 globalDim by splitting the array's
+        # inner dim. Stays byte-identical with swizzle=NONE (TMA writes the
+        # box contiguously either way) — S2 flips the mode, S3 the consumer.
+        if mma_sync and box:
+            elem_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
+            inner_elems = box[-1]
+            atom_elems, _ = pick_swizzle_atom(inner_elems, elem_bytes)
+            if atom_elems < inner_elems:
+                inner_coord = coords[-1]
+                outer_coord = BinaryExpr("/", inner_coord, Literal(atom_elems, "int"))
+                box = (*box[:-1], inner_elems // atom_elems, atom_elems)
+                coords = (*coords[:-1], outer_coord, Literal(0, "int"))
         if desc_name not in descriptors:
             # Source shape is unknown at materialization time — the
             # backend resolves it from the bound array at launch.
@@ -383,7 +420,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 src_buf=src.buf,
                 src_shape=(),
                 box_extents=box,
-                swizzle=bundle.swizzle.value,
+                # Per-Source swizzle (S0 of plans/mma-sync-smem-swizzle.md):
+                # A (64 B inner) and B (128 B inner) share one bundle but
+                # need distinct modes, so the mode rides on the Source, not
+                # ``bundle.swizzle``. Defaults to NONE — byte-identical to
+                # the bundle read until 050_use_tma stamps a per-source mode.
+                swizzle=src.swizzle.value,
                 dtype=smem_cuda_dtype(src),
             )
         if mbar_name not in declared_mbar:

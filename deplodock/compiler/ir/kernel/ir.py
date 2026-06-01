@@ -847,6 +847,28 @@ class RegFragment(Stmt):
         return [f"{_pad(ctx.indent)}unsigned {self.name}[{n_regs}];"]
 
 
+# Per-lane fp16 element XOR matching the TMA hardware smem swizzle (S3 of
+# plans/mma-sync-smem-swizzle.md). The producer (cuTensorMapEncodeTiled with
+# SWIZZLE_{128,64,32}B) permutes 16-byte (8-fp16) chunks within each swizzle
+# row by the row-index-mod-2^B; the ldmatrix consumer must apply the same
+# permutation to its per-lane element offset. All three modes are CUTLASS
+# ``Swizzle<B,4,3>`` (M=4 → 16-byte base, S=3 → 8-row tile), differing ONLY in
+# B (3/2/1 XORed bits). In bytes the swizzle is
+# ``off ^= ((off >> (M+S)) & (2^B-1)) << M`` = ``((off >> 7) & mask) << 4``;
+# halving to fp16 elements turns ``>> 7`` into ``>> 6`` and ``<< 4`` into
+# ``<< 3`` — so the element shift is 6 for EVERY mode (a per-mode shift of
+# 6/5/4 silently corrupts B64/B32 while leaving B128 correct, which is easy to
+# miss since B128 dominates). Only the row mask changes: 0x7 / 0x3 / 0x1. The
+# 8-row × atom period divides the slab + slot strides, so the XOR is correct
+# measured from the buffer base. Maps mode → (element shift, row mask); the
+# chunk delta is always ``<< 3``.
+_LDMATRIX_SWIZZLE_XOR: dict[str, tuple[int, int]] = {
+    "B128": (6, 0x7),
+    "B64": (6, 0x3),
+    "B32": (6, 0x1),
+}
+
+
 @dataclass(frozen=True)
 class LdmatrixLoad(Stmt):
     """``ldmatrix.sync.aligned.m8n8.x{2,4}[.trans].b16`` — load one operand
@@ -868,6 +890,7 @@ class LdmatrixLoad(Stmt):
     src_index: tuple
     role: str  # "a" → x4; "b" → x2.trans
     ldm: int = 0
+    swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -894,11 +917,21 @@ class LdmatrixLoad(Stmt):
         lane = "(threadIdx.x & 31)"
         if self.role == "a":
             # 16×16 A: x4 — lane addresses M-row (lane%16), K-col block (lane/16)*8.
-            addr = f"&{self.src_buffer}[{flat} + ({lane} % 16) * {ldm} + ({lane} / 16) * 8]"
+            elem = f"{flat} + ({lane} % 16) * {ldm} + ({lane} / 16) * 8"
+            addr = self._swizzled_addr(elem)
             return [f"{_pad(ctx.indent)}dpl_ldmatrix_x4({self.frag}, {addr});"]
         # 16×8 B: x2.trans — lane addresses K-row (lane%16); .trans yields col-major.
-        addr = f"&{self.src_buffer}[{flat} + ({lane} % 16) * {ldm}]"
+        elem = f"{flat} + ({lane} % 16) * {ldm}"
+        addr = self._swizzled_addr(elem)
         return [f"{_pad(ctx.indent)}dpl_ldmatrix_x2_trans({self.frag}, {addr});"]
+
+    def _swizzled_addr(self, elem: str) -> str:
+        params = _LDMATRIX_SWIZZLE_XOR.get(self.swizzle)
+        if params is None:
+            return f"&{self.src_buffer}[{elem}]"
+        shift, mask = params
+        # ``e ^ (((e >> shift) & mask) << 3)`` reproduces the TMA chunk swizzle.
+        return f"&{self.src_buffer}[({elem}) ^ (((({elem}) >> {shift}) & {mask}) << 3)]"
 
 
 @dataclass(frozen=True)
@@ -1384,6 +1417,7 @@ def _(s: LdmatrixLoad, rename, sigma, axis_fn):
         src_index=tuple(sigma.apply(e) for e in s.src_index),
         role=s.role,
         ldm=s.ldm,
+        swizzle=s.swizzle,
     )
 
 

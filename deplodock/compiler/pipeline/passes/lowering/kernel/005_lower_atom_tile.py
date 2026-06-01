@@ -150,9 +150,14 @@ def _emit_chain(
         # here just drops the mma.sync variant, never the whole lowering.
         if a_load.input not in smem_sources or b_load.input not in smem_sources:
             raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
+        # Thread the per-Source TMA swizzle mode (S3 of
+        # plans/mma-sync-smem-swizzle.md) so the ldmatrix consumer applies the
+        # matching per-lane chunk XOR. NONE when the source wasn't swizzled.
+        a_swz = smem_sources[a_load.input].swizzle.value
+        b_swz = smem_sources[b_load.input].swizzle.value
         return (
-            LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm),
-            LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm),
+            LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
+            LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
             MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape),
         )
     return (
