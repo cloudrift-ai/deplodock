@@ -758,6 +758,8 @@ def _cancel_common_factors(op: str, left: Expr, right: Expr, ctx: SimplifyCtx) -
     cancelled = False
     R_remaining = list(R_factors)
     L_remaining: list[Expr] = []
+    common_factors: list[Expr] = []  # factors removed from BOTH sides (for the % identity)
+    common_int = 1
     for f in L_factors:
         matched_idx = None
         for i, rf in enumerate(R_remaining):
@@ -767,6 +769,7 @@ def _cancel_common_factors(op: str, left: Expr, right: Expr, ctx: SimplifyCtx) -
         if matched_idx is not None:
             R_remaining.pop(matched_idx)
             cancelled = True
+            common_factors.append(f)
         else:
             L_remaining.append(f)
 
@@ -776,6 +779,7 @@ def _cancel_common_factors(op: str, left: Expr, right: Expr, ctx: SimplifyCtx) -
             L_k //= g
             R_k //= g
             cancelled = True
+            common_int = g
 
     if not cancelled:
         return None
@@ -783,6 +787,7 @@ def _cancel_common_factors(op: str, left: Expr, right: Expr, ctx: SimplifyCtx) -
     new_left = _rebuild_product(L_remaining, L_k)
     new_right = _rebuild_product(R_remaining, R_k)
     if op in ("/", "//"):
+        # (c·x) / (c·y) == x / y — the common factor cancels outright.
         if _is_one(new_right):
             return new_left
         if _is_zero(new_left):
@@ -790,6 +795,12 @@ def _cancel_common_factors(op: str, left: Expr, right: Expr, ctx: SimplifyCtx) -
     elif op == "%":
         if _is_one(new_right) or _is_zero(new_left):
             return _make_int_literal(0)
+        # (c·x) % (c·y) == c · (x % y) — the common factor does NOT cancel out
+        # of a modulo; it scales the remainder. Multiplying it back is the fix
+        # for the old ``(f*8) % 64 → f % 8`` bug (should be ``8 * (f % 8)``).
+        common = _rebuild_product(common_factors, common_int)
+        mod = BinaryExpr("%", new_left, new_right)
+        return mod if _is_one(common) else BinaryExpr("*", common, mod)
     return BinaryExpr(op, new_left, new_right)
 
 
