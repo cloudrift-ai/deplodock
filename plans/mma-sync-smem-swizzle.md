@@ -1,6 +1,6 @@
 # mma.sync smem swizzle — TMA-box reshape + ldmatrix consumer XOR
 
-## Status (S0–S3 landed, S4 deferred)
+## Status (S0–S4 landed)
 
 **Done (branch `feature/mma-sync-atom`):** S0 per-`Source.swizzle` field, S1 swizzle-atom box reshape, S2 per-source mode
 pick (A=B64 / B=B128), S3 consumer XOR. mma.sync 2048² fp16 now **0.93× (107µs)** — beats WMMA 0.87× (the goal), short of
@@ -11,10 +11,13 @@ tile-stage `Source.dtype` is None so the swizzle byte-width must come from `matc
 `Swizzle<B,4,3>` modes share element shift 6 (only the mask differs). A descriptor whose swizzle mode mismatches its box
 inner byte width HANGS (producer mbarrier deadlock), not a clean encode error.
 
-**Deferred — S4 (promote to default):** the swizzle is auto-on for the mma_sync atom, but mma_sync stays opt-in (pinned
-`ATOM_KIND`). Making it the default fp16-matmul path is a separate, broader change: relax the `010_partition_loops` gate
-(sm_90+ only — sm_80-89 mma_sync falls back to slower cp.async staging), confirm the scorer/picker lands on it over WMMA,
-regenerate `square.*.fp16` goldens, and update `test_default_picker_lands_on_tma_golden_at_2048_fp16` (asserts WMMA).
+**Done — S4 (promote via measured autotune).** `010_partition_loops` auto-enumerates mma_sync as a *tunable candidate* on
+sm_90+ for large tiles (every extent ≥ 256). The greedy/DB-less default stays WMMA — the static scorer has no TMA-latency
+model and would mis-rank the leaner 16×8 atom on small tiles — so mma_sync wins only through measured autotune (the
+goldens), and `test_default_picker_lands_on_tma_golden_at_2048_fp16` (asserts WMMA) stays correct unchanged. Single-warp
+(WM·WN==1) mma_sync variants are pruned: `020_stage_inputs` skips staging at one warp and mma_sync has no gmem-direct
+fallback, so an unstaged AtomTile would crash render. All four fp16-square goldens regenerated onto mma_sync (512² 6.1µs /
+1.02×, 1024² 20.5µs, 2048² 106.7µs / 0.93×, 4096² 701µs / 0.95×) — each faster than its old WMMA golden.
 
 ## Context
 
