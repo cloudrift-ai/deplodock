@@ -793,9 +793,6 @@ class MmaStore(Stmt):
 # ``kernel/005_lower_atom_tile`` for an ``instruction="mma_sync"`` AtomSpec.
 # ---------------------------------------------------------------------------
 
-# fp32→narrow downconvert spelling, shared with :class:`MmaStore`'s epilogue.
-_NARROW_CONVERT = {"f16": "__float2half", "bf16": "__float2bfloat16"}
-
 
 def _mma_sync_nregs(role: str, shape: tuple[int, int, int]) -> int:
     """Per-lane register count for an mma.sync operand of cell ``shape``.
@@ -975,22 +972,32 @@ class RegStore(Stmt):
         flat = render_index(self.dst_buffer, self.dst_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.dst_buffer, ctx)
         dst_dt = ctx.buffer_dtypes.get(self.dst_buffer, "f32")
-        conv = _NARROW_CONVERT.get(dst_dt)
         pad = _pad(ctx.indent)
         lane = "(threadIdx.x & 31)"
-
-        def _v(i: int) -> str:
-            return f"{self.frag}[{i}]" if conv is None else f"{conv}({self.frag}[{i}])"
-
-        # C is 16×8: lane owns (row g, col 2t+{0,1}) and (row g+8, …) with
-        # g = lane/4, t = lane%4. ldm strides over N (the output row width).
-        # The ``{ }`` block scopes _g/_t so sibling RegStores don't collide.
+        # C is 16×8: lane owns (row g, cols 2t,2t+1) and (row g+8, cols 2t,2t+1)
+        # with g = lane/4, t = lane%4. The two cols per row are CONTIGUOUS, so
+        # each row's pair is one vectorized 4-byte store (``__half2`` / ``float2``)
+        # rather than two scalar stores — halves the epilogue store count and
+        # the address arithmetic. ldm strides over N (the output row width). The
+        # base ``flat`` is tile-aligned and ``2t`` is even, so the pair is
+        # 4-/8-byte aligned. The ``{ }`` block scopes _g/_t per RegStore.
+        vec2 = {"f16": "__half2", "bf16": "__nv_bfloat162", "f32": "float2"}.get(dst_dt)
+        if vec2 is not None:
+            packer = {"f16": "__floats2half2_rn", "bf16": "__floats2bfloat162_rn", "f32": "make_float2"}[dst_dt]
+            lo = f"{flat} + _g * {ldm} + _t * 2"
+            hi = f"{flat} + (_g + 8) * {ldm} + _t * 2"
+            return [
+                f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{lo}]) = {packer}({self.frag}[0], {self.frag}[1]);",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{hi}]) = {packer}({self.frag}[2], {self.frag}[3]); }}",
+            ]
+        # Fallback: per-element scalar stores (dtypes without a 2-vector packer).
         return [
             f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
-            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {_v(0)};",
-            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {_v(1)};",
-            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {_v(2)};",
-            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {_v(3)}; }}",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {self.frag}[0];",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {self.frag}[1];",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {self.frag}[2];",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {self.frag}[3]; }}",
         ]
 
 

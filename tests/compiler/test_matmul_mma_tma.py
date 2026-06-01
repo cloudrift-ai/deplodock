@@ -272,8 +272,8 @@ def test_mma_sync_path_emits_ldmatrix_and_mma_ptx(pin_mma_sync):
     assert "ldmatrix.sync.aligned" in src, "mma.sync operands must load via ldmatrix"
     assert "mma.sync.aligned.m16n8k16" in src, "the s16816 mma.sync instruction must be emitted"
     assert "wmma::" not in src, "the mma.sync path must not mix in legacy wmma intrinsics"
-    # f32 accumulate → f16 output goes through the per-lane __float2half epilogue.
-    assert "__float2half" in src, "f16 output needs the fp32→fp16 downconvert epilogue"
+    # f32 accumulate → f16 output goes through the per-lane vectorized __half2 epilogue.
+    assert "__floats2half2_rn" in src, "f16 output needs the fp32→fp16 downconvert epilogue"
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs sm_80+ (Ampere+)")
