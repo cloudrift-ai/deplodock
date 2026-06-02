@@ -22,7 +22,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.dtype import BF16, F16, DataType
 from deplodock.compiler.ir.tile.ir import (
     ATOM_KINDS,
     ATOM_REGISTRY,
@@ -54,27 +53,21 @@ __all__ = [
 _ATOM_KINDS_V1 = ATOM_KINDS
 
 
-def _mma_eligible_factory(
-    *,
-    cell_shape: tuple[int, int, int],
-    operand_dtype: DataType,
-    min_cc: tuple[int, int],
-) -> Callable[[LoopOp, Context, Graph], bool]:
-    """Build an mma.sync eligibility predicate for a given cell shape + operand
-    dtype + min cc gate. Parametrising the predicate lets the f16 and bf16
-    kinds reuse the same shape gate without copying the body.
+def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Callable[[LoopOp, Context, Graph], bool]:
+    """Build an mma.sync eligibility predicate for ``atom`` — its cell shape +
+    A-operand dtype come straight off the spec; ``min_cc`` is the device gate.
 
     The predicate checks:
 
     - At least one matmul-reduce in the body (``is_matmul_reduce``).
-    - Every K-indexed Load resolves to ``operand_dtype`` via
+    - Every K-indexed Load resolves to the atom's operand dtype via
       ``graph.nodes[buf].output.dtype``.
     - ``ctx.compute_capability >= min_cc``.
-    - K extent divisible by ``cell_shape[2]``.
-    - Each output extent divisible by the corresponding cell dim
-      (M by ``cell_shape[0]``, N by ``cell_shape[1]``).
+    - K extent divisible by the cell's K dim.
+    - Each output extent divisible by the corresponding cell dim (M / N).
     """
-    cell_m, cell_n, cell_k = cell_shape
+    cell_m, cell_n, cell_k = atom.shape
+    operand_dtype = atom.operand_dtype("a")
 
     def predicate(loop_op: LoopOp, ctx: Context, graph: Graph) -> bool:
         from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, StridedLoop  # noqa: PLC0415
@@ -138,19 +131,16 @@ def _mma_eligible_factory(
     return predicate
 
 
-# Per-kind eligibility predicates, keyed like ``ATOM_REGISTRY`` (cell shape +
-# operand dtype + min cc come from each kind's spec). Kept parallel to the
-# registry rather than on ``Atom`` so the spec stays a pure data record in
-# ``ir/tile/ir.py`` with no loop/graph/context dependency.
-_ELIGIBILITY: dict[str, Callable[[LoopOp, Context, Graph], bool]] = {
-    "mma_m16n8k16_f16": _mma_eligible_factory(cell_shape=(16, 8, 16), operand_dtype=F16, min_cc=(8, 0)),
-    "mma_m16n8k16_bf16": _mma_eligible_factory(cell_shape=(16, 8, 16), operand_dtype=BF16, min_cc=(8, 0)),
-}
+# Per-atom eligibility predicates, keyed by the ``Atom`` itself (cell shape +
+# operand dtype come from the spec). Kept parallel to the registry rather than
+# on ``Atom`` so the spec stays a pure data record in ``ir/tile/ir.py`` with no
+# loop/graph/context dependency.
+_ELIGIBILITY: dict[Atom, Callable[[LoopOp, Context, Graph], bool]] = {atom: _mma_eligible_factory(atom) for atom in ATOM_REGISTRY.values()}
 
 
-def is_atom_eligible(kind: str, loop_op: LoopOp, ctx: Context, *, graph: Graph) -> bool:
-    """Dispatch the per-kind eligibility predicate. Raises ``KeyError`` for an
-    unregistered kind. ``graph`` is the :class:`Graph` the ``loop_op`` lives in
-    — the predicate uses it to resolve Load source-buffer dtypes (Loop-IR Loads
-    don't carry ``.dtype`` until the Kernel-IR ``030_stamp_types`` pass)."""
-    return _ELIGIBILITY[kind](loop_op, ctx, graph)
+def is_atom_eligible(atom: Atom, loop_op: LoopOp, ctx: Context, *, graph: Graph) -> bool:
+    """Dispatch the per-atom eligibility predicate. ``graph`` is the
+    :class:`Graph` the ``loop_op`` lives in — the predicate uses it to resolve
+    Load source-buffer dtypes (Loop-IR Loads don't carry ``.dtype`` until the
+    Kernel-IR ``030_stamp_types`` pass)."""
+    return _ELIGIBILITY[atom](loop_op, ctx, graph)

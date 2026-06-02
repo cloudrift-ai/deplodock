@@ -104,7 +104,8 @@ mechanics. M1 of that plan landed the `AtomTile` flavor + the (then-empty)
 atom registry — now `ir/tile/ir.py`'s `ATOM_REGISTRY` — + the `TileParams = ScalarTileParams |
 WarpTileParams` sum-type split in `_enumeration` (`ScalarTileParams`
 carries today's `(BN, BM, FM, FN, BK, SPLITK, BR)`; `WarpTileParams`
-carries `(WN, WM, FM, FN, BK, SPLITK, ATOM_KIND)` — no `BR`, no
+carries `(WN, WM, FM, FN, BK, SPLITK, atom)` — the `Atom` spec object
+directly (the `ATOM_KIND` knob is stamped from `atom.name`) — no `BR`, no
 `BN`/`BM`). `085_warp_specialize` already emits `WarpTile(role)` (one
 role axis = total CTA warps) wrapping `WarpSpecialize` directly,
 bypassing the planner's tower builder — its role split is structural

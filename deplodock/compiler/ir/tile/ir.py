@@ -2057,7 +2057,7 @@ class TileOp(BodyOp):
 
         is_warp = isinstance(p, WarpTileParams)
         if is_warp:
-            atom_m, atom_n, _ = atom_shape(p.atom_kind)
+            atom_m, atom_n, _ = p.atom.shape
             per_m = p.wm * p.fm * atom_m
             per_n = p.wn * p.fn * atom_n
             # "Thread axes" for the warp tier = warps × lanes. Use a
@@ -2116,7 +2116,7 @@ class TileOp(BodyOp):
                 "BK": p.bk,
                 "WM": p.wm,
                 "WN": p.wn,
-                "ATOM_KIND": p.atom_kind,
+                "ATOM_KIND": p.atom.name,
             }
         else:
             score_knobs = {
@@ -2176,7 +2176,7 @@ class TileOp(BodyOp):
             # Warp-tier: the "thread" axes are warps × lanes. Treat the
             # WN × 32 contribution as the inner-stride coalescer along N,
             # mirroring the scalar BN role.
-            atom_m, atom_n, _ = atom_shape(params.atom_kind)
+            atom_m, atom_n, _ = params.atom.shape
             if shape.outer_m is not None and params.wm > 1:
                 thread_extent[shape.outer_m.axis.name] = params.wm * atom_m
             n_extent = params.wn * atom_n

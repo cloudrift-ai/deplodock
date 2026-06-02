@@ -13,9 +13,9 @@ Three layers:
        reduce / pointwise. Carries ``(bn, bm, fm, fn, bk, splitk, br,
        overhang)``.
      - :class:`WarpTileParams` — MMA / tensor-core warp-tier matmul. Carries
-       ``(wn, wm, fm, fn, bk, splitk, atom_kind, overhang)`` — no ``br``
-       (MMA gates BR=1 by construction), no ``bn``/``bm``. ``atom_kind``
-       resolves through :mod:`_atom` to the hardware instruction spec.
+       ``(wn, wm, fm, fn, bk, splitk, atom, overhang)`` — no ``br``
+       (MMA gates BR=1 by construction), no ``bn``/``bm``. ``atom`` is the
+       :class:`~deplodock.compiler.ir.tile.ir.Atom` spec object directly.
    Frozen for de-dup in the ``seen`` set inside the impls.
 2. Public ``enumerate_cartesian(...)`` — mode-dispatched wrapper that picks
    the candidate tuples + priority function for ``matmul`` / ``reduce`` /
@@ -45,9 +45,17 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+
+if TYPE_CHECKING:
+    # Used only in annotations (``WarpTileParams.atom`` / the generator params).
+    # A runtime import would cycle: _enumeration → ir.tile.ir → tuning →
+    # _enumeration. The code only reads attributes off ``Atom`` instances it's
+    # handed, never constructs the class, so a type-only import suffices.
+    from deplodock.compiler.ir.tile.ir import Atom
 
 _BK_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
 # Axis-extent + per-cell-owner cell-count candidate tuples for the matmul /
@@ -130,11 +138,12 @@ class WarpTileParams:
     MMA / tensor-core matmul. No ``br`` (MMA gates ``BR=1`` by construction);
     no ``bn``/``bm`` (the binding tier is WARP, not THREAD).
 
-    ``atom_kind`` resolves through :func:`_atom.atom_spec` to the hardware
-    instruction's cell shape ``(M, N, K)``, per-operand dtype, and group
-    size. ``wn``/``wm`` are the per-CTA warp count along the output N / M
-    axes; together with the atom cell shape and ``fn``/``fm`` they
-    determine the matmul tile dimensions
+    ``atom`` is the :class:`~deplodock.compiler.ir.tile.ir.Atom` spec directly
+    (cell shape ``(M, N, K)``, per-operand dtypes, group size) — carried as the
+    object, not a kind string (the ``ATOM_KIND`` knob is stamped from
+    ``atom.name`` when the bundle is built). ``wn``/``wm`` are the per-CTA warp
+    count along the output N / M axes; together with the atom cell shape and
+    ``fn``/``fm`` they determine the matmul tile dimensions
     ``BN = wn × fn × atom_n``, ``BM = wm × fm × atom_m``.
 
     ``overhang`` mirrors :class:`ScalarTileParams.overhang` for masked tiles.
@@ -146,7 +155,7 @@ class WarpTileParams:
     fn: int
     bk: int
     splitk: int
-    atom_kind: str
+    atom: Atom
     overhang: tuple[str, ...] = ()
 
 
@@ -279,7 +288,7 @@ def enumerate_cartesian(
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
-    atom_kinds: tuple[str, ...] = (),
+    atoms: tuple[Atom, ...] = (),
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
@@ -341,14 +350,14 @@ def enumerate_cartesian(
     # broader search space only changes behavior for tiny shapes.
     if mode_kind == "matmul" and mode_tier == "warp":
         # Warp-tier matmul — enumerate one WarpTileParams row per eligible
-        # ``atom_kind``. At M1 the impl returns []; M3 fills it in.
+        # ``Atom``.
         return _enumerate_warp_matmul_impl(
             E_M=E_M,
             E_N=E_N,
             E_K=E_K,
             ctx=ctx,
             force_splitk_one=force_splitk_one,
-            atom_kinds=atom_kinds,
+            atoms=atoms,
             m_axis_name=m_axis_name,
             n_axis_name=n_axis_name,
             m_forced_mask=m_forced_mask,
@@ -614,7 +623,7 @@ def _enumerate_warp_matmul_impl(
     E_K: int,
     ctx: Context,
     force_splitk_one: bool,
-    atom_kinds: tuple[str, ...],
+    atoms: tuple[Atom, ...],
     m_axis_name: str | None,  # noqa: ARG001 — overhang plumbing for M9 (skewed shapes)
     n_axis_name: str | None,  # noqa: ARG001
     m_forced_mask: bool,  # noqa: ARG001 — symbolic-axis masking for warp tier lands in M9
@@ -633,10 +642,8 @@ def _enumerate_warp_matmul_impl(
     matmul-shapes). BR is forced to 1 (MMA + cooperative-K is incompatible
     in v1; see Failure modes).
     """
-    if not atom_kinds:
+    if not atoms:
         return []
-
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
 
     out: list[WarpTileParams] = []
     seen: set[WarpTileParams] = set()
@@ -646,21 +653,23 @@ def _enumerate_warp_matmul_impl(
     # any CLI repro (``DEPLODOCK_WM=2 DEPLODOCK_WN=2 DEPLODOCK_BK=2 …``) rely
     # on this — without it, warp-tier pins silently fall through to the
     # scalar tier's narrows and the warp tier enumerates the full cartesian
-    # regardless. ``ATOM_KIND`` narrows the caller-supplied ``atom_kinds``
-    # tuple so a pin scopes the picker to a single kind.
+    # regardless. ``ATOM_KIND`` narrows the caller-supplied ``atoms``
+    # (by kind name) so a pin scopes the picker to a single kind.
     wm_choices = WM.narrow(_TUNE_WARP_AXIS_CHOICES)
     wn_choices = WN.narrow(_TUNE_WARP_AXIS_CHOICES)
     bk_choices = BK.narrow(_BK_CANDIDATES)
-    atom_kinds = ATOM_KIND.narrow(atom_kinds)
+    # ``ATOM_KIND`` narrows by kind *name* (the knob string); keep the atoms
+    # whose name survives the env pin.
+    _kept = set(ATOM_KIND.narrow(tuple(a.name for a in atoms)))
+    atoms = tuple(a for a in atoms if a.name in _kept)
     # v1: MMA + SPLITK > 1 needs atomic-add on MmaStore (cross-CTA
     # accumulation), which isn't wired yet. Force SPLITK=1 so each output
     # cell is written by exactly one CTA. force_splitk_one is honoured
     # but otherwise redundant here. M9 / future plan can enable
     # split-K MMA once atomic MmaStore lands.
     splitk_choices: tuple[int, ...] = (1,)
-    for kind in atom_kinds:
-        spec = atom_spec(kind)
-        atom_m, atom_n, atom_k = spec.shape
+    for atom in atoms:
+        atom_m, atom_n, atom_k = atom.shape
         if E_M % atom_m != 0 or E_N % atom_n != 0 or E_K % atom_k != 0:
             # Outer divisibility — the eligibility predicate already enforced
             # this for the kind it gated, but a different kind in the same
@@ -710,7 +719,7 @@ def _enumerate_warp_matmul_impl(
                                     fn=fn,
                                     bk=bk,
                                     splitk=splitk,
-                                    atom_kind=kind,
+                                    atom=atom,
                                 )
                                 if row in seen:
                                     continue

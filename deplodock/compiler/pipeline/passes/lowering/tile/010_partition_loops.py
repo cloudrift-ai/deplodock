@@ -288,7 +288,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
         return build_fork_tree(
             params=warp_params,
             levels=[
-                Level((ATOM_KIND.name,), lambda p: (p.atom_kind,)),
+                Level((ATOM_KIND.name,), lambda p: (p.atom.name,)),
                 Level((WM.name, WN.name), lambda p: (p.wm, p.wn)),
                 Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
                 Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
@@ -648,14 +648,11 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # param list — the fork tree in :func:`rewrite` splits the rows by
         # type and emits sibling subtrees with disjoint level schemas.
         from deplodock import config  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import (  # noqa: PLC0415
-            _ATOM_KINDS_V1,
-            ATOM_REGISTRY,
-            is_atom_eligible,
-        )
+        from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
         if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
-            eligible = tuple(k for k in _ATOM_KINDS_V1 if is_atom_eligible(k, loop_op, ctx, graph=graph))
+            eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
             # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
             # tensor-core family (WMMA was removed; the swizzled slab beats it —
             # S0–S4 of plans/mma-sync-smem-swizzle.md). It auto-enumerates
@@ -674,8 +671,8 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
             if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
                 # Auto-enumerating the mma.sync (s16816) family — the only
                 # registered atom family — needs the swizzled-TMA fast path
-                # (Hopper+); on sm_80-89 it's pin-only, so drop every atom kind.
-                eligible = tuple(k for k in eligible if k not in ATOM_REGISTRY)
+                # (Hopper+); on sm_80-89 it's pin-only, so drop every atom.
+                eligible = ()
             if eligible:
                 warp_combos = enumerate_cartesian(
                     E_M=E_M,
@@ -684,15 +681,15 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     ctx=ctx,
                     priority_mode=("matmul", "warp"),
                     force_splitk_one=force_splitk_one,
-                    atom_kinds=eligible,
+                    atoms=eligible,
                 )
-                # Drop single-warp (WM·WN == 1) atom variants: ldmatrix is
+                # Drop single-warp (WM·WN == 1) variants: ldmatrix is
                 # smem→register only, so the atom REQUIRES staged operands, but
                 # ``020_stage_inputs`` skips staging when the CTA is one warp
                 # (``n_thread <= warp_size``) — an unstaged AtomTile would crash
                 # at render. The scalar tier covers those tiny tiles. Single-warp
                 # is never the perf pick anyway, so pruning is free.
-                warp_combos = [p for p in warp_combos if not (p.atom_kind in ATOM_REGISTRY and p.wm * p.wn == 1)]
+                warp_combos = [p for p in warp_combos if p.wm * p.wn != 1]
                 param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
@@ -790,7 +787,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
             FN.name: params.fn,
             BK.name: params.bk,
             SPLITK.name: params.splitk,
-            ATOM_KIND.name: params.atom_kind,
+            ATOM_KIND.name: params.atom.name,
         }
     else:
         knobs = {
@@ -1093,10 +1090,7 @@ def _build_split_body_warp(shape: KernelShape, params: WarpTileParams) -> tuple[
     know the fragment shape and emits one ``MmaSync`` per (M_r, N_r)
     cell.
     """
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
-
-    spec = atom_spec(params.atom_kind)
-    atom_m, atom_n, atom_k = spec.shape
+    atom_m, atom_n, atom_k = params.atom.shape
 
     sigma_map: dict[str, object] = {}
 
