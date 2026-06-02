@@ -281,14 +281,15 @@ one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
 `kernel/005_lower_atom_tile`. The matmul cell inside an `AtomTile` is put
 into tensor-core form early (right after `partition_loops`, by
-`tile/011_lower_atom_cell`): the operand `Load`s gain an `atom` / `role`
-tag and the `Assign(multiply) + Accum` collapses into a single `Mma` op
-(`c += a @ b`, a reduce-accumulate sibling of `Accum` — it makes its
-loop `is_reduce`). Both are ordinary IR that the staging passes carry
-through (the loads stage like any `Load`, preserving their tags through
-`rewrite`/`simplify`); `kernel/005_lower_atom_tile` then lowers the tagged
-Loads → `RegFragment`+`LdmatrixLoad` and the `Mma` → `MmaSyncPtx`, with a
-final `RegStore`. The `AtomTile` presence is the structural "this matmul
+`tile/011_lower_atom_cell`): each operand `Load`'s `dtype` becomes a
+`FragmentType` (a structured `DataType` carrying the atom kind + `"a"`/`"b"`
+role; see `dtype.py`) and the `Assign(multiply) + Accum` collapses into a
+single `Mma` op (`c += a @ b`, a reduce-accumulate sibling of `Accum` — it
+makes its loop `is_reduce`). Both are ordinary IR that the staging passes
+carry through (the loads stage like any `Load`, the fragment identity
+riding on the preserved `dtype` channel); `kernel/005_lower_atom_tile` then
+lowers the fragment Loads → `RegFragment`+`LdmatrixLoad` and the `Mma` →
+`MmaSyncPtx`, with a final `RegStore`. The `AtomTile` presence is the structural "this matmul
 factorizes through tensor cores" signal, paired with the `ATOM_KIND` knob
 on the enclosing `TileOp`. Downstream consumer plans (MMA fragment
 factorization, warp-specialize refactor) emit `WarpTile` to drive

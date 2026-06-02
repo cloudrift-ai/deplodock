@@ -28,6 +28,7 @@ to collapse), so a second visit tags nothing and the pass skips.
 
 from __future__ import annotations
 
+from deplodock.compiler.dtype import FragmentType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
@@ -132,7 +133,10 @@ def _try_tag_here(body: Body, *, kind: str, k_name: str | None, write: Write | N
 
 
 def _with_tag(load: Load, *, kind: str, role: str) -> Load:
-    return Load(names=load.names, input=load.input, index=load.index, dtype=load.dtype, atom=kind, role=role)
+    # The fragment identity lives on the dtype (a FragmentType); `element`
+    # stays None — the operand dtype is resolved from the atom spec at
+    # kernel/005_lower_atom_tile, which runs before dtypes are stamped.
+    return Load(names=load.names, input=load.input, index=load.index, dtype=FragmentType(kind, role))
 
 
 def _classify_ab(loads: list[Load], *, k_name: str | None, write: Write | None) -> tuple[Load | None, Load | None]:

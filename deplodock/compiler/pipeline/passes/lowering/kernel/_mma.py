@@ -20,7 +20,7 @@ warp-tier variant so the scalar tier covers that shape. See the
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import DataType
+from deplodock.compiler.dtype import AtomSpec, DataType, atom_spec
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     LdmatrixLoad,
@@ -38,7 +38,6 @@ from deplodock.compiler.ir.tile.ir import (
     WarpSpecialize,
 )
 from deplodock.compiler.pipeline import RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._atom import AtomSpec, atom_spec
 
 
 def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Source]) -> tuple[Body, bool]:

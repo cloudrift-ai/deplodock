@@ -203,9 +203,8 @@ def _revert_loads(body: Body, revert: dict[str, Source]) -> Body:
         src = revert.get(s.input)
         if src is None:
             return s
-        # Preserve the mma fragment tag (atom/role) when reverting a staged
-        # Load back to its global source so the re-staged Load still lowers
-        # to ldmatrix.
-        return Load(names=s.names, input=src.buf, index=_reconstruct_global_index(src), dtype=s.dtype, atom=s.atom, role=s.role)
+        # Preserve ``dtype`` (a fragment Load's FragmentType) when reverting a
+        # staged Load to its global source so it still lowers to ldmatrix.
+        return Load(names=s.names, input=src.buf, index=_reconstruct_global_index(src), dtype=s.dtype)
 
     return body.map(fn)

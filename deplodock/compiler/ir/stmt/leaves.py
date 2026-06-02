@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.dtype import F32, DataType
+from deplodock.compiler.dtype import F32, DataType, FragmentType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, dtype_promote, op_to_expr, render_index, select_to_ternary
@@ -145,18 +145,13 @@ class Load(Stmt):
     names: tuple[str, ...]
     input: str
     index: tuple[Expr, ...]
+    # When ``dtype`` is a :class:`~deplodock.compiler.dtype.FragmentType`, this
+    # Load reads one tensor-core operand fragment — the atom kind + role live on
+    # the type, so the tensor-core intent rides through every pass on the
+    # ordinary ``dtype`` channel (``tile/011_lower_atom_cell`` sets it;
+    # ``kernel/005_lower_atom_tile`` lowers it to ``RegFragment`` +
+    # ``LdmatrixLoad``). The ``atom`` / ``role`` properties below read it back.
     dtype: DataType | None
-    # MMA fragment tag. When ``atom`` is set (an ``ATOM_KIND``), this Load
-    # reads one tensor-core operand fragment — ``role`` is ``"a"`` (M×K) or
-    # ``"b"`` (K×N). Emitted by ``tile/011_lower_atom_cell`` so the cell
-    # carries its tensor-core intent through the staging passes (which treat
-    # it as an ordinary Load), and consumed by the late ``kernel/005_lower_atom_tile``
-    # pass, which lowers a tagged Load to a ``RegFragment`` + ``LdmatrixLoad``.
-    # Empty ``atom`` = an ordinary scalar/vector Load (the default everywhere
-    # else). Both ride through ``rewrite``/``replace`` so staging's gmem→smem
-    # rewrite preserves them.
-    atom: str
-    role: str
 
     def __init__(
         self,
@@ -166,8 +161,6 @@ class Load(Stmt):
         *,
         names: tuple[str, ...] | None = None,
         dtype: DataType | None = None,
-        atom: str = "",
-        role: str = "",
     ) -> None:
         if names is None:
             if name is None:
@@ -185,8 +178,18 @@ class Load(Stmt):
         object.__setattr__(self, "input", input)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "dtype", dtype)
-        object.__setattr__(self, "atom", atom)
-        object.__setattr__(self, "role", role)
+
+    @property
+    def atom(self) -> str:
+        """The atom kind when this is a fragment Load (``dtype`` is a
+        ``FragmentType``); ``""`` otherwise."""
+        return self.dtype.atom if isinstance(self.dtype, FragmentType) else ""
+
+    @property
+    def role(self) -> str:
+        """The fragment operand role (``"a"`` / ``"b"`` / ``"c"``) when this is
+        a fragment Load; ``""`` otherwise."""
+        return self.dtype.role if isinstance(self.dtype, FragmentType) else ""
 
     @property
     def name(self) -> str:

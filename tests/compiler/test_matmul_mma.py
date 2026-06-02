@@ -220,8 +220,10 @@ def test_atom_cell_carries_through_staging(monkeypatch):
     fuses the compute into an ``Mma`` right after ``partition_loops``; both
     ride through the staging passes, and ``kernel/005_lower_atom_tile`` lowers
     them to the ``ldmatrix`` + ``mma.sync`` chain. Run the tile chain, confirm
-    the tagged Loads + ``Mma`` survive staging, then the full chain confirms
-    the kernel still emits the s16816 instruction."""
+    the tagged Loads + ``Mma`` survive staging (the tag living on the Load's
+    ``FragmentType`` dtype), then the full chain confirms the kernel still emits
+    the s16816 instruction."""
+    from deplodock.compiler.dtype import FragmentType
     from deplodock.compiler.ir.kernel.render import render_kernelop
     from deplodock.compiler.ir.stmt import Load, Mma
     from deplodock.compiler.pipeline import TILE_PASSES
@@ -245,6 +247,9 @@ def test_atom_cell_carries_through_staging(monkeypatch):
     assert all(m.atom == "mma_m16n8k16_f16" for m in mmas)
     roles = {ld.role for ld in tagged}
     assert roles == {"a", "b"}, "both operand Loads must keep their atom/role tag through staging"
+    # The tag rides on the Load's dtype — a FragmentType — not a side field.
+    assert all(isinstance(ld.dtype, FragmentType) for ld in tagged)
+    assert {ld.dtype.atom for ld in tagged} == {"mma_m16n8k16_f16"}
 
     # Full chain still produces the s16816 kernel.
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)

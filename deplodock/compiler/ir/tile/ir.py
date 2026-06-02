@@ -50,7 +50,7 @@ import enum
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
-from deplodock.compiler.dtype import DataType
+from deplodock.compiler.dtype import DataType, atom_shape, atom_spec
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -1683,8 +1683,6 @@ def score_tile_geometry(
         # corner (see ``plans/mma-warp-scoring.md`` for the 2048² fp16
         # sweep).
         if "ATOM_KIND" in knobs:
-            from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
-
             _atom_n = atom_spec(str(knobs["ATOM_KIND"])).shape[1]
             n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
             # Warp-tier MMA: the actual TMA-pipelined band on sm_90+ /
@@ -1727,8 +1725,6 @@ def score_tile_geometry(
     # and the post-materialization score agree (the lazy/eager parity check).
     # See project_cublas_gap_ncu_2026-05-31 memory.
     if "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
-
         atom_m, atom_n, atom_k = atom_spec(str(knobs["ATOM_KIND"])).shape
         bm = int(knobs.get("WM", 1)) * int(knobs.get("FM", 1)) * atom_m
         bn = int(knobs.get("WN", 1)) * int(knobs.get("FN", 1)) * atom_n
@@ -1965,7 +1961,6 @@ class TileOp(BodyOp):
         """
         if shapes is None or params is None:
             return None
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_shape  # noqa: PLC0415
         from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         shape = shapes
@@ -2088,7 +2083,6 @@ class TileOp(BodyOp):
         with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
         """
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_shape  # noqa: PLC0415
         from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         thread_extent: dict[str, int] = {}
