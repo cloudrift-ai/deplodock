@@ -175,7 +175,6 @@ def test_registry_spec_shape_and_group_size():
     spec = ATOM_REGISTRY["mma_m16n8k16_f16"]
     assert spec.shape == (16, 8, 16)
     assert spec.group_size == 32
-    assert spec.instruction == "mma_sync"
     assert spec.operand_dtypes["a"] == F16
     assert spec.operand_dtypes["b"] == F16
     assert spec.operand_dtypes["c"] == F32

@@ -86,9 +86,9 @@ class FragmentType(StructuredType):
     rides through every pass on the existing ``dtype`` channel.
 
     - ``atom`` — the ``ATOM_KIND``; resolves (in this module) to the cell shape
-      + per-operand dtypes + PTX instruction via :func:`atom_spec`. The
-      per-lane register-array width (``a[4]`` / ``b[2]`` / ``c[4]``) is derived
-      by the MMA lowering, not stored here.
+      + per-operand dtypes via :func:`atom_spec`. The per-lane register-array
+      width (``a[4]`` / ``b[2]`` / ``c[4]``) is derived by the MMA lowering,
+      not stored here.
     - ``role`` — ``"a"`` (M×K) / ``"b"`` (K×N) / ``"c"`` (accumulator).
     - ``element`` — the scalar element dtype, **derived** from the atom spec
       (``atom_spec(atom).operand_dtypes[role]``); ``name`` / ``np`` / ``nbytes``
@@ -141,17 +141,17 @@ class AtomSpec:
       scaled kinds extend with ``"a_scale"`` / ``"b_scale"``) to its element
       dtype. The materializer reads this to declare each register array, and
       :class:`FragmentType` reads it to derive ``element``.
-    - ``instruction`` names the hardware instruction family (``"mma_sync"`` for
-      the sm_80+ s16816 ``mma.sync.aligned`` + ``ldmatrix`` path; future
-      ``"wgmma"`` for sm_90+, ``"mma_scaled"`` for sm_100+ NVFP4/MXFP4).
     - ``group_size`` is the threads-per-cell count (32 for the warp-level
       mma.sync atom; 128 for a future wgmma warp-group). Used by the warp-tier
       launch-geometry math when computing per-CTA thread count.
+
+    Today the only family registered is the s16816 ``mma.sync.aligned`` +
+    ``ldmatrix`` path; when a second hardware family lands (wgmma, mma_scaled)
+    its lowering/gating differences get a discriminator field at that point.
     """
 
     shape: tuple[int, int, int]
     operand_dtypes: Mapping[str, DataType]
-    instruction: str
     group_size: int
 
 
@@ -159,13 +159,12 @@ ATOM_REGISTRY: dict[str, AtomSpec] = {
     # Modern warp-level MMA: ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` (the
     # ``s16816`` cell cuBLAS/CUTLASS use) — the sole tensor-core family. f16 /
     # bf16 operands, f32 accumulate, sm_80+ (the m16n8k16 op is Ampere+).
-    # ``instruction="mma_sync"``: ``kernel/005_lower_atom_tile`` emits the
-    # RegFragment/LdmatrixLoad/MmaSyncPtx/RegStore chain. The path has **no
-    # gmem-direct load** (ldmatrix is smem→register only).
+    # ``kernel/005_lower_atom_tile`` emits the RegFragment/LdmatrixLoad/
+    # MmaSyncPtx/RegStore chain. The path has **no gmem-direct load**
+    # (ldmatrix is smem→register only).
     "mma_m16n8k16_f16": AtomSpec(
         shape=(16, 8, 16),
         operand_dtypes={"a": F16, "b": F16, "c": F32},
-        instruction="mma_sync",
         group_size=32,
     ),
     # bf16 sibling: same s16816 path (bf16 and f16 share the 16-bit fragment
@@ -174,7 +173,6 @@ ATOM_REGISTRY: dict[str, AtomSpec] = {
     "mma_m16n8k16_bf16": AtomSpec(
         shape=(16, 8, 16),
         operand_dtypes={"a": BF16, "b": BF16, "c": F32},
-        instruction="mma_sync",
         group_size=32,
     ),
 }

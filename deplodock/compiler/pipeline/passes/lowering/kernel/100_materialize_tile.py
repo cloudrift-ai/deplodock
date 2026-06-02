@@ -102,15 +102,13 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
 
 
 def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
-    """True iff ``atom_kind`` names an ``instruction="mma_sync"`` AtomSpec
-    (the s16816 ldmatrix path). Returns False for WMMA / unset kinds."""
+    """True iff ``atom_kind`` is a registered tensor-core atom (the s16816
+    ldmatrix path — the only family today). Returns False for unset kinds."""
     if not atom_kind:
         return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY, atom_spec  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY  # noqa: PLC0415
 
-    if atom_kind not in ATOM_REGISTRY:
-        return False
-    return atom_spec(atom_kind).instruction == "mma_sync"
+    return atom_kind in ATOM_REGISTRY
 
 
 def _materialize_top(top: Stmt, *, warp_size: int, escape=None, mma_sync: bool = False) -> Stmt:

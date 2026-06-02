@@ -187,12 +187,13 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
 
 
 def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
-    """True iff ``atom_kind`` names an ``instruction="mma_sync"`` AtomSpec."""
+    """True iff ``atom_kind`` is a registered tensor-core atom (the s16816
+    ldmatrix path — the only family today). False for unset / scalar kinds."""
     if not atom_kind:
         return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY, atom_spec  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY  # noqa: PLC0415
 
-    return atom_kind in ATOM_REGISTRY and atom_spec(atom_kind).instruction == "mma_sync"
+    return atom_kind in ATOM_REGISTRY
 
 
 def _walk(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:

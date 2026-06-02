@@ -1,6 +1,6 @@
 """Per-kernel atom *eligibility* — the planner-side gate for each matmul atom.
 
-The atom **specs** (shape, per-operand dtypes, instruction, group size) + the
+The atom **specs** (shape, per-operand dtypes, group size) + the
 ``ATOM_REGISTRY`` + the ``atom_spec`` / ``atom_shape`` / ``atom_group_size``
 lookups now live in :mod:`deplodock.compiler.dtype`, next to
 :class:`~deplodock.compiler.dtype.FragmentType` (the type system is the single

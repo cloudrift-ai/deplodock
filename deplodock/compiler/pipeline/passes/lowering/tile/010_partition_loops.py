@@ -651,7 +651,6 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         from deplodock.compiler.pipeline.passes.lowering.tile._atom import (  # noqa: PLC0415
             _ATOM_KINDS_V1,
             ATOM_REGISTRY,
-            atom_spec,
             is_atom_eligible,
         )
 
@@ -671,9 +670,12 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
             # unstaged AtomTile can't lower). A ``DEPLODOCK_ATOM_KIND`` pin
             # forces the kind at any size / arch (bring-up + A-B benching).
             pinned_atom = config.knob_raw("ATOM_KIND")
-            pin_is_mma_sync = pinned_atom in ATOM_REGISTRY and atom_spec(pinned_atom).instruction == "mma_sync"
+            pin_is_mma_sync = pinned_atom in ATOM_REGISTRY
             if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
-                eligible = tuple(k for k in eligible if atom_spec(k).instruction != "mma_sync")
+                # Auto-enumerating the mma.sync (s16816) family — the only
+                # registered atom family — needs the swizzled-TMA fast path
+                # (Hopper+); on sm_80-89 it's pin-only, so drop every atom kind.
+                eligible = tuple(k for k in eligible if k not in ATOM_REGISTRY)
             if eligible:
                 warp_combos = enumerate_cartesian(
                     E_M=E_M,
@@ -684,13 +686,13 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     force_splitk_one=force_splitk_one,
                     atom_kinds=eligible,
                 )
-                # Drop single-warp (WM·WN == 1) mma.sync variants: ldmatrix is
-                # smem→register only, so mma.sync REQUIRES staged operands, but
+                # Drop single-warp (WM·WN == 1) atom variants: ldmatrix is
+                # smem→register only, so the atom REQUIRES staged operands, but
                 # ``020_stage_inputs`` skips staging when the CTA is one warp
                 # (``n_thread <= warp_size``) — an unstaged AtomTile would crash
                 # at render. The scalar tier covers those tiny tiles. Single-warp
                 # is never the perf pick anyway, so pruning is free.
-                warp_combos = [p for p in warp_combos if not (atom_spec(p.atom_kind).instruction == "mma_sync" and p.wm * p.wn == 1)]
+                warp_combos = [p for p in warp_combos if not (p.atom_kind in ATOM_REGISTRY and p.wm * p.wn == 1)]
                 param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
