@@ -128,6 +128,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
+    Atom,
     AtomTile,
     GridTile,
     RegisterTile,
@@ -405,8 +406,12 @@ def _identity_rename(name: str) -> str:
     return name
 
 
-def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...]) -> tuple[Stmt, ...]:
+def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...], *, atom: Atom | None = None) -> tuple[Stmt, ...]:
     """Wrap ``inner`` in nested typed tile flavors, innermost layer first.
+
+    ``atom`` is the :class:`Atom` spec for an ``AtomTile`` layer (required iff
+    ``layers`` contains a ``Role.ATOM`` — i.e. the warp-tier matmul tower); it
+    is stamped onto the emitted ``AtomTile`` so the spec rides the IR structure.
 
     ``layers`` is innermost-first: ``[(K_i, STAGE_INNER), (K_o, SERIAL_OUTER)]``
     walks outer ``K_o`` outermost. Consecutive parallel-binding axes group
@@ -495,7 +500,8 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...])
             # the case wires the tower builder so M3 of
             # ``plans/mma-fragment-factorization.md`` lands without
             # revisiting ``_wrap_tower`` mechanics.
-            current = (AtomTile(axes=tuple(axes), body=Body(current)),)
+            assert atom is not None, "_wrap_tower: an ATOM layer requires the atom spec"
+            current = (AtomTile(axes=tuple(axes), body=Body(current), atom=atom),)
         else:  # serial — one axis per layer
             ax = axes[0]
             role = roles[0]
@@ -1168,7 +1174,7 @@ def _build_split_body_warp(shape: KernelShape, params: WarpTileParams) -> tuple[
     if K_s is not None:
         layers.append((K_s, Role.BLOCK))
     layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
-    return _wrap_tower(layers, new_inner)
+    return _wrap_tower(layers, new_inner, atom=params.atom)
 
 
 def _replace_k_loops(

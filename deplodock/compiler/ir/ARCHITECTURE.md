@@ -279,20 +279,22 @@ collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
-`kernel/005_lower_atom_tile`. The matmul cell inside an `AtomTile` is put
-into tensor-core form early (right after `partition_loops`, by
-`tile/011_lower_atom_cell`): the `Assign(multiply) + Accum` collapses into a
-single `Mma` op (`c += a @ b`, a reduce-accumulate sibling of `Accum` — it
-makes its loop `is_reduce`) that carries the `Atom` spec (the cell shape +
-operand dtypes — `Atom` lives in `ir/tile/ir.py`) and names its A/B operand
-`Load`s by SSA value. The operand loads stay **plain** — the `Mma` is
-the sole tensor-core marker. Both are ordinary IR the staging passes carry
-through (the loads stage like any `Load`); `kernel/005_lower_atom_tile` then
-recovers each operand's role from the co-located `Mma` and lowers the loads →
+`kernel/005_lower_atom_tile`. `partition_loops` stamps the `Atom` spec (cell
+shape + operand dtypes — `Atom` lives in `ir/tile/ir.py`) **onto the `AtomTile`
+itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
+tensor cores" signal, carried in the IR rather than re-derived from a knob.
+Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
+collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
+(`c += a @ b`, a reduce-accumulate sibling of `Accum` — it makes its loop
+`is_reduce`) that carries that `Atom` and names its A/B operand `Load`s by SSA
+value. The operand loads stay **plain** — the `Mma` is the sole tensor-core
+marker downstream. Both are ordinary IR the staging passes carry through (the
+loads stage like any `Load`); `kernel/005_lower_atom_tile` recovers each
+operand's role from the co-located `Mma` and lowers the loads →
 `RegFragment`+`LdmatrixLoad` and the `Mma` → `MmaSyncPtx`, with a final
-`RegStore`. The `AtomTile` presence is the structural "this matmul
-factorizes through tensor cores" signal, paired with the `ATOM_KIND` knob
-on the enclosing `TileOp`. Downstream consumer plans (MMA fragment
+`RegStore`. The `ATOM_KIND` knob on the enclosing `TileOp` is the *tuning*
+shadow of the same choice (DB / config / search identity), not the semantic
+source. Downstream consumer plans (MMA fragment
 factorization, warp-specialize refactor) emit `WarpTile` to drive
 warp-cooperative codegen.
 

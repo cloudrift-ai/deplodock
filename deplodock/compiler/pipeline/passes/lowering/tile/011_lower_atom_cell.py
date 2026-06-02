@@ -17,16 +17,17 @@ Everything else (the ``AtomTile`` wrapper, the K_o / K_i ``SerialTile``s, the
 ``Write``) is preserved structurally; ``080_pipeline_stages`` duplicates the
 whole ``Load + Load + Mma`` cell into the prologue / epilogue via ``rewrite``.
 
-Eligibility: ``op.knobs["ATOM_KIND"]`` set (warp-tier matmul rows only).
-Idempotence: after this pass the cell holds an ``Mma`` (no ``Assign``/``Accum``
-to collapse), so a second visit rewrites nothing and the pass skips.
+Eligibility: an ``AtomTile`` in the body (its ``.atom`` is the spec used to
+build the ``Mma`` — no ``ATOM_KIND`` knob lookup). Idempotence: after this pass
+the cell holds an ``Mma`` (no ``Assign``/``Accum`` to collapse), so a second
+visit rewrites nothing and the pass skips.
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Stmt, Write
-from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp, atom_spec
+from deplodock.compiler.ir.tile.ir import Atom, AtomTile, SerialTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -34,23 +35,21 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(match: Match, root: Node) -> Graph | None:
     op = root.op
-    kind = op.knobs.get("ATOM_KIND")
-    if not kind:
-        raise RuleSkipped("not an MMA TileOp (no ATOM_KIND knob)")
-    new_body, found = _tag_atom_tiles(op.body, kind=kind)
+    new_body, found = _tag_atom_tiles(op.body)
     if not found:
-        raise RuleSkipped("no scalar matmul cell to tag (already an Mma, or none)")
+        raise RuleSkipped("no AtomTile matmul cell to tag (scalar, or already an Mma)")
     return TileOp(body=new_body, name=op.name, knobs=op.knobs)
 
 
-def _tag_atom_tiles(body: Body, *, kind: str) -> tuple[Body, bool]:
-    """Walk ``body``; for each ``AtomTile``, tag the matmul cell inside it.
+def _tag_atom_tiles(body: Body) -> tuple[Body, bool]:
+    """Walk ``body``; for each ``AtomTile``, tag the matmul cell inside it,
+    using the ``Atom`` spec carried on the tile itself (no ``ATOM_KIND`` knob).
     Recurses into other block stmts so a deep-nested AtomTile is reached."""
     out: list[Stmt] = []
     found = False
     for s in body:
         if isinstance(s, AtomTile):
-            new_cell_body, cell_found = _tag_cell(s.body, kind=kind, k_name=None, write=None)
+            new_cell_body, cell_found = _tag_cell(s.body, atom=s.atom, k_name=None, write=None)
             out.append(s.with_bodies((new_cell_body,)))
             found = found or cell_found
             continue
@@ -58,7 +57,7 @@ def _tag_atom_tiles(body: Body, *, kind: str) -> tuple[Body, bool]:
             new_bodies: list[Body] = []
             any_found = False
             for sub in s.nested():
-                ns, sf = _tag_atom_tiles(sub, kind=kind)
+                ns, sf = _tag_atom_tiles(sub)
                 new_bodies.append(ns)
                 any_found = any_found or sf
             out.append(s.with_bodies(tuple(new_bodies)))
@@ -68,7 +67,7 @@ def _tag_atom_tiles(body: Body, *, kind: str) -> tuple[Body, bool]:
     return Body(out), found
 
 
-def _tag_cell(body: Body, *, kind: str, k_name: str | None, write: Write | None) -> tuple[Body, bool]:
+def _tag_cell(body: Body, *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Body, bool]:
     """Recursively rewrite the AtomTile body. A reduce ``SerialTile`` body
     holding the canonical ``[Load, Load, Assign(multiply), Accum]`` cell
     (shapes A/B/D) becomes ``[Load a*, Load b*, Mma]``; a bare inline cell at
@@ -77,7 +76,7 @@ def _tag_cell(body: Body, *, kind: str, k_name: str | None, write: Write | None)
     # Track the enclosing Write so shape C can classify by output index.
     write = next((s for s in body if isinstance(s, Write)), write)
 
-    tagged = _try_tag_here(body, kind=kind, k_name=k_name, write=write)
+    tagged = _try_tag_here(body, atom=atom, k_name=k_name, write=write)
     if tagged is not None:
         return tagged, True
 
@@ -85,7 +84,7 @@ def _tag_cell(body: Body, *, kind: str, k_name: str | None, write: Write | None)
     found = False
     for s in body:
         if isinstance(s, SerialTile) and s.is_reduce:
-            new_inner, inner_found = _tag_cell(s.body, kind=kind, k_name=s.axis.name, write=write)
+            new_inner, inner_found = _tag_cell(s.body, atom=atom, k_name=s.axis.name, write=write)
             out.append(s.with_bodies((new_inner,)))
             found = found or inner_found
             continue
@@ -93,7 +92,7 @@ def _tag_cell(body: Body, *, kind: str, k_name: str | None, write: Write | None)
             new_bodies = []
             any_found = False
             for sub in s.nested():
-                ns, sf = _tag_cell(sub, kind=kind, k_name=k_name, write=write)
+                ns, sf = _tag_cell(sub, atom=atom, k_name=k_name, write=write)
                 new_bodies.append(ns)
                 any_found = any_found or sf
             out.append(s.with_bodies(tuple(new_bodies)))
@@ -103,7 +102,7 @@ def _tag_cell(body: Body, *, kind: str, k_name: str | None, write: Write | None)
     return Body(out), found
 
 
-def _try_tag_here(body: Body, *, kind: str, k_name: str | None, write: Write | None) -> Body | None:
+def _try_tag_here(body: Body, *, atom: Atom, k_name: str | None, write: Write | None) -> Body | None:
     """If ``body`` is the canonical matmul cell (2 Loads + one
     ``Assign(multiply)`` + one ``Accum``), return the rewritten cell — the two
     operand ``Load``s kept **plain**, the ``Assign + Accum`` replaced by one
@@ -119,11 +118,12 @@ def _try_tag_here(body: Body, *, kind: str, k_name: str | None, write: Write | N
     a_load, b_load = _classify_ab(loads, k_name=k_name, write=write)
     if a_load is None or b_load is None:
         return None
-    # The Mma carries the resolved Atom spec + the A/B operand identity (by SSA
-    # name); the operand Loads stay plain — kernel/005_lower_atom_tile reads the
-    # spec off the Mma and recovers each load's role from it. Emit the (plain)
-    # loads in A,B order then the Mma; the multiply + Accum are dropped.
-    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom_spec(kind), axes=accum.axes)
+    # The Mma carries the Atom spec (taken straight off the AtomTile) + the A/B
+    # operand identity (by SSA name); the operand Loads stay plain —
+    # kernel/005_lower_atom_tile reads the spec off the Mma and recovers each
+    # load's role from it. Emit the (plain) loads in A,B order then the Mma;
+    # the multiply + Accum are dropped.
+    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom, axes=accum.axes)
     rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
     return Body((*rest, a_load, b_load, mma))
 

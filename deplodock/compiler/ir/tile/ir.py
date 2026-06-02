@@ -1010,21 +1010,22 @@ class AtomTile(ParallelTile):
 
     Marker for the per-cell hardware-atomic extent on a matmul-reduce kernel
     (see ``plans/mma-fragment-factorization.md``). The axes carry the cell
-    shape (e.g. ``(M=16, N=16)`` for ``wmma_m16n16k16_f16``); the body inside
-    is the per-cell compute the materializer will replace with a fragment
-    instruction chain (``MmaFragment`` decls + ``MmaLoad`` + ``MmaSync``).
+    shape (e.g. ``(M=16, N=8)``); the body inside is the per-cell compute that
+    ``011_lower_atom_cell`` turns into an ``Mma`` + the lowering replaces with
+    the fragment chain.
 
-    The MMA cell materializer (``kernel/010_split_register_axes`` MMA arm)
-    consumes ``AtomTile`` structurally — its presence is the "this kernel
-    factorizes through tensor cores" signal, complementing the
-    ``ATOM_KIND`` knob on the enclosing ``TileOp``. Scalar matmul kernels
-    never emit an ``AtomTile`` (the absence of the tier is the absence of
-    the atom — see :class:`ScalarTileParams` in
-    ``passes/lowering/tile/_enumeration``).
+    ``atom`` is the :class:`Atom` this cell realises, carried **structurally**
+    on the tile — its presence (and this field) is the "this kernel factorizes
+    through tensor cores" signal, and ``011_lower_atom_cell`` reads ``.atom``
+    off it to build the ``Mma`` (no ``ATOM_KIND`` knob lookup; the knob is the
+    tuning shadow of the same choice, not the semantic source). Scalar matmul
+    kernels never emit an ``AtomTile``.
 
     Render is intentionally unimplemented: every ``AtomTile`` must be
     consumed before kernel render, mirroring ``RegisterTile``'s contract.
     """
+
+    atom: Atom
 
     def render(self, ctx: RenderCtx) -> list[str]:
         raise NotImplementedError(
