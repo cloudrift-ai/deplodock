@@ -145,7 +145,9 @@ class Atom:
 # bf16 share the 16-bit fragment layout (only ``MmaSyncPtx.ab_dtype`` differs);
 # scalar matmul is the absence of an atom. ``kernel/005_lower_atom_tile`` emits
 # the RegFragment / LdmatrixLoad / MmaSyncPtx / RegStore chain (smem-staged only —
-# ldmatrix has no gmem-direct path).
+# ldmatrix has no gmem-direct path). Insertion order is the planner's enumeration
+# priority (f16 first, then bf16); the launch-geometry / eligibility paths look a
+# kind up directly via ``ATOM_REGISTRY[knobs["ATOM_KIND"]]``.
 ATOM_REGISTRY: dict[str, Atom] = {
     "mma_m16n8k16_f16": Atom(
         name="mma_m16n8k16_f16",
@@ -160,17 +162,6 @@ ATOM_REGISTRY: dict[str, Atom] = {
         group_size=32,
     ),
 }
-
-# Priority-ordered kinds the planner enumerates (f16 first, then bf16).
-ATOM_KINDS: tuple[str, ...] = ("mma_m16n8k16_f16", "mma_m16n8k16_bf16")
-
-
-def atom_spec(kind: str) -> Atom:
-    """Resolve a kind *name* to its :class:`Atom` — the one string→spec boundary,
-    used where only the ``ATOM_KIND`` knob is in hand (``011_lower_atom_cell``,
-    launch geometry). Elsewhere the ``Atom`` is carried directly. ``KeyError``
-    for an unregistered kind (scalar matmul has no atom)."""
-    return ATOM_REGISTRY[kind]
 
 
 # ---------------------------------------------------------------------------
@@ -1762,7 +1753,7 @@ def score_tile_geometry(
         # corner (see ``plans/mma-warp-scoring.md`` for the 2048² fp16
         # sweep).
         if "ATOM_KIND" in knobs:
-            _atom_n = atom_spec(str(knobs["ATOM_KIND"])).shape[1]
+            _atom_n = ATOM_REGISTRY[str(knobs["ATOM_KIND"])].shape[1]
             n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
             # Warp-tier MMA: the actual TMA-pipelined band on sm_90+ /
             # sm_120 is ``BK ≤ 4`` (BK=2 is the empirical sweet spot —
@@ -1804,7 +1795,7 @@ def score_tile_geometry(
     # and the post-materialization score agree (the lazy/eager parity check).
     # See project_cublas_gap_ncu_2026-05-31 memory.
     if "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
-        atom_m, atom_n, atom_k = atom_spec(str(knobs["ATOM_KIND"])).shape
+        atom_m, atom_n, atom_k = ATOM_REGISTRY[str(knobs["ATOM_KIND"])].shape
         bm = int(knobs.get("WM", 1)) * int(knobs.get("FM", 1)) * atom_m
         bn = int(knobs.get("WN", 1)) * int(knobs.get("FN", 1)) * atom_n
         bk_k = int(knobs.get("BK", 1))
@@ -2242,8 +2233,6 @@ BLOCK_SIZE = _coop_block_size()
 __all__ = [
     "Atom",
     "ATOM_REGISTRY",
-    "ATOM_KINDS",
-    "atom_spec",
     # Shared expressions (re-exported for convenience)
     "Var",
     "Literal",

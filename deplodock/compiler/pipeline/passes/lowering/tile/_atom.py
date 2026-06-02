@@ -1,10 +1,10 @@
 """Per-kernel atom *eligibility* — the planner-side gate for each matmul atom.
 
 The :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (cell shape, per-operand
-dtypes, group size) + the ``ATOM_REGISTRY`` + the ``atom_spec`` name→spec lookup
-live in ``ir/tile/ir.py`` (next to the other tile-IR types, and carried directly
-on the ``Mma`` op). They are re-exported here so existing
-``from ...tile._atom import atom_spec`` call sites keep working.
+dtypes, group size) + the ``ATOM_REGISTRY`` live in ``ir/tile/ir.py`` (next to
+the other tile-IR types, and carried directly on the ``Mma`` op). They are
+re-exported here so existing ``from ...tile._atom import ATOM_REGISTRY`` call
+sites keep working.
 
 This module owns only the part that *can't* live in the IR layer: the per-kind
 **eligibility** predicate (does a given ``LoopOp`` admit this atom on this
@@ -22,12 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.ir.tile.ir import (
-    ATOM_KINDS,
-    ATOM_REGISTRY,
-    Atom,
-    atom_spec,
-)
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 
 if TYPE_CHECKING:
@@ -37,16 +32,10 @@ if TYPE_CHECKING:
 
 # Back-compat re-exports (canonical definitions live in ``ir/tile/ir.py``).
 __all__ = [
-    "ATOM_KINDS",
     "ATOM_REGISTRY",
     "Atom",
-    "_ATOM_KINDS_V1",
-    "atom_spec",
     "is_atom_eligible",
 ]
-
-# Legacy alias — some call sites / tests import the pre-move name.
-_ATOM_KINDS_V1 = ATOM_KINDS
 
 
 def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Callable[[LoopOp, Context, Graph], bool]:

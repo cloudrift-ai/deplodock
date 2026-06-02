@@ -18,10 +18,8 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
-    _ATOM_KINDS_V1,
     ATOM_REGISTRY,
     Atom,
-    atom_spec,
     is_atom_eligible,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
@@ -110,14 +108,14 @@ def test_mma_eligibility_fires_on_f16_matmul():
     F16 inputs and a sm_80 target satisfies every mma.sync F16 gate."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    assert is_atom_eligible(atom_spec("mma_m16n8k16_f16"), loop_op, _ctx(cc=(8, 0)), graph=g)
+    assert is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
 def test_mma_eligibility_rejects_f32_loads():
     """F32 operands fall through the per-Load dtype check."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F32)
     loop_op = g.nodes["c"].op
-    assert not is_atom_eligible(atom_spec("mma_m16n8k16_f16"), loop_op, _ctx(cc=(8, 0)), graph=g)
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
 def test_mma_eligibility_rejects_pre_ampere():
@@ -125,7 +123,7 @@ def test_mma_eligibility_rejects_pre_ampere():
     gate (min_cc=(8, 0))."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    assert not is_atom_eligible(atom_spec("mma_m16n8k16_f16"), loop_op, _ctx(cc=(7, 0)), graph=g)
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(7, 0)), graph=g)
 
 
 def test_mma_eligibility_rejects_non_matmul():
@@ -137,7 +135,7 @@ def test_mma_eligibility_rejects_non_matmul():
     g.add_node(op=op, inputs=["x"], output=Tensor("o", (64,), dtype=F16), node_id="o")
     g.inputs = ["x"]
     g.outputs = ["o"]
-    assert not is_atom_eligible(atom_spec("mma_m16n8k16_f16"), op, _ctx(cc=(8, 0)), graph=g)
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(8, 0)), graph=g)
 
 
 def test_mma_eligibility_rejects_indivisible_extents():
@@ -145,7 +143,7 @@ def test_mma_eligibility_rejects_indivisible_extents():
     not a multiple of 16) can't cover with m16n8k16 cells."""
     g = _matmul_graph(M=63, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
-    assert not is_atom_eligible(atom_spec("mma_m16n8k16_f16"), loop_op, _ctx(cc=(8, 0)), graph=g)
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
 def test_unregistered_kind_raises():
@@ -159,16 +157,14 @@ def test_unregistered_kind_raises():
         is_atom_eligible(Atom(name="scalar", shape=(1, 1, 1), operand_dtypes=(), group_size=1), loop_op, _ctx(), graph=g)
 
 
-def test_v1_atom_kinds_priority_order():
-    """The priority-ordered kinds tuple is the source of truth for the
-    planner's enumeration. The s16816 ``mma.sync`` path is now the sole
+def test_atom_registry_priority_order():
+    """The registry's insertion order is the source of truth for the planner's
+    enumeration priority. The s16816 ``mma.sync`` path is now the sole
     tensor-core family (legacy WMMA removed): f16 first, then bf16."""
-    assert _ATOM_KINDS_V1 == (
+    assert tuple(ATOM_REGISTRY) == (
         "mma_m16n8k16_f16",
         "mma_m16n8k16_bf16",
     )
-    for kind in _ATOM_KINDS_V1:
-        assert kind in ATOM_REGISTRY
 
 
 def test_registry_spec_shape_and_group_size():
@@ -192,7 +188,7 @@ def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("mma_m16n8k1
         E_K=K,
         ctx=_ctx(cc=(8, 0)),
         force_splitk_one=False,
-        atoms=tuple(atom_spec(k) for k in kinds),
+        atoms=tuple(ATOM_REGISTRY[k] for k in kinds),
         m_axis_name="m",
         n_axis_name="n",
         m_forced_mask=False,
@@ -249,8 +245,8 @@ def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
     """
     from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
 
-    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom=atom_spec("mma_m16n8k16_f16"))
-    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom=atom_spec("mma_m16n8k16_f16"))
+    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
+    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
     # On sm_90+ the gold tile must outscore the gmem-direct sibling.
     gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
     baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
@@ -313,7 +309,7 @@ def test_warp_enumerator_force_splitk_one():
         E_K=64,
         ctx=_ctx(cc=(8, 0)),
         force_splitk_one=True,
-        atoms=(atom_spec("mma_m16n8k16_f16"),),
+        atoms=(ATOM_REGISTRY["mma_m16n8k16_f16"],),
         m_axis_name="m",
         n_axis_name="n",
         m_forced_mask=False,
