@@ -203,8 +203,6 @@ def _revert_loads(body: Body, revert: dict[str, Source]) -> Body:
         src = revert.get(s.input)
         if src is None:
             return s
-        # Preserve ``dtype`` (a fragment Load's FragmentType) when reverting a
-        # staged Load to its global source so it still lowers to ldmatrix.
         return Load(names=s.names, input=src.buf, index=_reconstruct_global_index(src), dtype=s.dtype)
 
     return body.map(fn)

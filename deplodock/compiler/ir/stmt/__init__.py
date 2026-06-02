@@ -8,9 +8,9 @@ Defined here rather than under any one IR package because all three IRs
 - Leaves: ``Load``, ``Assign``, ``Accum``, ``Mma``, ``Init``, ``Write``,
   ``Select``, ``SelectBranch`` — pure compute primitives that read/write SSA
   names and external buffers (in :mod:`.leaves`). ``Mma`` is the tensor-core
-  fused multiply-accumulate (``c += a @ b``); a fragment ``Load``'s ``dtype``
-  is a ``FragmentType`` (carrying the atom kind + role) — both lowered by
-  ``kernel/005_lower_atom_tile``.
+  fused multiply-accumulate (``c += a @ b``) — it carries the atom kind and
+  names its A/B operand ``Load``s by SSA value (the operand loads stay plain),
+  and is lowered by ``kernel/005_lower_atom_tile``.
 - Block stmts: ``Loop``, ``StridedLoop``, ``Cond`` — carry child bodies
   (in :mod:`.blocks`).
 - Tree walks: :meth:`Body.iter` (pre-order recursive) and

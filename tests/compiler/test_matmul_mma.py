@@ -216,14 +216,13 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_atom_cell_carries_through_staging(monkeypatch):
-    """``tile/011_lower_atom_cell`` tags the operand Loads (``role`` a/b) and
-    fuses the compute into an ``Mma`` right after ``partition_loops``; both
-    ride through the staging passes, and ``kernel/005_lower_atom_tile`` lowers
-    them to the ``ldmatrix`` + ``mma.sync`` chain. Run the tile chain, confirm
-    the tagged Loads + ``Mma`` survive staging (the tag living on the Load's
-    ``FragmentType`` dtype), then the full chain confirms the kernel still emits
-    the s16816 instruction."""
-    from deplodock.compiler.dtype import FragmentType
+    """``tile/011_lower_atom_cell`` fuses the matmul compute into an ``Mma``
+    right after ``partition_loops``; the ``Mma`` (carrying the atom kind +
+    naming its A/B operand Loads by SSA value) rides the staging passes, and
+    ``kernel/005_lower_atom_tile`` recovers each operand's role from the ``Mma``
+    to emit the ``ldmatrix`` + ``mma.sync`` chain. Run the tile chain, confirm
+    the ``Mma`` survives staging and still names its two operand Loads, then the
+    full chain confirms the kernel still emits the s16816 instruction."""
     from deplodock.compiler.ir.kernel.render import render_kernelop
     from deplodock.compiler.ir.stmt import Load, Mma
     from deplodock.compiler.pipeline import TILE_PASSES
@@ -236,20 +235,18 @@ def test_atom_cell_carries_through_staging(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_FN", "8")
     monkeypatch.setenv("DEPLODOCK_BK", "2")
 
-    # After the full tile chain (partition + tag + staging) the cell carries an
-    # Mma + atom-tagged Loads reading the staged smem buffers.
+    # After the full tile chain (partition + lower-atom-cell + staging) the cell
+    # is an Mma whose A/B names resolve to two (plain) Loads of the staged smem.
     g_tile = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)
     g_tile = Pipeline.build(TILE_PASSES).run(g_tile)
     top = g_tile.nodes["c"].op
     mmas = [s for s in top.body.iter() if isinstance(s, Mma)]
-    tagged = [s for s in top.body.iter() if isinstance(s, Load) and s.atom]
     assert mmas, "the matmul compute should be an Mma carried through staging"
     assert all(m.atom == "mma_m16n8k16_f16" for m in mmas)
-    roles = {ld.role for ld in tagged}
-    assert roles == {"a", "b"}, "both operand Loads must keep their atom/role tag through staging"
-    # The tag rides on the Load's dtype — a FragmentType — not a side field.
-    assert all(isinstance(ld.dtype, FragmentType) for ld in tagged)
-    assert {ld.dtype.atom for ld in tagged} == {"mma_m16n8k16_f16"}
+    # The Mma names its operands; each names a real Load (operand Loads are plain).
+    load_names = {ld.names[0] for ld in top.body.iter() if isinstance(ld, Load)}
+    for m in mmas:
+        assert m.a in load_names and m.b in load_names and m.a != m.b
 
     # Full chain still produces the s16816 kernel.
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)

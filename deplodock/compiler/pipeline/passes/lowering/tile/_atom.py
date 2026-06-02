@@ -2,9 +2,8 @@
 
 The atom **specs** (shape, per-operand dtypes, group size) + the
 ``ATOM_REGISTRY`` + the ``atom_spec`` / ``atom_shape`` / ``atom_group_size``
-lookups now live in :mod:`deplodock.compiler.dtype`, next to
-:class:`~deplodock.compiler.dtype.FragmentType` (the type system is the single
-source of truth for "what does kind X mean"). They are re-exported here so
+lookups live in :mod:`deplodock.compiler.dtype` — the type module is the single
+source of truth for "what does kind X mean". They are re-exported here so
 existing ``from ...tile._atom import atom_spec`` call sites keep working.
 
 This module owns only the part that *can't* live in ``dtype.py``: the per-kind

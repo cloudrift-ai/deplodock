@@ -1,8 +1,8 @@
-"""Scalar / structured ``DataType`` hierarchy + ``FragmentType``."""
+"""Scalar / structured ``DataType`` hierarchy."""
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import BF16, F16, F32, DataType, F16x2, FragmentType, StructuredType, get
+from deplodock.compiler.dtype import BF16, F16, F32, DataType, F16x2, StructuredType, get
 
 
 def test_scalars_are_not_structured():
@@ -19,25 +19,8 @@ def test_f16x2_is_structured():
     assert get("f16x2") is F16x2
 
 
-def test_fragment_type_derives_element_from_spec():
-    ft = FragmentType("mma_m16n8k16_f16", "a")
-    assert ft.is_structured and isinstance(ft, StructuredType)
-    assert ft.atom == "mma_m16n8k16_f16"
-    assert ft.role == "a"
-    # element + nbytes derived from the atom spec's operand dtype (a -> F16).
-    assert ft.element is F16
-    assert ft.nbytes == F16.nbytes
-    assert ft.name == "frag:mma_m16n8k16_f16:a"
-
-
-def test_fragment_c_role_is_fp32_accumulator():
-    c = FragmentType("mma_m16n8k16_f16", "c")
-    assert c.element is F32  # the accumulator is always fp32
-
-
-def test_fragment_roles_distinct():
-    a = FragmentType("mma_m16n8k16_f16", "a")
-    b = FragmentType("mma_m16n8k16_f16", "b")
-    assert a != b
-    assert a.role != b.role
-    assert hash(a) != hash(b)
+def test_structured_keeps_scalar_carrier_info():
+    # The packed type still reports a usable numpy dtype + byte width
+    # (one 32-bit register = two fp16).
+    assert F16x2.np == F16.np
+    assert F16x2.nbytes == 4

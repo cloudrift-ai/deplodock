@@ -1,9 +1,9 @@
 """MMA fragment-chain lowering helpers for ``kernel/005_lower_atom_tile``.
 
-The matmul cell reaches the kernel chain already in tensor-core form (the
-tile-IR ``tile/011_lower_atom_cell`` pass tagged the operand ``Load``s with
-``atom`` / ``role`` and fused the compute into an :class:`Mma`, and the staging
-passes carried both through). This module does the final, mechanical lowering:
+The matmul cell reaches the kernel chain already in tensor-core form: the
+tile-IR ``tile/011_lower_atom_cell`` pass fused the compute into an ``Mma`` that
+names its A/B operand Loads by SSA value (the loads stay plain), and the staging
+passes carried it through. This module does the final, mechanical lowering:
 walk a ``TileOp`` body, find each ``AtomTile``, and rewrite its (staged) cell
 into the kernel-IR ``RegFragment`` + ``LdmatrixLoad`` + ``MmaSyncPtx`` +
 ``RegStore`` chain — re-harvesting the live ``Source``s so each
@@ -41,7 +41,7 @@ from deplodock.compiler.pipeline import RuleSkipped
 
 
 def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
-    """Walk ``body``; for each ``AtomTile``, lower its tagged matmul cell to
+    """Walk ``body``; for each ``AtomTile``, lower its matmul cell to
     the kernel-IR fragment chain and strip the wrapper. Threads ``smem_sources``
     from enclosing ``StageBundle`` / ``WarpSpecialize`` scopes so each operand's
     slab addressing resolves from the live ``Source``. Returns
@@ -90,7 +90,7 @@ def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Sour
 
 
 def _lower_cell(atom_body: Body, *, spec: AtomSpec, c_dtype: DataType, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
-    """Lower one AtomTile body (tagged Loads + ``Mma``) to the fragment chain.
+    """Lower one AtomTile body (operand Loads + ``Mma``) to the fragment chain.
 
     Prepends the ``RegFragment`` decls (seeding stable fragment SSA names from
     the FIRST reduce site, so the per-cell replicator in
@@ -108,7 +108,7 @@ def _lower_cell(atom_body: Body, *, spec: AtomSpec, c_dtype: DataType, smem_sour
     if write_stmt is None:
         raise RuleSkipped("AtomTile body unrecognised — no Write")
     if a_seed is None or b_seed is None or c_seed is None:
-        raise RuleSkipped(f"AtomTile body unrecognised — expected tagged Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
+        raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
 
     c_frag, a_frag, b_frag = f"{c_seed}_frag", f"{a_seed}_frag", f"{b_seed}_frag"
     fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=c_dtype)
@@ -117,10 +117,10 @@ def _lower_cell(atom_body: Body, *, spec: AtomSpec, c_dtype: DataType, smem_sour
         transformed = _transform_walk(atom_body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=bundle_sources, spec=spec)
         return (*fragments, *transformed)
 
-    # Shape C: K filtered — inline chain from the body's tagged Loads + store.
+    # Shape C: K filtered — inline chain from the body's operand Loads + store.
     a_load, b_load = _find_role_loads(atom_body)
     if a_load is None or b_load is None:
-        raise RuleSkipped("Atom body (shape C) missing tagged A/B loads")
+        raise RuleSkipped("Atom body (shape C) missing its Mma / A/B loads")
     chain = _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=bundle_sources)
     store = _emit_store(spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag)
     return (*fragments, *chain, store)
@@ -141,43 +141,26 @@ def _iter_bundles(body: Body):
 
 def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | None, bool]:
     """Recursively scan the AtomTile body. Returns the first ``Write``, the
-    seed ``(a_name, b_name, c_name)`` from the FIRST reduce site's tagged
-    Loads + ``Mma`` (falling back to a bare inline cell for shape C), and
-    ``has_reduce``."""
+    seed ``(a_name, b_name, c_name)`` from the first ``Mma`` (every reduce site
+    shares the same operand/accumulator SSA names, so any ``Mma`` seeds stable
+    fragment names), and ``has_reduce``."""
     write_stmt: Write | None = None
-    a_seed: str | None = None
-    b_seed: str | None = None
-    c_seed: str | None = None
+    seed: tuple[str, str, str] | None = None
     has_reduce = False
-    flat_a: str | None = None
-    flat_b: str | None = None
-    flat_c: str | None = None
 
     def _walk(stmts: Body) -> None:
-        nonlocal write_stmt, a_seed, b_seed, c_seed, has_reduce, flat_a, flat_b, flat_c
+        nonlocal write_stmt, seed, has_reduce
         for s in stmts:
             if isinstance(s, Write):
                 if write_stmt is None:
                     write_stmt = s
                 continue
-            if isinstance(s, Load) and s.atom:
-                if s.role == "a" and flat_a is None:
-                    flat_a = s.names[0]
-                elif s.role == "b" and flat_b is None:
-                    flat_b = s.names[0]
-                continue
             if isinstance(s, Mma):
-                if flat_c is None:
-                    flat_c = s.c
+                if seed is None:
+                    seed = (s.a, s.b, s.c)
                 continue
             if isinstance(s, SerialTile) and s.is_reduce:
                 has_reduce = True
-                if a_seed is None or b_seed is None or c_seed is None:
-                    ra = next((c.names[0] for c in s.body if isinstance(c, Load) and c.role == "a"), None)
-                    rb = next((c.names[0] for c in s.body if isinstance(c, Load) and c.role == "b"), None)
-                    rc = next((c.c for c in s.body if isinstance(c, Mma)), None)
-                    if ra is not None and rb is not None and rc is not None:
-                        a_seed, b_seed, c_seed = ra, rb, rc
                 _walk(s.body)
                 continue
             if s.nested():
@@ -185,16 +168,19 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
                     _walk(sub)
 
     _walk(body)
-    if not has_reduce and a_seed is None:
-        a_seed, b_seed, c_seed = flat_a, flat_b, flat_c
+    a_seed, b_seed, c_seed = seed if seed is not None else (None, None, None)
     return write_stmt, a_seed, b_seed, c_seed, has_reduce
 
 
 def _find_role_loads(body: Body) -> tuple[Load | None, Load | None]:
-    """The top-level tagged A / B Loads (shape C inline cell)."""
-    a_load = next((s for s in body if isinstance(s, Load) and s.role == "a"), None)
-    b_load = next((s for s in body if isinstance(s, Load) and s.role == "b"), None)
-    return a_load, b_load
+    """The A / B operand Loads of the cell in ``body`` — identified via the
+    co-located ``Mma``, which names its operands by SSA value (so the operand
+    Loads need no tensor-core tag of their own)."""
+    mma = next((s for s in body if isinstance(s, Mma)), None)
+    if mma is None:
+        return None, None
+    by_name = {ld.names[0]: ld for ld in body if isinstance(ld, Load) and ld.names}
+    return by_name.get(mma.a), by_name.get(mma.b)
 
 
 def _transform_walk(
@@ -250,11 +236,11 @@ def _build_chain(
     spec: AtomSpec,
 ) -> tuple[Stmt, ...]:
     """Build the ``ldmatrix a + ldmatrix b + mma.sync`` chain that replaces a
-    reduce SerialTile's ``[Load a*, Load b*, Mma]`` body — operands matched by
-    the ``Load.role`` tag (set by ``tile/011_lower_atom_cell``)."""
+    reduce SerialTile's ``[Load a, Load b, Mma]`` body — operands matched via
+    the body's ``Mma`` (which names its A/B operands by SSA value)."""
     a_load, b_load = _find_role_loads(reduce_body)
     if a_load is None or b_load is None:
-        raise RuleSkipped("reduce SerialTile body missing tagged A/B Loads")
+        raise RuleSkipped("reduce SerialTile body missing its Mma / A/B Loads")
     return _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=smem_sources)
 
 

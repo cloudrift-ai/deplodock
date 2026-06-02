@@ -711,9 +711,7 @@ def _rewrite_loads(stmt: Stmt, name_rewrites: dict[str, tuple[str, tuple[Expr, .
     def fn(s: Stmt) -> Stmt:
         if isinstance(s, Load) and s.name in name_rewrites:
             smem_name, new_index = name_rewrites[s.name]
-            # Preserve ``dtype`` so a fragment Load (dtype is a FragmentType)
-            # still lowers to ldmatrix at kernel/005_lower_atom_tile.
-            return Load(name=s.name, input=smem_name, index=new_index, dtype=s.dtype)
+            return Load(name=s.name, input=smem_name, index=new_index)
         return s
 
     return Body((stmt,)).map(fn)[0]

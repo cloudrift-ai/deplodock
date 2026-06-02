@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.dtype import F32, DataType, FragmentType
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, dtype_promote, op_to_expr, render_index, select_to_ternary
@@ -145,12 +145,6 @@ class Load(Stmt):
     names: tuple[str, ...]
     input: str
     index: tuple[Expr, ...]
-    # When ``dtype`` is a :class:`~deplodock.compiler.dtype.FragmentType`, this
-    # Load reads one tensor-core operand fragment — the atom kind + role live on
-    # the type, so the tensor-core intent rides through every pass on the
-    # ordinary ``dtype`` channel (``tile/011_lower_atom_cell`` sets it;
-    # ``kernel/005_lower_atom_tile`` lowers it to ``RegFragment`` +
-    # ``LdmatrixLoad``). The ``atom`` / ``role`` properties below read it back.
     dtype: DataType | None
 
     def __init__(
@@ -178,18 +172,6 @@ class Load(Stmt):
         object.__setattr__(self, "input", input)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "dtype", dtype)
-
-    @property
-    def atom(self) -> str:
-        """The atom kind when this is a fragment Load (``dtype`` is a
-        ``FragmentType``); ``""`` otherwise."""
-        return self.dtype.atom if isinstance(self.dtype, FragmentType) else ""
-
-    @property
-    def role(self) -> str:
-        """The fragment operand role (``"a"`` / ``"b"`` / ``"c"``) when this is
-        a fragment Load; ``""`` otherwise."""
-        return self.dtype.role if isinstance(self.dtype, FragmentType) else ""
 
     @property
     def name(self) -> str:
@@ -235,8 +217,7 @@ class Load(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
         names = ", ".join(self.names)
-        tag = f" (atom {self.atom} {self.role})" if self.atom else ""
-        return [f"{indent}{names} = load {self.input}[{idx}]{tag}"]
+        return [f"{indent}{names} = load {self.input}[{idx}]"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
@@ -542,16 +523,19 @@ class Mma(Stmt):
 
     The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
     cell on the tensor-core path. Emitted by ``tile/011_lower_atom_cell``
-    alongside the atom-tagged operand ``Load``s, carried through the staging
-    passes (it makes its reduce loop ``is_reduce`` just like an ``Accum``),
-    and lowered to a kernel-IR ``MmaSyncPtx`` by ``kernel/005_lower_atom_tile``.
+    alongside its two operand ``Load``s — which stay **plain** (no tensor-core
+    tag): the ``Mma`` is the sole carrier of the cell's atom kind + operand
+    identity, naming its A/B operands by SSA value, so ``kernel/005_lower_atom_tile``
+    recovers each operand Load's role from the co-located ``Mma``. Carried
+    through the staging passes (it makes its reduce loop ``is_reduce`` just like
+    an ``Accum``), and lowered to a kernel-IR ``MmaSyncPtx``.
 
     - ``c`` — the accumulator SSA name (declared + zero-init'd as the fp32 c
       fragment at lowering); read-and-written, like ``Accum.name``.
-    - ``a`` / ``b`` — the operand fragment SSA names (the atom-tagged Loads'
-      bindings).
-    - ``atom`` — the ``ATOM_KIND`` (cell shape + operand dtypes + PTX
-      instruction family).
+    - ``a`` / ``b`` — the SSA names of the two operand ``Load``s (A = M×K,
+      B = K×N); the lowering matches each Load by these names.
+    - ``atom`` — the ``ATOM_KIND`` (resolves to the cell shape + operand dtypes
+      via ``atom_spec``).
     - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
       cooperative-K info the escape analysis reads). Threaded through
       ``rewrite`` like ``Accum.axes``.

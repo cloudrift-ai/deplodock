@@ -27,10 +27,9 @@ class DataType:
 
     - **Scalar** — a single logical element per value (``F32`` / ``F16`` /
       ``BF16`` / ``I32`` / ``I64``). These are plain ``DataType`` instances.
-    - **Structured** (:class:`StructuredType`) — a register-composite value:
-      a packed vector (``F16x2``) or a tensor-core operand fragment
-      (:class:`FragmentType`, which carries the scalar ``element`` it is
-      built from).
+    - **Structured** (:class:`StructuredType`) — a register-composite value
+      with a hardware-specific layout, e.g. the packed vector ``F16x2``
+      (``__half2``), as opposed to a plain scalar element.
     """
 
     name: str
@@ -48,12 +47,12 @@ class DataType:
 
 @dataclass(frozen=True)
 class StructuredType(DataType):
-    """A register-composite type — a packed vector (``F16x2``) or a tensor-core
-    fragment (:class:`FragmentType`) — as opposed to a plain scalar element.
+    """A register-composite type — a packed vector like ``F16x2`` — as opposed
+    to a plain scalar element.
 
-    These occupy registers with a hardware-specific layout (``__half2``; an
-    mma per-lane register array). The renderer / lowering keys on the concrete
-    subtype rather than treating it as a scalar."""
+    It occupies a register with a hardware-specific layout (``__half2``); the
+    renderer / lowering keys on the concrete subtype rather than treating it as
+    a scalar."""
 
     @property
     def is_structured(self) -> bool:
@@ -76,39 +75,6 @@ BF16 = DataType("bf16", np.dtype(np.uint16), 2)
 F16x2 = StructuredType("f16x2", np.dtype(np.float16), 4)
 
 
-@dataclass(frozen=True, init=False)
-class FragmentType(StructuredType):
-    """A tensor-core MMA operand fragment — a :class:`StructuredType` family
-    parameterized by ``(atom, role)``.
-
-    Replaces the ad-hoc ``Load.atom`` / ``Load.role`` string tags: a fragment
-    ``Load``'s ``dtype`` *is* a ``FragmentType``, so the tensor-core intent
-    rides through every pass on the existing ``dtype`` channel.
-
-    - ``atom`` — the ``ATOM_KIND``; resolves (in this module) to the cell shape
-      + per-operand dtypes via :func:`atom_spec`. The per-lane register-array
-      width (``a[4]`` / ``b[2]`` / ``c[4]``) is derived by the MMA lowering,
-      not stored here.
-    - ``role`` — ``"a"`` (M×K) / ``"b"`` (K×N) / ``"c"`` (accumulator).
-    - ``element`` — the scalar element dtype, **derived** from the atom spec
-      (``atom_spec(atom).operand_dtypes[role]``); ``name`` / ``np`` / ``nbytes``
-      follow from it. The fragment is fully specified by ``(atom, role)``.
-    """
-
-    element: DataType
-    atom: str
-    role: str
-
-    def __init__(self, atom: str, role: str) -> None:
-        element = atom_spec(atom).operand_dtypes[role]
-        object.__setattr__(self, "atom", atom)
-        object.__setattr__(self, "role", role)
-        object.__setattr__(self, "element", element)
-        object.__setattr__(self, "name", f"frag:{atom}:{role}")
-        object.__setattr__(self, "np", element.np)
-        object.__setattr__(self, "nbytes", element.nbytes)
-
-
 # Integer types — appear on ``input_ids`` placeholders from HF whole-model
 # traces. The compiler doesn't generate kernels that compute on them today
 # (LM-head gather + embedding lookup is index math); they exist so the
@@ -118,14 +84,15 @@ I64 = DataType("i64", np.dtype(np.int64), 8)
 
 
 # ===========================================================================
-# Atom kinds — the hardware-instruction spec behind each tensor-core fragment.
+# Atom kinds — the hardware-instruction spec for each tensor-core matmul cell.
 # ===========================================================================
 #
-# An *atom* is the hardware-atomic shape of one matmul-reduce cell; a
-# :class:`FragmentType` references one by ``atom`` kind. Scalar matmul isn't an
-# atom (it's the absence of one). The registry lives here, next to
-# ``FragmentType``, so the fragment can resolve its own element dtype and the
-# type module is the single source of truth for "what does kind X mean."
+# An *atom* is the hardware-atomic shape of one matmul-reduce cell, named by an
+# ``ATOM_KIND`` string (carried on the ``Mma`` op + the ``TileOp`` knob). Scalar
+# matmul isn't an atom (it's the absence of one). The registry lives here so the
+# type module is the single source of truth for "what does kind X mean" — the
+# MMA lowering (``kernel/005_lower_atom_tile``) reads the shape + operand dtypes,
+# and ``ir/tile/ir.py`` reads the shape for launch geometry, all via ``atom_spec``.
 #
 # Per-kernel *eligibility* (does this LoopOp admit this atom?) is NOT here — it
 # depends on the loop/graph/context and stays in the planner
@@ -139,8 +106,8 @@ class AtomSpec:
     - ``shape`` is the cell shape ``(M, N, K)`` one instruction realises.
     - ``operand_dtypes`` maps each operand role (``"a"`` / ``"b"`` / ``"c"``;
       scaled kinds extend with ``"a_scale"`` / ``"b_scale"``) to its element
-      dtype. The materializer reads this to declare each register array, and
-      :class:`FragmentType` reads it to derive ``element``.
+      dtype. The MMA lowering reads it to declare each register array and to
+      type the per-operand fragments.
     - ``group_size`` is the threads-per-cell count (32 for the warp-level
       mma.sync atom; 128 for a future wgmma warp-group). Used by the warp-tier
       launch-geometry math when computing per-CTA thread count.

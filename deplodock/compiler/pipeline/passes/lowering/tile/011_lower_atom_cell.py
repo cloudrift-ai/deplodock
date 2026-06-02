@@ -1,34 +1,29 @@
-"""Tag the warp-tier matmul cell as a tensor-core atom — runs right after
+"""Rewrite the warp-tier matmul cell into tensor-core form — runs right after
 ``010_partition_loops``, before any staging pass.
 
 ``010_partition_loops`` emits the matmul cell as the scalar shape
 ``AtomTile > … > SerialTile(K_i, reduce) > [Load a, Load b, Assign(multiply),
 Accum]`` (operands still gmem-direct — staging hasn't run yet). This pass
-rewrites that cell, **in place**, into its tensor-core form:
+collapses the ``Assign(multiply) + Accum`` pair into a single :class:`Mma` op
+(``c += a @ b``) that names its A (M×K) / B (K×N) operands by SSA value and
+carries the atom kind + reduce axes. The ``Mma`` keeps the reduce loop
+``is_reduce`` (so the staging gates still fire).
 
-- the two operand ``Load``s gain an ``atom`` / ``role`` tag (``"a"`` = M×K,
-  ``"b"`` = K×N), so they keep flowing through the staging passes as ordinary
-  ``Load``s (``020_stage_inputs`` stages them, preserving the tags);
-- the ``Assign(multiply) + Accum`` pair collapses into a single :class:`Mma`
-  op (``c += a @ b``), which keeps the reduce loop ``is_reduce`` (so the
-  staging gates still fire) and carries the atom kind + reduce axes forward.
-
+The two operand ``Load``s stay **plain** — no tensor-core tag. They flow
+through the staging passes as ordinary ``Load``s, and the late
+``kernel/005_lower_atom_tile`` pass recovers each one's A/B role from the
+co-located ``Mma`` (which names them), so nothing needs to ride a side channel.
 Everything else (the ``AtomTile`` wrapper, the K_o / K_i ``SerialTile``s, the
-``Write``) is preserved structurally. The duplication done later by
-``080_pipeline_stages`` copies the tagged ``Load``s + ``Mma`` through
-``rewrite`` into the prologue / epilogue. The final lowering to the kernel-IR
-``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore`` chain is the
-late ``kernel/005_lower_atom_tile`` pass, which reads the tags + ``Mma`` off the
-staged cell.
+``Write``) is preserved structurally; ``080_pipeline_stages`` duplicates the
+whole ``Load + Load + Mma`` cell into the prologue / epilogue via ``rewrite``.
 
 Eligibility: ``op.knobs["ATOM_KIND"]`` set (warp-tier matmul rows only).
 Idempotence: after this pass the cell holds an ``Mma`` (no ``Assign``/``Accum``
-to collapse), so a second visit tags nothing and the pass skips.
+to collapse), so a second visit rewrites nothing and the pass skips.
 """
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import FragmentType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
@@ -110,8 +105,9 @@ def _tag_cell(body: Body, *, kind: str, k_name: str | None, write: Write | None)
 
 def _try_tag_here(body: Body, *, kind: str, k_name: str | None, write: Write | None) -> Body | None:
     """If ``body`` is the canonical matmul cell (2 Loads + one
-    ``Assign(multiply)`` + one ``Accum``), return the tagged rewrite; else
-    ``None``."""
+    ``Assign(multiply)`` + one ``Accum``), return the rewritten cell — the two
+    operand ``Load``s kept **plain**, the ``Assign + Accum`` replaced by one
+    ``Mma`` that names its A/B operands by SSA value. Else ``None``."""
     loads = [s for s in body if isinstance(s, Load)]
     assigns = [s for s in body if isinstance(s, Assign)]
     accums = [s for s in body if isinstance(s, Accum)]
@@ -123,20 +119,13 @@ def _try_tag_here(body: Body, *, kind: str, k_name: str | None, write: Write | N
     a_load, b_load = _classify_ab(loads, k_name=k_name, write=write)
     if a_load is None or b_load is None:
         return None
-    a_tagged = _with_tag(a_load, kind=kind, role="a")
-    b_tagged = _with_tag(b_load, kind=kind, role="b")
+    # The Mma carries the atom kind + the A/B operand identity (by SSA name);
+    # the operand Loads stay plain — kernel/005_lower_atom_tile recovers each
+    # one's role from this Mma. Emit the (plain) loads in A,B order then the
+    # Mma; the multiply + Accum are dropped.
     mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=kind, axes=accum.axes)
-    # Preserve any non-cell stmts (none expected) before the cell; emit the
-    # tagged loads + Mma in operand-stable order.
     rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
-    return Body((*rest, a_tagged, b_tagged, mma))
-
-
-def _with_tag(load: Load, *, kind: str, role: str) -> Load:
-    # The fragment identity lives on the dtype (a FragmentType); `element`
-    # stays None — the operand dtype is resolved from the atom spec at
-    # kernel/005_lower_atom_tile, which runs before dtypes are stamped.
-    return Load(names=load.names, input=load.input, index=load.index, dtype=FragmentType(kind, role))
+    return Body((*rest, a_load, b_load, mma))
 
 
 def _classify_ab(loads: list[Load], *, k_name: str | None, write: Write | None) -> tuple[Load | None, Load | None]:
