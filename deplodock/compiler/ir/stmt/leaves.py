@@ -150,7 +150,7 @@ class Load(Stmt):
     # reads one tensor-core operand fragment — ``role`` is ``"a"`` (M×K) or
     # ``"b"`` (K×N). Emitted by ``tile/011_lower_atom_cell`` so the cell
     # carries its tensor-core intent through the staging passes (which treat
-    # it as an ordinary Load), and consumed by the late ``kernel/005_lower_atom``
+    # it as an ordinary Load), and consumed by the late ``kernel/005_lower_atom_tile``
     # pass, which lowers a tagged Load to a ``RegFragment`` + ``LdmatrixLoad``.
     # Empty ``atom`` = an ordinary scalar/vector Load (the default everywhere
     # else). Both ride through ``rewrite``/``replace`` so staging's gmem→smem
@@ -541,7 +541,7 @@ class Mma(Stmt):
     cell on the tensor-core path. Emitted by ``tile/011_lower_atom_cell``
     alongside the atom-tagged operand ``Load``s, carried through the staging
     passes (it makes its reduce loop ``is_reduce`` just like an ``Accum``),
-    and lowered to a kernel-IR ``MmaSyncPtx`` by ``kernel/005_lower_atom``.
+    and lowered to a kernel-IR ``MmaSyncPtx`` by ``kernel/005_lower_atom_tile``.
 
     - ``c`` — the accumulator SSA name (declared + zero-init'd as the fp32 c
       fragment at lowering); read-and-written, like ``Accum.name``.
@@ -574,8 +574,7 @@ class Mma(Stmt):
 
     def render(self, ctx: RenderCtx) -> list[str]:
         raise NotImplementedError(
-            "Mma must be consumed by kernel/005_lower_atom before render — "
-            f"reached render with atom={self.atom!r}"
+            f"Mma must be consumed by kernel/005_lower_atom_tile before render — reached render with atom={self.atom!r}"
         )
 
 

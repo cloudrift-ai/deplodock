@@ -1777,100 +1777,6 @@ def _count_loop_input_buffers(shape) -> int:
     return len(inputs)
 
 
-@dataclass(frozen=True)
-class Atom(Stmt):
-    """One hardware-atomic matmul cell — the entire fragment calculation.
-
-    Produced by ``kernel/005_lower_atom_tile`` once it has recognised the
-    ``AtomTile`` body, classified the A/B operands, and resolved the atom
-    spec. A single ``Atom`` owns the whole per-cell computation: declare the
-    fragments, run the K reduce loop of ``load a + load b + mma-accumulate``
-    MAC steps, and store the accumulator. ``kernel/006_expand_atom`` lowers
-    it to the kernel-IR ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
-    ``RegStore`` chain the downstream passes (``010_split_register_axes`` …)
-    consume — so ``Atom`` lives in the IR only between those two passes.
-
-    Fields:
-
-    - ``spec_kind`` — the ``ATOM_KIND`` knob value; resolves to an
-      ``AtomSpec`` (cell shape + operand dtypes + PTX instruction) via
-      ``atom_spec``.
-    - ``body`` — the staged K-reduce skeleton (``SerialTile(K_o)`` /
-      ``StageBundle`` / ``AsyncWait`` / reduce ``SerialTile`` whose bodies
-      hold ``Load a + Load b + Accum``; shape C is the bare inline
-      ``Load + Load + Assign + Accum``). The ``Write`` is hoisted out into
-      ``out_buffer`` / ``out_index``.
-    - ``a_buffer`` / ``b_buffer`` — the staged smem buffer *names* classified as
-      the A (M×K) and B (K×N) operands. The expander matches each reduce site's
-      Loads by buffer (instead of re-classifying) and re-harvests the live
-      ``Source`` for the slab addressing — buffer names are stable across the
-      axis renumbering that happens between this node's creation and its
-      expansion, whereas a ``Source`` snapshot's ``cache_axes`` would drift out
-      of sync with the body's loop vars.
-    - ``c_name`` / ``a_name`` / ``b_name`` — the accumulator / operand SSA
-      base names; the fragment arrays are ``f"{name}_frag"`` (kept stable so
-      the per-cell replicator in ``010_split_register_axes`` renames them
-      consistently across prologue / inner / epilogue chains).
-    - ``out_buffer`` / ``out_index`` — the store target (the hoisted
-      ``Write``).
-    - ``c_dtype`` — the accumulator (``c`` fragment) dtype, always fp32 for
-      the registered mma.sync kinds.
-
-    Render is intentionally unimplemented: every ``Atom`` must be consumed by
-    ``006_expand_atom`` before kernel render, mirroring ``AtomTile`` /
-    ``RegisterTile``. ``Atom`` lives in the IR only between those two passes.
-    """
-
-    spec_kind: str
-    body: Body
-    a_buffer: str
-    b_buffer: str
-    c_name: str
-    a_name: str
-    b_name: str
-    out_buffer: str
-    out_index: tuple
-    c_dtype: DataType
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.body, Body):
-            object.__setattr__(self, "body", Body(self.body))
-
-    def nested(self) -> tuple[Body, ...]:
-        return (self.body,)
-
-    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
-        (body,) = bodies
-        return replace(self, body=body)
-
-    def exprs(self) -> tuple[Expr, ...]:
-        return tuple(self.out_index)
-
-    def external_writes(self) -> tuple[str, ...]:
-        # The store target is hoisted out of ``body`` into ``out_buffer``, so
-        # the body no longer surfaces it — report it here to keep the output
-        # on the kernel signature until ``006_expand_atom`` re-emits the
-        # ``RegStore``.
-        return (self.out_buffer,)
-
-    def has_side_effects(self) -> bool:
-        # Always stores its accumulator (the hoisted Write).
-        return True
-
-    def pretty(self, indent: str = "") -> list[str]:
-        idx = ", ".join(e.pretty() for e in self.out_index)
-        head = (
-            f"{indent}Atom {self.spec_kind} {self.out_buffer}[{idx}] <- "
-            f"{self.a_buffer} @ {self.b_buffer} (c={self.c_name}:{self.c_dtype.name})"
-        )
-        return [head, *pretty_body(self.body, indent + INDENT)]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        raise NotImplementedError(
-            f"Atom must be consumed by kernel/006_expand_atom before render — reached render with spec_kind={self.spec_kind!r}"
-        )
-
-
 @dataclass
 class TileOp(BodyOp):
     """One GPU kernel as a Tile IR program — pre-materialization.
@@ -2291,7 +2197,6 @@ __all__ = [
     "SerialTile",
     "StridedTile",
     "SerialKind",
-    "Atom",
     "Stage",
     "StageBundle",
     "StagePolicy",

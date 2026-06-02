@@ -290,7 +290,9 @@ def _accums_independent_in(body: Body) -> bool:
 def _make_phase_load_rewriter(staged_names: set[str], phase):
     def fn(s: Stmt) -> Stmt:
         if isinstance(s, Load) and s.input in staged_names:
-            return Load(name=s.name, input=s.input, index=(phase, *s.index))
+            # Preserve the mma fragment tag (atom/role) through the phase-prefix
+            # rewrite so the buffered consumer Load still lowers to ldmatrix.
+            return Load(name=s.name, input=s.input, index=(phase, *s.index), dtype=s.dtype, atom=s.atom, role=s.role)
         return s
 
     return fn

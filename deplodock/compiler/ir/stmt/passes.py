@@ -211,7 +211,7 @@ def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
 
 @simplify.register
 def _(s: Load, ctx: SimplifyCtx) -> Stmt:
-    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index), dtype=s.dtype)
+    return Load(names=s.names, input=s.input, index=tuple(e.simplify(ctx) for e in s.index), dtype=s.dtype, atom=s.atom, role=s.role)
 
 
 @simplify.register

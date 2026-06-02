@@ -279,17 +279,20 @@ collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
-`kernel/005_lower_atom_tile`, which classifies the cell's A/B operands +
-accumulator + store target and packages the whole per-cell computation
-into an `Atom`. `Atom` (the entire fragment calculation — declare
-fragments, K-reduce loop of load+mma+accumulate MAC steps, store) is in
-turn consumed by `kernel/006_expand_atom`, which lowers it to the
-`RegFragment`/`LdmatrixLoad`/`MmaSyncPtx`/`RegStore` kernel chain — so it
-lives in the IR only across that 005→006 gap. The `AtomTile` presence is
-the structural "this matmul factorizes through tensor cores" signal,
-paired with the `ATOM_KIND` knob on the enclosing `TileOp`. Downstream
-consumer plans (MMA fragment factorization, warp-specialize refactor)
-emit `WarpTile` to drive warp-cooperative codegen.
+`kernel/005_lower_atom_tile`. The matmul cell inside an `AtomTile` is put
+into tensor-core form early (right after `partition_loops`, by
+`tile/011_lower_atom_cell`): the operand `Load`s gain an `atom` / `role`
+tag and the `Assign(multiply) + Accum` collapses into a single `Mma` op
+(`c += a @ b`, a reduce-accumulate sibling of `Accum` — it makes its
+loop `is_reduce`). Both are ordinary IR that the staging passes carry
+through (the loads stage like any `Load`, preserving their tags through
+`rewrite`/`simplify`); `kernel/005_lower_atom_tile` then lowers the tagged
+Loads → `RegFragment`+`LdmatrixLoad` and the `Mma` → `MmaSyncPtx`, with a
+final `RegStore`. The `AtomTile` presence is the structural "this matmul
+factorizes through tensor cores" signal, paired with the `ATOM_KIND` knob
+on the enclosing `TileOp`. Downstream consumer plans (MMA fragment
+factorization, warp-specialize refactor) emit `WarpTile` to drive
+warp-cooperative codegen.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative

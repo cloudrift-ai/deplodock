@@ -1,78 +1,35 @@
-"""Lower AtomTile to MMA fragment Stmts — M5 of
-``plans/mma-fragment-factorization.md`` plus M5 of
-``plans/mma-smem-staging.md`` plus M2 of
-``plans/mma-perf-closures.md``.
+"""Lower the tensor-core matmul cell to the kernel-IR MMA fragment chain.
 
-Runs *before* ``010_split_register_axes`` in the kernel chain. The
-partition planner emits one of four AtomTile body shapes:
+The matmul cell arrives in tensor-core form: ``tile/011_lower_atom_cell``
+tagged the operand ``Load``s with ``atom`` / ``role`` and fused the compute
+into an :class:`~deplodock.compiler.ir.stmt.Mma`, and the staging passes
+carried both through (the loads staged like any other, the ``Mma`` keeping its
+reduce loop ``is_reduce``). The partition planner emits one of four cell
+shapes:
 
-A. Direct K-loop, no staging (gmem-direct MMA):
-   ``AtomTile > SerialTile(K_o) > SerialTile(K_i, reduce) > Load+Accum``
+A. Direct K-loop, no staging (pruned for mma.sync — ldmatrix is smem-only):
+   ``AtomTile > SerialTile(K_o) > SerialTile(K_i, reduce) > [Load a*, Load b*, Mma]``
 B. Single-bundle staged (SYNC or single-buffer ASYNC):
-   ``AtomTile > SerialTile(K_o) > StageBundle > SerialTile(K_i, reduce) > Load+Accum``
-C. Filtered K (single-iter, no SerialTile):
-   ``AtomTile > Load+Assign+Accum`` (inline)
-D. Pipelined + buffered (cp.async double-buffered, M2 of mma-perf-closures):
-   ``AtomTile > StageBundle(prologue) > SerialTile(K_o-1) {
-       StageBundle(issue next), AsyncWait, SerialTile(K_i, reduce), AsyncWait
-   }, AsyncWait, SerialTile(K_i, reduce) (epilogue), Write``
+   ``AtomTile > SerialTile(K_o) > StageBundle > SerialTile(K_i, reduce) > [Load a*, Load b*, Mma]``
+C. Filtered K (single-iter, no SerialTile): ``AtomTile > [Load a*, Load b*, Mma]`` (inline)
+D. Pipelined + buffered (cp.async double-buffered): prologue StageBundle, K_o-1
+   loop with issue-next StageBundle + AsyncWait + reduce, AsyncWait, epilogue reduce, Write.
 
-For shapes A/B/D the rewrite is a **transform walk** that preserves every
-structural Stmt (StageBundle wraps, AsyncWait, K_o SerialTile,
-prologue/epilogue) and only rewrites:
+This pass walks the ``TileOp`` body, finds each ``AtomTile``, and rewrites its
+cell into ``RegFragment`` decls + per-reduce ``LdmatrixLoad a + LdmatrixLoad b
++ MmaSyncPtx`` + final ``RegStore``, then strips the ``AtomTile`` wrapper. The
+fragment SSA names are seeded once from the FIRST reduce site (stable across
+prologue/inner/epilogue, which is what the per-cell replicator in
+``010_split_register_axes`` expects). Operands are matched per reduce site by
+the ``Load.role`` tag; the slab ``src_index`` / ``ldm`` come from re-harvesting
+the live ``Source`` (``_mma_src_index``), so the phase-prefix prepend for
+double-buffered slabs stays correct.
 
-- every ``SerialTile(is_reduce=True)`` body → ``MmaLoad a + MmaLoad b + MmaSync`` chain,
-  with the ``is_reduce`` flag cleared (no more Accum inside).
-- every ``Write`` → ``MmaStore``.
-
-A pre-scan finds one ``(a_load, b_load)`` pair to seed the fragment SSA
-names and the dtypes from the atom spec; the chain inside each per-reduce
-``SerialTile`` re-classifies its own loads (shapes D has prologue/epilogue
-reduces with the same K name, so the classification is stable across all
-reduce sites).
-
-For shape C the rewrite emits the Mma chain inline alongside an MmaStore.
-
-The transform walk approach replaces the pre-2026 pattern-match-and-rebuild
-path which captured exactly one ``(outer_st, reduce_st, enclosing_bundle)``
-triple and rebuilt the AtomTile body from it — losing the prologue
-StageBundle, the epilogue AsyncWait, and the epilogue reduce SerialTile
-that shape D produces. The plan B/C bench gates need the pipelined path
-working to measure the double-buffered cp.async lever.
-
-**Phase-prefix prepend** (M2 Bug B of plans/mma-perf-closures.md). For
-BUFFERED / ASYNC stages with ``buffer_count >= 2`` the slab is allocated
-as ``[phase, …cache_axes…]`` (rank-prepended). The consumer Load gets
-rewritten by 020_stage_inputs to ``Load(input='b_smem',
-index=(phase_expr, cache_var_0, cache_var_1, …))`` — phase is the leading
-dim. ``_mma_src_index`` preserves that leading prefix on the MmaLoad
-``src_index`` by detecting ``len(load.index) > len(cache_axes)`` and
-splicing the prefix in front of the cache-coord tuple. The ``ldm``
-calculation stays per-cache-axis (the phase dim doesn't change the
-inner-source-dim row stride).
-
-**A/B classification for staged loads** (M2 Bug C). The pre-pipelined
-heuristic keys off ``K_name in load.index[-1]`` → A vs ``in load.index[0]``
-→ B. For staged smem loads the index is multi-dim slab coords (e.g.
-``(phase, a2, a4, a6)``) where the K axis sits in the *middle*. When
-``load.input`` resolves to a staged smem name, classify A vs B by reading
-``Source.cache_dims`` — the cache axis whose ``axis.name == K_name`` has
-``source_dim == 1`` for A (K inner) or ``0`` for B (K outer).
-
-This pass does the **recognition** half only: it classifies the A/B operands,
-the accumulator, and the store target, and packages the whole per-cell
-computation into one Tile-IR ``Atom`` node (``plans/...``). The mechanical
-expansion of ``Atom`` into the kernel-IR ``RegFragment`` / ``LdmatrixLoad`` /
-``MmaSyncPtx`` / ``RegStore`` chain is the sibling ``006_expand_atom`` pass —
-so ``Atom`` lives in the IR only between these two passes, and the downstream
-passes (``010_split_register_axes`` …) keep consuming the same kernel chain.
-
-The recognition helpers (``lower_to_atoms`` / ``build_atom`` + the classifier)
-live in the sibling ``_mma`` module; this file is the pass entry point.
-Eligibility: ``op.knobs["ATOM_KIND"]`` set (only warp-tier matmul rows carry
-this knob — the scalar planner branch leaves it unset and this pass skips).
-Idempotence: after this pass the AtomTile is gone (replaced by ``Atom``), so
-on a second visit the pattern doesn't match and the pass skips.
+The lowering helpers live in the sibling ``_``-prefixed ``_mma`` module, which
+the pass loader skips; this file is the pattern + ``rewrite`` entry point.
+Eligibility: ``op.knobs["ATOM_KIND"]`` set (warp-tier matmul rows only).
+Idempotence: after this pass the ``AtomTile`` is gone, so a second visit finds
+nothing and the pass skips.
 """
 
 from __future__ import annotations
@@ -80,13 +37,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.kernel._mma import lower_to_atoms, resolve_c_dtype
-from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
-    parallel_tile_of,
-    replace_parallel_tile_body,
-    single_tile,
-)
+from deplodock.compiler.pipeline.passes.lowering.kernel._mma import lower_atom_cells
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -96,22 +47,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     atom_kind = op.knobs.get("ATOM_KIND")
     if not atom_kind:
         raise RuleSkipped("not an MMA TileOp (no ATOM_KIND knob)")
-    spec = atom_spec(atom_kind)
-    body = op.body
-    idx, outer = single_tile(body)
-    tt = parallel_tile_of(outer)
-
-    # Accumulate in fp32 (the spec's c dtype) regardless of output buffer
-    # dtype — matches cuBLAS / PyTorch fp16-GEMM precision. When the output
-    # buffer is narrower (``__half*`` / ``__nv_bfloat16*``), ``RegStore``
-    # emits an epilogue downconvert so the element-type match still holds.
-    # See ``resolve_c_dtype`` + ``RegStore`` docstrings.
-    c_dtype = resolve_c_dtype(root, spec.operand_dtypes["c"])
-
-    lowered, found = lower_to_atoms(tt.body, spec_kind=atom_kind, c_dtype=c_dtype, smem_sources={})
+    lowered, found = lower_atom_cells(op.body, spec_kind=atom_kind, smem_sources={})
     if not found:
-        # Could happen on a second visit (AtomTile already consumed).
+        # Second visit (AtomTile already consumed) or a non-MMA tower.
         raise RuleSkipped("no AtomTile in body — already lowered")
-
-    rebuilt = replace_parallel_tile_body(outer, lowered)
-    return TileOp(body=body[:idx] + (rebuilt,) + body[idx + 1 :], name=op.name, knobs=op.knobs)
+    return TileOp(body=lowered, name=op.name, knobs=op.knobs)

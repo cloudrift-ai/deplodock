@@ -5,9 +5,11 @@ Defined here rather than under any one IR package because all three IRs
 (Loop, Tile, Kernel) consume the same leaf vocabulary:
 
 - ``Stmt`` — abstract base for every body statement.
-- Leaves: ``Load``, ``Assign``, ``Accum``, ``Init``, ``Write``, ``Select``,
-  ``SelectBranch`` — pure compute primitives that read/write SSA names
-  and external buffers (in :mod:`.leaves`).
+- Leaves: ``Load``, ``Assign``, ``Accum``, ``Mma``, ``Init``, ``Write``,
+  ``Select``, ``SelectBranch`` — pure compute primitives that read/write SSA
+  names and external buffers (in :mod:`.leaves`). ``Mma`` is the tensor-core
+  fused multiply-accumulate (``c += a @ b``); ``Load`` carries an optional
+  ``atom`` / ``role`` fragment tag — both lowered by ``kernel/005_lower_atom_tile``.
 - Block stmts: ``Loop``, ``StridedLoop``, ``Cond`` — carry child bodies
   (in :mod:`.blocks`).
 - Tree walks: :meth:`Body.iter` (pre-order recursive) and

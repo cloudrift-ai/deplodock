@@ -215,15 +215,16 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
-def test_atom_node_is_the_005_006_handshake(monkeypatch):
-    """``005_lower_atom_tile`` packages each warp-tier matmul cell into a
-    Tile-IR ``Atom`` (recognition); ``006_expand_atom`` lowers it to the
-    ``ldmatrix`` + ``mma.sync`` kernel chain (expansion). Spy on the expander
-    to confirm the handshake fires with a well-formed ``Atom`` and that the
-    final kernel still emits the s16816 instruction."""
-    import deplodock.compiler.pipeline.passes.lowering.kernel._mma as mma_mod
+def test_atom_cell_carries_through_staging(monkeypatch):
+    """``tile/011_lower_atom_cell`` tags the operand Loads (``role`` a/b) and
+    fuses the compute into an ``Mma`` right after ``partition_loops``; both
+    ride through the staging passes, and ``kernel/005_lower_atom_tile`` lowers
+    them to the ``ldmatrix`` + ``mma.sync`` chain. Run the tile chain, confirm
+    the tagged Loads + ``Mma`` survive staging, then the full chain confirms
+    the kernel still emits the s16816 instruction."""
     from deplodock.compiler.ir.kernel.render import render_kernelop
-    from deplodock.compiler.ir.tile.ir import Atom
+    from deplodock.compiler.ir.stmt import Load, Mma
+    from deplodock.compiler.pipeline import TILE_PASSES
 
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
     monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
@@ -233,31 +234,23 @@ def test_atom_node_is_the_005_006_handshake(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_FN", "8")
     monkeypatch.setenv("DEPLODOCK_BK", "2")
 
-    captured: list[Atom] = []
-    orig = mma_mod.expand_atom
+    # After the full tile chain (partition + tag + staging) the cell carries an
+    # Mma + atom-tagged Loads reading the staged smem buffers.
+    g_tile = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)
+    g_tile = Pipeline.build(TILE_PASSES).run(g_tile)
+    top = g_tile.nodes["c"].op
+    mmas = [s for s in top.body.iter() if isinstance(s, Mma)]
+    tagged = [s for s in top.body.iter() if isinstance(s, Load) and s.atom]
+    assert mmas, "the matmul compute should be an Mma carried through staging"
+    assert all(m.atom == "mma_m16n8k16_f16" for m in mmas)
+    roles = {ld.role for ld in tagged}
+    assert roles == {"a", "b"}, "both operand Loads must keep their atom/role tag through staging"
 
-    def spy(atom, *, smem_sources):
-        captured.append(atom)
-        return orig(atom, smem_sources=smem_sources)
-
-    monkeypatch.setattr(mma_mod, "expand_atom", spy)
-
+    # Full chain still produces the s16816 kernel.
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)
     g = Pipeline.build(KERNEL_PASSES).run(g)
-
-    # 006 expanded at least one Atom emitted by 005.
-    assert captured, "expected 006_expand_atom to consume an Atom emitted by 005"
-    atom = captured[0]
-    assert isinstance(atom, Atom)
-    assert atom.spec_kind == "mma_m16n8k16_f16"
-    # Operands classified to distinct staged smem buffers; store target hoisted.
-    assert atom.a_buffer and atom.b_buffer and atom.a_buffer != atom.b_buffer
-    assert atom.out_buffer == "c"
-    assert atom.body, "the staged K-reduce skeleton must survive on the Atom body"
-
-    # The handshake produced the real kernel chain (every Atom consumed).
     kop = g.nodes["c"].op
-    assert not any(isinstance(s, Atom) for s in kop.body.iter()), "every Atom must be expanded before render"
+    assert not any(isinstance(s, Mma) for s in kop.body.iter()), "every Mma must be lowered before render"
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
     assert "mma.sync.aligned.m16n8k16" in src
