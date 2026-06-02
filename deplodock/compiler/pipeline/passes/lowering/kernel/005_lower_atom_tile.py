@@ -59,12 +59,20 @@ heuristic keys off ``K_name in load.index[-1]`` → A vs ``in load.index[0]``
 ``Source.cache_dims`` — the cache axis whose ``axis.name == K_name`` has
 ``source_dim == 1`` for A (K inner) or ``0`` for B (K outer).
 
-The MMA-fragment lowering helpers (``lower_atom_tiles`` and the per-reduce
-chain builders) live in the sibling ``_mma`` module; this file is the pass
-entry point. Eligibility: ``op.knobs["ATOM_KIND"]`` set (only warp-tier
-matmul rows carry this knob — the scalar planner branch leaves it unset and
-this pass skips). Idempotence: after this pass the AtomTile is gone, so on
-a second visit the pattern doesn't match and the pass skips.
+This pass does the **recognition** half only: it classifies the A/B operands,
+the accumulator, and the store target, and packages the whole per-cell
+computation into one Tile-IR ``Atom`` node (``plans/...``). The mechanical
+expansion of ``Atom`` into the kernel-IR ``RegFragment`` / ``LdmatrixLoad`` /
+``MmaSyncPtx`` / ``RegStore`` chain is the sibling ``006_expand_atom`` pass —
+so ``Atom`` lives in the IR only between these two passes, and the downstream
+passes (``010_split_register_axes`` …) keep consuming the same kernel chain.
+
+The recognition helpers (``lower_to_atoms`` / ``build_atom`` + the classifier)
+live in the sibling ``_mma`` module; this file is the pass entry point.
+Eligibility: ``op.knobs["ATOM_KIND"]`` set (only warp-tier matmul rows carry
+this knob — the scalar planner branch leaves it unset and this pass skips).
+Idempotence: after this pass the AtomTile is gone (replaced by ``Atom``), so
+on a second visit the pattern doesn't match and the pass skips.
 """
 
 from __future__ import annotations
@@ -72,7 +80,7 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.kernel._mma import lower_atom_tiles, resolve_c_dtype
+from deplodock.compiler.pipeline.passes.lowering.kernel._mma import lower_to_atoms, resolve_c_dtype
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     parallel_tile_of,
@@ -95,12 +103,12 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 
     # Accumulate in fp32 (the spec's c dtype) regardless of output buffer
     # dtype — matches cuBLAS / PyTorch fp16-GEMM precision. When the output
-    # buffer is narrower (``__half*`` / ``__nv_bfloat16*``), ``MmaStore``
-    # emits an epilogue downconvert so ``store_matrix_sync``'s element-type
-    # match still holds. See ``resolve_c_dtype`` + ``MmaStore`` docstrings.
-    c_dtype_override = resolve_c_dtype(root, spec.operand_dtypes["c"])
+    # buffer is narrower (``__half*`` / ``__nv_bfloat16*``), ``RegStore``
+    # emits an epilogue downconvert so the element-type match still holds.
+    # See ``resolve_c_dtype`` + ``RegStore`` docstrings.
+    c_dtype = resolve_c_dtype(root, spec.operand_dtypes["c"])
 
-    lowered, found = lower_atom_tiles(tt.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources={})
+    lowered, found = lower_to_atoms(tt.body, spec_kind=atom_kind, c_dtype=c_dtype, smem_sources={})
     if not found:
         # Could happen on a second visit (AtomTile already consumed).
         raise RuleSkipped("no AtomTile in body — already lowered")

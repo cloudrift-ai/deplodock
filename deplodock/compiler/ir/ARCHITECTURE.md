@@ -279,11 +279,17 @@ collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
-the MMA arm of the same pass (its presence is the structural "this
-matmul factorizes through tensor cores" signal, paired with the
-`ATOM_KIND` knob on the enclosing `TileOp`). Downstream consumer plans
-(MMA fragment factorization, warp-specialize refactor) emit `WarpTile`
-to drive warp-cooperative codegen.
+`kernel/005_lower_atom_tile`, which classifies the cell's A/B operands +
+accumulator + store target and packages the whole per-cell computation
+into an `Atom`. `Atom` (the entire fragment calculation — declare
+fragments, K-reduce loop of load+mma+accumulate MAC steps, store) is in
+turn consumed by `kernel/006_expand_atom`, which lowers it to the
+`RegFragment`/`LdmatrixLoad`/`MmaSyncPtx`/`RegStore` kernel chain — so it
+lives in the IR only across that 005→006 gap. The `AtomTile` presence is
+the structural "this matmul factorizes through tensor cores" signal,
+paired with the `ATOM_KIND` knob on the enclosing `TileOp`. Downstream
+consumer plans (MMA fragment factorization, warp-specialize refactor)
+emit `WarpTile` to drive warp-cooperative codegen.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative

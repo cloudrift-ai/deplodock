@@ -25,6 +25,7 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
 from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
+    Atom,
     AtomTile,
     GridTile,
     ParallelTile,
@@ -69,6 +70,27 @@ def _(s: StageBundle, ctx: SimplifyCtx) -> Stmt:
     kwargs["stages"] = tuple(simplify(c, ctx) for c in s.stages)
     kwargs["body"] = tuple(simplify(c, ctx) for c in s.body)
     return type(s)(**kwargs)
+
+
+@rewrite.register
+def _(s: Atom, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return _replace(
+        s,
+        body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
+        c_name=rename(s.c_name),
+        a_name=rename(s.a_name),
+        b_name=rename(s.b_name),
+        out_index=tuple(sigma.apply(e) for e in s.out_index),
+    )
+
+
+@simplify.register
+def _(s: Atom, ctx: SimplifyCtx) -> Stmt:
+    return _replace(
+        s,
+        body=tuple(simplify(c, ctx) for c in s.body),
+        out_index=tuple(e.simplify(ctx) for e in s.out_index),
+    )
 
 
 @rewrite.register

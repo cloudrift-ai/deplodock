@@ -1,15 +1,26 @@
-"""MMA-fragment lowering helpers for ``005_lower_atom_tile``.
+"""MMA-fragment helpers for the ``Atom`` lowering passes.
 
-The transform-walk skeleton (:func:`lower_atom_tiles` / :func:`_atom_body_to_mma` /
-:func:`_transform_walk` / :func:`_build_mma_chain`) builds the ``ldmatrix`` +
-``mma.sync.aligned`` register-array chain (the s16816 path) — the sole tensor-core
-family (``instruction="mma_sync"``). The mma.sync path has no gmem-direct load: its
-operands MUST be staged smem (:func:`_emit_chain` RuleSkips an unstaged leaf, which
-prunes the variant so the scalar tier covers that shape).
+Two halves, around the Tile-IR :class:`~deplodock.compiler.ir.tile.ir.Atom`
+node:
 
-See the ``005_lower_atom_tile`` module docstring for the four AtomTile body shapes
-(A/B/C/D) these helpers rewrite, the phase-prefix prepend, and the A/B
-classification rules.
+- **Recognition** (``kernel/005_lower_atom_tile``): :func:`lower_to_atoms`
+  walks a TileOp body, finds each ``AtomTile``, and :func:`build_atom`
+  classifies its A/B operands + accumulator + store target (via
+  :func:`_scan_atom_body` / :func:`_classify_ab` / :func:`_iter_bundles`) and
+  packages the whole per-cell computation into one ``Atom``.
+- **Expansion** (``kernel/006_expand_atom``): :func:`expand_atoms` walks a
+  TileOp body, finds each ``Atom``, and :func:`expand_atom` lowers it to the
+  kernel-IR ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore``
+  chain (the ``_emit_*`` leaf emitters + :func:`_transform_walk` /
+  :func:`_build_mma_chain` / :func:`_mma_src_index`) — the shape the downstream
+  passes (``010_split_register_axes`` …) consume.
+
+The s16816 ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` path is the sole
+tensor-core family (``instruction="mma_sync"``). It has no gmem-direct load
+(ldmatrix is smem→register only), so :func:`build_atom` RuleSkips an unstaged
+operand — pruning the warp-tier variant so the scalar tier covers that shape.
+See the ``005_lower_atom_tile`` module docstring for the four AtomTile body
+shapes (A/B/C/D), the phase-prefix prepend, and the A/B classification rules.
 """
 
 from __future__ import annotations
@@ -26,6 +37,7 @@ from deplodock.compiler.ir.kernel.ir import (
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
+    Atom,
     AtomTile,
     SerialTile,
     Source,
@@ -33,53 +45,11 @@ from deplodock.compiler.ir.tile.ir import (
     WarpSpecialize,
 )
 from deplodock.compiler.pipeline import RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._atom import AtomSpec
+from deplodock.compiler.pipeline.passes.lowering.tile._atom import AtomSpec, atom_spec
 
-# --- Per-instruction leaf emitters -----------------------------------------
-
-
-def _emit_fragments(spec: AtomSpec, *, c_frag: str, a_frag: str, b_frag: str, c_dtype: DataType) -> tuple[Stmt, ...]:
-    """Register-array declarations. Three ``RegFragment`` decls; the ``c``
-    array is zero-initialised at declaration, so there's no separate fill."""
-    return (
-        RegFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
-        RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
-        RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
-    )
-
-
-def _emit_chain(
-    spec: AtomSpec,
-    *,
-    a_load: Load,
-    b_load: Load,
-    a_frag: str,
-    b_frag: str,
-    c_frag: str,
-    smem_sources: dict[str, Source],
-) -> tuple[Stmt, ...]:
-    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
-    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
-    b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
-    # ldmatrix is smem→register only — both operands must be staged. RuleSkipping
-    # here drops this warp-tier variant so the scalar tier covers the shape.
-    if a_load.input not in smem_sources or b_load.input not in smem_sources:
-        raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
-    # Thread the per-Source TMA swizzle mode (S3 of
-    # plans/mma-sync-smem-swizzle.md) so the ldmatrix consumer applies the
-    # matching per-lane chunk XOR. NONE when the source wasn't swizzled.
-    a_swz = smem_sources[a_load.input].swizzle.value
-    b_swz = smem_sources[b_load.input].swizzle.value
-    return (
-        LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
-        LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
-        MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtypes["a"].name),
-    )
-
-
-def _emit_store(spec: AtomSpec, *, dst_buffer: str, dst_index: tuple, c_frag: str) -> Stmt:
-    """The accumulator → output store (with epilogue downconvert)."""
-    return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape)
+# ===========================================================================
+# Recognition: AtomTile -> Atom  (kernel/005_lower_atom_tile)
+# ===========================================================================
 
 
 def resolve_c_dtype(root: Node, spec_c_dtype: DataType) -> DataType:  # noqa: ARG001
@@ -104,32 +74,30 @@ def resolve_c_dtype(root: Node, spec_c_dtype: DataType) -> DataType:  # noqa: AR
     return spec_c_dtype
 
 
-def lower_atom_tiles(
+def lower_to_atoms(
     body: Body,
     *,
-    spec: AtomSpec,
-    c_dtype_override: DataType,
+    spec_kind: str,
+    c_dtype: DataType,
     smem_sources: dict[str, Source],
 ) -> tuple[Body, bool]:
-    """Walk ``body``; for each ``AtomTile`` encountered, rewrite its
-    interior matmul-shape body into an Mma* fragment chain and strip
-    the AtomTile wrapper. Recurses into non-AtomTile block stmts so a
+    """Walk ``body``; for each ``AtomTile`` encountered, package its
+    interior matmul-shape body into an :class:`Atom` node and strip the
+    AtomTile wrapper. Recurses into non-AtomTile block stmts so a
     deep-nested AtomTile (under RegisterTile / SerialTile / Cond / ...)
     is reached. Returns ``(new_body, found_any)``.
 
     ``smem_sources`` is a flat ``smem_name → Source`` map of Sources
-    in-scope from enclosing ``StageBundle``s. When ``_atom_body_to_mma``
-    encounters a Load reading from a staged smem buffer, it rebuilds
-    ``src_index`` via the Source's ``AffineAddressing.source_index`` so
-    the MMA fragment lands on the correct (block-scaled) slab offset.
-    M2-M5 of ``plans/mma-smem-staging.md``.
+    in-scope from enclosing ``StageBundle``s. :func:`build_atom` uses it to
+    classify the A/B operands and to snapshot their ``Source``s onto the
+    ``Atom`` (so the expander resolves slab addressing without re-threading
+    enclosing scope). M2-M5 of ``plans/mma-smem-staging.md``.
     """
     out: list[Stmt] = []
     found = False
     for s in body:
         if isinstance(s, AtomTile):
-            new_stmts = _atom_body_to_mma(s.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources=smem_sources)
-            out.extend(new_stmts)
+            out.append(build_atom(s.body, spec_kind=spec_kind, c_dtype=c_dtype, smem_sources=smem_sources))
             found = True
             continue
         if isinstance(s, StageBundle):
@@ -142,12 +110,11 @@ def lower_atom_tiles(
             for stage in s.stages:
                 for src in stage.sources:
                     inner_sources[src.name] = src
-            new_bundle_body, body_found = lower_atom_tiles(s.body, spec=spec, c_dtype_override=c_dtype_override, smem_sources=inner_sources)
+            new_bundle_body, body_found = lower_to_atoms(s.body, spec_kind=spec_kind, c_dtype=c_dtype, smem_sources=inner_sources)
             # ``StageBundle.with_bodies`` expects ``(stages_body, body)`` —
             # stages stay byte-clean (no AtomTile lives inside producer
             # Sources), we only rebuild the consumer body.
-            new_stages_body = Body(s.stages)
-            out.append(s.with_bodies((new_stages_body, new_bundle_body)))
+            out.append(s.with_bodies((Body(s.stages), new_bundle_body)))
             found = found or body_found
             continue
         if isinstance(s, WarpSpecialize):
@@ -163,9 +130,7 @@ def lower_atom_tiles(
                     for stage in st.stages:
                         for src in stage.sources:
                             ws_sources[src.name] = src
-            new_consumer, cons_found = lower_atom_tiles(
-                s.consumer_body, spec=spec, c_dtype_override=c_dtype_override, smem_sources=ws_sources
-            )
+            new_consumer, cons_found = lower_to_atoms(s.consumer_body, spec_kind=spec_kind, c_dtype=c_dtype, smem_sources=ws_sources)
             out.append(s.with_bodies((s.producer_body, new_consumer)))
             found = found or cons_found
             continue
@@ -173,7 +138,7 @@ def lower_atom_tiles(
             new_bodies: list[Body] = []
             any_lowered = False
             for sub in s.nested():
-                new_sub, sub_found = lower_atom_tiles(sub, spec=spec, c_dtype_override=c_dtype_override, smem_sources=smem_sources)
+                new_sub, sub_found = lower_to_atoms(sub, spec_kind=spec_kind, c_dtype=c_dtype, smem_sources=smem_sources)
                 new_bodies.append(new_sub)
                 any_lowered = any_lowered or sub_found
             found = found or any_lowered
@@ -183,76 +148,61 @@ def lower_atom_tiles(
     return Body(out), found
 
 
-def _atom_body_to_mma(
-    body: Body,
+def build_atom(
+    atom_body: Body,
     *,
-    spec: AtomSpec,
-    c_dtype_override: DataType,
+    spec_kind: str,
+    c_dtype: DataType,
     smem_sources: dict[str, Source],
-) -> tuple[Stmt, ...]:
-    """Rewrite the AtomTile body to an Mma* fragment chain.
+) -> Atom:
+    """Package an AtomTile body into one :class:`Atom`.
 
-    Two cases:
+    Pre-scans the body for the ``Write`` + ``Accum`` + a sample
+    ``(a_load, b_load)`` pair, classifies which staged smem buffer is the A
+    (M×K) and which is the B (K×N) operand, and hoists the ``Write`` out into
+    the ``out_*`` fields. Only the buffer *names* are recorded — the expander
+    re-harvests the live ``Source`` (its ``cache_axes`` track axis renumbering
+    that a 005-time snapshot would not).
 
-    - **Shape A/B/D** (has at least one ``SerialTile(is_reduce=True)``):
-      transform-walk the body in place. Each reduce SerialTile's body is
-      replaced with the Mma chain; the ``is_reduce`` flag is cleared
-      (no more Accum inside). The Write is replaced with MmaStore.
-      Every other structural Stmt (StageBundle wraps, AsyncWait, K_o
-      SerialTile, prologue/epilogue) flows through unchanged.
-
-    - **Shape C** (no reduce SerialTile — single-iter K filtered away):
-      emit the Mma chain inline at the AtomTile body level alongside an
-      MmaStore.
-
-    Both cases prepend ``MmaFragment(c/a/b)`` decls + ``MmaFill(c_frag, 0)``
-    at the head of the returned tuple.
+    mma.sync is smem→register only (no gmem-direct ldmatrix), so an unstaged
+    operand RuleSkips here — pruning the warp-tier variant so the scalar tier
+    covers that shape.
     """
-    # Local copy so a bundle nested inside the AtomTile's body contributes
-    # its Sources to the lookup ``_mma_src_index`` consults below — without
-    # leaking back to siblings.
+    # Flatten every in-scope Source (enclosing + bundles nested inside the
+    # AtomTile body) so the pre-scan classification + Source snapshot see the
+    # full table. A local copy so sibling subtrees don't leak.
     bundle_sources = dict(smem_sources)
-    for stage_bundle in _iter_bundles(body):
+    for stage_bundle in _iter_bundles(atom_body):
         for stage in stage_bundle.stages:
             for src in stage.sources:
                 bundle_sources[src.name] = src
 
-    # Pre-scan: find one Write, one Accum, and one (a_load, b_load) sample
-    # pair to seed fragment SSA names + dtypes from the atom spec.
-    write_stmt, accum, sample_a_load, sample_b_load, has_reduce = _scan_atom_body(body, bundle_sources)
-
+    write_stmt, accum, a_load, b_load, _has_reduce = _scan_atom_body(atom_body, bundle_sources)
     if write_stmt is None:
         raise RuleSkipped("AtomTile body unrecognised — no Write")
-    if accum is None or sample_a_load is None or sample_b_load is None:
-        raise RuleSkipped(
-            f"AtomTile body unrecognised — expected Load+Load+Accum chain (got accum={accum!r}, a={sample_a_load!r}, b={sample_b_load!r})"
-        )
+    if accum is None or a_load is None or b_load is None:
+        raise RuleSkipped(f"AtomTile body unrecognised — expected Load+Load+Accum chain (got accum={accum!r}, a={a_load!r}, b={b_load!r})")
 
-    c_frag = f"{accum.name}_frag"
-    a_frag = f"{sample_a_load.names[0]}_frag"
-    b_frag = f"{sample_b_load.names[0]}_frag"
+    a_buffer, b_buffer = a_load.input, b_load.input
+    if a_buffer not in bundle_sources or b_buffer not in bundle_sources:
+        raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
 
-    # Fragment / register-array decls (+ fill for WMMA; mma.sync zero-inits
-    # its ``c`` array in the decl, so ``_emit_fragments`` carries the right head).
-    fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=c_dtype_override)
-
-    if has_reduce:
-        transformed = _transform_walk(
-            body,
-            c_frag=c_frag,
-            a_frag=a_frag,
-            b_frag=b_frag,
-            smem_sources=bundle_sources,
-            spec=spec,
-        )
-        return (*fragments, *transformed)
-
-    # Shape C: K filtered, inline Mma chain + store.
-    chain = _emit_chain(
-        spec, a_load=sample_a_load, b_load=sample_b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=bundle_sources
+    # Hoist the store target out of the body — the expander re-emits it as a
+    # ``RegStore`` epilogue. The Write is always a top-level child of the
+    # AtomTile body (after the K_o loop / epilogue).
+    new_body = Body(tuple(s for s in atom_body if not isinstance(s, Write)))
+    return Atom(
+        spec_kind=spec_kind,
+        body=new_body,
+        a_buffer=a_buffer,
+        b_buffer=b_buffer,
+        c_name=accum.name,
+        a_name=a_load.names[0],
+        b_name=b_load.names[0],
+        out_buffer=write_stmt.output,
+        out_index=write_stmt.index,
+        c_dtype=c_dtype,
     )
-    store = _emit_store(spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag)
-    return (*fragments, *chain, store)
 
 
 def _iter_bundles(body: Body):
@@ -277,10 +227,9 @@ def _scan_atom_body(body: Body, smem_sources: dict[str, Source]) -> tuple[Write 
     ``has_reduce`` (True if any reduce SerialTile was found).
 
     The sample (a, b) pair is pulled from the FIRST reduce SerialTile if
-    present, falling back to the bare body's Loads (shape C). The
-    classification heuristic for the sample pair is the same one
-    ``_build_mma_chain`` re-uses for every reduce site — pulling it out
-    of one fixed location keeps the fragment SSA names stable across
+    present, falling back to the bare body's Loads (shape C). Classifying
+    the pair once (and matching every other reduce site against its
+    buffers at expansion) keeps the fragment SSA names stable across
     prologue / inner / epilogue chains (which is what the per-cell
     replicator in 010_split_register_axes expects).
     """
@@ -398,39 +347,134 @@ def _classify_ab(
     return a_load, b_load
 
 
+# ===========================================================================
+# Expansion: Atom -> kernel fragment chain  (kernel/006_expand_atom)
+# ===========================================================================
+
+
+def expand_atoms(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
+    """Walk ``body``; replace every :class:`Atom` with its expanded kernel
+    fragment chain (:func:`expand_atom`). Threads ``smem_sources`` from
+    enclosing ``StageBundle`` / ``WarpSpecialize`` scopes (mirroring 005's
+    :func:`lower_to_atoms`) so the expander resolves the operand slab
+    addressing from the *live* ``Source`` — its ``cache_axes`` track the axis
+    renumbering applied since the ``Atom`` was emitted. Returns
+    ``(new_body, found_any)``."""
+    out: list[Stmt] = []
+    found = False
+    for s in body:
+        if isinstance(s, Atom):
+            out.extend(expand_atom(s, smem_sources=smem_sources))
+            found = True
+            continue
+        if isinstance(s, StageBundle):
+            inner_sources = dict(smem_sources)
+            for stage in s.stages:
+                for src in stage.sources:
+                    inner_sources[src.name] = src
+            new_bundle_body, body_found = expand_atoms(s.body, smem_sources=inner_sources)
+            out.append(s.with_bodies((Body(s.stages), new_bundle_body)))
+            found = found or body_found
+            continue
+        if isinstance(s, WarpSpecialize):
+            ws_sources = dict(smem_sources)
+            for st in s.producer_body.iter():
+                if isinstance(st, StageBundle):
+                    for stage in st.stages:
+                        for src in stage.sources:
+                            ws_sources[src.name] = src
+            new_consumer, cons_found = expand_atoms(s.consumer_body, smem_sources=ws_sources)
+            out.append(s.with_bodies((s.producer_body, new_consumer)))
+            found = found or cons_found
+            continue
+        if s.nested():
+            new_bodies: list[Body] = []
+            any_found = False
+            for sub in s.nested():
+                new_sub, sub_found = expand_atoms(sub, smem_sources=smem_sources)
+                new_bodies.append(new_sub)
+                any_found = any_found or sub_found
+            found = found or any_found
+            out.append(s.with_bodies(tuple(new_bodies)))
+            continue
+        out.append(s)
+    return Body(out), found
+
+
+def expand_atom(atom: Atom, *, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
+    """Lower one :class:`Atom` to its kernel-IR fragment chain.
+
+    Prepends the ``RegFragment`` decls, rewrites the body (each reduce
+    SerialTile → ``ldmatrix a + ldmatrix b + mma.sync``; shape C → inline
+    chain), and appends the ``RegStore`` epilogue from the hoisted ``out_*``.
+    ``smem_sources`` carries the enclosing-scope ``Source``s; the bundles
+    nested inside ``atom.body`` are harvested on top so per-operand slab
+    addressing resolves from the live table."""
+    spec = atom_spec(atom.spec_kind)
+    c_frag = f"{atom.c_name}_frag"
+    a_frag = f"{atom.a_name}_frag"
+    b_frag = f"{atom.b_name}_frag"
+    fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=atom.c_dtype)
+    store = _emit_store(spec, dst_buffer=atom.out_buffer, dst_index=atom.out_index, c_frag=c_frag)
+
+    # Flatten every in-scope Source (enclosing + bundles nested inside the
+    # body) so ``_mma_src_index`` resolves each operand's slab addressing.
+    bundle_sources = dict(smem_sources)
+    for stage_bundle in _iter_bundles(atom.body):
+        for stage in stage_bundle.stages:
+            for src in stage.sources:
+                bundle_sources[src.name] = src
+
+    has_reduce = any(st.is_reduce for st in atom.body.iter_of_type(SerialTile))
+    if has_reduce:
+        transformed = _transform_walk(
+            atom.body,
+            c_frag=c_frag,
+            a_frag=a_frag,
+            b_frag=b_frag,
+            a_buffer=atom.a_buffer,
+            b_buffer=atom.b_buffer,
+            smem_sources=bundle_sources,
+            spec=spec,
+        )
+        return (*fragments, *transformed, store)
+
+    # Shape C: K filtered — inline chain from the body's two Loads.
+    loads = [s for s in atom.body if isinstance(s, Load)]
+    a_load = next((ld for ld in loads if ld.input == atom.a_buffer), None)
+    b_load = next((ld for ld in loads if ld.input == atom.b_buffer), None)
+    if a_load is None or b_load is None:
+        raise RuleSkipped("Atom body (shape C) didn't match the A/B buffers")
+    chain = _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=bundle_sources)
+    return (*fragments, *chain, store)
+
+
 def _transform_walk(
     body: Body,
     *,
     c_frag: str,
     a_frag: str,
     b_frag: str,
+    a_buffer: str,
+    b_buffer: str,
     smem_sources: dict[str, Source],
     spec: AtomSpec,
 ) -> tuple[Stmt, ...]:
-    """Recursively rewrite ``body`` in place. Replaces:
-
-    - every ``SerialTile(is_reduce=True)`` body with an Mma chain
-      (clearing the ``is_reduce`` flag — no Accum remains inside).
-    - every ``Write`` with ``MmaStore``.
-
-    Preserves every other Stmt structurally — StageBundle wraps + their
-    Stages, AsyncWait, non-reduce SerialTile (K_o outer), Cond, etc.
-    Descends into nested bodies via ``s.nested()`` so deeply-nested
-    reduce sites (e.g. shape D's inner-K_o body) are reached.
-
-    ``smem_sources`` is threaded through StageBundle descent so the Mma
-    chain's A/B classification + phase-prefix prepend has the full
-    in-scope Source table.
-    """
+    """Recursively rewrite ``body`` in place. Replaces every
+    ``SerialTile(is_reduce=True)`` body with an Mma chain (clearing the
+    ``is_reduce`` flag — no Accum remains inside). Preserves every other Stmt
+    structurally — StageBundle wraps + their Stages, AsyncWait, non-reduce
+    SerialTile (K_o outer), Cond, etc. Descends into nested bodies via
+    ``s.nested()`` so deeply-nested reduce sites (e.g. shape D's inner-K_o
+    body) are reached. The ``Write`` was already hoisted off the ``Atom`` by
+    :func:`build_atom`, so it never appears here."""
     out: list[Stmt] = []
     for s in body:
-        if isinstance(s, Write):
-            out.append(_emit_store(spec, dst_buffer=s.output, dst_index=s.index, c_frag=c_frag))
-            continue
         if isinstance(s, SerialTile) and s.is_reduce:
             chain = _build_mma_chain(
                 s.body,
-                k_name=s.axis.name,
+                a_buffer=a_buffer,
+                b_buffer=b_buffer,
                 c_frag=c_frag,
                 a_frag=a_frag,
                 b_frag=b_frag,
@@ -445,18 +489,35 @@ def _transform_walk(
             out.append(s.with_bodies((Body(chain),)))
             continue
         if isinstance(s, StageBundle):
-            inner_sources = dict(smem_sources)
-            for stage in s.stages:
-                for src in stage.sources:
-                    inner_sources[src.name] = src
-            new_body = _transform_walk(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=inner_sources, spec=spec)
-            # Stages stay byte-clean — no Mma rewrite happens inside a
-            # producer scope.
+            new_body = _transform_walk(
+                s.body,
+                c_frag=c_frag,
+                a_frag=a_frag,
+                b_frag=b_frag,
+                a_buffer=a_buffer,
+                b_buffer=b_buffer,
+                smem_sources=smem_sources,
+                spec=spec,
+            )
+            # Stages stay byte-clean — no Mma rewrite happens inside a producer
+            # scope. (All in-scope Sources are already flattened into
+            # ``smem_sources`` by the caller, so no per-bundle re-harvest.)
             out.append(s.with_bodies((Body(s.stages), Body(new_body))))
             continue
         if s.nested():
             new_bodies = tuple(
-                Body(_transform_walk(sub, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources, spec=spec))
+                Body(
+                    _transform_walk(
+                        sub,
+                        c_frag=c_frag,
+                        a_frag=a_frag,
+                        b_frag=b_frag,
+                        a_buffer=a_buffer,
+                        b_buffer=b_buffer,
+                        smem_sources=smem_sources,
+                        spec=spec,
+                    )
+                )
                 for sub in s.nested()
             )
             out.append(s.with_bodies(new_bodies))
@@ -469,7 +530,8 @@ def _transform_walk(
 def _build_mma_chain(
     reduce_body: Body,
     *,
-    k_name: str,
+    a_buffer: str,
+    b_buffer: str,
     c_frag: str,
     a_frag: str,
     b_frag: str,
@@ -477,18 +539,64 @@ def _build_mma_chain(
     spec: AtomSpec,
 ) -> tuple[Stmt, ...]:
     """Build the per-reduce ``load a + load b + mma`` chain that replaces a
-    reduce SerialTile's body. Re-classifies A/B from this reduce site's
-    Loads — shape D has prologue/inner/epilogue reduces with the same K
-    name and the classification is stable. The instruction-specific node
-    choice (WMMA vs mma.sync) is delegated to :func:`_emit_chain`.
-    """
+    reduce SerialTile's body. Matches this reduce site's Loads against the
+    ``Atom``'s classified A/B buffers — shape D has prologue/inner/epilogue
+    reduces all reading the same staged buffers, so the match is stable."""
     loads = [s for s in reduce_body if isinstance(s, Load)]
     if len(loads) != 2:
         raise RuleSkipped(f"reduce SerialTile body unrecognised — expected 2 Loads, got {len(loads)}")
-    a_load, b_load = _classify_ab(loads, k_name=k_name, smem_sources=smem_sources, write=None)
+    a_load = next((ld for ld in loads if ld.input == a_buffer), None)
+    b_load = next((ld for ld in loads if ld.input == b_buffer), None)
     if a_load is None or b_load is None:
-        raise RuleSkipped("reduce SerialTile Loads didn't match A=[M,K], B=[K,N] shape")
+        raise RuleSkipped("reduce SerialTile Loads didn't match the Atom's A/B buffers")
     return _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=smem_sources)
+
+
+# --- Per-instruction leaf emitters -----------------------------------------
+
+
+def _emit_fragments(spec: AtomSpec, *, c_frag: str, a_frag: str, b_frag: str, c_dtype: DataType) -> tuple[Stmt, ...]:
+    """Register-array declarations. Three ``RegFragment`` decls; the ``c``
+    array is zero-initialised at declaration, so there's no separate fill."""
+    return (
+        RegFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
+        RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
+        RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
+    )
+
+
+def _emit_chain(
+    spec: AtomSpec,
+    *,
+    a_load: Load,
+    b_load: Load,
+    a_frag: str,
+    b_frag: str,
+    c_frag: str,
+    smem_sources: dict[str, Source],
+) -> tuple[Stmt, ...]:
+    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
+    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
+    b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
+    # ldmatrix is smem→register only — both operands must be staged. RuleSkipping
+    # here drops this warp-tier variant so the scalar tier covers the shape.
+    if a_load.input not in smem_sources or b_load.input not in smem_sources:
+        raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
+    # Thread the per-Source TMA swizzle mode (S3 of
+    # plans/mma-sync-smem-swizzle.md) so the ldmatrix consumer applies the
+    # matching per-lane chunk XOR. NONE when the source wasn't swizzled.
+    a_swz = smem_sources[a_load.input].swizzle.value
+    b_swz = smem_sources[b_load.input].swizzle.value
+    return (
+        LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
+        LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
+        MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtypes["a"].name),
+    )
+
+
+def _emit_store(spec: AtomSpec, *, dst_buffer: str, dst_index: tuple, c_frag: str) -> Stmt:
+    """The accumulator → output store (with epilogue downconvert)."""
+    return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape)
 
 
 def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
