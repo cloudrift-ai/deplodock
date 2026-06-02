@@ -19,7 +19,7 @@ from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, SelectBranch, Unpack, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Mma, Pack, Select, SelectBranch, Unpack, Write
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
@@ -85,6 +85,8 @@ def _(s: Load, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         input=s.input,
         index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
         dtype=s.dtype,
+        atom=s.atom,
+        role=s.role,
     )
 
 
@@ -118,6 +120,12 @@ def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         dtype=s.dtype,
         axes=new_axes,
     )
+
+
+@rewrite.register
+def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
+    return Mma(c=rename(s.c), a=rename(s.a), b=rename(s.b), atom=s.atom, axes=new_axes)
 
 
 def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:

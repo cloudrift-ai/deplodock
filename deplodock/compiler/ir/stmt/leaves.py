@@ -146,6 +146,17 @@ class Load(Stmt):
     input: str
     index: tuple[Expr, ...]
     dtype: DataType | None
+    # MMA fragment tag. When ``atom`` is set (an ``ATOM_KIND``), this Load
+    # reads one tensor-core operand fragment — ``role`` is ``"a"`` (M×K) or
+    # ``"b"`` (K×N). Emitted by ``tile/011_lower_atom_cell`` so the cell
+    # carries its tensor-core intent through the staging passes (which treat
+    # it as an ordinary Load), and consumed by the late ``kernel/005_lower_atom``
+    # pass, which lowers a tagged Load to a ``RegFragment`` + ``LdmatrixLoad``.
+    # Empty ``atom`` = an ordinary scalar/vector Load (the default everywhere
+    # else). Both ride through ``rewrite``/``replace`` so staging's gmem→smem
+    # rewrite preserves them.
+    atom: str
+    role: str
 
     def __init__(
         self,
@@ -155,6 +166,8 @@ class Load(Stmt):
         *,
         names: tuple[str, ...] | None = None,
         dtype: DataType | None = None,
+        atom: str = "",
+        role: str = "",
     ) -> None:
         if names is None:
             if name is None:
@@ -172,6 +185,8 @@ class Load(Stmt):
         object.__setattr__(self, "input", input)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "atom", atom)
+        object.__setattr__(self, "role", role)
 
     @property
     def name(self) -> str:
@@ -217,7 +232,8 @@ class Load(Stmt):
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.index)
         names = ", ".join(self.names)
-        return [f"{indent}{names} = load {self.input}[{idx}]"]
+        tag = f" (atom {self.atom} {self.role})" if self.atom else ""
+        return [f"{indent}{names} = load {self.input}[{idx}]{tag}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
@@ -515,6 +531,52 @@ class Accum(Stmt):
             return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
         return [f"{pad}{self.name} {op} {rhs};"]
+
+
+@dataclass(frozen=True)
+class Mma(Stmt):
+    """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
+
+    The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
+    cell on the tensor-core path. Emitted by ``tile/011_lower_atom_cell``
+    alongside the atom-tagged operand ``Load``s, carried through the staging
+    passes (it makes its reduce loop ``is_reduce`` just like an ``Accum``),
+    and lowered to a kernel-IR ``MmaSyncPtx`` by ``kernel/005_lower_atom``.
+
+    - ``c`` — the accumulator SSA name (declared + zero-init'd as the fp32 c
+      fragment at lowering); read-and-written, like ``Accum.name``.
+    - ``a`` / ``b`` — the operand fragment SSA names (the atom-tagged Loads'
+      bindings).
+    - ``atom`` — the ``ATOM_KIND`` (cell shape + operand dtypes + PTX
+      instruction family).
+    - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
+      cooperative-K info the escape analysis reads). Threaded through
+      ``rewrite`` like ``Accum.axes``.
+    """
+
+    c: str
+    a: str
+    b: str
+    atom: str
+    axes: tuple[str, ...] = ()
+
+    def deps(self) -> tuple[str, ...]:
+        # Mirror ``Accum``: the accumulator read is implicit (loop-carried),
+        # so only the operands are listed — keeps sibling-def analyses (topo
+        # sort, reg-pipeline) from treating ``c`` as a same-scope read.
+        return (self.a, self.b)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.c,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.c} <- mma[{self.atom}]({self.a} @ {self.b})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise NotImplementedError(
+            "Mma must be consumed by kernel/005_lower_atom before render — "
+            f"reached render with atom={self.atom!r}"
+        )
 
 
 @dataclass(frozen=True)

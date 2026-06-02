@@ -71,6 +71,7 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
+    Mma,
     Select,
     SelectBranch,
     Stmt,
@@ -1037,8 +1038,9 @@ class SerialTileBase(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A serial tile is a reduce iff its immediate body contains an ``Accum``."""
-        return any(isinstance(s, Accum) for s in self.body)
+        """A serial tile is a reduce iff its immediate body contains an ``Accum``
+        (or its tensor-core fused form ``Mma``, which accumulates ``c += a @ b``)."""
+        return any(isinstance(s, (Accum, Mma)) for s in self.body)
 
 
 @dataclass(frozen=True)

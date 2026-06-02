@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Mma, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import RuleSkipped
 
@@ -149,7 +149,8 @@ def single_tile(body: Body) -> tuple[int, ParallelTile]:
 def is_matmul_reduce(loop) -> bool:
     """True iff ``loop`` is a reduce-loop whose body matches the matmul
     signature: ≥2 distinct buffers with K-indexed Loads (where K is
-    ``loop.axis.name``) plus at least one ``Accum``.
+    ``loop.axis.name``) plus at least one ``Accum`` (or its tensor-core fused
+    form ``Mma``, after ``tile/011_lower_atom_cell`` has rewritten the cell).
 
     Accepts both Loop-IR ``Loop`` / ``StridedLoop`` (the pre-launch_geometry
     shape seen by ``010_partition_loops``) and Tile-IR ``SerialTile`` /
@@ -164,7 +165,7 @@ def is_matmul_reduce(loop) -> bool:
     bufs = {ld.input for ld in loop.body.of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}}
     if len(bufs) < 2:
         return False
-    return any(isinstance(s, Accum) for s in loop.body)
+    return any(isinstance(s, (Accum, Mma)) for s in loop.body)
 
 
 def collect_invariant_names(stmt: Stmt) -> set[str]:
