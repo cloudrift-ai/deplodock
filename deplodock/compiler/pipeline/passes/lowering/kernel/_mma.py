@@ -20,7 +20,7 @@ warp-tier variant so the scalar tier covers that shape. See the
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import AtomSpec, DataType, atom_spec
+from deplodock.compiler.dtype import DataType
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
     LdmatrixLoad,
@@ -31,6 +31,7 @@ from deplodock.compiler.ir.kernel.ir import (
 from deplodock.compiler.ir.stmt import Body, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
+    Atom,
     AtomTile,
     SerialTile,
     Source,
@@ -40,19 +41,17 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import RuleSkipped
 
 
-def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
+def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
     """Walk ``body``; for each ``AtomTile``, lower its matmul cell to
     the kernel-IR fragment chain and strip the wrapper. Threads ``smem_sources``
     from enclosing ``StageBundle`` / ``WarpSpecialize`` scopes so each operand's
-    slab addressing resolves from the live ``Source``. Returns
-    ``(new_body, found_any)``."""
-    spec = atom_spec(spec_kind)
-    c_dtype = spec.operand_dtypes["c"]
+    slab addressing resolves from the live ``Source``. The atom spec is read off
+    each cell's ``Mma`` (no knob lookup). Returns ``(new_body, found_any)``."""
     out: list[Stmt] = []
     found = False
     for s in body:
         if isinstance(s, AtomTile):
-            out.extend(_lower_cell(s.body, spec=spec, c_dtype=c_dtype, smem_sources=smem_sources))
+            out.extend(_lower_cell(s.body, smem_sources=smem_sources))
             found = True
             continue
         if isinstance(s, StageBundle):
@@ -60,7 +59,7 @@ def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Sour
             for stage in s.stages:
                 for src in stage.sources:
                     inner_sources[src.name] = src
-            new_body, body_found = lower_atom_cells(s.body, spec_kind=spec_kind, smem_sources=inner_sources)
+            new_body, body_found = lower_atom_cells(s.body, smem_sources=inner_sources)
             out.append(s.with_bodies((Body(s.stages), new_body)))
             found = found or body_found
             continue
@@ -71,7 +70,7 @@ def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Sour
                     for stage in st.stages:
                         for src in stage.sources:
                             ws_sources[src.name] = src
-            new_consumer, cons_found = lower_atom_cells(s.consumer_body, spec_kind=spec_kind, smem_sources=ws_sources)
+            new_consumer, cons_found = lower_atom_cells(s.consumer_body, smem_sources=ws_sources)
             out.append(s.with_bodies((s.producer_body, new_consumer)))
             found = found or cons_found
             continue
@@ -79,7 +78,7 @@ def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Sour
             new_bodies: list[Body] = []
             any_found = False
             for sub in s.nested():
-                ns, sf = lower_atom_cells(sub, spec_kind=spec_kind, smem_sources=smem_sources)
+                ns, sf = lower_atom_cells(sub, smem_sources=smem_sources)
                 new_bodies.append(ns)
                 any_found = any_found or sf
             out.append(s.with_bodies(tuple(new_bodies)))
@@ -89,29 +88,29 @@ def lower_atom_cells(body: Body, *, spec_kind: str, smem_sources: dict[str, Sour
     return Body(out), found
 
 
-def _lower_cell(atom_body: Body, *, spec: AtomSpec, c_dtype: DataType, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
+def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
     """Lower one AtomTile body (operand Loads + ``Mma``) to the fragment chain.
 
-    Prepends the ``RegFragment`` decls (seeding stable fragment SSA names from
-    the FIRST reduce site, so the per-cell replicator in
-    ``010_split_register_axes`` renames them consistently across
-    prologue/inner/epilogue), then for shapes A/B/D transform-walks the body
-    (each reduce ``SerialTile`` → chain, ``Write`` → ``RegStore``); shape C
-    inlines a single chain + store."""
+    The atom :class:`Atom` spec comes from the cell's ``Mma``. Prepends the
+    ``RegFragment`` decls (seeding stable fragment SSA names from the FIRST
+    reduce site, so the per-cell replicator in ``010_split_register_axes``
+    renames them consistently across prologue/inner/epilogue), then for shapes
+    A/B/D transform-walks the body (each reduce ``SerialTile`` → chain,
+    ``Write`` → ``RegStore``); shape C inlines a single chain + store."""
     bundle_sources = dict(smem_sources)
     for stage_bundle in _iter_bundles(atom_body):
         for stage in stage_bundle.stages:
             for src in stage.sources:
                 bundle_sources[src.name] = src
 
-    write_stmt, a_seed, b_seed, c_seed, has_reduce = _scan_cell(atom_body)
+    write_stmt, a_seed, b_seed, c_seed, has_reduce, spec = _scan_cell(atom_body)
     if write_stmt is None:
         raise RuleSkipped("AtomTile body unrecognised — no Write")
-    if a_seed is None or b_seed is None or c_seed is None:
+    if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
 
     c_frag, a_frag, b_frag = f"{c_seed}_frag", f"{a_seed}_frag", f"{b_seed}_frag"
-    fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=c_dtype)
+    fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=spec.operand_dtype("c"))
 
     if has_reduce:
         transformed = _transform_walk(atom_body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=bundle_sources, spec=spec)
@@ -139,17 +138,18 @@ def _iter_bundles(body: Body):
                 yield from _iter_bundles(sub)
 
 
-def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | None, bool]:
+def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | None, bool, Atom | None]:
     """Recursively scan the AtomTile body. Returns the first ``Write``, the
-    seed ``(a_name, b_name, c_name)`` from the first ``Mma`` (every reduce site
-    shares the same operand/accumulator SSA names, so any ``Mma`` seeds stable
-    fragment names), and ``has_reduce``."""
+    seed ``(a_name, b_name, c_name)`` + the :class:`Atom` spec from the first
+    ``Mma`` (every reduce site shares the same operand/accumulator SSA names and
+    spec, so any ``Mma`` seeds stable fragment names), and ``has_reduce``."""
     write_stmt: Write | None = None
     seed: tuple[str, str, str] | None = None
+    spec: Atom | None = None
     has_reduce = False
 
     def _walk(stmts: Body) -> None:
-        nonlocal write_stmt, seed, has_reduce
+        nonlocal write_stmt, seed, spec, has_reduce
         for s in stmts:
             if isinstance(s, Write):
                 if write_stmt is None:
@@ -158,6 +158,7 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
             if isinstance(s, Mma):
                 if seed is None:
                     seed = (s.a, s.b, s.c)
+                    spec = s.atom
                 continue
             if isinstance(s, SerialTile) and s.is_reduce:
                 has_reduce = True
@@ -169,7 +170,7 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
 
     _walk(body)
     a_seed, b_seed, c_seed = seed if seed is not None else (None, None, None)
-    return write_stmt, a_seed, b_seed, c_seed, has_reduce
+    return write_stmt, a_seed, b_seed, c_seed, has_reduce, spec
 
 
 def _find_role_loads(body: Body) -> tuple[Load | None, Load | None]:
@@ -190,7 +191,7 @@ def _transform_walk(
     a_frag: str,
     b_frag: str,
     smem_sources: dict[str, Source],
-    spec: AtomSpec,
+    spec: Atom,
 ) -> tuple[Stmt, ...]:
     """Recursively rewrite ``body``: every reduce ``SerialTile`` body → the Mma
     chain (the ``Mma`` op is consumed, clearing ``is_reduce``); every ``Write``
@@ -233,7 +234,7 @@ def _build_chain(
     a_frag: str,
     b_frag: str,
     smem_sources: dict[str, Source],
-    spec: AtomSpec,
+    spec: Atom,
 ) -> tuple[Stmt, ...]:
     """Build the ``ldmatrix a + ldmatrix b + mma.sync`` chain that replaces a
     reduce SerialTile's ``[Load a, Load b, Mma]`` body — operands matched via
@@ -247,18 +248,18 @@ def _build_chain(
 # --- Per-instruction leaf emitters -----------------------------------------
 
 
-def _emit_fragments(spec: AtomSpec, *, c_frag: str, a_frag: str, b_frag: str, c_dtype: DataType) -> tuple[Stmt, ...]:
+def _emit_fragments(spec: Atom, *, c_frag: str, a_frag: str, b_frag: str, c_dtype: DataType) -> tuple[Stmt, ...]:
     """Register-array declarations. Three ``RegFragment`` decls; the ``c``
     array is zero-initialised at declaration, so there's no separate fill."""
     return (
         RegFragment(name=c_frag, role="c", shape=spec.shape, dtype=c_dtype),
-        RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtypes["a"]),
-        RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtypes["b"]),
+        RegFragment(name=a_frag, role="a", shape=spec.shape, dtype=spec.operand_dtype("a")),
+        RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtype("b")),
     )
 
 
 def _emit_chain(
-    spec: AtomSpec,
+    spec: Atom,
     *,
     a_load: Load,
     b_load: Load,
@@ -282,11 +283,11 @@ def _emit_chain(
     return (
         LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
         LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
-        MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtypes["a"].name),
+        MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
     )
 
 
-def _emit_store(spec: AtomSpec, *, dst_buffer: str, dst_index: tuple, c_frag: str) -> Stmt:
+def _emit_store(spec: Atom, *, dst_buffer: str, dst_index: tuple, c_frag: str) -> Stmt:
     """The accumulator → output store (with epilogue downconvert)."""
     return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape)
 

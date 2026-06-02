@@ -540,7 +540,7 @@ class WarpShuffle(Stmt):
 # referenced positionally inside inline PTX (``RegFragment`` / ``LdmatrixLoad``
 # / ``MmaSyncPtx`` / ``RegStore``), rendered via the ``_MMA_SYNC_PRELUDE``
 # helper wrappers (pure PTX — NVRTC-clean, no ``<mma.h>``). Emitted by
-# ``kernel/005_lower_atom_tile`` for an ``instruction="mma_sync"`` AtomSpec.
+# ``kernel/005_lower_atom_tile`` from the ``Mma`` op's ``Atom`` spec.
 # (The opaque ``nvcuda::wmma`` node family was removed — the swizzled mma.sync
 # slab beat it; see plans/mma-sync-smem-swizzle.md.)
 # ---------------------------------------------------------------------------

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Stmt, Write
-from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
+from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp, atom_spec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -119,11 +119,11 @@ def _try_tag_here(body: Body, *, kind: str, k_name: str | None, write: Write | N
     a_load, b_load = _classify_ab(loads, k_name=k_name, write=write)
     if a_load is None or b_load is None:
         return None
-    # The Mma carries the atom kind + the A/B operand identity (by SSA name);
-    # the operand Loads stay plain — kernel/005_lower_atom_tile recovers each
-    # one's role from this Mma. Emit the (plain) loads in A,B order then the
-    # Mma; the multiply + Accum are dropped.
-    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=kind, axes=accum.axes)
+    # The Mma carries the resolved Atom spec + the A/B operand identity (by SSA
+    # name); the operand Loads stay plain — kernel/005_lower_atom_tile reads the
+    # spec off the Mma and recovers each load's role from it. Emit the (plain)
+    # loads in A,B order then the Mma; the multiply + Accum are dropped.
+    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom_spec(kind), axes=accum.axes)
     rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
     return Body((*rest, a_load, b_load, mma))
 

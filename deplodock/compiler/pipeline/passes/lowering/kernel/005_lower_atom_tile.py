@@ -25,9 +25,11 @@ the ``Load.role`` tag; the slab ``src_index`` / ``ldm`` come from re-harvesting
 the live ``Source`` (``_mma_src_index``), so the phase-prefix prepend for
 double-buffered slabs stays correct.
 
-The lowering helpers live in the sibling ``_``-prefixed ``_mma`` module, which
-the pass loader skips; this file is the pattern + ``rewrite`` entry point.
-Eligibility: ``op.knobs["ATOM_KIND"]`` set (warp-tier matmul rows only).
+Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
+dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
+lowering helpers live in the sibling ``_``-prefixed ``_mma`` module, which the
+pass loader skips; this file is the pattern + ``rewrite`` entry point.
+Eligibility: an ``AtomTile`` in the body (scalar TileOps have none → skip).
 Idempotence: after this pass the ``AtomTile`` is gone, so a second visit finds
 nothing and the pass skips.
 """
@@ -44,11 +46,10 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(match: Match, root: Node) -> Graph | None:
     op = root.op
-    atom_kind = op.knobs.get("ATOM_KIND")
-    if not atom_kind:
-        raise RuleSkipped("not an MMA TileOp (no ATOM_KIND knob)")
-    lowered, found = lower_atom_cells(op.body, spec_kind=atom_kind, smem_sources={})
+    # No knob lookup: each cell's atom spec is read off its ``Mma`` (the
+    # ``AtomTile`` presence is the signal). Scalar / already-lowered TileOps
+    # have no ``AtomTile`` → found is False → skip.
+    lowered, found = lower_atom_cells(op.body, smem_sources={})
     if not found:
-        # Second visit (AtomTile already consumed) or a non-MMA tower.
-        raise RuleSkipped("no AtomTile in body — already lowered")
+        raise RuleSkipped("no AtomTile in body (scalar, or already lowered)")
     return TileOp(body=lowered, name=op.name, knobs=op.knobs)

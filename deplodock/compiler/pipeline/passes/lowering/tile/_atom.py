@@ -1,17 +1,18 @@
 """Per-kernel atom *eligibility* — the planner-side gate for each matmul atom.
 
-The atom **specs** (shape, per-operand dtypes, group size) + the
-``ATOM_REGISTRY`` + the ``atom_spec`` / ``atom_shape`` / ``atom_group_size``
-lookups live in :mod:`deplodock.compiler.dtype` — the type module is the single
-source of truth for "what does kind X mean". They are re-exported here so
-existing ``from ...tile._atom import atom_spec`` call sites keep working.
+The :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (cell shape, per-operand
+dtypes, group size) + the ``ATOM_REGISTRY`` + the ``atom_spec`` / ``atom_shape``
+/ ``atom_group_size`` lookups live in ``ir/tile/ir.py`` (next to the other
+tile-IR types, and carried directly on the ``Mma`` op). They are re-exported
+here so existing ``from ...tile._atom import atom_spec`` call sites keep working.
 
-This module owns only the part that *can't* live in ``dtype.py``: the per-kind
+This module owns only the part that *can't* live in the IR layer: the per-kind
 **eligibility** predicate (does a given ``LoopOp`` admit this atom on this
 device?). It depends on the loop body / graph / context and on
 ``is_matmul_reduce`` — pipeline-layer concerns — so it stays in the planner.
 :func:`is_atom_eligible` dispatches via the ``_ELIGIBILITY`` map; adding a kind
-(future: wgmma, NVFP4) registers a spec in ``dtype.py`` and a predicate here.
+(future: wgmma, NVFP4) registers an ``Atom`` in ``ir/tile/ir.py`` and a
+predicate here.
 
 Prefixed ``_`` so the pipeline rule loader (``_load_rules``) skips it.
 """
@@ -21,13 +22,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.dtype import (
+from deplodock.compiler.dtype import BF16, F16, DataType
+from deplodock.compiler.ir.tile.ir import (
     ATOM_KINDS,
     ATOM_REGISTRY,
-    BF16,
-    F16,
-    AtomSpec,
-    DataType,
+    Atom,
     atom_group_size,
     atom_shape,
     atom_spec,
@@ -39,11 +38,11 @@ if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.ir.loop import LoopOp
 
-# Back-compat re-exports (canonical definitions live in ``dtype``).
+# Back-compat re-exports (canonical definitions live in ``ir/tile/ir.py``).
 __all__ = [
     "ATOM_KINDS",
     "ATOM_REGISTRY",
-    "AtomSpec",
+    "Atom",
     "_ATOM_KINDS_V1",
     "atom_group_size",
     "atom_shape",
@@ -141,8 +140,8 @@ def _mma_eligible_factory(
 
 # Per-kind eligibility predicates, keyed like ``ATOM_REGISTRY`` (cell shape +
 # operand dtype + min cc come from each kind's spec). Kept parallel to the
-# registry rather than on ``AtomSpec`` so the spec stays a pure data record in
-# ``dtype.py`` with no loop/graph/context dependency.
+# registry rather than on ``Atom`` so the spec stays a pure data record in
+# ``ir/tile/ir.py`` with no loop/graph/context dependency.
 _ELIGIBILITY: dict[str, Callable[[LoopOp, Context, Graph], bool]] = {
     "mma_m16n8k16_f16": _mma_eligible_factory(cell_shape=(16, 8, 16), operand_dtype=F16, min_cc=(8, 0)),
     "mma_m16n8k16_bf16": _mma_eligible_factory(cell_shape=(16, 8, 16), operand_dtype=BF16, min_cc=(8, 0)),

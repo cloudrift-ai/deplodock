@@ -50,7 +50,7 @@ import enum
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
-from deplodock.compiler.dtype import DataType, atom_shape, atom_spec
+from deplodock.compiler.dtype import BF16, F16, F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -93,6 +93,92 @@ from deplodock.compiler.ir.stmt.blocks import (
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
+
+
+# ===========================================================================
+# Atom kinds — the hardware-instruction spec for each tensor-core matmul cell.
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class Atom:
+    """Hardware-instruction spec for one matmul atom kind — the cell a single
+    tensor-core instruction realises (``C[M×N] += A[M×K] · B[K×N]``).
+
+    Carried directly on the :class:`~deplodock.compiler.ir.stmt.Mma` op (and
+    keyed by ``name`` in :data:`ATOM_REGISTRY`), so ``kernel/005_lower_atom_tile``
+    reads the cell shape + operand dtypes straight off the ``Mma`` — no registry
+    lookup at lowering.
+
+    - ``name`` — the ``ATOM_KIND`` (e.g. ``"mma_m16n8k16_f16"``); the registry key.
+    - ``shape`` — the cell shape ``(M, N, K)`` one instruction realises.
+    - ``operand_dtypes`` — ``(role, dtype)`` pairs (``"a"`` / ``"b"`` / ``"c"``;
+      scaled kinds extend with ``"a_scale"`` / ``"b_scale"``). A tuple, not a
+      dict, so ``Atom`` stays **hashable** — it rides on a frozen ``Mma`` Stmt.
+      Use :meth:`operand_dtype` for role lookup.
+    - ``group_size`` — threads-per-cell (32 for the warp-level mma.sync atom;
+      128 for a future wgmma warp-group). Drives the warp-tier launch geometry.
+
+    Per-kernel *eligibility* (does a LoopOp admit this atom?) is NOT here — it
+    needs the loop / graph / context and lives in the planner
+    (``passes/lowering/tile/_atom.py``).
+    """
+
+    name: str
+    shape: tuple[int, int, int]
+    operand_dtypes: tuple[tuple[str, DataType], ...]
+    group_size: int
+
+    def operand_dtype(self, role: str) -> DataType:
+        """The element dtype of operand ``role`` (``"a"`` / ``"b"`` / ``"c"``)."""
+        for r, dt in self.operand_dtypes:
+            if r == role:
+                return dt
+        raise KeyError(f"atom {self.name!r} has no operand role {role!r}")
+
+    def __str__(self) -> str:
+        return self.name
+
+
+# The s16816 ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` path is the sole
+# tensor-core family — f16 / bf16 operands, f32 accumulate, sm_80+. f16 and
+# bf16 share the 16-bit fragment layout (only ``MmaSyncPtx.ab_dtype`` differs);
+# scalar matmul is the absence of an atom. ``kernel/005_lower_atom_tile`` emits
+# the RegFragment / LdmatrixLoad / MmaSyncPtx / RegStore chain (smem-staged only —
+# ldmatrix has no gmem-direct path).
+ATOM_REGISTRY: dict[str, Atom] = {
+    "mma_m16n8k16_f16": Atom(
+        name="mma_m16n8k16_f16",
+        shape=(16, 8, 16),
+        operand_dtypes=(("a", F16), ("b", F16), ("c", F32)),
+        group_size=32,
+    ),
+    "mma_m16n8k16_bf16": Atom(
+        name="mma_m16n8k16_bf16",
+        shape=(16, 8, 16),
+        operand_dtypes=(("a", BF16), ("b", BF16), ("c", F32)),
+        group_size=32,
+    ),
+}
+
+# Priority-ordered kinds the planner enumerates (f16 first, then bf16).
+ATOM_KINDS: tuple[str, ...] = ("mma_m16n8k16_f16", "mma_m16n8k16_bf16")
+
+
+def atom_spec(kind: str) -> Atom:
+    """Resolve ``kind`` to its :class:`Atom`. ``KeyError`` for an unregistered
+    kind (scalar matmul has no atom)."""
+    return ATOM_REGISTRY[kind]
+
+
+def atom_shape(kind: str) -> tuple[int, int, int]:
+    """Cell shape ``(M, N, K)`` of ``kind``."""
+    return ATOM_REGISTRY[kind].shape
+
+
+def atom_group_size(kind: str) -> int:
+    """Threads-per-cell of ``kind``."""
+    return ATOM_REGISTRY[kind].group_size
 
 
 # ---------------------------------------------------------------------------
@@ -2161,6 +2247,12 @@ BLOCK_SIZE = _coop_block_size()
 
 
 __all__ = [
+    "Atom",
+    "ATOM_REGISTRY",
+    "ATOM_KINDS",
+    "atom_spec",
+    "atom_shape",
+    "atom_group_size",
     # Shared expressions (re-exported for convenience)
     "Var",
     "Literal",

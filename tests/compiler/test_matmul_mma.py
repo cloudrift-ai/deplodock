@@ -242,7 +242,7 @@ def test_atom_cell_carries_through_staging(monkeypatch):
     top = g_tile.nodes["c"].op
     mmas = [s for s in top.body.iter() if isinstance(s, Mma)]
     assert mmas, "the matmul compute should be an Mma carried through staging"
-    assert all(m.atom == "mma_m16n8k16_f16" for m in mmas)
+    assert all(m.atom.name == "mma_m16n8k16_f16" for m in mmas)
     # The Mma names its operands; each names a real Load (operand Loads are plain).
     load_names = {ld.names[0] for ld in top.body.iter() if isinstance(ld, Load)}
     for m in mmas:

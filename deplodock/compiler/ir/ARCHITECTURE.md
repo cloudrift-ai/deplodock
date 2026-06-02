@@ -283,8 +283,9 @@ one fragment) are both consumed before kernel render: `RegisterTile` by
 into tensor-core form early (right after `partition_loops`, by
 `tile/011_lower_atom_cell`): the `Assign(multiply) + Accum` collapses into a
 single `Mma` op (`c += a @ b`, a reduce-accumulate sibling of `Accum` — it
-makes its loop `is_reduce`) that carries the `ATOM_KIND` and names its A/B
-operand `Load`s by SSA value. The operand loads stay **plain** — the `Mma` is
+makes its loop `is_reduce`) that carries the `Atom` spec (the cell shape +
+operand dtypes — `Atom` lives in `ir/tile/ir.py`) and names its A/B operand
+`Load`s by SSA value. The operand loads stay **plain** — the `Mma` is
 the sole tensor-core marker. Both are ordinary IR the staging passes carry
 through (the loads stage like any `Load`); `kernel/005_lower_atom_tile` then
 recovers each operand's role from the co-located `Mma` and lowers the loads →
