@@ -166,19 +166,11 @@ ATOM_KINDS: tuple[str, ...] = ("mma_m16n8k16_f16", "mma_m16n8k16_bf16")
 
 
 def atom_spec(kind: str) -> Atom:
-    """Resolve ``kind`` to its :class:`Atom`. ``KeyError`` for an unregistered
-    kind (scalar matmul has no atom)."""
+    """Resolve a kind *name* to its :class:`Atom` — the one string→spec boundary,
+    used where only the ``ATOM_KIND`` knob is in hand (``011_lower_atom_cell``,
+    launch geometry). Elsewhere the ``Atom`` is carried directly. ``KeyError``
+    for an unregistered kind (scalar matmul has no atom)."""
     return ATOM_REGISTRY[kind]
-
-
-def atom_shape(kind: str) -> tuple[int, int, int]:
-    """Cell shape ``(M, N, K)`` of ``kind``."""
-    return ATOM_REGISTRY[kind].shape
-
-
-def atom_group_size(kind: str) -> int:
-    """Threads-per-cell of ``kind``."""
-    return ATOM_REGISTRY[kind].group_size
 
 
 # ---------------------------------------------------------------------------
@@ -2251,8 +2243,6 @@ __all__ = [
     "ATOM_REGISTRY",
     "ATOM_KINDS",
     "atom_spec",
-    "atom_shape",
-    "atom_group_size",
     # Shared expressions (re-exported for convenience)
     "Var",
     "Literal",
