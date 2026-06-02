@@ -32,9 +32,6 @@ Env vars:
   Default is M-adaptive.
 - ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
 
-(``DEPLODOCK_TMA_SWIZZLE`` — the TMA hardware-swizzle opt-in — is a
-``Knob`` owned by ``050_use_tma``, not a matmul-tile heuristic.)
-
 ## API
 
 Heuristics are pure numeric functions: they take ``output_extents``

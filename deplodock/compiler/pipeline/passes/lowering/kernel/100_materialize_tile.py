@@ -199,9 +199,6 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
 
     rename: dict[str, str] = {}
 
-    # TMA stages always emit with ``swizzle=NONE`` — the post-refactor
-    # pipeline doesn't carry a swizzle-picker pass (012 was dropped).
-
     def transform(s: Stmt) -> Stmt:
         if rename:
             s = s.rewrite(lambda n: rename.get(n, n))
