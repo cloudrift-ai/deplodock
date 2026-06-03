@@ -54,6 +54,31 @@ def test_matmul_and_pointwise_force_fk_one():
     assert all(p.fk == 1 for p in pw), "pointwise must not sweep FK"
 
 
+def test_matmul_fp16_window_sweeps_even_fk():
+    """fp16 matmul (``fp16_window=True``) sweeps an even half2 window length
+    FK = bk; every FK>1 variant ties FK to its bk and stays even."""
+    combos = enumerate_cartesian(E_M=512, E_N=512, E_K=512, ctx=_CTX, priority_mode="matmul", fp16_window=True)
+    window = [p for p in combos if p.fk > 1]
+    assert window, "fp16 window matmul produced no FK>1 variant"
+    for p in window:
+        assert p.fk == p.bk, f"window FK must equal bk; got fk={p.fk} bk={p.bk}"
+        assert p.fk % 2 == 0, f"window FK must be even; got {p.fk}"
+        assert p.fp16_window, "FK>1 matmul variant must be flagged fp16_window"
+
+
+def test_matmul_fp16_window_off_keeps_fk_one():
+    """Without ``fp16_window`` (fp32 / bf16 / MMA matmul) FK stays 1."""
+    combos = enumerate_cartesian(E_M=512, E_N=512, E_K=512, ctx=_CTX, priority_mode="matmul", fp16_window=False)
+    assert all(p.fk == 1 and not p.fp16_window for p in combos)
+
+
+def test_matmul_fp16_window_greedy_default_is_fk_one():
+    """The greedy (first-by-priority) fp16 matmul pick stays FK=1 so the
+    non-tuned ``compile`` is byte-identical to the fp32-accumulate path."""
+    combos = enumerate_cartesian(E_M=512, E_N=512, E_K=512, ctx=_CTX, priority_mode="matmul", fp16_window=True)
+    assert combos[0].fk == 1, f"greedy default must be FK=1, got {combos[0].fk}"
+
+
 def test_fk_one_ranks_first_in_priority():
     """For the greedy (non-tuned) default the FK=1 variant must outrank its
     FK>1 siblings sharing the same BR / thread geometry, so ``compile`` stays

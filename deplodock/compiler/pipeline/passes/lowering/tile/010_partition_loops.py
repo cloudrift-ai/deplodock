@@ -121,12 +121,13 @@ import enum
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     Atom,
     AtomTile,
@@ -531,6 +532,27 @@ def _layer_kind_for(role: Role | None) -> str:
     return "serial"
 
 
+def _is_fp16_matmul(matmul_reduces: list, graph: Graph | None) -> bool:
+    """True iff every K-indexed operand ``Load`` in every matmul-reduce loop
+    resolves to an ``F16`` source buffer. Loop-IR Loads don't carry a dtype
+    until ``kernel/030_stamp_types``, so the operand dtype comes off
+    ``graph.nodes[buf].output.dtype`` (mirrors ``_atom._mma_eligible_factory``).
+    Gates the fp16 half2 accumulation window — fp32 / bf16 / mixed matmuls keep
+    the scalar fp32-accumulate path."""
+    if graph is None or not matmul_reduces:
+        return False
+    for k_loop in matmul_reduces:
+        K_name = k_loop.axis.name
+        k_loads = [ld for ld in k_loop.body.iter_of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}]
+        if not k_loads:
+            return False
+        for ld in k_loads:
+            node = graph.nodes.get(ld.input)
+            if node is None or node.output.dtype != F16:
+                return False
+    return True
+
+
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph: Graph | None = None) -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
@@ -636,6 +658,12 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # keeps symbolic axes degenerate (E=1, no mask): correct via the
         # symbolic grid, one output element per thread.
         mask_ok = not prologue
+        # fp16 half2 window (FK on the scalar matmul path): enabled only when
+        # every K-indexed operand Load is fp16 and there's no fused prologue
+        # (SDPA P@V's softmax stats would interleave with the windowed flush).
+        # The window trades a bounded fp16-accumulation error for 2× packed
+        # ``__hfma2`` throughput — see ``plans/fk-half2-fp16-matmul.md``.
+        fp16_window = (not prologue) and not k_symbolic and _is_fp16_matmul(matmul_reduces, graph)
         param_combos = enumerate_cartesian(
             E_M=E_M if (mask_ok or not m_symbolic) else 1,
             E_N=E_N if (mask_ok or not n_symbolic) else 1,
@@ -647,6 +675,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
             n_axis_name=outer_n.axis.name,
             m_forced_mask=m_symbolic and mask_ok,
             n_forced_mask=n_symbolic and mask_ok,
+            fp16_window=fp16_window,
         )
         # Warp-tier MMA: only when DEPLODOCK_MMA is on, no prologue (M9
         # extension), static M/N/K, and the per-kind eligibility predicate
@@ -808,6 +837,12 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
             SPLITK.name: params.splitk,
             BR.name: params.br,
         }
+        if params.fp16_window:
+            # Distinct marker so ``kernel/015_pack_fk_window`` fires only on the
+            # fp16-matmul half2 window — NOT on the reduce-axis FK (which also
+            # stamps FK>1 but is realized by the reduce fold in
+            # ``kernel/010_split_register_axes``).
+            knobs["FKWIN"] = params.fk
     # Drop leading stmts whose SSA name is *also* defined inside ``chain_body``.
     # A pre-loop invariant (e.g. ``v0 = reciprocal(1024)``) used only by a
     # post-reduce stmt gets pulled into the thread scope by the body builder as
@@ -943,7 +978,12 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     K_s = K_c = K_f = None
     K_o_ext: object = 0
     K_src: Axis | None = None
-    fk = params.fk
+    # The fp16-matmul half2 window keeps the FK=1 fp32 K factorization here — the
+    # window length is the stage chunk ``bk`` and the entire two-level
+    # (fp16 window + fp32 master) rewrite is done downstream in
+    # ``kernel/075_pack_fk_window`` off the stamped ``FK`` knob. Only the reduce
+    # strip-mine consumes ``fk`` in the factorization / K_f tile below.
+    fk = 1 if params.fp16_window else params.fk
     if shape.k_loop is not None:
         K_axis = shape.k_loop.axis
         K_name = K_axis.name

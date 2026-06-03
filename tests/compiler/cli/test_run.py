@@ -98,6 +98,33 @@ def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
     assert rc == 0, f"stderr: {stderr}"
 
 
+def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
+    """Structural guard: a pinned FK window must actually rewrite the K loop into
+    the half2 pack + ``__half2`` accumulate + widen-flush (catches a silent
+    015_pack_fk_window regression that would fall back to fp32 accumulate). No
+    CUDA device needed — just inspects the generated source."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("DEPLODOCK_FK", "4")
+    rc, stdout, stderr = run_cli(
+        "compile", "--code", "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)", "--ir", "cuda"
+    )
+    assert rc == 0, f"stderr: {stderr}"
+    assert "__halves2half2" in stdout, "no __half2 pack — FK window did not fire"
+    assert "__low2half" in stdout and "__high2half" in stdout, "no widen+flush of the half2 window"
+
+
+@requires_cuda
+@pytest.mark.parametrize("fk", [2, 4, 8])
+def test_run_code_fp16_matmul_window_accuracy(run_cli, monkeypatch, fk):
+    """fp16 scalar matmul half2 accumulation window (``plans/fk-half2-fp16-matmul.md``):
+    pin MMA off + an even FK window and confirm the windowed half2 accumulate +
+    fp32 flush matches eager within fp16 tolerance — ``rc == 0`` asserts it."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("DEPLODOCK_FK", str(fk))
+    rc, _, stderr = run_cli("run", "--code", "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)")
+    assert rc == 0, f"stderr: {stderr}"
+
+
 @requires_cuda
 @pytest.mark.parametrize("br", [None, 1])
 def test_run_code_softmax_fk_accuracy(run_cli, monkeypatch, br):
