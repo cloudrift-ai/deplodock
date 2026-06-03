@@ -40,6 +40,8 @@ nothing and the pass skips.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
@@ -57,6 +59,10 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
+# A ``_map_staged`` visitor: given a stmt and the in-scope ``Source`` table,
+# return a replacement tuple (splice, no descent) or ``None`` (descend).
+_StagedHandler = Callable[[Stmt, dict[str, Source]], "tuple[Stmt, ...] | None"]
+
 PATTERN = [Pattern("root", TileOp)]
 
 
@@ -72,50 +78,60 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 
 
 def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
-    """Walk ``body``; for each ``AtomTile``, lower its matmul cell to
-    the kernel-IR fragment chain and strip the wrapper. Threads ``smem_sources``
-    from enclosing ``StageBundle`` / ``WarpSpecialize`` scopes so each operand's
-    slab addressing resolves from the live ``Source``. The atom spec is read off
-    each cell's ``Mma`` (no knob lookup). Returns ``(new_body, found_any)``."""
-    out: list[Stmt] = []
+    """For each ``AtomTile`` in ``body``, lower its matmul cell to the kernel-IR
+    fragment chain and strip the wrapper. Runs through :func:`_map_staged`, which
+    threads the in-scope ``Source`` table from enclosing ``StageBundle`` /
+    ``WarpSpecialize`` scopes so each operand's slab addressing resolves from the
+    live ``Source``. The atom spec is read off each cell's ``Mma`` (no knob
+    lookup). Returns ``(new_body, found_any)``."""
     found = False
-    for s in body:
+
+    def handler(s: Stmt, sources: dict[str, Source]) -> tuple[Stmt, ...] | None:
+        nonlocal found
         if isinstance(s, AtomTile):
-            out.extend(_lower_cell(s.body, smem_sources=smem_sources))
             found = True
+            return _lower_cell(s.body, smem_sources=sources)
+        return None
+
+    return _map_staged(body, smem_sources, handler), found
+
+
+def _map_staged(body: Body, sources: dict[str, Source], handler: _StagedHandler) -> Body:
+    """Rewrite ``body`` while threading the in-scope ``Source`` table. For each
+    stmt, call ``handler(stmt, sources)``: a returned tuple splices in (no descent
+    into that stmt); ``None`` means descend structurally. Descending a
+    ``StageBundle`` adds its stage ``Source``s to the table; a ``WarpSpecialize``
+    adds the producer's, then rewrites only the consumer body — so a consumer
+    access always sees the slabs its producer staged. This is the single
+    source-aware traversal both lowering walks (cell discovery + cell rewrite)
+    share, replacing the per-walk hand-rolled descent."""
+    out: list[Stmt] = []
+    for s in body:
+        repl = handler(s, sources)
+        if repl is not None:
+            out.extend(repl)
             continue
         if isinstance(s, StageBundle):
-            inner_sources = dict(smem_sources)
+            inner = dict(sources)
             for stage in s.stages:
                 for src in stage.sources:
-                    inner_sources[src.name] = src
-            new_body, body_found = lower_atom_cells(s.body, smem_sources=inner_sources)
-            out.append(s.with_bodies((Body(s.stages), new_body)))
-            found = found or body_found
+                    inner[src.name] = src
+            out.append(s.with_bodies((Body(s.stages), _map_staged(s.body, inner, handler))))
             continue
         if isinstance(s, WarpSpecialize):
-            ws_sources = dict(smem_sources)
+            inner = dict(sources)
             for st in s.producer_body.iter():
                 if isinstance(st, StageBundle):
                     for stage in st.stages:
                         for src in stage.sources:
-                            ws_sources[src.name] = src
-            new_consumer, cons_found = lower_atom_cells(s.consumer_body, smem_sources=ws_sources)
-            out.append(s.with_bodies((s.producer_body, new_consumer)))
-            found = found or cons_found
+                            inner[src.name] = src
+            out.append(s.with_bodies((s.producer_body, _map_staged(s.consumer_body, inner, handler))))
             continue
         if s.nested():
-            new_bodies: list[Body] = []
-            any_found = False
-            for sub in s.nested():
-                ns, sf = lower_atom_cells(sub, smem_sources=smem_sources)
-                new_bodies.append(ns)
-                any_found = any_found or sf
-            out.append(s.with_bodies(tuple(new_bodies)))
-            found = found or any_found
+            out.append(s.with_bodies(tuple(_map_staged(sub, sources, handler) for sub in s.nested())))
             continue
         out.append(s)
-    return Body(out), found
+    return Body(out)
 
 
 def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
@@ -125,8 +141,12 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
     ``RegFragment`` decls (seeding stable fragment SSA names from the FIRST
     reduce site, so the per-cell replicator in ``010_split_register_axes``
     renames them consistently across prologue/inner/epilogue), then for shapes
-    A/B/D transform-walks the body (each reduce ``SerialTile`` → chain,
-    ``Write`` → ``RegStore``); shape C inlines a single chain + store."""
+    A/B/D maps the body (each reduce ``SerialTile`` → chain, ``Write`` →
+    ``RegStore``); shape C inlines a single chain + store."""
+    # Flatten *every* bundle in the cell up front: a double-buffered (shape D)
+    # epilogue reduce is a sibling of the staging bundles, not nested inside
+    # them, so descent-threading alone wouldn't reach the slab Sources. Seed the
+    # rewrite with this union so a sibling cell still resolves its operands.
     bundle_sources = dict(smem_sources)
     for stage_bundle in _iter_bundles(atom_body):
         for stage in stage_bundle.stages:
@@ -143,7 +163,16 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
     fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=spec.operand_dtype("c"))
 
     if has_reduce:
-        transformed = _transform_walk(atom_body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=bundle_sources, spec=spec)
+
+        def handler(s: Stmt, sources: dict[str, Source]) -> tuple[Stmt, ...] | None:
+            if isinstance(s, Write):
+                return (_emit_store(spec, dst_buffer=s.output, dst_index=s.index, c_frag=c_frag),)
+            if isinstance(s, SerialTile) and s.is_reduce:
+                chain = _build_chain(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=sources, spec=spec)
+                return (s.with_bodies((Body(chain),)),)
+            return None
+
+        transformed = _map_staged(atom_body, bundle_sources, handler)
         return (*fragments, *transformed)
 
     # Shape C: K filtered — inline chain from the body's operand Loads + store.
@@ -212,49 +241,6 @@ def _find_role_loads(body: Body) -> tuple[Load | None, Load | None]:
         return None, None
     by_name = {ld.names[0]: ld for ld in body if isinstance(ld, Load) and ld.names}
     return by_name.get(mma.a), by_name.get(mma.b)
-
-
-def _transform_walk(
-    body: Body,
-    *,
-    c_frag: str,
-    a_frag: str,
-    b_frag: str,
-    smem_sources: dict[str, Source],
-    spec: Atom,
-) -> tuple[Stmt, ...]:
-    """Recursively rewrite ``body``: every reduce ``SerialTile`` body → the Mma
-    chain (the ``Mma`` op is consumed, clearing ``is_reduce``); every ``Write``
-    → ``RegStore``. Preserves every other Stmt structurally (StageBundle wraps +
-    Stages, AsyncWait, K_o SerialTile, Cond). ``smem_sources`` is threaded
-    through StageBundle descent so the chain's phase-prefix prepend sees the
-    full in-scope Source table."""
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, Write):
-            out.append(_emit_store(spec, dst_buffer=s.output, dst_index=s.index, c_frag=c_frag))
-            continue
-        if isinstance(s, SerialTile) and s.is_reduce:
-            chain = _build_chain(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources, spec=spec)
-            out.append(s.with_bodies((Body(chain),)))
-            continue
-        if isinstance(s, StageBundle):
-            inner_sources = dict(smem_sources)
-            for stage in s.stages:
-                for src in stage.sources:
-                    inner_sources[src.name] = src
-            new_body = _transform_walk(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=inner_sources, spec=spec)
-            out.append(s.with_bodies((Body(s.stages), Body(new_body))))
-            continue
-        if s.nested():
-            new_bodies = tuple(
-                Body(_transform_walk(sub, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=smem_sources, spec=spec))
-                for sub in s.nested()
-            )
-            out.append(s.with_bodies(new_bodies))
-            continue
-        out.append(s)
-    return tuple(out)
 
 
 def _build_chain(
