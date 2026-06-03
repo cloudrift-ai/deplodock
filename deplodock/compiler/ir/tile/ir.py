@@ -47,6 +47,7 @@ synthesized at materialization.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
@@ -1517,6 +1518,62 @@ class StageBundle(Stmt):
 
 
 # ---------------------------------------------------------------------------
+# Source-aware traversal
+# ---------------------------------------------------------------------------
+
+# A ``map_staged`` visitor: given a stmt and the in-scope ``Source`` table,
+# return a replacement tuple (splice in, no descent into that stmt) or ``None``
+# (descend structurally). The handler is the only thing a caller writes; the
+# StageBundle / WarpSpecialize / nested descent — and the Source threading that
+# makes the in-scope table available — is shared.
+StagedHandler = Callable[["Stmt", dict[str, "Source"]], "tuple[Stmt, ...] | None"]
+
+
+def map_staged(body: Body, handler: StagedHandler, *, sources: dict[str, Source] | None = None) -> Body:
+    """Rewrite ``body`` while threading the in-scope ``Source`` table.
+
+    For each stmt, call ``handler(stmt, sources)``: a returned tuple splices in
+    (no descent into that stmt); ``None`` means descend structurally. Descending
+    a :class:`StageBundle` adds its stage ``Source``s to the table; a
+    :class:`WarpSpecialize` adds the producer's, then rewrites only the consumer
+    body — so a consumer access always sees the slabs its producer staged. Other
+    block stmts recurse with the table unchanged.
+
+    The one source-aware traversal lowering passes share instead of re-rolling
+    the descent + threading by hand. Used both as a transformer (handler returns
+    rewrites) and, with an always-``None`` collecting handler, as a visitor (the
+    rebuilt body is discarded; the handler accumulates via closure)."""
+    scope = sources if sources is not None else {}
+    out: list[Stmt] = []
+    for s in body:
+        repl = handler(s, scope)
+        if repl is not None:
+            out.extend(repl)
+            continue
+        if isinstance(s, StageBundle):
+            inner = dict(scope)
+            for stage in s.stages:
+                for src in stage.sources:
+                    inner[src.name] = src
+            out.append(s.with_bodies((Body(s.stages), map_staged(s.body, handler, sources=inner))))
+            continue
+        if isinstance(s, WarpSpecialize):
+            inner = dict(scope)
+            for st in s.producer_body.iter():
+                if isinstance(st, StageBundle):
+                    for stage in st.stages:
+                        for src in stage.sources:
+                            inner[src.name] = src
+            out.append(s.with_bodies((s.producer_body, map_staged(s.consumer_body, handler, sources=inner))))
+            continue
+        if s.nested():
+            out.append(s.with_bodies(tuple(map_staged(sub, handler, sources=scope) for sub in s.nested())))
+            continue
+        out.append(s)
+    return Body(out)
+
+
+# ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
 
@@ -2272,6 +2329,9 @@ __all__ = [
     "CacheDim",
     "Source",
     "AsyncWait",
+    # Source-aware traversal (transformer / visitor over staged bodies)
+    "map_staged",
+    "StagedHandler",
     "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
     "Stmt",

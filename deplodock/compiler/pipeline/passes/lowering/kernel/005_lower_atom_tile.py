@@ -40,8 +40,6 @@ nothing and the pass skips.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
@@ -55,13 +53,9 @@ from deplodock.compiler.ir.tile.ir import (
     Source,
     StageBundle,
     TileOp,
-    WarpSpecialize,
+    map_staged,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-
-# A ``_map_staged`` visitor: given a stmt and the in-scope ``Source`` table,
-# return a replacement tuple (splice, no descent) or ``None`` (descend).
-_StagedHandler = Callable[[Stmt, dict[str, Source]], "tuple[Stmt, ...] | None"]
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -79,8 +73,9 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 
 def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
     """For each ``AtomTile`` in ``body``, lower its matmul cell to the kernel-IR
-    fragment chain and strip the wrapper. Runs through :func:`_map_staged`, which
-    threads the in-scope ``Source`` table from enclosing ``StageBundle`` /
+    fragment chain and strip the wrapper. Runs through the shared
+    :func:`~deplodock.compiler.ir.tile.ir.map_staged` traversal, which threads
+    the in-scope ``Source`` table from enclosing ``StageBundle`` /
     ``WarpSpecialize`` scopes so each operand's slab addressing resolves from the
     live ``Source``. The atom spec is read off each cell's ``Mma`` (no knob
     lookup). Returns ``(new_body, found_any)``."""
@@ -93,45 +88,7 @@ def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Bo
             return _lower_cell(s.body, smem_sources=sources)
         return None
 
-    return _map_staged(body, smem_sources, handler), found
-
-
-def _map_staged(body: Body, sources: dict[str, Source], handler: _StagedHandler) -> Body:
-    """Rewrite ``body`` while threading the in-scope ``Source`` table. For each
-    stmt, call ``handler(stmt, sources)``: a returned tuple splices in (no descent
-    into that stmt); ``None`` means descend structurally. Descending a
-    ``StageBundle`` adds its stage ``Source``s to the table; a ``WarpSpecialize``
-    adds the producer's, then rewrites only the consumer body — so a consumer
-    access always sees the slabs its producer staged. This is the single
-    source-aware traversal both lowering walks (cell discovery + cell rewrite)
-    share, replacing the per-walk hand-rolled descent."""
-    out: list[Stmt] = []
-    for s in body:
-        repl = handler(s, sources)
-        if repl is not None:
-            out.extend(repl)
-            continue
-        if isinstance(s, StageBundle):
-            inner = dict(sources)
-            for stage in s.stages:
-                for src in stage.sources:
-                    inner[src.name] = src
-            out.append(s.with_bodies((Body(s.stages), _map_staged(s.body, inner, handler))))
-            continue
-        if isinstance(s, WarpSpecialize):
-            inner = dict(sources)
-            for st in s.producer_body.iter():
-                if isinstance(st, StageBundle):
-                    for stage in st.stages:
-                        for src in stage.sources:
-                            inner[src.name] = src
-            out.append(s.with_bodies((s.producer_body, _map_staged(s.consumer_body, inner, handler))))
-            continue
-        if s.nested():
-            out.append(s.with_bodies(tuple(_map_staged(sub, sources, handler) for sub in s.nested())))
-            continue
-        out.append(s)
-    return Body(out)
+    return map_staged(body, handler, sources=smem_sources), found
 
 
 def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
@@ -146,12 +103,19 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
     # Flatten *every* bundle in the cell up front: a double-buffered (shape D)
     # epilogue reduce is a sibling of the staging bundles, not nested inside
     # them, so descent-threading alone wouldn't reach the slab Sources. Seed the
-    # rewrite with this union so a sibling cell still resolves its operands.
+    # rewrite with this union so a sibling cell still resolves its operands. The
+    # gather rides ``map_staged`` as a pure visitor — the rebuilt body is
+    # discarded; ``_gather`` accumulates every bundle's Sources via closure.
     bundle_sources = dict(smem_sources)
-    for stage_bundle in _iter_bundles(atom_body):
-        for stage in stage_bundle.stages:
-            for src in stage.sources:
-                bundle_sources[src.name] = src
+
+    def _gather(s: Stmt, _scope: dict[str, Source]) -> None:
+        if isinstance(s, StageBundle):
+            for stage in s.stages:
+                for src in stage.sources:
+                    bundle_sources[src.name] = src
+        return None
+
+    map_staged(atom_body, _gather)
 
     write_stmt, a_seed, b_seed, c_seed, has_reduce, spec = _scan_cell(atom_body)
     if write_stmt is None:
@@ -172,7 +136,7 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
                 return (s.with_bodies((Body(chain),)),)
             return None
 
-        transformed = _map_staged(atom_body, bundle_sources, handler)
+        transformed = map_staged(atom_body, handler, sources=bundle_sources)
         return (*fragments, *transformed)
 
     # Shape C: K filtered — inline chain from the body's operand Loads + store.
@@ -182,19 +146,6 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
     chain = _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=bundle_sources)
     store = _emit_store(spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag)
     return (*fragments, *chain, store)
-
-
-def _iter_bundles(body: Body):
-    """Yield every ``StageBundle`` reachable inside ``body`` — flattens all
-    in-scope Sources before the chain emitters resolve slab addressing."""
-    for s in body:
-        if isinstance(s, StageBundle):
-            yield s
-            yield from _iter_bundles(s.body)
-            continue
-        if s.nested():
-            for sub in s.nested():
-                yield from _iter_bundles(sub)
 
 
 def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | None, bool, Atom | None]:
