@@ -17,7 +17,6 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Body, Load
 from deplodock.compiler.ir.tile.ir import (
-    CacheDim,
     Source,
     StageBundle,
     StagePolicy,
@@ -25,12 +24,9 @@ from deplodock.compiler.ir.tile.ir import (
 
 
 def _source(name: str, buf: str) -> Source:
-    cache_dims = (
-        CacheDim(axis=Axis(f"{name}_c0", 16), source_dim=0),
-        CacheDim(axis=Axis(f"{name}_c1", 8), source_dim=1),
-    )
+    cache_axes = (Axis(f"{name}_c0", 16), Axis(f"{name}_c1", 8))
     origin = (Var("k_outer") * Literal(16, "int"), Literal(0, "int"))
-    return Source(name=name, buf=buf, cache_dims=cache_dims, origin=origin)
+    return Source(name=name, buf=buf, cache_axes=cache_axes, origin=origin)
 
 
 def _consumer_body() -> Body:
@@ -138,7 +134,7 @@ def test_bundle_tma_rejects_padded_source():
     src_padded = Source(
         name="w_smem",
         buf="w",
-        cache_dims=(CacheDim(axis=Axis("c0", 16), source_dim=0),),
+        cache_axes=(Axis("c0", 16),),
         origin=(Literal(0, "int"),),
         pad=(4,),
     )

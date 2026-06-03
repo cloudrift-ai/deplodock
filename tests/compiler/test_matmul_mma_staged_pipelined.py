@@ -22,7 +22,7 @@ SerialTile, prologue/epilogue) and only rewrites reduce SerialTiles
   carries the leading phase. ``_mma_src_index`` splices the prefix back
   in front of the computed cache coords so the fragment reads the right
   slot.
-- **A/B classification via Source.cache_dims** — for staged smem loads
+- **A/B classification via Source.cache_axes** — for staged smem loads
   the K axis sits in the *middle* of the index tuple (not the last/first
   dim), so the legacy "K_name in load.index[-1]" heuristic misclassifies.
   We instead read the cache_dim whose ``axis.name == K_name`` and
@@ -270,7 +270,7 @@ def test_cp_async_fp16_vectorized_16byte(pin_staged_pipelined):
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_staged_pipelined_ab_classification(pin_staged_pipelined):
-    """A vs B classification via ``Source.cache_dims`` — the cache axis
+    """A vs B classification via ``Source.cache_axes`` — the cache axis
     whose ``axis.name == K_name`` has ``source_dim == 1`` for A (K is the
     inner gmem dim) or ``0`` for B (K is the outer gmem dim). Pre-M2 the
     classification used ``K_name in load.index[-1]`` which for staged

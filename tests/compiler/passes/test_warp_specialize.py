@@ -18,7 +18,6 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Body, Load, Write
 from deplodock.compiler.ir.tile.ir import (
-    CacheDim,
     SerialTile,
     Source,
     StageBundle,
@@ -65,10 +64,7 @@ def _tile_op_tma_pipelined() -> TileOp:
     src = Source(
         name="a_smem",
         buf="a",
-        cache_dims=(
-            CacheDim(axis=Axis("a_c0", 16), source_dim=0),
-            CacheDim(axis=Axis("a_c1", 16), source_dim=1),
-        ),
+        cache_axes=(Axis("a_c0", 16), Axis("a_c1", 16)),
         origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
     )
     tma_bundle = StageBundle(
@@ -107,10 +103,7 @@ def _tile_op_warp_tma_pipelined() -> TileOp:
     src = Source(
         name="a_smem",
         buf="a",
-        cache_dims=(
-            CacheDim(axis=Axis("a_c0", 16), source_dim=0),
-            CacheDim(axis=Axis("a_c1", 16), source_dim=1),
-        ),
+        cache_axes=(Axis("a_c0", 16), Axis("a_c1", 16)),
         origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
     )
     tma_bundle = StageBundle(

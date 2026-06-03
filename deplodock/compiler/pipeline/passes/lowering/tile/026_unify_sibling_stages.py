@@ -33,7 +33,7 @@ When it visits a ``StageBundle``, every ``Source`` whose
 ``(buf, bundle.phase)`` is already in the set is dropped and the
 consumer ``Load``s inside the bundle body that referenced that Source's
 slab name are rewritten back to read from gmem at the original index
-(reconstructed from ``Source.origin`` + ``cache_dims``, or directly
+(reconstructed from ``Source.origin`` + ``cache_axes``, or directly
 from ``Source.template_index`` when the addressing was template). If
 every Source in the bundle gets dropped the bundle is unwrapped (its
 body inlined at the parent scope).
@@ -154,7 +154,7 @@ def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, B
 
 def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     """Build the gmem ``Load.index`` that 020 would have emitted had it
-    not promoted this Source to smem. ``cache_dims`` carries the
+    not promoted this Source to smem. ``cache_axes`` + the addressing carry the
     affine mapping (``origin[d] + composite-stride decode`` over each
     cache axis mapping to dim ``d``); ``TemplateAddressing.exprs`` is
     the verbatim non-affine form when 020 set it. Inverse of 020's
@@ -173,7 +173,7 @@ def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     ``linear_1_reduce`` with ``a4 * 2`` dropped from the M coord)."""
     if isinstance(src.addressing, TemplateAddressing):
         return src.addressing.exprs
-    coord_for = {cd.axis.name: Var(cd.axis.name) for cd in src.cache_dims}
+    coord_for = {ax.name: Var(ax.name) for ax in src.cache_axes}
     # AffineAddressing.source_index threads ``block`` through the per-dim
     # composite stride so MMA-strided sources revert to the same gmem σ
     # the planner emitted. Scalar paths keep block=() and behave

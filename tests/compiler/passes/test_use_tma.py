@@ -19,7 +19,6 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile.ir import (
-    CacheDim,
     SerialTile,
     Source,
     StageBundle,
@@ -48,10 +47,7 @@ def _eligible_source(*, name: str, buf: str) -> Source:
     return Source(
         name=name,
         buf=buf,
-        cache_dims=(
-            CacheDim(axis=Axis(f"{name}_m", 16), source_dim=0),
-            CacheDim(axis=Axis(f"{name}_k", 32), source_dim=1),
-        ),
+        cache_axes=(Axis(f"{name}_m", 16), Axis(f"{name}_k", 32)),
         origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
     )
 

@@ -91,7 +91,6 @@ from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     AtomTile,
-    CacheDim,
     GridTile,
     RegisterTile,
     SerialTile,
@@ -669,28 +668,28 @@ def _build_sources(
             if used_bytes + slab.n_bytes > scope_budget:
                 continue
             smem_name = _gen_name(buf, used_names)
-            cache_dims = tuple(CacheDim(axis=ax, source_dim=d) for ax, d in zip(slab.cache_axes, slab.slab_dims, strict=True))
+            cache_axes = tuple(slab.cache_axes)
             # Pick addressing eagerly: template when ``_classify`` flagged a
             # collapsed-reshape (slab.template is the verbatim source-dim Exprs),
-            # affine otherwise (dims pulled off cache_dims). Source's
-            # ``__post_init__`` builds the affine default when ``addressing`` is
-            # omitted, but stamping it explicitly here keeps the IR's stored
-            # field stable across pretty-printer / serialization roundtrips.
-            # ``slab.block`` is non-empty when ``_classify`` extracted a non-
-            # unit literal coefficient on at least one cache var (MMA atom σ
-            # is the M3-driving case); it folds into ``AffineAddressing.block``.
+            # affine otherwise (dims = the slab's per-cache-axis source dims).
+            # Source's ``__post_init__`` builds an identity-dims affine default
+            # when ``addressing`` is omitted, but stamping it explicitly here
+            # carries the real (possibly non-identity / collapsed) source-dim
+            # mapping. ``slab.block`` is non-empty when ``_classify`` extracted
+            # a non-unit literal coefficient on at least one cache var (MMA atom
+            # σ is the M3-driving case); it folds into ``AffineAddressing.block``.
             addressing: AffineAddressing | TemplateAddressing
             if slab.template is not None:
                 addressing = TemplateAddressing(exprs=slab.template)
             else:
                 addressing = AffineAddressing(
-                    dims=tuple(cd.source_dim for cd in cache_dims),
+                    dims=tuple(slab.slab_dims),
                     block=slab.block,
                 )
             src = Source(
                 name=smem_name,
                 buf=buf,
-                cache_dims=cache_dims,
+                cache_axes=cache_axes,
                 origin=slab.origin,
                 pad=(),
                 addressing=addressing,

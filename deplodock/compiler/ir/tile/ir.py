@@ -345,7 +345,7 @@ class WarpSpecialize(Stmt):
 
 
 # ---------------------------------------------------------------------------
-# Stage primitives: Source + CacheDim + AffineAddressing/TemplateAddressing
+# Stage primitives: Source + AffineAddressing/TemplateAddressing
 # ---------------------------------------------------------------------------
 
 # Bytes per stored element in smem. fp32-only assumption — fp16 paths
@@ -477,23 +477,6 @@ class TemplateAddressing:
 
 
 @dataclass(frozen=True)
-class CacheDim:
-    """One cache (smem) axis + which source-buffer dim it covers.
-
-    ``axis`` carries the cache axis identity (its ``source_axis``
-    back-pointer, set by 020_stage_inputs at construction time, identifies
-    which original output axis this cache dim corresponds to — used by
-    downstream passes for per-source-axis grouping).
-
-    ``source_dim`` is the index into the source buffer's shape that this
-    cache axis decodes into (i.e. the dim the cache var is added to).
-    """
-
-    axis: Axis
-    source_dim: int
-
-
-@dataclass(frozen=True)
 class Source:
     """One gmem operand staged into one smem slab.
 
@@ -501,8 +484,12 @@ class Source:
 
     - ``name`` — smem buffer name visible to consumer Loads.
     - ``buf`` — gmem source buffer name (the input).
-    - ``cache_dims`` — per-cache-axis source-dim mapping; defines the
-      slab layout in smem and how cache vars decode into source dims.
+    - ``cache_axes`` — the smem slab's cache axes (one ``Axis`` per slab
+      dim, in slab-layout order); their extents define the slab shape and
+      the cooperative-load iteration domain. Which *source* buffer dim
+      each cache axis decodes into lives on ``addressing`` (``AffineAddressing.dims``),
+      not here — the two used to be bundled in a ``CacheDim`` whose
+      ``source_dim`` simply duplicated ``addressing.dims``.
     - ``origin`` — per-source-dim CTA-uniform anchor. The cooperative
       load reads ``buf[origin[d] + cache_var(d)]`` (affine) or
       ``buf[addressing.exprs[d]]`` (template).
@@ -514,9 +501,9 @@ class Source:
       coef-block (e.g. atom-strided MMA) in exactly one source dim;
       template when the consumer's original Load was a collapsed-reshape
       and ``origin + decoded`` can't reconstruct it. Defaults to
-      ``AffineAddressing(dims=tuple(cd.source_dim for cd in cache_dims))``
-      when omitted, so legacy construction sites that didn't specify
-      addressing keep their semantics. Pre-M2 this was a derived
+      ``AffineAddressing(dims=tuple(range(len(cache_axes))))`` (identity
+      cache-axis → source-dim mapping) when omitted, so construction sites
+      with the common identity layout can skip it. Pre-M2 this was a derived
       property of ``cache_dims`` + ``template_index``; the refactor
       collapses both addressing-mode payloads into the addressing object
       so ``Source`` stays focused on slab identity / gmem anchor.
@@ -542,7 +529,7 @@ class Source:
 
     name: str
     buf: str
-    cache_dims: tuple[CacheDim, ...]
+    cache_axes: tuple[Axis, ...]
     origin: tuple[Expr, ...]
     pad: tuple[int, ...] = ()
     addressing: AffineAddressing | TemplateAddressing | None = None
@@ -551,20 +538,16 @@ class Source:
     swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:
-        # Default addressing: affine with dims pulled off cache_dims. The
-        # field is typed Optional only so the default sentinel can be
-        # ``None`` (a tuple-of-int default would require a frozen factory
+        # Default addressing: affine with the identity cache-axis → source-dim
+        # mapping. The field is typed Optional only so the default sentinel can
+        # be ``None`` (a tuple-of-int default would require a frozen factory
         # for the dims, which is awkward). Frozen-set via object.__setattr__.
         if self.addressing is None:
             object.__setattr__(
                 self,
                 "addressing",
-                AffineAddressing(dims=tuple(cd.source_dim for cd in self.cache_dims)),
+                AffineAddressing(dims=tuple(range(len(self.cache_axes)))),
             )
-
-    @property
-    def cache_axes(self) -> tuple[Axis, ...]:
-        return tuple(cd.axis for cd in self.cache_dims)
 
     @property
     def alloc_extents(self) -> tuple[int, ...]:
@@ -689,7 +672,8 @@ def _source_pretty(src: Source) -> str:
     which formats each source as ``shared name[...] = buf[...]`` at the
     Stage's indent.
     """
-    cache = ", ".join(f"{ax.name}:{ax.extent}@{cd.source_dim}" for ax, cd in zip(src.cache_axes, src.cache_dims, strict=True))
+    dims = src.addressing.dims if isinstance(src.addressing, AffineAddressing) else tuple(range(len(src.cache_axes)))
+    cache = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(src.cache_axes, dims, strict=True))
     origin = ", ".join(e.pretty() for e in src.origin)
     pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
     tpl = ""
@@ -2242,7 +2226,6 @@ __all__ = [
     "SwizzleMode",
     "AffineAddressing",
     "TemplateAddressing",
-    "CacheDim",
     "Source",
     "AsyncWait",
     # Source-aware traversal (transformer / visitor over staged bodies)

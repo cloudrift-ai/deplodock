@@ -245,7 +245,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         # but ``base = a3 * 12`` lands at 12 bytes for a3=1 — not 8-byte
         # aligned for float2). The last-dim coeff check passes vacuously
         # (no free vars there), so the broader check has to walk back into
-        # the preceding logical dims via the Source's cache_dims. If any
+        # the preceding logical dims via the Source's cache_axes. If any
         # preceding dim's cache-axis extent is not a multiple of n at the
         # innermost slot (= the byte stride from the cell-offset Load
         # group's base to its neighbour group isn't n-aligned), refuse to
@@ -262,7 +262,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         # surfaces as a hang on the BUFFERED / unpipelined paths that
         # do see a contiguous Load run here).
         source = _find_source(top.body, input_name)
-        if source is not None and len(source.cache_dims) >= 2:
+        if source is not None and len(source.cache_axes) >= 2:
             inner_extent = source.alloc_extents[-1]
             if inner_extent % n != 0:
                 return None

@@ -17,7 +17,6 @@ from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.stmt import Body, Load
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
-    CacheDim,
     Source,
     StageBundle,
     StagePolicy,
@@ -34,15 +33,12 @@ def _load_pass():
 
 
 def _src(*, name: str, buf: str, block: tuple[int, ...] = ()) -> Source:
-    cache = (
-        CacheDim(axis=Axis("a3", 8), source_dim=0),
-        CacheDim(axis=Axis("a7", 32), source_dim=1),
-    )
+    cache_axes = (Axis("a3", 8), Axis("a7", 32))
     addressing = AffineAddressing(dims=(0, 1), block=block)
     return Source(
         name=name,
         buf=buf,
-        cache_dims=cache,
+        cache_axes=cache_axes,
         origin=(Literal(0, "int"), Literal(0, "int")),
         addressing=addressing,
     )

@@ -16,7 +16,6 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
-    CacheDim,
     Source,
     TemplateAddressing,
 )
@@ -28,18 +27,15 @@ def _src(*, addressing: AffineAddressing | TemplateAddressing | None = None) -> 
     return Source(
         name="a_smem",
         buf="a",
-        cache_dims=(
-            CacheDim(axis=Axis("m_r", 16), source_dim=0),
-            CacheDim(axis=Axis("k_i", 32), source_dim=1),
-        ),
+        cache_axes=(Axis("m_r", 16), Axis("k_i", 32)),
         origin=(Literal(0, "int"), Literal(0, "int")),
         addressing=addressing,
     )
 
 
-def test_default_addressing_is_affine_pulled_from_cache_dims():
-    """Omitting ``addressing`` materializes ``AffineAddressing`` with dims
-    derived from ``cache_dims`` — the pre-M2 implicit semantics."""
+def test_default_addressing_is_affine_identity_dims():
+    """Omitting ``addressing`` materializes ``AffineAddressing`` with the
+    identity cache-axis → source-dim mapping (``dims == range(len)``)."""
     src = _src()
     assert isinstance(src.addressing, AffineAddressing)
     assert src.addressing.dims == (0, 1)
@@ -80,10 +76,7 @@ def test_alloc_extents_pad_adds_after_block():
     src = Source(
         name="b_smem",
         buf="b",
-        cache_dims=(
-            CacheDim(axis=Axis("n_r", 16), source_dim=0),
-            CacheDim(axis=Axis("k_i", 32), source_dim=1),
-        ),
+        cache_axes=(Axis("n_r", 16), Axis("k_i", 32)),
         origin=(Literal(0, "int"), Literal(0, "int")),
         pad=(0, 1),
         addressing=addr,
