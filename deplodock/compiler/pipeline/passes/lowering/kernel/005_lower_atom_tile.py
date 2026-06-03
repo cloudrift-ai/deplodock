@@ -256,9 +256,8 @@ def _emit_chain(
             "chosen without staging in scope (e.g. TMA=0). Force the scalar FMA path with "
             "DEPLODOCK_MMA=0, or enable staging for the atom path with TMA=1."
         )
-    # Thread the per-Source TMA swizzle mode (S3) so the ldmatrix consumer
-    # applies the matching per-lane chunk XOR. NONE when the source wasn't
-    # swizzled.
+    # Thread the per-Source TMA swizzle mode so the ldmatrix consumer applies
+    # the matching per-lane chunk XOR. NONE when the source wasn't swizzled.
     a_swz = smem_sources[a_load.input].swizzle.value
     b_swz = smem_sources[b_load.input].swizzle.value
     return (

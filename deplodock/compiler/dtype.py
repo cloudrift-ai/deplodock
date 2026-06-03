@@ -61,7 +61,7 @@ class StructuredType(DataType):
 F32 = DataType("f32", np.dtype(np.float32), 4)
 F16 = DataType("f16", np.dtype(np.float16), 2)
 # BFloat16 — same 2-byte footprint as F16 but different exponent / mantissa
-# split (8 / 7 vs 5 / 10). Used by WMMA's bf16 atom kinds (M9 of the MMA
+# split (8 / 7 vs 5 / 10). Used by the mma.sync bf16 atom kind (M9 of the MMA
 # fragment-factorization plan). NumPy has no first-class bf16; we map to
 # the closest carrier (uint16 with the bf16 bit-pattern) so Tensor.dtype
 # round-trips through serialization. CUDA-side spelling is

@@ -152,7 +152,7 @@ def _plan_for_bundle(bundle: StageBundle, plan: dict[int, dict[str, tuple[int, .
         for src in stage.sources:
             if src.pad and any(src.pad):
                 continue
-            # M7: a +1 pad on the inner cache axis breaks WMMA's
+            # M7: a +1 pad on the inner cache axis breaks the mma.sync
             # ``ldmatrix`` 16-byte alignment, so block-stamped Sources
             # (MMA atom-strided σ) must skip padding entirely. A future
             # MMA-friendly swizzle (XOR-style row shuffle matching

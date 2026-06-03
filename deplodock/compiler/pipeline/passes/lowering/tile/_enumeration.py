@@ -211,7 +211,7 @@ def _priority_matmul_warp(p: WarpTileParams, *, ctx: Context | None = None) -> t
     # Warp-tier ranking for tensor-core MMA matmul (fp16 / bf16 with f32
     # accumulator, swizzled s16816 ``mma_m16n8k16_*`` atom on sm_90+).
     #
-    # **Non-TMA arches (sm_70 / sm_80)**: ``cp.async``-staged WMMA pays
+    # **Non-TMA arches (sm_70 / sm_80)**: ``cp.async``-staged mma.sync pays
     # per-K_o overhead in cooperative-load instructions, so larger BK
     # (fewer K_o iters) amortizes best and threads-near-256 (8 warps)
     # keeps the per-warp cooperative slice dense. Ranked on cells≈16 +

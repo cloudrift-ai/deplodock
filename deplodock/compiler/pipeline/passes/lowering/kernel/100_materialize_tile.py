@@ -86,10 +86,10 @@ _TMA_ALIGN_BYTES = 128
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
-    # Swizzle-atom box reshape (S1, below) is gated
+    # Swizzle-atom box reshape (below) is gated
     # to the mma.sync atom: only its explicit-ldmatrix consumer can read a
     # swizzled slab, so only its TMA descriptors get the rank+1 swizzle-atom
-    # box. WMMA / cp.async / SDPA TMA sources keep the legacy collapsed box
+    # box. cp.async / SDPA TMA sources keep the legacy collapsed box
     # (zero blast radius for the default path).
     mma_sync = _is_mma_sync_kernel(root.op.knobs.get("ATOM_KIND"))
     new_body: list[Stmt] = []
@@ -363,7 +363,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
         # the same source dim — e.g. an outer-block axis and a per-thread
         # fragment axis both decoded into the M dim of a matmul slab). The
         # per-axis ``AffineAddressing.block`` multiplier encodes per-cell
-        # strides (e.g. ``atom_n = 16`` for square WMMA), which the eligibility
+        # strides (e.g. ``atom_n = 8`` for the m16n8k16 atom), which the eligibility
         # check at 050_use_tma.py:_stage_eligible already mirrors. Without
         # threading block through here the TMA descriptor's box width would
         # under-report the actual slab inner width for warp-tier MMA slabs.
@@ -394,16 +394,16 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
         )
         box = tuple(full_box[d] for d in kept)
         coords = tuple(src.origin[d] for d in kept)
-        # Swizzle-atom box reshape (S1): split the innermost box dim down to
-        # the swizzle atom width so the descriptor's innermost dim in bytes
-        # equals the swizzle width (TMA rejects swizzle when the inner box-dim
-        # byte span exceeds the atom). Only fires for the mma.sync kernel
-        # (gated by ``mma_sync``). The box rank grows by one; the runtime
+        # Swizzle-atom box reshape: split the innermost box dim down to the
+        # swizzle atom width so the descriptor's innermost dim in bytes equals
+        # the swizzle width (TMA rejects swizzle when the inner box-dim byte
+        # span exceeds the atom). Only fires for the mma.sync kernel (gated by
+        # ``mma_sync``). The box rank grows by one; the runtime
         # ``_collapse_inert_dims`` reconstructs the matching rank+1 globalDim
         # by splitting the array's inner dim. Pairs with the per-Source mode
-        # 050_use_tma stamps (S2) and the matching ldmatrix consumer XOR in
-        # 005_lower_atom_tile (S3) — both on by default for mma.sync, so the
-        # slab is genuinely swizzled (B64 / B128), not NONE.
+        # 050_use_tma stamps and the matching ldmatrix consumer XOR in
+        # 005_lower_atom_tile — both on by default for mma.sync, so the slab
+        # is genuinely swizzled (B64 / B128), not NONE.
         if mma_sync and box:
             elem_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
             inner_elems = box[-1]
@@ -421,9 +421,9 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
                 src_buf=src.buf,
                 src_shape=(),
                 box_extents=box,
-                # Per-Source swizzle (S0): A (64 B inner) and B (128 B inner)
-                # share one bundle but need distinct modes, so the mode rides
-                # on the Source, not ``bundle.swizzle``. 050_use_tma stamps
+                # Per-Source swizzle: A (64 B inner) and B (128 B inner) share
+                # one bundle but need distinct modes, so the mode rides on the
+                # Source, not ``bundle.swizzle``. 050_use_tma stamps
                 # B64 / B128 here on every mma.sync source; it stays NONE for
                 # the non-swizzled TMA paths (e.g. SDPA).
                 swizzle=src.swizzle.value,
@@ -445,7 +445,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
         # bytes match the actual copy size on fp16 inputs (legacy
         # ``BYTES_PER_ELEM`` over-counted fp16 by 2x). Multiply through the
         # per-axis ``AffineAddressing.block`` multiplier for the same reason
-        # ``box_per_dim`` does — without it, warp-tier WMMA slabs report a
+        # ``box_per_dim`` does — without it, warp-tier MMA slabs report a
         # ``slab_bytes`` of ``∏ cache_extents`` (e.g. 2·2·4 = 16 elements =
         # 32 B for fp16) while the actual TMA box delivers
         # ``∏ cache_extents · ∏ block`` (e.g. 32·128 = 4096 elements =
