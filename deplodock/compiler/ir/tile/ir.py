@@ -969,7 +969,26 @@ class RegisterTile(ParallelTile):
     ``010_split_register_axes`` pass runs, every ``RegisterTile`` is
     consumed: the body is fully unrolled, SSA names get per-cell
     suffixes, and the ``RegisterTile`` wrapper disappears.
+
+    ``reduce`` marks the **reduce-axis** (K_f) register tile emitted by the
+    partition planner for the ``FK`` multiple-accumulator optimization
+    (see ``plans/fk-register-tile-reductions.md``). It strip-mines the K
+    (reduce) axis so each of the ``FK`` cells owns an independent
+    accumulator. When the wrapped body contains ``Accum``s,
+    ``010_split_register_axes`` replicates each into ``acc_0 .. acc_{FK-1}``
+    and then appends a cross-accumulator tree-fold collapsing them back into
+    the original accumulator name after the enclosing K serial loops close;
+    a K_f tile wrapping a non-reduce (post-pointwise) body carries the flag
+    too but folds nothing (its replicas are independent FK-unrolled writes).
+    The flag also routes knob stamping (``FK`` vs ``FM``/``FN``). The default
+    ``reduce=False`` is the output-cell (FM/FN) tile — replicate-and-drop,
+    no fold.
     """
+
+    reduce: bool = False
+
+    def _pretty_label(self) -> str:
+        return "register reduce" if self.reduce else "register"
 
     def render(self, ctx: RenderCtx) -> list[str]:
         raise NotImplementedError(

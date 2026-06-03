@@ -60,7 +60,14 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     has_fp16_input = any(match.graph.nodes[inp].output.dtype == F16 for inp in root.inputs)
     accumulating_dtype = F32
     selecting_dtype = F16 if has_fp16_input else F32
-    new_body = _place_inits_in_body(root.op.body, accumulating_dtype, selecting_dtype)
+    # Accumulators that already carry an explicit ``Init`` anywhere in the body
+    # are scoped by whoever placed it — e.g. ``015_pack_fk_window`` puts the fp16
+    # half2 window accumulator's ``Init`` *inside* K_o (reset per window) and the
+    # flush consumes it there, so the default crossable-reduce hoist would wrongly
+    # lift it above K_o. Skip them so we don't emit a second, redundant Init at an
+    # outer scope.
+    preplaced = frozenset(s.name for s in root.op.body.iter() if isinstance(s, Init))
+    new_body = _place_inits_in_body(root.op.body, accumulating_dtype, selecting_dtype, preplaced)
     if new_body == root.op.body:
         raise RuleSkipped("no Accum needs an Init placed (already placed or no reduce in body)")
     return TileOp(body=new_body, name=root.op.name)
@@ -81,7 +88,9 @@ def _decide_dtype(accum: Accum, accumulating_dtype: DataType, selecting_dtype: D
     return accumulating_dtype
 
 
-def _place_inits_in_body(body: tuple, accumulating_dtype: DataType, selecting_dtype: DataType) -> tuple:
+def _place_inits_in_body(
+    body: tuple, accumulating_dtype: DataType, selecting_dtype: DataType, preplaced: frozenset[str] = frozenset()
+) -> tuple:
     """Find the innermost ``ParallelTile`` (or the TileOp body itself when
     none nests one) and place Inits at that scope.
 
@@ -122,23 +131,25 @@ def _place_inits_in_body(body: tuple, accumulating_dtype: DataType, selecting_dt
                     # fires inside the loop, resetting the accumulators every
                     # K chunk (the WS=1 accuracy bug).
                     ws = inner[0]
-                    new_cons = _place_inits_in_scope(tuple(ws.consumer_body), accumulating_dtype, selecting_dtype)
+                    new_cons = _place_inits_in_scope(tuple(ws.consumer_body), accumulating_dtype, selecting_dtype, preplaced)
                     out.append(s.with_bodies(((replace(ws, consumer_body=new_cons),),)))
                 else:
-                    new_inner = _place_inits_in_scope(tuple(s.body), accumulating_dtype, selecting_dtype)
+                    new_inner = _place_inits_in_scope(tuple(s.body), accumulating_dtype, selecting_dtype, preplaced)
                     out.append(s.with_bodies((new_inner,)))
                 opened = True
             else:
                 out.append(s)
         if not opened:
             # No ParallelTile in this scope — treat the scope itself.
-            return _place_inits_in_scope(stmts, accumulating_dtype, selecting_dtype)
+            return _place_inits_in_scope(stmts, accumulating_dtype, selecting_dtype, preplaced)
         return tuple(out)
 
     return _open_scope(body)
 
 
-def _place_inits_in_scope(body: tuple, accumulating_dtype: DataType, selecting_dtype: DataType) -> tuple:
+def _place_inits_in_scope(
+    body: tuple, accumulating_dtype: DataType, selecting_dtype: DataType, preplaced: frozenset[str] = frozenset()
+) -> tuple:
     """At each scope (Tile body, or a free-Loop body), collect all Accum
     names whose Init belongs HERE (= no free-Loop interposed between this
     scope and the Accum). Insert an Init for each at the start of the
@@ -156,7 +167,7 @@ def _place_inits_in_scope(body: tuple, accumulating_dtype: DataType, selecting_d
     inits_here: dict[str, Accum] = {}
     for s in body:
         for a in _accums_under_reduces_only(s):
-            if a.name in existing:
+            if a.name in existing or a.name in preplaced:
                 continue
             inits_here.setdefault(a.name, a)
 
@@ -164,7 +175,7 @@ def _place_inits_in_scope(body: tuple, accumulating_dtype: DataType, selecting_d
 
     new_body: list[Stmt] = []
     for s in body:
-        new_body.append(_recurse(s, init_dtypes, accumulating_dtype, selecting_dtype))
+        new_body.append(_recurse(s, init_dtypes, accumulating_dtype, selecting_dtype, preplaced))
 
     init_stmts: list[Stmt] = [Init(name=n, op=a.op, dtype=init_dtypes[n]) for n, a in inits_here.items()]
     return tuple(init_stmts + new_body)
@@ -273,7 +284,13 @@ def _is_reduce_recursive(loop) -> bool:
     return has_inner_reduce
 
 
-def _recurse(stmt: Stmt, init_dtypes: dict[str, DataType], accumulating_dtype: DataType, selecting_dtype: DataType) -> Stmt:
+def _recurse(
+    stmt: Stmt,
+    init_dtypes: dict[str, DataType],
+    accumulating_dtype: DataType,
+    selecting_dtype: DataType,
+    preplaced: frozenset[str] = frozenset(),
+) -> Stmt:
     """Descend into block-structured stmts so nested free tiles get their
     own Init placement at their own scope. Same recursive-reduce
     distinction as ``_accums_under_reduces_only``: a SerialTile / StridedTile
@@ -291,8 +308,10 @@ def _recurse(stmt: Stmt, init_dtypes: dict[str, DataType], accumulating_dtype: D
         return replace(stmt, dtype=init_dtypes[stmt.name])
     if isinstance(stmt, (SerialTile, StridedTile)) and not _is_reduce_recursive(stmt):
         # Free serial-tile loop — its body is its own scope; place Inits there.
-        return replace(stmt, body=_place_inits_in_scope(stmt.body, accumulating_dtype, selecting_dtype))
+        return replace(stmt, body=_place_inits_in_scope(stmt.body, accumulating_dtype, selecting_dtype, preplaced))
     nested = stmt.nested()
     if not nested:
         return stmt
-    return stmt.with_bodies(tuple(tuple(_recurse(c, init_dtypes, accumulating_dtype, selecting_dtype) for c in b) for b in nested))
+    return stmt.with_bodies(
+        tuple(tuple(_recurse(c, init_dtypes, accumulating_dtype, selecting_dtype, preplaced) for c in b) for b in nested)
+    )

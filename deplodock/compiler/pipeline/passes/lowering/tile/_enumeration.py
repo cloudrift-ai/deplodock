@@ -95,10 +95,15 @@ ATOM_KIND = Knob(
 # Tier-shared knobs (same arithmetic role in both scalar and warp tiers).
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul M (output) axis")
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul N (output) axis")
+# Reduce-axis register tier (non-matmul reduces only). FK independent
+# accumulators strip-mine the K (reduce) axis for multiple-accumulator ILP —
+# see ``plans/fk-register-tile-reductions.md``. Matmul gets the same win
+# through FM/FN replicating output cells, so it keeps FK=1.
+FK = Knob("FK", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread independent accumulators along the reduce (K) axis (1 = single)")
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 
-_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, BK, SPLITK, BR, WN, WM, ATOM_KIND)
+_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, FK, BK, SPLITK, BR, WN, WM, ATOM_KIND)
 
 
 def planner_pin_set() -> bool:
@@ -129,6 +134,18 @@ class ScalarTileParams:
     bk: int
     splitk: int
     br: int = 1
+    # Reduce-axis multiple-accumulator factor. For non-matmul reduces (> 1)
+    # strip-mines the K serial loop into FK independent accumulators
+    # (``plans/fk-register-tile-reductions.md``). For the fp16 scalar matmul it
+    # is the half2 accumulation-window length (= ``bk``, even) when
+    # ``fp16_window`` is set (``plans/fk-half2-fp16-matmul.md``); the planner
+    # still emits the FK=1 fp32 structure and ``kernel/075_pack_fk_window``
+    # realizes the windowed half2 accumulate + fp32 flush from the stamped knob.
+    fk: int = 1
+    # True for the fp16-matmul half2-window variant — disambiguates ``fk > 1``
+    # (window length = bk) from the reduce strip-mine so the planner keeps the
+    # fp32 K factorization and only 075 rewrites it.
+    fp16_window: bool = False
     overhang: tuple[str, ...] = ()
 
 
@@ -203,6 +220,11 @@ def _priority_matmul_thread(p: ScalarTileParams) -> tuple[int, ...]:
         -abs(256 - threads),  # threads near 256
         bk_key,  # cuBLAS-band BK tier, then large BK otherwise
         -p.splitk,
+        # fp16 half2 window FK: ``FK=1`` (scalar fp32 accumulate) ranks first so
+        # the greedy default stays byte-identical; among the windowed variants
+        # prefer the 2–8 band. Sits below the geometry keys (a low tiebreak).
+        int(p.fk == 1),
+        int(2 <= p.fk <= 8),
         -len(p.overhang),
     )
 
@@ -269,8 +291,15 @@ def _priority_reduce(p: ScalarTileParams) -> tuple[int, ...]:
     # Warp-sized BR enables warp-shuffle Combine; threads near 256.
     # Static reduce never masks; a symbolic free axis forces masking (every
     # variant then carries the same overhang, so no clean-divisor tiebreak).
+    #
+    # FK ordering, all *below* BR / threads (the geometry that dominates a
+    # memory-bound reduce): ``FK=1`` ranks first so the greedy (non-tuned)
+    # ``compile`` pick is byte-identical to the pre-FK planner — FK only adds
+    # extra leaves the *tuner* explores, never shifting the default. Among the
+    # FK>1 leaves the 2–4 ILP sweet spot is preferred so the search visits a
+    # couple of multiple-accumulator variants early.
     threads = p.bn * p.bm * p.br
-    return (min(p.br, 256), -abs(256 - threads), p.bk, -p.splitk)
+    return (min(p.br, 256), -abs(256 - threads), int(p.fk == 1), int(2 <= p.fk <= 4), p.bk, -p.splitk)
 
 
 _NarrowFn = Callable[[tuple[int, ...]], tuple[int, ...]]
@@ -289,6 +318,7 @@ def enumerate_cartesian(
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
     atoms: tuple[Atom, ...] = (),
+    fp16_window: bool = False,
 ) -> list[TileParams]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
@@ -363,6 +393,13 @@ def enumerate_cartesian(
             m_forced_mask=m_forced_mask,
             n_forced_mask=n_forced_mask,
         )
+    # ``sweep_fk`` enables the reduce-axis multiple-accumulator (FK) sweep —
+    # only for non-matmul reduces. Matmul gets the ILP win from FM/FN replicating
+    # output cells; pointwise has no reduce axis to strip-mine.
+    # ``window_fk`` enables the orthogonal fp16 matmul half2-window FK (the
+    # window length = stage chunk ``bk``, even), passed via ``fp16_window``.
+    sweep_fk = False
+    window_fk = False
     if mode_kind == "matmul":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
@@ -371,6 +408,7 @@ def enumerate_cartesian(
         br_choices: tuple[int, ...] = (1,)
         min_k_chunks = 1
         priority_fn: Callable[[ScalarTileParams], tuple[int, ...]] = _priority_matmul_thread
+        window_fk = fp16_window
     elif mode_kind == "reduce":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
@@ -379,6 +417,7 @@ def enumerate_cartesian(
         br_choices = _BR_CANDIDATES
         min_k_chunks = 1
         priority_fn = _priority_reduce
+        sweep_fk = True
     elif mode_kind == "pointwise":
         bn_choices = _TUNE_AXIS_CHOICES
         bm_choices = _TUNE_AXIS_CHOICES
@@ -428,6 +467,9 @@ def enumerate_cartesian(
             br_choices=BR.narrow(br_choices) if apply_pins else br_choices,
             fm_narrow=FM.narrow if apply_pins else None,
             fn_narrow=FN.narrow if apply_pins else None,
+            fk_narrow=FK.narrow if apply_pins else None,
+            sweep_fk=sweep_fk,
+            window_fk=window_fk,
             max_threads_per_cta=ctx.max_threads_per_cta,
             min_k_chunks=min_k_chunks,
             priority_fn=priority_fn,
@@ -458,6 +500,9 @@ def _enumerate_cartesian_impl(
     br_choices: tuple[int, ...],
     fm_narrow: _NarrowFn | None,
     fn_narrow: _NarrowFn | None,
+    fk_narrow: _NarrowFn | None = None,
+    sweep_fk: bool = False,
+    window_fk: bool = False,
     max_threads_per_cta: int,
     min_k_chunks: int,
     priority_fn: Callable[[ScalarTileParams], tuple[int, ...]],
@@ -589,25 +634,66 @@ def _enumerate_cartesian_impl(
                             for splitk in splitk_choices:
                                 if k_o_total % splitk != 0:
                                     continue
-                                overhang_axes: tuple[str, ...] = ()
-                                if fn_overhang and n_axis_name is not None:
-                                    overhang_axes = (*overhang_axes, n_axis_name)
-                                if fm_overhang and m_axis_name is not None:
-                                    overhang_axes = (*overhang_axes, m_axis_name)
-                                params = ScalarTileParams(
-                                    bn=bn_c,
-                                    bm=bm_c,
-                                    fm=fm,
-                                    fn=fn,
-                                    bk=bk,
-                                    splitk=splitk,
-                                    br=br,
-                                    overhang=overhang_axes,
-                                )
-                                if params in seen:
-                                    continue
-                                seen.add(params)
-                                ordered.append(params)
+                                # FK strip-mines the per-thread serial K loop
+                                # (extent ``K_o_ext = k_o_total // splitk``) into
+                                # FK independent accumulators. Only the reduce
+                                # mode sweeps it (``sweep_fk``); FK must divide
+                                # K_o_ext (so the outer serial loop tiles cleanly)
+                                # and ``FK · FM · FN`` must stay within the
+                                # per-thread register budget. Matmul / pointwise
+                                # keep FK=1.
+                                K_o_ext = k_o_total // splitk
+                                if sweep_fk:
+                                    # Reduce path: FK strip-mines the serial K loop
+                                    # into independent accumulators (divisor of K_o_ext).
+                                    fk_candidates = _divisors_up_to(K_o_ext, _MAX_CELLS_PER_THREAD // (fm * fn))
+                                elif window_fk and bk % 2 == 0 and bk >= 2:
+                                    # fp16 matmul half2 window: the window length is the
+                                    # stage chunk ``bk`` (even). The window is a runtime
+                                    # ``for k in 0..bk/2`` loop of ``__hfma2`` packed
+                                    # multiply-adds (NOT fully unrolled), so a large bk —
+                                    # same staging as the fp32 path — keeps the half2
+                                    # throughput win without bloating registers. FK=1
+                                    # (scalar fp32 accumulate) stays the default.
+                                    fk_candidates = (1, bk)
+                                else:
+                                    fk_candidates = (1,)
+                                if fk_narrow is not None:
+                                    fk_candidates = fk_narrow(fk_candidates)
+                                for fk in fk_candidates:
+                                    # Window FK rides on bk (FK=bk), so it skips the
+                                    # K_o_ext-divisor / cell-budget gates that the reduce
+                                    # FK obeys; only the reduce FK multiplies output cells.
+                                    if fk < 1:
+                                        continue
+                                    if window_fk and fk > 1 and fk != bk:
+                                        # The half2 window length is the stage chunk; an
+                                        # FK pin whose value isn't this bk (authoritative
+                                        # ``Knob.narrow``) doesn't apply to this variant.
+                                        continue
+                                    if fk > 1 and not window_fk and (fm * fn * fk > _MAX_CELLS_PER_THREAD or K_o_ext % fk != 0):
+                                        continue
+                                    overhang_axes: tuple[str, ...] = ()
+                                    if fn_overhang and n_axis_name is not None:
+                                        overhang_axes = (*overhang_axes, n_axis_name)
+                                    if fm_overhang and m_axis_name is not None:
+                                        overhang_axes = (*overhang_axes, m_axis_name)
+                                    params = ScalarTileParams(
+                                        bn=bn_c,
+                                        bm=bm_c,
+                                        fm=fm,
+                                        fn=fn,
+                                        bk=bk,
+                                        splitk=splitk,
+                                        br=br,
+                                        fk=fk,
+                                        fp16_window=window_fk and fk > 1,
+                                        overhang=overhang_axes,
+                                    )
+                                    if params in seen:
+                                        continue
+                                    seen.add(params)
+                                    ordered.append(params)
 
     ordered.sort(key=priority_fn, reverse=True)
     return ordered

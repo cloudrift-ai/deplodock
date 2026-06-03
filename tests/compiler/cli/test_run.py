@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import torch  # used by test_bind_inputs_preserves_int_dtype
 
 from ..conftest import requires_cuda
@@ -79,6 +80,73 @@ def test_run_code_softmax_blockify(run_cli, dtype):
 @requires_cuda
 def test_run_code_matmul_blockify(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.matmul({_randn('64,128', dtype)}, {_randn('128,64', dtype)})")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("fk", [2, 4, 8])
+@pytest.mark.parametrize("br", [None, 1])
+def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
+    """FK register-tiles the reduce axis into ``fk`` independent accumulators +
+    a cross-accumulator fold (``plans/fk-register-tile-reductions.md``). Pin FK
+    (and optionally BR=1 for the pure-serial scope) and confirm the folded
+    reduction still matches eager — ``rc == 0`` is the accuracy assertion."""
+    monkeypatch.setenv("DEPLODOCK_FK", str(fk))
+    if br is not None:
+        monkeypatch.setenv("DEPLODOCK_BR", str(br))
+    rc, _, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(2048)(torch.randn(4,32,2048))")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
+    """Structural guard: a pinned FK window must actually rewrite the K loop into
+    the half2 pack + ``__half2`` accumulate + widen-flush (catches a silent
+    015_pack_fk_window regression that would fall back to fp32 accumulate). No
+    CUDA device needed — just inspects the generated source.
+
+    Pins a FULL clean (no-overhang) knob set + ``--target sm_90`` so the variant
+    is fully determined: the greedy pick keys off ``compute_capability`` via
+    ``score_tile_geometry``, so without the target override a GPU-less CI runner
+    resolves a different capability, picks a masked non-window variant, and the
+    FK-only pin falls back to FK=1 (no window). The full pin + fixed target make
+    the single FK=bk window variant the only candidate on any runner."""
+    monkeypatch.setenv("DEPLODOCK_KNOBS", "MMA=0,BN=16,BM=16,FM=1,FN=1,BK=4,SPLITK=1,FK=4")
+    rc, stdout, stderr = run_cli(
+        "compile",
+        "--code",
+        "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)",
+        "--ir",
+        "cuda",
+        "--target",
+        "sm_90",
+    )
+    assert rc == 0, f"stderr: {stderr}"
+    assert "__halves2half2" in stdout, "no __half2 pack — FK window did not fire"
+    assert "__low2half" in stdout and "__high2half" in stdout, "no widen+flush of the half2 window"
+
+
+@requires_cuda
+@pytest.mark.parametrize("fk", [2, 4, 8])
+def test_run_code_fp16_matmul_window_accuracy(run_cli, monkeypatch, fk):
+    """fp16 scalar matmul half2 accumulation window (``plans/fk-half2-fp16-matmul.md``):
+    pin MMA off + an even FK window and confirm the windowed half2 accumulate +
+    fp32 flush matches eager within fp16 tolerance — ``rc == 0`` asserts it."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("DEPLODOCK_FK", str(fk))
+    rc, _, stderr = run_cli("run", "--code", "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("br", [None, 1])
+def test_run_code_softmax_fk_accuracy(run_cli, monkeypatch, br):
+    """Softmax carries both a ``max`` and a ``sum`` reduce, so FK exercises the
+    ``fmaxf`` and ``+`` cross-accumulator folds together. ``rc == 0`` asserts
+    the pinned-FK kernel matches eager."""
+    monkeypatch.setenv("DEPLODOCK_FK", "4")
+    if br is not None:
+        monkeypatch.setenv("DEPLODOCK_BR", str(br))
+    rc, _, stderr = run_cli("run", "--code", "torch.softmax(torch.randn(4,32,2048), dim=-1)")
     assert rc == 0, f"stderr: {stderr}"
 
 
