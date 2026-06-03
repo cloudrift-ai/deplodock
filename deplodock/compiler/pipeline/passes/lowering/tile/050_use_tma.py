@@ -3,12 +3,12 @@
 For each ``StageBundle`` with ``policy in {BUFFERED, ASYNC}`` (i.e.
 ring-buffered cooperative-load OR cp.async) inside a
 ``SerialTile(serial_outer)``, switch ``policy`` to ``TMA`` (keeping
-``buffer_count`` / ``phase`` / ``pipeline_depth``; the *bundle*
-``swizzle`` stays NONE) when every member ``Stage`` is TMA-eligible.
-On the mma.sync atom (``_is_mma_sync_kernel``) the per-``Source``
-swizzle mode is stamped instead (``_stamp_source_swizzle``: A=B64 /
-B=B128 from the inner-row byte span) — the bundle stays NONE because A
-and B share it but need distinct modes; the materializer reads
+``buffer_count`` / ``phase`` / ``pipeline_depth``) when every member
+``Stage`` is TMA-eligible. On the mma.sync path (detected structurally —
+the body carries an ``AtomTile``) the per-``Source`` swizzle mode is
+stamped (``_stamp_source_swizzle``: A=B64 / B=B128 from the inner-row
+byte span). Swizzle is per-Source, not bundle-level, because A and B
+share a bundle but need distinct modes; the materializer reads
 ``src.swizzle`` into each TmaDescriptor. Running on
 BUFFERED directly (the post-``040_use_ring_buffers`` state) means the
 rule fires before ``060_use_async_copy`` would promote to ASYNC —
@@ -59,12 +59,12 @@ from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
+    AtomTile,
     SerialTile,
     Source,
     Stage,
     StageBundle,
     StagePolicy,
-    SwizzleMode,
     TileOp,
     pick_swizzle_atom,
 )
@@ -158,8 +158,11 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # Per-source swizzle is stamped only on mma.sync kernels — their
     # explicit-ldmatrix consumer reads the swizzled slab with a matching
     # per-lane XOR; scalar kernels don't stage for ldmatrix, so their sources
-    # stay NONE. The atom kind rides on the TileOp knobs.
-    swizzle = _is_mma_sync_kernel(root.op.knobs.get("ATOM_KIND"))
+    # stay NONE. Detect the tensor-core path structurally (the body carries an
+    # ``AtomTile``, created by 010_partition_loops and not lowered until
+    # kernel/005), rather than off the ``ATOM_KIND`` knob — the knob is a
+    # tuning shadow, the AtomTile is the semantic source.
+    swizzle = any(isinstance(s, AtomTile) for s in body.iter())
     # Per-buffer element byte width from the graph. The tile-stage ``Source``
     # has no ``dtype`` yet (``030_stamp_types`` is a kernel pass that runs AFTER
     # this), so ``src.dtype`` would fall back to the fp32 ``BYTES_PER_ELEM`` and
@@ -171,16 +174,6 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     if not changed:
         _fail("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
     return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
-
-
-def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
-    """True iff ``atom_kind`` is a registered tensor-core atom (the s16816
-    ldmatrix path — the only family today). False for unset / scalar kinds."""
-    if not atom_kind:
-        return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY  # noqa: PLC0415
-
-    return atom_kind in ATOM_REGISTRY
 
 
 def _walk(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:
@@ -247,6 +240,9 @@ def _split_multi_source_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
 
 
 def _promote(bundle: StageBundle, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> StageBundle:
+    # Swizzle is per-Source (A=B64, B=B128 — distinct modes on sources sharing
+    # one bundle), stamped onto each Source here; the materializer reads
+    # ``src.swizzle`` into each TmaDescriptor. There is no bundle-level mode.
     stages = _split_multi_source_stages(bundle.stages)
     if swizzle:
         stages = tuple(_stamp_source_swizzle(stage, dtype_bytes or {}) for stage in stages)
@@ -257,10 +253,6 @@ def _promote(bundle: StageBundle, *, swizzle: bool = False, dtype_bytes: dict[st
         buffer_count=bundle.buffer_count,
         phase=bundle.phase,
         pipeline_depth=bundle.pipeline_depth,
-        # Bundle-level swizzle stays NONE — the mode is per-Source (A=B64,
-        # B=B128) because A and B share this bundle. The materializer reads
-        # ``src.swizzle`` into each TmaDescriptor.
-        swizzle=SwizzleMode.NONE,
     )
 
 

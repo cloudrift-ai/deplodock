@@ -24,7 +24,6 @@ from deplodock.compiler.ir.tile.ir import (
     Stage,
     StageBundle,
     StagePolicy,
-    SwizzleMode,
     ThreadTile,
     TileOp,
     WarpSpecialize,
@@ -80,7 +79,6 @@ def _tile_op_tma_pipelined() -> TileOp:
         buffer_count=2,
         phase=Var("k_outer") % Literal(2, "int"),
         pipeline_depth=2,
-        swizzle=SwizzleMode.NONE,
     )
     outer_loop = SerialTile(
         axis=k_outer,
@@ -123,7 +121,6 @@ def _tile_op_warp_tma_pipelined() -> TileOp:
         buffer_count=2,
         phase=Var("k_outer") % Literal(2, "int"),
         pipeline_depth=2,
-        swizzle=SwizzleMode.NONE,
     )
     outer_loop = SerialTile(axis=k_outer, body=Body((tma_bundle,)), kind="serial_outer")
     # WM×WN = 2×2 = 4 consumer warps.

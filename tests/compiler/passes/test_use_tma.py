@@ -25,7 +25,6 @@ from deplodock.compiler.ir.tile.ir import (
     Stage,
     StageBundle,
     StagePolicy,
-    SwizzleMode,
     ThreadTile,
     TileOp,
 )
@@ -74,7 +73,6 @@ def _tile_op_buffered(*, policy: StagePolicy, buffer_count: int = 2) -> tuple[Ti
             buffer_count=1,
             phase=None,
             pipeline_depth=1,
-            swizzle=SwizzleMode.NONE,
         )
     else:
         bundle = StageBundle(
@@ -84,7 +82,6 @@ def _tile_op_buffered(*, policy: StagePolicy, buffer_count: int = 2) -> tuple[Ti
             buffer_count=buffer_count,
             phase=Var("k_outer") % Literal(buffer_count, "int"),
             pipeline_depth=1,
-            swizzle=SwizzleMode.NONE,
         )
     k_outer = Axis("k_outer", 8)
     outer = SerialTile(axis=k_outer, body=Body((bundle,)), kind="serial_outer")
@@ -125,7 +122,6 @@ def test_rule_fires_on_buffered_eligible():
     # Buffering / phase / pipeline_depth survive the policy swap.
     assert bundles[0].buffer_count == 2
     assert bundles[0].pipeline_depth == 1
-    assert bundles[0].swizzle == SwizzleMode.NONE
 
 
 def test_rule_fires_on_async_eligible():
