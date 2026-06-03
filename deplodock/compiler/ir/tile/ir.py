@@ -362,10 +362,9 @@ class SwizzleMode(enum.Enum):
     ``StageBundle.policy == StagePolicy.TMA``.
 
     Defined here (above ``Source``) so it can be a ``Source.swizzle`` field
-    default. The per-operand swizzle mode lives on the ``Source`` (S0 of
-    plans/mma-sync-smem-swizzle.md), not only on the bundle, because A
-    (64 B inner → ``B64``) and B (128 B inner → ``B128``) share one
-    StageBundle but need distinct modes.
+    default. The per-operand swizzle mode lives on the ``Source`` (S0), not
+    only on the bundle, because A (64 B inner → ``B64``) and B (128 B inner →
+    ``B128``) share one StageBundle but need distinct modes.
     """
 
     NONE = "NONE"
@@ -398,7 +397,7 @@ def pick_swizzle_atom(inner_elems: int, elem_bytes: int) -> tuple[int, SwizzleMo
 
     Shared by ``kernel/100_materialize_tile`` (S1 box reshape) and
     ``tile/050_use_tma`` (S2 per-source mode pick) so the two agree on the
-    atom width — see plans/mma-sync-smem-swizzle.md.
+    atom width.
     """
     inner_bytes = inner_elems * elem_bytes
     for wb, mode in _SWIZZLE_BY_BYTES:

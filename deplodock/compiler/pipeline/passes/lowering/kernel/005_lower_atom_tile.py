@@ -27,8 +27,12 @@ double-buffered slabs stays correct.
 
 The s16816 ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` path is the sole
 tensor-core family; it has no gmem-direct load (ldmatrix is smem→register
-only), so :func:`_emit_chain` RuleSkips an unstaged operand — pruning the
-warp-tier variant so the scalar tier covers that shape.
+only), so :func:`_emit_chain` raises an actionable ``LoweringError`` on an
+unstaged operand. By the time this pass runs the atom-vs-scalar fork is already
+decided (back at ``tile/010_partition_loops``), so there is no scalar sibling
+left to fall back to — a silent skip would leak the unconsumed ``AtomTile`` to
+render and crash with an opaque ``NotImplementedError``; the error names the
+``DEPLODOCK_MMA=0`` (scalar) / ``TMA=1`` (stage the atom path) remedies instead.
 
 Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
 dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
@@ -55,7 +59,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     map_staged,
 )
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import LoweringError, Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -238,13 +242,23 @@ def _emit_chain(
     """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
     a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
     b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
-    # ldmatrix is smem→register only — both operands must be staged. RuleSkipping
-    # here drops this warp-tier variant so the scalar tier covers the shape.
+    # ldmatrix is smem→register only — both operands must be staged. We reach
+    # here only once the atom (warp-tier) variant has been committed (the
+    # atom-vs-scalar fork is decided back at the tile planner), so there is no
+    # scalar sibling left to fall back to: a RuleSkip would silently leak the
+    # unconsumed AtomTile to render and crash with an opaque NotImplementedError.
+    # Raise an actionable error naming the remedies instead (mirrors the
+    # "TMA cannot fire" guard in tile/050_use_tma).
     if a_load.input not in smem_sources or b_load.input not in smem_sources:
-        raise RuleSkipped("mma.sync requires staged smem operands (ldmatrix has no gmem-direct path)")
-    # Thread the per-Source TMA swizzle mode (S3 of
-    # plans/mma-sync-smem-swizzle.md) so the ldmatrix consumer applies the
-    # matching per-lane chunk XOR. NONE when the source wasn't swizzled.
+        raise LoweringError(
+            "tensor-core (mma.sync) matmul selected but its operands are not staged in shared "
+            "memory for ldmatrix (ldmatrix has no gmem-direct path) — typically the atom path was "
+            "chosen without staging in scope (e.g. TMA=0). Force the scalar FMA path with "
+            "DEPLODOCK_MMA=0, or enable staging for the atom path with TMA=1."
+        )
+    # Thread the per-Source TMA swizzle mode (S3) so the ldmatrix consumer
+    # applies the matching per-lane chunk XOR. NONE when the source wasn't
+    # swizzled.
     a_swz = smem_sources[a_load.input].swizzle.value
     b_swz = smem_sources[b_load.input].swizzle.value
     return (

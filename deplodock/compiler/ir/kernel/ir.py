@@ -542,7 +542,7 @@ class WarpShuffle(Stmt):
 # helper wrappers (pure PTX — NVRTC-clean, no ``<mma.h>``). Emitted by
 # ``kernel/005_lower_atom_tile`` from the ``Mma`` op's ``Atom`` spec.
 # (The opaque ``nvcuda::wmma`` node family was removed — the swizzled mma.sync
-# slab beat it; see plans/mma-sync-smem-swizzle.md.)
+# slab beat it.)
 # ---------------------------------------------------------------------------
 
 
@@ -599,8 +599,8 @@ class RegFragment(Stmt):
         return [f"{_pad(ctx.indent)}unsigned {self.name}[{n_regs}];"]
 
 
-# Per-lane fp16 element XOR matching the TMA hardware smem swizzle (S3 of
-# plans/mma-sync-smem-swizzle.md). The producer (cuTensorMapEncodeTiled with
+# Per-lane fp16 element XOR matching the TMA hardware smem swizzle (S3 — the
+# ldmatrix consumer side). The producer (cuTensorMapEncodeTiled with
 # SWIZZLE_{128,64,32}B) permutes 16-byte (8-fp16) chunks within each swizzle
 # row by the row-index-mod-2^B; the ldmatrix consumer must apply the same
 # permutation to its per-lane element offset. All three modes are CUTLASS

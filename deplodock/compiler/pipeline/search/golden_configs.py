@@ -25,9 +25,8 @@ shared-load bank conflicts WMMA can't (it reads smem opaquely), so mma.sync is t
 faster fp16 GEMM. On sm_120 the warp-tier prior + greedy now land on a square
 **64×64 output tile on a 4-warp CTA with WARP_SPECIALIZE=1** (producer warp issues
 TMA, consumer warps run the mma chain), measured at / above cuBLAS across the
-squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See
-plans/mma-sync-smem-swizzle.md and the warp-tier block in
-``compiler/ir/tile/ir.py:score_tile_geometry``.
+squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See the
+warp-tier block in ``compiler/ir/tile/ir.py:score_tile_geometry``.
 """
 
 from __future__ import annotations

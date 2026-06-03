@@ -660,8 +660,8 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
             eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
             # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
-            # tensor-core family (WMMA was removed; the swizzled slab beats it —
-            # S0–S4 of plans/mma-sync-smem-swizzle.md). It auto-enumerates
+            # tensor-core family (WMMA was removed; the swizzled slab beats
+            # it). It auto-enumerates
             # alongside the scalar register-tile tier on **sm_90+** (the
             # swizzled-TMA fast path needs Hopper+; on sm_80-89 mma.sync would
             # fall back to slower cp.async staging, so keep it pin-only there).

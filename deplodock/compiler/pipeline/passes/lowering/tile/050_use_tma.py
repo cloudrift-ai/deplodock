@@ -9,8 +9,7 @@ On the mma.sync atom (``_is_mma_sync_kernel``) the per-``Source``
 swizzle mode is stamped instead (``_stamp_source_swizzle``: A=B64 /
 B=B128 from the inner-row byte span) — the bundle stays NONE because A
 and B share it but need distinct modes; the materializer reads
-``src.swizzle`` into each TmaDescriptor (S2 of
-plans/mma-sync-smem-swizzle.md). Running on
+``src.swizzle`` into each TmaDescriptor (S2). Running on
 BUFFERED directly (the post-``040_use_ring_buffers`` state) means the
 rule fires before ``060_use_async_copy`` would promote to ASYNC —
 otherwise the file ordering (050 < 060) leaves 050 staring at SYNC /
@@ -156,7 +155,7 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
 
-    # Per-source swizzle (S2 of plans/mma-sync-smem-swizzle.md) is stamped
+    # Per-source swizzle (S2) is stamped
     # only on mma.sync kernels — their explicit-ldmatrix consumer can read a
     # swizzled slab; WMMA's opaque ``load_matrix_sync`` cannot, so its sources
     # stay NONE. The atom kind rides on the TileOp knobs.
@@ -259,9 +258,8 @@ def _promote(bundle: StageBundle, *, swizzle: bool = False, dtype_bytes: dict[st
         phase=bundle.phase,
         pipeline_depth=bundle.pipeline_depth,
         # Bundle-level swizzle stays NONE — the mode is per-Source (A=B64,
-        # B=B128) because A and B share this bundle (S2 of
-        # plans/mma-sync-smem-swizzle.md). The materializer reads
-        # ``src.swizzle`` into each TmaDescriptor.
+        # B=B128) because A and B share this bundle (S2). The materializer
+        # reads ``src.swizzle`` into each TmaDescriptor.
         swizzle=SwizzleMode.NONE,
     )
 
