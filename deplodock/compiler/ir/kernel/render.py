@@ -12,7 +12,7 @@ from deplodock.compiler.backend.cuda.dtype import cuda_includes, cuda_name
 from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
 from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor
+from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor, pack_smem
 from deplodock.compiler.ir.stmt import RenderCtx, render_body
 from deplodock.compiler.tensor import Tensor
 
@@ -280,13 +280,17 @@ def render_kernelop(
     body_text = "\n".join(render_body(kernel_op.body, ctx))
     if smem_offsets:
         # All Smem decls were rewritten to pointer aliases into a single
-        # dynamic pool; declare the pool at function entry. ``__align__(16)``
-        # satisfies TMA's 16-byte requirement and any FP32/FP64 alignment.
+        # dynamic pool; declare the pool at function entry. The pool base must
+        # be aligned to the strictest buffer it holds — ≥1024 B whenever a
+        # swizzled TMA operand is present, else the per-buffer pad inside the
+        # pool would still land on a base that doesn't zero the swizzle's
+        # source address bits (16 B otherwise satisfies TMA + FP32/FP64).
         # ``extern __shared__`` arrays must be declared without an explicit
         # size — NVCC otherwise treats the decl as a *static* definition
         # (with the static cap), defeating the whole point of the switch.
         # The runtime size is supplied at launch via ``shared_mem=``.
-        pool_decl = f"    extern __shared__ __align__(16) unsigned char _smem_pool[];  // {smem_total} bytes\n"
+        pool_align = max(16, *(max(_nbytes_of(s.dtype), int(s.align) if s.align else 0) for s in kernel_op.smem_buffers.values()))
+        pool_decl = f"    extern __shared__ __align__({pool_align}) unsigned char _smem_pool[];  // {smem_total} bytes\n"
         body_text = pool_decl + body_text
     prelude = _TMA_PRELUDE if desc_names else ""
     sig_dtypes = [_dtype_for(n) for n in kernel_op.inputs if n not in literals]
@@ -309,35 +313,18 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
     so ``Smem.render`` can emit pool aliases. Otherwise return an empty
     map — the kernel keeps using ``__shared__ T arr[N]``.
 
-    Offsets are aligned on the larger of the dtype size and the Smem's
-    explicit ``align`` field (TMA slabs request 16-byte). The final pool
-    size is the offset right after the last buffer (no trailing padding
-    required — dynamic smem is sized at launch time)."""
+    Offsets/total come from :func:`pack_smem` (each buffer aligned to the
+    larger of its dtype size and explicit ``align`` field — TMA swizzle slabs
+    request 256/512/1024 B), the same packer ``KernelOp.smem_bytes`` uses — so
+    the static-vs-dynamic gate here and the launch-time pool size agree."""
     smems: list[Smem] = list(kernel_op.smem_buffers.values())
     if not smems:
         return {}, 0
 
-    total = 0
-    sizes: list[tuple[Smem, int]] = []
-    for s in smems:
-        elements = 1
-        for e in s.extents:
-            elements *= int(e)
-        n_bytes = elements * _nbytes_of(s.dtype)
-        total += n_bytes
-        sizes.append((s, n_bytes))
+    offsets, total = pack_smem(smems)
     if total <= STATIC_SMEM_CAP:
         return {}, 0
-
-    offsets: dict[str, int] = {}
-    cursor = 0
-    for s, n_bytes in sizes:
-        natural = _nbytes_of(s.dtype)
-        align = max(natural, int(s.align) if s.align else 0)
-        cursor = (cursor + align - 1) // align * align
-        offsets[s.name] = cursor
-        cursor += n_bytes
-    return offsets, cursor
+    return offsets, total
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:

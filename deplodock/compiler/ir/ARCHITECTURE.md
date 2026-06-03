@@ -337,7 +337,7 @@ directly (no separate AST class).
 | Symbol             | Role                                                              |
 |--------------------|-------------------------------------------------------------------|
 | `KernelOp`         | Graph-op wrapper around a `Tile`-rooted body. One per kernel.     |
-| `Smem`             | `__shared__` array allocation (name + dtype + extents).           |
+| `Smem`             | `__shared__` array allocation (name + dtype + extents + optional `align`). Swizzled TMA operand slabs align to their full swizzle atom (`8 × swizzle_width` B: B128→1024, B64→512, B32→256) — the coordinate-only `ldmatrix` XOR only reproduces the hardware's absolute-address swizzle when the base zeroes the swizzle's source-address bits; non-swizzled TMA keeps 128 B, fp16 16 B. `pack_smem` (the shared pool packer used by `smem_bytes` and the renderer) pads each buffer to `max(sizeof(dtype), align)` so the static-vs-dynamic gate and the launch-time dynamic-pool size agree. |
 | `Sync`             | `__syncthreads()` barrier.                                        |
 | `TreeHalve`        | Cross-thread tree reduction over a smem buffer.                   |
 | `RegFragment`      | mma.sync (s16816) per-thread register array decl (one per operand role `"a"`/`"b"`/`"c"`): `unsigned a[4]`/`b[2]` (16-bit operands, 2 elems/reg) or `float c[4]` (f32 acc, zero-init at decl — no separate fill). Carries the cell shape `(M, N, K)` + dtype. Emitted by the MMA cell lowering pass (`kernel/005_lower_atom_tile`). The sole tensor-core fragment family (the opaque `nvcuda::wmma` nodes were removed). |
