@@ -4,8 +4,8 @@ Subclass hierarchy (``BufferedStage`` / ``AsyncBufferedStage`` /
 ``TmaBufferedStage`` / ``ComputeStage``) has been collapsed:
 ``StageBundle`` carries the transport policy (``StagePolicy``) and
 policy-specific fields (``buffer_count`` / ``phase`` /
-``pipeline_depth`` / ``swizzle``). ``Stage`` carries ``sources`` plus
-an optional ``compute`` template body.
+``pipeline_depth``). ``Stage`` carries ``sources`` plus an optional
+``compute`` template body.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from deplodock.compiler.ir.tile.ir import (
     Stage,
     StageBundle,
     StagePolicy,
-    SwizzleMode,
 )
 
 
@@ -108,7 +107,6 @@ def test_bundle_sync_default_construction():
     assert bundle.buffer_count == 1
     assert bundle.phase is None
     assert bundle.pipeline_depth == 1
-    assert bundle.swizzle == SwizzleMode.NONE
 
 
 def test_bundle_requires_at_least_one_stage():
@@ -192,30 +190,6 @@ def test_bundle_pipeline_depth_gt_1_requires_async_or_tma():
             buffer_count=2,
             phase=Var("k") % Literal(2, "int"),
             pipeline_depth=2,
-        )
-
-
-def test_bundle_tma_with_swizzle_ok():
-    bundle = StageBundle(
-        stages=_stages_two(),
-        body=_consumer_body(),
-        policy=StagePolicy.TMA,
-        buffer_count=2,
-        phase=Var("k") % Literal(2, "int"),
-        swizzle=SwizzleMode.B128,
-    )
-    assert bundle.swizzle == SwizzleMode.B128
-
-
-def test_bundle_swizzle_requires_tma():
-    with pytest.raises(ValueError, match="non-NONE swizzle requires TMA"):
-        StageBundle(
-            stages=_stages_two(),
-            body=Body(()),
-            policy=StagePolicy.ASYNC,
-            buffer_count=2,
-            phase=Var("k") % Literal(2, "int"),
-            swizzle=SwizzleMode.B64,
         )
 
 
@@ -376,7 +350,7 @@ def test_pretty_buffered_header_shows_policy_and_phase():
     assert lines[0].startswith("bundle buffered[2@")
 
 
-def test_pretty_tma_header_shows_depth_and_swizzle():
+def test_pretty_tma_header_shows_depth():
     phase = Var("k") % Literal(2, "int")
     bundle = StageBundle(
         stages=_stages_two(),
@@ -385,12 +359,10 @@ def test_pretty_tma_header_shows_depth_and_swizzle():
         buffer_count=2,
         phase=phase,
         pipeline_depth=3,
-        swizzle=SwizzleMode.B128,
     )
     header = bundle.pretty()[0]
     assert "tma[2@" in header
     assert "depth=3" in header
-    assert "swizzle=B128" in header
 
 
 # ---------------------------------------------------------------------------

@@ -408,7 +408,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 box_extents=box,
                 # Per-Source swizzle: A (64 B inner) and B (128 B inner) share
                 # one bundle but need distinct modes, so the mode rides on the
-                # Source, not ``bundle.swizzle``. 050_use_tma stamps
+                # Source (there is no bundle-level mode). 050_use_tma stamps
                 # B64 / B128 here on every mma.sync source; it stays NONE for
                 # the non-swizzled TMA paths (e.g. SDPA).
                 swizzle=src.swizzle.value,

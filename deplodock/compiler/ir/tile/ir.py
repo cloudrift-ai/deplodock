@@ -1253,7 +1253,7 @@ class StridedTile(SerialTileBase):
 #   Stage(sources, body)                                 → StageBundle(stages=(Stage(sources),), body, SYNC)
 #   BufferedStage(sources, body, buffer_count, phase)    → StageBundle(stages=(Stage(sources),), body, BUFFERED, buffer_count, phase)
 #   AsyncBufferedStage(sources, body, ..., depth)        → StageBundle(stages=(Stage(sources),), body, ASYNC, ..., pipeline_depth)
-#   TmaBufferedStage(sources, body, ..., depth, swizzle) → StageBundle(stages=(Stage(sources),), body, TMA, ..., pipeline_depth, swizzle)
+#   TmaBufferedStage(sources, body, ..., depth)          → StageBundle(stages=(Stage(sources),), body, TMA, ..., pipeline_depth)
 #   ComputeStage(sources, body, compute, ...)            → StageBundle(stages=(Stage(sources, compute=...),), body, BUFFERED|SYNC, ...)
 #
 # Stage retains NO body — the bundle owns the consumer scope.
@@ -1421,7 +1421,6 @@ class StageBundle(Stmt):
     buffer_count: int = 1
     phase: Expr | None = None
     pipeline_depth: int = 1
-    swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -1445,8 +1444,6 @@ class StageBundle(Stmt):
                 raise ValueError(f"StageBundle {self.policy.value}: phase required when buffer_count >= 2")
         if self.pipeline_depth != 1 and self.policy not in (StagePolicy.ASYNC, StagePolicy.TMA):
             raise ValueError(f"StageBundle: pipeline_depth > 1 requires ASYNC or TMA policy, got {self.policy.value}")
-        if self.swizzle != SwizzleMode.NONE and self.policy != StagePolicy.TMA:
-            raise ValueError(f"StageBundle: non-NONE swizzle requires TMA policy, got {self.policy.value}")
         if self.policy == StagePolicy.TMA:
             for stage in self.stages:
                 for src in stage.sources:
@@ -1491,8 +1488,8 @@ class StageBundle(Stmt):
         return per_slab * max(self.buffer_count, 1)
 
     def _policy_label(self) -> str:
-        """Render a compact ``policy[buffer_count@phase depth=N swizzle=X]``
-        label used in the bundle header line."""
+        """Render a compact ``policy[buffer_count@phase depth=N]`` label used
+        in the bundle header line."""
         if self.policy == StagePolicy.SYNC:
             return "sync"
         parts: list[str] = [f"{self.policy.value}[{self.buffer_count}"]
@@ -1500,8 +1497,6 @@ class StageBundle(Stmt):
             parts.append(f"@{self.phase.pretty()}")
         if self.pipeline_depth > 1:
             parts.append(f" depth={self.pipeline_depth}")
-        if self.swizzle != SwizzleMode.NONE:
-            parts.append(f" swizzle={self.swizzle.value}")
         parts.append("]")
         return "".join(parts)
 
