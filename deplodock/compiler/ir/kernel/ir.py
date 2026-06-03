@@ -542,7 +542,7 @@ class WarpShuffle(Stmt):
 # helper wrappers (pure PTX — NVRTC-clean, no ``<mma.h>``). Emitted by
 # ``kernel/005_lower_atom_tile`` from the ``Mma`` op's ``Atom`` spec.
 # (The opaque ``nvcuda::wmma`` node family was removed — the swizzled mma.sync
-# slab beat it; see plans/mma-sync-smem-swizzle.md.)
+# slab beat it.)
 # ---------------------------------------------------------------------------
 
 
@@ -567,10 +567,10 @@ def _mma_sync_nregs(role: str, shape: tuple[int, int, int]) -> int:
 class RegFragment(Stmt):
     """Declare an mma.sync per-thread register array.
 
-    Unlike the opaque ``wmma::fragment``, mma.sync multiplicands are
-    explicit per-lane register arrays — ``unsigned a[4]`` / ``unsigned
-    b[2]`` (f16, two halfs per 32-bit reg) — and the accumulator is
-    ``float c[4]`` (f32). ``shape`` is the cell ``(M, N, K)``; the count
+    mma.sync multiplicands are explicit per-lane register arrays —
+    ``unsigned a[4]`` / ``unsigned b[2]`` (f16, two halfs per 32-bit
+    reg) — and the accumulator is ``float c[4]`` (f32). ``shape`` is the
+    cell ``(M, N, K)``; the count
     derives from ``shape`` + ``role`` via :func:`_mma_sync_nregs`. The
     ``c`` array is zero-initialised at declaration, so the mma.sync path
     needs no separate ``MmaFill``."""
@@ -599,8 +599,8 @@ class RegFragment(Stmt):
         return [f"{_pad(ctx.indent)}unsigned {self.name}[{n_regs}];"]
 
 
-# Per-lane fp16 element XOR matching the TMA hardware smem swizzle (S3 of
-# plans/mma-sync-smem-swizzle.md). The producer (cuTensorMapEncodeTiled with
+# Per-lane fp16 element XOR matching the TMA hardware smem swizzle (the
+# ldmatrix consumer side). The producer (cuTensorMapEncodeTiled with
 # SWIZZLE_{128,64,32}B) permutes 16-byte (8-fp16) chunks within each swizzle
 # row by the row-index-mod-2^B; the ldmatrix consumer must apply the same
 # permutation to its per-lane element offset. All three modes are CUTLASS
@@ -628,7 +628,7 @@ class LdmatrixLoad(Stmt):
 
     ``frag`` is the destination :class:`RegFragment`; ``src_buffer`` /
     ``src_index`` are the cell's smem tile base (the same ``(buffer,
-    base-offset)`` ``_mma_src_index`` computes for the WMMA path); ``ldm``
+    base-offset)`` ``_mma_src_index`` computes); ``ldm``
     is the smem row stride in elements. Each lane derives its own row
     address from its warp lane id (``threadIdx.x & 31``): the 16×K ``a``
     tile uses ``x4`` (``row = lane%16``, K-col block ``(lane/16)*8``); the

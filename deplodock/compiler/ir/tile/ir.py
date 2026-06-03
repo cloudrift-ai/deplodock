@@ -362,10 +362,9 @@ class SwizzleMode(enum.Enum):
     ``StageBundle.policy == StagePolicy.TMA``.
 
     Defined here (above ``Source``) so it can be a ``Source.swizzle`` field
-    default. The per-operand swizzle mode lives on the ``Source`` (S0 of
-    plans/mma-sync-smem-swizzle.md), not only on the bundle, because A
-    (64 B inner → ``B64``) and B (128 B inner → ``B128``) share one
-    StageBundle but need distinct modes.
+    default. The per-operand swizzle mode lives on the ``Source``, not only on
+    the bundle, because A (64 B inner → ``B64``) and B (128 B inner → ``B128``)
+    share one StageBundle but need distinct modes.
     """
 
     NONE = "NONE"
@@ -388,7 +387,7 @@ def pick_swizzle_atom(inner_elems: int, elem_bytes: int) -> tuple[int, SwizzleMo
     is ``inner_elems`` elements of ``elem_bytes`` bytes each.
 
     Returns ``(atom_elems, mode)`` where ``atom_elems`` is the swizzle atom
-    width in *elements* (the innermost descriptor-box dim after the S1
+    width in *elements* (the innermost descriptor-box dim after the box
     reshape) and ``mode`` the matching :class:`SwizzleMode`. The widest atom
     in ``{128, 64, 32}`` B that (a) is ``<=`` the inner span and (b) divides
     it evenly wins — so a 256 B inner (128 fp16 elems) picks ``B128`` (64
@@ -396,9 +395,9 @@ def pick_swizzle_atom(inner_elems: int, elem_bytes: int) -> tuple[int, SwizzleMo
     (32 elems, no split). Returns ``(inner_elems, NONE)`` when no atom fits
     (the descriptor keeps the unswizzled collapsed box).
 
-    Shared by ``kernel/100_materialize_tile`` (S1 box reshape) and
-    ``tile/050_use_tma`` (S2 per-source mode pick) so the two agree on the
-    atom width — see plans/mma-sync-smem-swizzle.md.
+    Shared by ``kernel/100_materialize_tile`` (box reshape) and
+    ``tile/050_use_tma`` (per-source mode pick) so the two agree on the
+    atom width.
     """
     inner_bytes = inner_elems * elem_bytes
     for wb, mode in _SWIZZLE_BY_BYTES:
@@ -627,7 +626,7 @@ def affine_decode_per_dim(
     (``stride = 1``, coord added verbatim). Multi-axis-per-dim (matmul
     N-side ``BN_thread × FN_register`` collapse) gets the composite
     stride that mirrors the original ``load.index[d]`` shape.
-    Non-trivial ``block`` (e.g. WMMA ``(1, atom_M, 1, atom_K)``) folds
+    Non-trivial ``block`` (e.g. the mma.sync ``(1, atom_M, 1, atom_K)``) folds
     each axis's atom multiplier into its own stride — the slab is sized
     ``extent · block`` per axis, and the per-axis decode reads from
     ``cache_var · block · stride_of_inner_axes`` so the σ output of an
@@ -1614,8 +1613,8 @@ def score_tile_geometry(
     # Warp-tier MMA on TMA-capable HW (sm_90+) hits its perf sweet spot at
     # 4 warps × 128 threads with the mma chain saturating the tensor cores
     # while TMA off-warps the gmem loads. The pre-2026 ``target_threads =
-    # 256`` was tuned for scalar matmul + gmem-direct WMMA where larger
-    # warp counts amortized cooperative-load instructions; with TMA those
+    # 256`` was tuned for scalar matmul where larger warp counts amortized
+    # cooperative-load instructions; with TMA those
     # loads cost one mbarrier handshake from one issuer thread, so 256
     # threads buys nothing and competes for tensor-core throughput.
     # Empirical sweep at 2048² fp16 on sm_120 (RTX 5090): the 4-warp / 128-

@@ -9,8 +9,7 @@ On the mma.sync atom (``_is_mma_sync_kernel``) the per-``Source``
 swizzle mode is stamped instead (``_stamp_source_swizzle``: A=B64 /
 B=B128 from the inner-row byte span) — the bundle stays NONE because A
 and B share it but need distinct modes; the materializer reads
-``src.swizzle`` into each TmaDescriptor (S2 of
-plans/mma-sync-smem-swizzle.md). Running on
+``src.swizzle`` into each TmaDescriptor. Running on
 BUFFERED directly (the post-``040_use_ring_buffers`` state) means the
 rule fires before ``060_use_async_copy`` would promote to ASYNC —
 otherwise the file ordering (050 < 060) leaves 050 staring at SYNC /
@@ -156,9 +155,9 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
 
-    # Per-source swizzle (S2 of plans/mma-sync-smem-swizzle.md) is stamped
-    # only on mma.sync kernels — their explicit-ldmatrix consumer can read a
-    # swizzled slab; WMMA's opaque ``load_matrix_sync`` cannot, so its sources
+    # Per-source swizzle is stamped only on mma.sync kernels — their
+    # explicit-ldmatrix consumer reads the swizzled slab with a matching
+    # per-lane XOR; scalar kernels don't stage for ldmatrix, so their sources
     # stay NONE. The atom kind rides on the TileOp knobs.
     swizzle = _is_mma_sync_kernel(root.op.knobs.get("ATOM_KIND"))
     # Per-buffer element byte width from the graph. The tile-stage ``Source``
@@ -259,8 +258,7 @@ def _promote(bundle: StageBundle, *, swizzle: bool = False, dtype_bytes: dict[st
         phase=bundle.phase,
         pipeline_depth=bundle.pipeline_depth,
         # Bundle-level swizzle stays NONE — the mode is per-Source (A=B64,
-        # B=B128) because A and B share this bundle (S2 of
-        # plans/mma-sync-smem-swizzle.md). The materializer reads
+        # B=B128) because A and B share this bundle. The materializer reads
         # ``src.swizzle`` into each TmaDescriptor.
         swizzle=SwizzleMode.NONE,
     )
@@ -277,9 +275,10 @@ def _source_inner_elems(src: Source) -> int:
     operand puts the K (contiguous) axis FIRST and the M axes last, so
     ``dims = (1, 0, 0)`` and ``dims[-1]`` would pick the M dim (128 elems →
     wrongly B128) instead of K (32 elems → B64). Keying on ``max(dims)``
-    matches the materializer's ``box[-1] = full_box[max(kept)]`` so S2's mode
-    pick agrees with S1's box reshape (a disagreement makes the descriptor's
-    swizzle mode claim a width its box doesn't have → TMA copy deadlock)."""
+    matches the materializer's ``box[-1] = full_box[max(kept)]`` so this mode
+    pick agrees with the materializer's box reshape (a disagreement makes the
+    descriptor's swizzle mode claim a width its box doesn't have → TMA copy
+    deadlock)."""
     addressing = src.addressing
     assert isinstance(addressing, AffineAddressing)
     dims = addressing.dims
@@ -365,13 +364,13 @@ def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> boo
     # gate for collapse cases).
     #
     # The per-axis ``AffineAddressing.block`` multiplier encodes per-cell
-    # strides (e.g. ``atom_n = 16`` for square WMMA on the N side) — without
-    # it, warp-tier MMA slabs whose cache axes are warp/cell-granular
+    # strides (e.g. ``atom_n = 8`` on the N side of the m16n8k16 atom) —
+    # without it, warp-tier MMA slabs whose cache axes are warp/cell-granular
     # (``WN × FN`` per the inner dim) report ``inner_extent = WN·FN`` of
     # ~4-8 elements when the actual slab inner width is
     # ``WN·FN·atom_n`` of 64-128 elements. Pre-fix the warp tier was
-    # silently TMA-ineligible at every shape; the gmem-direct WMMA was the
-    # only path the picker could land on.
+    # silently TMA-ineligible at every shape, so the picker could only fall
+    # back to a slower non-TMA staging path.
     inner_dim = dims[-1]
     block = src.addressing.block
     inner_extent = 1

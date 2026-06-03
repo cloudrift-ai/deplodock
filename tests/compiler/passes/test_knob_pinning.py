@@ -223,6 +223,70 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
+# Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM, see
+# plans/make-a-plan-for-sparkling-hamster.md). On cc>=9.0 the F16 atom is
+# eligible whenever the K-loads are F16, so at >=512^3 the greedy compile
+# *prefers* the tensor-core variant; ``DEPLODOCK_MMA=0`` is what forces the
+# scalar register-tile FMA path (fp16 in -> fp32 accumulate -> fp16 out). The
+# 512^3 shape is the smallest where MMA=0 is load-bearing (<=256^3 greedy picks
+# scalar on its own, so a small shape wouldn't prove the knob does anything).
+def _build_f16_matmul_graph(M: int, N: int, K: int):
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=F16), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (K, N), dtype=F16), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("c", (M, N), dtype=F16), node_id="c")
+    g.inputs, g.outputs = ["a", "b"], ["c"]
+    rng = np.random.default_rng(0)
+    inputs = {
+        "a": (rng.standard_normal((M, K), dtype=np.float32) * 0.1).astype(np.float16),
+        "b": (rng.standard_normal((K, N), dtype=np.float32) * 0.1).astype(np.float16),
+    }
+    ref = (inputs["a"].astype(np.float32) @ inputs["b"].astype(np.float32)).astype(np.float16)
+    return g, inputs, ref
+
+
+# Scalar-only knobs (no ATOM_KIND / WARP_SPECIALIZE). With DEPLODOCK_MMA unset
+# these make the greedy compile pick the (unstaged-with-TMA=0) atom variant.
+_SCALAR_F16_KNOBS = {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0, "STAGE": 11}
+
+
+@requires_cuda
+def test_scalar_matmul_f16(monkeypatch):
+    """fp16 matmul forced through the scalar register-tile FMA path
+    (``DEPLODOCK_MMA=0``); fp32 accumulate, verified vs the numpy backend.
+    Guards against fp16 being re-routed to the tensor-core atom path and
+    against the fp16 scalar render (``__half2float`` multiply, ``__float2half``
+    store) regressing."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    g, inputs, ref = _build_f16_matmul_graph(512, 512, 512)
+    forced = _run_with_knobs(g, inputs, "c", _SCALAR_F16_KNOBS, monkeypatch)
+    peak = float(np.max(np.abs(ref.astype(np.float32))))
+    atol = max(5e-1, 0.1 * peak)
+    np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
+
+
+@requires_cuda
+def test_unstageable_atom_raises_clear_error(monkeypatch):
+    """When the greedy compile picks the tensor-core atom variant but its
+    operands aren't staged for ``ldmatrix`` (``TMA=0``, no ``DEPLODOCK_MMA=0``),
+    ``005_lower_atom_tile`` must raise an actionable ``LoweringError`` naming the
+    remedies — not leak the unconsumed ``AtomTile`` to render and crash with the
+    opaque ``NotImplementedError`` (compile-only; the error fires during lowering)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.pipeline import LoweringError
+
+    g, _, _ = _build_f16_matmul_graph(512, 512, 512)
+    for k, v in _SCALAR_F16_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    with pytest.raises(LoweringError, match="DEPLODOCK_MMA=0"):
+        CudaBackend().compile(g)
+
+
 # Regressions for the article-reproduction work (see plans + git log
 # for ``cab3c83e``, ``8940dc25``, the affine-collapse commit). Each row
 # pins a configuration that used to fail before a specific fix:

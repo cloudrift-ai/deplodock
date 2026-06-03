@@ -1,12 +1,13 @@
 """Offline kernel compilation via the ``nvcc`` binary (ptxas).
 
-cupy's NVRTC path was the v1 default, but its bundled cu13 toolkit is
-missing ``crt/mma.h`` (the WMMA helper header) — every kernel using
-``wmma::*`` fails to compile through NVRTC. The system ``nvcc`` toolkit
-ships the full ``crt/`` directory, so we use ``nvcc --cubin`` exclusively
-now. Bonus: it's ~3× faster than cold NVRTC on the complex tile-search
+cupy's NVRTC path was the v1 default; we use ``nvcc --cubin`` exclusively
+now because it's ~3× faster than cold NVRTC on the complex tile-search
 kernels that dominate autotune, GPU-free for the compile step, and the
-cubin loads with no driver JIT (~25 ms).
+cubin loads with no driver JIT (~25 ms). (The original trigger was
+historical: cupy's bundled cu13 toolkit lacked ``crt/mma.h``, so the
+then-tensor-core ``wmma::*`` kernels couldn't compile through NVRTC. That
+node family is gone now — the s16816 ``mma.sync`` path emits pure PTX with
+no ``<mma.h>`` — but the perf / cubin-cache wins kept nvcc as the only path.)
 
 The two halves are split on purpose:
 
@@ -156,18 +157,16 @@ def load_function(source: str, name: str, options, *, uses_tma: bool):  # noqa: 
     and ``max_dynamic_shared_size_bytes`` is settable for the >48KB smem path).
 
     Raises ``RuntimeError`` if ``nvcc`` is unavailable — the NVRTC fallback
-    was dropped because cupy's bundled cu13 toolkit lacks ``crt/mma.h``, so
-    any WMMA kernel would have silently failed to compile through it. ``nvcc``
-    is now a hard dependency.
+    was dropped (faster compiles, GPU-free, cubin-cacheable; see the module
+    docstring), so ``nvcc`` is now a hard dependency.
     """
     import cupy as cp  # noqa: PLC0415
 
     if nvcc_path() is None:
         raise RuntimeError(
             "nvcc unavailable — deplodock requires the CUDA toolkit's "
-            "nvcc binary on PATH / under $CUDA_HOME (NVRTC fallback was "
-            "dropped because cupy's bundled toolkit lacks crt/mma.h, "
-            "breaking the WMMA path)"
+            "nvcc binary on PATH / under $CUDA_HOME (the NVRTC fallback was "
+            "dropped for faster, GPU-free, cubin-cacheable compiles)"
         )
     try:
         cubin = compile_to_cubin(source, name, arch=device_arch(uses_tma))

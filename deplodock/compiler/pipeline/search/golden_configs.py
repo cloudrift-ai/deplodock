@@ -20,14 +20,13 @@ path. The **fp16** squares (``*.fp16``) instead ride the warp-tier tensor-core p
 and compare against cuBLAS HGEMM (torch's default fp16 matmul) — same tensor-core
 hardware on both sides, so the ratio is apples-to-apples vs cuBLAS. On sm_90+ the
 autotuner lands these on the swizzled s16816 ``mma_m16n8k16_f16`` (ldmatrix +
-mma.sync) atom rather than ``nvcuda::wmma`` — the swizzled smem slab kills the
-shared-load bank conflicts WMMA can't (it reads smem opaquely), so mma.sync is the
-faster fp16 GEMM. On sm_120 the warp-tier prior + greedy now land on a square
+mma.sync) atom — the swizzled smem slab avoids shared-load bank conflicts (a
+fragment load reading smem opaquely cannot), so mma.sync is the faster fp16
+GEMM. On sm_120 the warp-tier prior + greedy now land on a square
 **64×64 output tile on a 4-warp CTA with WARP_SPECIALIZE=1** (producer warp issues
 TMA, consumer warps run the mma chain), measured at / above cuBLAS across the
-squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See
-plans/mma-sync-smem-swizzle.md and the warp-tier block in
-``compiler/ir/tile/ir.py:score_tile_geometry``.
+squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See the
+warp-tier block in ``compiler/ir/tile/ir.py:score_tile_geometry``.
 """
 
 from __future__ import annotations

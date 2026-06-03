@@ -47,7 +47,7 @@ REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
      extract the literal coefficient on each cache var, divide out the
      running ``extent · block`` suffix product, and stamp
      ``AffineAddressing(dims=..., block=(c_0, c_1, ...))``. The slab
-     grows by ``block[i]`` per cache dim so the WMMA fragment-load can
+     grows by ``block[i]`` per cache dim so the mma.sync fragment-load can
      read a full ``atom_M × atom_K`` cell.
 
   Scalar paths that hit a non-1 σ coef fall through to template — the
@@ -63,7 +63,7 @@ sharing the same index ⇒ temporal reuse).
 WarpTile (MMA path), ``n_thread`` is multiplied by ``warp_size`` so the
 cooperative-load fan-out covers all CTA lanes, not just the warp
 count. ``_collect_candidates`` and ``_process_scope`` recurse
-transparently into ``AtomTile`` — its axes parameterize the WMMA
+transparently into ``AtomTile`` — its axes parameterize the mma.sync
 instruction shape and contribute as ``block`` multipliers rather than
 register iteration.
 
@@ -240,7 +240,7 @@ def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
     # WarpTile axes count warps, not lanes; multiply by warp width to get
     # the CTA thread count the cooperative load actually has to fan out
     # across (one cooperative slab fill per CTA, all 4 × 32 = 128 lanes
-    # participate even though the per-warp WMMA atom is the consumer).
+    # participate even though the per-warp mma.sync atom is the consumer).
     if isinstance(tt, WarpTile):
         n_thread *= warp_size
     if n_thread <= warp_size:
@@ -300,7 +300,7 @@ def _collect_candidates(
             # MMA fragment-shape wrapper: ``005_lower_atom_tile`` consumes
             # this and re-emits the body as an Mma* chain whose
             # ``MmaLoad``s read from the smem slab we're about to admit
-            # here. ``AtomTile.axes`` parameterize the WMMA instruction
+            # here. ``AtomTile.axes`` parameterize the mma.sync instruction
             # shape, not loop iteration — they appear in the σ as
             # ``cache_var * atom_M``-style stride multipliers and become
             # ``AffineAddressing.block`` factors, so they don't get
@@ -811,7 +811,7 @@ def _classify(
     #    output reduces to ``origin[d] + ax_0·(e_1·b_1·…·b_0) + … +
     #    ax_{k-1}·b_{k-1}`` where ``b_i`` is the per-axis literal stride
     #    factor (e.g. ``atom_M`` = 16). The slab grows by ``b_i`` per axis
-    #    so the WMMA fragment load can read a full ``atom_M × atom_K`` cell.
+    #    so the mma.sync fragment load can read a full ``atom_M × atom_K`` cell.
     #
     # For scalar paths, tier 2 is skipped — a non-1 coef on the cache var
     # (typically from a register-axis sitting between origin and cache,
