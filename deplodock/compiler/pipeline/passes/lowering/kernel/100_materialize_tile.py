@@ -64,6 +64,7 @@ from deplodock.compiler.ir.tile.ir import (
     StageBundle,
     StagePolicy,
     StridedTile,
+    SwizzleMode,
     ThreadTile,
     TileOp,
     WarpSpecialize,
@@ -86,32 +87,16 @@ _TMA_ALIGN_BYTES = 128
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
     escape = root.op.body.coordination
-    # Swizzle-atom box reshape (below) is gated
-    # to the mma.sync atom: only its explicit-ldmatrix consumer can read a
-    # swizzled slab, so only its TMA descriptors get the rank+1 swizzle-atom
-    # box. cp.async / SDPA TMA sources keep the legacy collapsed box
-    # (zero blast radius for the default path).
-    mma_sync = _is_mma_sync_kernel(root.op.knobs.get("ATOM_KIND"))
     new_body: list[Stmt] = []
     for s in root.op.body:
         if isinstance(s, (GridTile, ThreadTile, WarpTile)):
-            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape, mma_sync=mma_sync))
+            new_body.append(_materialize_top(s, warp_size=ctx.warp_size, escape=escape))
         else:
             new_body.append(s)
     return KernelOp(body=new_body, name=root.op.name)
 
 
-def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
-    """True iff ``atom_kind`` is a registered tensor-core atom (the s16816
-    ldmatrix path — the only family today). Returns False for unset kinds."""
-    if not atom_kind:
-        return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY  # noqa: PLC0415
-
-    return atom_kind in ATOM_REGISTRY
-
-
-def _materialize_top(top: Stmt, *, warp_size: int, escape=None, mma_sync: bool = False) -> Stmt:
+def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     """Dispatch the outermost tile of a TileOp body to materialization.
 
     Three shapes are possible coming out of ``001_launch_geometry`` /
@@ -137,12 +122,12 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None, mma_sync: bool =
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, (ThreadTile, WarpTile)):
-                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape, mma_sync=mma_sync))
+                new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
     if isinstance(top, (ThreadTile, WarpTile)):
-        return _materialize(top, warp_size=warp_size, escape=escape, mma_sync=mma_sync)
+        return _materialize(top, warp_size=warp_size, escape=escape)
     raise ValueError(f"unexpected top-level tile flavor: {type(top).__name__}")
 
 
@@ -151,7 +136,7 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None, mma_sync: bool =
 # ---------------------------------------------------------------------------
 
 
-def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma_sync: bool = False) -> Stmt:
+def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> Stmt:
     """Materialize a ``ThreadTile`` or ``WarpTile`` body. The inner tile
     carries the per-CTA scope axes directly (no BoundAxis filtering
     needed); strategies set this up — this pass commits no axis
@@ -397,14 +382,14 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None, mma
         # Swizzle-atom box reshape: split the innermost box dim down to the
         # swizzle atom width so the descriptor's innermost dim in bytes equals
         # the swizzle width (TMA rejects swizzle when the inner box-dim byte
-        # span exceeds the atom). Only fires for the mma.sync kernel (gated by
-        # ``mma_sync``). The box rank grows by one; the runtime
-        # ``_collapse_inert_dims`` reconstructs the matching rank+1 globalDim
-        # by splitting the array's inner dim. Pairs with the per-Source mode
-        # 050_use_tma stamps and the matching ldmatrix consumer XOR in
-        # 005_lower_atom_tile — both on by default for mma.sync, so the slab
-        # is genuinely swizzled (B64 / B128), not NONE.
-        if mma_sync and box:
+        # span exceeds the atom). Gated on ``src.swizzle`` — the per-Source
+        # mode 050_use_tma stamps (B64 / B128 on mma.sync sources, NONE
+        # otherwise), so the box reshape and the descriptor's swizzle mode are
+        # driven by the same field and can't disagree. The box rank grows by
+        # one; the runtime ``_collapse_inert_dims`` reconstructs the matching
+        # rank+1 globalDim by splitting the array's inner dim. The matching
+        # ldmatrix consumer XOR is emitted by 005_lower_atom_tile.
+        if src.swizzle != SwizzleMode.NONE and box:
             elem_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
             inner_elems = box[-1]
             atom_elems, _ = pick_swizzle_atom(inner_elems, elem_bytes)
