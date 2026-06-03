@@ -38,8 +38,8 @@ the same group mbarrier whose ``arrive_count`` equals the source count.
 This is equivalent to the article's 1-thread-issues-both pattern via
 hardware mbarrier semantics: tx-bytes from N arrives sum to the total,
 and per-source ``cp.async.bulk.tensor`` completions add to that total.
-Hoisted-compute Stages (``Stage.compute is not None``) can't split —
-their producer body is shared across sources — and stay on cp.async.
+Hoisted-compute bundles (``StageBundle.compute is not None``) are emitted
+``SYNC`` and never reach this rule (the compute phase blocks TMA).
 
 The pass is **all-or-nothing per tile**: if any ASYNC bundle in the
 tile body is ineligible, leave the whole tile on cp.async (avoids
@@ -225,13 +225,11 @@ def _split_multi_source_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
     distribute the arrives across distinct elected threads without any
     materializer changes.
 
-    Hoisted-compute Stages (``compute is not None``) are passed through
-    intact — their producer body reads from sibling-stage smem and can't be
-    split per source.
+    Single-source stages pass through unchanged.
     """
     out: list[Stage] = []
     for stage in stages:
-        if stage.compute is not None or len(stage.sources) <= 1:
+        if len(stage.sources) <= 1:
             out.append(stage)
             continue
         for src in stage.sources:
@@ -289,10 +287,8 @@ def _stamp_source_swizzle(stage: Stage, dtype_bytes: dict[str, int]) -> Stage:
 
     ``dtype_bytes`` maps gmem buffer name → element byte width (from the graph
     node, since the tile-stage ``Source.dtype`` isn't populated yet). Only
-    affine single-source transport stages can swizzle (the box reshape needs
-    ``AffineAddressing``); compute / template sources are left NONE."""
-    if stage.compute is not None:
-        return stage
+    affine transport sources can swizzle (the box reshape needs
+    ``AffineAddressing``); template sources are left NONE."""
     new_sources = []
     for src in stage.sources:
         if not isinstance(src.addressing, AffineAddressing):
@@ -313,11 +309,10 @@ def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]]
 
 
 def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> bool:
-    # Hoisted-compute stages are never TMA-eligible (their producer body
-    # reads from sibling-stage smem, not gmem). The multi-source case has
-    # already been split by ``_split_multi_source_stages`` before this
-    # check fires — we only see single-source transport Stages here.
-    if stage.compute is not None or len(stage.sources) != 1:
+    # The multi-source case has already been split by
+    # ``_split_multi_source_stages`` before this check fires — we only see
+    # single-source transport Stages here.
+    if len(stage.sources) != 1:
         return False
     (src,) = stage.sources
     if not isinstance(src.addressing, AffineAddressing):

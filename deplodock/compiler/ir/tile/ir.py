@@ -1257,9 +1257,9 @@ class StridedTile(SerialTileBase):
 #   ComputeStage(sources, body, compute, ...)            → StageBundle(stages=(Stage(sources, compute=...),), body, BUFFERED|SYNC, ...)
 #
 # Stage retains NO body — the bundle owns the consumer scope.
-# Stage's ``compute`` field is non-None iff it's a hoisted-invariant
-# compute stage (sibling-smem → own-smem producer template); None for
-# plain transport stages.
+# The hoisted-invariant cooperative compute (sibling-smem → own-smem
+# producer template) is a distinct ``StageBundle.compute`` phase, not a
+# field on a peer Stage; transport stages are homogeneous.
 
 
 class StagePolicy(enum.Enum):
@@ -1288,23 +1288,18 @@ class StagePolicy(enum.Enum):
 
 @dataclass(frozen=True)
 class Stage(Stmt):
-    """Cooperative-staging unit: one or more ``Source`` entries plus an
-    optional cooperative ``compute`` template.
+    """Cooperative-staging unit: one or more ``Source`` entries grouped
+    behind a single transport barrier.
 
-    A bare transport stage has ``compute=None``; the producer-side IR
-    is synthesized at materialize time from the sources (cooperative
-    ``Load + Write`` per source).
+    A transport stage's producer-side IR is synthesized at materialize
+    time from the sources (cooperative ``Load + Write`` per source).
+    ``Stage`` carries no bodies of its own — the consumer scope is owned
+    by the enclosing :class:`StageBundle`, and the hoisted-invariant
+    cooperative compute (formerly a ``compute`` template on a peer Stage)
+    is now a distinct :class:`StageBundle` phase (``bundle.compute``).
 
-    A *hoisted-invariant compute* stage has ``compute != None`` — a
-    per-thread cooperative body that reads from sibling-stage smem (via
-    Sources whose ``buf`` names a sibling Stage's smem buffer) and
-    writes into this Stage's smem allocation. ``external_reads()``
-    returns empty for compute stages (sibling smem isn't external).
-
-    The consumer scope is owned by the enclosing :class:`StageBundle`;
-    Stage itself carries no consumer ``body`` field. Transport policy
-    (sync / buffered / async / TMA) and policy-specific knobs
-    (``buffer_count`` / ``phase`` / ``pipeline_depth`` / ``swizzle``)
+    Transport policy (sync / buffered / async / TMA) and policy-specific
+    knobs (``buffer_count`` / ``phase`` / ``pipeline_depth`` / ``swizzle``)
     live on the bundle.
 
     A Stage that lives outside a bundle is invalid; constructors that
@@ -1312,34 +1307,23 @@ class Stage(Stmt):
     """
 
     sources: tuple[Source, ...]
-    compute: Body | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if not self.sources:
             raise ValueError("Stage: requires at least one Source")
-        if self.compute is not None and not isinstance(self.compute, Body):
-            object.__setattr__(self, "compute", Body.coerce(self.compute))
 
     def nested(self) -> tuple[Body, ...]:
-        return (self.compute,) if self.compute is not None else ()
+        return ()
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
-        if self.compute is None:
-            if bodies:
-                raise ValueError("Stage(compute=None).with_bodies: expected 0 bodies")
-            return self
-        (compute,) = bodies
-        return replace(self, compute=compute)
+        if bodies:
+            raise ValueError("Stage.with_bodies: expected 0 bodies (Stage carries no body)")
+        return self
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
     def external_reads(self) -> tuple[str, ...]:
-        # Compute stages read from sibling-stage smem (same Tile scope),
-        # not external gmem — return empty so the staging-eligibility
-        # passes don't treat them as gmem-transport candidates.
-        if self.compute is not None:
-            return ()
         return tuple(s.buf for s in self.sources)
 
     def local_decls(self) -> tuple[str, ...]:
@@ -1361,33 +1345,29 @@ class Stage(Stmt):
         return replace(self, sources=sources)
 
     def pretty(self, indent: str = "") -> list[str]:
-        """Render per-source ``shared name[...] = buf[...];`` decl lines.
-        When ``compute`` is present, follow with a synthesized
-        ``cooperative`` for-nest over the first source's cache axes
-        wrapping the producer body.
-        """
-        out: list[str] = []
-        if self.compute is not None:
-            for s in self.sources:
-                cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in s.cache_axes)
-                out.append(f"{indent}shared {s.name}[{cache}]")
-            cache_axes = self.sources[0].cache_axes
-            for_lines = [f"for {ax.name} in 0..{ax.extent}" for ax in cache_axes]
-            out.extend(_render_tile_bracket(indent + INDENT, for_lines, "cooperative", self.compute))
-        else:
-            out = [f"{indent}{_source_decl_line(s)}" for s in self.sources]
-        return out
+        """Render per-source ``shared name[...] = buf[...];`` decl lines."""
+        return [f"{indent}{_source_decl_line(s)}" for s in self.sources]
 
 
 @dataclass(frozen=True)
 class StageBundle(Stmt):
     """Single-policy group of cooperative ``Stage`` members sharing one
-    consumer ``body``.
+    consumer ``body``, plus an optional hoisted-invariant ``compute`` phase.
 
     The bundle owns the consumer scope (``body``) and the staging
     policy (``policy`` plus policy-specific fields ``buffer_count`` /
     ``phase`` / ``pipeline_depth`` / ``swizzle``). Each member Stage
-    contributes its ``sources`` (and optional ``compute`` template).
+    contributes its ``sources``.
+
+    ``compute`` (optional) is a *self-describing* cooperative compute body:
+    ``Load``s reading already-staged sibling slabs (the transport
+    ``sources``), ``Assign``s applying a transform, and a single ``Write``
+    into a freshly derived smem slab. It is emitted as a distinct bundle
+    *phase* — after all transport stages, before the consumer body —
+    so the transport stages stay homogeneous and the slab name / loop
+    domain / dtype are recovered at materialize from the body itself
+    (the ``Write.output`` name, the cone sources' ``cache_axes``, the
+    ``Write`` value dtype). Set by ``030_hoist_invariant_compute``.
 
     Invariants:
 
@@ -1407,16 +1387,19 @@ class StageBundle(Stmt):
 
     Iteration / recursion:
 
-    - ``nested()`` returns ``(Body(self.stages), self.body)`` — the
-      stages tuple is exposed as a synthetic Body so generic walkers
-      (``Body.iter`` / ``Body.map`` / ``Body.fold``) traverse into
-      individual members without special-casing StageBundle. Each
-      member's own ``nested()`` (the optional ``compute`` template) is
-      then reached via the standard descent.
+    - ``nested()`` returns ``(Body(self.stages), self.compute or Body(()),
+      self.body)`` — the stages tuple is exposed as a synthetic Body so
+      generic walkers (``Body.iter`` / ``Body.map`` / ``Body.fold``)
+      traverse into individual members without special-casing
+      StageBundle; the compute phase (a plain ``Body``) and the consumer
+      body follow. An absent compute phase is exposed as ``Body(())`` so
+      the arity stays fixed; ``with_bodies`` collapses an empty middle
+      body back to ``None``.
     """
 
     stages: tuple[Stage, ...]
     body: Body
+    compute: Body | None = None
     policy: StagePolicy = StagePolicy.SYNC
     buffer_count: int = 1
     phase: Expr | None = None
@@ -1425,6 +1408,8 @@ class StageBundle(Stmt):
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             object.__setattr__(self, "body", Body.coerce(self.body))
+        if self.compute is not None and not isinstance(self.compute, Body):
+            object.__setattr__(self, "compute", Body.coerce(self.compute))
         if not self.stages:
             raise ValueError("StageBundle: requires at least one Stage")
         for s in self.stages:
@@ -1451,13 +1436,14 @@ class StageBundle(Stmt):
                         raise ValueError(f"StageBundle TMA: source {src.name!r} pad must be empty, got {src.pad!r}")
 
     def nested(self) -> tuple[Body, ...]:
-        return (Body(self.stages), self.body)
+        return (Body(self.stages), self.compute if self.compute is not None else Body(()), self.body)
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
-        if len(bodies) != 2:
-            raise ValueError(f"StageBundle.with_bodies: expected 2 bodies (stages, body), got {len(bodies)}")
-        stages_body, body = bodies
-        return replace(self, stages=tuple(stages_body), body=body)
+        if len(bodies) != 3:
+            raise ValueError(f"StageBundle.with_bodies: expected 3 bodies (stages, compute, body), got {len(bodies)}")
+        stages_body, compute_body, body = bodies
+        compute = compute_body if compute_body else None
+        return replace(self, stages=tuple(stages_body), compute=compute, body=body)
 
     def deps(self) -> tuple[str, ...]:
         return ()
@@ -1472,6 +1458,12 @@ class StageBundle(Stmt):
         out: tuple[str, ...] = ()
         for s in self.stages:
             out = (*out, *s.local_decls())
+        # The compute phase fills a fresh smem slab named by its Write — a
+        # kernel-local buffer, not a signature input/output. Declaring it
+        # here keeps ``BodyOp._derive_io_names`` from promoting it to a
+        # kernel arg (the materializer pre-emits its ``Smem`` decl).
+        if self.compute is not None:
+            out = (*out, *(s.output for s in self.compute if isinstance(s, Write)))
         return out
 
     def exprs(self) -> tuple[Expr, ...]:
@@ -1501,12 +1493,20 @@ class StageBundle(Stmt):
         return "".join(parts)
 
     def pretty(self, indent: str = "") -> list[str]:
-        """Render as ``bundle <policy>:`` header with member stages and
-        the consumer body indented beneath."""
+        """Render as ``bundle <policy>:`` header with member stages, the
+        optional cooperative compute phase, and the consumer body indented
+        beneath."""
         inner = indent + INDENT
         out: list[str] = [f"{indent}bundle {self._policy_label()}:"]
         for s in self.stages:
             out.extend(s.pretty(inner))
+        if self.compute is not None:
+            # The compute body names its inputs (sibling cone slabs) and
+            # its output slab via a final Write; the cache-axis loop nest
+            # is synthesized at materialize, so render it as a flat
+            # ``cooperative:`` block of the body stmts.
+            out.append(f"{inner}cooperative:")
+            out.extend(pretty_body(self.compute, inner + INDENT))
         out.extend(pretty_body(self.body, inner))
         return out
 
@@ -1549,7 +1549,8 @@ def map_staged(body: Body, handler: StagedHandler, *, sources: dict[str, Source]
             for stage in s.stages:
                 for src in stage.sources:
                     inner[src.name] = src
-            out.append(s.with_bodies((Body(s.stages), map_staged(s.body, handler, sources=inner))))
+            compute = map_staged(s.compute, handler, sources=inner) if s.compute is not None else Body(())
+            out.append(s.with_bodies((Body(s.stages), compute, map_staged(s.body, handler, sources=inner))))
             continue
         if isinstance(s, WarpSpecialize):
             inner = dict(scope)

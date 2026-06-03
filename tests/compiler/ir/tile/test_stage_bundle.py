@@ -2,10 +2,11 @@
 
 Subclass hierarchy (``BufferedStage`` / ``AsyncBufferedStage`` /
 ``TmaBufferedStage`` / ``ComputeStage``) has been collapsed:
-``StageBundle`` carries the transport policy (``StagePolicy``) and
-policy-specific fields (``buffer_count`` / ``phase`` /
-``pipeline_depth``). ``Stage`` carries ``sources`` plus an optional
-``compute`` template body.
+``StageBundle`` carries the transport policy (``StagePolicy``),
+policy-specific fields (``buffer_count`` / ``phase`` / ``pipeline_depth``),
+and an optional hoisted-invariant ``compute`` phase body. ``Stage`` carries
+only ``sources`` — a homogeneous group of gmem transport operands behind one
+barrier; it holds no body of its own.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ def _stages_two() -> tuple[Stage, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Stage (single-class, optional compute)
+# Stage (sources-only — no body)
 # ---------------------------------------------------------------------------
 
 
@@ -51,46 +52,16 @@ def test_stage_requires_at_least_one_source():
         Stage(sources=())
 
 
-def test_stage_default_no_compute():
+def test_stage_is_sources_only():
     s = Stage(sources=(_source("w_smem", "w"),))
-    assert s.compute is None
     assert s.nested() == ()
     assert s.external_reads() == ("w",)
     assert s.local_decls() == ("w_smem",)
 
 
-def test_stage_compute_present_is_compute_stage():
-    """A Stage with compute != None is the old ComputeStage semantically:
-    sibling-smem → own-smem cooperative producer. external_reads() returns
-    empty because sibling-smem reads aren't external."""
-    s = Stage(
-        sources=(_source("a_smem", "a"),),
-        compute=Body((Load(name="ca", input="x_smem", index=(Var("i"),)),)),
-    )
-    assert s.compute is not None
-    assert s.nested() == (s.compute,)
-    assert s.external_reads() == ()  # sibling smem
-
-
-def test_stage_compute_body_coerced():
-    s = Stage(sources=(_source("a_smem", "a"),), compute=())  # type: ignore[arg-type]
-    assert isinstance(s.compute, Body)
-
-
-def test_stage_with_bodies_round_trip_compute():
-    s = Stage(
-        sources=(_source("a_smem", "a"),),
-        compute=Body((Load(name="ca", input="x_smem", index=(Var("i"),)),)),
-    )
-    new_compute = Body((Load(name="ca2", input="x_smem", index=(Var("j"),)),))
-    s2 = s.with_bodies((new_compute,))
-    assert isinstance(s2, Stage)
-    assert s2.compute == new_compute
-
-
-def test_stage_with_bodies_no_compute_expects_empty():
+def test_stage_with_bodies_expects_empty():
     s = Stage(sources=(_source("w_smem", "w"),))
-    # No compute → with_bodies expects no body args.
+    # Stage carries no body → with_bodies expects no body args.
     assert s.with_bodies(()) is s
     with pytest.raises(ValueError):
         s.with_bodies((Body(()),))
@@ -216,14 +187,45 @@ def test_bundle_tma_rejects_padded_source():
 # ---------------------------------------------------------------------------
 
 
-def test_nested_exposes_stages_as_synthetic_body():
-    """Body.iter traverses into stages naturally via the synthetic body."""
+def test_nested_exposes_stages_compute_and_body():
+    """nested() is (Body(stages), compute or Body(()), body). Body.iter
+    traverses into stages naturally via the synthetic body."""
     bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
     nested = bundle.nested()
-    assert len(nested) == 2
+    assert len(nested) == 3
     assert isinstance(nested[0], Body)
     assert tuple(nested[0]) == bundle.stages
-    assert nested[1] == bundle.body
+    assert nested[1] == Body(())  # no compute phase
+    assert nested[2] == bundle.body
+
+
+def test_nested_exposes_compute_phase():
+    compute = Body((Load(name="ca", input="w_smem", index=(Var("i"),)),))
+    bundle = StageBundle(stages=_stages_two(), body=_consumer_body(), compute=compute)
+    nested = bundle.nested()
+    assert len(nested) == 3
+    assert nested[1] == compute
+
+
+def test_compute_body_coerced():
+    bundle = StageBundle(stages=_stages_two(), body=_consumer_body(), compute=())  # type: ignore[arg-type]
+    assert isinstance(bundle.compute, Body)
+
+
+def test_with_bodies_round_trips_compute():
+    compute = Body((Load(name="ca", input="w_smem", index=(Var("i"),)),))
+    bundle = StageBundle(stages=_stages_two(), body=_consumer_body(), compute=compute)
+    new_compute = Body((Load(name="ca2", input="w_smem", index=(Var("j"),)),))
+    new = bundle.with_bodies((Body(bundle.stages), new_compute, bundle.body))
+    assert new.compute == new_compute
+
+
+def test_with_bodies_empty_compute_collapses_to_none():
+    """An empty middle body (the ``Body(())`` placeholder for an absent
+    compute phase) collapses back to ``None`` so the structure round-trips."""
+    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+    new = bundle.with_bodies((Body(bundle.stages), Body(()), bundle.body))
+    assert new.compute is None
 
 
 def test_body_iter_yields_stages_inside_bundle():
@@ -250,7 +252,7 @@ def test_with_bodies_round_trip():
     )
     new_stage = Stage(sources=(_source("z_smem", "z"),))
     new_body = Body((Load(name="v2", input="z_smem", index=(Var("c"),)),))
-    new_bundle = bundle.with_bodies((Body((new_stage,)), new_body))
+    new_bundle = bundle.with_bodies((Body((new_stage,)), Body(()), new_body))
     assert isinstance(new_bundle, StageBundle)
     assert new_bundle.stages == (new_stage,)
     assert new_bundle.body == new_body
@@ -261,7 +263,7 @@ def test_with_bodies_round_trip():
 
 def test_with_bodies_wrong_count_rejected():
     bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
-    with pytest.raises(ValueError, match="expected 2 bodies"):
+    with pytest.raises(ValueError, match="expected 3 bodies"):
         bundle.with_bodies((Body(()),))
 
 
@@ -275,13 +277,12 @@ def test_external_reads_concatenates_member_reads():
     assert bundle.external_reads() == ("w", "y")
 
 
-def test_external_reads_skips_compute_stage_members():
-    """Stage members with compute != None contribute no external reads
-    (they read from sibling smem)."""
-    s_compute = Stage(sources=(_source("a_smem", "a"),), compute=Body(()))
-    s_plain = Stage(sources=(_source("w_smem", "w"),))
-    bundle = StageBundle(stages=(s_compute, s_plain), body=Body(()))
-    assert bundle.external_reads() == ("w",)
+def test_external_reads_ignores_compute_phase():
+    """The compute phase reads sibling smem (not external gmem), so it
+    contributes no external reads — only the transport stages' bufs do."""
+    compute = Body((Load(name="ca", input="w_smem", index=(Var("i"),)),))
+    bundle = StageBundle(stages=_stages_two(), body=Body(()), compute=compute)
+    assert bundle.external_reads() == ("w", "y")
 
 
 def test_local_decls_concatenates_member_decls():

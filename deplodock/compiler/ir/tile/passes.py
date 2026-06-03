@@ -41,18 +41,14 @@ from deplodock.compiler.ir.tile.ir import (
 
 @rewrite.register
 def _(s: Stage, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    kwargs = _stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn)
-    if s.compute is not None:
-        kwargs["compute"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.compute)
-    return type(s)(**kwargs)
+    # Stage carries only ``sources`` (Expr in origins / template exprs);
+    # ``_stage_kwargs`` walks those, and Stage holds no nested Stmt body.
+    return type(s)(**_stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn))
 
 
 @simplify.register
 def _(s: Stage, ctx: SimplifyCtx) -> Stmt:
-    kwargs = _stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a)
-    if s.compute is not None:
-        kwargs["compute"] = tuple(simplify(c, ctx) for c in s.compute)
-    return type(s)(**kwargs)
+    return type(s)(**_stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a))
 
 
 @rewrite.register
@@ -60,6 +56,8 @@ def _(s: StageBundle, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     kwargs = _stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn)
     kwargs["stages"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.stages)
     kwargs["body"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
+    if s.compute is not None:
+        kwargs["compute"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.compute)
     return type(s)(**kwargs)
 
 
@@ -68,6 +66,8 @@ def _(s: StageBundle, ctx: SimplifyCtx) -> Stmt:
     kwargs = _stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a)
     kwargs["stages"] = tuple(simplify(c, ctx) for c in s.stages)
     kwargs["body"] = tuple(simplify(c, ctx) for c in s.body)
+    if s.compute is not None:
+        kwargs["compute"] = tuple(simplify(c, ctx) for c in s.compute)
     return type(s)(**kwargs)
 
 

@@ -35,7 +35,6 @@ from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
     SerialTile,
-    Stage,
     StageBundle,
     StridedTile,
     ThreadTile,
@@ -207,14 +206,13 @@ def _accums_under_reduces_only(stmt: Stmt) -> list[Accum]:
         # StageBundle: consumer subtree (containing the reduce + Accum)
         # lives inside bundle.body. Walk through it so Accums get their Init
         # placed at the enclosing scope (the bundle is transparent for
-        # accumulator scoping).
+        # accumulator scoping). The cooperative compute phase could in
+        # principle hold an Accum too — descend it as well.
         for child in stmt.body:
             out.extend(_accums_under_reduces_only(child))
-    elif isinstance(stmt, Stage) and stmt.compute is not None:
-        # A Stage with a compute template (formerly ComputeStage) — accums
-        # could in principle live in the cooperative compute body; descend.
-        for child in stmt.compute:
-            out.extend(_accums_under_reduces_only(child))
+        if stmt.compute is not None:
+            for child in stmt.compute:
+                out.extend(_accums_under_reduces_only(child))
     return out
 
 

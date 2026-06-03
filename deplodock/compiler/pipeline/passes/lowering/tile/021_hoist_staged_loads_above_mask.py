@@ -142,10 +142,11 @@ def _lift_if_match(s: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt | 
 
 def _stamp_gmem_extents(stmt: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt:
     """Recursively rewrite ``stmt`` so every ``StageBundle`` Source whose
-    ``buf`` is a static-shaped kernel input carries ``gmem_extents``. Only
-    transport Sources (``Stage.compute is None``) get stamped — a
-    hoisted-compute stage reads sibling smem, not gmem. Both affine and
-    template (reshape) addressings are stamped: a masked weight's smem slab
+    ``buf`` is a static-shaped kernel input carries ``gmem_extents``. This
+    pass runs before ``030_hoist_invariant_compute``, so no bundle carries a
+    ``compute`` phase yet — every Source here is a gmem transport operand.
+    Both affine and template (reshape) addressings are stamped: a masked
+    weight's smem slab
     is often template-addressed (the very case that overruns).
     ``_stage_expand._clamp_source_index`` handles both index shapes — per-dim
     when the ``source_index`` rank matches ``gmem_extents``, and a single
@@ -154,9 +155,6 @@ def _stamp_gmem_extents(stmt: Stmt, input_shapes: dict[str, tuple[int, ...]]) ->
     if isinstance(stmt, StageBundle):
         new_stages: list[Stage] = []
         for stage in stmt.stages:
-            if stage.compute is not None:
-                new_stages.append(stage)
-                continue
             new_sources = tuple(
                 replace(src, gmem_extents=input_shapes[src.buf]) if src.buf in input_shapes and src.gmem_extents is None else src
                 for src in stage.sources

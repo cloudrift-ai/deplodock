@@ -73,7 +73,12 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
-from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import emit_compute_stage, emit_stage, smem_cuda_dtype
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
+    compute_phase_info,
+    emit_compute_phase,
+    emit_stage,
+    smem_cuda_dtype,
+)
 from deplodock.compiler.pipeline.passes.lowering.kernel._tma_groups import partition_tma_groups
 
 PATTERN = [Pattern("root", TileOp)]
@@ -276,6 +281,24 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 smem_align = _TMA_ALIGN_BYTES if is_tma else (16 if smem_dtype == "__half" else 0)
                 compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
                 declared_smem.add(src.name)
+        # Hoisted-compute phase: the fused slab is no longer carried as a
+        # ``Source``, so pre-emit its kernel-scope Smem decl here — right
+        # after the transport sources (byte-identical first-seen order).
+        # Name / cache axes / dtype are recovered from the self-describing
+        # compute body (its single Write + the cone sources it reads).
+        if stmt.compute is not None:
+            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+            all_sources = tuple(src for member in stmt.stages for src in member.sources)
+            fused_name, fused_axes, fused_value_dtype = compute_phase_info(stmt.compute, all_sources)
+            if fused_name not in declared_smem:
+                fused_extents = tuple(ax.extent.as_static() for ax in fused_axes)
+                if buf_count > 1:
+                    fused_extents = (buf_count, *fused_extents)
+                fused_dtype = cuda_name(fused_value_dtype) if fused_value_dtype is not None else "float"
+                fused_align = 16 if fused_dtype == "__half" else 0
+                compute_stage_prologue.append(Smem(name=fused_name, extents=fused_extents, dtype=fused_dtype, align=fused_align))
+                declared_smem.add(fused_name)
 
     tma = partition_tma_groups(body)
 
@@ -484,14 +507,15 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         return out
 
     def emit_bundle_producer(bundle: StageBundle) -> list[Stmt]:
-        """Emit producer-side scaffolding for every member Stage of a
-        bundle. Dispatch:
+        """Emit producer-side scaffolding for a bundle. Dispatch:
 
-        - ``member.compute is not None`` → cooperative compute template
-          (formerly ``ComputeStage``).
-        - ``bundle.policy == TMA`` → TMA box copy.
+        - ``bundle.policy == TMA`` → TMA box copy per transport stage.
         - otherwise (SYNC / BUFFERED / ASYNC) → cooperative
-          ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC).
+          ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC) per stage.
+
+        Then, if ``bundle.compute`` is set, the hoisted-invariant
+        cooperative compute phase is emitted after all transport stages
+        (reads the just-staged sibling slabs, fills the fused slab).
 
         For unpipelined TMA bundles (``pipeline_depth == 1``) with
         multiple stages, the per-stage mbarrier is shared with
@@ -502,9 +526,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         """
         out: list[Stmt] = []
         for member in bundle.stages:
-            if member.compute is not None:
-                out.extend(emit_compute_stage(member, tid_expr, n_threads, buffer_count=bundle.buffer_count))
-            elif bundle.policy == StagePolicy.TMA:
+            if bundle.policy == StagePolicy.TMA:
                 out.extend(emit_tma_stage(bundle, member))
             else:
                 out.extend(
@@ -518,10 +540,13 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                         pipeline_depth=bundle.pipeline_depth,
                     )
                 )
+        if bundle.compute is not None:
+            all_sources = tuple(src for member in bundle.stages for src in member.sources)
+            out.extend(emit_compute_phase(bundle.compute, all_sources, tid_expr, n_threads, buffer_count=bundle.buffer_count))
         # Unpipelined TMA: trailing wait+sync once after all stages
         # arrived (mbarrier ``arrive_count = N`` is met).
         if bundle.policy == StagePolicy.TMA and bundle.pipeline_depth == 1:
-            tma_members = [m for m in bundle.stages if m.compute is None]
+            tma_members = list(bundle.stages)
             if tma_members:
                 first_src = tma_members[0].sources[0]
                 gid = tma.stage_group[first_src.name]
