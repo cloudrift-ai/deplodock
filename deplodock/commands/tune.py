@@ -79,6 +79,33 @@ def register_tune_command(subparsers):
             "to <dump-dir>/kernels.html when a dump dir is set. Can take minutes on a large model."
         ),
     )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help=(
+            "After tuning (and --bench, if set), compress the local tuning DB and upload it as a "
+            "per-GPU release asset on the deplodock GitHub release, updating tune-data-index.json. "
+            "Requires the `gh` CLI to be installed and authenticated."
+        ),
+    )
+    parser.add_argument(
+        "--pull",
+        action="store_true",
+        help=(
+            "Before tuning, pull the published DB matching this GPU into the local cache (a no-op "
+            "if no entry is available). Lets the tuner warm-start from previously-published configs."
+        ),
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip every network call (no manifest fetch, no auto-attach of published data).",
+    )
+    parser.add_argument(
+        "--contributor",
+        default="",
+        help="With --publish: optional contributor handle (e.g. @username) recorded in the manifest entry.",
+    )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --bench random inputs (default: 0).")
@@ -169,6 +196,22 @@ def handle_tune(args):
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
 
+    # Warm-start: pull a published DB matching this GPU into the local cache and
+    # ATTACH it so the inner search reads its perf rows as a prior. ``--offline``
+    # skips. Errors are logged and swallowed — tuning proceeds with local data
+    # only.
+    if args.offline:
+        os.environ["DEPLODOCK_NO_FETCH"] = "1"
+    if args.pull or args.publish:
+        # ``--pull`` is implied by ``--publish`` (we want fresh state before
+        # uploading); both go through the same attach helper.
+        try:
+            from deplodock.publish.autofetch import ensure_published_attached
+
+            ensure_published_attached(db)
+        except Exception as exc:  # noqa: BLE001 — autofetch is best-effort
+            logger.info("warm-start skipped: %s", exc)
+
     # Live progress bar — default verbosity on a tty only. Disabled under -v
     # (the [tune] INFO lines show progress instead) and -q (errors only), and
     # when stderr is redirected (no \r smearing in piped logs).
@@ -221,6 +264,8 @@ def handle_tune(args):
 
     if args.bench and result.assembled is not None:
         _run_bench(args, bench_bundle, result.assembled, dump, html_dir=html_dir)
+    if args.publish:
+        _publish_local_db(args, db_path)
     if tmp_dump_dir is not None:
         import shutil
 
@@ -236,6 +281,23 @@ def handle_tune(args):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
+
+
+def _publish_local_db(args, db_path) -> None:
+    """``--publish`` wrapper around :func:`deplodock.publish.publish_flow.publish_local_db`.
+
+    Logs and continues on failure rather than calling ``sys.exit`` — the tuning
+    run itself already succeeded; failure to publish is recoverable (try again
+    later via ``deplodock tune-data publish``)."""
+    try:
+        from deplodock.detect import detect_local_gpus
+        from deplodock.publish.publish_flow import publish_local_db
+
+        gpu_name, _ = detect_local_gpus()
+        entry = publish_local_db(db_path, gpu_name, contributor=args.contributor)
+        sys.stderr.write(f"\n[tune] --publish: uploaded {entry.url}\n")
+    except Exception as exc:  # noqa: BLE001 — publish failures are operational, not fatal
+        sys.stderr.write(f"\n[tune] --publish failed ({exc}); re-run `deplodock tune-data publish` to retry\n")
 
 
 def _clean_caches(db_path) -> None:

@@ -177,6 +177,26 @@ class SearchDB:
             PRIMARY KEY (context_key, op_key, backend)
         )
         """,
+        # ``golden`` — curated golden configs loaded from ``goldens/*.yaml`` (see
+        # :mod:`deplodock.publish.goldens`). The repo, not the autotune sweep, is
+        # the source of truth; this table is a derived view materialized by
+        # :func:`deplodock.publish.goldens_to_db.load_goldens_into` so a single
+        # SQL query returns "the best known config" regardless of origin. Idempotent:
+        # ``(name)`` PK upserts overwrite; ``UPDATE`` never narrows fields. ``payload``
+        # carries the full YAML entry as JSON so kind-specific fields (``M``/``N``/``K``
+        # for matmul, etc.) are queryable without per-kind schema growth.
+        """
+        CREATE TABLE IF NOT EXISTS golden (
+            name          TEXT PRIMARY KEY,
+            kind          TEXT NOT NULL,
+            gpu_name      TEXT NOT NULL,
+            compute_cap   TEXT NOT NULL,
+            knobs         TEXT NOT NULL,
+            deplodock_us  REAL NOT NULL,
+            cublas_us     REAL NOT NULL,
+            payload       TEXT NOT NULL
+        )
+        """,
         # ``op_effort`` — how hard the per-op inner search has tried each
         # op, keyed by ``(context_key, op_key)``. ``effort`` is the
         # patience the inner ``TuningSearch`` ran with, or ``inf`` once
@@ -488,6 +508,87 @@ class SearchDB:
             return None
         perf = self.lookup_perf(context_key, cur, backend=backend)
         return perf.stats.median if perf is not None and perf.status == "ok" else None
+
+    # ------------------------------------------------------------------
+    # Golden configs (materialized from goldens/*.yaml)
+    # ------------------------------------------------------------------
+
+    def record_golden(
+        self,
+        *,
+        name: str,
+        kind: str,
+        gpu_name: str,
+        compute_cap: tuple[int, int],
+        knobs: dict,
+        deplodock_us: float,
+        cublas_us: float,
+        payload: dict,
+    ) -> None:
+        """Upsert one golden config row by ``name``. Re-running the loader is
+        idempotent and overwrites with the latest YAML state — goldens are a
+        derived view of ``goldens/*.yaml``, never edited in-DB."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO golden "
+            "(name, kind, gpu_name, compute_cap, knobs, deplodock_us, cublas_us, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                name,
+                kind,
+                gpu_name,
+                json.dumps(list(compute_cap)),
+                json.dumps(knobs, sort_keys=True, default=str),
+                float(deplodock_us),
+                float(cublas_us),
+                json.dumps(payload, sort_keys=True, default=str),
+            ),
+        )
+
+    def iter_goldens(self, *, kind: str | None = None, gpu_name: str | None = None) -> Iterator[dict]:
+        """Yield golden rows as plain dicts (knobs/compute_cap/payload pre-parsed).
+
+        Optional filters narrow by ``kind`` (e.g. ``"matmul"``) and ``gpu_name``."""
+        sql = "SELECT name, kind, gpu_name, compute_cap, knobs, deplodock_us, cublas_us, payload FROM golden"
+        clauses, params = [], []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if gpu_name is not None:
+            clauses.append("gpu_name = ?")
+            params.append(gpu_name)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        for row in self._conn.execute(sql, params):
+            yield {
+                "name": row[0],
+                "kind": row[1],
+                "gpu_name": row[2],
+                "compute_cap": tuple(json.loads(row[3])),
+                "knobs": json.loads(row[4]),
+                "deplodock_us": row[5],
+                "cublas_us": row[6],
+                "payload": json.loads(row[7]),
+            }
+
+    # ------------------------------------------------------------------
+    # Attach a read-only published DB alongside the local writeable one
+    # ------------------------------------------------------------------
+
+    def attach_published(self, path: Path | str, alias: str = "pub") -> None:
+        """ATTACH ``path`` as ``alias`` so callers can ``UNION ALL`` across
+        local and published tables. No-op when already attached under the same
+        alias.
+
+        Idempotent: re-ATTACH on the same alias is a SQLite error, so we check
+        ``PRAGMA database_list`` first. Callers must coordinate alias names —
+        the convention is ``pub`` for the single published DB matching this
+        process's GPU. The published file is treated as immutable by callers
+        (no INSERT/UPDATE on ``alias.*``); we don't enforce read-only at the
+        SQLite layer to keep the connect path simple."""
+        existing = {row[1] for row in self._conn.execute("PRAGMA database_list")}
+        if alias in existing:
+            return
+        self._conn.execute("ATTACH DATABASE ? AS " + alias, (str(Path(path).resolve()),))
 
     # ------------------------------------------------------------------
     # House-keeping

@@ -15,6 +15,7 @@ from deplodock.commands.run import register_run_command
 from deplodock.commands.teardown import register_teardown_command
 from deplodock.commands.trace import register_trace_command
 from deplodock.commands.tune import register_tune_command
+from deplodock.commands.tune_data import register_tune_data_command
 from deplodock.commands.vm import register_vm_command
 from deplodock.logging_setup import setup_cli_logging
 
@@ -41,6 +42,7 @@ def main():
     register_trace_command(subparsers)
     register_compile_command(subparsers)
     register_tune_command(subparsers)
+    register_tune_data_command(subparsers)
     register_run_command(subparsers)
     register_inspect_command(subparsers)
     register_knobs_command(subparsers)

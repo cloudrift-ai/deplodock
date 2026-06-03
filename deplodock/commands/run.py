@@ -18,6 +18,17 @@ from deplodock import config
 logger = logging.getLogger(__name__)
 
 
+def _try_autofetch(db) -> None:
+    """Best-effort attach of the published tune-data DB matching this GPU
+    (mirror of the helper in :mod:`deplodock.commands.compile`)."""
+    try:
+        from deplodock.publish.autofetch import ensure_published_attached
+
+        ensure_published_attached(db)
+    except Exception as exc:  # noqa: BLE001 — autofetch is best-effort
+        logger.debug("autofetch skipped (%s)", exc)
+
+
 def register_run_command(subparsers):
     parser = subparsers.add_parser("run", help="Compile + run an inline torch expression on the CUDA backend")
     parser.add_argument(
@@ -824,12 +835,14 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     frontend = graph.copy() if torch_ref.is_runnable(graph) else None
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
-    db = None
-    if backend.tune_db is not None and backend.tune_db.exists():
-        from deplodock.compiler.pipeline.search.db import SearchDB
+    from deplodock.compiler.pipeline.search.db import SearchDB
 
+    if backend.tune_db is not None and backend.tune_db.exists():
         db = SearchDB(path=backend.tune_db)
         logger.info("Using tuning DB: %s", backend.tune_db)
+    else:
+        db = SearchDB()
+    _try_autofetch(db)
     if tail:
         # Thread the tune DB through the tail lowering so greedy fork selection
         # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered

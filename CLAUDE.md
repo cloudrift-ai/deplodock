@@ -11,6 +11,7 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **CLI usage** (deploy local/ssh/cloud, bench, teardown, vm, hardware-aware deploy, fixed-host mode, experiments, CI workflow) → [`deplodock/commands/ARCHITECTURE.md`](deplodock/commands/ARCHITECTURE.md)
 - **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`deplodock/recipe/ARCHITECTURE.md`](deplodock/recipe/ARCHITECTURE.md)
 - **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
+- **Publish & distribute tuning data** (goldens YAML, per-GPU release-asset DBs, manifest, autofetch on compile/run) → [`deplodock/publish/ARCHITECTURE.md`](deplodock/publish/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before answering — they hold details that are no longer in the README.
 
@@ -26,6 +27,9 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
 `DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
 …) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
+The publish/autofetch path adds `DEPLODOCK_NO_FETCH`, `DEPLODOCK_TUNE_DATA_REPO`, `DEPLODOCK_RELEASE`,
+`DEPLODOCK_PUBLISHED_CACHE`, `DEPLODOCK_GOLDENS_DIR`, `DEPLODOCK_GH_BIN` — these live with the publish package
+(`deplodock/publish/ARCHITECTURE.md`) since they only matter when distributing tune data, not in the compile path.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
 layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
 `compiler/pipeline/knob.py` (which borrows `config.knob_var` / `config.knob_raw`); provider/secret vars stay with

@@ -157,7 +157,7 @@ def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
     mma.sync tile for 2048² fp16: a **square 64×64 output tile on a 4-warp
     CTA with WARP_SPECIALIZE** — ``WN=4 WM=1 FM=4 FN=2 BK=2 BUFFER_COUNT=2``
     (M-tile = WM·FM·16 = 64, N-tile = WN·FN·atom_n = 4·2·8 = 64). This matches
-    ``golden_configs.square.2048.fp16`` (≈107 µs / 1.06× cuBLAS on RTX 5090).
+    the ``square.2048.fp16`` entry in ``goldens/matmul.yaml`` (≈107 µs / 1.06× cuBLAS on RTX 5090).
     ``WM=1 WN=4`` and the balanced ``WM=2 WN=2`` give the identical 64×64 tile
     and are perf-equal; the deterministic enumeration order picks the former.
 

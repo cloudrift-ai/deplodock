@@ -240,6 +240,18 @@ def register_compile_command(subparsers):
     parser.set_defaults(func=handle_compile)
 
 
+def _try_autofetch(db) -> None:
+    """Best-effort: attach the published tune-data DB matching this GPU. Fail-open
+    — any network / GPU / manifest failure logs at debug and proceeds with the
+    local DB only. ``DEPLODOCK_NO_FETCH=1`` opts out entirely."""
+    try:
+        from deplodock.publish.autofetch import ensure_published_attached
+
+        ensure_published_attached(db)
+    except Exception as exc:  # noqa: BLE001 — autofetch is best-effort
+        logger.debug("autofetch skipped (%s)", exc)
+
+
 def handle_compile(args):
     if args.code and args.input:
         logger.error("--code and positional input are mutually exclusive")
@@ -265,13 +277,16 @@ def handle_compile(args):
     # Pick tuned forks from the DB when one is reachable; otherwise the
     # engine falls back to rule defaults (greedy option-0). Compile never
     # errors on a missing DB — that's only a hint, not a requirement.
-    # ``DEPLODOCK_TUNE_DB`` env var overrides the default path.
+    # ``DEPLODOCK_TUNE_DB`` env var overrides the default path. Open an
+    # empty DB even when no file exists so autofetch can ATTACH a published
+    # DB alongside it — the read side just sees the union.
     tune_db_path = resolve_tune_db()
-    db = SearchDB(path=tune_db_path) if tune_db_path.exists() else None
-    if db is not None:
+    db = SearchDB(path=tune_db_path) if tune_db_path.exists() else SearchDB()
+    if tune_db_path.exists():
         logger.info("Using tuning DB: %s", tune_db_path)
     else:
         logger.debug("No tuning DB at %s — using rule defaults", tune_db_path)
+    _try_autofetch(db)
 
     result = Pipeline.build(passes, dump=dump).run(graph, db=db)
 
