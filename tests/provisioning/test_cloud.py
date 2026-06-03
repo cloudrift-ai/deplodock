@@ -7,7 +7,13 @@ import pytest
 import yaml
 
 from deplodock.provisioning.candidates import VmCandidate
-from deplodock.provisioning.cloud import _provision_cloudrift, delete_cloud_vm, resolve_vm_spec
+from deplodock.provisioning.cloud import (
+    _provision_cloudrift,
+    _ssh_keys_metadata_value,
+    delete_cloud_vm,
+    read_public_key_files,
+    resolve_vm_spec,
+)
 from deplodock.provisioning.types import VMConnectionInfo
 from deplodock.recipe import load_recipe
 
@@ -241,3 +247,63 @@ async def test_provision_cloudrift_no_network(mock_create, tmp_path):
 
     assert conn is not None
     assert mock_create.call_args.kwargs["network"] is None
+
+
+# ── read_public_key_files (extra authorized keys) ────────────────
+
+
+def test_read_public_key_files_reads_all(tmp_path):
+    a = tmp_path / "alice.pub"
+    a.write_text("ssh-ed25519 AAAA alice@host\n")
+    b = tmp_path / "bob.pub"
+    b.write_text("ssh-ed25519 BBBB bob@host\n")
+
+    keys = read_public_key_files([str(a), str(b)])
+
+    assert keys == ["ssh-ed25519 AAAA alice@host", "ssh-ed25519 BBBB bob@host"]
+
+
+def test_read_public_key_files_none_returns_empty():
+    assert read_public_key_files(None) == []
+
+
+def test_read_public_key_files_missing_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="missing.pub"):
+        read_public_key_files([str(tmp_path / "missing.pub")])
+
+
+def test_read_public_key_files_empty_raises(tmp_path):
+    empty = tmp_path / "empty.pub"
+    empty.write_text("   \n")
+    with pytest.raises(ValueError, match="empty"):
+        read_public_key_files([str(empty)])
+
+
+# ── _ssh_keys_metadata_value (GCP) ───────────────────────────────
+
+
+def test_ssh_keys_metadata_value_single():
+    assert _ssh_keys_metadata_value("deploy", "ssh-ed25519 AAAA own@host", None) == "deploy:ssh-ed25519 AAAA own@host"
+
+
+def test_ssh_keys_metadata_value_multiple():
+    value = _ssh_keys_metadata_value("deploy", "ssh-ed25519 AAAA own@host", ["ssh-ed25519 BBBB bob@host"])
+    assert value == "deploy:ssh-ed25519 AAAA own@host\ndeploy:ssh-ed25519 BBBB bob@host"
+
+
+@patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
+@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+async def test_provision_cloudrift_forwards_extra_keys(mock_create, tmp_path):
+    """extra_authorized_keys is forwarded to create_instance as extra_public_keys."""
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("private-key")
+    pub_file = tmp_path / "id_ed25519.pub"
+    pub_file.write_text("ssh-ed25519 AAAA test@host\n")
+
+    mock_create.return_value = VMConnectionInfo(host="1.2.3.4", username="user", ssh_port=22222)
+
+    extra = ["ssh-ed25519 BBBB bob@host"]
+    conn = await _provision_cloudrift(_cr_cand(), str(key_file), {}, False, logging.getLogger(), extra)
+
+    assert conn is not None
+    assert mock_create.call_args.kwargs["extra_public_keys"] == extra

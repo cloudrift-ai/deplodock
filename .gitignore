@@ -25,6 +25,7 @@ nginx.vllm.conf
 .env
 .env.local
 .env.*.local
+.env.*
 tests/perf/.results/
 _test_data
 

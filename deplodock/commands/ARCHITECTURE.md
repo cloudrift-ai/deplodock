@@ -263,6 +263,17 @@ deplodock vm delete cloudrift --instance-id <id>
 
 CloudRift attach to a specific network with `--network <name>` (on `vm create cloudrift`, `vm create gpu`, `deploy cloud`, and `bench`). The name must exist in the target datacenter; omit to let CloudRift pick a public network.
 
+**Extra authorized keys.** `--ssh-key` is the *private* key deplodock connects with; its `.pub` is always installed in
+the VM's `authorized_keys`. To grant additional people access, pass `--authorized-key PATH` (repeatable, on `vm create
+gpu` and `deploy cloud`) — each points to one public key file. The authorized set becomes `[ssh-key's .pub] + [every
+--authorized-key]` (CloudRift via the rent payload's `PublicKeys` list; GCP via newline-joined `ssh-keys` metadata).
+Missing or empty key files fail fast before any VM is provisioned.
+
+```bash
+deplodock vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 --provider cloudrift \
+  --authorized-key ~/.ssh/alice.pub --authorized-key ~/.ssh/bob.pub
+```
+
 #### Allocation strategy (shared by `deploy cloud`, `bench`, `vm create gpu`)
 
 All three commands go through `provision_cloud_vm()` in `deplodock/provisioning/cloud.py`. It enumerates *candidates* from `hardware.GPU_INSTANCE_TYPES` (preference-ordered) and, for GCP, fans out across the zones listed in `GPU_GCP_ZONES`. For each candidate it makes up to `SAME_CANDIDATE_RETRIES` attempts on transient failures, then advances. Providers signal "no capacity, try next" by raising `CapacityExhausted`; non-retryable errors raise `TerminalProvisionError` and abort. Fallback never silently crosses provider boundaries — `--provider` (or the first hardware-table entry) bounds the search.
