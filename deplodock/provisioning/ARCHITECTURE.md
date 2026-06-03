@@ -52,7 +52,7 @@ When every candidate is exhausted, the orchestrator returns `None` and logs the 
 
 `errors.py` defines two exceptions that providers raise to communicate intent:
 
-* **`CapacityExhausted`** — the current candidate has no capacity. Raised for CloudRift HTTP 503/429 on rent, CloudRift `Inactive` terminal status / readiness timeout, GCP `ZONE_RESOURCE_POOL_EXHAUSTED` / `QUOTA_EXCEEDED` / `STOCKOUT` in `gcloud create` stderr, and GCP RUNNING-status timeout. Recoverable by trying a different candidate.
+* **`CapacityExhausted`** — the current candidate has no capacity. Raised for CloudRift HTTP 503/429 on rent, CloudRift `Inactive` / `Failed` terminal status / readiness timeout, GCP `ZONE_RESOURCE_POOL_EXHAUSTED` / `QUOTA_EXCEEDED` / `STOCKOUT` in `gcloud create` stderr, and GCP RUNNING-status timeout. Recoverable by trying a different candidate.
 * **`TerminalProvisionError`** — auth, malformed request, anything that will recur on any candidate. Raised for CloudRift HTTP 4xx (other than 429) and unrecognized non-zero `gcloud create` exit. Not recoverable; propagated to caller.
 
 Anything else a provider raises is treated as transient by the orchestrator.
@@ -80,6 +80,28 @@ Both providers swallow termination errors and log them — the original failure 
 
 Mismatches leave the GPU unusable because the wrong kernel-module flavor is on disk. The proprietary-driver image
 mirrors the recipe CloudRift's `rift-console` surfaces only for hosts whose `brand_short` matches `/\bV100|P100\b/`.
+
+## CloudRift API protocol version
+
+Every CloudRift request carries an envelope `{"version": API_VERSION, "data": {...}}`. The server versions its public
+types by calendar date and decodes each request against the newest declared schema whose date is `<= API_VERSION` (an
+unknown in-between date silently resolves *down* to the nearest older schema). `API_VERSION` (`cloudrift.py`) is pinned
+to `2026-05-26`, the **v059** generation: `instances/rent` resolves to v059, `instances/list` to v058, and
+`instances/terminate` to v055. Pin to a date rather than `~upcoming` (CloudRift's own client default) so a future server
+release can't change request/response shapes under us.
+
+Two v059-era behaviours the client relies on:
+
+* **`instances/list` mask.** v058 added a `mask` (`with_connection_info` / `with_hardware_info` / `with_usage_info`,
+  all default-false) and honours it for v058+ callers — older callers were force-fed `ALL`. `_get_instance_info` sends
+  `{"with_connection_info": True}` only: `host_address` / `port_mappings` / login info are gated behind that flag, while
+  `status` and `virtual_machines` (the `ready` flag + credentials) are ungated. We read no hardware/usage fields, so
+  leaving those flags off lets the server skip those lookups. **Dropping the mask would null out host/port and break
+  SSH.**
+* **`Failed` status.** v059 reports a first-class `Failed` status plus a `failure` object (`cause`, `user_message`).
+  `wait_for_status` treats `Failed` as terminal regardless of the caller's `fail_statuses` and logs `user_message`, so a
+  failed rental fails fast with a reason instead of polling until timeout (the `None` return then flows through the
+  orphan-cleanup path to `CapacityExhausted`).
 
 ## Adding a new provider
 
