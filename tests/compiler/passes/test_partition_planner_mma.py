@@ -146,6 +146,123 @@ def test_mma_eligibility_rejects_indivisible_extents():
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
+def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
+    """Matmul whose accumulator feeds a post-reduce ``add(acc, r)`` (fused
+    residual) before the Write — the mma fragment-store can't apply it."""
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Load(name="r", input="r", index=(Var("i"), Var("j"))),
+                            Assign(name="e", op=ElementwiseImpl("add"), args=("acc", "r")),
+                            Write(output="c", index=(Var("i"), Var("j")), value="e"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _matmul_collapsed_k_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
+    """Matmul whose A operand spreads the K axis across two index dims (a
+    collapsed-reshape access ``020_stage_inputs`` can't stage)."""
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("k"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_mma_eligibility_rejects_fused_epilogue():
+    """A matmul whose accumulator feeds a post-reduce ``add`` (fused residual)
+    is gated off — the mma fragment-store path drops the epilogue and leaves
+    the scalar accumulator undefined at codegen."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    op = _matmul_with_epilogue_loop_op()
+    g.nodes["c"].op = op
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
+def test_mma_eligibility_rejects_collapsed_k_operand():
+    """An operand whose K axis spans two index dims (collapsed reshape, e.g.
+    an attention output reaching the o_proj) can't be staged for ldmatrix."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    op = _matmul_collapsed_k_loop_op()
+    g.nodes["c"].op = op
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
+def test_mma_eligibility_rejects_in_kernel_intermediate():
+    """An operand buffer also produced (Written) inside the same kernel is a
+    register-resident intermediate — not a stage-able gmem input."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    i, j, k = Axis("i", 64), Axis("j", 64), Axis("k", 64)
+    op = LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            # Produce buffer "a" in-kernel, then consume it as a matmul operand.
+                            Load(name="bv", input="b", index=(Var("i"), Var("j"))),
+                            Write(output="a", index=(Var("i"), Var("j")), value="bv"),
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b2", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b2")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    g.nodes["c"].op = op
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
 def test_unregistered_kind_raises():
     """The dispatcher has no fallback — an unknown kind surfaces a
     ``KeyError`` rather than silently returning False. "scalar" is the

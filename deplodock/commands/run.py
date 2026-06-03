@@ -19,14 +19,23 @@ logger = logging.getLogger(__name__)
 
 
 def register_run_command(subparsers):
-    parser = subparsers.add_parser("run", help="Compile + run an inline torch expression on the CUDA backend")
+    parser = subparsers.add_parser("run", help="Compile + run a model / inline torch expression on the CUDA backend")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        help=(
+            "HuggingFace model ID or .json IR file. A model ID is traced + compiled + executed and "
+            "(with --bench) timed end-to-end against the real torch module; a .json IR file behaves "
+            "like --ir. Mutually exclusive with --code / --ir."
+        ),
+    )
     parser.add_argument(
         "--code",
         "-c",
         help=(
             "Inline Python expression whose last statement is a call (same grammar as "
             "``compile --code``). Example: 'torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))'. "
-            "Mutually exclusive with --ir."
+            "Mutually exclusive with the positional input / --ir."
         ),
     )
     parser.add_argument(
@@ -34,8 +43,21 @@ def register_run_command(subparsers):
         help=(
             "Path to a JSON IR dump (any stage: torch / tensor / loop / tile / kernel / cuda). "
             "The remaining lowering passes are run, then the kernel(s) are executed with random "
-            "inputs and benchmarked. Skips eager accuracy check (no reference model available)."
+            "inputs and benchmarked. Skips eager accuracy check (no reference model available). "
+            "Equivalent to passing the same .json path as the positional input."
         ),
+    )
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=None,
+        help="Layer index (when the positional input is a model ID). Omit to run the whole model.",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=32,
+        help="Sequence length for full-model tracing when the input is a model ID (default: 32).",
     )
     parser.add_argument(
         "--bench", "-b", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table."
@@ -44,7 +66,7 @@ def register_run_command(subparsers):
         "--profile",
         action="store_true",
         help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
-        "(SM-active %, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %). Skipped if "
+        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%). Skipped if "
         "ncu is not on PATH or the user lacks performance-counter permissions.",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
@@ -115,31 +137,36 @@ def handle_run(args):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.commands.trace import trace_inline_code
+    from deplodock.commands.compile import load_or_trace
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline.dump import CompilerDump
 
-    if args.ir is not None and args.code is not None:
-        logger.error("--ir and --code are mutually exclusive")
+    if sum(x is not None for x in (args.input, args.code, args.ir)) > 1:
+        logger.error("input / --code / --ir are mutually exclusive")
         sys.exit(1)
 
     if not torch.cuda.is_available():
         logger.error("CUDA GPU required")
         sys.exit(1)
 
-    if args.ir is not None:
+    # A .json input (via --ir or as the positional) takes the IR path: finish
+    # lowering an arbitrary-stage dump, no traced module to bench against torch.
+    ir_path = args.ir
+    if ir_path is None and args.input is not None and Path(args.input).suffix == ".json" and Path(args.input).exists():
+        ir_path = args.input
+    if ir_path is not None:
+        args.ir = ir_path
         _handle_run_ir(args, CudaBackend, CompilerDump)
         return
 
-    if args.code is None:
-        logger.error("Either --code or --ir is required")
+    if args.input is None and args.code is None:
+        logger.error("Either a model ID / .json input, --code, or --ir is required")
         sys.exit(1)
 
-    info = trace_inline_code(args.code, dynamic_shapes=_resolve_dynamic_shapes(args))
-    graph = info["graph"]
-    module = info["module"]
-    example_args = info["args"]
-    example_kwargs = info["kwargs"]
+    # Model ID or --code: trace to a frontend graph + keep the runnable module
+    # (+ example inputs) so accuracy / --bench compare against real torch.
+    graph, _base_name, bundle = load_or_trace(args)
+    module, example_args, example_kwargs = bundle
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
@@ -300,23 +327,6 @@ def _reset_persisting_l2_cache() -> None:
             logger.debug("cudaCtxResetPersistingL2Cache returned %d (continuing)", err)
     except (OSError, AttributeError) as e:
         logger.debug("cudaCtxResetPersistingL2Cache unavailable: %s", e)
-
-
-def _resolve_dynamic_shapes(args) -> dict | None:
-    """Parse ``--dynamic NAME@INPUT:AXIS`` specs into a torch.export
-    ``dynamic_shapes`` dict. Returns ``None`` when no specs were passed.
-    Mirrors :func:`deplodock.commands.compile._resolve_dynamic_shapes`."""
-    specs_raw = getattr(args, "dynamic", None)
-    if not specs_raw:
-        return None
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
-
-    try:
-        specs = parse_position_specs(specs_raw)
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(2)
-    return build_torch_dynamic_shapes(specs)
 
 
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
@@ -895,10 +905,14 @@ def _bind_inputs(compiled, module, example_args, example_kwargs):
         np_dtype = compiled.nodes[nid].output.dtype.np
         input_data[nid] = tensor.detach().cpu().numpy().astype(np_dtype, copy=False)
 
+    # ``remove_duplicate=False`` so tied weights (e.g. a model whose lm_head
+    # shares the embedding matrix) are surfaced under *every* name, including
+    # the ``source_path`` the tracer recorded — otherwise the alias the trace
+    # picked may be the one torch dedups away and the constant won't bind.
     sources: dict[str, np.ndarray] = {}
-    for path, tensor in module.named_parameters():
+    for path, tensor in module.named_parameters(remove_duplicate=False):
         sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
-    for path, tensor in module.named_buffers():
+    for path, tensor in module.named_buffers(remove_duplicate=False):
         sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
 
     input_data.update(bind_constants(compiled, sources))

@@ -204,6 +204,14 @@ def _enumerate_variants(
     forced = _forced_stage_mask(n)
     if forced is not None:
         masks = [forced]
+    elif atom_kind is not None:
+        # MMA operands feed ``ldmatrix`` (smem→register only — no gmem-direct
+        # path), so every staged candidate of an atom kernel MUST land in smem.
+        # The no-stage / partial masks the scalar path enumerates would leave an
+        # operand gmem-direct and crash in ``kernel/005_lower_atom_tile``; the
+        # greedy picker, ranking by prior alone, would otherwise be free to pick
+        # one. Offer only the fully-staged variant for the atom path.
+        masks = [(1 << n) - 1]
     else:
         masks = sorted(range(1 << n), key=lambda m: (-bin(m).count("1"), m))
     variants: list[TileOp] = []
