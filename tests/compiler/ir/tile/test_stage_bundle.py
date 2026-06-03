@@ -1,12 +1,12 @@
-"""Tests for the ``StageBundle`` IR node + the single ``Stage`` type.
+"""Tests for the ``StageBundle`` IR node.
 
-Subclass hierarchy (``BufferedStage`` / ``AsyncBufferedStage`` /
-``TmaBufferedStage`` / ``ComputeStage``) has been collapsed:
-``StageBundle`` carries the transport policy (``StagePolicy``),
-policy-specific fields (``buffer_count`` / ``phase`` / ``pipeline_depth``),
-and an optional hoisted-invariant ``compute`` phase body. ``Stage`` carries
-only ``sources`` — a homogeneous group of gmem transport operands behind one
-barrier; it holds no body of its own.
+The wrap-body ``Stage`` hierarchy (``Stage`` / ``BufferedStage`` /
+``AsyncBufferedStage`` / ``TmaBufferedStage`` / ``ComputeStage``) has been
+fully collapsed onto ``StageBundle``: the bundle holds its transport
+``sources`` directly (a homogeneous group of gmem operands loaded behind one
+barrier), the consumer ``body``, an optional hoisted-invariant ``compute``
+phase body, and the transport policy (``StagePolicy`` + ``buffer_count`` /
+``phase`` / ``pipeline_depth``). There is no longer any ``Stage`` class.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from deplodock.compiler.ir.stmt import Body, Load
 from deplodock.compiler.ir.tile.ir import (
     CacheDim,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
 )
@@ -38,33 +37,8 @@ def _consumer_body() -> Body:
     return Body((Load(name="v", input="w_smem", index=(Var("w_smem_c0"), Var("w_smem_c1"))),))
 
 
-def _stages_two() -> tuple[Stage, ...]:
-    return (Stage(sources=(_source("w_smem", "w"),)), Stage(sources=(_source("y_smem", "y"),)))
-
-
-# ---------------------------------------------------------------------------
-# Stage (sources-only — no body)
-# ---------------------------------------------------------------------------
-
-
-def test_stage_requires_at_least_one_source():
-    with pytest.raises(ValueError, match="at least one Source"):
-        Stage(sources=())
-
-
-def test_stage_is_sources_only():
-    s = Stage(sources=(_source("w_smem", "w"),))
-    assert s.nested() == ()
-    assert s.external_reads() == ("w",)
-    assert s.local_decls() == ("w_smem",)
-
-
-def test_stage_with_bodies_expects_empty():
-    s = Stage(sources=(_source("w_smem", "w"),))
-    # Stage carries no body → with_bodies expects no body args.
-    assert s.with_bodies(()) is s
-    with pytest.raises(ValueError):
-        s.with_bodies((Body(()),))
+def _sources_two() -> tuple[Source, ...]:
+    return (_source("w_smem", "w"), _source("y_smem", "y"))
 
 
 # ---------------------------------------------------------------------------
@@ -73,41 +47,37 @@ def test_stage_with_bodies_expects_empty():
 
 
 def test_bundle_sync_default_construction():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
     assert bundle.policy == StagePolicy.SYNC
     assert bundle.buffer_count == 1
     assert bundle.phase is None
     assert bundle.pipeline_depth == 1
+    assert bundle.compute is None
 
 
-def test_bundle_requires_at_least_one_stage():
-    with pytest.raises(ValueError, match="at least one Stage"):
-        StageBundle(stages=(), body=Body(()))
-
-
-def test_bundle_rejects_non_stage_members():
-    with pytest.raises(TypeError, match="must be a Stage"):
-        StageBundle(stages=("not a stage",), body=Body(()))  # type: ignore[arg-type]
+def test_bundle_requires_at_least_one_source():
+    with pytest.raises(ValueError, match="at least one Source"):
+        StageBundle(sources=(), body=Body(()))
 
 
 def test_bundle_body_coerced():
-    bundle = StageBundle(stages=_stages_two(), body=())  # type: ignore[arg-type]
+    bundle = StageBundle(sources=_sources_two(), body=())  # type: ignore[arg-type]
     assert isinstance(bundle.body, Body)
 
 
 def test_bundle_sync_rejects_buffer_count_gt_1():
     with pytest.raises(ValueError, match="SYNC: buffer_count must be 1"):
-        StageBundle(stages=_stages_two(), body=Body(()), policy=StagePolicy.SYNC, buffer_count=2)
+        StageBundle(sources=_sources_two(), body=Body(()), policy=StagePolicy.SYNC, buffer_count=2)
 
 
 def test_bundle_sync_rejects_phase():
     with pytest.raises(ValueError, match="SYNC: phase must be None"):
-        StageBundle(stages=_stages_two(), body=Body(()), policy=StagePolicy.SYNC, phase=Var("k") % Literal(2, "int"))
+        StageBundle(sources=_sources_two(), body=Body(()), policy=StagePolicy.SYNC, phase=Var("k") % Literal(2, "int"))
 
 
 def test_bundle_sync_rejects_pipeline_depth_gt_1():
     with pytest.raises(ValueError, match="SYNC: pipeline_depth must be 1"):
-        StageBundle(stages=_stages_two(), body=Body(()), policy=StagePolicy.SYNC, pipeline_depth=2)
+        StageBundle(sources=_sources_two(), body=Body(()), policy=StagePolicy.SYNC, pipeline_depth=2)
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +87,13 @@ def test_bundle_sync_rejects_pipeline_depth_gt_1():
 
 def test_bundle_buffered_requires_phase_when_buffer_count_ge_2():
     with pytest.raises(ValueError, match="phase required when buffer_count >= 2"):
-        StageBundle(stages=_stages_two(), body=Body(()), policy=StagePolicy.BUFFERED, buffer_count=2)
+        StageBundle(sources=_sources_two(), body=Body(()), policy=StagePolicy.BUFFERED, buffer_count=2)
 
 
 def test_bundle_buffered_with_phase_ok():
     phase = Var("k") % Literal(2, "int")
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=_consumer_body(),
         policy=StagePolicy.BUFFERED,
         buffer_count=2,
@@ -141,7 +111,7 @@ def test_bundle_buffered_with_phase_ok():
 
 def test_bundle_async_with_pipeline_depth_ok():
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=_consumer_body(),
         policy=StagePolicy.ASYNC,
         buffer_count=2,
@@ -155,7 +125,7 @@ def test_bundle_async_with_pipeline_depth_ok():
 def test_bundle_pipeline_depth_gt_1_requires_async_or_tma():
     with pytest.raises(ValueError, match="pipeline_depth > 1 requires ASYNC or TMA"):
         StageBundle(
-            stages=_stages_two(),
+            sources=_sources_two(),
             body=Body(()),
             policy=StagePolicy.BUFFERED,
             buffer_count=2,
@@ -174,7 +144,7 @@ def test_bundle_tma_rejects_padded_source():
     )
     with pytest.raises(ValueError, match="TMA: source"):
         StageBundle(
-            stages=(Stage(sources=(src_padded,)),),
+            sources=(src_padded,),
             body=Body(()),
             policy=StagePolicy.TMA,
             buffer_count=2,
@@ -187,83 +157,78 @@ def test_bundle_tma_rejects_padded_source():
 # ---------------------------------------------------------------------------
 
 
-def test_nested_exposes_stages_compute_and_body():
-    """nested() is (Body(stages), compute or Body(()), body). Body.iter
-    traverses into stages naturally via the synthetic body."""
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+def test_nested_exposes_compute_and_body():
+    """nested() is (compute or Body(()), body) — sources carry no body."""
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
     nested = bundle.nested()
-    assert len(nested) == 3
-    assert isinstance(nested[0], Body)
-    assert tuple(nested[0]) == bundle.stages
-    assert nested[1] == Body(())  # no compute phase
-    assert nested[2] == bundle.body
+    assert len(nested) == 2
+    assert nested[0] == Body(())  # no compute phase
+    assert nested[1] == bundle.body
 
 
 def test_nested_exposes_compute_phase():
     compute = Body((Load(name="ca", input="w_smem", index=(Var("i"),)),))
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body(), compute=compute)
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body(), compute=compute)
     nested = bundle.nested()
-    assert len(nested) == 3
-    assert nested[1] == compute
+    assert len(nested) == 2
+    assert nested[0] == compute
+    assert nested[1] == bundle.body
 
 
 def test_compute_body_coerced():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body(), compute=())  # type: ignore[arg-type]
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body(), compute=())  # type: ignore[arg-type]
     assert isinstance(bundle.compute, Body)
 
 
 def test_with_bodies_round_trips_compute():
     compute = Body((Load(name="ca", input="w_smem", index=(Var("i"),)),))
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body(), compute=compute)
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body(), compute=compute)
     new_compute = Body((Load(name="ca2", input="w_smem", index=(Var("j"),)),))
-    new = bundle.with_bodies((Body(bundle.stages), new_compute, bundle.body))
+    new = bundle.with_bodies((new_compute, bundle.body))
     assert new.compute == new_compute
+    assert new.sources == bundle.sources
 
 
 def test_with_bodies_empty_compute_collapses_to_none():
-    """An empty middle body (the ``Body(())`` placeholder for an absent
+    """An empty leading body (the ``Body(())`` placeholder for an absent
     compute phase) collapses back to ``None`` so the structure round-trips."""
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
-    new = bundle.with_bodies((Body(bundle.stages), Body(()), bundle.body))
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
+    new = bundle.with_bodies((Body(()), bundle.body))
     assert new.compute is None
 
 
-def test_body_iter_yields_stages_inside_bundle():
-    """The whole point of synthetic-body nested: Body.iter() sees stages
-    via the generic descent without special-casing StageBundle."""
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+def test_body_iter_yields_bundle_and_consumer():
+    """Body.iter() yields the bundle then descends its compute + consumer
+    bodies (sources are not Stmts, so they aren't re-yielded)."""
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
     outer = Body((bundle,))
     iterated = list(outer.iter())
-    # First yielded: bundle itself; then Body(stages) descent yields each Stage;
-    # then bundle.body descent yields the Load.
     assert bundle in iterated
-    assert any(isinstance(s, Stage) for s in iterated)
-    stages_yielded = [s for s in iterated if isinstance(s, Stage)]
-    assert stages_yielded == list(bundle.stages)
+    # The consumer Load is reached via the body descent.
+    assert any(isinstance(s, Load) for s in iterated)
 
 
 def test_with_bodies_round_trip():
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=_consumer_body(),
         policy=StagePolicy.BUFFERED,
         buffer_count=2,
         phase=Var("k") % Literal(2, "int"),
     )
-    new_stage = Stage(sources=(_source("z_smem", "z"),))
     new_body = Body((Load(name="v2", input="z_smem", index=(Var("c"),)),))
-    new_bundle = bundle.with_bodies((Body((new_stage,)), Body(()), new_body))
+    new_bundle = bundle.with_bodies((Body(()), new_body))
     assert isinstance(new_bundle, StageBundle)
-    assert new_bundle.stages == (new_stage,)
     assert new_bundle.body == new_body
+    assert new_bundle.sources == bundle.sources
     # Policy fields preserved.
     assert new_bundle.policy == StagePolicy.BUFFERED
     assert new_bundle.buffer_count == 2
 
 
 def test_with_bodies_wrong_count_rejected():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
-    with pytest.raises(ValueError, match="expected 3 bodies"):
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
+    with pytest.raises(ValueError, match="expected 2 bodies"):
         bundle.with_bodies((Body(()),))
 
 
@@ -272,55 +237,62 @@ def test_with_bodies_wrong_count_rejected():
 # ---------------------------------------------------------------------------
 
 
-def test_external_reads_concatenates_member_reads():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+def test_external_reads_lists_source_bufs():
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
     assert bundle.external_reads() == ("w", "y")
 
 
-def test_external_reads_ignores_compute_phase():
-    """The compute phase reads sibling smem (not external gmem), so it
-    contributes no external reads — only the transport stages' bufs do."""
-    compute = Body((Load(name="ca", input="w_smem", index=(Var("i"),)),))
-    bundle = StageBundle(stages=_stages_two(), body=Body(()), compute=compute)
-    assert bundle.external_reads() == ("w", "y")
-
-
-def test_local_decls_concatenates_member_decls():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+def test_local_decls_lists_source_names():
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
     assert bundle.local_decls() == ("w_smem", "y_smem")
 
 
+def test_local_decls_includes_compute_output_slab():
+    """The compute phase's Write output is a kernel-local smem slab, so it
+    rides on local_decls (keeping it off the kernel signature)."""
+    from deplodock.compiler.ir.stmt import Write
+
+    compute = Body(
+        (
+            Load(name="ca", input="w_smem", index=(Var("i"),)),
+            Write(output="fused", index=(Var("i"),), value="ca"),
+        )
+    )
+    bundle = StageBundle(sources=_sources_two(), body=Body(()), compute=compute)
+    assert bundle.local_decls() == ("w_smem", "y_smem", "fused")
+
+
 def test_smem_bytes_sync_no_buffer_factor():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
-    expected = sum(s.smem_bytes for s in bundle.stages)
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
+    expected = sum(s.smem_bytes for s in bundle.sources)
     assert bundle.smem_bytes == expected
 
 
 def test_smem_bytes_buffered_includes_buffer_count_factor():
     phase = Var("k") % Literal(3, "int")
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=_consumer_body(),
         policy=StagePolicy.BUFFERED,
         buffer_count=3,
         phase=phase,
     )
-    expected = sum(s.smem_bytes for s in bundle.stages) * 3
+    expected = sum(s.smem_bytes for s in bundle.sources) * 3
     assert bundle.smem_bytes == expected
 
 
-def test_exprs_includes_member_origins_and_bundle_phase():
+def test_exprs_includes_source_origins_and_bundle_phase():
     """Used by σ-substitution / dependency walkers."""
     phase = Var("k") % Literal(2, "int")
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=Body(()),
         policy=StagePolicy.BUFFERED,
         buffer_count=2,
         phase=phase,
     )
     all_exprs = bundle.exprs()
-    # Two stages × 2 origin exprs each = 4, plus bundle.phase = 5.
+    # Two sources × 2 origin exprs each = 4, plus bundle.phase = 5.
     assert len(all_exprs) == 5
     assert phase in all_exprs
 
@@ -331,7 +303,7 @@ def test_exprs_includes_member_origins_and_bundle_phase():
 
 
 def test_pretty_sync_header():
-    bundle = StageBundle(stages=_stages_two(), body=_consumer_body())
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body())
     lines = bundle.pretty(indent="  ")
     assert lines[0] == "  bundle sync:"
     for line in lines[1:]:
@@ -341,7 +313,7 @@ def test_pretty_sync_header():
 def test_pretty_buffered_header_shows_policy_and_phase():
     phase = Var("k_outer") % Literal(2, "int")
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=_consumer_body(),
         policy=StagePolicy.BUFFERED,
         buffer_count=2,
@@ -354,7 +326,7 @@ def test_pretty_buffered_header_shows_policy_and_phase():
 def test_pretty_tma_header_shows_depth():
     phase = Var("k") % Literal(2, "int")
     bundle = StageBundle(
-        stages=_stages_two(),
+        sources=_sources_two(),
         body=_consumer_body(),
         policy=StagePolicy.TMA,
         buffer_count=2,
@@ -366,11 +338,25 @@ def test_pretty_tma_header_shows_depth():
     assert "depth=3" in header
 
 
+def test_pretty_renders_compute_phase():
+    from deplodock.compiler.ir.stmt import Write
+
+    compute = Body(
+        (
+            Load(name="ca", input="w_smem", index=(Var("i"),)),
+            Write(output="fused", index=(Var("i"),), value="ca"),
+        )
+    )
+    bundle = StageBundle(sources=_sources_two(), body=_consumer_body(), compute=compute)
+    lines = bundle.pretty()
+    assert any("cooperative:" in line for line in lines)
+
+
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
 
 
-def test_single_stage_bundle_is_valid():
-    bundle = StageBundle(stages=(Stage(sources=(_source("w_smem", "w"),)),), body=Body(()))
-    assert len(bundle.stages) == 1
+def test_single_source_bundle_is_valid():
+    bundle = StageBundle(sources=(_source("w_smem", "w"),), body=Body(()))
+    assert len(bundle.sources) == 1

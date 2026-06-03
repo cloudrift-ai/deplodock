@@ -110,14 +110,12 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
         return len(group_stage_names) - 1
 
     def _add_bundle(gid: int, bundle: StageBundle) -> None:
-        # 050_use_tma keeps the bundle's stages tuple intact; group_stage_names
-        # tracks per-Source smem name across every member so issuer-tid
-        # allocation distributes the arrive+TmaLoad across distinct elected
-        # threads.
-        for member in bundle.stages:
-            for src in member.sources:
-                stage_group_by_smem[src.name] = gid
-                group_stage_names[gid].add(src.name)
+        # group_stage_names tracks per-Source smem name across the bundle so
+        # issuer-tid allocation distributes the arrive+TmaLoad across distinct
+        # elected threads.
+        for src in bundle.sources:
+            stage_group_by_smem[src.name] = gid
+            group_stage_names[gid].add(src.name)
         group_buffer_count[gid] = max(group_buffer_count[gid], bundle.buffer_count)
 
     # Shared mutable state across recursion levels — single Python list/int

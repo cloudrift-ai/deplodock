@@ -1,10 +1,10 @@
 """Stage frequently-reused external inputs into shared memory (wrap-body).
 
-Emits ``Stage(sources=[...], body=<consumer>)`` — the Stage *wraps* the
-consumer subtree containing the rewritten Loads. Producer cooperative
+Emits ``StageBundle(sources=[...], body=<consumer>)`` — the bundle *wraps*
+the consumer subtree containing the rewritten Loads. Producer cooperative
 ``Load+Write`` is synthesized at materialize time from ``Source``
 entries (cache axes, origin, source-dim mapping); no producer body is
-stored on the Stage.
+stored.
 
 Runs *before* ``010_split_register_axes`` (pre-register-tile: there
 is exactly one Load per ``(buffer, access-pattern)`` rather than F×F
@@ -96,7 +96,6 @@ from deplodock.compiler.ir.tile.ir import (
     RegisterTile,
     SerialTile,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
     StridedTile,
@@ -230,7 +229,7 @@ def _enumerate_variants(
 def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
-    if any(isinstance(s, Stage) for s in tt.body.iter()):
+    if any(isinstance(s, StageBundle) for s in tt.body.iter()):
         return []
     if not tt.axes:
         return []
@@ -608,12 +607,12 @@ def _process_scope(
     if not stmt_contains_loads_idx:
         return tuple(rewritten)
     lo, hi = stmt_contains_loads_idx[0], stmt_contains_loads_idx[-1]
-    # Emit a single-policy SYNC bundle holding one multi-source Stage; the
-    # bundle owns the consumer body. Downstream passes (030 hoist, 040 ring-
-    # buffer promotion, 050/060 TMA/async promotion) operate on bundles.
-    wrapped_stage = Stage(sources=tuple(sources))
+    # Emit a single-policy SYNC bundle holding the multi-source transport
+    # operands directly; the bundle owns the consumer body. Downstream passes
+    # (030 hoist, 040 ring-buffer promotion, 050/060 TMA/async promotion)
+    # operate on bundles.
     bundle = StageBundle(
-        stages=(wrapped_stage,),
+        sources=tuple(sources),
         body=Body(tuple(rewritten[lo : hi + 1])),
         policy=StagePolicy.SYNC,
     )

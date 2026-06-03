@@ -427,13 +427,6 @@ class Body(tuple[Stmt, ...]):
 
         return self.iter_of_type(Loop)
 
-    @cached_property
-    def stages(self) -> tuple[Stmt, ...]:
-        """All ``Stage`` stmts in the body (recursive — Tile-IR only)."""
-        from deplodock.compiler.ir.tile.ir import Stage  # noqa: PLC0415
-
-        return self.iter_of_type(Stage)
-
     # -- structural identity --------------------------------------------
 
     def structural_key(self) -> str:
@@ -486,7 +479,7 @@ class Body(tuple[Stmt, ...]):
 
         - block axes = union of every ``GridTile.axes``
         - thread axes = union of every ``ThreadTile.axes``
-        - staging buffers = ``Smem.name`` + ``Stage.sources.name``
+        - staging buffers = ``Smem.name`` + ``StageBundle.sources.name``
         - per-Accum cooperative axes = ``Accum.axes ∩ thread axes``
         - per-Write atomic axes = ``block axes − Write.index free vars``
           (skipped for staging-buffer Writes)
@@ -502,9 +495,9 @@ class Body(tuple[Stmt, ...]):
         because those are per-thread slab slots, not racing global
         stores."""
         # Lazy imports avoid the ir/stmt → ir/tile cycle (ir/tile/ir.py
-        # imports Body from this module). Smem / Stage are picked up
-        # generically via ``Stmt.local_decls`` so no kernel-IR import
-        # is needed.
+        # imports Body from this module). Smem / StageBundle staging buffers
+        # are picked up generically via ``Stmt.local_decls`` so no kernel-IR
+        # import is needed.
         from deplodock.compiler.ir.stmt.leaves import Accum, Write  # noqa: PLC0415
         from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 

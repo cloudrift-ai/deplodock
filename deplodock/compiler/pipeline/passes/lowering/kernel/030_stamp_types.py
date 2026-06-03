@@ -54,7 +54,7 @@ from deplodock.compiler.ir.stmt import (
     Write,
 )
 from deplodock.compiler.ir.stmt.base import dtype_promote
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import Source, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -87,8 +87,6 @@ def _stamp_body(body: Body, ctx: _StampCtx) -> Body:
 def _stamp_stmt(s: Stmt, ctx: _StampCtx) -> Stmt:
     if isinstance(s, StageBundle):
         return _stamp_bundle(s, ctx)
-    if isinstance(s, Stage):
-        return _stamp_stage(s, ctx)
     if isinstance(s, Load):
         return _stamp_load(s, ctx)
     if isinstance(s, Assign):
@@ -116,33 +114,21 @@ def _stamp_stmt(s: Stmt, ctx: _StampCtx) -> Stmt:
     return s.with_bodies(new_bodies)
 
 
-def _stamp_stage(s: Stage, ctx: _StampCtx) -> Stmt:
-    """Stamp each Source.dtype on a bare Stage. Stage carries no body — the
-    consumer scope and the optional cooperative compute phase are owned by
-    the enclosing StageBundle and walked by ``_stamp_bundle``. (Bare Stages
-    only appear inside a bundle; this arm is defensive.)"""
-    return replace(s, sources=tuple(_stamp_source(src, ctx) for src in s.sources))
-
-
 def _stamp_bundle(s: StageBundle, ctx: _StampCtx) -> Stmt:
-    """Stamp each member Stage's sources, aggregate the source-dtype map
-    across all members, then walk the optional ``compute`` phase and
-    ``bundle.body`` with the aggregated map in scope so the compute body's
-    sibling-slab Loads and consumer Loads against any staged smem resolve
-    correctly.
+    """Stamp each Source.dtype, aggregate the source-dtype map, then walk the
+    optional ``compute`` phase and ``bundle.body`` with the aggregated map in
+    scope so the compute body's sibling-slab Loads and consumer Loads against
+    any staged smem resolve correctly.
     """
     saved = dict(ctx.source_dtypes)
-    new_stages: list[Stage] = []
-    for member in s.stages:
-        new_sources = tuple(_stamp_source(src, ctx) for src in member.sources)
-        for src in new_sources:
-            if src.dtype is not None:
-                ctx.source_dtypes[src.name] = src.dtype
-        new_stages.append(replace(member, sources=new_sources))
+    new_sources = tuple(_stamp_source(src, ctx) for src in s.sources)
+    for src in new_sources:
+        if src.dtype is not None:
+            ctx.source_dtypes[src.name] = src.dtype
     new_compute = _stamp_body(s.compute, ctx) if s.compute is not None else None
     new_body = _stamp_body(s.body, ctx)
     ctx.source_dtypes = saved
-    return replace(s, stages=tuple(new_stages), compute=new_compute, body=new_body)
+    return replace(s, sources=new_sources, compute=new_compute, body=new_body)
 
 
 def _stamp_source(src: Source, ctx: _StampCtx) -> Source:

@@ -117,8 +117,9 @@ def _promote(bundle: StageBundle) -> StageBundle:
     # cooperative-load path inside _emit_stage so we can over-promote
     # here without correctness risk.
     return StageBundle(
-        stages=bundle.stages,
+        sources=bundle.sources,
         body=bundle.body,
+        compute=bundle.compute,
         policy=StagePolicy.ASYNC,
         buffer_count=bundle.buffer_count,
         phase=bundle.phase,

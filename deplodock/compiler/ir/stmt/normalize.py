@@ -783,7 +783,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
     from deplodock.compiler.ir.tile.ir import (  # noqa: PLC0415 — break stmt↔tile cycle
         ParallelTile,
         SerialTileBase,
-        Stage,
+        StageBundle,
     )
 
     stmts = Body.coerce(stmts)
@@ -848,7 +848,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             # parallel coords keep their pre-order rename slots.
             for ax in stmt.axes:
                 _record_axis(ax.name)
-        elif isinstance(stmt, Stage):
+        elif isinstance(stmt, StageBundle):
             for src in stmt.sources:
                 for ax in src.cache_axes:
                     _record_axis(ax.name)

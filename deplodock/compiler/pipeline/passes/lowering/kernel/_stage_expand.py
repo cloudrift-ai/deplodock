@@ -1,10 +1,11 @@
 """Stage-expansion helpers for ``100_materialize_tile``.
 
-Producer scaffolding for wrap-body Stages: a transport ``Stage`` becomes a
-cooperative ``Load + Write`` (or ``CpAsyncCopy``) nest, a ``ComputeStage``
-becomes a σ-substituted cooperative ``StridedLoop``. Both flatten multi-axis
-cache slabs via a row-major flat-iter decode. Pure functions — no shared
-materializer state — so they live here rather than inside the pass.
+Producer scaffolding for a ``StageBundle``: its transport ``sources`` become
+cooperative ``Load + Write`` (or ``CpAsyncCopy``) nests, and its optional
+``compute`` phase becomes a σ-substituted cooperative ``StridedLoop``. Both
+flatten multi-axis cache slabs via a row-major flat-iter decode. Pure
+functions — no shared materializer state — so they live here rather than
+inside the pass.
 
 The leading-underscore module name keeps the pass loader (which globs
 ``*.py`` skipping ``_``-prefixed files) from mistaking this for a rule.
@@ -16,7 +17,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, StagePolicy, TemplateAddressing
+from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
 
 
 def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | None) -> int:
@@ -114,7 +115,7 @@ def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | N
 
 
 def emit_stage(
-    stage: Stage,
+    sources,  # noqa: ANN001 — tuple[Source, ...]
     tid_expr,
     n_threads: int,
     *,
@@ -123,17 +124,15 @@ def emit_stage(
     phase,
     pipeline_depth: int,
 ) -> list[Stmt]:
-    """Emit producer scaffolding for a Stage member of a StageBundle.
+    """Emit producer scaffolding for a bundle's transport ``sources``.
 
-    For each ``Source`` in ``stage.sources``, emits per-source
-    cooperative ``Load + Write`` (``CpAsyncCopy`` for ASYNC). Smem decls
-    are hoisted to kernel scope in ``_materialize`` (we skip them via
-    the dedup filter). Leading + trailing ``Sync`` bracket the
-    cooperative load for SYNC policy; BUFFERED/ASYNC/TMA drop the
-    leading sync (different physical slab per iter).
+    For each ``Source``, emits per-source cooperative ``Load + Write``
+    (``CpAsyncCopy`` for ASYNC). Smem decls are hoisted to kernel scope in
+    ``_materialize`` (we skip them via the dedup filter). Leading + trailing
+    ``Sync`` bracket the cooperative load for SYNC policy; BUFFERED/ASYNC/TMA
+    drop the leading sync (different physical slab per iter).
 
-    Bundle context (policy, buffer_count, phase, pipeline_depth) is
-    passed in; the Stage itself no longer carries those fields.
+    Bundle context (policy, buffer_count, phase, pipeline_depth) is passed in.
     """
     is_buffered = policy != StagePolicy.SYNC
     is_async = policy == StagePolicy.ASYNC
@@ -141,7 +140,7 @@ def emit_stage(
     prelude: list[Stmt] = [] if is_buffered else [Sync()]
     body_out: list[Stmt] = list(prelude)
 
-    for src in stage.sources:
+    for src in sources:
         # Per-Source iteration axis: synthesize a unique flat-iter axis
         # so the StridedLoop's loop variable doesn't collide with outer
         # thread-decode variables.

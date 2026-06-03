@@ -39,7 +39,7 @@ from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.stmt import Body, Cond, Stmt, Write
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, Stage, StageBundle, StridedTile, ThreadTile, TileOp, WarpTile
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StageBundle, StridedTile, ThreadTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -73,13 +73,13 @@ def _vectorize_body(top: TileOp, body: Body, atomic_write_ids: frozenset[int]) -
     scan this scope for consecutive-Write runs. Threads ``top`` through
     so ``_buf_dtype`` can resolve per-buffer dtypes against the same op.
 
-    Stage Writes belong to the *producer* side, synthesized at materialize
-    time — they aren't in the TileOp body yet, so the Stage block stmts
-    are walked as opaque (their consumer subtree's Writes target the
-    kernel output, not the smem slab)."""
+    Staged-source Writes belong to the *producer* side, synthesized at
+    materialize time — they aren't in the TileOp body yet, so the StageBundle
+    block stmts are walked via their nested bodies (their consumer subtree's
+    Writes target the kernel output, not the smem slab)."""
     descended: list[Stmt] = []
     for s in body:
-        if isinstance(s, (SerialTile, StridedTile, RegisterTile, Stage, StageBundle)):
+        if isinstance(s, (SerialTile, StridedTile, RegisterTile, StageBundle)):
             new_nested = tuple(_vectorize_body(top, b, atomic_write_ids) for b in s.nested())
             descended.append(s.with_bodies(new_nested))
         elif isinstance(s, Cond):

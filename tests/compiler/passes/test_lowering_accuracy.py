@@ -197,9 +197,8 @@ def _pad_summary(op: TileOp) -> dict[str, tuple[int, ...]]:
         # 070 pads BUFFERED / ASYNC bundles (SYNC needs no rotation break, TMA
         # forbids pad). On sm_80+ 040's ring is realized as ASYNC.
         if isinstance(s, StageBundle) and s.policy in (StagePolicy.BUFFERED, StagePolicy.ASYNC):
-            for stage in s.stages:
-                for src in stage.sources:
-                    out[src.name] = src.pad
+            for src in s.sources:
+                out[src.name] = src.pad
     return out
 
 

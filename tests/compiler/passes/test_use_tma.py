@@ -22,7 +22,6 @@ from deplodock.compiler.ir.tile.ir import (
     CacheDim,
     SerialTile,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
     ThreadTile,
@@ -67,7 +66,7 @@ def _tile_op_buffered(*, policy: StagePolicy, buffer_count: int = 2) -> tuple[Ti
     # carry a non-None phase + buffer_count >= 2.
     if policy == StagePolicy.SYNC:
         bundle = StageBundle(
-            stages=(Stage(sources=(src,)),),
+            sources=(src,),
             body=Body(()),
             policy=policy,
             buffer_count=1,
@@ -76,7 +75,7 @@ def _tile_op_buffered(*, policy: StagePolicy, buffer_count: int = 2) -> tuple[Ti
         )
     else:
         bundle = StageBundle(
-            stages=(Stage(sources=(src,)),),
+            sources=(src,),
             body=Body(()),
             policy=policy,
             buffer_count=buffer_count,

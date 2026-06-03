@@ -148,27 +148,26 @@ def _plan_for_bundle(bundle: StageBundle, plan: dict[int, dict[str, tuple[int, .
     if not thread_axes:
         return
     per_src: dict[str, tuple[int, ...]] = {}
-    for stage in bundle.stages:
-        for src in stage.sources:
-            if src.pad and any(src.pad):
-                continue
-            # M7: a +1 pad on the inner cache axis breaks the mma.sync
-            # ``ldmatrix`` 16-byte alignment, so block-stamped Sources
-            # (MMA atom-strided σ) must skip padding entirely. A future
-            # MMA-friendly swizzle (XOR-style row shuffle matching
-            # ldmatrix.x4) is the right answer; until then, leave the
-            # bundle un-padded.
-            addressing = src.addressing
-            if isinstance(addressing, AffineAddressing) and addressing.block:
-                continue
-            loads = [s for s in bundle.body.iter() if isinstance(s, Load) and s.input == src.name]
-            if not loads:
-                continue
-            inner_safe = not _has_vectorizable_run(loads)
-            pad = _pick_pad(loads, src, thread_axes=thread_axes, inner_safe=inner_safe)
-            if pad is None:
-                continue
-            per_src[src.name] = pad
+    for src in bundle.sources:
+        if src.pad and any(src.pad):
+            continue
+        # M7: a +1 pad on the inner cache axis breaks the mma.sync
+        # ``ldmatrix`` 16-byte alignment, so block-stamped Sources
+        # (MMA atom-strided σ) must skip padding entirely. A future
+        # MMA-friendly swizzle (XOR-style row shuffle matching
+        # ldmatrix.x4) is the right answer; until then, leave the
+        # bundle un-padded.
+        addressing = src.addressing
+        if isinstance(addressing, AffineAddressing) and addressing.block:
+            continue
+        loads = [s for s in bundle.body.iter() if isinstance(s, Load) and s.input == src.name]
+        if not loads:
+            continue
+        inner_safe = not _has_vectorizable_run(loads)
+        pad = _pick_pad(loads, src, thread_axes=thread_axes, inner_safe=inner_safe)
+        if pad is None:
+            continue
+        per_src[src.name] = pad
     if per_src:
         plan[id(bundle)] = per_src
 
@@ -210,22 +209,14 @@ def _apply_pad(body: Body, plan: dict[int, dict[str, tuple[int, ...]]]) -> tuple
     for s in body:
         if isinstance(s, StageBundle) and id(s) in plan:
             per_src = plan[id(s)]
-            new_stages = []
-            for stage in s.stages:
-                new_sources: list[Source] = []
-                src_changed = False
-                for src in stage.sources:
-                    if src.name in per_src:
-                        new_sources.append(src.with_pad(per_src[src.name]))
-                        applied = True
-                        src_changed = True
-                    else:
-                        new_sources.append(src)
-                if src_changed:
-                    new_stages.append(stage.replace_sources(tuple(new_sources)))
+            new_sources: list[Source] = []
+            for src in s.sources:
+                if src.name in per_src:
+                    new_sources.append(src.with_pad(per_src[src.name]))
+                    applied = True
                 else:
-                    new_stages.append(stage)
-            s = _replace(s, stages=tuple(new_stages))
+                    new_sources.append(src)
+            s = _replace(s, sources=tuple(new_sources))
         nested = s.nested()
         if nested:
             new_bodies: list[Body] = []

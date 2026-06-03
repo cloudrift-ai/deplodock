@@ -2,8 +2,8 @@
 
 - :mod:`.ir` — typed tile flavor dataclasses (``GridTile``,
   ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) +
-  ``Stage`` family, plus re-exports of Loop-IR leaves and shared
-  expressions.
+  ``StageBundle`` (sources + policy + optional compute phase), plus
+  re-exports of Loop-IR leaves and shared expressions.
 
 Loop-IR → Tile-IR lowering is owned by ``passes/lowering/tile/010_partition_loops``
 (constructs tile flavors directly via ``_wrap_tower``). Materialization
@@ -33,7 +33,6 @@ from deplodock.compiler.ir.tile.ir import (
     SerialKind,
     SerialTile,
     SerialTileBase,
-    Stage,
     Stmt,
     StridedLoop,
     StridedTile,
@@ -71,7 +70,6 @@ __all__ = [
     "SerialTile",
     "StridedTile",
     "SerialKind",
-    "Stage",
     "Stmt",
     "TileOp",
     "Axis",

@@ -424,7 +424,7 @@ incompatible divisibility still get a sensible default.
 | `SPLITK`      | INT      | `010_partition_loops`        | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
 | `BN`          | INT      | `010_partition_loops`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
 | `BM`          | INT      | `010_partition_loops`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
-| `STAGE`       | BINMASK  | `020_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one wrap-body Stage with per-source Source entries. |
+| `STAGE`       | BINMASK  | `020_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one `StageBundle` with per-source `Source` entries. |
 | `FM`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul M (output row) axis; per-thread cell-grid height.           |
 | `FN`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. The planner emits one outer `RegisterTile(N_r)` around `{Init, K-reduce, Write}`; the Kernel-IR replicator + `dedup_replicated` pass produce the textbook blocked-GEMM shape (N-invariant Loads kept single-copy, N-dependent Accums replicated). |
 | `BR`          | INT      | `010_partition_loops`        | Cooperative-K thread count (1 = pure serial chunked reduce); BR > 1 routes through the cooperative reduce path with cross-thread combine. |

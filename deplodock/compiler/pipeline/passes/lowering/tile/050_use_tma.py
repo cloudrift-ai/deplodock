@@ -16,7 +16,7 @@ otherwise the file ordering (050 < 060) leaves 050 staring at SYNC /
 BUFFERED bundles with nothing to promote, since the cursor only
 restarts the rule scan on Graph splices not Op rebinds.
 
-Eligibility (per ``Source`` after multi-source split):
+Eligibility (per ``Source``):
 
 - ``ctx.compute_capability >= (9, 0)`` (Hopper+).
 - The source uses ``AffineAddressing`` (template addressing is a
@@ -27,19 +27,18 @@ Eligibility (per ``Source`` after multi-source split):
   inner at least 2× the box inner.
 - Source rank ≤ 5 (TMA descriptor limit).
 
-A multi-source ``Stage`` (e.g. matmul A+B emitted by
-``020_stage_inputs`` as a single ``Stage(sources=(A, B))``) is **split**
-into N single-source ``Stage``s under the same ``StageBundle`` before
-the eligibility check. The downstream materializer (``100_materialize_tile``
-+ ``_tma_groups``) already handles N single-source stages: each source
-gets its own ``MbarrierArriveExpectTx + TmaLoad`` pair issued from a
-distinct elected thread (``issuer_tid 0, 1, …``), all arriving against
-the same group mbarrier whose ``arrive_count`` equals the source count.
-This is equivalent to the article's 1-thread-issues-both pattern via
-hardware mbarrier semantics: tx-bytes from N arrives sum to the total,
-and per-source ``cp.async.bulk.tensor`` completions add to that total.
-Hoisted-compute bundles (``StageBundle.compute is not None``) are emitted
-``SYNC`` and never reach this rule (the compute phase blocks TMA).
+A multi-source bundle (e.g. matmul A+B emitted by ``020_stage_inputs`` as
+``StageBundle(sources=(A, B))``) needs no splitting: the materializer
+(``100_materialize_tile`` + ``_tma_groups``) emits one descriptor per
+``Source`` directly — each source gets its own ``MbarrierArriveExpectTx +
+TmaLoad`` pair issued from a distinct elected thread (``issuer_tid 0, 1,
+…``), all arriving against the same group mbarrier whose ``arrive_count``
+equals the source count. This is equivalent to the article's
+1-thread-issues-both pattern via hardware mbarrier semantics: tx-bytes
+from N arrives sum to the total, and per-source ``cp.async.bulk.tensor``
+completions add to that total. Hoisted-compute bundles
+(``StageBundle.compute is not None``) are emitted ``SYNC`` and never reach
+this rule (the compute phase blocks TMA).
 
 The pass is **all-or-nothing per tile**: if any ASYNC bundle in the
 tile body is ineligible, leave the whole tile on cp.async (avoids
@@ -62,7 +61,6 @@ from deplodock.compiler.ir.tile.ir import (
     AtomTile,
     SerialTile,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
     TileOp,
@@ -214,39 +212,22 @@ def _promote_in_kouter(body: Body, *, swizzle: bool = False, dtype_bytes: dict[s
     return Body(tuple(out)), changed
 
 
-def _split_multi_source_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
-    """Replace each multi-source transport Stage with N single-source Stages.
-
-    ``020_stage_inputs`` packs every load-eligible buffer of a Tile into one
-    ``Stage(sources=(A, B, …))``. TMA's per-source ``cp.async.bulk.tensor``
-    needs one elected thread + one ``arrive_expect_tx`` per source descriptor,
-    not per Stage — splitting here lets the existing N-stages-per-bundle
-    materializer ( ``100_materialize_tile`` + ``_tma_groups.issuer_tid``)
-    distribute the arrives across distinct elected threads without any
-    materializer changes.
-
-    Single-source stages pass through unchanged.
-    """
-    out: list[Stage] = []
-    for stage in stages:
-        if len(stage.sources) <= 1:
-            out.append(stage)
-            continue
-        for src in stage.sources:
-            out.append(replace(stage, sources=(src,)))
-    return tuple(out)
-
-
 def _promote(bundle: StageBundle, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> StageBundle:
+    # TMA emits one descriptor + one elected-thread ``arrive_expect_tx`` per
+    # source directly (the materializer + ``_tma_groups.issuer_tid`` key per
+    # ``Source.name``), so a multi-source bundle needs no splitting — the box
+    # copies fan out across distinct elected threads from the source list.
+    #
     # Swizzle is per-Source (A=B64, B=B128 — distinct modes on sources sharing
     # one bundle), stamped onto each Source here; the materializer reads
     # ``src.swizzle`` into each TmaDescriptor. There is no bundle-level mode.
-    stages = _split_multi_source_stages(bundle.stages)
+    sources = bundle.sources
     if swizzle:
-        stages = tuple(_stamp_source_swizzle(stage, dtype_bytes or {}) for stage in stages)
+        sources = tuple(_stamp_source_swizzle(src, dtype_bytes or {}) for src in sources)
     return StageBundle(
-        stages=stages,
+        sources=sources,
         body=bundle.body,
+        compute=bundle.compute,
         policy=StagePolicy.TMA,
         buffer_count=bundle.buffer_count,
         phase=bundle.phase,
@@ -282,39 +263,26 @@ def _source_inner_elems(src: Source) -> int:
     return inner
 
 
-def _stamp_source_swizzle(stage: Stage, dtype_bytes: dict[str, int]) -> Stage:
-    """Stamp each source's :class:`SwizzleMode` from its inner-row byte span.
+def _stamp_source_swizzle(src: Source, dtype_bytes: dict[str, int]) -> Source:
+    """Stamp one source's :class:`SwizzleMode` from its inner-row byte span.
 
     ``dtype_bytes`` maps gmem buffer name → element byte width (from the graph
     node, since the tile-stage ``Source.dtype`` isn't populated yet). Only
     affine transport sources can swizzle (the box reshape needs
     ``AffineAddressing``); template sources are left NONE."""
-    new_sources = []
-    for src in stage.sources:
-        if not isinstance(src.addressing, AffineAddressing):
-            new_sources.append(src)
-            continue
-        elem_bytes = dtype_bytes.get(src.buf, BYTES_PER_ELEM)
-        _, mode = pick_swizzle_atom(_source_inner_elems(src), elem_bytes)
-        new_sources.append(replace(src, swizzle=mode))
-    return stage.replace_sources(tuple(new_sources))
+    if not isinstance(src.addressing, AffineAddressing):
+        return src
+    elem_bytes = dtype_bytes.get(src.buf, BYTES_PER_ELEM)
+    _, mode = pick_swizzle_atom(_source_inner_elems(src), elem_bytes)
+    return replace(src, swizzle=mode)
 
 
 def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]]) -> bool:
-    """A bundle is TMA-eligible iff every (post-split) member Stage is."""
-    for stage in _split_multi_source_stages(bundle.stages):
-        if not _stage_eligible(stage, src_shapes):
-            return False
-    return True
+    """A bundle is TMA-eligible iff every Source is."""
+    return all(_source_eligible(src, src_shapes) for src in bundle.sources)
 
 
-def _stage_eligible(stage: Stage, src_shapes: dict[str, tuple[int, ...]]) -> bool:
-    # The multi-source case has already been split by
-    # ``_split_multi_source_stages`` before this check fires — we only see
-    # single-source transport Stages here.
-    if len(stage.sources) != 1:
-        return False
-    (src,) = stage.sources
+def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]]) -> bool:
     if not isinstance(src.addressing, AffineAddressing):
         return False
     cache_axes = src.cache_axes

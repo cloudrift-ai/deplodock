@@ -87,7 +87,7 @@ from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import Source, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -281,13 +281,8 @@ def _find_source(body: Body, name: str) -> Source | None:
     (sources are unique by name within a TileOp by construction) or
     ``None`` if the buffer isn't a Stage-backed smem (e.g. a gmem input)."""
     for stmt in body.iter():
-        if isinstance(stmt, Stage):
+        if isinstance(stmt, StageBundle):
             for src in stmt.sources:
                 if src.name == name:
                     return src
-        elif isinstance(stmt, StageBundle):
-            for stage in stmt.stages:
-                for src in stage.sources:
-                    if src.name == name:
-                        return src
     return None

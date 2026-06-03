@@ -19,7 +19,6 @@ from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
     CacheDim,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
 )
@@ -53,9 +52,7 @@ def _bundle(src: Source) -> StageBundle:
     """Minimal BUFFERED bundle with one consumer Load — the shape
     ``_plan_for_bundle`` walks for padding decisions."""
     consumer = Load(name="v", input=src.name, index=(Literal(0, "int"), Literal(0, "int")))
-    return StageBundle(
-        stages=(Stage(sources=(src,)),), body=Body((consumer,)), policy=StagePolicy.BUFFERED, buffer_count=2, phase=Literal(0, "int")
-    )
+    return StageBundle(sources=(src,), body=Body((consumer,)), policy=StagePolicy.BUFFERED, buffer_count=2, phase=Literal(0, "int"))
 
 
 def test_pad_smem_skips_blocked_source():

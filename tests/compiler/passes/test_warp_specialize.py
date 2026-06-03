@@ -21,7 +21,6 @@ from deplodock.compiler.ir.tile.ir import (
     CacheDim,
     SerialTile,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
     ThreadTile,
@@ -73,7 +72,7 @@ def _tile_op_tma_pipelined() -> TileOp:
         origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
     )
     tma_bundle = StageBundle(
-        stages=(Stage(sources=(src,)),),
+        sources=(src,),
         body=Body(()),
         policy=StagePolicy.TMA,
         buffer_count=2,
@@ -115,7 +114,7 @@ def _tile_op_warp_tma_pipelined() -> TileOp:
         origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
     )
     tma_bundle = StageBundle(
-        stages=(Stage(sources=(src,)),),
+        sources=(src,),
         body=Body(()),
         policy=StagePolicy.TMA,
         buffer_count=2,

@@ -35,7 +35,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import RegisterTile, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import RegisterTile, StageBundle, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
 
@@ -136,14 +136,12 @@ def _replicate_along_axis(
     buffers, constants, axis-free producers)."""
 
     def fn(s: Stmt, child_T: tuple[frozenset[str] | None, ...], bound: frozenset[str]) -> frozenset[str]:
-        # Stage / StageBundle cache-axis Vars are smem-local — they don't vary
+        # StageBundle cache-axis Vars are smem-local — they don't vary
         # per replica. Mark them bound here so the staging IR isn't tagged for
         # replication; only the consumer Loads (which σ-rewrite cache-axis
         # Vars) multiply.
-        if isinstance(s, Stage):
+        if isinstance(s, StageBundle):
             local_bound = bound | frozenset(ax.name for src in s.sources for ax in src.cache_axes)
-        elif isinstance(s, StageBundle):
-            local_bound = bound | frozenset(ax.name for stage in s.stages for src in stage.sources for ax in src.cache_axes)
         else:
             local_bound = bound
         own: frozenset[str] = frozenset()
@@ -196,13 +194,11 @@ def _replicate_along_axis(
             # wrapping a per-cell Write — each replica must get its own σ-folded
             # predicate, otherwise the wrapper references a no-longer-defined
             # register-axis Var (or worse, collides with a later loop axis
-            # named the same). Stage/StageBundle hide their cache axes from
-            # this check — those Vars are smem-local and shouldn't drive
+            # named the same). StageBundle hides its cache axes from this
+            # check — those Vars are smem-local and shouldn't drive
             # replication of the wrapper.
-            if isinstance(s, Stage):
+            if isinstance(s, StageBundle):
                 wrapper_bound = frozenset(ax.name for src in s.sources for ax in src.cache_axes)
-            elif isinstance(s, StageBundle):
-                wrapper_bound = frozenset(ax.name for stage in s.stages for src in stage.sources for ax in src.cache_axes)
             else:
                 wrapper_bound = frozenset()
             own_refs_axis = axis not in wrapper_bound and any(axis in e.free_vars() for e in s.exprs())
