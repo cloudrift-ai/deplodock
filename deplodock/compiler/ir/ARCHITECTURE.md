@@ -273,7 +273,14 @@ collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
-`kernel/005_lower_atom_tile`. `partition_loops` stamps the `Atom` spec (cell
+`kernel/005_lower_atom_tile`. `RegisterTile.reduce` (default `False` = the
+FM/FN output-cell tile) flags the **reduce-axis** `K_f` tile the planner
+emits for the `FK` multiple-accumulator optimization (non-matmul reduces;
+see `plans/fk-register-tile-reductions.md`): it strip-mines the K serial
+loop so each cell owns an independent accumulator, and
+`010_split_register_axes` appends a cross-accumulator tree-fold (collapsing
+`acc_0..acc_{FK-1}` back to one `acc` after the K serial loops) when the tile
+wraps `Accum`s — the flag also routes `FK`-vs-`FM`/`FN` knob stamping. `partition_loops` stamps the `Atom` spec (cell
 shape + operand dtypes — `Atom` lives in `ir/tile/ir.py`) **onto the `AtomTile`
 itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
 tensor cores" signal, carried in the IR rather than re-derived from a knob.

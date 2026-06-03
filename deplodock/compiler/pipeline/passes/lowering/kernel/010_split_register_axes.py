@@ -34,10 +34,16 @@ from collections.abc import Callable
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import RegisterTile, StageBundle, TileOp
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Stmt
+from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
+
+# Reduce ops the cross-accumulator fold may reorder. The FK strip-mine reorders
+# the per-thread reduction (independent partial sums folded at the end), so the
+# op must be associative + commutative — the same fp-reassociation the existing
+# BR cross-thread warp-shuffle combine already relies on (within eager tolerance).
+_ASSOCIATIVE_REDUCE_OPS = frozenset({"add", "sum", "maximum", "amax", "minimum", "amin", "multiply", "prod"})
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -47,15 +53,20 @@ def rewrite(root: Node) -> Graph | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
 
-    new_body, factors = _replicate_register_tiles(tt.body)
-    if not factors:
-        # No RegisterTile in body — non-matmul kernel (planner only emits
-        # RegisterTile for matmul) or this rule has already run and
-        # consumed them. Either way, nothing to do.
+    new_body, factors, saw_register, folds = _replicate_register_tiles(tt.body)
+    if not saw_register:
+        # No RegisterTile in body — non-matmul kernel with no FK strip-mine, or
+        # this rule has already run and consumed them. Either way, nothing to do.
         raise RuleSkipped("no RegisterTile in body")
+    # Every fold is placed at its enclosing non-K-serial scope inside the walk;
+    # the top-level call is itself a non-K-serial scope, so none should escape.
+    assert not folds, "reduce-accumulator fold escaped the register-tile walk"
 
-    # FM/FN are stamped by the planner; preserve them rather than
-    # overwriting (factors carry the same values).
+    # FM/FN are stamped by the planner; preserve them rather than overwriting.
+    # ``factors`` carries only the output-cell (reduce=False) tile extents in
+    # outermost-first order — the reduce-axis (K_f) tiles are excluded so the
+    # FM/FN stamping stays role-driven, not positional, even when an FK tile
+    # coexists with the FM/FN output tile.
     knobs = dict(root.op.knobs)
     if len(factors) >= 1 and "FM" not in knobs:
         knobs["FM"] = factors[0]
@@ -65,23 +76,40 @@ def rewrite(root: Node) -> Graph | None:
     return TileOp(body=body[:idx] + (rebuilt,) + body[idx + 1 :], name=root.op.name, knobs=knobs)
 
 
-def _replicate_register_tiles(body: Body) -> tuple[Body, list[int]]:
+def _replicate_register_tiles(body: Body, *, in_k_serial: bool = False) -> tuple[Body, list[int], bool, list[Stmt]]:
     """Inside-out unwrap of ``RegisterTile`` flavors. For each tile, recurse
     into nested RegisterTiles first, then replicate this layer's body by
     ``axis.extent`` with ``σ: axis → literal(i)`` for each of the tile's
-    axes (outermost first). Returns ``(new_body, factors)`` with factors
-    in outermost-first order. Caller stamps factors[0] → FM, factors[1] → FN.
+    axes (outermost first). Returns ``(new_body, factors, saw_register,
+    folds)`` — ``factors`` lists only the output-cell (``reduce=False``)
+    tile extents in outermost-first order (FM/FN); ``saw_register`` is True
+    iff any RegisterTile (output or reduce) was consumed; ``folds`` are the
+    pending cross-accumulator folds bubbling up to their enclosing scope.
 
     Walks into non-RegisterTile block stmts (e.g. ``SerialTile`` wrapping
     a softmax prologue + ``RegisterTile``-tiled matmul body for SDPA P@V)
     so deeply-nested RegisterTiles get replicated too.
+
+    **FK reduce tiles** (``RegisterTile.reduce=True``, the K_f strip-mine):
+    after replicating the wrapped ``Accum``s into ``acc_0 .. acc_{FK-1}``,
+    a cross-accumulator tree-fold ``acc = op(acc_0, …, acc_{FK-1})`` is
+    emitted *after the enclosing K serial loops close* — i.e. at the first
+    enclosing non-K-serial scope (the ThreadTile body, or the FM/FN output
+    RegisterTile body when one wraps the reduce). ``in_k_serial`` tracks
+    whether the body being walked is the body of a K serial loop
+    (``SerialTile`` of kind ``serial_outer`` / ``stage_inner``); folds
+    bubble up through those and land at the first scope where it's False.
     """
     out: list[Stmt] = []
     factors: list[int] = []
+    saw_register = False
+    bubble_folds: list[Stmt] = []
     for s in body:
         if isinstance(s, RegisterTile):
-            inner_unwrapped, inner_factors = _replicate_register_tiles(s.body)
+            saw_register = True
+            inner_unwrapped, inner_factors, inner_saw, inner_folds = _replicate_register_tiles(s.body, in_k_serial=False)
             current = inner_unwrapped
+            saw_register = saw_register or inner_saw
             local_factors: list[int] = []
             # Replicate from innermost axis outward.
             for ax in reversed(s.axes):
@@ -90,21 +118,102 @@ def _replicate_register_tiles(body: Body) -> tuple[Body, list[int]]:
                 local_factors.append(factor)
             local_factors.reverse()
             out.extend(current)
-            factors.extend(local_factors)
-            factors.extend(inner_factors)
+            # inner_folds were generated with in_k_serial=False, so they've
+            # already been placed inside ``current``; none escape here.
+            my_folds = list(inner_folds)
+            if s.reduce:
+                my_folds.extend(_build_accum_fold(s))
+            else:
+                factors.extend(local_factors)
+            if in_k_serial:
+                bubble_folds.extend(my_folds)
+            else:
+                out.extend(my_folds)
         elif s.nested():
             # Descend into block stmts (SerialTile / StridedTile / Cond / etc.)
             # to find nested RegisterTiles. Each nested body is rewritten
-            # independently and re-attached via ``with_bodies``.
+            # independently and re-attached via ``with_bodies``. A K serial
+            # loop body propagates ``in_k_serial=True`` so any reduce fold from
+            # below keeps bubbling until the loop closes.
+            child_in_k = isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner")
             new_bodies: list[Body] = []
+            child_folds: list[Stmt] = []
             for sub in s.nested():
-                new_sub, sub_factors = _replicate_register_tiles(sub)
+                new_sub, sub_factors, sub_saw, sub_folds = _replicate_register_tiles(sub, in_k_serial=child_in_k)
                 new_bodies.append(new_sub)
                 factors.extend(sub_factors)
+                saw_register = saw_register or sub_saw
+                child_folds.extend(sub_folds)
             out.append(s.with_bodies(tuple(new_bodies)))
+            # The K serial loop ``s`` has now closed at this scope. If this scope
+            # is itself a K serial loop body, keep bubbling; otherwise the
+            # accumulators are final — drop the fold right after ``s``.
+            if in_k_serial:
+                bubble_folds.extend(child_folds)
+            else:
+                out.extend(child_folds)
         else:
             out.append(s)
-    return Body(out), factors
+    return Body(out), factors, saw_register, bubble_folds
+
+
+def _build_accum_fold(tile: RegisterTile) -> list[Stmt]:
+    """Cross-accumulator tree-fold for an FK reduce tile. The tile's single
+    K_f axis has extent FK; ``010``'s replication has just turned each wrapped
+    ``Accum(acc, …)`` into siblings ``acc_0 .. acc_{FK-1}``. Emit
+    ``acc = op(acc_0, …, acc_{FK-1})`` as a balanced binary tree of ``Assign``s
+    (same shape as ``_combine.TreeHalve``) so downstream reads of ``acc`` see
+    the combined partial — the materializer / cross-thread combine then run on
+    a single ``acc`` exactly as in the FK=1 path. Returns ``[]`` when the tile
+    wraps no ``Accum`` (a post-pointwise K_f tile — FK-unrolled writes only)."""
+    (k_f,) = tile.axes
+    fk = k_f.extent.as_static()
+    folds: list[Stmt] = []
+    for accum in _iter_accums(tile.body):
+        op_name = accum.op.name
+        if op_name not in _ASSOCIATIVE_REDUCE_OPS:
+            raise RuleSkipped(f"FK fold requires an associative reduce op; got {op_name!r} on accumulator {accum.name!r}")
+        folds.extend(_fold_tree(accum.name, fk, accum.op))
+    return folds
+
+
+def _iter_accums(body: Body) -> list[Accum]:
+    """All ``Accum``s reachable in ``body`` (recursing through nested block
+    stmts). For an FK reduce tile the body is the flat innermost reduce
+    ``[Load, Assign…, Accum]``, but recurse defensively."""
+    found: list[Accum] = []
+    for s in body:
+        if isinstance(s, Accum):
+            found.append(s)
+        for sub in s.nested():
+            found.extend(_iter_accums(sub))
+    return found
+
+
+def _fold_tree(acc: str, fk: int, op) -> list[Stmt]:
+    """Balanced binary fold of ``acc_0 .. acc_{fk-1}`` into ``acc`` via ``op``.
+    Intermediate sums get unique ``<acc>__fk<n>`` names; the final ``Assign``
+    defines ``acc`` itself, so the original accumulator name is rebound to the
+    combined value (matching ``acc = (acc0+acc1)+(acc2+acc3)`` in the plan)."""
+    level = [f"{acc}_{i}" for i in range(fk)]
+    out: list[Stmt] = []
+    ctr = 0
+    while len(level) > 1:
+        nxt: list[str] = []
+        i = 0
+        while i < len(level):
+            if i + 1 < len(level):
+                final = len(level) == 2  # the last surviving pair names the result
+                name = acc if final else f"{acc}__fk{ctr}"
+                ctr += 1
+                out.append(Assign(name=name, op=op, args=(level[i], level[i + 1])))
+                nxt.append(name)
+                i += 2
+            else:
+                nxt.append(level[i])
+                i += 1
+        level = nxt
+    return out
 
 
 def _sigma_to_literal(axis: str) -> Callable[[int], Sigma]:

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import torch  # used by test_bind_inputs_preserves_int_dtype
 
 from ..conftest import requires_cuda
@@ -79,6 +80,34 @@ def test_run_code_softmax_blockify(run_cli, dtype):
 @requires_cuda
 def test_run_code_matmul_blockify(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.matmul({_randn('64,128', dtype)}, {_randn('128,64', dtype)})")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("fk", [2, 4, 8])
+@pytest.mark.parametrize("br", [None, 1])
+def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
+    """FK register-tiles the reduce axis into ``fk`` independent accumulators +
+    a cross-accumulator fold (``plans/fk-register-tile-reductions.md``). Pin FK
+    (and optionally BR=1 for the pure-serial scope) and confirm the folded
+    reduction still matches eager — ``rc == 0`` is the accuracy assertion."""
+    monkeypatch.setenv("DEPLODOCK_FK", str(fk))
+    if br is not None:
+        monkeypatch.setenv("DEPLODOCK_BR", str(br))
+    rc, _, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(2048)(torch.randn(4,32,2048))")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("br", [None, 1])
+def test_run_code_softmax_fk_accuracy(run_cli, monkeypatch, br):
+    """Softmax carries both a ``max`` and a ``sum`` reduce, so FK exercises the
+    ``fmaxf`` and ``+`` cross-accumulator folds together. ``rc == 0`` asserts
+    the pinned-FK kernel matches eager."""
+    monkeypatch.setenv("DEPLODOCK_FK", "4")
+    if br is not None:
+        monkeypatch.setenv("DEPLODOCK_BR", str(br))
+    rc, _, stderr = run_cli("run", "--code", "torch.softmax(torch.randn(4,32,2048), dim=-1)")
     assert rc == 0, f"stderr: {stderr}"
 
 

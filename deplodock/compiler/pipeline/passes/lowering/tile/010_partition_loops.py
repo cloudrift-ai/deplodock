@@ -145,6 +145,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     BM,
     BN,
     BR,
+    FK,
     FM,
     FN,
     SPLITK,
@@ -802,6 +803,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
             BM.name: params.bm,
             FM.name: params.fm,
             FN.name: params.fn,
+            FK.name: params.fk,
             BK.name: params.bk,
             SPLITK.name: params.splitk,
             BR.name: params.br,
@@ -935,24 +937,28 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     sigma_outer = Sigma(sigma_map)
 
     # K axes: K_s / K_c are kernel-wide (single SPLITK / single cooperative
-    # thread direction); K_o / K_i are per-K-Loop, built inside _replace_k_loops.
-    K_s = K_c = None
+    # thread direction); K_o / K_i / K_f are per-K-Loop, built inside
+    # _replace_k_loops. K_f (the FK multiple-accumulator register strip-mine of
+    # the K serial loop) only exists for non-matmul reduces with ``params.fk > 1``.
+    K_s = K_c = K_f = None
     K_o_ext: object = 0
     K_src: Axis | None = None
+    fk = params.fk
     if shape.k_loop is not None:
         K_axis = shape.k_loop.axis
         K_name = K_axis.name
         K_src = K_axis.source_axis or K_axis
         if K_axis.extent.is_static:
             E_K = K_axis.extent.as_static()
-            K_o_ext = E_K // (params.splitk * params.br * params.bk)
+            K_o_ext = E_K // (params.splitk * params.br * params.bk * fk)
         else:
-            # Symbolic K (params.bk=splitk=br=1 by planner construction): whole
+            # Symbolic K (params.bk=splitk=br=fk=1 by planner construction): whole
             # axis stays as one serial K_o iteration. ``Axis.__post_init__``
             # coerces the ``Dim`` straight back into the K_o axis.
             K_o_ext = K_axis.extent
         K_s = Axis(f"{K_name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None
         K_c = Axis(f"{K_name}_c", params.br, source_axis=K_src) if params.br > 1 else None
+        K_f = Axis(f"{K_name}_f", fk, source_axis=K_src) if fk > 1 else None
 
     # σ-rewrite outer_n's body (M/N axes), then replace every K-iter Loop with
     # a K_o · K_i tower. Both paths use shared canonical K_o / K_i names so
@@ -966,8 +972,10 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
             K_canonical_name=shape.k_loop.axis.name,
             K_s=K_s,
             K_c=K_c,
+            K_f=K_f,
             br=params.br,
             bk=params.bk,
+            fk=fk,
             K_o_ext=K_o_ext,
         )
         if n_replaced == 0:
@@ -1011,8 +1019,10 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
                 K_canonical_name=shape.k_loop.axis.name,
                 K_s=K_s,
                 K_c=K_c,
+                K_f=K_f,
                 br=params.br,
                 bk=params.bk,
+                fk=fk,
                 K_o_ext=K_o_ext,
             )
         else:
@@ -1184,8 +1194,10 @@ def _replace_k_loops(
     K_canonical_name: str,
     K_s: Axis | None,
     K_c: Axis | None,
+    K_f: Axis | None = None,
     br: int,
     bk: int,
+    fk: int = 1,
     K_o_ext: int,
     atom_k: int = 1,
 ) -> tuple[tuple[Stmt, ...], int]:
@@ -1199,6 +1211,16 @@ def _replace_k_loops(
     the same K extent). ``Loop.is_reduce`` is derived from body Accum
     presence, so K_i inherits the right status automatically.
 
+    ``K_f`` / ``fk`` (the FK multiple-accumulator strip-mine; ``None`` / ``1``
+    when unused): when present the innermost reduce body is wrapped in a
+    ``RegisterTile((K_f,), reduce=s.is_reduce)`` placed *inside* ``K_i``, so
+    ``010_split_register_axes`` replicates the body into FK independent
+    accumulators. The σ then carries the ``K_f`` term and ``K_o`` strides by
+    ``br·bk·fk`` (see :func:`_build_k_sigma`). Both the reduce loop AND any
+    per-K post-pointwise loop sharing this K extent get the K_f tile so the
+    factorization covers the full K range — the post-pointwise tile carries
+    ``reduce=False`` (replicate-and-drop, no fold; FK-unrolled writes).
+
     Non-reduce match + SPLITK > 1: wrap the K_o tower in ``Cond(K_s == 0)`` —
     every K_s CTA would otherwise re-execute the post. Reduce-K skips the
     Cond; launch_geometry's atomic-Write rewrite handles cross-CTA SPLITK."""
@@ -1210,8 +1232,17 @@ def _replace_k_loops(
             K_src = s.axis.source_axis or s.axis
             K_o = Axis(f"{K_canonical_name}_o", K_o_ext, source_axis=K_src)
             K_i = Axis(f"{K_canonical_name}_i", bk, source_axis=K_src)
-            sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_o_ext, br, bk, atom_k=atom_k)
+            sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_f, K_o_ext, br, bk, fk, atom_k=atom_k)
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            # FK strip-mine: the register tile sits innermost (inside K_i) so the
+            # FK cells are the unrolled, ILP-exposed dimension. ``reduce=True``
+            # marks it as a reduce-AXIS (K_f) tile — distinguishing it from the
+            # FM/FN output tile in ``010_split_register_axes`` so the
+            # cross-accumulator fold + role-driven knob stamping fire correctly.
+            # The post-pointwise loop's K_f tile carries the same flag but wraps
+            # no Accum, so the fold is a no-op there (FK-unrolled writes).
+            if K_f is not None:
+                new_body = (RegisterTile(axes=(K_f,), body=Body(new_body), reduce=True),)
             tower = _wrap_tower([(K_i, Role.STAGE_INNER), (K_o, Role.SERIAL_OUTER)], new_body)
             if not s.is_reduce and K_s is not None:
                 out.append(
@@ -1232,8 +1263,10 @@ def _replace_k_loops(
                 K_canonical_name=K_canonical_name,
                 K_s=K_s,
                 K_c=K_c,
+                K_f=K_f,
                 br=br,
                 bk=bk,
+                fk=fk,
                 K_o_ext=K_o_ext,
                 atom_k=atom_k,
             )
@@ -1248,8 +1281,10 @@ def _replace_k_loops(
                 K_canonical_name=K_canonical_name,
                 K_s=K_s,
                 K_c=K_c,
+                K_f=K_f,
                 br=br,
                 bk=bk,
+                fk=fk,
                 K_o_ext=K_o_ext,
                 atom_k=atom_k,
             )
@@ -1259,8 +1294,10 @@ def _replace_k_loops(
                 K_canonical_name=K_canonical_name,
                 K_s=K_s,
                 K_c=K_c,
+                K_f=K_f,
                 br=br,
                 bk=bk,
+                fk=fk,
                 K_o_ext=K_o_ext,
                 atom_k=atom_k,
             )
@@ -1278,20 +1315,28 @@ def _build_k_sigma(
     K_o: Axis,
     K_c: Axis | None,
     K_i: Axis,
+    K_f: Axis | None,
     K_o_ext: int,
     br: int,
     bk: int,
+    fk: int = 1,
     atom_k: int = 1,
 ) -> Sigma:
-    """σ for ``K = K_s·(K_o_ext·br·bk·atom_k) + K_o·(br·bk·atom_k) +
-    K_i·br·atom_k + K_c·atom_k`` (in the most general form). K_s / K_c
-    terms collapse when those axes are None (SPLITK=1 / BR=1); when K_c
-    is absent, K_i loses its ``·br`` stride. ``atom_k`` (the mma.sync K
-    dimension; default 1 for scalar) extends every per-K-step factor —
+    """σ for ``K = K_s·(K_o_ext·br·bk·fk·atom_k) + K_o·(br·bk·fk·atom_k) +
+    K_f·(br·bk·atom_k) + K_i·br·atom_k + K_c·atom_k`` (in the most general
+    form). K_s / K_c / K_f terms collapse when those axes are None
+    (SPLITK=1 / BR=1 / FK=1); when K_c is absent, K_i loses its ``·br``
+    stride. ``K_f`` (the FK multiple-accumulator strip-mine of the K serial
+    loop) inserts a register-tile step of stride ``br·bk·atom_k`` between
+    K_o and K_i, and multiplies the K_o / K_s strides by ``fk`` so the
+    factorization still covers the full K extent. ``atom_k`` (the mma.sync
+    K dimension; default 1 for scalar) extends every per-K-step factor —
     one K_i step covers ``atom_k`` K-elements when MMA is in play, so
     the inner body's K-indexed Loads see ``K_o·bk·atom_k + K_i·atom_k``
     instead of ``K_o·bk + K_i``."""
-    inner_expr = Var(K_o.name) * Literal(br * bk * atom_k, "int")
+    inner_expr = Var(K_o.name) * Literal(br * bk * fk * atom_k, "int")
+    if K_f is not None:
+        inner_expr = inner_expr + Var(K_f.name) * Literal(br * bk * atom_k, "int")
     if K_c is not None:
         if atom_k > 1:
             inner_expr = inner_expr + Var(K_i.name) * Literal(br * atom_k, "int") + Var(K_c.name) * Literal(atom_k, "int")
@@ -1302,5 +1347,5 @@ def _build_k_sigma(
     else:
         inner_expr = inner_expr + Var(K_i.name)
     if K_s is not None:
-        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk * atom_k, "int") + inner_expr
+        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk * fk * atom_k, "int") + inner_expr
     return Sigma({K_name: inner_expr})
