@@ -54,6 +54,7 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.stmt import Accum, Cond, Stmt
 from deplodock.compiler.ir.tile.ir import (
+    _SWIZZLE_BY_BYTES,
     BYTES_PER_ELEM,
     AffineAddressing,
     AsyncWait,
@@ -87,6 +88,17 @@ PATTERN = [Pattern("root", TileOp)]
 # 128 B is what NVIDIA's TMA programming guide recommends for max
 # throughput on box copies.
 _TMA_ALIGN_BYTES = 128
+
+
+def _swizzle_align_bytes(mode: SwizzleMode) -> int:
+    """Swizzled TMA smem aligns to its full swizzle atom (8 rows × width):
+    B128→1024, B64→512, B32→256 — the coordinate-only ldmatrix XOR only
+    reproduces the hardware deposit when the base zeroes the swizzle's
+    source address bits. NONE keeps NVIDIA's 128 B box recommendation."""
+    for wb, m in _SWIZZLE_BY_BYTES:
+        if m == mode:
+            return 8 * wb
+    return _TMA_ALIGN_BYTES
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
@@ -275,7 +287,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                     extents = (*extents[:-1], padded_inner)
             if buf_count > 1:
                 extents = (buf_count, *extents)
-            smem_align = _TMA_ALIGN_BYTES if is_tma else (16 if smem_dtype == "__half" else 0)
+            smem_align = _swizzle_align_bytes(src.swizzle) if is_tma else (16 if smem_dtype == "__half" else 0)
             compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
             declared_smem.add(src.name)
         # Hoisted-compute phase: the fused slab is no longer carried as a
@@ -483,11 +495,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 ),
             ),
         )
-        # 128 B = NVIDIA's recommended TMA-destination alignment for box
-        # copies. Swizzle modes would need wider alignment but the swizzle
-        # picker (012) was dropped from the wrap-body pipeline, so every
-        # TMA stage runs at the base recommendation.
-        align = _TMA_ALIGN_BYTES
+        # Swizzled TMA smem aligns to its full swizzle atom (8 rows × width):
+        # B128→1024, B64→512, B32→256. The coordinate-only ldmatrix XOR (emitted
+        # by 005_lower_atom_tile) only reproduces the hardware's absolute-address
+        # swizzle when the buffer base zeroes the swizzle's source address bits.
+        # Non-swizzled (NONE) keeps NVIDIA's 128 B box-copy recommendation.
+        align = _swizzle_align_bytes(src.swizzle)
         smem_dtype = smem_cuda_dtype(src)
         out: list[Stmt] = [
             Smem(name=src.name, extents=full_extents, align=align, dtype=smem_dtype),

@@ -238,6 +238,34 @@ def test_tma_mma_matches_f32_reference(pin_tma_mma, M: int, N: int, K: int):
     assert diff < 1e-2, f"M={M} N={N} K={K} max-abs-err {diff}"
 
 
+@pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
+def test_tma_swizzle_smem_aligns_to_atom(pin_tma_mma):
+    """Swizzled TMA operand slabs align to their full swizzle atom (8 rows ×
+    width), not the bare 128 B box recommendation: A's inner row is
+    ``BK·atom_k`` = 32 fp16 = 64 B → B64 → ``__align__(512)``; B's is
+    ``WN·FN·atom_n`` = 128 fp16 = 256 B → B128 → ``__align__(1024)``.
+
+    The coordinate-only ldmatrix XOR (005_lower_atom_tile) only reproduces the
+    TMA hardware's absolute-address swizzle when the buffer base zeroes the
+    swizzle's source address bits — i.e. when the base is atom-aligned. Pre-fix
+    these rode the incidental 1024-alignment of the static/dynamic segment;
+    this pins it explicit."""
+    _, kop, src = _compile_and_render(M=256, N=256, K=128, out_dtype=F32)
+    assert "cp.async.bulk.tensor" in src  # smoke-check the swizzled TMA path fired
+
+    operand_smems = {name: s for name, s in kop.smem_buffers.items() if s.dtype != "unsigned long long"}
+    assert operand_smems["a_smem"].align == 512, f"A (B64) must align to 8×64=512 B, got {operand_smems['a_smem'].align}"
+    assert operand_smems["b_smem"].align == 1024, f"B (B128) must align to 8×128=1024 B, got {operand_smems['b_smem'].align}"
+
+    # Static path emits the per-buffer ``__align__``; the dynamic-pool path
+    # (large tiles) folds them into one ``_smem_pool`` base aligned to the
+    # strictest buffer (≥1024 when a B128 operand is present).
+    if "_smem_pool" in src:
+        assert "__align__(1024)" in src and "_smem_pool" in src, "dynamic pool must align its base to the B128 atom"
+    else:
+        assert "__align__(512)" in src and "__align__(1024)" in src, "static swizzled slabs must carry atom alignment"
+
+
 # --- mma.sync (s16816) path: ldmatrix + mma.sync.aligned.m16n8k16 -----------
 
 

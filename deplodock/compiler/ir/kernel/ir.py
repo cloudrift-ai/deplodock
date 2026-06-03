@@ -848,6 +848,33 @@ def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: s
 _MAX_CTAS = 65536
 
 
+def pack_smem(smems) -> tuple[dict[str, int], int]:  # noqa: ANN001 — smems: Iterable[Smem]
+    """Pack ``Smem`` buffers into one contiguous pool, padding each to its
+    alignment. Walks the buffers in order, aligns the running cursor to
+    ``max(nbytes_of(dtype), s.align)`` before placing each buffer, and returns
+    ``({name: byte_offset}, total_padded_bytes)``.
+
+    Single source of truth for the per-CTA smem footprint: ``KernelOp.smem_bytes``
+    and ``render._compute_dynamic_smem_offsets`` both call this so the
+    static-vs-dynamic gate and the launch-time pool size agree (an unpadded sum
+    would under-report when a buffer's alignment exceeds its natural stride —
+    e.g. a 512/1024 B swizzle-atom-aligned operand)."""
+    from math import prod  # noqa: PLC0415
+
+    from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
+
+    offsets: dict[str, int] = {}
+    cursor = 0
+    for s in smems:
+        elements = prod(int(e) for e in s.extents) if s.extents else 1
+        align = max(nbytes_of(s.dtype), int(s.align) if s.align else 0)
+        if align:
+            cursor = (cursor + align - 1) // align * align
+        offsets[s.name] = cursor
+        cursor += elements * nbytes_of(s.dtype)
+    return offsets, cursor
+
+
 @dataclass
 class KernelOp(BodyOp):
     """One ``__global__`` GPU kernel as a Kernel IR program.
@@ -876,18 +903,11 @@ class KernelOp(BodyOp):
         return {s.name: s for s in self if isinstance(s, Smem)}
 
     def smem_bytes(self) -> int:
-        """Total static + dynamic ``__shared__`` bytes declared in the
-        body — sum of ``prod(Smem.extents) * sizeof(Smem.dtype)`` over
-        every ``Smem`` decl."""
-        from math import prod  # noqa: PLC0415
-
-        from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
-
-        total = 0
-        for s in self.smem_buffers.values():
-            elements = prod(int(e) for e in s.extents) if s.extents else 1
-            total += elements * nbytes_of(s.dtype)
-        return total
+        """Total static + dynamic ``__shared__`` bytes declared in the body —
+        the padding-aware pool footprint from :func:`pack_smem` (each buffer
+        aligned to ``max(sizeof(dtype), Smem.align)``), so this matches the
+        renderer's pool packer and the launch-time pool size."""
+        return pack_smem(self.smem_buffers.values())[1]
 
     def validate(self, ctx) -> bool:
         """Drop kernels whose launch wouldn't fit the hardware. Runs
