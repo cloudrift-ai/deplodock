@@ -262,7 +262,10 @@ async def test_get_instance_info_found(mock_api):
     assert info["id"] == "c4bf5e16-1063-11f1-9096-5f6ae8f8983f"
     assert info["status"] == "Active"
     call_data = mock_api.call_args[0][2]
-    assert call_data == {"selector": {"ById": ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]}}
+    assert call_data == {
+        "selector": {"ById": ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]},
+        "mask": {"with_connection_info": True},
+    }
 
 
 @patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
@@ -532,6 +535,21 @@ async def test_wait_for_status_returns_none_on_fail_status(mock_get, mock_sleep)
     mock_get.return_value = {"id": "inst-123", "status": "Inactive"}
     info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, fail_statuses={"Inactive"})
     assert info is None
+
+
+@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+async def test_wait_for_status_returns_none_on_failed_status(mock_get, mock_sleep, caplog):
+    """The v059 'Failed' status short-circuits without the caller listing it, and logs the reason."""
+    mock_get.return_value = {
+        "id": "inst-123",
+        "status": "Failed",
+        "failure": {"cause": "DockerImagePullFailed", "user_message": "image pull failed: unauthorized"},
+    }
+    with caplog.at_level("ERROR"):
+        info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=120)
+    assert info is None
+    assert "image pull failed: unauthorized" in caplog.text
 
 
 @patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)

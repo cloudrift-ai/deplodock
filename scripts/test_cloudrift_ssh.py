@@ -72,7 +72,9 @@ async def rent_instance(api_key, public_key):
 
 
 async def get_instance(api_key, instance_id):
-    data = {"selector": {"ById": [instance_id]}}
+    # v058+ honours the caller mask (defaults all-false); request connection info so
+    # host_address / port_mappings come back populated.
+    data = {"selector": {"ById": [instance_id]}, "mask": {"with_connection_info": True}}
     result = await api_request("POST", "/api/v1/instances/list", data, api_key)
     instances = result.get("instances", [])
     return instances[0] if instances else None

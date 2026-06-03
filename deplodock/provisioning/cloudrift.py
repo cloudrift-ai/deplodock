@@ -22,7 +22,11 @@ DEFAULT_IMAGE_URL_NVIDIA_PROPRIETARY = (
 )
 DEFAULT_IMAGE_URL_AMD = "https://storage.googleapis.com/cloudrift-vm-disks/disks/github/ubuntu-noble-server-rocm-64-20260220-025112.img"
 DEFAULT_CLOUDINIT_URL = "https://storage.googleapis.com/cloudrift-vm-disks/cloudinit/ubuntu-base.cloudinit"
-API_VERSION = "2026-02-10"
+# Pins the CloudRift v059 protocol generation: instances/rent resolves to v059,
+# instances/list to v058 (mask-aware response), instances/terminate to v055.
+# Pin to the date rather than "~upcoming" so a future server version can't silently
+# change request/response shapes (e.g. add another default-off field mask) under us.
+API_VERSION = "2026-05-26"
 
 
 def select_image_url(instance_type):
@@ -127,7 +131,10 @@ async def _get_instance_info(api_key, instance_id, api_url=DEFAULT_API_URL, dry_
     POST /api/v1/instances/list with ById selector.
     Returns the instance dict or None.
     """
-    data = {"selector": {"ById": [instance_id]}}
+    # mask requests only connection info (host_address / port_mappings / login_info); the
+    # server skips the hardware + usage lookups we never read (v058+ honours the caller mask,
+    # defaulting every flag to false — without with_connection_info host/port come back null).
+    data = {"selector": {"ById": [instance_id]}, "mask": {"with_connection_info": True}}
     result = await _api_request("POST", "/api/v1/instances/list", data, api_key, api_url, dry_run)
     if result is None:  # dry-run
         return None
@@ -231,8 +238,13 @@ async def wait_for_status(
         status = info.get("status")
         if status == target_status and _instance_fully_ready(info):
             return info
-        if status in fail_statuses:
-            logger.error(f"Instance {instance_id} reached fail status '{status}'")
+        # "Failed" is a first-class terminal state in the v059 response (carrying a `failure`
+        # detail); treat it as terminal regardless of the caller's fail_statuses so a failed
+        # rental fails fast with an actionable reason instead of polling until timeout.
+        if status == "Failed" or status in fail_statuses:
+            failure = info.get("failure") or {}
+            detail = failure.get("user_message") or failure.get("cause") or "no detail"
+            logger.error(f"Instance {instance_id} reached fail status '{status}': {detail}")
             return None
         await asyncio.sleep(interval)
         elapsed += interval
