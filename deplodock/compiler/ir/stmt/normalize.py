@@ -711,22 +711,6 @@ def _topo(body: Body) -> Body:
     return Body(tuple(items[i] for i in order))
 
 
-#: Marker suffix for loop-carried register-pipeline operand buffers
-#: (``kernel/013_pipeline_mma_regs``). Such a fragment is written by the
-#: prefetch at the *bottom* of the K_o loop body and read by the ``mma`` at the
-#: *top* of the NEXT iteration — a loop-carried dependency across the back-edge,
-#: NOT an intra-body def→use. ``topo_sort_siblings`` must not bind the read to
-#: the in-body write (it would sink the read below the prefetch and compute the
-#: next tile instead of the current one); these names are excluded from the
-#: def-use edge graph so their already-correct source order is preserved by the
-#: stable tiebreak. Single-assignment names (every other body) are unaffected.
-_LOOP_CARRIED_MARK = "__rp1"
-
-
-def _loop_carried(name: str) -> bool:
-    return _LOOP_CARRIED_MARK in name
-
-
 def _sibling_defs_uses(stmt: Stmt) -> tuple[frozenset[str], frozenset[str]]:
     """Names ``stmt`` makes visible to siblings, and names it depends on
     from siblings.
@@ -735,16 +719,10 @@ def _sibling_defs_uses(stmt: Stmt) -> tuple[frozenset[str], frozenset[str]]:
     Block stmts: ``defs`` = Accum names escaping the body (recursive);
     ``uses`` = wrapper's own deps ∪ ((all inner uses) − (all inner SSA
     defs)).
-
-    Loop-carried register-pipeline buffers (``_loop_carried``) are dropped from
-    both sets so the topo sort leaves their read-then-rewrite ordering alone.
     """
     nested = stmt.nested()
     if not nested:
-        return (
-            frozenset(n for n in stmt.defines() if not _loop_carried(n)),
-            frozenset(n for n in stmt.deps() if not _loop_carried(n)),
-        )
+        return frozenset(stmt.defines()), frozenset(stmt.deps())
     defs: set[str] = set()
     all_uses: set[str] = set(stmt.deps())
     all_inner_defs: set[str] = set()
@@ -752,7 +730,7 @@ def _sibling_defs_uses(stmt: Stmt) -> tuple[frozenset[str], frozenset[str]]:
         defs |= _exported_accs(b)
         all_uses |= _all_ssa_uses(b)
         all_inner_defs |= _all_ssa_defs(b)
-    return frozenset(n for n in defs if not _loop_carried(n)), frozenset(n for n in (all_uses - all_inner_defs) if not _loop_carried(n))
+    return frozenset(defs), frozenset(all_uses - all_inner_defs)
 
 
 def _exported_accs(body: Body) -> frozenset[str]:
