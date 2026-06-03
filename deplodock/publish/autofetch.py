@@ -40,16 +40,25 @@ def _repo() -> str:
 def installed_release() -> str:
     """The release tag the installed ``deplodock`` wheel corresponds to.
 
-    ``DEPLODOCK_RELEASE`` override > ``deplodock`` PyPI version → ``v<version>``
-    tag > ``"dev"`` (source checkout, no install). The env-var override wins so
-    contributors and tests can pin a specific release tag independently of what
-    the local wheel reports."""
+    Resolution order:
+    1. ``DEPLODOCK_RELEASE`` env override (tests + contributors pinning a tag).
+    2. ``importlib.metadata`` version of the installed wheel (``v<version>``).
+    3. ``pyproject.toml`` ``[project].version`` (source checkout with no install).
+    4. ``"dev"`` (no pyproject reachable either)."""
     override = os.environ.get("DEPLODOCK_RELEASE")
     if override:
         return override
     try:
         return f"v{version('deplodock')}"
     except PackageNotFoundError:
+        pass
+    try:
+        import tomllib
+
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        with open(pyproject, "rb") as f:
+            return f"v{tomllib.load(f)['project']['version']}"
+    except (OSError, KeyError):
         return "dev"
 
 
