@@ -162,13 +162,7 @@ constructed `LoopOp` (including intermediate fusion results) is
 canonicalized before validation:
 
 - `topo_sort_siblings` — stable Kahn reorder so SSA defs precede their uses
-  within each body (fixes splicer-produced use-before-def). Names containing
-  `_LOOP_CARRIED_MARK` (`__rp1`, the register-pipeline operand buffers of
-  `kernel/013_pipeline_mma_regs`) are **excluded** from the def-use graph: they
-  are loop-carried (read at the top of a K_o iteration, rewritten by the
-  prefetch at the bottom), not single-assignment, so the topo edge would wrongly
-  sink the read below the rewrite — the stable tiebreak preserves their source
-  order instead.
+  within each body (fixes splicer-produced use-before-def).
 - `drop_size_one_free_axes` — inline extent-1 free Loops.
 - `canonicalize_free_axis_order` — sort outer free Loops by axis name.
 - `eliminate_copy_aliases` — drop `y = copy(x)` Assigns.
@@ -279,11 +273,24 @@ collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
 register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
 one fragment) are both consumed before kernel render: `RegisterTile` by
 `kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
-the MMA arm of the same pass (its presence is the structural "this
-matmul factorizes through tensor cores" signal, paired with the
-`ATOM_KIND` knob on the enclosing `TileOp`). Downstream consumer plans
-(MMA fragment factorization, warp-specialize refactor) emit `WarpTile`
-to drive warp-cooperative codegen.
+`kernel/005_lower_atom_tile`. `partition_loops` stamps the `Atom` spec (cell
+shape + operand dtypes — `Atom` lives in `ir/tile/ir.py`) **onto the `AtomTile`
+itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
+tensor cores" signal, carried in the IR rather than re-derived from a knob.
+Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
+collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
+(`c += a @ b`, a reduce-accumulate sibling of `Accum` — it makes its loop
+`is_reduce`) that carries that `Atom` and names its A/B operand `Load`s by SSA
+value. The operand loads stay **plain** — the `Mma` is the sole tensor-core
+marker downstream. Both are ordinary IR the staging passes carry through (the
+loads stage like any `Load`); `kernel/005_lower_atom_tile` recovers each
+operand's role from the co-located `Mma` and lowers the loads →
+`RegFragment`+`LdmatrixLoad` and the `Mma` → `MmaSyncPtx`, with a final
+`RegStore`. The `ATOM_KIND` knob on the enclosing `TileOp` is the *tuning*
+shadow of the same choice (DB / config / search identity), not the semantic
+source. Downstream consumer plans (MMA fragment
+factorization, warp-specialize refactor) emit `WarpTile` to drive
+warp-cooperative codegen.
 
 **Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
 the *consumer* subtree using the staged smem. The producer (cooperative

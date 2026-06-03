@@ -147,14 +147,6 @@ def partition_tma_groups(body: tuple[Stmt, ...]) -> TmaGroups:
                             _add_bundle(gid, s)
                         elif isinstance(s, AsyncWait):
                             wait_group_by_id[id(s)] = gid
-                        elif isinstance(s, Cond):
-                            # A guarded wait inside the K_o body (e.g. the
-                            # register-pipeline iteration-0 prime in
-                            # ``kernel/013_pipeline_mma_regs``) belongs to this
-                            # loop's pipeline group too.
-                            for cs in (*tuple(s.body), *tuple(s.else_body)):
-                                if isinstance(cs, AsyncWait):
-                                    wait_group_by_id[id(cs)] = gid
                     last_pipeline_group[0] = gid
                     continue
                 # Outer wrapper or unrelated SerialTile — recurse into

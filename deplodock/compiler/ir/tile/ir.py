@@ -47,10 +47,11 @@ synthesized at materialization.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
-from deplodock.compiler.dtype import DataType
+from deplodock.compiler.dtype import BF16, F16, F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
@@ -71,6 +72,7 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
+    Mma,
     Select,
     SelectBranch,
     Stmt,
@@ -92,6 +94,75 @@ from deplodock.compiler.ir.stmt.blocks import (
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
+
+
+# ===========================================================================
+# Atom kinds — the hardware-instruction spec for each tensor-core matmul cell.
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class Atom:
+    """Hardware-instruction spec for one matmul atom kind — the cell a single
+    tensor-core instruction realises (``C[M×N] += A[M×K] · B[K×N]``).
+
+    Carried directly on the :class:`~deplodock.compiler.ir.stmt.Mma` op (and
+    keyed by ``name`` in :data:`ATOM_REGISTRY`), so ``kernel/005_lower_atom_tile``
+    reads the cell shape + operand dtypes straight off the ``Mma`` — no registry
+    lookup at lowering.
+
+    - ``name`` — the ``ATOM_KIND`` (e.g. ``"mma_m16n8k16_f16"``); the registry key.
+    - ``shape`` — the cell shape ``(M, N, K)`` one instruction realises.
+    - ``operand_dtypes`` — ``(role, dtype)`` pairs (``"a"`` / ``"b"`` / ``"c"``;
+      scaled kinds extend with ``"a_scale"`` / ``"b_scale"``). A tuple, not a
+      dict, so ``Atom`` stays **hashable** — it rides on a frozen ``Mma`` Stmt.
+      Use :meth:`operand_dtype` for role lookup.
+    - ``group_size`` — threads-per-cell (32 for the warp-level mma.sync atom;
+      128 for a future wgmma warp-group). Drives the warp-tier launch geometry.
+
+    Per-kernel *eligibility* (does a LoopOp admit this atom?) is NOT here — it
+    needs the loop / graph / context and lives in the planner
+    (``passes/lowering/tile/_atom.py``).
+    """
+
+    name: str
+    shape: tuple[int, int, int]
+    operand_dtypes: tuple[tuple[str, DataType], ...]
+    group_size: int
+
+    def operand_dtype(self, role: str) -> DataType:
+        """The element dtype of operand ``role`` (``"a"`` / ``"b"`` / ``"c"``)."""
+        for r, dt in self.operand_dtypes:
+            if r == role:
+                return dt
+        raise KeyError(f"atom {self.name!r} has no operand role {role!r}")
+
+    def __str__(self) -> str:
+        return self.name
+
+
+# The s16816 ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` path is the sole
+# tensor-core family — f16 / bf16 operands, f32 accumulate, sm_80+. f16 and
+# bf16 share the 16-bit fragment layout (only ``MmaSyncPtx.ab_dtype`` differs);
+# scalar matmul is the absence of an atom. ``kernel/005_lower_atom_tile`` emits
+# the RegFragment / LdmatrixLoad / MmaSyncPtx / RegStore chain (smem-staged only —
+# ldmatrix has no gmem-direct path). Insertion order is the planner's enumeration
+# priority (f16 first, then bf16); the launch-geometry / eligibility paths look a
+# kind up directly via ``ATOM_REGISTRY[knobs["ATOM_KIND"]]``.
+ATOM_REGISTRY: dict[str, Atom] = {
+    "mma_m16n8k16_f16": Atom(
+        name="mma_m16n8k16_f16",
+        shape=(16, 8, 16),
+        operand_dtypes=(("a", F16), ("b", F16), ("c", F32)),
+        group_size=32,
+    ),
+    "mma_m16n8k16_bf16": Atom(
+        name="mma_m16n8k16_bf16",
+        shape=(16, 8, 16),
+        operand_dtypes=(("a", BF16), ("b", BF16), ("c", F32)),
+        group_size=32,
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -931,21 +1002,22 @@ class AtomTile(ParallelTile):
 
     Marker for the per-cell hardware-atomic extent on a matmul-reduce kernel
     (see ``plans/mma-fragment-factorization.md``). The axes carry the cell
-    shape (e.g. ``(M=16, N=16)`` for ``wmma_m16n16k16_f16``); the body inside
-    is the per-cell compute the materializer will replace with a fragment
-    instruction chain (``MmaFragment`` decls + ``MmaLoad`` + ``MmaSync``).
+    shape (e.g. ``(M=16, N=8)``); the body inside is the per-cell compute that
+    ``011_lower_atom_cell`` turns into an ``Mma`` + the lowering replaces with
+    the fragment chain.
 
-    The MMA cell materializer (``kernel/010_split_register_axes`` MMA arm)
-    consumes ``AtomTile`` structurally — its presence is the "this kernel
-    factorizes through tensor cores" signal, complementing the
-    ``ATOM_KIND`` knob on the enclosing ``TileOp``. Scalar matmul kernels
-    never emit an ``AtomTile`` (the absence of the tier is the absence of
-    the atom — see :class:`ScalarTileParams` in
-    ``passes/lowering/tile/_enumeration``).
+    ``atom`` is the :class:`Atom` this cell realises, carried **structurally**
+    on the tile — its presence (and this field) is the "this kernel factorizes
+    through tensor cores" signal, and ``011_lower_atom_cell`` reads ``.atom``
+    off it to build the ``Mma`` (no ``ATOM_KIND`` knob lookup; the knob is the
+    tuning shadow of the same choice, not the semantic source). Scalar matmul
+    kernels never emit an ``AtomTile``.
 
     Render is intentionally unimplemented: every ``AtomTile`` must be
     consumed before kernel render, mirroring ``RegisterTile``'s contract.
     """
+
+    atom: Atom
 
     def render(self, ctx: RenderCtx) -> list[str]:
         raise NotImplementedError(
@@ -1037,8 +1109,9 @@ class SerialTileBase(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A serial tile is a reduce iff its immediate body contains an ``Accum``."""
-        return any(isinstance(s, Accum) for s in self.body)
+        """A serial tile is a reduce iff its immediate body contains an ``Accum``
+        (or its tensor-core fused form ``Mma``, which accumulates ``c += a @ b``)."""
+        return any(isinstance(s, (Accum, Mma)) for s in self.body)
 
 
 @dataclass(frozen=True)
@@ -1445,6 +1518,62 @@ class StageBundle(Stmt):
 
 
 # ---------------------------------------------------------------------------
+# Source-aware traversal
+# ---------------------------------------------------------------------------
+
+# A ``map_staged`` visitor: given a stmt and the in-scope ``Source`` table,
+# return a replacement tuple (splice in, no descent into that stmt) or ``None``
+# (descend structurally). The handler is the only thing a caller writes; the
+# StageBundle / WarpSpecialize / nested descent — and the Source threading that
+# makes the in-scope table available — is shared.
+StagedHandler = Callable[["Stmt", dict[str, "Source"]], "tuple[Stmt, ...] | None"]
+
+
+def map_staged(body: Body, handler: StagedHandler, *, sources: dict[str, Source] | None = None) -> Body:
+    """Rewrite ``body`` while threading the in-scope ``Source`` table.
+
+    For each stmt, call ``handler(stmt, sources)``: a returned tuple splices in
+    (no descent into that stmt); ``None`` means descend structurally. Descending
+    a :class:`StageBundle` adds its stage ``Source``s to the table; a
+    :class:`WarpSpecialize` adds the producer's, then rewrites only the consumer
+    body — so a consumer access always sees the slabs its producer staged. Other
+    block stmts recurse with the table unchanged.
+
+    The one source-aware traversal lowering passes share instead of re-rolling
+    the descent + threading by hand. Used both as a transformer (handler returns
+    rewrites) and, with an always-``None`` collecting handler, as a visitor (the
+    rebuilt body is discarded; the handler accumulates via closure)."""
+    scope = sources if sources is not None else {}
+    out: list[Stmt] = []
+    for s in body:
+        repl = handler(s, scope)
+        if repl is not None:
+            out.extend(repl)
+            continue
+        if isinstance(s, StageBundle):
+            inner = dict(scope)
+            for stage in s.stages:
+                for src in stage.sources:
+                    inner[src.name] = src
+            out.append(s.with_bodies((Body(s.stages), map_staged(s.body, handler, sources=inner))))
+            continue
+        if isinstance(s, WarpSpecialize):
+            inner = dict(scope)
+            for st in s.producer_body.iter():
+                if isinstance(st, StageBundle):
+                    for stage in st.stages:
+                        for src in stage.sources:
+                            inner[src.name] = src
+            out.append(s.with_bodies((s.producer_body, map_staged(s.consumer_body, handler, sources=inner))))
+            continue
+        if s.nested():
+            out.append(s.with_bodies(tuple(map_staged(sub, handler, sources=scope) for sub in s.nested())))
+            continue
+        out.append(s)
+    return Body(out)
+
+
+# ---------------------------------------------------------------------------
 # Top-level: TileOp
 # ---------------------------------------------------------------------------
 
@@ -1681,9 +1810,7 @@ def score_tile_geometry(
         # corner (see ``plans/mma-warp-scoring.md`` for the 2048² fp16
         # sweep).
         if "ATOM_KIND" in knobs:
-            from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
-
-            _atom_n = atom_spec(str(knobs["ATOM_KIND"])).shape[1]
+            _atom_n = ATOM_REGISTRY[str(knobs["ATOM_KIND"])].shape[1]
             n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
             # Warp-tier MMA: the actual TMA-pipelined band on sm_90+ /
             # sm_120 is ``BK ≤ 4`` (BK=2 is the empirical sweet spot —
@@ -1725,9 +1852,7 @@ def score_tile_geometry(
     # and the post-materialization score agree (the lazy/eager parity check).
     # See project_cublas_gap_ncu_2026-05-31 memory.
     if "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_spec  # noqa: PLC0415
-
-        atom_m, atom_n, atom_k = atom_spec(str(knobs["ATOM_KIND"])).shape
+        atom_m, atom_n, atom_k = ATOM_REGISTRY[str(knobs["ATOM_KIND"])].shape
         bm = int(knobs.get("WM", 1)) * int(knobs.get("FM", 1)) * atom_m
         bn = int(knobs.get("WN", 1)) * int(knobs.get("FN", 1)) * atom_n
         bk_k = int(knobs.get("BK", 1))
@@ -1963,7 +2088,6 @@ class TileOp(BodyOp):
         """
         if shapes is None or params is None:
             return None
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_shape  # noqa: PLC0415
         from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         shape = shapes
@@ -1974,7 +2098,7 @@ class TileOp(BodyOp):
 
         is_warp = isinstance(p, WarpTileParams)
         if is_warp:
-            atom_m, atom_n, _ = atom_shape(p.atom_kind)
+            atom_m, atom_n, _ = p.atom.shape
             per_m = p.wm * p.fm * atom_m
             per_n = p.wn * p.fn * atom_n
             # "Thread axes" for the warp tier = warps × lanes. Use a
@@ -2033,7 +2157,7 @@ class TileOp(BodyOp):
                 "BK": p.bk,
                 "WM": p.wm,
                 "WN": p.wn,
-                "ATOM_KIND": p.atom_kind,
+                "ATOM_KIND": p.atom.name,
             }
         else:
             score_knobs = {
@@ -2086,7 +2210,6 @@ class TileOp(BodyOp):
         with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
         """
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import atom_shape  # noqa: PLC0415
         from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         thread_extent: dict[str, int] = {}
@@ -2094,7 +2217,7 @@ class TileOp(BodyOp):
             # Warp-tier: the "thread" axes are warps × lanes. Treat the
             # WN × 32 contribution as the inner-stride coalescer along N,
             # mirroring the scalar BN role.
-            atom_m, atom_n, _ = atom_shape(params.atom_kind)
+            atom_m, atom_n, _ = params.atom.shape
             if shape.outer_m is not None and params.wm > 1:
                 thread_extent[shape.outer_m.axis.name] = params.wm * atom_m
             n_extent = params.wn * atom_n
@@ -2165,6 +2288,8 @@ BLOCK_SIZE = _coop_block_size()
 
 
 __all__ = [
+    "Atom",
+    "ATOM_REGISTRY",
     # Shared expressions (re-exported for convenience)
     "Var",
     "Literal",
@@ -2204,6 +2329,9 @@ __all__ = [
     "CacheDim",
     "Source",
     "AsyncWait",
+    # Source-aware traversal (transformer / visitor over staged bodies)
+    "map_staged",
+    "StagedHandler",
     "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
     "Stmt",

@@ -212,3 +212,47 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
     assert kop.knobs.get("ATOM_KIND") is None, "MMA variant should not be emitted when DEPLODOCK_MMA=0"
     # Scalar path should stamp BN/BM.
     assert "BN" in kop.knobs and "BM" in kop.knobs
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+def test_atom_cell_carries_through_staging(monkeypatch):
+    """``tile/011_lower_atom_cell`` fuses the matmul compute into an ``Mma``
+    right after ``partition_loops``; the ``Mma`` (carrying the atom kind +
+    naming its A/B operand Loads by SSA value) rides the staging passes, and
+    ``kernel/005_lower_atom_tile`` recovers each operand's role from the ``Mma``
+    to emit the ``ldmatrix`` + ``mma.sync`` chain. Run the tile chain, confirm
+    the ``Mma`` survives staging and still names its two operand Loads, then the
+    full chain confirms the kernel still emits the s16816 instruction."""
+    from deplodock.compiler.ir.kernel.render import render_kernelop
+    from deplodock.compiler.ir.stmt import Load, Mma
+    from deplodock.compiler.pipeline import TILE_PASSES
+
+    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+    monkeypatch.setenv("DEPLODOCK_FM", "4")
+    monkeypatch.setenv("DEPLODOCK_FN", "8")
+    monkeypatch.setenv("DEPLODOCK_BK", "2")
+
+    # After the full tile chain (partition + lower-atom-cell + staging) the cell
+    # is an Mma whose A/B names resolve to two (plain) Loads of the staged smem.
+    g_tile = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)
+    g_tile = Pipeline.build(TILE_PASSES).run(g_tile)
+    top = g_tile.nodes["c"].op
+    mmas = [s for s in top.body.iter() if isinstance(s, Mma)]
+    assert mmas, "the matmul compute should be an Mma carried through staging"
+    assert all(m.atom.name == "mma_m16n8k16_f16" for m in mmas)
+    # The Mma names its operands; each names a real Load (operand Loads are plain).
+    load_names = {ld.names[0] for ld in top.body.iter() if isinstance(ld, Load)}
+    for m in mmas:
+        assert m.a in load_names and m.b in load_names and m.a != m.b
+
+    # Full chain still produces the s16816 kernel.
+    g = _matmul_graph(M=128, N=128, K=128, out_dtype=F32)
+    g = Pipeline.build(KERNEL_PASSES).run(g)
+    kop = g.nodes["c"].op
+    assert not any(isinstance(s, Mma) for s in kop.body.iter()), "every Mma must be lowered before render"
+    tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
+    src = render_kernelop(kop, tensors=tensors)
+    assert "mma.sync.aligned.m16n8k16" in src

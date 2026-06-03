@@ -188,12 +188,11 @@ def ncu_child() -> bool:
     return _bool(NCU_CHILD)
 
 
-# Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) and
-# ``DEPLODOCK_TMA_SWIZZLE`` (TMA hardware-swizzle opt-in) used to live here as
-# bespoke getters. They are now real ``Knob`` descriptors in their owning rules
-# (``025_swizzle_blocks.py`` / ``050_use_tma.py``) so they show up in
-# ``deplodock knobs`` and read through the descriptor's env path. Env access
-# still routes through this module's ``knob_raw`` / ``int_env`` primitives.
+# Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) used to live here as
+# a bespoke getter. It is now a real ``Knob`` descriptor in its owning rule
+# (``025_swizzle_blocks.py``) so it shows up in ``deplodock knobs`` and reads
+# through the descriptor's env path. Env access still routes through this
+# module's ``knob_raw`` / ``int_env`` primitives.
 
 
 # --- Setters (write os.environ so subprocesses inherit) --------------------

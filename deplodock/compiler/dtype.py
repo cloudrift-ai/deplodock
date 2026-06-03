@@ -21,6 +21,14 @@ class DataType:
 
     ``name`` is the canonical token written on ``Tensor.dtype`` and used
     everywhere the graph compares dtypes (e.g. structural keys).
+
+    Two sub-families (see :func:`is_structured`):
+
+    - **Scalar** — a single logical element per value (``F32`` / ``F16`` /
+      ``BF16`` / ``I32`` / ``I64``). These are plain ``DataType`` instances.
+    - **Structured** (:class:`StructuredType`) — a register-composite value
+      with a hardware-specific layout, e.g. the packed vector ``F16x2``
+      (``__half2``), as opposed to a plain scalar element.
     """
 
     name: str
@@ -29,6 +37,25 @@ class DataType:
 
     def __str__(self) -> str:
         return self.name
+
+    @property
+    def is_structured(self) -> bool:
+        """True for register-composite types (packed vectors, fragments)."""
+        return False
+
+
+@dataclass(frozen=True)
+class StructuredType(DataType):
+    """A register-composite type — a packed vector like ``F16x2`` — as opposed
+    to a plain scalar element.
+
+    It occupies a register with a hardware-specific layout (``__half2``); the
+    renderer / lowering keys on the concrete subtype rather than treating it as
+    a scalar."""
+
+    @property
+    def is_structured(self) -> bool:
+        return True
 
 
 F32 = DataType("f32", np.dtype(np.float32), 4)
@@ -41,10 +68,12 @@ F16 = DataType("f16", np.dtype(np.float16), 2)
 # ``__nv_bfloat16`` (see ``backend/cuda/dtype.py``).
 BF16 = DataType("bf16", np.dtype(np.uint16), 2)
 # Two ``__half`` values packed into a 32-bit register, semantically a
-# 2-wide vector of fp16. Same numpy dtype as F16 since numpy doesn't
-# distinguish — packing is a CUDA-side storage detail; the canonical
-# IR token "f16x2" is what the renderer keys on.
-F16x2 = DataType("f16x2", np.dtype(np.float16), 4)
+# 2-wide vector of fp16 — the first ``StructuredType``. Same numpy dtype as
+# F16 since numpy doesn't distinguish — packing is a CUDA-side storage detail;
+# the canonical IR token "f16x2" is what the renderer keys on.
+F16x2 = StructuredType("f16x2", np.dtype(np.float16), 4)
+
+
 # Integer types — appear on ``input_ids`` placeholders from HF whole-model
 # traces. The compiler doesn't generate kernels that compute on them today
 # (LM-head gather + embedding lookup is index math); they exist so the

@@ -246,7 +246,7 @@ def pin_mma_sync(monkeypatch):
     """Pin the modern warp-level MMA atom + a staged 128×128 warp tile.
 
     ``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` opts the s16816 path into the
-    enumeration (it's appended to ``_ATOM_KINDS_V1`` but not auto-selected
+    enumeration (it's a registered ``ATOM_REGISTRY`` kind but not auto-selected
     until perf-promoted). ``WM=2 FM=4`` → M-tile 128 (``2·4·atom_m=16``);
     ``WN=2 FN=8`` → N-tile 128 (``2·8·atom_n=8``); ``BK=2`` → 32-element
     K-stage. ``DEPLODOCK_TMA=1`` lets the staged bundle promote to TMA on

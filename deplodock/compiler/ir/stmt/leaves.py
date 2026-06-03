@@ -8,11 +8,19 @@ Tile / Cond) live in ``blocks``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, dtype_promote, op_to_expr, render_index, select_to_ternary
+
+if TYPE_CHECKING:
+    # ``Mma.atom`` holds an ``Atom`` (defined in the tile-IR layer, which builds
+    # on this stmt layer). The annotation is lazy (``from __future__ import
+    # annotations``) and ``Mma`` never calls the class at runtime — it just
+    # holds an instance — so this stays a type-only import, no stmt↔tile cycle.
+    from deplodock.compiler.ir.tile.ir import Atom
 
 
 def _resolve_value(name: str, ctx: RenderCtx) -> str:
@@ -515,6 +523,56 @@ class Accum(Stmt):
             return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
         op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
         return [f"{pad}{self.name} {op} {rhs};"]
+
+
+@dataclass(frozen=True)
+class Mma(Stmt):
+    """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
+
+    The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
+    cell on the tensor-core path. Emitted by ``tile/011_lower_atom_cell``
+    alongside its two operand ``Load``s — which stay **plain** (no tensor-core
+    tag): the ``Mma`` is the sole carrier of the cell's :class:`Atom` spec +
+    operand identity, naming its A/B operands by SSA value, so
+    ``kernel/005_lower_atom_tile`` reads the spec straight off the ``Mma`` and
+    recovers each operand Load's role from it. Carried through the staging
+    passes (it makes its reduce loop ``is_reduce`` just like an ``Accum``), and
+    lowered to a kernel-IR ``MmaSyncPtx``.
+
+    - ``c`` — the accumulator SSA name (declared + zero-init'd as the fp32 c
+      fragment at lowering); read-and-written, like ``Accum.name``.
+    - ``a`` / ``b`` — the SSA names of the two operand ``Load``s (A = M×K,
+      B = K×N); the lowering matches each Load by these names.
+    - ``atom`` — the :class:`~deplodock.compiler.ir.tile.ir.Atom` spec itself
+      (cell shape + per-operand dtypes + group size); a hashable frozen record,
+      so it rides on this frozen ``Mma`` Stmt.
+    - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
+      cooperative-K info the escape analysis reads). Threaded through
+      ``rewrite`` like ``Accum.axes``.
+    """
+
+    c: str
+    a: str
+    b: str
+    atom: Atom
+    axes: tuple[str, ...] = ()
+
+    def deps(self) -> tuple[str, ...]:
+        # Mirror ``Accum``: the accumulator read is implicit (loop-carried),
+        # so only the operands are listed — keeps sibling-def analyses (topo
+        # sort, reg-pipeline) from treating ``c`` as a same-scope read.
+        return (self.a, self.b)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.c,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.c} <- mma[{self.atom.name}]({self.a} @ {self.b})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise NotImplementedError(
+            f"Mma must be consumed by kernel/005_lower_atom_tile before render — reached render with atom={self.atom.name!r}"
+        )
 
 
 @dataclass(frozen=True)

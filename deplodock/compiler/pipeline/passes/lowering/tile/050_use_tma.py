@@ -108,18 +108,6 @@ TMA = Knob(
     help="Promote BUFFERED/ASYNC bundles to TMA. 1 = force (hard-fail on ineligibility), 0 = skip pass.",
 )
 
-# TMA hardware-swizzle opt-in. Hints ``(False, True)`` so the default (first
-# candidate) is off — the swizzle only fires when a stage's inner box-dim byte
-# size matches a swizzle width AND the user pins ``DEPLODOCK_TMA_SWIZZLE=1``.
-# The SwizzleMode selection (currently stubbed to NONE) lives in this rule, so
-# the knob is declared here even though no live code reads it yet.
-TMA_SWIZZLE = Knob(
-    "TMA_SWIZZLE",
-    KnobType.BOOL,
-    hints=(False, True),
-    help="Opt in to TMA hardware-swizzle modes (SWIZZLE_{128,64,32}B). Off by default.",
-)
-
 
 def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # Arch-gated default: only Hopper+ offers TMA at all. Hand narrow the
@@ -187,12 +175,13 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
 
 
 def _is_mma_sync_kernel(atom_kind: str | None) -> bool:
-    """True iff ``atom_kind`` names an ``instruction="mma_sync"`` AtomSpec."""
+    """True iff ``atom_kind`` is a registered tensor-core atom (the s16816
+    ldmatrix path — the only family today). False for unset / scalar kinds."""
     if not atom_kind:
         return False
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY, atom_spec  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY  # noqa: PLC0415
 
-    return atom_kind in ATOM_REGISTRY and atom_spec(atom_kind).instruction == "mma_sync"
+    return atom_kind in ATOM_REGISTRY
 
 
 def _walk(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:
