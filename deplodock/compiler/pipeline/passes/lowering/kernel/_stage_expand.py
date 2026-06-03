@@ -1,10 +1,11 @@
 """Stage-expansion helpers for ``100_materialize_tile``.
 
-Producer scaffolding for wrap-body Stages: a transport ``Stage`` becomes a
-cooperative ``Load + Write`` (or ``CpAsyncCopy``) nest, a ``ComputeStage``
-becomes a σ-substituted cooperative ``StridedLoop``. Both flatten multi-axis
-cache slabs via a row-major flat-iter decode. Pure functions — no shared
-materializer state — so they live here rather than inside the pass.
+Producer scaffolding for a ``StageBundle``: its transport ``sources`` become
+cooperative ``Load + Write`` (or ``CpAsyncCopy``) nests, and its optional
+``compute`` phase becomes a σ-substituted cooperative ``StridedLoop``. Both
+flatten multi-axis cache slabs via a row-major flat-iter decode. Pure
+functions — no shared materializer state — so they live here rather than
+inside the pass.
 
 The leading-underscore module name keeps the pass loader (which globs
 ``*.py`` skipping ``_``-prefixed files) from mistaking this for a rule.
@@ -16,7 +17,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import AffineAddressing, Stage, StagePolicy, TemplateAddressing
+from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
 
 
 def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | None) -> int:
@@ -114,7 +115,7 @@ def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | N
 
 
 def emit_stage(
-    stage: Stage,
+    sources,  # noqa: ANN001 — tuple[Source, ...]
     tid_expr,
     n_threads: int,
     *,
@@ -123,17 +124,15 @@ def emit_stage(
     phase,
     pipeline_depth: int,
 ) -> list[Stmt]:
-    """Emit producer scaffolding for a Stage member of a StageBundle.
+    """Emit producer scaffolding for a bundle's transport ``sources``.
 
-    For each ``Source`` in ``stage.sources``, emits per-source
-    cooperative ``Load + Write`` (``CpAsyncCopy`` for ASYNC). Smem decls
-    are hoisted to kernel scope in ``_materialize`` (we skip them via
-    the dedup filter). Leading + trailing ``Sync`` bracket the
-    cooperative load for SYNC policy; BUFFERED/ASYNC/TMA drop the
-    leading sync (different physical slab per iter).
+    For each ``Source``, emits per-source cooperative ``Load + Write``
+    (``CpAsyncCopy`` for ASYNC). Smem decls are hoisted to kernel scope in
+    ``_materialize`` (we skip them via the dedup filter). Leading + trailing
+    ``Sync`` bracket the cooperative load for SYNC policy; BUFFERED/ASYNC/TMA
+    drop the leading sync (different physical slab per iter).
 
-    Bundle context (policy, buffer_count, phase, pipeline_depth) is
-    passed in; the Stage itself no longer carries those fields.
+    Bundle context (policy, buffer_count, phase, pipeline_depth) is passed in.
     """
     is_buffered = policy != StagePolicy.SYNC
     is_async = policy == StagePolicy.ASYNC
@@ -141,7 +140,7 @@ def emit_stage(
     prelude: list[Stmt] = [] if is_buffered else [Sync()]
     body_out: list[Stmt] = list(prelude)
 
-    for src in stage.sources:
+    for src in sources:
         # Per-Source iteration axis: synthesize a unique flat-iter axis
         # so the StridedLoop's loop variable doesn't collide with outer
         # thread-decode variables.
@@ -284,38 +283,54 @@ def emit_stage(
     return body_out
 
 
-def emit_compute_stage(stage: Stage, tid_expr, n_threads: int, *, buffer_count: int) -> list[Stmt]:
-    """Emit producer scaffolding for a ``ComputeStage``.
+def compute_phase_info(compute, sources):  # noqa: ANN001 — Body, tuple[Source, ...]
+    """Recover the fused-slab descriptors from a self-describing compute body.
 
-    Wraps ``stage.compute`` in a cooperative ``StridedLoop`` over the
-    fused cache axes — each thread executes the compute template once
-    per cell it owns, σ-substituting cache-axis Vars with row-major
-    flat-iter decoded coords. ``stage.body`` (the consumer subtree) is
-    pre-flattened to siblings by ``flatten_wrap_stages`` before we run,
-    so it's empty here.
+    The compute phase (``StageBundle.compute``, set by
+    ``030_hoist_invariant_compute``) carries no structured output fields —
+    its single ``Write`` names the output slab and its cache-axis index
+    ``Var``s, and the cache-axis ``Axis`` objects (with extents) live on the
+    sibling cone ``Source``s the compute ``Load``s read. Returns
+    ``(slab_name, cache_axes, value_dtype)`` where ``value_dtype`` is the
+    ``Write``'s stamped dtype (``None`` until ``030_stamp_types`` runs)."""
+    write = None
+    for s in compute:
+        if isinstance(s, Write):
+            write = s
+    if write is None:
+        raise ValueError("compute phase body has no Write — not a hoisted-compute bundle")
+    axis_map: dict[str, Axis] = {}
+    for src in sources:
+        for ax in src.cache_axes:
+            axis_map[ax.name] = ax
+    cache_axes = tuple(axis_map[v.name] for v in write.index)
+    if not cache_axes:
+        raise ValueError(f"compute phase {write.output!r}: needs at least one cache axis")
+    return write.output, cache_axes, write.value_dtype
 
-    The output Source's smem decl is hoisted to kernel scope by
-    ``_materialize``'s prologue walk; the dedup filter drops the
-    redundant in-line decl. Leading ``Sync`` ensures sibling-Stage
-    smem writes are visible; trailing ``Sync`` makes the freshly
-    computed slab CTA-visible to the consumer.
+
+def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_count: int) -> list[Stmt]:  # noqa: ANN001
+    """Emit producer scaffolding for a ``StageBundle.compute`` phase.
+
+    Wraps the compute body in a cooperative ``StridedLoop`` over the fused
+    cache axes — each thread executes the compute template once per cell it
+    owns, σ-substituting cache-axis Vars with row-major flat-iter decoded
+    coords. The fused slab name / cache axes are recovered from the body via
+    :func:`compute_phase_info` (no output ``Source`` is carried).
+
+    The fused slab's smem decl is hoisted to kernel scope by
+    ``_materialize``'s prologue walk; the dedup filter drops the redundant
+    in-line decl. Leading ``Sync`` ensures sibling-stage smem writes are
+    visible; trailing ``Sync`` makes the freshly computed slab CTA-visible to
+    the consumer.
     """
     from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
 
-    # Compute Stage member has exactly one output Source (the slab it fills).
-    if stage.compute is None:
-        raise ValueError("emit_compute_stage: stage.compute is None — not a compute member")
-    if len(stage.sources) != 1:
-        raise ValueError(f"compute Stage: expected 1 output Source, got {len(stage.sources)}")
-    out = stage.sources[0]
-    cache_axes = out.cache_axes
-    if not cache_axes:
-        raise ValueError(f"ComputeStage {out.name!r}: needs at least one cache axis")
-    padded_extents = out.alloc_extents
+    name, cache_axes, _dtype = compute_phase_info(compute, sources)
     total = 1
     for ax in cache_axes:
         total *= ax.extent.as_static()
-    iter_axis = Axis(name=f"{out.name}_flat", extent=total)
+    iter_axis = Axis(name=f"{name}_flat", extent=total)
     if len(cache_axes) == 1:
         coord_for = {cache_axes[0].name: Var(iter_axis.name)}
     else:
@@ -327,13 +342,14 @@ def emit_compute_stage(stage: Stage, tid_expr, n_threads: int, *, buffer_count: 
     # enough; no recursion into nested bodies is needed for the cone
     # shape this pass produces.
     new_stmts: list[Stmt] = []
-    for s in stage.compute:
+    for s in compute:
         new_stmts.append(s.rewrite(lambda n: n, sigma))
 
-    full_extents = (buffer_count, *padded_extents) if buffer_count > 1 else padded_extents
+    extents = tuple(ax.extent.as_static() for ax in cache_axes)
+    full_extents = (buffer_count, *extents) if buffer_count > 1 else extents
     body_out: list[Stmt] = [
         Sync(),
-        Smem(name=out.name, extents=full_extents),
+        Smem(name=name, extents=full_extents),
         StridedLoop(
             axis=iter_axis,
             start=tid_expr,

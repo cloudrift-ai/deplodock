@@ -87,7 +87,7 @@ from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TileOp
+from deplodock.compiler.ir.tile.ir import Source, StageBundle, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -245,7 +245,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         # but ``base = a3 * 12`` lands at 12 bytes for a3=1 — not 8-byte
         # aligned for float2). The last-dim coeff check passes vacuously
         # (no free vars there), so the broader check has to walk back into
-        # the preceding logical dims via the Source's cache_dims. If any
+        # the preceding logical dims via the Source's cache_axes. If any
         # preceding dim's cache-axis extent is not a multiple of n at the
         # innermost slot (= the byte stride from the cell-offset Load
         # group's base to its neighbour group isn't n-aligned), refuse to
@@ -262,7 +262,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         # surfaces as a hang on the BUFFERED / unpipelined paths that
         # do see a contiguous Load run here).
         source = _find_source(top.body, input_name)
-        if source is not None and len(source.cache_dims) >= 2:
+        if source is not None and len(source.cache_axes) >= 2:
             inner_extent = source.alloc_extents[-1]
             if inner_extent % n != 0:
                 return None
@@ -281,13 +281,8 @@ def _find_source(body: Body, name: str) -> Source | None:
     (sources are unique by name within a TileOp by construction) or
     ``None`` if the buffer isn't a Stage-backed smem (e.g. a gmem input)."""
     for stmt in body.iter():
-        if isinstance(stmt, Stage):
+        if isinstance(stmt, StageBundle):
             for src in stmt.sources:
                 if src.name == name:
                     return src
-        elif isinstance(stmt, StageBundle):
-            for stage in stmt.stages:
-                for src in stage.sources:
-                    if src.name == name:
-                        return src
     return None

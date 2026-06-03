@@ -1,15 +1,15 @@
 """Tile-IR Stmt registrations for the shared rewrite / simplify dispatch.
 
-There is now a single ``Stage`` class (carrying ``sources`` plus an
-optional cooperative ``compute`` template) and a single ``StageBundle``
-class (carrying member stages + consumer ``body`` + transport policy
-fields). Both go through introspection-based handlers — adding a new
-``Expr`` / ``Axis`` field is picked up automatically without an override.
+``StageBundle`` carries its ``sources`` directly (the gmem transport
+operands) plus the consumer ``body``, an optional cooperative ``compute``
+phase, and the transport policy fields. It goes through the
+introspection-based handler — adding a new ``Expr`` / ``Axis`` field is
+picked up automatically without an override.
 
-Stage's optional ``compute`` template and StageBundle's stages tuple +
-``body`` are explicit-recursion fields: ``_stage_kwargs`` walks
-``Expr`` / ``Axis`` content but stops at ``Stmt`` boundaries, so we
-recurse into nested Stmts ourselves.
+StageBundle's ``body`` and optional ``compute`` phase are explicit-recursion
+fields: ``_stage_kwargs`` walks ``Expr`` / ``Axis`` content (including the
+``sources``' origins / template exprs) but stops at ``Stmt`` boundaries, so
+we recurse into the nested bodies ourselves.
 
 Registration runs at module import (loaded from the bottom of
 ``tile/ir.py`` after class definitions, breaking the tile→stmt→tile cycle).
@@ -30,7 +30,6 @@ from deplodock.compiler.ir.tile.ir import (
     ParallelTile,
     RegisterTile,
     SerialTile,
-    Stage,
     StageBundle,
     StridedTile,
     ThreadTile,
@@ -40,34 +39,22 @@ from deplodock.compiler.ir.tile.ir import (
 
 
 @rewrite.register
-def _(s: Stage, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+def _(s: StageBundle, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # ``sources`` (Expr in origins / template exprs) ride through ``_stage_kwargs``;
+    # ``body`` / ``compute`` are nested Stmt bodies we recurse into explicitly.
     kwargs = _stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn)
+    kwargs["body"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
     if s.compute is not None:
         kwargs["compute"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.compute)
     return type(s)(**kwargs)
 
 
 @simplify.register
-def _(s: Stage, ctx: SimplifyCtx) -> Stmt:
-    kwargs = _stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a)
-    if s.compute is not None:
-        kwargs["compute"] = tuple(simplify(c, ctx) for c in s.compute)
-    return type(s)(**kwargs)
-
-
-@rewrite.register
-def _(s: StageBundle, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    kwargs = _stage_kwargs(s, on_expr=sigma.apply, on_axis=axis_fn)
-    kwargs["stages"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.stages)
-    kwargs["body"] = tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body)
-    return type(s)(**kwargs)
-
-
-@simplify.register
 def _(s: StageBundle, ctx: SimplifyCtx) -> Stmt:
     kwargs = _stage_kwargs(s, on_expr=lambda e: e.simplify(ctx), on_axis=lambda a: a)
-    kwargs["stages"] = tuple(simplify(c, ctx) for c in s.stages)
     kwargs["body"] = tuple(simplify(c, ctx) for c in s.body)
+    if s.compute is not None:
+        kwargs["compute"] = tuple(simplify(c, ctx) for c in s.compute)
     return type(s)(**kwargs)
 
 

@@ -191,15 +191,14 @@ def _vec_elems_for_lane(tile, lane_var: str, *, lds128_bytes: int) -> int | None
     for bundle in tile.body.iter():
         if not isinstance(bundle, StageBundle):
             continue
-        for member in bundle.stages:
-            for src in member.sources:
-                loads = loads_reading(tile.body, src.name)
-                for ld in loads:
-                    if lane_var not in _load_free_vars(ld):
-                        continue
-                    if ld.dtype is None:
-                        return None
-                    sizes.add(lds128_bytes // ld.dtype.nbytes)
+        for src in bundle.sources:
+            loads = loads_reading(tile.body, src.name)
+            for ld in loads:
+                if lane_var not in _load_free_vars(ld):
+                    continue
+                if ld.dtype is None:
+                    return None
+                sizes.add(lds128_bytes // ld.dtype.nbytes)
     if not sizes:
         return None
     return min(sizes)
@@ -254,23 +253,22 @@ def _swap_helps_any_stage(tile, lane_var: str, F: int, lane_ext: int, *, vec_ele
         # Non-SYNC bundles (BUFFERED / ASYNC / TMA) prepend a phase index
         # to consumer Loads of staged smem.
         leading_phase = bundle.policy != StagePolicy.SYNC
-        for member in bundle.stages:
-            for src in member.sources:
-                loads = loads_reading(tile.body, src.name)
-                if not loads:
-                    continue
-                extents = tuple(ax.extent.as_static() for ax in src.cache_axes)
-                pre = _stage_max_way(loads, extents, leading_phase, tile)
-                if pre is None or pre <= 1:
-                    continue
-                chunk_stride = vec_elems * lane_ext
-                rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride, vec_elems=vec_elems) for ld in loads]
-                post = _stage_max_way(rewritten, extents, leading_phase, tile)
-                if post is None:
-                    continue
-                if post < pre:
-                    logger.debug("Stage %s: bank conflict %d -> %d under chunk rewrite", src.name, pre, post)
-                    return True
+        for src in bundle.sources:
+            loads = loads_reading(tile.body, src.name)
+            if not loads:
+                continue
+            extents = tuple(ax.extent.as_static() for ax in src.cache_axes)
+            pre = _stage_max_way(loads, extents, leading_phase, tile)
+            if pre is None or pre <= 1:
+                continue
+            chunk_stride = vec_elems * lane_ext
+            rewritten = [_rewrite_load_index(ld, lane_var, F, chunk_stride, vec_elems=vec_elems) for ld in loads]
+            post = _stage_max_way(rewritten, extents, leading_phase, tile)
+            if post is None:
+                continue
+            if post < pre:
+                logger.debug("Stage %s: bank conflict %d -> %d under chunk rewrite", src.name, pre, post)
+                return True
     return False
 
 

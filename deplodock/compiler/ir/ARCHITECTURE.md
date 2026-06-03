@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, wrap-body `Stage`/`BufferedStage`/`AsyncBufferedStage`/`TmaBufferedStage`/`ComputeStage` carrying `Source`/`CacheDim` per-operand layouts, `StridedLoop`) |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, sources-only `Stage` carrying `Source`/`CacheDim` per-operand layouts, `StageBundle` carrying policy + optional `compute` phase, `StridedLoop`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -292,26 +292,28 @@ source. Downstream consumer plans (MMA fragment
 factorization, warp-specialize refactor) emit `WarpTile` to drive
 warp-cooperative codegen.
 
-**Wrap-body Stage:** `Stage` is a block-structured Stmt whose `body` is
-the *consumer* subtree using the staged smem. The producer (cooperative
-`Load+Write` per source) is synthesized at materialize time from
-`Stage.sources` — each `Source` carries `name` (smem buffer), `buf`
-(gmem operand), `cache_dims`, `origin`, optional `pad`, and a stored
-`addressing` of type `AffineAddressing | TemplateAddressing` describing
-how cache vars decode into source-buffer indices. Multi-source Stages
-(e.g. matmul A+B) load both behind one sync boundary; sibling Stages
-exist only when scopes differ.
+**Stage + StageBundle:** `Stage` is a sources-only group of gmem
+transport operands behind one barrier — it carries no body. The
+producer (cooperative `Load+Write` per source) is synthesized at
+materialize time from `Stage.sources` — each `Source` carries `name`
+(smem buffer), `buf` (gmem operand), `cache_dims`, `origin`, optional
+`pad`, and a stored `addressing` of type `AffineAddressing |
+TemplateAddressing` describing how cache vars decode into source-buffer
+indices. Multi-source bundles (e.g. matmul A+B) load all behind one sync
+boundary. The `StageBundle` owns the consumer `body`, the transport
+`policy` (`StagePolicy.SYNC/BUFFERED/ASYNC/TMA` + policy fields
+`buffer_count`/`phase`/`pipeline_depth`), and an optional
+hoisted-invariant `compute` phase (a self-describing cooperative body
+that reads sibling slabs and writes a fresh fused slab — emitted after
+the transport sources, before the consumer body).
 
 | Symbol             | Role                                                              |
 |--------------------|-------------------------------------------------------------------|
 | `TileOp`              | Graph-op carrying a `Tile`-rooted body. One per kernel.                                                                              |
 | `Tile`                | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).                                                                     |
-| `Stage`               | Wrap-body cooperative stage. ``sources: tuple[Source, ...]`` carries per-operand smem layouts; ``body`` is the consumer subtree. Materialize emits leading `Sync` + per-source cooperative `Load+Write` + trailing `Sync` + materialized consumer body. |
-| `BufferedStage`       | `Stage` subtype with `buffer_count >= 2` rotating slabs selected by `phase`. Sync transport, ping-pong slabs (no leading `Sync`).    |
-| `AsyncBufferedStage`  | `BufferedStage` subtype using `cp.async` per source; emits `CpAsyncCopy`+`CpAsyncCommit`. The cooperative load is **vectorized** — `_stage_expand._cp_async_width` picks the widest legal copy (`CpAsyncCopy.nbytes` ∈ {4,8,16}; 16⇒`cp.async.cg`) so a contiguous fp16 tile streams 8 halves per `cp.async` (the CUTLASS/cuBLAS shape), gated on inner-axis stride-1 contiguity + alloc/gmem-stride alignment (fp16 needs ≥4B, so non-contiguous fp16 falls back to the scalar sync load). `pipeline_depth>1` marks the stage for temporal pipelining (prologue/main/epilogue), expanded by the bucket-10 pass. |
-| `TmaBufferedStage`    | `BufferedStage` subtype using TMA (`cp.async.bulk.tensor` + mbarrier). `pipeline_depth>1` for pipelining. (Shared-memory swizzle is per-`Source`, see `Source.swizzle` below — not a bundle-level field.) |
-| `ComputeStage`        | `Stage` subtype for hoisted invariant compute. Carries a separate `compute: Body` (per-thread compute reading sibling-stage smem, writing this stage's smem). `external_reads()` returns `()` so 015 / tuning don't classify sibling-smem reads as gmem dependencies. |
-| `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `addressing`, `dtype`, `swizzle` (per-operand TMA smem-swizzle mode; `NONE` except on mma.sync ldmatrix operands). Each Stage carries one or more. |
+| `StageBundle`         | Single-policy cooperative-staging unit: ``sources: tuple[Source, ...]`` (gmem transport operands, per-operand smem layouts) wrapping one consumer `body`. Materialize emits leading `Sync` + per-source cooperative `Load+Write` (or `CpAsyncCopy` / per-source TMA box copy per the policy) + trailing `Sync`. Carries the transport `policy` (`StagePolicy.SYNC/BUFFERED/ASYNC/TMA`) + policy fields (`buffer_count` ≥ 2 rotating slabs selected by `phase`; `pipeline_depth` > 1 marks temporal pipelining expanded by the pipeline-stages pass), and an optional `compute` phase. ASYNC `cp.async` loads are **vectorized** — `_stage_expand._cp_async_width` picks the widest legal copy (`CpAsyncCopy.nbytes` ∈ {4,8,16}; 16⇒`cp.async.cg`) gated on inner-axis stride-1 contiguity + alloc/gmem-stride alignment. TMA shared-memory swizzle is per-`Source` (`Source.swizzle`), not a bundle field. |
+| `StageBundle.compute` | Optional hoisted-invariant cooperative compute phase (a `Body`, set by `030_hoist_invariant_compute`): `Load`s reading sibling cone slabs + `Assign`s + a single `Write` into a fresh fused slab. Self-describing — the materializer recovers the slab name / loop domain / dtype from the body's `Write` + the cone sources (no output `Source`). Emitted after the transport sources, before the consumer body. |
+| `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `addressing`, `dtype`, `swizzle` (per-operand TMA smem-swizzle mode; `NONE` except on mma.sync ldmatrix operands). A `StageBundle` carries one or more. |
 | `CacheDim`            | One cache (smem) axis paired with the source-buffer dim it maps to. `Source.cache_dims` is a tuple of these.                          |
 | `AffineAddressing`    | Stored addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. Optional per-cache-dim `block` multiplier grows the slab and producer iteration range by `block[i]` per cache dim (e.g. MMA atom factor); default `()` keeps coef-1 semantics. |
 | `TemplateAddressing`  | Stored addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views and any other case where `origin + decoded` can't reconstruct the load. |

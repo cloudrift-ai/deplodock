@@ -114,9 +114,8 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
 
     def _gather(s: Stmt, _scope: dict[str, Source]) -> None:
         if isinstance(s, StageBundle):
-            for stage in s.stages:
-                for src in stage.sources:
-                    bundle_sources[src.name] = src
+            for src in s.sources:
+                bundle_sources[src.name] = src
         return None
 
     map_staged(atom_body, _gather)

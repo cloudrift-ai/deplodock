@@ -229,8 +229,9 @@ def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count:
             new_inner = s.body.map(_make_phase_load_rewriter(staged_names, phase))
             new_kouter_body.append(
                 StageBundle(
-                    stages=s.stages,
+                    sources=s.sources,
                     body=new_inner,
+                    compute=s.compute,
                     policy=StagePolicy.BUFFERED,
                     buffer_count=buffer_count,
                     phase=phase,
@@ -254,16 +255,15 @@ def _bundle_real_bytes(bundle: StageBundle, input_nbytes: dict[str, int]) -> int
     ``Source.smem_bytes`` uses pre-``030_stamp_types``. Sources whose ``buf``
     isn't a known input fall back to the property (still fp32-safe)."""
     total = 0
-    for stage in bundle.stages:
-        for src in stage.sources:
-            nbytes = input_nbytes.get(src.buf)
-            if nbytes is None:
-                total += src.smem_bytes
-                continue
-            count = 1
-            for e in src.alloc_extents:
-                count *= e
-            total += count * nbytes
+    for src in bundle.sources:
+        nbytes = input_nbytes.get(src.buf)
+        if nbytes is None:
+            total += src.smem_bytes
+            continue
+        count = 1
+        for e in src.alloc_extents:
+            count *= e
+        total += count * nbytes
     return total
 
 

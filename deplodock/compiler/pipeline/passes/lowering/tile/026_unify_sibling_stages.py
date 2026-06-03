@@ -33,11 +33,10 @@ When it visits a ``StageBundle``, every ``Source`` whose
 ``(buf, bundle.phase)`` is already in the set is dropped and the
 consumer ``Load``s inside the bundle body that referenced that Source's
 slab name are rewritten back to read from gmem at the original index
-(reconstructed from ``Source.origin`` + ``cache_dims``, or directly
+(reconstructed from ``Source.origin`` + ``cache_axes``, or directly
 from ``Source.template_index`` when the addressing was template). If
-every Source in a Stage gets dropped the Stage is removed; if every
-Stage in the bundle goes the bundle is unwrapped (its body inlined at
-the parent scope).
+every Source in the bundle gets dropped the bundle is unwrapped (its
+body inlined at the parent scope).
 
 Runs between ``020_stage_inputs`` and ``030_hoist_invariant_compute``
 so every subsequent pass (ring-buffer / TMA promotion / pad / pipeline)
@@ -53,7 +52,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, Stage, StageBundle, TemplateAddressing, TileOp
+from deplodock.compiler.ir.tile.ir import Source, StageBundle, TemplateAddressing, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -130,20 +129,16 @@ def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, B
     bundle wrapper carried only staging policy + sync glue, no longer
     needed)."""
     revert: dict[str, Source] = {}
-    new_stages: list[Stage] = []
+    kept_sources: list[Source] = []
     phase = bundle.phase
-    for stage in bundle.stages:
-        kept_sources: list[Source] = []
-        for src in stage.sources:
-            key = (src.buf, phase)
-            if key in state.bufs_staged:
-                revert[src.name] = src
-                state.dropped_any = True
-                continue
-            state.bufs_staged.add(key)
-            kept_sources.append(src)
-        if kept_sources:
-            new_stages.append(replace(stage, sources=tuple(kept_sources)))
+    for src in bundle.sources:
+        key = (src.buf, phase)
+        if key in state.bufs_staged:
+            revert[src.name] = src
+            state.dropped_any = True
+            continue
+        state.bufs_staged.add(key)
+        kept_sources.append(src)
 
     # Recurse into the bundle body first so any nested StageBundle (a
     # bulk-prefetch pipeline emits sibling bundles inside a serial_outer
@@ -152,14 +147,14 @@ def _visit_bundle(bundle: StageBundle, *, state: _State) -> tuple[Stmt | None, B
     if revert:
         new_inner = _revert_loads(new_inner, revert)
 
-    if not new_stages:
+    if not kept_sources:
         return None, new_inner
-    return replace(bundle, stages=tuple(new_stages), body=new_inner), Body(())
+    return replace(bundle, sources=tuple(kept_sources), body=new_inner), Body(())
 
 
 def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     """Build the gmem ``Load.index`` that 020 would have emitted had it
-    not promoted this Source to smem. ``cache_dims`` carries the
+    not promoted this Source to smem. ``cache_axes`` + the addressing carry the
     affine mapping (``origin[d] + composite-stride decode`` over each
     cache axis mapping to dim ``d``); ``TemplateAddressing.exprs`` is
     the verbatim non-affine form when 020 set it. Inverse of 020's
@@ -178,7 +173,7 @@ def _reconstruct_global_index(src: Source) -> tuple[Expr, ...]:
     ``linear_1_reduce`` with ``a4 * 2`` dropped from the M coord)."""
     if isinstance(src.addressing, TemplateAddressing):
         return src.addressing.exprs
-    coord_for = {cd.axis.name: Var(cd.axis.name) for cd in src.cache_dims}
+    coord_for = {ax.name: Var(ax.name) for ax in src.cache_axes}
     # AffineAddressing.source_index threads ``block`` through the per-dim
     # composite stride so MMA-strided sources revert to the same gmem σ
     # the planner emitted. Scalar paths keep block=() and behave

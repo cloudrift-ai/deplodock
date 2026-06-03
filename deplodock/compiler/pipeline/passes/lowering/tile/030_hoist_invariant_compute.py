@@ -30,14 +30,14 @@ are emitted in fixed order whenever a cone is found:
   already produces the inline-fuse shape (multi-source Stage with the
   chain in the K_i body); the chain runs per-thread per-K_i, redundant
   across the N tile.
-- ``True`` — split the multi-source Stage into a *transport* Stage for
-  the cone sources wrapping a *compute* Stage that cooperatively fills
-  a fresh smem slab with the cone frontier; the K_i reduce reads the
-  slab instead of re-running the chain. Non-cone sources move to an
-  outer Stage so they stay in scope through the rewrite. Materialized
-  by ``100_materialize_tile._emit_compute_stage`` — emits a single
-  cooperative ``StridedLoop`` over the fused cache axes that runs the
-  compute body once per cell.
+- ``True`` — keep the single multi-source transport Stage and attach
+  the cone frontier as a ``StageBundle.compute`` phase: a self-describing
+  cooperative body that reads the cone sibling slabs and writes a fresh
+  fused smem slab; the K_i reduce reads that slab instead of re-running
+  the chain. Materialized by ``100_materialize_tile`` (``emit_compute_phase``)
+  — emits a single cooperative ``StridedLoop`` over the fused cache axes
+  (recovered from the compute body's Write + the cone sources) that runs
+  the compute body once per cell.
 
 Idempotence: stamps ``HOIST_COMPUTE`` on every emitted variant so
 re-entry self-skips.
@@ -50,10 +50,8 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    CacheDim,
     SerialTile,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
     TileOp,
@@ -68,10 +66,10 @@ HOIST_COMPUTE = Knob(
     KnobType.BOOL,
     hints=(False, True),
     help=(
-        "Hoist an invariant compute cone out of a multi-source Stage's K_i reduce body. "
+        "Hoist an invariant compute cone out of a multi-source bundle's K_i reduce body. "
         "False (default) — pass-through the inline-fuse shape from 020_stage_inputs. "
-        "True — split the multi-source Stage into transport + ComputeStage so the cone "
-        "chain runs once per cell instead of per (N) thread per K_i. Autotune fork."
+        "True — keep the multi-source transport bundle and attach a StageBundle.compute "
+        "phase so the cone chain runs once per cell instead of per (N) thread per K_i. Autotune fork."
     ),
 )
 
@@ -102,13 +100,12 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
 
 
 class _ConeTarget:
-    """Cached cone-detection result for one Stage inside a SYNC bundle."""
+    """Cached cone-detection result for one SYNC bundle."""
 
-    __slots__ = ("bundle", "stage", "reduce", "cone_sources", "cone_loads", "cone_assigns", "boundary_name", "fused_cache_axes")
+    __slots__ = ("bundle", "reduce", "cone_sources", "cone_loads", "cone_assigns", "boundary_name", "fused_cache_axes")
 
-    def __init__(self, bundle, stage, reduce, cone_sources, cone_loads, cone_assigns, boundary_name, fused_cache_axes):
+    def __init__(self, bundle, reduce, cone_sources, cone_loads, cone_assigns, boundary_name, fused_cache_axes):
         self.bundle = bundle
-        self.stage = stage
         self.reduce = reduce
         self.cone_sources = cone_sources
         self.cone_loads = cone_loads
@@ -118,35 +115,32 @@ class _ConeTarget:
 
 
 def _find_first_cone_target(body: Body) -> _ConeTarget | None:
-    """Scan for a SYNC bundle holding exactly one multi-source transport
-    Stage (no compute template) with a hoistable cone. Bundles produced
-    by 020_stage_inputs always satisfy this shape pre-promotion."""
+    """Scan for a multi-source SYNC bundle (no compute phase) with a
+    hoistable cone. Bundles produced by 020_stage_inputs always satisfy
+    this shape pre-promotion."""
     for s in body.iter():
         if not isinstance(s, StageBundle):
             continue
-        if s.policy != StagePolicy.SYNC or len(s.stages) != 1:
+        if s.policy != StagePolicy.SYNC or s.compute is not None:
             continue
-        inner = s.stages[0]
-        if inner.compute is not None:
-            continue
-        target = _try_find_cone(s, inner)
+        target = _try_find_cone(s)
         if target is not None:
             return target
     return None
 
 
-def _try_find_cone(bundle: StageBundle, stage: Stage) -> _ConeTarget | None:
-    if len(stage.sources) < 2:
+def _try_find_cone(bundle: StageBundle) -> _ConeTarget | None:
+    if len(bundle.sources) < 2:
         return None
     reduce = _find_unique_stage_inner_reduce(bundle.body)
     if reduce is None:
         return None
 
     # Group sources by their cache-axis name tuple. Only groups of ≥ 2
-    # produce a fusable cone (1 source means the existing single-stage
+    # produce a fusable cone (1 source means the existing single-source
     # staging already does the work).
     by_axes: dict[tuple[str, ...], list[Source]] = {}
-    for src in stage.sources:
+    for src in bundle.sources:
         key = tuple(ax.name for ax in src.cache_axes)
         by_axes.setdefault(key, []).append(src)
 
@@ -181,7 +175,6 @@ def _try_find_cone(bundle: StageBundle, stage: Stage) -> _ConeTarget | None:
         fused_cache_axes = group[0].cache_axes
         return _ConeTarget(
             bundle=bundle,
-            stage=stage,
             reduce=reduce,
             cone_sources=group_names,
             cone_loads=frozenset(cone_loads),
@@ -251,17 +244,15 @@ def _find_boundary(body: Body, cone: set[str] | frozenset[str]) -> set[str]:
 
 
 def _apply_hoist(body: Body, target: _ConeTarget) -> Body:
-    """Replace ``target.bundle`` with a new SYNC bundle whose ``stages``
-    tuple is ``(non_cone_stage, cone_stage, compute_stage)`` (omitting
-    ``non_cone_stage`` if it has no sources) and whose ``body`` is the
-    original bundle body with the K_i reduce rewritten to read the
-    fused slab via a single Load.
+    """Replace ``target.bundle`` with a new SYNC bundle holding a single
+    multi-source transport Stage (sources ``non_cone + cone``), a
+    ``compute=Body((cone_loads, cone_assigns, fused_write))`` phase, and a
+    ``body`` that is the original bundle body with the K_i reduce rewritten
+    to read the fused slab via a single Load.
 
-    The compute Stage carries ``compute=Body((cone_loads, cone_assigns,
-    fused_write))`` — a per-thread cooperative body that reads sibling
-    cone smem and writes into ``fused_name`` smem. The bundle shape
-    means producer ordering is `non_cone → cone → compute → consumer`
-    by stages-tuple position.
+    The compute phase is a per-thread cooperative body that reads sibling
+    cone smem and writes into ``fused_name`` smem. Producer ordering at
+    materialize is `transport → compute → consumer`.
 
     The walk is by-identity on the bundle (``id(stmt) == id(target.bundle)``)
     rather than via :meth:`Body.map`, which would rebuild every wrapper
@@ -288,8 +279,8 @@ def _apply_hoist(body: Body, target: _ConeTarget) -> Body:
 
 
 def _build_hoisted_replacement(target: _ConeTarget) -> StageBundle:
-    cone_sources = tuple(src for src in target.stage.sources if src.name in target.cone_sources)
-    non_cone_sources = tuple(src for src in target.stage.sources if src.name not in target.cone_sources)
+    cone_sources = tuple(src for src in target.bundle.sources if src.name in target.cone_sources)
+    non_cone_sources = tuple(src for src in target.bundle.sources if src.name not in target.cone_sources)
     fused_name = "_".join(src.name for src in cone_sources) + "_fused"
     fused_index: tuple[Expr, ...] = tuple(Var(ax.name) for ax in target.fused_cache_axes)
 
@@ -327,20 +318,6 @@ def _build_hoisted_replacement(target: _ConeTarget) -> StageBundle:
         unroll=target.reduce.unroll,
     )
 
-    # Output Source for the fused slab. ``buf`` is self-referential —
-    # the compute Stage writes into its own smem, not from gmem.
-    from deplodock.compiler.ir.expr import Literal  # noqa: PLC0415
-
-    zero_origin = tuple(Literal(0, "int") for _ in target.fused_cache_axes)
-    fused_source = Source(
-        name=fused_name,
-        buf=fused_name,
-        cache_dims=tuple(CacheDim(axis=ax, source_dim=i) for i, ax in enumerate(target.fused_cache_axes)),
-        origin=zero_origin,
-    )
-    compute_stage = Stage(sources=(fused_source,), compute=Body(tuple(compute_stmts)))
-    cone_stage = Stage(sources=cone_sources)
-
     # New bundle body: original bundle.body with the reduce stmt replaced
     # by the rewritten new_reduce (which reads the fused slab via the
     # boundary SSA name).
@@ -355,18 +332,18 @@ def _build_hoisted_replacement(target: _ConeTarget) -> StageBundle:
     if not placed:  # defensive — reduce should be at top level of bundle.body
         new_body_stmts.append(new_reduce)
 
-    # Stage tuple order = producer issue order. non_cone first (gmem
-    # transport), then cone (gmem transport), then compute (sibling-smem
-    # → own-smem). When non_cone is empty, omit it.
-    stages: tuple[Stage, ...]
-    if non_cone_sources:
-        non_cone_stage = Stage(sources=non_cone_sources)
-        stages = (non_cone_stage, cone_stage, compute_stage)
-    else:
-        stages = (cone_stage, compute_stage)
+    # One homogeneous transport bundle holding ALL gmem operands. Source
+    # order == producer issue order: ``non_cone_sources + cone_sources``
+    # (keeps the cooperative-load emit order byte-identical to the
+    # pre-collapse three-stage shape). The hoisted compute is a bundle
+    # *phase* (``compute=``) — it is self-describing (its Loads name the
+    # cone slabs, its single Write names the fused slab), so no output
+    # ``Source`` is needed; the materializer recovers the slab name / loop
+    # domain / dtype from the body at emit.
     return StageBundle(
-        stages=stages,
+        sources=non_cone_sources + cone_sources,
         body=Body(tuple(new_body_stmts)),
+        compute=Body(tuple(compute_stmts)),
         policy=StagePolicy.SYNC,
     )
 

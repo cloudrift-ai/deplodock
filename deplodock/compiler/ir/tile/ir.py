@@ -13,23 +13,22 @@ Pipeline shape::
                      ──materialize_tile──▶ Kernel IR
                      ──render_kernelop──▶ CUDA source
 
-**Wrap-body Stage:** every ``Stage`` is a block-structured Stmt whose
+**StageBundle:** every ``StageBundle`` is a block-structured Stmt whose
 ``body`` is the *consumer* subtree that uses the staged smem buffers.
 The producer (cooperative Load+Write per source) is synthesized at
-materialize time from ``Stage.sources``. Smem lifetime is structural
-(decl-to-end-of-Stage.body, not implicit-end-of-block).
+materialize time from ``StageBundle.sources``. Smem lifetime is
+structural (decl-to-end-of-bundle.body, not implicit-end-of-block).
 
-**Sources.** Each Stage carries one or more ``Source`` entries; each
-Source maps one gmem buffer into one smem slab with its own cache axes
-and origin. Multi-source stages (e.g. A + B in a matmul reduce) load
-both behind a single sync boundary. Stages with genuinely different
+**Sources.** Each bundle carries one or more ``Source`` entries directly;
+each Source maps one gmem buffer into one smem slab with its own cache
+axes and origin. Multi-source bundles (e.g. A + B in a matmul reduce)
+load all behind a single sync boundary. Bundles with genuinely different
 consumer scopes nest instead of multi-sourcing.
 
-**Transport subclasses** (``Stage``, ``BufferedStage``,
-``AsyncBufferedStage``, ``TmaBufferedStage``) encode transport policy:
-sync cooperative load, ring-buffered sync, cp.async, TMA box-copy.
-``pipeline_depth > 1`` on the async / TMA flavors marks a stage for
-temporal pipelining (prologue/main/epilogue), expanded by
+**Transport policy** (``StagePolicy.SYNC`` / ``BUFFERED`` / ``ASYNC`` /
+``TMA``) on the bundle encodes sync cooperative load, ring-buffered sync,
+cp.async, or TMA box-copy. ``pipeline_depth > 1`` (ASYNC / TMA) marks a
+bundle for temporal pipelining (prologue/main/epilogue), expanded by
 ``080_pipeline_stages`` before materialization.
 
 **Leaf compute reuses Loop IR.** ``Load`` / ``Assign`` / ``Select`` /
@@ -346,7 +345,7 @@ class WarpSpecialize(Stmt):
 
 
 # ---------------------------------------------------------------------------
-# Stage primitives: Source + CacheDim + AffineAddressing/TemplateAddressing
+# Stage primitives: Source + AffineAddressing/TemplateAddressing
 # ---------------------------------------------------------------------------
 
 # Bytes per stored element in smem. fp32-only assumption — fp16 paths
@@ -478,23 +477,6 @@ class TemplateAddressing:
 
 
 @dataclass(frozen=True)
-class CacheDim:
-    """One cache (smem) axis + which source-buffer dim it covers.
-
-    ``axis`` carries the cache axis identity (its ``source_axis``
-    back-pointer, set by 020_stage_inputs at construction time, identifies
-    which original output axis this cache dim corresponds to — used by
-    downstream passes for per-source-axis grouping).
-
-    ``source_dim`` is the index into the source buffer's shape that this
-    cache axis decodes into (i.e. the dim the cache var is added to).
-    """
-
-    axis: Axis
-    source_dim: int
-
-
-@dataclass(frozen=True)
 class Source:
     """One gmem operand staged into one smem slab.
 
@@ -502,8 +484,12 @@ class Source:
 
     - ``name`` — smem buffer name visible to consumer Loads.
     - ``buf`` — gmem source buffer name (the input).
-    - ``cache_dims`` — per-cache-axis source-dim mapping; defines the
-      slab layout in smem and how cache vars decode into source dims.
+    - ``cache_axes`` — the smem slab's cache axes (one ``Axis`` per slab
+      dim, in slab-layout order); their extents define the slab shape and
+      the cooperative-load iteration domain. Which *source* buffer dim
+      each cache axis decodes into lives on ``addressing`` (``AffineAddressing.dims``),
+      not here — the two used to be bundled in a ``CacheDim`` whose
+      ``source_dim`` simply duplicated ``addressing.dims``.
     - ``origin`` — per-source-dim CTA-uniform anchor. The cooperative
       load reads ``buf[origin[d] + cache_var(d)]`` (affine) or
       ``buf[addressing.exprs[d]]`` (template).
@@ -515,9 +501,9 @@ class Source:
       coef-block (e.g. atom-strided MMA) in exactly one source dim;
       template when the consumer's original Load was a collapsed-reshape
       and ``origin + decoded`` can't reconstruct it. Defaults to
-      ``AffineAddressing(dims=tuple(cd.source_dim for cd in cache_dims))``
-      when omitted, so legacy construction sites that didn't specify
-      addressing keep their semantics. Pre-M2 this was a derived
+      ``AffineAddressing(dims=tuple(range(len(cache_axes))))`` (identity
+      cache-axis → source-dim mapping) when omitted, so construction sites
+      with the common identity layout can skip it. Pre-M2 this was a derived
       property of ``cache_dims`` + ``template_index``; the refactor
       collapses both addressing-mode payloads into the addressing object
       so ``Source`` stays focused on slab identity / gmem anchor.
@@ -543,7 +529,7 @@ class Source:
 
     name: str
     buf: str
-    cache_dims: tuple[CacheDim, ...]
+    cache_axes: tuple[Axis, ...]
     origin: tuple[Expr, ...]
     pad: tuple[int, ...] = ()
     addressing: AffineAddressing | TemplateAddressing | None = None
@@ -552,20 +538,16 @@ class Source:
     swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:
-        # Default addressing: affine with dims pulled off cache_dims. The
-        # field is typed Optional only so the default sentinel can be
-        # ``None`` (a tuple-of-int default would require a frozen factory
+        # Default addressing: affine with the identity cache-axis → source-dim
+        # mapping. The field is typed Optional only so the default sentinel can
+        # be ``None`` (a tuple-of-int default would require a frozen factory
         # for the dims, which is awkward). Frozen-set via object.__setattr__.
         if self.addressing is None:
             object.__setattr__(
                 self,
                 "addressing",
-                AffineAddressing(dims=tuple(cd.source_dim for cd in self.cache_dims)),
+                AffineAddressing(dims=tuple(range(len(self.cache_axes)))),
             )
-
-    @property
-    def cache_axes(self) -> tuple[Axis, ...]:
-        return tuple(cd.axis for cd in self.cache_dims)
 
     @property
     def alloc_extents(self) -> tuple[int, ...]:
@@ -690,7 +672,8 @@ def _source_pretty(src: Source) -> str:
     which formats each source as ``shared name[...] = buf[...]`` at the
     Stage's indent.
     """
-    cache = ", ".join(f"{ax.name}:{ax.extent}@{cd.source_dim}" for ax, cd in zip(src.cache_axes, src.cache_dims, strict=True))
+    dims = src.addressing.dims if isinstance(src.addressing, AffineAddressing) else tuple(range(len(src.cache_axes)))
+    cache = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(src.cache_axes, dims, strict=True))
     origin = ", ".join(e.pretty() for e in src.origin)
     pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
     tpl = ""
@@ -1237,34 +1220,33 @@ class StridedTile(SerialTileBase):
 
 
 # ---------------------------------------------------------------------------
-# Stage + StageBundle — single-policy bundles of cooperative stages
+# StageBundle — single-policy cooperative-staging unit
 # ---------------------------------------------------------------------------
 #
-# Replaces the wrap-body Stage hierarchy. There is now ONE ``Stage``
-# class carrying ``sources`` plus an optional ``compute`` template body
-# (the producer-side cooperative compute, previously specific to
-# ``ComputeStage``). Staging policy — sync transport, ring-buffered,
-# cp.async, TMA — lives on the enclosing ``StageBundle`` instead of
-# per-Stage subclasses. A bundle is single-policy: all member stages
-# share the same transport. K_o-dependency partitioning produces
-# separate bundles with different policies rather than mixed bundles.
+# Replaces the wrap-body Stage hierarchy. The intermediate ``Stage``
+# grouping layer is gone: a ``StageBundle`` holds its ``sources`` directly
+# (the gmem transport operands), the consumer ``body``, an optional
+# ``compute`` phase, and the staging policy — sync transport,
+# ring-buffered, cp.async, TMA. A bundle is single-policy: every source
+# shares the same transport. K_o-dependency partitioning produces separate
+# bundles with different policies rather than mixed bundles.
 #
 # Mapping from old hierarchy:
-#   Stage(sources, body)                                 → StageBundle(stages=(Stage(sources),), body, SYNC)
-#   BufferedStage(sources, body, buffer_count, phase)    → StageBundle(stages=(Stage(sources),), body, BUFFERED, buffer_count, phase)
-#   AsyncBufferedStage(sources, body, ..., depth)        → StageBundle(stages=(Stage(sources),), body, ASYNC, ..., pipeline_depth)
-#   TmaBufferedStage(sources, body, ..., depth)          → StageBundle(stages=(Stage(sources),), body, TMA, ..., pipeline_depth)
-#   ComputeStage(sources, body, compute, ...)            → StageBundle(stages=(Stage(sources, compute=...),), body, BUFFERED|SYNC, ...)
+#   Stage(sources, body)                                 → StageBundle(sources, body, SYNC)
+#   BufferedStage(sources, body, buffer_count, phase)    → StageBundle(sources, body, BUFFERED, buffer_count, phase)
+#   AsyncBufferedStage(sources, body, ..., depth)        → StageBundle(sources, body, ASYNC, ..., pipeline_depth)
+#   TmaBufferedStage(sources, body, ..., depth)          → StageBundle(sources, body, TMA, ..., pipeline_depth)
+#   ComputeStage(sources, body, compute, ...)            → StageBundle(sources, body, compute=..., SYNC, ...)
 #
-# Stage retains NO body — the bundle owns the consumer scope.
-# Stage's ``compute`` field is non-None iff it's a hoisted-invariant
-# compute stage (sibling-smem → own-smem producer template); None for
-# plain transport stages.
+# The hoisted-invariant cooperative compute (sibling-smem → own-smem
+# producer template) is a distinct ``StageBundle.compute`` phase; the
+# transport sources are homogeneous (multi-source loads behind one
+# barrier; per-source TMA descriptors are emitted directly).
 
 
 class StagePolicy(enum.Enum):
-    """Transport policy for a ``StageBundle`` — applied uniformly to
-    every member ``Stage``.
+    """Transport policy for a ``StageBundle`` — applied uniformly to every
+    source.
 
     - ``SYNC``      — cooperative ``Load + Write`` + ``__syncthreads``
                       barrier. No ring-buffering.
@@ -1287,136 +1269,52 @@ class StagePolicy(enum.Enum):
 
 
 @dataclass(frozen=True)
-class Stage(Stmt):
-    """Cooperative-staging unit: one or more ``Source`` entries plus an
-    optional cooperative ``compute`` template.
-
-    A bare transport stage has ``compute=None``; the producer-side IR
-    is synthesized at materialize time from the sources (cooperative
-    ``Load + Write`` per source).
-
-    A *hoisted-invariant compute* stage has ``compute != None`` — a
-    per-thread cooperative body that reads from sibling-stage smem (via
-    Sources whose ``buf`` names a sibling Stage's smem buffer) and
-    writes into this Stage's smem allocation. ``external_reads()``
-    returns empty for compute stages (sibling smem isn't external).
-
-    The consumer scope is owned by the enclosing :class:`StageBundle`;
-    Stage itself carries no consumer ``body`` field. Transport policy
-    (sync / buffered / async / TMA) and policy-specific knobs
-    (``buffer_count`` / ``phase`` / ``pipeline_depth`` / ``swizzle``)
-    live on the bundle.
-
-    A Stage that lives outside a bundle is invalid; constructors that
-    accept Stages always wrap them in a StageBundle.
-    """
-
-    sources: tuple[Source, ...]
-    compute: Body | None = field(default=None, kw_only=True)
-
-    def __post_init__(self) -> None:
-        if not self.sources:
-            raise ValueError("Stage: requires at least one Source")
-        if self.compute is not None and not isinstance(self.compute, Body):
-            object.__setattr__(self, "compute", Body.coerce(self.compute))
-
-    def nested(self) -> tuple[Body, ...]:
-        return (self.compute,) if self.compute is not None else ()
-
-    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
-        if self.compute is None:
-            if bodies:
-                raise ValueError("Stage(compute=None).with_bodies: expected 0 bodies")
-            return self
-        (compute,) = bodies
-        return replace(self, compute=compute)
-
-    def deps(self) -> tuple[str, ...]:
-        return ()
-
-    def external_reads(self) -> tuple[str, ...]:
-        # Compute stages read from sibling-stage smem (same Tile scope),
-        # not external gmem — return empty so the staging-eligibility
-        # passes don't treat them as gmem-transport candidates.
-        if self.compute is not None:
-            return ()
-        return tuple(s.buf for s in self.sources)
-
-    def local_decls(self) -> tuple[str, ...]:
-        return tuple(s.name for s in self.sources)
-
-    def exprs(self) -> tuple[Expr, ...]:
-        out: tuple[Expr, ...] = ()
-        for s in self.sources:
-            out = (*out, *s.origin)
-            if isinstance(s.addressing, TemplateAddressing):
-                out = (*out, *s.addressing.exprs)
-        return out
-
-    @property
-    def smem_bytes(self) -> int:
-        return sum(s.smem_bytes for s in self.sources)
-
-    def replace_sources(self, sources: tuple[Source, ...]) -> Stage:
-        return replace(self, sources=sources)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        """Render per-source ``shared name[...] = buf[...];`` decl lines.
-        When ``compute`` is present, follow with a synthesized
-        ``cooperative`` for-nest over the first source's cache axes
-        wrapping the producer body.
-        """
-        out: list[str] = []
-        if self.compute is not None:
-            for s in self.sources:
-                cache = ", ".join(f"{ax.name}:{ax.extent}" for ax in s.cache_axes)
-                out.append(f"{indent}shared {s.name}[{cache}]")
-            cache_axes = self.sources[0].cache_axes
-            for_lines = [f"for {ax.name} in 0..{ax.extent}" for ax in cache_axes]
-            out.extend(_render_tile_bracket(indent + INDENT, for_lines, "cooperative", self.compute))
-        else:
-            out = [f"{indent}{_source_decl_line(s)}" for s in self.sources]
-        return out
-
-
-@dataclass(frozen=True)
 class StageBundle(Stmt):
-    """Single-policy group of cooperative ``Stage`` members sharing one
-    consumer ``body``.
+    """Single-policy cooperative-staging unit: a homogeneous group of gmem
+    transport ``sources`` (loaded behind one barrier) wrapping one consumer
+    ``body``, plus an optional hoisted-invariant ``compute`` phase.
 
-    The bundle owns the consumer scope (``body``) and the staging
-    policy (``policy`` plus policy-specific fields ``buffer_count`` /
-    ``phase`` / ``pipeline_depth`` / ``swizzle``). Each member Stage
-    contributes its ``sources`` (and optional ``compute`` template).
+    The bundle owns the consumer scope (``body``) and the staging policy
+    (``policy`` plus policy-specific fields ``buffer_count`` / ``phase`` /
+    ``pipeline_depth``). Per-source TMA swizzle lives on each ``Source``.
+
+    ``compute`` (optional) is a *self-describing* cooperative compute body:
+    ``Load``s reading already-staged sibling slabs (the transport
+    ``sources``), ``Assign``s applying a transform, and a single ``Write``
+    into a freshly derived smem slab. It is emitted as a distinct bundle
+    *phase* — after the transport sources, before the consumer body — so the
+    transport sources stay homogeneous and the slab name / loop domain /
+    dtype are recovered at materialize from the body itself (the
+    ``Write.output`` name, the cone sources' ``cache_axes``, the ``Write``
+    value dtype). Set by ``030_hoist_invariant_compute``.
 
     Invariants:
 
-    - ``stages`` is non-empty.
-    - All members share the bundle's policy; mixed-policy bundles are
-      illegal. K_o-dep partition (010_use_ring_buffers) emits separate
+    - ``sources`` is non-empty.
+    - All sources share the bundle's policy; mixed-policy bundles are
+      illegal. K_o-dep partition (040_use_ring_buffers) emits separate
       bundles with different policies rather than mixing.
-    - Member ORDER == issue order. Passes looking for a specific stage
-      MUST locate it by name/source, never by position.
+    - Source ORDER == issue order. Passes looking for a specific source
+      MUST locate it by name, never by position.
     - ``buffer_count >= 2`` requires ``phase``; allowed only for
       ``BUFFERED`` / ``ASYNC`` / ``TMA`` policies. ``SYNC`` has
       ``buffer_count == 1``, ``phase is None``.
     - ``pipeline_depth > 1`` allowed only for ``ASYNC`` / ``TMA``.
-    - ``swizzle != NONE`` allowed only for ``TMA``.
-    - ``TMA`` policy: every Source on every member must have empty
-      ``pad`` (TMA writes contiguous rows; bank-pad would misalign).
+    - ``TMA`` policy: every Source must have empty ``pad`` (TMA writes
+      contiguous rows; bank-pad would misalign).
 
     Iteration / recursion:
 
-    - ``nested()`` returns ``(Body(self.stages), self.body)`` — the
-      stages tuple is exposed as a synthetic Body so generic walkers
-      (``Body.iter`` / ``Body.map`` / ``Body.fold``) traverse into
-      individual members without special-casing StageBundle. Each
-      member's own ``nested()`` (the optional ``compute`` template) is
-      then reached via the standard descent.
+    - ``nested()`` returns ``(self.compute or Body(()), self.body)`` — the
+      compute phase (a plain ``Body``) and the consumer body. An absent
+      compute phase is exposed as ``Body(())`` so the arity stays fixed;
+      ``with_bodies`` collapses an empty leading body back to ``None``.
+      Sources carry no nested Stmt bodies, so they aren't exposed here.
     """
 
-    stages: tuple[Stage, ...]
+    sources: tuple[Source, ...]
     body: Body
+    compute: Body | None = None
     policy: StagePolicy = StagePolicy.SYNC
     buffer_count: int = 1
     phase: Expr | None = None
@@ -1425,11 +1323,10 @@ class StageBundle(Stmt):
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             object.__setattr__(self, "body", Body.coerce(self.body))
-        if not self.stages:
-            raise ValueError("StageBundle: requires at least one Stage")
-        for s in self.stages:
-            if not isinstance(s, Stage):
-                raise TypeError(f"StageBundle: member must be a Stage, got {type(s).__name__}")
+        if self.compute is not None and not isinstance(self.compute, Body):
+            object.__setattr__(self, "compute", Body.coerce(self.compute))
+        if not self.sources:
+            raise ValueError("StageBundle: requires at least one Source")
         if self.policy == StagePolicy.SYNC:
             if self.buffer_count != 1:
                 raise ValueError(f"StageBundle SYNC: buffer_count must be 1, got {self.buffer_count}")
@@ -1445,46 +1342,49 @@ class StageBundle(Stmt):
         if self.pipeline_depth != 1 and self.policy not in (StagePolicy.ASYNC, StagePolicy.TMA):
             raise ValueError(f"StageBundle: pipeline_depth > 1 requires ASYNC or TMA policy, got {self.policy.value}")
         if self.policy == StagePolicy.TMA:
-            for stage in self.stages:
-                for src in stage.sources:
-                    if src.pad and any(src.pad):
-                        raise ValueError(f"StageBundle TMA: source {src.name!r} pad must be empty, got {src.pad!r}")
+            for src in self.sources:
+                if src.pad and any(src.pad):
+                    raise ValueError(f"StageBundle TMA: source {src.name!r} pad must be empty, got {src.pad!r}")
 
     def nested(self) -> tuple[Body, ...]:
-        return (Body(self.stages), self.body)
+        return (self.compute if self.compute is not None else Body(()), self.body)
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         if len(bodies) != 2:
-            raise ValueError(f"StageBundle.with_bodies: expected 2 bodies (stages, body), got {len(bodies)}")
-        stages_body, body = bodies
-        return replace(self, stages=tuple(stages_body), body=body)
+            raise ValueError(f"StageBundle.with_bodies: expected 2 bodies (compute, body), got {len(bodies)}")
+        compute_body, body = bodies
+        compute = compute_body if compute_body else None
+        return replace(self, compute=compute, body=body)
 
     def deps(self) -> tuple[str, ...]:
         return ()
 
     def external_reads(self) -> tuple[str, ...]:
-        out: tuple[str, ...] = ()
-        for s in self.stages:
-            out = (*out, *s.external_reads())
-        return out
+        return tuple(s.buf for s in self.sources)
 
     def local_decls(self) -> tuple[str, ...]:
-        out: tuple[str, ...] = ()
-        for s in self.stages:
-            out = (*out, *s.local_decls())
+        out: tuple[str, ...] = tuple(s.name for s in self.sources)
+        # The compute phase fills a fresh smem slab named by its Write — a
+        # kernel-local buffer, not a signature input/output. Declaring it
+        # here keeps ``BodyOp._derive_io_names`` from promoting it to a
+        # kernel arg (the materializer pre-emits its ``Smem`` decl).
+        if self.compute is not None:
+            out = (*out, *(s.output for s in self.compute if isinstance(s, Write)))
         return out
 
     def exprs(self) -> tuple[Expr, ...]:
         out: tuple[Expr, ...] = ()
-        for s in self.stages:
-            out = (*out, *s.exprs())
+        for s in self.sources:
+            out = (*out, *s.origin)
+            if isinstance(s.addressing, TemplateAddressing):
+                out = (*out, *s.addressing.exprs)
         if self.phase is not None:
             out = (*out, self.phase)
         return out
 
     @property
     def smem_bytes(self) -> int:
-        per_slab = sum(s.smem_bytes for s in self.stages)
+        per_slab = sum(s.smem_bytes for s in self.sources)
         return per_slab * max(self.buffer_count, 1)
 
     def _policy_label(self) -> str:
@@ -1501,12 +1401,20 @@ class StageBundle(Stmt):
         return "".join(parts)
 
     def pretty(self, indent: str = "") -> list[str]:
-        """Render as ``bundle <policy>:`` header with member stages and
-        the consumer body indented beneath."""
+        """Render as ``bundle <policy>:`` header with per-source decl lines,
+        the optional cooperative compute phase, and the consumer body
+        indented beneath."""
         inner = indent + INDENT
         out: list[str] = [f"{indent}bundle {self._policy_label()}:"]
-        for s in self.stages:
-            out.extend(s.pretty(inner))
+        for s in self.sources:
+            out.append(f"{inner}{_source_decl_line(s)}")
+        if self.compute is not None:
+            # The compute body names its inputs (sibling cone slabs) and
+            # its output slab via a final Write; the cache-axis loop nest
+            # is synthesized at materialize, so render it as a flat
+            # ``cooperative:`` block of the body stmts.
+            out.append(f"{inner}cooperative:")
+            out.extend(pretty_body(self.compute, inner + INDENT))
         out.extend(pretty_body(self.body, inner))
         return out
 
@@ -1546,18 +1454,17 @@ def map_staged(body: Body, handler: StagedHandler, *, sources: dict[str, Source]
             continue
         if isinstance(s, StageBundle):
             inner = dict(scope)
-            for stage in s.stages:
-                for src in stage.sources:
-                    inner[src.name] = src
-            out.append(s.with_bodies((Body(s.stages), map_staged(s.body, handler, sources=inner))))
+            for src in s.sources:
+                inner[src.name] = src
+            compute = map_staged(s.compute, handler, sources=inner) if s.compute is not None else Body(())
+            out.append(s.with_bodies((compute, map_staged(s.body, handler, sources=inner))))
             continue
         if isinstance(s, WarpSpecialize):
             inner = dict(scope)
             for st in s.producer_body.iter():
                 if isinstance(st, StageBundle):
-                    for stage in st.stages:
-                        for src in stage.sources:
-                            inner[src.name] = src
+                    for src in st.sources:
+                        inner[src.name] = src
             out.append(s.with_bodies((s.producer_body, map_staged(s.consumer_body, handler, sources=inner))))
             continue
         if s.nested():
@@ -1985,12 +1892,14 @@ class TileOp(BodyOp):
         # silently reject pipelined variants on smem-tight kernels.
         per_source: dict[str, int] = {}
         for s in self.body.iter():
-            if isinstance(s, Stage):
+            if isinstance(s, StageBundle):
                 for src in s.sources:
-                    # ``s.smem_bytes`` includes the buffer_count factor; the
-                    # per-source share is the source's slab × buffer_count.
-                    buf_count = getattr(s, "buffer_count", 1)
-                    per_source[src.name] = src.smem_bytes * buf_count
+                    # Single-slot per-source slab — the ring ``buffer_count``
+                    # factor is intentionally NOT applied here (this budget
+                    # gate counts the un-multiplied footprint; the old
+                    # per-Stage walk did the same since ``Stage`` carried no
+                    # ``buffer_count``).
+                    per_source[src.name] = src.smem_bytes
         staged = sum(per_source.values())
         if staged > ctx.max_dynamic_smem:
             return False
@@ -2025,8 +1934,6 @@ class TileOp(BodyOp):
         :class:`Context` is frozen and the score is a pure function of
         ``(self, cap)``.
         """
-        from deplodock.compiler.ir.tile.ir import Stage as _Stage  # noqa: PLC0415
-
         block_axes, thread_axes = self._launch_geometry()
         if not thread_axes and not block_axes:
             return 0.0
@@ -2034,7 +1941,7 @@ class TileOp(BodyOp):
         block_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in block_axes]
         if not thread_extents:
             return 0.0
-        has_stages = any(isinstance(s, _Stage) for s in self.body.iter())
+        has_stages = any(isinstance(s, StageBundle) for s in self.body.iter())
         # Match the planner-time count by walking the materialized body's
         # Load.input set — so the smem-fit signal in score_tile_geometry sees
         # the same ``n_staged_inputs`` here as it did in ``lazy_score`` for
@@ -2314,13 +2221,11 @@ __all__ = [
     "SerialTile",
     "StridedTile",
     "SerialKind",
-    "Stage",
     "StageBundle",
     "StagePolicy",
     "SwizzleMode",
     "AffineAddressing",
     "TemplateAddressing",
-    "CacheDim",
     "Source",
     "AsyncWait",
     # Source-aware traversal (transformer / visitor over staged bodies)

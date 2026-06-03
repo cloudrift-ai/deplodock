@@ -1,10 +1,10 @@
 """Stage frequently-reused external inputs into shared memory (wrap-body).
 
-Emits ``Stage(sources=[...], body=<consumer>)`` — the Stage *wraps* the
-consumer subtree containing the rewritten Loads. Producer cooperative
+Emits ``StageBundle(sources=[...], body=<consumer>)`` — the bundle *wraps*
+the consumer subtree containing the rewritten Loads. Producer cooperative
 ``Load+Write`` is synthesized at materialize time from ``Source``
 entries (cache axes, origin, source-dim mapping); no producer body is
-stored on the Stage.
+stored.
 
 Runs *before* ``010_split_register_axes`` (pre-register-tile: there
 is exactly one Load per ``(buffer, access-pattern)`` rather than F×F
@@ -13,9 +13,9 @@ duplicates). REGISTER axes in scope join cache axes via the
 with stride-1 Affine addressing, instead of ``BM × BK`` with
 TemplateAddressing as it would post-replicate. Stages emit wrapping
 the K_o body; their cache-axis iteration vars shadow the outer
-REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
-(no recursion into their producer-side state — only the consumer
-``body`` descends).
+REGISTER Loops, and ``010_split_register_axes`` treats a ``StageBundle``
+as opaque for replication (its ``sources`` carry no body — only the
+consumer ``body`` / compute phase descend).
 
 **Pipeline:**
 
@@ -27,8 +27,8 @@ REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
 3. **Per buffer, fit one slab.** Classify every Load. If they all agree
    on slab geometry, build one Source; if they disagree, bail.
 4. **Admit & emit.** Greedily admit Sources until the per-scope smem
-   budget is hit; emit a single Stage wrapping the consumer stmts;
-   rewrite admitted Loads to read from staged smem.
+   budget is hit; emit a single ``StageBundle`` wrapping the consumer
+   stmts; rewrite admitted Loads to read from staged smem.
 
 **Slab geometry from a Load's index** (computed in ``_classify``):
 
@@ -91,12 +91,10 @@ from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     AtomTile,
-    CacheDim,
     GridTile,
     RegisterTile,
     SerialTile,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
     StridedTile,
@@ -230,7 +228,7 @@ def _enumerate_variants(
 def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
-    if any(isinstance(s, Stage) for s in tt.body.iter()):
+    if any(isinstance(s, StageBundle) for s in tt.body.iter()):
         return []
     if not tt.axes:
         return []
@@ -463,9 +461,9 @@ def _process_scope(
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
     if all Loads agree on slab geometry. Admit Sources under budget;
-    emit one Stage wrapping the contiguous range of consumer stmts that
-    contain rewritten Loads. Source name + index rewrites are applied
-    inside the Stage's body."""
+    emit one ``StageBundle`` wrapping the contiguous range of consumer
+    stmts that contain rewritten Loads. Source name + index rewrites are
+    applied inside the bundle's body."""
     rewritten_inner: list[Stmt] = []
     # For each top-level stmt, the list of (load, reduce_axis, scope_axes, extra_cache_axes) bucketed by buf.
     # We keep a per-stmt map (by index in rewritten_inner) so we know which top-level stmts must end up
@@ -608,12 +606,12 @@ def _process_scope(
     if not stmt_contains_loads_idx:
         return tuple(rewritten)
     lo, hi = stmt_contains_loads_idx[0], stmt_contains_loads_idx[-1]
-    # Emit a single-policy SYNC bundle holding one multi-source Stage; the
-    # bundle owns the consumer body. Downstream passes (030 hoist, 040 ring-
-    # buffer promotion, 050/060 TMA/async promotion) operate on bundles.
-    wrapped_stage = Stage(sources=tuple(sources))
+    # Emit a single-policy SYNC bundle holding the multi-source transport
+    # operands directly; the bundle owns the consumer body. Downstream passes
+    # (030 hoist, 040 ring-buffer promotion, 050/060 TMA/async promotion)
+    # operate on bundles.
     bundle = StageBundle(
-        stages=(wrapped_stage,),
+        sources=tuple(sources),
         body=Body(tuple(rewritten[lo : hi + 1])),
         policy=StagePolicy.SYNC,
     )
@@ -670,28 +668,27 @@ def _build_sources(
             if used_bytes + slab.n_bytes > scope_budget:
                 continue
             smem_name = _gen_name(buf, used_names)
-            cache_dims = tuple(CacheDim(axis=ax, source_dim=d) for ax, d in zip(slab.cache_axes, slab.slab_dims, strict=True))
             # Pick addressing eagerly: template when ``_classify`` flagged a
             # collapsed-reshape (slab.template is the verbatim source-dim Exprs),
-            # affine otherwise (dims pulled off cache_dims). Source's
-            # ``__post_init__`` builds the affine default when ``addressing`` is
-            # omitted, but stamping it explicitly here keeps the IR's stored
-            # field stable across pretty-printer / serialization roundtrips.
-            # ``slab.block`` is non-empty when ``_classify`` extracted a non-
-            # unit literal coefficient on at least one cache var (MMA atom σ
-            # is the M3-driving case); it folds into ``AffineAddressing.block``.
+            # affine otherwise (dims = the slab's per-cache-axis source dims).
+            # Source's ``__post_init__`` builds an identity-dims affine default
+            # when ``addressing`` is omitted, but stamping it explicitly here
+            # carries the real (possibly non-identity / collapsed) source-dim
+            # mapping. ``slab.block`` is non-empty when ``_classify`` extracted
+            # a non-unit literal coefficient on at least one cache var (MMA atom
+            # σ is the M3-driving case); it folds into ``AffineAddressing.block``.
             addressing: AffineAddressing | TemplateAddressing
             if slab.template is not None:
                 addressing = TemplateAddressing(exprs=slab.template)
             else:
                 addressing = AffineAddressing(
-                    dims=tuple(cd.source_dim for cd in cache_dims),
+                    dims=tuple(slab.slab_dims),
                     block=slab.block,
                 )
             src = Source(
                 name=smem_name,
                 buf=buf,
-                cache_dims=cache_dims,
+                cache_axes=slab.cache_axes,
                 origin=slab.origin,
                 pad=(),
                 addressing=addressing,

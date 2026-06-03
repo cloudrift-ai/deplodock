@@ -1,9 +1,9 @@
 """Materialize a Tile-IR ``TileOp`` into a Kernel-IR ``KernelOp``.
 
 The wrapper stays as ``Tile`` (shared with Tile IR via ``ir.stmt``);
-only the body content changes — ``Stage`` becomes ``Smem`` + cooperative
-load, cooperative ``Accum`` escapes become smem tree-halve / warp-shuffle
-via the escape-analysis helper (``ir/tile/escape_analysis.py``),
+only the body content changes — a ``StageBundle`` becomes ``Smem`` +
+cooperative loads, cooperative ``Accum`` escapes become smem tree-halve /
+warp-shuffle via the escape-analysis helper (``ir/tile/escape_analysis.py``),
 ``Loop`` / ``StridedLoop`` pass through. Two paths:
 
 - **Non-cooperative** (no ``BIND_BLOCK`` axes): every BoundAxis is
@@ -17,10 +17,10 @@ via the escape-analysis helper (``ir/tile/escape_analysis.py``),
   ``Tile.axes`` through, computes a linear thread index ``tid_expr``
   from the THREAD axes, then walks the body:
 
-    * ``Stage`` → smem decl + cooperative load driven by ``tid_expr``
-      (multi-axis stages flatten via row-major decode).
+    * ``StageBundle`` → per-source smem decl + cooperative load driven by
+      ``tid_expr`` (multi-axis slabs flatten via row-major decode).
     * ``Loop`` / ``StridedLoop`` → passed through (recursive walk for
-      Stage / Write handling inside).
+      bundle / Write handling inside).
     * Cooperative ``Accum`` (per ``accum_cooperative_axes``) → smem
       tree-halve + broadcast emitted right after the enclosing reduce.
     * ``Write`` whose index references a THREAD axis is emitted
@@ -60,7 +60,6 @@ from deplodock.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
     SerialTile,
-    Stage,
     StageBundle,
     StagePolicy,
     StridedTile,
@@ -73,7 +72,12 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
-from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import emit_compute_stage, emit_stage, smem_cuda_dtype
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
+    compute_phase_info,
+    emit_compute_phase,
+    emit_stage,
+    smem_cuda_dtype,
+)
 from deplodock.compiler.pipeline.passes.lowering.kernel._tma_groups import partition_tma_groups
 
 PATTERN = [Pattern("root", TileOp)]
@@ -157,10 +161,9 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
     output) wrap them in ``Cond(thread_var == 0)`` themselves —
     materialization passes Writes through unchanged."""
     axes = blk.axes
-    # Wrap-body Stages are already flattened to the legacy shape
-    # ([Stage(empty body), *consumer_stmts]) by ``090_flatten_wrap_stages``,
-    # so the walker sees producer scaffolding (Stage.sources) followed by
-    # the consumer stmts as siblings.
+    # Each ``StageBundle`` is materialized in place: ``emit_bundle_producer``
+    # emits the per-source cooperative-load scaffolding (and the optional
+    # compute phase) ahead of the bundle's consumer ``body`` stmts.
     body = blk.body
     thread_axes = axes
     if not thread_axes:
@@ -237,45 +240,61 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         # both, the second slot lands at a 64 B offset from a 128 B base —
         # silently misaligned for cp.async.bulk.tensor.
         is_tma = stmt.policy == StagePolicy.TMA
-        for member in stmt.stages:
-            for src in member.sources:
-                if src.name in declared_smem:
-                    continue
-                extents = src.alloc_extents
-                smem_dtype = smem_cuda_dtype(src)
-                if is_tma:
-                    # Round the slot's inner BOX EXTENT up to make the slot
-                    # bytes a multiple of 128 B. The check is on the
-                    # COLLAPSED inner box (product of cache_axes mapping to
-                    # the innermost source dim), not just ``extents[-1]`` —
-                    # for the multi-axis collapse case (e.g. cache
-                    # ``(BK=32, BN_thread=32, FN_reg=4)`` mapping to dims
-                    # ``(0, 1, 1)``), the natural flat layout already packs
-                    # each K row as ``BN_thread × FN_reg = 128`` cells =
-                    # 512 B, well 128 B-aligned; padding the last axis (4 →
-                    # 32) would 8x the smem with zero correctness gain.
-                    # Only pad when the collapsed inner is genuinely
-                    # sub-128 B — single-axis ``BN=16`` etc.
-                    inner_per_align = _TMA_ALIGN_BYTES // BYTES_PER_ELEM
-                    addressing = src.addressing
-                    if isinstance(addressing, AffineAddressing):
-                        inner_dim = addressing.dims[-1]
-                        block = addressing.block
-                        collapsed_inner = 1
-                        for i, (d, ax) in enumerate(zip(addressing.dims, src.cache_axes, strict=True)):
-                            if d == inner_dim:
-                                b = block[i] if block else 1
-                                collapsed_inner *= ax.extent.as_static() * b
-                    else:
-                        collapsed_inner = extents[-1]
-                    if collapsed_inner % inner_per_align != 0:
-                        padded_inner = (extents[-1] + inner_per_align - 1) // inner_per_align * inner_per_align
-                        extents = (*extents[:-1], padded_inner)
+        for src in stmt.sources:
+            if src.name in declared_smem:
+                continue
+            extents = src.alloc_extents
+            smem_dtype = smem_cuda_dtype(src)
+            if is_tma:
+                # Round the slot's inner BOX EXTENT up to make the slot
+                # bytes a multiple of 128 B. The check is on the
+                # COLLAPSED inner box (product of cache_axes mapping to
+                # the innermost source dim), not just ``extents[-1]`` —
+                # for the multi-axis collapse case (e.g. cache
+                # ``(BK=32, BN_thread=32, FN_reg=4)`` mapping to dims
+                # ``(0, 1, 1)``), the natural flat layout already packs
+                # each K row as ``BN_thread × FN_reg = 128`` cells =
+                # 512 B, well 128 B-aligned; padding the last axis (4 →
+                # 32) would 8x the smem with zero correctness gain.
+                # Only pad when the collapsed inner is genuinely
+                # sub-128 B — single-axis ``BN=16`` etc.
+                inner_per_align = _TMA_ALIGN_BYTES // BYTES_PER_ELEM
+                addressing = src.addressing
+                if isinstance(addressing, AffineAddressing):
+                    inner_dim = addressing.dims[-1]
+                    block = addressing.block
+                    collapsed_inner = 1
+                    for i, (d, ax) in enumerate(zip(addressing.dims, src.cache_axes, strict=True)):
+                        if d == inner_dim:
+                            b = block[i] if block else 1
+                            collapsed_inner *= ax.extent.as_static() * b
+                else:
+                    collapsed_inner = extents[-1]
+                if collapsed_inner % inner_per_align != 0:
+                    padded_inner = (extents[-1] + inner_per_align - 1) // inner_per_align * inner_per_align
+                    extents = (*extents[:-1], padded_inner)
+            if buf_count > 1:
+                extents = (buf_count, *extents)
+            smem_align = _TMA_ALIGN_BYTES if is_tma else (16 if smem_dtype == "__half" else 0)
+            compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
+            declared_smem.add(src.name)
+        # Hoisted-compute phase: the fused slab is no longer carried as a
+        # ``Source``, so pre-emit its kernel-scope Smem decl here — right
+        # after the transport sources (byte-identical first-seen order).
+        # Name / cache axes / dtype are recovered from the self-describing
+        # compute body (its single Write + the cone sources it reads).
+        if stmt.compute is not None:
+            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+            fused_name, fused_axes, fused_value_dtype = compute_phase_info(stmt.compute, stmt.sources)
+            if fused_name not in declared_smem:
+                fused_extents = tuple(ax.extent.as_static() for ax in fused_axes)
                 if buf_count > 1:
-                    extents = (buf_count, *extents)
-                smem_align = _TMA_ALIGN_BYTES if is_tma else (16 if smem_dtype == "__half" else 0)
-                compute_stage_prologue.append(Smem(name=src.name, extents=extents, dtype=smem_dtype, align=smem_align))
-                declared_smem.add(src.name)
+                    fused_extents = (buf_count, *fused_extents)
+                fused_dtype = cuda_name(fused_value_dtype) if fused_value_dtype is not None else "float"
+                fused_align = 16 if fused_dtype == "__half" else 0
+                compute_stage_prologue.append(Smem(name=fused_name, extents=fused_extents, dtype=fused_dtype, align=fused_align))
+                declared_smem.add(fused_name)
 
     tma = partition_tma_groups(body)
 
@@ -330,11 +349,10 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         # or AsyncWait whose pipeline group couldn't be inferred).
         return [CpAsyncWait(group=stmt.keep), trailing_sync]
 
-    def emit_tma_stage(bundle: StageBundle, stage: Stage) -> list[Stmt]:
-        # 050_use_tma only promotes single-Source bundles, so the box-copy
-        # here issues exactly one TMA load per group activation per member.
-        assert len(stage.sources) == 1, f"TMA stage requires one Source, got {len(stage.sources)}"
-        src = stage.sources[0]
+    def emit_tma_stage(bundle: StageBundle, src) -> list[Stmt]:  # noqa: ANN001 — src: Source
+        # One TMA box-copy per source: the materializer emits a descriptor +
+        # elected-thread arrive per ``Source`` directly (no per-source stage
+        # wrapper), all arriving against the bundle's group mbarrier.
         addressing = src.addressing
         assert isinstance(addressing, AffineAddressing), f"TMA stage source {src.name!r} must use AffineAddressing"
         desc_name = f"{src.name}_desc"
@@ -484,46 +502,47 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         return out
 
     def emit_bundle_producer(bundle: StageBundle) -> list[Stmt]:
-        """Emit producer-side scaffolding for every member Stage of a
-        bundle. Dispatch:
+        """Emit producer-side scaffolding for a bundle. Dispatch:
 
-        - ``member.compute is not None`` → cooperative compute template
-          (formerly ``ComputeStage``).
-        - ``bundle.policy == TMA`` → TMA box copy.
+        - ``bundle.policy == TMA`` → one TMA box copy per source.
         - otherwise (SYNC / BUFFERED / ASYNC) → cooperative
-          ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC).
+          ``Load + Write`` (or ``CpAsyncCopy`` for ASYNC) over all sources
+          behind one barrier pair.
 
-        For unpipelined TMA bundles (``pipeline_depth == 1``) with
-        multiple stages, the per-stage mbarrier is shared with
-        ``arrive_count = N`` (one per stage), so a single trailing
-        ``MbarrierWait`` after every stage has arrived/issued is what
-        flips the phase. Emitting the wait inside ``emit_tma_stage``
-        would deadlock between stages (only one arrive has happened).
+        Then, if ``bundle.compute`` is set, the hoisted-invariant
+        cooperative compute phase is emitted after the transport sources
+        (reads the just-staged sibling slabs, fills the fused slab).
+
+        For unpipelined TMA bundles (``pipeline_depth == 1``) with multiple
+        sources, the group mbarrier is shared with ``arrive_count = N`` (one
+        per source), so a single trailing ``MbarrierWait`` after every source
+        has arrived/issued is what flips the phase. Emitting the wait inside
+        ``emit_tma_stage`` would deadlock (only one arrive has happened).
         """
         out: list[Stmt] = []
-        for member in bundle.stages:
-            if member.compute is not None:
-                out.extend(emit_compute_stage(member, tid_expr, n_threads, buffer_count=bundle.buffer_count))
-            elif bundle.policy == StagePolicy.TMA:
-                out.extend(emit_tma_stage(bundle, member))
-            else:
-                out.extend(
-                    emit_stage(
-                        member,
-                        tid_expr,
-                        n_threads,
-                        policy=bundle.policy,
-                        buffer_count=bundle.buffer_count,
-                        phase=bundle.phase,
-                        pipeline_depth=bundle.pipeline_depth,
-                    )
+        if bundle.policy == StagePolicy.TMA:
+            for src in bundle.sources:
+                out.extend(emit_tma_stage(bundle, src))
+        else:
+            out.extend(
+                emit_stage(
+                    bundle.sources,
+                    tid_expr,
+                    n_threads,
+                    policy=bundle.policy,
+                    buffer_count=bundle.buffer_count,
+                    phase=bundle.phase,
+                    pipeline_depth=bundle.pipeline_depth,
                 )
-        # Unpipelined TMA: trailing wait+sync once after all stages
+            )
+        if bundle.compute is not None:
+            out.extend(emit_compute_phase(bundle.compute, bundle.sources, tid_expr, n_threads, buffer_count=bundle.buffer_count))
+        # Unpipelined TMA: trailing wait+sync once after all sources
         # arrived (mbarrier ``arrive_count = N`` is met).
         if bundle.policy == StagePolicy.TMA and bundle.pipeline_depth == 1:
-            tma_members = [m for m in bundle.stages if m.compute is None]
-            if tma_members:
-                first_src = tma_members[0].sources[0]
+            tma_srcs = list(bundle.sources)
+            if tma_srcs:
+                first_src = tma_srcs[0]
                 gid = tma.stage_group[first_src.name]
                 mbar_name = tma.mbar_name(gid)
                 mbar_phase = _mbar_wait_phase(bundle.phase, bundle.buffer_count)

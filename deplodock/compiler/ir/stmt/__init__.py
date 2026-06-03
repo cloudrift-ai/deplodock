@@ -26,7 +26,7 @@ Defined here rather than under any one IR package because all three IRs
 Each IR layer adds its own scheduling-specific Stmts on top:
 
 - Loop IR: nothing extra — its bodies are exactly Loop / leaves.
-- Tile IR: ``Stage``, ``Combine``, plus the shared ``Loop`` / ``StridedLoop``
+- Tile IR: ``StageBundle``, plus the shared ``Loop`` / ``StridedLoop``
   constructs from this module and the typed tile flavors (``GridTile``,
   ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) from
   :mod:`deplodock.compiler.ir.tile.ir`.

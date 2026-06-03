@@ -17,9 +17,7 @@ from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.stmt import Body, Load
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
-    CacheDim,
     Source,
-    Stage,
     StageBundle,
     StagePolicy,
 )
@@ -35,15 +33,12 @@ def _load_pass():
 
 
 def _src(*, name: str, buf: str, block: tuple[int, ...] = ()) -> Source:
-    cache = (
-        CacheDim(axis=Axis("a3", 8), source_dim=0),
-        CacheDim(axis=Axis("a7", 32), source_dim=1),
-    )
+    cache_axes = (Axis("a3", 8), Axis("a7", 32))
     addressing = AffineAddressing(dims=(0, 1), block=block)
     return Source(
         name=name,
         buf=buf,
-        cache_dims=cache,
+        cache_axes=cache_axes,
         origin=(Literal(0, "int"), Literal(0, "int")),
         addressing=addressing,
     )
@@ -53,9 +48,7 @@ def _bundle(src: Source) -> StageBundle:
     """Minimal BUFFERED bundle with one consumer Load — the shape
     ``_plan_for_bundle`` walks for padding decisions."""
     consumer = Load(name="v", input=src.name, index=(Literal(0, "int"), Literal(0, "int")))
-    return StageBundle(
-        stages=(Stage(sources=(src,)),), body=Body((consumer,)), policy=StagePolicy.BUFFERED, buffer_count=2, phase=Literal(0, "int")
-    )
+    return StageBundle(sources=(src,), body=Body((consumer,)), policy=StagePolicy.BUFFERED, buffer_count=2, phase=Literal(0, "int"))
 
 
 def test_pad_smem_skips_blocked_source():

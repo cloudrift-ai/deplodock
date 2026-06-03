@@ -64,7 +64,6 @@ from deplodock.compiler.ir.expr import BinaryExpr
 from deplodock.compiler.ir.stmt import Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     SerialTile,
-    Stage,
     StageBundle,
     StridedTile,
     TileOp,
@@ -142,28 +141,23 @@ def _lift_if_match(s: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt | 
 
 def _stamp_gmem_extents(stmt: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt:
     """Recursively rewrite ``stmt`` so every ``StageBundle`` Source whose
-    ``buf`` is a static-shaped kernel input carries ``gmem_extents``. Only
-    transport Sources (``Stage.compute is None``) get stamped — a
-    hoisted-compute stage reads sibling smem, not gmem. Both affine and
-    template (reshape) addressings are stamped: a masked weight's smem slab
+    ``buf`` is a static-shaped kernel input carries ``gmem_extents``. This
+    pass runs before ``030_hoist_invariant_compute``, so no bundle carries a
+    ``compute`` phase yet — every Source here is a gmem transport operand.
+    Both affine and template (reshape) addressings are stamped: a masked
+    weight's smem slab
     is often template-addressed (the very case that overruns).
     ``_stage_expand._clamp_source_index`` handles both index shapes — per-dim
     when the ``source_index`` rank matches ``gmem_extents``, and a single
     flat ``< ∏extents`` clamp when the template collapsed the index to one
     dim — so the OOB is caught either way."""
     if isinstance(stmt, StageBundle):
-        new_stages: list[Stage] = []
-        for stage in stmt.stages:
-            if stage.compute is not None:
-                new_stages.append(stage)
-                continue
-            new_sources = tuple(
-                replace(src, gmem_extents=input_shapes[src.buf]) if src.buf in input_shapes and src.gmem_extents is None else src
-                for src in stage.sources
-            )
-            new_stages.append(replace(stage, sources=new_sources))
+        new_sources = tuple(
+            replace(src, gmem_extents=input_shapes[src.buf]) if src.buf in input_shapes and src.gmem_extents is None else src
+            for src in stmt.sources
+        )
         new_body = Body(tuple(_stamp_gmem_extents(s, input_shapes) for s in stmt.body))
-        return replace(stmt, stages=tuple(new_stages), body=new_body)
+        return replace(stmt, sources=new_sources, body=new_body)
     nested = stmt.nested()
     if not nested:
         return stmt
@@ -213,9 +207,8 @@ def _collect_smem_names(stmt: Stmt) -> set[str]:
     them."""
     names: set[str] = set()
     if isinstance(stmt, StageBundle):
-        for stage in stmt.stages:
-            for src in stage.sources:
-                names.add(src.name)
+        for src in stmt.sources:
+            names.add(src.name)
     for body in stmt.nested():
         for s in body:
             names |= _collect_smem_names(s)

@@ -36,7 +36,6 @@ from deplodock.compiler.ir.tile.ir import (
     ParallelTile,
     RegisterTile,
     SerialTile,
-    Stage,
     StageBundle,
     StridedTile,
     ThreadTile,
@@ -54,13 +53,13 @@ BANKS = 32
 
 @dataclass
 class StageBinding:
-    """One ``(Stage, Source, body-Load reading it)`` triple plus surrounding context.
+    """One ``(StageBundle, Source, body-Load reading it)`` triple plus context.
 
-    Wrap-body Stages carry multiple Sources, each with its own smem buffer
+    A StageBundle carries multiple Sources, each with its own smem buffer
     and cache layout — bank-conflict analysis runs per-Source.
     """
 
-    stage: Stage
+    stage: StageBundle
     load: Load
     tile: ParallelTile  # the per-thread scope (ThreadTile, or GridTile+ThreadTile nest's ThreadTile)
     enclosing_loop_axes: tuple[Axis, ...]  # outermost-first
@@ -116,11 +115,11 @@ class BankConflictResult:
 
 
 def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> list[StageBinding]:
-    """Yield one ``StageBinding`` per (Stage, body Load) pair across every
-    ``TileOp`` in ``graph``. Each Stage declared inside the (single) Tile
-    body is matched against every body Load whose ``input`` is the staged
-    name; enclosing ``Loop`` / ``StridedLoop`` axes are propagated so
-    callers can pin the inner-iter axis at simulation time.
+    """Yield one ``StageBinding`` per (Source, body Load) pair across every
+    ``TileOp`` in ``graph``. Each StageBundle source declared inside the
+    (single) Tile body is matched against every body Load whose ``input`` is
+    the staged name; enclosing ``Loop`` / ``StridedLoop`` axes are propagated
+    so callers can pin the inner-iter axis at simulation time.
     """
     out: list[StageBinding] = []
     for node in graph.nodes.values():
@@ -143,12 +142,12 @@ def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> lis
                 tt = top
             else:
                 continue
-            # Map smem buffer name → (Stage, Source) for every staged buffer.
-            # The wrap-body Stage carries multiple Sources, each with its own
-            # smem name — bank-conflict bindings are per-Source, not per-Stage.
-            sources: dict[str, tuple[Stage, object]] = {}
+            # Map smem buffer name → (StageBundle, Source) for every staged
+            # buffer. A StageBundle carries multiple Sources, each with its own
+            # smem name — bank-conflict bindings are per-Source.
+            sources: dict[str, tuple[StageBundle, object]] = {}
             for s in _walk(tt.body):
-                if isinstance(s, Stage):
+                if isinstance(s, StageBundle):
                     for src in s.sources:
                         if stage_filter is None or src.name in stage_filter:
                             sources.setdefault(src.name, (s, src))
@@ -172,8 +171,8 @@ def find_all_bindings(graph: Graph, stage_filter: set[str] | None = None) -> lis
 def _walk(body) -> Iterable:
     # body may be a Body (recursive iter via nested()) or a plain tuple
     # from a legacy caller. Body.iter() descends into every nested body
-    # (including the synthetic Body(stages) inside a StageBundle), so it
-    # naturally yields Stage members live inside bundles.
+    # (the StageBundle compute phase + consumer body), so the bundles
+    # themselves are yielded directly.
     if hasattr(body, "iter"):
         yield from body.iter()
         return
