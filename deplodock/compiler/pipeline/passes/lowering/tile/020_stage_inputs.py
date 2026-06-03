@@ -13,9 +13,9 @@ duplicates). REGISTER axes in scope join cache axes via the
 with stride-1 Affine addressing, instead of ``BM × BK`` with
 TemplateAddressing as it would post-replicate. Stages emit wrapping
 the K_o body; their cache-axis iteration vars shadow the outer
-REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
-(no recursion into their producer-side state — only the consumer
-``body`` descends).
+REGISTER Loops, and ``010_split_register_axes`` treats a ``StageBundle``
+as opaque for replication (its ``sources`` carry no body — only the
+consumer ``body`` / compute phase descend).
 
 **Pipeline:**
 
@@ -27,8 +27,8 @@ REGISTER Loops, and ``010_split_register_axes`` treats Stages as opaque
 3. **Per buffer, fit one slab.** Classify every Load. If they all agree
    on slab geometry, build one Source; if they disagree, bail.
 4. **Admit & emit.** Greedily admit Sources until the per-scope smem
-   budget is hit; emit a single Stage wrapping the consumer stmts;
-   rewrite admitted Loads to read from staged smem.
+   budget is hit; emit a single ``StageBundle`` wrapping the consumer
+   stmts; rewrite admitted Loads to read from staged smem.
 
 **Slab geometry from a Load's index** (computed in ``_classify``):
 
@@ -461,9 +461,9 @@ def _process_scope(
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
     if all Loads agree on slab geometry. Admit Sources under budget;
-    emit one Stage wrapping the contiguous range of consumer stmts that
-    contain rewritten Loads. Source name + index rewrites are applied
-    inside the Stage's body."""
+    emit one ``StageBundle`` wrapping the contiguous range of consumer
+    stmts that contain rewritten Loads. Source name + index rewrites are
+    applied inside the bundle's body."""
     rewritten_inner: list[Stmt] = []
     # For each top-level stmt, the list of (load, reduce_axis, scope_axes, extra_cache_axes) bucketed by buf.
     # We keep a per-stmt map (by index in rewritten_inner) so we know which top-level stmts must end up
@@ -668,7 +668,6 @@ def _build_sources(
             if used_bytes + slab.n_bytes > scope_budget:
                 continue
             smem_name = _gen_name(buf, used_names)
-            cache_axes = tuple(slab.cache_axes)
             # Pick addressing eagerly: template when ``_classify`` flagged a
             # collapsed-reshape (slab.template is the verbatim source-dim Exprs),
             # affine otherwise (dims = the slab's per-cache-axis source dims).
@@ -689,7 +688,7 @@ def _build_sources(
             src = Source(
                 name=smem_name,
                 buf=buf,
-                cache_axes=cache_axes,
+                cache_axes=slab.cache_axes,
                 origin=slab.origin,
                 pad=(),
                 addressing=addressing,
