@@ -5,9 +5,8 @@ For each shape, this: traces ``torch.matmul`` via the shared ``matmul_snippet``,
 autotunes it at ``-Xcicc -O1`` (ranking pass) into an isolated SQLite DB, reads
 the winning knobs off the assembled ``CudaOp`` graph, re-benches the winner at
 ``-O3`` (deployable) against cuBLAS (``torch.matmul``, TF32 pinned off), and
-records a :class:`MatmulGoldenConfig`. The collected list is spliced into the
-``BEGIN/END GENERATED`` region of
-``deplodock/compiler/pipeline/search/golden_configs.py``.
+records a :class:`MatmulGoldenConfig`. The collected list is written to
+``goldens/matmul.yaml`` via :func:`deplodock.publish.goldens.dump_goldens`.
 
 Usage:
     python scripts/find_golden_configs.py                       # all shapes
@@ -33,18 +32,15 @@ logging.getLogger("deplodock").setLevel(logging.WARNING)
 logger = logging.getLogger("find_golden_configs")
 
 from deplodock import config  # noqa: E402
-from deplodock.compiler.pipeline.search.golden_configs import (  # noqa: E402
+from deplodock.publish.goldens import (  # noqa: E402
     QWEN3_06B_HIDDEN,
     QWEN3_06B_INTER,
     QWEN3_06B_KV_DIM,
     QWEN3_06B_Q_DIM,
     MatmulGoldenConfig,
+    dump_goldens,
     matmul_snippet,
 )
-
-_DATA_MODULE = Path(__file__).resolve().parent.parent / "deplodock" / "compiler" / "pipeline" / "search" / "golden_configs.py"
-_BEGIN = "# --- BEGIN GENERATED (scripts/find_golden_configs.py) ---"
-_END = "# --- END GENERATED ---"
 
 
 def _shape_table() -> list[tuple[str, int, int, int, str]]:
@@ -196,43 +192,13 @@ def _gpu_name() -> str:
     return _GPU_NAME_CACHE[0]
 
 
-def _render(configs: list[MatmulGoldenConfig]) -> str:
-    """Render the ``GOLDEN_CONFIGS = [...]`` assignment for the data module."""
-    lines = ["GOLDEN_CONFIGS: list[GoldenConfig] = ["]
-    for c in configs:
-        dtype = "" if c.dtype == "fp32" else f'\n        dtype="{c.dtype}",'
-        lines.append(
-            "    MatmulGoldenConfig(\n"
-            f'        name="{c.name}",\n'
-            f"        M={c.M}, N={c.N}, K={c.K},{dtype}\n"
-            f'        gpu_name="{c.gpu_name}",\n'
-            f"        compute_cap={c.compute_cap!r},\n"
-            f"        knobs={c.knobs!r},\n"
-            f"        deplodock_us={c.deplodock_us!r}, cublas_us={c.cublas_us!r},\n"
-            "    ),"
-        )
-    lines.append("]")
-    return "\n".join(lines)
+def _write_yaml(configs: list[MatmulGoldenConfig]) -> None:
+    """Persist ``configs`` to ``goldens/*.yaml`` via the shared dumper."""
+    from deplodock.publish.goldens import goldens_dir
 
-
-def _splice(rendered: str) -> None:
-    """Rewrite the data module's generated region in place, then ruff-format it
-    (the rendered knob dicts are one-liners that exceed the 140-char limit)."""
-    import subprocess
-
-    text = _DATA_MODULE.read_text()
-    before, _, rest = text.partition(_BEGIN)
-    _, _, after = rest.partition(_END)
-    new = f"{before}{_BEGIN}\n{rendered}\n{_END}{after}"
-    _DATA_MODULE.write_text(new)
-    logger.info("Wrote %d configs to %s", rendered.count("MatmulGoldenConfig("), _DATA_MODULE)
-
-    ruff = Path(sys.executable).parent / "ruff"
-    ruff_cmd = str(ruff) if ruff.exists() else "ruff"
-    try:
-        subprocess.run([ruff_cmd, "format", str(_DATA_MODULE)], check=True, capture_output=True)
-    except (OSError, subprocess.CalledProcessError) as exc:  # noqa: BLE001 — formatting is best-effort
-        logger.warning("ruff format skipped (%s); run `make format` before committing", exc)
+    out = goldens_dir()
+    dump_goldens(configs, out)
+    logger.info("Wrote %d configs to %s", len(configs), out)
 
 
 def main() -> None:
@@ -283,12 +249,13 @@ def main() -> None:
     golden_n = sum(1 for c in configs if c.golden)
     logger.info("Done: %d config(s), %d golden (>=95%% cuBLAS)", len(configs), golden_n)
 
-    rendered = _render(configs)
     if args.dry_run:
+        import yaml
+
         print()
-        print(rendered)
+        print(yaml.safe_dump([{"name": c.name, "knobs": dict(c.knobs)} for c in configs], sort_keys=False))
     else:
-        _splice(rendered)
+        _write_yaml(configs)
 
 
 if __name__ == "__main__":
