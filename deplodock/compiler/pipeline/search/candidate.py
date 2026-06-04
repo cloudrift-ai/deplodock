@@ -55,14 +55,6 @@ class Candidate:
         any candidate uniformly."""
         return self
 
-    def score(self) -> float:
-        """Mean of every node's ``op.score(ctx)`` over the ops that
-        return a non-``None`` score. Used as the MCTS prior for
-        ordering unmeasured siblings. Returns ``0.0`` when no op in
-        the graph provides a score."""
-        scores = [s for n in self.graph.nodes.values() if (s := n.op.score(self.ctx)) is not None]
-        return sum(scores) / len(scores) if scores else 0.0
-
     def lazy(self) -> LazyCandidate:
         """Wrap in a no-op :class:`LazyCandidate` (``pending=None``). The search
         layer always handles ``LazyCandidate``; this helper lifts a
@@ -327,31 +319,28 @@ class LazyCandidate:
         return resolved
 
     def score(self) -> float:
-        """Mean of every node's ``op.score(ctx)`` in the candidate's
-        graph, with the pending Fork's planner prior added on top.
-
-        Branch and leaf Forks score identically: ``inner.score() +
-        fork.score``. ``fork.score`` is the planner-computed prior the
-        rule attached (for partition leaves, that's
-        ``TileOp.lazy_score(ctx, knobs=..., shapes=...)`` — the same
-        formula ``TileOp.score`` runs post-materialization, but cheap).
+        """The pending Fork's planner prior (``fork.score()``), or ``0.0``
+        for a no-pending wrapper. This is the MCTS unvisited-sibling
+        tiebreak — and the fork prior is the ONLY meaningful component:
+        siblings at a fork point share ``inner`` by reference, and UCB
+        only ever compares children of one parent, so any inner-graph
+        term would be a constant offset within every comparison set.
+        (``Op.score``, the old post-materialization walk that supplied
+        such a term, was dropped for exactly that reason —
+        ``Op.lazy_score`` is the only scorer.)
 
         We deliberately do NOT fire ``fork.expand()`` here to recover
         the option and re-score it: ``expand()`` for a partition leaf
         runs ``_build_split_body`` + ``TileOp.__post_init__`` (full body
         normalization), and MCTS's ``_ucb_key`` reads this score for
         every unvisited sibling at every descent level. Materializing
-        every leaf just to rank them defeats the whole lazy-planner
-        design. The leaf's planner-side score is already an accurate
-        equivalent of what its post-materialization
-        ``TileOp.score(ctx)`` would return (the lazy/eager parity
-        check in ``test_lazy_score_matches_tile_op_score`` enforces
-        this), so the cheap signal is the right one to use.
+        every leaf just to rank it defeats the whole lazy-planner
+        design — the planner-side ``lazy_score`` is the signal.
         """
         if self.pending is None:
-            return self.inner.score()
+            return 0.0
         _, fork = self.pending
-        return self.inner.score() + fork.score()
+        return fork.score()
 
 
 # ---------------------------------------------------------------------------

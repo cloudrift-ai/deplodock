@@ -103,24 +103,12 @@ class Op:
         """
         return True
 
-    def score(self, ctx) -> float | None:  # noqa: ARG002 — ``ctx`` consumed by subclass overrides
-        """Heuristic "promisingness" prior for autotune candidate
-        ordering. Higher = explore first. Returned without bounds; the
-        search uses it only as a tiebreaker among unvisited siblings.
-        Default: ``None`` (no prior available — the op does not
-        contribute to the candidate's mean score). Override in
-        subclasses with domain knowledge (``TileOp.score`` prefers CTAs
-        near the target thread count that stage their inputs and
-        register-tile, for example).
-        """
-        return None
-
     @staticmethod
     def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:  # noqa: ARG004
         """Cheap pre-instantiation scorer. Lets a rule rank variants
-        without building each op just to read :meth:`score` — the
-        instantiation may be the bulk of the lowering cost (e.g.
-        ``TileOp.__post_init__`` runs full body normalization).
+        without ever building the op — the instantiation may be the bulk
+        of the lowering cost (e.g. ``TileOp.__post_init__`` runs full
+        body normalization).
 
         Subclasses override to implement when the score formula can be
         evaluated from precomputed inputs:
@@ -133,11 +121,10 @@ class Op:
           for ``TileOp`` — the static per-LoopOp planning state)
 
         Return ``None`` when the lazy path isn't implementable for
-        these inputs; callers (rules using deferred-materialization
-        forks) fall back to constructing the op and calling
-        :meth:`score`. The contract is "lazy = score-equivalent when
-        non-None": ``cls.lazy_score(...) == cls(...).score(ctx)`` for
-        any inputs both can score.
+        these inputs. This is the ONLY scorer — there is deliberately no
+        post-materialization ``Op.score``: every ranking decision the
+        search makes flows through the same cheap (knobs, shapes)
+        formula, so an op never needs to exist just to be ranked.
         """
         return None
 

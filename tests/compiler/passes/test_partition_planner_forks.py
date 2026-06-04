@@ -221,10 +221,9 @@ def test_first_leaf_matches_best_score_variant():
     the leaf reachable by always taking option-0 must be the highest-
     scoring TileParams in the planner's enumeration. Greedy primary =
     score primary (single source of truth, also used as MCTS prior).
-
-    Asserted against ``TileOp.lazy_score`` (the cheap pre-materialization
-    scorer on the Op protocol) rather than instantiating every variant —
-    both compute the same number by ``lazy_score``'s contract."""
+    ``lazy_score`` is the ONLY scorer (there is no post-materialization
+    ``Op.score``), so the option-0 leaf's fork prior is compared against
+    a from-scratch argmax over every enumerated variant."""
     plan = _matmul_plan()
     ctx = _ctx()
     tree = _build_fork_tree_lazy(plan, ctx)
@@ -232,33 +231,12 @@ def test_first_leaf_matches_best_score_variant():
     node = tree if isinstance(tree, Fork) else tree[0]
     while not node.is_leaf:
         node = node.expand()[0]
-    leaf_op = node.expand()[0]
 
     def _lazy(p):
         return TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
 
-    expected = max(plan.params, key=_lazy)
-    assert leaf_op.score(ctx) == pytest.approx(_lazy(expected)), (
-        f"option-0 leaf TileOp.score {leaf_op.score(ctx)} != best lazy_score {_lazy(expected)}"
-    )
-
-
-def test_lazy_score_matches_tile_op_score():
-    """``Op.lazy_score`` contract check: the lazy estimate must equal what
-    the materialized ``TileOp.score(ctx)`` returns — both consume the SAME
-    knob dict (``_variant_knobs`` builds it; ``_materialize`` stamps it).
-    Run across every variant of the matmul plan since it has the widest
-    variant set + the full FM/FN/SPLITK branching that exercises every
-    score-formula branch."""
-    plan = _matmul_plan()
-    ctx = _ctx()
-    for p in plan.params:
-        materialized = _materialize(plan, p)
-        lazy = TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
-        assert lazy is not None, f"TileOp.lazy_score returned None for {p}"
-        assert materialized.score(ctx) == pytest.approx(lazy), (
-            f"score mismatch for {p}: TileOp.score={materialized.score(ctx)} vs lazy_score={lazy}"
-        )
+    best = max(_lazy(p) for p in plan.params)
+    assert node.score() == pytest.approx(best), f"option-0 leaf prior {node.score()} != best lazy_score {best}"
 
 
 def test_pointwise_collapses_br_layer():

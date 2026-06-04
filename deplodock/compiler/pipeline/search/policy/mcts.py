@@ -41,15 +41,12 @@ class SearchNode:
 
     @cached_property
     def score(self) -> float:
-        """Cached :meth:`LazyCandidate.score` — UCB descent reads this on
-        every unvisited sibling at every level per pop. Without the
-        cache, ``Candidate.score`` (which iterates every graph node and
-        calls ``op.score(ctx)``) re-runs ~O(siblings) per pop, with
-        leaf-Fork siblings additionally materializing their TileOps via
-        ``fork.expand()`` (full ``_build_split_body`` + body
-        normalization). The cache is sound because ``LazyCandidate.score``
-        is a pure function of ``inner.graph`` + ``pending``, both
-        frozen once the SearchNode is attached.
+        """Cached :meth:`LazyCandidate.score` (the pending fork's lazy
+        prior) — UCB descent reads this on every unvisited sibling at
+        every level per pop, and a branch fork's prior is a max over its
+        param subgroup, so the per-node cache keeps repeated descents
+        O(1). Sound because ``LazyCandidate.score`` is a pure function
+        of ``pending``, frozen once the SearchNode is attached.
         """
         return self.candidate.score() if self.candidate is not None else float("-inf")
 

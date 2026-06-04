@@ -191,25 +191,19 @@ build this keeps whole-model Qwen3-0.6B compile at ~3 minutes (down from ~5; an 
 cross-LoopOp memo + per-plan score-input hoisting bought a further 2.6× to ~70 s but was dropped for
 simplicity — see git history of `010_partition_loops` if the trade ever reverses).
 
-For rules that want a custom lazy scorer, override
-`Op.lazy_score(cls, ctx, *, knobs=None, shapes=None)` on
-the producing Op class. The base implementation returns `None` (no
-lazy estimate available); callers fall back to constructing the op
-and calling `score(ctx)`. `TileOp.lazy_score` is the reference
-implementation — it consumes `KernelShape` + the variant's stamped knob
-dict (the planner's `_variant_knobs` builds the exact dict `_materialize`
-stamps, so the lazy and eager paths read identical knob inputs; any knob
-source — DB rows, golden configs, pin sets — is scoreable without
-reconstructing a `TileParams`) and matches `TileOp.score`'s formula
-( `score_tile_geometry`) on the launch-geometry + cells + coalescing
-keys. The smem-fit penalty needs the count of input buffers the kernel
-will stage, which `lazy_score` derives from `KernelShape` (walking
-`outer_m` / `extra_outer` / `prologue` for distinct `Load.input`); the
-post-materialization path defaults to 2 (plain A+B) when no shape is
-available, so the two scores can disagree by up to the smem-fit
-penalty's ±2.5 on SDPA-with-mask / RoPE-fused kernels. That asymmetry
-is acceptable because only the planner-time scorer drives sibling
-ordering; the post-materialization score is a sanity metric.
+For rules that want a custom scorer, override
+`Op.lazy_score(cls, ctx, *, knobs=None, shapes=None)` on the producing Op class. The base implementation
+returns `None` (no prior available). This is the ONLY scorer — there is deliberately no
+post-materialization `Op.score`; every ranking decision flows through the same cheap (knobs, shapes)
+formula, so an op never needs to exist just to be ranked (the old eager walk also contributed nothing to
+search decisions: fork siblings share their `inner` snapshot by reference and UCB only compares children of
+one parent, so an inner-graph term was a constant offset within every comparison set). `TileOp.lazy_score`
+is the reference implementation — it consumes `KernelShape` + the variant's stamped knob dict (the
+planner's `_variant_knobs` builds the exact dict `_materialize` stamps; any knob source — DB rows, golden
+configs, pin sets — is scoreable without reconstructing a `TileParams`) and computes
+`score_tile_geometry` on the launch-geometry + cells + coalescing keys, with the smem-fit penalty's
+input-buffer count derived from `KernelShape` (walking `outer_m` / `extra_outer` / `prologue` for distinct
+`Load.input`).
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
@@ -383,7 +377,7 @@ over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
-  `child.score` is a rank-only structural prior the rule stamped via `TileOp.score` (no magnitude — only relative ordering).
+  `child.score` is a rank-only structural prior the rule stamped via `TileOp.lazy_score` (no magnitude — only relative ordering).
 - **Expansion** is implicit: `Pipeline.search` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
 - **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU

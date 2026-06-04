@@ -1509,11 +1509,11 @@ def score_tile_geometry(
     n_staged_inputs: int = 2,
     compute_capability: tuple[int, int] | None = None,
 ) -> float:
-    """Pure-formula scoring shared by :meth:`TileOp.score` and the partition
-    planner. Takes the launch-geometry summary the score depends on (already
+    """Pure-formula scoring backing :meth:`TileOp.lazy_score` (the only
+    scorer). Takes the launch-geometry summary the score depends on (already
     resolved to static ints, symbolic axes substituted as 1) plus the knob
-    bundle, so the planner can score un-materialized ``TileParams`` against
-    the same yardstick a fully-built ``TileOp`` would use.
+    bundle, so the planner can rank un-materialized ``TileParams`` without a
+    ``TileOp`` ever existing.
 
     ``coalescing_inner_extent`` is the summed extent of thread axes that
     appear in any Write's inner-stride dim (0 when none align).
@@ -1931,56 +1931,6 @@ class TileOp(BodyOp):
         threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes)
         return threads <= ctx.max_threads_per_cta
 
-    def score(self, ctx) -> float:
-        cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
-        cc = getattr(ctx, "compute_capability", None) if ctx is not None else None
-        cache = self.__dict__.setdefault("_score_by_cap", {})
-        key = (cap, cc)
-        if key in cache:
-            return cache[key]
-        val = self._compute_score(cap, cc)
-        cache[key] = val
-        return val
-
-    def _compute_score(self, smem_cap: int | None, compute_capability: tuple[int, int] | None = None) -> float:
-        """Score formula — keyed on the live geometry and the ctx-supplied
-        ``smem_cap`` (so the macro-tile fit signal in :func:`score_tile_geometry`
-        gets a real cap to compare against). Memoized by cap on ``self`` so
-        repeated MCTS sibling scoring stays cheap — without that cache,
-        ``Candidate.score`` re-walks every body Stmt for coalescing analysis
-        on every visit; on Qwen3 0.6B with ~150 TileOps in the graph that
-        was the dominant tune-mode cost. Per-cap caching is sound because
-        :class:`Context` is frozen and the score is a pure function of
-        ``(self, cap)``.
-        """
-        block_axes, thread_axes = self._launch_geometry()
-        if not thread_axes and not block_axes:
-            return 0.0
-        thread_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in thread_axes]
-        block_extents = [ax.extent.as_static() if ax.extent.is_static else 1 for ax in block_axes]
-        if not thread_extents:
-            return 0.0
-        has_stages = any(isinstance(s, StageBundle) for s in self.body.iter())
-        # Match the planner-time count by walking the materialized body's
-        # Load.input set — so the smem-fit signal in score_tile_geometry sees
-        # the same ``n_staged_inputs`` here as it did in ``lazy_score`` for
-        # the pre-materialization version. Without this, fused-prologue or
-        # multi-input matmul kernels score differently between the two paths
-        # and ``test_lazy_score_matches_tile_op_score`` mismatches.
-        n_staged = len({s.input for s in self.body.iter() if isinstance(s, Load)})
-        if n_staged == 0:
-            n_staged = 2
-        return score_tile_geometry(
-            thread_extents=thread_extents,
-            block_extents=block_extents,
-            knobs=self.knobs,
-            has_stages=has_stages,
-            coalescing_inner_extent=self._coalescing_inner_extent(thread_axes),
-            smem_cap_bytes=smem_cap,
-            n_staged_inputs=n_staged,
-            compute_capability=compute_capability,
-        )
-
     @staticmethod
     def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:
         """Lazy scorer (see :meth:`Op.lazy_score`). Returns ``None`` unless
@@ -2045,9 +1995,8 @@ class TileOp(BodyOp):
         # ceil-div, not floor — when ``per_m > E_M`` (or ``per_n > E_N``) the
         # materializer still emits 1 CTA (with a masked Cond), and when
         # ``per_m`` doesn't divide ``E_M`` it emits ⌈E_M / per_m⌉ CTAs with the
-        # last one masked. Mirror that here so the post-materialization
-        # ``_compute_score`` (which reads the GridTile's actual axis extents)
-        # sees the same block_extents as ``lazy_score`` does pre-materialize.
+        # last one masked. Mirror that here so the block_extents match the
+        # GridTile axis extents the materializer will actually emit.
         block_extents: list[int] = []
         if splitk > 1:
             block_extents.append(splitk)
@@ -2090,19 +2039,23 @@ class TileOp(BodyOp):
 
     @staticmethod
     def _coalescing_inner_extent_from_writes(shape, knobs) -> int:
-        """Mirror of :meth:`_coalescing_inner_extent` computed against the
-        un-rewritten LoopOp body. σ_outer keeps the outer M/N axis names
-        on the eventual thread tiles (M_t inherits ``outer_m.axis.name``,
-        N_t inherits ``outer_n.axis.name``, K_c inherits ``k_loop.axis.name``),
-        so the inner-stride free-var match works the same way before and
-        after body construction. ``knobs`` is the variant's stamped knob
-        dict (warp tier recognized by the ``MMA`` key).
+        """Sum the extents of the variant's thread axes that appear in the
+        inner-stride dim of any ``Write`` in the un-rewritten LoopOp body —
+        the coalescing term of :func:`score_tile_geometry`. σ_outer keeps
+        the outer M/N axis names on the eventual thread tiles (M_t inherits
+        ``outer_m.axis.name``, N_t inherits ``outer_n.axis.name``, K_c
+        inherits ``k_loop.axis.name``), so the inner-stride free-var match
+        works against the pre-materialization body. ``knobs`` is the
+        variant's stamped knob dict (warp tier recognized by the ``MMA``
+        key); size-1 thread axes are skipped (``normalize_body`` would
+        inline them out of the materialized body).
 
-        Size-1 thread axes are skipped — ``normalize_body`` inlines them
-        out of the materialized body, so they don't appear in the post-
-        materialization ``thread_axes`` ``_coalescing_inner_extent``
-        iterates. Mirroring that here keeps the lazy score consistent
-        with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
+        Why this matters: two variants with identical ``cells × threads ×
+        ctas`` can differ 2x in measured latency purely because one parks
+        its threads along the M (outer-stride) output axis and the other
+        along N (inner-stride). The N-major variant coalesces gmem loads +
+        the output store; the M-major one strides by N per thread. The
+        four base score terms can't distinguish them.
         """
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
 
@@ -2141,36 +2094,6 @@ class TileOp(BodyOp):
             if not matched:
                 continue
             extent = sum(thread_extent[name] for name in matched)
-            if extent > best:
-                best = extent
-        return best
-
-    def _coalescing_inner_extent(self, thread_axes) -> int:
-        """Sum the extents of thread axes that appear in the inner-stride
-        dim of any top-level ``Write`` in the body. Feeds the coalescing
-        term in :func:`score_tile_geometry`.
-
-        Why this matters: two variants with identical ``cells × threads
-        × ctas`` can differ 2x in measured latency purely because one
-        parks its threads along the M (outer-stride) output axis and
-        the other along N (inner-stride). The N-major variant coalesces
-        gmem loads + the output store; the M-major one strides by N
-        per thread. The four base score terms can't distinguish them.
-        """
-        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
-
-        if not thread_axes:
-            return 0
-        thread_names = {ax.name for ax in thread_axes}
-        best = 0
-        for stmt in self.body.iter():
-            if not isinstance(stmt, Write) or not stmt.index:
-                continue
-            inner_vars = set(stmt.index[-1].free_vars())
-            matched = inner_vars & thread_names
-            if not matched:
-                continue
-            extent = sum((ax.extent.as_static() if ax.extent.is_static else 1) for ax in thread_axes if ax.name in matched)
             if extent > best:
                 best = extent
         return best

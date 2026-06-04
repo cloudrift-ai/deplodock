@@ -265,8 +265,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     chosen variant per LoopOp. ``_plan_kernel`` runs the cheap up-front
     classification + enumeration and produces a ``_Plan`` with bare
     ``TileParams`` tuples; sibling sorting uses :meth:`TileOp.lazy_score`
-    (mirrors :meth:`TileOp.score`) so the ordering matches what the
-    fully-built TileOps would have produced.
+    — the only scorer — so ranking never needs a materialized TileOp.
 
     The finished plan rides the LoopOp as op metadata (re-plans of the
     same op object are a stamp hit — see :func:`_plan_kernel`), and
