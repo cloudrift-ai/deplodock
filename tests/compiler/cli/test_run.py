@@ -55,6 +55,17 @@ def test_run_code_rmsnorm_accuracy(run_cli, dtype):
 
 
 @requires_cuda
+def test_run_code_rmsnorm_via_pow_neg_half(run_cli):
+    """Gemma-style RMSNorm normalization uses ``torch.pow(ms, -0.5)`` (not
+    ``rsqrt``); the exponent arrives as a broadcast constant. Guards the
+    ``030_pow`` regression where every ``pow`` was squared — here that would
+    compute ``x * (mean+eps)²`` and fail the eager comparison."""
+    code = "x = torch.randn(2,64,256); torch.mul(x, torch.pow(torch.mean(torch.pow(x,2),-1,keepdim=True)+1e-6, -0.5))"
+    rc, _, stderr = run_cli("run", "--code", code)
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
 def test_run_code_matmul_accuracy(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.matmul({_randn('16,32', dtype)}, {_randn('32,16', dtype)})")
     assert rc == 0, f"stderr: {stderr}"

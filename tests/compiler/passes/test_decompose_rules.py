@@ -11,6 +11,7 @@ import numpy as np
 from deplodock.compiler.backend.numpy import NumpyBackend
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
     LinearOp,
@@ -56,11 +57,26 @@ def _apply(graph: Graph, rule_name: str) -> Graph:
 # ===================================================================
 
 
-def _make_pow_graph():
+def _make_pow_graph(exp: float = 2.0, *, broadcast: bool = False):
+    """Build ``out = pow(x, exp)``. With ``broadcast=True`` the exponent reaches
+    the pow op through an IndexMap broadcast of the constant (the shape the real
+    tracer produces: ``pow_c1_bc = pow_c1[k]``) — the case the old guard's
+    ``isinstance(inp_exp.op, ConstantOp)`` check missed, squaring every pow."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 128)), node_id="x")
-    g.add_node(op=ConstantOp(name="exp", value=2.0), inputs=[], output=Tensor("exp", (1,)), node_id="exp")
-    g.add_node(op=ElementwiseOp(op="pow"), inputs=["x", "exp"], output=Tensor("out", (4, 128)), node_id="out")
+    g.add_node(op=ConstantOp(name="exp", value=exp), inputs=[], output=Tensor("exp", (1,)), node_id="exp")
+    exp_id = "exp"
+    if broadcast:
+        from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+
+        g.add_node(
+            op=IndexMapOp(out_shape=(4, 128), sources=(IndexSource(input_idx=0, coord_map=(Literal(0, "int"),)),)),
+            inputs=["exp"],
+            output=Tensor("exp_bc", (4, 128)),
+            node_id="exp_bc",
+        )
+        exp_id = "exp_bc"
+    g.add_node(op=ElementwiseOp(op="pow"), inputs=["x", exp_id], output=Tensor("out", (4, 128)), node_id="out")
     g.inputs, g.outputs = ["x"], ["out"]
     return g
 
@@ -96,6 +112,44 @@ def test_pow_idempotent():
 def test_pow_correctness():
     g = _make_pow_graph()
     x = rng.standard_normal((4, 128)).astype(np.float32)
+    inputs = {"x": x}
+    before = _run(g, inputs)
+    after = _run(_apply(g, "030_pow.py"), inputs)
+    _assert_close(before, after)
+
+
+def _out_op_name(result):
+    return result.nodes[result.outputs[0]].op.name
+
+
+def test_pow_neg_half_decomposes_to_rsqrt():
+    """``pow(x, -0.5)`` (Gemma RMSNorm normalization) must become ``rsqrt`` —
+    NOT ``x * x``. The old guard squared it because the exponent arrives as a
+    broadcast of the constant, not the constant directly."""
+    assert _out_op_name(_apply(_make_pow_graph(-0.5, broadcast=True), "030_pow.py")) == "rsqrt"
+
+
+def test_pow_half_decomposes_to_sqrt():
+    assert _out_op_name(_apply(_make_pow_graph(0.5, broadcast=True), "030_pow.py")) == "sqrt"
+
+
+def test_pow_two_through_broadcast_still_squares():
+    """A broadcast exponent of 2 still resolves to a self-multiply."""
+    result = _apply(_make_pow_graph(2.0, broadcast=True), "030_pow.py")
+    out = result.nodes[result.outputs[0]]
+    assert out.op.name == "multiply" and out.inputs[0] == out.inputs[1]
+
+
+def test_pow_other_exponent_left_as_pow():
+    """A non-{2, ±0.5} exponent is not decomposed (stays ``pow`` → ``powf``),
+    rather than being silently squared."""
+    assert _out_op_name(_apply(_make_pow_graph(3.0, broadcast=True), "030_pow.py")) == "pow"
+
+
+def test_pow_neg_half_correctness():
+    """End-to-end numeric check: decomposed rsqrt matches ``pow(x, -0.5)``."""
+    g = _make_pow_graph(-0.5, broadcast=True)
+    x = (rng.standard_normal((4, 128)).astype(np.float32) ** 2) + 1.0  # positive base for rsqrt
     inputs = {"x": x}
     before = _run(g, inputs)
     after = _run(_apply(g, "030_pow.py"), inputs)

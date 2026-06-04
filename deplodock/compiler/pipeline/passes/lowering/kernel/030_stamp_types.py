@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from deplodock.compiler.dtype import F32, DataType
+from deplodock.compiler.dtype import F16, F32, DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import (
     Accum,
@@ -179,8 +179,28 @@ def _stamp_assign(s: Assign, ctx: _StampCtx) -> Assign:
     from deplodock.compiler.dtype import get as _get  # noqa: PLC0415
 
     result_dt = _get(result_name)
+    # Overflow guard: a square (``x * x``) or a ``pow`` of an fp16 value can
+    # blow past fp16's 65504 ceiling (x² reaches ~4.3e9), giving inf → a
+    # garbage reduction (RMSNorm's mean-of-squares: inf → rsqrt(inf)=0, or a
+    # near-zero mean → huge rsqrt). torch sidesteps this by computing the
+    # reduction in fp32 (the ``x.float()`` in RMSNorm/variance); deplodock
+    # drops that cast, so compute these exploding ops in fp32 here. The render
+    # then upcasts the half operands (``__half2float``) and accumulates in f32.
+    # Matmul — ``multiply`` of *distinct* args — is untouched, preserving its
+    # fp16 path; only the same-arg square / pow are promoted.
+    if result_dt == F16 and _is_overflow_prone(s):
+        result_dt = F32
     ctx.ssa_dtypes[s.name] = result_dt
     return replace(s, dtype=result_dt)
+
+
+def _is_overflow_prone(s: Assign) -> bool:
+    """True for elementwise ops that can overflow fp16 from in-range inputs —
+    the square ``multiply(a, a)`` and any ``pow`` (e.g. RMSNorm's
+    mean-of-squares). Distinct-arg ``multiply`` (matmul) is excluded."""
+    if s.op.name == "pow":
+        return True
+    return s.op.name == "multiply" and len(s.args) == 2 and s.args[0] == s.args[1]
 
 
 def _stamp_write(s: Write, ctx: _StampCtx) -> Write:
