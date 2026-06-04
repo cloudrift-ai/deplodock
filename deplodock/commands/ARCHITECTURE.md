@@ -46,7 +46,9 @@ The central orchestration layer. Provides a single entry point for deploying rec
 **Modules:**
 - `params.py` — `DeployParams` dataclass (holds `recipe: Recipe`, `gpu_device_ids`, etc.)
 - `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
-- `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`
+- `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`. `run_deploy()` / `deploy()` accept an
+  optional `timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics))
+- `log_phases.py` — `parse_engine_load_phases()` (best-effort `weights_load` / `cuda_graph_capture` from container logs)
 - `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
 - `scale_out.py` — `ScaleOutStrategy` ABC, `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy`, `STRATEGIES`, `DEFAULT_STRATEGY`
 - `local.py` — `make_run_cmd()`, `make_write_file()` (local subprocess transport)
@@ -76,8 +78,11 @@ Benchmark configuration, task enumeration, and execution.
 - `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `add_group_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_GroupNameFilter`, `_BenchConsoleFormatter`
 - `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
 - `tasks.py` — `enumerate_tasks()`
-- `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type
-- `results.py` — `BenchmarkMetrics`, `SystemInfo` dataclasses, `parse_benchmark_metrics()`, `parse_system_info()`, `compose_json_result()`
+- `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type. Times provisioning (per
+  group) + deploy/bench/teardown (per task); task results are `(task, ok, timing)` triples
+- `results.py` — `BenchmarkMetrics`, `SystemInfo` dataclasses, `parse_benchmark_metrics()`, `parse_system_info()`,
+  `compose_json_result()` (optional `timing` arg → `"timing"` key)
+- `workload.py` — `compose_result()` (optional `timing` arg → `=== Timing ===` section), `run_benchmark_workload()`
 
 ### `planner/` — Planner Layer
 
@@ -146,6 +151,32 @@ For each task in group:
     v
 delete_cloud_vm(conn.delete_info) (skipped with --no-teardown; writes instances.json)
 ```
+
+## Timing metrics
+
+`deplodock/timing.py` provides `PhaseTimer` — an ordered collector of `phase -> seconds` durations, threaded by
+mutation through the async deploy/bench chain (so `run_deploy()` keeps its `bool` return). Each phase is wrapped in
+`async with timer.ameasure(name)` (sync `measure()` also exists); the elapsed is recorded even if the body raises,
+and a `[timing] <name>: 12.3s` line is logged. Phase-name constants live in `timing.py`.
+
+**Measured phases:** provisioning `vm_provision`, `remote_provision`; deploy `image_pull`, `model_download`,
+`model_load_and_warmup` (the `compose up --wait` window — covers weight load into GPU + CUDA graph capture + warmup),
+`smoke_test`; plus `benchmark`, `teardown`, and `command` (command recipes). After `model_load_and_warmup`,
+`orchestrate.py` scrapes `docker compose logs` via `log_phases.parse_engine_load_phases()` for best-effort sub-phases
+`weights_load` / `cuda_graph_capture` — absent when the engine/log format doesn't match. These two are a breakdown of
+`model_load_and_warmup`, so they are **excluded from `total`** (which would otherwise double-count). Near-zero phases
+(`container_cleanup`, health poll, `system_info`) are intentionally not timed, so the phases don't fully sum to raw
+wall-clock.
+
+**Attribution:** provisioning runs once per `ExecutionGroup` (shared VM) but is seeded into each task's timer, so every
+task's result reflects what it cost to stand up its host. `vm_provision` is omitted for fixed/local hosts (no VM
+created). `timing["benchmark"]` is wall-clock (incl. the docker bench-client startup), distinct from
+`metrics.benchmark_duration_s` (the server-measured window).
+
+**Output:** `bench` persists timing into each task's `.json` (`"timing"` key) and `.txt` (`=== Timing ===` section) and
+prints a per-task `TIMING` table in the end-of-run summary (`commands/bench/__init__.py::_format_timing_table`).
+Standalone `deploy local/ssh/cloud` are display-only (no results dir) — they log the `PhaseTimer.format_table()`
+breakdown at the end.
 
 ### Fixed-host mode (`--local` / `--ssh`)
 

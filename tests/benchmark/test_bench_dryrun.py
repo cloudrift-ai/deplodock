@@ -49,6 +49,21 @@ def test_bench_dry_run_deploy_then_benchmark(run_cli, make_bench_config, recipes
     assert pull_idx < bench_idx
 
 
+def test_bench_dry_run_reports_timing(run_cli, make_bench_config, recipes_dir, tmp_path):
+    """The end-of-run summary includes a TIMING breakdown for successful tasks."""
+    config_path = make_bench_config(tmp_path)
+    recipe = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")
+    rc, stdout, stderr = run_cli(
+        "bench",
+        recipe,
+        "--config",
+        config_path,
+        "--dry-run",
+    )
+    assert rc == 0, f"stderr: {stderr}\nstdout: {stdout}"
+    assert "TIMING" in stdout
+
+
 def test_bench_multiple_recipes(run_cli, make_bench_config, recipes_dir, tmp_path):
     config_path = make_bench_config(tmp_path)
     recipe1 = os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ")

@@ -18,6 +18,7 @@ from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_target import parse_ssh_target
 from deplodock.recipe import resolve_for_hardware
 from deplodock.redact import register_secret
+from deplodock.timing import PHASE_REMOTE_PROVISION, PhaseTimer
 
 logger = logging.getLogger(__name__)
 
@@ -71,18 +72,24 @@ async def _handle_ssh(args):
     )
     skip_nvidia = recipe.deploy.gpu is not None and recipe.deploy.gpu.startswith("AMD")
     host = RemoteHost(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
-    await provision_remote(
-        host,
-        skip_nvidia=skip_nvidia,
-        driver_version=recipe.deploy.driver_version,
-        cuda_version=recipe.deploy.cuda_version,
-    )
+    timer = PhaseTimer()
+    async with timer.ameasure(PHASE_REMOTE_PROVISION):
+        await provision_remote(
+            host,
+            skip_nvidia=skip_nvidia,
+            driver_version=recipe.deploy.driver_version,
+            cuda_version=recipe.deploy.cuda_version,
+        )
 
     if args.teardown:
         return await teardown_entry(params)
 
-    if not await deploy_entry(params):
+    if not await deploy_entry(params, timer=timer):
         sys.exit(1)
+
+    logger.info("\nTiming:")
+    for line in timer.format_table().splitlines():
+        logger.info(line)
 
 
 def register_ssh_target(subparsers):

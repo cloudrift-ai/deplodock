@@ -48,6 +48,11 @@ For each candidate, the orchestrator makes up to `SAME_CANDIDATE_RETRIES` (= 2) 
 
 When every candidate is exhausted, the orchestrator returns `None` and logs the last error.
 
+**Timing:** `bench` (`benchmark/execution.py`) wraps `provision_cloud_vm()` → `vm_provision` and `provision_remote()`
+→ `remote_provision` in a timer. These run once per `ExecutionGroup` (shared VM) but are seeded into each task's timer,
+so every task's result reflects its host's stand-up cost. `vm_provision` is omitted for pre-allocated/fixed/local hosts
+(no VM created). See `deplodock/commands/ARCHITECTURE.md` → Timing metrics.
+
 ## Error contract
 
 `errors.py` defines two exceptions that providers raise to communicate intent:

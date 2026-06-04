@@ -236,6 +236,24 @@ def test_compose_json_result(tmp_path):
     assert isinstance(result["compose"], str)
     assert isinstance(result["bench_command"], str)
 
+    # No timing key when timing is not supplied
+    assert "timing" not in result
+
+
+def test_compose_json_result_with_timing(tmp_path):
+    task = _make_task(tmp_path)
+    timing = {"image_pull": 95.3, "model_load_and_warmup": 73.1, "benchmark": 372.1, "total": 540.5}
+    result = compose_json_result(
+        task,
+        benchmark_output=BENCHMARK_OUTPUT_FULL,
+        compose_content="services:\n  vllm_0:\n    image: vllm/vllm-openai:v0.17.0",
+        bench_command="vllm bench serve --model test-org/test-model",
+        system_info_raw=SYSTEM_INFO_RAW,
+        timing=timing,
+    )
+    assert result["timing"] == timing
+    assert result["timing"]["total"] == 540.5
+
 
 # ── json_result_path ──────────────────────────────────────────────
 

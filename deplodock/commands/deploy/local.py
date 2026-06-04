@@ -12,6 +12,7 @@ from deplodock.provisioning.host import LocalHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import resolve_for_hardware
 from deplodock.redact import register_secret
+from deplodock.timing import PhaseTimer
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ async def _handle_local(args):
             cuda_version=recipe.deploy.cuda_version,
         )
 
+    timer = PhaseTimer()
     success = await run_deploy(
         run_cmd=run_cmd,
         write_file=write_file,
@@ -72,10 +74,15 @@ async def _handle_local(args):
         hf_token=hf_token,
         host="localhost",
         dry_run=dry_run,
+        timer=timer,
     )
 
     if not success:
         sys.exit(1)
+
+    logger.info("\nTiming:")
+    for line in timer.format_table().splitlines():
+        logger.info(line)
 
 
 def register_local_target(subparsers):
