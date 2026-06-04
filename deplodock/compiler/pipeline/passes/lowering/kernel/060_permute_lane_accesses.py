@@ -126,7 +126,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
     # Touch ``config`` so the env read stays on the standard knob_raw path.
     _ = config.knob_raw(PERMUTE_LANES.name)
     knobs = root.op.knobs
-    if knobs.get("ATOM_KIND"):
+    if knobs.get("MMA"):
         # MMA path: the s16816 ``ldmatrix`` consumer applies its own per-lane
         # swizzle XOR — the per-thread LDS.128 permute doesn't apply. Skip per
         # plans/mma-fragment-factorization.md M7.

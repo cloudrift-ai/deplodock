@@ -135,7 +135,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # deepest 2-block ring — right for scalar / 128×128, but here it picks a
     # depth that disqualifies the better WS kernel). The autotuner still sees
     # every depth.
-    if "ATOM_KIND" in root.op.knobs:
+    if "MMA" in root.op.knobs:
         variants.sort(key=lambda bv: (bv[0] != 2, bv[0]))
         return [v for _, v in variants]
 

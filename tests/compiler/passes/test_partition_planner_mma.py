@@ -411,8 +411,7 @@ def test_warp_enumerator_atom_kind_alias_narrow(monkeypatch):
     """``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` — the ``MMA`` knob's alias
     spelling — pins the kind even when the caller passes a multi-kind tuple,
     scoping the picker to a single tensor-core family."""
-    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
     assert rows
     assert all(r.atom.name == "mma_m16n8k16_f16" for r in rows)
@@ -438,7 +437,6 @@ def test_mma_mode_decodes_three_way(monkeypatch):
 def test_warp_enumerator_mma_name_pins_kind(monkeypatch):
     """``DEPLODOCK_MMA=<kind name>`` pins the atom kind exactly like
     ``DEPLODOCK_ATOM_KIND`` — one knob enables + pins in one go."""
-    monkeypatch.delenv("DEPLODOCK_ATOM_KIND", raising=False)
     monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
     assert rows
@@ -516,7 +514,7 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     # GridTile should still be the outermost tier.
     assert any(isinstance(s, GridTile) for s in tile_op.body), "warp variant must keep the GridTile outer wrapper"
     # Knobs reflect the warp tier.
-    assert tile_op.knobs["ATOM_KIND"] == "mma_m16n8k16_f16"
+    assert tile_op.knobs["MMA"] == "mma_m16n8k16_f16"
     assert "BR" not in tile_op.knobs  # warp tier doesn't carry BR
 
 
@@ -542,7 +540,6 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
     pin on top of the gate."""
     from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
 
-    monkeypatch.delenv("DEPLODOCK_ATOM_KIND", raising=False)
     monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")

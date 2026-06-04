@@ -103,7 +103,7 @@ def test_fp16_ring_buffer_uses_real_dtype_bytes(monkeypatch):
     ctx = Context(compute_capability=(9, 0), max_dynamic_smem=_SM120_SMEM_CAP)
     out = Pipeline.build(TILE_PASSES).run(g, ctx=ctx)
     kop = out.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     got = kop.knobs.get("BUFFER_COUNT")
     assert got == 4, f"BUFFER_COUNT=4 should fire at the real fp16 byte count, got {got}"
     assert _max_buffer_count(out) == 4, "expected a depth-4 ring StageBundle in the lowered body"

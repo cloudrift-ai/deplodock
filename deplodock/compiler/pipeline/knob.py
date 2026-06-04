@@ -49,8 +49,7 @@ class Knob:
     own structural validity gates). ``help`` is a short docstring shown
     by future tooling (``deplodock knobs``). ``aliases`` are alternate
     names whose ``DEPLODOCK_<ALIAS>`` env vars also pin this knob (read
-    via :meth:`raw`; the primary name wins when both are set) — e.g.
-    ``MMA`` accepts its historical ``ATOM_KIND`` spelling."""
+    via :meth:`raw`; the primary name wins when both are set)"""
 
     name: str
     type: KnobType

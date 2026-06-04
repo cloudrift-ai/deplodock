@@ -180,10 +180,10 @@ def test_idempotent_skip_when_knob_pinned(monkeypatch):
 
 
 def test_mma_path_skipped(monkeypatch):
-    """``ATOM_KIND`` set (MMA path) → skip; MMA SPLITK stays on the
+    """``MMA`` set (MMA path) → skip; MMA SPLITK stays on the
     codegen-derived atomic rewrite."""
     monkeypatch.delenv("DEPLODOCK_ATOMIC_FREE_SPLITK", raising=False)
-    op = _matmul_tileop(knobs={"ATOM_KIND": "mma_m16n8k16_f16"})
+    op = _matmul_tileop(knobs={"MMA": "mma_m16n8k16_f16"})
     with pytest.raises(RuleSkipped, match="MMA TileOp"):
         _rewrite(op)
 

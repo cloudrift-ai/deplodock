@@ -25,7 +25,7 @@ coordination). The schedule is bandwidth-bound at the target shape
 the generic ``100_materialize_tile.py`` handles the body unchanged.
 
 Idempotent: re-running on a TileOp whose ``knobs`` already names
-``ATOMIC_FREE_SPLITK`` skips. MMA TileOps (``ATOM_KIND`` set) skip too —
+``ATOMIC_FREE_SPLITK`` skips. MMA TileOps (``MMA`` set) skip too —
 their accumulation flows through the C fragment, not scalar
 Init/Accum, and split-K on the MMA path stays on the codegen-derived
 atomic rewrite (see ``plans/mma-fragment-factorization.md``).
@@ -268,7 +268,7 @@ def _build_atomic_free_fragment(match: Match, root: Node, op: TileOp, k_s_axis: 
 
 def rewrite(ctx: Context, match: Match, root: Node) -> list[TileOp | Graph] | None:
     op: TileOp = root.op
-    if op.knobs.get("ATOM_KIND"):
+    if op.knobs.get("MMA"):
         # MMA path: fragment-accumulation; the C-fragment Write isn't a
         # scalar Write we can rewire here, and split-K on MMA stays on
         # the codegen-derived atomic rewrite path.

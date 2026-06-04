@@ -189,7 +189,7 @@ def test_staged_pipelined_matches_f32_reference(pin_staged_pipelined, M: int, N:
     from deplodock.compiler.backend.cuda.nvcc import compile_to_cubin  # noqa: PLC0415
 
     g, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     # The pinned BK=2 with buffer_count >= 2 must produce the cp.async-staged
     # pipelined MMA path — verified at the C source.
     assert "cp.async.commit_group" in src

@@ -142,7 +142,7 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     g = _matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16", "expected warp-tier mma.sync variant"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected warp-tier mma.sync variant"
 
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
@@ -196,7 +196,7 @@ def test_mma_default_on_picks_warp_variant(monkeypatch):
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16", "MMA should be on by default"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "MMA should be on by default"
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
@@ -208,7 +208,7 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") is None, "MMA variant should not be emitted when DEPLODOCK_MMA=0"
+    assert kop.knobs.get("MMA") is None, "MMA variant should not be emitted when DEPLODOCK_MMA=0"
     # Scalar path should stamp BN/BM.
     assert "BN" in kop.knobs and "BM" in kop.knobs
 

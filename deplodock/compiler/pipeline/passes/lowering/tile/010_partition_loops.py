@@ -142,7 +142,6 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
-    ATOM_KIND,
     BK,
     BM,
     BN,
@@ -150,6 +149,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     FK,
     FM,
     FN,
+    MMA,
     SPLITK,
     WM,
     WN,
@@ -316,7 +316,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
         return build_fork_tree(
             params=warp_params,
             levels=[
-                Level((ATOM_KIND.name,), lambda p: (p.atom.name,)),
+                Level((MMA.name,), lambda p: (p.atom.name,)),
                 Level((WM.name, WN.name), lambda p: (p.wm, p.wn)),
                 Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
                 Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
@@ -948,7 +948,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
             FN.name: params.fn,
             BK.name: params.bk,
             SPLITK.name: params.splitk,
-            ATOM_KIND.name: params.atom.name,
+            MMA.name: params.atom.name,
         }
     else:
         knobs = {

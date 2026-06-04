@@ -168,7 +168,7 @@ def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
     """
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
     _, kop, _ = _compile_and_render(M=2048, N=2048, K=2048, out_dtype=F16)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert int(kop.knobs.get("WN", 0)) == 4, f"expected WN=4, got {kop.knobs.get('WN')}"
     assert int(kop.knobs.get("WM", 0)) == 1, f"expected WM=1, got {kop.knobs.get('WM')}"
     assert int(kop.knobs.get("FM", 0)) == 4, f"expected FM=4, got {kop.knobs.get('FM')}"
@@ -215,7 +215,7 @@ def test_tma_mma_matches_f32_reference(pin_tma_mma, M: int, N: int, K: int):
     the regression that motivated routing the launch through the backend,
     which binds every ``CUtensorMap`` via ``_prebuild_descriptors``."""
     _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "cp.async.bulk.tensor" in src  # smoke-check the TMA path actually fired
 
     # Launch through the real backend so ``_prebuild_descriptors`` binds the
@@ -293,7 +293,7 @@ def test_mma_sync_path_emits_ldmatrix_and_mma_ptx(pin_mma_sync):
     inline PTX (the s16816 path) and emits zero ``nvcuda::wmma`` intrinsics —
     a clean swap of the tensor-core instruction family, not a mix."""
     _, kop, src = _compile_and_render(M=256, N=256, K=128, out_dtype=F16)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "ldmatrix.sync.aligned" in src, "mma.sync operands must load via ldmatrix"
     assert "mma.sync.aligned.m16n8k16" in src, "the s16816 mma.sync instruction must be emitted"
     assert "wmma::" not in src, "the mma.sync path must not mix in legacy wmma intrinsics"
@@ -313,7 +313,7 @@ def test_mma_sync_matches_reference(pin_mma_sync, M: int, N: int, K: int, out_dt
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=out_dtype)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "mma.sync.aligned.m16n8k16" in src
 
     np.random.seed(7)

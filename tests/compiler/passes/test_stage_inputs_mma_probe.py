@@ -96,5 +96,5 @@ def test_mma_matmul_stages_through_smem(monkeypatch):
     g = _mma_matmul_graph()
     out = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert _has_stage_bundle(out)

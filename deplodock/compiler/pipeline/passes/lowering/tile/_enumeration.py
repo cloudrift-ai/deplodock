@@ -1,7 +1,7 @@
 """Knob-cartesian enumeration for the partition planner.
 
 Owns the planner's tunable knob globals (BN / BM / WM / WN / FM / FN / BK /
-SPLITK / BR / ATOM_KIND), the per-mode candidate tuples (matmul / pointwise
+SPLITK / BR / MMA), the per-mode candidate tuples (matmul / pointwise
 / reduce), the pruned cartesian generator, and the per-mode priority/score
 functions used to rank the resulting ``TileParams`` set.
 
@@ -88,24 +88,11 @@ BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread c
 _TUNE_WARP_AXIS_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 WN = Knob("WN", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA innermost WARP count along matmul output N")
 WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WARP count along matmul output M")
-ATOM_KIND = Knob(
-    "ATOM_KIND", KnobType.STR, hints=(), help="Hardware matmul atom kind (MMA/wgmma/...) — see pipeline/passes/lowering/tile/_atom.py"
-)
-# Global control, not an autotune fork (the tuner picks warp-vs-scalar through
-# the ATOM_KIND sibling subtree). Three-way string: falsy ("0" / "false" / …)
-# forces the scalar-only path (debug / fallback); truthy ("1" / "true" / …) or
-# unset (the default) auto-enumerates every eligible atom kind; any other
-# value names an atom kind (e.g. ``mma_m16n8k16_f16``) — enable + pin that
-# kind. ``ATOM_KIND`` is its env alias (``DEPLODOCK_ATOM_KIND=<kind>`` works
-# too; the primary ``DEPLODOCK_MMA`` wins when both are set), while the
-# ``ATOM_KIND`` Knob above stays the variant's fork-level / DB identity.
-# Decoded by :func:`mma_mode`; lives in ``_PLANNER_KNOBS`` so the
-# enumeration-memo pin snapshot covers it like every other planner pin.
 MMA = Knob(
     "MMA",
     KnobType.STR,
     hints=(),
-    help="Warp-tier MMA control: 0 = scalar-only; 1/true (default) = auto-enumerate; an atom-kind name pins that kind",
+    help="Warp-tier MMA control: 0 = scalar-only; 1/true (default) = auto-enumerate; hardware matmul atom kind (MMA/wgmma/...)",
     aliases=("ATOM_KIND",),
 )
 
@@ -205,13 +192,13 @@ class ScalarTileParams:
 
 @dataclass(frozen=True)
 class WarpTileParams:
-    """One ``(WN, WM, FM, FN, BK, SPLITK, ATOM_KIND)`` warp-tier variant —
+    """One ``(WN, WM, FM, FN, BK, SPLITK, MMA)`` warp-tier variant —
     MMA / tensor-core matmul. No ``br`` (MMA gates ``BR=1`` by construction);
     no ``bn``/``bm`` (the binding tier is WARP, not THREAD).
 
     ``atom`` is the :class:`~deplodock.compiler.ir.tile.ir.Atom` spec directly
     (cell shape ``(M, N, K)``, per-operand dtypes, group size) — carried as the
-    object, not a kind string (the ``ATOM_KIND`` knob is stamped from
+    object, not a kind string (the ``MMA`` knobs-dict entry is stamped from
     ``atom.name`` when the bundle is built). ``wn``/``wm`` are the per-CTA warp
     count along the output N / M axes; together with the atom cell shape and
     ``fn``/``fm`` they determine the matmul tile dimensions

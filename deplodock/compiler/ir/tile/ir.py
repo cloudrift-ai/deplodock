@@ -147,7 +147,7 @@ class Atom:
 # the RegFragment / LdmatrixLoad / MmaSyncPtx / RegStore chain (smem-staged only —
 # ldmatrix has no gmem-direct path). Insertion order is the planner's enumeration
 # priority (f16 first, then bf16); the launch-geometry / eligibility paths look a
-# kind up directly via ``ATOM_REGISTRY[knobs["ATOM_KIND"]]``.
+# kind up directly via ``ATOM_REGISTRY[knobs["MMA"]]``.
 ATOM_REGISTRY: dict[str, Atom] = {
     "mma_m16n8k16_f16": Atom(
         name="mma_m16n8k16_f16",
@@ -1541,7 +1541,7 @@ def score_tile_geometry(
     # Empirical sweep at 2048² fp16 on sm_120 (RTX 5090): the 4-warp / 128-
     # thread 64×64 tile (+WS) wins at 94 µs; 8-warp/256-thread variants land
     # at 106+ µs. See the warp-tier MMA block below for the tile-shape reward.
-    tma_capable_warp = "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0)
+    tma_capable_warp = "MMA" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0)
     target_threads = 128 if tma_capable_warp else 256
     target_ctas = 128
     score = 0.0
@@ -1571,7 +1571,7 @@ def score_tile_geometry(
 
     if cells == 1:
         score -= 1.0
-    elif "ATOM_KIND" in knobs:
+    elif "MMA" in knobs:
         # Tensor-core MMA (warp-tier mma.sync path). The measured perf sweet
         # spot (2026 pinned sweep on RTX 5090 over 1024²/2048²/4096² fp16, each
         # tile paired with WARP_SPECIALIZE) is a **square 64×64 OUTPUT tile on
@@ -1729,8 +1729,8 @@ def score_tile_geometry(
         # advantage that pushed the picker to the FM=1 FN=32 spill
         # corner (see ``plans/mma-warp-scoring.md`` for the 2048² fp16
         # sweep).
-        if "ATOM_KIND" in knobs:
-            _atom_n = ATOM_REGISTRY[str(knobs["ATOM_KIND"])].shape[1]
+        if "MMA" in knobs:
+            _atom_n = ATOM_REGISTRY[str(knobs["MMA"])].shape[1]
             n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
             # Warp-tier MMA: the actual TMA-pipelined band on sm_90+ /
             # sm_120 is ``BK ≤ 4`` (BK=2 is the empirical sweet spot —
@@ -1771,8 +1771,8 @@ def score_tile_geometry(
     # earn the bonus. Keyed only off planner knobs (WM/WN/FM/FN/BK) so lazy_score
     # and the post-materialization score agree (the lazy/eager parity check).
     # See project_cublas_gap_ncu_2026-05-31 memory.
-    if "ATOM_KIND" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
-        atom_m, atom_n, atom_k = ATOM_REGISTRY[str(knobs["ATOM_KIND"])].shape
+    if "MMA" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
+        atom_m, atom_n, atom_k = ATOM_REGISTRY[str(knobs["MMA"])].shape
         bm = int(knobs.get("WM", 1)) * int(knobs.get("FM", 1)) * atom_m
         bn = int(knobs.get("WN", 1)) * int(knobs.get("FN", 1)) * atom_n
         bk_k = int(knobs.get("BK", 1))
@@ -2072,9 +2072,9 @@ class TileOp(BodyOp):
         # ``self.knobs`` which already carries these; without them here the
         # lazy_score path would silently fall back to BM=BN=1 defaults).
         if is_warp:
-            # ATOM_KIND / WM / WN feed the warp-tier branch of
+            # MMA / WM / WN feed the warp-tier branch of
             # ``score_tile_geometry``: the cells-sweet-spot prior keys off
-            # ``ATOM_KIND in knobs``, the aspect-ratio prior reads FM/FN
+            # ``MMA in knobs``, the aspect-ratio prior reads FM/FN
             # (already here), and the TMA-bonus's N-stride calc uses
             # ``WN · FN · atom_N``. Omitting them silently routed the warp
             # tier through the scalar branch and over-counted the TMA
@@ -2087,7 +2087,7 @@ class TileOp(BodyOp):
                 "BK": p.bk,
                 "WM": p.wm,
                 "WN": p.wn,
-                "ATOM_KIND": p.atom.name,
+                "MMA": p.atom.name,
             }
         else:
             score_knobs = {

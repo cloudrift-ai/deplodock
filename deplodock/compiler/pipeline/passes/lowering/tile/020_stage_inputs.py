@@ -43,7 +43,7 @@ consumer ``body`` / compute phase descend).
      and compare to ``origin[d] + 1``. Admits scalar paths (matmul,
      RMSNorm, softmax) byte-clean; stamps
      ``AffineAddressing(dims=..., block=())``.
-  2. **Block-stamped composite** (only when parent has ``ATOM_KIND``):
+  2. **Block-stamped composite** (only when parent has ``MMA``):
      extract the literal coefficient on each cache var, divide out the
      running ``extent · block`` suffix product, and stamp
      ``AffineAddressing(dims=..., block=(c_0, c_1, ...))``. The slab
@@ -51,7 +51,7 @@ consumer ``body`` / compute phase descend).
      read a full ``atom_M × atom_K`` cell.
 
   Scalar paths that hit a non-1 σ coef fall through to template — the
-  block path is gated on ATOM_KIND so a register-axis sitting between
+  block path is gated on MMA so a register-axis sitting between
   origin and cache doesn't get misread as a block multiplier.
 
 **Reuse.** A Load qualifies for staging iff at least one bound axis
@@ -157,7 +157,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
-    atom_kind = root.op.knobs.get("ATOM_KIND")
+    atom_kind = root.op.knobs.get("MMA")
     # Per-buffer bytes-per-elem so ``_classify``'s slab-cap check sizes
     # fp16 slabs at 2 B/elem instead of the BYTES_PER_ELEM=4 hardcoded
     # over-count. Without this the half-precision MMA path rejects every
@@ -844,7 +844,7 @@ def _classify(
         expected_unit = sorted(t.pretty() for t in _flatten_add((origin[d] + composite_unit).simplify(ctx)))
         if actual == expected_unit:
             continue
-        # Tier 2: try block-stamped composite, only under ATOM_KIND. Per-
+        # Tier 2: try block-stamped composite, only under MMA. Per-
         # axis coef probe: zero every cache var EXCEPT the one we're
         # probing, σ-reduce, pluck the literal multiplier on ``Var(ax)``
         # via ``_extract_var_coef``.
