@@ -161,6 +161,24 @@ def test_dtype_signature_separates_memo_entries():
     assert key_f16 != key_none and key_f32 != key_none
 
 
+def test_plan_rides_op_metadata(monkeypatch):
+    """Re-planning the SAME LoopOp object is an op-metadata hit — the
+    stamped ``_Plan`` comes back without re-running classification or
+    enumeration — and a pin flip invalidates the stamp (the stored memo
+    key no longer matches)."""
+    ctx = _ctx()
+    loop_op = _loop_op_matmul()
+    plan_1 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
+    assert plan_1 is not None
+    assert loop_op.meta["plan"][1] is plan_1
+    plan_2 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
+    assert plan_2 is plan_1, "same op object must return the stamped plan"
+    monkeypatch.setenv("DEPLODOCK_BK", "16")
+    plan_3 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
+    assert plan_3 is not plan_1, "a pin flip must invalidate the op-metadata stamp"
+    assert all(p.bk == 16 for p in plan_3.params)
+
+
 def test_mma_pin_lands_in_memo_key(monkeypatch):
     """``MMA`` is a planner knob, so the pin snapshot covers it: flipping
     ``DEPLODOCK_MMA`` must produce a fresh memo key (it gates the warp-tier

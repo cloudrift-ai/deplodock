@@ -183,7 +183,10 @@ original lazy split assumed) — so two more layers keep planning off the profil
   + carry-forward knobs + input dtypes (the fp16 half2 window gates on operand dtype) + the hardware context
   + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`, so a pin flip
   mid-process lands on a fresh key). The memo's shared `params` tuple is what keeps the `id(param)`-keyed
-  score cache valid — plans must never copy it.
+  score cache valid — plans must never copy it. The finished `_Plan` additionally rides its LoopOp as op
+  metadata (`loop_op.meta["plan"] = (memo_key, plan)`): ops are shared by reference across graph copies and
+  `single_node_graph` tune slices, so re-planning the same op object short-circuits entirely (classification
+  included) — validated against the live key, so pin / ctx / dtype changes invalidate the stamp.
 - **Hoisted score inputs**: `lazy_score`'s params-independent body walks (`_count_loop_input_buffers`, the
   per-Write inner-stride `free_vars`) are computed once per `_Plan` and threaded in as kwargs, so each
   variant's score is pure knob arithmetic.

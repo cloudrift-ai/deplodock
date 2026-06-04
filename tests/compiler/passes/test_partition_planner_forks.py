@@ -166,7 +166,6 @@ def test_single_variant_short_circuits_to_single_leaf():
         leading=plan.leading,
         base_knobs=plan.base_knobs,
         kernel_name=plan.kernel_name,
-        loop_op=plan.loop_op,
         params=plan.params[:1],
     )
     tree = _build_fork_tree_lazy(one_plan, _ctx())

@@ -237,13 +237,19 @@ class _Plan:
     by ``id(param)`` — safe only because the memo holds the one shared
     ``params`` tuple alive for the process lifetime; never copy or rebuild
     ``params``, or the id-keyed scores silently miss and recompute.
+
+    The built plan rides its LoopOp as op metadata
+    (``loop_op.meta["plan"] = (memo_key, plan)``) rather than carrying an
+    op back-reference: ops are shared by reference across graph copies and
+    tune slices, so re-planning the same op object is a metadata hit —
+    validated against the live memo key, since pins / ctx may have changed
+    since the stamp.
     """
 
     shape: KernelShape
     leading: tuple[Stmt, ...]
     base_knobs: dict
     kernel_name: str
-    loop_op: LoopOp
     params: tuple[TileParams, ...]
     # ``None`` defaults → ``lazy_score`` recomputes from ``shape`` (the
     # pre-memo behavior); ``_plan_kernel`` always fills them in.
@@ -671,16 +677,24 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     the partitioner runs unchanged. ``_wrap_tower``'s size-1-axis filter
     drops the phantom before it reaches the IR.
 
-    **Enumeration memo.** The classification (chain walk, ``shape``,
-    ``leading``) always runs per-LoopOp — materialization needs the layer's
-    real buffer / axis names. The expensive parts — the
-    ``enumerate_cartesian`` calls and (lazily, via ``_score_variant``) the
-    per-variant scores — are shared across structurally identical LoopOps
-    through ``_ENUM_MEMO``, keyed by :func:`_enum_cache_key`. The memo is
-    only written after a successful non-empty enumeration, so skipped /
-    rejected shapes never poison it.
+    **Plan caching, two layers.** The finished ``_Plan`` rides the LoopOp
+    as op metadata (``loop_op.meta["plan"] = (memo_key, plan)``): ops are
+    shared by reference across graph copies and ``single_node_graph`` tune
+    slices, so re-planning the same op object returns the stamped plan
+    outright — validated against the live :func:`_enum_cache_key`, since
+    pins / ctx / dtypes may have changed since the stamp. On a metadata
+    miss, the classification (chain walk, ``shape``, ``leading``) runs
+    per-LoopOp — materialization needs the layer's real buffer / axis
+    names — while the expensive parts (the ``enumerate_cartesian`` calls
+    and, lazily via ``_score_variant``, the per-variant scores) are shared
+    across structurally identical LoopOps through ``_ENUM_MEMO`` under the
+    same key. Both caches are only written after a successful non-empty
+    enumeration, so skipped / rejected shapes never poison them.
     """
     memo_key = _enum_cache_key(loop_op, ctx, graph)
+    stamped = loop_op.meta.get("plan")
+    if stamped is not None and stamped[0] == memo_key:
+        return stamped[1]
     cached = _ENUM_MEMO.get(memo_key)
     chain, prologue = _outer_free_loop_chain(loop_op.body)
     if not chain:
@@ -908,17 +922,18 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         params = tuple(param_combos)
         score_cache = {}
         _ENUM_MEMO[memo_key] = (params, score_cache)
-    return _Plan(
+    plan = _Plan(
         shape=shape,
         leading=leading,
         base_knobs=dict(loop_op.knobs),
         kernel_name=kernel_name,
-        loop_op=loop_op,
         params=params,
         score_n_staged=_count_loop_input_buffers(shape),
         score_write_inner_fv=TileOp._write_inner_free_vars(shape),
         score_cache=score_cache,
     )
+    loop_op.meta["plan"] = (memo_key, plan)
+    return plan
 
 
 def _materialize(plan: _Plan, params: TileParams) -> TileOp:

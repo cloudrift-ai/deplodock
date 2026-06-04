@@ -60,6 +60,16 @@ class Op:
     # autotune knob picked along the chain. Excluded from structural
     # identity and equality — pure attribution metadata.
     knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
+    # Free-form per-op-instance scratch metadata for passes that derive
+    # expensive analysis from the op and want it to ride the op instead of
+    # being threaded through call chains (e.g. the partition planner caches
+    # its ``_Plan`` under ``meta["plan"]``). Ops are shared by reference
+    # across ``Graph.copy`` snapshots and ``single_node_graph`` slices, so
+    # an entry stamped once is visible to every later consumer of the same
+    # op object — entries MUST therefore be keyed/validated by their owner
+    # against anything environmental they depend on. Never serialized,
+    # never part of structural identity or equality.
+    meta: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     inputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     outputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
