@@ -7,7 +7,9 @@ propagated child score, and collapses levels whose key has a single distinct
 value across the group. The LAST level is the leaf level: its grouping
 produces one leaf Fork per param (no branch wrapper) — knobs stamped onto
 the leaf, ``expand`` thunk yields ``materialize(p)`` once the search engine
-resolves that leaf.
+resolves that leaf. Branch construction is lazy: only the returned level's
+Forks exist up front, and a branch's ``expand`` builds the next level on
+demand (see :func:`build_fork_tree`).
 
 Use this when a rule produces ≥2 hierarchical levels of knob bundling with
 score-propagated ranking (today: ``passes/lowering/tile/010_partition_loops``).
@@ -71,6 +73,15 @@ def build_fork_tree[P](
     ``score(p)`` is called exactly once per param at builder entry; the
     returned value is reused for both the leaf's own score and any branch
     ``max(child scores)`` propagation.
+
+    **Construction is lazy below the top level.** Only the returned level's
+    Fork objects exist up front; a branch's ``expand`` builds the next
+    level on demand. A branch's score is ``max`` over the leaf scores of
+    its param subgroup — provably equal to the eager
+    ``max(child scores)`` propagation (child scores bottom out at the same
+    ``leaf_score`` values) without instantiating the subtree. Greedy
+    descent therefore builds O(path) Forks instead of one Fork per param
+    (~42k for a matmul-class kernel), and MCTS pays one level per pop.
     """
     if not params:
         return []
@@ -98,7 +109,7 @@ def build_fork_tree[P](
             ]
         )
 
-    def _branch(group: list[P], depth: int) -> list[Fork]:
+    def _build_level(group: list[P], depth: int) -> list[Fork]:
         if depth == len(branch_levels):
             return _leaves(group)
         level = branch_levels[depth]
@@ -108,21 +119,21 @@ def build_fork_tree[P](
         # Single-value collapse: the level adds no choice, so skip the
         # 1-child Fork wrapper and recurse straight into the next level.
         if len(keyed) == 1:
-            return _branch(next(iter(keyed.values())), depth + 1)
+            return _build_level(next(iter(keyed.values())), depth + 1)
         siblings: list[Fork] = []
         for key, sub in keyed.items():
-            children = _branch(sub, depth + 1)
-            if not children:
-                continue
+            # ``expand`` recurses one level on demand (default-arg capture
+            # again); the subtree below this branch doesn't exist until the
+            # engine pops the branch.
             siblings.append(
                 Fork(
                     knobs=dict(zip(level.knob_names, key, strict=True)),
-                    expand=(lambda c=children: list(c)),
-                    score=max(c.score for c in children),
+                    expand=(lambda sub=sub, depth=depth: _build_level(sub, depth + 1)),
+                    score=max(leaf_score[id(p)] for p in sub),
                     is_leaf=False,
                 )
             )
         return _sorted(siblings)
 
-    top = _branch(list(params), 0)
+    top = _build_level(list(params), 0)
     return top[0] if len(top) == 1 else top

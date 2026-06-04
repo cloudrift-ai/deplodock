@@ -112,6 +112,14 @@ def planner_pin_set() -> bool:
     return any(os.environ.get(k.env) is not None for k in _PLANNER_KNOBS)
 
 
+def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
+    """Live ``(name, env value)`` snapshot of every planner knob pin.
+    Folded into the partition planner's enumeration-memo key so a pin
+    flipped mid-process (tests use ``config.set_knob``) lands on a fresh
+    key instead of replaying a stale cached enumeration."""
+    return tuple((k.name, os.environ.get(k.env)) for k in _PLANNER_KNOBS)
+
+
 @dataclass(frozen=True)
 class ScalarTileParams:
     """One ``(BN, BM, FM, FN, BK, SPLITK, BR)`` scalar-tier variant. Frozen

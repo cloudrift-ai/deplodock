@@ -68,6 +68,7 @@ tests/
 │   │   ├── test_matcher.py                     # Pattern matcher unit tests
 │   │   ├── test_matmul_rules.py / test_reduction_rules.py / test_register_tile_rules.py
 │   │   ├── test_partition_planner_rules.py / test_partition_planner_forks.py
+│   │   ├── test_partition_planner_memo.py      # enumeration memo + lazy fork-tree call counts
 │   │   ├── test_launch_geometry_rules.py / test_masked_tile.py
 │   │   ├── test_stage_inputs_classify.py
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end

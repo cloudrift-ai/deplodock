@@ -134,7 +134,11 @@ collapse single-key levels, sort siblings by max-propagated score, defer
 leaf materialization to `expand` thunks) lives in `pipeline/fork_tree.py`
 as the reusable `Level` + `build_fork_tree` pair — `partition_loops`
 supplies the four `Level`s + `materialize=` + `score=` callables and
-forwards the result. Future rules with multi-level knob-cartesian forks
+forwards the result. Construction is lazy below the returned level: a branch's
+`expand` builds its children on demand, and its score is `max` over the leaf scores of its param subgroup
+(provably the same max-propagation as an eager build, without instantiating the subtree). Scores are still
+computed eagerly once per param at builder entry — they're cheap dict lookups thanks to the planner's
+structural memo (below). Future rules with multi-level knob-cartesian forks
 should reuse the builder; one-shot flat forks (e.g.
 `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element list) stay
 inline.
@@ -169,10 +173,25 @@ N-invariant-cone partition (see `plans/obsolete-blocked-gemm-builder.md`).
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
 12-pass `normalize_body`) only fire for the variant the search actually
-resolves. In greedy `deplodock compile`, that's one variant per
-LoopOp. Earlier behavior materialized every variant up front (dozens
-to ~200 per matmul-class kernel) just to score them; the lazy split
-cut whole-model Qwen3 0.6B compile from 10+ minutes to ~48 seconds.
+resolves. In greedy `deplodock compile`, that's one variant per LoopOp. The enumeration is large — the
+widened FM/FN candidate set yields ~40k+ `TileParams` per matmul-class kernel (not the "couple hundred" the
+original lazy split assumed) — so two more layers keep planning off the profile:
+
+- **Structural enumeration memo** (`_ENUM_MEMO` in `010_partition_loops`): structurally identical LoopOps
+  (the same kernel repeated once per transformer layer — 28× on Qwen3-0.6B) share one `enumerate_cartesian`
+  run and one score per variant. The key is `Body.structural_key()` (canonical SSA / buffer / axis renames)
+  + carry-forward knobs + input dtypes (the fp16 half2 window gates on operand dtype) + the hardware context
+  + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`, so a pin flip
+  mid-process lands on a fresh key). The memo's shared `params` tuple is what keeps the `id(param)`-keyed
+  score cache valid — plans must never copy it.
+- **Hoisted score inputs**: `lazy_score`'s params-independent body walks (`_count_loop_input_buffers`, the
+  per-Write inner-stride `free_vars`) are computed once per `_Plan` and threaded in as kwargs, so each
+  variant's score is pure knob arithmetic.
+
+Together with the lazy tree build these took the whole-model Qwen3-0.6B partition pass from ~4 minutes
+(80% of a 4m56s compile: 14.4M `lazy_score` calls, an eager ~42k-Fork tree per matmul kernel) to seconds —
+whole compile 4m56s → 1m10s, `enumerate_cartesian` runs once per distinct kernel shape (14 on this model,
+was 337) and `lazy_score` drops to one pass per distinct shape (~426k calls, was 14.4M).
 
 For rules that want a custom lazy scorer, override
 `Op.lazy_score(cls, ctx, *, knobs=None, shapes=None, params=None)` on
@@ -190,6 +209,10 @@ available, so the two scores can disagree by up to the smem-fit
 penalty's ±2.5 on SDPA-with-mask / RoPE-fused kernels. That asymmetry
 is acceptable because only the planner-time scorer drives sibling
 ordering; the post-materialization score is a sanity metric.
+`TileOp.lazy_score` additionally accepts precomputed `n_staged_inputs` /
+`write_inner_free_vars` kwargs (the params-independent body-walk
+results); `None` recomputes from the shape, so direct callers and the
+lazy↔eager parity contract are unaffected.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate

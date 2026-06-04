@@ -1982,7 +1982,7 @@ class TileOp(BodyOp):
         )
 
     @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004 — knobs reserved for symmetry with Op.lazy_score
+    def lazy_score(ctx, *, knobs=None, shapes=None, params=None, n_staged_inputs=None, write_inner_free_vars=None) -> float | None:  # noqa: ARG004 — knobs reserved for symmetry with Op.lazy_score
         """Lazy scorer (see :meth:`Op.lazy_score`). Returns ``None`` unless
         called with both ``shapes`` (a :class:`KernelShape` from the
         partition planner) and ``params`` (a :class:`TileParams` variant —
@@ -1991,6 +1991,16 @@ class TileOp(BodyOp):
         without running ``_build_split_body`` or ``TileOp.__post_init__`` —
         lets the planner rank dozens of variants per LoopOp in microseconds
         instead of milliseconds each.
+
+        ``n_staged_inputs`` / ``write_inner_free_vars`` are optional
+        precomputed inputs (see :func:`_count_loop_input_buffers` and
+        :meth:`_write_inner_free_vars`). Both are params-independent —
+        pure functions of ``shapes`` — so the planner computes them once
+        per :class:`KernelShape` and passes them to every variant's score
+        call instead of re-walking the kernel body tens of thousands of
+        times. ``None`` (the default) recomputes from ``shapes``, keeping
+        this drop-in compatible with direct callers (and the lazy↔eager
+        parity contract).
 
         Launch geometry the planner will produce (mirrors ``_wrap_tower``):
             - scalar tier: block axes ``[K_s?, M_b?, N_b]`` extent
@@ -2093,7 +2103,7 @@ class TileOp(BodyOp):
         # output never contains them at this point.
         has_stages = False
 
-        coalescing = TileOp._coalescing_inner_extent_from_writes(shape, p)
+        coalescing = TileOp._coalescing_inner_extent_from_writes(shape, p, write_inner_free_vars=write_inner_free_vars)
 
         smem_cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
         cc = getattr(ctx, "compute_capability", None) if ctx is not None else None
@@ -2101,7 +2111,7 @@ class TileOp(BodyOp):
         # slab estimate is per-A+B (2 inputs); kernels that fuse more (SDPA-with-
         # mask + RoPE = 4-6 inputs; gated MLP = 3 inputs) need the slab estimate
         # bumped to match the per-iter smem footprint.
-        n_staged = _count_loop_input_buffers(shape)
+        n_staged = n_staged_inputs if n_staged_inputs is not None else _count_loop_input_buffers(shape)
 
         return score_tile_geometry(
             thread_extents=thread_extents,
@@ -2115,7 +2125,20 @@ class TileOp(BodyOp):
         )
 
     @staticmethod
-    def _coalescing_inner_extent_from_writes(shape, params) -> int:
+    def _write_inner_free_vars(shape) -> tuple[frozenset[str], ...]:
+        """Per-Write inner-stride free-var sets of ``shape.outer_n.body`` —
+        the params-independent half of
+        :meth:`_coalescing_inner_extent_from_writes`. One body walk +
+        ``free_vars()`` per indexed Write; the planner computes this once
+        per :class:`KernelShape` and feeds it to every variant's
+        :meth:`lazy_score` call so the per-variant work collapses to a set
+        intersection."""
+        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
+
+        return tuple(frozenset(stmt.index[-1].free_vars()) for stmt in shape.outer_n.body.iter() if isinstance(stmt, Write) and stmt.index)
+
+    @staticmethod
+    def _coalescing_inner_extent_from_writes(shape, params, *, write_inner_free_vars=None) -> int:
         """Mirror of :meth:`_coalescing_inner_extent` computed against the
         un-rewritten LoopOp body. σ_outer keeps the outer M/N axis names
         on the eventual thread tiles (M_t inherits ``outer_m.axis.name``,
@@ -2128,8 +2151,11 @@ class TileOp(BodyOp):
         materialization ``thread_axes`` ``_coalescing_inner_extent``
         iterates. Mirroring that here keeps the lazy score consistent
         with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
+
+        ``write_inner_free_vars`` short-circuits the body walk with the
+        precomputed :meth:`_write_inner_free_vars` result (params-
+        independent); ``None`` recomputes from ``shape``.
         """
-        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
         from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         thread_extent: dict[str, int] = {}
@@ -2153,11 +2179,10 @@ class TileOp(BodyOp):
         if not thread_extent:
             return 0
 
+        if write_inner_free_vars is None:
+            write_inner_free_vars = TileOp._write_inner_free_vars(shape)
         best = 0
-        for stmt in shape.outer_n.body.iter():
-            if not isinstance(stmt, Write) or not stmt.index:
-                continue
-            inner_vars = set(stmt.index[-1].free_vars())
+        for inner_vars in write_inner_free_vars:
             matched = inner_vars & thread_extent.keys()
             if not matched:
                 continue

@@ -118,7 +118,7 @@ reduce prefers warp-sized-or-larger BR. All target ~256 threads/CTA.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.dtype import F16
@@ -137,6 +137,7 @@ from deplodock.compiler.ir.tile.ir import (
     ThreadTile,
     TileOp,
     WarpTile,
+    _count_loop_input_buffers,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
@@ -156,6 +157,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     TileParams,
     WarpTileParams,
     enumerate_cartesian,
+    planner_pin_snapshot,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
@@ -223,6 +225,17 @@ class _Plan:
     construction — ``_materialize(plan, params)`` runs the expensive
     ``_build_split_body`` + ``TileOp.__post_init__`` work for one
     variant only, called lazily from the chosen Fork leaf's ``expand``.
+
+    ``score_n_staged`` / ``score_write_inner_fv`` are the params-independent
+    scoring inputs (one body walk each), precomputed once here so
+    :func:`_score_variant` doesn't re-walk the kernel body per variant.
+
+    ``params`` and ``score_cache`` come from the structural memo
+    (``_ENUM_MEMO``) and are SHARED across structurally identical LoopOps
+    (e.g. the same kernel in 28 transformer layers). ``score_cache`` keys
+    by ``id(param)`` — safe only because the memo holds the one shared
+    ``params`` tuple alive for the process lifetime; never copy or rebuild
+    ``params``, or the id-keyed scores silently miss and recompute.
     """
 
     shape: KernelShape
@@ -231,6 +244,11 @@ class _Plan:
     kernel_name: str
     loop_op: LoopOp
     params: tuple[TileParams, ...]
+    # ``None`` defaults → ``lazy_score`` recomputes from ``shape`` (the
+    # pre-memo behavior); ``_plan_kernel`` always fills them in.
+    score_n_staged: int | None = None
+    score_write_inner_fv: tuple[frozenset[str], ...] | None = None
+    score_cache: dict[int, float] = field(default_factory=dict)
 
 
 def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | list[Fork]:
@@ -250,7 +268,13 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     classification + enumeration and produces a ``_Plan`` with bare
     ``TileParams`` tuples; sibling sorting uses :meth:`TileOp.lazy_score`
     (mirrors :meth:`TileOp.score`) so the ordering matches what the
-    fully-built TileOps would have produced."""
+    fully-built TileOps would have produced.
+
+    Enumeration + scores are shared across structurally identical LoopOps
+    via ``_ENUM_MEMO`` (one transformer layer's kernels re-key for every
+    other layer), and ``build_fork_tree`` constructs branch Forks lazily —
+    a whole-model compile builds O(path) Forks per kernel instead of one
+    per enumerated variant."""
     loop_op: LoopOp = root.op
     # Name was stamped onto the LoopOp by ``loop/fusion/030_stamp_loop_names``
     # (the last loop-dialect pass), so we just forward it onto the TileOp.
@@ -317,11 +341,29 @@ def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
     :meth:`TileOp.lazy_score` (cheap, params/shape-only) and falls back to
     materializing + :meth:`TileOp.score` if a future TileOp drops its lazy
     implementation. Lets the planner rank siblings before paying the
-    body-construction cost."""
-    lazy = TileOp.lazy_score(ctx, shapes=plan.shape, params=params)
-    if lazy is not None:
-        return lazy
-    return _materialize(plan, params).score(ctx)
+    body-construction cost.
+
+    Two memo layers keep this off the profile (it used to dominate
+    whole-model compiles at ~14M calls): ``plan.score_cache`` shares
+    computed scores across structurally identical LoopOps (keyed by
+    ``id(params)`` over the memo-shared params tuple — see :class:`_Plan`),
+    and the precomputed ``score_n_staged`` / ``score_write_inner_fv``
+    inputs spare ``lazy_score`` its per-variant body walks. The score is a
+    pure function of (structural shape, params, ctx, knob pins) — all
+    captured by the ``_ENUM_MEMO`` key — so cross-LoopOp sharing is exact."""
+    cached = plan.score_cache.get(id(params))
+    if cached is not None:
+        return cached
+    lazy = TileOp.lazy_score(
+        ctx,
+        shapes=plan.shape,
+        params=params,
+        n_staged_inputs=plan.score_n_staged,
+        write_inner_free_vars=plan.score_write_inner_fv,
+    )
+    score = lazy if lazy is not None else _materialize(plan, params).score(ctx)
+    plan.score_cache[id(params)] = score
+    return score
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -553,6 +595,63 @@ def _is_fp16_matmul(matmul_reduces: list, graph: Graph | None) -> bool:
     return True
 
 
+# Enumeration memo: structural cache of ``(params tuple, score_cache)`` shared
+# across structurally identical LoopOps. A whole-model graph repeats the same
+# ~dozen kernel shapes once per transformer layer (28× on Qwen3-0.6B); without
+# the memo each repeat re-runs ``enumerate_cartesian`` (~42k rows per matmul
+# kernel) and re-scores every row. The key captures everything the enumeration
+# and the scores depend on; the value's ``score_cache`` (``id(param) → score``)
+# is filled lazily by :func:`_score_variant`. The memo's strong reference to
+# the shared ``params`` tuple is what keeps the ``id()`` keys stable — see
+# :class:`_Plan`.
+_ENUM_MEMO: dict[tuple, tuple[tuple[TileParams, ...], dict[int, float]]] = {}
+
+
+def _reset_enum_memo() -> None:
+    """Test hook: clear the structural enumeration memo."""
+    _ENUM_MEMO.clear()
+
+
+def _input_dtype_signature(loop_op: LoopOp, graph: Graph | None) -> tuple[str, ...] | None:
+    """Sorted multiset of the body's ``Load.input`` buffer dtypes — the
+    graph-dependent input to enumeration (``_is_fp16_matmul`` gates the fp16
+    half2 window; ``is_atom_eligible`` checks operand dtypes). Sorted (not
+    positional) so raw Load order doesn't cause spurious misses across
+    layers; the enumeration consumers are multiset-determined ("are all
+    K-operands fp16"), so a same-multiset collision is harmless. ``None``
+    when no graph is supplied (matches ``_is_fp16_matmul``'s short-circuit)."""
+    if graph is None:
+        return None
+    sig: list[str] = []
+    for ld in loop_op.body.iter_of_type(Load):
+        node = graph.nodes.get(ld.input)
+        sig.append(str(node.output.dtype) if node is not None else "?")
+    return tuple(sorted(sig))
+
+
+def _enum_cache_key(loop_op: LoopOp, ctx: Context, graph: Graph | None) -> tuple:
+    """Memo key for ``_ENUM_MEMO`` — everything that changes the enumerated
+    ``TileParams`` list or a variant's score: the canonical body structure
+    (``Body.structural_key`` renames SSA / buffer / axis names away, so the
+    same kernel in different layers keys equal), the carry-forward knobs,
+    the input dtypes, the hardware context, and the live ``DEPLODOCK_*``
+    planner pins (``enumerate_cartesian`` folds pins via ``Knob.narrow``, so
+    a pin flipped mid-process must land on a fresh key)."""
+    from deplodock import config  # noqa: PLC0415
+
+    return (
+        loop_op.body.structural_key(),
+        tuple(sorted(loop_op.knobs.items())),
+        _input_dtype_signature(loop_op, graph),
+        ctx.compute_capability,
+        ctx.warp_size,
+        ctx.max_dynamic_smem,
+        ctx.max_threads_per_cta,
+        config.mma_enabled(),
+        planner_pin_snapshot(),
+    )
+
+
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph: Graph | None = None) -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
@@ -572,7 +671,18 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     axis and wrap the LoopOp body in one outer free Loop so the rest of
     the partitioner runs unchanged. ``_wrap_tower``'s size-1-axis filter
     drops the phantom before it reaches the IR.
+
+    **Enumeration memo.** The classification (chain walk, ``shape``,
+    ``leading``) always runs per-LoopOp — materialization needs the layer's
+    real buffer / axis names. The expensive parts — the
+    ``enumerate_cartesian`` calls and (lazily, via ``_score_variant``) the
+    per-variant scores — are shared across structurally identical LoopOps
+    through ``_ENUM_MEMO``, keyed by :func:`_enum_cache_key`. The memo is
+    only written after a successful non-empty enumeration, so skipped /
+    rejected shapes never poison it.
     """
+    memo_key = _enum_cache_key(loop_op, ctx, graph)
+    cached = _ENUM_MEMO.get(memo_key)
     chain, prologue = _outer_free_loop_chain(loop_op.body)
     if not chain:
         # Synthesize a single size-1 outer Loop so the rest of the
@@ -610,6 +720,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
 
     k_loop: Loop | None
     target_names: frozenset[str]
+    param_combos: list[TileParams] = []  # stays empty on a memo hit — the cached params tuple is used instead
     if matmul_reduces:
         if outer_m is None:
             return None
@@ -648,85 +759,86 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # ``acc + r`` while every other K_s CTA atomic-adds just ``acc``,
         # so ``sum_i acc_i + r = c·sum_k a_k + r``. Non-linear epilogues
         # (e.g. ``v = acc * r``) fall through here and force splitk=1.
-        multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
-        has_nonlinear_epilogue = has_nonlinear_post_reduce_epilogue(outer_n.body)
-        force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
-        # A fused prologue (SDPA P@V: softmax max/sum) carries a per-M-row
-        # reduction whose accumulators must reset per register cell. Masking a
-        # symbolic M/N axis admits FM/FN > 1, register-tiling the row and
-        # sharing one accumulator across cells — wrong. So a prologue matmul
-        # keeps symbolic axes degenerate (E=1, no mask): correct via the
-        # symbolic grid, one output element per thread.
-        mask_ok = not prologue
-        # fp16 half2 window (FK on the scalar matmul path): enabled only when
-        # every K-indexed operand Load is fp16 and there's no fused prologue
-        # (SDPA P@V's softmax stats would interleave with the windowed flush).
-        # The window trades a bounded fp16-accumulation error for 2× packed
-        # ``__hfma2`` throughput — see ``plans/fk-half2-fp16-matmul.md``.
-        fp16_window = (not prologue) and not k_symbolic and _is_fp16_matmul(matmul_reduces, graph)
-        param_combos = enumerate_cartesian(
-            E_M=E_M if (mask_ok or not m_symbolic) else 1,
-            E_N=E_N if (mask_ok or not n_symbolic) else 1,
-            E_K=E_K,
-            ctx=ctx,
-            priority_mode="matmul",
-            force_splitk_one=force_splitk_one,
-            m_axis_name=outer_m.axis.name if outer_m is not None else None,
-            n_axis_name=outer_n.axis.name,
-            m_forced_mask=m_symbolic and mask_ok,
-            n_forced_mask=n_symbolic and mask_ok,
-            fp16_window=fp16_window,
-        )
-        # Warp-tier MMA: only when DEPLODOCK_MMA is on, no prologue (M9
-        # extension), static M/N/K, and the per-kind eligibility predicate
-        # fires. Each eligible kind gets one WarpTileParams row per
-        # (wn, wm, fm, fn, bk, splitk); we concatenate them onto the scalar
-        # param list — the fork tree in :func:`rewrite` splits the rows by
-        # type and emits sibling subtrees with disjoint level schemas.
-        from deplodock import config  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
+        if cached is None:  # enumeration is structural — skipped on a memo hit
+            multi_accum = any(sum(1 for s in lp.body if isinstance(s, Accum)) > 1 for lp in matmul_reduces)
+            has_nonlinear_epilogue = has_nonlinear_post_reduce_epilogue(outer_n.body)
+            force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
+            # A fused prologue (SDPA P@V: softmax max/sum) carries a per-M-row
+            # reduction whose accumulators must reset per register cell. Masking a
+            # symbolic M/N axis admits FM/FN > 1, register-tiling the row and
+            # sharing one accumulator across cells — wrong. So a prologue matmul
+            # keeps symbolic axes degenerate (E=1, no mask): correct via the
+            # symbolic grid, one output element per thread.
+            mask_ok = not prologue
+            # fp16 half2 window (FK on the scalar matmul path): enabled only when
+            # every K-indexed operand Load is fp16 and there's no fused prologue
+            # (SDPA P@V's softmax stats would interleave with the windowed flush).
+            # The window trades a bounded fp16-accumulation error for 2× packed
+            # ``__hfma2`` throughput — see ``plans/fk-half2-fp16-matmul.md``.
+            fp16_window = (not prologue) and not k_symbolic and _is_fp16_matmul(matmul_reduces, graph)
+            param_combos = enumerate_cartesian(
+                E_M=E_M if (mask_ok or not m_symbolic) else 1,
+                E_N=E_N if (mask_ok or not n_symbolic) else 1,
+                E_K=E_K,
+                ctx=ctx,
+                priority_mode="matmul",
+                force_splitk_one=force_splitk_one,
+                m_axis_name=outer_m.axis.name if outer_m is not None else None,
+                n_axis_name=outer_n.axis.name,
+                m_forced_mask=m_symbolic and mask_ok,
+                n_forced_mask=n_symbolic and mask_ok,
+                fp16_window=fp16_window,
+            )
+            # Warp-tier MMA: only when DEPLODOCK_MMA is on, no prologue (M9
+            # extension), static M/N/K, and the per-kind eligibility predicate
+            # fires. Each eligible kind gets one WarpTileParams row per
+            # (wn, wm, fm, fn, bk, splitk); we concatenate them onto the scalar
+            # param list — the fork tree in :func:`rewrite` splits the rows by
+            # type and emits sibling subtrees with disjoint level schemas.
+            from deplodock import config  # noqa: PLC0415
+            from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+            from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
-        if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
-            eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
-            # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
-            # tensor-core family (WMMA was removed; the swizzled slab beats
-            # it). It auto-enumerates
-            # alongside the scalar register-tile tier on **sm_90+** (the
-            # swizzled-TMA fast path needs Hopper+; on sm_80-89 mma.sync would
-            # fall back to slower cp.async staging, so keep it pin-only there).
-            # The greedy/DB-less picker and the autotuner choose mma.sync vs
-            # scalar per shape. Shapes mma.sync can't serve fall to scalar:
-            # non-divisible extents (filtered by ``is_atom_eligible``) and
-            # single-warp tiles (pruned below — ``020_stage_inputs`` skips
-            # staging at one warp and ldmatrix is smem→register only, so an
-            # unstaged AtomTile can't lower). A ``DEPLODOCK_ATOM_KIND`` pin
-            # forces the kind at any size / arch (bring-up + A-B benching).
-            pinned_atom = config.knob_raw("ATOM_KIND")
-            pin_is_mma_sync = pinned_atom in ATOM_REGISTRY
-            if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
-                # Auto-enumerating the mma.sync (s16816) family — the only
-                # registered atom family — needs the swizzled-TMA fast path
-                # (Hopper+); on sm_80-89 it's pin-only, so drop every atom.
-                eligible = ()
-            if eligible:
-                warp_combos = enumerate_cartesian(
-                    E_M=E_M,
-                    E_N=E_N,
-                    E_K=E_K,
-                    ctx=ctx,
-                    priority_mode=("matmul", "warp"),
-                    force_splitk_one=force_splitk_one,
-                    atoms=eligible,
-                )
-                # Drop single-warp (WM·WN == 1) variants: ldmatrix is
-                # smem→register only, so the atom REQUIRES staged operands, but
-                # ``020_stage_inputs`` skips staging when the CTA is one warp
-                # (``n_thread <= warp_size``) — an unstaged AtomTile would crash
-                # at render. The scalar tier covers those tiny tiles. Single-warp
-                # is never the perf pick anyway, so pruning is free.
-                warp_combos = [p for p in warp_combos if p.wm * p.wn != 1]
-                param_combos = [*warp_combos, *param_combos]
+            if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
+                eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
+                # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
+                # tensor-core family (WMMA was removed; the swizzled slab beats
+                # it). It auto-enumerates
+                # alongside the scalar register-tile tier on **sm_90+** (the
+                # swizzled-TMA fast path needs Hopper+; on sm_80-89 mma.sync would
+                # fall back to slower cp.async staging, so keep it pin-only there).
+                # The greedy/DB-less picker and the autotuner choose mma.sync vs
+                # scalar per shape. Shapes mma.sync can't serve fall to scalar:
+                # non-divisible extents (filtered by ``is_atom_eligible``) and
+                # single-warp tiles (pruned below — ``020_stage_inputs`` skips
+                # staging at one warp and ldmatrix is smem→register only, so an
+                # unstaged AtomTile can't lower). A ``DEPLODOCK_ATOM_KIND`` pin
+                # forces the kind at any size / arch (bring-up + A-B benching).
+                pinned_atom = config.knob_raw("ATOM_KIND")
+                pin_is_mma_sync = pinned_atom in ATOM_REGISTRY
+                if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
+                    # Auto-enumerating the mma.sync (s16816) family — the only
+                    # registered atom family — needs the swizzled-TMA fast path
+                    # (Hopper+); on sm_80-89 it's pin-only, so drop every atom.
+                    eligible = ()
+                if eligible:
+                    warp_combos = enumerate_cartesian(
+                        E_M=E_M,
+                        E_N=E_N,
+                        E_K=E_K,
+                        ctx=ctx,
+                        priority_mode=("matmul", "warp"),
+                        force_splitk_one=force_splitk_one,
+                        atoms=eligible,
+                    )
+                    # Drop single-warp (WM·WN == 1) variants: ldmatrix is
+                    # smem→register only, so the atom REQUIRES staged operands, but
+                    # ``020_stage_inputs`` skips staging when the CTA is one warp
+                    # (``n_thread <= warp_size``) — an unstaged AtomTile would crash
+                    # at render. The scalar tier covers those tiny tiles. Single-warp
+                    # is never the perf pick anyway, so pruning is free.
+                    warp_combos = [p for p in warp_combos if p.wm * p.wn != 1]
+                    param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
@@ -752,28 +864,30 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # breaking the cross-thread combine. So a symbolic free axis stays
         # degenerate here (E=1, no forced mask): correct at any seq_len via the
         # symbolic grid, just not register-tiled.
-        param_combos = enumerate_cartesian(
-            E_M=1 if m_symbolic else E_M,
-            E_N=1 if n_symbolic else E_N,
-            E_K=E_K,
-            ctx=ctx,
-            priority_mode="reduce",
-        )
+        if cached is None:
+            param_combos = enumerate_cartesian(
+                E_M=1 if m_symbolic else E_M,
+                E_N=1 if n_symbolic else E_N,
+                E_K=E_K,
+                ctx=ctx,
+                priority_mode="reduce",
+            )
     else:
         # Pointwise — no qualifying reduce.
         k_loop = None
         target_names = frozenset()
-        param_combos = enumerate_cartesian(
-            E_M=E_M,
-            E_N=E_N,
-            E_K=1,
-            ctx=ctx,
-            priority_mode="pointwise",
-            m_axis_name=outer_m.axis.name if outer_m is not None else None,
-            n_axis_name=outer_n.axis.name,
-            m_forced_mask=m_symbolic,
-            n_forced_mask=n_symbolic,
-        )
+        if cached is None:
+            param_combos = enumerate_cartesian(
+                E_M=E_M,
+                E_N=E_N,
+                E_K=1,
+                ctx=ctx,
+                priority_mode="pointwise",
+                m_axis_name=outer_m.axis.name if outer_m is not None else None,
+                n_axis_name=outer_n.axis.name,
+                m_forced_mask=m_symbolic,
+                n_forced_mask=n_symbolic,
+            )
 
     shape = KernelShape(
         outer_n=outer_n,
@@ -784,15 +898,24 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         prologue=prologue,
     )
     leading, _ = _split_leading_non_loops(loop_op.body)
-    if not param_combos:
-        return None
+    if cached is not None:
+        params, score_cache = cached
+    else:
+        if not param_combos:
+            return None
+        params = tuple(param_combos)
+        score_cache = {}
+        _ENUM_MEMO[memo_key] = (params, score_cache)
     return _Plan(
         shape=shape,
         leading=leading,
         base_knobs=dict(loop_op.knobs),
         kernel_name=kernel_name,
         loop_op=loop_op,
-        params=tuple(param_combos),
+        params=params,
+        score_n_staged=_count_loop_input_buffers(shape),
+        score_write_inner_fv=TileOp._write_inner_free_vars(shape),
+        score_cache=score_cache,
     )
 
 
