@@ -9,7 +9,7 @@ from deplodock.deploy.compose import (
     generate_compose,
     generate_nginx_conf,
 )
-from deplodock.deploy.log_phases import parse_engine_load_phases
+from deplodock.deploy.log_phases import decompose_model_load, parse_engine_load_phases
 from deplodock.deploy.params import DeployParams
 from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file
 from deplodock.recipe.types import Recipe
@@ -112,12 +112,15 @@ async def run_deploy(
         await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
         return False
 
-    # Best-effort: split weights-load / cuda-graph-capture out of the warmup window
-    # by scraping the container logs. Absent keys when the engine/log format differs.
+    # Best-effort: break the warmup window into startup / weights_load / torch_compile /
+    # engine_warmup / cuda_graph_capture by scraping the container logs. The leaves sum to
+    # model_load_and_warmup; absent/degraded to a single `other` when the format differs.
     if not dry_run:
         rc_logs, logs, _ = await run_cmd("docker compose logs --no-color", stream=False, timeout=120)
         if rc_logs == 0 and logs:
-            for name, seconds in parse_engine_load_phases(logs, recipe.engine.llm.engine_name).items():
+            raw = parse_engine_load_phases(logs, recipe.engine.llm.engine_name)
+            mlw = timer.phases.get(PHASE_MODEL_LOAD_AND_WARMUP, 0.0)
+            for name, seconds in decompose_model_load(raw, mlw).items():
                 timer.record(name, seconds)
 
     # Step 5: Poll health

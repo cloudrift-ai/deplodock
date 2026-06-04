@@ -25,10 +25,16 @@ PHASE_MODEL_LOAD_AND_WARMUP = "model_load_and_warmup"  # compose up --wait until
 PHASE_SMOKE_TEST = "smoke_test"
 
 # Optional sub-phases parsed best-effort from container logs (absent when unmatched).
-# They live *inside* model_load_and_warmup, so they are excluded from the total.
+# They live *inside* model_load_and_warmup, so they are excluded from the total. When the
+# engine-init line is parsed they form a non-overlapping breakdown that sums to the parent:
+#   startup + weights_load + torch_compile + engine_warmup + cuda_graph_capture == parent
+# Otherwise only what matched is recorded plus an `other` remainder.
+PHASE_STARTUP = "startup"  # container start + CUDA init + imports (load-window remainder)
 PHASE_WEIGHTS_LOAD = "weights_load"
 PHASE_TORCH_COMPILE = "torch_compile"  # engine kernel / torch.compile (inductor) compilation
+PHASE_ENGINE_WARMUP = "engine_warmup"  # profile + create KV cache + warmup model
 PHASE_CUDA_GRAPH = "cuda_graph_capture"
+PHASE_LOAD_OTHER = "other"  # remainder when engine-init isn't parseable (older vLLM / SGLang)
 
 # Benchmark / teardown (per task)
 PHASE_BENCHMARK = "benchmark"
@@ -36,7 +42,16 @@ PHASE_TEARDOWN = "teardown"
 PHASE_COMMAND = "command"  # command-recipe coarse wall-clock
 
 # Sub-phases excluded from total() (they are a breakdown of model_load_and_warmup).
-SUBPHASES = frozenset({PHASE_WEIGHTS_LOAD, PHASE_TORCH_COMPILE, PHASE_CUDA_GRAPH})
+SUBPHASES = frozenset(
+    {
+        PHASE_STARTUP,
+        PHASE_WEIGHTS_LOAD,
+        PHASE_TORCH_COMPILE,
+        PHASE_ENGINE_WARMUP,
+        PHASE_CUDA_GRAPH,
+        PHASE_LOAD_OTHER,
+    }
+)
 
 # Canonical render order for the .txt section and console table.
 PHASE_ORDER = [
@@ -45,9 +60,12 @@ PHASE_ORDER = [
     PHASE_IMAGE_PULL,
     PHASE_MODEL_DOWNLOAD,
     PHASE_MODEL_LOAD_AND_WARMUP,
+    PHASE_STARTUP,
     PHASE_WEIGHTS_LOAD,
     PHASE_TORCH_COMPILE,
+    PHASE_ENGINE_WARMUP,
     PHASE_CUDA_GRAPH,
+    PHASE_LOAD_OTHER,
     PHASE_SMOKE_TEST,
     PHASE_BENCHMARK,
     PHASE_TEARDOWN,

@@ -162,9 +162,12 @@ and a `[timing] <name>: 12.3s` line is logged. Phase-name constants live in `tim
 **Measured phases:** provisioning `vm_provision`, `remote_provision`; deploy `image_pull`, `model_download`,
 `model_load_and_warmup` (the `compose up --wait` window — covers weight load into GPU + CUDA graph capture + warmup),
 `smoke_test`; plus `benchmark`, `teardown`, and `command` (command recipes). After `model_load_and_warmup`,
-`orchestrate.py` scrapes `docker compose logs` via `log_phases.parse_engine_load_phases()` for best-effort sub-phases
-`weights_load` / `torch_compile` (engine kernel / torch.compile time) / `cuda_graph_capture` — absent when the
-engine/log format doesn't match. These three are a breakdown of `model_load_and_warmup`, so they are **excluded from
+`orchestrate.py` scrapes `docker compose logs` and runs `log_phases.parse_engine_load_phases()` +
+`log_phases.decompose_model_load()` to break that window into a **non-overlapping** set of sub-phases that sums to the
+parent: `startup` (container + CUDA init + imports) / `weights_load` / `torch_compile` (engine kernel / torch.compile
+time) / `engine_warmup` (profile + KV cache + warmup, derived from vLLM's `init engine … took X s` line) /
+`cuda_graph_capture`. When the engine-init line isn't present (older vLLM / SGLang) the unattributed time collapses into
+a single `other` remainder. All of these are a breakdown of `model_load_and_warmup`, so they are **excluded from
 `total`** (which would otherwise double-count). Near-zero phases
 (`container_cleanup`, health poll, `system_info`) are intentionally not timed, so the phases don't fully sum to raw
 wall-clock.

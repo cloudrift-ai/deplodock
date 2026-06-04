@@ -1,6 +1,6 @@
 """Tests for best-effort engine-load-phase parsing from container logs."""
 
-from deplodock.deploy.log_phases import parse_engine_load_phases
+from deplodock.deploy.log_phases import decompose_model_load, parse_engine_load_phases
 
 # Real vLLM 0.20.1 startup log lines (captured from a live CloudRift pro6000 deploy of
 # Qwen3.6-35B-A3B-FP8). The CUDA-graph tqdm bars are concatenated onto one line, as
@@ -28,9 +28,44 @@ def test_parse_vllm():
     out = parse_engine_load_phases(VLLM_LOGS, "vllm")
     assert out["weights_load"] == 22.120985
     assert out["torch_compile"] == 54.60
+    assert out["init_engine"] == 200.37
     # cuda_graph_capture comes from the clean "finished in 4 secs" summary, NOT the
     # tqdm bar's first [00:00<...] update (which would be 0).
     assert out["cuda_graph_capture"] == 4.0
+
+
+def test_decompose_full_breakdown_sums_to_total():
+    # Raw values from the real deploy run; model_load_and_warmup wall-clock = 288.4s.
+    raw = {"weights_load": 22.12, "torch_compile": 54.60, "cuda_graph_capture": 4.0, "init_engine": 200.37}
+    leaves = decompose_model_load(raw, 288.4)
+    assert leaves["weights_load"] == 22.12
+    assert leaves["torch_compile"] == 54.60
+    assert leaves["cuda_graph_capture"] == 4.0
+    # engine_warmup = init_engine - compile - graph = 200.37 - 54.60 - 4.0
+    assert leaves["engine_warmup"] == 141.77
+    # startup = total - (weights + init_engine)
+    assert leaves["startup"] == 65.91
+    assert abs(sum(leaves.values()) - 288.4) < 0.05
+    assert "other" not in leaves
+
+
+def test_decompose_fallback_other_when_no_init_engine():
+    # Older vLLM / SGLang: no init-engine line → unattributed time collapses to `other`.
+    raw = {"weights_load": 10.0, "cuda_graph_capture": 3.0}
+    leaves = decompose_model_load(raw, 100.0)
+    assert leaves["weights_load"] == 10.0
+    assert leaves["cuda_graph_capture"] == 3.0
+    assert leaves["other"] == 87.0
+    assert "engine_warmup" not in leaves
+    assert "startup" not in leaves
+
+
+def test_decompose_no_remainder_when_subsecond_skew():
+    raw = {"weights_load": 22.12, "torch_compile": 54.60, "cuda_graph_capture": 4.0, "init_engine": 200.37}
+    # total essentially equals weights + init_engine → startup remainder is ~0, omitted.
+    leaves = decompose_model_load(raw, 222.49)
+    assert "startup" not in leaves
+    assert "engine_warmup" in leaves
 
 
 def test_parse_vllm_old_weights_phrasing():
