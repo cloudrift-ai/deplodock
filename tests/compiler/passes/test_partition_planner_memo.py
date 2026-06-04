@@ -182,7 +182,7 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
     path: list[Fork] = [node]
     while not node.is_leaf:
         children = node.expand()
-        assert node.score == pytest.approx(max(c.score for c in children)), "lazy branch score != max over expanded children"
+        assert node.score() == pytest.approx(max(c.score() for c in children)), "lazy branch score != max over expanded children"
         node = children[0]
         path.append(node)
     assert created["n"] < len(plan.params), f"lazy tree created {created['n']} Forks for a single-path walk over {len(plan.params)} params"

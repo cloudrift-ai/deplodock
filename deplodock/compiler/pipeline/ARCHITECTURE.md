@@ -135,15 +135,16 @@ producer/consumer overlap), so the autotuner normally picks WS=0 — the warp
 arm is for parity / investigation and Hopper-class parts.
 
 The tree-building algorithm itself (group params by per-level knob keys,
-collapse single-key levels, sort siblings by max-propagated score, defer
+collapse single-key levels, skip empty-key levels, sort siblings by max-propagated score, defer
 leaf materialization to `expand` thunks) lives in `pipeline/fork_tree.py`
 as the reusable `Level` + `build_fork_tree` pair — `partition_loops`
-supplies the four `Level`s + `materialize=` + `score=` callables and
-forwards the result. Construction is lazy below the returned level: a branch's
-`expand` builds its children on demand, and its score is `max` over the leaf scores of its param subgroup
-(provably the same max-propagation as an eager build, without instantiating the subtree). Scores are still
-computed eagerly once per param at builder entry. Future rules with multi-level knob-cartesian forks
-should reuse the builder; one-shot flat forks (e.g.
+supplies the `Level`s + `materialize=` + `score=` callables and returns the
+result. The builder hands back the lazy ROOT `Fork` and nothing else exists yet: a branch's `expand` builds
+(and sorts) its children on demand, its score is a lazy thunk taking `max` over the per-param scores of its
+subgroup (provably the same max-propagation as an eager build, without instantiating the subtree), and
+`score(p)` itself runs at most once per param — memoized, and only when a level containing it first
+expands. `Fork.score` is correspondingly a 0-arg callable everywhere. Future rules with multi-level
+knob-cartesian forks should reuse the builder; one-shot flat forks (e.g.
 `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element list) stay
 inline.
 

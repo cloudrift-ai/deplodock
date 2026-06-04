@@ -411,7 +411,7 @@ def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
         Fork(
             knobs={WARP_SPECIALIZE.name: ws},
             expand=(lambda ws=ws: [_stamp(ws)]),
-            score=_ws_score(ws),
+            score=(lambda ws=ws: _ws_score(ws)),
             is_leaf=True,
         )
         for ws in ordered

@@ -351,7 +351,7 @@ class LazyCandidate:
         if self.pending is None:
             return self.inner.score()
         _, fork = self.pending
-        return self.inner.score() + fork.score
+        return self.inner.score() + fork.score()
 
 
 # ---------------------------------------------------------------------------

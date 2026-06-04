@@ -165,13 +165,16 @@ class Fork:
     polymorphically without isinstance.
 
     ``knobs`` is the knob-delta this Fork pins (used by :func:`_best_fork`
-    to match the lowering DB without firing the thunk). ``score`` is the
-    MCTS prior for the unvisited-sibling tiebreak — typically the score
-    of the best-reachable leaf under this branch."""
+    to match the lowering DB without firing the thunk). ``score`` is a
+    LAZY 0-arg thunk for the MCTS prior / greedy sibling ordering —
+    typically the score of the best-reachable leaf under this branch.
+    Lazy so that building a fork hierarchy costs nothing: a level's
+    siblings are scored (and sorted) only when that level actually
+    expands. Producers memoize so repeated reads stay cheap."""
 
     knobs: dict
     expand: Callable[[], list[Op | Graph | Fork]]
-    score: float = 0.0
+    score: Callable[[], float] = lambda: 0.0
     is_leaf: bool = False
 
 

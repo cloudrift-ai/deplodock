@@ -1,15 +1,15 @@
 """Hierarchical Fork-tree builder shared by pipeline rules that enumerate a
 knob cartesian.
 
-Converts a flat list of variant params into a Fork tree where each ``Level``
-groups siblings by a (sub)tuple of knob values, sorts siblings by max-
-propagated child score, and collapses levels whose key has a single distinct
-value across the group. The LAST level is the leaf level: its grouping
+Converts a flat list of variant params into the ROOT ``Fork`` of a lazy
+tree: each ``Level`` groups siblings by a (sub)tuple of knob values, sorts
+siblings by lazily-computed max-propagated score, and collapses levels
+whose key has a single distinct value across the group (params with an
+empty key skip the level). The LAST level is the leaf level: its grouping
 produces one leaf Fork per param (no branch wrapper) — knobs stamped onto
 the leaf, ``expand`` thunk yields ``materialize(p)`` once the search engine
-resolves that leaf. Branch construction is lazy: only the returned level's
-Forks exist up front, and a branch's ``expand`` builds the next level on
-demand (see :func:`build_fork_tree`).
+resolves that leaf. Everything is lazy: no Fork below the root exists and
+no param is scored until a level expands (see :func:`build_fork_tree`).
 
 Use this when a rule produces ≥2 hierarchical levels of knob bundling with
 score-propagated ranking (today: ``passes/lowering/tile/010_partition_loops``).
@@ -63,41 +63,53 @@ def build_fork_tree[P](
     materialize: Callable[[P], Op | Graph],
     score: Callable[[P], float],
 ) -> Fork | list[Fork]:
-    """Group ``params`` into a Fork tree per ``levels`` (outermost first).
+    """Return the ROOT branch ``Fork`` of a lazy tree grouping ``params``
+    per ``levels`` (outermost first).
+
+    Nothing is built or scored at call time — the root carries an
+    ``expand`` thunk for level 0 and a lazy score thunk; each branch's
+    ``expand`` builds (and sorts) the next level on demand, so greedy
+    descent instantiates O(path) Forks instead of one per param (~42k for
+    a matmul-class kernel) and MCTS pays one level per pop.
 
     The LAST level is the leaf level: each param becomes one leaf Fork
     (``is_leaf=True``), knobs stamped from ``level.key(p)``, ``expand``
     thunk yields ``[materialize(p)]``. Earlier levels emit branch Forks
     keyed by ``level.key`` over the enclosing subgroup; siblings sort by
-    ``-score`` (max-of-children propagates upward); levels whose key has a
-    single distinct value across the group are collapsed (no 1-child branch
-    wrapper). Returns a single ``Fork`` when the top level collapses to one
-    branch (engine still routes through fork-spawn since
-    ``isinstance(option, Fork)``), otherwise the top-level ``list[Fork]``.
+    ``-score()``; levels whose key has a single distinct value across the
+    group are collapsed (no 1-child branch wrapper); params whose key is
+    empty skip the level (their next-level subtree splices up as siblings
+    of the keyed branches).
 
-    ``score(p)`` is called exactly once per param at builder entry; the
-    returned value is reused for both the leaf's own score and any branch
-    ``max(child scores)`` propagation.
-
-    **Construction is lazy below the top level.** Only the returned level's
-    Fork objects exist up front; a branch's ``expand`` builds the next
-    level on demand. A branch's score is ``max`` over the leaf scores of
-    its param subgroup — provably equal to the eager
-    ``max(child scores)`` propagation (child scores bottom out at the same
-    ``leaf_score`` values) without instantiating the subtree. Greedy
-    descent therefore builds O(path) Forks instead of one Fork per param
-    (~42k for a matmul-class kernel), and MCTS pays one level per pop.
+    Scores are LAZY: ``score(p)`` runs at most once per param (memoized),
+    and only when a level containing ``p`` first expands — a branch's
+    score thunk is ``max`` over its param subgroup, provably equal to
+    eager max-of-children propagation (child scores bottom out at the
+    same per-param values) without instantiating the subtree.
     """
     if not params:
         return []
     if not levels:
         raise ValueError("build_fork_tree: at least one Level required")
-    leaf_score = {id(p): score(p) for p in params}
+    all_params = list(params)
     leaf_level = levels[-1]
     branch_levels = levels[:-1]
 
+    _memo: dict[int, float] = {}
+
+    def _score(p: P) -> float:
+        sid = id(p)
+        v = _memo.get(sid)
+        if v is None:
+            v = score(p)
+            _memo[sid] = v
+        return v
+
+    def _group_score(group: list[P]) -> Callable[[], float]:
+        return lambda: max(_score(p) for p in group)
+
     def _sorted(forks: list[Fork]) -> list[Fork]:
-        return sorted(forks, key=lambda f: -f.score)
+        return sorted(forks, key=lambda f: -f.score())
 
     def _leaves(group: list[P]) -> list[Fork]:
         # Default-arg capture (``p=p``) avoids the late-binding closure
@@ -107,7 +119,7 @@ def build_fork_tree[P](
                 Fork(
                     knobs=dict(zip(leaf_level.knob_names, leaf_level.key(p), strict=True)),
                     expand=(lambda p=p: [materialize(p)]),
-                    score=leaf_score[id(p)],
+                    score=(lambda p=p: _score(p)),
                     is_leaf=True,
                 )
                 for p in group
@@ -145,7 +157,7 @@ def build_fork_tree[P](
                 Fork(
                     knobs=dict(zip(level.knob_names, key, strict=True)),
                     expand=(lambda sub=sub, depth=depth: _build_level(sub, depth + 1)),
-                    score=max(leaf_score[id(p)] for p in sub),
+                    score=_group_score(sub),
                     is_leaf=False,
                 )
             )
@@ -153,5 +165,4 @@ def build_fork_tree[P](
             siblings.extend(_build_level(skipped, depth + 1))
         return _sorted(siblings)
 
-    top = _build_level(list(params), 0)
-    return top[0] if len(top) == 1 else top
+    return Fork(knobs={}, expand=(lambda: _build_level(all_params, 0)), score=_group_score(all_params), is_leaf=False)

@@ -82,14 +82,16 @@ def test_empty_levels_raises():
 
 
 def test_single_param_single_leaf():
-    """One param → bare leaf Fork (not list), knobs from the LAST level."""
+    """One param → the root expands straight to one leaf Fork (every level
+    above the leaf collapses), knobs from the LAST level."""
     tree = build_fork_tree(params=[P(1, 2, 3)], levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
     assert isinstance(tree, Fork)
-    assert tree.is_leaf
-    # Every level above the leaf collapses (one distinct key each); leaf
-    # carries only the deepest level's pin.
-    assert tree.knobs == {"C": 3}
-    assert tree.expand() == ["op(1,2,3)"]
+    assert not tree.is_leaf and tree.knobs == {}  # lazy root: nothing pinned, nothing built
+    (leaf,) = tree.expand()
+    assert leaf.is_leaf
+    # Leaf carries only the deepest level's pin.
+    assert leaf.knobs == {"C": 3}
+    assert leaf.expand() == ["op(1,2,3)"]
 
 
 def test_two_params_identical_branch_key_collapses_branch():
@@ -98,10 +100,10 @@ def test_two_params_identical_branch_key_collapses_branch():
     params = [P(1, 2, 3), P(1, 2, 5)]
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
     # A and B both have one distinct key → collapse. The leaf level (C)
-    # sees two distinct values, so it emits two sibling leaves directly.
-    assert isinstance(tree, list)
-    assert all(f.is_leaf for f in tree)
-    assert {tuple(f.knobs.items()) for f in tree} == {(("C", 3),), (("C", 5),)}
+    # sees two distinct values, so the root expands to two sibling leaves.
+    top = tree.expand()
+    assert all(f.is_leaf for f in top)
+    assert {tuple(f.knobs.items()) for f in top} == {(("C", 3),), (("C", 5),)}
 
 
 def test_two_params_distinct_branch_key_emits_branches():
@@ -109,9 +111,9 @@ def test_two_params_distinct_branch_key_emits_branches():
     one leaf child."""
     params = [P(1, 2, 3), P(2, 2, 3)]
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
-    assert isinstance(tree, list)
-    assert len(tree) == 2
-    for branch in tree:
+    top = tree.expand()
+    assert len(top) == 2
+    for branch in top:
         assert not branch.is_leaf
         assert set(branch.knobs.keys()) == {"A"}
         children = branch.expand()
@@ -123,12 +125,11 @@ def test_branch_score_is_max_of_children():
     """A branch Fork's score equals max(child scores) recursively."""
     params = [P(1, 1, 1), P(1, 1, 9), P(2, 1, 1)]  # distinct A keys → top branches
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
-    assert isinstance(tree, list)
     for branch in _walk_branches(tree):
         children = branch.expand()
         assert children
-        expected = max(c.score for c in children)
-        assert branch.score == pytest.approx(expected)
+        expected = max(c.score() for c in children)
+        assert branch.score() == pytest.approx(expected)
 
 
 def test_siblings_sorted_descending_by_score():
@@ -136,8 +137,7 @@ def test_siblings_sorted_descending_by_score():
     # Three distinct A values; identity_score makes A=3 best, A=1 worst.
     params = [P(1, 0, 0), P(3, 0, 0), P(2, 0, 0)]
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
-    assert isinstance(tree, list)
-    scores = [f.score for f in tree]
+    scores = [f.score() for f in tree.expand()]
     assert scores == sorted(scores, reverse=True)
 
 
@@ -208,9 +208,10 @@ def test_materialize_is_lazy():
     assert len(calls) == 2
 
 
-def test_score_called_once_per_param():
-    """``score`` fires exactly once per param at builder entry (the
-    ``leaf_score`` dict) — no rescoring during depth-recursion."""
+def test_score_is_lazy_and_called_at_most_once_per_param():
+    """``score`` fires ZERO times at build (the root is fully lazy) and at
+    most once per param after a full tree walk — the per-param memo means
+    no rescoring across levels or repeated ``score()`` reads."""
     calls: list[P] = []
 
     def counting_score(p: P) -> float:
@@ -218,7 +219,10 @@ def test_score_called_once_per_param():
         return _identity_score(p)
 
     params = [P(a, b, c) for a in (1, 2) for b in (1, 2) for c in (1, 2)]  # 8 unique params
-    build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=counting_score)
+    tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=counting_score)
+    assert calls == [], "score fired during build — it must be lazy"
+    _walk_leaves(tree)  # full expansion sorts every level
+    tree.score()  # repeated reads hit the memo
     assert len(calls) == len(params)
     assert set(calls) == set(params)
 

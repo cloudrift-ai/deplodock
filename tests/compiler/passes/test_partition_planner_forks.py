@@ -159,10 +159,11 @@ def _walk_branches(tree: Fork | list[Fork]) -> list[Fork]:
     return branches
 
 
-def test_single_variant_short_circuits_to_single_leaf():
-    """With one variant in, the builder collapses every level and returns
-    a single leaf Fork (not a list of siblings). The engine still routes
-    it through the fork-spawn path since ``isinstance(option, Fork)``."""
+def test_single_variant_collapses_to_single_leaf_on_expand():
+    """With one variant in, the lazy root expands straight to one leaf
+    Fork — every level above the leaf collapses. (The planner's
+    ``rewrite()`` short-circuits a 1-param plan to a bare ``_materialize``
+    before ever building a tree; this pins the builder's own behavior.)"""
     plan = _matmul_plan()
     one_plan = _planner._Plan(
         shape=plan.shape,
@@ -173,7 +174,9 @@ def test_single_variant_short_circuits_to_single_leaf():
     )
     tree = _build_fork_tree_lazy(one_plan, _ctx())
     assert isinstance(tree, Fork)
-    assert tree.is_leaf
+    assert not tree.is_leaf and tree.knobs == {}
+    (leaf,) = tree.expand()
+    assert leaf.is_leaf
 
 
 def test_multi_variant_matmul_emits_branch_forks():
@@ -209,8 +212,8 @@ def test_branch_score_is_max_of_children():
     for branch in _walk_branches(tree):
         children = branch.expand()
         assert children
-        expected = max(c.score for c in children)
-        assert branch.score == pytest.approx(expected), f"branch.score {branch.score} != max(child scores) {expected}"
+        expected = max(c.score() for c in children)
+        assert branch.score() == pytest.approx(expected), f"branch.score {branch.score()} != max(child scores) {expected}"
 
 
 def test_first_leaf_matches_best_score_variant():
