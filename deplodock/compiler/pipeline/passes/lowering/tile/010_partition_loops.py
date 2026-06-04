@@ -159,6 +159,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
 from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.pipeline.search.keys import loop_structural_id
 
 
 class Role(enum.Enum):
@@ -233,6 +234,9 @@ class _Plan:
 
     shape: KernelShape
     leading: tuple[Stmt, ...]
+    # The LoopOp's carry-forward knobs, including its ``SID`` structural
+    # identity — the score-cache key component that lets structurally
+    # identical kernels share entries.
     base_knobs: dict
     kernel_name: str
     params: tuple[dict, ...]
@@ -299,17 +303,39 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     )
 
 
+# Value-keyed score cache: ``(SID, ctx fields, frozenset(row.items())) →
+# score``. The SID knob (``loop/fusion/040_stamp_structural_id``) makes the knob dict a
+# complete variant identity, so structurally identical kernels — the same
+# layer repeated through a whole model — share entries with no
+# object-identity bookkeeping, and entries can never go stale: the score is
+# a pure function of the key. Process-lifetime; no reset hook needed.
+_SCORE_CACHE: dict[tuple, float] = {}
+
+
 def _score_variant(plan: _Plan, params: dict, ctx: Context) -> float:
     """Score one variant: the row IS the knob delta the materialized TileOp
-    will carry, so ``lazy_score`` consumes ``base_knobs`` merged with the
-    row verbatim. Scoring MUST stay materialization-free — this runs once
-    per enumerated variant (~40k+ per matmul kernel), and a single
-    ``_materialize`` is ~1.5 ms of body building + normalization; a ``None``
-    here means ``lazy_score``'s contract was broken, not a fallback case."""
+    will carry, so on a cache miss ``lazy_score`` consumes ``base_knobs``
+    merged with the row verbatim. Scoring MUST stay materialization-free —
+    this runs once per enumerated variant (~40k+ per matmul kernel), and a
+    single ``_materialize`` is ~1.5 ms of body building + normalization; a
+    ``None`` here means ``lazy_score``'s contract was broken, not a
+    fallback case."""
+    key = (
+        plan.base_knobs["SID"],
+        ctx.compute_capability,
+        ctx.warp_size,
+        ctx.max_dynamic_smem,
+        ctx.max_threads_per_cta,
+        frozenset(params.items()),
+    )
+    cached = _SCORE_CACHE.get(key)
+    if cached is not None:
+        return cached
     knobs = {**plan.base_knobs, **params} if plan.base_knobs else params
     lazy = TileOp.lazy_score(ctx, knobs=knobs, shapes=plan.shape)
     if lazy is None:
         raise AssertionError(f"TileOp.lazy_score returned None for kernel {plan.kernel_name!r} — the variant scorer must not materialize")
+    _SCORE_CACHE[key] = lazy
     return lazy
 
 
@@ -542,36 +568,17 @@ def _is_fp16_matmul(matmul_reduces: list, graph: Graph | None) -> bool:
     return True
 
 
-def _input_dtype_signature(loop_op: LoopOp, graph: Graph | None) -> tuple[str, ...] | None:
-    """Sorted multiset of the body's ``Load.input`` buffer dtypes — the
-    graph-dependent input to enumeration (``_is_fp16_matmul`` gates the fp16
-    half2 window; ``is_atom_eligible`` checks operand dtypes). Sorted (not
-    positional) so raw Load order doesn't cause spurious misses across
-    layers; the enumeration consumers are multiset-determined ("are all
-    K-operands fp16"), so a same-multiset collision is harmless. ``None``
-    when no graph is supplied (matches ``_is_fp16_matmul``'s short-circuit)."""
-    if graph is None:
-        return None
-    sig: list[str] = []
-    for ld in loop_op.body.iter_of_type(Load):
-        node = graph.nodes.get(ld.input)
-        sig.append(str(node.output.dtype) if node is not None else "?")
-    return tuple(sorted(sig))
-
-
-def _plan_cache_key(loop_op: LoopOp, ctx: Context, graph: Graph | None) -> tuple:
+def _plan_cache_key(loop_op: LoopOp, ctx: Context) -> tuple:
     """Validity key for the op-metadata plan stamp — everything that changes
-    the enumerated knob rows or a variant's score: the canonical
-    body structure (``Body.structural_key`` renames SSA / buffer / axis names
-    away), the carry-forward knobs, the input dtypes, the hardware context,
-    and the live ``DEPLODOCK_*`` planner pins (``enumerate_cartesian`` folds
-    pins via ``Knob.narrow``, so a pin flipped mid-process must land on a
-    fresh key; the ``MMA`` gate is a planner knob, so the snapshot covers it
-    too)."""
+    the enumerated knob rows or a variant's score. The kernel's structural
+    identity (canonical body + operand dtypes) rides ``knobs["SID"]``
+    (stamped by ``loop/fusion/040_stamp_structural_id``), so the carry-forward knobs
+    alone cover the structure; the rest is the hardware context and the live
+    ``DEPLODOCK_*`` planner pins (``enumerate_cartesian`` folds pins via
+    ``Knob.narrow``, so a pin flipped mid-process must land on a fresh key;
+    the ``MMA`` gate is a planner knob, so the snapshot covers it too)."""
     return (
-        loop_op.body.structural_key(),
         tuple(sorted(loop_op.knobs.items())),
-        _input_dtype_signature(loop_op, graph),
         ctx.compute_capability,
         ctx.warp_size,
         ctx.max_dynamic_smem,
@@ -609,7 +616,12 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     only written after a successful non-empty enumeration, so skipped /
     rejected shapes never poison it.
     """
-    cache_key = _plan_cache_key(loop_op, ctx, graph)
+    if "SID" not in loop_op.knobs:
+        # Normally stamped by ``loop/fusion/040_stamp_structural_id``;
+        # direct callers (tests, ad-hoc planning) get the same identity
+        # computed here.
+        loop_op.knobs["SID"] = loop_structural_id(loop_op, graph)
+    cache_key = _plan_cache_key(loop_op, ctx)
     stamped = loop_op.meta.get("plan")
     if stamped is not None and stamped[0] == cache_key:
         return stamped[1]

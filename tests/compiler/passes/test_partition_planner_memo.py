@@ -41,6 +41,9 @@ def _no_stray_pins(monkeypatch):
         monkeypatch.delenv(knob.env, raising=False)
         for alias in knob.aliases:
             monkeypatch.delenv(f"DEPLODOCK_{alias}", raising=False)
+    # The score cache is value-keyed and pure (stale entries are impossible),
+    # but call-count assertions below need a deterministic starting point.
+    _planner._SCORE_CACHE.clear()
 
 
 def _ctx() -> Context:
@@ -137,16 +140,27 @@ def test_op_metadata_hit_skips_enumeration(monkeypatch):
     assert calls["n"] == n_first, "op-metadata hit re-ran enumerate_cartesian"
 
 
-def test_dtype_signature_separates_cache_keys():
-    """Same body structure, different operand dtypes → different plan cache
-    keys (dtypes gate the fp16 half2 window enumeration)."""
+def test_dtype_signature_separates_structural_ids():
+    """Same body structure, different operand dtypes → different SIDs
+    (dtypes gate the fp16 half2 window enumeration), and the SID lands in
+    the plan cache key via the knobs."""
+    from deplodock.compiler.pipeline.search.keys import loop_structural_id
+
     ctx = _ctx()
-    loop_op = _loop_op_matmul()
-    key_f16 = _planner._plan_cache_key(loop_op, ctx, _graph_with_dtypes("f16", "f16"))
-    key_f32 = _planner._plan_cache_key(loop_op, ctx, _graph_with_dtypes("f32", "f32"))
-    key_none = _planner._plan_cache_key(loop_op, ctx, None)
-    assert key_f16 != key_f32
-    assert key_f16 != key_none and key_f32 != key_none
+    sid_f16 = loop_structural_id(_loop_op_matmul(), _graph_with_dtypes("f16", "f16"))
+    sid_f32 = loop_structural_id(_loop_op_matmul(), _graph_with_dtypes("f32", "f32"))
+    sid_none = loop_structural_id(_loop_op_matmul(), None)
+    assert sid_f16 != sid_f32
+    assert sid_f16 != sid_none and sid_f32 != sid_none
+    # Same structure + same dtypes → same SID even across distinct op
+    # objects with different SSA / buffer / axis names.
+    other = _loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2")
+    assert loop_structural_id(other, _graph_with_dtypes("f16", "f16", a="w", b="x")) == sid_f16
+    op = _loop_op_matmul()
+    plan = _planner._plan_kernel(op, ctx, kernel_name="k")
+    assert plan is not None
+    assert plan.base_knobs["SID"] == op.knobs["SID"]
+    assert ("SID", op.knobs["SID"]) in _planner._plan_cache_key(op, ctx)[0]
 
 
 def test_mma_pin_lands_in_cache_key(monkeypatch):
@@ -155,9 +169,9 @@ def test_mma_pin_lands_in_cache_key(monkeypatch):
     warp-tier enumeration)."""
     ctx = _ctx()
     loop_op = _loop_op_matmul()
-    key_default = _planner._plan_cache_key(loop_op, ctx, None)
+    key_default = _planner._plan_cache_key(loop_op, ctx)
     monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    key_off = _planner._plan_cache_key(loop_op, ctx, None)
+    key_off = _planner._plan_cache_key(loop_op, ctx)
     assert key_default != key_off
 
 
@@ -197,3 +211,50 @@ def test_score_variant_matches_lazy_score():
     for p in plan.params:
         lazy = TileOp.lazy_score(ctx, knobs={**plan.base_knobs, **p}, shapes=plan.shape)
         assert _planner._score_variant(plan, p, ctx) == pytest.approx(lazy)
+
+
+def test_sid_stamped_by_last_loop_pass():
+    """``loop/fusion/040_stamp_structural_id`` runs last in the loop dialect:
+    every fused LoopOp leaves the loop passes carrying ``knobs["SID"]`` equal
+    to its :func:`loop_structural_id` — identity settles with the final fused
+    body, before any tune-DB keying or tile-stage scoring sees the op."""
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+    from deplodock.compiler.pipeline.search.db import SearchDB
+    from deplodock.compiler.pipeline.search.keys import loop_structural_id
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (64, 128)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (128, 32)), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (64, 32)), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+    fused = Pipeline.build(LOOP_PASSES).run(g, ctx=_ctx(), db=SearchDB())
+    loops = [n.op for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
+    assert loops, "fusion should leave at least one LoopOp"
+    for op in loops:
+        assert op.knobs.get("SID") == loop_structural_id(op, fused)
+
+
+def test_scores_shared_across_identical_loop_ops(monkeypatch):
+    """The value-keyed score cache (``(SID, ctx, row)``) makes structurally
+    identical LoopOps — different SSA / buffer / axis names — share every
+    score: expanding the second kernel's tree computes ZERO new scores."""
+    calls = {"n": 0}
+    real = TileOp.lazy_score
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(TileOp, "lazy_score", staticmethod(counting))
+    ctx = _ctx()
+    plan_1 = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
+    plan_2 = _planner._plan_kernel(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2"), ctx, kernel_name="k_l1")
+    assert plan_1 is not None and plan_2 is not None
+    assert plan_1.base_knobs["SID"] == plan_2.base_knobs["SID"], "structurally identical ops must share a SID"
+    _build_tree(plan_1, ctx).expand()  # sorting the top level scores every param
+    n_first = calls["n"]
+    assert n_first == len(plan_1.params)
+    _build_tree(plan_2, ctx).expand()
+    assert calls["n"] == n_first, "second kernel's tree re-scored rows instead of hitting the value-keyed cache"
