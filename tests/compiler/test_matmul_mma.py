@@ -103,7 +103,7 @@ def _np_dtype(dt: DataType):
     return {F16: np.float16, F32: np.float32}[dt]
 
 
-# Default-on MMA matches `config.mma_enabled()` (per
+# Default-on MMA matches the `MMA` knob's unset default (`mma_mode()`; per
 # `plans/mma-fragment-factorization.md` post-M5). The pin is still set
 # in tests so the fixture is robust against env-var clobbering during
 # parallel pytest runs (xdist).
@@ -132,8 +132,7 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     (ldmatrix is smem→register only), so the pin forces the staged path."""
     from deplodock.compiler.ir.kernel.render import render_kernelop
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")
@@ -186,7 +185,7 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_mma_default_on_picks_warp_variant(monkeypatch):
-    """With DEPLODOCK_MMA defaulted ON (config.mma_enabled defaults True),
+    """With DEPLODOCK_MMA defaulted ON (the MMA knob reads default True),
     a no-env run of an MMA-eligible multi-warp F16 matmul still emits the
     warp variant. Guards against accidental default flips and confirms
     priority ordering (warp variants outrank scalar in the fork tree).
@@ -227,8 +226,7 @@ def test_atom_cell_carries_through_staging(monkeypatch):
     from deplodock.compiler.ir.stmt import Load, Mma
     from deplodock.compiler.pipeline import TILE_PASSES
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")

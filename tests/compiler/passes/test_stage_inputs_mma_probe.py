@@ -83,12 +83,11 @@ def test_mma_matmul_stages_through_smem(monkeypatch):
     in the post-tile body. Pins the M6 invariant: the ATOM_KIND skip
     block in 020_stage_inputs is gone, so the staging admission path
     runs for every warp-tier MMA TileOp."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
     # Pin the s16816 atom + a multi-warp tile: single-warp mma.sync is pruned
-    # (ldmatrix is smem→register only), and an ATOM_KIND pin enumerates the
-    # kind at any arch. 64²: WM=2 FM=2 → M-tile 64, WN=2 FN=4 → N-tile
+    # (ldmatrix is smem→register only), and an ``MMA=<kind>`` pin enumerates
+    # the kind at any arch. 64²: WM=2 FM=2 → M-tile 64, WN=2 FN=4 → N-tile
     # 2·4·atom_n(8)=64, BK=2 → K-stage 32.
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "2")

@@ -42,7 +42,6 @@ in what order" lives here.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -92,6 +91,48 @@ WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WAR
 ATOM_KIND = Knob(
     "ATOM_KIND", KnobType.STR, hints=(), help="Hardware matmul atom kind (MMA/wgmma/...) — see pipeline/passes/lowering/tile/_atom.py"
 )
+# Global control, not an autotune fork (the tuner picks warp-vs-scalar through
+# the ATOM_KIND sibling subtree). Three-way string: falsy ("0" / "false" / …)
+# forces the scalar-only path (debug / fallback); truthy ("1" / "true" / …) or
+# unset (the default) auto-enumerates every eligible atom kind; any other
+# value names an atom kind (e.g. ``mma_m16n8k16_f16``) — enable + pin that
+# kind. ``ATOM_KIND`` is its env alias (``DEPLODOCK_ATOM_KIND=<kind>`` works
+# too; the primary ``DEPLODOCK_MMA`` wins when both are set), while the
+# ``ATOM_KIND`` Knob above stays the variant's fork-level / DB identity.
+# Decoded by :func:`mma_mode`; lives in ``_PLANNER_KNOBS`` so the
+# enumeration-memo pin snapshot covers it like every other planner pin.
+MMA = Knob(
+    "MMA",
+    KnobType.STR,
+    hints=(),
+    help="Warp-tier MMA control: 0 = scalar-only; 1/true (default) = auto-enumerate; an atom-kind name pins that kind",
+    aliases=("ATOM_KIND",),
+)
+
+_MMA_FALSY = frozenset({"0", "false", "no", "off"})
+_MMA_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def mma_mode() -> tuple[bool, str | None]:
+    """Decode the ``MMA`` knob into ``(enabled, pinned_kind)``.
+
+    Unset / empty / truthy → ``(True, None)`` (auto-enumerate, the default);
+    falsy → ``(False, None)`` (scalar-only); any other string is an atom-kind
+    name → ``(True, name)``. A name the registry doesn't know simply narrows
+    the eligible atoms to nothing and the warp tier falls to scalar. Reads
+    through :meth:`Knob.raw`, so the ``ATOM_KIND`` alias spelling decodes
+    identically."""
+    raw = MMA.raw()
+    if raw is None:
+        return True, None
+    s = raw.strip()
+    if not s or s.lower() in _MMA_TRUTHY:
+        return True, None
+    if s.lower() in _MMA_FALSY:
+        return False, None
+    return True, s
+
+
 # Tier-shared knobs (same arithmetic role in both scalar and warp tiers).
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul M (output) axis")
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the matmul N (output) axis")
@@ -103,21 +144,26 @@ FK = Knob("FK", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread independen
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 
-_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, FK, BK, SPLITK, BR, WN, WM, ATOM_KIND)
+# ``ATOM_KIND`` is deliberately absent: the kind pin rides the ``MMA`` knob
+# (``DEPLODOCK_ATOM_KIND`` is read as ``MMA``'s alias via ``Knob.raw``), so
+# listing it here would double-count the same pin.
+_PLANNER_KNOBS: tuple[Knob, ...] = (BN, BM, FM, FN, FK, BK, SPLITK, BR, WN, WM, MMA)
 
 
 def planner_pin_set() -> bool:
-    """True if any planner knob has its ``DEPLODOCK_<NAME>`` env pin set.
-    Used by ``enumerate_cartesian`` to gate the peer-kernel fallback."""
-    return any(os.environ.get(k.env) is not None for k in _PLANNER_KNOBS)
+    """True if any planner knob has its ``DEPLODOCK_<NAME>`` env pin set
+    (alias spellings included — ``Knob.raw`` consults them). Used by
+    ``enumerate_cartesian`` to gate the peer-kernel fallback."""
+    return any(k.raw() is not None for k in _PLANNER_KNOBS)
 
 
 def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
-    """Live ``(name, env value)`` snapshot of every planner knob pin.
-    Folded into the partition planner's enumeration-memo key so a pin
-    flipped mid-process (tests use ``config.set_knob``) lands on a fresh
+    """Live ``(name, effective env value)`` snapshot of every planner knob
+    pin (``Knob.raw`` — alias spellings resolve to the same entry as the
+    primary). Folded into the partition planner's enumeration-memo key so a
+    pin flipped mid-process (tests use ``config.set_knob``) lands on a fresh
     key instead of replaying a stale cached enumeration."""
-    return tuple((k.name, os.environ.get(k.env)) for k in _PLANNER_KNOBS)
+    return tuple((k.name, k.raw()) for k in _PLANNER_KNOBS)
 
 
 @dataclass(frozen=True)
@@ -747,14 +793,16 @@ def _enumerate_warp_matmul_impl(
     # any CLI repro (``DEPLODOCK_WM=2 DEPLODOCK_WN=2 DEPLODOCK_BK=2 …``) rely
     # on this — without it, warp-tier pins silently fall through to the
     # scalar tier's narrows and the warp tier enumerates the full cartesian
-    # regardless. ``ATOM_KIND`` narrows the caller-supplied ``atoms``
+    # regardless. ``MMA=<kind name>`` narrows the caller-supplied ``atoms``
     # (by kind name) so a pin scopes the picker to a single kind.
     wm_choices = WM.narrow(_TUNE_WARP_AXIS_CHOICES)
     wn_choices = WN.narrow(_TUNE_WARP_AXIS_CHOICES)
     bk_choices = BK.narrow(_BK_CANDIDATES)
-    # ``ATOM_KIND`` narrows by kind *name* (the knob string); keep the atoms
-    # whose name survives the env pin.
-    _kept = set(ATOM_KIND.narrow(tuple(a.name for a in atoms)))
+    # The ``MMA=<kind>`` pin narrows by kind *name*; keep the atoms whose
+    # name survives (authoritative like ``Knob.narrow`` — an unknown name
+    # keeps nothing and the warp tier falls to scalar).
+    _pin = mma_mode()[1]
+    _kept = {_pin} if _pin is not None else {a.name for a in atoms}
     atoms = tuple(a for a in atoms if a.name in _kept)
     # v1: MMA + SPLITK > 1 needs atomic-add on MmaStore (cross-CTA
     # accumulation), which isn't wired yet. Force SPLITK=1 so each output

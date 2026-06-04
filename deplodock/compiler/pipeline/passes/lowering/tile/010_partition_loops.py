@@ -157,6 +157,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     TileParams,
     WarpTileParams,
     enumerate_cartesian,
+    mma_mode,
     planner_pin_snapshot,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
@@ -636,9 +637,8 @@ def _enum_cache_key(loop_op: LoopOp, ctx: Context, graph: Graph | None) -> tuple
     same kernel in different layers keys equal), the carry-forward knobs,
     the input dtypes, the hardware context, and the live ``DEPLODOCK_*``
     planner pins (``enumerate_cartesian`` folds pins via ``Knob.narrow``, so
-    a pin flipped mid-process must land on a fresh key)."""
-    from deplodock import config  # noqa: PLC0415
-
+    a pin flipped mid-process must land on a fresh key; the ``MMA`` gate is a
+    planner knob, so the snapshot covers it too)."""
     return (
         loop_op.body.structural_key(),
         tuple(sorted(loop_op.knobs.items())),
@@ -647,7 +647,6 @@ def _enum_cache_key(loop_op: LoopOp, ctx: Context, graph: Graph | None) -> tuple
         ctx.warp_size,
         ctx.max_dynamic_smem,
         ctx.max_threads_per_cta,
-        config.mma_enabled(),
         planner_pin_snapshot(),
     )
 
@@ -789,17 +788,20 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                 n_forced_mask=n_symbolic and mask_ok,
                 fp16_window=fp16_window,
             )
-            # Warp-tier MMA: only when DEPLODOCK_MMA is on, no prologue (M9
-            # extension), static M/N/K, and the per-kind eligibility predicate
-            # fires. Each eligible kind gets one WarpTileParams row per
-            # (wn, wm, fm, fn, bk, splitk); we concatenate them onto the scalar
-            # param list — the fork tree in :func:`rewrite` splits the rows by
-            # type and emits sibling subtrees with disjoint level schemas.
-            from deplodock import config  # noqa: PLC0415
+            # Warp-tier MMA: only when the MMA knob is enabled (default;
+            # ``DEPLODOCK_MMA=0`` for scalar-only, ``DEPLODOCK_MMA=<kind>``
+            # to enable + pin one atom kind — see ``_enumeration.mma_mode``),
+            # no prologue (M9 extension), static M/N/K, and the per-kind
+            # eligibility predicate fires. Each eligible kind gets one
+            # WarpTileParams row per (wn, wm, fm, fn, bk, splitk); we
+            # concatenate them onto the scalar param list — the fork tree in
+            # :func:`rewrite` splits the rows by type and emits sibling
+            # subtrees with disjoint level schemas.
             from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
             from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
-            if config.mma_enabled() and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
+            mma_on, pinned_atom = mma_mode()
+            if mma_on and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
                 eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
                 # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
                 # tensor-core family (WMMA was removed; the swizzled slab beats
@@ -812,9 +814,9 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                 # non-divisible extents (filtered by ``is_atom_eligible``) and
                 # single-warp tiles (pruned below — ``020_stage_inputs`` skips
                 # staging at one warp and ldmatrix is smem→register only, so an
-                # unstaged AtomTile can't lower). A ``DEPLODOCK_ATOM_KIND`` pin
-                # forces the kind at any size / arch (bring-up + A-B benching).
-                pinned_atom = config.knob_raw("ATOM_KIND")
+                # unstaged AtomTile can't lower). A ``DEPLODOCK_MMA=<kind>``
+                # pin forces the kind at any size / arch (bring-up + A-B
+                # benching).
                 pin_is_mma_sync = pinned_atom in ATOM_REGISTRY
                 if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
                     # Auto-enumerating the mma.sync (s16816) family — the only

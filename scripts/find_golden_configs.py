@@ -95,10 +95,11 @@ def _pin_true_fp32() -> None:
 
 
 def _clear_mma_pins() -> None:
-    """Drop any inherited MMA / warp pins (the matmul-MMA tests set ``DEPLODOCK_MMA=1``,
-    ``DEPLODOCK_ATOM_KIND`` etc.) so each shape autotunes freely. With the pins gone the
-    ``config.mma_enabled()`` default (ON) governs: fp16 squares enumerate the warp-tier
-    WMMA variants (eligibility fires on F16 loads), fp32 stays scalar thread-tier (the
+    """Drop any inherited MMA / warp pins (the matmul-MMA tests set
+    ``DEPLODOCK_MMA=<kind>`` etc.; ``DEPLODOCK_ATOM_KIND`` is its alias) so each
+    shape autotunes freely. With the pins gone the ``MMA`` knob default (ON,
+    auto-enumerate) governs: fp16 squares enumerate the warp-tier
+    variants (eligibility fires on F16 loads), fp32 stays scalar thread-tier (the
     eligibility predicate needs F16 operands, so no MMA fork is even emitted)."""
     for var in ("DEPLODOCK_MMA", "DEPLODOCK_WM", "DEPLODOCK_WN", "DEPLODOCK_ATOM_KIND"):
         os.environ.pop(var, None)

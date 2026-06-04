@@ -37,7 +37,7 @@ computed once in `_plan_kernel` and forwarded by `_score_variant`.
 structurally identical LoopOps. Key components: `Body.structural_key()` (canonical SSA / buffer / axis
 renames), carry-forward `loop_op.knobs`, the sorted multiset of `Load.input` dtypes (the fp16 half2 window
 gates on operand dtype via `_is_fp16_matmul`), `ctx` hardware fields (compute capability, warp size, smem
-cap, max threads/CTA), `config.mma_enabled()`, and `planner_pin_snapshot()` (live `DEPLODOCK_<KNOB>` env
+cap, max threads/CTA), and `planner_pin_snapshot()` (live `DEPLODOCK_<KNOB>` env
 values — a pin flipped mid-process lands on a fresh key). Classification (chain walk, `shape`, `leading`)
 still runs per-LoopOp since materialization needs the layer's real buffer names; only the
 `enumerate_cartesian` output and the lazily filled `id(param) → score` cache are shared. The memo is only

@@ -32,7 +32,16 @@ BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planne
 
 
 @pytest.fixture(autouse=True)
-def _fresh_memo():
+def _fresh_memo(monkeypatch):
+    """Fresh memo + no stray planner pins: enumeration counts and memo keys
+    are pin-sensitive, so clear every ``DEPLODOCK_<KNOB>`` a previous test in
+    the same worker may have leaked."""
+    from deplodock.compiler.pipeline.passes.lowering.tile import _enumeration  # noqa: PLC0415
+
+    for knob in _enumeration._PLANNER_KNOBS:
+        monkeypatch.delenv(knob.env, raising=False)
+        for alias in knob.aliases:
+            monkeypatch.delenv(f"DEPLODOCK_{alias}", raising=False)
     _planner._reset_enum_memo()
     yield
     _planner._reset_enum_memo()
@@ -150,6 +159,18 @@ def test_dtype_signature_separates_memo_entries():
     key_none = _planner._enum_cache_key(loop_op, ctx, None)
     assert key_f16 != key_f32
     assert key_f16 != key_none and key_f32 != key_none
+
+
+def test_mma_pin_lands_in_memo_key(monkeypatch):
+    """``MMA`` is a planner knob, so the pin snapshot covers it: flipping
+    ``DEPLODOCK_MMA`` must produce a fresh memo key (it gates the warp-tier
+    enumeration)."""
+    ctx = _ctx()
+    loop_op = _loop_op_matmul()
+    key_default = _planner._enum_cache_key(loop_op, ctx, None)
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    key_off = _planner._enum_cache_key(loop_op, ctx, None)
+    assert key_default != key_off
 
 
 def test_pin_snapshot_invalidates_memo(monkeypatch):

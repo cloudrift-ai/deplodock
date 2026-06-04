@@ -407,14 +407,52 @@ def test_warp_enumerator_bk_narrow(monkeypatch):
     assert all(r.bk == 2 for r in rows)
 
 
-def test_warp_enumerator_atom_kind_narrow(monkeypatch):
-    """``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` pins the kind even
-    when the caller passes a multi-kind tuple — scopes the picker to a
-    single tensor-core family."""
+def test_warp_enumerator_atom_kind_alias_narrow(monkeypatch):
+    """``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` — the ``MMA`` knob's alias
+    spelling — pins the kind even when the caller passes a multi-kind tuple,
+    scoping the picker to a single tensor-core family."""
+    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
     monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
     assert rows
     assert all(r.atom.name == "mma_m16n8k16_f16" for r in rows)
+
+
+def test_mma_mode_decodes_three_way(monkeypatch):
+    """``MMA`` knob string decode: unset / truthy → auto-enumerate, falsy →
+    disabled, anything else → enabled with that atom kind pinned."""
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import mma_mode
+
+    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
+    assert mma_mode() == (True, None)
+    for truthy in ("1", "true", "True", "yes", "on", ""):
+        monkeypatch.setenv("DEPLODOCK_MMA", truthy)
+        assert mma_mode() == (True, None), f"MMA={truthy!r} should auto-enumerate"
+    for falsy in ("0", "false", "False", "no", "off"):
+        monkeypatch.setenv("DEPLODOCK_MMA", falsy)
+        assert mma_mode() == (False, None), f"MMA={falsy!r} should disable"
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    assert mma_mode() == (True, "mma_m16n8k16_f16")
+
+
+def test_warp_enumerator_mma_name_pins_kind(monkeypatch):
+    """``DEPLODOCK_MMA=<kind name>`` pins the atom kind exactly like
+    ``DEPLODOCK_ATOM_KIND`` — one knob enables + pins in one go."""
+    monkeypatch.delenv("DEPLODOCK_ATOM_KIND", raising=False)
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
+    assert rows
+    assert all(r.atom.name == "mma_m16n8k16_f16" for r in rows)
+
+
+def test_mma_primary_wins_over_atom_kind_alias(monkeypatch):
+    """When both spellings are set, the primary ``DEPLODOCK_MMA`` wins over
+    its ``DEPLODOCK_ATOM_KIND`` alias (``Knob.raw`` checks primary first)."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_bf16")
+    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
+    rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
+    assert rows
+    assert all(r.atom.name == "mma_m16n8k16_bf16" for r in rows)
 
 
 def test_warp_enumerator_force_splitk_one():
@@ -495,3 +533,24 @@ def test_planner_scalar_only_when_mma_disabled(monkeypatch):
     assert plan is not None
     assert all(isinstance(p, ScalarTileParams) for p in plan.params)
     assert not any(isinstance(p, WarpTileParams) for p in plan.params)
+
+
+def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
+    """``DEPLODOCK_MMA=<kind name>`` behaves like an atom-kind pin: it forces
+    the kind on a pin-only arch (sm_80-89, where mma.sync doesn't
+    auto-enumerate) — previously this took a separate ``DEPLODOCK_ATOM_KIND``
+    pin on top of the gate."""
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
+
+    monkeypatch.delenv("DEPLODOCK_ATOM_KIND", raising=False)
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
+    assert plan is not None
+    warp_rows = [p for p in plan.params if isinstance(p, WarpTileParams)]
+    assert warp_rows, "MMA=<kind> must enable the warp tier on a pin-only arch"
+    assert all(p.atom.name == "mma_m16n8k16_f16" for p in warp_rows)

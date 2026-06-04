@@ -156,9 +156,8 @@ def pin_staged_pipelined(monkeypatch):
     occupancy-ordered greedy default now front-loads a depth-3 ring for
     this 128×128 tile, whose ``080_pipeline_stages`` unroll emits explicit
     per-slot offsets instead of the ``a7 % 2`` phase Expr."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_TMA", "0")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")

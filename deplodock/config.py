@@ -129,20 +129,6 @@ def nvcc_flags() -> str:
     return _str(NVCC_FLAGS)
 
 
-def mma_enabled() -> bool:
-    """``DEPLODOCK_MMA`` — enable the MMA fragment-factorization planner.
-
-    Default ON: the planner emits warp-tier MMA variants alongside scalar
-    register-tile variants for every eligible matmul. The autotune /
-    GreedySearch picks per-shape between the two; on sm_70+ with f16 /
-    bf16 operands and divisible extents the MMA path is typically faster
-    (warp-cooperative tensor-core ops vs per-thread FMA register tiles).
-    Set ``DEPLODOCK_MMA=0`` to force the scalar-only path (debug /
-    pre-Volta hardware / fallback).
-    """
-    return _bool(knob_var("MMA"), default=True)
-
-
 def debug_enabled() -> bool:
     """``DEPLODOCK_DEBUG`` — per-launch debug dump path in the CUDA backend."""
     return _bool(DEBUG)

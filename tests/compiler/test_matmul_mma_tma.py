@@ -129,9 +129,8 @@ def pin_tma_mma(monkeypatch):
     K-stage_inner trip count. ``DEPLODOCK_TMA=1`` forces ``050_use_tma`` to
     promote eligible buffered bundles (the block-aware ``_stage_eligible``).
     """
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_TMA", "1")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")
@@ -273,15 +272,14 @@ def test_tma_swizzle_smem_aligns_to_atom(pin_tma_mma):
 def pin_mma_sync(monkeypatch):
     """Pin the modern warp-level MMA atom + a staged 128×128 warp tile.
 
-    ``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` opts the s16816 path into the
+    ``DEPLODOCK_MMA=mma_m16n8k16_f16`` opts the s16816 path into the
     enumeration (it's a registered ``ATOM_REGISTRY`` kind but not auto-selected
     until perf-promoted). ``WM=2 FM=4`` → M-tile 128 (``2·4·atom_m=16``);
     ``WN=2 FN=8`` → N-tile 128 (``2·8·atom_n=8``); ``BK=2`` → 32-element
     K-stage. ``DEPLODOCK_TMA=1`` lets the staged bundle promote to TMA on
     sm_90+ (ldmatrix still reads from the staged smem slab either way)."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_TMA", "1")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")

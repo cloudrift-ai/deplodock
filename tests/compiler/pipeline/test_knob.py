@@ -128,9 +128,48 @@ def test_narrow_binmask_rejected(monkeypatch):
         k.narrow((0b000, 0b111))
 
 
+def test_raw_alias_fallback(monkeypatch):
+    """``Knob.raw`` reads the primary ``DEPLODOCK_<NAME>`` first, then each
+    alias in declaration order (e.g. ``MMA`` accepting ``ATOM_KIND``)."""
+    k = Knob("NEWNAME", KnobType.STR, aliases=("OLDNAME",))
+    monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
+    monkeypatch.delenv("DEPLODOCK_OLDNAME", raising=False)
+    assert k.raw() is None
+    monkeypatch.setenv("DEPLODOCK_OLDNAME", "via-alias")
+    assert k.raw() == "via-alias"
+    monkeypatch.setenv("DEPLODOCK_NEWNAME", "primary")
+    assert k.raw() == "primary"
+
+
+def test_narrow_reads_alias(monkeypatch):
+    """``Knob.narrow`` honors an alias-spelled env pin."""
+    k = Knob("NEWNAME", KnobType.INT, aliases=("OLDNAME",))
+    monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
+    monkeypatch.setenv("DEPLODOCK_OLDNAME", "8")
+    assert k.narrow((1, 2)) == (8,)
+
+
 # ---------------------------------------------------------------------------
 # DEPLODOCK_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_deplodock_env():
+    """``apply_knobs_env`` writes ``DEPLODOCK_<K>`` via ``config.set_knob`` —
+    a direct ``os.environ`` write monkeypatch can't undo (``delenv`` on an
+    absent var records nothing to restore), so splatted pins used to leak
+    into later tests in the same xdist worker (pin-sensitive planner tests
+    then enumerate under stray ``BK``/``BM``/``BN`` pins). Snapshot + restore
+    the whole ``DEPLODOCK_*`` namespace around each test."""
+    import os  # noqa: PLC0415
+
+    saved = {k: v for k, v in os.environ.items() if k.startswith("DEPLODOCK_")}
+    yield
+    for k in [k for k in os.environ if k.startswith("DEPLODOCK_")]:
+        if k not in saved:
+            del os.environ[k]
+    os.environ.update(saved)
 
 
 def test_apply_knobs_env_splats_into_individual_keys(monkeypatch):
