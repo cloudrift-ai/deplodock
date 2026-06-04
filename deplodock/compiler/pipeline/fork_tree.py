@@ -41,10 +41,15 @@ class Level[P]:
     """One grouping level in the Fork tree.
 
     ``knob_names`` and ``key`` must agree in arity: ``key(p)`` returns a
-    tuple of the same length as ``knob_names``, in matching order. Across
-    all Levels the ``knob_names`` should partition the knob set the caller
-    wants Forks to pin (no duplicates; collapsed-constant knobs may be
-    absent — they're pinned by the materialized leaf Op itself).
+    tuple of the same length as ``knob_names``, in matching order — or an
+    EMPTY tuple when the level doesn't apply to ``p`` (branch levels only;
+    the leaf level must apply to every param). Params with an empty key
+    skip the level: their next-level subtree splices up as siblings of the
+    level's keyed branches, so e.g. scalar tile variants carry no ``MMA``
+    branch while warp variants of the same kernel do. Across all Levels the
+    ``knob_names`` should partition the knob set the caller wants Forks to
+    pin (no duplicates; collapsed-constant knobs may be absent — they're
+    pinned by the materialized leaf Op itself).
     """
 
     knob_names: tuple[str, ...]
@@ -114,11 +119,22 @@ def build_fork_tree[P](
             return _leaves(group)
         level = branch_levels[depth]
         keyed: dict[tuple, list[P]] = {}
+        # Params whose key is empty skip the level (it doesn't apply to
+        # them) — their next-level subtree splices up as siblings of the
+        # keyed branches below.
+        skipped: list[P] = []
         for p in group:
-            keyed.setdefault(level.key(p), []).append(p)
+            key = level.key(p)
+            if not key:
+                skipped.append(p)
+            else:
+                keyed.setdefault(key, []).append(p)
+        if not keyed:
+            # Level applies to nothing in this group — skip it wholesale.
+            return _build_level(group, depth + 1)
         # Single-value collapse: the level adds no choice, so skip the
         # 1-child Fork wrapper and recurse straight into the next level.
-        if len(keyed) == 1:
+        if not skipped and len(keyed) == 1:
             return _build_level(next(iter(keyed.values())), depth + 1)
         siblings: list[Fork] = []
         for key, sub in keyed.items():
@@ -133,6 +149,8 @@ def build_fork_tree[P](
                     is_leaf=False,
                 )
             )
+        if skipped:
+            siblings.extend(_build_level(skipped, depth + 1))
         return _sorted(siblings)
 
     top = _build_level(list(params), 0)

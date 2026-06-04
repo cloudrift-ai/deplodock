@@ -88,8 +88,10 @@ def _build_tree(plan, ctx: Context) -> Fork | list[Fork]:
     return build_fork_tree(
         params=plan.params,
         levels=[
+            Level((_planner.MMA.name,), lambda p: (p.atom.name,) if p.atom is not None else ()),
             Level((BR.name,), lambda p: (p.br,)),
             Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
+            Level((_planner.WM.name, _planner.WN.name), lambda p: (p.wm, p.wn)),
             Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
             Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
         ],

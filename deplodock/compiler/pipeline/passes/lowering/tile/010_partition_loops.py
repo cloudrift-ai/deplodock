@@ -42,7 +42,7 @@ FM=FN=1, BK=16, SPLITK=1, BR=1):
                                 Write(C[m_b·16 + m_t, n_b·16 + n_t], acc)
 
 Warp-tier (MMA) variant — emitted by ``_build_split_body_warp`` when the
-planner picks a :class:`WarpTileParams` row (only fires when
+planner picks a warp-tier ``TileParams`` row (only fires when
 ``DEPLODOCK_MMA=1`` and ``is_atom_eligible`` passes; see
 ``plans/mma-fragment-factorization.md``). The output-axis factorization
 gains a WARP tier between BLOCK and REGISTER and an ATOM tier inside
@@ -152,9 +152,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     SPLITK,
     WM,
     WN,
-    ScalarTileParams,
     TileParams,
-    WarpTileParams,
     enumerate_cartesian,
     mma_mode,
     planner_pin_snapshot,
@@ -242,14 +240,24 @@ class _Plan:
 
 
 def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | list[Fork]:
-    """Emit a hierarchical Fork tree over knob bundles:
-    ``BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
+    """Emit one hierarchical Fork tree over knob bundles:
+    ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
+
+    Both tiers live in the one tree: the root ``MMA`` level keys the warp
+    rows by atom kind while scalar rows return an empty key and SKIP the
+    level (their ``BR``-and-below subtree splices up as siblings of the
+    atom branches — no ``MMA`` knob ever pins a scalar path), and the
+    builder's single-value collapse erases tier-foreign levels — warp rows
+    carry ``br = bm = bn = 1`` so the ``BR`` / ``(BM,BN)`` levels vanish
+    inside a warp subtree, scalar rows carry ``wm = wn = 1`` so ``(WM,WN)``
+    vanishes inside the scalar subtree. Warp-vs-scalar ordering is
+    score-driven like every other sibling decision (an explicit
+    ``DEPLODOCK_MMA=<kind>`` pin is authoritative — ``_plan_kernel`` drops
+    the scalar tier so score can't sidestep the pin).
 
     Single-variant kernels short-circuit to a bare ``TileOp`` (the engine
-    applies it inline without a fork point). Single-value Fork levels are
-    collapsed so a tree with N effective branching levels emits only N
-    Fork wrappers — most matmul kernels have BR fixed at 1 so they
-    actually emit a 3-level tree.
+    applies it inline without a fork point). Most matmul kernels have BR
+    fixed at 1, so they actually emit a 3-level scalar tree.
 
     Variant *materialization* (``_build_split_body`` + ``TileOp(...)``
     which runs the body-normalize pipeline) is deferred to the leaf
@@ -278,52 +286,19 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     if len(plan.params) == 1:
         return _materialize(plan, plan.params[0])
 
-    # Per Design decision 11 of plans/mma-fragment-factorization.md, scalar
-    # and warp tiers carry disjoint knob bundles → disjoint fork-tree level
-    # schemas. Split params by row type and emit one subtree per non-empty
-    # tier. Warp-tier siblings sort first (matmul priority puts MMA above
-    # scalar by construction). When only scalar params exist (the today's
-    # default with DEPLODOCK_MMA=off), the second call returns ``[]`` and
-    # the result is byte-identical to the pre-M3 single call.
-    scalar_params = tuple(p for p in plan.params if isinstance(p, ScalarTileParams))
-    warp_params = tuple(p for p in plan.params if isinstance(p, WarpTileParams))
-
-    def _build_scalar_subtree() -> Fork | list[Fork]:
-        return build_fork_tree(
-            params=scalar_params,
-            levels=[
-                Level((BR.name,), lambda p: (p.br,)),
-                Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
-                Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
-                Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
-            ],
-            materialize=lambda p: _materialize(plan, p),
-            score=lambda p: _score_variant(plan, p, ctx),
-        )
-
-    def _build_warp_subtree() -> Fork | list[Fork]:
-        return build_fork_tree(
-            params=warp_params,
-            levels=[
-                Level((MMA.name,), lambda p: (p.atom.name,)),
-                Level((WM.name, WN.name), lambda p: (p.wm, p.wn)),
-                Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
-                Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
-            ],
-            materialize=lambda p: _materialize(plan, p),
-            score=lambda p: _score_variant(plan, p, ctx),
-        )
-
-    if not warp_params:
-        return _build_scalar_subtree()
-    if not scalar_params:
-        return _build_warp_subtree()
-    # Both tiers present — concatenate as sibling Forks.
-    scalar_tree = _build_scalar_subtree()
-    warp_tree = _build_warp_subtree()
-    scalar_list = [scalar_tree] if isinstance(scalar_tree, Fork) else list(scalar_tree)
-    warp_list = [warp_tree] if isinstance(warp_tree, Fork) else list(warp_tree)
-    return [*warp_list, *scalar_list]
+    return build_fork_tree(
+        params=plan.params,
+        levels=[
+            Level((MMA.name,), lambda p: (p.atom.name,) if p.atom is not None else ()),
+            Level((BR.name,), lambda p: (p.br,)),
+            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
+            Level((WM.name, WN.name), lambda p: (p.wm, p.wn)),
+            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
+            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+        ],
+        materialize=lambda p: _materialize(plan, p),
+        score=lambda p: _score_variant(plan, p, ctx),
+    )
 
 
 def _variant_knobs(base_knobs: dict, params: TileParams) -> dict:
@@ -332,7 +307,7 @@ def _variant_knobs(base_knobs: dict, params: TileParams) -> dict:
     :func:`_score_variant` (handed to ``TileOp.lazy_score``), so the lazy
     and eager score paths read identical knob inputs and a params → knobs
     translation can't drift between them."""
-    if isinstance(params, WarpTileParams):
+    if params.atom is not None:
         return {
             **base_knobs,
             WN.name: params.wn,
@@ -787,7 +762,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # to enable + pin one atom kind — see ``_enumeration.mma_mode``),
         # no prologue (M9 extension), static M/N/K, and the per-kind
         # eligibility predicate fires. Each eligible kind gets one
-        # WarpTileParams row per (wn, wm, fm, fn, bk, splitk); we
+        # warp-tier TileParams row per (wn, wm, fm, fn, bk, splitk); we
         # concatenate them onto the scalar param list — the fork tree in
         # :func:`rewrite` splits the rows by type and emits sibling
         # subtrees with disjoint level schemas.
@@ -834,7 +809,15 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                 # at render. The scalar tier covers those tiny tiles. Single-warp
                 # is never the perf pick anyway, so pruning is free.
                 warp_combos = [p for p in warp_combos if p.wm * p.wn != 1]
-                param_combos = [*warp_combos, *param_combos]
+                if pinned_atom is not None and warp_combos:
+                    # An explicit ``DEPLODOCK_MMA=<kind>`` pin is authoritative
+                    # (mirrors ``Knob.narrow``): drop the scalar tier so the
+                    # score-driven sibling order can't sidestep the pin. A
+                    # structurally unworkable pin (no surviving warp rows)
+                    # keeps the scalar fallback.
+                    param_combos = warp_combos
+                else:
+                    param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
         # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
         # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
@@ -953,13 +936,13 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     the prologue's M-axis references resolve to the in-scope ``M_r``.
 
     The warp-tier MMA builder lands here in M3 of
-    ``plans/mma-fragment-factorization.md``. At M1 no ``WarpTileParams`` row
+    ``plans/mma-fragment-factorization.md``. At M1 no warp-tier row
     ever reaches this function (the warp enumerator returns []) — the
-    isinstance dispatch routes warp-tier rows to
+    ``atom is not None`` dispatch routes warp-tier rows to
     :func:`_build_split_body_warp` (M3); the rest of this function handles
     the scalar tier.
     """
-    if isinstance(params, WarpTileParams):
+    if params.atom is not None:
         return _build_split_body_warp(shape, params)
     sigma_map: dict[str, object] = {}
 
@@ -1204,7 +1187,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     return _wrap_tower(layers, new_inner)
 
 
-def _build_split_body_warp(shape: KernelShape, params: WarpTileParams) -> tuple[Stmt, ...]:
+def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...]:
     """σ-split + tower wrap for the warp-tier MMA matmul path.
 
     Mirrors :func:`_build_split_body` but with the 4-level output-axis
@@ -1219,7 +1202,7 @@ def _build_split_body_warp(shape: KernelShape, params: WarpTileParams) -> tuple[
     No prologue / masked tile support at M3 (matches the warp enumerator,
     which rejects non-divisor extents). Symbolic axes / cooperative-K
     are gated off by construction (the eligibility predicate refuses
-    them; ``BR=1`` is enforced in :class:`WarpTileParams`).
+    them; ``BR=1`` is enforced on warp-tier rows by construction).
 
     The ``M_a`` / ``N_a`` Vars *do not appear* in ``σ_outer`` — the
     in-fragment lane offset is owned by the mma.sync instruction, not the

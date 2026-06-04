@@ -1,7 +1,8 @@
 """Tests for the hierarchical Fork tree emitted by ``010_partition_loops``.
 
-The planner emits a ``BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``
-Fork tree from a ``_Plan`` (cheap-to-build pre-materialization state).
+The planner emits one ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) →
+(BK,SPLITK) → TileOp leaf`` Fork tree from a ``_Plan`` (cheap-to-build
+pre-materialization state); tier-foreign levels collapse (single value).
 Levels with a single value collapse (no Fork wrapper). Branch scores
 propagate ``max`` from leaves so the search picks high-Q subtrees first.
 Leaf ``expand`` thunks materialize the chosen TileOp on demand —
@@ -44,8 +45,10 @@ def _build_fork_tree_lazy(plan, ctx: Context) -> Fork | list[Fork]:
     return build_fork_tree(
         params=plan.params,
         levels=[
+            Level((_planner.MMA.name,), lambda p: (p.atom.name,) if p.atom is not None else ()),
             Level((BR.name,), lambda p: (p.br,)),
             Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
+            Level((_planner.WM.name, _planner.WN.name), lambda p: (p.wm, p.wn)),
             Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
             Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
         ],
@@ -266,11 +269,12 @@ def test_pointwise_collapses_br_layer():
 
 def test_branch_knobs_partition_cleanly():
     """The union of (root-fork knobs, walked branch knobs, leaf knobs)
-    along any root→leaf path must cover ``{BR, BM, BN, FM, FN, BK, SPLITK}``
-    exactly once each — no knob duplicated across levels, none missing."""
+    along any root→leaf path must cover the planner's level knobs
+    ``{MMA, BR, BM, BN, WM, WN, FM, FN, BK, SPLITK}`` at most once each —
+    no knob duplicated across levels (tier-foreign levels collapse)."""
     plan = _matmul_plan()
     tree = _build_fork_tree_lazy(plan, _ctx())
-    expected = {"BR", "BM", "BN", "FM", "FN", "BK", "SPLITK"}
+    expected = {"MMA", "BR", "BM", "BN", "WM", "WN", "FM", "FN", "BK", "SPLITK"}
 
     # Walk one root→leaf path and check.
     def _first_path(node: Fork) -> list[Fork]:

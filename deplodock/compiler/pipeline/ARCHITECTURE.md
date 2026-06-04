@@ -85,9 +85,16 @@ into get materialized. `Fork.knobs` is read by `_best_fork` (for
 DB-seeded greedy replay) without firing the thunk; `Fork.score` is the
 MCTS prior the producing rule attaches.
 
-The partition planner (`lowering/tile/010_partition_loops`) emits a
-hierarchical Fork tree: `BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp`
-leaf. Sibling sorting uses `TileOp.lazy_score(ctx, knobs=..., shapes=...)`
+The partition planner (`lowering/tile/010_partition_loops`) emits one
+hierarchical Fork tree over both tiers:
+`MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → (BK,SPLITK) → TileOp` leaf. The root
+`MMA` level keys warp rows by atom kind; scalar rows return an empty key and skip the level (their subtree
+splices up as siblings of the atom branches — no `MMA` knob ever pins a scalar path), and the builder's
+single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 1`, scalar rows
+`wm = wn = 1`), so a pure-scalar kernel's tree is exactly the classic
+`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`. Warp-vs-scalar ordering is score-driven; an explicit
+`DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so score can't sidestep it).
+Sibling sorting uses `TileOp.lazy_score(ctx, knobs=..., shapes=...)`
 — the static-method counterpart of `Op.score` that estimates the same
 formula from cheap inputs (the variant's stamped knob dict + planner shape)
 so siblings rank without anyone instantiating a TileOp. The branch tree's `Fork.score`
@@ -101,12 +108,10 @@ hardware-atomic MMA cell tier) are wired through `_layer_kind_for` /
 fragment-factorization consumer plan (`plans/mma-fragment-factorization.md`)
 will flip these tiers when its M3 ships, without revisiting the tower
 mechanics. M1 of that plan landed the `AtomTile` flavor + the (then-empty)
-atom registry — now `ir/tile/ir.py`'s `ATOM_REGISTRY` — + the `TileParams = ScalarTileParams |
-WarpTileParams` sum-type split in `_enumeration` (`ScalarTileParams`
-carries today's `(BN, BM, FM, FN, BK, SPLITK, BR)`; `WarpTileParams`
-carries `(WN, WM, FM, FN, BK, SPLITK, atom)` — the `Atom` spec object
-directly (the `MMA` knobs-dict entry is stamped from `atom.name`) — no `BR`, no
-`BN`/`BM`). `085_warp_specialize` already emits `WarpTile(role)` (one
+atom registry — now `ir/tile/ir.py`'s `ATOM_REGISTRY` — + the warp-tier row in `_enumeration`'s
+`TileParams` (one frozen structure for both tiers, discriminated by `atom`: `None` = scalar with
+`bn / bm / br / fk` meaningful, an `Atom` spec object = warp tier with `wn / wm` meaningful and the rest
+neutral at 1; the `MMA` knobs-dict entry is stamped from `atom.name`). `085_warp_specialize` already emits `WarpTile(role)` (one
 role axis = total CTA warps) wrapping `WarpSpecialize` directly,
 bypassing the planner's tower builder — its role split is structural
 (`Cond(role < n_producer_warps, …)`), not the σ-shifted extended

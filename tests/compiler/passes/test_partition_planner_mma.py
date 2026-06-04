@@ -23,7 +23,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
     is_atom_eligible,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
-    WarpTileParams,
+    TileParams,
     _enumerate_warp_matmul_impl,
 )
 
@@ -267,7 +267,7 @@ def test_unregistered_kind_raises():
     """The dispatcher has no fallback — an unknown kind surfaces a
     ``KeyError`` rather than silently returning False. "scalar" is the
     canonical example: it's the *absence* of an atom (modelled by
-    ``ScalarTileParams``), not a registered kind."""
+    a scalar-tier ``TileParams``), not a registered kind."""
     g = _matmul_graph(dtype=F16)
     loop_op = g.nodes["c"].op
     with pytest.raises(KeyError):
@@ -298,7 +298,7 @@ def test_registry_spec_shape_and_group_size():
 # --- Warp-tier enumerator (M3) ---------------------------------------
 
 
-def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("mma_m16n8k16_f16",)) -> list[WarpTileParams]:
+def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("mma_m16n8k16_f16",)) -> list[TileParams]:
     return _enumerate_warp_matmul_impl(
         E_M=M,
         E_N=N,
@@ -362,8 +362,8 @@ def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
     """
     from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
 
-    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
-    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
+    gold = TileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
+    baseline = TileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
     # On sm_90+ the gold tile must outscore the gmem-direct sibling.
     gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
     baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
@@ -485,7 +485,6 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     sm_90 here; the single-warp variant is pruned (ldmatrix needs staged
     smem) so a multi-warp pin (WM=WN=2) keeps the tower."""
     from deplodock.compiler.ir.tile.ir import AtomTile, GridTile, TileOp, WarpTile
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
 
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
@@ -496,8 +495,8 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(9, 0)), kernel_name="c", graph=g)
     assert plan is not None
     assert plan.params, "expected ≥1 enumerated variant"
-    warp_rows = [p for p in plan.params if isinstance(p, WarpTileParams)]
-    assert warp_rows, "expected ≥1 WarpTileParams row when DEPLODOCK_MMA=1"
+    warp_rows = [p for p in plan.params if p.atom is not None]
+    assert warp_rows, "expected ≥1 warp-tier row when DEPLODOCK_MMA=1"
 
     # Materialize the first warp row and verify the tower shape.
     tile_op = _planner._materialize(plan, warp_rows[0])
@@ -521,16 +520,14 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
 def test_planner_scalar_only_when_mma_disabled(monkeypatch):
     """With ``DEPLODOCK_MMA=0`` set explicitly, the planner emits only
     scalar variants. (Default is now ON; setting ``0`` is the opt-out.)"""
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import ScalarTileParams, WarpTileParams
-
     monkeypatch.setenv("DEPLODOCK_MMA", "0")
 
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    assert all(isinstance(p, ScalarTileParams) for p in plan.params)
-    assert not any(isinstance(p, WarpTileParams) for p in plan.params)
+    assert all(p.atom is None for p in plan.params)
+    assert not any(p.atom is not None for p in plan.params)
 
 
 def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
@@ -538,8 +535,6 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
     the kind on a pin-only arch (sm_80-89, where mma.sync doesn't
     auto-enumerate) — previously this took a separate ``DEPLODOCK_ATOM_KIND``
     pin on top of the gate."""
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
-
     monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
@@ -548,6 +543,6 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    warp_rows = [p for p in plan.params if isinstance(p, WarpTileParams)]
+    warp_rows = [p for p in plan.params if p.atom is not None]
     assert warp_rows, "MMA=<kind> must enable the warp tier on a pin-only arch"
     assert all(p.atom.name == "mma_m16n8k16_f16" for p in warp_rows)

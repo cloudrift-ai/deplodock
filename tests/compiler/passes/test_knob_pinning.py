@@ -283,6 +283,11 @@ def test_unstageable_atom_raises_clear_error(monkeypatch):
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
     for k, v in _SCALAR_F16_KNOBS.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    # Pin the kind: a DEPLODOCK_MMA=<kind> pin is authoritative (the planner
+    # drops the scalar tier), so greedy MUST take the atom variant — without
+    # the pin the score-driven sibling order may pick the scalar config and
+    # never reach the unstageable-atom error path.
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     with pytest.raises(LoweringError, match="DEPLODOCK_MMA=0"):
         CudaBackend().compile(g)
 
