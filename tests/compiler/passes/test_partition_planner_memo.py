@@ -1,11 +1,10 @@
-"""Tests for the partition planner's structural enumeration memo + the lazy
-Fork-tree build (``010_partition_loops._ENUM_MEMO`` / ``fork_tree.build_fork_tree``).
+"""Tests for the partition planner's op-metadata plan cache + the lazy
+Fork-tree build (``010_partition_loops`` / ``fork_tree.build_fork_tree``).
 
-A whole-model graph repeats the same kernel shapes once per transformer layer;
-the memo shares the enumerated ``TileParams`` and their scores across
-structurally identical LoopOps, and the lazy tree builds branch Forks only
-along the explored path. All assertions are call-count / identity based —
-no wall-time flakiness.
+The finished ``_Plan`` rides its LoopOp as op metadata, keyed by
+``_plan_cache_key`` so pin / ctx / dtype changes invalidate the stamp; the
+lazy tree builds branch Forks only along the explored path. All assertions
+are call-count / identity based — no wall-time flakiness.
 """
 
 from __future__ import annotations
@@ -32,19 +31,16 @@ BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planne
 
 
 @pytest.fixture(autouse=True)
-def _fresh_memo(monkeypatch):
-    """Fresh memo + no stray planner pins: enumeration counts and memo keys
-    are pin-sensitive, so clear every ``DEPLODOCK_<KNOB>`` a previous test in
-    the same worker may have leaked."""
+def _no_stray_pins(monkeypatch):
+    """Plan cache keys and enumeration counts are pin-sensitive — clear every
+    ``DEPLODOCK_<KNOB>`` (alias spellings included) a previous test in the
+    same worker may have leaked."""
     from deplodock.compiler.pipeline.passes.lowering.tile import _enumeration  # noqa: PLC0415
 
     for knob in _enumeration._PLANNER_KNOBS:
         monkeypatch.delenv(knob.env, raising=False)
         for alias in knob.aliases:
             monkeypatch.delenv(f"DEPLODOCK_{alias}", raising=False)
-    _planner._reset_enum_memo()
-    yield
-    _planner._reset_enum_memo()
 
 
 def _ctx() -> Context:
@@ -52,9 +48,7 @@ def _ctx() -> Context:
 
 
 def _loop_op_matmul(*, a: str = "a", b: str = "b", o: str = "o", i: str = "i", j: str = "j", k: str = "k") -> LoopOp:
-    """Plain matmul LoopOp with parameterized buffer / axis names — two calls
-    with different names are structurally identical (``Body.structural_key``
-    canonicalizes SSA, buffer, and free-axis names away)."""
+    """Plain matmul LoopOp with parameterized buffer / axis names."""
     i_ax, j_ax, k_ax = Axis(i, 128), Axis(j, 128), Axis(k, 64)
     return LoopOp(
         body=(
@@ -104,67 +98,10 @@ def _build_tree(plan, ctx: Context) -> Fork | list[Fork]:
     )
 
 
-def test_enumeration_memoized_across_identical_loop_ops(monkeypatch):
-    """Two structurally identical LoopOps (different SSA / buffer / axis
-    names) must share one ``enumerate_cartesian`` run — the second
-    ``_plan_kernel`` is a memo hit."""
-    calls = {"n": 0}
-    real = _planner.enumerate_cartesian
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(_planner, "enumerate_cartesian", counting)
-    ctx = _ctx()
-    plan_1 = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
-    n_after_first = calls["n"]
-    plan_2 = _planner._plan_kernel(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2"), ctx, kernel_name="k_l1")
-    assert plan_1 is not None and plan_2 is not None
-    assert n_after_first >= 1
-    assert calls["n"] == n_after_first, "second structurally identical LoopOp re-ran enumerate_cartesian"
-    # The SAME params tuple object is shared — the id()-keyed score cache
-    # relies on this (see _Plan docstring).
-    assert plan_1.params is plan_2.params
-
-
-def test_scores_shared_across_identical_loop_ops(monkeypatch):
-    """Building the Fork tree for two structurally identical plans must
-    compute each param's lazy score exactly once in total: the second
-    tree's ``_score_variant`` calls hit the shared ``score_cache``."""
-    calls = {"n": 0}
-    real = TileOp.lazy_score
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(TileOp, "lazy_score", staticmethod(counting))
-    ctx = _ctx()
-    plan_1 = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
-    plan_2 = _planner._plan_kernel(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2"), ctx, kernel_name="k_l1")
-    _build_tree(plan_1, ctx)
-    assert calls["n"] == len(plan_1.params)
-    _build_tree(plan_2, ctx)
-    assert calls["n"] == len(plan_1.params), "second tree re-scored params instead of hitting the shared score_cache"
-
-
-def test_dtype_signature_separates_memo_entries():
-    """Same body structure, different operand dtypes → different memo keys
-    (dtypes gate the fp16 half2 window enumeration)."""
-    ctx = _ctx()
-    loop_op = _loop_op_matmul()
-    key_f16 = _planner._enum_cache_key(loop_op, ctx, _graph_with_dtypes("f16", "f16"))
-    key_f32 = _planner._enum_cache_key(loop_op, ctx, _graph_with_dtypes("f32", "f32"))
-    key_none = _planner._enum_cache_key(loop_op, ctx, None)
-    assert key_f16 != key_f32
-    assert key_f16 != key_none and key_f32 != key_none
-
-
 def test_plan_rides_op_metadata(monkeypatch):
     """Re-planning the SAME LoopOp object is an op-metadata hit — the
     stamped ``_Plan`` comes back without re-running classification or
-    enumeration — and a pin flip invalidates the stamp (the stored memo
+    enumeration — and a pin flip invalidates the stamp (the stored cache
     key no longer matches)."""
     ctx = _ctx()
     loop_op = _loop_op_matmul()
@@ -179,21 +116,8 @@ def test_plan_rides_op_metadata(monkeypatch):
     assert all(p.bk == 16 for p in plan_3.params)
 
 
-def test_mma_pin_lands_in_memo_key(monkeypatch):
-    """``MMA`` is a planner knob, so the pin snapshot covers it: flipping
-    ``DEPLODOCK_MMA`` must produce a fresh memo key (it gates the warp-tier
-    enumeration)."""
-    ctx = _ctx()
-    loop_op = _loop_op_matmul()
-    key_default = _planner._enum_cache_key(loop_op, ctx, None)
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    key_off = _planner._enum_cache_key(loop_op, ctx, None)
-    assert key_default != key_off
-
-
-def test_pin_snapshot_invalidates_memo(monkeypatch):
-    """A ``DEPLODOCK_<KNOB>`` pin flipped mid-process must land on a fresh
-    memo key — ``enumerate_cartesian`` folds pins live via ``Knob.narrow``."""
+def test_op_metadata_hit_skips_enumeration(monkeypatch):
+    """The stamp hit must not re-run ``enumerate_cartesian``."""
     calls = {"n": 0}
     real = _planner.enumerate_cartesian
 
@@ -203,13 +127,36 @@ def test_pin_snapshot_invalidates_memo(monkeypatch):
 
     monkeypatch.setattr(_planner, "enumerate_cartesian", counting)
     ctx = _ctx()
-    _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
-    n_unpinned = calls["n"]
-    monkeypatch.setenv("DEPLODOCK_BK", "16")
-    plan_pinned = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
-    assert calls["n"] > n_unpinned, "pinned re-plan replayed the unpinned cached enumeration"
-    assert plan_pinned is not None
-    assert all(p.bk == 16 for p in plan_pinned.params)
+    loop_op = _loop_op_matmul()
+    _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
+    n_first = calls["n"]
+    assert n_first >= 1
+    _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
+    assert calls["n"] == n_first, "op-metadata hit re-ran enumerate_cartesian"
+
+
+def test_dtype_signature_separates_cache_keys():
+    """Same body structure, different operand dtypes → different plan cache
+    keys (dtypes gate the fp16 half2 window enumeration)."""
+    ctx = _ctx()
+    loop_op = _loop_op_matmul()
+    key_f16 = _planner._plan_cache_key(loop_op, ctx, _graph_with_dtypes("f16", "f16"))
+    key_f32 = _planner._plan_cache_key(loop_op, ctx, _graph_with_dtypes("f32", "f32"))
+    key_none = _planner._plan_cache_key(loop_op, ctx, None)
+    assert key_f16 != key_f32
+    assert key_f16 != key_none and key_f32 != key_none
+
+
+def test_mma_pin_lands_in_cache_key(monkeypatch):
+    """``MMA`` is a planner knob, so the pin snapshot covers it: flipping
+    ``DEPLODOCK_MMA`` must produce a fresh plan cache key (it gates the
+    warp-tier enumeration)."""
+    ctx = _ctx()
+    loop_op = _loop_op_matmul()
+    key_default = _planner._plan_cache_key(loop_op, ctx, None)
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    key_off = _planner._plan_cache_key(loop_op, ctx, None)
+    assert key_default != key_off
 
 
 def test_lazy_tree_builds_only_expanded_path(monkeypatch):
@@ -236,13 +183,14 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
         assert node.score == pytest.approx(max(c.score for c in children)), "lazy branch score != max over expanded children"
         node = children[0]
         path.append(node)
-    assert created["n"] < len(plan.params), f"lazy tree created {created['n']} Forks for a single-path walk over {len(plan.params)} params"
+    assert created["n"] < len(plan.params), (
+        f"lazy tree created {created['n']} Forks for a single-path walk over {len(plan.params)} params"
+    )
 
 
-def test_score_variant_parity_with_uncached_lazy_score():
-    """The precomputed score inputs (``score_n_staged`` /
-    ``score_write_inner_fv``) must not change the score: ``_score_variant``
-    equals a from-scratch ``TileOp.lazy_score`` for every variant."""
+def test_score_variant_matches_lazy_score():
+    """``_score_variant`` is a thin wrapper over ``TileOp.lazy_score`` — the
+    two must agree for every variant."""
     ctx = _ctx()
     plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     assert plan is not None
