@@ -27,6 +27,7 @@ PHASE_SMOKE_TEST = "smoke_test"
 # Optional sub-phases parsed best-effort from container logs (absent when unmatched).
 # They live *inside* model_load_and_warmup, so they are excluded from the total.
 PHASE_WEIGHTS_LOAD = "weights_load"
+PHASE_TORCH_COMPILE = "torch_compile"  # engine kernel / torch.compile (inductor) compilation
 PHASE_CUDA_GRAPH = "cuda_graph_capture"
 
 # Benchmark / teardown (per task)
@@ -35,7 +36,7 @@ PHASE_TEARDOWN = "teardown"
 PHASE_COMMAND = "command"  # command-recipe coarse wall-clock
 
 # Sub-phases excluded from total() (they are a breakdown of model_load_and_warmup).
-SUBPHASES = frozenset({PHASE_WEIGHTS_LOAD, PHASE_CUDA_GRAPH})
+SUBPHASES = frozenset({PHASE_WEIGHTS_LOAD, PHASE_TORCH_COMPILE, PHASE_CUDA_GRAPH})
 
 # Canonical render order for the .txt section and console table.
 PHASE_ORDER = [
@@ -45,6 +46,7 @@ PHASE_ORDER = [
     PHASE_MODEL_DOWNLOAD,
     PHASE_MODEL_LOAD_AND_WARMUP,
     PHASE_WEIGHTS_LOAD,
+    PHASE_TORCH_COMPILE,
     PHASE_CUDA_GRAPH,
     PHASE_SMOKE_TEST,
     PHASE_BENCHMARK,

@@ -163,8 +163,9 @@ and a `[timing] <name>: 12.3s` line is logged. Phase-name constants live in `tim
 `model_load_and_warmup` (the `compose up --wait` window — covers weight load into GPU + CUDA graph capture + warmup),
 `smoke_test`; plus `benchmark`, `teardown`, and `command` (command recipes). After `model_load_and_warmup`,
 `orchestrate.py` scrapes `docker compose logs` via `log_phases.parse_engine_load_phases()` for best-effort sub-phases
-`weights_load` / `cuda_graph_capture` — absent when the engine/log format doesn't match. These two are a breakdown of
-`model_load_and_warmup`, so they are **excluded from `total`** (which would otherwise double-count). Near-zero phases
+`weights_load` / `torch_compile` (engine kernel / torch.compile time) / `cuda_graph_capture` — absent when the
+engine/log format doesn't match. These three are a breakdown of `model_load_and_warmup`, so they are **excluded from
+`total`** (which would otherwise double-count). Near-zero phases
 (`container_cleanup`, health poll, `system_info`) are intentionally not timed, so the phases don't fully sum to raw
 wall-clock.
 

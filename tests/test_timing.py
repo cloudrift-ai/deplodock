@@ -8,6 +8,7 @@ from deplodock.timing import (
     PHASE_CUDA_GRAPH,
     PHASE_IMAGE_PULL,
     PHASE_MODEL_LOAD_AND_WARMUP,
+    PHASE_TORCH_COMPILE,
     PHASE_VM_PROVISION,
     PHASE_WEIGHTS_LOAD,
     PhaseTimer,
@@ -66,10 +67,11 @@ def test_total_excludes_subphases():
     t = PhaseTimer()
     t.record(PHASE_MODEL_LOAD_AND_WARMUP, 70.0, log=False)
     t.record(PHASE_WEIGHTS_LOAD, 11.0, log=False)
+    t.record(PHASE_TORCH_COMPILE, 20.0, log=False)
     t.record(PHASE_CUDA_GRAPH, 18.0, log=False)
     t.record(PHASE_IMAGE_PULL, 30.0, log=False)
-    # weights_load + cuda_graph_capture are a breakdown of model_load_and_warmup,
-    # so they must not inflate the total.
+    # weights_load + torch_compile + cuda_graph_capture are a breakdown of
+    # model_load_and_warmup, so they must not inflate the total.
     assert t.total() == 100.0
 
 
