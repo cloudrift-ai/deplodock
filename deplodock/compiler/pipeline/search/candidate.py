@@ -333,7 +333,7 @@ class LazyCandidate:
         Branch and leaf Forks score identically: ``inner.score() +
         fork.score``. ``fork.score`` is the planner-computed prior the
         rule attached (for partition leaves, that's
-        ``TileOp.lazy_score(ctx, shapes=..., params=...)`` — the same
+        ``TileOp.lazy_score(ctx, knobs=..., shapes=...)`` — the same
         formula ``TileOp.score`` runs post-materialization, but cheap).
 
         We deliberately do NOT fire ``fork.expand()`` here to recover

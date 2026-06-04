@@ -183,16 +183,15 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
         assert node.score == pytest.approx(max(c.score for c in children)), "lazy branch score != max over expanded children"
         node = children[0]
         path.append(node)
-    assert created["n"] < len(plan.params), (
-        f"lazy tree created {created['n']} Forks for a single-path walk over {len(plan.params)} params"
-    )
+    assert created["n"] < len(plan.params), f"lazy tree created {created['n']} Forks for a single-path walk over {len(plan.params)} params"
 
 
 def test_score_variant_matches_lazy_score():
     """``_score_variant`` is a thin wrapper over ``TileOp.lazy_score`` — the
-    two must agree for every variant."""
+    two must agree for every variant when fed the same stamped knob dict."""
     ctx = _ctx()
     plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     assert plan is not None
     for p in plan.params:
-        assert _planner._score_variant(plan, p, ctx) == pytest.approx(TileOp.lazy_score(ctx, shapes=plan.shape, params=p))
+        lazy = TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
+        assert _planner._score_variant(plan, p, ctx) == pytest.approx(lazy)

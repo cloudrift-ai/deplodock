@@ -326,16 +326,55 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     return [*warp_list, *scalar_list]
 
 
+def _variant_knobs(base_knobs: dict, params: TileParams) -> dict:
+    """The exact knob dict the materialized TileOp carries for ``params`` —
+    the single source of truth shared by :func:`_materialize` (stamping) and
+    :func:`_score_variant` (handed to ``TileOp.lazy_score``), so the lazy
+    and eager score paths read identical knob inputs and a params → knobs
+    translation can't drift between them."""
+    if isinstance(params, WarpTileParams):
+        return {
+            **base_knobs,
+            WN.name: params.wn,
+            WM.name: params.wm,
+            FM.name: params.fm,
+            FN.name: params.fn,
+            BK.name: params.bk,
+            SPLITK.name: params.splitk,
+            MMA.name: params.atom.name,
+        }
+    knobs = {
+        **base_knobs,
+        BN.name: params.bn,
+        BM.name: params.bm,
+        FM.name: params.fm,
+        FN.name: params.fn,
+        FK.name: params.fk,
+        BK.name: params.bk,
+        SPLITK.name: params.splitk,
+        BR.name: params.br,
+    }
+    if params.fp16_window:
+        # Distinct marker so ``kernel/015_pack_fk_window`` fires only on the
+        # fp16-matmul half2 window — NOT on the reduce-axis FK (which also
+        # stamps FK>1 but is realized by the reduce fold in
+        # ``kernel/010_split_register_axes``).
+        knobs["FKWIN"] = params.fk
+    return knobs
+
+
 def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
-    """Score one variant from the plan + params. Prefers
-    :meth:`TileOp.lazy_score` (cheap, params/shape-only) and falls back to
-    materializing + :meth:`TileOp.score` if a future TileOp drops its lazy
-    implementation. Lets the planner rank siblings before paying the
-    body-construction cost."""
-    lazy = TileOp.lazy_score(ctx, shapes=plan.shape, params=params)
-    if lazy is not None:
-        return lazy
-    return _materialize(plan, params).score(ctx)
+    """Score one variant via :meth:`TileOp.lazy_score` (cheap, knobs/shape-only
+    — fed the exact knob dict the materialized op would carry, via
+    :func:`_variant_knobs`). Lets the planner rank siblings before paying the
+    body-construction cost. Scoring MUST stay materialization-free — this
+    runs once per enumerated variant (~40k+ per matmul kernel), and a single
+    ``_materialize`` is ~1.5 ms of body building + normalization; a ``None``
+    here means ``lazy_score``'s contract was broken, not a fallback case."""
+    lazy = TileOp.lazy_score(ctx, knobs=_variant_knobs(plan.base_knobs, params), shapes=plan.shape)
+    if lazy is None:
+        raise AssertionError(f"TileOp.lazy_score returned None for kernel {plan.kernel_name!r} — the variant scorer must not materialize")
+    return lazy
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -884,35 +923,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
         chain_body = _build_split_body(plan.shape, params)
     except RuleSkipped as exc:
         raise AssertionError(f"shape-level RuleSkipped fired at materialize time for kernel {plan.kernel_name!r}: {exc}") from exc
-    if isinstance(params, WarpTileParams):
-        knobs = {
-            **plan.base_knobs,
-            WN.name: params.wn,
-            WM.name: params.wm,
-            FM.name: params.fm,
-            FN.name: params.fn,
-            BK.name: params.bk,
-            SPLITK.name: params.splitk,
-            MMA.name: params.atom.name,
-        }
-    else:
-        knobs = {
-            **plan.base_knobs,
-            BN.name: params.bn,
-            BM.name: params.bm,
-            FM.name: params.fm,
-            FN.name: params.fn,
-            FK.name: params.fk,
-            BK.name: params.bk,
-            SPLITK.name: params.splitk,
-            BR.name: params.br,
-        }
-        if params.fp16_window:
-            # Distinct marker so ``kernel/015_pack_fk_window`` fires only on the
-            # fp16-matmul half2 window — NOT on the reduce-axis FK (which also
-            # stamps FK>1 but is realized by the reduce fold in
-            # ``kernel/010_split_register_axes``).
-            knobs["FKWIN"] = params.fk
+    knobs = _variant_knobs(plan.base_knobs, params)
     # Drop leading stmts whose SSA name is *also* defined inside ``chain_body``.
     # A pre-loop invariant (e.g. ``v0 = reciprocal(1024)``) used only by a
     # post-reduce stmt gets pulled into the thread scope by the body builder as

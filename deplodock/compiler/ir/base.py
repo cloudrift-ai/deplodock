@@ -116,7 +116,7 @@ class Op:
         return None
 
     @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004
+    def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:  # noqa: ARG004
         """Cheap pre-instantiation scorer. Lets a rule rank variants
         without building each op just to read :meth:`score` — the
         instantiation may be the bulk of the lowering cost (e.g.
@@ -125,10 +125,12 @@ class Op:
         Subclasses override to implement when the score formula can be
         evaluated from precomputed inputs:
 
-        - ``knobs`` — pinned knob dict for this variant
+        - ``knobs`` — the variant's knob dict, exactly what the
+          materialized op would carry in ``Op.knobs`` (so DB rows /
+          golden configs / pin sets are scoreable without
+          reconstructing any rule-internal variant type)
         - ``shapes`` — op-defined shape descriptor (e.g. ``KernelShape``
           for ``TileOp`` — the static per-LoopOp planning state)
-        - ``params`` — op-defined variant tuple (e.g. ``TileParams``)
 
         Return ``None`` when the lazy path isn't implementable for
         these inputs; callers (rules using deferred-materialization

@@ -1982,15 +1982,18 @@ class TileOp(BodyOp):
         )
 
     @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004 — knobs reserved for symmetry with Op.lazy_score
+    def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:
         """Lazy scorer (see :meth:`Op.lazy_score`). Returns ``None`` unless
         called with both ``shapes`` (a :class:`KernelShape` from the
-        partition planner) and ``params`` (a :class:`TileParams` variant —
-        :class:`ScalarTileParams` or :class:`WarpTileParams`). Computes the
-        same value :meth:`score` would on the materialized TileOp, but
-        without running ``_build_split_body`` or ``TileOp.__post_init__`` —
-        lets the planner rank dozens of variants per LoopOp in microseconds
-        instead of milliseconds each.
+        partition planner) and ``knobs`` (the variant's stamped knob dict —
+        the exact dict the materialized TileOp would carry, built by the
+        planner's ``_variant_knobs``). Computes the same value :meth:`score`
+        would on the materialized TileOp, but without running
+        ``_build_split_body`` or ``TileOp.__post_init__`` — lets the planner
+        rank dozens of variants per LoopOp in microseconds instead of
+        milliseconds each. The warp tier is recognized by the ``MMA`` key,
+        mirroring :func:`score_tile_geometry`'s own dispatch; the atom cell
+        shape comes from ``ATOM_REGISTRY[knobs["MMA"]]``.
 
         Launch geometry the planner will produce (mirrors ``_wrap_tower``):
             - scalar tier: block axes ``[K_s?, M_b?, N_b]`` extent
@@ -2006,34 +2009,38 @@ class TileOp(BodyOp):
         product (matches what :meth:`score` does with non-static
         ``Axis.extent``).
         """
-        if shapes is None or params is None:
+        if shapes is None or knobs is None:
             return None
-        from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
-
         shape = shapes
-        p = params
 
         m_symbolic = shape.outer_m is not None and not shape.outer_m.axis.extent.is_static
         n_symbolic = not shape.outer_n.axis.extent.is_static
 
-        is_warp = isinstance(p, WarpTileParams)
-        if is_warp:
-            atom_m, atom_n, _ = p.atom.shape
-            per_m = p.wm * p.fm * atom_m
-            per_n = p.wn * p.fn * atom_n
+        fm = int(knobs.get("FM", 1))
+        fn = int(knobs.get("FN", 1))
+        splitk = int(knobs.get("SPLITK", 1))
+        if "MMA" in knobs:
+            atom_m, atom_n, _ = ATOM_REGISTRY[str(knobs["MMA"])].shape
+            wm = int(knobs.get("WM", 1))
+            wn = int(knobs.get("WN", 1))
+            per_m = wm * fm * atom_m
+            per_n = wn * fn * atom_n
             # "Thread axes" for the warp tier = warps × lanes. Use a
             # 2-element decomposition that products to wn·wm·32 so the
             # score_tile_geometry occupancy / coalescing math still works.
-            thread_extents: list[int] = [p.wn * 32, p.wm]
+            thread_extents: list[int] = [wn * 32, wm]
         else:
-            per_m = p.bm * p.fm
-            per_n = p.bn * p.fn
+            bm = int(knobs.get("BM", 1))
+            bn = int(knobs.get("BN", 1))
+            br = int(knobs.get("BR", 1))
+            per_m = bm * fm
+            per_n = bn * fn
             thread_extents = []
-            if p.br > 1:
-                thread_extents.append(p.br)
+            if br > 1:
+                thread_extents.append(br)
             if shape.outer_m is not None:
-                thread_extents.append(p.bm)
-            thread_extents.append(p.bn)
+                thread_extents.append(bm)
+            thread_extents.append(bn)
 
         # ceil-div, not floor — when ``per_m > E_M`` (or ``per_n > E_N``) the
         # materializer still emits 1 CTA (with a masked Cond), and when
@@ -2042,8 +2049,8 @@ class TileOp(BodyOp):
         # ``_compute_score`` (which reads the GridTile's actual axis extents)
         # sees the same block_extents as ``lazy_score`` does pre-materialize.
         block_extents: list[int] = []
-        if p.splitk > 1:
-            block_extents.append(p.splitk)
+        if splitk > 1:
+            block_extents.append(splitk)
         if shape.outer_m is not None:
             if m_symbolic:
                 block_extents.append(1)
@@ -2056,44 +2063,11 @@ class TileOp(BodyOp):
             E_N = shape.outer_n.axis.extent.as_static()
             block_extents.append(max(1, (E_N + per_n - 1) // per_n))
 
-        # Planner always stamps FM/FN — score keys off ``"FM" in knobs``.
-        # BM/BN/BK go in too so the macro-aspect + smem-fit signals see the
-        # planner's tile shape (post-materialization ``_cached_score`` reads
-        # ``self.knobs`` which already carries these; without them here the
-        # lazy_score path would silently fall back to BM=BN=1 defaults).
-        if is_warp:
-            # MMA / WM / WN feed the warp-tier branch of
-            # ``score_tile_geometry``: the cells-sweet-spot prior keys off
-            # ``MMA in knobs``, the aspect-ratio prior reads FM/FN
-            # (already here), and the TMA-bonus's N-stride calc uses
-            # ``WN · FN · atom_N``. Omitting them silently routed the warp
-            # tier through the scalar branch and over-counted the TMA
-            # bonus for skewed shapes — exactly the FM=1 FN=32 regression
-            # ``plans/mma-warp-scoring.md`` chases.
-            score_knobs = {
-                "FM": p.fm,
-                "FN": p.fn,
-                "SPLITK": p.splitk,
-                "BK": p.bk,
-                "WM": p.wm,
-                "WN": p.wn,
-                "MMA": p.atom.name,
-            }
-        else:
-            score_knobs = {
-                "FM": p.fm,
-                "FN": p.fn,
-                "SPLITK": p.splitk,
-                "BM": p.bm,
-                "BN": p.bn,
-                "BK": p.bk,
-            }
-
         # Stages are added by later passes (020_stage_inputs); the planner's
         # output never contains them at this point.
         has_stages = False
 
-        coalescing = TileOp._coalescing_inner_extent_from_writes(shape, p)
+        coalescing = TileOp._coalescing_inner_extent_from_writes(shape, knobs)
 
         smem_cap = getattr(ctx, "max_dynamic_smem", None) if ctx is not None else None
         cc = getattr(ctx, "compute_capability", None) if ctx is not None else None
@@ -2106,7 +2080,7 @@ class TileOp(BodyOp):
         return score_tile_geometry(
             thread_extents=thread_extents,
             block_extents=block_extents,
-            knobs=score_knobs,
+            knobs=knobs,
             has_stages=has_stages,
             coalescing_inner_extent=coalescing,
             smem_cap_bytes=smem_cap,
@@ -2115,13 +2089,14 @@ class TileOp(BodyOp):
         )
 
     @staticmethod
-    def _coalescing_inner_extent_from_writes(shape, params) -> int:
+    def _coalescing_inner_extent_from_writes(shape, knobs) -> int:
         """Mirror of :meth:`_coalescing_inner_extent` computed against the
         un-rewritten LoopOp body. σ_outer keeps the outer M/N axis names
         on the eventual thread tiles (M_t inherits ``outer_m.axis.name``,
         N_t inherits ``outer_n.axis.name``, K_c inherits ``k_loop.axis.name``),
         so the inner-stride free-var match works the same way before and
-        after body construction.
+        after body construction. ``knobs`` is the variant's stamped knob
+        dict (warp tier recognized by the ``MMA`` key).
 
         Size-1 thread axes are skipped — ``normalize_body`` inlines them
         out of the materialized body, so they don't appear in the post-
@@ -2130,26 +2105,30 @@ class TileOp(BodyOp):
         with ``TileOp.score`` on size-1 corners (e.g. BN=1 matmul rows).
         """
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams  # noqa: PLC0415
 
         thread_extent: dict[str, int] = {}
-        if isinstance(params, WarpTileParams):
+        if "MMA" in knobs:
             # Warp-tier: the "thread" axes are warps × lanes. Treat the
             # WN × 32 contribution as the inner-stride coalescer along N,
             # mirroring the scalar BN role.
-            atom_m, atom_n, _ = params.atom.shape
-            if shape.outer_m is not None and params.wm > 1:
-                thread_extent[shape.outer_m.axis.name] = params.wm * atom_m
-            n_extent = params.wn * atom_n
+            atom_m, atom_n, _ = ATOM_REGISTRY[str(knobs["MMA"])].shape
+            wm = int(knobs.get("WM", 1))
+            wn = int(knobs.get("WN", 1))
+            if shape.outer_m is not None and wm > 1:
+                thread_extent[shape.outer_m.axis.name] = wm * atom_m
+            n_extent = wn * atom_n
             if n_extent > 1:
                 thread_extent[shape.outer_n.axis.name] = n_extent
         else:
-            if params.br > 1 and shape.k_loop is not None:
-                thread_extent[shape.k_loop.axis.name] = params.br
-            if shape.outer_m is not None and params.bm > 1:
-                thread_extent[shape.outer_m.axis.name] = params.bm
-            if params.bn > 1:
-                thread_extent[shape.outer_n.axis.name] = params.bn
+            bm = int(knobs.get("BM", 1))
+            bn = int(knobs.get("BN", 1))
+            br = int(knobs.get("BR", 1))
+            if br > 1 and shape.k_loop is not None:
+                thread_extent[shape.k_loop.axis.name] = br
+            if shape.outer_m is not None and bm > 1:
+                thread_extent[shape.outer_m.axis.name] = bm
+            if bn > 1:
+                thread_extent[shape.outer_n.axis.name] = bn
         if not thread_extent:
             return 0
 

@@ -228,22 +228,27 @@ def test_first_leaf_matches_best_score_variant():
         node = node.expand()[0]
     leaf_op = node.expand()[0]
 
-    expected = max(plan.params, key=lambda p: TileOp.lazy_score(ctx, shapes=plan.shape, params=p))
-    assert leaf_op.score(ctx) == pytest.approx(TileOp.lazy_score(ctx, shapes=plan.shape, params=expected)), (
-        f"option-0 leaf TileOp.score {leaf_op.score(ctx)} != best lazy_score {TileOp.lazy_score(ctx, shapes=plan.shape, params=expected)}"
+    def _lazy(p):
+        return TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
+
+    expected = max(plan.params, key=_lazy)
+    assert leaf_op.score(ctx) == pytest.approx(_lazy(expected)), (
+        f"option-0 leaf TileOp.score {leaf_op.score(ctx)} != best lazy_score {_lazy(expected)}"
     )
 
 
 def test_lazy_score_matches_tile_op_score():
     """``Op.lazy_score`` contract check: the lazy estimate must equal what
-    the materialized ``TileOp.score(ctx)`` returns. Run across every
-    variant of the matmul plan since it has the widest variant set + the
-    full FM/FN/SPLITK branching that exercises every score-formula branch."""
+    the materialized ``TileOp.score(ctx)`` returns — both consume the SAME
+    knob dict (``_variant_knobs`` builds it; ``_materialize`` stamps it).
+    Run across every variant of the matmul plan since it has the widest
+    variant set + the full FM/FN/SPLITK branching that exercises every
+    score-formula branch."""
     plan = _matmul_plan()
     ctx = _ctx()
     for p in plan.params:
         materialized = _materialize(plan, p)
-        lazy = TileOp.lazy_score(ctx, shapes=plan.shape, params=p)
+        lazy = TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
         assert lazy is not None, f"TileOp.lazy_score returned None for {p}"
         assert materialized.score(ctx) == pytest.approx(lazy), (
             f"score mismatch for {p}: TileOp.score={materialized.score(ctx)} vs lazy_score={lazy}"
