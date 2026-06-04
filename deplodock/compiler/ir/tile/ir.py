@@ -1512,7 +1512,7 @@ def score_tile_geometry(
     """Pure-formula scoring backing :meth:`TileOp.lazy_score` (the only
     scorer). Takes the launch-geometry summary the score depends on (already
     resolved to static ints, symbolic axes substituted as 1) plus the knob
-    bundle, so the planner can rank un-materialized ``TileParams`` without a
+    bundle, so the planner can rank un-materialized knob rows without a
     ``TileOp`` ever existing.
 
     ``coalescing_inner_extent`` is the summed extent of thread axes that

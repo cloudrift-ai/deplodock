@@ -45,12 +45,12 @@ def _build_fork_tree_lazy(plan, ctx: Context) -> Fork | list[Fork]:
     return build_fork_tree(
         params=plan.params,
         levels=[
-            Level((_planner.MMA.name,), lambda p: (p.atom.name,) if p.atom is not None else ()),
-            Level((BR.name,), lambda p: (p.br,)),
-            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
-            Level((_planner.WM.name, _planner.WN.name), lambda p: (p.wm, p.wn)),
-            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
-            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+            Level((_planner.MMA.name,), lambda p: (p["MMA"],) if "MMA" in p else ()),
+            Level((BR.name,), lambda p: (p.get("BR", 1),)),
+            Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
+            Level((_planner.WM.name, _planner.WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
+            Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
+            Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _materialize(plan, p),
         score=lambda p: _score_variant(plan, p, ctx),
@@ -233,7 +233,7 @@ def test_first_leaf_matches_best_score_variant():
         node = node.expand()[0]
 
     def _lazy(p):
-        return TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
+        return TileOp.lazy_score(ctx, knobs={**plan.base_knobs, **p}, shapes=plan.shape)
 
     best = max(_lazy(p) for p in plan.params)
     assert node.score() == pytest.approx(best), f"option-0 leaf prior {node.score()} != best lazy_score {best}"

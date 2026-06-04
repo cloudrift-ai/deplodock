@@ -3,16 +3,15 @@
 Owns the planner's tunable knob globals (BN / BM / WM / WN / FM / FN / BK /
 SPLITK / BR / MMA), the per-mode candidate tuples (matmul / pointwise
 / reduce), the pruned cartesian generator, and the per-mode priority/score
-functions used to rank the resulting ``TileParams`` set.
+functions used to rank the resulting knob-row set.
 
 Three layers:
 
-1. Public ``TileParams`` — the cartesian product element, one frozen
-   structure for both tiers, discriminated by ``atom``: ``None`` = scalar
-   (``bn / bm / br / fk`` meaningful), an
-   :class:`~deplodock.compiler.ir.tile.ir.Atom` = warp-tier MMA matmul
-   (``wn / wm`` meaningful; the rest neutral at 1). Frozen for de-dup in
-   the ``seen`` set inside the impls.
+1. The variant row — a plain knob dict (see the block comment above the
+   priority functions): scalar tier carries {BN, BM, FM, FN, FK, BK,
+   SPLITK, BR} (+ FKWIN / OVERHANG), warp tier {WN, WM, FM, FN, BK,
+   SPLITK, MMA}; ``"MMA" in row`` discriminates. De-dup keys on
+   ``frozenset(row.items())``.
 2. Public ``enumerate_cartesian(...)`` — mode-dispatched wrapper that picks
    the candidate tuples + priority function for ``matmul`` / ``reduce`` /
    ``pointwise``, folds ``DEPLODOCK_<KNOB>`` env pins via ``Knob.narrow``,
@@ -23,9 +22,9 @@ Three layers:
    bare ``"matmul"`` string is an alias for the thread tier.
 3. Private ``_enumerate_cartesian_impl(...)`` — pure cartesian generator
    over caller-supplied (already-narrowed) tuples; produces scalar-tier
-   :class:`TileParams` rows (matmul / reduce / pointwise). A sibling
+   scalar-tier knob rows (matmul / reduce / pointwise). A sibling
    ``_enumerate_warp_matmul_impl`` produces warp-tier rows
-   (``atom`` set).
+   (``MMA`` key set).
 
 Kept as a non-pass sibling module (``_`` prefix → Pass loader skips) so
 the planner imports the public API without going through
@@ -38,14 +37,13 @@ in what order" lives here.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 if TYPE_CHECKING:
-    # Used only in annotations (``TileParams.atom`` / the generator params).
+    # Used only in annotations (the warp generator's ``atoms`` param).
     # A runtime import would cycle: _enumeration → ir.tile.ir → tuning →
     # _enumeration. The code only reads attributes off ``Atom`` instances it's
     # handed, never constructs the class, so a type-only import suffices.
@@ -148,63 +146,24 @@ def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
     return tuple((k.name, k.raw()) for k in _PLANNER_KNOBS)
 
 
-@dataclass(frozen=True)
-class TileParams:
-    """One enumerated tile variant — both tiers in one frozen structure, the
-    tier discriminated by ``atom``: ``None`` = scalar (THREAD-binding; ``bn``
-    / ``bm`` / ``br`` / ``fk`` meaningful, ``wn`` / ``wm`` fixed at 1), an
-    :class:`~deplodock.compiler.ir.tile.ir.Atom` = warp-tier MMA matmul
-    (``wn`` / ``wm`` meaningful; ``bn`` / ``bm`` / ``br`` / ``fk`` fixed at
-    their neutral 1). The neutral defaults keep both enumeration sites terse
-    AND let the planner's single unified fork tree collapse tier-foreign
-    levels (a warp subtree's ``BR`` / ``(BM, BN)`` levels are single-valued
-    at 1 → no Fork wrapper; ditto ``(WM, WN)`` in the scalar subtree).
-    Frozen for de-dup in the cartesian's ``seen`` set.
-
-    Scalar tier: used for scalar matmul, cooperative-K reduce, and pointwise
-    kernels — any kernel whose per-output-cell compute is owned by a single
-    thread.
-
-    Warp tier: ``atom`` is the :class:`~deplodock.compiler.ir.tile.ir.Atom`
-    spec directly (cell shape ``(M, N, K)``, per-operand dtypes, group size)
-    — carried as the object, not a kind string (the ``MMA`` knobs-dict entry
-    is stamped from ``atom.name`` when the bundle is built). ``wn``/``wm``
-    are the per-CTA warp count along the output N / M axes; together with the
-    atom cell shape and ``fn``/``fm`` they determine the matmul tile
-    dimensions ``BN = wn × fn × atom_n``, ``BM = wm × fm × atom_m``. No
-    ``br`` (MMA gates ``BR=1`` by construction).
-
-    ``overhang`` lists output-axis names admitted at a non-divisor tile
-    (masked tiles). Empty for clean-divisor variants. The planner stamps the
-    same tuple onto the emitted ``TileOp.knobs["OVERHANG"]`` so downstream
-    passes (staging, materialization) can guard cooperative loads.
-    """
-
-    fm: int
-    fn: int
-    bk: int
-    splitk: int
-    # --- scalar (THREAD-binding) tier; neutral 1 on warp rows ---
-    bn: int = 1
-    bm: int = 1
-    br: int = 1
-    # Reduce-axis multiple-accumulator factor. For non-matmul reduces (> 1)
-    # strip-mines the K serial loop into FK independent accumulators
-    # (``plans/fk-register-tile-reductions.md``). For the fp16 scalar matmul it
-    # is the half2 accumulation-window length (= ``bk``, even) when
-    # ``fp16_window`` is set (``plans/fk-half2-fp16-matmul.md``); the planner
-    # still emits the FK=1 fp32 structure and ``kernel/075_pack_fk_window``
-    # realizes the windowed half2 accumulate + fp32 flush from the stamped knob.
-    fk: int = 1
-    # True for the fp16-matmul half2-window variant — disambiguates ``fk > 1``
-    # (window length = bk) from the reduce strip-mine so the planner keeps the
-    # fp32 K factorization and only 075 rewrites it.
-    fp16_window: bool = False
-    # --- warp (WARP-binding MMA) tier; neutral 1 / None on scalar rows ---
-    wn: int = 1
-    wm: int = 1
-    atom: Atom | None = None
-    overhang: tuple[str, ...] = ()
+# A planner variant row IS its knob dict — the exact keys the materialized
+# TileOp will carry (the planner merges it over the LoopOp's carry-forward
+# knobs when stamping / scoring):
+#
+#   scalar tier  {BN, BM, FM, FN, FK, BK, SPLITK, BR}
+#                (+ ``FKWIN``: the fp16 half2 accumulation-window length —
+#                disambiguates window ``FK`` from the reduce strip-mine, see
+#                ``plans/fk-half2-fp16-matmul.md``; + ``OVERHANG``: tuple of
+#                masked output-axis names for non-divisor tiles)
+#   warp tier    {WN, WM, FM, FN, BK, SPLITK, MMA}
+#                (``"MMA" in row`` discriminates the tier; the ``Atom`` spec
+#                is ``ATOM_REGISTRY[row["MMA"]]``)
+#
+# There is deliberately no row class: one representation flows end-to-end —
+# enumeration → fork-tree levels → ``TileOp.lazy_score`` → body builder →
+# ``TileOp.knobs`` → DB rows — so any recorded knob dict is directly
+# scoreable and materializable. De-dup inside the impls keys on
+# ``frozenset(row.items())``.
 
 
 def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
@@ -215,7 +174,7 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
     return tuple(d for d in range(1, min(n, cap) + 1) if n % d == 0)
 
 
-def _priority_matmul_thread(p: TileParams) -> tuple[int, ...]:
+def _priority_matmul_thread(p: dict) -> tuple[int, ...]:
     # Tiebreaker for the enumeration sort. The Fork-tree builder re-sorts
     # each level by ``score_tile_geometry`` (the MCTS prior) — see
     # ``compiler/pipeline/fork_tree.py`` — so this ordering only affects
@@ -230,30 +189,30 @@ def _priority_matmul_thread(p: TileParams) -> tuple[int, ...]:
     # too coarse for fp32 lanes), BK=1/2 stay last (the K-loop collapses
     # to ≤2 steps; the -O1/-O3 ranking inversion makes them look
     # artificially fast during tuning).
-    threads = p.bn * p.bm
-    macro_area = p.bm * p.fm * p.bn * p.fn
+    threads = p["BN"] * p["BM"]
+    macro_area = p["BM"] * p["FM"] * p["BN"] * p["FN"]
     fat_tile = macro_area >= 8192
     if fat_tile:
         _BK_FAT_PREF = {16: 5, 32: 5, 8: 4, 64: 3, 4: 2, 2: 1, 1: 0}
-        bk_key = _BK_FAT_PREF.get(p.bk, -1)
+        bk_key = _BK_FAT_PREF.get(p["BK"], -1)
     else:
-        bk_key = p.bk
+        bk_key = p["BK"]
     return (
         int(fat_tile),  # fat-tile variants surface first
-        min(p.fm * p.fn, 128),  # cells/thread, capped at the register-tile sweet spot
+        min(p["FM"] * p["FN"], 128),  # cells/thread, capped at the register-tile sweet spot
         -abs(256 - threads),  # threads near 256
         bk_key,  # cuBLAS-band BK tier, then large BK otherwise
-        -p.splitk,
+        -p["SPLITK"],
         # fp16 half2 window FK: ``FK=1`` (scalar fp32 accumulate) ranks first so
         # the greedy default stays byte-identical; among the windowed variants
         # prefer the 2–8 band. Sits below the geometry keys (a low tiebreak).
-        int(p.fk == 1),
-        int(2 <= p.fk <= 8),
-        -len(p.overhang),
+        int(p["FK"] == 1),
+        int(2 <= p["FK"] <= 8),
+        -len(p.get("OVERHANG", ())),
     )
 
 
-def _priority_matmul_warp(p: TileParams, *, ctx: Context | None = None) -> tuple[int, ...]:
+def _priority_matmul_warp(p: dict, *, ctx: Context | None = None) -> tuple[int, ...]:
     # Warp-tier ranking for tensor-core MMA matmul (fp16 / bf16 with f32
     # accumulator, swizzled s16816 ``mma_m16n8k16_*`` atom on sm_90+).
     #
@@ -285,33 +244,33 @@ def _priority_matmul_warp(p: TileParams, *, ctx: Context | None = None) -> tuple
     # (``|m_tile − n_tile|``), a 4-warp CTA, a balanced warp grid, then BK=2.
     # (Same-tile warp splits — WM2 WN2 vs WM1 WN4, both 64×64 — are perf-equal;
     # which one wins the residual tie is not load-bearing.)
-    threads = p.wn * p.wm * 32
-    cells = p.fm * p.fn
+    threads = p["WN"] * p["WM"] * 32
+    cells = p["FM"] * p["FN"]
     tma_capable = ctx is not None and ctx.compute_capability >= (9, 0)
     if tma_capable:
-        m_tile = p.wm * p.fm * 16
-        n_tile = p.wn * p.fn * 8
+        m_tile = p["WM"] * p["FM"] * 16
+        n_tile = p["WN"] * p["FN"] * 8
         return (
             -abs(m_tile * n_tile - 64 * 64),  # 64×64 output tile (4096 elems/CTA)
             -abs(m_tile - n_tile),  # square tile beats skewed same-area
             -abs(threads - 128),  # 4-warp CTA
-            -abs(p.wm - p.wn),  # balanced warp grid (avoid WN1/WM1 skew)
-            -abs(p.bk - 2),
-            -p.bk,
-            -p.splitk,
-            -len(p.overhang),
+            -abs(p["WM"] - p["WN"]),  # balanced warp grid (avoid WN1/WM1 skew)
+            -abs(p["BK"] - 2),
+            -p["BK"],
+            -p["SPLITK"],
+            -len(p.get("OVERHANG", ())),
         )
-    return (-abs(cells - 16), -abs(p.fm - p.fn), -abs(256 - threads), p.bk, -p.splitk, -len(p.overhang))
+    return (-abs(cells - 16), -abs(p["FM"] - p["FN"]), -abs(256 - threads), p["BK"], -p["SPLITK"], -len(p.get("OVERHANG", ())))
 
 
-def _priority_pointwise(p: TileParams) -> tuple[int, ...]:
+def _priority_pointwise(p: dict) -> tuple[int, ...]:
     # Memory-bandwidth bound — fewer cells/thread → more CTAs → better
     # SM occupancy. Threads near 256. Final tiebreaker: clean-divisor wins.
-    threads = p.bn * p.bm
-    return (-(p.fm * p.fn), -abs(256 - threads), -len(p.overhang))
+    threads = p["BN"] * p["BM"]
+    return (-(p["FM"] * p["FN"]), -abs(256 - threads), -len(p.get("OVERHANG", ())))
 
 
-def _priority_reduce(p: TileParams) -> tuple[int, ...]:
+def _priority_reduce(p: dict) -> tuple[int, ...]:
     # Warp-sized BR enables warp-shuffle Combine; threads near 256.
     # Static reduce never masks; a symbolic free axis forces masking (every
     # variant then carries the same overhang, so no clean-divisor tiebreak).
@@ -322,8 +281,8 @@ def _priority_reduce(p: TileParams) -> tuple[int, ...]:
     # extra leaves the *tuner* explores, never shifting the default. Among the
     # FK>1 leaves the 2–4 ILP sweet spot is preferred so the search visits a
     # couple of multiple-accumulator variants early.
-    threads = p.bn * p.bm * p.br
-    return (min(p.br, 256), -abs(256 - threads), int(p.fk == 1), int(2 <= p.fk <= 4), p.bk, -p.splitk)
+    threads = p["BN"] * p["BM"] * p["BR"]
+    return (min(p["BR"], 256), -abs(256 - threads), int(p["FK"] == 1), int(2 <= p["FK"] <= 4), p["BK"], -p["SPLITK"])
 
 
 _NarrowFn = Callable[[tuple[int, ...]], tuple[int, ...]]
@@ -343,7 +302,7 @@ def enumerate_cartesian(
     n_forced_mask: bool = False,
     atoms: tuple[Atom, ...] = (),
     fp16_window: bool = False,
-) -> list[TileParams]:
+) -> list[dict]:
     """Pruned cartesian over ``(BN, BM, FM, FN, BK, SPLITK, BR)``, sorted by
     priority.
 
@@ -403,7 +362,7 @@ def enumerate_cartesian(
     # the resulting size-1 THREAD axes before they reach the IR, so the
     # broader search space only changes behavior for tiny shapes.
     if mode_kind == "matmul" and mode_tier == "warp":
-        # Warp-tier matmul — enumerate one TileParams row per eligible
+        # Warp-tier matmul — enumerate one knob row per eligible
         # ``Atom``.
         return _enumerate_warp_matmul_impl(
             E_M=E_M,
@@ -431,7 +390,7 @@ def enumerate_cartesian(
         splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
         br_choices: tuple[int, ...] = (1,)
         min_k_chunks = 1
-        priority_fn: Callable[[TileParams], tuple[int, ...]] = _priority_matmul_thread
+        priority_fn: Callable[[dict], tuple[int, ...]] = _priority_matmul_thread
         window_fk = fp16_window
     elif mode_kind == "reduce":
         bn_choices = _TUNE_AXIS_CHOICES
@@ -479,7 +438,7 @@ def enumerate_cartesian(
     # divisor-sweepable too; only plain matmul gets the wider sweep.
     allow_nondivisor_f_on_mask = mode_kind == "matmul" and not force_splitk_one
 
-    def _run(apply_pins: bool) -> list[TileParams]:
+    def _run(apply_pins: bool) -> list[dict]:
         return _enumerate_cartesian_impl(
             E_M=E_M,
             E_N=E_N,
@@ -529,7 +488,7 @@ def _enumerate_cartesian_impl(
     window_fk: bool = False,
     max_threads_per_cta: int,
     min_k_chunks: int,
-    priority_fn: Callable[[TileParams], tuple[int, ...]],
+    priority_fn: Callable[[dict], tuple[int, ...]],
     allow_empty_threads: bool = False,
     allow_masked: bool = False,
     allow_nondivisor_f_on_mask: bool = True,
@@ -537,7 +496,7 @@ def _enumerate_cartesian_impl(
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
-) -> list[TileParams]:
+) -> list[dict]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
     (``None`` to skip), the per-thread K-chunk floor, and the sort key.
@@ -545,7 +504,7 @@ def _enumerate_cartesian_impl(
 
     When ``allow_masked`` is set, candidates that violate the BN/BM-divides-E
     constraint are also admitted with the offending axis name recorded in
-    ``TileParams.overhang``. ``m_forced_mask`` / ``n_forced_mask`` (set for a
+    the row's ``OVERHANG`` entry. ``m_forced_mask`` / ``n_forced_mask`` (set for a
     symbolic axis tuned at its hint) admit masking regardless of ``allow_masked``
     AND record the axis in ``overhang`` even when BN/BM divides the hint — the
     runtime extent is unknown, so the masked boundary guard is always needed.
@@ -558,8 +517,8 @@ def _enumerate_cartesian_impl(
     # phantom / degenerate axes.
     n_maskable = (allow_masked or n_forced_mask) and n_axis_name is not None and E_N > 1
     m_maskable = (allow_masked or m_forced_mask) and m_axis_name is not None and E_M > 1
-    seen: set[TileParams] = set()
-    ordered: list[TileParams] = []
+    seen: set[tuple] = set()
+    ordered: list[dict] = []
     for bn in bn_choices:
         bn_c = min(bn, E_N)
         if bn_c < 1:
@@ -702,21 +661,27 @@ def _enumerate_cartesian_impl(
                                         overhang_axes = (*overhang_axes, n_axis_name)
                                     if fm_overhang and m_axis_name is not None:
                                         overhang_axes = (*overhang_axes, m_axis_name)
-                                    params = TileParams(
-                                        bn=bn_c,
-                                        bm=bm_c,
-                                        fm=fm,
-                                        fn=fn,
-                                        bk=bk,
-                                        splitk=splitk,
-                                        br=br,
-                                        fk=fk,
-                                        fp16_window=window_fk and fk > 1,
-                                        overhang=overhang_axes,
-                                    )
-                                    if params in seen:
+                                    # De-dup on the value tuple (cheaper than
+                                    # hashing the row dict's items) BEFORE
+                                    # building the row.
+                                    key = (bn_c, bm_c, fm, fn, fk, bk, splitk, br, overhang_axes)
+                                    if key in seen:
                                         continue
-                                    seen.add(params)
+                                    seen.add(key)
+                                    params = {
+                                        "BN": bn_c,
+                                        "BM": bm_c,
+                                        "FM": fm,
+                                        "FN": fn,
+                                        "FK": fk,
+                                        "BK": bk,
+                                        "SPLITK": splitk,
+                                        "BR": br,
+                                    }
+                                    if window_fk and fk > 1:
+                                        params["FKWIN"] = fk
+                                    if overhang_axes:
+                                        params["OVERHANG"] = overhang_axes
                                     ordered.append(params)
 
     ordered.sort(key=priority_fn, reverse=True)
@@ -738,9 +703,9 @@ def _enumerate_warp_matmul_impl(
     n_axis_name: str | None,  # noqa: ARG001
     m_forced_mask: bool,  # noqa: ARG001 — symbolic-axis masking for warp tier lands in M9
     n_forced_mask: bool,  # noqa: ARG001
-) -> list[TileParams]:
+) -> list[dict]:
     """Pure cartesian enumeration for the warp tier — produces
-    :class:`TileParams` rows. Parallel in spirit to
+    warp-tier knob rows. Parallel in spirit to
     :func:`_enumerate_cartesian_impl` but with the warp divisibility +
     per-CTA-thread budget formulae (per Design decision 11 of
     ``plans/mma-fragment-factorization.md``):
@@ -755,8 +720,8 @@ def _enumerate_warp_matmul_impl(
     if not atoms:
         return []
 
-    out: list[TileParams] = []
-    seen: set[TileParams] = set()
+    out: list[dict] = []
+    seen: set[tuple] = set()
     # Knob-narrow gate: fold ``DEPLODOCK_<KNOB>`` env pins into the candidate
     # tuples here at the warp tier, parallel to ``enumerate_cartesian``'s
     # ``_run(apply_pins=True)`` for the scalar tier. The plan B/C sweep and
@@ -824,19 +789,21 @@ def _enumerate_warp_matmul_impl(
                             for splitk in splitk_choices:
                                 if splitk < 1 or k_o_total % splitk != 0:
                                     continue
-                                row = TileParams(
-                                    wn=wn,
-                                    wm=wm,
-                                    fm=fm,
-                                    fn=fn,
-                                    bk=bk,
-                                    splitk=splitk,
-                                    atom=atom,
-                                )
-                                if row in seen:
+                                key = (wn, wm, fm, fn, bk, splitk, atom.name)
+                                if key in seen:
                                     continue
-                                seen.add(row)
-                                out.append(row)
+                                seen.add(key)
+                                out.append(
+                                    {
+                                        "WN": wn,
+                                        "WM": wm,
+                                        "FM": fm,
+                                        "FN": fn,
+                                        "BK": bk,
+                                        "SPLITK": splitk,
+                                        "MMA": atom.name,
+                                    }
+                                )
 
     out.sort(key=lambda p: _priority_matmul_warp(p, ctx=ctx), reverse=True)
     return out

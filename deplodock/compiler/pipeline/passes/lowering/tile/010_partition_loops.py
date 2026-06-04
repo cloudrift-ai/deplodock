@@ -42,7 +42,7 @@ FM=FN=1, BK=16, SPLITK=1, BR=1):
                                 Write(C[m_b·16 + m_t, n_b·16 + n_t], acc)
 
 Warp-tier (MMA) variant — emitted by ``_build_split_body_warp`` when the
-planner picks a warp-tier ``TileParams`` row (only fires when
+planner picks a warp-tier knob row (only fires when
 ``DEPLODOCK_MMA=1`` and ``is_atom_eligible`` passes; see
 ``plans/mma-fragment-factorization.md``). The output-axis factorization
 gains a WARP tier between BLOCK and REGISTER and an ATOM tier inside
@@ -129,6 +129,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Loop, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
+    ATOM_REGISTRY,
     Atom,
     AtomTile,
     GridTile,
@@ -145,14 +146,12 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     BM,
     BN,
     BR,
-    FK,
     FM,
     FN,
     MMA,
     SPLITK,
     WM,
     WN,
-    TileParams,
     enumerate_cartesian,
     mma_mode,
     planner_pin_snapshot,
@@ -194,7 +193,7 @@ PATTERN = [Pattern("root", LoopOp)]
 
 @dataclass(frozen=True)
 class KernelShape:
-    """Per-LoopOp shape info that stays constant across every ``TileParams``
+    """Per-LoopOp shape info that stays constant across every knob-row
     variant of a single kernel: the output axis Loops (innermost-N, optional
     M, extra outer chain), the K reduce Loop (None for pointwise), and the
     set of axis names ``_replace_k_loops`` should rewrite (collected once
@@ -218,7 +217,7 @@ class _Plan:
     LoopOp. Holds the inputs ``_materialize`` needs to build any single
     TileOp on demand: the per-LoopOp ``shape``, the leading non-Loop body
     stmts, the LoopOp's carry-forward knobs, the rendered kernel name, and
-    the enumerated ``TileParams`` sorted by score. The planner runs every
+    the enumerated knob rows sorted by score. The planner runs every
     classification + enumeration step once and stops short of body
     construction — ``_materialize(plan, params)`` runs the expensive
     ``_build_split_body`` + ``TileOp.__post_init__`` work for one
@@ -236,7 +235,7 @@ class _Plan:
     leading: tuple[Stmt, ...]
     base_knobs: dict
     kernel_name: str
-    params: tuple[TileParams, ...]
+    params: tuple[dict, ...]
 
 
 def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | list[Fork]:
@@ -264,7 +263,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     Fork's ``expand`` thunk, so greedy compile only builds the one
     chosen variant per LoopOp. ``_plan_kernel`` runs the cheap up-front
     classification + enumeration and produces a ``_Plan`` with bare
-    ``TileParams`` tuples; sibling sorting uses :meth:`TileOp.lazy_score`
+    knob rows; sibling sorting uses :meth:`TileOp.lazy_score`
     — the only scorer — so ranking never needs a materialized TileOp.
 
     The finished plan rides the LoopOp as op metadata (re-plans of the
@@ -288,64 +287,27 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     return build_fork_tree(
         params=plan.params,
         levels=[
-            Level((MMA.name,), lambda p: (p.atom.name,) if p.atom is not None else ()),
-            Level((BR.name,), lambda p: (p.br,)),
-            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
-            Level((WM.name, WN.name), lambda p: (p.wm, p.wn)),
-            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
-            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+            Level((MMA.name,), lambda p: (p["MMA"],) if "MMA" in p else ()),
+            Level((BR.name,), lambda p: (p.get("BR", 1),)),
+            Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
+            Level((WM.name, WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
+            Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
+            Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _materialize(plan, p),
         score=lambda p: _score_variant(plan, p, ctx),
     )
 
 
-def _variant_knobs(base_knobs: dict, params: TileParams) -> dict:
-    """The exact knob dict the materialized TileOp carries for ``params`` —
-    the single source of truth shared by :func:`_materialize` (stamping) and
-    :func:`_score_variant` (handed to ``TileOp.lazy_score``), so the lazy
-    and eager score paths read identical knob inputs and a params → knobs
-    translation can't drift between them."""
-    if params.atom is not None:
-        return {
-            **base_knobs,
-            WN.name: params.wn,
-            WM.name: params.wm,
-            FM.name: params.fm,
-            FN.name: params.fn,
-            BK.name: params.bk,
-            SPLITK.name: params.splitk,
-            MMA.name: params.atom.name,
-        }
-    knobs = {
-        **base_knobs,
-        BN.name: params.bn,
-        BM.name: params.bm,
-        FM.name: params.fm,
-        FN.name: params.fn,
-        FK.name: params.fk,
-        BK.name: params.bk,
-        SPLITK.name: params.splitk,
-        BR.name: params.br,
-    }
-    if params.fp16_window:
-        # Distinct marker so ``kernel/015_pack_fk_window`` fires only on the
-        # fp16-matmul half2 window — NOT on the reduce-axis FK (which also
-        # stamps FK>1 but is realized by the reduce fold in
-        # ``kernel/010_split_register_axes``).
-        knobs["FKWIN"] = params.fk
-    return knobs
-
-
-def _score_variant(plan: _Plan, params: TileParams, ctx: Context) -> float:
-    """Score one variant via :meth:`TileOp.lazy_score` (cheap, knobs/shape-only
-    — fed the exact knob dict the materialized op would carry, via
-    :func:`_variant_knobs`). Lets the planner rank siblings before paying the
-    body-construction cost. Scoring MUST stay materialization-free — this
-    runs once per enumerated variant (~40k+ per matmul kernel), and a single
+def _score_variant(plan: _Plan, params: dict, ctx: Context) -> float:
+    """Score one variant: the row IS the knob delta the materialized TileOp
+    will carry, so ``lazy_score`` consumes ``base_knobs`` merged with the
+    row verbatim. Scoring MUST stay materialization-free — this runs once
+    per enumerated variant (~40k+ per matmul kernel), and a single
     ``_materialize`` is ~1.5 ms of body building + normalization; a ``None``
     here means ``lazy_score``'s contract was broken, not a fallback case."""
-    lazy = TileOp.lazy_score(ctx, knobs=_variant_knobs(plan.base_knobs, params), shapes=plan.shape)
+    knobs = {**plan.base_knobs, **params} if plan.base_knobs else params
+    lazy = TileOp.lazy_score(ctx, knobs=knobs, shapes=plan.shape)
     if lazy is None:
         raise AssertionError(f"TileOp.lazy_score returned None for kernel {plan.kernel_name!r} — the variant scorer must not materialize")
     return lazy
@@ -599,7 +561,7 @@ def _input_dtype_signature(loop_op: LoopOp, graph: Graph | None) -> tuple[str, .
 
 def _plan_cache_key(loop_op: LoopOp, ctx: Context, graph: Graph | None) -> tuple:
     """Validity key for the op-metadata plan stamp — everything that changes
-    the enumerated ``TileParams`` list or a variant's score: the canonical
+    the enumerated knob rows or a variant's score: the canonical
     body structure (``Body.structural_key`` renames SSA / buffer / axis names
     away), the carry-forward knobs, the input dtypes, the hardware context,
     and the live ``DEPLODOCK_*`` planner pins (``enumerate_cartesian`` folds
@@ -621,7 +583,7 @@ def _plan_cache_key(loop_op: LoopOp, ctx: Context, graph: Graph | None) -> tuple
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph: Graph | None = None) -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
-    candidate ``TileParams`` but doesn't materialize any TileOp — the
+    candidate knob row but doesn't materialize any TileOp — the
     expensive ``_build_split_body`` + ``TileOp.__post_init__`` work is
     deferred to :func:`_materialize`, invoked from the chosen Fork leaf's
     ``expand`` thunk in :func:`_build_fork_tree_lazy`.
@@ -688,7 +650,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
 
     k_loop: Loop | None
     target_names: frozenset[str]
-    param_combos: list[TileParams]
+    param_combos: list[dict]
     if matmul_reduces:
         if outer_m is None:
             return None
@@ -761,11 +723,10 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # to enable + pin one atom kind — see ``_enumeration.mma_mode``),
         # no prologue (M9 extension), static M/N/K, and the per-kind
         # eligibility predicate fires. Each eligible kind gets one
-        # warp-tier TileParams row per (wn, wm, fm, fn, bk, splitk); we
+        # warp-tier knob row per (WN, WM, FM, FN, BK, SPLITK); we
         # concatenate them onto the scalar param list — the fork tree in
         # :func:`rewrite` splits the rows by type and emits sibling
         # subtrees with disjoint level schemas.
-        from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
         from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
         mma_on, pinned_atom = mma_mode()
@@ -807,7 +768,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                 # (``n_thread <= warp_size``) — an unstaged AtomTile would crash
                 # at render. The scalar tier covers those tiny tiles. Single-warp
                 # is never the perf pick anyway, so pruning is free.
-                warp_combos = [p for p in warp_combos if p.wm * p.wn != 1]
+                warp_combos = [p for p in warp_combos if p["WM"] * p["WN"] != 1]
                 if pinned_atom is not None and warp_combos:
                     # An explicit ``DEPLODOCK_MMA=<kind>`` pin is authoritative
                     # (mirrors ``Knob.narrow``): drop the scalar tier so the
@@ -887,8 +848,8 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     return plan
 
 
-def _materialize(plan: _Plan, params: TileParams) -> TileOp:
-    """Build one ``TileOp`` for a single ``TileParams`` against the
+def _materialize(plan: _Plan, params: dict) -> TileOp:
+    """Build one ``TileOp`` for a single knob row against the
     planner's pre-computed shape. The expensive bits — ``_build_split_body``
     and ``TileOp.__post_init__`` (which runs ``normalize_body`` over the
     fresh body) — happen here, lazily, from the chosen Fork leaf's
@@ -905,7 +866,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
         chain_body = _build_split_body(plan.shape, params)
     except RuleSkipped as exc:
         raise AssertionError(f"shape-level RuleSkipped fired at materialize time for kernel {plan.kernel_name!r}: {exc}") from exc
-    knobs = _variant_knobs(plan.base_knobs, params)
+    knobs = {**plan.base_knobs, **params}
     # Drop leading stmts whose SSA name is *also* defined inside ``chain_body``.
     # A pre-loop invariant (e.g. ``v0 = reciprocal(1024)``) used only by a
     # post-reduce stmt gets pulled into the thread scope by the body builder as
@@ -919,7 +880,7 @@ def _materialize(plan: _Plan, params: TileParams) -> TileOp:
     return TileOp(body=leading + chain_body, name=plan.kernel_name, knobs=knobs)
 
 
-def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...]:
+def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     """σ-split ``shape.outer_n``'s body and wrap in the output
     BLOCK/THREAD/REGISTER tower. ``shape.outer_m`` / ``shape.k_loop`` are
     None for 1D pointwise / non-reduce kernels.
@@ -941,7 +902,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     :func:`_build_split_body_warp` (M3); the rest of this function handles
     the scalar tier.
     """
-    if params.atom is not None:
+    if "MMA" in params:
         return _build_split_body_warp(shape, params)
     sigma_map: dict[str, object] = {}
 
@@ -950,11 +911,11 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # passes use this to group surrounding axes by source identity (e.g.
     # the MMA factorization plan's BLOCK·GROUP·CELL·ATOM enumeration along
     # each output axis) without name-suffix string matching.
-    overhang = frozenset(params.overhang)
+    overhang = frozenset(params.get("OVERHANG", ()))
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
     N_src = N_axis.source_axis or N_axis
-    n_bnfn = params.bn * params.fn
+    n_bnfn = params["BN"] * params["FN"]
     # ``n_bound`` is the masked-boundary Cond RHS (an Expr): ``Literal(E_N)`` for
     # a static overhang axis, the symbolic ``Var`` for a hint-driven one, None
     # when N isn't masked.
@@ -980,8 +941,8 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         # Symbolic, no hint (degenerate): bn=fn=1 by construction, bind the
         # whole axis to GridTile; the size-1 normalizer drops N_t / N_r.
         N_b = Axis(f"{N_name}_b", N_axis.extent, source_axis=N_src)
-    N_t = Axis(f"{N_name}_t", params.bn, source_axis=N_src)
-    N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
+    N_t = Axis(f"{N_name}_t", params["BN"], source_axis=N_src)
+    N_r = Axis(f"{N_name}_r", params["FN"], source_axis=N_src)
     # N register-tile decode — two layouts:
     #
     #   blocked      ``N = N_b·(BN·FN) + N_t·FN + N_r``  (thread-major)
@@ -1001,11 +962,11 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # warp reads BN contiguous columns per step (coalesced) despite the
     # per-cell guards. The Stage-fill (if any) and the register read share
     # this σ, so the column order stays self-consistent either way.
-    n_block = Var(N_b.name) * Literal(params.bn * params.fn, "int")
+    n_block = Var(N_b.name) * Literal(params["BN"] * params["FN"], "int")
     if N_name in overhang:
-        sigma_map[N_name] = n_block + Var(N_r.name) * Literal(params.bn, "int") + Var(N_t.name)
+        sigma_map[N_name] = n_block + Var(N_r.name) * Literal(params["BN"], "int") + Var(N_t.name)
     else:
-        sigma_map[N_name] = n_block + Var(N_t.name) * Literal(params.fn, "int") + Var(N_r.name)
+        sigma_map[N_name] = n_block + Var(N_t.name) * Literal(params["FN"], "int") + Var(N_r.name)
 
     M_b = M_t = M_r = None
     m_bound: object | None = None
@@ -1013,7 +974,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
         M_axis = shape.outer_m.axis
         M_name = M_axis.name
         M_src = M_axis.source_axis or M_axis
-        m_bnfm = params.bm * params.fm
+        m_bnfm = params["BM"] * params["FM"]
         if M_axis.extent.is_static:
             E_M = M_axis.extent.as_static()
             if M_name in overhang:
@@ -1026,10 +987,10 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
             m_bound = M_axis.extent.expr
         else:
             M_b = Axis(f"{M_name}_b", M_axis.extent, source_axis=M_src)
-        M_t = Axis(f"{M_name}_t", params.bm, source_axis=M_src)
-        M_r = Axis(f"{M_name}_r", params.fm, source_axis=M_src)
+        M_t = Axis(f"{M_name}_t", params["BM"], source_axis=M_src)
+        M_r = Axis(f"{M_name}_r", params["FM"], source_axis=M_src)
         sigma_map[M_name] = (
-            Var(M_b.name) * Literal(params.bm * params.fm, "int") + Var(M_t.name) * Literal(params.fm, "int") + Var(M_r.name)
+            Var(M_b.name) * Literal(params["BM"] * params["FM"], "int") + Var(M_t.name) * Literal(params["FM"], "int") + Var(M_r.name)
         )
 
     sigma_outer = Sigma(sigma_map)
@@ -1037,7 +998,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # K axes: K_s / K_c are kernel-wide (single SPLITK / single cooperative
     # thread direction); K_o / K_i / K_f are per-K-Loop, built inside
     # _replace_k_loops. K_f (the FK multiple-accumulator register strip-mine of
-    # the K serial loop) only exists for non-matmul reduces with ``params.fk > 1``.
+    # the K serial loop) only exists for non-matmul reduces with ``FK > 1``.
     K_s = K_c = K_f = None
     K_o_ext: object = 0
     K_src: Axis | None = None
@@ -1046,21 +1007,21 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     # (fp16 window + fp32 master) rewrite is done downstream in
     # ``kernel/075_pack_fk_window`` off the stamped ``FK`` knob. Only the reduce
     # strip-mine consumes ``fk`` in the factorization / K_f tile below.
-    fk = 1 if params.fp16_window else params.fk
+    fk = 1 if "FKWIN" in params else params["FK"]
     if shape.k_loop is not None:
         K_axis = shape.k_loop.axis
         K_name = K_axis.name
         K_src = K_axis.source_axis or K_axis
         if K_axis.extent.is_static:
             E_K = K_axis.extent.as_static()
-            K_o_ext = E_K // (params.splitk * params.br * params.bk * fk)
+            K_o_ext = E_K // (params["SPLITK"] * params["BR"] * params["BK"] * fk)
         else:
-            # Symbolic K (params.bk=splitk=br=fk=1 by planner construction): whole
+            # Symbolic K (params["BK"]=splitk=br=fk=1 by planner construction): whole
             # axis stays as one serial K_o iteration. ``Axis.__post_init__``
             # coerces the ``Dim`` straight back into the K_o axis.
             K_o_ext = K_axis.extent
-        K_s = Axis(f"{K_name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None
-        K_c = Axis(f"{K_name}_c", params.br, source_axis=K_src) if params.br > 1 else None
+        K_s = Axis(f"{K_name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
+        K_c = Axis(f"{K_name}_c", params["BR"], source_axis=K_src) if params["BR"] > 1 else None
         K_f = Axis(f"{K_name}_f", fk, source_axis=K_src) if fk > 1 else None
 
     # σ-rewrite outer_n's body (M/N axes), then replace every K-iter Loop with
@@ -1076,8 +1037,8 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
             K_s=K_s,
             K_c=K_c,
             K_f=K_f,
-            br=params.br,
-            bk=params.bk,
+            br=params["BR"],
+            bk=params["BK"],
             fk=fk,
             K_o_ext=K_o_ext,
         )
@@ -1123,8 +1084,8 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
                 K_s=K_s,
                 K_c=K_c,
                 K_f=K_f,
-                br=params.br,
-                bk=params.bk,
+                br=params["BR"],
+                bk=params["BK"],
                 fk=fk,
                 K_o_ext=K_o_ext,
             )
@@ -1186,7 +1147,7 @@ def _build_split_body(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...
     return _wrap_tower(layers, new_inner)
 
 
-def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt, ...]:
+def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     """σ-split + tower wrap for the warp-tier MMA matmul path.
 
     Mirrors :func:`_build_split_body` but with the 4-level output-axis
@@ -1209,7 +1170,8 @@ def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt
     know the fragment shape and emits one ``MmaSync`` per (M_r, N_r)
     cell.
     """
-    atom_m, atom_n, atom_k = params.atom.shape
+    atom = ATOM_REGISTRY[str(params["MMA"])]
+    atom_m, atom_n, atom_k = atom.shape
 
     sigma_map: dict[str, object] = {}
 
@@ -1217,15 +1179,15 @@ def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
     N_src = N_axis.source_axis or N_axis
-    n_per_block = params.wn * params.fn * atom_n
+    n_per_block = params["WN"] * params["FN"] * atom_n
     E_N = N_axis.extent.as_static()
     N_b = Axis(f"{N_name}_b", E_N // n_per_block, source_axis=N_src)
-    N_w = Axis(f"{N_name}_w", params.wn, source_axis=N_src)
-    N_r = Axis(f"{N_name}_r", params.fn, source_axis=N_src)
+    N_w = Axis(f"{N_name}_w", params["WN"], source_axis=N_src)
+    N_r = Axis(f"{N_name}_r", params["FN"], source_axis=N_src)
     N_a = Axis(f"{N_name}_a", atom_n, source_axis=N_src)
     sigma_map[N_name] = (
         Var(N_b.name) * Literal(n_per_block, "int")
-        + Var(N_w.name) * Literal(params.fn * atom_n, "int")
+        + Var(N_w.name) * Literal(params["FN"] * atom_n, "int")
         + Var(N_r.name) * Literal(atom_n, "int")
     )
 
@@ -1234,15 +1196,15 @@ def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt
     M_axis = shape.outer_m.axis
     M_name = M_axis.name
     M_src = M_axis.source_axis or M_axis
-    m_per_block = params.wm * params.fm * atom_m
+    m_per_block = params["WM"] * params["FM"] * atom_m
     E_M = M_axis.extent.as_static()
     M_b = Axis(f"{M_name}_b", E_M // m_per_block, source_axis=M_src)
-    M_w = Axis(f"{M_name}_w", params.wm, source_axis=M_src)
-    M_r = Axis(f"{M_name}_r", params.fm, source_axis=M_src)
+    M_w = Axis(f"{M_name}_w", params["WM"], source_axis=M_src)
+    M_r = Axis(f"{M_name}_r", params["FM"], source_axis=M_src)
     M_a = Axis(f"{M_name}_a", atom_m, source_axis=M_src)
     sigma_map[M_name] = (
         Var(M_b.name) * Literal(m_per_block, "int")
-        + Var(M_w.name) * Literal(params.fm * atom_m, "int")
+        + Var(M_w.name) * Literal(params["FM"] * atom_m, "int")
         + Var(M_r.name) * Literal(atom_m, "int")
     )
 
@@ -1253,8 +1215,8 @@ def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt
     K_axis = shape.k_loop.axis
     K_src = K_axis.source_axis or K_axis
     E_K = K_axis.extent.as_static()
-    K_o_ext = E_K // (params.splitk * params.bk * atom_k)
-    K_s = Axis(f"{K_axis.name}_s", params.splitk, source_axis=K_src) if params.splitk > 1 else None
+    K_o_ext = E_K // (params["SPLITK"] * params["BK"] * atom_k)
+    K_s = Axis(f"{K_axis.name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
 
     # σ-rewrite the matmul body's outer axes (M/N), then expand the K reduce
     # into a K_o > K_i serial tower with K_i stride = atom_k.
@@ -1266,7 +1228,7 @@ def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt
         K_s=K_s,
         K_c=None,
         br=1,
-        bk=params.bk,
+        bk=params["BK"],
         K_o_ext=K_o_ext,
         atom_k=atom_k,
     )
@@ -1287,7 +1249,7 @@ def _build_split_body_warp(shape: KernelShape, params: TileParams) -> tuple[Stmt
     if K_s is not None:
         layers.append((K_s, Role.BLOCK))
     layers.extend((lp.axis, Role.BLOCK) for lp in reversed(shape.extra_outer))
-    return _wrap_tower(layers, new_inner, atom=params.atom)
+    return _wrap_tower(layers, new_inner, atom=atom)
 
 
 def _replace_k_loops(

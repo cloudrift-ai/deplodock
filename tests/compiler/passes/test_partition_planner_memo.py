@@ -88,12 +88,12 @@ def _build_tree(plan, ctx: Context) -> Fork | list[Fork]:
     return build_fork_tree(
         params=plan.params,
         levels=[
-            Level((_planner.MMA.name,), lambda p: (p.atom.name,) if p.atom is not None else ()),
-            Level((BR.name,), lambda p: (p.br,)),
-            Level((BM.name, BN.name), lambda p: (p.bm, p.bn)),
-            Level((_planner.WM.name, _planner.WN.name), lambda p: (p.wm, p.wn)),
-            Level((FM.name, FN.name), lambda p: (p.fm, p.fn)),
-            Level((BK.name, SPLITK.name), lambda p: (p.bk, p.splitk)),
+            Level((_planner.MMA.name,), lambda p: (p["MMA"],) if "MMA" in p else ()),
+            Level((BR.name,), lambda p: (p.get("BR", 1),)),
+            Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
+            Level((_planner.WM.name, _planner.WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
+            Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
+            Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _planner._materialize(plan, p),
         score=lambda p: _planner._score_variant(plan, p, ctx),
@@ -115,7 +115,7 @@ def test_plan_rides_op_metadata(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_BK", "16")
     plan_3 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
     assert plan_3 is not plan_1, "a pin flip must invalidate the op-metadata stamp"
-    assert all(p.bk == 16 for p in plan_3.params)
+    assert all(p["BK"] == 16 for p in plan_3.params)
 
 
 def test_op_metadata_hit_skips_enumeration(monkeypatch):
@@ -195,5 +195,5 @@ def test_score_variant_matches_lazy_score():
     plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     assert plan is not None
     for p in plan.params:
-        lazy = TileOp.lazy_score(ctx, knobs=_planner._variant_knobs(plan.base_knobs, p), shapes=plan.shape)
+        lazy = TileOp.lazy_score(ctx, knobs={**plan.base_knobs, **p}, shapes=plan.shape)
         assert _planner._score_variant(plan, p, ctx) == pytest.approx(lazy)
