@@ -42,9 +42,26 @@ def test_run_code_and_ir_mutually_exclusive(run_cli, tmp_path):
     assert "mutually exclusive" in (stdout + stderr).lower()
 
 
+def test_run_input_and_code_mutually_exclusive(run_cli):
+    rc, stdout, stderr = run_cli("run", "some/model", "--code", "torch.zeros(4)")
+    assert rc != 0
+    assert "mutually exclusive" in (stdout + stderr).lower()
+
+
 @requires_cuda
 def test_run_code_rmsnorm_accuracy(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(64)({_randn('1,8,64', dtype)})")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+def test_run_code_rmsnorm_via_pow_neg_half(run_cli):
+    """Gemma-style RMSNorm normalization uses ``torch.pow(ms, -0.5)`` (not
+    ``rsqrt``); the exponent arrives as a broadcast constant. Guards the
+    ``030_pow`` regression where every ``pow`` was squared — here that would
+    compute ``x * (mean+eps)²`` and fail the eager comparison."""
+    code = "x = torch.randn(2,64,256); torch.mul(x, torch.pow(torch.mean(torch.pow(x,2),-1,keepdim=True)+1e-6, -0.5))"
+    rc, _, stderr = run_cli("run", "--code", code)
     assert rc == 0, f"stderr: {stderr}"
 
 
@@ -273,6 +290,15 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
 
 
 @requires_cuda
+def test_run_positional_json_like_ir(run_cli, project_root, tmp_path):
+    """A ``.json`` passed as the positional input takes the same IR path as ``--ir``."""
+    ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "loop", tmp_path)
+    rc, stdout, stderr = run_cli("run", "-v", str(ir_path))
+    assert rc == 0, f"stderr: {stderr}"
+    assert "Loaded loop IR" in (stdout + stderr)
+
+
+@requires_cuda
 def test_run_ir_tile_stage(run_cli, project_root, tmp_path):
     """Tile-IR JSON loads and runs only the kernel + cuda tail."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "tile", tmp_path)
@@ -387,10 +413,10 @@ def test_bind_inputs_preserves_int_dtype():
     g.inputs = ["input_ids", "position_ids", "activations"]
 
     class _EmptyModule:
-        def named_parameters(self):
+        def named_parameters(self, remove_duplicate=True):
             return iter(())
 
-        def named_buffers(self):
+        def named_buffers(self, remove_duplicate=True):
             return iter(())
 
     input_ids = torch.zeros((1, 8), dtype=torch.long)

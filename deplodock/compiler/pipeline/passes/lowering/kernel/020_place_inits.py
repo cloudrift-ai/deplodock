@@ -262,10 +262,19 @@ def _is_reduce_recursive(loop) -> bool:
         elif isinstance(s, Cond):
             # Treat Cond as a transparent wrapper: an Accum nested behind
             # a per-cell predicate (the masked-N reg_block path) still
-            # accumulates across the enclosing reduce loop. ``Write``
-            # inside the Cond escapes per-iter the same way it does at
-            # body level — recurse and honor its False-return.
+            # accumulates across the enclosing reduce loop. But a ``Write``
+            # inside the Cond is the masked-boundary output store of a
+            # register tile (``if (coord < N) out[...] = acc``) — a
+            # per-iteration output escape exactly like a bare Write at body
+            # level, so the enclosing loop must reset its accumulators per
+            # iteration. Mirror the top-level ``Write -> return False``;
+            # without it the mask hides the escape, the loop is judged
+            # crossable, and ``020_place_inits`` hoists the Init above it so
+            # accumulators leak across register-tile rows (wrong RMSNorm
+            # scale + matmul sums for every row past the first).
             for branch in (s.body, s.else_body):
+                if any(isinstance(c, Write) for c in branch):
+                    return False
 
                 class _Probe:
                     body = branch  # noqa: B023 — bound at iteration

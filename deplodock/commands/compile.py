@@ -401,7 +401,8 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
         graph = trace_module(wrapper, (input_ids,), dynamic_shapes=dynamic_shapes)
         return graph, (wrapper, (input_ids,), {})
 
-    layers = model.model.layers
+    decoder = _find_text_decoder(model)
+    layers = decoder.layers
     if layer >= len(layers):
         logger.error("Layer %d not found (model has %d layers)", layer, len(layers))
         sys.exit(1)
@@ -409,10 +410,34 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
     block = layers[layer]
     logger.info("Tracing layer %d...", layer)
 
-    hidden_size = model.config.hidden_size
+    hidden_size = decoder.config.hidden_size
     x = torch.randn(1, seq_len, hidden_size, dtype=dtype)
     position_ids = torch.arange(seq_len).unsqueeze(0)
-    cos, sin = model.model.rotary_emb(x, position_ids)
+    # Some architectures (e.g. Gemma's sliding/global split) key RoPE on the
+    # layer's attention type; pass it when the rotary module / layer expose it.
+    layer_type = getattr(getattr(block, "self_attn", None), "layer_type", None)
+    try:
+        cos, sin = decoder.rotary_emb(x, position_ids, layer_type)
+    except TypeError:
+        cos, sin = decoder.rotary_emb(x, position_ids)
 
     graph = trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)}, dynamic_shapes=dynamic_shapes)
     return graph, (block, (x,), {"position_embeddings": (cos, sin)})
+
+
+def _find_text_decoder(model):
+    """Locate the text transformer stack (the module owning the decoder
+    ``layers`` ModuleList + its ``rotary_emb``). Handles both the flat
+    ``model.model`` layout (Llama / Qwen) and nested multimodal layouts where
+    the language model sits under e.g. ``model.model.language_model`` (Gemma's
+    unified vision/audio/text models). Returns the deepest matching module."""
+    import torch.nn as nn
+
+    best = None
+    for _name, mod in model.named_modules():
+        if isinstance(getattr(mod, "layers", None), nn.ModuleList) and hasattr(mod, "rotary_emb") and hasattr(mod, "config"):
+            best = mod  # deepest wins (named_modules yields parents before children)
+    if best is None:
+        logger.error("Could not locate a text decoder (a module with `.layers` + `.rotary_emb`) in %s", type(model).__name__)
+        sys.exit(1)
+    return best
