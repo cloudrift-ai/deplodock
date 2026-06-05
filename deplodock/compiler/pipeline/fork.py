@@ -8,14 +8,17 @@ pipeline rules that enumerate a knob cartesian.
 (generic flat forks), and the tree node classes :class:`_Branch` /
 :class:`_Leaf` built by :func:`build_fork_tree`.
 
-The tree builder converts a flat list of variant params into the ROOT
-:class:`_Branch` of a lazy tree: each ``Level`` groups siblings by a
-(sub)tuple of knob values and collapses levels whose key has a single
-distinct value across the group (params with an empty key skip the level).
-The LAST level is the leaf level: its grouping produces one :class:`_Leaf`
-per param (no branch wrapper) — knobs stamped onto the leaf, ``expand()``
-yields ``materialize(p)`` once the search engine resolves that leaf.
-Everything is lazy: no Fork below the root exists and no param is scored
+The tree builder converts a flat list of variant knob rows (plain dicts)
+into the ROOT :class:`_Branch` of a lazy tree: each ``Level`` groups
+siblings by a (sub)tuple of knob values and collapses levels whose key has
+a single distinct value across the group (rows with an empty key skip the
+level). Below the last level every row becomes one :class:`_Leaf` carrying
+its COMPLETE row as ``knobs`` — the row IS the variant identity (the
+``SID`` structural-id knob rides the merged dict), so the engine's
+DB-replay (``_best_fork``) matches leaves and branches by knobs alone, no
+structural probing. ``expand()`` yields ``materialize(row)`` once the
+search engine resolves a leaf.
+Everything is lazy: no Fork below the root exists and no row is scored
 until the search reads a fork's score. Siblings are emitted in grouping
 order — RANKING IS SEARCH POLICY: each node carries a lazy max-propagated
 ``score(cache)``, read by the policies via ``Search.score_of`` (which
@@ -31,9 +34,8 @@ bare ``[ThunkFork(...), ThunkFork(...)]`` list comp is shorter and clearer
 — don't reach for the builder.
 
 The engine in ``pipeline.py`` consumes ``fork.knobs`` flat (it doesn't walk
-ancestors), so the LAST level's knob_names land on each leaf as the
-DB-matchable knob delta. Earlier levels' knobs sit on the branch Forks
-themselves.
+ancestors): branch Forks pin their level's slice of the row, leaves carry
+the whole row.
 """
 
 from __future__ import annotations
@@ -133,23 +135,22 @@ class ThunkFork(Fork):
 
 
 @dataclass(frozen=True)
-class Level[P]:
+class Level:
     """One grouping level in the Fork tree.
 
-    ``knob_names`` and ``key`` must agree in arity: ``key(p)`` returns a
+    ``knob_names`` and ``key`` must agree in arity: ``key(row)`` returns a
     tuple of the same length as ``knob_names``, in matching order — or an
-    EMPTY tuple when the level doesn't apply to ``p`` (branch levels only;
-    the leaf level must apply to every param). Params with an empty key
-    skip the level: their next-level subtree splices up as siblings of the
-    level's keyed branches, so e.g. scalar tile variants carry no ``MMA``
-    branch while warp variants of the same kernel do. Across all Levels the
-    ``knob_names`` should partition the knob set the caller wants Forks to
-    pin (no duplicates; collapsed-constant knobs may be absent — they're
-    pinned by the materialized leaf Op itself).
+    EMPTY tuple when the level doesn't apply to ``row``. Rows with an
+    empty key skip the level: their next-level subtree splices up as
+    siblings of the level's keyed branches, so e.g. scalar tile variants
+    carry no ``MMA`` branch while warp variants of the same kernel do.
+    Across all Levels the ``knob_names`` should partition the knob set the
+    caller wants BRANCHES to pin (no duplicates along a path); levels need
+    not cover every row knob — leaves carry the complete row regardless.
     """
 
     knob_names: tuple[str, ...]
-    key: Callable[[P], tuple]
+    key: Callable[[dict], tuple]
 
 
 @dataclass(frozen=True)
@@ -160,30 +161,30 @@ class _Tree[P]:
     ``cache`` it receives — repeat reads across overlapping branch
     subgroups re-pay only the scorer's cache-key lookup."""
 
-    branch_levels: tuple[Level[P], ...]
-    leaf_level: Level[P]
-    materialize: Callable[[P], Op | Graph]
-    score: Callable[[P, dict | None], float]
+    levels: tuple[Level, ...]
+    materialize: Callable[[dict], Op | Graph]
+    score: Callable[[dict, dict | None], float]
 
-    def build_level(self, group: list[P], depth: int) -> list[Fork]:
+    def build_level(self, group: list[dict], depth: int) -> list[Fork]:
         """Build the sibling Forks one level down from a branch at
         ``depth`` (in grouping order — ranking is the search's job)."""
-        if depth == len(self.branch_levels):
-            return [
-                _Leaf(tree=self, param=p, knobs=dict(zip(self.leaf_level.knob_names, self.leaf_level.key(p), strict=True))) for p in group
-            ]
-        level = self.branch_levels[depth]
-        keyed: dict[tuple, list[P]] = {}
-        # Params whose key is empty skip the level (it doesn't apply to
+        if depth == len(self.levels):
+            # One leaf per row, carrying the COMPLETE row as its knobs —
+            # the DB-matchable variant identity (levels may not cover
+            # every knob, e.g. FK / OVERHANG).
+            return [_Leaf(tree=self, knobs=dict(row)) for row in group]
+        level = self.levels[depth]
+        keyed: dict[tuple, list[dict]] = {}
+        # Rows whose key is empty skip the level (it doesn't apply to
         # them) — their next-level subtree splices up as siblings of the
         # keyed branches below.
-        skipped: list[P] = []
-        for p in group:
-            key = level.key(p)
+        skipped: list[dict] = []
+        for row in group:
+            key = level.key(row)
             if not key:
-                skipped.append(p)
+                skipped.append(row)
             else:
-                keyed.setdefault(key, []).append(p)
+                keyed.setdefault(key, []).append(row)
         if not keyed:
             # Level applies to nothing in this group — skip it wholesale.
             return self.build_level(group, depth + 1)
@@ -201,13 +202,13 @@ class _Tree[P]:
 
 
 @dataclass(frozen=True)
-class _Branch[P](Fork):
-    """Branch node: a subgroup of params pinned to ``knobs`` by its level
-    key. The subtree below doesn't exist until the engine pops the branch
-    and ``expand()`` builds the next level."""
+class _Branch(Fork):
+    """Branch node: a subgroup of knob rows pinned to ``knobs`` by its
+    level key. The subtree below doesn't exist until the engine pops the
+    branch and ``expand()`` builds the next level."""
 
-    tree: _Tree[P]
-    group: list[P]
+    tree: _Tree
+    group: list[dict]
     next_depth: int
     knobs: dict
 
@@ -215,60 +216,57 @@ class _Branch[P](Fork):
         return self.tree.build_level(self.group, self.next_depth)
 
     def score(self, cache: dict | None = None) -> float:
-        # Max over the param subgroup — provably equal to eager
+        # Max over the row subgroup — provably equal to eager
         # max-of-children propagation without instantiating the subtree.
-        return max(self.tree.score(p, cache) for p in self.group)
+        return max(self.tree.score(row, cache) for row in self.group)
 
 
 @dataclass(frozen=True)
-class _Leaf[P](Fork):
-    """Leaf node: one param, ``expand()`` materializes its Op/Graph."""
+class _Leaf(Fork):
+    """Leaf node: one knob row (= ``knobs``, the complete variant
+    identity); ``expand()`` materializes its Op/Graph."""
 
-    tree: _Tree[P]
-    param: P
+    tree: _Tree
     knobs: dict
     is_leaf = True
 
     def expand(self) -> list[Op | Graph | Fork]:
-        return [self.tree.materialize(self.param)]
+        return [self.tree.materialize(self.knobs)]
 
     def score(self, cache: dict | None = None) -> float:
-        return self.tree.score(self.param, cache)
+        return self.tree.score(self.knobs, cache)
 
 
-def build_fork_tree[P](
+def build_fork_tree(
     *,
-    params: Sequence[P],
-    levels: Sequence[Level[P]],
-    materialize: Callable[[P], Op | Graph],
-    score: Callable[[P, dict | None], float],
+    params: Sequence[dict],
+    levels: Sequence[Level],
+    materialize: Callable[[dict], Op | Graph],
+    score: Callable[[dict, dict | None], float],
 ) -> Fork:
-    """Return the ROOT branch ``Fork`` of a lazy tree grouping ``params``
-    per ``levels`` (outermost first). ``params`` must be non-empty (a
-    rule with nothing to enumerate has no fork point — skip the rule
-    instead) and ``levels`` non-empty; both raise ``ValueError``.
+    """Return the ROOT branch ``Fork`` of a lazy tree grouping the knob
+    rows ``params`` per ``levels`` (outermost first); below the last
+    level each row becomes one leaf carrying its complete row as
+    ``knobs``. ``params`` must be non-empty (a rule with nothing to
+    enumerate has no fork point — skip the rule instead) and ``levels``
+    non-empty; both raise ``ValueError``.
 
     Nothing is built or scored at call time — the root is a
-    :class:`_Branch` over the whole param list; each branch's ``expand()``
+    :class:`_Branch` over the whole row list; each branch's ``expand()``
     builds the next level on demand, so greedy descent instantiates
-    O(path) Forks instead of one per param (~42k for a matmul-class
+    O(path) Forks instead of one per row (~42k for a matmul-class
     kernel) and MCTS pays one level per pop. Scores are equally lazy:
     nothing is scored until the search reads a fork's score.
 
     ``score`` receives the search-owned value-keyed ``cache`` dict
-    alongside the param (``None`` when read outside a search) and owns
+    alongside the row (``None`` when read outside a search) and owns
     its own keying — the partition planner keys each variant by
-    ``(ctx, merged knobs)``, so the per-param work transfers across the
+    ``(ctx, merged knobs)``, so the per-row work transfers across the
     trees of structurally identical kernels.
     """
     if not params:
         raise ValueError("build_fork_tree: params must be non-empty")
     if not levels:
         raise ValueError("build_fork_tree: at least one Level required")
-    tree = _Tree(
-        branch_levels=tuple(levels[:-1]),
-        leaf_level=levels[-1],
-        materialize=materialize,
-        score=score,
-    )
+    tree = _Tree(levels=tuple(levels), materialize=materialize, score=score)
     return _Branch(tree=tree, group=list(params), next_depth=0, knobs={})

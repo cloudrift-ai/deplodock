@@ -26,7 +26,7 @@ from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from deplodock.compiler.tensor import Tensor
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
-BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN, _planner.BK, _planner.SPLITK)
+BR, BM, BN, FM, FN = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN)
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +92,6 @@ def _build_tree(plan, ctx: Context) -> Fork:
             Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
             Level((_planner.WM.name, _planner.WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
             Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
-            Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _planner._materialize(plan, p),
         score=lambda p, cache: _planner._score_variant(plan, p, ctx, cache),

@@ -99,12 +99,13 @@ pure function of the key. Greedy with a DB hit never scores anything at all.
 
 The partition planner (`lowering/tile/010_partition_loops`) emits one
 hierarchical Fork tree over both tiers:
-`MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → (BK,SPLITK) → TileOp` leaf. The root
+`MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → TileOp` leaf — each leaf carrying its COMPLETE knob row
+(incl. `BK` / `SPLITK` / `FK` / `OVERHANG`, which live in no level), the DB-matchable variant identity. The root
 `MMA` level keys warp rows by atom kind; scalar rows return an empty key and skip the level (their subtree
 splices up as siblings of the atom branches — no `MMA` knob ever pins a scalar path), and the builder's
 single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 1`, scalar rows
 `wm = wn = 1`), so a pure-scalar kernel's tree is exactly the classic
-`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`. Warp-vs-scalar ranking is score-driven; an explicit
+`BR → (BM,BN) → (FM,FN)` over full-row leaves. Warp-vs-scalar ranking is score-driven; an explicit
 `DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so score can't sidestep it).
 The per-variant prior is `TileOp.lazy_score(ctx, knobs=..., shapes=...)` — a pure formula over cheap
 inputs (the variant's stamped knob dict + planner shape) so siblings rank without anyone instantiating a
@@ -277,8 +278,28 @@ three entry points:
   lives on the Run, reached from engine-adjacent code through the candidate (`cand.run.dump`,
   `cand.run.rejections`, `cand.ctx`). `drive` seeds the root candidate, then per iteration pops a
   `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. At fork
-  points it looks up the best-known child for the parent op's `op_cache_key` in `lowering` and passes the
-  matching fork via `search.push(..., best=...)`. Greedy uses `best` when present; tuning ignores it.
+  points it looks up the best-known `lowering` row for the parent op's `op_cache_key` and passes the fork
+  whose KNOBS agree with the row's recorded delta via `search.push(..., best=...)` — matching is on knobs
+  alone (`_best_fork`; the variant identity is `(ctx, knobs)`), so nothing is ever materialized just to be
+  compared. Greedy uses `best` when present; tuning ignores it.
+
+### The keying map: two identities
+
+Everything the search stores or replays is keyed by one of TWO identities — when adding a cache or a
+table, pick one; don't invent a third:
+
+- **Variant identity = `(context, knobs)`** — anything *predictive or replayable*. The `SID` knob
+  (`loop/fusion/040_stamp_structural_id`: digest of the canonical LoopOp body + operand dtypes) makes the
+  merged knob dict a COMPLETE identity, so a prior is a pure function of it: the score cache keys
+  `(ctx fields, frozenset(merged knobs))`, the planner's op-metadata plan stamp keys the same plus the
+  `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration), and `_best_fork`
+  replays tuned choices by matching fork knobs against the recorded `lowering` knob delta. A future
+  *learned* prior slots in unchanged — `score(features(ctx, knobs))`, with the per-`SID` shape facts
+  (extents, dtypes) featurized at scoring time exactly where `TileOp.lazy_score` reads them today.
+- **Measurement identity = `(ctx.structural_key, op_cache_key)`** — ground truth about *materialized
+  leaves*: `perf` rows, op inventory (`loop_op`/`tile_op`/`kernel_op`/`cuda_op`), `op_effort` gating, and
+  two-level dedup. The structural `child_key` on `lowering` rows is measurement linkage (it joins the
+  inventory), NOT a replay key.
 
 ### Search persistence: on-disk inventory vs in-memory MCTS
 
@@ -409,7 +430,7 @@ over one op's forks — with max-Q normalized UCB1:
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
 adds the whole-slice total under the LoopOp key). A subsequent `deplodock compile` / `deplodock run` (or
 `make bench-kernels-tuned`) auto-resolves the same DB path (env or default) and replays the cached forks via
-`GreedySearch`, which walks the parent op's `op_cache_key` in `lowering` and follows the best-known child at each step —
+`GreedySearch`, which walks the parent op's `op_cache_key` in `lowering` and follows the best row's knob delta at each step —
 the same replay `run_two_level_tune` uses to assemble its final graph. No GPU bench is required on the replay path when
 every kernel already has a `perf` row.
 

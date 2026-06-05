@@ -142,14 +142,12 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
-    BK,
     BM,
     BN,
     BR,
     FM,
     FN,
     MMA,
-    SPLITK,
     WM,
     WN,
     enumerate_cartesian,
@@ -243,7 +241,9 @@ class _Plan:
 
 def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     """Emit one hierarchical Fork tree over knob bundles:
-    ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
+    ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → TileOp leaf`` — each leaf
+    carries its COMPLETE knob row (incl. ``BK`` / ``SPLITK`` / ``FK`` /
+    ``OVERHANG``), the DB-matchable variant identity.
 
     Both tiers live in the one tree: the root ``MMA`` level keys the warp
     rows by atom kind while scalar rows return an empty key and SKIP the
@@ -296,7 +296,6 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
             Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
             Level((WM.name, WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
             Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
-            Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _materialize(plan, p),
         score=lambda p, cache: _score_variant(plan, p, ctx, cache),
@@ -592,7 +591,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     candidate knob row but doesn't materialize any TileOp — the
     expensive ``_build_split_body`` + ``TileOp.__post_init__`` work is
     deferred to :func:`_materialize`, invoked from the chosen Fork leaf's
-    ``expand`` thunk in :func:`_build_fork_tree_lazy`.
+    ``expand`` thunk in the ``build_fork_tree`` tree.
 
     Detection is predicate-driven: ``is_matmul_reduce`` (≥ 2 K-indexed Loads +
     Accum) picks the matmul knob set; any other reduce with extent ≥ warp_size

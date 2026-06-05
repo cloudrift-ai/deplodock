@@ -707,22 +707,34 @@ def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
 # ---------------------------------------------------------------------------
 
 
+def _knob_eq(a, b) -> bool:
+    """Knob-value equality across the DB's JSON round-trip: tuples come
+    back as lists (e.g. the planner's ``OVERHANG``), so compare with
+    tuples canonicalized to lists."""
+    if isinstance(a, tuple):
+        a = list(a)
+    if isinstance(b, tuple):
+        b = list(b)
+    return a == b
+
+
 def _best_fork(forks, parent_cand, db):
-    """Pick the fork whose pending option matches the lowering DB's
+    """Pick the fork whose knob delta matches the lowering DB's
     best-known child for the parent op. Returns ``None`` when no row
-    exists (untuned site), the parent op has no cache key, or no fork
-    matches the recorded child key (variant drifted).
+    exists (untuned site), the parent op has no cache key, or no fork's
+    knobs agree with the recorded delta (variant drifted).
 
-    The comparison is on ``op_cache_key`` of the post-apply option:
-    :meth:`Candidate.apply` merges ``parent.knobs`` into ``option.knobs``
-    on resolve so the source-chain child carries the cumulative knob
-    set, and the recorded ``child_key`` was hashed against that merged
-    set. Pre-apply (here) the option only has the rule's local delta,
-    so we replicate the merge before hashing — otherwise the cache key
-    of a freshly-emitted option never matches what tune recorded for
-    the same fork."""
-    from dataclasses import replace  # noqa: PLC0415
-
+    Matching is on KNOBS ALONE — the variant identity is ``(ctx,
+    knobs)`` (the ``SID`` knob makes the dict complete), so branch and
+    leaf forks match uniformly and nothing is ever materialized just to
+    be compared. ``row.knobs`` is the full child-minus-parent delta
+    recorded by ``_bench_terminal``; a fork wins iff at least one of its
+    pinned knobs is constrained by the row and every constrained one
+    agrees. Distinct siblings always differ in a recorded knob — branch
+    siblings pin distinct level keys, and tree leaves carry their
+    complete knob row — so at most one sibling matches. The DB's
+    structural ``child_key`` is measurement linkage (inventory / perf),
+    not a replay key."""
     from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
     first = forks[0]
@@ -738,40 +750,13 @@ def _best_fork(forks, parent_cand, db):
     row = db.lookup_lowering(parent_key)
     if row is None:
         return None
-    parent_knobs = getattr(parent_node.op, "knobs", None) or {}
     for f in forks:
         if f.pending is None:
             continue
         _, fork = f.pending  # always a Fork after the constructor unification
-        opt_knobs = fork.knobs
-        if fork.is_leaf:
-            # Leaf Fork wrapping a concrete Op/Graph — match by structural
-            # cache key. Fire the (trivial) thunk to retrieve the wrapped
-            # leaf, then compare against the DB's child_key. The thunk
-            # for a leaf is ``lambda: [op]``, constant-time.
-            leaves = fork.expand()
-            if not leaves:
-                continue
-            leaf = leaves[0]
-            merged = {**parent_knobs, **opt_knobs}
-            probe = replace(leaf, knobs=merged) if merged != opt_knobs else leaf
-            if op_cache_key(probe) == row.child_key:
-                return f
-        else:
-            # Branch Fork — match by knobs-delta against the recorded
-            # row's knobs. The fork "wins" iff every knob it pins appears
-            # in ``row.knobs`` with the same value AND at least one of
-            # those knobs is constrained by the row; otherwise every
-            # sibling is equally consistent and we fall back to option-0.
-            # Branch Forks are emitted by the partition planner
-            # (``010_partition_loops``, via ``fork.build_fork_tree``)
-            # for the BR/(BM,BN)/(FM,FN) hierarchy when those levels carry
-            # more than one distinct knob value.
-            if not opt_knobs:
-                continue
-            constraining = [k for k in opt_knobs if k in row.knobs]
-            if constraining and all(row.knobs.get(k) == v for k, v in opt_knobs.items()):
-                return f
+        constraining = [k for k in fork.knobs if k in row.knobs]
+        if constraining and all(_knob_eq(row.knobs[k], fork.knobs[k]) for k in constraining):
+            return f
     return None
 
 

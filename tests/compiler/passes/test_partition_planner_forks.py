@@ -1,7 +1,7 @@
 """Tests for the hierarchical Fork tree emitted by ``010_partition_loops``.
 
 The planner emits one ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) →
-(BK,SPLITK) → TileOp leaf`` Fork tree from a ``_Plan`` (cheap-to-build
+TileOp leaf`` Fork tree from a ``_Plan`` (cheap-to-build
 pre-materialization state); tier-foreign levels collapse (single value).
 Levels with a single value collapse (no Fork wrapper). Branch scores
 propagate ``max`` from leaves so the search picks high-Q subtrees first.
@@ -33,7 +33,7 @@ _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.
 _plan_kernel = _planner._plan_kernel
 _materialize = _planner._materialize
 _score_variant = _planner._score_variant
-BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN, _planner.BK, _planner.SPLITK)
+BR, BM, BN, FM, FN = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN)
 
 
 def _build_fork_tree_lazy(plan, ctx: Context) -> Fork:
@@ -49,7 +49,6 @@ def _build_fork_tree_lazy(plan, ctx: Context) -> Fork:
             Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
             Level((_planner.WM.name, _planner.WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
             Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
-            Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _materialize(plan, p),
         score=lambda p, cache: _score_variant(plan, p, ctx, cache),
@@ -191,14 +190,16 @@ def test_leaves_preserve_every_variant():
     assert len(leaves) == len(plan.params), f"leaf count {len(leaves)} doesn't match variant count {len(plan.params)}"
 
 
-def test_leaf_knobs_are_bk_splitk_only():
-    """Leaf Forks pin only (BK, SPLITK) — the rest is committed by ancestor
-    branch Forks. The DB lookup at fork-replay time matches deltas
-    per-level, so the partition must be tight."""
+def test_leaf_knobs_are_the_complete_row():
+    """Each leaf Fork carries its FULL enumerated knob row — including
+    knobs no tree level covers (BK / SPLITK / FK / OVERHANG) — so the
+    DB replay (``_best_fork``) disambiguates leaf siblings by knobs
+    alone, never by materializing them."""
     plan = _matmul_plan()
     tree = _build_fork_tree_lazy(plan, _ctx())
+    rows = {tuple(sorted((k, str(v)) for k, v in p.items())) for p in plan.params}
     for leaf in _walk_leaves(tree):
-        assert set(leaf.knobs.keys()) <= {"BK", "SPLITK"}, f"leaf knobs leak into non-(BK,SPLITK): {leaf.knobs}"
+        assert tuple(sorted((k, str(v)) for k, v in leaf.knobs.items())) in rows, f"leaf knobs are not an enumerated row: {leaf.knobs}"
 
 
 def test_branch_score_is_max_of_children():
@@ -246,13 +247,13 @@ def test_pointwise_collapses_br_layer():
 
 
 def test_branch_knobs_partition_cleanly():
-    """The union of (root-fork knobs, walked branch knobs, leaf knobs)
-    along any root→leaf path must cover the planner's level knobs
-    ``{MMA, BR, BM, BN, WM, WN, FM, FN, BK, SPLITK}`` at most once each —
-    no knob duplicated across levels (tier-foreign levels collapse)."""
+    """BRANCH knobs along any root→leaf path must cover the planner's
+    level knobs ``{MMA, BR, BM, BN, WM, WN, FM, FN}`` at most once each —
+    no knob duplicated across levels (tier-foreign levels collapse) —
+    and the leaf's complete row must agree with every pinned value."""
     plan = _matmul_plan()
     tree = _build_fork_tree_lazy(plan, _ctx())
-    expected = {"MMA", "BR", "BM", "BN", "WM", "WN", "FM", "FN", "BK", "SPLITK"}
+    expected = {"MMA", "BR", "BM", "BN", "WM", "WN", "FM", "FN"}
 
     # Walk one root→leaf path and check.
     def _first_path(node: Fork) -> list[Fork]:
@@ -263,15 +264,16 @@ def test_branch_knobs_partition_cleanly():
         return path
 
     path = _first_path(tree)
+    leaf, branches = path[-1], path[:-1]
     seen: dict[str, int] = {}
-    for fork in path:
-        for k in fork.knobs:
+    for fork in branches:
+        for k, v in fork.knobs.items():
             seen[k] = seen.get(k, 0) + 1
+            assert leaf.knobs.get(k) == v, f"leaf row disagrees with pinned branch knob {k}"
     # Collapsed knobs (single-value across all variants) are absent from
-    # the path's Forks but pinned by the leaf TileOp — accept missing
-    # knobs that don't vary across variants. The check that matters:
-    # no knob appears twice (would mean overlapping branch deltas).
+    # the path's branch Forks but still present in the leaf row. The check
+    # that matters: no knob appears twice (overlapping branch deltas).
     duplicates = {k: c for k, c in seen.items() if c > 1}
     assert not duplicates, f"knobs appear at multiple levels: {duplicates}"
-    # Every pinned knob is one of the planner's expected set.
+    # Every pinned branch knob is one of the planner's level knobs.
     assert set(seen) <= expected, f"unexpected knob keys in path: {set(seen) - expected}"
