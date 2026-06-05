@@ -26,6 +26,7 @@ the parse primitives here but keeps its own descriptor logic.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 # --- Var-name constants (the single source of truth for spellings) ---------
@@ -136,6 +137,27 @@ def nvcc_flags() -> str:
     :func:`set_nvcc_flags`) and the bench-worker subprocess (which inherits the
     env) see the same value, and so the flags fold into cache keys."""
     return _str(NVCC_FLAGS)
+
+
+@contextmanager
+def nvcc_flags_override(flags: str | None):
+    """Temporarily swap ``DEPLODOCK_NVCC_FLAGS`` for one compile (e.g. re-benching
+    a tune winner at ``-Xcicc -O3``). ``None`` is a no-op. Since ``nvcc_flags`` is
+    read fresh and folds into the cubin cache key, this transparently selects the
+    right (and separately-cached) cubin. Applied in whichever process compiles —
+    the bench worker reads it off the request and wraps its own compile."""
+    if flags is None:
+        yield
+        return
+    prev = os.environ.get(NVCC_FLAGS)
+    os.environ[NVCC_FLAGS] = flags
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(NVCC_FLAGS, None)
+        else:
+            os.environ[NVCC_FLAGS] = prev
 
 
 def debug_enabled() -> bool:

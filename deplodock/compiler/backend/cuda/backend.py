@@ -166,8 +166,12 @@ class CudaBackend(Backend):
         warmup: int = 5,
         num_iters: int | str = 20,
         on_iter=None,
+        nvcc_flags: str | None = None,
     ) -> BenchmarkResult:
         del input_data
+        # ``nvcc_flags`` re-points this one bench's compile at a different opt
+        # level (e.g. an -O3 re-bench of a tune winner) without disturbing the
+        # ambient flags — the worker applies it per-request; in-process we wrap.
         # ``bench_wall_timeout_s`` selects between two paths:
         # - Set (autotune sweep): run in a subprocess-isolated worker so
         #   a wedged kernel can be SIGKILLed without leaving the
@@ -190,16 +194,18 @@ class CudaBackend(Backend):
                 num_iters=num_iters,
                 compile_timeout_s=self.bench_compile_timeout_s,
                 run_timeout_s=self.bench_run_timeout_s,
+                nvcc_flags=nvcc_flags,
             )
         else:
-            result = benchmark_program(
-                compiled,
-                warmup=warmup,
-                num_iters=num_iters,
-                on_iter=on_iter,
-                compile_timeout_s=self.bench_compile_timeout_s,
-                run_timeout_s=self.bench_run_timeout_s,
-            )
+            with config.nvcc_flags_override(nvcc_flags):
+                result = benchmark_program(
+                    compiled,
+                    warmup=warmup,
+                    num_iters=num_iters,
+                    on_iter=on_iter,
+                    compile_timeout_s=self.bench_compile_timeout_s,
+                    run_timeout_s=self.bench_run_timeout_s,
+                )
         return BenchmarkResult(
             time_ms=result.time_ms,
             min_ms=result.min_ms,

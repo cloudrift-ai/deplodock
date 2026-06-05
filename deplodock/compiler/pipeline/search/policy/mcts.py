@@ -102,7 +102,7 @@ class TuningSearch(Search):
         self,
         tree: SearchTree | None = None,
         *,
-        patience: int = 20,
+        patience: int = 50,
         ucb_c: float = DEFAULT_UCB_C,
         max_visits: int | None = None,
         score_cache: dict[Hashable, float] | None = None,
@@ -134,6 +134,11 @@ class TuningSearch(Search):
         # yielding). Carries no role in the search itself.
         self.last_stats: PerfStats | None = None
         self.last_status: str | None = None
+        # Set in ``observe`` when a bench sets a new global best; the engine reads
+        # it to trigger an -O3 re-bench (``observe_o3``). ``o3_rows`` holds those
+        # deployable winner samples (knobs tagged ``H_opt=3``) for the prior.
+        self.last_improved_best = False
+        self.o3_rows: list[tuple[dict, float]] = []
 
     def observe(self, token: object | None, stats: PerfStats, status: str, candidate: object | None = None) -> None:
         self.last_stats = stats
@@ -145,12 +150,30 @@ class TuningSearch(Search):
         # fork-prefix when no candidate is supplied.
         token.realized_knobs = self._realized_knobs(candidate) if candidate is not None else self._node_knobs(token)
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
+        prev_best = self.tree.best_reward
         self.tree.record_terminal(token, reward)
+        # Flag a new global best so the engine can re-bench this winner at -O3 for
+        # a deployable prior sample (the -O1 sweep ranks but is not deployable;
+        # -O1 ties configs that differ at -O3 — e.g. FK on a reduction).
+        self.last_improved_best = status == "ok" and self.tree.best_reward > prev_best
         if self.prior_model is not None:
             # Record the leaf for the end-of-run stats. The model itself is fixed
             # during a run — it refits in batches between ops (see ``Prior``), not
             # per bench — so there is nothing to refit here.
             self.prior_model.record_bench(token.realized_knobs, stats.median, status)
+
+    def observe_o3(self, token: object | None, o3_us: float) -> None:
+        """Record an extra training row for an -O1 winner re-benched at -O3: the
+        same realized knobs but tagged ``H_opt=3`` (the deployable regime) and
+        labeled with the -O3 latency. The prior can then rank winners by -O3 cost
+        where -O1 ties them; ``H_opt`` lets the -O1 and -O3 rows coexist."""
+        if o3_us <= 0 or not isinstance(token, SearchNode) or token.realized_knobs is None:
+            return
+        knobs = dict(token.realized_knobs)
+        knobs["H_opt"] = 3.0
+        self.o3_rows.append((knobs, math.log(1.0 / o3_us)))
+        if self.prior_model is not None:
+            self.prior_model.record_bench(knobs, o3_us, "ok")
 
     def _realized_knobs(self, candidate: object) -> dict:
         """The terminal's complete knob set: the kernel's ``base_knobs`` (``S_*``

@@ -514,6 +514,13 @@ class Pipeline:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
             stats, status = _bench_terminal(cand, backend=backend, db=run.db)
             search.observe(token, stats, status, candidate=cand)
+            # A new -O1 best → re-bench it at -O3 for a deployable prior sample
+            # (the -O1 sweep ranks but isn't deployable; it ties configs that
+            # differ at -O3). Best-effort, winners only, so the cost is bounded.
+            if backend is not None and getattr(search, "last_improved_best", False):
+                o3_us = _rebench_o3(cand, backend)
+                if o3_us is not None:
+                    search.observe_o3(token, o3_us)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 
@@ -711,6 +718,23 @@ def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
 # ---------------------------------------------------------------------------
 # Bench + DB persistence for autotune terminals (used by Pipeline.tune)
 # ---------------------------------------------------------------------------
+
+
+def _rebench_o3(cand, backend):
+    """Re-bench an already-lowered tune winner at ``-Xcicc -O3`` (deployable
+    codegen) for a clean prior sample. Returns the -O3 median latency in µs, or
+    ``None`` when the sweep is already at -O3 or the bench errors (best-effort —
+    a re-bench hiccup must never abort the sweep). The winner already benched OK
+    at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
+    from deplodock import config  # noqa: PLC0415
+
+    if "-O3" in config.nvcc_flags():
+        return None  # already deployable codegen — nothing to re-bench
+    try:
+        result = backend.benchmark(cand.graph, nvcc_flags="-Xcicc -O3")
+    except Exception:  # noqa: BLE001 — a re-bench failure is non-fatal to tuning
+        return None
+    return result.time_ms * 1000.0 if result.time_ms else None
 
 
 def _bench_terminal(cand, *, backend, db):

@@ -241,10 +241,10 @@ def inner_reward(
             db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
             benched = True
             if prior is not None:
-                # Stream this op's final value-of-position rows into the global
-                # (reservoir-bounded) dataset; refit + checkpoint once enough new
-                # rows have accumulated (batched, not per-op — see ``Prior``).
-                prior.add_rows(inner._collect_rows())
+                # Stream this op's value-of-position rows (-O1) plus any -O3 winner
+                # samples into the global (reservoir-bounded) dataset; refit +
+                # checkpoint once enough new rows accumulate (batched — see ``Prior``).
+                prior.add_rows(inner._collect_rows() + inner.o3_rows)
                 if prior.maybe_refit():
                     prior.checkpoint()
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)

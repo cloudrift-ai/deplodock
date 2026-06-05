@@ -926,8 +926,8 @@ class _BenchWorker:
     def __del__(self) -> None:
         self._kill()
 
-    def bench(self, graph: Graph, *, wall_timeout_s: float, **kwargs) -> BenchmarkResult:
-        request = pickle.dumps({"graph": graph, "kwargs": kwargs}, protocol=pickle.HIGHEST_PROTOCOL)
+    def bench(self, graph: Graph, *, wall_timeout_s: float, nvcc_flags: str | None = None, **kwargs) -> BenchmarkResult:
+        request = pickle.dumps({"graph": graph, "kwargs": kwargs, "nvcc_flags": nvcc_flags}, protocol=pickle.HIGHEST_PROTOCOL)
         # A previous worker may have exited between our last interaction
         # and this request — most commonly through the dirty-context exit
         # path in ``_bench_worker.main``. ``poll()`` has a brief window
@@ -1023,6 +1023,7 @@ def benchmark_program_isolated(
     num_iters: int | str = 20,
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
+    nvcc_flags: str | None = None,
 ) -> BenchmarkResult:
     """Wall-time-bounded ``benchmark_program``. Runs the bench in a
     persistent subprocess; on ``wall_timeout_s`` overrun the worker is
@@ -1043,6 +1044,7 @@ def benchmark_program_isolated(
     return _bench_worker().bench(
         graph,
         wall_timeout_s=wall_timeout_s,
+        nvcc_flags=nvcc_flags,
         warmup=warmup,
         num_iters=num_iters,
         compile_timeout_s=compile_timeout_s,
