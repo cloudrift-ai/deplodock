@@ -119,28 +119,43 @@ class CatBoostPrior(Prior):
     def from_json(cls, obj: dict) -> CatBoostPrior:
         """Reconstruct a checkpointed prior from :meth:`to_json` — model (for
         inference / warm-start) plus the reservoir dataset (so a tune keeps
-        accumulating from where it left off)."""
+        accumulating). Tolerant of a stale checkpoint: an incompatible / corrupt
+        model blob is dropped (the rows are still salvaged and a refit rebuilds
+        the model), so e.g. a pre-CatBoost prior file migrates instead of crashing."""
         p = cls()
         p._cols = obj.get("cols")
-        p._dataset = [(dict(k), float(v)) for k, v in obj.get("dataset", [])]
+        # ``dataset`` is the current key; ``archived_rows`` the legacy one — keep
+        # either so an old checkpoint's accumulated rows survive the migration.
+        raw = obj.get("dataset") or obj.get("archived_rows") or []
+        p._dataset = [(dict(k), float(v)) for k, v in raw]
         p._seen = int(obj.get("seen", len(p._dataset)))
         p._since_fit = int(obj.get("since_fit", 0))
+        # Only a base64 string is a CatBoost ``cbm`` blob; anything else (e.g. a
+        # dict — the former BayesianRidge prior's sklearn estimator state) is
+        # discarded, and the next refit rebuilds the model from the rows.
         blob = obj.get("model")
-        if blob:
-            p._model = cls._model_from_b64(blob)
-            p._first_fit_idx = 0  # loaded → warm, no cold warmup this run
+        if isinstance(blob, str) and blob:
+            try:
+                p._model = cls._model_from_b64(blob)
+                p._first_fit_idx = 0  # loaded → warm, no cold warmup this run
+            except Exception:  # noqa: BLE001 — corrupt/incompatible blob → refit fresh
+                p._model = None
         return p
 
     @classmethod
     def load(cls, *, seed: int = 0, path=None) -> CatBoostPrior:
         """The one global prior — warm from its JSON checkpoint if present, else
         fresh — bound so :meth:`checkpoint` saves it back. ``path`` defaults to
-        ``config.prior_path()``."""
+        ``config.prior_path()``. Best-effort: an unreadable / incompatible
+        checkpoint falls back to a fresh prior rather than failing the compile."""
         from deplodock import config, storage  # noqa: PLC0415
 
         path = path or config.prior_path()
         obj = storage.read_json(path)
-        p = cls.from_json(obj) if isinstance(obj, dict) else cls(seed=seed)
+        try:
+            p = cls.from_json(obj) if isinstance(obj, dict) else cls(seed=seed)
+        except Exception:  # noqa: BLE001 — never let a bad checkpoint break tune/compile
+            p = cls(seed=seed)
         p._path = path
         return p
 

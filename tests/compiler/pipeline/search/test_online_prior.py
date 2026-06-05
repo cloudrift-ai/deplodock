@@ -144,6 +144,27 @@ def test_prior_file_checkpoint_round_trips(tmp_path):
         assert abs(p.mean_score({"BM": bm}) - q.mean_score({"BM": bm})) < 1e-6
 
 
+def test_load_tolerates_stale_checkpoint(tmp_path):
+    """A pre-CatBoost checkpoint (sklearn estimator-state ``model`` dict +
+    legacy ``archived_rows`` key) migrates instead of crashing: the unusable
+    model is dropped, the rows are salvaged, and the next refit rebuilds it."""
+    from deplodock import storage
+
+    path = tmp_path / "prior.json"
+    stale = {
+        "cols": ["BM"],
+        "model": {"class": "BayesianRidge", "state": {}},  # sklearn estimator state, not a cbm blob
+        "archived_rows": [[{"BM": bm}, math.log(bm)] for bm in (2, 4, 8, 16)],
+    }
+    storage.write_json(path, stale)
+    p = CatBoostPrior.load(path=path)
+    assert not p.fitted  # stale model discarded
+    assert len(p._dataset) == 4  # legacy rows salvaged
+    p.add_rows(_bm_rows())
+    p.fit()
+    assert p.fitted  # rebuilt fine from salvaged + new rows
+
+
 def test_dataset_accumulates_across_load():
     """A reloaded prior keeps its dataset + reservoir counters so a follow-up tune
     keeps accumulating from where it left off."""

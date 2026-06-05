@@ -58,7 +58,9 @@ except ImportError:
 try:
     from catboost import CatBoostRegressor
 
-    _OPTIONAL["catboost"] = lambda: CatBoostRegressor(iterations=400, depth=6, learning_rate=0.05, random_seed=0, verbose=False, allow_writing_files=False)
+    _OPTIONAL["catboost"] = lambda: CatBoostRegressor(
+        iterations=400, depth=6, learning_rate=0.05, random_seed=0, verbose=False, allow_writing_files=False
+    )
 except ImportError:
     pass
 
