@@ -362,8 +362,9 @@ def _print_kernel_stats(graph, bench):
     if not cuda_nodes:
         return
 
-    times_by_idx = {lt.idx: lt.time_ms * 1000 for lt in (bench.per_launch or [])}
-    total_us = bench.time_ms * 1000
+    # Per-kernel best-case (min) to match the min-based comparison table.
+    times_by_idx = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (bench.per_launch or [])}
+    total_us = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
     attrs_by_kname = _collect_kernel_attrs(graph)
     occ_limits = _occupancy_limits()
 
@@ -1165,21 +1166,18 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
 
-    import statistics as _stats  # noqa: PLC0415
-
     results: dict[str, float] = {}
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
             # ``elapsed_time`` is in ms across the whole batch; divide
             # by the batch size and multiply by 1000 to get per-call us.
-            # Median (not mean) for symmetry with deplodock's reduction
-            # in ``benchmark_program`` — keeps a single thermal-blip or
-            # lock-contention outlier from dragging eager's reported
-            # latency up.
+            # ``min`` (best-case iter) for both torch and deplodock — the
+            # least-noise latency, matching tune's min-over-variants reporting
+            # so tune and run numbers are comparable.
             per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
-            results[name] = _stats.median(per_iter_us)
-    results["Deplodock"] = bench.time_ms * 1000
+            results[name] = min(per_iter_us)
+    results["Deplodock"] = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
     return results, bench
 
 

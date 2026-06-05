@@ -202,6 +202,7 @@ class CudaBackend(Backend):
             )
         return BenchmarkResult(
             time_ms=result.time_ms,
+            min_ms=result.min_ms,
             num_launches=result.num_launches,
             per_launch=result.per_launch,
         )

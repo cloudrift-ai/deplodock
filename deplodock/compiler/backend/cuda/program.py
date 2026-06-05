@@ -850,6 +850,7 @@ def _samples_to_result(samples: list[list[float]], launches: list[_Launch]) -> B
 
     n = len(launches)
     medians = [(_stats.median(samples[i]) if samples[i] else 0.0) for i in range(n)]
+    mins = [(min(samples[i]) if samples[i] else 0.0) for i in range(n)]
     per_launch = [
         LaunchTime(
             idx=i,
@@ -859,7 +860,10 @@ def _samples_to_result(samples: list[list[float]], launches: list[_Launch]) -> B
         )
         for i in range(n)
     ]
-    return BenchmarkResult(time_ms=sum(medians), num_launches=n, per_launch=per_launch if per_launch else None)
+    # ``time_ms`` is the per-launch median (stable for tune's ranking); ``min_ms``
+    # is the per-launch best-case (least OS/thermal noise — what ``run --bench``
+    # reports, matching tune's min-over-variants reporting).
+    return BenchmarkResult(time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None)
 
 
 # ---------------------------------------------------------------------------
