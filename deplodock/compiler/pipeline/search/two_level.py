@@ -330,8 +330,9 @@ def run_two_level_tune(
     # One global end-of-run sanity block (the prior spans every kernel now).
     if prior.fitted or prior.trajectory:
         prior_summaries.append(prior.summary("global"))
-    # Persist the final state so the reservoir dataset accumulates across runs
-    # even when the last batch didn't cross the refit threshold.
+    # Force a final fit so even a small tune that never crossed a refit tier ends
+    # with a usable model, then persist (dataset accumulates across runs).
+    prior.maybe_refit(force=True)
     prior.checkpoint()
 
     assembled: Graph | None = None

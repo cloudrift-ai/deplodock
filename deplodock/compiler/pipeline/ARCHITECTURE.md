@@ -448,7 +448,8 @@ The dataset is bounded + batched (`base.Prior`): each tuned op's value-of-positi
 dataset capped at `MAX_ROWS` (100k — Algorithm R keeps a uniform sample of all rows ever seen, across runs), and the
 model refits (`maybe_refit`) on a **dataset-size-tiered cadence** (`REFIT_SCHEDULE`) — frequently while data-poor, then
 coarsening: every 100 rows up to 1k, every 1k up to 10k, every 10k from there on — then checkpoints. So the model warms
-up fast on the first op (~10 refits inside the first ~1k rows) and settles to ~once per op once large. The checkpoint is
+up fast on the first op (~10 refits inside the first ~1k rows) and settles to ~once per op once large. End-of-run does a
+`maybe_refit(force=True)` so even a small tune that never crossed a tier still ends with a fitted model (above `min_rows`). The checkpoint is
 a JSON file (`config.prior_path()`, `~/.cache/deplodock/prior.json`) holding the CatBoost `cbm` blob (base64) + the
 dataset, via `deplodock.storage`; `tune` writes it, `compile` / `run` read it.
 

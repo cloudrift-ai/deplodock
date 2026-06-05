@@ -116,12 +116,19 @@ class Prior(ABC):
                 return interval
         return REFIT_SCHEDULE[-1][1]
 
-    def maybe_refit(self) -> bool:
+    def maybe_refit(self, *, force: bool = False) -> bool:
         """Refit (and stamp the warmup boundary) iff enough rows have streamed in
         since the last fit (:meth:`_refit_interval`) and the dataset clears
-        ``min_rows``. Returns whether a fit happened (caller checkpoints on
-        ``True``)."""
-        if self._since_fit < self._refit_interval() or len(self._dataset) < self.min_rows:
+        ``min_rows``. ``force`` (used at end-of-run) bypasses the interval so a
+        small tune that never crossed a tier threshold still gets a fitted model —
+        but only when there's new data or no model yet, never a redundant re-fit.
+        Returns whether a fit happened (caller checkpoints on ``True``)."""
+        if len(self._dataset) < self.min_rows:
+            return False
+        if force:
+            if self.fitted and self._since_fit == 0:
+                return False  # nothing new since the last fit
+        elif self._since_fit < self._refit_interval():
             return False
         self.fit()
         self._since_fit = 0

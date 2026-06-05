@@ -104,6 +104,17 @@ def test_maybe_refit_gated_by_min_rows():
     assert not p.maybe_refit() and not p.fitted
 
 
+def test_force_refit_fits_small_dataset_below_tier():
+    """A small tune whose rows never cross the first tier (100) still gets a model
+    via ``force=True`` (end-of-run), as long as it clears ``min_rows``; a forced
+    refit with nothing new since the last fit is a no-op."""
+    p = CatBoostPrior(seed=0, iterations=20, min_rows=10)
+    p.add_rows(_bm_rows(reps=6))  # 36 rows: below the 100 tier, above min_rows
+    assert not p.maybe_refit()  # interval not reached
+    assert p.maybe_refit(force=True) and p.fitted  # forced fit lands
+    assert not p.maybe_refit(force=True)  # nothing new → no redundant re-fit
+
+
 def test_refit_interval_tiers_by_dataset_size():
     """Default (no ``refit_every`` override) coarsens the refit interval as the
     dataset grows: every 100 up to 1k, every 1k up to 10k, every 10k beyond."""
