@@ -125,7 +125,16 @@ def test_node_knobs_accumulates_along_path():
     b1 = _node({"BR": 2}, tree.root)
     b2 = _node({"BM": 64}, b1)
     leaf = _node({"BN": 32}, b2)
-    assert TuningSearch._node_knobs(leaf) == {"BR": 2, "BM": 64, "BN": 32}
+    assert TuningSearch(tree=tree)._node_knobs(leaf) == {"BR": 2, "BM": 64, "BN": 32}
+
+
+def test_node_knobs_includes_base_structural_knobs():
+    """base_knobs (the op's S_* identity) is merged under the fork deltas, so
+    the global prior's features carry op-structure."""
+    tree = SearchTree()
+    leaf = _node({"BR": 2}, tree.root)
+    s = TuningSearch(tree=tree, base_knobs={"S_n_loop": 3.0, "S_ext_reduce_max": 64.0})
+    assert s._node_knobs(leaf) == {"S_n_loop": 3.0, "S_ext_reduce_max": 64.0, "BR": 2}
 
 
 def test_prior_score_zero_when_no_model():

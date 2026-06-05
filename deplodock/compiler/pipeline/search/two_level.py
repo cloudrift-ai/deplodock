@@ -208,7 +208,9 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior)
+            # The LoopOp's knobs carry its ``S_*`` structural identity — feed them
+            # as the search's base knobs so the global prior's rows are op-aware.
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior, base_knobs=dict(op.knobs))
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats

@@ -102,6 +102,7 @@ class TuningSearch(Search):
         max_visits: int | None = None,
         score_cache: dict[Hashable, float] | None = None,
         prior_model: Prior | None = None,
+        base_knobs: dict | None = None,
     ) -> None:
         super().__init__(score_cache=score_cache)
         self.tree = tree if tree is not None else SearchTree()
@@ -112,6 +113,10 @@ class TuningSearch(Search):
         # ``refit_every`` benches; one Thompson draw per descent. ``None`` for a
         # single-shot compile (no benching) → uniform PUCT → emission-order pick.
         self.prior_model = prior_model
+        # The kernel's identity knobs (the ``S_*`` structural features stamped on
+        # the LoopOp) — merged under every node's accumulated fork deltas so the
+        # GLOBAL prior sees op-structure and can tell kernels apart.
+        self._base_knobs = dict(base_knobs) if base_knobs else {}
         self._benches_since_fit = 0
         self._best_reward = 0.0
         self._visits_at_best = 0
@@ -205,12 +210,12 @@ class TuningSearch(Search):
                 best_v, best = v, c
         return best
 
-    @staticmethod
-    def _node_knobs(node: SearchNode) -> dict:
-        """Accumulated knob dict for a node — merge of every ``fork.knobs``
-        delta from the root down to ``node``. A branch pins its level slice;
-        a leaf carries the complete row, so deeper nodes hold a superset. This
-        is the (partial-or-full) feature input the prior featurizes."""
+    def _node_knobs(self, node: SearchNode) -> dict:
+        """Accumulated knob dict for a node — the kernel's ``base_knobs`` (its
+        ``S_*`` structural identity) merged with every ``fork.knobs`` delta from
+        the root down to ``node``. A branch pins its level slice; a leaf carries
+        the complete row, so deeper nodes hold a superset. This is the
+        (partial-or-full) feature input the prior featurizes."""
         chain: list[dict] = []
         cur: SearchNode | None = node
         while cur is not None and cur.candidate is not None:
@@ -218,7 +223,7 @@ class TuningSearch(Search):
             if fork is not None:
                 chain.append(fork.knobs)
             cur = cur.parent
-        merged: dict = {}
+        merged: dict = dict(self._base_knobs)
         for knobs in reversed(chain):
             merged.update(knobs)
         return merged
