@@ -435,9 +435,22 @@ maintains on `SearchNode.best_reward`. `TuningSearch._collect_rows` walks the li
 every node with a benched descendant (leaves **and** branches); `_node_knobs` accumulates the `fork.knobs` deltas along
 the path; `knob.knob_features` vectorizes. Because the labels are non-stationary (they only rise), the model **refits
 from a tree snapshot** every `refit_every` benches rather than streaming. Selection draws one Thompson sample per descent
-(`resample`) so exploration stays honest; the magnitude is irrelevant, only the ranking. `--prior shadow` fits + reports
-the same end-of-run sanity block (silly-pick rate warmup-vs-post, self-calibration) but scores `0` — the pure-UCB
-baseline arm of the A/B. Findings + the road to a shipped, default-on prior live in `plans/learned-prior-puct.md`.
+(`resample`) so exploration stays honest; the magnitude is irrelevant, only the ranking.
+
+How the prior enters selection — two depths (`--prior` mode):
+
+- **`online` (depth-1)** — the prior is the unvisited-sibling *tiebreak*. Unvisited children still get UCB1 `+∞`, so
+  every sibling is force-visited once (forced breadth); the prior only orders those first-visits. Cheap, but its control
+  is weak — it can't skip a confidently-bad sibling.
+- **`puct` (depth-2)** — the prior enters the UCB *arithmetic* as a softmax policy (`_select_puct`): `score(c) = Q(c) +
+  c·P(c)·√(N_parent+1)/(1+N_c)`, `Q = best_reward/global_best` (0 if unvisited), `P = softmax` over the sibling set's
+  Thompson scores. A low-`P` unvisited sibling gets a tiny exploration term → deprioritized instead of force-benched, so
+  the search stops paying full breadth at every fork. Falls back to depth-1 UCB1 during warmup (before the prior is fit)
+  to seed the model. `c` is `--ucb-c`.
+- **`shadow`** — fits + reports the same end-of-run sanity block (silly-pick rate warmup-vs-post, self-calibration) but
+  scores `0` (pure-UCB baseline arm of the A/B).
+
+Findings + the road to a shipped, default-on prior live in `plans/learned-prior-puct.md`.
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search

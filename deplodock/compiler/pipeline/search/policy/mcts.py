@@ -40,6 +40,15 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.search.prior import OnlinePrior
 
 
+def _softmax(xs: list[float]) -> list[float]:
+    """Numerically-stable softmax (shift-invariant, so any constant offset in
+    the prior scores — e.g. its ``y_mean`` — cancels)."""
+    m = max(xs)
+    exps = [math.exp(x - m) for x in xs]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
 @dataclass
 class SearchNode:
     candidate: LazyCandidate | None  # None for the root sentinel
@@ -96,6 +105,7 @@ class TuningSearch(Search):
         max_visits: int | None = None,
         score_cache: dict[Hashable, float] | None = None,
         prior_model: OnlinePrior | None = None,
+        acquisition: bool = False,
     ) -> None:
         super().__init__(score_cache=score_cache)
         self.tree = tree if tree is not None else SearchTree()
@@ -106,6 +116,11 @@ class TuningSearch(Search):
         # from the live tree every ``refit_every`` benches; one Thompson draw
         # per descent. The static ``score_of`` prior is no longer consulted.
         self.prior_model = prior_model
+        # Depth-2: once the prior is fit, select by PUCT (prior as a softmax
+        # policy modulating the exploration bonus) instead of the depth-1
+        # +∞-unvisited tiebreak — so confidently-bad siblings aren't force-
+        # benched. Falls back to UCB1 + forced breadth during warmup.
+        self.acquisition = acquisition
         self._benches_since_fit = 0
         self._best_reward = 0.0
         self._visits_at_best = 0
@@ -157,7 +172,7 @@ class TuningSearch(Search):
             descendable = [c for c in node.children if c.live > 0]
             if not descendable:
                 return None
-            node = max(descendable, key=lambda c: self._ucb_key(c, node))
+            node = self._select(descendable, node)
         # Frontier just got handed off — drop it from the live count
         # on every ancestor. The engine may push children of this node
         # before the next pop; those pushes re-grow the count.
@@ -187,6 +202,38 @@ class TuningSearch(Search):
         if self.prior_model is None or child.candidate is None:
             return 0.0
         return self.prior_model.score(self._node_knobs(child))
+
+    def _select(self, children: list[SearchNode], parent: SearchNode) -> SearchNode:
+        """Pick the next child to descend into. Depth-2 PUCT once the prior is
+        fit (``acquisition`` mode); otherwise depth-1 UCB1 + ``+∞``-unvisited
+        forced breadth (also the warmup path that seeds the prior)."""
+        if self.acquisition and self.prior_model is not None and self.prior_model.fitted:
+            return self._select_puct(children, parent)
+        return max(children, key=lambda c: self._ucb_key(c, parent))
+
+    def _select_puct(self, children: list[SearchNode], parent: SearchNode) -> SearchNode:
+        """PUCT: the learned prior enters the UCB *arithmetic* as a softmax
+        policy that scales each child's exploration bonus —
+
+            score(c) = Q(c) + c_ucb · P(c) · √(N_parent + 1) / (1 + N_c)
+
+        where ``Q = best_reward / global_best`` (``0`` for an unvisited child)
+        and ``P`` is the softmax over the Thompson-sampled prior scores of the
+        sibling set. A confidently-bad unvisited sibling gets a small ``P`` →
+        tiny exploration term → it is deprioritized rather than force-visited
+        (the ``+∞``-unvisited rule that caused forced breadth is gone). The
+        prior is still soft: a draw that boosts its logit, or a parent visited
+        enough, can still surface it. ``c_ucb`` is ``--ucb-c``."""
+        global_best = self.tree.best_reward or 1.0
+        probs = _softmax([self._prior_score(c) for c in children])
+        sqrt_parent = math.sqrt(parent.visits + 1)
+        best, best_v = children[0], float("-inf")
+        for c, p in zip(children, probs, strict=True):
+            q = (c.best_reward / global_best) if c.visits > 0 else 0.0
+            v = q + self._ucb_c * p * sqrt_parent / (1 + c.visits)
+            if v > best_v:
+                best_v, best = v, c
+        return best
 
     @staticmethod
     def _node_knobs(node: SearchNode) -> dict:

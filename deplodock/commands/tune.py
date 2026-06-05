@@ -53,14 +53,15 @@ def register_tune_command(subparsers):
     )
     parser.add_argument(
         "--prior",
-        choices=("off", "online", "shadow"),
+        choices=("off", "online", "shadow", "puct"),
         default="off",
         help=(
-            "Unvisited-sibling tiebreaker for the inner MCTS. 'off' = pure UCB1 (emission order). "
-            "'online' = a learned Bayesian-ridge prior fit in-memory from this run's own benches "
-            "(Thompson-sampled), with an end-of-run sanity block per kernel. 'shadow' = fit + report "
-            "the same stats but DON'T steer selection (pure-UCB baseline for the online-vs-UCB A/B). "
-            "Default: off."
+            "How the learned Bayesian-ridge prior (fit in-memory from this run's own benches) enters the inner "
+            "MCTS. 'off' = pure UCB1 (emission order). 'online' = depth-1 unvisited-sibling tiebreak "
+            "(Thompson-sampled). 'puct' = depth-2 acquisition: the prior becomes a softmax policy that modulates "
+            "the exploration bonus, so confidently-bad siblings are deprioritized instead of force-benched. "
+            "'shadow' = fit + report stats but DON'T steer selection (pure-UCB baseline for the A/B). All non-off "
+            "modes print an end-of-run sanity block per kernel. Default: off."
         ),
     )
     parser.add_argument(

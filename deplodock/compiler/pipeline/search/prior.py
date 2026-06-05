@@ -51,11 +51,14 @@ class OnlinePrior:
     ``min_rows`` gate how often the search calls :meth:`fit`; ``resample`` is
     called once per descent for a fresh Thompson draw."""
 
-    def __init__(self, *, seed: int = 0, ridge: float = 1.0, refit_every: int = 4, min_rows: int = 6, active: bool = True) -> None:
+    def __init__(
+        self, *, seed: int = 0, ridge: float = 1.0, refit_every: int = 4, min_rows: int = 6, active: bool = True, mode: str = "online"
+    ) -> None:
         # ``active=False`` (shadow mode): the model still fits and records the
         # trajectory for the end-of-run stats, but :meth:`score` returns 0 so
         # selection is pure UCB — the baseline arm of the online-vs-UCB A/B.
         self.active = active
+        self.mode = mode  # display label for the summary block
         self.refit_every = refit_every
         self.min_rows = min_rows
         self._ridge = ridge
@@ -159,9 +162,8 @@ class OnlinePrior:
         best = min(us for _, us in oks)
         best_idx = next(i for i, (_, us, st) in enumerate(self.trajectory) if st == "ok" and us == best)
         warm = self._first_fit_idx if self._first_fit_idx is not None else n
-        mode = "online" if self.active else "shadow/UCB"
         lines = [
-            f"[prior] {label} ({mode}) — {n} benches (warmup {warm} / post {n - warm})",
+            f"[prior] {label} ({self.mode}) — {n} benches (warmup {warm} / post {n - warm})",
             f"  best:        {best:.3f} us @ bench #{best_idx}",
             f"  silly (>=2x best):  {self._silly(0, warm, 2 * best)}   {self._silly(warm, n, 2 * best, post=True)}",
         ]

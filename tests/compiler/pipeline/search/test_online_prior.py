@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch
+from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch, _softmax
 from deplodock.compiler.pipeline.search.prior import OnlinePrior, _spearman
 
 
@@ -143,6 +143,73 @@ def test_pure_ucb_when_no_model():
     child = _node({"BM": 64}, tree.root)
     s = TuningSearch(tree=tree)  # prior_model=None
     assert s._prior_score(child) == 0.0
+
+
+# --- depth-2 PUCT acquisition ----------------------------------------------
+
+
+def _fitted_prior_bm():
+    """A prior that has learned bigger BM = lower latency = higher reward."""
+    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
+    p = OnlinePrior(seed=0, min_rows=3)
+    p.fit(rows)
+    return p
+
+
+def test_puct_deprioritizes_bad_unvisited_vs_forced_breadth():
+    """The whole point of depth-2: a confidently-bad *unvisited* sibling must
+    NOT be force-selected over a good *visited* one — unlike depth-1, where the
+    unvisited child's UCB1 = +∞ forces it."""
+    prior = _fitted_prior_bm()
+    tree = SearchTree()
+    good_visited = _node({"BM": 64}, tree.root)
+    bad_unvisited = _node({"BM": 2}, tree.root)
+    tree.root.children = [good_visited, bad_unvisited]
+    tree.record_terminal(good_visited, 1.0)  # global_best = 1.0, Q(good) = 1
+    s = TuningSearch(tree=tree, prior_model=prior, acquisition=True)
+    prior.resample()
+
+    # Depth-1 (forced breadth): the unvisited child wins on +∞.
+    assert s._ucb_key(bad_unvisited, tree.root)[0] == float("inf")
+    assert max([good_visited, bad_unvisited], key=lambda c: s._ucb_key(c, tree.root)) is bad_unvisited
+    # Depth-2 PUCT: the bad unvisited child is deprioritized; we keep exploiting.
+    assert s._select_puct([good_visited, bad_unvisited], tree.root) is good_visited
+
+
+def test_puct_still_explores_promising_unvisited():
+    """A *promising* unvisited sibling (high prior) should still be explored
+    over a mediocre visited one — depth-2 deprioritizes only the bad ones."""
+    prior = _fitted_prior_bm()
+    tree = SearchTree()
+    mediocre_visited = _node({"BM": 8}, tree.root)
+    good_unvisited = _node({"BM": 64}, tree.root)
+    tree.root.children = [mediocre_visited, good_unvisited]
+    tree.record_terminal(mediocre_visited, 0.3)  # global_best 0.3, but BM=8 is so-so
+    s = TuningSearch(tree=tree, prior_model=prior, acquisition=True)
+    prior.resample()
+    assert s._select_puct([mediocre_visited, good_unvisited], tree.root) is good_unvisited
+
+
+def test_acquisition_falls_back_to_ucb_during_warmup():
+    """Before the prior is fit, ``_select`` is plain UCB1 + forced breadth so
+    the model gets seed data."""
+    tree = SearchTree()
+    a = _node({"BM": 64}, tree.root)
+    b = _node({"BM": 2}, tree.root)
+    tree.root.children = [a, b]
+    prior = OnlinePrior(seed=0)  # not fitted
+    s = TuningSearch(tree=tree, prior_model=prior, acquisition=True)
+    # Both unvisited → +∞ → first wins (emission order), exactly depth-1.
+    assert s._select([a, b], tree.root) is a
+
+
+def test_softmax_sums_to_one_and_orders():
+    p = _softmax([1.0, 2.0, 3.0])
+    assert abs(sum(p) - 1.0) < 1e-12
+    assert p[2] > p[1] > p[0]
+    # Shift-invariance (a constant offset cancels).
+    p2 = _softmax([101.0, 102.0, 103.0])
+    assert all(abs(a - b) < 1e-12 for a, b in zip(p, p2, strict=True))
 
 
 # --- spearman helper -------------------------------------------------------

@@ -207,8 +207,10 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            prior_model = _make_prior(prior, prior_seed) if prior in ("online", "shadow") else None
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior_model)
+            prior_model = _make_prior(prior, prior_seed) if prior in ("online", "shadow", "puct") else None
+            inner = TuningSearch(
+                patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior_model, acquisition=(prior == "puct")
+            )
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
@@ -253,11 +255,13 @@ def inner_reward(
 
 def _make_prior(prior: str, seed: int):
     """Construct an :class:`OnlinePrior` (lazy import — keeps numpy off the
-    default ``off`` path). ``shadow`` fits + reports but doesn't steer
-    selection (pure-UCB baseline for the A/B)."""
+    default ``off`` path). ``shadow`` fits + reports but doesn't steer selection
+    (pure-UCB baseline); ``online`` is the depth-1 tiebreak; ``puct`` is the
+    depth-2 acquisition (the ``acquisition`` flag is set search-side)."""
     from deplodock.compiler.pipeline.search.prior import OnlinePrior  # noqa: PLC0415
 
-    return OnlinePrior(seed=seed, active=(prior == "online"))
+    label = {"online": "online", "shadow": "shadow/UCB", "puct": "puct"}[prior]
+    return OnlinePrior(seed=seed, active=(prior in ("online", "puct")), mode=label)
 
 
 def run_two_level_tune(
