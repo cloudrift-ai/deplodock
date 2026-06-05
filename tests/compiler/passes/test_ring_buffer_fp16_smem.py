@@ -90,7 +90,6 @@ def _max_buffer_count(graph: Graph) -> int:
 
 
 def _pin(monkeypatch, **knobs: int | str) -> None:
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
     for k, v in knobs.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
 
@@ -99,12 +98,12 @@ def test_fp16_ring_buffer_uses_real_dtype_bytes(monkeypatch):
     """A 64×256 fp16 warp tile pinned to ``BUFFER_COUNT=4`` admits the depth-4
     ring under the sm_120 cap — the depth-4 slab is 80 KB at the real 2 B/elem,
     which fits; the pre-fix fp32 over-count reported 160 KB and rejected it."""
-    _pin(monkeypatch, ATOM_KIND="mma_m16n8k16_f16", WM=1, WN=4, FM=4, FN=8, BK=2, BUFFER_COUNT=4)
+    _pin(monkeypatch, MMA="mma_m16n8k16_f16", WM=1, WN=4, FM=4, FN=8, BK=2, BUFFER_COUNT=4)
     g = _mma_matmul_graph(M=2048, N=2048, K=2048)
     ctx = Context(compute_capability=(9, 0), max_dynamic_smem=_SM120_SMEM_CAP)
     out = Pipeline.build(TILE_PASSES).run(g, ctx=ctx)
     kop = out.nodes["c"].op
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     got = kop.knobs.get("BUFFER_COUNT")
     assert got == 4, f"BUFFER_COUNT=4 should fire at the real fp16 byte count, got {got}"
     assert _max_buffer_count(out) == 4, "expected a depth-4 ring StageBundle in the lowered body"
@@ -115,7 +114,7 @@ def test_fp16_ring_buffer_rejects_when_real_bytes_overflow(monkeypatch):
     still reject depth 4 — the fix corrects the byte count, it doesn't disable
     the smem budget guard. At a 64 KB cap the depth-4 80 KB ring genuinely
     overflows, so ``BUFFER_COUNT=4`` cannot fire."""
-    _pin(monkeypatch, ATOM_KIND="mma_m16n8k16_f16", WM=1, WN=4, FM=4, FN=8, BK=2, BUFFER_COUNT=4)
+    _pin(monkeypatch, MMA="mma_m16n8k16_f16", WM=1, WN=4, FM=4, FN=8, BK=2, BUFFER_COUNT=4)
     g = _mma_matmul_graph(M=2048, N=2048, K=2048)
     ctx = Context(compute_capability=(9, 0), max_dynamic_smem=64 * 1024)
     # Pinned-but-unfittable BUFFER_COUNT surfaces as a hard error (the pass

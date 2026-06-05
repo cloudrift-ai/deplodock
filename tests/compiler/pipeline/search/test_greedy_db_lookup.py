@@ -3,14 +3,14 @@
 Drives a real fork point (``005_launch_geometry`` on a matmul) through
 ``run_pipeline`` and asserts:
 
-1. **Baseline**: fresh DB → no lookup hit → greedy falls back to
-   option 0 (rule's heuristic ordering).
+1. **Baseline**: fresh DB → no lookup hit → greedy falls back to the
+   max-prior sibling (``Search.score_of``; ties keep emission order).
 2. **Irrelevant seed**: a ``lowering`` row keyed on an op we never see
-   doesn't match the fork's parent → greedy still falls back to
-   option 0.
+   doesn't match the fork's parent → greedy still falls back to the
+   max-prior sibling.
 3. **Relevant seed**: a ``lowering`` row keyed on the fork's actual
-   parent and pointing at a non-option-0 child overrides the rule's
-   default; greedy resolves the seeded variant.
+   parent and pointing at a different child overrides the prior pick;
+   greedy resolves the seeded variant.
 """
 
 from __future__ import annotations

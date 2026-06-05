@@ -28,7 +28,7 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import RuleSkipped
-from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.tensor import Tensor
 
 _ws = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.085_warp_specialize")

@@ -156,9 +156,8 @@ def pin_staged_pipelined(monkeypatch):
     occupancy-ordered greedy default now front-loads a depth-3 ring for
     this 128×128 tile, whose ``080_pipeline_stages`` unroll emits explicit
     per-slot offsets instead of the ``a7 % 2`` phase Expr."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_TMA", "0")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")
@@ -190,7 +189,7 @@ def test_staged_pipelined_matches_f32_reference(pin_staged_pipelined, M: int, N:
     from deplodock.compiler.backend.cuda.nvcc import compile_to_cubin  # noqa: PLC0415
 
     g, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     # The pinned BK=2 with buffer_count >= 2 must produce the cp.async-staged
     # pipelined MMA path — verified at the C source.
     assert "cp.async.commit_group" in src

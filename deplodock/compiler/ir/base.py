@@ -60,6 +60,16 @@ class Op:
     # autotune knob picked along the chain. Excluded from structural
     # identity and equality — pure attribution metadata.
     knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
+    # Free-form per-op-instance scratch metadata for passes that derive
+    # expensive analysis from the op and want it to ride the op instead of
+    # being threaded through call chains (e.g. the partition planner caches
+    # its ``_Plan`` under ``meta["plan"]``). Ops are shared by reference
+    # across ``Graph.copy`` snapshots and ``single_node_graph`` slices, so
+    # an entry stamped once is visible to every later consumer of the same
+    # op object — entries MUST therefore be keyed/validated by their owner
+    # against anything environmental they depend on. Never serialized,
+    # never part of structural identity or equality.
+    meta: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     inputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     outputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
@@ -93,39 +103,28 @@ class Op:
         """
         return True
 
-    def score(self, ctx) -> float | None:  # noqa: ARG002 — ``ctx`` consumed by subclass overrides
-        """Heuristic "promisingness" prior for autotune candidate
-        ordering. Higher = explore first. Returned without bounds; the
-        search uses it only as a tiebreaker among unvisited siblings.
-        Default: ``None`` (no prior available — the op does not
-        contribute to the candidate's mean score). Override in
-        subclasses with domain knowledge (``TileOp.score`` prefers CTAs
-        near the target thread count that stage their inputs and
-        register-tile, for example).
-        """
-        return None
-
     @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None, params=None) -> float | None:  # noqa: ARG004
+    def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:  # noqa: ARG004
         """Cheap pre-instantiation scorer. Lets a rule rank variants
-        without building each op just to read :meth:`score` — the
-        instantiation may be the bulk of the lowering cost (e.g.
-        ``TileOp.__post_init__`` runs full body normalization).
+        without ever building the op — the instantiation may be the bulk
+        of the lowering cost (e.g. ``TileOp.__post_init__`` runs full
+        body normalization).
 
         Subclasses override to implement when the score formula can be
         evaluated from precomputed inputs:
 
-        - ``knobs`` — pinned knob dict for this variant
+        - ``knobs`` — the variant's knob dict, exactly what the
+          materialized op would carry in ``Op.knobs`` (so DB rows /
+          golden configs / pin sets are scoreable without
+          reconstructing any rule-internal variant type)
         - ``shapes`` — op-defined shape descriptor (e.g. ``KernelShape``
           for ``TileOp`` — the static per-LoopOp planning state)
-        - ``params`` — op-defined variant tuple (e.g. ``TileParams``)
 
         Return ``None`` when the lazy path isn't implementable for
-        these inputs; callers (rules using deferred-materialization
-        forks) fall back to constructing the op and calling
-        :meth:`score`. The contract is "lazy = score-equivalent when
-        non-None": ``cls.lazy_score(...) == cls(...).score(ctx)`` for
-        any inputs both can score.
+        these inputs. This is the ONLY scorer — there is deliberately no
+        post-materialization ``Op.score``: every ranking decision the
+        search makes flows through the same cheap (knobs, shapes)
+        formula, so an op never needs to exist just to be ranked.
         """
         return None
 

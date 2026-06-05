@@ -1,17 +1,18 @@
 """Pipeline value types and compile driver: ``Pattern``, ``Match``,
-``Rule``, ``RuleSkipped``, ``Pass``, ``Cursor``, ``Pipeline``.
+``Rule``, ``RuleSkipped``, ``Pass``, ``Cursor``, ``Pipeline``, ``Run``.
 
 Bundled together because they form a tight chain — ``Pattern`` defines
 what a rule matches, ``Rule`` carries the pattern + rewrite, ``Pass``
-groups rules, ``Pipeline`` holds passes and drives matching, ``Cursor``
-tracks per-candidate resume state, and ``Match`` carries ``Rule`` (which
-backref-resolves to ``Pass``) + ``Pipeline`` so callers can read all
-pass / rule / dump metadata off one field.
+groups rules, ``Pipeline`` is the frozen pass layout + matcher, ``Run``
+owns ONE drive of that layout (ctx / search / db / backend / dump /
+rejections + the engine loop), ``Cursor`` tracks per-candidate resume
+state inside a Run, and ``Match`` carries ``Rule`` (which backref-resolves
+to ``Pass``).
 
 ``Pipeline`` also owns the compile entry points — :meth:`build`,
-:meth:`run`, :meth:`tune`, :meth:`search`. The per-rule logging,
-rewrite-kwarg dispatch, and snapshot rendering live on
-:class:`Candidate` (see :mod:`..search.candidate`).
+:meth:`run`, :meth:`tune` (each constructs a :class:`Run` and drives it).
+The per-rule logging, rewrite-kwarg dispatch, and snapshot rendering live
+on :class:`Candidate` (see :mod:`..search.candidate`).
 """
 
 from __future__ import annotations
@@ -143,38 +144,6 @@ class LoweringError(Exception):
     shapes, so no sink is installed and nothing is raised."""
 
 
-@dataclass(frozen=True)
-class Fork:
-    """A deferred fork option in the search tree.
-
-    Two flavors share the same shape:
-
-    - **Branch Fork** (``is_leaf=False``) — produced explicitly by a rule's
-      ``rewrite()`` to spawn a hierarchical fork point. ``expand()`` returns
-      the next level of options (more Forks, concrete leaves, or a mix);
-      the search loop drives this via :meth:`LazyCandidate.expand`.
-    - **Leaf Fork** (``is_leaf=True``) — produced by
-      :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` to
-      uniformly wrap concrete ``Op`` / ``Graph`` rewrites. ``expand()``
-      returns ``[option]`` (one element); :meth:`LazyCandidate.resolve`
-      invokes it once at resolve time to retrieve the leaf and apply it.
-
-    Sharing one shape lets ``LazyCandidate.pending`` carry just ``Fork``
-    (no tagged union) — the search loop branches on ``Fork.is_leaf`` to
-    decide expand-vs-resolve, and :func:`_best_fork` reads ``Fork.knobs``
-    polymorphically without isinstance.
-
-    ``knobs`` is the knob-delta this Fork pins (used by :func:`_best_fork`
-    to match the lowering DB without firing the thunk). ``score`` is the
-    MCTS prior for the unvisited-sibling tiebreak — typically the score
-    of the best-reachable leaf under this branch."""
-
-    knobs: dict
-    expand: Callable[[], list[Op | Graph | Fork]]
-    score: float = 0.0
-    is_leaf: bool = False
-
-
 @dataclass
 class Pass:
     """One pipeline pass: a named, indexed list of rules.
@@ -243,12 +212,13 @@ class Match:
     redirected to. ``output`` defaults to ``root_node_id`` when left
     as ``None``.
 
-    ``pipeline`` + ``rule`` locate this match in the run; the rewriter
-    reaches pass metadata via ``match.rule.pass_`` and the dump sink
-    via ``match.pipeline.dump``. Both stamped by :meth:`Pipeline.match`
-    at construction time. ``is_last`` is stamped on the last live
-    match returned by :meth:`Pipeline.match` so
-    ``Candidate.try_rewrite`` knows when to advance the cursor.
+    ``rule`` locates this match in the pipeline; the rewriter reaches
+    pass metadata via ``match.rule.pass_``. Stamped by
+    :meth:`Pipeline.match` at construction time. Run-scoped sinks (dump,
+    rejections) live on the :class:`Run` — reached through the candidate,
+    not the match. ``is_last`` is stamped on the last live match returned
+    by :meth:`Pipeline.match` so ``Candidate.try_rewrite`` knows when to
+    advance the cursor.
 
     Use the helpers (``root``, ``node()``, ``input()``, ``is_alive()``)
     to resolve ids to ``Node`` objects through ``graph`` — they're the
@@ -257,7 +227,6 @@ class Match:
 
     graph: Graph
     root_node_id: str
-    pipeline: Pipeline
     rule: Rule
     nodes: dict[str, str] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
@@ -314,7 +283,6 @@ class Match:
         return Match(
             graph=graph,
             root_node_id=self.root_node_id,
-            pipeline=self.pipeline,
             rule=self.rule,
             nodes=dict(self.nodes),
             consumed=set(self.consumed),
@@ -329,11 +297,11 @@ class Cursor:
     """Pipeline resume state for a candidate. Owns the entire advance
     logic: ``advance(graph)`` moves past the current rule batch,
     wrapping to the next pass — logging "compile: <pass> done" and
-    flushing ``pipeline.dump.on_pass`` — when the scan completes with
+    flushing ``run.dump.on_pass`` — when the scan completes with
     no functional rewrites.
 
-    * ``pipeline`` — the pipeline being driven; needed to look up the
-      current pass / rule by index.
+    * ``run`` — the :class:`Run` being driven; resolves the pipeline
+      (current pass / rule by index) and the per-run dump sink.
     * ``pass_idx`` — index of the pass to apply next.
     * ``rule_idx`` — index of the rule within the current pass to try
       next.
@@ -343,19 +311,19 @@ class Cursor:
       with the counter ``== 0``, the engine advances to the next pass.
     """
 
-    pipeline: Pipeline
+    run: Run
     pass_idx: int = 0
     rule_idx: int = 0
     n_applied: int = 0
 
     @property
     def is_done(self) -> bool:
-        return self.pass_idx >= len(self.pipeline.passes)
+        return self.pass_idx >= len(self.run.pipeline.passes)
 
     @property
     def current_pass(self) -> Pass:
-        assert not self.is_done, f"cursor is done (pass_idx={self.pass_idx} >= {len(self.pipeline.passes)})"
-        return self.pipeline.passes[self.pass_idx]
+        assert not self.is_done, f"cursor is done (pass_idx={self.pass_idx} >= {len(self.run.pipeline.passes)})"
+        return self.run.pipeline.passes[self.pass_idx]
 
     @property
     def current_rule(self) -> Rule:
@@ -365,7 +333,7 @@ class Cursor:
 
     def advance(self, graph: Graph) -> None:
         """Move past the just-finished rule batch. Wraps to the next
-        pass (logging done + flushing ``pipeline.dump.on_pass``) when
+        pass (logging done + flushing ``run.dump.on_pass``) when
         the scan completes with no functional rewrites; otherwise
         restarts the scan from rule 0 to apply newly-spawned matches.
         ``graph`` is the candidate's current graph — passed in so the
@@ -381,32 +349,24 @@ class Cursor:
         if finished:
             if pass_.name:
                 logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(graph.nodes))
-                if self.pipeline.dump is not None:
-                    self.pipeline.dump.on_pass(pass_, graph)
+                if self.run.dump is not None:
+                    self.run.dump.on_pass(pass_, graph)
             self.pass_idx += 1
 
 
 @dataclass(frozen=True)
 class Pipeline:
-    """Frozen per-run layout of the rewrite pipeline.
+    """Frozen, shareable pass layout of the rewrite pipeline — nothing
+    run-scoped lives here (that's :class:`Run`), so one Pipeline can
+    drive any number of concurrent runs.
 
     :meth:`match` is the only entry point for pattern matching: it
     walks the graph for one rule and stamps the rule onto every Match.
     Tests / standalone callers that just want pattern matching can
     build a one-rule Pipeline via :meth:`from_pattern`.
-
-    ``dump`` is the optional artifact collector — when set,
-    :class:`Candidate` routes per-rule diffs through ``dump.on_rule``
-    inside :meth:`Candidate._log_apply` and :class:`Cursor` routes
-    post-pass graph dumps through ``dump.on_pass`` inside
-    :meth:`Cursor.advance`. Living on Pipeline lets both read it off
-    one shared reference (reached via ``match.pipeline.dump`` and
-    ``cursor.pipeline.dump``) instead of threading it through every
-    helper.
     """
 
     passes: list[Pass]
-    dump: CompilerDump | None = None
 
     def match(self, graph: Graph, rule: Rule) -> list[Match]:
         """Enumerate every live pattern match for ``rule`` against
@@ -418,7 +378,7 @@ class Pipeline:
         may have removed a consumed node."""
         results: list[Match] = []
         for nid in graph.topological_order():
-            m = _match_at(graph, nid, self, rule)
+            m = _match_at(graph, nid, rule)
             if m is not None and m.is_alive():
                 results.append(m)
         if results:
@@ -435,92 +395,27 @@ class Pipeline:
         return cls(passes=[Pass(name="__test__", rules=[rule], index=0)])
 
     @classmethod
-    def build(cls, passes: list[str], *, select: Iterable[str] | None = None, dump: CompilerDump | None = None) -> Pipeline:
+    def build(cls, passes: list[str], *, select: Iterable[str] | None = None) -> Pipeline:
         """Load each named pass directory into a :class:`Pass` and
         assemble them into a Pipeline. ``select``, when given, filters
         rules whose stem (with or without numeric prefix) appears in
         the set."""
         select_set = set(select) if select is not None else None
-        return cls(passes=[Pass.load(name, i, select_set) for i, name in enumerate(passes)], dump=dump)
+        return cls(passes=[Pass.load(name, i, select_set) for i, name in enumerate(passes)])
 
-    def search(self, search: Search, ctx: Context | None, *, db: SearchDB | None = None) -> Iterator[Candidate]:
-        """The unified search-driven driver. Each iteration: pop a
-        candidate, run one rule's batch of matches against its graph,
-        push successor(s). Yields when a candidate reaches the end of
-        the pipeline (``cursor.pass_idx >= len(self.passes)``).
-
-        Per-rule batch semantics: enumerate matches via :meth:`match`
-        (which stamps ``rule`` on each Match plus ``is_last`` on the
-        last live one), call ``Candidate.try_rewrite`` for each.
-        Single-option matches apply inline; the first multi-option
-        match spawns one ``LazyCandidate`` per option and breaks the
-        loop. Cursor advance for the rule batch is owned by
-        :meth:`Cursor.advance`, fired from ``Candidate.apply`` on
-        ``match.is_last`` (and directly here for batches that produced
-        no live matches) even when the rewrite skipped or yielded no
-        valid options."""
-        from deplodock.compiler.pipeline.search.candidate import LazyCandidate  # noqa: PLC0415
-
-        while (popped := search.pop()) is not None:
-            # Thunk-bearing fork: expand before resolving. Each expansion
-            # spawns the next level of ``LazyCandidate``s (more thunks or
-            # concrete options) sharing the same ``inner`` and ``match`` —
-            # cursor advance is deferred until a leaf actually resolves.
-            if popped.is_expandable():
-                children = popped.expand()
-                best = _best_fork(children, popped.inner, db) if db is not None else None
-                search.push(children[0], *children[1:], best=best)
-                continue
-            cand = popped.resolve()
-            cur = cand.cursor
-            if cur.is_done:
-                yield cand
-                continue
-            pass_ = cur.current_pass
-            # Empty pass (e.g. all rules filtered out) OR no live
-            # matches → no apply fires → advance the cursor directly
-            # so the search loop doesn't re-pop the same rule batch
-            # forever. ``advance`` handles both cases uniformly: with
-            # ``n_applied == 0`` it wraps to the next pass and fires
-            # the post-pass log + dump.
-            if not pass_.rules:
-                cur.advance(cand.graph)
-                search.push(cand.lazy())
-                continue
-            matches = self.match(cand.graph, cur.current_rule)
-            if not matches:
-                cur.advance(cand.graph)
-                search.push(cand.lazy())
-                continue
-
-            forks: list[LazyCandidate] | None = None
-            for match in matches:
-                options = cand.try_rewrite(match)
-                if options is None:
-                    continue
-                # Multi-option fork point: spawn one ``LazyCandidate`` per
-                # option (option-0 included as the primary). Each shares
-                # ``cand`` as ``inner`` so siblings don't duplicate the
-                # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
-                # options into leaf Forks so every LazyCandidate's pending
-                # carries a uniform Fork shape. The fork's apply on
-                # resolve advances the cursor when ``match.is_last`` (the
-                # cursor advance the eager loop didn't do here, since we
-                # deferred to forks).
-                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
-                break
-
-            if forks is not None:
-                best = _best_fork(forks, cand, db) if db is not None else None
-                search.push(forks[0], *forks[1:], best=best)
-                continue
-
-            search.push(cand.lazy())
-
-    def run(self, graph: Graph, *, ctx: Context | None = None, backend=None, db: SearchDB | None = None) -> Graph:
+    def run(
+        self,
+        graph: Graph,
+        *,
+        ctx: Context | None = None,
+        backend=None,
+        db: SearchDB | None = None,
+        dump: CompilerDump | None = None,
+    ) -> Graph:
         """Single-shot greedy compile — run each pass in order, picking
-        option 0 at every fork point. Convenience wrapper around
-        :meth:`tune` that yields the first terminal.
+        the DB-best (or, untuned, the max-prior) fork at every fork
+        point. Convenience wrapper around :meth:`tune` that yields the
+        first terminal.
 
         ``ctx`` is built once (probing the live device if not provided)
         and passed to every rule that takes a ``ctx`` parameter.
@@ -535,7 +430,7 @@ class Pipeline:
         For exhaustive autotuning, call :meth:`tune` directly with
         :class:`TuningSearch` and iterate every yielded candidate.
 
-        Installs a per-run ``_lowering_rejections`` sink so
+        Installs a per-run ``rejections`` sink (on the :class:`Run`) so
         :func:`Candidate.try_rewrite` records any rewrite whose every
         option failed ``validate(ctx)``. After the single terminal
         settles, :func:`_raise_on_unlowered` turns a recorded rejection
@@ -543,14 +438,8 @@ class Pipeline:
         instead of a downstream ``CudaBackend`` mystery."""
         from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
 
-        # ``Pipeline`` is a frozen dataclass — stash the per-run sink via
-        # ``object.__setattr__`` (it's transient engine state, not a field).
         rejections: list[tuple[str, str, str]] = []
-        object.__setattr__(self, "_lowering_rejections", rejections)
-        try:
-            cand = next(self.tune(graph, search=GreedySearch(db=db), ctx=ctx, backend=backend, db=db))
-        finally:
-            object.__setattr__(self, "_lowering_rejections", None)
+        cand = next(self.tune(graph, search=GreedySearch(), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
         _raise_on_unlowered(cand.graph, rejections, cand.ctx)
         return cand.graph
 
@@ -562,6 +451,8 @@ class Pipeline:
         ctx: Context | None = None,
         backend=None,
         db: SearchDB | None = None,
+        dump: CompilerDump | None = None,
+        rejections: list[tuple[str, str, str]] | None = None,
     ) -> Iterator[Candidate]:
         """Drive the autotune search. Yields one terminal ``Candidate``
         per fully-explored branch. With deterministic rules (no
@@ -584,10 +475,10 @@ class Pipeline:
         written to ``db``).
 
         ``ctx`` is built once (probing the live device if not provided)
-        and shared by every candidate."""
+        and shared by every candidate. ``dump`` / ``rejections`` are
+        run-scoped sinks — see :class:`Run`."""
         from deplodock.compiler import provenance  # noqa: PLC0415
         from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.candidate import Candidate as _Candidate  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
 
         # Seed op provenance on the input graph before any pass runs — the one
@@ -602,19 +493,142 @@ class Pipeline:
             ctx = replace(ctx, backend_name=backend_name)
         t_start = time.monotonic()
 
-        search.push(_Candidate(ctx=ctx, graph=graph, cursor=Cursor(pipeline=self)).lazy())
-
-        if db is None:
-            db = _SearchDB()
+        run = Run(
+            pipeline=self,
+            ctx=ctx,
+            search=search,
+            db=db if db is not None else _SearchDB(),
+            backend=backend,
+            dump=dump,
+            rejections=rejections,
+        )
         n_terminals = 0
-        for cand in self.search(search, ctx, db=db):
+        for token, cand in run.drive(graph):
             n_terminals += 1
             if backend is not None:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
-            stats, status = _bench_terminal(cand, backend=backend, db=db)
-            search.observe(stats, status)
+            stats, status = _bench_terminal(cand, backend=backend, db=run.db)
+            search.observe(token, stats, status)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
+
+
+@dataclass
+class Run:
+    """Mutable per-run state of ONE drive of a pipeline — everything
+    scoped to a single compile / tune invocation lives here, so
+    :class:`Pipeline` stays a frozen, shareable pass layout and nothing
+    run-scoped is ever smuggled onto shared objects.
+
+    * ``pipeline`` — the frozen pass layout being driven.
+    * ``ctx`` — the resolved hardware context, shared by every candidate
+      (reached as ``cand.ctx``).
+    * ``search`` — the policy (greedy / MCTS) ordering the exploration.
+    * ``db`` — the autotune store ``_best_fork`` replays and
+      ``_bench_terminal`` persists into.
+    * ``backend`` — optional measurement backend (``None`` = stub bench,
+      no persistence).
+    * ``dump`` — optional artifact collector: :meth:`Candidate._log_apply`
+      routes per-rule diffs through ``dump.on_rule``, :meth:`Cursor.advance`
+      routes post-pass graphs through ``dump.on_pass``.
+    * ``rejections`` — optional sink for rewrites whose every option
+      failed ``validate(ctx)`` (installed by :meth:`Pipeline.run` so
+      greedy compiles can raise :class:`LoweringError`; absent under
+      tune, where a pruned fork is a legitimate dead end).
+
+    Candidates and cursors hold a back-reference to their Run, so
+    engine-adjacent code reads run state off the object at hand
+    (``cand.run.dump``) instead of threading six arguments around."""
+
+    pipeline: Pipeline
+    ctx: Context
+    search: Search
+    db: SearchDB
+    backend: object | None = None
+    dump: CompilerDump | None = None
+    rejections: list[tuple[str, str, str]] | None = None
+
+    def drive(self, graph: Graph) -> Iterator[tuple[object | None, Candidate]]:
+        """Seed ``graph`` as the root candidate and drive the search to
+        every terminal. Each iteration: pop a ``(token, candidate)``
+        pair, run one rule's batch of matches against the candidate's
+        graph, push successor(s) under ``parent=token``. Yields
+        ``(token, candidate)`` when a candidate reaches the end of the
+        pipeline (``cursor.is_done``) — the caller passes the token to
+        ``search.observe`` so the measurement lands on the terminal's
+        own lineage (no "most recently popped" hidden state).
+
+        Per-rule batch semantics: enumerate matches via
+        :meth:`Pipeline.match` (which stamps ``rule`` on each Match plus
+        ``is_last`` on the last live one), call
+        ``Candidate.try_rewrite`` for each. Single-option matches apply
+        inline; the first multi-option match spawns one
+        ``LazyCandidate`` per option and breaks the loop. Cursor advance
+        for the rule batch is owned by :meth:`Cursor.advance`, fired
+        from ``Candidate.apply`` on ``match.is_last`` (and directly here
+        for batches that produced no live matches) even when the rewrite
+        skipped or yielded no valid options."""
+        from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate  # noqa: PLC0415
+
+        search = self.search
+        # Seed candidate: no parent token — the policy roots it itself.
+        search.push(Candidate(run=self, graph=graph, cursor=Cursor(run=self)).lazy())
+
+        while (popped := search.pop()) is not None:
+            token, lc = popped
+            # Thunk-bearing fork: expand before resolving. Each expansion
+            # spawns the next level of ``LazyCandidate``s (more thunks or
+            # concrete options) sharing the same ``inner`` and ``match`` —
+            # cursor advance is deferred until a leaf actually resolves.
+            if lc.is_expandable():
+                children = lc.expand()
+                search.push(*children, parent=token, best=_best_fork(children, lc.inner, self.db))
+                continue
+            cand = lc.resolve()
+            cur = cand.cursor
+            if cur.is_done:
+                yield token, cand
+                continue
+            pass_ = cur.current_pass
+            # Empty pass (e.g. all rules filtered out) OR no live
+            # matches → no apply fires → advance the cursor directly
+            # so the search loop doesn't re-pop the same rule batch
+            # forever. ``advance`` handles both cases uniformly: with
+            # ``n_applied == 0`` it wraps to the next pass and fires
+            # the post-pass log + dump.
+            if not pass_.rules:
+                cur.advance(cand.graph)
+                search.push(cand.lazy(), parent=token)
+                continue
+            matches = self.pipeline.match(cand.graph, cur.current_rule)
+            if not matches:
+                cur.advance(cand.graph)
+                search.push(cand.lazy(), parent=token)
+                continue
+
+            forks: list[LazyCandidate] | None = None
+            for match in matches:
+                options = cand.try_rewrite(match)
+                if options is None:
+                    continue
+                # Multi-option fork point: spawn one ``LazyCandidate`` per
+                # option, in rule-emission order (the search ranks them
+                # via ``score_of``; rules need not pre-sort). Each shares
+                # ``cand`` as ``inner`` so siblings don't duplicate the
+                # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
+                # options into leaf Forks so every LazyCandidate's pending
+                # carries a uniform Fork shape. The fork's apply on
+                # resolve advances the cursor when ``match.is_last`` (the
+                # cursor advance the eager loop didn't do here, since we
+                # deferred to forks).
+                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
+                break
+
+            if forks is not None:
+                search.push(*forks, parent=token, best=_best_fork(forks, cand, self.db))
+                continue
+
+            search.push(cand.lazy(), parent=token)
 
 
 def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ctx: Context) -> None:
@@ -653,7 +667,7 @@ def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ct
     )
 
 
-def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match | None:
+def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
     nid: str | None = start
     nodes: dict[str, str] = {}
     consumed: set[str] = set()
@@ -681,7 +695,6 @@ def _match_at(graph: Graph, start: str, pipeline: Pipeline, rule: Rule) -> Match
     return Match(
         graph=graph,
         root_node_id=start,
-        pipeline=pipeline,
         rule=rule,
         nodes=nodes,
         consumed=consumed,
@@ -751,7 +764,7 @@ def _best_fork(forks, parent_cand, db):
             # those knobs is constrained by the row; otherwise every
             # sibling is equally consistent and we fall back to option-0.
             # Branch Forks are emitted by the partition planner
-            # (``010_partition_loops``, via ``fork_tree.build_fork_tree``)
+            # (``010_partition_loops``, via ``fork.build_fork_tree``)
             # for the BR/(BM,BN)/(FM,FN) hierarchy when those levels carry
             # more than one distinct knob value.
             if not opt_knobs:

@@ -137,10 +137,12 @@ def test_tuning_does_not_raise_and_prunes_branch():
     assert isinstance(terminals[0].graph.nodes["y"].op, TileOp)
 
 
-def test_run_sink_cleared_after_use():
-    # After a successful guardrail run the transient sink is reset to None
-    # so a subsequent tune sees no sink (silent fork-pruning preserved).
+def test_run_leaves_no_state_on_pipeline():
+    # The rejection sink is Run-scoped (``Run.rejections``), never stashed on
+    # the shared frozen Pipeline — a subsequent tune on the same Pipeline sees
+    # no sink (silent fork-pruning preserved), and concurrent runs can't
+    # clobber each other.
     pipeline = _build_pipeline()
     with pytest.raises(LoweringError):
         pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
-    assert getattr(pipeline, "_lowering_rejections", None) is None
+    assert not hasattr(pipeline, "_lowering_rejections")

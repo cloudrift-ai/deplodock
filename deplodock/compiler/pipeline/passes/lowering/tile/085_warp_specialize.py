@@ -100,8 +100,8 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.fork import ThunkFork
 from deplodock.compiler.pipeline.knob import Knob, KnobType
-from deplodock.compiler.pipeline.pipeline import Fork
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -359,7 +359,7 @@ def _ws_transform(op: TileOp) -> TileOp:
 # ---------------------------------------------------------------------------
 
 
-def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
+def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | None:
     op: TileOp = root.op
 
     if WARP_SPECIALIZE.name in op.knobs:
@@ -394,25 +394,18 @@ def rewrite(ctx: Context, root: Node) -> TileOp | Fork | list[Fork] | None:
 
     # Prior (rank-only — the MCTS still measures both). For the warp-tier MMA
     # tower, WS=1 is a measured win (≈17% at 64×64, neutral at 128×128 — see
-    # the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``), so rank
-    # the WS=1 fork first and the greedy/first-guess path takes it. The scalar
+    # the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``), so score
+    # the WS=1 fork higher and the greedy/first-guess path takes it. The scalar
     # (pointwise / coop-reduce) tier has no such consensus, so it stays neutral
-    # (0.0) and greedy follows the hint order.
+    # (0.0) and greedy follows the hint order (a score tie keeps emission
+    # order). The score alone drives both pickers: greedy takes the max-prior
+    # sibling (``Search.score_of``), MCTS uses it as the UCB unvisited tiebreak.
     _, is_warp = _find_consumer_tile(op.body)
 
-    def _ws_score(ws: bool) -> float:
-        return 1.0 if (ws and is_warp) else 0.0
+    def _ws_expand(knobs: dict) -> list[TileOp]:
+        return [_stamp(knobs[WARP_SPECIALIZE.name])]
 
-    # Order matters for the greedy default (``GreedySearch`` keeps fork option-0
-    # by *order*, not score), score matters for the MCTS UCB prior. Put the
-    # higher-scored choice first so both paths prefer WS=1 on the warp tier.
-    ordered = sorted(ws_choices, key=_ws_score, reverse=True)
-    return [
-        Fork(
-            knobs={WARP_SPECIALIZE.name: ws},
-            expand=(lambda ws=ws: [_stamp(ws)]),
-            score=_ws_score(ws),
-            is_leaf=True,
-        )
-        for ws in ordered
-    ]
+    def _ws_score(knobs: dict) -> float:
+        return 1.0 if (knobs[WARP_SPECIALIZE.name] and is_warp) else 0.0
+
+    return [ThunkFork(knobs={WARP_SPECIALIZE.name: ws}, expand_fn=_ws_expand, score_fn=_ws_score, is_leaf=True) for ws in ws_choices]

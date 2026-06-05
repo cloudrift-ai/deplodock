@@ -71,7 +71,7 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     assert _tile_has_combine(out)
     assert "chunk_matmul_k" not in fired
@@ -86,7 +86,7 @@ def test_short_axis_sum_does_not_fire_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert not _tile_has_combine(out)
 
 
@@ -101,7 +101,7 @@ def test_warp_sized_axis_fires_cooperative_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert _tile_has_combine(out)
 
 
@@ -115,7 +115,7 @@ def test_warp_cooperative_skips_stage_inputs(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     assert _tile_has_combine(out)
     assert "stage_inputs" not in fired
@@ -141,7 +141,7 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(KERNEL_PASSES).run(g, dump=recording_dump)
     stmts = _kernel_body_stmts(out)
     assert any(isinstance(s, WarpShuffle) for s in stmts)
     assert not any(isinstance(s, TreeHalve) for s in stmts)
@@ -159,7 +159,7 @@ def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(KERNEL_PASSES).run(g, dump=recording_dump)
     stmts = _kernel_body_stmts(out)
     warp_shuffles = [s for s in stmts if isinstance(s, WarpShuffle)]
     tree_halves = [s for s in stmts if isinstance(s, TreeHalve)]
@@ -182,7 +182,7 @@ def test_block_cooperative_skips_stage_inputs(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     assert _tile_has_combine(out)
     assert "stage_inputs" not in fired
@@ -202,7 +202,7 @@ def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert not _tile_has_combine(out)
 
 

@@ -95,7 +95,7 @@ def _run_rule(op: TileOp, g: Graph):
     node = g.nodes["op"]
     # Build a minimal Match — the rule only reads ``match.graph`` for
     # the static-shape probe; no need to populate the full match tree.
-    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", pipeline=None, rule=None, is_last=True)  # type: ignore[arg-type]
+    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", rule=None, is_last=True)  # type: ignore[arg-type]
     return _use_tma.rewrite(_ctx(), match, node)
 
 
@@ -136,7 +136,7 @@ def test_skipped_on_pre_hopper_target():
     op, g = _tile_op_buffered(policy=StagePolicy.BUFFERED)
     from deplodock.compiler.pipeline.pipeline import Match  # noqa: PLC0415
 
-    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", pipeline=None, rule=None, is_last=True)  # type: ignore[arg-type]
+    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", rule=None, is_last=True)  # type: ignore[arg-type]
     with pytest.raises(RuleSkipped, match="TMA requires compute capability"):
         _use_tma.rewrite(Context(compute_capability=(8, 0)), match, g.nodes["op"])
 

@@ -68,7 +68,7 @@ def _walk_apply_gate(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:
     op: TileOp = root.op
-    if op.knobs.get("ATOM_KIND"):
+    if op.knobs.get("MMA"):
         # MMA path: accumulation flows through the C fragment (one
         # per cell), not through scalar Init/Accum stmts; the
         # linear-residual gate has no surface to hoist here. SplitK on

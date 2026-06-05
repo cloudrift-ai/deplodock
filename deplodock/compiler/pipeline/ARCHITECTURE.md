@@ -6,7 +6,8 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 
 ```
 pipeline/
-├── pipeline.py    # Pattern, Match, Rule, Pass, Pipeline; engine + Pipeline.run / Pipeline.tune / Pipeline.search
+├── pipeline.py    # Pattern, Match, Rule, Pass, Pipeline (frozen layout), Run (per-run state + engine loop)
+├── fork.py        # Fork interface + OptionFork / ThunkFork; Level + build_fork_tree lazy knob-cartesian tree builder
 ├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
@@ -25,7 +26,7 @@ pipeline/
     │   └── optimization/   # IndexMap fusion before lift-to-loop
     ├── loop/
     │   ├── lifting/        # tensor ops → trivial LoopOp nodes
-    │   └── fusion/         # fuse fan-out indexmaps into all consumers, then merge adjacent LoopOp pairs (splice)
+    │   └── fusion/         # fuse fan-out indexmaps into all consumers, merge adjacent LoopOp pairs (splice), then stamp name + structural-id (SID) knobs
     └── lowering/
         ├── tile/           # LoopOp → TileOp (tileify + scheduling rules)
         ├── kernel/         # TileOp → KernelOp (materialize scheduling)
@@ -67,31 +68,47 @@ The dispatcher binds parameters by name. Reserved names: `graph`,
 matched `Node` objects. Anything else binds positionally to
 `root.inputs[i]`. Take only what you need — `ctx` is optional.
 
-**Returning a list = autotune fork.** A rule that's unsure which
-parameter to use returns the alternatives as a list. The engine applies
-option 0 inline and pushes one `Candidate` per remaining option onto the
-search queue (deep-copying the graph at the fork point). Single-option
+**Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
+alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
+parent's graph snapshot) and hands them ALL to the search, which picks: greedy takes the DB-best fork when
+a `lowering` row matches, else the max-prior sibling via `Search.score_of` (a score tie keeps emission
+order, so unscored flat rules still get their option-0 default); tuning explores every fork. Single-option
 returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
-**Lazy hierarchical forks via `Fork`.** A rule can also return a list of
-`Fork(knobs=..., expand=..., score=...)` objects — each Fork carries the
-knob delta it pins plus a thunk that produces the next level of options
-(more Forks, concrete `Op`/`Graph` leaves, or a mix). The search loop
-pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize
-the children, pushes them back, and continues; cursor advance only
-fires when the lineage resolves to a concrete leaf. Lets a rule expose
-a hierarchy of decisions lazily — only the subtrees MCTS actually walks
-into get materialized. `Fork.knobs` is read by `_best_fork` (for
-DB-seeded greedy replay) without firing the thunk; `Fork.score` is the
-MCTS prior the producing rule attaches.
+**Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
+the fork pins), `is_leaf`, `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
+leaves, or a mix; exactly `[option]` for a leaf), and `score(cache)` (the lazy planner prior — see below).
+The search loop pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize the children,
+pushes them back, and continues; cursor advance only fires when the lineage resolves to a concrete leaf.
+Lets a rule expose a hierarchy of decisions lazily — only the subtrees the search actually walks into get
+materialized. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy replay) without expanding.
+Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
+`LazyCandidate.from_option`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
+`score_fn(knobs)` functions of the fork's own knob delta, so siblings share one function instead of
+per-instance capture lambdas; used by `085_warp_specialize`), and the tree builder's branch / leaf node
+classes.
 
-The partition planner (`lowering/tile/010_partition_loops`) emits a
-hierarchical Fork tree: `BR → (BM,BN) → (FM,FN) → (BK,SPLITK) → TileOp`
-leaf. Sibling sorting uses `TileOp.lazy_score(ctx, shapes=..., params=...)`
-— the static-method counterpart of `Op.score` that estimates the same
-formula from cheap inputs (knob bundle + planner shape) so siblings rank
-without anyone instantiating a TileOp. The branch tree's `Fork.score`
-propagates max from leaves, matching MCTS's max-Q semantics.
+**Scoring is search policy.** Rules emit siblings unranked; the policies rank via `Search.score_of(fork)`
+= `fork.score(self.score_cache)`. The search OWNS the value-keyed score cache and hands it down to the
+fork's compute; the KEYING is the scorer's own, since only it knows its value identity — the partition
+planner keys each variant by `(ctx fields, frozenset(merged knobs))`, complete because the `SID`
+structural-identity knob rides the dict, so structurally identical kernels (the same layer repeated
+through a whole model) share every score, across trees and — via the shared dict `two_level.inner_reward`
+threads into each per-op `TuningSearch` — across tune slices. Entries can never go stale: the score is a
+pure function of the key. Greedy with a DB hit never scores anything at all.
+
+The partition planner (`lowering/tile/010_partition_loops`) emits one
+hierarchical Fork tree over both tiers:
+`MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → (BK,SPLITK) → TileOp` leaf. The root
+`MMA` level keys warp rows by atom kind; scalar rows return an empty key and skip the level (their subtree
+splices up as siblings of the atom branches — no `MMA` knob ever pins a scalar path), and the builder's
+single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 1`, scalar rows
+`wm = wn = 1`), so a pure-scalar kernel's tree is exactly the classic
+`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`. Warp-vs-scalar ranking is score-driven; an explicit
+`DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so score can't sidestep it).
+The per-variant prior is `TileOp.lazy_score(ctx, knobs=..., shapes=...)` — a pure formula over cheap
+inputs (the variant's stamped knob dict + planner shape) so siblings rank without anyone instantiating a
+TileOp. The branch tree's `score()` propagates max from leaves, matching MCTS's max-Q semantics.
 
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
@@ -101,12 +118,9 @@ hardware-atomic MMA cell tier) are wired through `_layer_kind_for` /
 fragment-factorization consumer plan (`plans/mma-fragment-factorization.md`)
 will flip these tiers when its M3 ships, without revisiting the tower
 mechanics. M1 of that plan landed the `AtomTile` flavor + the (then-empty)
-atom registry — now `ir/tile/ir.py`'s `ATOM_REGISTRY` — + the `TileParams = ScalarTileParams |
-WarpTileParams` sum-type split in `_enumeration` (`ScalarTileParams`
-carries today's `(BN, BM, FM, FN, BK, SPLITK, BR)`; `WarpTileParams`
-carries `(WN, WM, FM, FN, BK, SPLITK, atom)` — the `Atom` spec object
-directly (the `ATOM_KIND` knob is stamped from `atom.name`) — no `BR`, no
-`BN`/`BM`). `085_warp_specialize` already emits `WarpTile(role)` (one
+atom registry — now `ir/tile/ir.py`'s `ATOM_REGISTRY` — + the warp-tier variant row in `_enumeration`
+(a plain knob dict like every row: warp tier carries `{WN, WM, FM, FN, BK, SPLITK, MMA}` and is
+discriminated by the `MMA` key; the `Atom` spec is `ATOM_REGISTRY[row["MMA"]]`). `085_warp_specialize` already emits `WarpTile(role)` (one
 role axis = total CTA warps) wrapping `WarpSpecialize` directly,
 bypassing the planner's tower builder — its role split is structural
 (`Cond(role < n_producer_warps, …)`), not the σ-shifted extended
@@ -129,15 +143,19 @@ GeForce s16816 (its cuBLAS gap is the SASS mma schedule below the IR, not
 producer/consumer overlap), so the autotuner normally picks WS=0 — the warp
 arm is for parity / investigation and Hopper-class parts.
 
-The tree-building algorithm itself (group params by per-level knob keys,
-collapse single-key levels, sort siblings by max-propagated score, defer
-leaf materialization to `expand` thunks) lives in `pipeline/fork_tree.py`
-as the reusable `Level` + `build_fork_tree` pair — `partition_loops`
-supplies the four `Level`s + `materialize=` + `score=` callables and
-forwards the result. Future rules with multi-level knob-cartesian forks
-should reuse the builder; one-shot flat forks (e.g.
-`lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element list) stay
-inline.
+The tree-building algorithm itself (group params by per-level knob keys, collapse single-key levels, skip
+empty-key levels, defer leaf materialization to `expand()`) lives in `pipeline/fork.py` (next to the
+`Fork` interface and its flat implementations) as the
+reusable `Level` + `build_fork_tree` pair — `partition_loops` supplies the `Level`s + `materialize=` +
+`score=` callables and returns the result. Nodes are real classes holding data, not closures: every
+`_Branch` / `_Leaf` references one shared `_Tree` (levels + callables). The
+builder hands back the lazy ROOT `_Branch` and nothing else exists yet: a branch's `expand()` builds its
+children on demand (in grouping order — ranking is the search's job), its `score(cache)` takes `max` over
+the per-param scores of its subgroup (provably the same max-propagation as an eager build, without
+instantiating the subtree), and the per-param scorer — `score(p, cache)`, which receives the search-owned
+value-keyed cache and owns its own keying — fires only when a score is actually read; the builder adds no
+caching of its own. Future rules with multi-level knob-cartesian forks should reuse the builder; one-shot flat
+forks (e.g. `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element `ThunkFork` list) stay inline.
 
 **FN > 1 lowering.** The partition planner always emits the per-cell
 shape — one `RegisterTile(N_r)` wrapping the whole
@@ -169,27 +187,34 @@ N-invariant-cone partition (see `plans/obsolete-blocked-gemm-builder.md`).
 Leaf Fork `expand` thunks call `_materialize(plan, params)` lazily —
 `_build_split_body` + `TileOp.__post_init__` (which runs the full
 12-pass `normalize_body`) only fire for the variant the search actually
-resolves. In greedy `deplodock compile`, that's one variant per
-LoopOp. Earlier behavior materialized every variant up front (dozens
-to ~200 per matmul-class kernel) just to score them; the lazy split
-cut whole-model Qwen3 0.6B compile from 10+ minutes to ~48 seconds.
+resolves. In greedy `deplodock compile`, that's one variant per LoopOp. The enumeration is large — the
+widened FM/FN candidate set yields ~40k+ knob rows per matmul-class kernel (not the "couple hundred" the
+original lazy split assumed) — so the finished `_Plan` rides its LoopOp as op metadata
+(`loop_op.meta["plan"] = (cache_key, plan)`): ops are shared by reference across graph copies and
+`single_node_graph` tune slices, so re-planning the same op object short-circuits entirely (classification
+and enumeration included). The stamp is validated against `_plan_cache_key` — the carry-forward knobs,
+which include the `SID` structural identity stamped by `loop/fusion/040_stamp_structural_id` (canonical
+body + operand dtypes, so a dtype change is an identity change), + the hardware context + the live
+`DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`) — so a pin / ctx / dtype
+change invalidates it. The SID also powers the search-owned value-keyed score cache (see "Scoring is
+search policy" above): `_score_variant` keys each variant by `(ctx fields, frozenset(merged knobs))`,
+complete because the SID rides the knob dict, so structurally identical kernels — the same layer repeated
+through a whole model — share every score with no object-identity bookkeeping, and entries can never go
+stale because the score is a pure function of the key.
 
-For rules that want a custom lazy scorer, override
-`Op.lazy_score(cls, ctx, *, knobs=None, shapes=None, params=None)` on
-the producing Op class. The base implementation returns `None` (no
-lazy estimate available); callers fall back to constructing the op
-and calling `score(ctx)`. `TileOp.lazy_score` is the reference
-implementation — it consumes `KernelShape` + `TileParams` from the
-partition planner and matches `TileOp.score`'s formula
-( `score_tile_geometry`) on the launch-geometry + cells + coalescing
-keys. The smem-fit penalty needs the count of input buffers the kernel
-will stage, which `lazy_score` derives from `KernelShape` (walking
-`outer_m` / `extra_outer` / `prologue` for distinct `Load.input`); the
-post-materialization path defaults to 2 (plain A+B) when no shape is
-available, so the two scores can disagree by up to the smem-fit
-penalty's ±2.5 on SDPA-with-mask / RoPE-fused kernels. That asymmetry
-is acceptable because only the planner-time scorer drives sibling
-ordering; the post-materialization score is a sanity metric.
+For rules that want a custom scorer, override
+`Op.lazy_score(cls, ctx, *, knobs=None, shapes=None)` on the producing Op class. The base implementation
+returns `None` (no prior available). This is the ONLY scorer — there is deliberately no
+post-materialization `Op.score`; every ranking decision flows through the same cheap (knobs, shapes)
+formula, so an op never needs to exist just to be ranked (the old eager walk also contributed nothing to
+search decisions: fork siblings share their `inner` snapshot by reference and UCB only compares children of
+one parent, so an inner-graph term was a constant offset within every comparison set). `TileOp.lazy_score`
+is the reference implementation — it consumes `KernelShape` + the variant's stamped knob dict (the
+planner's `_variant_knobs` builds the exact dict `_materialize` stamps; any knob source — DB rows, golden
+configs, pin sets — is scoreable, and via `_materialize` buildable, as-is) and computes
+`score_tile_geometry` on the launch-geometry + cells + coalescing keys, with the smem-fit penalty's
+input-buffer count derived from `KernelShape` (walking `outer_m` / `extra_outer` / `prologue` for distinct
+`Load.input`).
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
@@ -219,8 +244,8 @@ A rewrite that *returns* an op which fails `Op.validate(ctx)` (e.g. a
 `100_materialize_tile` `KernelOp` whose smem exceeds `ctx.max_dynamic_smem`)
 is filtered by `Candidate.try_rewrite` — correct as **fork pruning** (sibling
 branches carry other tile shapes) but fatal in a single-path greedy compile,
-where it leaves the node un-lowered. `Pipeline.run` installs a transient
-`_lowering_rejections` sink that records each such drop `(node, pass, reason)`;
+where it leaves the node un-lowered. `Pipeline.run` installs a `rejections` sink on the
+`Run` that records each such drop `(node, pass, reason)`;
 after the terminal settles, `_raise_on_unlowered` raises a loud `LoweringError`
 naming any still-un-lowered node (its op is still a `LoopOp`/`TileOp`) instead
 of letting it leak to `CudaBackend` as a cryptic `non-CudaOp` `TypeError`. The
@@ -246,13 +271,14 @@ three entry points:
   `backend=None` the bench is stubbed to `latency_us=1.0` and nothing
   is persisted — otherwise `Pipeline.run` (also routed through `tune`)
   would overwrite tuned `best_median_us` rows with the stub.
-- `Pipeline.search(search, ctx, *, db=None) -> Iterator[Candidate]` — the
-  inner engine loop both wrappers drive. Pops a `LazyCandidate`,
-  resolves it, runs one rule batch, pushes successors. At fork points,
-  if `db` is provided, looks up the best-known child for the parent
-  op's `op_cache_key` in `lowering` and passes the matching fork via
-  `search.push(..., best=...)`. Greedy uses `best` when present;
-  tuning ignores it.
+- `Run.drive(graph) -> Iterator[tuple[token, Candidate]]` — the inner engine loop both wrappers drive.
+  `Run` is the per-run state object (`pipeline` + `ctx` + `search` + `db` + `backend` + `dump` +
+  `rejections`): `Pipeline` stays a frozen, shareable pass layout while every run-scoped sink and service
+  lives on the Run, reached from engine-adjacent code through the candidate (`cand.run.dump`,
+  `cand.run.rejections`, `cand.ctx`). `drive` seeds the root candidate, then per iteration pops a
+  `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. At fork
+  points it looks up the best-known child for the parent op's `op_cache_key` in `lowering` and passes the
+  matching fork via `search.push(..., best=...)`. Greedy uses `best` when present; tuning ignores it.
 
 ### Search persistence: on-disk inventory vs in-memory MCTS
 
@@ -273,10 +299,14 @@ The autotune state is split across two cooperating modules:
   policy that reads it. Each tree node wraps a `LazyCandidate`; nodes
   carry `visits` and `best_reward` (max reward over the subtree's
   measured leaves), plus a `live` counter that filters out subtrees
-  whose frontier has been fully drained. Tree built from push lineage
-  (parent of a pushed node = the most recently popped node). Rebuilt
-  fresh each process; cached `perf` rows in the DB ensure no re-bench
-  on warm starts. `GreedySearch` has no tree.
+  whose frontier has been fully drained. Lineage is TOKEN-THREADED, not
+  call-order-dependent: `pop()` returns `(token, candidate)` (the token
+  IS the `SearchNode`), the engine pushes children with `parent=token`
+  and observes the terminal's measurement with the same token, so the
+  tree stays correct however the engine interleaves pops / pushes /
+  observes. Rebuilt fresh each process; cached `perf` rows in the DB
+  ensure no re-bench on warm starts. `GreedySearch` has no tree (its
+  tokens are `None`).
 
 `Pipeline._bench_terminal` is the only function that knows about all
 four parts (graph, DB, tree-through-`search.observe`, backend). It
@@ -309,7 +339,7 @@ opposite structure, so `search/two_level.py` splits them:
   fusion is deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`), so the outer
   tree has exactly one terminal and this reduces to "tune each op once, sum, assemble". The outer tree is the
   generalization that lets fusion forks plug in later with no change to the inner search. The outer uses
-  `Pipeline.search` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
+  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
 - **Inner search** (`inner_reward`) tunes each finalized kernel **independently** in its own single-node slice
   (`single_node_graph`, `search/slice.py`) with a plain `TuningSearch` over `LOWERING_PASSES` only (`tile → kernel →
   cuda`). The slice keeps the root kernel + its leaf-op closure and turns every other kernel-input into a synthetic
@@ -363,15 +393,16 @@ over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
-  `child.score` is a rank-only structural prior the rule stamped via `TileOp.score` (no magnitude — only relative ordering).
-- **Expansion** is implicit: `Pipeline.search` pops a node and runs one rule batch; every fork pushes one new child per
+  The unvisited-sibling tiebreak is the fork's rank-only structural prior (`TileOp.lazy_score` magnitude carries no meaning —
+  only relative ordering), read via `Search.score_of` and memoized per node (`SearchNode.prior`).
+- **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
 - **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU
   run of a single-kernel slice per leaf.
 - **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
   UCB1 calls see the new max-Q.
 - **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
-  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
+  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Run.drive` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
@@ -418,29 +449,30 @@ incompatible divisibility still get a sensible default.
 
 **Registered knobs.** All knobs in `passes/lowering/tile/*.py`:
 
-| Knob          | Type     | Owning rule                  | What it controls                                                                                  |
-|---------------|----------|------------------------------|---------------------------------------------------------------------------------------------------|
-| `BK`          | INT      | `010_partition_loops`        | Per-stage K-chunk size for matmul reductions; intra-CTA K-loop trip count = `K / BK`.             |
-| `SPLITK`      | INT      | `010_partition_loops`        | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine. |
-| `BN`          | INT      | `010_partition_loops`        | CTA innermost THREAD-axis width (the column tile each warp covers).                               |
-| `BM`          | INT      | `010_partition_loops`        | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                        |
-| `STAGE`       | BINMASK  | `020_stage_inputs`           | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one `StageBundle` with per-source `Source` entries. |
-| `FM`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul M (output row) axis; per-thread cell-grid height.           |
-| `FN`          | INT      | `010_partition_loops`        | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. The planner emits one outer `RegisterTile(N_r)` around `{Init, K-reduce, Write}`; the Kernel-IR replicator + `dedup_replicated` pass produce the textbook blocked-GEMM shape (N-invariant Loads kept single-copy, N-dependent Accums replicated). |
-| `BR`          | INT      | `010_partition_loops`        | Cooperative-K thread count (1 = pure serial chunked reduce); BR > 1 routes through the cooperative reduce path with cross-thread combine. |
-| `FK`          | INT      | `010_partition_loops`        | Reduce-axis multiple-accumulator factor (non-matmul reduces). Strip-mines the per-thread K serial loop into `FK` independent accumulators (a `RegisterTile(K_f, reduce=True)` inside `K_i`) for ILP; `010_split_register_axes` replicates the wrapped `Accum` into `acc_0..acc_{FK-1}` and appends a cross-accumulator tree-fold after the K serial loops, so the materializer/combine see one `acc`. Swept only as a divisor of the per-thread K-chunk extent, capped by `FK·FM·FN ≤ _MAX_CELLS_PER_THREAD`. **fp16 scalar matmul** reuses `FK` as the half2 accumulation-window length (= even `bk`): the planner keeps the FK=1 fp32 structure + stamps `FKWIN`, and `kernel/015_pack_fk_window` rewrites the window K loop into `__hfma2` packed multiply-adds over a `__half2` accumulator with a widen+horizontal-sum flush into the fp32 master each stage — bounded fp16 error for 2× packed throughput. `FK=1` (and fp32/bf16/MMA) is byte-identical to the pre-FK planner (it ranks first in the greedy tiebreak). See `plans/fk-register-tile-reductions.md` and `plans/fk-half2-fp16-matmul.md`. |
-| `WN`          | INT      | `010_partition_loops`        | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only).               |
-| `WM`          | INT      | `010_partition_loops`        | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only).                   |
-| `ATOM_KIND`   | STR      | `010_partition_loops`        | Hardware matmul atom kind; the `Atom` specs (shape / operand dtypes / group size) + `ATOM_REGISTRY` live in `ir/tile/ir.py` (the spec is carried structurally on `AtomTile.atom` and on the `Mma` op — this knob is its *tuning* shadow, not the semantic source), per-kernel eligibility in `passes/lowering/tile/_atom.py`. The s16816 `mma.sync` + swizzled-`ldmatrix` path is the sole tensor-core family: `mma_m16n8k16_f16` / `mma_m16n8k16_bf16` (the legacy `nvcuda::wmma` kinds were removed). Auto-enumerates alongside the scalar tier on **sm_90+** (the swizzled-TMA fast path needs Hopper+; on sm_80-89 it's pin-only). Shapes it can't serve fall to scalar: non-divisible extents (M%16/N%8/K%16); single-warp tiles (WM·WN==1 — it has no gmem-direct fallback and one-warp CTAs don't stage); an operand `020_stage_inputs` can't stage for `ldmatrix` (its K axis spans >1 index dim — a collapsed-reshape access like an attention output reaching the o_proj — or it's an in-kernel intermediate, not an external gmem input); and a fused post-reduce epilogue (the accumulator feeds an `Assign` after the K-loop, e.g. a residual `add` — the mma fragment-store can't apply it). A pin forces the kind at any size / arch (the stageability / epilogue gates still hold). |
-| `HOIST_COMPUTE`   | BOOL     | `030_hoist_invariant_compute`       | False (default) → inline-fuse Stage; True → single transport Stage + a `StageBundle.compute` phase. Autotune fork. |
-| `PAD_SMEM`        | BOOL     | `070_pad_smem`                       | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork. |
-| `GROUP_M`         | INT      | `025_swizzle_blocks`                | L2-friendly CTA-swizzle row-group size (Triton/CUTLASS convention). Default `8`; `1` is the global escape hatch (row-major decode). Stamped on the outer matmul GridTile's `swizzle_group_m` field; the renderer emits a Triton-canonical `blockIdx.x` remap so groups of `GROUP_M` CTAs walk down M before stepping N, sharing A's row tile in L2. Self-disabling on tiny / tall-skinny matmuls via the runtime `min(GROUP_M, num_m - first_m)` clamp. |
-| `BUFFER_COUNT`    | INT      | `040_use_ring_buffers`              | Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops. `2` = classic double-buffer; `3`/`4` = CUTLASS-style multistage (pruned when the per-stage smem × N exceeds the cap). The greedy default orders the surviving variants by occupancy — front-loading the deepest depth that still keeps **2 CTA-blocks/SM** resident (`2 × depth × per-stage ≤ cap`), since past that the kernel drops to 1 block/SM and runs slower (measured 2048² fp16: 128×128 depth-3 = 115 µs vs depth-4 = 136 µs). This reorder fires **only for single-`StageBundle` kernels** (a pure GEMM, where the ring slab is the whole dynamic-smem footprint so the keeps-2 test is exact); a fused multi-bundle kernel (SDPA's QK+P@V) carries an intermediate cross-bundle workspace that dominates the materialized smem and is invisible to the ring-byte budget, so it keeps the shallow-first default (depth-2, always downstream-valid) — the autotuner still explores its deeper rings. |
-| `TMA`             | BOOL     | `050_use_tma`                       | Promote BUFFERED/ASYNC bundles to TMA. `1` = force (hard-fail on ineligibility), `0` = skip the pass. Default on for Hopper+. |
-| `ASYNC_COPY`      | BOOL     | `060_use_async_copy`                | Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). `0` = keep the synchronous double-buffer. Default on for sm_80+. |
-| `PIPELINE_STAGES` | BOOL     | `080_pipeline_stages`               | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop. |
-| `WARP_SPECIALIZE` | BOOL     | `085_warp_specialize`               | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `BUFFER_COUNT=2` on the warp tier to keep it eligible). Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is ranked first for the warp tier. |
-| `ATOMIC_FREE_SPLITK` | BOOL  | `017_atomic_free_splitk`            | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). |
+| Knob                 | Type      | Owning rule                   | What it controls                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+|----------------------|-----------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `BK`                 | INT       | `010_partition_loops`         | Per-stage K-chunk size for matmul reductions; intra-CTA K-loop trip count = `K / BK`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `SPLITK`             | INT       | `010_partition_loops`         | Cross-CTA K-split factor for matmul; `1` = no split. Multiplies CTA count, requires a final combine.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `BN`                 | INT       | `010_partition_loops`         | CTA innermost THREAD-axis width (the column tile each warp covers).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `BM`                 | INT       | `010_partition_loops`         | CTA outer THREAD-axis width (matmul only — the row tile each warp covers).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `STAGE`              | BINMASK   | `020_stage_inputs`            | Bitmask over ranked candidate buffers — char `i` = stage buffer `i`. Selected buffers fold into one `StageBundle` with per-source `Source` entries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `FM`                 | INT       | `010_partition_loops`         | Register-tile factor along the matmul M (output row) axis; per-thread cell-grid height.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `FN`                 | INT       | `010_partition_loops`         | Register-tile factor along the matmul N (output column) axis; per-thread cell-grid width. The planner emits one outer `RegisterTile(N_r)` around `{Init, K-reduce, Write}`; the Kernel-IR replicator + `dedup_replicated` pass produce the textbook blocked-GEMM shape (N-invariant Loads kept single-copy, N-dependent Accums replicated).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `BR`                 | INT       | `010_partition_loops`         | Cooperative-K thread count (1 = pure serial chunked reduce); BR > 1 routes through the cooperative reduce path with cross-thread combine.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `FK`                 | INT       | `010_partition_loops`         | Reduce-axis multiple-accumulator factor (non-matmul reduces). Strip-mines the per-thread K serial loop into `FK` independent accumulators (a `RegisterTile(K_f, reduce=True)` inside `K_i`) for ILP; `010_split_register_axes` replicates the wrapped `Accum` into `acc_0..acc_{FK-1}` and appends a cross-accumulator tree-fold after the K serial loops, so the materializer/combine see one `acc`. Swept only as a divisor of the per-thread K-chunk extent, capped by `FK·FM·FN ≤ _MAX_CELLS_PER_THREAD`. **fp16 scalar matmul** reuses `FK` as the half2 accumulation-window length (= even `bk`): the planner keeps the FK=1 fp32 structure + stamps `FKWIN`, and `kernel/015_pack_fk_window` rewrites the window K loop into `__hfma2` packed multiply-adds over a `__half2` accumulator with a widen+horizontal-sum flush into the fp32 master each stage — bounded fp16 error for 2× packed throughput. `FK=1` (and fp32/bf16/MMA) is byte-identical to the pre-FK planner (it ranks first in the greedy tiebreak). See `plans/fk-register-tile-reductions.md` and `plans/fk-half2-fp16-matmul.md`. |
+| `WN`                 | INT       | `010_partition_loops`         | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `WM`                 | INT       | `010_partition_loops`         | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `SID`                | STR       | `loop/fusion/040_stamp_structural_id` | The LoopOp's structural identity: digest of the canonical body (`Body.structural_key`) + operand dtypes. Not tunable — identity metadata that makes a knob dict a complete variant identity (the planner's value-keyed score cache, DB-row self-identification). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, search-tree comparisons) sees one consistent knob set. |
+| `MMA`                | STR       | `010_partition_loops`         | Three-way control for warp-tier MMA (tensor-core) matmul enumeration: falsy (`0`/`false`/…) forces the scalar-only path (debug / fallback); truthy (`1`/`true`/…) or unset (the default) auto-enumerates every eligible atom kind; any other value names an atom kind (e.g. `mma_m16n8k16_f16`) — enable **and** pin that kind, incl. the force-at-any-arch pin-only path. `DEPLODOCK_ATOM_KIND` is its env **alias** (`Knob.aliases` — either spelling works; the primary `DEPLODOCK_MMA` wins when both are set). Not an autotune fork: the tuner picks warp-vs-scalar through the `ATOM_KIND` sibling subtree. Declared in `_enumeration.py`, decoded by `mma_mode()`; sits in `_PLANNER_KNOBS` so the enumeration-memo pin snapshot covers it (alias included, via `Knob.raw`).                                                                                                                                                                                                                                                                                                                          |
+| `HOIST_COMPUTE`      | BOOL      | `030_hoist_invariant_compute` | False (default) → inline-fuse Stage; True → single transport Stage + a `StageBundle.compute` phase. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `PAD_SMEM`           | BOOL      | `070_pad_smem`                | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `GROUP_M`            | INT       | `025_swizzle_blocks`          | L2-friendly CTA-swizzle row-group size (Triton/CUTLASS convention). Default `8`; `1` is the global escape hatch (row-major decode). Stamped on the outer matmul GridTile's `swizzle_group_m` field; the renderer emits a Triton-canonical `blockIdx.x` remap so groups of `GROUP_M` CTAs walk down M before stepping N, sharing A's row tile in L2. Self-disabling on tiny / tall-skinny matmuls via the runtime `min(GROUP_M, num_m - first_m)` clamp.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `BUFFER_COUNT`       | INT       | `040_use_ring_buffers`        | Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops. `2` = classic double-buffer; `3`/`4` = CUTLASS-style multistage (pruned when the per-stage smem × N exceeds the cap). The greedy default orders the surviving variants by occupancy — front-loading the deepest depth that still keeps **2 CTA-blocks/SM** resident (`2 × depth × per-stage ≤ cap`), since past that the kernel drops to 1 block/SM and runs slower (measured 2048² fp16: 128×128 depth-3 = 115 µs vs depth-4 = 136 µs). This reorder fires **only for single-`StageBundle` kernels** (a pure GEMM, where the ring slab is the whole dynamic-smem footprint so the keeps-2 test is exact); a fused multi-bundle kernel (SDPA's QK+P@V) carries an intermediate cross-bundle workspace that dominates the materialized smem and is invisible to the ring-byte budget, so it keeps the shallow-first default (depth-2, always downstream-valid) — the autotuner still explores its deeper rings.                                                                                                          |
+| `TMA`                | BOOL      | `050_use_tma`                 | Promote BUFFERED/ASYNC bundles to TMA. `1` = force (hard-fail on ineligibility), `0` = skip the pass. Default on for Hopper+.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `ASYNC_COPY`         | BOOL      | `060_use_async_copy`          | Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). `0` = keep the synchronous double-buffer. Default on for sm_80+.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `PIPELINE_STAGES`    | BOOL      | `080_pipeline_stages`         | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `WARP_SPECIALIZE`    | BOOL      | `085_warp_specialize`         | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `BUFFER_COUNT=2` on the warp tier to keep it eligible). Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is ranked first for the warp tier.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `ATOMIC_FREE_SPLITK` | BOOL      | `017_atomic_free_splitk`      | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
@@ -472,7 +504,7 @@ the pass runs) → `unify_sibling_stages` (drops a `StageBundle` Source whose `b
 prior sibling scope and reverts its consumer Loads back to gmem — keeps the fused RMSNorm + linear `x_smem`
 single-allocation invariant when the matmul-side K_i, now visible as a reduce through transparent
 `RegisterTile` wrappers, would otherwise re-stage `x`) → `hoist_invariant_compute` → `use_ring_buffers` →
-`use_tma` → `use_async_copy` → `pad_smem` → `pipeline_stages` → `mark_unroll`. Coordination (split-K atomic-writes, cooperative-K Combine emission, broadcast-write guards) is no longer a separate pass: the materializer / Kernel-IR render derives those decisions from `ir/tile/escape_analysis.py` queries against the tile body. Cooperativity is derived from `Accum.axes ∩ ThreadTile.axes`; atomic writes from enclosing `GridTile.axes` vs `Write.index`. `015_gate_splitk_residual` reuses the same `Body.coordination.atomic_axes` signal to identify the split-K block axis without any axis-naming convention or role tag — when SPLITK > 1, it wraps a `matmul_add`-shape linear residual epilogue under `Cond(K_s == 0, ...)` so the residual is atomic-added exactly once across the K_s CTAs (rewrite + predicates live in sibling `_splitk_residual.py`, shared with `010_partition_loops`'s `force_splitk_one` enumeration-time gate). The partition planner's knob globals + per-mode candidate tuples + the pruned `(BN, BM, FM, FN, BK, SPLITK, BR)` cartesian generator + per-mode priority/score functions live in sibling `_enumeration.py` — `010_partition_loops.py` imports the `enumerate_cartesian` entry point and the `TileParams` cartesian element; tests can hit `_enumeration` directly without routing through `_plan_kernel`. `split_register_axes` / `permute_lane_accesses` used to live here but moved to `lowering/kernel/` once dtype-aware analytical passes consolidated there (see `plans/stamp-ssa-dtypes-and-reorder.md`); they still pattern-match `TileOp` because they run pre-materialize. |
+`use_tma` → `use_async_copy` → `pad_smem` → `pipeline_stages` → `mark_unroll`. Coordination (split-K atomic-writes, cooperative-K Combine emission, broadcast-write guards) is no longer a separate pass: the materializer / Kernel-IR render derives those decisions from `ir/tile/escape_analysis.py` queries against the tile body. Cooperativity is derived from `Accum.axes ∩ ThreadTile.axes`; atomic writes from enclosing `GridTile.axes` vs `Write.index`. `015_gate_splitk_residual` reuses the same `Body.coordination.atomic_axes` signal to identify the split-K block axis without any axis-naming convention or role tag — when SPLITK > 1, it wraps a `matmul_add`-shape linear residual epilogue under `Cond(K_s == 0, ...)` so the residual is atomic-added exactly once across the K_s CTAs (rewrite + predicates live in sibling `_splitk_residual.py`, shared with `010_partition_loops`'s `force_splitk_one` enumeration-time gate). The partition planner's knob globals + per-mode candidate tuples + the pruned `(BN, BM, FM, FN, BK, SPLITK, BR)` cartesian generator + per-mode priority/score functions live in sibling `_enumeration.py` — `010_partition_loops.py` imports the `enumerate_cartesian` entry point; rows are plain knob dicts, so tests can hit `_enumeration` directly without routing through `_plan_kernel`. `split_register_axes` / `permute_lane_accesses` used to live here but moved to `lowering/kernel/` once dtype-aware analytical passes consolidated there (see `plans/stamp-ssa-dtypes-and-reorder.md`); they still pattern-match `TileOp` because they run pre-materialize. |
 | `lowering/kernel/`         | Pre-materialize dtype-aware analytical passes plus the final `TileOp → KernelOp` lowering. Order: `lower_atom_tile` (MMA-only: lowers the tensor-core matmul cell — plain operand `Load`s + an `Mma`, carried in from `tile/011_lower_atom_cell` through the staging passes — to the `"mma_sync"` s16816 kernel chain: `RegFragment` decls + per-reduce `LdmatrixLoad a`+`LdmatrixLoad b`+`MmaSyncPtx` + final `RegStore` (the `ldmatrix` + `mma.sync.aligned` register-array path). Operands are matched per reduce site via the `Mma` (which names its A/B operands by SSA value); the fragment SSA names are seeded once from the FIRST reduce site (stable across prologue/inner/epilogue for the per-cell replicator); each `LdmatrixLoad.src_index` is rebuilt per cache-axis (each `Var * block`) with `ldm` from the inner source dim's slab stride by re-harvesting the live `Source`s. mma.sync is smem→register only, so an unstaged operand raises an actionable `LoweringError` here (naming the `DEPLODOCK_MMA=0` / `TMA=1` remedies) — the atom-vs-scalar fork was already decided at `tile/010_partition_loops`, so there is no scalar sibling left to fall back to and a silent skip would leak the unconsumed `AtomTile` to render and crash opaquely. Strips the `AtomTile` wrapper. The `rewrite` entry point and its lowering helpers all live in this one module. Scalar TileOps skip; see `plans/mma-fragment-factorization.md` and `plans/mma-smem-staging.md`) → `split_register_axes` (replicates REGISTER-tagged bodies per-cell, with dep-tracked single-copy preservation of axis-invariant statements — for MMA kernels, replicates the Mma* chain per (M_r, N_r) cell, threading per-cell fragment SSA renames via the `Mma*.rewrite.register` handlers) → `dedup_replicated` (content-agnostic CSE: structurally identical Loads / Assigns left over after replication fold into one — the same shape the deleted blocked-GEMM builder used to produce by hand-partitioning N-invariant cones; see `plans/obsolete-blocked-gemm-builder.md`) → `place_inits` (places explicit `Init` Stmts at correct accumulator scope — descends into a `WarpTile`-wrapped `WarpSpecialize` to land the Init at the **consumer_body head**, above the consumer K loop and inside the role split; placing it higher would let the renderer's default per-loop init fire inside the loop and reset the accumulator every K chunk. A `Cond` wrapping a `Write` (the masked-boundary output store of a register tile — `if (coord < N) out[...] = acc`, emitted for non-divisible extents) is a per-iteration output escape just like a bare `Write`, so the crossable-reduce check treats it as non-crossable and the Init lands inside the register-M loop; without that the mask hid the escape and accumulators leaked across register-tile rows) → `stamp_types` (single body walk populating `Load.dtype` / `Assign.dtype` / `Write.value_dtype` / `Source.dtype` from `graph.nodes[buf].output.dtype`; also forces fp32 for overflow-prone ops — a square `multiply(a, a)` or any `pow` — so RMSNorm's mean-of-squares of large fp16 activations (e.g. Gemma's q/k pre-norm ±200s, whose square exceeds fp16's 65504) computes in fp32 like torch's `.float()`, rather than overflowing to inf → garbage reduction; distinct-arg `multiply` (matmul) stays fp16) → `demote_to_write_dtype` (folds f16-only chains feeding f16 Writes) → `vectorize_loads` (widens consecutive scalar Loads into LDS.128 / `__half2`) → `permute_lane_accesses` (chunks the N register tile into LDS.128-sized strips to remove bank conflicts on `FN > V`; skipped for MMA — `ldmatrix` handles its own swizzling) → `pack_fp16_pairs` (pairs scalar `__half` Inits/Accums into `__half2`; skipped for MMA — the C fragment IS the accumulator) → `vectorize_stores` (widens consecutive scalar Writes) → `flatten_wrap_stages` (flattens wrap-body `Stage(... body=[consumer])` into `[Stage(empty), *consumer]` so the materializer walks producer scaffolding then consumer siblings) → `materialize_tile` (purely-mechanical Tile → Kernel lowering; Smem decls read `Source.dtype` directly, and swizzled TMA operand slabs align to their full swizzle atom (`8 × swizzle_width` B: B128→1024, B64→512, B32→256) so the coordinate-only `ldmatrix` XOR matches the hardware's absolute-address swizzle (non-swizzled TMA stays at the 128 B box recommendation); its emit logic lives in sibling `_`-prefixed helper modules `_stage_expand` / `_combine` / `_tma_groups`, which the pass loader skips) → `drop_redundant_syncs` (Kernel-IR peephole collapsing back-to-back / leading `Sync`s at the tile-body level). All passes through `flatten_wrap_stages` pattern-match `TileOp`; `materialize_tile` consumes `TileOp` and produces the `KernelOp`; `drop_redundant_syncs` rewrites `KernelOp → KernelOp`. |
 | `lowering/cuda/`           | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (via `ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 

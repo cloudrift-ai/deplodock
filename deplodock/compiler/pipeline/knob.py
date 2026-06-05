@@ -47,16 +47,33 @@ class Knob:
     the env override ``DEPLODOCK_<NAME>``. ``hints`` is the autotune
     candidate list (a guideline, not a constraint — rules apply their
     own structural validity gates). ``help`` is a short docstring shown
-    by future tooling (``deplodock knobs``)."""
+    by future tooling (``deplodock knobs``). ``aliases`` are alternate
+    names whose ``DEPLODOCK_<ALIAS>`` env vars also pin this knob (read
+    via :meth:`raw`; the primary name wins when both are set)"""
 
     name: str
     type: KnobType
     hints: tuple = ()
     help: str = ""
+    aliases: tuple[str, ...] = ()
 
     @property
     def env(self) -> str:
         return config.knob_var(self.name)
+
+    def raw(self) -> str | None:
+        """Live env pin: the primary ``DEPLODOCK_<NAME>`` first, then each
+        alias in declaration order; ``None`` when nothing is set. Every
+        env read of an alias-bearing knob must route through here so the
+        alias spelling behaves identically to the primary."""
+        value = config.knob_raw(self.name)
+        if value is not None:
+            return value
+        for alias in self.aliases:
+            value = config.knob_raw(alias)
+            if value is not None:
+                return value
+        return None
 
     def read_int(self, default: int) -> int:
         """Read this knob's ``DEPLODOCK_<NAME>`` env pin as an int (empty /
@@ -128,7 +145,7 @@ class Knob:
 
         ``BINMASK`` isn't supported — it would need ``width``, and no
         rule enumerates BINMASK candidates today."""
-        raw = config.knob_raw(self.name)
+        raw = self.raw()
         if raw is None:
             return tuple(candidates)
         if self.type is KnobType.BINMASK:

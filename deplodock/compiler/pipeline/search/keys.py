@@ -55,6 +55,29 @@ def op_cache_key(op: object) -> str | None:
     return None
 
 
+def loop_structural_id(op, graph=None) -> str:
+    """Structural identity of a ``LoopOp``'s kernel: a digest of the
+    canonical body (:meth:`Body.structural_key` — SSA / axis / buffer names
+    renamed away, extents included) plus the sorted multiset of its
+    ``Load.input`` operand dtypes from ``graph`` (the fp16 half2 window and
+    atom eligibility gate on operand dtype, so two same-body kernels with
+    different dtypes must not share an identity). Stamped into
+    ``LoopOp.knobs["SID"]`` by ``lowering/tile/005_stamp_structural_id`` so
+    the knob dict alone fully identifies a tile variant — structurally
+    identical kernels (the same layer repeated through a model) carry the
+    same SID and share value-keyed score-cache entries."""
+    from deplodock.compiler.ir.stmt import Load  # noqa: PLC0415
+
+    dtypes: tuple[str, ...] = ()
+    if graph is not None:
+        sig = []
+        for ld in op.body.iter_of_type(Load):
+            node = graph.nodes.get(ld.input)
+            sig.append(str(node.output.dtype) if node is not None else "?")
+        dtypes = tuple(sorted(sig))
+    return digest("LoopSID", op.body.structural_key(), dtypes)
+
+
 def dialect_of(op: object) -> Dialect | None:
     """Return the dialect tag for any kernel-bearing op, or ``None``."""
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415

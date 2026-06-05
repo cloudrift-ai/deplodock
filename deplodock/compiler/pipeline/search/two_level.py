@@ -43,7 +43,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.search.candidate import Candidate
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.slice import single_node_graph
@@ -172,6 +171,12 @@ def inner_reward(
     # Ops with no cache key are unreachable through the bench path so they
     # don't enter the dedup map at all (matches the previous filter).
     unique: OrderedDict[str, tuple[str, object, int]] = OrderedDict()
+    # One score cache for ALL the per-op inner searches: ``Fork.score_key``
+    # is value-keyed (plan cache key + knob row), so slices of structurally
+    # identical kernels — and re-visits of the same kernel — share every
+    # planner-prior score instead of recomputing ~40k ``lazy_score`` rows
+    # per slice.
+    score_cache: dict = {}
     for nid, op in _kernel_nodes(fused_graph):
         key = op_cache_key(op)
         if key is None:
@@ -190,7 +195,7 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c)
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache)
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
@@ -246,30 +251,30 @@ def run_two_level_tune(
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
     the whole graph once for the separability check.
 
-    The outer uses :meth:`Pipeline.search` directly (manual ``observe``)
+    The outer drives a :class:`Run` directly (manual ``observe``)
     because its terminal reward comes from the inner tuning, not
     ``_bench_terminal``. Today there are no multi-option fusion forks, so the
     outer yields a single terminal and this reduces to "tune each op once, sum,
     assemble"."""
     from deplodock.compiler import provenance  # noqa: PLC0415
-    from deplodock.compiler.pipeline.pipeline import Cursor  # noqa: PLC0415
+    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     provenance.seed(graph)
     outer = TuningSearch(patience=patience, ucb_c=ucb_c)
-    # The outer drives only the graph-changing passes — no dump here; the
-    # winning config's full stage artifacts (incl. per-kernel ``.torch.json``
-    # reproducers) come from the final assembled CUDA_PASSES run below.
-    outer_pipeline = Pipeline.build(OUTER_PASSES)
-    outer.push(Candidate(ctx=ctx, graph=graph, cursor=Cursor(pipeline=outer_pipeline)).lazy())
+    # The outer drives only the graph-changing passes — no dump on this Run;
+    # the winning config's full stage artifacts (incl. per-kernel
+    # ``.torch.json`` reproducers) come from the final assembled CUDA_PASSES
+    # run below.
+    outer_run = Run(pipeline=Pipeline.build(OUTER_PASSES), ctx=ctx, search=outer, db=db)
 
     best_fused: Graph | None = None
     best_reward: InnerReward | None = None
     n_terminals = 0
-    for fused in outer_pipeline.search(outer, ctx, db=db):
+    for token, fused in outer_run.drive(graph):
         n_terminals += 1
         reward = inner_reward(fused.graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=ucb_c, progress=progress)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
-        outer.observe(stats, "ok" if reward.ok else "bench_fail")
+        outer.observe(token, stats, "ok" if reward.ok else "bench_fail")
         positions = sum(r.multiplicity for r in reward.per_op)
         logger.info(
             "[tune] fused terminal #%d: Σ per-op = %.2f us (%d unique kernels, %d positions)",
@@ -293,5 +298,5 @@ def run_two_level_tune(
         # the tight tune compile budget it could (and did) abort whole-model
         # tunes when a slow-compiling kernel raised. ``--bench`` re-benches
         # the assembled graph at -O3 anyway, which is the deployable number.
-        assembled = Pipeline.build(CUDA_PASSES, dump=dump).run(graph, ctx=ctx, db=db)
+        assembled = Pipeline.build(CUDA_PASSES).run(graph, ctx=ctx, db=db, dump=dump)
     return TwoLevelResult(best_fused=best_fused, best_reward=best_reward, n_terminals=n_terminals, assembled=assembled)
