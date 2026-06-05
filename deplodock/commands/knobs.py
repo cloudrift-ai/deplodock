@@ -146,12 +146,15 @@ def _emit_registry() -> None:
 
 
 def _emit_golden_check(kernel_filter: str | None) -> None:
-    """Greedy-compile each golden config with the current prior and report the
-    found knobs vs the recorded golden knobs — does the prior reproduce the
-    golden ground truth? No benching, no tuning; reads
+    """Dry-run the greedy fork pick (current prior) for each golden config and
+    report, one line each, the golden perf + knobs vs the found knobs — does the
+    prior reproduce the golden ground truth? Stops at the tile dialect: every
+    knob fork is resolved there, so no kernel/cuda codegen and no nvcc. Reads
     ``DEPLODOCK_PRIOR_FILE``."""
+    import logging as _logging  # noqa: PLC0415
+
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
-    from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     def tunable(knobs: dict) -> dict:
@@ -159,7 +162,7 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
 
     def picked(snippet: str) -> dict:
         graph, _, _ = graph_from_code(snippet)
-        compiled = Pipeline.build(CUDA_PASSES).run(graph)
+        compiled = Pipeline.build(TILE_PASSES).run(graph)  # tile dialect only — no codegen/nvcc
         knobs: dict = {}
         for node in compiled.nodes.values():
             k = getattr(node.op, "knobs", None)
@@ -171,24 +174,35 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
 
+    # Silence the trace/compile chatter while picking; collect, then print clean.
+    dd_log = _logging.getLogger("deplodock")
+    prev_level = dd_log.level
+    dd_log.setLevel(_logging.WARNING)
+    results = []
+    try:
+        for g in configs:
+            try:
+                results.append((g, tunable(g.knobs), picked(g.snippet()), None))
+            except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
+                msg = " ".join(f"{type(e).__name__}: {e}".split())  # collapse to one line
+                results.append((g, tunable(g.knobs), {}, msg[:160]))
+    finally:
+        dd_log.setLevel(prev_level)
+
     logger.info("")
-    logger.info("Golden reproduction — greedy compile (current prior) vs recorded golden:")
+    logger.info("Golden reproduction — greedy dry-run (current prior) vs recorded golden:")
     n_match = 0
-    for g in configs:
-        gold = tunable(g.knobs)
-        try:
-            got = picked(g.snippet())
-        except Exception as e:  # noqa: BLE001 — a single shape's compile error shouldn't abort the report
-            logger.info("  %-26s  ERR  %s: %s", g.name, type(e).__name__, e)
-            continue
+    for g, gold, got, err in results:
         keys = sorted(gold)
+        if err:
+            logger.info("  %-26s  ERR  %s", g.name, err)
+            continue
         match = all(got.get(k) == gold[k] for k in keys)
         n_match += match
-        verdict = "✓ exact" if match else "✗ differs"
-        logger.info("  %-26s  %s  (golden deplodock=%.1fus, cuBLAS=%.1fus)", g.name, verdict, g.deplodock_us, g.cublas_us)
-        if not match:
-            logger.info("      golden: %s", "  ".join(f"{k}={gold[k]}" for k in keys))
-            logger.info("      greedy: %s", "  ".join(f"{k}={got.get(k)}" for k in keys))
+        gold_s = " ".join(f"{k}={gold[k]}" for k in keys)
+        got_s = " ".join(f"{k}={got.get(k)}" for k in keys)
+        perf = f"golden {g.deplodock_us:.1f}us/cuBLAS {g.cublas_us:.1f}us"
+        logger.info(f"  {g.name:<26} {'✓' if match else '✗'}  {perf}  G[{gold_s}]  F[{got_s}]")
     logger.info("  reproduced golden knobs exactly: %d/%d", n_match, len(configs))
 
 
