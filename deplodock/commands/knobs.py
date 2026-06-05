@@ -46,7 +46,7 @@ _KERNEL_NAME_RE = re.compile(r"void\s+(\w+)\s*\(")
 def register_knobs_command(subparsers) -> None:
     parser = subparsers.add_parser(
         "knobs",
-        help="Knob-impact analysis from the autotune DB (regret per knob, knob interactions)",
+        help="List the registered knob schema, then (if a tune DB exists) per-knob regret + interactions",
     )
     parser.add_argument(
         "--db",
@@ -66,10 +66,15 @@ def register_knobs_command(subparsers) -> None:
 
 
 def handle_knobs(args) -> None:
+    # The canonical schema from the knob registry — always available (no DB).
+    _emit_registry()
+
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
-        logger.error("Tune DB not found: %s", db_path)
+        logger.info("")
+        logger.info("No tune DB at %s — skipping the measured per-knob regret analysis.", db_path)
         return
+    logger.info("")
     logger.info("Reading: %s", db_path)
 
     variants_by_kernel = _load_variants(db_path, kernel_filter=args.kernel)
@@ -91,6 +96,29 @@ def handle_knobs(args) -> None:
 
     interactions = _compute_interactions(kernels, [r.knob for r in rows])
     _emit_interaction_matrix([r.knob for r in rows], interactions)
+
+
+def _emit_registry() -> None:
+    """List every registered :class:`~deplodock.compiler.pipeline.knob.Knob` — the
+    canonical tuning schema (name, type, candidate hints, aliases, help) collected
+    by ``knob.registry`` from all loaded passes, regardless of any DB."""
+    from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline, knob  # noqa: PLC0415
+
+    # ``registry`` only sees passes already imported into ``sys.modules``; build
+    # the full pipeline once so every Knob-bearing rule module is loaded first.
+    Pipeline.build(CUDA_PASSES)
+    reg = knob.registry()
+    logger.info("Registered tuning knobs (%d) — the canonical schema:", len(reg))
+    header = f"{'knob':<16} {'type':<8} {'candidate hints':<34} help"
+    logger.info(header)
+    logger.info("-" * len(header))
+    for name in sorted(reg):
+        k = reg[name]
+        hints = ", ".join(str(h) for h in k.hints) if k.hints else "-"
+        if len(hints) > 33:
+            hints = hints[:32] + "…"
+        alias = f"  [aliases: {', '.join(k.aliases)}]" if k.aliases else ""
+        logger.info("%-16s %-8s %-34s %s%s", name, k.type.value, hints, k.help or "", alias)
 
 
 @dataclass(frozen=True)
