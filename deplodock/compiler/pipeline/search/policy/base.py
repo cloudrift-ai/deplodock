@@ -78,9 +78,12 @@ class Search(ABC):
         token back verbatim into :meth:`push` (as ``parent``) and
         :meth:`observe`."""
 
-    def observe(self, token: object | None, stats: PerfStats, status: str) -> None:  # noqa: B027
+    def observe(self, token: object | None, stats: PerfStats, status: str, candidate: object | None = None) -> None:  # noqa: B027
         """Hook for the policy to consume a terminal's measurement.
         ``token`` is the one the terminal was popped with; ``stats``
         aggregates its per-iter latencies in microseconds (median /
         mean / variance / etc.); ``status`` is ``"ok"`` or
-        ``"bench_fail"``. Default no-op; :class:`TuningSearch` overrides it."""
+        ``"bench_fail"``. ``candidate`` is the *resolved* terminal Candidate —
+        its ``graph`` carries the realized op ``knobs`` (the full config,
+        including knobs stamped at deterministic lowering steps that never
+        appear as forks). Default no-op; :class:`TuningSearch` overrides it."""

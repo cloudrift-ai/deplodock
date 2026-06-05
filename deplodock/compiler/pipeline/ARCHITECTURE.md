@@ -433,8 +433,13 @@ level, from `Context.features`) are **features in every row**, not a cache key. 
 real benches exist only at leaves, but the prior ranks partial-knob siblings at every fork level, so the label for any
 node is `log(best_reward)` — the max over its benched descendants, which `record_terminal` maintains on
 `SearchNode.best_reward`. `TuningSearch._collect_rows` walks the live tree and emits `(knobs, label)` for every node with
-a benched descendant (leaves **and** branches); `_node_knobs` accumulates the `fork.knobs` deltas under the op's `S_*`/`H_*`
-base; `knob.knob_features` vectorizes.
+a benched descendant (leaves **and** branches). A directly-benched **leaf** uses its `realized_knobs` — the FULL config
+read off the resolved graph's op in `observe` (so knobs stamped at deterministic, non-forking lowering steps —
+`FK`/`BK`/`SPLITK`/`STAGE`/… — are captured, not just the `BR`/`FM`/`FN` that come from multi-option forks). A **branch**
+has no realized knobs of its own, so it falls back to `_node_knobs` (its partial `fork.knobs` prefix under the op's
+`S_*`/`H_*` base), carrying the value-of-position label. `knob.knob_features` vectorizes. (Before this, `_collect_rows`
+used only the fork prefix for every node, so the prior was blind to every deterministically-stamped knob — e.g. it never
+saw `FK`, the dominant knob for a reduction, and greedy stayed on `FK=1`.)
 
 Why CatBoost (chosen by `scripts/prior_bakeoff.py` over a multi-op tuning dataset): the model's greedy argmax must not run
 off to a degenerate corner. A linear model (the former `BayesianRidgePrior`) is monotone in every knob, so its argmax is

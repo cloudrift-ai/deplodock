@@ -57,6 +57,11 @@ class SearchNode:
     visits: int = 0
     best_reward: float = 0.0  # max reward over this subtree's measured leaves
     live: int = 0  # count of un-popped frontier leaves in this subtree
+    # The benched terminal's FULL realized knob set (S_/H_ base + every tunable
+    # knob, incl. those stamped at deterministic lowering steps that never fork).
+    # Set on directly-benched leaves in ``observe``; ``None`` on branches, which
+    # keep their partial fork-prefix for value-of-position.
+    realized_knobs: dict | None = field(default=None, repr=False)
 
 
 class SearchTree:
@@ -130,17 +135,37 @@ class TuningSearch(Search):
         self.last_stats: PerfStats | None = None
         self.last_status: str | None = None
 
-    def observe(self, token: object | None, stats: PerfStats, status: str) -> None:
+    def observe(self, token: object | None, stats: PerfStats, status: str, candidate: object | None = None) -> None:
         self.last_stats = stats
         self.last_status = status
         assert isinstance(token, SearchNode), f"TuningSearch.observe needs the terminal's pop token, got {type(token).__name__}"
+        # Record the benched leaf's FULL realized knobs (from the resolved graph),
+        # not just its fork-prefix — so knobs stamped at deterministic lowering
+        # steps (FK / BK / STAGE / …) reach the prior. Falls back to the
+        # fork-prefix when no candidate is supplied.
+        token.realized_knobs = self._realized_knobs(candidate) if candidate is not None else self._node_knobs(token)
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
         self.tree.record_terminal(token, reward)
         if self.prior_model is not None:
             # Record the leaf for the end-of-run stats. The model itself is fixed
             # during a run — it refits in batches between ops (see ``Prior``), not
             # per bench — so there is nothing to refit here.
-            self.prior_model.record_bench(self._node_knobs(token), stats.median, status)
+            self.prior_model.record_bench(token.realized_knobs, stats.median, status)
+
+    def _realized_knobs(self, candidate: object) -> dict:
+        """The terminal's complete knob set: the kernel's ``base_knobs`` (``S_*``
+        identity + ``H_*`` regime) merged with the realized op ``knobs`` off the
+        resolved graph (every tunable knob, including deterministically-stamped
+        ones that ``_node_knobs`` can't see). Unions all op knob dicts — a
+        single-kernel slice has one kernel-bearing op, constants carry none."""
+        merged: dict = dict(self._base_knobs)
+        graph = getattr(candidate, "graph", None)
+        if graph is not None:
+            for node in graph.nodes.values():
+                knobs = getattr(node.op, "knobs", None)
+                if knobs:
+                    merged.update(knobs)
+        return merged
 
     def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
         # ``parent`` is the token the spawning candidate was popped with;
@@ -224,7 +249,11 @@ class TuningSearch(Search):
         """Value-of-position training rows from the live tree: every node with
         a benched descendant (``visits > 0`` and ``best_reward > 0``) — leaves
         *and* branches — labeled ``log(best_reward)`` (= −log median latency,
-        the max over its subtree). Re-read each refit since labels only rise."""
+        the max over its subtree). Re-read each refit since labels only rise.
+
+        A directly-benched leaf uses its ``realized_knobs`` (the FULL config);
+        a branch (no realized knobs of its own) uses its partial fork-prefix
+        (``_node_knobs``) — the value-of-position label still rides on it."""
         rows: list[tuple[dict, float]] = []
         stack = list(self.tree.root.children)
         while stack:
@@ -232,7 +261,8 @@ class TuningSearch(Search):
             stack.extend(node.children)
             if node.candidate is None or node.visits == 0 or node.best_reward <= 0:
                 continue
-            rows.append((self._node_knobs(node), math.log(node.best_reward)))
+            knobs = node.realized_knobs if node.realized_knobs is not None else self._node_knobs(node)
+            rows.append((knobs, math.log(node.best_reward)))
         return rows
 
     def _should_stop(self) -> bool:

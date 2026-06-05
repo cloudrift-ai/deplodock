@@ -513,7 +513,7 @@ class Pipeline:
             if backend is not None:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
             stats, status = _bench_terminal(cand, backend=backend, db=run.db)
-            search.observe(token, stats, status)
+            search.observe(token, stats, status, candidate=cand)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 
