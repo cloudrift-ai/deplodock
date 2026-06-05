@@ -124,3 +124,17 @@ class BayesianRidgePrior(Prior):
         if p._model is not None:
             p._first_fit_idx = 0  # warm from the start — no cold warmup this run
         return p
+
+    @classmethod
+    def load(cls, regime_key: str, *, seed: int = 0, path=None) -> BayesianRidgePrior:
+        """The global prior for ``regime_key`` — warm from its checkpoint file if
+        present, else fresh — bound so :meth:`checkpoint` saves it back. ``path``
+        defaults to ``config.prior_path()``."""
+        from deplodock import config  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.prior import store  # noqa: PLC0415
+
+        path = path or config.prior_path()
+        blob = store.load(path, regime_key)
+        p = cls.from_bytes(blob) if blob is not None else cls(seed=seed)
+        p.regime_key, p._path = regime_key, path
+        return p

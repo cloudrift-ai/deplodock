@@ -190,7 +190,6 @@ def handle_tune(args):
             dump=dump,
             progress=progress,
             prior_seed=args.seed,
-            prior_path=config.prior_path(),
         )
     except KeyboardInterrupt:
         # Manual abort: per-op bests already landed in the DB as they were

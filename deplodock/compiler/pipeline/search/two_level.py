@@ -72,17 +72,6 @@ LOWERING_PASSES = CUDA_PASSES[len(LOOP_PASSES) :]
 _FAIL_US = 1e12
 
 
-def _load_global_prior(prior_path, ctx_key: str, seed: int):
-    """Load the checkpointed global prior for this regime from its file, or
-    start a fresh one (lazy import — keeps numpy/sklearn off non-tune callers).
-    The prior is GLOBAL (one model across every kernel), keyed by regime
-    (``ctx_key``)."""
-    from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior, store  # noqa: PLC0415
-
-    blob = store.load(prior_path, ctx_key) if prior_path is not None else None
-    return BayesianRidgePrior.from_bytes(blob) if blob is not None else BayesianRidgePrior(seed=seed)
-
-
 @dataclass
 class OpResult:
     """One unique kernel's inner-search outcome, for the per-op summary.
@@ -148,7 +137,6 @@ def inner_reward(
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     progress=None,
     prior=None,
-    prior_path=None,
 ) -> InnerReward:
     """Tune every post-fusion kernel of ``fused_graph`` in its own single-node
     slice and return ``Σ best-per-op time`` — the outer terminal reward.
@@ -249,13 +237,9 @@ def inner_reward(
             benched = True
             if prior is not None:
                 # Freeze this op's final value-of-position rows into the global
-                # training set, then checkpoint the global prior to its file.
+                # training set, then checkpoint the prior to its own file.
                 prior.archive(inner._collect_rows())
-                blob = prior.to_bytes()
-                if blob is not None and prior_path is not None:
-                    from deplodock.compiler.pipeline.search.prior import store  # noqa: PLC0415
-
-                    store.save(prior_path, ctx_key, blob)
+                prior.checkpoint()
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
         per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
         # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
@@ -281,7 +265,6 @@ def run_two_level_tune(
     dump=None,
     progress=None,
     prior_seed: int = 0,
-    prior_path=None,
 ) -> TwoLevelResult:
     """Drive the outer fusion search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
@@ -296,8 +279,11 @@ def run_two_level_tune(
     from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     provenance.seed(graph)
-    # ONE global prior for the whole run, warm-started from its file checkpoint.
-    prior = _load_global_prior(prior_path, ctx.structural_key(), prior_seed)
+    # ONE global prior for the whole run — warm-started from its own checkpoint
+    # file (lazy import keeps numpy/sklearn off non-tune callers).
+    from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior  # noqa: PLC0415
+
+    prior = BayesianRidgePrior.load(ctx.structural_key(), seed=prior_seed)
     outer = TuningSearch(patience=patience, ucb_c=ucb_c)
     # The outer drives only the graph-changing passes — no dump on this Run;
     # the winning config's full stage artifacts (incl. per-kernel
@@ -320,7 +306,6 @@ def run_two_level_tune(
             ucb_c=ucb_c,
             progress=progress,
             prior=prior,
-            prior_path=prior_path,
         )
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(token, stats, "ok" if reward.ok else "bench_fail")

@@ -38,6 +38,10 @@ class Prior(ABC):
         # pure UCB); subclasses set it in :meth:`fit` via :meth:`_note_fit`.
         self.trajectory: list[tuple[dict, float, str]] = []
         self._first_fit_idx: int | None = None
+        # Checkpoint binding — set by :meth:`load`; lets :meth:`checkpoint`
+        # persist the prior to its own file without the caller threading a path.
+        self.regime_key: str | None = None
+        self._path = None
 
     @property
     @abstractmethod
@@ -67,6 +71,20 @@ class Prior(ABC):
     def archive(self, rows: list[tuple[dict, float]]) -> None:  # noqa: B027
         """Freeze a finished op's value-of-position rows into the global
         training set. Default no-op; see :meth:`BayesianRidgePrior.archive`."""
+
+    def checkpoint(self) -> None:
+        """Persist this prior to its bound file under its ``regime_key`` (a no-op
+        if unbound or there's nothing to save). The binding is set by
+        :meth:`load`, so callers checkpoint without threading a path around."""
+        if self.regime_key is None:
+            return
+        blob = self.to_bytes()
+        if blob is None:
+            return
+        from deplodock import config  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.prior import store  # noqa: PLC0415
+
+        store.save(self._path or config.prior_path(), self.regime_key, blob)
 
     def to_bytes(self) -> bytes | None:
         """Serialize the fitted model for persistence (``None`` when unfit or
