@@ -96,13 +96,33 @@ def register_tune_command(subparsers):
     parser.set_defaults(func=handle_tune)
 
 
+def _tune_offline(args):
+    """``deplodock tune`` with no op: refit the global learned prior on its
+    persisted reservoir dataset and print offline diagnostics — no GPU, no
+    benching. Answers "can the prior reach the best configs?" over everything
+    tuned so far."""
+    from deplodock import config
+    from deplodock.compiler.pipeline.search.prior import CatBoostPrior, diagnostics
+
+    prior = CatBoostPrior.load(seed=args.seed)
+    if not prior._dataset:
+        logger.error("no prior dataset at %s — run `deplodock tune <model>` first", config.prior_path())
+        sys.exit(1)
+    sys.stderr.write(f"[tune] offline refit on {len(prior._dataset)} rows from {config.prior_path()}\n")
+    prior.fit()  # unconditional re-fit on the whole accumulated dataset
+    prior.checkpoint()
+    sys.stderr.write(diagnostics.report(prior) + "\n")
+
+
 def handle_tune(args):
     if args.code and args.input:
         logger.error("--code and positional input are mutually exclusive")
         sys.exit(2)
     if not args.code and not args.input:
-        logger.error("either a positional model ID / IR file or --code is required")
-        sys.exit(2)
+        # No op to tune → offline mode: refit the learned prior on its persisted
+        # dataset and print diagnostics (reachability, calibration, golden coverage).
+        _tune_offline(args)
+        return
 
     import time
 

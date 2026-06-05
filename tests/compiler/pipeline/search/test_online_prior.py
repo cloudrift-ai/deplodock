@@ -176,6 +176,24 @@ def test_load_tolerates_stale_checkpoint(tmp_path):
     assert p.fitted  # rebuilt fine from salvaged + new rows
 
 
+def test_diagnostics_report_reachability():
+    """``diagnostics.report`` groups by op and reports argmax reachability — on a
+    perfectly-rankable synthetic op the prior recovers the best (ratio 1.0)."""
+    from deplodock.compiler.pipeline.search.prior import diagnostics
+
+    # one op-structure (S_kind), bigger BM = lower latency = higher reward
+    rows = [({"S_kind": 1.0, "BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64) for _ in range(6)]
+    p = _fit(rows)
+    groups = diagnostics.group_by_op(p._dataset)
+    assert len(groups) == 1
+    rr = diagnostics.reachability(p, groups)
+    assert len(rr) == 1
+    _, best_us, argmax_us, ratio, _ = rr[0]
+    assert ratio == min(r[3] for r in rr) and ratio < 1.01  # recovers the best leaf
+    text = diagnostics.report(p)
+    assert "argmax reachability" in text and "golden coverage" in text
+
+
 def test_dataset_accumulates_across_load():
     """A reloaded prior keeps its dataset + reservoir counters so a follow-up tune
     keeps accumulating from where it left off."""
