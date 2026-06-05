@@ -107,18 +107,31 @@ def _emit_registry() -> None:
     # ``registry`` only sees passes already imported into ``sys.modules``; build
     # the full pipeline once so every Knob-bearing rule module is loaded first.
     Pipeline.build(CUDA_PASSES)
+    import textwrap  # noqa: PLC0415
+
     reg = knob.registry()
+    names = sorted(reg)
+    kw = max((len(n) for n in names), default=4)  # knob-name column width
+    tw = max((len(reg[n].type.value) for n in names), default=4)  # type column width
+    hw = 33  # hints column width (truncated past this)
+    help_w = 64  # help wraps to this width; continuation lines indent under it
+    indent = " " * (kw + 2 + tw + 2 + hw + 2)
+
     logger.info("Registered tuning knobs (%d) — the canonical schema:", len(reg))
-    header = f"{'knob':<16} {'type':<8} {'candidate hints':<34} help"
-    logger.info(header)
-    logger.info("-" * len(header))
-    for name in sorted(reg):
+    logger.info(f"{'knob':<{kw}}  {'type':<{tw}}  {'candidates':<{hw}}  help")
+    logger.info("-" * (kw + 2 + tw + 2 + hw + 2 + help_w))
+    for name in names:
         k = reg[name]
         hints = ", ".join(str(h) for h in k.hints) if k.hints else "-"
-        if len(hints) > 33:
-            hints = hints[:32] + "…"
-        alias = f"  [aliases: {', '.join(k.aliases)}]" if k.aliases else ""
-        logger.info("%-16s %-8s %-34s %s%s", name, k.type.value, hints, k.help or "", alias)
+        if len(hints) > hw:
+            hints = hints[: hw - 1] + "…"
+        help_txt = " ".join((k.help or "").split())  # collapse whitespace/newlines
+        if k.aliases:
+            help_txt += f" [aliases: {', '.join(k.aliases)}]"
+        lines = textwrap.wrap(help_txt, width=help_w) or [""]
+        logger.info(f"{name:<{kw}}  {k.type.value:<{tw}}  {hints:<{hw}}  {lines[0]}")
+        for cont in lines[1:]:
+            logger.info(indent + cont)
 
 
 @dataclass(frozen=True)
