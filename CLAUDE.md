@@ -90,7 +90,10 @@ same worker.
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
-  `--bench` below, or `run --bench`). Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
+  `--bench` below, or `run --bench`). To keep the **learned prior** deployable anyway, the engine **re-benches every new
+  global-best at `-Xcicc -O3`** and feeds that as an extra training row tagged `H_opt=3` (so `compile` / `run`, which run
+  at -O3, rank by the deployable numbers — the -O1 sweep alone ties configs that differ at -O3, e.g. a reduction's `FK`).
+  Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
   flags are folded into the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
   On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
   `<kernel> <current us> (best <best us>) <knobs>` tail — the current latency is fixed-width and the knobs sit

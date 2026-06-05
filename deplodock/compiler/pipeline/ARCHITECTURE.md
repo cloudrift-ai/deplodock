@@ -458,6 +458,14 @@ up fast on the first op (~10 refits inside the first ~1k rows) and settles to ~o
 a JSON file (`config.prior_path()`, `~/.cache/deplodock/prior.json`) holding the CatBoost `cbm` blob (base64) + the
 dataset, via `deplodock.storage`; `tune` writes it, `compile` / `run` read it.
 
+**-O3 winner samples.** The sweep compiles at `-Xcicc -O1` (fast, but a *ranking* signal — it ties configs that differ at
+-O3, e.g. a reduction's `FK`). So whenever a bench sets a new global best (`TuningSearch.last_improved_best`), the engine
+re-benches that winner at `-Xcicc -O3` (`_rebench_o3`) and `observe_o3` records an extra row with the same realized knobs
+tagged `H_opt=3` (the deployable regime). The `H_*` feature lets the -O1 (broad) and -O3 (winners-only) rows coexist;
+`compile` / `run` run at -O3 (`H_opt=3`) so greedy ranks by the deployable rows and reaches the true optimum. The
+`nvcc_flags` override rides the bench request to the worker (`config.nvcc_flags_override`), so only winners pay the -O3
+recompile and the cubin cache keys on the flags.
+
 How the prior enters selection — **PUCT is the only rule** (`_select`): the prior is the *sole* signal; greedy-tiebreak and
 the `+∞`-unvisited UCB rule are gone.
 
