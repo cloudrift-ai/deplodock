@@ -66,7 +66,6 @@ def _run_place_inits(op: TileOp) -> TileOp:
         nodes={"root": "op"},
         consumed=set(),
         root_node_id="op",
-        pipeline=None,  # type: ignore[arg-type]
         rule=None,  # type: ignore[arg-type]
         is_last=True,
     )

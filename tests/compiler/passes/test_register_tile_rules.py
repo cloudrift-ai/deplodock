@@ -38,7 +38,7 @@ def test_plain_matmul_fires_register_tile(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     # M14: planner owns matmul partition (BN/BM/FM/FN/BK/SPLITK). When the
     # chosen variant has FM=FN=1, the extent-1 REG loops are eliminated by
     # the normalize pass before 006a sees them, so 006a doesn't fire. The
@@ -55,7 +55,7 @@ def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
 
 
@@ -68,7 +68,7 @@ def test_single_buffer_reduce_does_not_fire_register_tile(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
 
 
@@ -82,7 +82,7 @@ def test_small_matmul_does_not_fire_register_tile(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
 
 
@@ -102,7 +102,7 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(KERNEL_PASSES).run(g, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/kernel")
     assert "split_register_axes" in fired, fired
 
@@ -120,5 +120,5 @@ def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
     g.inputs = ["q", "k", "v"]
     g.outputs = ["o"]
 
-    Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(KERNEL_PASSES).run(g, dump=recording_dump)
     assert "split_register_axes" in recording_dump.fired_rules("lowering/kernel")

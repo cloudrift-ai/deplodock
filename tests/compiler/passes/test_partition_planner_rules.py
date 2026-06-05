@@ -38,7 +38,7 @@ def test_planner_fires_on_pointwise(recording_dump, monkeypatch):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "partition_loops" in recording_dump.fired_rules("lowering/tile")
 
 

@@ -273,7 +273,7 @@ def handle_compile(args):
     else:
         logger.debug("No tuning DB at %s — using rule defaults", tune_db_path)
 
-    result = Pipeline.build(passes, dump=dump).run(graph, db=db)
+    result = Pipeline.build(passes).run(graph, db=db, dump=dump)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)

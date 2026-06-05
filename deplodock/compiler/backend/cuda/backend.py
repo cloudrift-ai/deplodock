@@ -111,7 +111,7 @@ class CudaBackend(Backend):
             from deplodock.compiler.pipeline.search.db import SearchDB
 
             db = SearchDB(path=self.tune_db)
-        return Pipeline.build(CUDA_PASSES, dump=self.dump).run(graph, db=db)
+        return Pipeline.build(CUDA_PASSES).run(graph, db=db, dump=self.dump)
 
     def run(
         self,

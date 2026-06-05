@@ -184,9 +184,12 @@ def test_is_expandable_discriminates_fork_vs_op() -> None:
     # via Pipeline.match to get a real Match.
     cur = pipeline.passes[0].rules[0]
     from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline.pipeline import Run
+    from deplodock.compiler.pipeline.search.db import SearchDB
+    from deplodock.compiler.pipeline.search.policy import GreedySearch
 
-    ctx = Context.probe()
-    cand = Candidate(ctx=ctx, graph=graph, cursor=None)  # cursor unused for these calls
+    run = Run(pipeline=pipeline, ctx=Context.probe(), search=GreedySearch(), db=SearchDB())
+    cand = Candidate(run=run, graph=graph, cursor=None)  # cursor unused for these calls
 
     matches = pipeline.match(graph, cur)
     assert matches, "pattern must match the stub node"

@@ -6,7 +6,7 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 
 ```
 pipeline/
-├── pipeline.py    # Pattern, Match, Rule, Pass, Pipeline; engine + Pipeline.run / Pipeline.tune / Pipeline.search
+├── pipeline.py    # Pattern, Match, Rule, Pass, Pipeline (frozen layout), Run (per-run state + engine loop)
 ├── fork.py        # Fork interface + OptionFork / ThunkFork; Level + build_fork_tree lazy knob-cartesian tree builder
 ├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
@@ -244,8 +244,8 @@ A rewrite that *returns* an op which fails `Op.validate(ctx)` (e.g. a
 `100_materialize_tile` `KernelOp` whose smem exceeds `ctx.max_dynamic_smem`)
 is filtered by `Candidate.try_rewrite` — correct as **fork pruning** (sibling
 branches carry other tile shapes) but fatal in a single-path greedy compile,
-where it leaves the node un-lowered. `Pipeline.run` installs a transient
-`_lowering_rejections` sink that records each such drop `(node, pass, reason)`;
+where it leaves the node un-lowered. `Pipeline.run` installs a `rejections` sink on the
+`Run` that records each such drop `(node, pass, reason)`;
 after the terminal settles, `_raise_on_unlowered` raises a loud `LoweringError`
 naming any still-un-lowered node (its op is still a `LoopOp`/`TileOp`) instead
 of letting it leak to `CudaBackend` as a cryptic `non-CudaOp` `TypeError`. The
@@ -271,13 +271,14 @@ three entry points:
   `backend=None` the bench is stubbed to `latency_us=1.0` and nothing
   is persisted — otherwise `Pipeline.run` (also routed through `tune`)
   would overwrite tuned `best_median_us` rows with the stub.
-- `Pipeline.search(search, ctx, *, db=None) -> Iterator[Candidate]` — the
-  inner engine loop both wrappers drive. Pops a `LazyCandidate`,
-  resolves it, runs one rule batch, pushes successors. At fork points,
-  if `db` is provided, looks up the best-known child for the parent
-  op's `op_cache_key` in `lowering` and passes the matching fork via
-  `search.push(..., best=...)`. Greedy uses `best` when present;
-  tuning ignores it.
+- `Run.drive(graph) -> Iterator[tuple[token, Candidate]]` — the inner engine loop both wrappers drive.
+  `Run` is the per-run state object (`pipeline` + `ctx` + `search` + `db` + `backend` + `dump` +
+  `rejections`): `Pipeline` stays a frozen, shareable pass layout while every run-scoped sink and service
+  lives on the Run, reached from engine-adjacent code through the candidate (`cand.run.dump`,
+  `cand.run.rejections`, `cand.ctx`). `drive` seeds the root candidate, then per iteration pops a
+  `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. At fork
+  points it looks up the best-known child for the parent op's `op_cache_key` in `lowering` and passes the
+  matching fork via `search.push(..., best=...)`. Greedy uses `best` when present; tuning ignores it.
 
 ### Search persistence: on-disk inventory vs in-memory MCTS
 
@@ -338,7 +339,7 @@ opposite structure, so `search/two_level.py` splits them:
   fusion is deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`), so the outer
   tree has exactly one terminal and this reduces to "tune each op once, sum, assemble". The outer tree is the
   generalization that lets fusion forks plug in later with no change to the inner search. The outer uses
-  `Pipeline.search` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
+  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
 - **Inner search** (`inner_reward`) tunes each finalized kernel **independently** in its own single-node slice
   (`single_node_graph`, `search/slice.py`) with a plain `TuningSearch` over `LOWERING_PASSES` only (`tile → kernel →
   cuda`). The slice keeps the root kernel + its leaf-op closure and turns every other kernel-input into a synthetic
@@ -394,14 +395,14 @@ over one op's forks — with max-Q normalized UCB1:
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
   The unvisited-sibling tiebreak is the fork's rank-only structural prior (`TileOp.lazy_score` magnitude carries no meaning —
   only relative ordering), read via `Search.score_of` and memoized per node (`SearchNode.prior`).
-- **Expansion** is implicit: `Pipeline.search` pops a node and runs one rule batch; every fork pushes one new child per
+- **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
 - **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU
   run of a single-kernel slice per leaf.
 - **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
   UCB1 calls see the new max-Q.
 - **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
-  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Pipeline.search` exits. The inner
+  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Run.drive` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on

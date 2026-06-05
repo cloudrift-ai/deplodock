@@ -51,7 +51,6 @@ def _run(op: TileOp) -> TileOp:
         nodes={"root": "op"},
         consumed=set(),
         root_node_id="op",
-        pipeline=None,
         rule=None,
         is_last=True,  # type: ignore[arg-type]
     )
