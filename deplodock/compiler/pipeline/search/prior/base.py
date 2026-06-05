@@ -1,19 +1,14 @@
 """Base class for the inner-``tune`` learned prior + shared diagnostics.
 
 A :class:`Prior` is fit *within one inner ``TuningSearch``* (per kernel,
-discarded after the op is tuned) and consulted by the MCTS to rank unvisited
-siblings. Subclasses implement the model — :meth:`fit` / :meth:`resample` /
-:meth:`score` / :meth:`mean_score` / :attr:`fitted`; the base owns the bench
-trajectory and the end-of-run sanity block.
-
-Mode flags (set by the command, carried on the object so the search reads them
-off the prior rather than via extra constructor args):
-
-- ``active`` — :meth:`score` steers selection (``False`` = *shadow*: still fit +
-  report, but score ``0`` so selection is pure UCB — the A/B baseline).
-- ``acquisition`` — depth-2 PUCT (the prior enters the UCB *arithmetic* as a
-  softmax policy) vs the depth-1 unvisited tiebreak; read by ``TuningSearch``.
-- ``mode`` — display label for the summary block.
+discarded after the op is tuned) and consulted by the MCTS to rank candidates
+via PUCT — the prior is the **only** selection signal (greedy / the
+``+∞``-unvisited UCB fallback are gone). Subclasses implement the model —
+:meth:`fit` / :meth:`resample` / :meth:`score` / :meth:`mean_score` /
+:attr:`fitted`; the base owns the bench trajectory and the end-of-run sanity
+block. :meth:`score` returns ``0`` until the first fit, so a cold prior gives a
+uniform softmax policy (PUCT still explores via its exploration term — no forced
+breadth).
 
 Training signal is **value-of-position**: real benches exist only at leaves, but
 the prior ranks partial-knob siblings at every fork level, so the label for any
@@ -36,12 +31,7 @@ class Prior(ABC):
     the search calls :meth:`fit`; :meth:`resample` is called once per descent
     for a fresh draw (Thompson)."""
 
-    def __init__(
-        self, *, active: bool = True, acquisition: bool = False, mode: str = "online", refit_every: int = 4, min_rows: int = 6
-    ) -> None:
-        self.active = active
-        self.acquisition = acquisition
-        self.mode = mode
+    def __init__(self, *, refit_every: int = 4, min_rows: int = 6) -> None:
         self.refit_every = refit_every
         self.min_rows = min_rows
         # Bench trajectory for the end-of-run stats: (knobs, median, status) in
@@ -65,8 +55,8 @@ class Prior(ABC):
 
     @abstractmethod
     def score(self, knobs: dict) -> float:
-        """Sampled prediction for ranking. ``0.0`` until the first fit, or
-        always in shadow mode (``active=False``)."""
+        """Sampled prediction for ranking. ``0.0`` until the first fit (a cold
+        prior → uniform PUCT policy)."""
 
     @abstractmethod
     def mean_score(self, knobs: dict) -> float:
@@ -75,6 +65,12 @@ class Prior(ABC):
     def record_bench(self, knobs: dict, median: float, status: str) -> None:
         """Append a benched leaf to the trajectory (for the summary stats)."""
         self.trajectory.append((dict(knobs), median, status))
+
+    def to_bytes(self) -> bytes | None:
+        """Serialize the fitted model for persistence (``None`` when unfit or
+        not serializable). Override in subclasses; see
+        :meth:`BayesianRidgePrior.to_bytes`."""
+        return None
 
     def _note_fit(self) -> None:
         """Subclasses call this at the end of a successful :meth:`fit` to stamp
@@ -96,7 +92,7 @@ class Prior(ABC):
         best_idx = next(i for i, (_, us, st) in enumerate(self.trajectory) if st == "ok" and us == best)
         warm = self._first_fit_idx if self._first_fit_idx is not None else n
         lines = [
-            f"[prior] {label} ({self.mode}) — {n} benches (warmup {warm} / post {n - warm})",
+            f"[prior] {label} — {n} benches (warmup {warm} / post {n - warm})",
             f"  best:        {best:.3f} us @ bench #{best_idx}",
             f"  silly (>=2x best):  {self._silly(0, warm, 2 * best)}   {self._silly(warm, n, 2 * best, post=True)}",
         ]

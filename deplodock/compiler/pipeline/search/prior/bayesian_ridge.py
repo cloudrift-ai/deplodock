@@ -17,6 +17,8 @@ the absent pattern is constant, so it never perturbs the ranking that matters.
 
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 
 from deplodock.compiler.pipeline import knob
@@ -87,7 +89,7 @@ class BayesianRidgePrior(Prior):
         self._theta_sample = self._theta + self._cov_L @ z
 
     def score(self, knobs: dict) -> float:
-        if not self.active or self._theta_sample is None:
+        if self._theta_sample is None:
             return 0.0
         return float(self._vec(knobs) @ self._theta_sample + self._y_mean)
 
@@ -101,3 +103,33 @@ class BayesianRidgePrior(Prior):
         f = knob.knob_features(knobs)
         x = np.array([f.get(c, 0.0) for c in self._cols], dtype=float)
         return (x - self._mean) / self._std
+
+    # --- persistence ------------------------------------------------------
+
+    def to_bytes(self) -> bytes | None:
+        """Serialize the fitted posterior for persistence (``None`` if unfit).
+        The state is plain arrays / lists / floats — no custom classes — so the
+        blob unpickles safely anywhere (e.g. a fresh ``compile``)."""
+        if self._theta is None:
+            return None
+        return pickle.dumps(
+            {
+                "cols": self._cols,
+                "mean": self._mean,
+                "std": self._std,
+                "theta": self._theta,
+                "cov_L": self._cov_L,
+                "y_mean": self._y_mean,
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, blob: bytes) -> BayesianRidgePrior:
+        """Reconstruct a fitted prior for inference (``mean_score`` argmax or
+        Thompson ``score``) from a :meth:`to_bytes` blob."""
+        st = pickle.loads(blob)
+        p = cls()
+        p._cols, p._mean, p._std = st["cols"], st["mean"], st["std"]
+        p._theta, p._cov_L, p._y_mean = st["theta"], st["cov_L"], st["y_mean"]
+        p.resample()
+        return p

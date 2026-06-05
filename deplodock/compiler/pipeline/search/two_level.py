@@ -237,6 +237,11 @@ def inner_reward(
             benched = True
             if prior_model is not None:
                 prior_summaries.append(prior_model.summary(name))
+                # Persist the trained prior so a later compile / run (or a fresh
+                # tune) can load it — keyed structurally like perf / effort.
+                blob = prior_model.to_bytes()
+                if blob is not None:
+                    db.save_prior(ctx_key, key, blob, n_rows=len(prior_model.trajectory))
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
         per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
         # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes

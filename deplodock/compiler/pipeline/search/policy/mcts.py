@@ -1,16 +1,17 @@
-"""Single-player MCTS for ``deplodock tune`` with max-reward propagation
-and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
+"""Single-player MCTS for ``deplodock tune`` with max-reward propagation and
+**PUCT** selection — the learned
+:class:`~deplodock.compiler.pipeline.search.prior.Prior` is the *only* selection
+signal (greedy and the ``+∞``-unvisited UCB rule are gone).
 
     select   — descend from root, picking at each level
-               ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
-               where ``Q_norm = best_reward / global_best``. Unvisited
-               children get ``+∞``, breaking ties on the learned
-               :class:`~deplodock.compiler.pipeline.search.prior.Prior`
-               (Thompson-sampled per descent) when one is attached, else
-               ``0`` → emission order (pure UCB). The static
-               ``TileOp.score`` prior was nuked from selection.
-               Live-count filtering skips subtrees whose frontier has
-               been fully drained.
+               ``argmax_c [ Q_norm(c) + c · P(c) · √(N_parent+1) / (1+N_c) ]``
+               where ``Q_norm = best_reward / global_best`` and ``P`` is the
+               softmax over the prior's Thompson-sampled scores of the sibling
+               set. No ``+∞``-unvisited rule → no forced breadth: a
+               confidently-bad sibling gets a small ``P`` and is skipped. A cold
+               or absent prior gives a uniform ``P`` (PUCT still explores via the
+               exploration term; a single-shot compile with no prior descends
+               emission-order). Live-count filtering skips drained subtrees.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
                candidates as children of the ``parent`` token (the
                ``SearchNode`` their spawning candidate was popped with);
@@ -20,9 +21,8 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
                ``visits`` and updating
                ``best_reward = max(best_reward, leaf_reward)``.
 
-Reward is normalized to [0,1] against the global best so the UCB
-exploration constant is unit-free. The prior never enters arithmetic
-with the reward — it only breaks ties among unvisited siblings.
+Reward is normalized to [0,1] against the global best so the exploration
+constant ``c`` is unit-free.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class SearchTree:
 
 
 class TuningSearch(Search):
-    """SP-MCTS: max-Q normalized UCB1 with a rank-only prior."""
+    """SP-MCTS with PUCT selection — the learned prior is the sole signal."""
 
     DEFAULT_UCB_C = math.sqrt(2)
 
@@ -108,11 +108,9 @@ class TuningSearch(Search):
         self._ucb_c = ucb_c
         self._patience = patience
         self._max_visits = max_visits
-        # Learned prior for unvisited siblings (``None`` → pure UCB). Refit from
-        # the live tree every ``refit_every`` benches; one Thompson draw per
-        # descent. Selection depth is read off the prior: ``acquisition`` →
-        # depth-2 PUCT (prior in the UCB arithmetic), else depth-1 tiebreak. The
-        # static ``score_of`` prior is no longer consulted.
+        # Learned prior driving PUCT selection. Refit from the live tree every
+        # ``refit_every`` benches; one Thompson draw per descent. ``None`` for a
+        # single-shot compile (no benching) → uniform PUCT → emission-order pick.
         self.prior_model = prior_model
         self._benches_since_fit = 0
         self._best_reward = 0.0
@@ -175,48 +173,27 @@ class TuningSearch(Search):
             cur = cur.parent
         return node, node.candidate
 
-    def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
-        """Selection score = (UCB1 value, learned-prior tiebreak). Returned
-        as a tuple so unvisited siblings (UCB1 = +∞) are ranked by the
-        Thompson-sampled :class:`Prior` (``0`` → emission order under
-        pure UCB). Visited siblings need no tiebreak (their UCB values are
-        distinct), so the prior is only computed for the unvisited frontier.
-        Reward is normalized against the global best so ``c`` is unit-free."""
-        if child.visits == 0:
-            return float("inf"), self._prior_score(child)
-        global_best = self.tree.best_reward
-        q_norm = (child.best_reward / global_best) if global_best > 0 else 0.0
-        bonus = self._ucb_c * math.sqrt(math.log(max(parent.visits, 1)) / child.visits)
-        return q_norm + bonus, 0.0
-
     def _prior_score(self, child: SearchNode) -> float:
-        """Learned-prior tiebreak for an unvisited child (``0`` when no model
-        is attached or the child is the root sentinel)."""
+        """The prior's Thompson-sampled score for a child (``0`` when no model
+        is attached, the model is unfit, or the child is the root sentinel — in
+        which case the softmax over siblings is uniform)."""
         if self.prior_model is None or child.candidate is None:
             return 0.0
         return self.prior_model.score(self._node_knobs(child))
 
     def _select(self, children: list[SearchNode], parent: SearchNode) -> SearchNode:
-        """Pick the next child to descend into. Depth-2 PUCT once the prior is
-        fit (``acquisition`` mode); otherwise depth-1 UCB1 + ``+∞``-unvisited
-        forced breadth (also the warmup path that seeds the prior)."""
-        if self.prior_model is not None and self.prior_model.acquisition and self.prior_model.fitted:
-            return self._select_puct(children, parent)
-        return max(children, key=lambda c: self._ucb_key(c, parent))
-
-    def _select_puct(self, children: list[SearchNode], parent: SearchNode) -> SearchNode:
-        """PUCT: the learned prior enters the UCB *arithmetic* as a softmax
-        policy that scales each child's exploration bonus —
+        """PUCT is the *only* selection rule — the prior is the sole signal.
 
             score(c) = Q(c) + c_ucb · P(c) · √(N_parent + 1) / (1 + N_c)
 
         where ``Q = best_reward / global_best`` (``0`` for an unvisited child)
-        and ``P`` is the softmax over the Thompson-sampled prior scores of the
-        sibling set. A confidently-bad unvisited sibling gets a small ``P`` →
-        tiny exploration term → it is deprioritized rather than force-visited
-        (the ``+∞``-unvisited rule that caused forced breadth is gone). The
-        prior is still soft: a draw that boosts its logit, or a parent visited
-        enough, can still surface it. ``c_ucb`` is ``--ucb-c``."""
+        and ``P`` is the softmax over the prior's Thompson-sampled scores of the
+        sibling set. A confidently-bad sibling gets a small ``P`` → tiny
+        exploration term → it is deprioritized rather than force-visited. There
+        is no ``+∞``-unvisited rule (no forced breadth) and no greedy/UCB
+        fallback: a cold or absent prior just yields a uniform ``P``, so PUCT
+        still explores via the exploration term (and a single-shot compile with
+        no prior descends emission-order). ``c_ucb`` is ``--ucb-c``."""
         global_best = self.tree.best_reward or 1.0
         probs = _softmax([self._prior_score(c) for c in children])
         sqrt_parent = math.sqrt(parent.visits + 1)

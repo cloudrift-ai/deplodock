@@ -52,19 +52,6 @@ def register_tune_command(subparsers):
         ),
     )
     parser.add_argument(
-        "--prior",
-        choices=("off", "online", "shadow", "puct"),
-        default="off",
-        help=(
-            "How the learned Bayesian-ridge prior (fit in-memory from this run's own benches) enters the inner "
-            "MCTS. 'off' = pure UCB1 (emission order). 'online' = depth-1 unvisited-sibling tiebreak "
-            "(Thompson-sampled). 'puct' = depth-2 acquisition: the prior becomes a softmax policy that modulates "
-            "the exploration bonus, so confidently-bad siblings are deprioritized instead of force-benched. "
-            "'shadow' = fit + report stats but DON'T steer selection (pure-UCB baseline for the A/B). All non-off "
-            "modes print an end-of-run sanity block per kernel. Default: off."
-        ),
-    )
-    parser.add_argument(
         "--bench-timeout",
         type=float,
         default=20.0,
@@ -202,7 +189,7 @@ def handle_tune(args):
             ucb_c=args.ucb_c,
             dump=dump,
             progress=progress,
-            prior_factory=_prior_factory(args.prior, args.seed),
+            prior_factory=_prior_factory(args.seed),
         )
     except KeyboardInterrupt:
         # Manual abort: per-op bests already landed in the DB as they were
@@ -261,19 +248,12 @@ def handle_tune(args):
     os._exit(0)
 
 
-def _prior_factory(mode: str, seed: int):
-    """Build the per-kernel prior factory for ``--prior`` (``None`` for 'off').
-    The mode flags (``active`` / ``acquisition``) ride the prior object; the
-    search reads them off it. ``inner_reward`` calls the factory once per
-    kernel for a fresh in-memory model."""
-    if mode == "off":
-        return None
+def _prior_factory(seed: int):
+    """The per-kernel prior factory: ``inner_reward`` calls it once per kernel
+    for a fresh in-memory PUCT prior (the only selection policy)."""
     from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior
 
-    label = {"online": "online", "shadow": "shadow/UCB", "puct": "puct"}[mode]
-    active = mode in ("online", "puct")
-    acquisition = mode == "puct"
-    return lambda: BayesianRidgePrior(seed=seed, active=active, acquisition=acquisition, mode=label)
+    return lambda: BayesianRidgePrior(seed=seed)
 
 
 def _clean_caches(db_path) -> None:

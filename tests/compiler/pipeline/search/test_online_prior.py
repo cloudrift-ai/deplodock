@@ -139,14 +139,14 @@ def test_node_knobs_accumulates_along_path():
     assert TuningSearch._node_knobs(leaf) == {"BR": 2, "BM": 64, "BN": 32}
 
 
-def test_pure_ucb_when_no_model():
+def test_prior_score_zero_when_no_model():
     tree = SearchTree()
     child = _node({"BM": 64}, tree.root)
     s = TuningSearch(tree=tree)  # prior_model=None
     assert s._prior_score(child) == 0.0
 
 
-# --- depth-2 PUCT acquisition ----------------------------------------------
+# --- PUCT selection (the only rule) ----------------------------------------
 
 
 def _fitted_prior_bm():
@@ -157,10 +157,9 @@ def _fitted_prior_bm():
     return p
 
 
-def test_puct_deprioritizes_bad_unvisited_vs_forced_breadth():
-    """The whole point of depth-2: a confidently-bad *unvisited* sibling must
-    NOT be force-selected over a good *visited* one — unlike depth-1, where the
-    unvisited child's UCB1 = +∞ forces it."""
+def test_puct_deprioritizes_bad_unvisited():
+    """A confidently-bad *unvisited* sibling must NOT be selected over a good
+    *visited* one — there is no ``+∞``-unvisited rule to force it."""
     prior = _fitted_prior_bm()
     tree = SearchTree()
     good_visited = _node({"BM": 64}, tree.root)
@@ -169,17 +168,12 @@ def test_puct_deprioritizes_bad_unvisited_vs_forced_breadth():
     tree.record_terminal(good_visited, 1.0)  # global_best = 1.0, Q(good) = 1
     s = TuningSearch(tree=tree, prior_model=prior)
     prior.resample()
-
-    # Depth-1 (forced breadth): the unvisited child wins on +∞.
-    assert s._ucb_key(bad_unvisited, tree.root)[0] == float("inf")
-    assert max([good_visited, bad_unvisited], key=lambda c: s._ucb_key(c, tree.root)) is bad_unvisited
-    # Depth-2 PUCT: the bad unvisited child is deprioritized; we keep exploiting.
-    assert s._select_puct([good_visited, bad_unvisited], tree.root) is good_visited
+    assert s._select([good_visited, bad_unvisited], tree.root) is good_visited
 
 
 def test_puct_still_explores_promising_unvisited():
     """A *promising* unvisited sibling (high prior) should still be explored
-    over a mediocre visited one — depth-2 deprioritizes only the bad ones."""
+    over a mediocre visited one — PUCT deprioritizes only the bad ones."""
     prior = _fitted_prior_bm()
     tree = SearchTree()
     mediocre_visited = _node({"BM": 8}, tree.root)
@@ -188,21 +182,48 @@ def test_puct_still_explores_promising_unvisited():
     tree.record_terminal(mediocre_visited, 0.3)  # global_best 0.3, but BM=8 is so-so
     s = TuningSearch(tree=tree, prior_model=prior)
     prior.resample()
-    assert s._select_puct([mediocre_visited, good_unvisited], tree.root) is good_unvisited
+    assert s._select([mediocre_visited, good_unvisited], tree.root) is good_unvisited
 
 
-def test_acquisition_falls_back_to_ucb_during_warmup():
-    """Before the prior is fit, ``_select`` is plain UCB1 + forced breadth so
-    the model gets seed data."""
+def test_cold_or_absent_prior_descends_emission_order():
+    """With no prior (single-shot compile) or a cold prior, every score is 0 →
+    uniform softmax → PUCT picks the first child (emission order). No forced
+    breadth, no +∞."""
     tree = SearchTree()
     a = _node({"BM": 64}, tree.root)
     b = _node({"BM": 2}, tree.root)
     tree.root.children = [a, b]
-    prior = BayesianRidgePrior(seed=0, acquisition=True)  # acquisition on, but not fitted
-    s = TuningSearch(tree=tree, prior_model=prior)
-    # Acquisition is requested but the prior isn't fit → _select falls back to
-    # depth-1 UCB1: both unvisited → +∞ → first wins (emission order).
-    assert s._select([a, b], tree.root) is a
+    assert TuningSearch(tree=tree)._select([a, b], tree.root) is a  # no prior
+    cold = BayesianRidgePrior(seed=0)  # attached but unfit
+    assert TuningSearch(tree=tree, prior_model=cold)._select([a, b], tree.root) is a
+
+
+def test_prior_persistence_round_trips():
+    """``to_bytes`` → ``from_bytes`` reconstructs a fitted prior whose
+    ``mean_score`` matches the original; an unfit prior serializes to ``None``."""
+    from deplodock.compiler.pipeline.search.prior import prior_from_bytes
+
+    assert BayesianRidgePrior(seed=0).to_bytes() is None  # unfit → nothing to save
+    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
+    p = BayesianRidgePrior(seed=0, min_rows=3)
+    p.fit(rows)
+    blob = p.to_bytes()
+    assert blob is not None
+    q = prior_from_bytes(blob)
+    assert q.fitted
+    for bm in (4, 16, 64):
+        assert abs(p.mean_score({"BM": bm}) - q.mean_score({"BM": bm})) < 1e-9
+
+
+def test_db_save_load_prior():
+    from deplodock.compiler.pipeline.search.db import SearchDB
+
+    db = SearchDB()  # in-memory
+    assert db.load_prior("ctx", "op") is None
+    db.save_prior("ctx", "op", b"blobdata", n_rows=7)
+    assert db.load_prior("ctx", "op") == b"blobdata"
+    db.save_prior("ctx", "op", b"newer", n_rows=9)  # latest-kept
+    assert db.load_prior("ctx", "op") == b"newer"
 
 
 def test_softmax_sums_to_one_and_orders():

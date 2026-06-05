@@ -57,7 +57,7 @@ def resolve_tune_db() -> Path:
 
     Callers should treat the path as advisory — the engine only opens
     it when the file actually exists; otherwise the compile falls back
-    to rule defaults (greedy option-0)."""
+    to rule defaults (single-shot option-0)."""
     return config.tune_db_path()
 
 
@@ -263,7 +263,7 @@ def handle_compile(args):
         dump.dump_input_graph(graph)
 
     # Pick tuned forks from the DB when one is reachable; otherwise the
-    # engine falls back to rule defaults (greedy option-0). Compile never
+    # engine falls back to rule defaults (single-shot option-0). Compile never
     # errors on a missing DB — that's only a hint, not a requirement.
     # ``DEPLODOCK_TUNE_DB`` env var overrides the default path.
     tune_db_path = resolve_tune_db()

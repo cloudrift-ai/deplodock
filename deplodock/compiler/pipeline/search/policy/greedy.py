@@ -1,4 +1,14 @@
-"""Greedy single-shot search — stops at the first terminal candidate."""
+"""Single-shot compile driver — stops at the first terminal candidate.
+
+This is NOT an exploration policy (the learned prior / PUCT in
+:class:`TuningSearch` is the only one of those). It is the deterministic
+``Pipeline.run`` driver for ``compile`` / ``run`` and the assembled-graph
+lowering: it emits a single option-0 lowering with **O(1) work per step**.
+
+It deliberately keeps *no* MCTS tree. Routing a whole-model compile through
+``TuningSearch`` instead is O(N²) in the number of rule applications — its
+``pop`` re-descends from the root each call — so a transformer-block compile
+effectively hangs. A single pending slot avoids that entirely."""
 
 from __future__ import annotations
 
@@ -14,11 +24,9 @@ class GreedySearch(Search):
     yields a terminal without pushing it back, the next ``pop`` finds
     the slot empty and returns ``None``, ending the search.
 
-    Used by ``run_pipeline`` for single-shot compiles. Selection by the
-    DB-best fork (``_best_fork``) and the static ``score_of`` prior were
-    both nuked, so greedy now keeps the **first** emitted sibling (the
-    rule's option-0 default). Reconnecting greedy to the learned prior is
-    deferred until the prior proves out in search."""
+    Keeps the **first** emitted sibling (the rule's option-0 default) — there
+    is no prior in single-shot compile (no benches to fit one). Wiring a
+    warm-started prior into compile is a deferred follow-up."""
 
     def __init__(self) -> None:
         super().__init__()

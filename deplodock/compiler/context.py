@@ -84,11 +84,10 @@ class Context:
     # pick the per-thread N-chunk width that keeps each LDS.128 phase
     # bank-conflict-free.
     lds128_bytes: int = 16
-    # Identifies which backend's perf rows this compile should consult
-    # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
-    # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the
-    # canonical autotune target. ``run_autotune`` replaces this when a
-    # live :class:`Backend` is supplied.
+    # Identifies which backend's perf rows this compile reads/writes — the
+    # tune DB keys ``perf`` by ``(context_key, op_key, backend)``. Defaults to
+    # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
+    # this when a live :class:`Backend` is supplied.
     backend_name: str = "cuda"
     # Extra nvcc flags this compile uses (from ``DEPLODOCK_NVCC_FLAGS`` — e.g.
     # tune's ``-Xcicc -O1`` vs compile/run's -O3). Folded into

@@ -193,6 +193,23 @@ class SearchDB:
             PRIMARY KEY (context_key, op_key)
         )
         """,
+        # ``prior_model`` — the learned per-op prior trained by the inner
+        # ``tune`` search, persisted so a later ``compile`` / ``run`` (or a
+        # fresh tune) can load it and pick knobs without re-searching. ``blob``
+        # is the model's serialized state (pickle of plain arrays — no custom
+        # classes); keyed by ``(context_key, op_key)`` like ``perf`` / effort,
+        # so the structural op identity + hardware context selects the model.
+        # Latest-kept: re-tuning replaces the row.
+        """
+        CREATE TABLE IF NOT EXISTS prior_model (
+            context_key  TEXT NOT NULL,
+            op_key       TEXT NOT NULL,
+            blob         BLOB NOT NULL,
+            n_rows       INTEGER NOT NULL,
+            trained_at   TEXT NOT NULL,
+            PRIMARY KEY (context_key, op_key)
+        )
+        """,
     ]
 
     def __init__(self, path: Path | str | None = None) -> None:
@@ -452,6 +469,25 @@ class SearchDB:
         so it is terminated at every patience). The two-level driver skips
         the inner search for terminated ops."""
         return self.effort_for(context_key, op_key) >= patience
+
+    def save_prior(self, context_key: str, op_key: str, blob: bytes, n_rows: int) -> None:
+        """Persist a trained per-op prior's serialized state. Latest-kept —
+        a re-tune replaces the row."""
+        import datetime  # noqa: PLC0415
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO prior_model (context_key, op_key, blob, n_rows, trained_at) VALUES (?, ?, ?, ?, ?)",
+            (context_key, op_key, blob, int(n_rows), datetime.datetime.now(datetime.UTC).isoformat()),
+        )
+
+    def load_prior(self, context_key: str, op_key: str) -> bytes | None:
+        """The persisted prior blob for ``op_key`` in this context, or ``None``
+        when no prior was trained for it."""
+        row = self._conn.execute(
+            "SELECT blob FROM prior_model WHERE context_key = ? AND op_key = ?",
+            (context_key, op_key),
+        ).fetchone()
+        return bytes(row[0]) if row is not None else None
 
     def best_per_op_time(self, context_key: str, op_key: str, *, backend: str = "cuda") -> float | None:
         """Best measured median (us) for the kernel that ``op_key`` lowers

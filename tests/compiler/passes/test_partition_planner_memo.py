@@ -200,7 +200,7 @@ def test_scores_shared_across_identical_loop_ops(monkeypatch):
     through the SAME search computes ZERO new scores. (Expansion alone
     never scores — ranking is search policy, so the read happens via
     ``Search.score_of``.)"""
-    from deplodock.compiler.pipeline.search.policy import GreedySearch
+    from deplodock.compiler.pipeline.search.policy import TuningSearch
 
     calls = {"n": 0}
     real = TileOp.lazy_score
@@ -217,7 +217,7 @@ def test_scores_shared_across_identical_loop_ops(monkeypatch):
     struct_1 = {k: v for k, v in plan_1.base_knobs.items() if k.startswith("S_")}
     struct_2 = {k: v for k, v in plan_2.base_knobs.items() if k.startswith("S_")}
     assert struct_1 and struct_1 == struct_2, "structurally identical ops must share structural features"
-    search = GreedySearch()
+    search = TuningSearch()
     tree_1 = _build_tree(plan_1, ctx)
     assert calls["n"] == 0, "building a tree must not score"
     tree_1.expand()

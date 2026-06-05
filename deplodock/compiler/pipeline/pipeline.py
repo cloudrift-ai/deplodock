@@ -438,6 +438,11 @@ class Pipeline:
         instead of a downstream ``CudaBackend`` mystery."""
         from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
 
+        # Single-shot compile uses the O(1)-per-step ``GreedySearch`` driver, NOT
+        # the MCTS tree: ``TuningSearch.pop`` re-descends from the root each call,
+        # so a whole-model compile through it would be O(N²) and hang. Greedy
+        # emits a single option-0 lowering (no prior — nothing to fit without
+        # benches). Exploration (the learned prior / PUCT) stays in ``tune``.
         rejections: list[tuple[str, str, str]] = []
         cand = next(self.tune(graph, search=GreedySearch(), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
         _raise_on_unlowered(cand.graph, rejections, cand.ctx)

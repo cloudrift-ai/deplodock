@@ -20,8 +20,7 @@ the engine interleaves pops, pushes, and observes.
   :class:`TuningSearch` overrides it to backprop on its MCTS tree.
 
 Tokens are minted by the policy and opaque to the engine:
-:class:`TuningSearch` uses its ``SearchNode``; :class:`GreedySearch`
-keeps no lineage and mints ``None``.
+:class:`TuningSearch` (the only policy) uses its ``SearchNode`` as the token.
 """
 
 from __future__ import annotations
@@ -68,9 +67,9 @@ class Search(ABC):
 
         ``parent`` is the token of the :meth:`pop` whose candidate
         spawned these siblings, or ``None`` for the seed candidate that
-        starts a run. Selection is the policy's job: greedy keeps the
-        first sibling (option-0); tuning explores every fork and ranks
-        the unvisited frontier with its learned prior."""
+        starts a run. Selection is the policy's job: :class:`TuningSearch`
+        ranks the frontier by PUCT over its learned prior (a single-shot
+        compile, prior absent, descends emission-order)."""
 
     @abstractmethod
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
@@ -84,4 +83,4 @@ class Search(ABC):
         ``token`` is the one the terminal was popped with; ``stats``
         aggregates its per-iter latencies in microseconds (median /
         mean / variance / etc.); ``status`` is ``"ok"`` or
-        ``"bench_fail"``. Default no-op (greedy doesn't use it)."""
+        ``"bench_fail"``. Default no-op; :class:`TuningSearch` overrides it."""

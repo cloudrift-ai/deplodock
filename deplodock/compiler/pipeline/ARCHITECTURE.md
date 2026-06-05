@@ -11,7 +11,7 @@ pipeline/
 ├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
-│   ├── policy/       # Search ABC (base.py) + GreedySearch (greedy.py) / TuningSearch (mcts.py)
+│   ├── policy/       # Search ABC (base.py) + TuningSearch (mcts.py) — the only policy
 │   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf + op_effort
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
@@ -70,10 +70,10 @@ matched `Node` objects. Anything else binds positionally to
 
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
-parent's graph snapshot) and hands them ALL to the search, which picks: greedy keeps the first (option-0)
-sibling — DB-best replay (`_best_fork`) and the static `score_of` prior were **nuked from selection**;
-tuning explores every fork, ranking the unvisited frontier with its learned `BayesianRidgePrior` (search/prior/,
-Thompson-sampled — `0` → emission order under pure UCB). Single-option returns (or bare `Graph` / `Op`)
+parent's graph snapshot) and hands them ALL to the single `TuningSearch` policy, which ranks them by PUCT over
+its learned `BayesianRidgePrior` (`search/prior/`). A single-shot compile has no prior → uniform PUCT → it keeps
+the first (option-0) sibling; a `tune` sweep explores every fork. (DB-best replay `_best_fork`, the static
+`score_of` prior, and `GreedySearch` were all removed.) Single-option returns (or bare `Graph` / `Op`)
 are the deterministic case — no fork.
 
 **Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
@@ -262,7 +262,8 @@ rules — they're shared helpers for the pass's rule modules.
 three entry points:
 
 - `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
-  compile via `GreedySearch`. Stops at the first terminal candidate.
+  compile via `TuningSearch(max_visits=1)` with no prior (uniform PUCT →
+  emission-order descent). Stops at the first terminal candidate.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
   yields one terminal `Candidate` per fully-explored rollout.
@@ -278,8 +279,8 @@ three entry points:
   lives on the Run, reached from engine-adjacent code through the candidate (`cand.run.dump`,
   `cand.run.rejections`, `cand.ctx`). `drive` seeds the root candidate, then per iteration pops a
   `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. Selection is
-  the policy's job: greedy keeps option-0, tuning ranks the unvisited frontier with its learned prior. (The
-  DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
+  `TuningSearch`'s job (PUCT over the learned prior; a single-shot compile, prior absent, descends
+  emission-order). (The DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
   selection" above; the perf DB still *records* every bench as the prior's training data.)
 
 ### The keying map: two identities
@@ -412,11 +413,10 @@ full-model + per-kernel tables and (when a dump dir is set) an HTML chart at `<d
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner
 over one op's forks — with max-Q normalized UCB1:
 
-- **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
-  where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
-  The unvisited-sibling tiebreak is the learned `BayesianRidgePrior` (`search/prior/`), Thompson-sampled once per descent —
-  `0` when no prior is attached (`--prior off`), which falls back to emission order (pure UCB). The static `TileOp.score`
-  tiebreak was nuked from selection.
+- **Selection** is PUCT (`_select`): `Q_norm(c) + ucb_c · P(c) · sqrt(N_parent+1)/(1+N_c)`, where
+  `Q_norm = child.best_reward / global_best_reward`, `reward = 1 / median_us`, and `P` is the softmax over the learned
+  `BayesianRidgePrior`'s Thompson scores of the sibling set. The prior is the sole signal — greedy, the static
+  `TileOp.score` tiebreak, and the `+∞`-unvisited UCB rule are all gone (see the learned-prior section).
 - **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
 - **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU
@@ -437,20 +437,16 @@ the path; `knob.knob_features` vectorizes. Because the labels are non-stationary
 from a tree snapshot** every `refit_every` benches rather than streaming. Selection draws one Thompson sample per descent
 (`resample`) so exploration stays honest; the magnitude is irrelevant, only the ranking.
 
-How the prior enters selection — two depths (`--prior` mode):
+How the prior enters selection — **PUCT is the only rule** (`_select`): the prior is the *sole* signal; greedy and the
+`+∞`-unvisited UCB rule are gone.
 
-- **`online` (depth-1)** — the prior is the unvisited-sibling *tiebreak*. Unvisited children still get UCB1 `+∞`, so
-  every sibling is force-visited once (forced breadth); the prior only orders those first-visits. Cheap, but its control
-  is weak — it can't skip a confidently-bad sibling.
-- **`puct` (depth-2)** — the prior enters the UCB *arithmetic* as a softmax policy (`_select_puct`): `score(c) = Q(c) +
-  c·P(c)·√(N_parent+1)/(1+N_c)`, `Q = best_reward/global_best` (0 if unvisited), `P = softmax` over the sibling set's
-  Thompson scores. A low-`P` unvisited sibling gets a tiny exploration term → deprioritized instead of force-benched, so
-  the search stops paying full breadth at every fork. Falls back to depth-1 UCB1 during warmup (before the prior is fit)
-  to seed the model. `c` is `--ucb-c`.
-- **`shadow`** — fits + reports the same end-of-run sanity block (silly-pick rate warmup-vs-post, self-calibration) but
-  scores `0` (pure-UCB baseline arm of the A/B).
+    score(c) = Q(c) + c · P(c) · √(N_parent+1) / (1+N_c)
 
-The `shadow` arm makes the online-vs-UCB and depth-1-vs-depth-2 A/Bs measurable on one op.
+`Q = best_reward/global_best` (0 if unvisited), `P = softmax` over the sibling set's Thompson scores, `c = --ucb-c`. A
+low-`P` sibling gets a tiny exploration term → it is deprioritized instead of force-benched (no forced breadth). A cold
+or absent prior yields a uniform `P`, so PUCT still explores via the exploration term — and a single-shot compile (no
+prior, `max_visits=1`) descends emission-order, the old option-0 pick. The end-of-run sanity block (silly-pick rate
+warmup-vs-post, self-calibration) prints per kernel.
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
