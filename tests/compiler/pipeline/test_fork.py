@@ -37,10 +37,10 @@ def _identity_score(p: P, cache: dict | None = None) -> float:  # noqa: ARG001 �
     return float(p.a * 100 + p.b * 10 + p.c)
 
 
-def _walk_leaves(node: Fork | list[Fork]) -> list[Fork]:
-    """Collect every leaf Fork in tree order (option-0 first)."""
+def _walk_leaves(node: Fork) -> list[Fork]:
+    """Collect every leaf Fork in tree order (grouping order first)."""
     out: list[Fork] = []
-    stack: list[Fork] = [node] if isinstance(node, Fork) else list(node)
+    stack: list[Fork] = [node]
     while stack:
         cur = stack.pop(0)
         if cur.is_leaf:
@@ -50,10 +50,10 @@ def _walk_leaves(node: Fork | list[Fork]) -> list[Fork]:
     return out
 
 
-def _walk_branches(node: Fork | list[Fork]) -> list[Fork]:
+def _walk_branches(node: Fork) -> list[Fork]:
     """Collect every non-leaf branch Fork in the tree."""
     out: list[Fork] = []
-    stack: list[Fork] = [node] if isinstance(node, Fork) else list(node)
+    stack: list[Fork] = [node]
     while stack:
         cur = stack.pop()
         if cur.is_leaf:
@@ -72,9 +72,12 @@ _LEVELS = [
 ]
 
 
-def test_empty_params_returns_empty_list():
-    out = build_fork_tree(params=[], levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
-    assert out == []
+def test_empty_params_raises():
+    """No params ⟹ no fork point — the caller should skip the rule, not
+    build a tree. The non-empty invariant keeps the return type a bare
+    ``Fork`` (the engine never sees an empty option list)."""
+    with pytest.raises(ValueError, match="params must be non-empty"):
+        build_fork_tree(params=[], levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
 
 
 def test_empty_levels_raises():
@@ -174,26 +177,20 @@ def test_branch_knobs_no_overlap_along_path():
     knob is pinned exactly once across all Forks on the path."""
     params = [P(a, b, c) for a in (1, 2) for b in (1, 2) for c in (1, 2)]
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
-    roots = [tree] if isinstance(tree, Fork) else list(tree)
 
-    def _first_path(root: Fork) -> list[Fork]:
-        path = [root]
-        node = root
-        while not node.is_leaf:
-            node = node.expand()[0]
-            path.append(node)
-        return path
-
-    for root in roots:
-        path = _first_path(root)
-        seen: dict[str, int] = {}
-        for f in path:
-            for k in f.knobs:
-                seen[k] = seen.get(k, 0) + 1
-        duplicates = {k: v for k, v in seen.items() if v > 1}
-        assert not duplicates, f"knob duplicated along path: {duplicates}"
-        # Every pinned knob is one of the level knob_names.
-        assert set(seen) <= {"A", "B", "C"}
+    path = [tree]
+    node = tree
+    while not node.is_leaf:
+        node = node.expand()[0]
+        path.append(node)
+    seen: dict[str, int] = {}
+    for f in path:
+        for k in f.knobs:
+            seen[k] = seen.get(k, 0) + 1
+    duplicates = {k: v for k, v in seen.items() if v > 1}
+    assert not duplicates, f"knob duplicated along path: {duplicates}"
+    # Every pinned knob is one of the level knob_names.
+    assert set(seen) <= {"A", "B", "C"}
 
 
 def test_collapsed_constant_level_omits_branch():
@@ -227,28 +224,37 @@ def test_materialize_is_lazy():
     assert len(calls) == 2
 
 
-def test_score_is_lazy_and_called_at_most_once_per_param():
+def test_score_is_lazy_and_caching_is_the_scorers_job():
     """``score`` fires ZERO times at build AND at expansion (ranking is
-    search policy — nothing scores until a score is read) and at most
-    once per param across a full tree's reads — the per-tree memo means
-    no rescoring across levels or repeated ``score()`` reads."""
-    calls: list[P] = []
+    search policy — nothing scores until a score is read). The builder
+    adds NO caching of its own: a scorer that memoizes into the ``cache``
+    it receives (the production pattern) computes once per param across a
+    full tree's reads; repeat reads re-enter the scorer and hit its
+    cache."""
+    computes: list[P] = []
 
-    def counting_score(p: P, cache: dict | None = None) -> float:  # noqa: ARG001
-        calls.append(p)
-        return _identity_score(p)
+    def caching_score(p: P, cache: dict | None = None) -> float:
+        key = (p.a, p.b, p.c)
+        if cache is not None and key in cache:
+            return cache[key]
+        computes.append(p)
+        v = _identity_score(p)
+        if cache is not None:
+            cache[key] = v
+        return v
 
     params = [P(a, b, c) for a in (1, 2) for b in (1, 2) for c in (1, 2)]  # 8 unique params
-    tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=counting_score)
-    assert calls == [], "score fired during build — it must be lazy"
+    tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=caching_score)
+    assert computes == [], "score fired during build — it must be lazy"
     leaves = _walk_leaves(tree)
     branches = _walk_branches(tree)
-    assert calls == [], "score fired during expansion — ranking is the search's job"
+    assert computes == [], "score fired during expansion — ranking is the search's job"
+    the_cache: dict = {}
     for fork in (tree, *branches, *leaves):
-        fork.score()
-    tree.score()  # repeated reads hit the memo
-    assert len(calls) == len(params)
-    assert set(calls) == set(params)
+        fork.score(the_cache)
+    tree.score(the_cache)  # repeated reads hit the scorer's cache
+    assert len(computes) == len(params)
+    assert set(computes) == set(params)
 
 
 def test_leaf_expand_returns_own_param_materialization():

@@ -241,7 +241,7 @@ class _Plan:
     params: tuple[dict, ...]
 
 
-def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | list[Fork]:
+def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     """Emit one hierarchical Fork tree over knob bundles:
     ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → (BK,SPLITK) → TileOp leaf``.
 

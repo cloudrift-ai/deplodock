@@ -36,7 +36,7 @@ _score_variant = _planner._score_variant
 BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN, _planner.BK, _planner.SPLITK)
 
 
-def _build_fork_tree_lazy(plan, ctx: Context) -> Fork | list[Fork]:
+def _build_fork_tree_lazy(plan, ctx: Context) -> Fork:
     """Mirror the planner's own call site in ``rewrite()`` — builds the same
     Fork tree from a ``_Plan`` + ``ctx`` via the shared
     ``pipeline/fork.py`` builder, with the planner's canonical level
@@ -132,10 +132,9 @@ def _pointwise_plan():
     return plan
 
 
-def _walk_leaves(tree: Fork | list[Fork]) -> list[Fork]:
-    roots = [tree] if isinstance(tree, Fork) else list(tree)
+def _walk_leaves(tree: Fork) -> list[Fork]:
     leaves: list[Fork] = []
-    stack = list(roots)
+    stack = [tree]
     while stack:
         node = stack.pop()
         if node.is_leaf:
@@ -145,10 +144,9 @@ def _walk_leaves(tree: Fork | list[Fork]) -> list[Fork]:
     return leaves
 
 
-def _walk_branches(tree: Fork | list[Fork]) -> list[Fork]:
-    roots = [tree] if isinstance(tree, Fork) else list(tree)
+def _walk_branches(tree: Fork) -> list[Fork]:
     branches: list[Fork] = []
-    stack = list(roots)
+    stack = [tree]
     while stack:
         node = stack.pop()
         if node.is_leaf:
@@ -227,7 +225,7 @@ def test_max_score_descent_reaches_best_variant():
     ctx = _ctx()
     tree = _build_fork_tree_lazy(plan, ctx)
 
-    node = tree if isinstance(tree, Fork) else max(tree, key=lambda f: f.score())
+    node = tree
     while not node.is_leaf:
         node = max(node.expand(), key=lambda f: f.score())
 
@@ -264,18 +262,16 @@ def test_branch_knobs_partition_cleanly():
             path.append(node)
         return path
 
-    roots = [tree] if isinstance(tree, Fork) else list(tree)
-    for root in roots:
-        path = _first_path(root)
-        seen: dict[str, int] = {}
-        for fork in path:
-            for k in fork.knobs:
-                seen[k] = seen.get(k, 0) + 1
-        # Collapsed knobs (single-value across all variants) are absent from
-        # the path's Forks but pinned by the leaf TileOp — accept missing
-        # knobs that don't vary across variants. The check that matters:
-        # no knob appears twice (would mean overlapping branch deltas).
-        duplicates = {k: c for k, c in seen.items() if c > 1}
-        assert not duplicates, f"knobs appear at multiple levels: {duplicates}"
-        # Every pinned knob is one of the planner's expected set.
-        assert set(seen) <= expected, f"unexpected knob keys in path: {set(seen) - expected}"
+    path = _first_path(tree)
+    seen: dict[str, int] = {}
+    for fork in path:
+        for k in fork.knobs:
+            seen[k] = seen.get(k, 0) + 1
+    # Collapsed knobs (single-value across all variants) are absent from
+    # the path's Forks but pinned by the leaf TileOp — accept missing
+    # knobs that don't vary across variants. The check that matters:
+    # no knob appears twice (would mean overlapping branch deltas).
+    duplicates = {k: c for k, c in seen.items() if c > 1}
+    assert not duplicates, f"knobs appear at multiple levels: {duplicates}"
+    # Every pinned knob is one of the planner's expected set.
+    assert set(seen) <= expected, f"unexpected knob keys in path: {set(seen) - expected}"

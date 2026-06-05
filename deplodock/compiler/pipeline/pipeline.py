@@ -518,7 +518,7 @@ class Pipeline:
         rejections: list[tuple[str, str, str]] = []
         object.__setattr__(self, "_lowering_rejections", rejections)
         try:
-            cand = next(self.tune(graph, search=GreedySearch(db=db), ctx=ctx, backend=backend, db=db))
+            cand = next(self.tune(graph, search=GreedySearch(), ctx=ctx, backend=backend, db=db))
         finally:
             object.__setattr__(self, "_lowering_rejections", None)
         _raise_on_unlowered(cand.graph, rejections, cand.ctx)

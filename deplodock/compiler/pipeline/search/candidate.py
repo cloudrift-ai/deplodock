@@ -44,17 +44,12 @@ class Candidate:
     callback wiring is needed.
 
     :class:`LazyCandidate` is the deferred-apply counterpart used for
-    autotune fork siblings; both expose :meth:`resolve` so the search
-    loop can treat them uniformly."""
+    autotune fork siblings — the search queue holds only LazyCandidates;
+    a concrete Candidate enters it via :meth:`lazy`."""
 
     ctx: Context
     graph: Graph
     cursor: Cursor
-
-    def resolve(self) -> Candidate:
-        """Identity — already concrete. Provided so callers can resolve
-        any candidate uniformly."""
-        return self
 
     def lazy(self) -> LazyCandidate:
         """Wrap in a no-op :class:`LazyCandidate` (``pending=None``). The search
@@ -218,12 +213,12 @@ class LazyCandidate:
     Sibling forks at the same rewrite point share ``inner`` by reference
     — only one snapshot is ever held in memory per fork point. Each
     sibling's ``pending`` carries its own :class:`Fork` (branch or leaf;
-    see :class:`deplodock.compiler.pipeline.pipeline.Fork`).
+    see :class:`deplodock.compiler.pipeline.fork.Fork`).
 
-    The constructor classmethods (:meth:`from_op` / :meth:`from_graph` /
-    :meth:`from_fork` / :meth:`from_option`) are the supported way to
-    spawn a non-trivial LazyCandidate — they handle the Op/Graph-to-Fork
-    leaf-wrapping uniformly so callers don't have to.
+    :meth:`from_option` is the supported way to spawn a non-trivial
+    LazyCandidate — it lifts concrete ``Op`` / ``Graph`` options into
+    :class:`OptionFork` leaves so ``pending`` always carries a uniform
+    Fork shape.
 
     ``cursor`` is the lazy candidate's own pipeline cursor (typically a
     copy of the parent's cursor at fork-creation time)."""
@@ -233,36 +228,16 @@ class LazyCandidate:
     pending: tuple[Match, Fork] | None
 
     @classmethod
-    def from_op(cls, *, inner: Candidate, cursor: Cursor, match: Match, op: Op) -> LazyCandidate:
-        """Wrap a concrete ``Op`` rewrite as a leaf-Fork-pending LazyCandidate.
-        Validation has already happened upstream (in ``try_rewrite``'s
-        filter) — the constructor just lifts the option into the Fork
-        shape so resolve / expand / _best_fork can treat it uniformly."""
-        knobs = dict(getattr(op, "knobs", None) or {})
-        leaf = OptionFork(option=op, knobs=knobs)
-        return cls(inner=inner, cursor=cursor, pending=(match, leaf))
-
-    @classmethod
-    def from_graph(cls, *, inner: Candidate, cursor: Cursor, match: Match, graph: Graph) -> LazyCandidate:
-        """Wrap a ``Graph`` fragment splice as a leaf-Fork-pending LazyCandidate."""
-        leaf = OptionFork(option=graph)
-        return cls(inner=inner, cursor=cursor, pending=(match, leaf))
-
-    @classmethod
-    def from_fork(cls, *, inner: Candidate, cursor: Cursor, match: Match, fork: Fork) -> LazyCandidate:
-        """Direct wrap for an explicit branch ``Fork`` produced by a rule."""
-        return cls(inner=inner, cursor=cursor, pending=(match, fork))
-
-    @classmethod
     def from_option(cls, *, inner: Candidate, cursor: Cursor, match: Match, option: Op | Graph | Fork) -> LazyCandidate:
-        """Dispatch on the option's type. The single entry point used by
-        ``Pipeline.search``'s fork-spawn site so every option gets lifted
-        consistently into a Fork-pending LazyCandidate."""
-        if isinstance(option, Fork):
-            return cls.from_fork(inner=inner, cursor=cursor, match=match, fork=option)
-        if isinstance(option, Op):
-            return cls.from_op(inner=inner, cursor=cursor, match=match, op=option)
-        return cls.from_graph(inner=inner, cursor=cursor, match=match, graph=option)
+        """The single fork-spawn constructor (used by ``Pipeline.search``
+        and :meth:`expand`): a rule-emitted ``Fork`` passes through; a
+        concrete ``Op`` / ``Graph`` (already validated upstream in
+        ``try_rewrite``'s filter) is lifted into an :class:`OptionFork`
+        leaf — an ``Op``'s knob delta rides along for ``_best_fork``."""
+        if not isinstance(option, Fork):
+            knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
+            option = OptionFork(option=option, knobs=knobs)
+        return cls(inner=inner, cursor=cursor, pending=(match, option))
 
     def is_expandable(self) -> bool:
         """``True`` iff ``pending`` carries a *branch* :class:`Fork` —

@@ -56,7 +56,7 @@ class SearchTree:
     def best_reward(self) -> float:
         return self.root.best_reward
 
-    def attach(self, candidates: list[LazyCandidate], parent: SearchNode) -> list[SearchNode]:
+    def attach(self, candidates: list[LazyCandidate], parent: SearchNode) -> None:
         nodes = [SearchNode(candidate=c, parent=parent, live=1) for c in candidates]
         parent.children.extend(nodes)
         # Each new child is a fresh frontier — bump live count on every ancestor.
@@ -64,7 +64,6 @@ class SearchTree:
         while cur is not None:
             cur.live += len(nodes)
             cur = cur.parent
-        return nodes
 
     def record_terminal(self, reward: float) -> None:
         """Max-propagate ``reward`` from the most recently popped node
@@ -98,15 +97,16 @@ class TuningSearch(Search):
         self._max_visits = max_visits
         self._best_reward = 0.0
         self._visits_at_best = 0
+        # Why the search stopped (set by ``_should_stop``): a patience /
+        # max_visits message, or ``None`` when the queue drained — the
+        # exhaustion signal ``two_level.inner_reward`` records as ``inf``
+        # effort.
         self.stop_reason: str | None = None
         # Last benched variant's measurement — read by the tune progress bar
         # after each yielded terminal (the engine calls ``observe`` right before
         # yielding). Carries no role in the search itself.
         self.last_stats: PerfStats | None = None
         self.last_status: str | None = None
-
-    def stop(self, reason: str) -> None:
-        self.stop_reason = reason
 
     def observe(self, stats: PerfStats, status: str) -> None:
         self.last_stats = stats

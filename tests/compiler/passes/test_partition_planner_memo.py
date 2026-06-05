@@ -82,7 +82,7 @@ def _graph_with_dtypes(dtype_a: str, dtype_b: str, *, a: str = "a", b: str = "b"
     return g
 
 
-def _build_tree(plan, ctx: Context) -> Fork | list[Fork]:
+def _build_tree(plan, ctx: Context) -> Fork:
     """The planner's canonical scalar level layout (mirrors ``rewrite()``)."""
     return build_fork_tree(
         params=plan.params,
@@ -193,7 +193,7 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
     assert plan is not None and len(plan.params) > 8
     tree = _build_tree(plan, ctx)
 
-    node = tree if isinstance(tree, Fork) else tree[0]
+    node = tree
     path: list[Fork] = [node]
     while not node.is_leaf:
         children = node.expand()

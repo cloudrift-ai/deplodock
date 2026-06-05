@@ -194,11 +194,11 @@ def test_is_expandable_discriminates_fork_vs_op() -> None:
 
     # Branch Fork → True
     branch = ThunkFork(knobs={"X": 1}, expand_fn=lambda knobs: [_StubOp()])
-    lc_fork = LazyCandidate.from_fork(inner=cand, cursor=cand.cursor, match=match, fork=branch)
+    lc_fork = LazyCandidate.from_option(inner=cand, cursor=cand.cursor, match=match, option=branch)
     assert lc_fork.is_expandable() is True
 
-    # Leaf-wrapped Op → False (resolves directly, no expand needed)
-    lc_op = LazyCandidate.from_op(inner=cand, cursor=cand.cursor, match=match, op=_StubOp(tag="leaf"))
+    # Op option → lifted into a leaf OptionFork → False (resolves directly)
+    lc_op = LazyCandidate.from_option(inner=cand, cursor=cand.cursor, match=match, option=_StubOp(tag="leaf"))
     assert lc_op.is_expandable() is False
 
     # None pending → False

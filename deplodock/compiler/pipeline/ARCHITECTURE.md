@@ -83,7 +83,7 @@ pushes them back, and continues; cursor advance only fires when the lineage reso
 Lets a rule expose a hierarchy of decisions lazily — only the subtrees the search actually walks into get
 materialized. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy replay) without expanding.
 Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
-`LazyCandidate.from_op` / `from_graph`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
+`LazyCandidate.from_option`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
 `score_fn(knobs)` functions of the fork's own knob delta, so siblings share one function instead of
 per-instance capture lambdas; used by `085_warp_specialize`), and the tree builder's branch / leaf node
 classes.
@@ -148,13 +148,13 @@ empty-key levels, defer leaf materialization to `expand()`) lives in `pipeline/f
 `Fork` interface and its flat implementations) as the
 reusable `Level` + `build_fork_tree` pair — `partition_loops` supplies the `Level`s + `materialize=` +
 `score=` callables and returns the result. Nodes are real classes holding data, not closures: every
-`_Branch` / `_Leaf` references one shared `_Tree` (levels + callables + the per-tree score memo). The
+`_Branch` / `_Leaf` references one shared `_Tree` (levels + callables). The
 builder hands back the lazy ROOT `_Branch` and nothing else exists yet: a branch's `expand()` builds its
 children on demand (in grouping order — ranking is the search's job), its `score(cache)` takes `max` over
 the per-param scores of its subgroup (provably the same max-propagation as an eager build, without
 instantiating the subtree), and the per-param scorer — `score(p, cache)`, which receives the search-owned
-value-keyed cache and owns its own keying — runs at most once per param per tree, and only when a score is
-actually read. Future rules with multi-level knob-cartesian forks should reuse the builder; one-shot flat
+value-keyed cache and owns its own keying — fires only when a score is actually read; the builder adds no
+caching of its own. Future rules with multi-level knob-cartesian forks should reuse the builder; one-shot flat
 forks (e.g. `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element `ThunkFork` list) stay inline.
 
 **FN > 1 lowering.** The partition planner always emits the per-cell

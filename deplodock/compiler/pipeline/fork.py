@@ -93,8 +93,8 @@ class Fork(ABC):
 @dataclass(frozen=True)
 class OptionFork(Fork):
     """Leaf Fork around an already-concrete rewrite option. Built by
-    :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` so
-    every ``LazyCandidate.pending`` carries a uniform Fork shape."""
+    :meth:`LazyCandidate.from_option` so every ``LazyCandidate.pending``
+    carries a uniform Fork shape."""
 
     option: Op | Graph
     knobs: dict = field(default_factory=dict)
@@ -156,24 +156,14 @@ class Level[P]:
 class _Tree[P]:
     """One tree's shared builder state — every :class:`_Branch` /
     :class:`_Leaf` node holds a reference back here instead of capturing
-    closures. ``memo`` keeps the per-param scorer to at most one call per
-    param per tree (a branch's max and its leaves bottom out at the same
-    per-param values); cross-tree sharing is the scorer's own job against
-    the search-owned ``cache`` it receives."""
+    closures. All caching is the scorer's own job against the search-owned
+    ``cache`` it receives — repeat reads across overlapping branch
+    subgroups re-pay only the scorer's cache-key lookup."""
 
     branch_levels: tuple[Level[P], ...]
     leaf_level: Level[P]
     materialize: Callable[[P], Op | Graph]
     score: Callable[[P, dict | None], float]
-    memo: dict[int, float] = field(default_factory=dict)
-
-    def param_score(self, p: P, cache: dict | None) -> float:
-        sid = id(p)
-        v = self.memo.get(sid)
-        if v is None:
-            v = self.score(p, cache)
-            self.memo[sid] = v
-        return v
 
     def build_level(self, group: list[P], depth: int) -> list[Fork]:
         """Build the sibling Forks one level down from a branch at
@@ -227,7 +217,7 @@ class _Branch[P](Fork):
     def score(self, cache: dict | None = None) -> float:
         # Max over the param subgroup — provably equal to eager
         # max-of-children propagation without instantiating the subtree.
-        return max(self.tree.param_score(p, cache) for p in self.group)
+        return max(self.tree.score(p, cache) for p in self.group)
 
 
 @dataclass(frozen=True)
@@ -243,7 +233,7 @@ class _Leaf[P](Fork):
         return [self.tree.materialize(self.param)]
 
     def score(self, cache: dict | None = None) -> float:
-        return self.tree.param_score(self.param, cache)
+        return self.tree.score(self.param, cache)
 
 
 def build_fork_tree[P](
@@ -252,17 +242,18 @@ def build_fork_tree[P](
     levels: Sequence[Level[P]],
     materialize: Callable[[P], Op | Graph],
     score: Callable[[P, dict | None], float],
-) -> Fork | list[Fork]:
+) -> Fork:
     """Return the ROOT branch ``Fork`` of a lazy tree grouping ``params``
-    per ``levels`` (outermost first).
+    per ``levels`` (outermost first). ``params`` must be non-empty (a
+    rule with nothing to enumerate has no fork point — skip the rule
+    instead) and ``levels`` non-empty; both raise ``ValueError``.
 
     Nothing is built or scored at call time — the root is a
     :class:`_Branch` over the whole param list; each branch's ``expand()``
     builds the next level on demand, so greedy descent instantiates
     O(path) Forks instead of one per param (~42k for a matmul-class
     kernel) and MCTS pays one level per pop. Scores are equally lazy:
-    nothing is scored until the search reads a fork's score, and the
-    per-tree memo keeps ``score(p, cache)`` to at most one call per param.
+    nothing is scored until the search reads a fork's score.
 
     ``score`` receives the search-owned value-keyed ``cache`` dict
     alongside the param (``None`` when read outside a search) and owns
@@ -271,7 +262,7 @@ def build_fork_tree[P](
     trees of structurally identical kernels.
     """
     if not params:
-        return []
+        raise ValueError("build_fork_tree: params must be non-empty")
     if not levels:
         raise ValueError("build_fork_tree: at least one Level required")
     tree = _Tree(

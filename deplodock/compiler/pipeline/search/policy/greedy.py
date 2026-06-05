@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
-from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.policy.base import Search
 
 
@@ -24,14 +23,9 @@ class GreedySearch(Search):
     rules whose options carry no scores still get their option-0
     default)."""
 
-    def __init__(self, *, db: SearchDB | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._db = db if db is not None else SearchDB()
         self._pending: LazyCandidate | None = None
-
-    @property
-    def db(self) -> SearchDB:
-        return self._db
 
     def push(self, *cands: LazyCandidate, best: LazyCandidate | None = None) -> None:
         self._pending = best if best is not None else max(cands, key=lambda c: self.score_of(c.fork))
