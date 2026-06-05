@@ -71,7 +71,7 @@ matched `Node` objects. Anything else binds positionally to
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
 parent's graph snapshot) and hands them ALL to the single `TuningSearch` policy, which ranks them by PUCT over
-its learned `BayesianRidgePrior` (`search/prior/`). A single-shot compile has no prior → uniform PUCT → it keeps
+its learned `CatBoostPrior` (`search/prior/`). A single-shot compile has no prior → uniform PUCT → it keeps
 the first (option-0) sibling; a `tune` sweep explores every fork. (DB-best replay `_best_fork`, the static
 `score_of` prior, and `GreedySearch` were all removed.) Single-option returns (or bare `Graph` / `Op`)
 are the deterministic case — no fork.
@@ -91,7 +91,7 @@ per-instance capture lambdas; used by `085_warp_specialize`), and the tree build
 classes.
 
 **The planner score compute (no longer drives selection).** The static prior was nuked from selection in
-favor of the learned prior (`BayesianRidgePrior`); `Search.score_of(fork) = fork.score(self.score_cache)` is retained as
+favor of the learned prior (`CatBoostPrior`); `Search.score_of(fork) = fork.score(self.score_cache)` is retained as
 latent compute (exercised directly by the partition-planner tests). It still keys cleanly: the search owns
 the value-keyed score cache, and the partition planner keys each variant by `(ctx fields, frozenset(merged
 knobs))`, complete because the `S_*` structural-feature knobs ride the dict, so structurally identical
@@ -415,7 +415,7 @@ over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** is PUCT (`_select`): `Q_norm(c) + ucb_c · P(c) · sqrt(N_parent+1)/(1+N_c)`, where
   `Q_norm = child.best_reward / global_best_reward`, `reward = 1 / median_us`, and `P` is the softmax over the learned
-  `BayesianRidgePrior`'s Thompson scores of the sibling set. The prior is the sole signal — greedy, the static
+  `CatBoostPrior`'s scores of the sibling set. The prior is the sole signal — greedy, the static
   `TileOp.score` tiebreak, and the `+∞`-unvisited UCB rule are all gone (see the learned-prior section).
 - **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
@@ -427,37 +427,57 @@ over one op's forks — with max-Q normalized UCB1:
   default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Run.drive` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
-**Learned prior (`search/prior/`, `--prior`).** An in-memory Bayesian-ridge model (`BayesianRidgePrior`) fit *within one inner
-`TuningSearch`* (per kernel, discarded after), replacing the nuked static tiebreak. Training signal is
-**value-of-position**: real benches exist only at leaves, but the prior ranks partial-knob siblings at every fork level,
-so the label for any node is `log(best_reward)` — the max over its benched descendants, which `record_terminal` already
-maintains on `SearchNode.best_reward`. `TuningSearch._collect_rows` walks the live tree and emits `(knobs, label)` for
-every node with a benched descendant (leaves **and** branches); `_node_knobs` accumulates the `fork.knobs` deltas along
-the path; `knob.knob_features` vectorizes. Because the labels are non-stationary (they only rise), the model **refits
-from a tree snapshot** every `refit_every` benches rather than streaming. Selection draws one Thompson sample per descent
-(`resample`) so exploration stays honest; the magnitude is irrelevant, only the ranking.
+**Learned prior (`search/prior/`).** ONE global `CatBoostPrior` across every kernel, GPU and nvcc setting — not per-op,
+not partitioned by regime. Op structure (`S_*`) and the host/hardware regime (`H_*` — GPU compute capability + nvcc opt
+level, from `Context.features`) are **features in every row**, not a cache key. Training signal is **value-of-position**:
+real benches exist only at leaves, but the prior ranks partial-knob siblings at every fork level, so the label for any
+node is `log(best_reward)` — the max over its benched descendants, which `record_terminal` maintains on
+`SearchNode.best_reward`. `TuningSearch._collect_rows` walks the live tree and emits `(knobs, label)` for every node with
+a benched descendant (leaves **and** branches); `_node_knobs` accumulates the `fork.knobs` deltas under the op's `S_*`/`H_*`
+base; `knob.knob_features` vectorizes.
 
-How the prior enters selection — **PUCT is the only rule** (`_select`): the prior is the *sole* signal; greedy and the
-`+∞`-unvisited UCB rule are gone.
+Why CatBoost (chosen by `scripts/prior_bakeoff.py` over a multi-op tuning dataset): the model's greedy argmax must not run
+off to a degenerate corner. A linear model (the former `BayesianRidgePrior`) is monotone in every knob, so its argmax is
+always a corner of the candidate box — the `BR=1` blow-up (4us → 232us / invalid kernels). Any **bounded** tree ensemble
+is off-manifold-safe (an un-benched extreme inherits the nearest leaf's value), and among them CatBoost also generalizes
+to an *untuned* op near-perfectly (leave-one-op-out argmax ratio ~1.0 vs xgb/lgbm 1.18, rf 1.31) thanks to ordered
+boosting + oblivious trees. So one global CatBoost prior is good enough on a new op that it is **not refit within an op's
+own search** — it is a fixed model per run.
+
+The dataset is bounded + batched (`base.Prior`): each tuned op's value-of-position rows stream into a reservoir-sampled
+dataset capped at `MAX_ROWS` (100k — Algorithm R keeps a uniform sample of all rows ever seen, across runs), and the
+model refits (`maybe_refit`) on a **dataset-size-tiered cadence** (`REFIT_SCHEDULE`) — frequently while data-poor, then
+coarsening: every 100 rows up to 1k, every 1k up to 10k, every 10k from there on — then checkpoints. So the model warms
+up fast on the first op (~10 refits inside the first ~1k rows) and settles to ~once per op once large. The checkpoint is
+a JSON file (`config.prior_path()`, `~/.cache/deplodock/prior.json`) holding the CatBoost `cbm` blob (base64) + the
+dataset, via `deplodock.storage`; `tune` writes it, `compile` / `run` read it.
+
+How the prior enters selection — **PUCT is the only rule** (`_select`): the prior is the *sole* signal; greedy-tiebreak and
+the `+∞`-unvisited UCB rule are gone.
 
     score(c) = Q(c) + c · P(c) · √(N_parent+1) / (1+N_c)
 
-`Q = best_reward/global_best` (0 if unvisited), `P = softmax` over the sibling set's Thompson scores, `c = --ucb-c`. A
-low-`P` sibling gets a tiny exploration term → it is deprioritized instead of force-benched (no forced breadth). A cold
-or absent prior yields a uniform `P`, so PUCT still explores via the exploration term — and a single-shot compile (no
-prior, `max_visits=1`) descends emission-order, the old option-0 pick. The end-of-run sanity block (silly-pick rate
-warmup-vs-post, self-calibration) prints per kernel.
+`Q = best_reward/global_best` (0 if unvisited), `P = softmax` over the sibling set's (deterministic) prior scores,
+`c = --ucb-c`. A low-`P` sibling gets a tiny exploration term → it is deprioritized instead of force-benched (no forced
+breadth). A cold or absent prior yields a uniform `P`, so PUCT still explores via the exploration term — and a single-shot
+compile descends emission-order (the option-0 pick) when no prior is loaded. The end-of-run sanity block (silly-pick rate
+warmup-vs-post, self-calibration) prints once for the global prior.
+
+**Greedy uses the prior too.** `Pipeline.run`'s `GreedySearch` (the O(1)-per-step `compile` / `run` driver) lazy-loads the
+same global `CatBoostPrior` and picks each fork by `mean_score` argmax over the candidate's `{H_* , S_* , path-deltas,
+fork-delta}` feature vector — the exact base the prior trained on. With no trained prior it falls back to the first emitted
+sibling (option-0). (Greedy benches nothing, so it can only *use* a prior, never train one; routing whole-model compile
+through `TuningSearch` would be O(N²).)
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
-adds the whole-slice total under the LoopOp key). A subsequent `deplodock compile` / `deplodock run` (or
-`make bench-kernels-tuned`) auto-resolves the same DB path (env or default) and replays the cached forks via
-`GreedySearch`, which walks the parent op's `op_cache_key` in `lowering` and follows the best row's knob delta at each step —
-the same replay `run_two_level_tune` uses to assemble its final graph. No GPU bench is required on the replay path when
-every kernel already has a `perf` row.
+adds the whole-slice total under the LoopOp key) — the bench record / training data. A subsequent `deplodock compile` /
+`deplodock run` does NOT replay these DB forks (the greedy DB→fork replay was removed with the learned prior); instead
+`GreedySearch` picks each fork from the global `CatBoostPrior` (`mean_score` argmax, option-0 when no prior is loaded) —
+see "Greedy uses the prior too" above. `run_two_level_tune` assembles its final graph the same way.
 
 **Stub backend.** With `backend=None`, `_bench_terminal` short-circuits to `latency_us=1.0` and persists nothing — used by
-test fixtures so `Pipeline.run`'s greedy replay doesn't clobber tuned rows with a stub when no GPU is available.
+test fixtures so `Pipeline.run`'s greedy compile doesn't clobber tuned rows with a stub when no GPU is available.
 
 ## Tunable knobs
 

@@ -26,6 +26,15 @@ os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
 
 
 @pytest.fixture(autouse=True)
+def _isolate_prior_file(tmp_path, monkeypatch):
+    """Point the learned-prior checkpoint at a per-test temp path so the
+    greedy compile driver (which loads the global prior) never picks up a
+    dev machine's ``~/.cache/deplodock/prior.json`` — tests stay deterministic
+    (empty prior → option-0), and a test that tunes writes only its own file."""
+    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+
+
+@pytest.fixture(autouse=True)
 def _seed_rng():
     """Pin RNGs for every test so numerical-tolerance assertions
     (e.g. ``test_torch_ops.test_unary``) don't flake on inputs that

@@ -98,8 +98,8 @@ class InnerReward:
     total_us: float
     ok: bool  # every kernel had a clean ``ok`` measurement
     per_op: list[OpResult] = field(default_factory=list)
-    # ``--prior online`` end-of-run sanity blocks (one per tuned kernel) —
-    # printed by the command after the progress bar closes.
+    # Learned-prior end-of-run sanity block(s) — printed by the command after
+    # the progress bar closes.
     prior_summaries: list[str] = field(default_factory=list)
 
 
@@ -111,7 +111,7 @@ class TwoLevelResult:
     best_reward: InnerReward | None  # its Σ-per-op breakdown
     n_terminals: int  # outer terminals evaluated (1 today)
     assembled: Graph | None  # greedy DB-best Graph[CudaOp] assembled from the bests
-    prior_summaries: list[str] = field(default_factory=list)  # ``--prior online`` stats
+    prior_summaries: list[str] = field(default_factory=list)  # learned-prior stats
 
 
 def _point_stats(us: float) -> PerfStats:
@@ -208,9 +208,12 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            # The LoopOp's knobs carry its ``S_*`` structural identity — feed them
-            # as the search's base knobs so the global prior's rows are op-aware.
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior, base_knobs=dict(op.knobs))
+            # Base knobs the prior sees on every row: the LoopOp's ``S_*``
+            # structural identity (op-aware rows) + the ``H_*`` host/hardware
+            # regime (GPU + nvcc opt level), so one global prior spans ops and
+            # regimes from the feature vector alone.
+            base_knobs = {**ctx.features(), **op.knobs}
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior, base_knobs=base_knobs)
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
@@ -238,10 +241,12 @@ def inner_reward(
             db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
             benched = True
             if prior is not None:
-                # Freeze this op's final value-of-position rows into the global
-                # training set, then checkpoint the prior to its own file.
-                prior.archive(inner._collect_rows())
-                prior.checkpoint()
+                # Stream this op's final value-of-position rows into the global
+                # (reservoir-bounded) dataset; refit + checkpoint once enough new
+                # rows have accumulated (batched, not per-op — see ``Prior``).
+                prior.add_rows(inner._collect_rows())
+                if prior.maybe_refit():
+                    prior.checkpoint()
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
         per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
         # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
@@ -282,10 +287,10 @@ def run_two_level_tune(
 
     provenance.seed(graph)
     # ONE global prior for the whole run — warm-started from its own checkpoint
-    # file (lazy import keeps numpy/sklearn off non-tune callers).
-    from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior  # noqa: PLC0415
+    # file (lazy import keeps catboost off non-tune callers).
+    from deplodock.compiler.pipeline.search.prior import CatBoostPrior  # noqa: PLC0415
 
-    prior = BayesianRidgePrior.load(ctx.structural_key(), seed=prior_seed)
+    prior = CatBoostPrior.load(seed=prior_seed)
     outer = TuningSearch(patience=patience, ucb_c=ucb_c)
     # The outer drives only the graph-changing passes — no dump on this Run;
     # the winning config's full stage artifacts (incl. per-kernel
@@ -325,6 +330,9 @@ def run_two_level_tune(
     # One global end-of-run sanity block (the prior spans every kernel now).
     if prior.fitted or prior.trajectory:
         prior_summaries.append(prior.summary("global"))
+    # Persist the final state so the reservoir dataset accumulates across runs
+    # even when the last batch didn't cross the refit threshold.
+    prior.checkpoint()
 
     assembled: Graph | None = None
     if best_fused is not None:

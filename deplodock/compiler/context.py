@@ -39,6 +39,21 @@ _MAX_DYNAMIC_SMEM_BY_CC: dict[tuple[int, int], int] = {
     (12, 0): 99 * 1024,
 }
 
+# Tensor-core generation by compute capability — Volta(1)/Turing(2)/Ampere+Ada(3)
+# /Hopper(4)/Blackwell(5). A coarse arch-capability axis for the learned prior's
+# regime features (e.g. which mma shapes / dtypes the SM can issue); unknown ccs
+# fall back to the major version.
+_TENSOR_CORE_GEN: dict[tuple[int, int], int] = {
+    (7, 0): 1,
+    (7, 5): 2,
+    (8, 0): 3,
+    (8, 6): 3,
+    (8, 9): 3,
+    (9, 0): 4,
+    (10, 0): 5,
+    (12, 0): 5,
+}
+
 
 def _env_compile_flags() -> str:
     """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``). Set by the
@@ -117,6 +132,39 @@ class Context:
         from deplodock.compiler.structural import digest  # noqa: PLC0415
 
         return digest("Context", self.compute_capability, self.compile_flags)
+
+    def features(self) -> dict[str, float]:
+        """Host/hardware regime as ``H_*`` features for the learned prior, so a
+        SINGLE global prior spans every GPU and nvcc opt level (these are
+        constant across a compile's sibling candidates → they never change the
+        argmax; they only let the model fit per-regime offsets instead of
+        averaging across regimes). Combines capability-derived facts with the
+        live device's physical SKU properties:
+
+        - ``H_cc`` — compute capability ``major*10 + minor``
+        - ``H_tc_gen`` — tensor-core generation (``_TENSOR_CORE_GEN``)
+        - ``H_smem_optin`` — per-block dynamic-smem opt-in cap (bytes)
+        - ``H_opt`` — nvcc cicc opt level from ``compile_flags`` (tune's
+          ``-Xcicc -O1`` → 1; compile/run's default → 3)
+        - ``H_sm_count`` / ``H_smem_per_sm`` / ``H_smem_per_block`` /
+          ``H_regs_per_block`` / ``H_warp_size`` — live device props
+          (:func:`target.live_device_features`; absent on GPU-less hosts)
+        """
+        import re  # noqa: PLC0415
+
+        from deplodock.compiler.target import live_device_features  # noqa: PLC0415
+
+        major, minor = self.compute_capability
+        m = re.search(r"-O(\d)", self.compile_flags)
+        feats = {
+            "H_cc": float(major * 10 + minor),
+            "H_tc_gen": float(_TENSOR_CORE_GEN.get((major, minor), major)),
+            "H_smem_optin": float(self.max_dynamic_smem),
+            "H_opt": float(m.group(1)) if m else 3.0,
+        }
+        for k, v in live_device_features().items():
+            feats[f"H_{k}"] = v
+        return feats
 
     @classmethod
     def probe(cls) -> Context:

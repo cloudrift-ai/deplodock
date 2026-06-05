@@ -123,10 +123,10 @@ def tune_db_path() -> Path:
 
 def prior_path() -> Path:
     """Learned-prior checkpoint file: ``DEPLODOCK_PRIOR_FILE`` →
-    ``~/.cache/deplodock/prior.pkl``. A single file (not the tune DB) holding the
-    global prior per regime; ``tune`` writes it, ``compile`` / ``run`` read it."""
+    ``~/.cache/deplodock/prior.json``. A single JSON file (not the tune DB)
+    holding the one global prior; ``tune`` writes it, ``compile`` / ``run`` read it."""
     override = os.environ.get(PRIOR_FILE)
-    return Path(override) if override else _CACHE_ROOT / "prior.pkl"
+    return Path(override) if override else _CACHE_ROOT / "prior.json"
 
 
 def nvcc_flags() -> str:

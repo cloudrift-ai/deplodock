@@ -213,7 +213,7 @@ def handle_tune(args):
 
     elapsed = time.monotonic() - t0
     sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {elapsed:.1f}s\n")
-    for block in result.prior_summaries:  # ``--prior online`` pick-quality sanity stats
+    for block in result.prior_summaries:  # learned-prior pick-quality sanity stats
         sys.stderr.write(block + "\n")
     if result.best_reward is None:
         sys.stderr.write("[tune] no kernels tuned — exiting without output\n")

@@ -1,8 +1,10 @@
-"""Unit tests for the learned prior (``search/prior/``) and its value-of-position
-label extraction + PUCT selection in the MCTS tree (``policy/mcts.py``).
+"""Unit tests for the learned prior (``search/prior/``) — CatBoost model, bounded
+reservoir dataset + batched refit — and its value-of-position label extraction +
+PUCT selection in the MCTS tree (``policy/mcts.py``).
 
-These are GPU-less: they exercise the model fit / Thompson draw and the
-tree-snapshot row collection on hand-built trees — no benching, no CUDA.
+GPU-less: they exercise the model fit / prediction, the dataset bookkeeping, and
+the tree-snapshot row collection on hand-built trees — no benching, no CUDA. The
+CatBoost fits use a small ``iterations`` to stay fast.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ import math
 from types import SimpleNamespace
 
 from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch, _softmax
-from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior
+from deplodock.compiler.pipeline.search.prior import CatBoostPrior, prior_from_json
 
 
 def _node(knobs: dict, parent: SearchNode) -> SearchNode:
@@ -20,66 +22,137 @@ def _node(knobs: dict, parent: SearchNode) -> SearchNode:
     return SearchNode(candidate=SimpleNamespace(fork=SimpleNamespace(knobs=knobs)), parent=parent)
 
 
+def _fit(rows, **kw):
+    """A CatBoostPrior fit on ``rows`` (fast: few iterations)."""
+    p = CatBoostPrior(seed=0, iterations=40, min_rows=3, **kw)
+    p.add_rows(rows)
+    p.fit()
+    return p
+
+
+def _bm_rows(reps=6):
+    """Synthetic: bigger BM = lower latency = higher reward, repeated for signal."""
+    return [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64) for _ in range(reps)]
+
+
 # --- model fit -------------------------------------------------------------
 
 
-def test_fits_and_ranks_linear_target():
-    """On an exactly-linear target the BayesianRidge fit ranks the rows in the
-    true order (Spearman ~1) — exact label recovery isn't expected (it fits its
-    own regularization), only correct ranking."""
-    rows = []
-    for bm in (16, 32, 64, 128):
-        for bn in (16, 32, 64):
-            rows.append(({"BM": bm, "BN": bn}, 0.01 * bm - 0.02 * bn))
-    p = BayesianRidgePrior(seed=0, min_rows=3)
-    p.fit(rows)
-    preds = [p.mean_score(k) for k, _ in rows]
-    ys = [y for _, y in rows]
-    order_pred = sorted(range(len(rows)), key=lambda i: preds[i])
-    order_true = sorted(range(len(rows)), key=lambda i: ys[i])
-    assert order_pred == order_true
-
-
 def test_ranks_lower_latency_higher():
-    """label = log(1/us); the prior must score the faster (lower-us) config
-    higher. Bigger BM is faster in this synthetic."""
-    rows = [({"BM": bm, "BN": 64}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p = BayesianRidgePrior(seed=0, min_rows=3)
-    p.fit(rows)
-    scores = [p.mean_score({"BM": bm, "BN": 64}) for bm in (16, 32, 64, 128)]
-    assert scores == sorted(scores), f"expected monotone-increasing in BM, got {scores}"
+    """label = log(1/us); the prior must score the faster (lower-us, bigger-BM)
+    config higher."""
+    p = _fit(_bm_rows())
+    scores = [p.mean_score({"BM": bm}) for bm in (2, 16, 64)]
+    assert scores[0] < scores[1] < scores[2], f"expected increasing in BM, got {scores}"
 
 
 def test_partial_knob_dicts_fit_and_score():
     """Rows with different knob key sets (a branch pins only BR; leaves add BM)
-    fit through one feature space — the partial row scores without error."""
+    fit through one feature space — a partial row scores without error."""
     rows = [
-        ({"BR": 1}, math.log(0.5)),  # branch: value-of-position
+        ({"BR": 1}, math.log(0.5)),
         ({"BR": 1, "BM": 32}, math.log(0.4)),
         ({"BR": 1, "BM": 64}, math.log(0.5)),
         ({"BR": 2, "BM": 64}, math.log(0.3)),
     ]
-    p = BayesianRidgePrior(seed=0, min_rows=3)
-    p.fit(rows)
-    # Scoring a never-seen partial state must not raise and must be finite.
-    v = p.mean_score({"BR": 1})
-    assert math.isfinite(v)
+    p = _fit(rows)
+    assert math.isfinite(p.mean_score({"BR": 1}))
 
 
 def test_score_is_zero_before_fit():
-    p = BayesianRidgePrior(seed=0)
+    p = CatBoostPrior(seed=0)
     assert p.score({"BM": 64}) == 0.0
     assert p.mean_score({"BM": 64}) == 0.0
+    assert not p.fitted
 
 
-def test_score_is_thompson_stochastic_mean_is_not():
-    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p = BayesianRidgePrior(seed=7, min_rows=3)
-    p.fit(rows)
-    # score() draws a fresh Thompson sample each call (per-point predictive std).
-    assert p.score({"BM": 64}) != p.score({"BM": 64})
-    # mean_score() is the deterministic posterior mean.
-    assert p.mean_score({"BM": 64}) == p.mean_score({"BM": 64})
+def test_score_equals_mean_and_is_deterministic():
+    """The CatBoost prior is deterministic — ``score`` (PUCT) and ``mean_score``
+    (greedy) coincide and repeat exactly (no Thompson draw)."""
+    p = _fit(_bm_rows())
+    assert p.score({"BM": 32}) == p.mean_score({"BM": 32}) == p.mean_score({"BM": 32})
+
+
+# --- bounded reservoir dataset + batched refit -----------------------------
+
+
+def test_add_rows_reservoir_caps_dataset():
+    """``add_rows`` keeps the dataset at ``max_rows`` via reservoir sampling while
+    counting every row ever seen."""
+    p = CatBoostPrior(seed=0, max_rows=20)
+    p.add_rows([({"BM": i}, float(i)) for i in range(36)])
+    assert len(p._dataset) == 20  # capped
+    assert p._seen == 36  # but all counted
+    assert p._since_fit == 36
+
+
+def test_maybe_refit_fires_on_cadence_and_resets():
+    """``maybe_refit`` fits only once ``refit_every`` rows have accumulated and
+    the dataset clears ``min_rows``, then resets the counter."""
+    p = CatBoostPrior(seed=0, iterations=20, min_rows=5, refit_every=20)
+    p.add_rows(_bm_rows(reps=2))  # 12 rows < refit_every
+    assert not p.maybe_refit() and not p.fitted
+    p.add_rows(_bm_rows(reps=2))  # now 24 >= 20
+    assert p.maybe_refit() and p.fitted
+    assert p._since_fit == 0
+    assert not p.maybe_refit()  # counter reset → no immediate re-fit
+
+
+def test_maybe_refit_gated_by_min_rows():
+    p = CatBoostPrior(seed=0, iterations=20, min_rows=100, refit_every=5)
+    p.add_rows(_bm_rows(reps=2))  # 12 rows: clears refit_every but not min_rows
+    assert not p.maybe_refit() and not p.fitted
+
+
+def test_refit_interval_tiers_by_dataset_size():
+    """Default (no ``refit_every`` override) coarsens the refit interval as the
+    dataset grows: every 100 up to 1k, every 1k up to 10k, every 10k beyond."""
+    p = CatBoostPrior(seed=0)  # tiered schedule
+    for n, expect in [(0, 100), (500, 100), (999, 100), (1000, 1000), (5000, 1000), (9999, 1000), (10_000, 10_000), (100_000, 10_000)]:
+        p._dataset = [None] * n  # only len() matters for the interval
+        assert p._refit_interval() == expect, f"size {n} → {p._refit_interval()}, want {expect}"
+
+
+# --- persistence -----------------------------------------------------------
+
+
+def test_prior_persistence_round_trips():
+    """``to_json`` → ``from_json`` reconstructs a prior whose ``mean_score``
+    matches; an empty prior serializes to ``None``."""
+    assert CatBoostPrior(seed=0).to_json() is None
+    p = _fit(_bm_rows())
+    obj = p.to_json()
+    assert obj is not None and obj["model"]
+    q = prior_from_json(obj)
+    assert q.fitted and len(q._dataset) == len(p._dataset)
+    for bm in (4, 16, 64):
+        assert abs(p.mean_score({"BM": bm}) - q.mean_score({"BM": bm})) < 1e-6
+
+
+def test_prior_file_checkpoint_round_trips(tmp_path):
+    """A fitted prior bound to a path checkpoints to JSON and reloads warm with
+    matching predictions; loading a missing file yields a fresh unfit prior."""
+    path = tmp_path / "prior.json"
+    assert not CatBoostPrior.load(path=path).fitted  # missing → fresh
+    p = _fit(_bm_rows())
+    p._path = path
+    p.checkpoint()
+    assert path.exists()
+    q = CatBoostPrior.load(path=path)
+    assert q.fitted and q._first_fit_idx == 0 and len(q._dataset) == len(p._dataset)
+    for bm in (4, 16, 64):
+        assert abs(p.mean_score({"BM": bm}) - q.mean_score({"BM": bm})) < 1e-6
+
+
+def test_dataset_accumulates_across_load():
+    """A reloaded prior keeps its dataset + reservoir counters so a follow-up tune
+    keeps accumulating from where it left off."""
+    p = _fit(_bm_rows())
+    seen0, n0 = p._seen, len(p._dataset)
+    q = prior_from_json(p.to_json())
+    assert q._seen == seen0 and len(q._dataset) == n0
+    q.add_rows([({"BM": 8}, math.log(1.0))])
+    assert q._seen == seen0 + 1
 
 
 # --- value-of-position labels from the tree --------------------------------
@@ -87,35 +160,30 @@ def test_score_is_thompson_stochastic_mean_is_not():
 
 def test_collect_rows_labels_branch_with_best_descendant():
     """A branch shared by two benched leaves is labeled with the BETTER leaf's
-    reward (max-propagation), not its own (it has no direct measurement)."""
+    reward (max-propagation), not its own."""
     tree = SearchTree()
     branch = _node({"BR": 1}, tree.root)
     leaf_slow = _node({"BR": 1, "BM": 32}, branch)
     leaf_fast = _node({"BR": 1, "BM": 64}, branch)
     tree.root.children = [branch]
     branch.children = [leaf_slow, leaf_fast]
-    tree.record_terminal(leaf_slow, 1.0)  # reward = 1/us
-    tree.record_terminal(leaf_fast, 2.0)  # faster → higher reward
-
+    tree.record_terminal(leaf_slow, 1.0)
+    tree.record_terminal(leaf_fast, 2.0)
     assert branch.best_reward == 2.0
     rows = TuningSearch(tree=tree)._collect_rows()
     by_knobs = {tuple(sorted(k.items())): lab for k, lab in rows}
-    # Branch row carries only its pinned slice, labeled with the best leaf.
     assert abs(by_knobs[(("BR", 1),)] - math.log(2.0)) < 1e-12
     assert abs(by_knobs[(("BM", 64), ("BR", 1))] - math.log(2.0)) < 1e-12
     assert abs(by_knobs[(("BM", 32), ("BR", 1))] - math.log(1.0)) < 1e-12
 
 
 def test_collect_rows_skips_unbenched_nodes():
-    """Nodes with no benched descendant (visits 0 / best_reward 0) are not
-    training rows — they are the prediction frontier, not labels."""
     tree = SearchTree()
     visited = _node({"BR": 1, "BM": 64}, tree.root)
-    frontier = _node({"BR": 2, "BM": 64}, tree.root)  # never benched
+    frontier = _node({"BR": 2, "BM": 64}, tree.root)
     tree.root.children = [visited, frontier]
     tree.record_terminal(visited, 1.5)
-    rows = TuningSearch(tree=tree)._collect_rows()
-    knob_sets = [tuple(sorted(k.items())) for k, _ in rows]
+    knob_sets = [tuple(sorted(k.items())) for k, _ in TuningSearch(tree=tree)._collect_rows()]
     assert (("BM", 64), ("BR", 1)) in knob_sets
     assert (("BM", 64), ("BR", 2)) not in knob_sets
 
@@ -129,8 +197,8 @@ def test_node_knobs_accumulates_along_path():
 
 
 def test_node_knobs_includes_base_structural_knobs():
-    """base_knobs (the op's S_* identity) is merged under the fork deltas, so
-    the global prior's features carry op-structure."""
+    """base_knobs (the op's S_* identity) is merged under the fork deltas, so the
+    global prior's features carry op-structure."""
     tree = SearchTree()
     leaf = _node({"BR": 2}, tree.root)
     s = TuningSearch(tree=tree, base_knobs={"S_n_loop": 3.0, "S_ext_reduce_max": 64.0})
@@ -140,123 +208,53 @@ def test_node_knobs_includes_base_structural_knobs():
 def test_prior_score_zero_when_no_model():
     tree = SearchTree()
     child = _node({"BM": 64}, tree.root)
-    s = TuningSearch(tree=tree)  # prior_model=None
-    assert s._prior_score(child) == 0.0
+    assert TuningSearch(tree=tree)._prior_score(child) == 0.0
 
 
 # --- PUCT selection (the only rule) ----------------------------------------
 
 
-def _fitted_prior_bm():
-    """A prior that has learned bigger BM = lower latency = higher reward."""
-    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
-    p = BayesianRidgePrior(seed=0, min_rows=3)
-    p.fit(rows)
-    return p
-
-
 def test_puct_deprioritizes_bad_unvisited():
     """A confidently-bad *unvisited* sibling must NOT be selected over a good
     *visited* one — there is no ``+∞``-unvisited rule to force it."""
-    prior = _fitted_prior_bm()
+    prior = _fit(_bm_rows())
     tree = SearchTree()
     good_visited = _node({"BM": 64}, tree.root)
     bad_unvisited = _node({"BM": 2}, tree.root)
     tree.root.children = [good_visited, bad_unvisited]
-    tree.record_terminal(good_visited, 1.0)  # global_best = 1.0, Q(good) = 1
+    tree.record_terminal(good_visited, 1.0)  # Q(good) = 1
     s = TuningSearch(tree=tree, prior_model=prior)
-    prior.resample()
     assert s._select([good_visited, bad_unvisited], tree.root) is good_visited
 
 
 def test_puct_still_explores_promising_unvisited():
-    """A *promising* unvisited sibling (high prior) should still be explored
-    over a mediocre visited one — PUCT deprioritizes only the bad ones."""
-    prior = _fitted_prior_bm()
+    """A *promising* unvisited sibling (high prior) should still be explored over
+    a mediocre visited one."""
+    prior = _fit(_bm_rows())
     tree = SearchTree()
     mediocre_visited = _node({"BM": 8}, tree.root)
     good_unvisited = _node({"BM": 64}, tree.root)
     tree.root.children = [mediocre_visited, good_unvisited]
-    tree.record_terminal(mediocre_visited, 0.3)  # global_best 0.3, but BM=8 is so-so
+    tree.record_terminal(mediocre_visited, 0.3)
     s = TuningSearch(tree=tree, prior_model=prior)
-    prior.resample()
     assert s._select([mediocre_visited, good_unvisited], tree.root) is good_unvisited
 
 
 def test_cold_or_absent_prior_descends_emission_order():
-    """With no prior (single-shot compile) or a cold prior, every score is 0 →
-    uniform softmax → PUCT picks the first child (emission order). No forced
-    breadth, no +∞."""
+    """With no prior or a cold prior, every score is 0 → uniform softmax → PUCT
+    picks the first child (emission order)."""
     tree = SearchTree()
     a = _node({"BM": 64}, tree.root)
     b = _node({"BM": 2}, tree.root)
     tree.root.children = [a, b]
-    assert TuningSearch(tree=tree)._select([a, b], tree.root) is a  # no prior
-    cold = BayesianRidgePrior(seed=0)  # attached but unfit
+    assert TuningSearch(tree=tree)._select([a, b], tree.root) is a
+    cold = CatBoostPrior(seed=0)
     assert TuningSearch(tree=tree, prior_model=cold)._select([a, b], tree.root) is a
-
-
-def test_prior_persistence_round_trips():
-    """``to_bytes`` → ``from_bytes`` reconstructs a fitted prior whose
-    ``mean_score`` matches the original; an unfit prior serializes to ``None``."""
-    from deplodock.compiler.pipeline.search.prior import prior_from_bytes
-
-    assert BayesianRidgePrior(seed=0).to_bytes() is None  # unfit → nothing to save
-    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
-    p = BayesianRidgePrior(seed=0, min_rows=3)
-    p.fit(rows)
-    blob = p.to_bytes()
-    assert blob is not None
-    q = prior_from_bytes(blob)
-    assert q.fitted
-    for bm in (4, 16, 64):
-        assert abs(p.mean_score({"BM": bm}) - q.mean_score({"BM": bm})) < 1e-9
-
-
-def test_prior_file_store_round_trips(tmp_path):
-    from deplodock.compiler.pipeline.search.prior import store
-
-    path = tmp_path / "prior.pkl"
-    assert store.load(path, "regimeA") is None  # missing file
-    store.save(path, "regimeA", b"blobA")
-    store.save(path, "regimeB", b"blobB")  # second regime coexists
-    assert store.load(path, "regimeA") == b"blobA"
-    assert store.load(path, "regimeB") == b"blobB"
-    store.save(path, "regimeA", b"newerA")  # upsert
-    assert store.load(path, "regimeA") == b"newerA"
-    assert store.load(path, "missing") is None
-
-
-def test_global_prior_archive_accumulates_and_warm_starts():
-    """A global prior trained on one op, archived, then reloaded is warm
-    (fitted, no warmup) and its archived rows survive the round-trip."""
-    from deplodock.compiler.pipeline.search.prior import prior_from_bytes
-
-    p = BayesianRidgePrior(seed=0, min_rows=3)
-    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
-    p.fit(rows)
-    p.archive(rows)  # freeze this op's rows into the global set
-    q = prior_from_bytes(p.to_bytes())
-    assert q.fitted
-    assert q._first_fit_idx == 0  # loaded → warm, no cold warmup
-    assert len(q._archived_rows) == len(rows)
 
 
 def test_softmax_sums_to_one_and_orders():
     p = _softmax([1.0, 2.0, 3.0])
     assert abs(sum(p) - 1.0) < 1e-12
     assert p[2] > p[1] > p[0]
-    # Shift-invariance (a constant offset cancels).
     p2 = _softmax([101.0, 102.0, 103.0])
     assert all(abs(a - b) < 1e-12 for a, b in zip(p, p2, strict=True))
-
-
-def test_seeded_priors_reproducible_mean_score():
-    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p1, p2 = BayesianRidgePrior(seed=3, min_rows=3), BayesianRidgePrior(seed=3, min_rows=3)
-    p1.fit(rows)
-    p2.fit(rows)
-    assert p1.mean_score({"BM": 32}) == p2.mean_score({"BM": 32})
-
-
-# --- spearman helper -------------------------------------------------------

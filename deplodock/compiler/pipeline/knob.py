@@ -37,6 +37,13 @@ _PKG_ROOT = Path(__file__).resolve().parents[2]
 # consumer can import it.
 STRUCT_PREFIX = "S_"
 
+# Reserved prefix for host/hardware-regime features injected from
+# :meth:`Context.features` (GPU compute capability + nvcc opt level).
+# Treated like ``STRUCT_PREFIX``: dropped from the tuning view, passed straight
+# through ``knob_features`` as floats — they describe the regime a row was
+# measured in, letting one global prior span every GPU / opt level.
+CTX_PREFIX = "H_"
+
 
 class KnobType(Enum):
     """Knob value type — drives ``Knob.parse`` and ``Knob.pretty``."""
@@ -299,7 +306,7 @@ def format_tuning_knobs(knobs: dict) -> str:
     """
     rendered: list[tuple[str, str]] = []
     for k, v in knobs.items():
-        if k.startswith(STRUCT_PREFIX):
+        if k.startswith(STRUCT_PREFIX) or k.startswith(CTX_PREFIX):
             continue
         knob = get(k)
         if knob is not None and knob.type is KnobType.BOOL:
@@ -319,9 +326,9 @@ def knob_features(knobs: dict) -> dict[str, float]:
     """Convert a knob dict into a flat numeric feature vector for the (future)
     learned planner prior — the single featurizer over the whole dict.
 
-    - ``STRUCT_PREFIX`` knobs (structural features stamped by
-      ``992_stamp_structural_features``) pass through as floats: they already are the
-      kernel's structural feature set.
+    - ``STRUCT_PREFIX`` (``S_``) structural-feature knobs and ``CTX_PREFIX``
+      (``H_``) host/hardware-regime knobs pass through as floats: they already
+      are the kernel's structural / regime feature set.
     - Registered tuning ``Knob``s are encoded by type: ``INT`` → float, ``BOOL``
       → 0/1, ``BINMASK`` (binary string) → ``{<name>_popcount, _width, _frac}``.
     - A ``Knob`` with a custom ``features`` callable (e.g. ``MMA``, which expands
@@ -332,7 +339,7 @@ def knob_features(knobs: dict) -> dict[str, float]:
     """
     feats: dict[str, float] = {}
     for name, val in knobs.items():
-        if name.startswith(STRUCT_PREFIX):
+        if name.startswith(STRUCT_PREFIX) or name.startswith(CTX_PREFIX):
             feats[name] = float(val)
             continue
         knob = get(name)
