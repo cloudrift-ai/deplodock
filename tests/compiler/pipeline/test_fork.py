@@ -1,9 +1,11 @@
-"""Unit tests for the hierarchical Fork-tree builder.
+"""Unit tests for ``pipeline/fork.py``'s hierarchical Fork-tree builder.
 
 Covers the generic builder contract using a synthetic param dataclass so
 the suite stays decoupled from any specific Tile-IR pass (`partition_loops`
 is the canonical caller; its integration tests live in
-``tests/compiler/passes/test_partition_planner_forks.py``).
+``tests/compiler/passes/test_partition_planner_forks.py``). The flat
+``Fork`` implementations (``OptionFork`` / ``ThunkFork``) are exercised
+through the engine in ``tests/compiler/pipeline/search/test_thunk_forks.py``.
 """
 
 from __future__ import annotations
@@ -12,8 +14,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
-from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 
 
 @dataclass(frozen=True)

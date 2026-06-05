@@ -20,7 +20,8 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.pipeline import Cursor, Fork, OptionFork
+from deplodock.compiler.pipeline.fork import Fork, OptionFork
+from deplodock.compiler.pipeline.pipeline import Cursor
 from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-

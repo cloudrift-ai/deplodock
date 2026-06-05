@@ -18,7 +18,8 @@ from typing import Any
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
-from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, ThunkFork
+from deplodock.compiler.pipeline.fork import ThunkFork
+from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule
 
 
 # A tiny stub Op for testing. Carries an arbitrary ``knobs`` dict that the

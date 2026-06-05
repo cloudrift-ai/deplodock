@@ -177,7 +177,7 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 def _priority_matmul_thread(p: dict) -> tuple[int, ...]:
     # Tiebreaker for the enumeration sort. The Fork-tree builder re-sorts
     # each level by ``score_tile_geometry`` (the MCTS prior) — see
-    # ``compiler/pipeline/fork_tree.py`` — so this ordering only affects
+    # ``compiler/pipeline/fork.py`` — so this ordering only affects
     # ties within a score band.
     #
     # Fat-tile regime (macro area ≥ 8192 cells): keep the explicit BK

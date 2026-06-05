@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Hashable
 
-from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
 

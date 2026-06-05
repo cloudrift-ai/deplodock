@@ -100,8 +100,8 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.fork import ThunkFork
 from deplodock.compiler.pipeline.knob import Knob, KnobType
-from deplodock.compiler.pipeline.pipeline import ThunkFork
 
 PATTERN = [Pattern("root", TileOp)]
 

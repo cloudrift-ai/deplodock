@@ -140,7 +140,7 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
+from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     BK,
     BM,
@@ -158,7 +158,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
-from deplodock.compiler.pipeline.pipeline import Fork
 from deplodock.compiler.pipeline.search.keys import loop_structural_id
 
 

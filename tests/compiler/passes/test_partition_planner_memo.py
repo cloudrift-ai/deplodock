@@ -1,5 +1,5 @@
 """Tests for the partition planner's op-metadata plan cache + the lazy
-Fork-tree build (``010_partition_loops`` / ``fork_tree.build_fork_tree``).
+Fork-tree build (``010_partition_loops`` / ``fork.build_fork_tree``).
 
 The finished ``_Plan`` rides its LoopOp as op metadata, keyed by
 ``_plan_cache_key`` so pin / ctx / dtype changes invalidate the stamp; the
@@ -21,9 +21,8 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import fork_tree
-from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
-from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.pipeline import fork as fork_mod
+from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from deplodock.compiler.tensor import Tensor
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
@@ -187,8 +186,8 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
 
         return Counting
 
-    monkeypatch.setattr(fork_tree, "_Branch", _counting(fork_tree._Branch))
-    monkeypatch.setattr(fork_tree, "_Leaf", _counting(fork_tree._Leaf))
+    monkeypatch.setattr(fork_mod, "_Branch", _counting(fork_mod._Branch))
+    monkeypatch.setattr(fork_mod, "_Leaf", _counting(fork_mod._Leaf))
     ctx = _ctx()
     plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     assert plan is not None and len(plan.params) > 8

@@ -27,8 +27,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline.fork_tree import Level, build_fork_tree
-from deplodock.compiler.pipeline.pipeline import Fork
+from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
 _plan_kernel = _planner._plan_kernel
@@ -40,7 +39,7 @@ BR, BM, BN, FM, FN, BK, SPLITK = (_planner.BR, _planner.BM, _planner.BN, _planne
 def _build_fork_tree_lazy(plan, ctx: Context) -> Fork | list[Fork]:
     """Mirror the planner's own call site in ``rewrite()`` — builds the same
     Fork tree from a ``_Plan`` + ``ctx`` via the shared
-    ``pipeline/fork_tree.py`` builder, with the planner's canonical level
+    ``pipeline/fork.py`` builder, with the planner's canonical level
     layout. Single source of truth for the test assertions below."""
     return build_fork_tree(
         params=plan.params,

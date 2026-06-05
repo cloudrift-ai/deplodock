@@ -7,6 +7,7 @@ Pattern-based rewrite engine + pass directories + dump hooks.
 ```
 pipeline/
 ├── pipeline.py    # Pattern, Match, Rule, Pass, Pipeline; engine + Pipeline.run / Pipeline.tune / Pipeline.search
+├── fork.py        # Fork interface + OptionFork / ThunkFork; Level + build_fork_tree lazy knob-cartesian tree builder
 ├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
@@ -74,7 +75,7 @@ a `lowering` row matches, else the max-prior sibling via `Search.score_of` (a sc
 order, so unscored flat rules still get their option-0 default); tuning explores every fork. Single-option
 returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
-**Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline.py`): `knobs` (the knob delta
+**Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
 the fork pins), `is_leaf`, `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
 leaves, or a mix; exactly `[option]` for a leaf), and `score(cache)` (the lazy planner prior — see below).
 The search loop pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize the children,
@@ -84,7 +85,7 @@ materialized. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy replay)
 Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
 `LazyCandidate.from_op` / `from_graph`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
 `score_fn(knobs)` functions of the fork's own knob delta, so siblings share one function instead of
-per-instance capture lambdas; used by `085_warp_specialize`), and `fork_tree`'s branch / leaf node
+per-instance capture lambdas; used by `085_warp_specialize`), and the tree builder's branch / leaf node
 classes.
 
 **Scoring is search policy.** Rules emit siblings unranked; the policies rank via `Search.score_of(fork)`
@@ -143,7 +144,8 @@ producer/consumer overlap), so the autotuner normally picks WS=0 — the warp
 arm is for parity / investigation and Hopper-class parts.
 
 The tree-building algorithm itself (group params by per-level knob keys, collapse single-key levels, skip
-empty-key levels, defer leaf materialization to `expand()`) lives in `pipeline/fork_tree.py` as the
+empty-key levels, defer leaf materialization to `expand()`) lives in `pipeline/fork.py` (next to the
+`Fork` interface and its flat implementations) as the
 reusable `Level` + `build_fork_tree` pair — `partition_loops` supplies the `Level`s + `materialize=` +
 `score=` callables and returns the result. Nodes are real classes holding data, not closures: every
 `_Branch` / `_Leaf` references one shared `_Tree` (levels + callables + the per-tree score memo). The

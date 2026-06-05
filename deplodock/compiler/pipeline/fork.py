@@ -1,27 +1,34 @@
-"""Hierarchical Fork-tree builder shared by pipeline rules that enumerate a
-knob cartesian.
+"""Fork interface + implementations: the deferred fork options the search
+engine ranks and resolves, and the hierarchical Fork-tree builder shared by
+pipeline rules that enumerate a knob cartesian.
 
-Converts a flat list of variant params into the ROOT :class:`_Branch` of a
-lazy tree: each ``Level`` groups siblings by a (sub)tuple of knob values and
-collapses levels whose key has a single distinct value across the group
-(params with an empty key skip the level). The LAST level is the leaf
-level: its grouping produces one :class:`_Leaf` per param (no branch
-wrapper) — knobs stamped onto the leaf, ``expand()`` yields
-``materialize(p)`` once the search engine resolves that leaf. Everything is
-lazy: no Fork below the root exists and no param is scored until the search
-reads a fork's score (see :func:`build_fork_tree`). Siblings are emitted in
-grouping order — RANKING IS SEARCH POLICY: each node carries a lazy
-max-propagated ``score(cache)``, read by the policies via
-``Search.score_of`` (which passes the search-owned value-keyed cache down
-to the caller's per-param scorer, so structurally identical kernels across
-a model share every score).
+:class:`Fork` is the interface — ``knobs``, ``is_leaf``, ``expand()``,
+``score(cache)``. Implementations hold their producer's state as data:
+:class:`OptionFork` (a concrete ``Op``/``Graph`` leaf), :class:`ThunkFork`
+(generic flat forks), and the tree node classes :class:`_Branch` /
+:class:`_Leaf` built by :func:`build_fork_tree`.
 
-Use this when a rule produces ≥2 hierarchical levels of knob bundling with
-score-propagated ranking (today: ``passes/lowering/tile/010_partition_loops``).
-For flat 2-element forks with no hierarchy (e.g.
-``passes/lowering/tile/085_warp_specialize``) a bare ``[ThunkFork(...),
-ThunkFork(...)]`` list comp is shorter and clearer — don't reach for this
-builder.
+The tree builder converts a flat list of variant params into the ROOT
+:class:`_Branch` of a lazy tree: each ``Level`` groups siblings by a
+(sub)tuple of knob values and collapses levels whose key has a single
+distinct value across the group (params with an empty key skip the level).
+The LAST level is the leaf level: its grouping produces one :class:`_Leaf`
+per param (no branch wrapper) — knobs stamped onto the leaf, ``expand()``
+yields ``materialize(p)`` once the search engine resolves that leaf.
+Everything is lazy: no Fork below the root exists and no param is scored
+until the search reads a fork's score. Siblings are emitted in grouping
+order — RANKING IS SEARCH POLICY: each node carries a lazy max-propagated
+``score(cache)``, read by the policies via ``Search.score_of`` (which
+passes the search-owned value-keyed cache down to the caller's per-param
+scorer, so structurally identical kernels across a model share every
+score).
+
+Use the builder when a rule produces ≥2 hierarchical levels of knob
+bundling with score-propagated ranking (today:
+``passes/lowering/tile/010_partition_loops``). For flat 2-element forks
+with no hierarchy (e.g. ``passes/lowering/tile/085_warp_specialize``) a
+bare ``[ThunkFork(...), ThunkFork(...)]`` list comp is shorter and clearer
+— don't reach for the builder.
 
 The engine in ``pipeline.py`` consumes ``fork.knobs`` flat (it doesn't walk
 ancestors), so the LAST level's knob_names land on each leaf as the
@@ -31,15 +38,98 @@ themselves.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline.pipeline import Fork
-
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.ir.base import Op
+
+
+class Fork(ABC):
+    """Interface for a deferred fork option in the search tree.
+
+    Two flavors share the interface:
+
+    - **Branch Fork** (``is_leaf=False``) — produced explicitly by a rule's
+      ``rewrite()`` to spawn a hierarchical fork point. ``expand()`` returns
+      the next level of options (more Forks, concrete leaves, or a mix);
+      the search loop drives this via :meth:`LazyCandidate.expand`.
+    - **Leaf Fork** (``is_leaf=True``) — wraps one concrete ``Op`` /
+      ``Graph`` rewrite. ``expand()`` returns ``[option]`` (one element);
+      :meth:`LazyCandidate.resolve` invokes it once at resolve time to
+      retrieve the leaf and apply it.
+
+    Sharing one interface lets ``LazyCandidate.pending`` carry just
+    ``Fork`` (no tagged union) — the search loop branches on
+    ``Fork.is_leaf`` to decide expand-vs-resolve, and ``_best_fork``
+    reads ``Fork.knobs`` polymorphically without isinstance.
+
+    ``knobs`` is the knob-delta this Fork pins (used by ``_best_fork``
+    to match the lowering DB without expanding). ``score(cache)`` is the
+    LAZY planner-prior compute — typically the score of the best-reachable
+    leaf under a branch. Ranking is SEARCH policy, not the producer's: the
+    engine hands unranked siblings to ``Search.push`` and the policy reads
+    ``Search.score_of``, which passes the search-owned ``score_cache``
+    dict down to the compute. A scorer with a value identity memoizes its
+    unit of work into that dict under its own key — the partition planner
+    keys each variant by ``(ctx, merged knobs)``, complete because the
+    ``SID`` structural-identity knob rides the dict — so structurally
+    identical kernels across a model share every score. Scorers with
+    nothing worth caching just ignore ``cache``."""
+
+    knobs: dict
+    is_leaf: bool = False
+
+    @abstractmethod
+    def expand(self) -> list[Op | Graph | Fork]: ...
+
+    def score(self, cache: dict | None = None) -> float:  # noqa: ARG002 — uniform signature; default prior is neutral
+        return 0.0
+
+
+@dataclass(frozen=True)
+class OptionFork(Fork):
+    """Leaf Fork around an already-concrete rewrite option. Built by
+    :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` so
+    every ``LazyCandidate.pending`` carries a uniform Fork shape."""
+
+    option: Op | Graph
+    knobs: dict = field(default_factory=dict)
+    is_leaf = True
+
+    def expand(self) -> list[Op | Graph | Fork]:
+        return [self.option]
+
+
+@dataclass(frozen=True)
+class ThunkFork(Fork):
+    """Generic implementation for flat one-off forks (e.g.
+    ``tile/085_warp_specialize``'s two-element WS fork): behavior as
+    plain functions of the fork's ``knobs`` — ``expand_fn(knobs)`` /
+    ``score_fn(knobs)`` — so siblings share ONE function instead of
+    per-instance capture lambdas (the knob delta is the only thing that
+    varies). Trivial computes — nothing worth the score cache. A
+    producer with real per-node state should define a dedicated ``Fork``
+    subclass instead (see :class:`_Branch` / :class:`_Leaf` below)."""
+
+    knobs: dict
+    expand_fn: Callable[[dict], list[Op | Graph | Fork]]
+    score_fn: Callable[[dict], float] | None = None
+    is_leaf: bool = False
+
+    def expand(self) -> list[Op | Graph | Fork]:
+        return self.expand_fn(self.knobs)
+
+    def score(self, cache: dict | None = None) -> float:  # noqa: ARG002
+        return self.score_fn(self.knobs) if self.score_fn is not None else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical Fork-tree builder (``Level`` + ``build_fork_tree``).
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
