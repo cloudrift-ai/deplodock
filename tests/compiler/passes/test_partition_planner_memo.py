@@ -41,9 +41,6 @@ def _no_stray_pins(monkeypatch):
         monkeypatch.delenv(knob.env, raising=False)
         for alias in knob.aliases:
             monkeypatch.delenv(f"DEPLODOCK_{alias}", raising=False)
-    # The score cache is value-keyed and pure (stale entries are impossible),
-    # but call-count assertions below need a deterministic starting point.
-    _planner._SCORE_CACHE.clear()
 
 
 def _ctx() -> Context:
@@ -99,7 +96,7 @@ def _build_tree(plan, ctx: Context) -> Fork | list[Fork]:
             Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _planner._materialize(plan, p),
-        score=lambda p: _planner._score_variant(plan, p, ctx),
+        score=lambda p, cache: _planner._score_variant(plan, p, ctx, cache),
     )
 
 
@@ -176,17 +173,22 @@ def test_mma_pin_lands_in_cache_key(monkeypatch):
 
 
 def test_lazy_tree_builds_only_expanded_path(monkeypatch):
-    """Walking only the option-0 path must instantiate O(path) Forks, not one
-    per param — and each branch's lazily computed score must equal the max
-    over its expanded children (exactness vs the eager build)."""
+    """Walking only one root→leaf path must instantiate O(path · level
+    fanout) Forks, not one per param — and each branch's lazily computed
+    score must equal the max over its expanded children (exactness vs the
+    eager build)."""
     created = {"n": 0}
 
-    class CountingFork(Fork):
-        def __init__(self, *args, **kwargs):
-            created["n"] += 1
-            super().__init__(*args, **kwargs)
+    def _counting(cls):
+        class Counting(cls):
+            def __init__(self, *args, **kwargs):
+                created["n"] += 1
+                super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(fork_tree, "Fork", CountingFork)
+        return Counting
+
+    monkeypatch.setattr(fork_tree, "_Branch", _counting(fork_tree._Branch))
+    monkeypatch.setattr(fork_tree, "_Leaf", _counting(fork_tree._Leaf))
     ctx = _ctx()
     plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     assert plan is not None and len(plan.params) > 8
@@ -237,9 +239,15 @@ def test_sid_stamped_by_last_loop_pass():
 
 
 def test_scores_shared_across_identical_loop_ops(monkeypatch):
-    """The value-keyed score cache (``(SID, ctx, row)``) makes structurally
-    identical LoopOps — different SSA / buffer / axis names — share every
-    score: expanding the second kernel's tree computes ZERO new scores."""
+    """The search-owned value-keyed score cache (the planner keys each
+    variant by ``(ctx, merged knobs)`` — complete thanks to the ``SID``
+    knob) makes structurally identical LoopOps — different SSA / buffer /
+    axis names — share every score: scoring the second kernel's tree
+    through the SAME search computes ZERO new scores. (Expansion alone
+    never scores — ranking is search policy, so the read happens via
+    ``Search.score_of``.)"""
+    from deplodock.compiler.pipeline.search.policy import GreedySearch
+
     calls = {"n": 0}
     real = TileOp.lazy_score
 
@@ -253,8 +261,13 @@ def test_scores_shared_across_identical_loop_ops(monkeypatch):
     plan_2 = _planner._plan_kernel(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2"), ctx, kernel_name="k_l1")
     assert plan_1 is not None and plan_2 is not None
     assert plan_1.base_knobs["SID"] == plan_2.base_knobs["SID"], "structurally identical ops must share a SID"
-    _build_tree(plan_1, ctx).expand()  # sorting the top level scores every param
+    search = GreedySearch()
+    tree_1 = _build_tree(plan_1, ctx)
+    assert calls["n"] == 0, "building a tree must not score"
+    tree_1.expand()
+    assert calls["n"] == 0, "expansion must not score — ranking is the search's job"
+    search.score_of(tree_1)  # root prior = max over every param
     n_first = calls["n"]
     assert n_first == len(plan_1.params)
-    _build_tree(plan_2, ctx).expand()
-    assert calls["n"] == n_first, "second kernel's tree re-scored rows instead of hitting the value-keyed cache"
+    search.score_of(_build_tree(plan_2, ctx))
+    assert calls["n"] == n_first, "second kernel's tree re-scored rows instead of hitting the search's value-keyed cache"

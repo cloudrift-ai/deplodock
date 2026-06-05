@@ -10,19 +10,22 @@ from deplodock.compiler.pipeline.search.policy.base import Search
 class GreedySearch(Search):
     """Stop at the first terminal candidate.
 
-    ``push`` always enqueues exactly one candidate (option-0 from the
-    rule's heuristic ordering) and drops the rest, so only a single
-    pending slot is ever needed. When the engine yields a terminal
-    without pushing it back, the next ``pop`` finds the slot empty and
-    returns ``None``, ending the search.
+    ``push`` keeps exactly one candidate per fork point and drops the
+    rest, so only a single pending slot is ever needed. When the engine
+    yields a terminal without pushing it back, the next ``pop`` finds
+    the slot empty and returns ``None``, ending the search.
 
     Used by ``run_pipeline`` for single-shot compiles. At fork points
     the engine looks up the lowering table and passes the DB-best fork
-    via ``push(..., best=...)``; greedy prefers it over the rule's
-    default option-0. When no DB entry exists (untuned site), greedy
-    falls back to ``primary``."""
+    via ``push(..., best=...)``; greedy takes it WITHOUT scoring
+    anything — a fully tuned compile does near-zero ranking work. When
+    no DB entry exists (untuned site), greedy keeps the max-prior
+    sibling via :meth:`Search.score_of` (ties keep emission order, so
+    rules whose options carry no scores still get their option-0
+    default)."""
 
     def __init__(self, *, db: SearchDB | None = None) -> None:
+        super().__init__()
         self._db = db if db is not None else SearchDB()
         self._pending: LazyCandidate | None = None
 
@@ -30,9 +33,8 @@ class GreedySearch(Search):
     def db(self) -> SearchDB:
         return self._db
 
-    def push(self, primary: LazyCandidate, *forks: LazyCandidate, best: LazyCandidate | None = None) -> None:
-        del forks  # greedy keeps a single candidate per fork point
-        self._pending = best if best is not None else primary
+    def push(self, *cands: LazyCandidate, best: LazyCandidate | None = None) -> None:
+        self._pending = best if best is not None else max(cands, key=lambda c: self.score_of(c.fork))
 
     def pop(self) -> LazyCandidate | None:
         c, self._pending = self._pending, None

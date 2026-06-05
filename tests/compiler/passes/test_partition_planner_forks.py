@@ -53,7 +53,7 @@ def _build_fork_tree_lazy(plan, ctx: Context) -> Fork | list[Fork]:
             Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _materialize(plan, p),
-        score=lambda p: _score_variant(plan, p, ctx),
+        score=lambda p, cache: _score_variant(plan, p, ctx, cache),
     )
 
 
@@ -216,27 +216,27 @@ def test_branch_score_is_max_of_children():
         assert branch.score() == pytest.approx(expected), f"branch.score {branch.score()} != max(child scores) {expected}"
 
 
-def test_first_leaf_matches_best_score_variant():
-    """Sibling ordering is by max-propagated ``TileOp.lazy_score`` descending:
-    the leaf reachable by always taking option-0 must be the highest-
-    scoring TileParams in the planner's enumeration. Greedy primary =
-    score primary (single source of truth, also used as MCTS prior).
+def test_max_score_descent_reaches_best_variant():
+    """Siblings are unranked (the search picks the max prior via
+    ``Search.score_of``); descending by max score at every level must
+    land on the leaf whose prior equals the global best over the whole
+    enumeration — i.e. greedy's pick = argmax ``TileOp.lazy_score``.
     ``lazy_score`` is the ONLY scorer (there is no post-materialization
-    ``Op.score``), so the option-0 leaf's fork prior is compared against
+    ``Op.score``), so the picked leaf's fork prior is compared against
     a from-scratch argmax over every enumerated variant."""
     plan = _matmul_plan()
     ctx = _ctx()
     tree = _build_fork_tree_lazy(plan, ctx)
 
-    node = tree if isinstance(tree, Fork) else tree[0]
+    node = tree if isinstance(tree, Fork) else max(tree, key=lambda f: f.score())
     while not node.is_leaf:
-        node = node.expand()[0]
+        node = max(node.expand(), key=lambda f: f.score())
 
     def _lazy(p):
         return TileOp.lazy_score(ctx, knobs={**plan.base_knobs, **p}, shapes=plan.shape)
 
     best = max(_lazy(p) for p in plan.params)
-    assert node.score() == pytest.approx(best), f"option-0 leaf prior {node.score()} != best lazy_score {best}"
+    assert node.score() == pytest.approx(best), f"max-descent leaf prior {node.score()} != best lazy_score {best}"
 
 
 def test_pointwise_collapses_br_layer():

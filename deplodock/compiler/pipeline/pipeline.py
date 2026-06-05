@@ -22,6 +22,7 @@ import logging
 import re
 import sys
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -143,39 +144,87 @@ class LoweringError(Exception):
     shapes, so no sink is installed and nothing is raised."""
 
 
-@dataclass(frozen=True)
-class Fork:
-    """A deferred fork option in the search tree.
+class Fork(ABC):
+    """Interface for a deferred fork option in the search tree.
 
-    Two flavors share the same shape:
+    Two flavors share the interface:
 
     - **Branch Fork** (``is_leaf=False``) — produced explicitly by a rule's
       ``rewrite()`` to spawn a hierarchical fork point. ``expand()`` returns
       the next level of options (more Forks, concrete leaves, or a mix);
       the search loop drives this via :meth:`LazyCandidate.expand`.
-    - **Leaf Fork** (``is_leaf=True``) — produced by
-      :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` to
-      uniformly wrap concrete ``Op`` / ``Graph`` rewrites. ``expand()``
-      returns ``[option]`` (one element); :meth:`LazyCandidate.resolve`
-      invokes it once at resolve time to retrieve the leaf and apply it.
+    - **Leaf Fork** (``is_leaf=True``) — wraps one concrete ``Op`` /
+      ``Graph`` rewrite. ``expand()`` returns ``[option]`` (one element);
+      :meth:`LazyCandidate.resolve` invokes it once at resolve time to
+      retrieve the leaf and apply it.
 
-    Sharing one shape lets ``LazyCandidate.pending`` carry just ``Fork``
-    (no tagged union) — the search loop branches on ``Fork.is_leaf`` to
-    decide expand-vs-resolve, and :func:`_best_fork` reads ``Fork.knobs``
-    polymorphically without isinstance.
+    Sharing one interface lets ``LazyCandidate.pending`` carry just
+    ``Fork`` (no tagged union) — the search loop branches on
+    ``Fork.is_leaf`` to decide expand-vs-resolve, and :func:`_best_fork`
+    reads ``Fork.knobs`` polymorphically without isinstance.
 
     ``knobs`` is the knob-delta this Fork pins (used by :func:`_best_fork`
-    to match the lowering DB without firing the thunk). ``score`` is a
-    LAZY 0-arg thunk for the MCTS prior / greedy sibling ordering —
-    typically the score of the best-reachable leaf under this branch.
-    Lazy so that building a fork hierarchy costs nothing: a level's
-    siblings are scored (and sorted) only when that level actually
-    expands. Producers memoize so repeated reads stay cheap."""
+    to match the lowering DB without expanding). ``score(cache)`` is the
+    LAZY planner-prior compute — typically the score of the best-reachable
+    leaf under a branch. Ranking is SEARCH policy, not the producer's: the
+    engine hands unranked siblings to ``Search.push`` and the policy reads
+    ``Search.score_of``, which passes the search-owned ``score_cache``
+    dict down to the compute. A scorer with a value identity memoizes its
+    unit of work into that dict under its own key — the partition planner
+    keys each variant by ``(ctx, merged knobs)``, complete because the
+    ``SID`` structural-identity knob rides the dict — so structurally
+    identical kernels across a model share every score. Scorers with
+    nothing worth caching just ignore ``cache``.
+
+    Implementations hold their producer's state as data: :class:`OptionFork`
+    (concrete leaf), :class:`ThunkFork` (generic flat forks), and the
+    branch / leaf node classes in ``fork_tree``."""
 
     knobs: dict
-    expand: Callable[[], list[Op | Graph | Fork]]
-    score: Callable[[], float] = lambda: 0.0
     is_leaf: bool = False
+
+    @abstractmethod
+    def expand(self) -> list[Op | Graph | Fork]: ...
+
+    def score(self, cache: dict | None = None) -> float:  # noqa: ARG002 — uniform signature; default prior is neutral
+        return 0.0
+
+
+@dataclass(frozen=True)
+class OptionFork(Fork):
+    """Leaf Fork around an already-concrete rewrite option. Built by
+    :meth:`LazyCandidate.from_op` / :meth:`LazyCandidate.from_graph` so
+    every ``LazyCandidate.pending`` carries a uniform Fork shape."""
+
+    option: Op | Graph
+    knobs: dict = field(default_factory=dict)
+    is_leaf = True
+
+    def expand(self) -> list[Op | Graph | Fork]:
+        return [self.option]
+
+
+@dataclass(frozen=True)
+class ThunkFork(Fork):
+    """Generic implementation for flat one-off forks (e.g.
+    ``tile/085_warp_specialize``'s two-element WS fork): behavior as
+    plain functions of the fork's ``knobs`` — ``expand_fn(knobs)`` /
+    ``score_fn(knobs)`` — so siblings share ONE function instead of
+    per-instance capture lambdas (the knob delta is the only thing that
+    varies). Trivial computes — nothing worth the score cache. A
+    producer with real per-node state should define a dedicated ``Fork``
+    subclass instead (see ``fork_tree``)."""
+
+    knobs: dict
+    expand_fn: Callable[[dict], list[Op | Graph | Fork]]
+    score_fn: Callable[[dict], float] | None = None
+    is_leaf: bool = False
+
+    def expand(self) -> list[Op | Graph | Fork]:
+        return self.expand_fn(self.knobs)
+
+    def score(self, cache: dict | None = None) -> float:  # noqa: ARG002
+        return self.score_fn(self.knobs) if self.score_fn is not None else 0.0
 
 
 @dataclass
@@ -472,7 +521,7 @@ class Pipeline:
             if popped.is_expandable():
                 children = popped.expand()
                 best = _best_fork(children, popped.inner, db) if db is not None else None
-                search.push(children[0], *children[1:], best=best)
+                search.push(*children, best=best)
                 continue
             cand = popped.resolve()
             cur = cand.cursor
@@ -502,7 +551,8 @@ class Pipeline:
                 if options is None:
                     continue
                 # Multi-option fork point: spawn one ``LazyCandidate`` per
-                # option (option-0 included as the primary). Each shares
+                # option, in rule-emission order (the search ranks them
+                # via ``score_of``; rules need not pre-sort). Each shares
                 # ``cand`` as ``inner`` so siblings don't duplicate the
                 # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
                 # options into leaf Forks so every LazyCandidate's pending
@@ -515,15 +565,16 @@ class Pipeline:
 
             if forks is not None:
                 best = _best_fork(forks, cand, db) if db is not None else None
-                search.push(forks[0], *forks[1:], best=best)
+                search.push(*forks, best=best)
                 continue
 
             search.push(cand.lazy())
 
     def run(self, graph: Graph, *, ctx: Context | None = None, backend=None, db: SearchDB | None = None) -> Graph:
         """Single-shot greedy compile — run each pass in order, picking
-        option 0 at every fork point. Convenience wrapper around
-        :meth:`tune` that yields the first terminal.
+        the DB-best (or, untuned, the max-prior) fork at every fork
+        point. Convenience wrapper around :meth:`tune` that yields the
+        first terminal.
 
         ``ctx`` is built once (probing the live device if not provided)
         and passed to every rule that takes a ``ctx`` parameter.

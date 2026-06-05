@@ -67,23 +67,34 @@ The dispatcher binds parameters by name. Reserved names: `graph`,
 matched `Node` objects. Anything else binds positionally to
 `root.inputs[i]`. Take only what you need — `ctx` is optional.
 
-**Returning a list = autotune fork.** A rule that's unsure which
-parameter to use returns the alternatives as a list. The engine applies
-option 0 inline and pushes one `Candidate` per remaining option onto the
-search queue (deep-copying the graph at the fork point). Single-option
+**Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
+alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
+parent's graph snapshot) and hands them ALL to the search, which picks: greedy takes the DB-best fork when
+a `lowering` row matches, else the max-prior sibling via `Search.score_of` (a score tie keeps emission
+order, so unscored flat rules still get their option-0 default); tuning explores every fork. Single-option
 returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
-**Lazy hierarchical forks via `Fork`.** A rule can also return a list of
-`Fork(knobs=..., expand=..., score=...)` objects — each Fork carries the
-knob delta it pins plus a thunk that produces the next level of options
-(more Forks, concrete `Op`/`Graph` leaves, or a mix). The search loop
-pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize
-the children, pushes them back, and continues; cursor advance only
-fires when the lineage resolves to a concrete leaf. Lets a rule expose
-a hierarchy of decisions lazily — only the subtrees MCTS actually walks
-into get materialized. `Fork.knobs` is read by `_best_fork` (for
-DB-seeded greedy replay) without firing the thunk; `Fork.score` is the
-MCTS prior the producing rule attaches.
+**Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline.py`): `knobs` (the knob delta
+the fork pins), `is_leaf`, `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
+leaves, or a mix; exactly `[option]` for a leaf), and `score(cache)` (the lazy planner prior — see below).
+The search loop pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize the children,
+pushes them back, and continues; cursor advance only fires when the lineage resolves to a concrete leaf.
+Lets a rule expose a hierarchy of decisions lazily — only the subtrees the search actually walks into get
+materialized. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy replay) without expanding.
+Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
+`LazyCandidate.from_op` / `from_graph`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
+`score_fn(knobs)` functions of the fork's own knob delta, so siblings share one function instead of
+per-instance capture lambdas; used by `085_warp_specialize`), and `fork_tree`'s branch / leaf node
+classes.
+
+**Scoring is search policy.** Rules emit siblings unranked; the policies rank via `Search.score_of(fork)`
+= `fork.score(self.score_cache)`. The search OWNS the value-keyed score cache and hands it down to the
+fork's compute; the KEYING is the scorer's own, since only it knows its value identity — the partition
+planner keys each variant by `(ctx fields, frozenset(merged knobs))`, complete because the `SID`
+structural-identity knob rides the dict, so structurally identical kernels (the same layer repeated
+through a whole model) share every score, across trees and — via the shared dict `two_level.inner_reward`
+threads into each per-op `TuningSearch` — across tune slices. Entries can never go stale: the score is a
+pure function of the key. Greedy with a DB hit never scores anything at all.
 
 The partition planner (`lowering/tile/010_partition_loops`) emits one
 hierarchical Fork tree over both tiers:
@@ -92,13 +103,11 @@ hierarchical Fork tree over both tiers:
 splices up as siblings of the atom branches — no `MMA` knob ever pins a scalar path), and the builder's
 single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 1`, scalar rows
 `wm = wn = 1`), so a pure-scalar kernel's tree is exactly the classic
-`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`. Warp-vs-scalar ordering is score-driven; an explicit
+`BR → (BM,BN) → (FM,FN) → (BK,SPLITK)`. Warp-vs-scalar ranking is score-driven; an explicit
 `DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so score can't sidestep it).
-Sibling sorting uses `TileOp.lazy_score(ctx, knobs=..., shapes=...)`
-— the static-method counterpart of `Op.score` that estimates the same
-formula from cheap inputs (the variant's stamped knob dict + planner shape)
-so siblings rank without anyone instantiating a TileOp. The branch tree's `Fork.score`
-propagates max from leaves, matching MCTS's max-Q semantics.
+The per-variant prior is `TileOp.lazy_score(ctx, knobs=..., shapes=...)` — a pure formula over cheap
+inputs (the variant's stamped knob dict + planner shape) so siblings rank without anyone instantiating a
+TileOp. The branch tree's `score()` propagates max from leaves, matching MCTS's max-Q semantics.
 
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
@@ -133,19 +142,18 @@ GeForce s16816 (its cuBLAS gap is the SASS mma schedule below the IR, not
 producer/consumer overlap), so the autotuner normally picks WS=0 — the warp
 arm is for parity / investigation and Hopper-class parts.
 
-The tree-building algorithm itself (group params by per-level knob keys,
-collapse single-key levels, skip empty-key levels, sort siblings by max-propagated score, defer
-leaf materialization to `expand` thunks) lives in `pipeline/fork_tree.py`
-as the reusable `Level` + `build_fork_tree` pair — `partition_loops`
-supplies the `Level`s + `materialize=` + `score=` callables and returns the
-result. The builder hands back the lazy ROOT `Fork` and nothing else exists yet: a branch's `expand` builds
-(and sorts) its children on demand, its score is a lazy thunk taking `max` over the per-param scores of its
-subgroup (provably the same max-propagation as an eager build, without instantiating the subtree), and
-`score(p)` itself runs at most once per param — memoized, and only when a level containing it first
-expands. `Fork.score` is correspondingly a 0-arg callable everywhere. Future rules with multi-level
-knob-cartesian forks should reuse the builder; one-shot flat forks (e.g.
-`lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element list) stay
-inline.
+The tree-building algorithm itself (group params by per-level knob keys, collapse single-key levels, skip
+empty-key levels, defer leaf materialization to `expand()`) lives in `pipeline/fork_tree.py` as the
+reusable `Level` + `build_fork_tree` pair — `partition_loops` supplies the `Level`s + `materialize=` +
+`score=` callables and returns the result. Nodes are real classes holding data, not closures: every
+`_Branch` / `_Leaf` references one shared `_Tree` (levels + callables + the per-tree score memo). The
+builder hands back the lazy ROOT `_Branch` and nothing else exists yet: a branch's `expand()` builds its
+children on demand (in grouping order — ranking is the search's job), its `score(cache)` takes `max` over
+the per-param scores of its subgroup (provably the same max-propagation as an eager build, without
+instantiating the subtree), and the per-param scorer — `score(p, cache)`, which receives the search-owned
+value-keyed cache and owns its own keying — runs at most once per param per tree, and only when a score is
+actually read. Future rules with multi-level knob-cartesian forks should reuse the builder; one-shot flat
+forks (e.g. `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element `ThunkFork` list) stay inline.
 
 **FN > 1 lowering.** The partition planner always emits the per-cell
 shape — one `RegisterTile(N_r)` wrapping the whole
@@ -186,8 +194,9 @@ and enumeration included). The stamp is validated against `_plan_cache_key` — 
 which include the `SID` structural identity stamped by `loop/fusion/040_stamp_structural_id` (canonical
 body + operand dtypes, so a dtype change is an identity change), + the hardware context + the live
 `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`) — so a pin / ctx / dtype
-change invalidates it. The SID also powers the planner's VALUE-keyed score cache (`_SCORE_CACHE`:
-`(SID, ctx, frozenset(row.items())) → score`): structurally identical kernels — the same layer repeated
+change invalidates it. The SID also powers the search-owned value-keyed score cache (see "Scoring is
+search policy" above): `_score_variant` keys each variant by `(ctx fields, frozenset(merged knobs))`,
+complete because the SID rides the knob dict, so structurally identical kernels — the same layer repeated
 through a whole model — share every score with no object-identity bookkeeping, and entries can never go
 stale because the score is a pure function of the key.
 
@@ -377,7 +386,8 @@ over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
-  `child.score` is a rank-only structural prior the rule stamped via `TileOp.lazy_score` (no magnitude — only relative ordering).
+  The unvisited-sibling tiebreak is the fork's rank-only structural prior (`TileOp.lazy_score` magnitude carries no meaning —
+  only relative ordering), read via `Search.score_of` and memoized per node (`SearchNode.prior`).
 - **Expansion** is implicit: `Pipeline.search` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
 - **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU

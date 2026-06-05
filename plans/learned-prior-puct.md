@@ -1,347 +1,267 @@
-# Learned-prior PUCT for `deplodock tune`
+# Learned online prior for `deplodock tune` (Bayesian-linear Thompson → LinUCB)
 
 ## Context
 
-Today `TuningSearch` (SP-MCTS) breaks ties among unvisited siblings using `TileOp.score(ctx)` — a hand-tuned heuristic
-defined at `deplodock/compiler/ir/tile/ir.py:608-700`. The heuristic is rank-only and feeds the tiebreaker slot in
-`_ucb_key()` at `deplodock/compiler/pipeline/search/policy/mcts.py:127-137`. Across runs we accumulate measured
-`(kernel, knobs, hardware) → latency` rows in `~/.cache/deplodock/autotune.db` (`perf` and `lowering` tables in
-`deplodock/compiler/pipeline/search/db.py:90-150`); the heuristic ignores all of this signal.
+Today the inner MCTS (`TuningSearch`, SP-MCTS) ranks unvisited siblings with `TileOp.score(ctx)` — a hand-written
+heuristic. It is computed lazily pre-materialization (`lazy_score`, `tile/ir.py:1985-2003`), cached per
+`(smem_cap, compute_capability)` (`tile/ir.py:1934-1982`), and the geometry formula lives in
+`tile/ir.py:1501-1610`. It feeds **only** the tiebreaker slot of `_ucb_key` (`mcts.py:147-157`): unvisited children get
+UCB `= +∞` and the prior just orders the mandatory first-visits among them — it never enters UCB arithmetic.
 
-We want to replace the hand-tuned `score()` with a **learned LightGBM `lambdarank` prior** fit on the SQLite cache. The
-prior should:
+Two facts drive this plan:
 
-1. Improve over runs (more data → better ranking → fewer wasted rollouts).
-2. Generalize across GPUs via numeric hardware features (not a categorical GPU id) so a new GPU starts warm.
-3. Be retrained periodically — triggered when the cache grows ≥10% since the last fit, or when the prior's calibration
-   drifts.
-4. Apply **lazily**: each `SearchNode` caches `(prior_value, model_version)`; if the global model version has advanced
-   since the cached value was computed, the node re-scores on next selection. Nodes that are never re-selected pay
-   nothing.
+1. **The heuristic is low quality and we want to stop relying on it.** It is a hand-tuned geometry proxy (thread-count
+   target, register-cell budget, MMA aspect reward, staging bonus) — not fit to any measured data. We do *not* want it
+   as a prior mean. (We may keep it as one input feature with a learned weight; see §3.)
+2. **The tiebreaker is a real latency lever despite never touching UCB arithmetic.** The inner search stops on
+   **patience** (N consecutive measured terminals with no new best), and at every node breadth is forced (`+∞` on
+   unvisited). So the prior's leverage is *which subtrees get deepened first*: surface the winner early → high reward →
+   UCB deepens the right subtree → patience closes sooner. Cost ≈ `(how early the good branches are ordered) + patience`.
+   A better ranking over the **top quantile** directly cuts benches-to-best. (Not just top-1 — UCB spends its bonus
+   across the competitive branches, so the upper slice of the order has to be trustworthy, not merely the single best.)
+
+We already accumulate the training signal: `~/.cache/deplodock/autotune.db` holds measured
+`(op_cache_key, knobs, hardware) → latency` rows in `perf` (`db.py:164-177`, columns include
+`latency_us_median/min/max/mean`, `n_samples`, `knobs` JSON), keyed structurally so the *same kernel transfers across
+models* (`keys.py:31-55`). The `knobs` command (`commands/knobs.py`) already computes per-knob regret + a
+knob-interaction matrix from these rows — we reuse both. Nothing today reads this history to warm-start a search;
+`TuningSearch.push` explicitly ignores the greedy DB hint (`mcts.py:123`).
+
+## Why this design (and why not the existing LightGBM plan)
+
+The previous revision of this file proposed an **offline LightGBM `lambdarank`** prior retrained periodically. We are
+replacing that with an **online Bayesian linear model**, for reasons specific to this problem:
+
+- **Signal arrives fast and asymmetric.** High-level knobs (BR, ATOM_KIND, BM/BN — the high-regret knobs per the `knobs`
+  command) swing latency hard, so a handful of benches already separate good from bad. Early data is mostly *bad/ok*;
+  *good* is rare. A point-estimate ranker (LightGBM, River-style SGD) learns "everything seen is bad-to-ok" and has **no
+  drive toward the rare good region**. The posterior **variance** is exactly what pulls exploration into the
+  unexplored-and-maybe-good corner. The asymmetry argues *for* keeping uncertainty in the loop, not against it.
+- **It updates per bench, in closed form.** Sherman-Morrison rank-1 updates, no SGD step size, no replay buffer, O(d²)
+  per observation — fits "learn during the tune run." LightGBM only retrains in batches between runs.
+- **Uncertainty unifies the prior and the exploration bonus.** The same posterior that ranks (Thompson/LinUCB) can later
+  replace the hand-set `ucb_c` and the `+∞`-unvisited hack — the natural graduation to a true PUCT-style `P(s,a)` term.
+- **It persists and transfers.** The posterior `(θ̄, Σ)` keyed structurally is the *high-quality replacement for the
+  heuristic*: a new kernel starts from the cross-run fit, not a hand formula.
+
+LightGBM/GBT stays in reserve as the nonlinearity escape hatch (§9) if linear + interactions proves too weak — but it
+loses the closed-form uncertainty, so it is not the default.
 
 ## Design
 
-### 1. Prior models (one per dialect)
+### 1. Core model — online Bayesian linear regression on log-latency
 
-The candidate types at each search level are structurally different — `LoopOp` decisions (fusion, loop tiling) share
-almost no feature schema with `TileOp` knobs (BM/BN/BK, num_warps, stages) or `KernelOp` lowering choices. We train and
-persist **three separate boosters**: `prior_loop`, `prior_tile`, `prior_kernel`. A single `PriorRegistry` dispatches on
-the candidate's dialect to the matching model. Each dialect has its own featurizer, its own version counter, and its
-own retrain trigger (see §4).
+Per regime (see §6), maintain a Bayesian linear model `y ≈ θ·φ(x)` in the **Normal-Inverse-Gamma** conjugate form
+(unknown noise σ², closed-form online updates, **Student-t** predictive — heavier tails when data is scarce → more
+exploration early, auto-tightening as benches land).
 
-For each dialect:
+- **Target** `y = −log(latency)`. Log compresses the dynamic range so a few catastrophic configs don't dominate the
+  least-squares fit (load-bearing given the high variance), homogenizes the noise, and is monotone so ranking is
+  unaffected. Higher `y` = faster = explore first.
+- **Prior mean 0** (pure ridge — no heuristic mean). Justified by the fast-signal point above: a prior mean only earns
+  its keep when data is scarce *and* per-bench SNR is low; here SNR is high, so cold-start is short.
+- **State**: precision `Λ` (d×d) and info vector `b = Λμ`, plus NIG scalars `(a, β)` for σ². Sufficient statistics
+  accumulate as `Λ += φφᵀ/σ²`, `b += φy/σ²`.
 
-- **Learner**: `lightgbm.LGBMRanker(objective="lambdarank")`.
-- **Group**: rows sharing `(parent_op_signature, depth_in_chain, hardware_tag)` form one ranking group — the unit of
-  "siblings PUCT has to rank against each other." Depth-in-chain matters because the same kernel appears at multiple
-  pipeline depths with progressively-more knobs fixed, and siblings always share a depth.
-- **Label and training-data extraction**. `perf` rows only exist for *terminals* (fully-specified lowerings that were
-  benched), but PUCT asks the prior to rank *partial* states with only some knobs fixed. Training only on terminals
-  puts inference in a feature subspace the model never saw. Instead, we use **value-of-position labels via ancestor
-  unrolling**:
+### 2. Features `φ(x)` — shape-relative, presence-aware
 
-  1. For each terminal in `perf`, walk its lowering chain back through `lowering(parent_key → child_key)` until the
-     dialect root.
-  2. Emit a training row at *every* intermediate state `(parent_op, knobs_so_far, hardware, depth)` along the chain.
-  3. Label = the best terminal latency reachable from that state (max over descendants in the chain DAG). Standard MCTS
-     bootstrapping — "value of this state assuming optimal downstream play."
+Available pre-materialization (same inputs `lazy_score` takes: `KernelShape` + `TileParams` + `compute_capability`) so
+the prior never forces body materialization.
 
-  Filter rows to the dialect being trained. The extraction is a single SQL pass: recursive CTE on `lowering` joined to
-  `perf`, aggregating `MIN(latency_us_median)` per intermediate state.
-- **Features** (all numeric / one-hot, no sequence input):
-  - *Parent op signature* (tabular fingerprint from the dialect's parent op body): op-kind histogram, in/out shape stats
-    (rank, log-bucketed extents, dtype one-hots), loop-nest depth, reduction count, broadcast count, signature hash
-    bucket (categorical).
-  - *Knobs* from `lowering.knobs` JSON — schema is dialect-specific (LoopOp fusion choices vs TileOp BM/BN/BK/num_warps
-    vs KernelOp lowering knobs). **Presence-aware encoding**: each knob becomes *two* features — a presence flag
-    (`has_BK ∈ {0,1}`) and its value (`BK_log2`, or `NaN` when absent). LightGBM handles `NaN` natively and learns
-    splits like "if `has_BK==0` (early state, no BK fixed yet) go left, else split on `BK_log2`." This makes partial
-    and full knob sets share a single feature space, which is required for the value-of-position labels above to be
-    usable at inference.
-  - *Depth-in-chain* as an explicit integer feature, so the model can condition on pipeline progress directly rather
-    than inferring it from presence-flag patterns.
-  - *Hardware features* derived from `Context.compute_capability` and `cuda` device props — `sm_count`, `smem_per_sm`,
-    `l2_size`, `mem_bandwidth_gb_s`, `cc_major/minor`, tensor-core gen flags, plus derived ratios
-    (`tile_smem_bytes / smem_per_sm`, `grid_size / sm_count`). Shared across all three models.
-- **Output**: pre-sigmoid relevance score, used as the tiebreaker tuple element in `_ucb_key` (replacing
-  `child.score`). Rank-only — absolute value irrelevant.
+- **Shape-relative, not raw dims** — required for cross-kernel transfer. Use ratios: cells/thread, predicted occupancy,
+  tile-to-problem ratio, smem/`smem_per_sm`, grid/`sm_count`, arithmetic intensity. Raw extents don't generalize across
+  kernels of different sizes.
+- **Knobs**: high-regret knobs as **main effects** (these move fast); **interaction terms only for the coupled pairs**
+  the `knobs` command flags as high-interaction (data-driven feature selection — keeps d small, regularizes the cross
+  terms). **Presence-aware** encoding (`has_BK ∈ {0,1}` + value-or-NaN) so partial states (some knobs fixed) and
+  terminals share one feature space — needed because the search ranks partial states.
+- **Hardware**: `cc_major/minor` + a `CUDA_DEVICE_SPECS` lookup (`sm_count`, `smem_per_sm`, `l2_size`,
+  `mem_bandwidth_gb_s`, tensor-core gen). The keyed lookup is what lets a new GPU start warm.
+- **Optional heuristic-as-feature**: include `TileOp.score(x)` as one input. If it's as low-quality as we believe, its
+  learned weight decays toward 0 (harmless); if it has residual signal, it earns a small weight. No-regret way to not
+  *trust* it while not *discarding* it.
+- **Standardize** all features (running mean/var, or fixed from the DB). Interaction products blow up the condition
+  number of `Λ` otherwise — this is what keeps Sherman-Morrison numerically stable, not optional.
 
-### 1b. Train/test split and evaluation
+For a *shared* cross-kernel posterior, fit log-latency with a **per-kernel intercept** (mixed-effects): the intercept
+absorbs per-kernel scale, the slopes carry the transferable knob signal. Matches "ordering, not absolute".
 
-Group-aware split — never shuffle rows, since the same `(parent, knobs)` pair appearing on both sides leaks measurement
-noise and inflates NDCG. PUCT faces unseen kernels at inference time; evaluation must reflect that.
+### 3. Cold-start — zero-mean prior + DB warm-start + golden seeding
 
-- **Split**: `GroupKFold(n_splits=5)` keyed on `parent_op_signature_hash` (single 80/20 group split for CI cheapness;
-  full k=5 cross-val for the offline `deplodock prior fit` command).
-- **Metrics reported per fit**: `NDCG@1`, `NDCG@5`, within-group Spearman ρ. NDCG@1 is the primary metric — it answers
-  "would the prior put the actual winner first among unvisited siblings?"
-- **Heuristic baseline**: compute the same metrics for the hand-tuned `TileOp.score` heuristic on the *same held-out
-  groups*. A new model is only promoted (i.e., its row written to `prior_model` and picked up by `latest_prior_version`)
-  if it beats the heuristic on held-out NDCG@1. Otherwise the run logs the regression and keeps the prior version
-  unchanged.
-- **Persistence**: extend the `prior_model` schema with `ndcg_at_1`, `ndcg_at_5`, `spearman`, `heuristic_ndcg_at_1`,
-  `n_groups_train`, `n_groups_eval` so model quality is inspectable across versions.
+Two warm-start tiers on top of the zero-mean prior:
 
-### 2. Persistence: model artifact + version
+1. **DB posterior warm-start (structural prior).** Offline-fit `(θ̄, Σ)` on the whole `perf` DB for the regime, load it
+   as the new kernel's prior. This learned posterior *is* the heuristic's replacement.
+2. **Golden-neighbor seeding (first real measurements).** Seed the first benches with the **golden configs of the
+   nearest kernels in shape-feature space**, then hand off to Thompson. This gives real, high-SNR labels at known-good
+   points immediately, and pairs with the zero-mean prior: no bad heuristic bias, but good empirical starting points
+   instead of wild first Thompson draws.
 
-- New table in `deplodock/compiler/pipeline/search/db.py`, scoped by dialect:
-  ```sql
-  CREATE TABLE IF NOT EXISTS prior_model (
-      dialect              TEXT NOT NULL,             -- 'loop' | 'tile' | 'kernel'
-      version              INTEGER NOT NULL,          -- monotonic per dialect
-      trained_at           TEXT NOT NULL,
-      n_rows               INTEGER NOT NULL,          -- rows used when fit
-      n_groups_train       INTEGER NOT NULL,
-      n_groups_eval        INTEGER NOT NULL,
-      ndcg_at_1            REAL NOT NULL,
-      ndcg_at_5            REAL NOT NULL,
-      spearman             REAL NOT NULL,
-      heuristic_ndcg_at_1  REAL NOT NULL,             -- baseline gap
-      model_blob           BLOB NOT NULL,             -- lightgbm.Booster.model_to_string()
-      feature_spec         TEXT NOT NULL,             -- JSON: feature names + categorical list
-      PRIMARY KEY (dialect, version)
-  );
-  ```
-- `SearchDB.latest_prior_version(dialect) -> int | None` and `load_prior(dialect, version) -> Prior` helpers.
-- A `Prior` wrapper owns the loaded booster + featurizer for one dialect; `prior.score(candidate, ctx) -> float`.
-- A `PriorRegistry` holds the three boosters and dispatches `score(candidate, ctx)` on the candidate's dialect, falling
-  back to `candidate.score()` (heuristic) for dialects with no trained model yet.
+**Seed, don't anchor — and this is a correctness point, not a preference.** Two ways to use goldens:
 
-### 3. Lazy recomputation in MCTS
+- *Seeding* (chosen): **bench** the golden configs ourselves → they get real labels **in the current `-O1` ranking
+  regime**, so the O1↔O3 reorder problem never bites.
+- *Anchoring* (rejected): inject goldens as low-noise pseudo-observations / prior mean. This **trusts goldens as good in
+  the current regime** — false under O1↔O3 reorder (goldens are `-O3` deployable winners; `tune` benches at `-O1`) and
+  false when the new kernel's optimum differs from its neighbors'. Only safe if anchored with goldens measured at the
+  *same* opt level.
 
-Modify `SearchNode` (`mcts.py:32-43`):
+Seeding **measures**; anchoring **trusts**. We measure.
 
-```python
-@dataclass
-class SearchNode:
-    ...
-    _prior_value: float | None = field(default=None, repr=False)
-    _prior_dialect: str | None = field(default=None, repr=False)
-    _prior_version: int | None = field(default=None, repr=False)
+### 4. Selection — Thompson sampling, two integration depths
+
+- **Depth 1 (drop-in, build first).** The posterior just *orders unvisited siblings* — Thompson draw `θ̃ ~ N(θ̄,Σ)`,
+  score the frontier, replace the `child.score` tiebreaker in `_ucb_key`. **Nothing else in `mcts.py` changes**;
+  `+∞`-unvisited and `ucb_c` stay. Minimal blast radius; directly tests whether the ranking leverage is real.
+- **Depth 2 (acquisition, only if depth-1 leverage is too weak).** Promote the posterior into the UCB arithmetic —
+  LinUCB (`θ̄·φ + α·√(φᵀΣφ)`) or LinTS guides descent; `ucb_c` and the `+∞`-unvisited breadth hack go away. Bigger
+  rewrite — earn it with depth-1 benches-to-best numbers first.
+
+**Batched selection** (if benching is ever parallel): draw an **independent posterior sample per slot** (batched
+Thompson) — do *not* draw once and take top-k (collapses exploration). But note `DEPLODOCK_GPU_LOCK` likely serializes
+benching within a run, in which case selection is effectively sequential and single-sample is the natural mode.
+
+### 5. Updates — Sherman-Morrison, mini-batch semantics
+
+- **Single-sample** rank-1 Sherman-Morrison per bench (the serialized-GPU common case), with a **periodic Cholesky
+  refactor of `Λ` every N steps** for numerical hygiene (incremental inverse updates drift; the refactor is the cheap
+  fix and is where any re-regularization clamps live).
+- **Mini-batches are statistically free for updates**: the posterior is a function of the accumulated sufficient
+  statistics `(Σφφᵀ, Σφy)`, so per-sample / rank-k Woodbury / periodic refactor all give the **identical**,
+  order-independent posterior. Batching is purely a compute choice. It matters in practice only for the **offline
+  warm-start refit** over the whole DB and for genuine multi-GPU parallel benching.
+
+### 6. Regularization & regime keying
+
+Most of the regularization is free from the Bayesian formulation:
+
+1. **The prior is ridge.** `Λ₀ = (σ²/τ²)·I` → ridge with `λ = σ²/τ²`. `τ²` controls how fast the model leaves the flat
+   start; broad is fine given high SNR. Auto-annealing: heavily regularized early, likelihood takes over as data lands.
+2. **σ² from data, not guessed.** `perf` stores `min/max/mean` over `n_samples` — a direct measurement-noise estimate.
+   Feed it in (or let the NIG posterior infer it). σ² matters twice: ridge ratio *and* Thompson exploration scale.
+3. **Feature selection = regularization.** Only the high-interaction knob pairs (`knobs` command) become cross-terms.
+4. **Conditioning.** Standardized features (§2) keep `Λ` well-conditioned.
+5. **Forgetting only cross-run.** `Λ ← γΛ` (γ<1) for the *persisted* model to handle driver/GPU drift; keep `γ=1`
+   within a stationary single-GPU run.
+
+**Regime key = `(compute_capability, nvcc_flags)`** — the same partitioning `perf` rows already use. O1 and O3 reorder
+variants, so an O1-trained model and O3 data never share a posterior. `tune`'s `-O1` benches are a *ranking* signal;
+this model ranks, it does not predict deployable latency.
+
+### 7. Persistence
+
+New table in `db.py`, keyed by regime + version:
+
+```sql
+CREATE TABLE IF NOT EXISTS prior_model (
+    regime_key   TEXT NOT NULL,   -- digest(compute_capability, nvcc_flags)
+    version      INTEGER NOT NULL,
+    trained_at   TEXT NOT NULL,
+    n_rows       INTEGER NOT NULL,
+    theta_blob   BLOB NOT NULL,   -- posterior mean μ̄
+    cov_blob     BLOB NOT NULL,   -- Σ (or Λ Cholesky) for Thompson draws
+    nig_blob     BLOB NOT NULL,   -- (a, β) noise posterior
+    scaler_blob  BLOB NOT NULL,   -- feature standardization stats
+    feature_spec TEXT NOT NULL,   -- JSON: feature names + knob/interaction spec
+    metrics      TEXT NOT NULL,   -- JSON: held-out regret@budget, NDCG@topq, calibration, golden-top-K
+    PRIMARY KEY (regime_key, version)
+);
 ```
 
-The `score` property becomes a method on `TuningSearch` (since prior needs the loaded booster):
-`_prior_for(child) -> float`. Cache hit when `(child._prior_dialect, child._prior_version)` matches the registry's
-current `(dialect, version)` for the candidate's dialect; otherwise recompute and update all three fields. Because the
-key is per-dialect, retraining one model never forces recompute for nodes whose candidates belong to a different
-dialect. Fallback to `child.candidate.score()` (the existing heuristic) when no prior is loaded for the candidate's
-dialect — gives day-one parity.
+`SearchDB.latest_prior(regime_key)` / `load_prior` / `write_prior` helpers. A `Prior` wrapper owns the loaded posterior
++ featurizer + scaler; `prior.thompson_scores(candidates, ctx)` returns ranking scores. Falls back to `TileOp.score`
+when no model exists for the regime — day-one parity.
 
-`_ucb_key` keeps shape `(ucb_value, prior_value)`; only the prior source changes.
+### 8. Lazy recompute in MCTS
 
-### 4. Retrain triggers
+Keep the version-tagged lazy scheme: `SearchNode` caches `(prior_value, prior_version)`; on selection, recompute iff the
+registry's current version for the regime has advanced. Nodes never re-selected pay nothing. `_ucb_key` keeps shape
+`(ucb_value, prior_value)` at depth 1 — only the prior *source* changes. (At depth 2 the key changes; defer.)
 
-A new `PriorTrainer` (`deplodock/compiler/pipeline/search/prior/trainer.py`) owns retraining **per dialect** (loop /
-tile / kernel). Triggers fire independently — tile retrains far more often than loop, which is correct.
+### 9. Escape hatch — nonlinearity
 
-- `maybe_retrain(db, mcts_state) -> list[str]` — returns the list of dialects whose model version was bumped.
-  Per-dialect conditions (OR):
-  - **Row growth**: `current_dialect_rows / rows_at_last_fit_for_dialect >= 1.10`, with a floor of `>= 200` new rows to
-    avoid thrashing early.
-  - **Calibration drift**: rolling NDCG@1 of prior predictions vs measured rank over the last K terminals *for that
-    dialect* drops below `0.6`. The trainer keeps one rolling buffer per dialect; `TuningSearch.observe()` feeds it
-    `(dialect, predicted_rank, measured_reward)` per terminal.
-  - **Hard cap**: after `terminals_since_retrain[dialect] >= N_forced` (default 500), retrain regardless.
+If linear + selected interactions can't separate the top quantile (check via the offline harness §10), escalate to an
+incrementally-fit GBT or online RankNet pairwise-SGD. Cost: lose closed-form uncertainty → hand exploration back to UCB
+(depth-1 only). Try linear first; it's the only option that keeps the whole loop closed-form.
 
-- **Promotion gate**: after fitting on the training groups, evaluate NDCG@1 on the held-out groups and compare to the
-  heuristic on the same groups. Promote (write the new `prior_model` row) only if `learned_ndcg_at_1 >
-  heuristic_ndcg_at_1`. Otherwise log the regression with the metrics and keep the previous version.
+## Validation
 
-- Retrain writes a new row to `prior_model` (when promoted); `TuningSearch` reads
-  `latest_prior_version(dialect)` between rollouts. Because node priors are version-tagged per dialect, in-flight tree
-  state stays consistent — stale nodes recompute on next visit; nodes never revisited cost nothing.
+Two levels, sharply separated. Note the memory rule: greedy/learned picks are GPU-dependent, so anything asserting a
+*pick* needs pinned regime — offline ranking validation is GPU-less, benches-to-best is a GPU/`perf`-marked test.
 
-Called from the `Pipeline.tune()` loop body (`deplodock/compiler/pipeline/pipeline.py:466-526`) after `_bench_terminal`.
+### 10. Offline harness (GPU-less, from the `perf` dump) — the cheap falsifier
 
-### 5. Featurizers
+Build this **first**; only proceed if it beats static `score`.
 
-Three things to featurize per training/inference row: the **parent Op** (its structural fingerprint), the **knobs**
-fixed so far (dialect-specific schema), and the **hardware context**. Op-structural features and hardware features are
-dialect-agnostic — only knobs need per-dialect treatment.
+- **Fit** the zero-mean log-latency NIG model on `perf` rows for a regime (reuses the `knobs` command's join +
+  interaction matrix). Optional heuristic-as-feature.
+- **Group split by kernel** (`op_cache_key` group split, never row-shuffle — variants of one kernel leaking across
+  train/test fakes transfer).
+- **Metrics** (all on held-out groups):
+  - **Regret-within-budget** — primary: rank held-out variants by the prior, report the best-found regret after B
+    pseudo-benches. This is the quantity that converts to saved benches.
+  - **NDCG@top-quantile / within-group Spearman** — smooth proxies over the upper slice (not top-1; §Context).
+  - **Golden-top-K** — does the prior surface the kernel's golden config in its top-K? Direct, label-efficient.
+  - **Leave-one-kernel-out (LOKO)** — for each kernel, train on all *others*, check it ranks this kernel's golden
+    highly **cold**. Measures pure transfer / warm-start — the whole value proposition. Near-zero LOKO ⇒ memorizing,
+    do not promote.
+  - **Posterior calibration** — do held-out latencies fall in the 90% Student-t interval ~90% of the time? Validates
+    the **uncertainty**, not just the mean; an overconfident posterior silently kills Thompson exploration and the
+    mean-ranking metrics won't catch it.
+- **Off-policy held-out coverage.** Validate on the broad exploration already in the DB from past full tune runs, *not*
+  on a Thompson-selected trajectory (which is on-policy biased).
+- **Regime match.** Validate the `-O1` model against `-O1`-best targets. Reserve `-O3` goldens for validating an
+  `-O3`-trained model or an end-to-end "final pick == golden" check — never validate an O1 model against O3 goldens.
+- **Promotion gate**: promote a new version only if it beats static `score` on held-out regret-within-budget *and* is
+  calibrated. Else log the regression, keep the old version.
 
-**Unified Op featurizer.** Every Op (LoopOp, TileOp, KernelOp) shares the same `body / inputs / outputs` shape after
-the BodyOp unification (PR #145), so a single function walks any Op and emits the same column set regardless of which
-dialect it lives in:
+### 11. Online truth (GPU, `perf`-marked) — benches-to-best
 
-```python
-# deplodock/compiler/pipeline/search/prior/op.py
-def op_features(op: Op) -> dict[str, float]:
-    """Dialect-agnostic structural features. Same columns whether op is a
-    LoopOp / TileOp / KernelOp — they share Op.body / .inputs / .outputs.
-    Used by all three per-dialect models."""
-    return {
-        # input/output tensor stats
-        "n_inputs": ..., "n_outputs": ...,
-        "in_rank_max": ..., "in_extent_log2_max": ...,
-        # ... dtype one-hots (fp16/bf16/fp32/i32/...)
-        # body fingerprint — recursive walk
-        **op_kind_histogram(op),               # counts of MatMul/Add/Mul/Exp/Reduce/...
-        "body_depth": ...,                     # max loop-nest depth in body
-        "n_reductions": ..., "n_broadcasts": ...,
-        "signature_hash_bucket": ...,          # categorical: hash(canonical_pretty) % N
-    }
-```
+The thing that matters. On target ops with wide knob spaces (Qwen matmul `(M=32,K=3584,N=18944)`; SDPA TinyLlama `s32`;
+`matmul_add s128`), run `tune` with `--prior off` vs `--prior auto` (cold) vs `--prior auto` (warm cache + golden
+seeding) against a snapshot DB; record `terminals_to_best` and `best_us`. Script: `scripts/bench_prior_reduction.py`.
 
-The op-kind histogram is itself dialect-agnostic — it counts whatever `Op` subclasses appear in `body`. A new dialect
-or new op kind just shows up as a new column in the histogram (existing column set extends, models retrained on the
-new schema pick it up).
-
-**Hardware features come from Context, unified with `structural_key`.** `Context.structural_key()` today
-(`deplodock/compiler/context.py:76-88`) hand-picks the codegen-affecting fields. The prior must consume the *same* set
-of fields — otherwise the cache key and the model drift as Context grows (forced TMA, splitk overrides, etc.). Single
-source of truth:
-
-```python
-def codegen_view(self) -> dict[str, Any]:
-    """Codegen-affecting fields, in a stable order. Single source of truth
-    for both ``structural_key`` (digested) and prior featurization."""
-    return {
-        "compute_capability": self.compute_capability,
-        # extend as forced-TMA / splitk-overrides land
-    }
-```
-
-- `structural_key()` becomes `digest("Context", *sorted(self.codegen_view().items()))` — same key as today.
-- `hardware_features(ctx)` reads `ctx.codegen_view()` and materializes numeric features: cc fields go in as-is, plus
-  looked-up specs from a `CUDA_DEVICE_SPECS` table keyed by `cc_major.cc_minor` (sm_count, smem_per_sm, l2_size,
-  mem_bandwidth_gb_s, tensor_core_gen flags). The keyed lookup is what lets the prior generalize cross-GPU.
-- A parity test asserts `codegen_view()`'s key set matches what `hardware_features` consumes.
-
-**Unified knob featurizer.** Knobs are already a uniform key-value dict in `lowering.knobs` JSON — same shape across
-all dialects, just different key sets. One function handles every dialect:
-
-```python
-# deplodock/compiler/pipeline/search/prior/knobs.py
-def knob_features(knobs: dict[str, Any], spec: KnobSpec) -> dict[str, float]:
-    """Presence-aware encoding for every knob in ``spec``. Dialect-agnostic
-    — the spec is just the union of knob keys observed in the training
-    rows for the dialect being fit."""
-    out: dict[str, float] = {}
-    for name, meta in spec.items():
-        if name in knobs:
-            out[f"has_{name}"] = 1.0
-            out[name] = meta.encode(knobs[name])   # log2 for sizes, raw for counts, ordinal for enums
-        else:
-            out[f"has_{name}"] = 0.0
-            out[name] = float("nan")
-    return out
-```
-
-The encoding (log2 vs raw vs ordinal vs categorical) is a property of the Knob, not of the featurizer. Today the
-encoding can be inferred heuristically (int → raw, power-of-two int → log2, str → ordinal hash); when richer typing is
-needed, extend the `Knob` class (e.g. `class Knob: name; kind: Literal["count", "log2_size", "enum"]; choices: ...`)
-and the featurizer reads `Knob.kind`. No per-dialect branching.
-
-`KnobSpec` for a dialect is the union of all knob keys ever observed in `lowering.knobs` for that dialect's rows,
-discovered during training-data extraction and persisted alongside the model in `prior_model.feature_spec`. New knobs
-appearing in future cache rows trigger a retrain (row-growth signal), and the new spec is captured then.
-
-**Top-level `featurize(parent_op, knobs, ctx, spec)`** concatenates `op_features(parent_op)` +
-`knob_features(knobs, spec)` + `hardware_features(ctx)` + `{"depth_in_chain": …}` into a numpy row in the spec order
-persisted in `prior_model.feature_spec`. No dialect-specific code path — only the loaded `feature_spec` (per-dialect)
-distinguishes models.
-
-All prior-related code lives in a single `search/prior/` package:
-
-```
-deplodock/compiler/pipeline/search/prior/
-    __init__.py    # public API: Prior, PriorRegistry, PriorTrainer, featurize
-    registry.py    # Prior (loaded booster + spec), PriorRegistry (per-dialect dispatch)
-    trainer.py     # PriorTrainer, maybe_retrain, group-aware split, promotion gate
-    features.py    # featurize(parent_op, knobs, ctx, spec) concatenator + KnobSpec discovery
-    op.py          # op_features(op)              — dialect-agnostic
-    knobs.py       # knob_features(knobs, spec)   — dialect-agnostic
-    hardware.py    # hardware_features(ctx)       — dialect-agnostic
-```
-
-### 6. CLI surface
-
-- `deplodock tune --prior {auto,off,heuristic}` (default `auto`):
-  - `auto`: use latest learned prior if `prior_model` table has a row, else fall back to heuristic.
-  - `off`: pure UCB1 with no tiebreaker (`prior_value = 0`).
-  - `heuristic`: force `TileOp.score`.
-- `deplodock prior fit [--db PATH] [--dialect {loop,tile,kernel,all}] [--cv-folds N]` — one-shot offline retrain that
-  ignores the trigger logic; defaults to `--dialect all --cv-folds 5`. Prints per-dialect held-out NDCG@1/NDCG@5/Spearman
-  and the heuristic baseline gap, then writes promoted models. Useful for bootstrapping from an existing cache.
-- `deplodock prior eval [--db PATH] [--dialect ...]` — load the latest promoted model per dialect and re-report
-  held-out metrics without retraining; useful for inspecting model drift over time.
+- **Pass**: median `terminals_to_best` reduction ≥ 30% with no op regressing `best_us` > 10% (the prior must not trade
+  quality for convergence speed).
+- **Held-out variant**: exclude the target ops' rows from the fit (LOKO). Pass: median reduction ≥ 15%. Near-zero ⇒
+  memorizing, do not ship.
 
 ## Files to modify
 
-- `deplodock/compiler/context.py` — add `Context.codegen_view()` helper; rewrite `structural_key()` to digest it so the
-  cache-key contract and prior featurization share a single source of truth.
-- `deplodock/compiler/pipeline/search/policy/mcts.py` — add `_prior_value/_prior_version` to `SearchNode`; route
-  tiebreaker through `TuningSearch._prior_for(child)`; expose `observe_prediction(child, reward)` hook for calibration
-  tracking.
-- `deplodock/compiler/pipeline/search/db.py` — add `prior_model` table to `_SCHEMA`; add `latest_prior_version`,
-  `load_prior_blob`, `write_prior_model` methods.
-- `deplodock/compiler/pipeline/search/prior/` *(new package, all prior code lives here)*:
-  - `registry.py` — `Prior` (loaded booster + feature_spec), `PriorRegistry` (per-dialect dispatch).
-  - `trainer.py` — `PriorTrainer`, `maybe_retrain` (per-dialect triggers), group-aware split + held-out evaluation +
-    heuristic-baseline promotion gate.
-  - `features.py` — top-level `featurize(parent_op, knobs, ctx, spec)` concatenator + `KnobSpec` discovery from cache.
-  - `op.py`, `knobs.py`, `hardware.py` — dialect-agnostic sub-featurizers (Op-structural, knob presence-encoding,
-    hardware lookup).
-  - `__init__.py` — re-exports the public API.
+- `deplodock/compiler/pipeline/search/prior/` *(new package)* — `model.py` (NIG Bayesian-linear: Sherman-Morrison
+  update, Thompson draw, Cholesky refactor), `features.py` (shape-relative + presence-aware knob + hardware featurizer,
+  standardizer, interaction selection from the `knobs`-command matrix), `seed.py` (nearest-kernel golden seeding),
+  `registry.py` (`Prior` wrapper + regime dispatch, heuristic fallback), `fit.py` (offline DB fit + group-split
+  evaluation + promotion gate), `__init__.py`.
+- `deplodock/compiler/pipeline/search/policy/mcts.py` — route the tiebreaker through `TuningSearch._prior_for(child)`
+  (Thompson score), version-tagged lazy recompute on `SearchNode`, `observe()` feeds `(features, latency)` to the online
+  update. Depth-2 LinUCB deferred.
+- `deplodock/compiler/pipeline/search/db.py` — `prior_model` table; `latest_prior` / `load_prior` / `write_prior`.
+- `deplodock/compiler/pipeline/pipeline.py` — online update + (optional) mid-run version bump after each terminal bench;
+  pass the loaded `Prior` into `TuningSearch`.
+- `deplodock/commands/tune.py` — `--prior {auto,off}` (default `auto`: learned if a `prior_model` row exists for the
+  regime, else heuristic fallback; `off`: zero tiebreaker).
+- `deplodock/commands/prior.py` *(new)* — `deplodock prior fit` / `prior eval` offline subcommands (bootstrap from an
+  existing cache, report held-out regret-within-budget / NDCG@topq / golden-top-K / calibration vs the static-`score`
+  baseline).
+- `scripts/bench_prior_reduction.py` *(new)* — the §11 benches-to-best harness.
+- Tests under `tests/compiler/search/` — featurizer determinism + presence-aware partial-state encoding; Sherman-Morrison
+  vs batch-refactor give identical posteriors; group-split correctness; promotion gate rejects a worse model; calibration
+  coverage on a toy fixture; lazy-recompute version invariants; golden seeding picks nearest-kernel configs.
 
-  The only per-dialect artifact is the `feature_spec` JSON persisted in `prior_model`.
-- `deplodock/compiler/pipeline/pipeline.py` — call `prior_trainer.maybe_retrain(db, search)` in the tune loop after each
-  bench; pass loaded `Prior` into `TuningSearch` (via constructor or `set_prior()`).
-- `deplodock/commands/tune.py` — `--prior` flag; load latest prior from DB on startup.
-- `deplodock/commands/prior.py` *(new)* — `deplodock prior fit` subcommand; register in CLI root.
-- Tests under `tests/compiler/search/` — unit tests for featurizer determinism, lazy recomputation invariants, retrain
-  trigger conditions; integration test that runs `tune` on a tiny kernel with a forced retrain mid-run and asserts
-  consistency.
+## Build order
 
-## Verification
+1. **Offline harness** (`prior fit` + §10 metrics) — the cheap falsifier. Fit zero-mean log-latency NIG on the `perf`
+   dump, evaluate LOKO regret-within-budget + golden-top-K + calibration vs static `score`. **Stop here if it doesn't
+   win.**
+2. **Online path behind the tiebreaker** (depth 1) — wire Thompson scoring + Sherman-Morrison `observe`, golden seeding,
+   DB warm-start. Measure §11 benches-to-best.
+3. **LinUCB acquisition** (depth 2) — only if depth-1 tiebreaker leverage is too weak.
 
-1. **Unit**: `./venv/bin/pytest tests/compiler/search/test_prior.py -v` — covers unified `op_features` determinism
-   across dialects (same Op subclass passed at LoopOp/TileOp/KernelOp wrapping levels yields the same structural
-   columns), unified `knob_features` determinism (a TileOp knob set and a LoopOp knob set both featurize through the
-   same function, each against its own `KnobSpec`), group-aware split correctness (no group appears in both train and eval), held-out NDCG
-   computation matches a hand-checked toy case, heuristic-baseline promotion gate rejects a worse model,
-   `SearchNode` lazy recompute (set `(dialect, version)`, assert recompute happens; bump version for one dialect,
-   assert nodes of other dialects are not invalidated), **`Context.codegen_view()` parity** (the helper's key set
-   matches what `hardware_features(ctx)` consumes; `structural_key()` digest is byte-stable across reordering of
-   `codegen_view()` insertion order), **ancestor-unrolling extraction** (a fixture DB with two terminals sharing an
-   intermediate ancestor produces the expected per-depth groups and best-of labels), and **presence-aware knob
-   encoding** (a partial knob set featurizes with `NaN` in the unset slots and the same column order as a terminal).
-2. **Integration**: `./venv/bin/pytest tests/compiler/search/test_tune_prior.py -v -p no:randomly` — small matmul tune
-   run with `--prior heuristic` vs `--prior auto` (cold) vs `--prior auto` (warm cache); assert warm-cache run reaches
-   the known optimum in fewer terminals than cold/heuristic.
-3. **End-to-end node-expansion reduction** (primary success metric). The whole point of the prior is to make MCTS
-   expand fewer terminals to reach the optimum. Measure it directly on operations with non-trivial search spaces:
+## Open questions
 
-   - **Target ops** (each has a wide TileOp knob space that the current heuristic only partially constrains):
-     - Qwen-shape matmul `(M=32, K=3584, N=18944)` — the shape the existing `TileOp.score` was hand-tuned to avoid
-       blowing up on (see docstring at `deplodock/compiler/ir/tile/ir.py:608-700`).
-     - SDPA TinyLlama `s32` — non-trivial fused softmax+matmul knob space; the 2026-05-15 autotune sweep
-       saw this regress from 8.08x → 4.17x, indicating real sensitivity to knob choice.
-     - `matmul_add s128` — already flagged in the autotune-failures memory as a wedged case under the heuristic.
-
-   - **Procedure** (script at `scripts/bench_prior_reduction.py`):
-     1. Snapshot the current `~/.cache/deplodock/autotune.db` to a fresh DB.
-     2. For each target op, run `deplodock tune --prior heuristic --patience 100` and record `terminals_to_best`
-        (number of bench-evaluated terminals before the patience window closed on the best variant).
-     3. Run `deplodock prior fit --db <snapshot>` to fit the learned prior from cache rows.
-     4. For each target op, run `deplodock tune --prior auto --patience 100` against the *same* snapshot and record
-        `terminals_to_best`.
-     5. Report a table `(op, terminals_heuristic, terminals_prior, reduction_pct, best_us_heuristic, best_us_prior)`.
-
-   - **Pass criteria**: median `reduction_pct ≥ 30%` across the target ops, with no individual op regressing more than
-     10% on `best_us` (the prior must not trade quality for speed of convergence). Numbers persisted to
-     `bench_results/prior_reduction.csv` so we can chart improvement across model versions.
-
-   - **Held-out variant**: repeat (3.3) with the target ops' rows *excluded* from the training set (group-level
-     leave-one-out by `parent_op_signature_hash`). Pass criteria: median `reduction_pct ≥ 15%`. This is the honest
-     test that the prior generalizes — if the held-out reduction is near zero, the prior is memorizing rather than
-     learning structure, and we should not promote it.
-
-4. **Smoke**: `deplodock prior fit --db ~/.cache/deplodock/autotune.db` then
-   `deplodock tune --code "torch.nn.Linear(2048, 2048)(torch.randn(32, 2048).cuda())"` — confirm the run loads the
-   prior (stderr line) and that terminal count to first record is lower than the heuristic baseline on the same
-   patience.
-5. **Full suite**: `make test` and `make lint` before commit.
-6. **Cross-GPU sanity**: train prior on sm_120 cache rows only, predict on synthetic sm_90 hardware features, confirm
-   ranker still produces sensible relative order on a fixed `(kernel, knobs)` sweep (no NaN, monotone with knob
-   sweeps that should monotonically improve).
+- Reward shape: `−log(latency)` vs a rank-transform per group — log keeps it Gaussian-NIG; rank-transform is fully
+  scale-free but loses magnitude. Decide from calibration results in step 1.
+- Does the per-kernel intercept (mixed-effects) transfer better than a global zero-mean fit? A/B in the offline harness.
+- Outer fusion-fork prior: forks are deterministic today (one terminal), so the prior is inner-search-only for now.
+  Revisit once `plans/structural-forks-in-two-level.md` makes forks branch.

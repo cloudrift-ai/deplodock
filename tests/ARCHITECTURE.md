@@ -177,3 +177,11 @@ pytest tests/deploy/test_recipe.py -v  # single file
 pytest tests/planner/ -v               # single directory
 pytest tests/perf/ -m perf -v          # GPU perf suite (see tests/perf/ARCHITECTURE.md)
 ```
+
+Under `make test` (`-n auto --dist=loadgroup`) the root `conftest.py` routes every CUDA-touching test onto two
+serial chains via dynamic `xdist_group` markers — `cuda` for in-process device work (one shared context, keeps
+the attention-chain accuracy thresholds deterministic) and `cuda-cli` for `run_cli` subprocess tests (each owns a
+fresh CUDA context; bounding their concurrency prevents GPU OOM from ~30 simultaneous subprocesses). The hook is
+`tryfirst` because xdist's worker-side hook bakes group names into nodeids before plain conftest hooks run —
+without it the markers land too late and CUDA tests silently scatter across workers. Non-CUDA tests are
+LPT-bucketed across the remaining workers using the cached duration table.

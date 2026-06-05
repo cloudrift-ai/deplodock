@@ -172,6 +172,12 @@ def inner_reward(
     # Ops with no cache key are unreachable through the bench path so they
     # don't enter the dedup map at all (matches the previous filter).
     unique: OrderedDict[str, tuple[str, object, int]] = OrderedDict()
+    # One score cache for ALL the per-op inner searches: ``Fork.score_key``
+    # is value-keyed (plan cache key + knob row), so slices of structurally
+    # identical kernels — and re-visits of the same kernel — share every
+    # planner-prior score instead of recomputing ~40k ``lazy_score`` rows
+    # per slice.
+    score_cache: dict = {}
     for nid, op in _kernel_nodes(fused_graph):
         key = op_cache_key(op)
         if key is None:
@@ -190,7 +196,7 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c)
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache)
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats

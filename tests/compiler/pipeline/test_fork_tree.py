@@ -32,7 +32,7 @@ def _stub_materialize(p: P) -> str:
     return f"op({p.a},{p.b},{p.c})"
 
 
-def _identity_score(p: P) -> float:
+def _identity_score(p: P, cache: dict | None = None) -> float:  # noqa: ARG001 — builder contract passes the search cache
     return float(p.a * 100 + p.b * 10 + p.c)
 
 
@@ -132,13 +132,31 @@ def test_branch_score_is_max_of_children():
         assert branch.score() == pytest.approx(expected)
 
 
-def test_siblings_sorted_descending_by_score():
-    """Sibling Forks at every level appear in descending score order."""
-    # Three distinct A values; identity_score makes A=3 best, A=1 worst.
+def test_siblings_unranked_in_grouping_order():
+    """The builder does NOT sort siblings — ranking is search policy
+    (``Search.score_of``). Siblings come out in grouping (= first-
+    occurrence) order regardless of score."""
+    # identity_score makes A=3 best, but A=1 was enumerated first.
     params = [P(1, 0, 0), P(3, 0, 0), P(2, 0, 0)]
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=_identity_score)
-    scores = [f.score() for f in tree.expand()]
-    assert scores == sorted(scores, reverse=True)
+    assert [f.knobs["A"] for f in tree.expand()] == [1, 3, 2]
+
+
+def test_score_receives_the_search_cache():
+    """``Fork.score(cache)`` threads the search-owned dict down to the
+    caller's per-param scorer (which owns its own keying), at every
+    level — branch max and leaf alike."""
+    seen: list[dict | None] = []
+
+    def recording_score(p: P, cache: dict | None = None) -> float:
+        seen.append(cache)
+        return _identity_score(p)
+
+    params = [P(1, 0, 0), P(2, 0, 0)]
+    tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=recording_score)
+    the_cache: dict = {}
+    tree.score(the_cache)
+    assert seen and all(c is the_cache for c in seen)
 
 
 def test_leaf_knobs_keys_equal_last_level_knob_names():
@@ -209,19 +227,24 @@ def test_materialize_is_lazy():
 
 
 def test_score_is_lazy_and_called_at_most_once_per_param():
-    """``score`` fires ZERO times at build (the root is fully lazy) and at
-    most once per param after a full tree walk — the per-param memo means
+    """``score`` fires ZERO times at build AND at expansion (ranking is
+    search policy — nothing scores until a score is read) and at most
+    once per param across a full tree's reads — the per-tree memo means
     no rescoring across levels or repeated ``score()`` reads."""
     calls: list[P] = []
 
-    def counting_score(p: P) -> float:
+    def counting_score(p: P, cache: dict | None = None) -> float:  # noqa: ARG001
         calls.append(p)
         return _identity_score(p)
 
     params = [P(a, b, c) for a in (1, 2) for b in (1, 2) for c in (1, 2)]  # 8 unique params
     tree = build_fork_tree(params=params, levels=_LEVELS, materialize=_stub_materialize, score=counting_score)
     assert calls == [], "score fired during build — it must be lazy"
-    _walk_leaves(tree)  # full expansion sorts every level
+    leaves = _walk_leaves(tree)
+    branches = _walk_branches(tree)
+    assert calls == [], "score fired during expansion — ranking is the search's job"
+    for fork in (tree, *branches, *leaves):
+        fork.score()
     tree.score()  # repeated reads hit the memo
     assert len(calls) == len(params)
     assert set(calls) == set(params)

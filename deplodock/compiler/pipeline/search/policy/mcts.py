@@ -4,9 +4,10 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
     select   — descend from root, picking at each level
                ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
                where ``Q_norm = best_reward / global_best``. Unvisited
-               children get ``+∞``, breaking ties on the candidate's
-               ``score()`` prior. Live-count filtering skips subtrees
-               whose frontier has been fully drained.
+               children get ``+∞``, breaking ties on the fork prior
+               (``Search.score_of`` — value-keyed, cached on the
+               search). Live-count filtering skips subtrees whose
+               frontier has been fully drained.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
                candidates as children of the last popped node;
     simulate — the engine runs the popped candidate and benches it;
@@ -22,8 +23,8 @@ with the reward — it only breaks ties among unvisited siblings.
 from __future__ import annotations
 
 import math
+from collections.abc import Hashable
 from dataclasses import dataclass, field
-from functools import cached_property
 
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
@@ -38,17 +39,12 @@ class SearchNode:
     visits: int = 0
     best_reward: float = 0.0  # max reward over this subtree's measured leaves
     live: int = 0  # count of un-popped frontier leaves in this subtree
-
-    @cached_property
-    def score(self) -> float:
-        """Cached :meth:`LazyCandidate.score` (the pending fork's lazy
-        prior) — UCB descent reads this on every unvisited sibling at
-        every level per pop, and a branch fork's prior is a max over its
-        param subgroup, so the per-node cache keeps repeated descents
-        O(1). Sound because ``LazyCandidate.score`` is a pure function
-        of ``pending``, frozen once the SearchNode is attached.
-        """
-        return self.candidate.score() if self.candidate is not None else float("-inf")
+    # Memoized ``Search.score_of`` read (filled by ``_ucb_key``) — UCB
+    # descent reads the prior on every unvisited sibling at every level
+    # per pop, and a branch fork's prior is a max over its param
+    # subgroup, so the per-node memo keeps repeated descents O(1). Sound
+    # because the fork's score is frozen once the SearchNode is attached.
+    prior: float | None = field(default=None, repr=False)
 
 
 class SearchTree:
@@ -93,7 +89,9 @@ class TuningSearch(Search):
         patience: int = 20,
         ucb_c: float = DEFAULT_UCB_C,
         max_visits: int | None = None,
+        score_cache: dict[Hashable, float] | None = None,
     ) -> None:
+        super().__init__(score_cache=score_cache)
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
         self._patience = patience
@@ -116,9 +114,9 @@ class TuningSearch(Search):
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
         self.tree.record_terminal(reward)
 
-    def push(self, primary: LazyCandidate, *forks: LazyCandidate, best: LazyCandidate | None = None) -> None:
+    def push(self, *cands: LazyCandidate, best: LazyCandidate | None = None) -> None:
         del best  # tuning explores every fork — DB hint is for greedy
-        self.tree.attach([primary, *forks], parent=self.tree.last_popped)
+        self.tree.attach(list(cands), parent=self.tree.last_popped)
 
     def pop(self) -> LazyCandidate | None:
         if self._should_stop():
@@ -144,14 +142,19 @@ class TuningSearch(Search):
     def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
         """Selection score = (UCB1 value, score-as-tiebreak). Returned as
         a tuple so unvisited siblings (UCB1 = +∞) are ranked by their
-        prior. Reward is normalized against the global best so the
-        ``c`` constant is unit-free."""
+        prior (``Search.score_of``, memoized per node — see
+        ``SearchNode.prior``). Reward is normalized against the global
+        best so the ``c`` constant is unit-free."""
+        prior = child.prior
+        if prior is None:
+            prior = self.score_of(child.candidate.fork) if child.candidate is not None else float("-inf")
+            child.prior = prior
         if child.visits == 0:
-            return float("inf"), child.score
+            return float("inf"), prior
         global_best = self.tree.best_reward
         q_norm = (child.best_reward / global_best) if global_best > 0 else 0.0
         bonus = self._ucb_c * math.sqrt(math.log(max(parent.visits, 1)) / child.visits)
-        return q_norm + bonus, child.score
+        return q_norm + bonus, prior
 
     def _should_stop(self) -> bool:
         if self.stop_reason is not None:

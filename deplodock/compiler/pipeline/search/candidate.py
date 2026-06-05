@@ -20,7 +20,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.pipeline import Cursor, Fork
+from deplodock.compiler.pipeline.pipeline import Cursor, Fork, OptionFork
 from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-
@@ -238,13 +238,13 @@ class LazyCandidate:
         filter) — the constructor just lifts the option into the Fork
         shape so resolve / expand / _best_fork can treat it uniformly."""
         knobs = dict(getattr(op, "knobs", None) or {})
-        leaf = Fork(knobs=knobs, expand=lambda: [op], is_leaf=True)
+        leaf = OptionFork(option=op, knobs=knobs)
         return cls(inner=inner, cursor=cursor, pending=(match, leaf))
 
     @classmethod
     def from_graph(cls, *, inner: Candidate, cursor: Cursor, match: Match, graph: Graph) -> LazyCandidate:
         """Wrap a ``Graph`` fragment splice as a leaf-Fork-pending LazyCandidate."""
-        leaf = Fork(knobs={}, expand=lambda: [graph], is_leaf=True)
+        leaf = OptionFork(option=graph)
         return cls(inner=inner, cursor=cursor, pending=(match, leaf))
 
     @classmethod
@@ -318,29 +318,14 @@ class LazyCandidate:
         self.inner = resolved
         return resolved
 
-    def score(self) -> float:
-        """The pending Fork's planner prior (``fork.score()``), or ``0.0``
-        for a no-pending wrapper. This is the MCTS unvisited-sibling
-        tiebreak — and the fork prior is the ONLY meaningful component:
-        siblings at a fork point share ``inner`` by reference, and UCB
-        only ever compares children of one parent, so any inner-graph
-        term would be a constant offset within every comparison set.
-        (``Op.score``, the old post-materialization walk that supplied
-        such a term, was dropped for exactly that reason —
-        ``Op.lazy_score`` is the only scorer.)
-
-        We deliberately do NOT fire ``fork.expand()`` here to recover
-        the option and re-score it: ``expand()`` for a partition leaf
-        runs ``_build_split_body`` + ``TileOp.__post_init__`` (full body
-        normalization), and MCTS's ``_ucb_key`` reads this score for
-        every unvisited sibling at every descent level. Materializing
-        every leaf just to rank it defeats the whole lazy-planner
-        design — the planner-side ``lazy_score`` is the signal.
-        """
-        if self.pending is None:
-            return 0.0
-        _, fork = self.pending
-        return fork.score()
+    @property
+    def fork(self) -> Fork | None:
+        """The pending :class:`Fork`, or ``None`` for a no-pending
+        wrapper. Scoring/ranking is search policy — the policies read
+        ``Search.score_of(cand.fork)`` (which owns the value-keyed
+        cache and the why-prior-only rationale); this accessor is just
+        the unwrap."""
+        return self.pending[1] if self.pending is not None else None
 
 
 # ---------------------------------------------------------------------------

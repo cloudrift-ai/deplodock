@@ -235,8 +235,8 @@ class _Plan:
     shape: KernelShape
     leading: tuple[Stmt, ...]
     # The LoopOp's carry-forward knobs, including its ``SID`` structural
-    # identity — the score-cache key component that lets structurally
-    # identical kernels share entries.
+    # identity — merged under every scored row so structurally identical
+    # kernels score identically.
     base_knobs: dict
     kernel_name: str
     params: tuple[dict, ...]
@@ -267,8 +267,9 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
     Fork's ``expand`` thunk, so greedy compile only builds the one
     chosen variant per LoopOp. ``_plan_kernel`` runs the cheap up-front
     classification + enumeration and produces a ``_Plan`` with bare
-    knob rows; sibling sorting uses :meth:`TileOp.lazy_score`
-    — the only scorer — so ranking never needs a materialized TileOp.
+    knob rows; sibling ranking (the search's job, via the Forks' score
+    thunks) uses :meth:`TileOp.lazy_score` — the only scorer — so it
+    never needs a materialized TileOp.
 
     The finished plan rides the LoopOp as op metadata (re-plans of the
     same op object are a stamp hit — see :func:`_plan_kernel`), and
@@ -299,43 +300,42 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | l
             Level((BK.name, SPLITK.name), lambda p: (p["BK"], p["SPLITK"])),
         ],
         materialize=lambda p: _materialize(plan, p),
-        score=lambda p: _score_variant(plan, p, ctx),
+        score=lambda p, cache: _score_variant(plan, p, ctx, cache),
     )
 
 
-# Value-keyed score cache: ``(SID, ctx fields, frozenset(row.items())) →
-# score``. The SID knob (``loop/fusion/040_stamp_structural_id``) makes the knob dict a
-# complete variant identity, so structurally identical kernels — the same
-# layer repeated through a whole model — share entries with no
-# object-identity bookkeeping, and entries can never go stale: the score is
-# a pure function of the key. Process-lifetime; no reset hook needed.
-_SCORE_CACHE: dict[tuple, float] = {}
-
-
-def _score_variant(plan: _Plan, params: dict, ctx: Context) -> float:
+def _score_variant(plan: _Plan, params: dict, ctx: Context, cache: dict | None = None) -> float:
     """Score one variant: the row IS the knob delta the materialized TileOp
-    will carry, so on a cache miss ``lazy_score`` consumes ``base_knobs``
-    merged with the row verbatim. Scoring MUST stay materialization-free —
-    this runs once per enumerated variant (~40k+ per matmul kernel), and a
-    single ``_materialize`` is ~1.5 ms of body building + normalization; a
+    will carry, so ``lazy_score`` consumes ``base_knobs`` merged with the
+    row verbatim. Scoring MUST stay materialization-free — this runs once
+    per enumerated variant (~40k+ per matmul kernel), and a single
+    ``_materialize`` is ~1.5 ms of body building + normalization; a
     ``None`` here means ``lazy_score``'s contract was broken, not a
-    fallback case."""
+    fallback case.
+
+    ``cache`` is the search-owned value-keyed score store (handed down via
+    ``Search.score_of`` → ``Fork.score``; ``None`` outside a search). The
+    key is ``(ctx fields, frozenset(merged knobs))`` — complete because
+    the ``SID`` knob (``loop/fusion/040_stamp_structural_id``) makes the
+    knob dict a full variant identity — so structurally identical kernels,
+    the same layer repeated through a whole model, share entries with no
+    object-identity bookkeeping, and entries can never go stale: the score
+    is a pure function of the key."""
+    knobs = {**plan.base_knobs, **params} if plan.base_knobs else params
     key = (
-        plan.base_knobs["SID"],
         ctx.compute_capability,
         ctx.warp_size,
         ctx.max_dynamic_smem,
         ctx.max_threads_per_cta,
-        frozenset(params.items()),
+        frozenset(knobs.items()),
     )
-    cached = _SCORE_CACHE.get(key)
-    if cached is not None:
+    if cache is not None and (cached := cache.get(key)) is not None:
         return cached
-    knobs = {**plan.base_knobs, **params} if plan.base_knobs else params
     lazy = TileOp.lazy_score(ctx, knobs=knobs, shapes=plan.shape)
     if lazy is None:
         raise AssertionError(f"TileOp.lazy_score returned None for kernel {plan.kernel_name!r} — the variant scorer must not materialize")
-    _SCORE_CACHE[key] = lazy
+    if cache is not None:
+        cache[key] = lazy
     return lazy
 
 
