@@ -271,11 +271,11 @@ def run_two_level_tune(
     best_fused: Graph | None = None
     best_reward: InnerReward | None = None
     n_terminals = 0
-    for fused in outer_pipeline.search(outer, ctx, db=db):
+    for token, fused in outer_pipeline.search(outer, db=db):
         n_terminals += 1
         reward = inner_reward(fused.graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=ucb_c, progress=progress)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
-        outer.observe(stats, "ok" if reward.ok else "bench_fail")
+        outer.observe(token, stats, "ok" if reward.ok else "bench_fail")
         positions = sum(r.multiplicity for r in reward.per_op)
         logger.info(
             "[tune] fused terminal #%d: Σ per-op = %.2f us (%d unique kernels, %d positions)",

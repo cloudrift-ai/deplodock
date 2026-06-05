@@ -27,9 +27,10 @@ class GreedySearch(Search):
         super().__init__()
         self._pending: LazyCandidate | None = None
 
-    def push(self, *cands: LazyCandidate, best: LazyCandidate | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None, best: LazyCandidate | None = None) -> None:
+        del parent  # greedy keeps no lineage — one pending slot, no tree
         self._pending = best if best is not None else max(cands, key=lambda c: self.score_of(c.fork))
 
-    def pop(self) -> LazyCandidate | None:
+    def pop(self) -> tuple[object | None, LazyCandidate] | None:
         c, self._pending = self._pending, None
-        return c
+        return (None, c) if c is not None else None

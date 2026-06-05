@@ -9,10 +9,12 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
                search). Live-count filtering skips subtrees whose
                frontier has been fully drained.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
-               candidates as children of the last popped node;
+               candidates as children of the ``parent`` token (the
+               ``SearchNode`` their spawning candidate was popped with);
     simulate — the engine runs the popped candidate and benches it;
     backprop — :meth:`SearchTree.record_terminal` walks ``parent``
-               links bumping ``visits`` and updating
+               links from the observed terminal's token, bumping
+               ``visits`` and updating
                ``best_reward = max(best_reward, leaf_reward)``.
 
 Reward is normalized to [0,1] against the global best so the UCB
@@ -50,7 +52,6 @@ class SearchNode:
 class SearchTree:
     def __init__(self) -> None:
         self.root = SearchNode(candidate=None)
-        self.last_popped = self.root
 
     @property
     def best_reward(self) -> float:
@@ -65,10 +66,11 @@ class SearchTree:
             cur.live += len(nodes)
             cur = cur.parent
 
-    def record_terminal(self, reward: float) -> None:
-        """Max-propagate ``reward`` from the most recently popped node
-        up to the root, bumping ``visits`` along the way."""
-        cur: SearchNode | None = self.last_popped
+    def record_terminal(self, node: SearchNode, reward: float) -> None:
+        """Max-propagate ``reward`` from ``node`` (the terminal's own
+        SearchNode — the token it was popped with) up to the root,
+        bumping ``visits`` along the way."""
+        cur: SearchNode | None = node
         while cur is not None:
             cur.visits += 1
             if reward > cur.best_reward:
@@ -108,17 +110,21 @@ class TuningSearch(Search):
         self.last_stats: PerfStats | None = None
         self.last_status: str | None = None
 
-    def observe(self, stats: PerfStats, status: str) -> None:
+    def observe(self, token: object | None, stats: PerfStats, status: str) -> None:
         self.last_stats = stats
         self.last_status = status
+        assert isinstance(token, SearchNode), f"TuningSearch.observe needs the terminal's pop token, got {type(token).__name__}"
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
-        self.tree.record_terminal(reward)
+        self.tree.record_terminal(token, reward)
 
-    def push(self, *cands: LazyCandidate, best: LazyCandidate | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None, best: LazyCandidate | None = None) -> None:
         del best  # tuning explores every fork — DB hint is for greedy
-        self.tree.attach(list(cands), parent=self.tree.last_popped)
+        # ``parent`` is the token the spawning candidate was popped with;
+        # ``None`` seeds the run under the root sentinel.
+        assert parent is None or isinstance(parent, SearchNode), f"TuningSearch.push needs a SearchNode token, got {type(parent).__name__}"
+        self.tree.attach(list(cands), parent=parent if parent is not None else self.tree.root)
 
-    def pop(self) -> LazyCandidate | None:
+    def pop(self) -> tuple[object | None, LazyCandidate] | None:
         if self._should_stop():
             return None
         node = self.tree.root
@@ -136,8 +142,7 @@ class TuningSearch(Search):
         while cur is not None:
             cur.live -= 1
             cur = cur.parent
-        self.tree.last_popped = node
-        return node.candidate
+        return node, node.candidate
 
     def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
         """Selection score = (UCB1 value, score-as-tiebreak). Returned as

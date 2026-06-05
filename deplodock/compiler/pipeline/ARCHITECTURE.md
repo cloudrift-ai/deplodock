@@ -298,10 +298,14 @@ The autotune state is split across two cooperating modules:
   policy that reads it. Each tree node wraps a `LazyCandidate`; nodes
   carry `visits` and `best_reward` (max reward over the subtree's
   measured leaves), plus a `live` counter that filters out subtrees
-  whose frontier has been fully drained. Tree built from push lineage
-  (parent of a pushed node = the most recently popped node). Rebuilt
-  fresh each process; cached `perf` rows in the DB ensure no re-bench
-  on warm starts. `GreedySearch` has no tree.
+  whose frontier has been fully drained. Lineage is TOKEN-THREADED, not
+  call-order-dependent: `pop()` returns `(token, candidate)` (the token
+  IS the `SearchNode`), the engine pushes children with `parent=token`
+  and observes the terminal's measurement with the same token, so the
+  tree stays correct however the engine interleaves pops / pushes /
+  observes. Rebuilt fresh each process; cached `perf` rows in the DB
+  ensure no re-bench on warm starts. `GreedySearch` has no tree (its
+  tokens are `None`).
 
 `Pipeline._bench_terminal` is the only function that knows about all
 four parts (graph, DB, tree-through-`search.observe`, backend). It

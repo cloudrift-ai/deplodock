@@ -411,11 +411,15 @@ class Pipeline:
         select_set = set(select) if select is not None else None
         return cls(passes=[Pass.load(name, i, select_set) for i, name in enumerate(passes)], dump=dump)
 
-    def search(self, search: Search, ctx: Context | None, *, db: SearchDB | None = None) -> Iterator[Candidate]:
+    def search(self, search: Search, *, db: SearchDB | None = None) -> Iterator[tuple[object | None, Candidate]]:
         """The unified search-driven driver. Each iteration: pop a
-        candidate, run one rule's batch of matches against its graph,
-        push successor(s). Yields when a candidate reaches the end of
-        the pipeline (``cursor.pass_idx >= len(self.passes)``).
+        ``(token, candidate)`` pair, run one rule's batch of matches
+        against the candidate's graph, push successor(s) under
+        ``parent=token``. Yields ``(token, candidate)`` when a candidate
+        reaches the end of the pipeline (``cursor.pass_idx >=
+        len(self.passes)``) — the caller passes the token to
+        ``search.observe`` so the measurement lands on the terminal's
+        own lineage (no "most recently popped" hidden state).
 
         Per-rule batch semantics: enumerate matches via :meth:`match`
         (which stamps ``rule`` on each Match plus ``is_last`` on the
@@ -430,19 +434,20 @@ class Pipeline:
         from deplodock.compiler.pipeline.search.candidate import LazyCandidate  # noqa: PLC0415
 
         while (popped := search.pop()) is not None:
+            token, lc = popped
             # Thunk-bearing fork: expand before resolving. Each expansion
             # spawns the next level of ``LazyCandidate``s (more thunks or
             # concrete options) sharing the same ``inner`` and ``match`` —
             # cursor advance is deferred until a leaf actually resolves.
-            if popped.is_expandable():
-                children = popped.expand()
-                best = _best_fork(children, popped.inner, db) if db is not None else None
-                search.push(*children, best=best)
+            if lc.is_expandable():
+                children = lc.expand()
+                best = _best_fork(children, lc.inner, db) if db is not None else None
+                search.push(*children, parent=token, best=best)
                 continue
-            cand = popped.resolve()
+            cand = lc.resolve()
             cur = cand.cursor
             if cur.is_done:
-                yield cand
+                yield token, cand
                 continue
             pass_ = cur.current_pass
             # Empty pass (e.g. all rules filtered out) OR no live
@@ -453,12 +458,12 @@ class Pipeline:
             # the post-pass log + dump.
             if not pass_.rules:
                 cur.advance(cand.graph)
-                search.push(cand.lazy())
+                search.push(cand.lazy(), parent=token)
                 continue
             matches = self.match(cand.graph, cur.current_rule)
             if not matches:
                 cur.advance(cand.graph)
-                search.push(cand.lazy())
+                search.push(cand.lazy(), parent=token)
                 continue
 
             forks: list[LazyCandidate] | None = None
@@ -481,10 +486,10 @@ class Pipeline:
 
             if forks is not None:
                 best = _best_fork(forks, cand, db) if db is not None else None
-                search.push(*forks, best=best)
+                search.push(*forks, parent=token, best=best)
                 continue
 
-            search.push(cand.lazy())
+            search.push(cand.lazy(), parent=token)
 
     def run(self, graph: Graph, *, ctx: Context | None = None, backend=None, db: SearchDB | None = None) -> Graph:
         """Single-shot greedy compile — run each pass in order, picking
@@ -572,17 +577,18 @@ class Pipeline:
             ctx = replace(ctx, backend_name=backend_name)
         t_start = time.monotonic()
 
+        # Seed candidate: no parent token — the policy roots it itself.
         search.push(_Candidate(ctx=ctx, graph=graph, cursor=Cursor(pipeline=self)).lazy())
 
         if db is None:
             db = _SearchDB()
         n_terminals = 0
-        for cand in self.search(search, ctx, db=db):
+        for token, cand in self.search(search, db=db):
             n_terminals += 1
             if backend is not None:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
             stats, status = _bench_terminal(cand, backend=backend, db=db)
-            search.observe(stats, status)
+            search.observe(token, stats, status)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 
