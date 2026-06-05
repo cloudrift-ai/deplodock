@@ -524,8 +524,8 @@ class Run:
     * ``ctx`` — the resolved hardware context, shared by every candidate
       (reached as ``cand.ctx``).
     * ``search`` — the policy (greedy / MCTS) ordering the exploration.
-    * ``db`` — the autotune store ``_best_fork`` replays and
-      ``_bench_terminal`` persists into.
+    * ``db`` — the autotune store ``_bench_terminal`` persists into (the
+      training data for the learned prior).
     * ``backend`` — optional measurement backend (``None`` = stub bench,
       no persistence).
     * ``dump`` — optional artifact collector: :meth:`Candidate._log_apply`
@@ -582,7 +582,7 @@ class Run:
             # cursor advance is deferred until a leaf actually resolves.
             if lc.is_expandable():
                 children = lc.expand()
-                search.push(*children, parent=token, best=_best_fork(children, lc.inner, self.db))
+                search.push(*children, parent=token)
                 continue
             cand = lc.resolve()
             cur = cand.cursor
@@ -612,9 +612,10 @@ class Run:
                 if options is None:
                     continue
                 # Multi-option fork point: spawn one ``LazyCandidate`` per
-                # option, in rule-emission order (the search ranks them
-                # via ``score_of``; rules need not pre-sort). Each shares
-                # ``cand`` as ``inner`` so siblings don't duplicate the
+                # option, in rule-emission order. Selection is the search's
+                # job (greedy keeps option-0; tuning explores every fork and
+                # ranks the unvisited frontier with its learned prior). Each
+                # shares ``cand`` as ``inner`` so siblings don't duplicate the
                 # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
                 # options into leaf Forks so every LazyCandidate's pending
                 # carries a uniform Fork shape. The fork's apply on
@@ -625,7 +626,7 @@ class Run:
                 break
 
             if forks is not None:
-                search.push(*forks, parent=token, best=_best_fork(forks, cand, self.db))
+                search.push(*forks, parent=token)
                 continue
 
             search.push(cand.lazy(), parent=token)
@@ -705,59 +706,6 @@ def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
 # ---------------------------------------------------------------------------
 # Bench + DB persistence for autotune terminals (used by Pipeline.tune)
 # ---------------------------------------------------------------------------
-
-
-def _knob_eq(a, b) -> bool:
-    """Knob-value equality across the DB's JSON round-trip: tuples come
-    back as lists (e.g. the planner's ``OVERHANG``), so compare with
-    tuples canonicalized to lists."""
-    if isinstance(a, tuple):
-        a = list(a)
-    if isinstance(b, tuple):
-        b = list(b)
-    return a == b
-
-
-def _best_fork(forks, parent_cand, db):
-    """Pick the fork whose knob delta matches the lowering DB's
-    best-known child for the parent op. Returns ``None`` when no row
-    exists (untuned site), the parent op has no cache key, or no fork's
-    knobs agree with the recorded delta (variant drifted).
-
-    Matching is on KNOBS ALONE — the variant identity is ``(ctx,
-    knobs)`` (the ``SID`` knob makes the dict complete), so branch and
-    leaf forks match uniformly and nothing is ever materialized just to
-    be compared. ``row.knobs`` is the full child-minus-parent delta
-    recorded by ``_bench_terminal``; a fork wins iff at least one of its
-    pinned knobs is constrained by the row and every constrained one
-    agrees. Distinct siblings always differ in a recorded knob — branch
-    siblings pin distinct level keys, and tree leaves carry their
-    complete knob row — so at most one sibling matches. The DB's
-    structural ``child_key`` is measurement linkage (inventory / perf),
-    not a replay key."""
-    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
-
-    first = forks[0]
-    if first.pending is None:
-        return None
-    match, _ = first.pending
-    parent_node = parent_cand.graph.nodes.get(match.root_node_id)
-    if parent_node is None:
-        return None
-    parent_key = op_cache_key(parent_node.op)
-    if parent_key is None:
-        return None
-    row = db.lookup_lowering(parent_key)
-    if row is None:
-        return None
-    for f in forks:
-        if f.pending is None:
-            continue
-        _, fork = f.pending  # always a Fork after the constructor unification
-        constraining = [k for k in fork.knobs if k in row.knobs]
-        if constraining and all(_knob_eq(row.knobs[k], fork.knobs[k]) for k in constraining):
-            return f
-    return None
 
 
 def _bench_terminal(cand, *, backend, db):

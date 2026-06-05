@@ -14,22 +14,19 @@ class GreedySearch(Search):
     yields a terminal without pushing it back, the next ``pop`` finds
     the slot empty and returns ``None``, ending the search.
 
-    Used by ``run_pipeline`` for single-shot compiles. At fork points
-    the engine looks up the lowering table and passes the DB-best fork
-    via ``push(..., best=...)``; greedy takes it WITHOUT scoring
-    anything — a fully tuned compile does near-zero ranking work. When
-    no DB entry exists (untuned site), greedy keeps the max-prior
-    sibling via :meth:`Search.score_of` (ties keep emission order, so
-    rules whose options carry no scores still get their option-0
-    default)."""
+    Used by ``run_pipeline`` for single-shot compiles. Selection by the
+    DB-best fork (``_best_fork``) and the static ``score_of`` prior were
+    both nuked, so greedy now keeps the **first** emitted sibling (the
+    rule's option-0 default). Reconnecting greedy to the learned prior is
+    deferred until the prior proves out in search."""
 
     def __init__(self) -> None:
         super().__init__()
         self._pending: LazyCandidate | None = None
 
-    def push(self, *cands: LazyCandidate, parent: object | None = None, best: LazyCandidate | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
         del parent  # greedy keeps no lineage — one pending slot, no tree
-        self._pending = best if best is not None else max(cands, key=lambda c: self.score_of(c.fork))
+        self._pending = cands[0] if cands else None
 
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
         c, self._pending = self._pending, None

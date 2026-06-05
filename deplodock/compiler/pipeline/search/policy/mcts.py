@@ -4,10 +4,13 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
     select   — descend from root, picking at each level
                ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
                where ``Q_norm = best_reward / global_best``. Unvisited
-               children get ``+∞``, breaking ties on the fork prior
-               (``Search.score_of`` — value-keyed, cached on the
-               search). Live-count filtering skips subtrees whose
-               frontier has been fully drained.
+               children get ``+∞``, breaking ties on the learned
+               :class:`~deplodock.compiler.pipeline.search.prior.OnlinePrior`
+               (Thompson-sampled per descent) when one is attached, else
+               ``0`` → emission order (pure UCB). The static
+               ``TileOp.score`` prior was nuked from selection.
+               Live-count filtering skips subtrees whose frontier has
+               been fully drained.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
                candidates as children of the ``parent`` token (the
                ``SearchNode`` their spawning candidate was popped with);
@@ -27,10 +30,14 @@ from __future__ import annotations
 import math
 from collections.abc import Hashable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
 from deplodock.compiler.pipeline.search.policy.base import Search
+
+if TYPE_CHECKING:
+    from deplodock.compiler.pipeline.search.prior import OnlinePrior
 
 
 @dataclass
@@ -41,12 +48,9 @@ class SearchNode:
     visits: int = 0
     best_reward: float = 0.0  # max reward over this subtree's measured leaves
     live: int = 0  # count of un-popped frontier leaves in this subtree
-    # Memoized ``Search.score_of`` read (filled by ``_ucb_key``) — UCB
-    # descent reads the prior on every unvisited sibling at every level
-    # per pop, and a branch fork's prior is a max over its param
-    # subgroup, so the per-node memo keeps repeated descents O(1). Sound
-    # because the fork's score is frozen once the SearchNode is attached.
-    prior: float | None = field(default=None, repr=False)
+    # No prior memo: the learned ``OnlinePrior`` is Thompson-sampled (a fresh
+    # draw per descent), so a node's tiebreak score is not frozen — it is
+    # recomputed each ``_ucb_key`` from the current draw.
 
 
 class SearchTree:
@@ -91,12 +95,18 @@ class TuningSearch(Search):
         ucb_c: float = DEFAULT_UCB_C,
         max_visits: int | None = None,
         score_cache: dict[Hashable, float] | None = None,
+        prior_model: OnlinePrior | None = None,
     ) -> None:
         super().__init__(score_cache=score_cache)
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
         self._patience = patience
         self._max_visits = max_visits
+        # Learned tiebreaker for unvisited siblings (``None`` → pure UCB). Refit
+        # from the live tree every ``refit_every`` benches; one Thompson draw
+        # per descent. The static ``score_of`` prior is no longer consulted.
+        self.prior_model = prior_model
+        self._benches_since_fit = 0
         self._best_reward = 0.0
         self._visits_at_best = 0
         # Why the search stopped (set by ``_should_stop``): a patience /
@@ -116,9 +126,12 @@ class TuningSearch(Search):
         assert isinstance(token, SearchNode), f"TuningSearch.observe needs the terminal's pop token, got {type(token).__name__}"
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
         self.tree.record_terminal(token, reward)
+        if self.prior_model is not None:
+            # Record the leaf for the end-of-run stats; flag a refit due.
+            self.prior_model.record_bench(self._node_knobs(token), stats.median, status)
+            self._benches_since_fit += 1
 
-    def push(self, *cands: LazyCandidate, parent: object | None = None, best: LazyCandidate | None = None) -> None:
-        del best  # tuning explores every fork — DB hint is for greedy
+    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
         # ``parent`` is the token the spawning candidate was popped with;
         # ``None`` seeds the run under the root sentinel.
         assert parent is None or isinstance(parent, SearchNode), f"TuningSearch.push needs a SearchNode token, got {type(parent).__name__}"
@@ -127,6 +140,16 @@ class TuningSearch(Search):
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
         if self._should_stop():
             return None
+        if self.prior_model is not None:
+            # Refit from a tree snapshot when enough new benches have landed
+            # (labels are non-stationary — re-read ``best_reward`` each time),
+            # then draw one Thompson sample for this whole descent.
+            if self._benches_since_fit >= self.prior_model.refit_every:
+                rows = self._collect_rows()
+                if len(rows) >= self.prior_model.min_rows:
+                    self.prior_model.fit(rows)
+                    self._benches_since_fit = 0
+            self.prior_model.resample()
         node = self.tree.root
         if node.live == 0:
             return None
@@ -145,21 +168,58 @@ class TuningSearch(Search):
         return node, node.candidate
 
     def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
-        """Selection score = (UCB1 value, score-as-tiebreak). Returned as
-        a tuple so unvisited siblings (UCB1 = +∞) are ranked by their
-        prior (``Search.score_of``, memoized per node — see
-        ``SearchNode.prior``). Reward is normalized against the global
-        best so the ``c`` constant is unit-free."""
-        prior = child.prior
-        if prior is None:
-            prior = self.score_of(child.candidate.fork) if child.candidate is not None else float("-inf")
-            child.prior = prior
+        """Selection score = (UCB1 value, learned-prior tiebreak). Returned
+        as a tuple so unvisited siblings (UCB1 = +∞) are ranked by the
+        Thompson-sampled :class:`OnlinePrior` (``0`` → emission order under
+        pure UCB). Visited siblings need no tiebreak (their UCB values are
+        distinct), so the prior is only computed for the unvisited frontier.
+        Reward is normalized against the global best so ``c`` is unit-free."""
         if child.visits == 0:
-            return float("inf"), prior
+            return float("inf"), self._prior_score(child)
         global_best = self.tree.best_reward
         q_norm = (child.best_reward / global_best) if global_best > 0 else 0.0
         bonus = self._ucb_c * math.sqrt(math.log(max(parent.visits, 1)) / child.visits)
-        return q_norm + bonus, prior
+        return q_norm + bonus, 0.0
+
+    def _prior_score(self, child: SearchNode) -> float:
+        """Learned-prior tiebreak for an unvisited child (``0`` when no model
+        is attached or the child is the root sentinel)."""
+        if self.prior_model is None or child.candidate is None:
+            return 0.0
+        return self.prior_model.score(self._node_knobs(child))
+
+    @staticmethod
+    def _node_knobs(node: SearchNode) -> dict:
+        """Accumulated knob dict for a node — merge of every ``fork.knobs``
+        delta from the root down to ``node``. A branch pins its level slice;
+        a leaf carries the complete row, so deeper nodes hold a superset. This
+        is the (partial-or-full) feature input the prior featurizes."""
+        chain: list[dict] = []
+        cur: SearchNode | None = node
+        while cur is not None and cur.candidate is not None:
+            fork = cur.candidate.fork
+            if fork is not None:
+                chain.append(fork.knobs)
+            cur = cur.parent
+        merged: dict = {}
+        for knobs in reversed(chain):
+            merged.update(knobs)
+        return merged
+
+    def _collect_rows(self) -> list[tuple[dict, float]]:
+        """Value-of-position training rows from the live tree: every node with
+        a benched descendant (``visits > 0`` and ``best_reward > 0``) — leaves
+        *and* branches — labeled ``log(best_reward)`` (= −log median latency,
+        the max over its subtree). Re-read each refit since labels only rise."""
+        rows: list[tuple[dict, float]] = []
+        stack = list(self.tree.root.children)
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            if node.candidate is None or node.visits == 0 or node.best_reward <= 0:
+                continue
+            rows.append((self._node_knobs(node), math.log(node.best_reward)))
+        return rows
 
     def _should_stop(self) -> bool:
         if self.stop_reason is not None:

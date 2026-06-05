@@ -52,6 +52,18 @@ def register_tune_command(subparsers):
         ),
     )
     parser.add_argument(
+        "--prior",
+        choices=("off", "online", "shadow"),
+        default="off",
+        help=(
+            "Unvisited-sibling tiebreaker for the inner MCTS. 'off' = pure UCB1 (emission order). "
+            "'online' = a learned Bayesian-ridge prior fit in-memory from this run's own benches "
+            "(Thompson-sampled), with an end-of-run sanity block per kernel. 'shadow' = fit + report "
+            "the same stats but DON'T steer selection (pure-UCB baseline for the online-vs-UCB A/B). "
+            "Default: off."
+        ),
+    )
+    parser.add_argument(
         "--bench-timeout",
         type=float,
         default=20.0,
@@ -181,7 +193,16 @@ def handle_tune(args):
     t0 = time.monotonic()
     try:
         result = run_two_level_tune(
-            graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=args.ucb_c, dump=dump, progress=progress
+            graph,
+            ctx=ctx,
+            db=db,
+            backend=backend,
+            patience=patience,
+            ucb_c=args.ucb_c,
+            dump=dump,
+            progress=progress,
+            prior=args.prior,
+            prior_seed=args.seed,
         )
     except KeyboardInterrupt:
         # Manual abort: per-op bests already landed in the DB as they were
@@ -205,6 +226,8 @@ def handle_tune(args):
 
     elapsed = time.monotonic() - t0
     sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {elapsed:.1f}s\n")
+    for block in result.prior_summaries:  # ``--prior online`` pick-quality sanity stats
+        sys.stderr.write(block + "\n")
     if result.best_reward is None:
         sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
         sys.stdout.flush()

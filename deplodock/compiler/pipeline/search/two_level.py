@@ -98,6 +98,9 @@ class InnerReward:
     total_us: float
     ok: bool  # every kernel had a clean ``ok`` measurement
     per_op: list[OpResult] = field(default_factory=list)
+    # ``--prior online`` end-of-run sanity blocks (one per tuned kernel) —
+    # printed by the command after the progress bar closes.
+    prior_summaries: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -108,6 +111,7 @@ class TwoLevelResult:
     best_reward: InnerReward | None  # its Σ-per-op breakdown
     n_terminals: int  # outer terminals evaluated (1 today)
     assembled: Graph | None  # greedy DB-best Graph[CudaOp] assembled from the bests
+    prior_summaries: list[str] = field(default_factory=list)  # ``--prior online`` stats
 
 
 def _point_stats(us: float) -> PerfStats:
@@ -132,9 +136,16 @@ def inner_reward(
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     progress=None,
+    prior: str = "off",
+    prior_seed: int = 0,
 ) -> InnerReward:
     """Tune every post-fusion kernel of ``fused_graph`` in its own single-node
     slice and return ``Σ best-per-op time`` — the outer terminal reward.
+
+    ``prior="online"`` attaches a fresh in-memory
+    :class:`~deplodock.compiler.pipeline.search.prior.OnlinePrior` to each
+    kernel's inner search (the learned unvisited-sibling tiebreaker) and
+    collects its end-of-run sanity block into ``InnerReward.prior_summaries``.
 
     Each kernel is gated on persisted effort: an op already tuned to
     ``>= patience`` (or exhausted, recorded ``inf``) is skipped and its cached
@@ -166,6 +177,7 @@ def inner_reward(
     total = 0.0
     ok = True
     per_op: list[OpResult] = []
+    prior_summaries: list[str] = []
     # Group structurally-identical LoopOps under one ``op_cache_key`` —
     # insertion order = first occurrence (drives the progress tail name).
     # Ops with no cache key are unreachable through the bench path so they
@@ -195,7 +207,8 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache)
+            prior_model = _make_prior(prior, prior_seed) if prior in ("online", "shadow") else None
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior_model)
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
@@ -222,6 +235,8 @@ def inner_reward(
             exhausted = inner.stop_reason is None
             db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
             benched = True
+            if prior_model is not None:
+                prior_summaries.append(prior_model.summary(name))
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
         per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
         # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
@@ -233,7 +248,16 @@ def inner_reward(
             total += best * count
         if progress is not None:
             progress.op_done(name)
-    return InnerReward(total_us=total, ok=ok, per_op=per_op)
+    return InnerReward(total_us=total, ok=ok, per_op=per_op, prior_summaries=prior_summaries)
+
+
+def _make_prior(prior: str, seed: int):
+    """Construct an :class:`OnlinePrior` (lazy import — keeps numpy off the
+    default ``off`` path). ``shadow`` fits + reports but doesn't steer
+    selection (pure-UCB baseline for the A/B)."""
+    from deplodock.compiler.pipeline.search.prior import OnlinePrior  # noqa: PLC0415
+
+    return OnlinePrior(seed=seed, active=(prior == "online"))
 
 
 def run_two_level_tune(
@@ -246,6 +270,8 @@ def run_two_level_tune(
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     dump=None,
     progress=None,
+    prior: str = "off",
+    prior_seed: int = 0,
 ) -> TwoLevelResult:
     """Drive the outer fusion search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
@@ -270,9 +296,21 @@ def run_two_level_tune(
     best_fused: Graph | None = None
     best_reward: InnerReward | None = None
     n_terminals = 0
+    prior_summaries: list[str] = []
     for token, fused in outer_run.drive(graph):
         n_terminals += 1
-        reward = inner_reward(fused.graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=ucb_c, progress=progress)
+        reward = inner_reward(
+            fused.graph,
+            ctx=ctx,
+            db=db,
+            backend=backend,
+            patience=patience,
+            ucb_c=ucb_c,
+            progress=progress,
+            prior=prior,
+            prior_seed=prior_seed,
+        )
+        prior_summaries.extend(reward.prior_summaries)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(token, stats, "ok" if reward.ok else "bench_fail")
         positions = sum(r.multiplicity for r in reward.per_op)
@@ -299,4 +337,6 @@ def run_two_level_tune(
         # tunes when a slow-compiling kernel raised. ``--bench`` re-benches
         # the assembled graph at -O3 anyway, which is the deployable number.
         assembled = Pipeline.build(CUDA_PASSES).run(graph, ctx=ctx, db=db, dump=dump)
-    return TwoLevelResult(best_fused=best_fused, best_reward=best_reward, n_terminals=n_terminals, assembled=assembled)
+    return TwoLevelResult(
+        best_fused=best_fused, best_reward=best_reward, n_terminals=n_terminals, assembled=assembled, prior_summaries=prior_summaries
+    )

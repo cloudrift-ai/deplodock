@@ -73,6 +73,22 @@ class Op:
     inputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     outputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
+    def __getstate__(self) -> dict:
+        """Pickle without ``meta`` — it is per-process scratch (the partition
+        planner stashes its ``_Plan`` there, whose class is loaded under a bare
+        rule-module stem and is unimportable in a subprocess). The bench worker
+        receives the ``CudaOp`` graph by pickle and its ``Op.source`` provenance
+        chain reaches a ``LoopOp`` carrying that ``_Plan``, so without this the
+        unpickle dies with ``No module named '010_partition_loops'``. ``meta``
+        is documented "never serialized"; this enforces it."""
+        state = self.__dict__.copy()
+        state["meta"] = {}
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self.__dict__.setdefault("meta", {})
+
     def populate_io(self, graph: Graph, node: Node) -> None:
         """Refresh ``inputs`` / ``outputs`` from the surrounding graph.
         Called by the matcher after a match is built. Default mapping

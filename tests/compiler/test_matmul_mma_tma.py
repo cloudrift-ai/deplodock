@@ -150,6 +150,11 @@ def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
+@pytest.mark.xfail(
+    reason="greedy's prior-based pick was nuked (learned-prior work, plans/learned-prior-puct.md): greedy now emits "
+    "option-0, not the score-max golden. Restore when compile/run reconnect to the learned prior.",
+    strict=False,
+)
 def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
     """With ``DEPLODOCK_MMA=1`` defaulted ON and *no* warp-tier pins, the
     DB-less greedy picker on sm_90+ lands on the priority-scored s16816

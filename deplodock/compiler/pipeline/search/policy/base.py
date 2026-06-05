@@ -53,29 +53,24 @@ class Search(ABC):
         """The fork's planner prior — ``fork.score(self.score_cache)``;
         ``None`` (a no-pending wrapper) scores ``0.0``.
 
-        This prior is the ONLY ranking signal for unresolved candidates:
-        siblings at a fork point share their ``inner`` snapshot by
-        reference, and policies only ever compare children of one parent,
-        so any inner-graph term would be a constant offset within every
-        comparison set. We deliberately do NOT fire ``fork.expand()`` to
-        recover the option and re-score it: expanding a partition leaf
-        runs the full body build + normalization, and the policies read
-        this score for every unranked sibling — materializing every leaf
-        just to rank it would defeat the lazy-planner design."""
+        NOTE: the policies no longer rank with this — the static prior was
+        nuked from selection in favor of the learned
+        :class:`~deplodock.compiler.pipeline.search.prior.OnlinePrior`. This
+        accessor is retained as the lazy-planner score *compute* (exercised
+        directly by the partition-planner tests and available as latent
+        infra); it never fires ``fork.expand()``, so reading it stays cheap."""
         return fork.score(self.score_cache) if fork is not None else 0.0
 
     @abstractmethod
-    def push(self, *cands: LazyCandidate, parent: object | None = None, best: LazyCandidate | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
         """Enqueue the spawned candidates — all siblings of one fork
-        point, in rule-emission order (NOT ranked; ranking is the
-        policy's job via :meth:`score_of`).
+        point, in rule-emission order.
 
         ``parent`` is the token of the :meth:`pop` whose candidate
         spawned these siblings, or ``None`` for the seed candidate that
-        starts a run. ``best`` (optional) carries the fork that matches
-        the DB's best-known lowering for the rewrite site. Greedy uses
-        it to skip ranking entirely and take the post-tuning winner;
-        tuning ignores it (it explores every fork)."""
+        starts a run. Selection is the policy's job: greedy keeps the
+        first sibling (option-0); tuning explores every fork and ranks
+        the unvisited frontier with its learned prior."""
 
     @abstractmethod
     def pop(self) -> tuple[object | None, LazyCandidate] | None:

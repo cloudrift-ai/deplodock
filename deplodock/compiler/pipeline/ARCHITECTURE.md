@@ -70,10 +70,11 @@ matched `Node` objects. Anything else binds positionally to
 
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
-parent's graph snapshot) and hands them ALL to the search, which picks: greedy takes the DB-best fork when
-a `lowering` row matches, else the max-prior sibling via `Search.score_of` (a score tie keeps emission
-order, so unscored flat rules still get their option-0 default); tuning explores every fork. Single-option
-returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
+parent's graph snapshot) and hands them ALL to the search, which picks: greedy keeps the first (option-0)
+sibling — DB-best replay (`_best_fork`) and the static `score_of` prior were **nuked from selection**;
+tuning explores every fork, ranking the unvisited frontier with its learned `OnlinePrior` (search/prior.py,
+Thompson-sampled — `0` → emission order under pure UCB). Single-option returns (or bare `Graph` / `Op`)
+are the deterministic case — no fork.
 
 **Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
 the fork pins), `is_leaf`, `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
@@ -81,21 +82,20 @@ leaves, or a mix; exactly `[option]` for a leaf), and `score(cache)` (the lazy p
 The search loop pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize the children,
 pushes them back, and continues; cursor advance only fires when the lineage resolves to a concrete leaf.
 Lets a rule expose a hierarchy of decisions lazily — only the subtrees the search actually walks into get
-materialized. `Fork.knobs` is read by `_best_fork` (for DB-seeded greedy replay) without expanding.
+materialized. `Fork.knobs` is the knob delta a fork pins — the variant identity the perf DB keys on — read
+without expanding.
 Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
 `LazyCandidate.from_option`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
 `score_fn(knobs)` functions of the fork's own knob delta, so siblings share one function instead of
 per-instance capture lambdas; used by `085_warp_specialize`), and the tree builder's branch / leaf node
 classes.
 
-**Scoring is search policy.** Rules emit siblings unranked; the policies rank via `Search.score_of(fork)`
-= `fork.score(self.score_cache)`. The search OWNS the value-keyed score cache and hands it down to the
-fork's compute; the KEYING is the scorer's own, since only it knows its value identity — the partition
-planner keys each variant by `(ctx fields, frozenset(merged knobs))`, complete because the `S_*`
-structural-feature knobs ride the dict, so structurally identical kernels (the same layer repeated
-through a whole model) share every score, across trees and — via the shared dict `two_level.inner_reward`
-threads into each per-op `TuningSearch` — across tune slices. Entries can never go stale: the score is a
-pure function of the key. Greedy with a DB hit never scores anything at all.
+**The planner score compute (no longer drives selection).** The static prior was nuked from selection in
+favor of the learned `OnlinePrior`; `Search.score_of(fork) = fork.score(self.score_cache)` is retained as
+latent compute (exercised directly by the partition-planner tests). It still keys cleanly: the search owns
+the value-keyed score cache, and the partition planner keys each variant by `(ctx fields, frozenset(merged
+knobs))`, complete because the `S_*` structural-feature knobs ride the dict, so structurally identical
+kernels share every score. The same `S_*` features are what the learned prior featurizes (`knob.knob_features`).
 
 The partition planner (`lowering/tile/010_partition_loops`) emits one
 hierarchical Fork tree over both tiers:
@@ -277,11 +277,10 @@ three entry points:
   `rejections`): `Pipeline` stays a frozen, shareable pass layout while every run-scoped sink and service
   lives on the Run, reached from engine-adjacent code through the candidate (`cand.run.dump`,
   `cand.run.rejections`, `cand.ctx`). `drive` seeds the root candidate, then per iteration pops a
-  `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. At fork
-  points it looks up the best-known `lowering` row for the parent op's `op_cache_key` and passes the fork
-  whose KNOBS agree with the row's recorded delta via `search.push(..., best=...)` — matching is on knobs
-  alone (`_best_fork`; the variant identity is `(ctx, knobs)`), so nothing is ever materialized just to be
-  compared. Greedy uses `best` when present; tuning ignores it.
+  `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. Selection is
+  the policy's job: greedy keeps option-0, tuning ranks the unvisited frontier with its learned prior. (The
+  DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
+  selection" above; the perf DB still *records* every bench as the prior's training data.)
 
 ### The keying map: two identities
 
@@ -292,11 +291,11 @@ table, pick one; don't invent a third:
   features (`loop/fusion/040_stamp_structural_id`: a stmt/op histogram + loop extents + operand dtypes) make
   the merged knob dict a COMPLETE identity, so a prior is a pure function of it: the score cache keys
   `(ctx fields, frozenset(merged knobs))`, the planner's op-metadata plan stamp keys the same plus the
-  `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration), and `_best_fork`
-  replays tuned choices by matching fork knobs against the recorded `lowering` knob delta. A future
-  *learned* prior slots in unchanged — `score(features(ctx, knobs))`: the structural facts (op histogram,
-  extents, dtypes) are already in the knob dict, so `knob.knob_features` turns it straight into the model
-  feature vector (the `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props).
+  `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration). The *learned*
+  prior is exactly `score(features(ctx, knobs))`: the structural facts (op histogram, extents, dtypes) are
+  already in the knob dict, so `knob.knob_features` turns it straight into the model feature vector (the
+  `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props). See the learned
+  `OnlinePrior` section below and `plans/learned-prior-puct.md`.
 - **Measurement identity = `(ctx.structural_key, op_cache_key)`** — ground truth about *materialized
   leaves*: `perf` rows, op inventory (`loop_op`/`tile_op`/`kernel_op`/`cuda_op`), `op_effort` gating, and
   two-level dedup. The structural `child_key` on `lowering` rows is measurement linkage (it joins the
@@ -415,8 +414,9 @@ over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
-  The unvisited-sibling tiebreak is the fork's rank-only structural prior (`TileOp.lazy_score` magnitude carries no meaning —
-  only relative ordering), read via `Search.score_of` and memoized per node (`SearchNode.prior`).
+  The unvisited-sibling tiebreak is the learned `OnlinePrior` (`search/prior.py`), Thompson-sampled once per descent —
+  `0` when no prior is attached (`--prior off`), which falls back to emission order (pure UCB). The static `TileOp.score`
+  tiebreak was nuked from selection.
 - **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
 - **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU
@@ -426,6 +426,18 @@ over one op's forks — with max-Q normalized UCB1:
 - **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
   default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Run.drive` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
+
+**Learned prior (`search/prior.py`, `--prior online`).** An in-memory Bayesian-ridge model fit *within one inner
+`TuningSearch`* (per kernel, discarded after), replacing the nuked static tiebreak. Training signal is
+**value-of-position**: real benches exist only at leaves, but the prior ranks partial-knob siblings at every fork level,
+so the label for any node is `log(best_reward)` — the max over its benched descendants, which `record_terminal` already
+maintains on `SearchNode.best_reward`. `TuningSearch._collect_rows` walks the live tree and emits `(knobs, label)` for
+every node with a benched descendant (leaves **and** branches); `_node_knobs` accumulates the `fork.knobs` deltas along
+the path; `knob.knob_features` vectorizes. Because the labels are non-stationary (they only rise), the model **refits
+from a tree snapshot** every `refit_every` benches rather than streaming. Selection draws one Thompson sample per descent
+(`resample`) so exploration stays honest; the magnitude is irrelevant, only the ranking. `--prior shadow` fits + reports
+the same end-of-run sanity block (silly-pick rate warmup-vs-post, self-calibration) but scores `0` — the pure-UCB
+baseline arm of the A/B. Findings + the road to a shipped, default-on prior live in `plans/learned-prior-puct.md`.
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search

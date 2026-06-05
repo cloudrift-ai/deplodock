@@ -145,6 +145,25 @@ seeds, not a single run. Benches-to-best stays a secondary number, not the headl
   sharing an intermediate ancestor labels that ancestor with the better leaf); Thompson ordering deterministic under a
   fixed drawn `θ̃`.
 
+## Probe results (2026-06-04)
+
+M1 + M2 landed on `feature/partition-planner-compile-perf`. Benching was fully broken on the branch first
+(`ModuleNotFoundError: '010_partition_loops'` — the plan-memo `_Plan` rode the pickled `Op.source` chain into the bench
+worker); fixed by dropping `meta` in `Op.__getstate__` (it is documented "never serialized"). With benching working:
+
+- **Small RMSNorm(2048)** — degenerate: ~26 variants, the search **exhausts** the space and emission order already nails
+  the winner at bench #0. Zero headroom; the silly-pick contrast inverts. Calibration still strong (+0.9).
+- **Large-K linear reduce (M=8, K=N=4096), seed 0, patience 30 — the real A/B:**
+  - shadow (pure UCB): best **205.9 µs** @ bench #39, 70 benches.
+  - online (learned prior): best **41.0 µs** @ bench #118, 149 benches — a **5× better** kernel. The prior kept
+    surfacing improvements (patience resetting) where UCB plateaued and gave up. Calibration +0.61.
+
+**Takeaways.** (1) The prior *learns* reduction-knob quality well (Spearman +0.6–0.9 within one run). (2) Even as a
+depth-1 tiebreaker it materially improves the tuned result on a space with real headroom (5×). (3) The "silly-pick rate"
+metric is misleading — measured against the *eventual* best, which the prior drives much lower, so more variants count as
+silly; **best-found** is the decisive metric. (4) Not a fixed-budget comparison (online ran more benches because it kept
+improving) — a `max_visits`-capped A/B is the honest next measurement.
+
 ## Risks / open questions
 
 - **Broken tune→compile handoff.** Nuking `_best_fork` removes how a tuned winner reaches `compile` / `run` — they now

@@ -237,7 +237,7 @@ class LazyCandidate:
         and :meth:`expand`): a rule-emitted ``Fork`` passes through; a
         concrete ``Op`` / ``Graph`` (already validated upstream in
         ``try_rewrite``'s filter) is lifted into an :class:`OptionFork`
-        leaf — an ``Op``'s knob delta rides along for ``_best_fork``."""
+        leaf — an ``Op``'s knob delta rides along as the fork's ``knobs``."""
         if not isinstance(option, Fork):
             knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
             option = OptionFork(option=option, knobs=knobs)

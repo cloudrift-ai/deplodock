@@ -841,9 +841,10 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         db = SearchDB(path=backend.tune_db)
         logger.info("Using tuning DB: %s", backend.tune_db)
     if tail:
-        # Thread the tune DB through the tail lowering so greedy fork selection
-        # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered
-        # at rule defaults and tuned results never showed up here.
+        # Finish the tail lowering. NOTE: greedy fork selection no longer replays
+        # tuned variants from the DB (``_best_fork`` was removed in the learned-prior
+        # work), so this emits rule-default forks; ``db=`` is kept for perf recording
+        # only. Reconnecting greedy to the learned prior is a deferred follow-up.
         graph = Pipeline.build(tail).run(graph, db=db, dump=dump)
 
     results, bench, torch_available = bench_lowered_vs_torch(

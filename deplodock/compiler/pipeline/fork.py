@@ -14,10 +14,10 @@ siblings by a (sub)tuple of knob values and collapses levels whose key has
 a single distinct value across the group (rows with an empty key skip the
 level). Below the last level every row becomes one :class:`_Leaf` carrying
 its COMPLETE row as ``knobs`` — the row IS the variant identity (the
-``SID`` structural-id knob rides the merged dict), so the engine's
-DB-replay (``_best_fork``) matches leaves and branches by knobs alone, no
-structural probing. ``expand()`` yields ``materialize(row)`` once the
-search engine resolves a leaf.
+``S_*`` structural-feature knobs ride the merged dict), so the perf DB and
+the learned prior key leaves and branches by knobs alone, no structural
+probing. ``expand()`` yields ``materialize(row)`` once the search engine
+resolves a leaf.
 Everything is lazy: no Fork below the root exists and no row is scored
 until the search reads a fork's score. Siblings are emitted in grouping
 order — RANKING IS SEARCH POLICY: each node carries a lazy max-propagated
@@ -66,13 +66,13 @@ class Fork(ABC):
 
     Sharing one interface lets ``LazyCandidate.pending`` carry just
     ``Fork`` (no tagged union) — the search loop branches on
-    ``Fork.is_leaf`` to decide expand-vs-resolve, and ``_best_fork``
-    reads ``Fork.knobs`` polymorphically without isinstance.
+    ``Fork.is_leaf`` to decide expand-vs-resolve.
 
-    ``knobs`` is the knob-delta this Fork pins (used by ``_best_fork``
-    to match the lowering DB without expanding). ``score(cache)`` is the
-    LAZY planner-prior compute — typically the score of the best-reachable
-    leaf under a branch. Ranking is SEARCH policy, not the producer's: the
+    ``knobs`` is the knob-delta this Fork pins (the variant identity the
+    perf DB and the learned prior key on, read without expanding).
+    ``score(cache)`` is the LAZY planner-prior compute — typically the score
+    of the best-reachable leaf under a branch; retained as latent compute,
+    no longer consulted for selection. Ranking is SEARCH policy: the
     engine hands unranked siblings to ``Search.push`` and the policy reads
     ``Search.score_of``, which passes the search-owned ``score_cache``
     dict down to the compute. A scorer with a value identity memoizes its
