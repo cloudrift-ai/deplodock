@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.features import STRUCT_PREFIX
+from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
 
 # Qwen3-Embedding-0.6B linear dims (mirrors ``tests/perf/cases.py``).
 QWEN3_06B_HIDDEN = 1024  # hidden_size

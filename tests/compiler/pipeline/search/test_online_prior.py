@@ -1,5 +1,5 @@
-"""Unit tests for the online learned prior (``search/prior.py``) and its
-value-of-position label extraction from the MCTS tree (``policy/mcts.py``).
+"""Unit tests for the learned prior (``search/prior/``) and its value-of-position
+label extraction + PUCT selection in the MCTS tree (``policy/mcts.py``).
 
 These are GPU-less: they exercise the model fit / Thompson draw and the
 tree-snapshot row collection on hand-built trees — no benching, no CUDA.
@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch, _softmax
-from deplodock.compiler.pipeline.search.prior import OnlinePrior, _spearman
+from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior
+from deplodock.compiler.pipeline.search.prior.base import _spearman
 
 
 def _node(knobs: dict, parent: SearchNode) -> SearchNode:
@@ -32,7 +33,7 @@ def test_noiseless_linear_is_recovered():
     for bm in (16, 32, 64, 128):
         for bn in (16, 32, 64):
             rows.append(({"BM": bm, "BN": bn}, 0.01 * bm - 0.02 * bn))
-    p = OnlinePrior(seed=0, ridge=1e-6, min_rows=3)
+    p = BayesianRidgePrior(seed=0, ridge=1e-6, min_rows=3)
     p.fit(rows)
     preds = np.array([p.mean_score(k) for k, _ in rows])
     ys = np.array([y for _, y in rows])
@@ -43,7 +44,7 @@ def test_ranks_lower_latency_higher():
     """label = log(1/us); the prior must score the faster (lower-us) config
     higher. Bigger BM is faster in this synthetic."""
     rows = [({"BM": bm, "BN": 64}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p = OnlinePrior(seed=0, min_rows=3)
+    p = BayesianRidgePrior(seed=0, min_rows=3)
     p.fit(rows)
     scores = [p.mean_score({"BM": bm, "BN": 64}) for bm in (16, 32, 64, 128)]
     assert scores == sorted(scores), f"expected monotone-increasing in BM, got {scores}"
@@ -58,7 +59,7 @@ def test_partial_knob_dicts_fit_and_score():
         ({"BR": 1, "BM": 64}, math.log(0.5)),
         ({"BR": 2, "BM": 64}, math.log(0.3)),
     ]
-    p = OnlinePrior(seed=0, min_rows=3)
+    p = BayesianRidgePrior(seed=0, min_rows=3)
     p.fit(rows)
     # Scoring a never-seen partial state must not raise and must be finite.
     v = p.mean_score({"BR": 1})
@@ -66,14 +67,14 @@ def test_partial_knob_dicts_fit_and_score():
 
 
 def test_score_is_zero_before_fit():
-    p = OnlinePrior(seed=0)
+    p = BayesianRidgePrior(seed=0)
     assert p.score({"BM": 64}) == 0.0
     assert p.mean_score({"BM": 64}) == 0.0
 
 
 def test_thompson_draw_is_deterministic_until_resample():
     rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p = OnlinePrior(seed=7, min_rows=3)
+    p = BayesianRidgePrior(seed=7, min_rows=3)
     p.fit(rows)  # fit() ends with a resample
     a = p.score({"BM": 64})
     b = p.score({"BM": 64})
@@ -85,8 +86,8 @@ def test_thompson_draw_is_deterministic_until_resample():
 
 def test_seeded_priors_are_reproducible():
     rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p1 = OnlinePrior(seed=3, min_rows=3)
-    p2 = OnlinePrior(seed=3, min_rows=3)
+    p1 = BayesianRidgePrior(seed=3, min_rows=3)
+    p2 = BayesianRidgePrior(seed=3, min_rows=3)
     p1.fit(rows)
     p2.fit(rows)
     assert p1.score({"BM": 32}) == p2.score({"BM": 32})
@@ -151,7 +152,7 @@ def test_pure_ucb_when_no_model():
 def _fitted_prior_bm():
     """A prior that has learned bigger BM = lower latency = higher reward."""
     rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
-    p = OnlinePrior(seed=0, min_rows=3)
+    p = BayesianRidgePrior(seed=0, min_rows=3)
     p.fit(rows)
     return p
 
@@ -166,7 +167,7 @@ def test_puct_deprioritizes_bad_unvisited_vs_forced_breadth():
     bad_unvisited = _node({"BM": 2}, tree.root)
     tree.root.children = [good_visited, bad_unvisited]
     tree.record_terminal(good_visited, 1.0)  # global_best = 1.0, Q(good) = 1
-    s = TuningSearch(tree=tree, prior_model=prior, acquisition=True)
+    s = TuningSearch(tree=tree, prior_model=prior)
     prior.resample()
 
     # Depth-1 (forced breadth): the unvisited child wins on +∞.
@@ -185,7 +186,7 @@ def test_puct_still_explores_promising_unvisited():
     good_unvisited = _node({"BM": 64}, tree.root)
     tree.root.children = [mediocre_visited, good_unvisited]
     tree.record_terminal(mediocre_visited, 0.3)  # global_best 0.3, but BM=8 is so-so
-    s = TuningSearch(tree=tree, prior_model=prior, acquisition=True)
+    s = TuningSearch(tree=tree, prior_model=prior)
     prior.resample()
     assert s._select_puct([mediocre_visited, good_unvisited], tree.root) is good_unvisited
 
@@ -197,9 +198,10 @@ def test_acquisition_falls_back_to_ucb_during_warmup():
     a = _node({"BM": 64}, tree.root)
     b = _node({"BM": 2}, tree.root)
     tree.root.children = [a, b]
-    prior = OnlinePrior(seed=0)  # not fitted
-    s = TuningSearch(tree=tree, prior_model=prior, acquisition=True)
-    # Both unvisited → +∞ → first wins (emission order), exactly depth-1.
+    prior = BayesianRidgePrior(seed=0, acquisition=True)  # acquisition on, but not fitted
+    s = TuningSearch(tree=tree, prior_model=prior)
+    # Acquisition is requested but the prior isn't fit → _select falls back to
+    # depth-1 UCB1: both unvisited → +∞ → first wins (emission order).
     assert s._select([a, b], tree.root) is a
 
 

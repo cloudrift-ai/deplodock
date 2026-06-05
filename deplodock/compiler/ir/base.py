@@ -60,34 +60,8 @@ class Op:
     # autotune knob picked along the chain. Excluded from structural
     # identity and equality — pure attribution metadata.
     knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
-    # Free-form per-op-instance scratch metadata for passes that derive
-    # expensive analysis from the op and want it to ride the op instead of
-    # being threaded through call chains (e.g. the partition planner caches
-    # its ``_Plan`` under ``meta["plan"]``). Ops are shared by reference
-    # across ``Graph.copy`` snapshots and ``single_node_graph`` slices, so
-    # an entry stamped once is visible to every later consumer of the same
-    # op object — entries MUST therefore be keyed/validated by their owner
-    # against anything environmental they depend on. Never serialized,
-    # never part of structural identity or equality.
-    meta: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     inputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     outputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
-
-    def __getstate__(self) -> dict:
-        """Pickle without ``meta`` — it is per-process scratch (the partition
-        planner stashes its ``_Plan`` there, whose class is loaded under a bare
-        rule-module stem and is unimportable in a subprocess). The bench worker
-        receives the ``CudaOp`` graph by pickle and its ``Op.source`` provenance
-        chain reaches a ``LoopOp`` carrying that ``_Plan``, so without this the
-        unpickle dies with ``No module named '010_partition_loops'``. ``meta``
-        is documented "never serialized"; this enforces it."""
-        state = self.__dict__.copy()
-        state["meta"] = {}
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        self.__dict__.setdefault("meta", {})
 
     def populate_io(self, graph: Graph, node: Node) -> None:
         """Refresh ``inputs`` / ``outputs`` from the surrounding graph.

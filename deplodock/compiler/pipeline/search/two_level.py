@@ -136,16 +136,16 @@ def inner_reward(
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     progress=None,
-    prior: str = "off",
-    prior_seed: int = 0,
+    prior_factory=None,
 ) -> InnerReward:
     """Tune every post-fusion kernel of ``fused_graph`` in its own single-node
     slice and return ``Σ best-per-op time`` — the outer terminal reward.
 
-    ``prior="online"`` attaches a fresh in-memory
-    :class:`~deplodock.compiler.pipeline.search.prior.OnlinePrior` to each
-    kernel's inner search (the learned unvisited-sibling tiebreaker) and
-    collects its end-of-run sanity block into ``InnerReward.prior_summaries``.
+    ``prior_factory`` (a no-arg callable → a fresh
+    :class:`~deplodock.compiler.pipeline.search.prior.Prior` per kernel) attaches
+    a learned prior to each inner search; its mode flags (``active`` /
+    ``acquisition``) live on the prior object. The end-of-run sanity block per
+    kernel is collected into ``InnerReward.prior_summaries``.
 
     Each kernel is gated on persisted effort: an op already tuned to
     ``>= patience`` (or exhausted, recorded ``inf``) is skipped and its cached
@@ -207,10 +207,8 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            prior_model = _make_prior(prior, prior_seed) if prior in ("online", "shadow", "puct") else None
-            inner = TuningSearch(
-                patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior_model, acquisition=(prior == "puct")
-            )
+            prior_model = prior_factory() if prior_factory is not None else None
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior_model)
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
@@ -253,17 +251,6 @@ def inner_reward(
     return InnerReward(total_us=total, ok=ok, per_op=per_op, prior_summaries=prior_summaries)
 
 
-def _make_prior(prior: str, seed: int):
-    """Construct an :class:`OnlinePrior` (lazy import — keeps numpy off the
-    default ``off`` path). ``shadow`` fits + reports but doesn't steer selection
-    (pure-UCB baseline); ``online`` is the depth-1 tiebreak; ``puct`` is the
-    depth-2 acquisition (the ``acquisition`` flag is set search-side)."""
-    from deplodock.compiler.pipeline.search.prior import OnlinePrior  # noqa: PLC0415
-
-    label = {"online": "online", "shadow": "shadow/UCB", "puct": "puct"}[prior]
-    return OnlinePrior(seed=seed, active=(prior in ("online", "puct")), mode=label)
-
-
 def run_two_level_tune(
     graph: Graph,
     *,
@@ -274,8 +261,7 @@ def run_two_level_tune(
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     dump=None,
     progress=None,
-    prior: str = "off",
-    prior_seed: int = 0,
+    prior_factory=None,
 ) -> TwoLevelResult:
     """Drive the outer fusion search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
@@ -311,8 +297,7 @@ def run_two_level_tune(
             patience=patience,
             ucb_c=ucb_c,
             progress=progress,
-            prior=prior,
-            prior_seed=prior_seed,
+            prior_factory=prior_factory,
         )
         prior_summaries.extend(reward.prior_summaries)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)

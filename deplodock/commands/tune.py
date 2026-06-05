@@ -202,8 +202,7 @@ def handle_tune(args):
             ucb_c=args.ucb_c,
             dump=dump,
             progress=progress,
-            prior=args.prior,
-            prior_seed=args.seed,
+            prior_factory=_prior_factory(args.prior, args.seed),
         )
     except KeyboardInterrupt:
         # Manual abort: per-op bests already landed in the DB as they were
@@ -260,6 +259,21 @@ def handle_tune(args):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
+
+
+def _prior_factory(mode: str, seed: int):
+    """Build the per-kernel prior factory for ``--prior`` (``None`` for 'off').
+    The mode flags (``active`` / ``acquisition``) ride the prior object; the
+    search reads them off it. ``inner_reward`` calls the factory once per
+    kernel for a fresh in-memory model."""
+    if mode == "off":
+        return None
+    from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior
+
+    label = {"online": "online", "shadow": "shadow/UCB", "puct": "puct"}[mode]
+    active = mode in ("online", "puct")
+    acquisition = mode == "puct"
+    return lambda: BayesianRidgePrior(seed=seed, active=active, acquisition=acquisition, mode=label)
 
 
 def _clean_caches(db_path) -> None:

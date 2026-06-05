@@ -129,7 +129,7 @@ piece sets onto the merged node (unioning the dissolved producers so a multi-out
 in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
 `Pipeline.tune` entry (idempotent); pure metadata, excluded from structural / cache keys.
 
-Consumers: `provenance.name_for` (called from `pipeline/passes/loop/fusion/030_stamp_loop_names`, the last
+Consumers: `provenance.name_for` (called from `pipeline/passes/loop/fusion/991_stamp_loop_names`, the last
 loop-dialect rule) names kernels after the ops they realize (`k_rms_norm` when full, `k_rms_norm_reduce` when partial)
 and stamps the name onto `LoopOp.name`; every subsequent dialect (`TileOp`/`KernelOp`/`CudaOp`) just copies it
 through. `pipeline/dump._dump_torch_repro` slices the pristine frontend graph by a kernel's origins into a runnable

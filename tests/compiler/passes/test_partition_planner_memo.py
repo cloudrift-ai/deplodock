@@ -1,10 +1,10 @@
-"""Tests for the partition planner's op-metadata plan cache + the lazy
-Fork-tree build (``010_partition_loops`` / ``fork.build_fork_tree``).
+"""Tests for the partition planner's lazy Fork-tree build + structural
+features (``010_partition_loops`` / ``fork.build_fork_tree`` /
+``992_stamp_structural_features``).
 
-The finished ``_Plan`` rides its LoopOp as op metadata, keyed by
-``_plan_cache_key`` so pin / ctx / dtype changes invalidate the stamp; the
-lazy tree builds branch Forks only along the explored path. All assertions
-are call-count / identity based — no wall-time flakiness.
+The lazy tree builds branch Forks only along the explored path; the structural
+``S_*`` features are the variant identity the score cache keys on. All
+assertions are call-count / identity based — no wall-time flakiness.
 """
 
 from __future__ import annotations
@@ -23,10 +23,14 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import fork as fork_mod
 from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
+from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
 from deplodock.compiler.tensor import Tensor
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
 BR, BM, BN, FM, FN = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN)
+# ``structure_features`` now lives in the stamp pass (loaded under a bare stem).
+_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.992_stamp_structural_features")
+structure_features = _stamp.structure_features
 
 
 @pytest.fixture(autouse=True)
@@ -82,6 +86,15 @@ def _graph_with_dtypes(dtype_a: str, dtype_b: str, *, a: str = "a", b: str = "b"
     return g
 
 
+def _stamped(loop_op: LoopOp, graph: Graph | None = None) -> LoopOp:
+    """Stamp the ``S_*`` structural features onto a hand-built LoopOp — the job
+    ``992_stamp_structural_features`` does in the real pipeline. Ad-hoc callers
+    of ``_plan_kernel`` must do this themselves (there is no fallback)."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    return replace(loop_op, knobs={**loop_op.knobs, **structure_features(loop_op.body, graph)})
+
+
 def _build_tree(plan, ctx: Context) -> Fork:
     """The planner's canonical scalar level layout (mirrors ``rewrite()``)."""
     return build_fork_tree(
@@ -98,50 +111,9 @@ def _build_tree(plan, ctx: Context) -> Fork:
     )
 
 
-def test_plan_rides_op_metadata(monkeypatch):
-    """Re-planning the SAME LoopOp object is an op-metadata hit — the
-    stamped ``_Plan`` comes back without re-running classification or
-    enumeration — and a pin flip invalidates the stamp (the stored cache
-    key no longer matches)."""
-    ctx = _ctx()
-    loop_op = _loop_op_matmul()
-    plan_1 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
-    assert plan_1 is not None
-    assert loop_op.meta["plan"][1] is plan_1
-    plan_2 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
-    assert plan_2 is plan_1, "same op object must return the stamped plan"
-    monkeypatch.setenv("DEPLODOCK_BK", "16")
-    plan_3 = _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
-    assert plan_3 is not plan_1, "a pin flip must invalidate the op-metadata stamp"
-    assert all(p["BK"] == 16 for p in plan_3.params)
-
-
-def test_op_metadata_hit_skips_enumeration(monkeypatch):
-    """The stamp hit must not re-run ``enumerate_cartesian``."""
-    calls = {"n": 0}
-    real = _planner.enumerate_cartesian
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(_planner, "enumerate_cartesian", counting)
-    ctx = _ctx()
-    loop_op = _loop_op_matmul()
-    _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
-    n_first = calls["n"]
-    assert n_first >= 1
-    _planner._plan_kernel(loop_op, ctx, kernel_name="k_l0")
-    assert calls["n"] == n_first, "op-metadata hit re-ran enumerate_cartesian"
-
-
 def test_dtype_signature_separates_structural_features():
     """Same body structure, different operand dtypes → different structural
-    features (the ``S_dtype_*`` multiset gates the fp16 half2 window), and the
-    features land in the plan cache key via the knobs."""
-    from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
-
-    ctx = _ctx()
+    features (the ``S_dtype_*`` multiset gates the fp16 half2 window)."""
     feats_f16 = structure_features(_loop_op_matmul().body, _graph_with_dtypes("f16", "f16"))
     feats_f32 = structure_features(_loop_op_matmul().body, _graph_with_dtypes("f32", "f32"))
     feats_none = structure_features(_loop_op_matmul().body, None)
@@ -151,25 +123,6 @@ def test_dtype_signature_separates_structural_features():
     # objects with different SSA / buffer / axis names (counts are name-invariant).
     other = _loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2")
     assert structure_features(other.body, _graph_with_dtypes("f16", "f16", a="w", b="x")) == feats_f16
-    op = _loop_op_matmul()
-    plan = _planner._plan_kernel(op, ctx, kernel_name="k")
-    assert plan is not None
-    struct = {k: v for k, v in op.knobs.items() if k.startswith(STRUCT_PREFIX)}
-    assert struct and all(plan.base_knobs[k] == v for k, v in struct.items())
-    key_knobs = dict(_planner._plan_cache_key(op, ctx)[0])
-    assert all(key_knobs[k] == v for k, v in struct.items())
-
-
-def test_mma_pin_lands_in_cache_key(monkeypatch):
-    """``MMA`` is a planner knob, so the pin snapshot covers it: flipping
-    ``DEPLODOCK_MMA`` must produce a fresh plan cache key (it gates the
-    warp-tier enumeration)."""
-    ctx = _ctx()
-    loop_op = _loop_op_matmul()
-    key_default = _planner._plan_cache_key(loop_op, ctx)
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    key_off = _planner._plan_cache_key(loop_op, ctx)
-    assert key_default != key_off
 
 
 def test_lazy_tree_builds_only_expanded_path(monkeypatch):
@@ -216,12 +169,11 @@ def test_score_variant_matches_lazy_score():
 
 
 def test_structural_features_stamped_by_last_loop_pass():
-    """``loop/fusion/040_stamp_structural_id`` runs last in the loop dialect:
-    every fused LoopOp leaves the loop passes carrying its ``S_*`` structural
-    features equal to :func:`structure_features` — identity settles with the
-    final fused body, before any tune-DB keying or tile-stage scoring sees the
-    op."""
-    from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
+    """``loop/fusion/992_stamp_structural_features`` runs last in the loop
+    dialect: every fused LoopOp leaves the loop passes carrying its ``S_*``
+    structural features equal to :func:`structure_features` — identity settles
+    with the final fused body, before any tune-DB keying or tile-stage scoring
+    sees the op."""
     from deplodock.compiler.ir.frontend.ir import MatmulOp
     from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
     from deplodock.compiler.pipeline.search.db import SearchDB
@@ -259,8 +211,8 @@ def test_scores_shared_across_identical_loop_ops(monkeypatch):
 
     monkeypatch.setattr(TileOp, "lazy_score", staticmethod(counting))
     ctx = _ctx()
-    plan_1 = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
-    plan_2 = _planner._plan_kernel(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2"), ctx, kernel_name="k_l1")
+    plan_1 = _planner._plan_kernel(_stamped(_loop_op_matmul()), ctx, kernel_name="k_l0")
+    plan_2 = _planner._plan_kernel(_stamped(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2")), ctx, kernel_name="k_l1")
     assert plan_1 is not None and plan_2 is not None
     struct_1 = {k: v for k, v in plan_1.base_knobs.items() if k.startswith("S_")}
     struct_2 = {k: v for k, v in plan_2.base_knobs.items() if k.startswith("S_")}

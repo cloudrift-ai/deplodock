@@ -81,12 +81,40 @@ BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread c
 _TUNE_WARP_AXIS_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 WN = Knob("WN", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA innermost WARP count along matmul output N")
 WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WARP count along matmul output M")
+
+
+def _mma_features(mma: object) -> dict[str, float]:
+    """Learned-prior featurizer for the ``MMA`` knob: expand an atom kind into
+    physical cell/dtype properties (cell shape, group size, operand bit widths)
+    via ``ATOM_REGISTRY`` so a new atom generalizes by geometry/dtype rather than
+    a one-hot id. The scalar tier (``0`` / unknown kind) is ``MMA_tier=0``.
+    Wired onto the ``MMA`` Knob so ``knob.knob_features`` needs no special-case.
+    Lazy import — ``_enumeration`` is imported while the tile IR is still being
+    built up."""
+    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+
+    atom = ATOM_REGISTRY.get(str(mma))
+    if atom is None:
+        return {"MMA_tier": 0.0}
+    m, n, k = atom.shape
+    return {
+        "MMA_tier": 1.0,
+        "MMA_atom_m": float(m),
+        "MMA_atom_n": float(n),
+        "MMA_atom_k": float(k),
+        "MMA_group_size": float(atom.group_size),
+        "MMA_a_bits": float(atom.operand_dtype("a").nbytes * 8),
+        "MMA_acc_bits": float(atom.operand_dtype("c").nbytes * 8),
+    }
+
+
 MMA = Knob(
     "MMA",
     KnobType.STR,
     hints=(),
     help="Warp-tier MMA control: 0 = scalar-only; 1/true (default) = auto-enumerate; hardware matmul atom kind (MMA/wgmma/...)",
     aliases=("ATOM_KIND",),
+    features=_mma_features,
 )
 
 _MMA_FALSY = frozenset({"0", "false", "no", "off"})

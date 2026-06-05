@@ -72,7 +72,7 @@ matched `Node` objects. Anything else binds positionally to
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
 parent's graph snapshot) and hands them ALL to the search, which picks: greedy keeps the first (option-0)
 sibling — DB-best replay (`_best_fork`) and the static `score_of` prior were **nuked from selection**;
-tuning explores every fork, ranking the unvisited frontier with its learned `OnlinePrior` (search/prior.py,
+tuning explores every fork, ranking the unvisited frontier with its learned `BayesianRidgePrior` (search/prior/,
 Thompson-sampled — `0` → emission order under pure UCB). Single-option returns (or bare `Graph` / `Op`)
 are the deterministic case — no fork.
 
@@ -91,7 +91,7 @@ per-instance capture lambdas; used by `085_warp_specialize`), and the tree build
 classes.
 
 **The planner score compute (no longer drives selection).** The static prior was nuked from selection in
-favor of the learned `OnlinePrior`; `Search.score_of(fork) = fork.score(self.score_cache)` is retained as
+favor of the learned prior (`BayesianRidgePrior`); `Search.score_of(fork) = fork.score(self.score_cache)` is retained as
 latent compute (exercised directly by the partition-planner tests). It still keys cleanly: the search owns
 the value-keyed score cache, and the partition planner keys each variant by `(ctx fields, frozenset(merged
 knobs))`, complete because the `S_*` structural-feature knobs ride the dict, so structurally identical
@@ -194,7 +194,7 @@ original lazy split assumed) — so the finished `_Plan` rides its LoopOp as op 
 (`loop_op.meta["plan"] = (cache_key, plan)`): ops are shared by reference across graph copies and
 `single_node_graph` tune slices, so re-planning the same op object short-circuits entirely (classification
 and enumeration included). The stamp is validated against `_plan_cache_key` — the carry-forward knobs,
-which include the `S_*` structural features stamped by `loop/fusion/040_stamp_structural_id` (a stmt/op
+which include the `S_*` structural features stamped by `loop/fusion/992_stamp_structural_features` (a stmt/op
 histogram + loop extents + operand dtypes, so a structure or dtype change is an identity change), + the
 hardware context + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`)
 — so a pin / ctx / structure change invalidates it. The `S_*` knobs also power the search-owned
@@ -288,14 +288,14 @@ Everything the search stores or replays is keyed by one of TWO identities — wh
 table, pick one; don't invent a third:
 
 - **Variant identity = `(context, knobs)`** — anything *predictive or replayable*. The `S_*` structural
-  features (`loop/fusion/040_stamp_structural_id`: a stmt/op histogram + loop extents + operand dtypes) make
+  features (`loop/fusion/992_stamp_structural_features`: a stmt/op histogram + loop extents + operand dtypes) make
   the merged knob dict a COMPLETE identity, so a prior is a pure function of it: the score cache keys
   `(ctx fields, frozenset(merged knobs))`, the planner's op-metadata plan stamp keys the same plus the
   `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration). The *learned*
   prior is exactly `score(features(ctx, knobs))`: the structural facts (op histogram, extents, dtypes) are
   already in the knob dict, so `knob.knob_features` turns it straight into the model feature vector (the
-  `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props). See the learned
-  `OnlinePrior` section below and `plans/learned-prior-puct.md`.
+  `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props). See the learned-prior
+  section below.
 - **Measurement identity = `(ctx.structural_key, op_cache_key)`** — ground truth about *materialized
   leaves*: `perf` rows, op inventory (`loop_op`/`tile_op`/`kernel_op`/`cuda_op`), `op_effort` gating, and
   two-level dedup. The structural `child_key` on `lowering` rows is measurement linkage (it joins the
@@ -414,7 +414,7 @@ over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** picks the child of the current node with the highest `Q_norm + ucb_c · sqrt(ln(parent_visits) / child_visits)`,
   where `Q_norm = child.best_reward / global_best_reward` and `reward = 1 / median_us` (so lower latency = higher reward).
-  The unvisited-sibling tiebreak is the learned `OnlinePrior` (`search/prior.py`), Thompson-sampled once per descent —
+  The unvisited-sibling tiebreak is the learned `BayesianRidgePrior` (`search/prior/`), Thompson-sampled once per descent —
   `0` when no prior is attached (`--prior off`), which falls back to emission order (pure UCB). The static `TileOp.score`
   tiebreak was nuked from selection.
 - **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
@@ -427,7 +427,7 @@ over one op's forks — with max-Q normalized UCB1:
   default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Run.drive` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
-**Learned prior (`search/prior.py`, `--prior online`).** An in-memory Bayesian-ridge model fit *within one inner
+**Learned prior (`search/prior/`, `--prior`).** An in-memory Bayesian-ridge model (`BayesianRidgePrior`) fit *within one inner
 `TuningSearch`* (per kernel, discarded after), replacing the nuked static tiebreak. Training signal is
 **value-of-position**: real benches exist only at leaves, but the prior ranks partial-knob siblings at every fork level,
 so the label for any node is `log(best_reward)` — the max over its benched descendants, which `record_terminal` already
@@ -450,7 +450,7 @@ How the prior enters selection — two depths (`--prior` mode):
 - **`shadow`** — fits + reports the same end-of-run sanity block (silly-pick rate warmup-vs-post, self-calibration) but
   scores `0` (pure-UCB baseline arm of the A/B).
 
-Findings + the road to a shipped, default-on prior live in `plans/learned-prior-puct.md`.
+The `shadow` arm makes the online-vs-UCB and depth-1-vs-depth-2 A/Bs measurable on one op.
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
@@ -509,7 +509,7 @@ incompatible divisibility still get a sensible default.
 | `FK`                 | INT       | `010_partition_loops`         | Reduce-axis multiple-accumulator factor (non-matmul reduces). Strip-mines the per-thread K serial loop into `FK` independent accumulators (a `RegisterTile(K_f, reduce=True)` inside `K_i`) for ILP; `010_split_register_axes` replicates the wrapped `Accum` into `acc_0..acc_{FK-1}` and appends a cross-accumulator tree-fold after the K serial loops, so the materializer/combine see one `acc`. Swept only as a divisor of the per-thread K-chunk extent, capped by `FK·FM·FN ≤ _MAX_CELLS_PER_THREAD`. **fp16 scalar matmul** reuses `FK` as the half2 accumulation-window length (= even `bk`): the planner keeps the FK=1 fp32 structure + stamps `FKWIN`, and `kernel/015_pack_fk_window` rewrites the window K loop into `__hfma2` packed multiply-adds over a `__half2` accumulator with a widen+horizontal-sum flush into the fp32 master each stage — bounded fp16 error for 2× packed throughput. `FK=1` (and fp32/bf16/MMA) is byte-identical to the pre-FK planner (it ranks first in the greedy tiebreak). See `plans/fk-register-tile-reductions.md` and `plans/fk-half2-fp16-matmul.md`. |
 | `WN`                 | INT       | `010_partition_loops`         | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `WM`                 | INT       | `010_partition_loops`         | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `S_*`                | FLOAT     | `loop/fusion/040_stamp_structural_id` | The LoopOp's structural features (`ir/features.py:structure_features`): a flat `S_`-prefixed dict — stmt/op histogram (`S_n_load`, `S_pw_*`, `S_reduce_*`, …) + loop extents (`S_ext_*`) + operand dtype multiset (`S_dtype_*`). Not tunable — identity facts that make a knob dict a complete variant identity (the planner's value-keyed score cache). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, search-tree comparisons) sees one consistent knob set; `knob_features` turns the whole knob dict into the model feature vector. Skipped by `format_tuning_knobs` (facts, not tuning decisions). |
+| `S_*`                | FLOAT     | `loop/fusion/992_stamp_structural_features` | The LoopOp's structural features (`ir/features.py:structure_features`): a flat `S_`-prefixed dict — stmt/op histogram (`S_n_load`, `S_pw_*`, `S_reduce_*`, …) + loop extents (`S_ext_*`) + operand dtype multiset (`S_dtype_*`). Not tunable — identity facts that make a knob dict a complete variant identity (the planner's value-keyed score cache). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, search-tree comparisons) sees one consistent knob set; `knob_features` turns the whole knob dict into the model feature vector. Skipped by `format_tuning_knobs` (facts, not tuning decisions). |
 | `MMA`                | STR       | `010_partition_loops`         | Three-way control for warp-tier MMA (tensor-core) matmul enumeration: falsy (`0`/`false`/…) forces the scalar-only path (debug / fallback); truthy (`1`/`true`/…) or unset (the default) auto-enumerates every eligible atom kind; any other value names an atom kind (e.g. `mma_m16n8k16_f16`) — enable **and** pin that kind, incl. the force-at-any-arch pin-only path. `DEPLODOCK_ATOM_KIND` is its env **alias** (`Knob.aliases` — either spelling works; the primary `DEPLODOCK_MMA` wins when both are set). Not an autotune fork: the tuner picks warp-vs-scalar through the `ATOM_KIND` sibling subtree. Declared in `_enumeration.py`, decoded by `mma_mode()`; sits in `_PLANNER_KNOBS` so the enumeration-memo pin snapshot covers it (alias included, via `Knob.raw`).                                                                                                                                                                                                                                                                                                                          |
 | `HOIST_COMPUTE`      | BOOL      | `030_hoist_invariant_compute` | False (default) → inline-fuse Stage; True → single transport Stage + a `StageBundle.compute` phase. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `PAD_SMEM`           | BOOL      | `070_pad_smem`                | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |

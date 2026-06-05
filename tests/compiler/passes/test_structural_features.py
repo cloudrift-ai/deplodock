@@ -1,11 +1,16 @@
-"""Unit tests for structural feature extraction (``ir/features.py``).
+"""Unit tests for structural feature extraction
+(``loop/fusion/992_stamp_structural_features.structure_features``).
 
 Hand-built ``Body`` fixtures (same style as ``tests/compiler/ir/stmt/
 test_structural_key.py``) exercise the skeleton histogram, the extent-free
-invariant, the ``S_ext_*`` extent block, and the ``S_dtype_*`` multiset.
+invariant, the ``S_ext_*`` extent block, and the ``S_dtype_*`` multiset; a
+second group compiles real frontend graphs (triple-matmul, matmul + epilogue,
+attention-like) through the loop passes and checks the stamped features.
 """
 
 from __future__ import annotations
+
+import importlib
 
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph
@@ -13,11 +18,16 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
+from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt.blocks import Loop
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
 from deplodock.compiler.tensor import Tensor
+
+# ``structure_features`` lives in the stamp pass (loaded under a bare stem).
+_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.992_stamp_structural_features")
+structure_features = _stamp.structure_features
 
 
 def _rms_body(ext_i: int = 8, ext_k: int = 64) -> Body:
@@ -157,3 +167,74 @@ def test_dtype_multiset_needs_graph():
     assert feats["S_dtype_f16"] == 1.0
     # Without a graph there are no dtype features.
     assert not any(k.startswith("S_dtype_") for k in structure_features(_rms_body()))
+
+
+# --- complex, compiled-through-the-loop-passes graphs ----------------------
+
+
+def _fused_loops(graph: Graph):
+    """Run the loop dialect (incl. the structural-feature stamp) and return
+    ``(fused_graph, [LoopOp, ...])``."""
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
+
+    fused = Pipeline.build(LOOP_PASSES).run(graph, ctx=Context(compute_capability="sm_80"), db=SearchDB())
+    return fused, [n.op for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
+
+
+def _matmul_chain(shapes: list[tuple[str, tuple[int, int]]], mms: list[tuple[str, str, str, tuple[int, int]]]) -> Graph:
+    """Build a frontend matmul graph: ``shapes`` are (id, shape) inputs; ``mms``
+    are (out_id, lhs_id, rhs_id, out_shape) MatmulOps applied in order."""
+    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+
+    g = Graph()
+    for nid, shape in shapes:
+        g.add_node(InputOp(), [], Tensor(nid, shape), node_id=nid)
+    for out, lhs, rhs, shape in mms:
+        g.add_node(MatmulOp(), [lhs, rhs], Tensor(out, shape), node_id=out)
+    g.inputs = [nid for nid, _ in shapes]
+    g.outputs = [mms[-1][0]]
+    return g
+
+
+def test_triple_matmul_features_consistent_and_per_kernel_reduce():
+    """A chained triple-matmul ``((a@b)@d)`` fuses to ≥2 matmul LoopOps; each
+    carries stamped ``S_*`` features equal to :func:`structure_features`, has a
+    K-reduce loop, and the distinct per-matmul K extents both show up."""
+    g = _matmul_chain(
+        [("a", (64, 128)), ("b", (128, 48)), ("d", (48, 80))],
+        [("c", "a", "b", (64, 48)), ("e", "c", "d", (64, 80))],
+    )
+    fused, loops = _fused_loops(g)
+    assert len(loops) >= 2, "two chained matmuls should not fuse into one kernel"
+    reduce_maxes = set()
+    for op in loops:
+        struct = {k: v for k, v in op.knobs.items() if k.startswith(STRUCT_PREFIX)}
+        assert struct == structure_features(op.body, fused), "stamped S_* must match structure_features"
+        assert struct["S_n_reduce_loop"] >= 1.0, "each matmul kernel has a K reduce"
+        reduce_maxes.add(struct["S_ext_reduce_max"])
+    assert {128.0, 48.0} <= reduce_maxes, f"both matmul K extents should appear, got {reduce_maxes}"
+
+
+def test_uncommon_shape_extents_land_in_features():
+    """A non-power-of-2 matmul (48×80×96): the free/reduce extents land in the
+    ``S_ext_*`` block (max free = N=80, reduce = K=96)."""
+    g = _matmul_chain([("a", (48, 96)), ("b", (96, 80))], [("c", "a", "b", (48, 80))])
+    fused, loops = _fused_loops(g)
+    assert len(loops) == 1
+    struct = {k: v for k, v in loops[0].knobs.items() if k.startswith(STRUCT_PREFIX)}
+    assert struct == structure_features(loops[0].body, fused)
+    assert struct["S_ext_reduce_max"] == 96.0
+    assert struct["S_ext_free_max"] == 80.0
+
+
+def test_matmul_features_differ_from_reduction():
+    """A matmul kernel's structural skeleton differs from a pure reduction's —
+    the multiply-accumulate inner vs the single reduce — so the prior can tell
+    them apart from features alone."""
+    g = _matmul_chain([("a", (48, 96)), ("b", (96, 80))], [("c", "a", "b", (48, 80))])
+    _, loops = _fused_loops(g)
+    matmul_skel = {k: v for k, v in structure_features(loops[0].body).items() if not k.startswith("S_ext_")}
+    rms_skel = {k: v for k, v in structure_features(_rms_body()).items() if not k.startswith("S_ext_")}
+    assert matmul_skel != rms_skel

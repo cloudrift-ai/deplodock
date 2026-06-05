@@ -17,7 +17,7 @@ instance — no ``register(...)`` wrapper, no manual bookkeeping.
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,10 +25,17 @@ from types import ModuleType
 from typing import Any
 
 from deplodock import config
-from deplodock.compiler.ir.features import STRUCT_PREFIX
 
 # The ``deplodock/`` package dir (knob.py → pipeline → compiler → deplodock).
 _PKG_ROOT = Path(__file__).resolve().parents[2]
+
+# Reserved prefix for the structural-feature knobs stamped by
+# ``loop/fusion/992_stamp_structural_features`` — distinct from any tuning Knob
+# name, so ``format_tuning_knobs`` drops them from the tuning view and
+# ``knob_features`` passes them through as-is. Declared here (rather than with
+# the producing pass, which is loaded under a bare module stem) so every
+# consumer can import it.
+STRUCT_PREFIX = "S_"
 
 
 class KnobType(Enum):
@@ -57,6 +64,12 @@ class Knob:
     hints: tuple = ()
     help: str = ""
     aliases: tuple[str, ...] = ()
+    # Optional custom featurizer for the learned-prior feature vector: maps this
+    # knob's value to a ``dict[str, float]`` of sub-features. Declared at the
+    # knob (e.g. ``MMA`` expands an atom kind into physical cell/dtype props) so
+    # ``knob_features`` needs no per-knob special-casing. ``None`` → encode by
+    # ``type`` (INT → float, BOOL → 0/1, BINMASK → popcount/width/frac).
+    features: Callable[[Any], dict[str, float]] | None = None
 
     @property
     def env(self) -> str:
@@ -281,7 +294,7 @@ def format_tuning_knobs(knobs: dict) -> str:
     ``BINMASK`` values are already stored as binary strings in
     ``op.knobs`` (rules stamp via ``Knob.pretty``), so ``str(v)`` here
     round-trips correctly. ``STRUCT_PREFIX`` knobs (the structural-feature
-    stamp from ``040_stamp_structural_id``) are facts about the kernel, not
+    stamp from ``992_stamp_structural_features``) are facts about the kernel, not
     tuning decisions, so they are dropped from this tuning-knob view.
     """
     rendered: list[tuple[str, str]] = []
@@ -307,14 +320,13 @@ def knob_features(knobs: dict) -> dict[str, float]:
     learned planner prior — the single featurizer over the whole dict.
 
     - ``STRUCT_PREFIX`` knobs (structural features stamped by
-      ``040_stamp_structural_id``) pass through as floats: they already are the
+      ``992_stamp_structural_features``) pass through as floats: they already are the
       kernel's structural feature set.
     - Registered tuning ``Knob``s are encoded by type: ``INT`` → float, ``BOOL``
       → 0/1, ``BINMASK`` (binary string) → ``{<name>_popcount, _width, _frac}``.
-    - ``MMA`` (a string atom kind) is expanded through ``ATOM_REGISTRY`` into
-      physical atom properties (cell shape, group size, operand bit widths) so a
-      new atom kind generalizes by geometry/dtype rather than a one-hot id; the
-      scalar tier (no ``MMA``) is encoded as ``MMA_tier=0``.
+    - A ``Knob`` with a custom ``features`` callable (e.g. ``MMA``, which expands
+      an atom kind into physical cell/dtype props) dispatches through it — no
+      per-knob special-casing here.
     - Unregistered, non-structural knobs are best-effort float-coerced (skipped
       when non-numeric); other ``STR`` knobs have no generic encoding.
     """
@@ -323,10 +335,10 @@ def knob_features(knobs: dict) -> dict[str, float]:
         if name.startswith(STRUCT_PREFIX):
             feats[name] = float(val)
             continue
-        if name == "MMA":
-            feats.update(_mma_features(str(val)))
-            continue
         knob = get(name)
+        if knob is not None and knob.features is not None:
+            feats.update(knob.features(val))
+            continue
         if knob is None:
             num = _coerce_float(val)
             if num is not None:
@@ -342,29 +354,9 @@ def knob_features(knobs: dict) -> dict[str, float]:
             feats[f"{name}_popcount"] = pop
             feats[f"{name}_width"] = float(len(s))
             feats[f"{name}_frac"] = pop / len(s) if s else 0.0
-        # STR knobs other than MMA: no generic numeric encoding.
-    feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom selected
+        # STR knobs with no custom featurizer: no generic numeric encoding.
+    feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom-kind knob present
     return feats
-
-
-def _mma_features(mma: str) -> dict[str, float]:
-    """Physical-property expansion of an ``MMA`` atom kind via ``ATOM_REGISTRY``
-    (lazy import — ``knob.py`` loads before the tile IR)."""
-    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
-
-    atom = ATOM_REGISTRY.get(mma)
-    if atom is None:
-        return {"MMA_tier": 0.0}
-    m, n, k = atom.shape
-    return {
-        "MMA_tier": 1.0,
-        "MMA_atom_m": float(m),
-        "MMA_atom_n": float(n),
-        "MMA_atom_k": float(k),
-        "MMA_group_size": float(atom.group_size),
-        "MMA_a_bits": float(atom.operand_dtype("a").nbytes * 8),
-        "MMA_acc_bits": float(atom.operand_dtype("c").nbytes * 8),
-    }
 
 
 def _as_bool(v: object) -> bool:

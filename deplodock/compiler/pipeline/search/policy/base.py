@@ -55,7 +55,7 @@ class Search(ABC):
 
         NOTE: the policies no longer rank with this — the static prior was
         nuked from selection in favor of the learned
-        :class:`~deplodock.compiler.pipeline.search.prior.OnlinePrior`. This
+        :class:`~deplodock.compiler.pipeline.search.prior.Prior`. This
         accessor is retained as the lazy-planner score *compute* (exercised
         directly by the partition-planner tests and available as latent
         infra); it never fires ``fork.expand()``, so reading it stays cheap."""

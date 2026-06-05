@@ -125,7 +125,6 @@ from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
-from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Loop, Stmt, StridedLoop, Write
@@ -153,7 +152,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     WN,
     enumerate_cartesian,
     mma_mode,
-    planner_pin_snapshot,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
@@ -220,13 +218,6 @@ class _Plan:
     construction — ``_materialize(plan, params)`` runs the expensive
     ``_build_split_body`` + ``TileOp.__post_init__`` work for one
     variant only, called lazily from the chosen Fork leaf's ``expand``.
-
-    The built plan rides its LoopOp as op metadata
-    (``loop_op.meta["plan"] = (cache_key, plan)``) rather than carrying an
-    op back-reference: ops are shared by reference across graph copies and
-    tune slices, so re-planning the same op object is a metadata hit —
-    validated against the live cache key, since pins / ctx may have changed
-    since the stamp.
     """
 
     shape: KernelShape
@@ -270,13 +261,11 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     thunks) uses :meth:`TileOp.lazy_score` — the only scorer — so it
     never needs a materialized TileOp.
 
-    The finished plan rides the LoopOp as op metadata (re-plans of the
-    same op object are a stamp hit — see :func:`_plan_kernel`), and
     ``build_fork_tree`` constructs branch Forks lazily — a whole-model
     compile builds O(path) Forks per kernel instead of one per enumerated
     variant."""
     loop_op: LoopOp = root.op
-    # Name was stamped onto the LoopOp by ``loop/fusion/030_stamp_loop_names``
+    # Name was stamped onto the LoopOp by ``loop/fusion/991_stamp_loop_names``
     # (the last loop-dialect pass), so we just forward it onto the TileOp.
     kernel_name = loop_op.name
     # Idempotence is structural: once the planner has built a TileOp, the
@@ -314,7 +303,7 @@ def _score_variant(plan: _Plan, params: dict, ctx: Context, cache: dict | None =
     ``cache`` is the search-owned value-keyed score store (handed down via
     ``Search.score_of`` → ``Fork.score``; ``None`` outside a search). The
     key is ``(ctx fields, frozenset(merged knobs))`` — complete because
-    the ``S_*`` structural-feature knobs (``loop/fusion/040_stamp_structural_id``)
+    the ``S_*`` structural-feature knobs (``loop/fusion/992_stamp_structural_features``)
     make the knob dict a full variant identity — so structurally identical kernels,
     the same layer repeated through a whole model, share entries with no
     object-identity bookkeeping, and entries can never go stale: the score
@@ -566,25 +555,6 @@ def _is_fp16_matmul(matmul_reduces: list, graph: Graph | None) -> bool:
     return True
 
 
-def _plan_cache_key(loop_op: LoopOp, ctx: Context) -> tuple:
-    """Validity key for the op-metadata plan stamp — everything that changes
-    the enumerated knob rows or a variant's score. The kernel's structural
-    identity rides the ``S_*`` structural-feature knobs (stamped by
-    ``loop/fusion/040_stamp_structural_id``), so the carry-forward knobs
-    alone cover the structure; the rest is the hardware context and the live
-    ``DEPLODOCK_*`` planner pins (``enumerate_cartesian`` folds pins via
-    ``Knob.narrow``, so a pin flipped mid-process must land on a fresh key;
-    the ``MMA`` gate is a planner knob, so the snapshot covers it too)."""
-    return (
-        tuple(sorted(loop_op.knobs.items())),
-        ctx.compute_capability,
-        ctx.warp_size,
-        ctx.max_dynamic_smem,
-        ctx.max_threads_per_cta,
-        planner_pin_snapshot(),
-    )
-
-
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph: Graph | None = None) -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
@@ -604,25 +574,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     axis and wrap the LoopOp body in one outer free Loop so the rest of
     the partitioner runs unchanged. ``_wrap_tower``'s size-1-axis filter
     drops the phantom before it reaches the IR.
-
-    **Plan caching.** The finished ``_Plan`` rides the LoopOp as op
-    metadata (``loop_op.meta["plan"] = (cache_key, plan)``): ops are
-    shared by reference across graph copies and ``single_node_graph`` tune
-    slices, so re-planning the same op object returns the stamped plan
-    outright — validated against the live :func:`_plan_cache_key`, since
-    pins / ctx / dtypes may have changed since the stamp. The stamp is
-    only written after a successful non-empty enumeration, so skipped /
-    rejected shapes never poison it.
     """
-    if not any(k.startswith(STRUCT_PREFIX) for k in loop_op.knobs):
-        # Normally stamped by ``loop/fusion/040_stamp_structural_id``;
-        # direct callers (tests, ad-hoc planning) get the same identity
-        # computed here.
-        loop_op.knobs.update(structure_features(loop_op.body, graph))
-    cache_key = _plan_cache_key(loop_op, ctx)
-    stamped = loop_op.meta.get("plan")
-    if stamped is not None and stamped[0] == cache_key:
-        return stamped[1]
     chain, prologue = _outer_free_loop_chain(loop_op.body)
     if not chain:
         # Synthesize a single size-1 outer Loop so the rest of the
@@ -854,7 +806,6 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         kernel_name=kernel_name,
         params=tuple(param_combos),
     )
-    loop_op.meta["plan"] = (cache_key, plan)
     return plan
 
 

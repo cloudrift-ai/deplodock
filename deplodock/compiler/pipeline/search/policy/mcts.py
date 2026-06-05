@@ -5,7 +5,7 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
                ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
                where ``Q_norm = best_reward / global_best``. Unvisited
                children get ``+∞``, breaking ties on the learned
-               :class:`~deplodock.compiler.pipeline.search.prior.OnlinePrior`
+               :class:`~deplodock.compiler.pipeline.search.prior.Prior`
                (Thompson-sampled per descent) when one is attached, else
                ``0`` → emission order (pure UCB). The static
                ``TileOp.score`` prior was nuked from selection.
@@ -37,7 +37,7 @@ from deplodock.compiler.pipeline.search.db import PerfStats
 from deplodock.compiler.pipeline.search.policy.base import Search
 
 if TYPE_CHECKING:
-    from deplodock.compiler.pipeline.search.prior import OnlinePrior
+    from deplodock.compiler.pipeline.search.prior import Prior
 
 
 def _softmax(xs: list[float]) -> list[float]:
@@ -57,9 +57,6 @@ class SearchNode:
     visits: int = 0
     best_reward: float = 0.0  # max reward over this subtree's measured leaves
     live: int = 0  # count of un-popped frontier leaves in this subtree
-    # No prior memo: the learned ``OnlinePrior`` is Thompson-sampled (a fresh
-    # draw per descent), so a node's tiebreak score is not frozen — it is
-    # recomputed each ``_ucb_key`` from the current draw.
 
 
 class SearchTree:
@@ -104,23 +101,19 @@ class TuningSearch(Search):
         ucb_c: float = DEFAULT_UCB_C,
         max_visits: int | None = None,
         score_cache: dict[Hashable, float] | None = None,
-        prior_model: OnlinePrior | None = None,
-        acquisition: bool = False,
+        prior_model: Prior | None = None,
     ) -> None:
         super().__init__(score_cache=score_cache)
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
         self._patience = patience
         self._max_visits = max_visits
-        # Learned tiebreaker for unvisited siblings (``None`` → pure UCB). Refit
-        # from the live tree every ``refit_every`` benches; one Thompson draw
-        # per descent. The static ``score_of`` prior is no longer consulted.
+        # Learned prior for unvisited siblings (``None`` → pure UCB). Refit from
+        # the live tree every ``refit_every`` benches; one Thompson draw per
+        # descent. Selection depth is read off the prior: ``acquisition`` →
+        # depth-2 PUCT (prior in the UCB arithmetic), else depth-1 tiebreak. The
+        # static ``score_of`` prior is no longer consulted.
         self.prior_model = prior_model
-        # Depth-2: once the prior is fit, select by PUCT (prior as a softmax
-        # policy modulating the exploration bonus) instead of the depth-1
-        # +∞-unvisited tiebreak — so confidently-bad siblings aren't force-
-        # benched. Falls back to UCB1 + forced breadth during warmup.
-        self.acquisition = acquisition
         self._benches_since_fit = 0
         self._best_reward = 0.0
         self._visits_at_best = 0
@@ -185,7 +178,7 @@ class TuningSearch(Search):
     def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
         """Selection score = (UCB1 value, learned-prior tiebreak). Returned
         as a tuple so unvisited siblings (UCB1 = +∞) are ranked by the
-        Thompson-sampled :class:`OnlinePrior` (``0`` → emission order under
+        Thompson-sampled :class:`Prior` (``0`` → emission order under
         pure UCB). Visited siblings need no tiebreak (their UCB values are
         distinct), so the prior is only computed for the unvisited frontier.
         Reward is normalized against the global best so ``c`` is unit-free."""
@@ -207,7 +200,7 @@ class TuningSearch(Search):
         """Pick the next child to descend into. Depth-2 PUCT once the prior is
         fit (``acquisition`` mode); otherwise depth-1 UCB1 + ``+∞``-unvisited
         forced breadth (also the warmup path that seeds the prior)."""
-        if self.acquisition and self.prior_model is not None and self.prior_model.fitted:
+        if self.prior_model is not None and self.prior_model.acquisition and self.prior_model.fitted:
             return self._select_puct(children, parent)
         return max(children, key=lambda c: self._ucb_key(c, parent))
 

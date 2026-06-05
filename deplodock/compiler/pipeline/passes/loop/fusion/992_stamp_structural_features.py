@@ -1,18 +1,28 @@
-"""Structural feature extraction — describe a kernel's loop-level computation
-as a flat numeric dict for the (future) learned planner prior.
+"""Stamp ``LoopOp.knobs`` with the kernel's structural features.
+
+Runs LAST in the loop dialect, after fusion has settled the body (and after
+``991_stamp_loop_names``) — the same rationale as the name stamp: the features
+must reflect the final fused form. Stamping here, rather than at the head of
+Tile-IR lowering, matters for consistency: the loop-dialect ``op_cache_key``
+includes knobs, so a mid-lowering stamp would give the same logical kernel two
+identities (pre- and post-stamp), splitting the tune DB's effort / perf keyings
+and any search-tree comparison that crosses the stamp point.
 
 :func:`structure_features` walks a ``LoopOp`` body and emits an ``S_``-prefixed
-``dict[str, float]``: a stmt-type / op-multiset histogram (the extent-free
-"skeleton") plus the loop-axis extents (``S_ext_*`` — the M/N/K shapes). The
-``S_`` prefix keeps these from colliding with tuning-knob names and lets the
-knob layer skip them in tuning displays.
+(``STRUCT_PREFIX``, declared in ``pipeline/knob.py``) flat ``dict[str, float]``:
+a stmt-type / op-multiset histogram (the extent-free "skeleton") plus the
+loop-axis extents (``S_ext_*`` — the M/N/K shapes). Stamped into the knobs and
+carried forward by the engine's knob-merge, they ARE the kernel's structural
+identity: the partition planner's score cache keys on ``(ctx, frozenset(merged
+knobs))`` by VALUE (``_score_variant``), so structurally identical kernels (the
+same layer repeated through a model) carry the same ``S_*`` knobs and share
+entries with no object-identity bookkeeping — and ``knob.knob_features`` turns
+the whole knob dict into the planner-prior feature vector. The reserved ``S_``
+prefix keeps them out of the tuning-knob view (``format_tuning_knobs``).
 
-These features are stamped into ``LoopOp.knobs`` by
-``loop/fusion/040_stamp_structural_id`` and carried forward by the engine's
-knob-merge, so a fully-lowered kernel's knob dict alone identifies its
-structure — and they ARE the structural identity the score cache keys on
-(``_score_variant`` folds ``frozenset(merged knobs)``). ``knob.knob_features``
-turns the whole knob dict (structural + tuning) into the model's feature vector.
+This pass is the ONLY producer of the structural features — callers that need a
+finalized identity stamp run it (idempotent: a LoopOp already carrying any
+``S_`` knob is skipped, so the rewrite engine reaches fixed-point in one pass).
 
 Known limitation: ``TileOp.lazy_score`` reads write-index *coalescing*
 (``_coalescing_inner_extent_from_writes``), which a stmt histogram does not
@@ -25,16 +35,27 @@ if collisions prove too coarse.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from math import prod
 from typing import TYPE_CHECKING
+
+from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.loop import LoopOp
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.ir.stmt.body import Body
 
-# Reserved prefix for structural-feature knobs — distinct from any tuning Knob
-# name. ``knob.format_tuning_knobs`` / ``knob.knob_features`` key off it.
-STRUCT_PREFIX = "S_"
+PATTERN = [Pattern("root", LoopOp)]
+
+
+def rewrite(match: Match, root: Node) -> LoopOp | None:
+    if any(k.startswith(STRUCT_PREFIX) for k in root.op.knobs):
+        raise RuleSkipped("LoopOp already carries structural features")
+    feats = structure_features(root.op.body, match.graph)
+    return replace(root.op, knobs={**root.op.knobs, **feats})
 
 
 def structure_features(body: Body, graph: Graph | None = None) -> dict[str, float]:
