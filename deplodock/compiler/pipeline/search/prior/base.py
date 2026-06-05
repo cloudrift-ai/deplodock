@@ -23,8 +23,6 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 
-import numpy as np
-
 
 class Prior(ABC):
     """Abstract inner-tune prior. ``refit_every`` / ``min_rows`` gate how often
@@ -111,7 +109,8 @@ class Prior(ABC):
 
     def _calibration(self, lo: int, hi: int) -> float | None:
         """Spearman ρ between the prior's posterior-mean prediction and the
-        measured reward (−log us) over post-warmup ok picks."""
+        measured reward (−log us) over post-warmup ok picks
+        (``scipy.stats.spearmanr``)."""
         if not self.fitted:
             return None
         pred, reward = [], []
@@ -122,25 +121,7 @@ class Prior(ABC):
             reward.append(-math.log(us))
         if len(pred) < 3:
             return None
-        return _spearman(np.array(pred), np.array(reward))
+        from scipy.stats import spearmanr  # noqa: PLC0415
 
-
-def _spearman(a: np.ndarray, b: np.ndarray) -> float:
-    """Spearman rank correlation = Pearson on ranks. Returns 0.0 when either
-    side is constant (rank std 0)."""
-    ra, rb = _rank(a), _rank(b)
-    sa, sb = ra.std(), rb.std()
-    if sa < 1e-12 or sb < 1e-12:
-        return 0.0
-    return float(((ra - ra.mean()) @ (rb - rb.mean())) / (len(a) * sa * sb))
-
-
-def _rank(x: np.ndarray) -> np.ndarray:
-    """Average ranks (ties share the mean rank)."""
-    order = x.argsort()
-    ranks = np.empty(len(x), dtype=float)
-    ranks[order] = np.arange(len(x), dtype=float)
-    _, inv, counts = np.unique(x, return_inverse=True, return_counts=True)
-    sums = np.zeros(len(counts))
-    np.add.at(sums, inv, ranks)
-    return (sums / counts)[inv]
+        rho = float(spearmanr(pred, reward).statistic)
+        return None if math.isnan(rho) else rho

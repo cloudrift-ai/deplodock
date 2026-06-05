@@ -10,11 +10,8 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
-import numpy as np
-
 from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch, _softmax
 from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior
-from deplodock.compiler.pipeline.search.prior.base import _spearman
 
 
 def _node(knobs: dict, parent: SearchNode) -> SearchNode:
@@ -26,18 +23,21 @@ def _node(knobs: dict, parent: SearchNode) -> SearchNode:
 # --- model fit -------------------------------------------------------------
 
 
-def test_noiseless_linear_is_recovered():
-    """With a tiny ridge and an exactly-linear target, the standardized ridge
-    fit reproduces the labels — the solve is correct end-to-end."""
+def test_fits_and_ranks_linear_target():
+    """On an exactly-linear target the BayesianRidge fit ranks the rows in the
+    true order (Spearman ~1) — exact label recovery isn't expected (it fits its
+    own regularization), only correct ranking."""
     rows = []
     for bm in (16, 32, 64, 128):
         for bn in (16, 32, 64):
             rows.append(({"BM": bm, "BN": bn}, 0.01 * bm - 0.02 * bn))
-    p = BayesianRidgePrior(seed=0, ridge=1e-6, min_rows=3)
+    p = BayesianRidgePrior(seed=0, min_rows=3)
     p.fit(rows)
-    preds = np.array([p.mean_score(k) for k, _ in rows])
-    ys = np.array([y for _, y in rows])
-    assert np.allclose(preds, ys, atol=1e-3)
+    preds = [p.mean_score(k) for k, _ in rows]
+    ys = [y for _, y in rows]
+    order_pred = sorted(range(len(rows)), key=lambda i: preds[i])
+    order_true = sorted(range(len(rows)), key=lambda i: ys[i])
+    assert order_pred == order_true
 
 
 def test_ranks_lower_latency_higher():
@@ -72,25 +72,14 @@ def test_score_is_zero_before_fit():
     assert p.mean_score({"BM": 64}) == 0.0
 
 
-def test_thompson_draw_is_deterministic_until_resample():
+def test_score_is_thompson_stochastic_mean_is_not():
     rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
     p = BayesianRidgePrior(seed=7, min_rows=3)
-    p.fit(rows)  # fit() ends with a resample
-    a = p.score({"BM": 64})
-    b = p.score({"BM": 64})
-    assert a == b, "score must be stable under a fixed Thompson draw"
-    p.resample()
-    # A fresh draw almost surely shifts the value (sanity that resample fires).
-    assert p.score({"BM": 64}) != a
-
-
-def test_seeded_priors_are_reproducible():
-    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
-    p1 = BayesianRidgePrior(seed=3, min_rows=3)
-    p2 = BayesianRidgePrior(seed=3, min_rows=3)
-    p1.fit(rows)
-    p2.fit(rows)
-    assert p1.score({"BM": 32}) == p2.score({"BM": 32})
+    p.fit(rows)
+    # score() draws a fresh Thompson sample each call (per-point predictive std).
+    assert p.score({"BM": 64}) != p.score({"BM": 64})
+    # mean_score() is the deterministic posterior mean.
+    assert p.mean_score({"BM": 64}) == p.mean_score({"BM": 64})
 
 
 # --- value-of-position labels from the tree --------------------------------
@@ -235,10 +224,12 @@ def test_softmax_sums_to_one_and_orders():
     assert all(abs(a - b) < 1e-12 for a, b in zip(p, p2, strict=True))
 
 
+def test_seeded_priors_reproducible_mean_score():
+    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (16, 32, 64, 128)]
+    p1, p2 = BayesianRidgePrior(seed=3, min_rows=3), BayesianRidgePrior(seed=3, min_rows=3)
+    p1.fit(rows)
+    p2.fit(rows)
+    assert p1.mean_score({"BM": 32}) == p2.mean_score({"BM": 32})
+
+
 # --- spearman helper -------------------------------------------------------
-
-
-def test_spearman_monotone_and_constant():
-    assert _spearman(np.array([1.0, 2, 3, 4]), np.array([1.0, 2, 3, 4])) > 0.999
-    assert _spearman(np.array([1.0, 2, 3, 4]), np.array([4.0, 3, 2, 1])) < -0.999
-    assert _spearman(np.array([1.0, 1, 1, 1]), np.array([1.0, 2, 3, 4])) == 0.0

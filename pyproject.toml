@@ -12,6 +12,7 @@ dependencies = [
     "httpx",
     "numpy",
     "pyyaml",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]
