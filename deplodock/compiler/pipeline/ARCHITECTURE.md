@@ -26,7 +26,7 @@ pipeline/
     │   └── optimization/   # IndexMap fusion before lift-to-loop
     ├── loop/
     │   ├── lifting/        # tensor ops → trivial LoopOp nodes
-    │   └── fusion/         # fuse fan-out indexmaps into all consumers, merge adjacent LoopOp pairs (splice), then stamp name + structural-id (SID) knobs
+    │   └── fusion/         # fuse fan-out indexmaps into all consumers, merge adjacent LoopOp pairs (splice), then stamp name + structural-feature (`S_*`) knobs
     └── lowering/
         ├── tile/           # LoopOp → TileOp (tileify + scheduling rules)
         ├── kernel/         # TileOp → KernelOp (materialize scheduling)
@@ -91,8 +91,8 @@ classes.
 **Scoring is search policy.** Rules emit siblings unranked; the policies rank via `Search.score_of(fork)`
 = `fork.score(self.score_cache)`. The search OWNS the value-keyed score cache and hands it down to the
 fork's compute; the KEYING is the scorer's own, since only it knows its value identity — the partition
-planner keys each variant by `(ctx fields, frozenset(merged knobs))`, complete because the `SID`
-structural-identity knob rides the dict, so structurally identical kernels (the same layer repeated
+planner keys each variant by `(ctx fields, frozenset(merged knobs))`, complete because the `S_*`
+structural-feature knobs ride the dict, so structurally identical kernels (the same layer repeated
 through a whole model) share every score, across trees and — via the shared dict `two_level.inner_reward`
 threads into each per-op `TuningSearch` — across tune slices. Entries can never go stale: the score is a
 pure function of the key. Greedy with a DB hit never scores anything at all.
@@ -194,14 +194,14 @@ original lazy split assumed) — so the finished `_Plan` rides its LoopOp as op 
 (`loop_op.meta["plan"] = (cache_key, plan)`): ops are shared by reference across graph copies and
 `single_node_graph` tune slices, so re-planning the same op object short-circuits entirely (classification
 and enumeration included). The stamp is validated against `_plan_cache_key` — the carry-forward knobs,
-which include the `SID` structural identity stamped by `loop/fusion/040_stamp_structural_id` (canonical
-body + operand dtypes, so a dtype change is an identity change), + the hardware context + the live
-`DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`) — so a pin / ctx / dtype
-change invalidates it. The SID also powers the search-owned value-keyed score cache (see "Scoring is
-search policy" above): `_score_variant` keys each variant by `(ctx fields, frozenset(merged knobs))`,
-complete because the SID rides the knob dict, so structurally identical kernels — the same layer repeated
-through a whole model — share every score with no object-identity bookkeeping, and entries can never go
-stale because the score is a pure function of the key.
+which include the `S_*` structural features stamped by `loop/fusion/040_stamp_structural_id` (a stmt/op
+histogram + loop extents + operand dtypes, so a structure or dtype change is an identity change), + the
+hardware context + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`)
+— so a pin / ctx / structure change invalidates it. The `S_*` knobs also power the search-owned
+value-keyed score cache (see "Scoring is search policy" above): `_score_variant` keys each variant by
+`(ctx fields, frozenset(merged knobs))`, complete because the `S_*` features ride the knob dict, so
+structurally identical kernels — the same layer repeated through a whole model — share every score with no
+object-identity bookkeeping, and entries can never go stale because the score is a pure function of the key.
 
 For rules that want a custom scorer, override
 `Op.lazy_score(cls, ctx, *, knobs=None, shapes=None)` on the producing Op class. The base implementation
@@ -288,14 +288,15 @@ three entry points:
 Everything the search stores or replays is keyed by one of TWO identities — when adding a cache or a
 table, pick one; don't invent a third:
 
-- **Variant identity = `(context, knobs)`** — anything *predictive or replayable*. The `SID` knob
-  (`loop/fusion/040_stamp_structural_id`: digest of the canonical LoopOp body + operand dtypes) makes the
-  merged knob dict a COMPLETE identity, so a prior is a pure function of it: the score cache keys
+- **Variant identity = `(context, knobs)`** — anything *predictive or replayable*. The `S_*` structural
+  features (`loop/fusion/040_stamp_structural_id`: a stmt/op histogram + loop extents + operand dtypes) make
+  the merged knob dict a COMPLETE identity, so a prior is a pure function of it: the score cache keys
   `(ctx fields, frozenset(merged knobs))`, the planner's op-metadata plan stamp keys the same plus the
   `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration), and `_best_fork`
   replays tuned choices by matching fork knobs against the recorded `lowering` knob delta. A future
-  *learned* prior slots in unchanged — `score(features(ctx, knobs))`, with the per-`SID` shape facts
-  (extents, dtypes) featurized at scoring time exactly where `TileOp.lazy_score` reads them today.
+  *learned* prior slots in unchanged — `score(features(ctx, knobs))`: the structural facts (op histogram,
+  extents, dtypes) are already in the knob dict, so `knob.knob_features` turns it straight into the model
+  feature vector (the `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props).
 - **Measurement identity = `(ctx.structural_key, op_cache_key)`** — ground truth about *materialized
   leaves*: `perf` rows, op inventory (`loop_op`/`tile_op`/`kernel_op`/`cuda_op`), `op_effort` gating, and
   two-level dedup. The structural `child_key` on `lowering` rows is measurement linkage (it joins the
@@ -483,7 +484,7 @@ incompatible divisibility still get a sensible default.
 | `FK`                 | INT       | `010_partition_loops`         | Reduce-axis multiple-accumulator factor (non-matmul reduces). Strip-mines the per-thread K serial loop into `FK` independent accumulators (a `RegisterTile(K_f, reduce=True)` inside `K_i`) for ILP; `010_split_register_axes` replicates the wrapped `Accum` into `acc_0..acc_{FK-1}` and appends a cross-accumulator tree-fold after the K serial loops, so the materializer/combine see one `acc`. Swept only as a divisor of the per-thread K-chunk extent, capped by `FK·FM·FN ≤ _MAX_CELLS_PER_THREAD`. **fp16 scalar matmul** reuses `FK` as the half2 accumulation-window length (= even `bk`): the planner keeps the FK=1 fp32 structure + stamps `FKWIN`, and `kernel/015_pack_fk_window` rewrites the window K loop into `__hfma2` packed multiply-adds over a `__half2` accumulator with a widen+horizontal-sum flush into the fp32 master each stage — bounded fp16 error for 2× packed throughput. `FK=1` (and fp32/bf16/MMA) is byte-identical to the pre-FK planner (it ranks first in the greedy tiebreak). See `plans/fk-register-tile-reductions.md` and `plans/fk-half2-fp16-matmul.md`. |
 | `WN`                 | INT       | `010_partition_loops`         | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `WM`                 | INT       | `010_partition_loops`         | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `SID`                | STR       | `loop/fusion/040_stamp_structural_id` | The LoopOp's structural identity: digest of the canonical body (`Body.structural_key`) + operand dtypes. Not tunable — identity metadata that makes a knob dict a complete variant identity (the planner's value-keyed score cache, DB-row self-identification). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, search-tree comparisons) sees one consistent knob set. |
+| `S_*`                | FLOAT     | `loop/fusion/040_stamp_structural_id` | The LoopOp's structural features (`ir/features.py:structure_features`): a flat `S_`-prefixed dict — stmt/op histogram (`S_n_load`, `S_pw_*`, `S_reduce_*`, …) + loop extents (`S_ext_*`) + operand dtype multiset (`S_dtype_*`). Not tunable — identity facts that make a knob dict a complete variant identity (the planner's value-keyed score cache). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, search-tree comparisons) sees one consistent knob set; `knob_features` turns the whole knob dict into the model feature vector. Skipped by `format_tuning_knobs` (facts, not tuning decisions). |
 | `MMA`                | STR       | `010_partition_loops`         | Three-way control for warp-tier MMA (tensor-core) matmul enumeration: falsy (`0`/`false`/…) forces the scalar-only path (debug / fallback); truthy (`1`/`true`/…) or unset (the default) auto-enumerates every eligible atom kind; any other value names an atom kind (e.g. `mma_m16n8k16_f16`) — enable **and** pin that kind, incl. the force-at-any-arch pin-only path. `DEPLODOCK_ATOM_KIND` is its env **alias** (`Knob.aliases` — either spelling works; the primary `DEPLODOCK_MMA` wins when both are set). Not an autotune fork: the tuner picks warp-vs-scalar through the `ATOM_KIND` sibling subtree. Declared in `_enumeration.py`, decoded by `mma_mode()`; sits in `_PLANNER_KNOBS` so the enumeration-memo pin snapshot covers it (alias included, via `Knob.raw`).                                                                                                                                                                                                                                                                                                                          |
 | `HOIST_COMPUTE`      | BOOL      | `030_hoist_invariant_compute` | False (default) → inline-fuse Stage; True → single transport Stage + a `StageBundle.compute` phase. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `PAD_SMEM`           | BOOL      | `070_pad_smem`                | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |

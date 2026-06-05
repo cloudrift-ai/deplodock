@@ -135,27 +135,29 @@ def test_op_metadata_hit_skips_enumeration(monkeypatch):
     assert calls["n"] == n_first, "op-metadata hit re-ran enumerate_cartesian"
 
 
-def test_dtype_signature_separates_structural_ids():
-    """Same body structure, different operand dtypes → different SIDs
-    (dtypes gate the fp16 half2 window enumeration), and the SID lands in
-    the plan cache key via the knobs."""
-    from deplodock.compiler.pipeline.search.keys import loop_structural_id
+def test_dtype_signature_separates_structural_features():
+    """Same body structure, different operand dtypes → different structural
+    features (the ``S_dtype_*`` multiset gates the fp16 half2 window), and the
+    features land in the plan cache key via the knobs."""
+    from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
 
     ctx = _ctx()
-    sid_f16 = loop_structural_id(_loop_op_matmul(), _graph_with_dtypes("f16", "f16"))
-    sid_f32 = loop_structural_id(_loop_op_matmul(), _graph_with_dtypes("f32", "f32"))
-    sid_none = loop_structural_id(_loop_op_matmul(), None)
-    assert sid_f16 != sid_f32
-    assert sid_f16 != sid_none and sid_f32 != sid_none
-    # Same structure + same dtypes → same SID even across distinct op
-    # objects with different SSA / buffer / axis names.
+    feats_f16 = structure_features(_loop_op_matmul().body, _graph_with_dtypes("f16", "f16"))
+    feats_f32 = structure_features(_loop_op_matmul().body, _graph_with_dtypes("f32", "f32"))
+    feats_none = structure_features(_loop_op_matmul().body, None)
+    assert feats_f16 != feats_f32
+    assert feats_f16 != feats_none and feats_f32 != feats_none
+    # Same structure + same dtypes → same features even across distinct op
+    # objects with different SSA / buffer / axis names (counts are name-invariant).
     other = _loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2")
-    assert loop_structural_id(other, _graph_with_dtypes("f16", "f16", a="w", b="x")) == sid_f16
+    assert structure_features(other.body, _graph_with_dtypes("f16", "f16", a="w", b="x")) == feats_f16
     op = _loop_op_matmul()
     plan = _planner._plan_kernel(op, ctx, kernel_name="k")
     assert plan is not None
-    assert plan.base_knobs["SID"] == op.knobs["SID"]
-    assert ("SID", op.knobs["SID"]) in _planner._plan_cache_key(op, ctx)[0]
+    struct = {k: v for k, v in op.knobs.items() if k.startswith(STRUCT_PREFIX)}
+    assert struct and all(plan.base_knobs[k] == v for k, v in struct.items())
+    key_knobs = dict(_planner._plan_cache_key(op, ctx)[0])
+    assert all(key_knobs[k] == v for k, v in struct.items())
 
 
 def test_mma_pin_lands_in_cache_key(monkeypatch):
@@ -213,15 +215,16 @@ def test_score_variant_matches_lazy_score():
         assert _planner._score_variant(plan, p, ctx) == pytest.approx(lazy)
 
 
-def test_sid_stamped_by_last_loop_pass():
+def test_structural_features_stamped_by_last_loop_pass():
     """``loop/fusion/040_stamp_structural_id`` runs last in the loop dialect:
-    every fused LoopOp leaves the loop passes carrying ``knobs["SID"]`` equal
-    to its :func:`loop_structural_id` — identity settles with the final fused
-    body, before any tune-DB keying or tile-stage scoring sees the op."""
+    every fused LoopOp leaves the loop passes carrying its ``S_*`` structural
+    features equal to :func:`structure_features` — identity settles with the
+    final fused body, before any tune-DB keying or tile-stage scoring sees the
+    op."""
+    from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
     from deplodock.compiler.ir.frontend.ir import MatmulOp
     from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
     from deplodock.compiler.pipeline.search.db import SearchDB
-    from deplodock.compiler.pipeline.search.keys import loop_structural_id
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (64, 128)), node_id="a")
@@ -233,14 +236,15 @@ def test_sid_stamped_by_last_loop_pass():
     loops = [n.op for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
     assert loops, "fusion should leave at least one LoopOp"
     for op in loops:
-        assert op.knobs.get("SID") == loop_structural_id(op, fused)
+        struct = {k: v for k, v in op.knobs.items() if k.startswith(STRUCT_PREFIX)}
+        assert struct == structure_features(op.body, fused)
 
 
 def test_scores_shared_across_identical_loop_ops(monkeypatch):
     """The search-owned value-keyed score cache (the planner keys each
-    variant by ``(ctx, merged knobs)`` — complete thanks to the ``SID``
-    knob) makes structurally identical LoopOps — different SSA / buffer /
-    axis names — share every score: scoring the second kernel's tree
+    variant by ``(ctx, merged knobs)`` — complete thanks to the ``S_*``
+    structural-feature knobs) makes structurally identical LoopOps — different
+    SSA / buffer / axis names — share every score: scoring the second kernel's tree
     through the SAME search computes ZERO new scores. (Expansion alone
     never scores — ranking is search policy, so the read happens via
     ``Search.score_of``.)"""
@@ -258,7 +262,9 @@ def test_scores_shared_across_identical_loop_ops(monkeypatch):
     plan_1 = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     plan_2 = _planner._plan_kernel(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2"), ctx, kernel_name="k_l1")
     assert plan_1 is not None and plan_2 is not None
-    assert plan_1.base_knobs["SID"] == plan_2.base_knobs["SID"], "structurally identical ops must share a SID"
+    struct_1 = {k: v for k, v in plan_1.base_knobs.items() if k.startswith("S_")}
+    struct_2 = {k: v for k, v in plan_2.base_knobs.items() if k.startswith("S_")}
+    assert struct_1 and struct_1 == struct_2, "structurally identical ops must share structural features"
     search = GreedySearch()
     tree_1 = _build_tree(plan_1, ctx)
     assert calls["n"] == 0, "building a tree must not score"

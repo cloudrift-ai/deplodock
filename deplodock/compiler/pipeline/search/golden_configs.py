@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from deplodock.compiler.ir.features import STRUCT_PREFIX
+
 # Qwen3-Embedding-0.6B linear dims (mirrors ``tests/perf/cases.py``).
 QWEN3_06B_HIDDEN = 1024  # hidden_size
 QWEN3_06B_INTER = 3072  # intermediate_size (gate / up / down)
@@ -56,8 +58,11 @@ def matmul_snippet(M: int, N: int, K: int, dtype: str = "fp32") -> str:
 
 
 def _knobs_env(knobs: dict) -> str:
-    """Render a knobs dict as a ``DEPLODOCK_KNOBS`` value: ``BM=8,BN=32,...``."""
-    return ",".join(f"{k}={v}" for k, v in knobs.items())
+    """Render a knobs dict as a ``DEPLODOCK_KNOBS`` value: ``BM=8,BN=32,...``.
+
+    Structural-feature knobs (``STRUCT_PREFIX``) are dropped — a repro command
+    pins tuning decisions, not the kernel's structural identity."""
+    return ",".join(f"{k}={v}" for k, v in knobs.items() if not k.startswith(STRUCT_PREFIX))
 
 
 @dataclass(frozen=True, kw_only=True)

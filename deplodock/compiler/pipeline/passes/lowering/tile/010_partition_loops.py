@@ -125,6 +125,7 @@ from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.features import STRUCT_PREFIX, structure_features
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Loop, Stmt, StridedLoop, Write
@@ -156,7 +157,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
-from deplodock.compiler.pipeline.search.keys import loop_structural_id
 
 
 class Role(enum.Enum):
@@ -231,9 +231,9 @@ class _Plan:
 
     shape: KernelShape
     leading: tuple[Stmt, ...]
-    # The LoopOp's carry-forward knobs, including its ``SID`` structural
-    # identity — merged under every scored row so structurally identical
-    # kernels score identically.
+    # The LoopOp's carry-forward knobs, including its ``S_*`` structural
+    # feature identity — merged under every scored row so structurally
+    # identical kernels score identically.
     base_knobs: dict
     kernel_name: str
     params: tuple[dict, ...]
@@ -314,8 +314,8 @@ def _score_variant(plan: _Plan, params: dict, ctx: Context, cache: dict | None =
     ``cache`` is the search-owned value-keyed score store (handed down via
     ``Search.score_of`` → ``Fork.score``; ``None`` outside a search). The
     key is ``(ctx fields, frozenset(merged knobs))`` — complete because
-    the ``SID`` knob (``loop/fusion/040_stamp_structural_id``) makes the
-    knob dict a full variant identity — so structurally identical kernels,
+    the ``S_*`` structural-feature knobs (``loop/fusion/040_stamp_structural_id``)
+    make the knob dict a full variant identity — so structurally identical kernels,
     the same layer repeated through a whole model, share entries with no
     object-identity bookkeeping, and entries can never go stale: the score
     is a pure function of the key."""
@@ -569,8 +569,8 @@ def _is_fp16_matmul(matmul_reduces: list, graph: Graph | None) -> bool:
 def _plan_cache_key(loop_op: LoopOp, ctx: Context) -> tuple:
     """Validity key for the op-metadata plan stamp — everything that changes
     the enumerated knob rows or a variant's score. The kernel's structural
-    identity (canonical body + operand dtypes) rides ``knobs["SID"]``
-    (stamped by ``loop/fusion/040_stamp_structural_id``), so the carry-forward knobs
+    identity rides the ``S_*`` structural-feature knobs (stamped by
+    ``loop/fusion/040_stamp_structural_id``), so the carry-forward knobs
     alone cover the structure; the rest is the hardware context and the live
     ``DEPLODOCK_*`` planner pins (``enumerate_cartesian`` folds pins via
     ``Knob.narrow``, so a pin flipped mid-process must land on a fresh key;
@@ -614,11 +614,11 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     only written after a successful non-empty enumeration, so skipped /
     rejected shapes never poison it.
     """
-    if "SID" not in loop_op.knobs:
+    if not any(k.startswith(STRUCT_PREFIX) for k in loop_op.knobs):
         # Normally stamped by ``loop/fusion/040_stamp_structural_id``;
         # direct callers (tests, ad-hoc planning) get the same identity
         # computed here.
-        loop_op.knobs["SID"] = loop_structural_id(loop_op, graph)
+        loop_op.knobs.update(structure_features(loop_op.body, graph))
     cache_key = _plan_cache_key(loop_op, ctx)
     stamped = loop_op.meta.get("plan")
     if stamped is not None and stamped[0] == cache_key:

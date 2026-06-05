@@ -25,6 +25,7 @@ from types import ModuleType
 from typing import Any
 
 from deplodock import config
+from deplodock.compiler.ir.features import STRUCT_PREFIX
 
 # The ``deplodock/`` package dir (knob.py → pipeline → compiler → deplodock).
 _PKG_ROOT = Path(__file__).resolve().parents[2]
@@ -279,10 +280,14 @@ def format_tuning_knobs(knobs: dict) -> str:
     dropped; unregistered boolean values are also dropped (forward-compat).
     ``BINMASK`` values are already stored as binary strings in
     ``op.knobs`` (rules stamp via ``Knob.pretty``), so ``str(v)`` here
-    round-trips correctly.
+    round-trips correctly. ``STRUCT_PREFIX`` knobs (the structural-feature
+    stamp from ``040_stamp_structural_id``) are facts about the kernel, not
+    tuning decisions, so they are dropped from this tuning-knob view.
     """
     rendered: list[tuple[str, str]] = []
     for k, v in knobs.items():
+        if k.startswith(STRUCT_PREFIX):
+            continue
         knob = get(k)
         if knob is not None and knob.type is KnobType.BOOL:
             continue
@@ -292,3 +297,86 @@ def format_tuning_knobs(knobs: dict) -> str:
     if not rendered:
         return "-"
     return ", ".join(f"{k}={v}" for k, v in sorted(rendered))
+
+
+# --- Feature vector ---------------------------------------------------------
+
+
+def knob_features(knobs: dict) -> dict[str, float]:
+    """Convert a knob dict into a flat numeric feature vector for the (future)
+    learned planner prior — the single featurizer over the whole dict.
+
+    - ``STRUCT_PREFIX`` knobs (structural features stamped by
+      ``040_stamp_structural_id``) pass through as floats: they already are the
+      kernel's structural feature set.
+    - Registered tuning ``Knob``s are encoded by type: ``INT`` → float, ``BOOL``
+      → 0/1, ``BINMASK`` (binary string) → ``{<name>_popcount, _width, _frac}``.
+    - ``MMA`` (a string atom kind) is expanded through ``ATOM_REGISTRY`` into
+      physical atom properties (cell shape, group size, operand bit widths) so a
+      new atom kind generalizes by geometry/dtype rather than a one-hot id; the
+      scalar tier (no ``MMA``) is encoded as ``MMA_tier=0``.
+    - Unregistered, non-structural knobs are best-effort float-coerced (skipped
+      when non-numeric); other ``STR`` knobs have no generic encoding.
+    """
+    feats: dict[str, float] = {}
+    for name, val in knobs.items():
+        if name.startswith(STRUCT_PREFIX):
+            feats[name] = float(val)
+            continue
+        if name == "MMA":
+            feats.update(_mma_features(str(val)))
+            continue
+        knob = get(name)
+        if knob is None:
+            num = _coerce_float(val)
+            if num is not None:
+                feats[name] = num
+            continue
+        if knob.type is KnobType.INT:
+            feats[name] = float(val)
+        elif knob.type is KnobType.BOOL:
+            feats[name] = 1.0 if _as_bool(val) else 0.0
+        elif knob.type is KnobType.BINMASK:
+            s = str(val)
+            pop = float(s.count("1"))
+            feats[f"{name}_popcount"] = pop
+            feats[f"{name}_width"] = float(len(s))
+            feats[f"{name}_frac"] = pop / len(s) if s else 0.0
+        # STR knobs other than MMA: no generic numeric encoding.
+    feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom selected
+    return feats
+
+
+def _mma_features(mma: str) -> dict[str, float]:
+    """Physical-property expansion of an ``MMA`` atom kind via ``ATOM_REGISTRY``
+    (lazy import — ``knob.py`` loads before the tile IR)."""
+    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+
+    atom = ATOM_REGISTRY.get(mma)
+    if atom is None:
+        return {"MMA_tier": 0.0}
+    m, n, k = atom.shape
+    return {
+        "MMA_tier": 1.0,
+        "MMA_atom_m": float(m),
+        "MMA_atom_n": float(n),
+        "MMA_atom_k": float(k),
+        "MMA_group_size": float(atom.group_size),
+        "MMA_a_bits": float(atom.operand_dtype("a").nbytes * 8),
+        "MMA_acc_bits": float(atom.operand_dtype("c").nbytes * 8),
+    }
+
+
+def _as_bool(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in {"1", "true", "yes", "on"}
+    return bool(v)
+
+
+def _coerce_float(v: object) -> float | None:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None

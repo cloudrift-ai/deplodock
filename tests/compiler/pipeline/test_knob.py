@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.knob import Knob, KnobType, apply_knobs_env
+import deplodock.compiler.pipeline.knob as knob_mod
+from deplodock.compiler.pipeline.knob import Knob, KnobType, apply_knobs_env, format_tuning_knobs, knob_features
 
 
 def test_int_parse():
@@ -226,6 +227,67 @@ def test_apply_knobs_env_uppercases_key(monkeypatch):
     monkeypatch.delenv("DEPLODOCK_BK", raising=False)
     applied = apply_knobs_env("bk=2")
     assert applied == {"DEPLODOCK_BK": "2"}
+
+
+# ---------------------------------------------------------------------------
+# knob_features — knob dict → flat numeric feature vector
+# ---------------------------------------------------------------------------
+
+
+def test_knob_features_struct_passthrough():
+    feats = knob_features({"S_n_load": 3.0, "S_ext_free_prod": 512.0})
+    assert feats["S_n_load"] == 3.0
+    assert feats["S_ext_free_prod"] == 512.0
+
+
+def test_knob_features_typed_knobs(monkeypatch):
+    monkeypatch.setattr(
+        knob_mod,
+        "_REGISTRY",
+        {
+            "BN": Knob("BN", KnobType.INT),
+            "FLAG": Knob("FLAG", KnobType.BOOL),
+            "STAGE": Knob("STAGE", KnobType.BINMASK),
+        },
+    )
+    feats = knob_features({"BN": 64, "FLAG": True, "STAGE": "101"})
+    assert feats["BN"] == 64.0
+    assert feats["FLAG"] == 1.0
+    assert feats["STAGE_popcount"] == 2.0
+    assert feats["STAGE_width"] == 3.0
+    assert feats["STAGE_frac"] == 2 / 3
+
+
+def test_knob_features_mma_expansion():
+    feats = knob_features({"MMA": "mma_m16n8k16_f16"})
+    assert feats["MMA_tier"] == 1.0
+    assert (feats["MMA_atom_m"], feats["MMA_atom_n"], feats["MMA_atom_k"]) == (16.0, 8.0, 16.0)
+    assert feats["MMA_a_bits"] == 16.0  # f16 operand
+    assert feats["MMA_acc_bits"] == 32.0  # f32 accumulator
+
+
+def test_knob_features_scalar_tier_default():
+    feats = knob_features({"S_n_load": 2.0})
+    assert feats["MMA_tier"] == 0.0  # no atom selected
+
+
+def test_knob_features_unregistered_numeric_vs_string():
+    feats = knob_features({"weird_num": 7, "weird_str": "not_a_number"})
+    assert feats["weird_num"] == 7.0
+    assert "weird_str" not in feats
+
+
+def test_knob_features_differs_by_one_knob():
+    a = knob_features({"S_n_load": 2.0, "S_n_write": 1.0})
+    b = knob_features({"S_n_load": 3.0, "S_n_write": 1.0})
+    assert a["S_n_load"] != b["S_n_load"]
+    assert a["S_n_write"] == b["S_n_write"]
+
+
+def test_format_tuning_knobs_skips_struct():
+    out = format_tuning_knobs({"BN": 64, "S_n_load": 3.0, "S_ext_free_prod": 512.0})
+    assert "S_n_load" not in out and "S_ext_free_prod" not in out
+    assert "BN=64" in out
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):

@@ -75,6 +75,15 @@ them.
 | `ConstantOp`    | Sentinel: weights / scalar constants. Scalars carry `value`; tensors carry `source_path` / `source_shape` / `source_dtype` (the safetensors / `nn.Module` address) plus `load_ops` — a chain of frontend ops applied at bind time by the loader. |
 | `_keepdim_axis` | Shape helper shared by `ReduceOp` (tensor) and `MeanOp` (frontend).            |
 
+## `features.py`
+
+Structural feature extraction for the planner prior. `structure_features(body, graph)` walks a `LoopOp` body
+and returns a flat `S_`-prefixed `dict[str, float]`: a stmt/op histogram (the extent-free skeleton) plus the
+loop-axis extents (`S_ext_*`). `loop/fusion/040_stamp_structural_id` stamps these into `LoopOp.knobs`; carried
+forward by the engine's knob-merge they ARE the kernel's structural identity (the score cache keys on the knob
+dict), and `pipeline/knob.py:knob_features` turns the whole knob dict (structural + tuning) into the model
+feature vector. The `S_` prefix (`STRUCT_PREFIX`) keeps them out of the tuning-knob display.
+
 ## `expr.py`
 
 Shared expression sublanguage used by every IR layer: `Load.index`,
