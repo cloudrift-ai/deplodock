@@ -60,7 +60,14 @@ def register_knobs_command(subparsers) -> None:
     )
     parser.add_argument(
         "--kernel",
-        help="Only include kernels whose C identifier contains this substring (e.g. 'matmul').",
+        help="Only include kernels whose C identifier contains this substring (e.g. 'matmul'); "
+        "with --golden, filters golden configs by name substring.",
+    )
+    parser.add_argument(
+        "--golden",
+        action="store_true",
+        help="Greedy-compile each golden config with the current prior and report the found vs golden "
+        "knobs (does the prior reproduce the golden ground truth?). Needs a GPU + DEPLODOCK_PRIOR_FILE.",
     )
     parser.set_defaults(func=handle_knobs)
 
@@ -68,6 +75,10 @@ def register_knobs_command(subparsers) -> None:
 def handle_knobs(args) -> None:
     # The canonical schema from the knob registry — always available (no DB).
     _emit_registry()
+
+    if args.golden:
+        _emit_golden_check(args.kernel)
+        return
 
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
@@ -132,6 +143,53 @@ def _emit_registry() -> None:
         logger.info(f"{name:<{kw}}  {k.type.value:<{tw}}  {hints:<{hw}}  {lines[0]}")
         for cont in lines[1:]:
             logger.info(indent + cont)
+
+
+def _emit_golden_check(kernel_filter: str | None) -> None:
+    """Greedy-compile each golden config with the current prior and report the
+    found knobs vs the recorded golden knobs — does the prior reproduce the
+    golden ground truth? No benching, no tuning; reads
+    ``DEPLODOCK_PRIOR_FILE``."""
+    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+    from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+
+    def tunable(knobs: dict) -> dict:
+        return {k: v for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
+
+    def picked(snippet: str) -> dict:
+        graph, _, _ = graph_from_code(snippet)
+        compiled = Pipeline.build(CUDA_PASSES).run(graph)
+        knobs: dict = {}
+        for node in compiled.nodes.values():
+            k = getattr(node.op, "knobs", None)
+            if k:
+                knobs.update(k)
+        return tunable(knobs)
+
+    configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    if kernel_filter:
+        configs = [g for g in configs if kernel_filter in g.name]
+
+    logger.info("")
+    logger.info("Golden reproduction — greedy compile (current prior) vs recorded golden:")
+    n_match = 0
+    for g in configs:
+        gold = tunable(g.knobs)
+        try:
+            got = picked(g.snippet())
+        except Exception as e:  # noqa: BLE001 — a single shape's compile error shouldn't abort the report
+            logger.info("  %-26s  ERR  %s: %s", g.name, type(e).__name__, e)
+            continue
+        keys = sorted(gold)
+        match = all(got.get(k) == gold[k] for k in keys)
+        n_match += match
+        verdict = "✓ exact" if match else "✗ differs"
+        logger.info("  %-26s  %s  (golden deplodock=%.1fus, cuBLAS=%.1fus)", g.name, verdict, g.deplodock_us, g.cublas_us)
+        if not match:
+            logger.info("      golden: %s", "  ".join(f"{k}={gold[k]}" for k in keys))
+            logger.info("      greedy: %s", "  ".join(f"{k}={got.get(k)}" for k in keys))
+    logger.info("  reproduced golden knobs exactly: %d/%d", n_match, len(configs))
 
 
 @dataclass(frozen=True)
