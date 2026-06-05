@@ -204,15 +204,33 @@ def test_prior_persistence_round_trips():
         assert abs(p.mean_score({"BM": bm}) - q.mean_score({"BM": bm})) < 1e-9
 
 
-def test_db_save_load_prior():
-    from deplodock.compiler.pipeline.search.db import SearchDB
+def test_prior_file_store_round_trips(tmp_path):
+    from deplodock.compiler.pipeline.search.prior import store
 
-    db = SearchDB()  # in-memory
-    assert db.load_prior("ctx", "op") is None
-    db.save_prior("ctx", "op", b"blobdata", n_rows=7)
-    assert db.load_prior("ctx", "op") == b"blobdata"
-    db.save_prior("ctx", "op", b"newer", n_rows=9)  # latest-kept
-    assert db.load_prior("ctx", "op") == b"newer"
+    path = tmp_path / "prior.pkl"
+    assert store.load(path, "regimeA") is None  # missing file
+    store.save(path, "regimeA", b"blobA")
+    store.save(path, "regimeB", b"blobB")  # second regime coexists
+    assert store.load(path, "regimeA") == b"blobA"
+    assert store.load(path, "regimeB") == b"blobB"
+    store.save(path, "regimeA", b"newerA")  # upsert
+    assert store.load(path, "regimeA") == b"newerA"
+    assert store.load(path, "missing") is None
+
+
+def test_global_prior_archive_accumulates_and_warm_starts():
+    """A global prior trained on one op, archived, then reloaded is warm
+    (fitted, no warmup) and its archived rows survive the round-trip."""
+    from deplodock.compiler.pipeline.search.prior import prior_from_bytes
+
+    p = BayesianRidgePrior(seed=0, min_rows=3)
+    rows = [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64)]
+    p.fit(rows)
+    p.archive(rows)  # freeze this op's rows into the global set
+    q = prior_from_bytes(p.to_bytes())
+    assert q.fitted
+    assert q._first_fit_idx == 0  # loaded → warm, no cold warmup
+    assert len(q._archived_rows) == len(rows)
 
 
 def test_softmax_sums_to_one_and_orders():

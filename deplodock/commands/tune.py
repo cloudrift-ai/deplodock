@@ -189,7 +189,8 @@ def handle_tune(args):
             ucb_c=args.ucb_c,
             dump=dump,
             progress=progress,
-            prior_factory=_prior_factory(args.seed),
+            prior_seed=args.seed,
+            prior_path=config.prior_path(),
         )
     except KeyboardInterrupt:
         # Manual abort: per-op bests already landed in the DB as they were
@@ -248,14 +249,6 @@ def handle_tune(args):
     os._exit(0)
 
 
-def _prior_factory(seed: int):
-    """The per-kernel prior factory: ``inner_reward`` calls it once per kernel
-    for a fresh in-memory PUCT prior (the only selection policy)."""
-    from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior
-
-    return lambda: BayesianRidgePrior(seed=seed)
-
-
 def _clean_caches(db_path) -> None:
     """``--clean``: nuke the tuning DB (+ WAL/SHM sidecars) and the kernel
     caches (deplodock's cubin cache + cupy's NVRTC cache) for a fresh sweep."""
@@ -270,6 +263,11 @@ def _clean_caches(db_path) -> None:
             if p.exists():
                 p.unlink()
                 removed.append(str(p))
+    # The learned-prior checkpoint file (a fresh sweep should start cold).
+    for p in (config.prior_path(), config.prior_path().with_suffix(config.prior_path().suffix + ".tmp")):
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
     nvcc.clear_cubin_cache()
     removed.append(str(nvcc.cubin_cache_dir()))
     try:

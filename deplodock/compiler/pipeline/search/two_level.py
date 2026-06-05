@@ -72,6 +72,17 @@ LOWERING_PASSES = CUDA_PASSES[len(LOOP_PASSES) :]
 _FAIL_US = 1e12
 
 
+def _load_global_prior(prior_path, ctx_key: str, seed: int):
+    """Load the checkpointed global prior for this regime from its file, or
+    start a fresh one (lazy import — keeps numpy/sklearn off non-tune callers).
+    The prior is GLOBAL (one model across every kernel), keyed by regime
+    (``ctx_key``)."""
+    from deplodock.compiler.pipeline.search.prior import BayesianRidgePrior, store  # noqa: PLC0415
+
+    blob = store.load(prior_path, ctx_key) if prior_path is not None else None
+    return BayesianRidgePrior.from_bytes(blob) if blob is not None else BayesianRidgePrior(seed=seed)
+
+
 @dataclass
 class OpResult:
     """One unique kernel's inner-search outcome, for the per-op summary.
@@ -136,16 +147,18 @@ def inner_reward(
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     progress=None,
-    prior_factory=None,
+    prior=None,
+    prior_path=None,
 ) -> InnerReward:
     """Tune every post-fusion kernel of ``fused_graph`` in its own single-node
     slice and return ``Σ best-per-op time`` — the outer terminal reward.
 
-    ``prior_factory`` (a no-arg callable → a fresh
-    :class:`~deplodock.compiler.pipeline.search.prior.Prior` per kernel) attaches
-    a learned prior to each inner search; its mode flags (``active`` /
-    ``acquisition``) live on the prior object. The end-of-run sanity block per
-    kernel is collected into ``InnerReward.prior_summaries``.
+    ``prior`` (a single shared
+    :class:`~deplodock.compiler.pipeline.search.prior.Prior`, or ``None``) drives
+    every inner search's PUCT — ONE **global** model across all kernels: each
+    op's search trains it on ``archived + this op's tree``; when the op finishes
+    its rows are archived and the prior is checkpointed to its file
+    (``prior_path``, keyed by regime), so a later compile / tune reloads it.
 
     Each kernel is gated on persisted effort: an op already tuned to
     ``>= patience`` (or exhausted, recorded ``inf``) is skipped and its cached
@@ -207,8 +220,7 @@ def inner_reward(
         benched = False
         if not db.terminated(ctx_key, key, patience):
             sub = single_node_graph(fused_graph, nid)
-            prior_model = prior_factory() if prior_factory is not None else None
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior_model)
+            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior)
             for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
                 if progress is not None:
                     st = inner.last_stats
@@ -235,13 +247,15 @@ def inner_reward(
             exhausted = inner.stop_reason is None
             db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
             benched = True
-            if prior_model is not None:
-                prior_summaries.append(prior_model.summary(name))
-                # Persist the trained prior so a later compile / run (or a fresh
-                # tune) can load it — keyed structurally like perf / effort.
-                blob = prior_model.to_bytes()
-                if blob is not None:
-                    db.save_prior(ctx_key, key, blob, n_rows=len(prior_model.trajectory))
+            if prior is not None:
+                # Freeze this op's final value-of-position rows into the global
+                # training set, then checkpoint the global prior to its file.
+                prior.archive(inner._collect_rows())
+                blob = prior.to_bytes()
+                if blob is not None and prior_path is not None:
+                    from deplodock.compiler.pipeline.search.prior import store  # noqa: PLC0415
+
+                    store.save(prior_path, ctx_key, blob)
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
         per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
         # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
@@ -266,7 +280,8 @@ def run_two_level_tune(
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     dump=None,
     progress=None,
-    prior_factory=None,
+    prior_seed: int = 0,
+    prior_path=None,
 ) -> TwoLevelResult:
     """Drive the outer fusion search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
@@ -281,6 +296,8 @@ def run_two_level_tune(
     from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     provenance.seed(graph)
+    # ONE global prior for the whole run, warm-started from its file checkpoint.
+    prior = _load_global_prior(prior_path, ctx.structural_key(), prior_seed)
     outer = TuningSearch(patience=patience, ucb_c=ucb_c)
     # The outer drives only the graph-changing passes — no dump on this Run;
     # the winning config's full stage artifacts (incl. per-kernel
@@ -302,9 +319,9 @@ def run_two_level_tune(
             patience=patience,
             ucb_c=ucb_c,
             progress=progress,
-            prior_factory=prior_factory,
+            prior=prior,
+            prior_path=prior_path,
         )
-        prior_summaries.extend(reward.prior_summaries)
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(token, stats, "ok" if reward.ok else "bench_fail")
         positions = sum(r.multiplicity for r in reward.per_op)
@@ -317,6 +334,10 @@ def run_two_level_tune(
         )
         if best_reward is None or (reward.ok and reward.total_us < best_reward.total_us):
             best_fused, best_reward = fused.graph, reward
+
+    # One global end-of-run sanity block (the prior spans every kernel now).
+    if prior.fitted or prior.trajectory:
+        prior_summaries.append(prior.summary("global"))
 
     assembled: Graph | None = None
     if best_fused is not None:

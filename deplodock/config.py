@@ -32,6 +32,7 @@ from pathlib import Path
 
 PREFIX = "DEPLODOCK_"
 TUNE_DB = "DEPLODOCK_TUNE_DB"
+PRIOR_FILE = "DEPLODOCK_PRIOR_FILE"
 NVCC_FLAGS = "DEPLODOCK_NVCC_FLAGS"
 DEBUG = "DEPLODOCK_DEBUG"
 DUMP_DIR = "DEPLODOCK_DUMP_DIR"
@@ -118,6 +119,14 @@ def tune_db_path() -> Path:
     advisory — the engine only opens it when the file exists."""
     override = os.environ.get(TUNE_DB)
     return Path(override) if override else _CACHE_ROOT / "autotune.db"
+
+
+def prior_path() -> Path:
+    """Learned-prior checkpoint file: ``DEPLODOCK_PRIOR_FILE`` →
+    ``~/.cache/deplodock/prior.pkl``. A single file (not the tune DB) holding the
+    global prior per regime; ``tune`` writes it, ``compile`` / ``run`` read it."""
+    override = os.environ.get(PRIOR_FILE)
+    return Path(override) if override else _CACHE_ROOT / "prior.pkl"
 
 
 def nvcc_flags() -> str:

@@ -64,6 +64,10 @@ class Prior(ABC):
         """Append a benched leaf to the trajectory (for the summary stats)."""
         self.trajectory.append((dict(knobs), median, status))
 
+    def archive(self, rows: list[tuple[dict, float]]) -> None:  # noqa: B027
+        """Freeze a finished op's value-of-position rows into the global
+        training set. Default no-op; see :meth:`BayesianRidgePrior.archive`."""
+
     def to_bytes(self) -> bytes | None:
         """Serialize the fitted model for persistence (``None`` when unfit or
         not serializable). Override in subclasses; see
