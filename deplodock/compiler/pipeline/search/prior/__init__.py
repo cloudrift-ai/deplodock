@@ -4,7 +4,7 @@ refit, end-of-run sanity stats) and the concrete :class:`CatBoostPrior`."""
 from __future__ import annotations
 
 from deplodock.compiler.pipeline.search.prior.base import Prior
-from deplodock.compiler.pipeline.search.prior.catboost_prior import CatBoostPrior
+from deplodock.compiler.pipeline.search.prior.catboost import CatBoostPrior
 
 
 def prior_from_json(obj: dict) -> Prior:
