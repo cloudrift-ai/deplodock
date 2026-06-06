@@ -10,11 +10,13 @@ from pathlib import Path
 from deplodock import config
 from deplodock.commands.compile import (
     add_diagnostics_args,
+    add_golden_arg,
     add_input_args,
     add_nvcc_args,
     apply_nvcc_flags,
     format_stage,
     load_or_trace,
+    resolve_golden_arg,
     resolve_tune_db,
     setup_pipeline_runtime,
 )
@@ -32,6 +34,7 @@ def register_tune_command(subparsers):
         ),
     )
     add_input_args(parser)
+    add_golden_arg(parser)
     parser.add_argument("--output", "-o", help="Output path for the tuned CUDA IR")
     parser.add_argument(
         "--patience",
@@ -112,9 +115,11 @@ def _tune_offline(args):
     prior.fit()  # unconditional re-fit on the whole accumulated dataset
     prior.checkpoint()
     sys.stderr.write(diagnostics.report(prior) + "\n")
+    sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
 
 
 def handle_tune(args):
+    resolve_golden_arg(args)  # --golden NAME → --code <snippet>
     if args.code and args.input:
         logger.error("--code and positional input are mutually exclusive")
         sys.exit(2)

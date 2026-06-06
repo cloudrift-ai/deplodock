@@ -194,6 +194,30 @@ def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
 # ``frozenset(row.items())``.
 
 
+def _matmul_thread_gate(r: dict) -> bool:
+    """The heuristic-plausible band for thread-tier matmul tiles, distilled from
+    the measured ``GOLDEN_CONFIGS`` (every recorded golden satisfies it). Used to
+    prune the enumeration so the learned prior can't extrapolate its ``mean_score``
+    argmax onto an *unbenched* degenerate tile (e.g. ``BN=8, tile_n=8``) and
+    override the golden-shaped option-0 — the failure that left greedy-with-prior
+    reproducing 0/23 goldens even after a clean tune. Coalesced wide inner axis,
+    short outer axis, large K-chunk, light split-K, clean output-column width. The
+    caller falls back to the ungated set when this empties (tiny / unusual shapes
+    with no in-band candidate), so it only ever *narrows*, never strands a graph."""
+    bn, bm = r["BN"], r["BM"]
+    threads = bn * bm
+    tile_n = bn * r["FN"]
+    return (
+        16 <= bn <= 64
+        and 8 <= bm <= 16
+        and bn >= bm
+        and r["BK"] >= 32
+        and r["SPLITK"] <= 2
+        and threads in (128, 256, 512, 1024)
+        and tile_n in (32, 64, 128)
+    )
+
+
 def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
     """Divisors of ``n`` ≤ ``cap``, ascending. FM / FN candidate set — a
     divisor of ``E / bm_c`` automatically satisfies the divisibility check."""
@@ -418,7 +442,18 @@ def enumerate_cartesian(
         splitk_choices = (1,) if force_splitk_one else _SPLITK_CANDIDATES
         br_choices: tuple[int, ...] = (1,)
         min_k_chunks = 1
-        priority_fn: Callable[[dict], tuple[int, ...]] = _priority_matmul_thread
+        # Order by the offline-learned occupancy-aware heuristic (ranks the
+        # recorded goldens at median rank ~7) rather than the old static tiebreak
+        # ``_priority_matmul_thread`` (which buried them at ~10⁴ — top picks were
+        # degenerate ``BN=1, BM=256``). This sets both the greedy default
+        # (option-0) and the order the tuner's inner search visits leaves under
+        # patience, so golden-shaped configs actually get benched. Lazy import
+        # breaks the ``heuristic → _enumeration`` cycle.
+        from deplodock.compiler.pipeline.search.heuristic import score_matmul_thread  # noqa: PLC0415
+
+        def priority_fn(p: dict) -> float:  # type: ignore[misc]  # shape-bound key; other modes assign tuple-returning fns
+            return score_matmul_thread(p, E_M, E_N, E_K)
+
         window_fk = fp16_window
     elif mode_kind == "reduce":
         bn_choices = _TUNE_AXIS_CHOICES
@@ -494,9 +529,16 @@ def enumerate_cartesian(
         )
 
     result = _run(apply_pins=True)
-    if result or not planner_pin_set():
-        return result
-    return _run(apply_pins=False)
+    if not result and planner_pin_set():
+        result = _run(apply_pins=False)
+    # Thread-tier matmul: narrow to the heuristic-plausible band so neither the
+    # tuner's exploration nor the learned prior's greedy argmax wanders onto an
+    # unbenched degenerate tile. Fall back to the full set if the gate empties.
+    if mode_kind == "matmul" and mode_tier != "warp":
+        gated = [r for r in result if _matmul_thread_gate(r)]
+        if gated:
+            result = gated
+    return result
 
 
 def _enumerate_cartesian_impl(

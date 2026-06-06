@@ -23,6 +23,7 @@ so :func:`pick_matmul` defers to the enumeration's own order there.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import enumerate_cartesian
@@ -154,22 +155,35 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
 
 
 def evaluate_golden(
-    M: int, N: int, K: int, dtype: str, golden_knobs: dict, ctx: Context, sm_count: int = DEFAULT_SM_COUNT
+    M: int,
+    N: int,
+    K: int,
+    dtype: str,
+    golden_knobs: dict,
+    ctx: Context,
+    sm_count: int = DEFAULT_SM_COUNT,
+    scorer: Callable[[dict], float] | None = None,
 ) -> tuple[dict, int | None, int]:
     """Score a matmul shape's full enumeration and return ``(pick, rank, pool)``:
-    the heuristic's argmax pick, the recorded golden's 0-based rank in the
-    heuristic order (``None`` if the golden isn't in the enumeration — pin / dtype
-    mismatch), and the enumeration size. The rank — not whether the #1 pick equals
-    the golden — is the metric that matters: it's where the tuner's patience budget
-    has to reach. Returns ``({}, None, 0)`` if nothing enumerates."""
+    the argmax pick, the recorded golden's 0-based rank in the scored order
+    (``None`` if the golden isn't in the enumeration — pin / dtype mismatch), and
+    the enumeration size. The rank — not whether the #1 pick equals the golden —
+    is the metric that matters: it's where the tuner's patience budget has to
+    reach. ``scorer`` overrides the default ranker (the hardcoded heuristic for the
+    thread tier, enumeration order for the warp tier) with any ``row → float``
+    (e.g. a learned prior's ``mean_score``), applied to both tiers. Returns
+    ``({}, None, 0)`` if nothing enumerates."""
     rows, match_keys, score_key = _enumerate(M, N, K, dtype, ctx)
     if not rows:
         return {}, None, 0
     want = tuple(golden_knobs.get(k) for k in match_keys)
     gidx = next((i for i, r in enumerate(rows) if tuple(r.get(k) for k in match_keys) == want), None)
-    if score_key == "order":  # warp: enumeration already priority-sorted
+    if scorer is not None:
+        scores = [scorer(r) for r in rows]
+    elif score_key == "order":  # warp: enumeration already priority-sorted
         return rows[0], gidx, len(rows)
-    scores = [score_matmul_thread(r, M, N, K, sm_count) for r in rows]
+    else:
+        scores = [score_matmul_thread(r, M, N, K, sm_count) for r in rows]
     best = max(range(len(rows)), key=scores.__getitem__)
     rank = sum(1 for s in scores if s > scores[gidx]) if gidx is not None else None
     return rows[best], rank, len(rows)

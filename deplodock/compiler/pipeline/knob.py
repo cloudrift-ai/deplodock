@@ -363,7 +363,51 @@ def knob_features(knobs: dict) -> dict[str, float]:
             feats[f"{name}_frac"] = pop / len(s) if s else 0.0
         # STR knobs with no custom featurizer: no generic numeric encoding.
     feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom-kind knob present
+    feats.update(_tile_features(knobs))
     return feats
+
+
+def _tile_features(knobs: dict) -> dict[str, float]:
+    """Engineered shape×knob interaction features (``D_*``) for tiled matmul/reduce
+    kernels — the occupancy / tile-geometry quantities a tree can't cheaply
+    reconstruct from the raw knobs plus the *coarse* ``S_ext_*`` extents: the CTA
+    count needs ``M·N / tile_area``, operand reuse needs the tile perimeter. These
+    mirror the analytic terms in
+    :func:`deplodock.compiler.pipeline.search.heuristic.score_matmul_thread` that
+    rank the goldens well, giving the learned prior the same derived signal
+    instead of forcing it to discover the products/ratios from axis-aligned
+    splits. Empty unless the core tile knobs (``BN/BM/FM/FN``) are present, so
+    pointwise / non-tiled kernels are unaffected."""
+    import math  # noqa: PLC0415
+
+    try:
+        bn, bm, fm, fn = int(knobs["BN"]), int(knobs["BM"]), int(knobs["FM"]), int(knobs["FN"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    br = int(knobs.get("BR", 1) or 1)
+    splitk = int(knobs.get("SPLITK", 1) or 1)
+    threads = bn * bm * br
+    tile_m, tile_n = bm * fm, bn * fn
+    area = max(tile_m * tile_n, 1)
+    out = {
+        "D_threads": float(threads),
+        "D_cells": float(fm * fn),
+        "D_tile_m": float(tile_m),
+        "D_tile_n": float(tile_n),
+        "D_log2_area": math.log2(area),
+        "D_reuse": area / (tile_m + tile_n) if (tile_m + tile_n) else 0.0,
+        "D_aspect": math.log2(max(tile_m, 1)) - math.log2(max(tile_n, 1)),  # tile squareness
+    }
+    # Occupancy needs the output extent: approximate #CTAs as M·N/tile_area·SPLITK
+    # (the ceil-free product, which — unlike ceil(M/tile_m)·ceil(N/tile_n) — needs
+    # only the M·N product the S_* features carry, not the per-axis M/N split).
+    free_prod = knobs.get("S_ext_free_prod")
+    if free_prod:
+        ctas = float(free_prod) / area * splitk
+        sm = float(knobs.get("H_sm_count") or 170.0)
+        out["D_log2_ctas"] = math.log2(max(ctas, 1.0))
+        out["D_log2_waves"] = math.log2(max(ctas / sm, 1e-3))  # CTAs relative to SM count
+    return out
 
 
 def _as_bool(v: object) -> bool:

@@ -91,6 +91,57 @@ def _golden_coverage(groups: dict) -> tuple[int, int]:
     return covered, len(GOLDEN_CONFIGS)
 
 
+def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
+    """Per golden matmul, the golden's **rank under the prior** over the shape's
+    full (gated) enumeration — the realistic "would greedy-with-prior pick the
+    golden?" test (greedy argmaxes the prior across the enumeration, not just the
+    benched leaves that :func:`reachability` scores). The ``S_*`` shape features
+    come from the dataset's matching op group (so only shapes with tuned data are
+    scored); ``H_*`` is the deployable compile regime (``Context.features``,
+    ``H_opt=3``) the greedy ``compile`` / ``run`` actually queries with.
+    ``kernel_filter`` restricts to golden configs whose name contains it."""
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search import heuristic  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+
+    # Index op groups by (free-dim product, reduce extent, is-matmul) so each
+    # golden shape maps to the S_* signature it was tuned under.
+    index: dict[tuple, dict] = {}
+    for sig in group_by_op(prior._dataset):
+        d = dict(sig)
+        key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_n_mma", 0) > 0)
+        index.setdefault(key, {k: v for k, v in d.items() if k.startswith("S_")})
+
+    thread = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
+    warp = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
+    rows, lines = [], ["[prior] golden selection — golden's rank under the prior over the full gated enumeration:"]
+    for g in GOLDEN_CONFIGS:
+        if not isinstance(g, MatmulGoldenConfig):
+            continue
+        if kernel_filter and kernel_filter not in g.name:
+            continue
+        s_feats = index.get((g.M * g.N, g.K, g.dtype != "fp32"))
+        if s_feats is None:
+            continue
+        base = {**Context.from_target(g.compute_cap).features(), **s_feats}
+        gold = {k: v for k, v in g.knobs.items() if k in (thread if g.dtype == "fp32" else warp)}
+        _, rank, pool = heuristic.evaluate_golden(
+            g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), scorer=lambda r, b=base: prior.mean_score({**b, **r})
+        )
+        if rank is not None:
+            rows.append((g.name, rank, pool))
+    for name, rank, pool in sorted(rows, key=lambda t: -t[1]):
+        lines.append(f"    {name:26}  rank {rank:5}/{pool}")
+    if rows:
+        ranks = [r for _, r, _ in rows]
+        n = len(ranks)
+        cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50))
+        lines.append(f"  median rank={sorted(ranks)[n // 2]}  {cov}  (over {n} golden shapes with tuned data)")
+    else:
+        lines.append("  no golden shapes have tuned data in the dataset yet")
+    return "\n".join(lines)
+
+
 def report(prior) -> str:
     """The full offline diagnostics block for a (re)fit prior."""
     dataset = prior._dataset
