@@ -280,7 +280,7 @@ def handle_run(args):
         _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
     _print_table(results)
-    _print_kernel_stats(compiled, bench)
+    _print_kernel_stats(compiled, bench, golden_configs=getattr(args, "golden_configs", None))
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
@@ -353,13 +353,17 @@ def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> Non
     out.write_text(_json.dumps(payload, indent=2, default=str))
 
 
-def _print_kernel_stats(graph, bench):
+def _print_kernel_stats(graph, bench, golden_configs=None):
     """Per-kernel breakdown. Pulls structural stats off each ``CudaOp``
     (block / grid / smem), per-launch timings from ``bench.per_launch``,
     and per-kernel hardware attributes from the compiled cupy RawKernels
     (register count, achieved theoretical occupancy). One row per kernel
     — quick at-a-glance for spotting which kernel dominates, whether
-    register pressure is killing occupancy, etc."""
+    register pressure is killing occupancy, etc.
+
+    ``golden_configs`` (from ``run --golden NAME``, possibly several configs)
+    are echoed as indented ``↳ golden`` rows under each kernel whose shape
+    matches — the recorded best to compare the greedy pick against."""
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     cuda_nodes = [(nid, node) for nid, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
@@ -385,6 +389,15 @@ def _print_kernel_stats(graph, bench):
 
     from deplodock.compiler.pipeline.knob import format_tuning_knobs  # noqa: PLC0415
 
+    def _matching_goldens(op):
+        """Recorded goldens whose matmul shape matches this kernel — keyed on the
+        op's ``S_*`` structural features (``S_ext_free_prod = M*N``,
+        ``S_ext_reduce_max = K``), the same shape signature the prior diagnostics
+        match goldens on."""
+        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
+        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
+        return [g for g in (golden_configs or []) if g.M * g.N == free_prod and g.K == reduce_max]
+
     print()
     print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
     print("-" * 90)
@@ -406,6 +419,9 @@ def _print_kernel_stats(graph, bench):
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
         knobs = format_tuning_knobs(getattr(op, "knobs", {}) or {})  # the greedy-picked tuning knobs for this kernel
         print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}  {knobs}")
+        for g in _matching_goldens(op):
+            ratio = f" ({g.ratio:.2f}x cuBLAS)" if g.cublas_us else ""
+            print(f"  ↳ golden {g.name}: {g.deplodock_us:.1f}us{ratio}  {format_tuning_knobs(g.knobs)}")
     print(f"{'TOTAL':<44s} {total_us:>7.1f}")
 
 

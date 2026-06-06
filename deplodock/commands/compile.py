@@ -129,24 +129,29 @@ def add_golden_arg(parser) -> None:
 
 
 def resolve_golden_arg(args) -> None:
-    """If ``--golden NAME`` is set, resolve it to ``args.code = <golden snippet>``.
-    Exits 2 on an unknown name (listing the available names) or a conflict with
-    ``--code`` / positional input / ``--ir``."""
+    """If ``--golden NAME`` is set, resolve it to ``args.code = <golden snippet>``
+    and stash every config recorded under NAME on ``args.golden_configs`` (a list —
+    one shape may carry several golden knob sets; ``run --bench`` echoes each under
+    its matching kernel). Exits 2 on an unknown name (listing the available names)
+    or a conflict with ``--code`` / positional input / ``--ir``."""
     name = getattr(args, "golden", None)
+    args.golden_configs = []
     if not name:
         return
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig, goldens_by_name
 
     if args.code or args.input or getattr(args, "ir", None):
         logger.error("--golden is mutually exclusive with --code / positional input / --ir")
         sys.exit(2)
-    match = next((g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig) and g.name == name), None)
-    if match is None:
-        names = ", ".join(sorted(g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)))
+    matches = goldens_by_name(name)
+    if not matches:
+        names = ", ".join(sorted({g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}))
         logger.error("unknown golden config %r.\nAvailable: %s", name, names)
         sys.exit(2)
-    args.code = match.snippet()
-    logger.info("[golden] %s → --code %s", match.name, args.code)
+    # All configs under one name share the shape, so any snippet is interchangeable.
+    args.golden_configs = matches
+    args.code = matches[0].snippet()
+    logger.info("[golden] %s → --code %s (%d recorded config%s)", name, args.code, len(matches), "" if len(matches) == 1 else "s")
 
 
 def add_diagnostics_args(parser) -> None:

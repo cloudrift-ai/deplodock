@@ -54,3 +54,40 @@ def test_golden_configs_set_is_well_formed():
         assert c.ratio >= 0.0, c.name
         assert c.golden == (c.ratio >= 0.95), c.name
         assert c.knobs, f"{c.name} has no recorded knobs"
+
+
+def _dup(knobs, us):
+    return MatmulGoldenConfig(name="dup.512", M=512, N=512, K=512, knobs=knobs, deplodock_us=us, cublas_us=14.0)
+
+
+def test_goldens_by_name_returns_every_config_under_a_name(monkeypatch):
+    """A name may carry several configs (e.g. a newly found faster variant beside
+    the old one); ``goldens_by_name`` returns them all, empty for an unknown name."""
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
+    assert gmod.goldens_by_name("dup.512") == [a, b]
+    assert gmod.goldens_by_name("nope") == []
+
+
+def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
+    """``--golden NAME`` stashes *every* recorded config under NAME on
+    ``args.golden_configs`` (all share the shape, so ``args.code`` is the snippet
+    of the first); no ``--golden`` leaves an empty list."""
+    from argparse import Namespace
+
+    from deplodock.commands import compile as cmod
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
+
+    args = Namespace(golden="dup.512", code=None, input=None, ir=None)
+    cmod.resolve_golden_arg(args)
+    assert args.golden_configs == [a, b]
+    assert args.code == a.snippet()
+
+    none = Namespace(golden=None, code=None, input=None, ir=None)
+    cmod.resolve_golden_arg(none)
+    assert none.golden_configs == []
