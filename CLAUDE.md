@@ -121,6 +121,13 @@ same worker.
   The (b) greedy pick reads the learned-prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior PATH`; option-0 when no prior
   is loaded) — **not** the `--db` tune DB, which feeds only the per-knob regret table. The heuristic weights are fit
   offline by `scripts/golden_knob_heuristics.py` (learning-to-rank the golden set).
+- `deplodock knobs --features [--kernel SUBSTR]` — print the exact feature vector the learned `CatBoostPrior`
+  regresses on for each golden config: the `S_*` structural / shape features (from compiling the shape to the loop
+  dialect, where `992_stamp_structural_features` runs), the `H_*` hardware regime, and the golden tuning knobs, all
+  via `knob.knob_features`. Note the shape enters only as the coarse `S_ext_*` extent products/maxes (`S_ext_free_prod`
+  = M·N, `S_ext_free_max` = max(M,N), `S_ext_reduce_prod` = K) — the occupancy / CTA-count / reuse terms that drive
+  matmul perf (and that `search/heuristic.py` computes) are NOT inputs, so the regressor must rediscover those
+  nonlinear interactions from splits.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

@@ -78,6 +78,13 @@ def register_knobs_command(subparsers) -> None:
         "its enumeration order — no GPU / no prior — and (b) the greedy pipeline pick (prior / option-0) "
         "vs golden. --kernel SUBSTR filters golden configs by name.",
     )
+    parser.add_argument(
+        "--features",
+        action="store_true",
+        help="Print the exact feature vector the learned prior (CatBoost) regresses on for each golden config: "
+        "the S_* structural / shape features (from compiling the shape to the loop dialect), the H_* hardware "
+        "regime, and the golden tuning knobs, all through knob.knob_features. --kernel SUBSTR filters by name.",
+    )
     parser.set_defaults(func=handle_knobs)
 
 
@@ -85,12 +92,15 @@ def handle_knobs(args) -> None:
     # The canonical schema from the knob registry — always available (no DB).
     _emit_registry()
 
+    if args.features:
+        _emit_golden_features(args.kernel)
     if args.golden:
         if args.prior:
             from deplodock import config  # noqa: PLC0415
 
             os.environ[config.PRIOR_FILE] = str(Path(args.prior).expanduser())
         _emit_golden_check(args.kernel)
+    if args.features or args.golden:
         return
 
     db_path = Path(args.db) if args.db else resolve_tune_db()
@@ -186,6 +196,60 @@ def _knob_cells(gold: dict, got: dict, keys: list[str]) -> str:
         cell = f"{k}={fv}/{gv}"
         out.append(f"{_RED}{cell}{_RESET}" if fv != gv else cell)
     return " ".join(out)
+
+
+def _emit_golden_features(kernel_filter: str | None) -> None:
+    """Print, per golden config, the exact feature vector the learned
+    :class:`CatBoostPrior` regresses on — ``knob.knob_features(merged)`` where
+    ``merged`` is the ``H_*`` host/regime features + the ``S_*`` structural/shape
+    features (obtained by compiling the shape to the loop dialect, where
+    ``992_stamp_structural_features`` runs) + the golden tuning knobs. This is
+    the model's *input* for that shape+config — note the shape enters only as the
+    coarse ``S_ext_*`` extent products/maxes; the occupancy / CTA-count / reuse
+    terms that drive matmul perf (and that the heuristic computes) are NOT here."""
+    import logging as _logging  # noqa: PLC0415
+
+    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, knob  # noqa: PLC0415
+    from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+
+    configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    if kernel_filter:
+        configs = [g for g in configs if kernel_filter in g.name]
+
+    logger.info("")
+    logger.info("Learned-prior feature vector (knob.knob_features) — the CatBoost regressor's input per golden config:")
+    quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
+    prev = [lg.level for lg in quiet]
+    for lg in quiet:
+        lg.setLevel(_logging.WARNING)
+    try:
+        for g in configs:
+            try:
+                graph, _, _ = graph_from_code(g.snippet())
+                compiled = Pipeline.build(LOOP_PASSES).run(graph)  # loop dialect — S_* stamped, no codegen
+                s_feats: dict = {}
+                for n in compiled.nodes.values():
+                    s_feats.update({k: v for k, v in (getattr(n.op, "knobs", {}) or {}).items() if k.startswith(STRUCT_PREFIX)})
+                merged = {**Context.from_target(g.compute_cap).features(), **s_feats, **g.knobs}
+                feats = knob.knob_features(merged)
+            except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
+                logger.info("  %-26s  ERR  %s", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100])
+                continue
+            logger.info("  %s  (%d features):", g.name, len(feats))
+            tuning = {k: v for k, v in feats.items() if not k.startswith((STRUCT_PREFIX, CTX_PREFIX))}
+            for label, sel in (
+                ("S_", {k: v for k, v in feats.items() if k.startswith(STRUCT_PREFIX)}),
+                ("H_", {k: v for k, v in feats.items() if k.startswith(CTX_PREFIX)}),
+                ("knob", tuning),
+            ):
+                if sel:
+                    logger.info("    %-5s %s", label, " ".join(f"{k}={v:g}" for k, v in sorted(sel.items())))
+    finally:
+        for lg, lv in zip(quiet, prev, strict=True):
+            lg.setLevel(lv)
 
 
 def _emit_golden_check(kernel_filter: str | None) -> None:
