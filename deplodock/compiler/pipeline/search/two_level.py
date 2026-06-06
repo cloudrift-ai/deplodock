@@ -29,16 +29,22 @@ So we split the search in two:
   structurally (:func:`op_cache_key`), so they transfer to the assembled graph
   unchanged AND are shared across outer terminals (a shared op is a DB hit).
 
-An op is skipped when it is already ``terminated`` — its recorded inner-search
-effort meets the requested patience (an exhausted op records ``inf``). That
-makes re-runs idempotent, higher patience re-deepen only under-tuned ops, and
-the whole thing resumable across sessions.
+The inner search runs for **every** op on every pass — it is never skipped on
+prior effort. Replay is cheap, not gated: each benched terminal hits the
+per-variant ``perf`` cache (:func:`pipeline._bench_terminal`), so a variant
+already measured is served from the DB with no GPU bench. An identical re-run
+(same prior) re-walks the same deterministic trajectory → every terminal is a
+cache hit → zero benches and the same total. But the global learned prior keeps
+changing (it refits across ops and runs), so the same patience can steer the
+MCTS down a *different* trajectory — re-running lets it reach and bench the
+genuinely-new variants the improved prior surfaces, replaying the rest for free.
+(The old per-op ``op_effort`` "skip already-tuned" gate is gone: it skipped the
+whole op, which would suppress exactly that prior-driven re-exploration.)
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -87,7 +93,6 @@ class OpResult:
     name: str
     op_key: str
     best_us: float | None
-    benched: bool  # True when the inner search ran; False when skipped (terminated)
     multiplicity: int = 1
 
 
@@ -148,12 +153,13 @@ def inner_reward(
     its rows are archived and the prior is checkpointed to its file
     (``prior_path``, keyed by regime), so a later compile / tune reloads it.
 
-    Each kernel is gated on persisted effort: an op already tuned to
-    ``>= patience`` (or exhausted, recorded ``inf``) is skipped and its cached
-    best is summed directly. Otherwise its slice is tuned by a plain inner
-    :class:`TuningSearch` over :data:`LOWERING_PASSES`, the effort is recorded
-    (``inf`` when the inner tree drained, else ``patience``), and the new best
-    is summed. Benches scale as ``Σ_k n_k`` (per op), never the product.
+    Every kernel's slice is tuned by a plain inner :class:`TuningSearch` over
+    :data:`LOWERING_PASSES` on every pass — never skipped on prior effort. The
+    cost is paid at the bench, not gated at the op: :func:`pipeline._bench_terminal`
+    serves any already-measured variant from the ``perf`` cache, so an identical
+    re-run benches nothing while a prior-shifted trajectory benches only its
+    genuinely-new variants. The per-op best is then read from the DB and summed.
+    Benches scale as ``Σ_k n_k`` (per op), never the product.
 
     ``progress`` (a duck-typed :class:`~deplodock.commands.tune_progress.TuneProgress`,
     or ``None``) drives the CLI progress bar: one op leaf ticked per *unique*
@@ -164,8 +170,8 @@ def inner_reward(
     Leaves are deduped by ``op_cache_key`` before iteration. The inner search
     keys every DB write on the structural key, so iterating per occurrence
     (337 LoopOp nodes on Qwen3-Embedding-0.6B) only differs from per-unique-key
-    iteration (~14) by an O(positions) ``db.terminated`` / ``best_per_op_time``
-    cache lookup — and gives the user a misleading progress denominator.
+    iteration (~14) by an O(positions) ``best_per_op_time`` cache lookup — and
+    gives the user a misleading progress denominator.
     Multiplicity is preserved: ``total_us`` weights each unique kernel's best
     by its node count, so the outer MCTS reward is bit-for-bit identical to
     the per-node-iterated total."""
@@ -205,50 +211,40 @@ def inner_reward(
         name = getattr(op, "name", None) or nid
         if progress is not None:
             progress.op_start(name)
-        benched = False
-        if not db.terminated(ctx_key, key, patience):
-            sub = single_node_graph(fused_graph, nid)
-            # Base knobs the prior sees on every row: the LoopOp's ``S_*``
-            # structural identity (op-aware rows) + the ``H_*`` host/hardware
-            # regime (GPU + nvcc opt level), so one global prior spans ops and
-            # regimes from the feature vector alone.
-            base_knobs = {**ctx.features(), **op.knobs}
-            inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior, base_knobs=base_knobs)
-            for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
-                if progress is not None:
-                    st = inner.last_stats
-                    best_us = (1.0 / inner.tree.best_reward) if inner.tree.best_reward > 0 else None
-                    progress.variant(
-                        name,
-                        variant_label(cand.graph),
-                        median_us=st.median if st is not None else None,
-                        status=inner.last_status or "",
-                        best_us=best_us,
-                    )
-            # The inner MCTS's best reward is ``1 / min whole-slice total``
-            # (``_bench_terminal`` sums every CudaOp in the slice, so a split-K
-            # main + combine both count). Record that total under the LoopOp
-            # key so ``best_per_op_time`` reads the true per-op cost — and a
-            # skipped (terminated) re-run still finds it.
-            best_total = 1.0 / inner.tree.best_reward if inner.tree.best_reward > 0 else None
-            if best_total is not None:
-                db.record_perf(ctx_key, key, backend=backend_name, status="ok", stats=_point_stats(best_total))
-            # ``stop_reason is None`` ⟺ the queue drained (every variant
-            # measured) ⟺ the op's tree is exhausted; record ``inf`` so any
-            # future patience treats it as terminated. A patience stop records
-            # exactly the patience it ran with (incremental deepening).
-            exhausted = inner.stop_reason is None
-            db.record_effort(ctx_key, key, math.inf if exhausted else float(patience))
-            benched = True
-            if prior is not None:
-                # Stream this op's value-of-position rows (-O1) plus any -O3 winner
-                # samples into the global (reservoir-bounded) dataset; refit +
-                # checkpoint once enough new rows accumulate (batched — see ``Prior``).
-                prior.add_rows(inner._collect_rows() + inner.o3_rows)
-                if prior.maybe_refit():
-                    prior.checkpoint()
+        sub = single_node_graph(fused_graph, nid)
+        # Base knobs the prior sees on every row: the LoopOp's ``S_*``
+        # structural identity (op-aware rows) + the ``H_*`` host/hardware
+        # regime (GPU + nvcc opt level), so one global prior spans ops and
+        # regimes from the feature vector alone.
+        base_knobs = {**ctx.features(), **op.knobs}
+        inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior, base_knobs=base_knobs)
+        for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
+            if progress is not None:
+                st = inner.last_stats
+                best_us = (1.0 / inner.tree.best_reward) if inner.tree.best_reward > 0 else None
+                progress.variant(
+                    name,
+                    variant_label(cand.graph),
+                    median_us=st.median if st is not None else None,
+                    status=inner.last_status or "",
+                    best_us=best_us,
+                )
+        # The inner MCTS's best reward is ``1 / min whole-slice total``
+        # (``_bench_terminal`` sums every CudaOp in the slice, so a split-K
+        # main + combine both count). Record that total under the LoopOp
+        # key so ``best_per_op_time`` reads the true per-op cost.
+        best_total = 1.0 / inner.tree.best_reward if inner.tree.best_reward > 0 else None
+        if best_total is not None:
+            db.record_perf(ctx_key, key, backend=backend_name, status="ok", stats=_point_stats(best_total))
+        if prior is not None:
+            # Stream this op's value-of-position rows (-O1) plus any -O3 winner
+            # samples into the global (reservoir-bounded) dataset; refit +
+            # checkpoint once enough new rows accumulate (batched — see ``Prior``).
+            prior.add_rows(inner._collect_rows() + inner.o3_rows)
+            if prior.maybe_refit():
+                prior.checkpoint()
         best = db.best_per_op_time(ctx_key, key, backend=backend_name)
-        per_op.append(OpResult(name=name, op_key=key, best_us=best, benched=benched, multiplicity=count))
+        per_op.append(OpResult(name=name, op_key=key, best_us=best, multiplicity=count))
         # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
         # 24 × best, matching the per-node total before dedup.
         if best is None:

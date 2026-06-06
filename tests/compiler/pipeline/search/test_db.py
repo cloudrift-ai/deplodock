@@ -167,57 +167,6 @@ def test_lowering_loop_to_tile_ignores_none_measurement() -> None:
 
 
 # ---------------------------------------------------------------------------
-# op_effort — "skip already-tuned" gate (max-kept, ∞ exhausted, context-keyed)
-# ---------------------------------------------------------------------------
-
-
-def test_effort_defaults_to_zero() -> None:
-    db = SearchDB()
-    assert db.effort_for("ctx", "op") == 0.0
-    assert not db.terminated("ctx", "op", patience=1)
-
-
-def test_record_effort_max_keeps() -> None:
-    db = SearchDB()
-    db.record_effort("ctx", "op", 5.0)
-    assert db.effort_for("ctx", "op") == 5.0
-    # A deeper run raises the recorded effort.
-    db.record_effort("ctx", "op", 20.0)
-    assert db.effort_for("ctx", "op") == 20.0
-    # A shallower re-run never lowers it.
-    db.record_effort("ctx", "op", 3.0)
-    assert db.effort_for("ctx", "op") == 20.0
-
-
-def test_record_effort_infinity_is_terminal_at_any_patience() -> None:
-    """An exhausted op records ``inf`` (round-trips through SQLite) and is
-    terminated at every requested patience."""
-    db = SearchDB()
-    db.record_effort("ctx", "op", float("inf"))
-    assert db.effort_for("ctx", "op") == float("inf")
-    assert db.terminated("ctx", "op", patience=10)
-    assert db.terminated("ctx", "op", patience=10**9)
-    # ``inf`` is the max — a finite re-run never lowers it.
-    db.record_effort("ctx", "op", 7.0)
-    assert db.effort_for("ctx", "op") == float("inf")
-
-
-def test_terminated_gates_on_patience() -> None:
-    db = SearchDB()
-    db.record_effort("ctx", "op", 10.0)
-    assert db.terminated("ctx", "op", patience=10)
-    assert db.terminated("ctx", "op", patience=5)
-    assert not db.terminated("ctx", "op", patience=20)
-
-
-def test_effort_is_context_keyed() -> None:
-    db = SearchDB()
-    db.record_effort("ctx-A", "op", 10.0)
-    assert db.effort_for("ctx-A", "op") == 10.0
-    assert db.effort_for("ctx-B", "op") == 0.0
-
-
-# ---------------------------------------------------------------------------
 # best_per_op_time — walk lowering chain to the cuda terminal, read perf
 # ---------------------------------------------------------------------------
 

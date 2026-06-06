@@ -2,12 +2,12 @@
 reach the best configs?", with no GPU.
 
 ``deplodock tune`` with no model / ``--code`` refits the prior on its persisted
-reservoir dataset and prints :func:`report`: a dataset summary, per-op **argmax
-reachability** (does the prior's argmax over an op's *measured* configs recover
-the measured-best leaf?), an in-sample ranking calibration, and coverage of the
-golden matmul configs. Reachability is the optimistic upper bound on greedy
-quality — if the prior can't even rank an op's own benched leaves to the top,
-greedy (which descends fork-by-fork) can't either.
+reservoir dataset and prints :func:`report`: a dataset summary, per-op **pick
+reachability** (does the prior's predicted-fastest config over an op's *measured*
+configs recover the measured-best leaf?), an in-sample ranking calibration, and
+coverage of the golden matmul configs. Reachability is the optimistic upper bound
+on greedy quality — if the prior can't even rank an op's own benched leaves to the
+top, greedy (which descends fork-by-fork) can't either.
 """
 
 from __future__ import annotations
@@ -45,24 +45,26 @@ def _op_label(sig: tuple) -> str:
 
 
 def reachability(prior, groups: dict) -> list[tuple]:
-    """Per op: ``(label, best_us, argmax_us, ratio, n_leaf_configs)`` — the prior's
-    argmax over the op's measured *leaf* configs vs the measured best (ratio = the
-    argmax config's latency / the best's; 1.0 = recovers the optimum)."""
+    """Per op: ``(label, best_us, pick_us, ratio, n_leaf_configs)`` — the config the
+    prior predicts fastest (``mean_score`` argmin) over the op's measured *leaf*
+    configs vs the measured best (ratio = the picked config's latency / the best's;
+    1.0 = recovers the optimum)."""
     out = []
     for sig, grp in groups.items():
         kmax = max(_n_tunable(k) for k, _ in grp)
         leaves = [(k, v) for k, v in grp if _n_tunable(k) == kmax]
         if len(leaves) < 2:
             continue
-        best_lab = max(v for _, v in leaves)
-        pick_lab = max(leaves, key=lambda t: prior.mean_score(t[0]))[1]
-        out.append((_op_label(sig), math.exp(-best_lab), math.exp(-pick_lab), math.exp(best_lab - pick_lab), len(leaves)))
+        best_us = min(v for _, v in leaves)  # labels are latency µs — lower is better
+        pick_us = min(leaves, key=lambda t: prior.mean_score(t[0]))[1]
+        out.append((_op_label(sig), best_us, pick_us, pick_us / best_us, len(leaves)))
     return out
 
 
 def _calibration(prior, groups: dict) -> float | None:
-    """Median per-op Spearman ρ between the prior's prediction and the measured
-    reward over each op's leaf configs."""
+    """Median per-op Spearman ρ between the prior's predicted latency and the
+    measured latency over each op's leaf configs (both µs → ρ near ``+1`` when
+    well-calibrated)."""
     from scipy.stats import spearmanr  # noqa: PLC0415
 
     rhos = []
@@ -94,8 +96,9 @@ def _golden_coverage(groups: dict) -> tuple[int, int]:
 def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     """Per golden matmul, the golden's **rank under the prior** over the shape's
     full (gated) enumeration — the realistic "would greedy-with-prior pick the
-    golden?" test (greedy argmaxes the prior across the enumeration, not just the
-    benched leaves that :func:`reachability` scores). The ``S_*`` shape features
+    golden?" test (greedy picks the prior's predicted-fastest config across the
+    enumeration, not just the benched leaves that :func:`reachability` scores).
+    The ``S_*`` shape features
     come from the dataset's matching op group (so only shapes with tuned data are
     scored); ``H_*`` is the deployable compile regime (``Context.features``,
     ``H_opt=3``) the greedy ``compile`` / ``run`` actually queries with.
@@ -125,8 +128,10 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
             continue
         base = {**Context.from_target(g.compute_cap).features(), **s_feats}
         gold = {k: v for k, v in g.knobs.items() if k in (thread if g.dtype == "fp32" else warp)}
+        # ``evaluate_golden`` ranks by descending score; the prior predicts latency
+        # (lower = better), so negate to rank the predicted-fastest config first.
         _, rank, pool = heuristic.evaluate_golden(
-            g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), scorer=lambda r, b=base: prior.mean_score({**b, **r})
+            g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), scorer=lambda r, b=base: -prior.mean_score({**b, **r})
         )
         if rank is not None:
             rows.append((g.name, rank, pool))
@@ -154,12 +159,12 @@ def report(prior) -> str:
     rr = reachability(prior, groups)
     if rr:
         ratios = [r[3] for r in rr]
-        lines.append("[prior] argmax reachability — does the prior's argmax recover each op's measured best?")
+        lines.append("[prior] pick reachability — does the prior's predicted-fastest config recover each op's measured best?")
         agg = f"mean {statistics.mean(ratios):.2f}x  median {statistics.median(ratios):.2f}x  worst {max(ratios):.2f}x"
         lines.append(f"  {agg}   (1.00 = optimum)")
         for label, best_us, pick_us, ratio, n in sorted(rr, key=lambda r: -r[3]):
             flag = "  <-- misses best" if ratio > 1.2 else ""
-            lines.append(f"    {label:26}  best {best_us:8.2f}us  argmax {pick_us:8.2f}us  ({ratio:.2f}x, {n} configs){flag}")
+            lines.append(f"    {label:26}  best {best_us:8.2f}us  pick {pick_us:8.2f}us  ({ratio:.2f}x, {n} configs){flag}")
     calib = _calibration(prior, groups)
     if calib is not None:
         lines.append(f"[prior] ranking calibration (median per-op Spearman): {calib:+.2f}")

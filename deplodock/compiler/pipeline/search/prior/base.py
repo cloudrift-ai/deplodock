@@ -17,10 +17,12 @@ not per-bench refitting.
 
 Training signal is **value-of-position**: real benches exist only at leaves, but
 the prior ranks partial-knob siblings at every fork level, so the label for any
-node is the max reward over its benched descendants (``SearchNode.best_reward``).
-The search hands :meth:`add_rows` ``(knobs, log(best_reward))`` rows for leaves
-*and* branches. :meth:`score` / :meth:`mean_score` return ``0`` until the first
-fit, so a cold prior gives a uniform PUCT policy (exploration via the PUCT term).
+node is the best (min) latency over its benched descendants (``1/best_reward``).
+The search hands :meth:`add_rows` ``(knobs, median_latency_µs)`` rows for leaves
+*and* branches — the prior regresses on latency, and the reward conversion lives
+in the MCTS selection loop. :meth:`score` / :meth:`mean_score` return ``0`` until
+the first fit, so a cold prior gives a uniform PUCT policy (exploration via the
+PUCT term).
 """
 
 from __future__ import annotations
@@ -180,7 +182,7 @@ class Prior(ABC):
         ]
         calib = self._calibration(warm, n)
         if calib is not None:
-            lines.append(f"  calibration (post Spearman pred vs reward): {calib:+.2f}")
+            lines.append(f"  calibration (post Spearman pred vs latency): {calib:+.2f}")
         return "\n".join(lines)
 
     def _silly(self, lo: int, hi: int, thresh: float, *, post: bool = False) -> str:
@@ -192,19 +194,20 @@ class Prior(ABC):
         return f"{tag} {silly}/{len(oks)} ({100 * silly / len(oks):.0f}%)"
 
     def _calibration(self, lo: int, hi: int) -> float | None:
-        """Spearman ρ between the prior's prediction and the measured reward
-        (−log us) over post-warmup ok picks (``scipy.stats.spearmanr``)."""
+        """Spearman ρ between the prior's predicted latency and the measured
+        latency over post-warmup ok picks (``scipy.stats.spearmanr``). Both are
+        µs, so a well-calibrated prior gives ρ near ``+1``."""
         if not self.fitted:
             return None
-        pred, reward = [], []
+        pred, latency = [], []
         for knobs, us, st in self.trajectory[lo:hi]:
             if st != "ok" or us <= 0:
                 continue
             pred.append(self.mean_score(knobs))
-            reward.append(-math.log(us))
+            latency.append(us)
         if len(pred) < 3:
             return None
         from scipy.stats import spearmanr  # noqa: PLC0415
 
-        rho = float(spearmanr(pred, reward).statistic)
+        rho = float(spearmanr(pred, latency).statistic)
         return None if math.isnan(rho) else rho

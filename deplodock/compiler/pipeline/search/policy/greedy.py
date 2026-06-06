@@ -8,11 +8,12 @@ would be O(N²) and hang). It is NOT an exploration policy: it benches nothing,
 so it can only *use* a prior trained earlier by ``tune``, never train one.
 
 When a trained global prior exists (``CatBoostPrior.load`` finds a
-checkpoint), it picks the sibling with the highest :meth:`Prior.mean_score` —
-the same feature vector the prior was trained on: the ``H_*`` host/hardware
-regime + the op's ``S_*`` structural knobs (read off the parent op) + the deltas
-chosen so far down this fork tree + the candidate's own delta. With no trained
-prior every score is 0 → it falls back to the first emitted sibling (option-0).
+checkpoint), it picks the sibling with the lowest :meth:`Prior.mean_score` (the
+prior predicts latency µs — lower is better) over the same feature vector the
+prior was trained on: the ``H_*`` host/hardware regime + the op's ``S_*``
+structural knobs (read off the parent op) + the deltas chosen so far down this
+fork tree + the candidate's own delta. With no trained prior the model is unfit →
+it falls back to the first emitted sibling (option-0).
 """
 
 from __future__ import annotations
@@ -51,11 +52,11 @@ class GreedySearch(Search):
             self._cur_inner = c0.inner
             self._path_knobs = {}
         base = self._base_knobs(c0)
-        best, best_v = cands[0], float("-inf")
+        best, best_v = cands[0], float("inf")
         for c in cands:
             full = {**base, **self._path_knobs, **(c.fork.knobs if c.fork is not None else {})}
-            v = prior.mean_score(full)
-            if v > best_v:
+            v = prior.mean_score(full)  # predicted latency µs — lower is better
+            if v < best_v:
                 best_v, best = v, c
         self._pending = best
         if best.fork is not None:

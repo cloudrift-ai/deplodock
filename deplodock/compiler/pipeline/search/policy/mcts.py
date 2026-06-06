@@ -4,14 +4,16 @@
 signal (greedy and the ``+∞``-unvisited UCB rule are gone).
 
     select   — descend from root, picking at each level
-               ``argmax_c [ Q_norm(c) + c · P(c) · √(N_parent+1) / (1+N_c) ]``
-               where ``Q_norm = best_reward / global_best`` and ``P`` is the
-               softmax over the prior's predicted scores of the sibling
-               set. No ``+∞``-unvisited rule → no forced breadth: a
-               confidently-bad sibling gets a small ``P`` and is skipped. A cold
-               or absent prior gives a uniform ``P`` (PUCT still explores via the
-               exploration term; a single-shot compile with no prior descends
-               emission-order). Live-count filtering skips drained subtrees.
+               ``argmax_c [ Q(c) + c · P(c) · √(N_parent+1) / (1+N_c) ]``
+               where ``Q = best_reward / global_best`` and ``P`` is the prior's
+               *predicted* reward on the same scale: the prior predicts latency,
+               which this loop converts to reward (``1/û``) and normalizes by the
+               same ``global_best`` as ``Q``. No softmax, no ``+∞``-unvisited rule
+               → no forced breadth: a confidently-bad sibling gets a small ``P``
+               and is skipped. A cold or absent prior gives a uniform ``P = 1``
+               (PUCT still explores via the exploration term; a single-shot
+               compile with no prior descends emission-order). Live-count
+               filtering skips drained subtrees.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
                candidates as children of the ``parent`` token (the
                ``SearchNode`` their spawning candidate was popped with);
@@ -21,8 +23,8 @@ signal (greedy and the ``+∞``-unvisited UCB rule are gone).
                ``visits`` and updating
                ``best_reward = max(best_reward, leaf_reward)``.
 
-Reward is normalized to [0,1] against the global best so the exploration
-constant ``c`` is unit-free.
+Reward — both measured and prior-predicted — is normalized against the global
+best so the exploration constant ``c`` is unit-free.
 """
 
 from __future__ import annotations
@@ -38,15 +40,6 @@ from deplodock.compiler.pipeline.search.policy.base import Search
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.search.prior import Prior
-
-
-def _softmax(xs: list[float]) -> list[float]:
-    """Numerically-stable softmax (shift-invariant, so any constant offset in
-    the prior scores — e.g. its ``y_mean`` — cancels)."""
-    m = max(xs)
-    exps = [math.exp(x - m) for x in xs]
-    total = sum(exps)
-    return [e / total for e in exps]
 
 
 @dataclass
@@ -165,13 +158,15 @@ class TuningSearch(Search):
     def observe_o3(self, token: object | None, o3_us: float) -> None:
         """Record an extra training row for an -O1 winner re-benched at -O3: the
         same realized knobs but tagged ``H_opt=3`` (the deployable regime) and
-        labeled with the -O3 latency. The prior can then rank winners by -O3 cost
-        where -O1 ties them; ``H_opt`` lets the -O1 and -O3 rows coexist."""
+        labeled with the -O3 median latency (µs) — the prior's regression target
+        is latency, converted to reward only in the MCTS selection loop. The prior
+        can then rank winners by -O3 cost where -O1 ties them; ``H_opt`` lets the
+        -O1 and -O3 rows coexist."""
         if o3_us <= 0 or not isinstance(token, SearchNode) or token.realized_knobs is None:
             return
         knobs = dict(token.realized_knobs)
         knobs["H_opt"] = 3.0
-        self.o3_rows.append((knobs, math.log(1.0 / o3_us)))
+        self.o3_rows.append((knobs, o3_us))
         if self.prior_model is not None:
             self.prior_model.record_bench(knobs, o3_us, "ok")
 
@@ -219,9 +214,9 @@ class TuningSearch(Search):
         return node, node.candidate
 
     def _prior_score(self, child: SearchNode) -> float:
-        """The prior's predicted score for a child (``0`` when no model
-        is attached, the model is unfit, or the child is the root sentinel — in
-        which case the softmax over siblings is uniform)."""
+        """The prior's predicted *latency* (µs) for a child (``0`` when no model
+        is attached, the model is unfit, or the child is the root sentinel — the
+        ``_select`` loop treats a non-positive prediction as a uniform ``P``)."""
         if self.prior_model is None or child.candidate is None:
             return 0.0
         return self.prior_model.score(self._node_knobs(child))
@@ -231,20 +226,26 @@ class TuningSearch(Search):
 
             score(c) = Q(c) + c_ucb · P(c) · √(N_parent + 1) / (1 + N_c)
 
-        where ``Q = best_reward / global_best`` (``0`` for an unvisited child)
-        and ``P`` is the softmax over the prior's predicted scores of the
-        sibling set. A confidently-bad sibling gets a small ``P`` → tiny
-        exploration term → it is deprioritized rather than force-visited. There
-        is no ``+∞``-unvisited rule (no forced breadth) and no greedy/UCB
-        fallback: a cold or absent prior just yields a uniform ``P``, so PUCT
-        still explores via the exploration term (and a single-shot compile with
-        no prior descends emission-order). ``c_ucb`` is ``--ucb-c``."""
+        where ``Q = best_reward / global_best`` (``0`` for an unvisited child) and
+        ``P`` is the prior's *predicted reward* on the same scale: the prior
+        predicts latency ``û(c)``, which this loop converts to reward (``1/û``)
+        and normalizes by the same ``global_best`` as ``Q`` — no softmax. A
+        confidently-bad sibling gets a small ``P`` → tiny exploration term → it is
+        deprioritized rather than force-visited. There is no ``+∞``-unvisited rule
+        (no forced breadth): a cold or absent prior yields a uniform ``P = 1``, so
+        PUCT still explores via the exploration term (and a single-shot compile
+        with no prior descends emission-order). ``c_ucb`` is ``--ucb-c``."""
         global_best = self.tree.best_reward or 1.0
-        probs = _softmax([self._prior_score(c) for c in children])
+        fitted = self.prior_model is not None and self.prior_model.fitted
         sqrt_parent = math.sqrt(parent.visits + 1)
         best, best_v = children[0], float("-inf")
-        for c, p in zip(children, probs, strict=True):
+        for c in children:
             q = (c.best_reward / global_best) if c.visits > 0 else 0.0
+            if fitted:
+                pred_us = self._prior_score(c)
+                p = (1.0 / pred_us) / global_best if pred_us > 0 else 0.0
+            else:
+                p = 1.0  # cold / absent prior → uniform exploration
             v = q + self._ucb_c * p * sqrt_parent / (1 + c.visits)
             if v > best_v:
                 best_v, best = v, c
@@ -271,8 +272,10 @@ class TuningSearch(Search):
     def _collect_rows(self) -> list[tuple[dict, float]]:
         """Value-of-position training rows from the live tree: every node with
         a benched descendant (``visits > 0`` and ``best_reward > 0``) — leaves
-        *and* branches — labeled ``log(best_reward)`` (= −log median latency,
-        the max over its subtree). Re-read each refit since labels only rise.
+        *and* branches — labeled with the best (min) median latency µs over its
+        subtree (``1/best_reward``; the prior regresses on latency, and the
+        reward conversion lives in the MCTS selection loop). Re-read each refit
+        since labels only fall.
 
         A directly-benched leaf uses its ``realized_knobs`` (the FULL config);
         a branch (no realized knobs of its own) uses its partial fork-prefix
@@ -285,7 +288,7 @@ class TuningSearch(Search):
             if node.candidate is None or node.visits == 0 or node.best_reward <= 0:
                 continue
             knobs = node.realized_knobs if node.realized_knobs is not None else self._node_knobs(node)
-            rows.append((knobs, math.log(node.best_reward)))
+            rows.append((knobs, 1.0 / node.best_reward))
         return rows
 
     def _should_stop(self) -> bool:

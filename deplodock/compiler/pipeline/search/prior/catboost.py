@@ -25,12 +25,16 @@ regularize hard against per-op overfitting. So one global CatBoost prior is good
 enough on a *new* op that we no longer refit within an op's own search (the model
 is fixed per run; see :mod:`base`).
 
-Regresses ``y = log(best_reward)`` (= −log median latency) on
-:func:`knob.knob_features` — the ``S_*`` structural + ``H_*`` hardware/nvcc-regime
-features let one model tell kernels and regimes apart from the feature vector.
-Predictions are deterministic, so :meth:`score` (PUCT ranking) and
-:meth:`mean_score` (greedy argmax + calibration) coincide; PUCT explores via its
-own exploration term rather than a Thompson draw. :meth:`to_json` / :meth:`from_json`
+Regresses ``y = log(median latency µs)`` on :func:`knob.knob_features` — the
+``S_*`` structural + ``H_*`` hardware/nvcc-regime features let one model tell
+kernels and regimes apart from the feature vector (log space keeps the RMSE fit
+from being dominated by the slow configs, where we least care). :meth:`score` /
+:meth:`mean_score` return the predicted latency in µs (``exp`` of the regressed
+log-latency); the search converts that to reward. **Lower is better** — greedy
+picks the ``mean_score`` *argmin*, and PUCT (see :mod:`policy.mcts`) inverts the
+prediction to a reward. Predictions are deterministic, so :meth:`score` (PUCT
+ranking) and :meth:`mean_score` (greedy + calibration) coincide; PUCT explores via
+its own exploration term rather than a Thompson draw. :meth:`to_json` / :meth:`from_json`
 round-trip the CatBoost model (its native ``cbm`` blob, base64'd) plus the
 reservoir dataset, so a follow-up ``tune`` keeps accumulating and a ``compile`` /
 ``run`` loads it to pick knobs.
@@ -67,16 +71,20 @@ class CatBoostPrior(Prior):
 
     def fit(self) -> None:
         """Refit a fresh CatBoostRegressor on the whole bounded dataset (RMSE on
-        the value-of-position labels). Columns are the sorted union of feature
-        keys; an absent knob 0-fills to a fixed coordinate."""
+        ``log(latency µs)``). Columns are the sorted union of feature keys; an
+        absent knob 0-fills to a fixed coordinate. Non-positive labels (a stale
+        pre-latency checkpoint stored log-reward rows) are dropped so ``log``
+        never sees a non-positive latency — rebuild such a prior with
+        ``tune --clean``."""
         from catboost import CatBoostRegressor  # noqa: PLC0415
 
-        feats = [knob.knob_features(k) for k, _ in self._dataset]
+        rows = [(k, lab) for k, lab in self._dataset if lab > 0]
+        feats = [knob.knob_features(k) for k, _ in rows]
         cols = sorted({c for f in feats for c in f})
         if not cols:
             return
         x = np.array([[f.get(c, 0.0) for c in cols] for f in feats], dtype=float)
-        y = np.array([lab for _, lab in self._dataset], dtype=float)
+        y = np.log(np.array([lab for _, lab in rows], dtype=float))
         model = CatBoostRegressor(
             iterations=self._iterations,
             depth=self.DEPTH,
@@ -94,11 +102,13 @@ class CatBoostPrior(Prior):
         return self.mean_score(knobs)
 
     def mean_score(self, knobs: dict) -> float:
+        """Predicted median latency in µs (``exp`` of the regressed log-latency);
+        ``0.0`` until the first fit. Lower is better."""
         if self._model is None:
             return 0.0
         f = knob.knob_features(knobs)
         x = np.array([[f.get(c, 0.0) for c in self._cols]], dtype=float)
-        return float(self._model.predict(x)[0])
+        return float(np.exp(self._model.predict(x)[0]))
 
     # --- persistence ------------------------------------------------------
 

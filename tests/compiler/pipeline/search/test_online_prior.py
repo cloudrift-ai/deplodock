@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
-from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch, _softmax
+from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch
 from deplodock.compiler.pipeline.search.prior import CatBoostPrior, prior_from_json
 
 
@@ -31,29 +31,29 @@ def _fit(rows, **kw):
 
 
 def _bm_rows(reps=6):
-    """Synthetic: bigger BM = lower latency = higher reward, repeated for signal."""
-    return [({"BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64) for _ in range(reps)]
+    """Synthetic: bigger BM = lower latency (label = µs), repeated for signal."""
+    return [({"BM": bm}, 100.0 / bm) for bm in (2, 4, 8, 16, 32, 64) for _ in range(reps)]
 
 
 # --- model fit -------------------------------------------------------------
 
 
-def test_ranks_lower_latency_higher():
-    """label = log(1/us); the prior must score the faster (lower-us, bigger-BM)
-    config higher."""
+def test_ranks_lower_latency_lower():
+    """label = median latency µs; the prior must predict the faster (lower-us,
+    bigger-BM) config as lower latency."""
     p = _fit(_bm_rows())
     scores = [p.mean_score({"BM": bm}) for bm in (2, 16, 64)]
-    assert scores[0] < scores[1] < scores[2], f"expected increasing in BM, got {scores}"
+    assert scores[0] > scores[1] > scores[2], f"expected decreasing in BM, got {scores}"
 
 
 def test_partial_knob_dicts_fit_and_score():
     """Rows with different knob key sets (a branch pins only BR; leaves add BM)
     fit through one feature space — a partial row scores without error."""
     rows = [
-        ({"BR": 1}, math.log(0.5)),
-        ({"BR": 1, "BM": 32}, math.log(0.4)),
-        ({"BR": 1, "BM": 64}, math.log(0.5)),
-        ({"BR": 2, "BM": 64}, math.log(0.3)),
+        ({"BR": 1}, 0.5),
+        ({"BR": 1, "BM": 32}, 0.4),
+        ({"BR": 1, "BM": 64}, 0.5),
+        ({"BR": 2, "BM": 64}, 0.3),
     ]
     p = _fit(rows)
     assert math.isfinite(p.mean_score({"BR": 1}))
@@ -181,17 +181,17 @@ def test_diagnostics_report_reachability():
     perfectly-rankable synthetic op the prior recovers the best (ratio 1.0)."""
     from deplodock.compiler.pipeline.search.prior import diagnostics
 
-    # one op-structure (S_kind), bigger BM = lower latency = higher reward
-    rows = [({"S_kind": 1.0, "BM": bm}, math.log(1.0 / (100.0 / bm))) for bm in (2, 4, 8, 16, 32, 64) for _ in range(6)]
+    # one op-structure (S_kind), bigger BM = lower latency (label = µs)
+    rows = [({"S_kind": 1.0, "BM": bm}, 100.0 / bm) for bm in (2, 4, 8, 16, 32, 64) for _ in range(6)]
     p = _fit(rows)
     groups = diagnostics.group_by_op(p._dataset)
     assert len(groups) == 1
     rr = diagnostics.reachability(p, groups)
     assert len(rr) == 1
-    _, best_us, argmax_us, ratio, _ = rr[0]
+    _, best_us, pick_us, ratio, _ = rr[0]
     assert ratio == min(r[3] for r in rr) and ratio < 1.01  # recovers the best leaf
     text = diagnostics.report(p)
-    assert "argmax reachability" in text and "golden coverage" in text
+    assert "reachability" in text and "golden coverage" in text
 
 
 def test_dataset_accumulates_across_load():
@@ -201,7 +201,7 @@ def test_dataset_accumulates_across_load():
     seen0, n0 = p._seen, len(p._dataset)
     q = prior_from_json(p.to_json())
     assert q._seen == seen0 and len(q._dataset) == n0
-    q.add_rows([({"BM": 8}, math.log(1.0))])
+    q.add_rows([({"BM": 8}, 12.5)])
     assert q._seen == seen0 + 1
 
 
@@ -210,7 +210,7 @@ def test_dataset_accumulates_across_load():
 
 def test_collect_rows_labels_branch_with_best_descendant():
     """A branch shared by two benched leaves is labeled with the BETTER leaf's
-    reward (max-propagation), not its own."""
+    latency (``1/best_reward``, the min over its subtree), not its own."""
     tree = SearchTree()
     branch = _node({"BR": 1}, tree.root)
     leaf_slow = _node({"BR": 1, "BM": 32}, branch)
@@ -222,9 +222,9 @@ def test_collect_rows_labels_branch_with_best_descendant():
     assert branch.best_reward == 2.0
     rows = TuningSearch(tree=tree)._collect_rows()
     by_knobs = {tuple(sorted(k.items())): lab for k, lab in rows}
-    assert abs(by_knobs[(("BR", 1),)] - math.log(2.0)) < 1e-12
-    assert abs(by_knobs[(("BM", 64), ("BR", 1))] - math.log(2.0)) < 1e-12
-    assert abs(by_knobs[(("BM", 32), ("BR", 1))] - math.log(1.0)) < 1e-12
+    assert abs(by_knobs[(("BR", 1),)] - 0.5) < 1e-12  # 1/best_reward = 1/2.0
+    assert abs(by_knobs[(("BM", 64), ("BR", 1))] - 0.5) < 1e-12
+    assert abs(by_knobs[(("BM", 32), ("BR", 1))] - 1.0) < 1e-12
 
 
 def test_collect_rows_skips_unbenched_nodes():
@@ -291,8 +291,8 @@ def test_puct_still_explores_promising_unvisited():
 
 
 def test_cold_or_absent_prior_descends_emission_order():
-    """With no prior or a cold prior, every score is 0 → uniform softmax → PUCT
-    picks the first child (emission order)."""
+    """With no prior or a cold (unfit) prior, ``P`` is uniform (= 1) → every
+    child's PUCT value ties → it picks the first child (emission order)."""
     tree = SearchTree()
     a = _node({"BM": 64}, tree.root)
     b = _node({"BM": 2}, tree.root)
@@ -300,11 +300,3 @@ def test_cold_or_absent_prior_descends_emission_order():
     assert TuningSearch(tree=tree)._select([a, b], tree.root) is a
     cold = CatBoostPrior(seed=0)
     assert TuningSearch(tree=tree, prior_model=cold)._select([a, b], tree.root) is a
-
-
-def test_softmax_sums_to_one_and_orders():
-    p = _softmax([1.0, 2.0, 3.0])
-    assert abs(sum(p) - 1.0) < 1e-12
-    assert p[2] > p[1] > p[0]
-    p2 = _softmax([101.0, 102.0, 103.0])
-    assert all(abs(a - b) < 1e-12 for a, b in zip(p, p2, strict=True))
