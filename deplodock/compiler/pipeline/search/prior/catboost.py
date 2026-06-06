@@ -1,29 +1,9 @@
 """CatBoost tuning prior — ONE global model across every kernel, GPU and nvcc
 setting, refit in batches from a bounded dataset and checkpointed to JSON.
 
-**Why CatBoost** (chosen by an offline bake-off, `scripts/prior_bakeoff.py`, over
-a multi-op tuning dataset; metrics = argmax latency-ratio in/out of sample +
-per-op Spearman + off-manifold safety):
-
-    model     in-sample  leave-1-op-out  spearman  off-manifold-safe
-    linear      1.01        1.13            +0.66     NO (argmax → a degenerate
-                                                          corner, e.g. BR=1/512:
-                                                          4us → 232us / invalid)
-    rf          1.00        1.31            +0.85     yes
-    hgb         1.01        1.04            +0.79     yes
-    xgb/lgbm    1.00        1.18            +0.85     ~ (slight creep)
-    catboost    1.01        1.01            +0.82     yes   ◀ winner
-
-The linear model (the old ``BayesianRidge`` prior) is monotone in every knob, so
-its greedy argmax is always a *corner* of the candidate box regardless of how
-well the interior is sampled — that is the `BR=1` blow-up. Any **bounded** tree
-ensemble is off-manifold-safe (an un-benched extreme inherits the nearest leaf's
-value, so it can't outrank the true optimum). Among them CatBoost uniquely also
-**generalizes to an untuned op near-perfectly** (leave-one-op-out argmax 1.01 vs
-xgb/lgbm 1.18, rf 1.31) — its ordered boosting + symmetric/oblivious trees
-regularize hard against per-op overfitting. So one global CatBoost prior is good
-enough on a *new* op that we no longer refit within an op's own search (the model
-is fixed per run; see :mod:`base`).
+**Why CatBoost**: an offline evaluation script measured
+linear / rf / hgb / xgb / lgbm / catboost over a multi-op tuning dataset, and
+CatBoost performed the best.
 
 Regresses ``y = log(median latency µs)`` on :func:`knob.knob_features` — the
 ``S_*`` structural + ``H_*`` hardware/nvcc-regime features let one model tell

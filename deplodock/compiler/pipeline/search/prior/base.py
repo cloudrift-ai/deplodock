@@ -11,8 +11,7 @@ model is data-poor, then progressively less often as returns diminish: every
 capped at :data:`MAX_ROWS` by **reservoir sampling** (Algorithm R) — a uniform
 random sample of every row ever seen, across runs — so a long-lived global prior
 neither grows without bound nor over-weights recent ops. The model is therefore
-*fixed during a single op's search* (the global prior already generalizes to a
-new op — see :class:`CatBoostPrior`), and exploration comes from PUCT's own term,
+*fixed during a single op's search*, and exploration comes from PUCT's own term,
 not per-bench refitting.
 
 Training signal is **value-of-position**: real benches exist only at leaves, but
