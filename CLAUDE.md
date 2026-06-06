@@ -117,8 +117,10 @@ same worker.
 - `deplodock knobs --golden [--kernel SUBSTR]` — for each `GOLDEN_CONFIGS` shape, report (a) the **hardcoded
   prior-free heuristic** (`compiler/pipeline/search/heuristic.py`) — the golden's **rank** in that heuristic's
   enumeration order (no GPU, no prior, no measurements; the metric the tuner's patience must reach), summarized as
-  median + top-k coverage; and (b) the greedy pipeline pick (prior / option-0) vs golden, per-knob `found/golden`.
-  The heuristic weights are fit offline by `scripts/golden_knob_heuristics.py` (learning-to-rank the golden set).
+  median + top-k coverage; and (b) the greedy pipeline pick vs golden, per-knob `found/golden` (mismatches in red).
+  The (b) greedy pick reads the learned-prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior PATH`; option-0 when no prior
+  is loaded) — **not** the `--db` tune DB, which feeds only the per-knob regret table. The heuristic weights are fit
+  offline by `scripts/golden_knob_heuristics.py` (learning-to-rank the golden set).
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

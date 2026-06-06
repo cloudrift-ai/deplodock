@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -51,7 +52,13 @@ def register_knobs_command(subparsers) -> None:
     )
     parser.add_argument(
         "--db",
-        help="Path to tune DB. Default uses DEPLODOCK_TUNE_DB or ~/.cache/deplodock/autotune.db.",
+        help="Path to tune DB for the per-knob REGRET analysis only. Default uses DEPLODOCK_TUNE_DB or "
+        "~/.cache/deplodock/autotune.db. (The --golden greedy pick reads the learned prior JSON, not this DB — see --prior.)",
+    )
+    parser.add_argument(
+        "--prior",
+        help="Path to the learned-prior JSON the --golden greedy pick loads. Default uses DEPLODOCK_PRIOR_FILE or "
+        "~/.cache/deplodock/prior.json. (`deplodock tune` writes this file; it is NOT the tune DB.)",
     )
     parser.add_argument(
         "--min-variants",
@@ -79,6 +86,10 @@ def handle_knobs(args) -> None:
     _emit_registry()
 
     if args.golden:
+        if args.prior:
+            from deplodock import config  # noqa: PLC0415
+
+            os.environ[config.PRIOR_FILE] = str(Path(args.prior).expanduser())
         _emit_golden_check(args.kernel)
         return
 
@@ -154,39 +165,42 @@ _TTY = sys.stdout.isatty()
 _GREEN, _YELLOW, _RED, _RESET = ("\033[32m", "\033[33m", "\033[31m", "\033[0m") if _TTY else ("", "", "", "")
 
 
-def _colored_ratio(matched: int, total: int) -> str:
-    """``matched/total`` colour-coded green (all) / yellow (>80%) / red (otherwise)."""
+def _ratio_color(matched: int, total: int) -> str:
+    """Green (all match) / yellow (>80%) / red (otherwise)."""
     frac = matched / total if total else 1.0
-    color = _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
-    return f"{color}{matched}/{total}{_RESET}"
+    return _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
 
 
-def _golden_line(name: str, gold: dict, got: dict, keys: list[str]) -> tuple[str, bool]:
-    """Compact one-line ``name M/T K=found/golden ...`` for a single golden config.
-    ``M/T`` is the colour-coded matched-knob ratio. Returns the line and whether
-    every shown knob matched."""
-    matched = sum(1 for k in keys if got.get(k) == gold[k])
-    cells = " ".join(f"{k}={got.get(k, '-')}/{gold[k]}" for k in keys)
-    return f"  {name:<26} {_colored_ratio(matched, len(keys))}  {cells}", matched == len(keys)
+def _cell(visible: str, width: int, color: str = "") -> str:
+    """Left-justify ``visible`` to ``width`` columns, padding by its *visible*
+    length so embedded ANSI colour codes don't throw off the alignment."""
+    body = f"{color}{visible}{_RESET}" if color else visible
+    return body + " " * max(1, width - len(visible))
+
+
+def _knob_cells(gold: dict, got: dict, keys: list[str]) -> str:
+    """``K=found/golden`` per knob, with mismatched knobs in red."""
+    out = []
+    for k in keys:
+        gv, fv = gold[k], got.get(k, "-")
+        cell = f"{k}={fv}/{gv}"
+        out.append(f"{_RED}{cell}{_RESET}" if fv != gv else cell)
+    return " ".join(out)
 
 
 def _emit_golden_check(kernel_filter: str | None) -> None:
-    """Report, one compact streamed line per golden config, how two prior-free /
-    prior-based pickers reproduce the recorded golden knobs:
+    """Report, one streamed line per golden config, how two pickers reproduce the
+    recorded golden knobs (knob cells show ``found/golden``, mismatches in red):
 
     - ``heuristic`` — the hardcoded analytic ranker (``search/heuristic``): no
-      prior, no GPU, no measurements. Picks the enumeration argmax by closed-form
-      score. Compared over the knobs it actually decides (``THREAD_KNOBS`` for
-      fp32, the warp set for fp16/bf16).
-    - ``prior``     — the greedy tile-pipeline pick (``DEPLODOCK_PRIOR_FILE``;
-      option-0 when no prior loaded). Compared over every tunable golden knob.
-      Best-effort: skipped per-config if the pipeline can't run here.
-
-    Output per config is ``name  M/T  r<rank>  K=found/golden ...`` — ``M/T`` is
-    the matched-knob ratio, ``r<rank>`` is the golden's position in the heuristic
-    ordering (what the tuner's patience must reach). The heuristic summary is
-    rank-based (median + top-k coverage), since the #1 pick rarely *equals* the
-    golden yet the golden sits near the top. ``--kernel SUBSTR`` filters by name."""
+      prior, no GPU, no measurements. Reports the golden's **rank** in the
+      heuristic's enumeration order (the position the tuner's patience must
+      reach), summarized median + top-k. Over the knobs it decides
+      (``THREAD_KNOBS`` for fp32, the warp set for fp16/bf16).
+    - ``prior``     — the greedy tile-pipeline pick. Reads the learned-prior JSON
+      (``DEPLODOCK_PRIOR_FILE`` / ``--prior``; **not** the ``--db`` tune DB —
+      that feeds only the regret table); option-0 when no prior is loaded. Over
+      every tunable golden knob. ``--kernel SUBSTR`` filters configs by name."""
     from statistics import median  # noqa: PLC0415
 
     from deplodock.compiler.context import Context  # noqa: PLC0415
@@ -196,10 +210,13 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
     configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
+    nw = max((len(g.name) for g in configs), default=10) + 2  # kernel-name column width
 
     # --- hardcoded heuristic (no prior) --- #
     logger.info("")
-    logger.info("Golden reproduction — hardcoded heuristic (no prior), golden's rank in the heuristic order:")
+    logger.info("Golden reproduction — hardcoded heuristic (no prior); 'rank' = golden's position in the heuristic order:")
+    header = _cell("kernel", nw) + _cell("m/t", 6) + _cell("rank", 8) + _cell("pool", 9) + "knobs (found/golden; red = mismatch)"
+    logger.info("  " + header)
     ranks: list[int] = []
     for g in configs:
         decided = THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS
@@ -207,13 +224,18 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
         try:
             got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-            logger.info("  %-26s  ERR  %s", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:120])
+            logger.info("  " + _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100])
             continue
         keys = sorted(gold)
         matched = sum(1 for k in keys if got.get(k) == gold[k])
-        rank_s = f"r{rank}" if rank is not None else "r?"
-        cells = " ".join(f"{k}={got.get(k, '-')}/{gold[k]}" for k in keys)
-        logger.info(f"  {g.name:<26} {_colored_ratio(matched, len(keys))}  {rank_s:>7}/{pool:<6}  {cells}")
+        line = (
+            _cell(g.name, nw)
+            + _cell(f"{matched}/{len(keys)}", 6, _ratio_color(matched, len(keys)))
+            + _cell(str(rank) if rank is not None else "?", 8)
+            + _cell(str(pool), 9)
+            + _knob_cells(gold, got, keys)
+        )
+        logger.info("  " + line)
         if rank is not None:
             ranks.append(rank)
     if ranks:
@@ -222,15 +244,17 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
         logger.info("  heuristic golden rank — median=%d  %s", int(median(ranks)), cov)
 
     # --- greedy tile-pipeline pick (prior / option-0), best-effort --- #
-    _emit_prior_golden_check(configs)
+    _emit_prior_golden_check(configs, nw)
 
 
-def _emit_prior_golden_check(configs: list) -> None:
-    """Greedy fork pick through the tile pipeline (reads ``DEPLODOCK_PRIOR_FILE``;
-    option-0 with no prior) vs recorded golden — compact + streamed. Stops at the
-    tile dialect (every knob fork resolves there: no codegen / nvcc)."""
+def _emit_prior_golden_check(configs: list, nw: int) -> None:
+    """Greedy fork pick through the tile pipeline vs recorded golden — compact +
+    streamed. The pick reads the learned-prior JSON (``config.prior_path()``:
+    ``DEPLODOCK_PRIOR_FILE`` / ``--prior``); option-0 with no fitted prior. Stops
+    at the tile dialect (every knob fork resolves there: no codegen / nvcc)."""
     import logging as _logging  # noqa: PLC0415
 
+    from deplodock import config  # noqa: PLC0415
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
     from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
 
@@ -247,8 +271,14 @@ def _emit_prior_golden_check(configs: list) -> None:
                 knobs.update(k)
         return tunable(knobs)
 
+    prior_path = config.prior_path()
     logger.info("")
-    logger.info("Golden reproduction — greedy pipeline pick (prior / option-0) vs recorded golden:")
+    logger.info(
+        "Golden reproduction — greedy pipeline pick vs recorded golden; prior: %s (%s):",
+        prior_path,
+        "loaded" if prior_path.exists() else "MISSING → option-0",
+    )
+    logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + "knobs (found/golden; red = mismatch)")
     # Silence the trace/compile chatter (different logger subtrees) so this
     # function's own ``logger`` can stream one clean result line per config.
     quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
@@ -262,11 +292,13 @@ def _emit_prior_golden_check(configs: list) -> None:
             try:
                 got = picked(g.snippet())
             except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-                logger.info("  %-26s  ERR  %s", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:120])
+                logger.info("  " + _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100])
                 continue
-            line, match = _golden_line(g.name, gold, got, sorted(gold))
-            n_match += match
-            logger.info(line)
+            keys = sorted(gold)
+            matched = sum(1 for k in keys if got.get(k) == gold[k])
+            n_match += matched == len(keys)
+            line = _cell(g.name, nw) + _cell(f"{matched}/{len(keys)}", 6, _ratio_color(matched, len(keys))) + _knob_cells(gold, got, keys)
+            logger.info("  " + line)
     finally:
         for lg, lv in zip(quiet, prev, strict=True):
             lg.setLevel(lv)
