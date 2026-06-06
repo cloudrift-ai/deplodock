@@ -144,6 +144,42 @@ static __device__ __forceinline__ void dpl_ldmatrix_x2_trans(unsigned* r, const 
                  : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
 }
 
+// gmem-direct fragment loads — the fallback when an mma.sync operand was NOT
+// staged into shared memory (ldmatrix is smem-only, so we read the fragment
+// straight from gmem instead, replicating the PTX m16n8k16 lane→element map).
+// Slower than ldmatrix (no smem reuse) but correct; ``005_lower_atom_tile``
+// emits these for an unstaged operand. ``ldm`` is the operand's gmem row stride
+// (K for the row-major A[M,K]; N for the row-major B[K,N]); ``g`` points at the
+// atom cell's base element, each lane adds its own (row,col) within the tile.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem(unsigned* r, const T* g, int ldm) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);          // M: groupID, +8 for the second row block
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);   // K: 2*threadID_in_group, +8 for the k16 half
+        const T* p = g + row * ldm + col;
+        unsigned packed;
+        ((T*)&packed)[0] = p[0];                     // .f16x2: low half = col, high half = col+1
+        ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem(unsigned* r, const T* g, int ldm) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;                                 // N: groupID (0..7)
+        int k = (tig << 1) + (i ? 8 : 0);            // K: 2*threadID_in_group, +8 for the k16 half
+        unsigned packed;
+        ((T*)&packed)[0] = g[k * ldm + n];           // .f16x2: low half = k, high half = k+1
+        ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"

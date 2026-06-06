@@ -7,7 +7,8 @@ the compute into an :class:`~deplodock.compiler.ir.stmt.Mma` (which names its A
 staged like any other, the ``Mma`` keeping its reduce loop ``is_reduce``). The
 partition planner emits one of four cell shapes:
 
-A. Direct K-loop, no staging (pruned for mma.sync — ldmatrix is smem-only):
+A. Direct K-loop, no staging (operands read from gmem via a gmem-direct fragment
+   load — see below):
    ``AtomTile > SerialTile(K_o) > SerialTile(K_i, reduce) > [Load a*, Load b*, Mma]``
 B. Single-bundle staged (SYNC or single-buffer ASYNC):
    ``AtomTile > SerialTile(K_o) > StageBundle > SerialTile(K_i, reduce) > [Load a*, Load b*, Mma]``
@@ -26,13 +27,14 @@ the live ``Source`` (``_mma_src_index``), so the phase-prefix prepend for
 double-buffered slabs stays correct.
 
 The s16816 ``mma.sync.aligned.m16n8k16`` + ``ldmatrix`` path is the sole
-tensor-core family; it has no gmem-direct load (ldmatrix is smem→register
-only), so :func:`_emit_chain` raises an actionable ``LoweringError`` on an
-unstaged operand. By the time this pass runs the atom-vs-scalar fork is already
-decided (back at ``tile/010_partition_loops``), so there is no scalar sibling
-left to fall back to — a silent skip would leak the unconsumed ``AtomTile`` to
-render and crash with an opaque ``NotImplementedError``; the error names the
-``DEPLODOCK_MMA=0`` (scalar) / ``TMA=1`` (stage the atom path) remedies instead.
+tensor-core family. ``ldmatrix`` is smem→register only, so :func:`_emit_chain`
+picks each operand's transport by whether an enclosing ``StageBundle`` staged
+it: staged → ``LdmatrixLoad`` (smem); unstaged → ``LdmatrixLoad(staged=False)``,
+which renders a **gmem-direct fragment load** (``dpl_mma_load_{a,b}_gmem``,
+replicating the PTX m16n8k16 lane→element map without ldmatrix). That way an
+MMA tile whose operands the staging passes declined to stage (e.g. slabs don't
+fit the smem budget) still compiles — slower than the staged path (no smem
+reuse), but correct — instead of crashing, so the search needn't avoid it.
 
 Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
 dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
@@ -59,7 +61,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     map_staged,
 )
-from deplodock.compiler.pipeline import LoweringError, Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -241,27 +243,21 @@ def _emit_chain(
     """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
     a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
     b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
-    # ldmatrix is smem→register only — both operands must be staged. We reach
-    # here only once the atom (warp-tier) variant has been committed (the
-    # atom-vs-scalar fork is decided back at the tile planner), so there is no
-    # scalar sibling left to fall back to: a RuleSkip would silently leak the
-    # unconsumed AtomTile to render and crash with an opaque NotImplementedError.
-    # Raise an actionable error naming the remedies instead (mirrors the
-    # "TMA cannot fire" guard in tile/050_use_tma).
-    if a_load.input not in smem_sources or b_load.input not in smem_sources:
-        raise LoweringError(
-            "tensor-core (mma.sync) matmul selected but its operands are not staged in shared "
-            "memory for ldmatrix (ldmatrix has no gmem-direct path) — typically the atom path was "
-            "chosen without staging in scope (e.g. TMA=0). Force the scalar FMA path with "
-            "DEPLODOCK_MMA=0, or enable staging for the atom path with TMA=1."
-        )
-    # Thread the per-Source TMA swizzle mode so the ldmatrix consumer applies
-    # the matching per-lane chunk XOR. NONE when the source wasn't swizzled.
-    a_swz = smem_sources[a_load.input].swizzle.value
-    b_swz = smem_sources[b_load.input].swizzle.value
+    # ldmatrix is smem→register only, so each operand's transport depends on
+    # whether an enclosing StageBundle staged it. Staged → ldmatrix (with the
+    # Source's TMA swizzle); unstaged → a gmem-direct fragment load (the staging
+    # passes legitimately decline to stage, e.g. when the operand slabs don't fit
+    # the smem budget — see ``tile/020_stage_inputs``; ``_mma_src_index`` returns
+    # the gmem index + ``ldm=0`` for that case). The gmem path is slower (no smem
+    # reuse) but lets a tensor-core variant compile instead of crashing, so the
+    # search needn't avoid unstageable MMA tiles.
+    a_staged = a_load.input in smem_sources
+    b_staged = b_load.input in smem_sources
+    a_swz = smem_sources[a_load.input].swizzle.value if a_staged else "NONE"
+    b_swz = smem_sources[b_load.input].swizzle.value if b_staged else "NONE"
     return (
-        LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz),
-        LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz),
+        LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz, staged=a_staged),
+        LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz, staged=b_staged),
         MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
     )
 
