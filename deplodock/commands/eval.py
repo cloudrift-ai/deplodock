@@ -228,14 +228,38 @@ def _cell(visible: str, width: int, color: str = "") -> str:
     return body + " " * max(1, width - len(visible))
 
 
-def _knob_cells(gold: dict, got: dict, keys: list[str]) -> str:
-    """``K=found/golden`` per knob, with mismatched knobs in red."""
-    out = []
-    for k in keys:
-        gv, fv = gold[k], got.get(k, "-")
-        cell = f"{k}={fv}/{gv}"
-        out.append(f"{_RED}{cell}{_RESET}" if fv != gv else cell)
-    return " ".join(out)
+# Canonical knob display order — the tile geometry knobs first (block / register
+# tile, split, pipeline), then everything else alphabetically. Keeps the
+# ``found/golden`` columns in a stable, readable order across kernels.
+_KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "BUFFER_COUNT", "STAGE", "MMA")
+_KNOB_RANK = {k: i for i, k in enumerate(_KNOB_ORDER)}
+
+
+def _knob_sort_key(k: str) -> tuple[int, str]:
+    """Sort knobs by :data:`_KNOB_ORDER`, unknown knobs last (alphabetically)."""
+    return (_KNOB_RANK.get(k, len(_KNOB_ORDER)), k)
+
+
+def _aligned_knob_cells(rows: list[tuple[dict, dict]]) -> list[str]:
+    """Render the ``K=found/golden`` knob columns for a set of ``(gold, got)`` rows,
+    aligned: the union of knobs across all rows in canonical order, each knob padded
+    to its widest cell so the columns line up vertically; mismatches red, blanks
+    where a row lacks the knob. Returns one string per input row, in order."""
+    keys = sorted({k for gold, _ in rows for k in gold}, key=_knob_sort_key)
+    width = {k: max(len(f"{k}={got.get(k, '-')}/{gold[k]}") for gold, got in rows if k in gold) for k in keys}
+    lines = []
+    for gold, got in rows:
+        cells = []
+        for k in keys:
+            if k not in gold:
+                cells.append(" " * width[k])
+                continue
+            gv, fv = gold[k], got.get(k, "-")
+            vis = f"{k}={fv}/{gv}"
+            body = f"{_RED}{vis}{_RESET}" if fv != gv else vis
+            cells.append(body + " " * (width[k] - len(vis)))
+        lines.append("  ".join(cells).rstrip())
+    return lines
 
 
 def _emit_golden_features(kernel_filter: str | None) -> None:
@@ -315,32 +339,33 @@ def _emit_heuristic_eval(kernel_filter: str | None) -> None:
     from deplodock.compiler.pipeline.search.heuristic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
 
     configs, nw = _golden_configs(kernel_filter)
-    logger.info("")
-    logger.info("Golden reproduction — hardcoded heuristic (no prior); 'rank' = golden's position in the heuristic order:")
     logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + _cell("rank", 8) + _cell("pool", 9) + "knobs (found/golden; red = mismatch)")
     ranks: list[int] = []
+    entries: list[tuple] = []  # ("row", prefix, gold, got) | ("err", text)
     for g in configs:
         gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
         try:
             got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-            logger.info("  " + _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100])
+            entries.append(("err", _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100]))
             continue
-        keys = sorted(gold)
-        matched = sum(1 for k in keys if got.get(k) == gold[k])
-        logger.info(
-            "  "
-            + _cell(g.name, nw)
-            + _cell(f"{matched}/{len(keys)}", 6, _ratio_color(matched, len(keys)))
+        matched = sum(1 for k in gold if got.get(k) == gold[k])
+        prefix = (
+            _cell(g.name, nw)
+            + _cell(f"{matched}/{len(gold)}", 6, _ratio_color(matched, len(gold)))
             + _cell(str(rank) if rank is not None else "?", 8)
             + _cell(str(pool), 9)
-            + _knob_cells(gold, got, keys)
         )
+        entries.append(("row", prefix, gold, got))
         if rank is not None:
             ranks.append(rank)
+    knob_lines = iter(_aligned_knob_cells([(p[2], p[3]) for p in entries if p[0] == "row"]))
+    for p in entries:
+        logger.info("  " + (p[1] if p[0] == "err" else p[1] + next(knob_lines)))
     if ranks:
         n = len(ranks)
         cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50, 100))
+        logger.info("")
         logger.info("  heuristic golden rank — median=%d  %s", int(median(ranks)), cov)
 
 
@@ -364,10 +389,11 @@ def _emit_prior_eval(kernel_filter: str | None) -> None:
 
 
 def _emit_prior_golden_check(configs: list, nw: int) -> None:
-    """Greedy fork pick through the tile pipeline vs recorded golden — compact +
-    streamed. The pick reads the learned-prior JSON (``config.prior_path()``:
-    ``DEPLODOCK_PRIOR_FILE`` / ``--prior``); option-0 with no fitted prior. Stops
-    at the tile dialect (every knob fork resolves there: no codegen / nvcc)."""
+    """Greedy fork pick through the tile pipeline vs recorded golden. The pick reads
+    the learned-prior JSON (``config.prior_path()``: ``DEPLODOCK_PRIOR_FILE`` /
+    ``--prior``); option-0 with no fitted prior. Stops at the tile dialect (every
+    knob fork resolves there: no codegen / nvcc). Rows are collected, then printed
+    with column-aligned ``found/golden`` knobs (canonical order)."""
     import logging as _logging  # noqa: PLC0415
 
     from deplodock import config  # noqa: PLC0415
@@ -394,7 +420,7 @@ def _emit_prior_golden_check(configs: list, nw: int) -> None:
         prior_path,
         "loaded" if prior_path.exists() else "MISSING → option-0",
     )
-    logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + "knobs (found/golden; red = mismatch)")
+    logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + "knobs (found/golden)")
     # Silence the trace/compile chatter (different logger subtrees) so this
     # function's own ``logger`` can stream one clean result line per config.
     quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
@@ -402,22 +428,25 @@ def _emit_prior_golden_check(configs: list, nw: int) -> None:
     for lg in quiet:
         lg.setLevel(_logging.WARNING)
     n_match = 0
+    entries: list[tuple] = []  # ("row", prefix, gold, got) | ("err", text)
     try:
         for g in configs:
             gold = tunable(g.knobs)
             try:
                 got = picked(g.snippet())
             except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-                logger.info("  " + _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100])
+                entries.append(("err", _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100]))
                 continue
-            keys = sorted(gold)
-            matched = sum(1 for k in keys if got.get(k) == gold[k])
-            n_match += matched == len(keys)
-            line = _cell(g.name, nw) + _cell(f"{matched}/{len(keys)}", 6, _ratio_color(matched, len(keys))) + _knob_cells(gold, got, keys)
-            logger.info("  " + line)
+            matched = sum(1 for k in gold if got.get(k) == gold[k])
+            n_match += matched == len(gold)
+            prefix = _cell(g.name, nw) + _cell(f"{matched}/{len(gold)}", 6, _ratio_color(matched, len(gold)))
+            entries.append(("row", prefix, gold, got))
     finally:
         for lg, lv in zip(quiet, prev, strict=True):
             lg.setLevel(lv)
+    knob_lines = iter(_aligned_knob_cells([(p[2], p[3]) for p in entries if p[0] == "row"]))
+    for p in entries:
+        logger.info("  " + (p[1] if p[0] == "err" else p[1] + next(knob_lines)))
     logger.info("  pipeline reproduced golden knobs exactly: %d/%d", n_match, len(configs))
 
 
