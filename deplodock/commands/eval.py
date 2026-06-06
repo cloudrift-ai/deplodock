@@ -1,7 +1,18 @@
-"""``deplodock knobs`` — knob-impact analysis from the tune DB.
+"""``deplodock eval <knobs|prior|heuristic>`` — evaluate the tuning machinery.
 
-For each kernel (grouped by the kernel C identifier extracted from
-``cuda_op.pretty``), compute per-knob regret:
+Three subcommands:
+
+- ``eval knobs``     — print the registered knob schema, then (with a tune DB)
+  per-knob **regret** + a knob-interaction matrix (the analysis below).
+- ``eval heuristic`` — evaluate the hardcoded prior-free heuristic
+  (``search/heuristic``) on the golden configs: the golden's **rank** in the
+  heuristic's enumeration order (the position the tuner's patience must reach).
+- ``eval prior``     — evaluate the learned ``CatBoostPrior`` on the golden
+  configs: the greedy pipeline pick vs golden (per-knob ``found/golden``), the
+  golden's rank under the prior, and (``--features``) the regressor input vector.
+
+The ``eval knobs`` regret analysis: for each kernel (grouped by the kernel C
+identifier extracted from ``cuda_op.pretty``), compute per-knob regret:
 
     regret[K] = max(best_us | K=v) / min(best_us | K=v)
 
@@ -45,63 +56,59 @@ logger = logging.getLogger(__name__)
 _KERNEL_NAME_RE = re.compile(r"void\s+(\w+)\s*\(")
 
 
-def register_knobs_command(subparsers) -> None:
+def register_eval_command(subparsers) -> None:
+    """``deplodock eval <knobs|prior|heuristic>`` — evaluate the tuning knobs, the
+    learned prior, or the hardcoded heuristic against the golden configs."""
     parser = subparsers.add_parser(
-        "knobs",
-        help="List the registered knob schema, then (if a tune DB exists) per-knob regret + interactions",
+        "eval",
+        help="Evaluate tuning knobs / the learned prior / the heuristic against golden configs",
     )
-    parser.add_argument(
-        "--db",
-        help="Path to tune DB for the per-knob REGRET analysis only. Default uses DEPLODOCK_TUNE_DB or "
-        "~/.cache/deplodock/autotune.db. (The --golden greedy pick reads the learned prior JSON, not this DB — see --prior.)",
+    sub = parser.add_subparsers(dest="eval_target", required=True)
+
+    pk = sub.add_parser("knobs", help="Print the registered knob schema + (with a tune DB) per-knob regret + interactions")
+    pk.add_argument("--db", help="Path to tune DB for the regret analysis. Default: DEPLODOCK_TUNE_DB or ~/.cache/deplodock/autotune.db.")
+    pk.add_argument("--min-variants", type=int, default=8, help="Skip kernels with fewer than this many measured variants (default: 8).")
+    pk.add_argument("--kernel", help="Only include kernels whose C identifier contains this substring (e.g. 'matmul').")
+    pk.set_defaults(func=handle_eval_knobs)
+
+    ph = sub.add_parser(
+        "heuristic",
+        help="Evaluate the hardcoded prior-free heuristic on the golden configs (golden's rank in its enumeration order)",
     )
-    parser.add_argument(
+    ph.add_argument("--kernel", help="Filter golden configs by name substring (e.g. 'square', 'q_proj').")
+    ph.set_defaults(func=handle_eval_heuristic)
+
+    pp = sub.add_parser(
+        "prior",
+        help="Evaluate the learned prior on the golden configs (greedy pick vs golden + golden's rank under the prior)",
+    )
+    pp.add_argument(
         "--prior",
-        help="Path to the learned-prior JSON the --golden greedy pick loads. Default uses DEPLODOCK_PRIOR_FILE or "
-        "~/.cache/deplodock/prior.json. (`deplodock tune` writes this file; it is NOT the tune DB.)",
+        help="Path to the learned-prior JSON to load. Default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json. "
+        "(`deplodock tune` writes this file; it is NOT the tune DB.)",
     )
-    parser.add_argument(
-        "--min-variants",
-        type=int,
-        default=8,
-        help="Skip kernels with fewer than this many measured variants (default: 8).",
-    )
-    parser.add_argument(
-        "--kernel",
-        help="Only include kernels whose C identifier contains this substring (e.g. 'matmul'); "
-        "with --golden, filters golden configs by name substring.",
-    )
-    parser.add_argument(
-        "--golden",
-        action="store_true",
-        help="For each golden config report (a) the hardcoded prior-free heuristic's rank of the golden in "
-        "its enumeration order — no GPU / no prior — and (b) the greedy pipeline pick (prior / option-0) "
-        "vs golden. --kernel SUBSTR filters golden configs by name.",
-    )
-    parser.add_argument(
+    pp.add_argument("--kernel", help="Filter golden configs by name substring.")
+    pp.add_argument(
         "--features",
         action="store_true",
-        help="Print the exact feature vector the learned prior (CatBoost) regresses on for each golden config: "
-        "the S_* structural / shape features (from compiling the shape to the loop dialect), the H_* hardware "
-        "regime, and the golden tuning knobs, all through knob.knob_features. --kernel SUBSTR filters by name.",
+        help="Also print the exact feature vector the prior (CatBoost) regresses on per golden config (knob.knob_features).",
     )
-    parser.set_defaults(func=handle_knobs)
+    pp.set_defaults(func=handle_eval_prior)
+
+    pg = sub.add_parser(
+        "golden",
+        help="Combined golden report: the prior-free heuristic's rank + the learned prior's greedy pick, per golden config",
+    )
+    pg.add_argument("--prior", help="Learned-prior JSON to load (default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json).")
+    pg.add_argument("--kernel", help="Filter golden configs by name substring.")
+    pg.add_argument("--features", action="store_true", help="Also print the prior's regressor feature vector per golden config.")
+    pg.set_defaults(func=handle_eval_golden)
 
 
-def handle_knobs(args) -> None:
-    # The canonical schema from the knob registry — always available (no DB).
+def handle_eval_knobs(args) -> None:
+    """``eval knobs`` — the registered knob schema, then (with a tune DB) per-knob
+    regret + the knob-interaction matrix."""
     _emit_registry()
-
-    if args.features:
-        _emit_golden_features(args.kernel)
-    if args.golden:
-        if args.prior:
-            from deplodock import config  # noqa: PLC0415
-
-            os.environ[config.PRIOR_FILE] = str(Path(args.prior).expanduser())
-        _emit_golden_check(args.kernel)
-    if args.features or args.golden:
-        return
 
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
@@ -130,6 +137,39 @@ def handle_knobs(args) -> None:
 
     interactions = _compute_interactions(kernels, [r.knob for r in rows])
     _emit_interaction_matrix([r.knob for r in rows], interactions)
+
+
+def handle_eval_heuristic(args) -> None:
+    """``eval heuristic`` — the hardcoded prior-free heuristic's rank of each golden."""
+    _emit_heuristic_eval(args.kernel)
+
+
+def handle_eval_prior(args) -> None:
+    """``eval prior`` — the learned prior on the golden configs: the greedy pick vs
+    golden, the golden's rank under the prior, and (with ``--features``) the
+    regressor input vector."""
+    if args.prior:
+        from deplodock import config  # noqa: PLC0415
+
+        os.environ[config.PRIOR_FILE] = str(Path(args.prior).expanduser())
+    if args.features:
+        _emit_golden_features(args.kernel)
+    _emit_prior_eval(args.kernel)
+
+
+def handle_eval_golden(args) -> None:
+    """``eval golden`` — the combined golden-reproduction report: the prior-free
+    heuristic's rank of each golden, then the learned prior's greedy pick + rank.
+    The view to watch while iteratively tuning golden shapes one at a time
+    (``deplodock tune --golden <name>``)."""
+    if args.prior:
+        from deplodock import config  # noqa: PLC0415
+
+        os.environ[config.PRIOR_FILE] = str(Path(args.prior).expanduser())
+    if args.features:
+        _emit_golden_features(args.kernel)
+    _emit_heuristic_eval(args.kernel)
+    _emit_prior_eval(args.kernel)
 
 
 def _emit_registry() -> None:
@@ -252,39 +292,35 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
             lg.setLevel(lv)
 
 
-def _emit_golden_check(kernel_filter: str | None) -> None:
-    """Report, one streamed line per golden config, how two pickers reproduce the
-    recorded golden knobs (knob cells show ``found/golden``, mismatches in red):
-
-    - ``heuristic`` — the hardcoded analytic ranker (``search/heuristic``): no
-      prior, no GPU, no measurements. Reports the golden's **rank** in the
-      heuristic's enumeration order (the position the tuner's patience must
-      reach), summarized median + top-k. Over the knobs it decides
-      (``THREAD_KNOBS`` for fp32, the warp set for fp16/bf16).
-    - ``prior``     — the greedy tile-pipeline pick. Reads the learned-prior JSON
-      (``DEPLODOCK_PRIOR_FILE`` / ``--prior``; **not** the ``--db`` tune DB —
-      that feeds only the regret table); option-0 when no prior is loaded. Over
-      every tunable golden knob. ``--kernel SUBSTR`` filters configs by name."""
-    from statistics import median  # noqa: PLC0415
-
-    from deplodock.compiler.context import Context  # noqa: PLC0415
+def _golden_configs(kernel_filter: str | None):
+    """The matmul golden configs, optionally filtered by name substring, plus the
+    kernel-name column width for aligned tables."""
     from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.heuristic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
 
     configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
-    nw = max((len(g.name) for g in configs), default=10) + 2  # kernel-name column width
+    return configs, max((len(g.name) for g in configs), default=10) + 2
 
-    # --- hardcoded heuristic (no prior) --- #
+
+def _emit_heuristic_eval(kernel_filter: str | None) -> None:
+    """``eval heuristic`` body: the hardcoded prior-free heuristic
+    (``search/heuristic``) — no prior, no GPU, no measurements. One streamed line
+    per golden config with the golden's **rank** in the heuristic's enumeration
+    order (the position the tuner's patience must reach) + per-knob ``found/golden``
+    (mismatches red), summarized as median + top-k coverage."""
+    from statistics import median  # noqa: PLC0415
+
+    from deplodock.compiler.context import Context  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.heuristic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
+
+    configs, nw = _golden_configs(kernel_filter)
     logger.info("")
     logger.info("Golden reproduction — hardcoded heuristic (no prior); 'rank' = golden's position in the heuristic order:")
-    header = _cell("kernel", nw) + _cell("m/t", 6) + _cell("rank", 8) + _cell("pool", 9) + "knobs (found/golden; red = mismatch)"
-    logger.info("  " + header)
+    logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + _cell("rank", 8) + _cell("pool", 9) + "knobs (found/golden; red = mismatch)")
     ranks: list[int] = []
     for g in configs:
-        decided = THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS
-        gold = {k: v for k, v in g.knobs.items() if k in decided}
+        gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
         try:
             got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
@@ -292,14 +328,14 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
             continue
         keys = sorted(gold)
         matched = sum(1 for k in keys if got.get(k) == gold[k])
-        line = (
-            _cell(g.name, nw)
+        logger.info(
+            "  "
+            + _cell(g.name, nw)
             + _cell(f"{matched}/{len(keys)}", 6, _ratio_color(matched, len(keys)))
             + _cell(str(rank) if rank is not None else "?", 8)
             + _cell(str(pool), 9)
             + _knob_cells(gold, got, keys)
         )
-        logger.info("  " + line)
         if rank is not None:
             ranks.append(rank)
     if ranks:
@@ -307,7 +343,23 @@ def _emit_golden_check(kernel_filter: str | None) -> None:
         cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50, 100))
         logger.info("  heuristic golden rank — median=%d  %s", int(median(ranks)), cov)
 
-    # --- greedy tile-pipeline pick (prior / option-0), best-effort --- #
+
+def _emit_prior_eval(kernel_filter: str | None) -> None:
+    """``eval prior`` body: the learned ``CatBoostPrior`` on the golden configs —
+    the golden's rank under the prior over the full enumeration (offline) followed
+    by the greedy tile-pipeline pick vs golden (the real selection). Reads the
+    prior JSON (``DEPLODOCK_PRIOR_FILE`` / ``--prior``; option-0 when none loaded)."""
+    from deplodock import config  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.prior import CatBoostPrior, diagnostics  # noqa: PLC0415
+
+    prior = CatBoostPrior.load()
+    logger.info("")
+    if prior.fitted:
+        logger.info(diagnostics.golden_prior_eval(prior, kernel_filter))
+    else:
+        logger.info("No fitted prior at %s — greedy falls to option-0 (run `deplodock tune`).", config.prior_path())
+
+    configs, nw = _golden_configs(kernel_filter)
     _emit_prior_golden_check(configs, nw)
 
 

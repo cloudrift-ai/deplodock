@@ -47,6 +47,9 @@ def register_run_command(subparsers):
             "Equivalent to passing the same .json path as the positional input."
         ),
     )
+    from deplodock.commands.compile import add_golden_arg
+
+    add_golden_arg(parser)
     parser.add_argument(
         "--layer",
         type=int,
@@ -137,10 +140,11 @@ def handle_run(args):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.commands.compile import load_or_trace
+    from deplodock.commands.compile import load_or_trace, resolve_golden_arg
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline.dump import CompilerDump
 
+    resolve_golden_arg(args)  # --golden NAME → --code <snippet>
     if sum(x is not None for x in (args.input, args.code, args.ir)) > 1:
         logger.error("input / --code / --ir are mutually exclusive")
         sys.exit(1)

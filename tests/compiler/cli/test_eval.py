@@ -1,4 +1,4 @@
-"""Tests for ``deplodock knobs`` — knob-impact analysis CLI.
+"""Tests for ``deplodock eval knobs`` — knob-impact analysis CLI.
 
 Each test builds a synthetic tune-DB inline (just the two tables the
 command reads: ``cuda_op`` and ``perf``), so the suite stays hermetic
@@ -68,11 +68,12 @@ def _make_tune_db(path: Path, variants: list[tuple[str, str, dict, float]]) -> N
 
 
 def test_knobs_missing_db(run_cli, tmp_path):
-    """Non-existent DB path produces a clean ``not found`` error (logged
-    via the CLI's standard error path, not an unhandled exception)."""
-    rc, stdout, stderr = run_cli("knobs", "--db", str(tmp_path / "does_not_exist.db"))
+    """A non-existent DB path is not an error: the registry schema still prints and
+    the regret analysis is skipped cleanly (exit 0, no traceback)."""
+    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(tmp_path / "does_not_exist.db"))
     combined = (stdout + stderr).lower()
-    assert "not found" in combined, f"expected 'not found' in output:\nstdout={stdout!r}\nstderr={stderr!r}"
+    assert rc == 0, f"stderr: {stderr}"
+    assert "no tune db" in combined and "skipping" in combined, f"expected graceful skip:\nstdout={stdout!r}"
     assert "traceback" not in combined
 
 
@@ -80,7 +81,7 @@ def test_knobs_empty_db(run_cli, tmp_path):
     """Empty DB → command exits 0 and reports zero kernels."""
     db = tmp_path / "empty.db"
     _make_tune_db(db, variants=[])
-    rc, stdout, stderr = run_cli("knobs", "--db", str(db))
+    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(db))
     assert rc == 0, f"stderr: {stderr}"
     assert "0 (of 0 total)" in stdout
 
@@ -101,7 +102,7 @@ def test_knobs_ranks_higher_impact_knob_first(run_cli, tmp_path):
             i += 1
     _make_tune_db(db, rows)
 
-    rc, stdout, stderr = run_cli("knobs", "--db", str(db))
+    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(db))
     assert rc == 0, f"stderr: {stderr}"
     # Both knobs appear, BIG first.
     assert "BIG" in stdout and "SMALL" in stdout
@@ -125,7 +126,7 @@ def test_knobs_min_variants_filter(run_cli, tmp_path):
         rows.append((f"b{i}", "k_big", {"A": i}, 1.0 + i))
     _make_tune_db(db, rows)
 
-    rc, stdout, stderr = run_cli("knobs", "--db", str(db), "--min-variants", "5")
+    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(db), "--min-variants", "5")
     assert rc == 0, f"stderr: {stderr}"
     assert "1 (of 2 total)" in stdout
 
@@ -139,7 +140,7 @@ def test_knobs_kernel_filter(run_cli, tmp_path):
         rows.append((f"r{i}", "k_rmsnorm", {"BM": 16 if i < 4 else 64}, 1.0 + i))
     _make_tune_db(db, rows)
 
-    rc, stdout, stderr = run_cli("knobs", "--db", str(db), "--kernel", "matmul")
+    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(db), "--kernel", "matmul")
     assert rc == 0, f"stderr: {stderr}"
     assert "1 (of 1 total)" in stdout
 
@@ -156,7 +157,7 @@ def test_knobs_interaction_matrix_present(run_cli, tmp_path):
             i += 1
     _make_tune_db(db, rows)
 
-    rc, stdout, stderr = run_cli("knobs", "--db", str(db))
+    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(db))
     assert rc == 0, f"stderr: {stderr}"
     assert "knob interaction" in stdout
     assert "K1\\K2" in stdout

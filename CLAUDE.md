@@ -111,23 +111,25 @@ same worker.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB.
-  Joins `perf` with `cuda_op` and prints per-knob regret + a knob-interaction matrix sorted by geomean impact —
-  use the rankings to drive Fork-tree knob ordering in the planner.
-- `deplodock knobs --golden [--kernel SUBSTR]` — for each `GOLDEN_CONFIGS` shape, report (a) the **hardcoded
-  prior-free heuristic** (`compiler/pipeline/search/heuristic.py`) — the golden's **rank** in that heuristic's
-  enumeration order (no GPU, no prior, no measurements; the metric the tuner's patience must reach), summarized as
-  median + top-k coverage; and (b) the greedy pipeline pick vs golden, per-knob `found/golden` (mismatches in red).
-  The (b) greedy pick reads the learned-prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior PATH`; option-0 when no prior
-  is loaded) — **not** the `--db` tune DB, which feeds only the per-knob regret table. The heuristic weights are fit
-  offline by `scripts/golden_knob_heuristics.py` (learning-to-rank the golden set).
-- `deplodock knobs --features [--kernel SUBSTR]` — print the exact feature vector the learned `CatBoostPrior`
-  regresses on for each golden config: the `S_*` structural / shape features (from compiling the shape to the loop
-  dialect, where `992_stamp_structural_features` runs), the `H_*` hardware regime, and the golden tuning knobs, all
-  via `knob.knob_features`. Note the shape enters only as the coarse `S_ext_*` extent products/maxes (`S_ext_free_prod`
-  = M·N, `S_ext_free_max` = max(M,N), `S_ext_reduce_prod` = K) — the occupancy / CTA-count / reuse terms that drive
-  matmul perf (and that `search/heuristic.py` computes) are NOT inputs, so the regressor must rediscover those
-  nonlinear interactions from splits.
+- `deplodock eval knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB:
+  the registered knob schema, then (with a tune DB) per-knob regret + a knob-interaction matrix sorted by geomean
+  impact (joins `perf` with `cuda_op`) — use the rankings to drive Fork-tree knob ordering in the planner.
+- `deplodock eval heuristic [--kernel SUBSTR]` — evaluate the **hardcoded prior-free heuristic**
+  (`compiler/pipeline/search/heuristic.py`) on each `GOLDEN_CONFIGS` shape: the golden's **rank** in that heuristic's
+  enumeration order (no GPU, no prior, no measurements; the metric the tuner's patience must reach) + per-knob
+  `found/golden` (mismatches in red), summarized as median + top-k. Weights fit offline by
+  `scripts/golden_knob_heuristics.py`.
+- `deplodock eval prior [--prior PATH] [--kernel SUBSTR] [--features]` — evaluate the learned `CatBoostPrior` on the
+  golden configs: the golden's rank under the prior over the full enumeration, then the greedy pipeline pick vs golden
+  (per-knob `found/golden`). Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded) —
+  **not** the `--db` tune DB. `--features` also prints the exact regressor input per golden config (`knob.knob_features`:
+  `S_*` structural/shape + `H_*` regime + tuning knobs; note the shape enters only as coarse `S_ext_*` products/maxes,
+  so the occupancy/CTA/reuse terms `heuristic.py` computes are added as engineered `D_*` features).
+- `deplodock eval golden [--prior PATH] [--kernel SUBSTR] [--features]` — the combined golden report (heuristic rank +
+  prior greedy pick), i.e. `eval heuristic` then `eval prior`. The view to watch while iteratively tuning golden shapes.
+- `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
+  the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
+  `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

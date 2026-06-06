@@ -113,6 +113,42 @@ def add_input_args(parser) -> None:
     add_target_arg(parser)
 
 
+def add_golden_arg(parser) -> None:
+    """Register ``--golden NAME`` (shared by ``tune`` and ``run``) — a shorthand
+    that resolves to ``--code <the named golden config's snippet>``. Pair with
+    :func:`resolve_golden_arg` in the handler."""
+    parser.add_argument(
+        "--golden",
+        metavar="NAME",
+        help=(
+            "Tune / run the named golden config from GOLDEN_CONFIGS (shorthand for --code <its snippet>) — lets you "
+            "build the learned prior up one shape at a time and `deplodock eval golden` between runs. An unknown NAME "
+            "lists the available names. Mutually exclusive with --code / positional input / --ir."
+        ),
+    )
+
+
+def resolve_golden_arg(args) -> None:
+    """If ``--golden NAME`` is set, resolve it to ``args.code = <golden snippet>``.
+    Exits 2 on an unknown name (listing the available names) or a conflict with
+    ``--code`` / positional input / ``--ir``."""
+    name = getattr(args, "golden", None)
+    if not name:
+        return
+    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig
+
+    if args.code or args.input or getattr(args, "ir", None):
+        logger.error("--golden is mutually exclusive with --code / positional input / --ir")
+        sys.exit(2)
+    match = next((g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig) and g.name == name), None)
+    if match is None:
+        names = ", ".join(sorted(g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)))
+        logger.error("unknown golden config %r.\nAvailable: %s", name, names)
+        sys.exit(2)
+    args.code = match.snippet()
+    logger.info("[golden] %s → --code %s", match.name, args.code)
+
+
 def add_diagnostics_args(parser) -> None:
     """Register the ``-v`` / ``-q`` / diff-rendering args shared by ``compile`` and ``tune``."""
     verbosity = parser.add_mutually_exclusive_group()
