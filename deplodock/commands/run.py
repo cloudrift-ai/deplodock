@@ -285,7 +285,7 @@ def handle_run(args):
     # so the kernel table can show it as a live A/B row beside the greedy pick.
     golden_benches = None
     if getattr(args, "golden_configs", None):
-        golden_benches = _bench_golden_variants(backend, graph, args.golden_configs, warmup=args.warmup, iters=args.iters)
+        golden_benches = _bench_golden_variants(backend, args.code, args.golden_configs, warmup=args.warmup, iters=args.iters)
 
     _print_table(results)
     _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
@@ -385,18 +385,24 @@ def _pinned_knobs(knobs: dict):
                 os.environ[key] = prev
 
 
-def _bench_golden_variants(backend, graph, golden_configs, *, warmup, iters):
+def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
     """Compile + bench each recorded golden config with its knobs pinned, returning
     a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
     measured row beside the greedy pick. Only the tunable knobs are pinned (``S_*``
-    / ``H_*`` features are not knobs). Best-effort: a golden whose pinned knobs fail
-    to compile / bench for the live device is skipped with a warning."""
+    / ``H_*`` features are not knobs). Each config re-traces a **fresh** graph from
+    ``code`` — a frontend graph can't be re-compiled (the first lowering mutates it
+    in place, so a reused graph would yield the first config's kernel every time).
+    Best-effort: a golden whose pinned knobs fail to compile / bench for the live
+    device is skipped with a warning."""
+    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+
     out = []
     for cfg in golden_configs or []:
         pins = {k: v for k, v in cfg.knobs.items() if not k.startswith(("S_", "H_"))}
         try:
             with _pinned_knobs(pins):
-                g_compiled = backend.compile(graph)  # knobs baked into the kernel source here
+                graph, _, _ = graph_from_code(code)  # fresh graph; knobs baked into the kernel source here
+                g_compiled = backend.compile(graph)
             g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
         except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
             logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", cfg.name, exc)
@@ -415,10 +421,14 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
 
     ``golden_benches`` (from ``run --golden NAME``, see :func:`_bench_golden_variants`)
     are each their own live compile+bench of a recorded golden config's pinned
-    knobs; their kernels print as ``(golden NAME)``-tagged rows beneath the
-    greedy kernel of matching shape — a real A/B, not the recorded number. Their
-    ``%`` column is ``--`` (they're not part of the deplodock TOTAL)."""
+    knobs; their kernels print beneath the greedy kernel of matching shape, labeled
+    ``golden NAME`` in the Kernel column — a real A/B, not the recorded number. Their
+    ``%`` column is ``--`` (they're not part of the deplodock TOTAL), and their knob
+    cells are colored red where they differ from the greedy pick (like ``eval``)."""
+    from deplodock.commands.knobfmt import align_knob_columns  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
 
     cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
@@ -433,17 +443,13 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
     # Symbolic grids (ceil-div over a dynamic axis) need a concrete env to
     # resolve for display — use each symbolic input dim's hint, so the printed
     # geometry reflects the hint-sized tile the kernel was tuned for.
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-
     sym_env: dict[str, int] = {}
     for nid in graph.inputs:
         for dim in graph.nodes[nid].output.shape:
             if isinstance(dim.expr, Var) and dim.hint is not None:
                 sym_env.setdefault(dim.expr.name, dim.hint)
 
-    from deplodock.compiler.pipeline.knob import format_tuning_knobs  # noqa: PLC0415
-
-    def _emit(op, t_us: float, pct_cell: str, attrs: dict, suffix: str = "") -> None:
+    def _geom(op, attrs: dict):
         block_dims = [resolve_dim(d, sym_env) for d in op.block]
         grid_dims = [resolve_dim(d, sym_env) for d in op.grid]
         block_threads = block_dims[0] * block_dims[1] * block_dims[2]
@@ -451,11 +457,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         regs = (attrs.get(op.kernel_name) or {}).get("num_regs", 0)
         occ_pct = _theoretical_occupancy(regs, op.smem_bytes, block_threads, occ_limits)
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
-        knobs = format_tuning_knobs(getattr(op, "knobs", {}) or {})
-        print(
-            f"{op.kernel_name[:42]:<44s} {t_us:>7.1f} {pct_cell:>5s} {grid_total:>7d} "
-            f"{block_threads:>5d} {op.smem_bytes / 1024:>5.1f}K {regs:>4d} {occ_str}  {knobs}{suffix}"
-        )
+        return grid_total, block_threads, op.smem_bytes / 1024, regs, occ_str
 
     def _matching(op):
         """Benched golden variants whose matmul shape matches this kernel — keyed
@@ -465,18 +467,37 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
         return [gb for gb in (golden_benches or []) if gb.config.M * gb.config.N == free_prod and gb.config.K == reduce_max]
 
-    print()
-    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
-    print("-" * 90)
+    # Build row records first (the knob columns are aligned across all rows, so we
+    # can't stream): (name, t_us, pct_cell, geom, knobs, ref_knobs_or_None). A
+    # golden row's ``ref`` is its matching greedy kernel's knobs — cells that differ
+    # are colored red.
+    records: list[tuple] = []
     for idx, node in enumerate(cuda_nodes):
+        op = node.op
         t_us = times_by_idx.get(idx, 0.0)
-        _emit(node.op, t_us, f"{(t_us / total_us * 100) if total_us > 0 else 0.0:.1f}%", attrs_by_kname)
-        for gb in _matching(node.op):
+        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
+        gknobs = dict(tuning_knob_items(op.knobs or {}))
+        records.append((op.kernel_name[:42], t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
+        for gb in _matching(op):
             g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
             g_attrs = _collect_kernel_attrs(gb.graph)
             g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
             for gidx, gnode in enumerate(g_nodes):
-                _emit(gnode.op, g_times.get(gidx, 0.0), "--", g_attrs, suffix=f"  (golden {gb.config.name})")
+                gk = dict(tuning_knob_items(gnode.op.knobs or {}))
+                records.append((f"golden {gb.config.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
+
+    knob_lines = align_knob_columns(
+        [{k: (f"{k}={v}", ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
+    )
+
+    print()
+    print(f"{'Kernel':<44s} {'us':>7s} {'%':>6s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
+    print("-" * 90)
+    for rec, kline in zip(records, knob_lines, strict=True):
+        name, t_us, pct_cell, (grid_total, block_threads, smem_kb, regs, occ_str) = rec[:4]
+        print(
+            f"{name:<44s} {t_us:>7.1f} {pct_cell:>6s} {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}  {kline}"
+        )
     print(f"{'TOTAL':<44s} {total_us:>7.1f}")
 
 

@@ -142,6 +142,31 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         cublas_us=14.5,
     ),
     MatmulGoldenConfig(
+        # Second golden for the same shape — a BN=16 / BK=32 / FN=4 / BUFFER_COUNT=4
+        # variant the prior+greedy land on, measured at parity with the config above
+        # (both 12.3 us). Kept alongside it (names need not be unique).
+        name="square.512",
+        M=512,
+        N=512,
+        K=512,
+        gpu_name="NVIDIA GeForce RTX 5090",
+        compute_cap=(12, 0),
+        knobs={
+            "BN": 16,
+            "BM": 8,
+            "FM": 4,
+            "FN": 4,
+            "BK": 32,
+            "SPLITK": 1,
+            "BR": 1,
+            "FK": 1,
+            "STAGE": "11",
+            "BUFFER_COUNT": 4,
+        },
+        deplodock_us=12.3,
+        cublas_us=14.5,
+    ),
+    MatmulGoldenConfig(
         name="square.1024",
         M=1024,
         N=1024,
@@ -524,6 +549,31 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
             "MMA": "mma_m16n8k16_f16",
             "STAGE": "11",
             "BUFFER_COUNT": 4,
+        },
+        deplodock_us=6.1,
+        cublas_us=6.2,
+    ),
+    MatmulGoldenConfig(
+        # Second golden for the same shape — a 8×1-warp / FM=1 / BUFFER_COUNT=2
+        # variant the prior+greedy land on, measured at parity with the 2×2-warp
+        # config above (both 6.1 us). Kept alongside it (names need not be unique).
+        name="square.512.fp16",
+        M=512,
+        N=512,
+        K=512,
+        dtype="fp16",
+        gpu_name="NVIDIA GeForce RTX 5090",
+        compute_cap=(12, 0),
+        knobs={
+            "WN": 1,
+            "WM": 8,
+            "FM": 1,
+            "FN": 2,
+            "BK": 2,
+            "SPLITK": 1,
+            "MMA": "mma_m16n8k16_f16",
+            "STAGE": "11",
+            "BUFFER_COUNT": 2,
         },
         deplodock_us=6.1,
         cublas_us=6.2,

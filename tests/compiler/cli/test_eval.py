@@ -161,3 +161,20 @@ def test_knobs_interaction_matrix_present(run_cli, tmp_path):
     assert rc == 0, f"stderr: {stderr}"
     assert "knob interaction" in stdout
     assert "K1\\K2" in stdout
+
+
+def test_align_knob_columns_orders_and_aligns():
+    """``align_knob_columns`` orders columns canonically (knob_sort_key), pads each
+    knob to its widest cell so columns line up, and blanks where a row lacks a knob.
+    (Colour is tty-gated, off under pytest, so the cells render plain.)"""
+    from deplodock.commands.knobfmt import align_knob_columns
+
+    lines = align_knob_columns(
+        [
+            {"BN": ("BN=16", False), "BK": ("BK=32", False)},
+            {"BN": ("BN=32", True), "MMA": ("MMA=x", False)},
+        ]
+    )
+    assert lines[0] == "BN=16  BK=32"  # canonical order BN before BK; trailing MMA blank stripped
+    assert lines[1].startswith("BN=32") and lines[1].endswith("MMA=x")  # BK column blank between
+    assert "BK" not in lines[1]

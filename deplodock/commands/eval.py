@@ -43,13 +43,17 @@ import math
 import os
 import re
 import sqlite3
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 
 from deplodock.commands.compile import resolve_tune_db
+from deplodock.commands.knobfmt import GREEN as _GREEN
+from deplodock.commands.knobfmt import RED as _RED
+from deplodock.commands.knobfmt import RESET as _RESET
+from deplodock.commands.knobfmt import YELLOW as _YELLOW
+from deplodock.commands.knobfmt import align_knob_columns
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +215,6 @@ def _emit_registry() -> None:
 
 _WARP_KNOBS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
 
-# ANSI colours, only when stdout is a tty (piped / logged output stays plain).
-_TTY = sys.stdout.isatty()
-_GREEN, _YELLOW, _RED, _RESET = ("\033[32m", "\033[33m", "\033[31m", "\033[0m") if _TTY else ("", "", "", "")
-
 
 def _ratio_color(matched: int, total: int) -> str:
     """Green (all match) / yellow (>80%) / red (otherwise)."""
@@ -229,38 +229,11 @@ def _cell(visible: str, width: int, color: str = "") -> str:
     return body + " " * max(1, width - len(visible))
 
 
-# Canonical knob display order — the tile geometry knobs first (block / register
-# tile, split, pipeline), then everything else alphabetically. Keeps the
-# ``found/golden`` columns in a stable, readable order across kernels.
-_KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "BUFFER_COUNT", "STAGE", "MMA")
-_KNOB_RANK = {k: i for i, k in enumerate(_KNOB_ORDER)}
-
-
-def _knob_sort_key(k: str) -> tuple[int, str]:
-    """Sort knobs by :data:`_KNOB_ORDER`, unknown knobs last (alphabetically)."""
-    return (_KNOB_RANK.get(k, len(_KNOB_ORDER)), k)
-
-
 def _aligned_knob_cells(rows: list[tuple[dict, dict]]) -> list[str]:
     """Render the ``K=found/golden`` knob columns for a set of ``(gold, got)`` rows,
-    aligned: the union of knobs across all rows in canonical order, each knob padded
-    to its widest cell so the columns line up vertically; mismatches red, blanks
-    where a row lacks the knob. Returns one string per input row, in order."""
-    keys = sorted({k for gold, _ in rows for k in gold}, key=_knob_sort_key)
-    width = {k: max(len(f"{k}={got.get(k, '-')}/{gold[k]}") for gold, got in rows if k in gold) for k in keys}
-    lines = []
-    for gold, got in rows:
-        cells = []
-        for k in keys:
-            if k not in gold:
-                cells.append(" " * width[k])
-                continue
-            gv, fv = gold[k], got.get(k, "-")
-            vis = f"{k}={fv}/{gv}"
-            body = f"{_RED}{vis}{_RESET}" if fv != gv else vis
-            cells.append(body + " " * (width[k] - len(vis)))
-        lines.append("  ".join(cells).rstrip())
-    return lines
+    aligned (canonical order, padded to the widest cell), mismatches red — via the
+    shared :func:`align_knob_columns`."""
+    return align_knob_columns([{k: (f"{k}={got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold} for gold, got in rows])
 
 
 def _emit_golden_features(kernel_filter: str | None) -> None:

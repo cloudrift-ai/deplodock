@@ -291,6 +291,18 @@ apply_knobs_env()
 
 # --- Rendering -------------------------------------------------------------
 
+# Canonical display order for tuning knobs — tile geometry first (block / register
+# tile, split, pipeline), then everything else alphabetically. Shared by the
+# ``run --bench`` kernel table and the ``deplodock eval`` golden tables so knob
+# columns read in a stable, comparable order everywhere.
+KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "BUFFER_COUNT", "STAGE", "MMA")
+_KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
+
+
+def knob_sort_key(name: str) -> tuple[int, str]:
+    """Sort key placing knobs in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
+    return (_KNOB_RANK.get(name, len(KNOB_ORDER)), name)
+
 
 def format_tuning_knobs(knobs: dict) -> str:
     """Render ``knobs`` as a compact ``key=value`` string, dropping
@@ -304,6 +316,15 @@ def format_tuning_knobs(knobs: dict) -> str:
     stamp from ``992_stamp_structural_features``) are facts about the kernel, not
     tuning decisions, so they are dropped from this tuning-knob view.
     """
+    items = tuning_knob_items(knobs)
+    return ", ".join(f"{k}={v}" for k, v in items) if items else "-"
+
+
+def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
+    """The filtered, canonically-ordered ``(name, str(value))`` tuning knobs —
+    the same view :func:`format_tuning_knobs` renders, but as items so callers can
+    build aligned columns. ``STRUCT_PREFIX`` / ``CTX_PREFIX`` features and marker
+    booleans are dropped; the rest is sorted by :func:`knob_sort_key`."""
     rendered: list[tuple[str, str]] = []
     for k, v in knobs.items():
         if k.startswith(STRUCT_PREFIX) or k.startswith(CTX_PREFIX):
@@ -314,9 +335,7 @@ def format_tuning_knobs(knobs: dict) -> str:
         if knob is None and isinstance(v, bool):
             continue
         rendered.append((k, str(v)))
-    if not rendered:
-        return "-"
-    return ", ".join(f"{k}={v}" for k, v in sorted(rendered))
+    return sorted(rendered, key=lambda kv: knob_sort_key(kv[0]))
 
 
 # --- Feature vector ---------------------------------------------------------

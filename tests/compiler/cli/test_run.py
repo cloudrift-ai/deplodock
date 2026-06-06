@@ -70,10 +70,10 @@ def test_pinned_knobs_sets_and_restores_env(monkeypatch):
 @requires_cuda
 def test_run_golden_bench_shows_benched_golden_row(run_cli):
     """``run --golden NAME --bench`` compiles + benches the recorded golden (knobs
-    pinned) and prints it as a ``(golden NAME)``-tagged row in the kernel table."""
+    pinned) and prints it as a ``golden NAME``-labeled row in the kernel table."""
     rc, stdout, stderr = run_cli("run", "--golden", "square.512", "--bench")
     assert rc == 0, f"stderr: {stderr}"
-    assert "(golden square.512)" in stdout, stdout
+    assert "golden square.512" in stdout, stdout
 
 
 @requires_cuda

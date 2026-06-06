@@ -295,6 +295,13 @@ def test_format_tuning_knobs_skips_struct():
     assert "BN=64" in out
 
 
+def test_format_tuning_knobs_canonical_order():
+    """Knobs render in canonical tile-geometry order (``KNOB_ORDER``), not
+    alphabetical — shared with the ``deplodock eval`` golden tables."""
+    out = format_tuning_knobs({"SPLITK": 1, "BN": 32, "BM": 8, "BK": 64, "MMA": "x", "FM": 4})
+    assert out == "BM=8, BN=32, BK=64, FM=4, SPLITK=1, MMA=x"
+
+
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
     """With no ``raw`` argument, the function reads ``DEPLODOCK_KNOBS``."""
     monkeypatch.delenv("DEPLODOCK_BK", raising=False)
