@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.search.golden_configs import (
+from deplodock.compiler.pipeline.search.golden import (
     GOLDEN_CONFIGS,
     GoldenConfig,
     MatmulGoldenConfig,

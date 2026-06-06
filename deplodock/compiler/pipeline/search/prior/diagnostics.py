@@ -80,7 +80,7 @@ def _calibration(prior, groups: dict) -> float | None:
 def _golden_coverage(groups: dict) -> tuple[int, int]:
     """How many golden matmul shapes have measured data in the dataset (matched by
     the op's free-dim product + reduce extent from its ``S_*`` features)."""
-    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS  # noqa: PLC0415
 
     have = set()
     for sig in groups:
@@ -102,7 +102,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     ``kernel_filter`` restricts to golden configs whose name contains it."""
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.pipeline.search import heuristic  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     # Index op groups by (free-dim product, reduce extent, is-matmul) so each
     # golden shape maps to the S_* signature it was tuned under.

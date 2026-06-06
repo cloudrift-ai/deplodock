@@ -253,7 +253,7 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, knob  # noqa: PLC0415
     from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
@@ -295,7 +295,7 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 def _golden_configs(kernel_filter: str | None):
     """The matmul golden configs, optionally filtered by name substring, plus the
     kernel-name column width for aligned tables."""
-    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:

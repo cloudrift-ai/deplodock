@@ -33,7 +33,7 @@ logging.getLogger("deplodock").setLevel(logging.WARNING)
 logger = logging.getLogger("find_golden_configs")
 
 from deplodock import config  # noqa: E402
-from deplodock.compiler.pipeline.search.golden_configs import (  # noqa: E402
+from deplodock.compiler.pipeline.search.golden import (  # noqa: E402
     QWEN3_06B_HIDDEN,
     QWEN3_06B_INTER,
     QWEN3_06B_KV_DIM,

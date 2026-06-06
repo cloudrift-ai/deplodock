@@ -49,7 +49,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     _priority_matmul_thread,
     enumerate_cartesian,
 )
-from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig
+from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
 from deplodock.compiler.pipeline.search.heuristic import score_matmul_thread
 
 # The knobs the thread-tier enumeration assigns (FK defaults to 1 when a golden

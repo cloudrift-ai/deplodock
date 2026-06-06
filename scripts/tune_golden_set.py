@@ -37,7 +37,7 @@ from pathlib import Path
 os.environ.setdefault("DEPLODOCK_PRIOR_FILE", "/tmp/golden_exp_prior.json")
 os.environ.setdefault("DEPLODOCK_TUNE_DB", "/tmp/golden_exp_autotune.db")
 
-from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: E402
+from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: E402
 
 _DD = "./venv/bin/deplodock"
 _DEPLODOCK_US = re.compile(r"Deplodock\s+([\d.]+)")

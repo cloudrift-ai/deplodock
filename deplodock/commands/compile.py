@@ -135,7 +135,7 @@ def resolve_golden_arg(args) -> None:
     name = getattr(args, "golden", None)
     if not name:
         return
-    from deplodock.compiler.pipeline.search.golden_configs import GOLDEN_CONFIGS, MatmulGoldenConfig
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
 
     if args.code or args.input or getattr(args, "ir", None):
         logger.error("--golden is mutually exclusive with --code / positional input / --ir")
