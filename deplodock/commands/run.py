@@ -383,8 +383,10 @@ def _print_kernel_stats(graph, bench):
             if isinstance(dim.expr, Var) and dim.hint is not None:
                 sym_env.setdefault(dim.expr.name, dim.hint)
 
+    from deplodock.compiler.pipeline.knob import format_tuning_knobs  # noqa: PLC0415
+
     print()
-    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}")
+    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
     print("-" * 90)
     for idx, (_, node) in enumerate(cuda_nodes):
         op = node.op
@@ -402,7 +404,8 @@ def _print_kernel_stats(graph, bench):
         regs = attrs.get("num_regs", 0)
         occ_pct = _theoretical_occupancy(regs, op.smem_bytes, block_threads, occ_limits)
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
-        print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}")
+        knobs = format_tuning_knobs(getattr(op, "knobs", {}) or {})  # the greedy-picked tuning knobs for this kernel
+        print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}  {knobs}")
     print(f"{'TOTAL':<44s} {total_us:>7.1f}")
 
 
