@@ -127,10 +127,15 @@ def _run_rule(op: TileOp):
     return _ws.rewrite(_ctx(), node)
 
 
-def test_rule_skipped_on_pointwise():
+def test_off_stamped_on_pointwise():
+    """An ineligible (pointwise) op records WARP_SPECIALIZE=False (body
+    unchanged) rather than RuleSkipping, so the realized config keeps a uniform
+    knob set for the learned prior."""
     op = _tile_op_pointwise()
-    with pytest.raises(RuleSkipped, match="no TMA"):
-        _run_rule(op)
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_ws.WARP_SPECIALIZE.name] is False
+    assert result.body == op.body
 
 
 def test_pinned_ws1_on_ineligible_fails_loudly(monkeypatch):

@@ -100,7 +100,13 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         msg = "; ".join(fail_reasons) if fail_reasons else "no candidate fit"
         if pinned:
             raise ValueError(f"DEPLODOCK_BUFFER_COUNT={candidates[0]} pinned but cannot fire: {msg}")
-        raise RuleSkipped(f"no K-outer StageBundle fits any BUFFER_COUNT candidate ({msg})")
+        # No buffered ring fits (smem cap / K-outer extent / no eligible SYNC
+        # bundle). Record the declined decision as BUFFER_COUNT=1 (single buffer
+        # = no ring) on the unchanged SYNC body so the realized config carries a
+        # uniform knob set — the knob is metadata for the prior / cache key and
+        # never touches the SYNC bundle. Downstream transport passes (050/060/080)
+        # then see SYNC and likewise record their off decisions.
+        return [TileOp(body=body, name=root.op.name, knobs={**root.op.knobs, BUFFER_COUNT.name: 1})]
 
     # Occupancy-optimal ordering for the GREEDY default. ``GreedySearch`` keeps
     # only option-0 of a rule's fork and drops the rest (it does NOT re-score the

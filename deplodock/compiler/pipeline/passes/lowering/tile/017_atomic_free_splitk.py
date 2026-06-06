@@ -25,10 +25,11 @@ coordination). The schedule is bandwidth-bound at the target shape
 the generic ``100_materialize_tile.py`` handles the body unchanged.
 
 Idempotent: re-running on a TileOp whose ``knobs`` already names
-``ATOMIC_FREE_SPLITK`` skips. MMA TileOps (``MMA`` set) skip too —
-their accumulation flows through the C fragment, not scalar
-Init/Accum, and split-K on the MMA path stays on the codegen-derived
-atomic rewrite (see ``plans/mma-fragment-factorization.md``).
+``ATOMIC_FREE_SPLITK`` skips. MMA TileOps (``MMA`` set) and non-split-K
+TileOps stamp ``ATOMIC_FREE_SPLITK=False`` (the decision is recorded for a
+uniform knob set, not skipped) — MMA accumulation flows through the C
+fragment, not scalar Init/Accum, so split-K there stays on the
+codegen-derived atomic rewrite (see ``plans/mma-fragment-factorization.md``).
 """
 
 from __future__ import annotations
@@ -268,16 +269,22 @@ def _build_atomic_free_fragment(match: Match, root: Node, op: TileOp, k_s_axis: 
 
 def rewrite(ctx: Context, match: Match, root: Node) -> list[TileOp | Graph] | None:
     op: TileOp = root.op
+    if ATOMIC_FREE_SPLITK.name in op.knobs:
+        raise RuleSkipped("ATOMIC_FREE_SPLITK already decided (idempotence)")
+
+    def _off() -> TileOp:
+        """Record the off decision (legacy atomic / not-applicable), body
+        unchanged, so the realized config keeps a uniform knob set."""
+        return TileOp(body=op.body, name=op.name, knobs={**op.knobs, ATOMIC_FREE_SPLITK.name: False})
+
     if op.knobs.get("MMA"):
         # MMA path: fragment-accumulation; the C-fragment Write isn't a
         # scalar Write we can rewire here, and split-K on MMA stays on
         # the codegen-derived atomic rewrite path.
-        raise RuleSkipped("MMA TileOp — atomic-free split-K does not apply")
-    if ATOMIC_FREE_SPLITK.name in op.knobs:
-        raise RuleSkipped("ATOMIC_FREE_SPLITK already pinned (idempotence)")
+        return _off()
     k_s_name = find_split_k_axis_name(op)
     if k_s_name is None:
-        raise RuleSkipped("no split-K axis (SPLITK = 1)")
+        return _off()  # no split-K (SPLITK = 1) — atomic-free is moot
 
     candidates = ATOMIC_FREE_SPLITK.narrow(ATOMIC_FREE_SPLITK.hints)
     if not candidates:

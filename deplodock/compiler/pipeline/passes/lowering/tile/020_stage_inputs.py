@@ -174,7 +174,10 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         bytes_per_elem=bytes_per_elem,
     )
     if not variants:
-        raise RuleSkipped("no Load qualifies for staging")
+        # No qualifying Load to stage (no candidate buffers): record the explicit
+        # no-stage decision (empty STAGE mask, body unchanged) so the realized
+        # config keeps a uniform knob set instead of leaving STAGE absent.
+        return [TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, STAGE.name: STAGE.pretty(0, width=0)})]
     return variants
 
 

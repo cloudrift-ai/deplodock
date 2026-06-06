@@ -77,16 +77,27 @@ def _group_m() -> int:
 
 
 def rewrite(root: Node) -> TileOp | None:
+    op: TileOp = root.op
+    # Idempotence: the decision is recorded as the GROUP_M knob (every path
+    # stamps it now), so a re-scan of the rebound op skips here.
+    if GROUP_M.name in op.knobs:
+        raise RuleSkipped("GROUP_M already decided (idempotence via knob)")
+
+    def _off() -> TileOp:
+        """Record the no-swizzle decision: GROUP_M=1 (row-major decode), body
+        unchanged. Stamped on every non-acting path (disabled / not-matmul / no
+        eligible grid) so the realized config keeps a uniform knob set."""
+        return TileOp(body=op.body, name=op.name, knobs={**op.knobs, GROUP_M.name: 1})
+
     group_m = _group_m()
     if group_m == 1:
-        raise RuleSkipped("DEPLODOCK_GROUP_M=1 disables CTA swizzle")
-    op: TileOp = root.op
+        return _off()
     if not _is_matmul(op):
-        raise RuleSkipped("not a matmul-priority TileOp (BK <= 1 or BR > 1) — no L2 A-row reuse story")
+        return _off()
     new_body, changed = _stamp_top_grid(op.body, group_m)
     if not changed:
-        raise RuleSkipped("no eligible top-level GridTile (single-block-axis grid, or already swizzled)")
-    return TileOp(body=new_body, name=op.name, knobs=op.knobs)
+        return _off()
+    return TileOp(body=new_body, name=op.name, knobs={**op.knobs, GROUP_M.name: group_m})
 
 
 def _is_matmul(op: TileOp) -> bool:

@@ -147,10 +147,11 @@ def _rewrite(op: TileOp) -> list:
 # ---------------------------------------------------------------------------
 
 
-def test_splitk_one_skips(monkeypatch):
-    """SPLITK = 1 — no atomic axis → ``RuleSkipped``."""
+def test_splitk_one_off_stamped(monkeypatch):
+    """SPLITK = 1 — no atomic axis → records ATOMIC_FREE_SPLITK=False (the
+    decision, not a skip), so the realized config keeps a uniform knob set."""
     monkeypatch.delenv("DEPLODOCK_ATOMIC_FREE_SPLITK", raising=False)
-    # No K_s axis in the GridTile → atomic_axes empty → skip.
+    # No K_s axis in the GridTile → atomic_axes empty → off.
     M_b = Axis("M_b", _M_EXT // _BM)
     N_b = Axis("N_b", _N_EXT // _BN)
     M_t = Axis("M_t", _BM)
@@ -167,25 +168,27 @@ def test_splitk_one_skips(monkeypatch):
         ),
     )
     op = TileOp(body=Body((body,)), name="k_matmul", knobs={"SPLITK": 1, "BM": _BM, "BN": _BN})
-    with pytest.raises(RuleSkipped, match="no split-K axis"):
-        _rewrite(op)
+    result = _rewrite(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs[afree.ATOMIC_FREE_SPLITK.name] is False
 
 
-def test_idempotent_skip_when_knob_pinned(monkeypatch):
+def test_idempotent_skip_when_knob_present(monkeypatch):
     """Re-running on a TileOp whose ``knobs`` already names the fork knob → skip."""
     monkeypatch.delenv("DEPLODOCK_ATOMIC_FREE_SPLITK", raising=False)
     op = _matmul_tileop(knobs={afree.ATOMIC_FREE_SPLITK.name: False})
-    with pytest.raises(RuleSkipped, match="already pinned"):
+    with pytest.raises(RuleSkipped, match="already decided"):
         _rewrite(op)
 
 
-def test_mma_path_skipped(monkeypatch):
-    """``MMA`` set (MMA path) → skip; MMA SPLITK stays on the
-    codegen-derived atomic rewrite."""
+def test_mma_path_off_stamped(monkeypatch):
+    """``MMA`` set (MMA path) → records ATOMIC_FREE_SPLITK=False; MMA SPLITK
+    stays on the codegen-derived atomic rewrite."""
     monkeypatch.delenv("DEPLODOCK_ATOMIC_FREE_SPLITK", raising=False)
     op = _matmul_tileop(knobs={"MMA": "mma_m16n8k16_f16"})
-    with pytest.raises(RuleSkipped, match="MMA TileOp"):
-        _rewrite(op)
+    result = _rewrite(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs[afree.ATOMIC_FREE_SPLITK.name] is False
 
 
 def test_fork_emits_two_variants(monkeypatch):

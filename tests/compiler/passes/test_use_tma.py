@@ -129,31 +129,56 @@ def test_rule_fires_on_async_eligible():
     assert bundles[0].policy == StagePolicy.TMA
 
 
-# --- eligibility-negative cases (RuleSkipped) ------------------------
+# --- eligibility-negative cases (decline → stamp TMA=False) ----------
+# The rule now records its decision on every non-idempotency path: a declined
+# promotion stamps ``TMA=False`` (body unchanged) so the realized config keeps a
+# uniform knob set, instead of leaving TMA absent (which 0-filled ambiguously in
+# the learned prior). A hard ``ValueError`` is reserved for ``DEPLODOCK_TMA=1``
+# pinned on infeasible ground.
 
 
-def test_skipped_on_pre_hopper_target():
+def _bundle_policies(op: TileOp) -> list[StagePolicy]:
+    return [s.policy for s in op.body.iter() if isinstance(s, StageBundle)]
+
+
+def test_off_stamped_on_pre_hopper_target():
+    """Pre-Hopper: TMA defaults off → records ``TMA=False``, body unchanged."""
     op, g = _tile_op_buffered(policy=StagePolicy.BUFFERED)
     from deplodock.compiler.pipeline.pipeline import Match  # noqa: PLC0415
 
     match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", rule=None, is_last=True)  # type: ignore[arg-type]
-    with pytest.raises(RuleSkipped, match="TMA requires compute capability"):
-        _use_tma.rewrite(Context(compute_capability=(8, 0)), match, g.nodes["op"])
+    result = _use_tma.rewrite(Context(compute_capability=(8, 0)), match, g.nodes["op"])
+    assert isinstance(result, TileOp)
+    assert result.knobs[_use_tma.TMA.name] is False
+    assert _bundle_policies(result) == [StagePolicy.BUFFERED]  # untouched
 
 
-def test_skipped_when_no_promotable_bundle():
-    """SYNC bundles aren't in ``_PROMOTABLE`` — rule skips."""
+def test_off_stamped_when_no_promotable_bundle():
+    """SYNC bundles aren't in ``_PROMOTABLE`` — the rule records ``TMA=False``."""
     op, g = _tile_op_buffered(policy=StagePolicy.SYNC, buffer_count=1)
-    with pytest.raises(RuleSkipped, match="no BUFFERED/ASYNC StageBundle"):
-        _run_rule(op, g)
+    result = _run_rule(op, g)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_use_tma.TMA.name] is False
+    assert _bundle_policies(result) == [StagePolicy.SYNC]
 
 
-def test_idempotent_when_already_tma():
-    """Re-running on a TileOp whose bundle is already TMA: nothing to
-    promote, rule skips cleanly (no double-promote, no error)."""
+def test_already_tma_stamps_true():
+    """A body already carrying a TMA bundle (no knob yet) records ``TMA=True`` —
+    no double-promote, no error."""
     op, g = _tile_op_buffered(policy=StagePolicy.TMA)
-    with pytest.raises(RuleSkipped, match="no BUFFERED/ASYNC StageBundle"):
-        _run_rule(op, g)
+    result = _run_rule(op, g)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_use_tma.TMA.name] is True
+    assert _bundle_policies(result) == [StagePolicy.TMA]
+
+
+def test_idempotent_when_knob_present():
+    """Once TMA is decided (knob present), a re-scan skips cleanly."""
+    op, g = _tile_op_buffered(policy=StagePolicy.BUFFERED)
+    stamped = TileOp(body=op.body, name=op.name, knobs={_use_tma.TMA.name: False})
+    g.nodes["op"].op = stamped
+    with pytest.raises(RuleSkipped, match="TMA already decided"):
+        _run_rule(stamped, g)
 
 
 # --- end-to-end staging-chain regression -----------------------------

@@ -107,6 +107,10 @@ TMA = Knob(
 
 
 def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
+    # Idempotence: the decision is recorded as the TMA knob (every path stamps
+    # it now), so a re-scan of the rebound op skips here.
+    if TMA.name in root.op.knobs:
+        raise RuleSkipped("TMA already decided (idempotence via knob)")
     # Arch-gated default: only Hopper+ offers TMA at all. Hand narrow the
     # full ``(True, False)`` hint tuple on supported arch, ``(False,)`` alone
     # otherwise — the first remaining candidate wins by priority order.
@@ -114,25 +118,28 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     use_tma = TMA.narrow(candidates)[0]
     pinned = config.knob_raw(TMA.name) is not None
 
-    if not use_tma:
-        if pinned:
-            raise RuleSkipped("TMA=0 pinned")
-        if ctx.compute_capability < _MIN_CAPABILITY:
-            raise RuleSkipped(f"TMA requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
-        raise RuleSkipped("TMA defaulted off")
+    def _off() -> TileOp:
+        """Record the declined decision: TMA=False, body unchanged. The realized
+        config keeps a uniform knob set, and 060_use_async_copy still promotes
+        the BUFFERED leftovers to cp.async."""
+        return TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, TMA.name: False})
 
-    def _fail(msg: str) -> None:
-        """Raise ``ValueError`` when explicitly pinned on, ``RuleSkipped`` otherwise."""
+    if not use_tma:
+        return _off()
+
+    def _decline(msg: str) -> TileOp:
+        """TMA wanted but impossible: hard-fail when explicitly pinned on (the
+        user forced it on infeasible ground), else record TMA=False."""
         if pinned:
             raise ValueError(f"DEPLODOCK_TMA=1 but TMA cannot fire: {msg}")
-        raise RuleSkipped(msg)
+        return _off()
 
     # TMA descriptors bake the source shape statically into the cuTensorMap; bail
     # out cleanly if any input shape carries a symbolic dim.
     for nid, node in match.graph.nodes.items():
         for d in node.output.shape:
             if not d.is_static:
-                _fail(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
+                return _decline(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
     src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
 
     body = root.op.body
@@ -148,7 +155,7 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
         if s.policy == StagePolicy.TMA:
             continue
         if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes):
-            _fail(
+            return _decline(
                 f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
             )
@@ -169,9 +176,10 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # TMA deadlock). Read the true element size off the gmem node here.
     dtype_bytes = {nid: node.output.dtype.nbytes for nid, node in match.graph.nodes.items()}
     new_body, changed = _walk(body, swizzle=swizzle, dtype_bytes=dtype_bytes)
-    if not changed:
-        _fail("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
-    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
+    already_tma = any(isinstance(s, StageBundle) and s.policy == StagePolicy.TMA for s in body.iter())
+    if not changed and not already_tma:
+        return _decline("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
+    return TileOp(body=new_body, name=root.op.name, knobs={**root.op.knobs, TMA.name: True})
 
 
 def _walk(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:

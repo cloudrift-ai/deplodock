@@ -87,7 +87,6 @@ from __future__ import annotations
 import logging
 from dataclasses import replace as dc_replace
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.diagnostics.bank_conflicts import lane_bank_distribution
 from deplodock.compiler.graph import Graph, Node
@@ -121,23 +120,37 @@ PERMUTE_LANES = Knob(
 
 
 def rewrite(ctx: Context, root: Node) -> Graph | None:
-    if not PERMUTE_LANES.narrow((True,))[0]:
-        raise RuleSkipped("PERMUTE_LANES=0 pinned")
-    # Touch ``config`` so the env read stays on the standard knob_raw path.
-    _ = config.knob_raw(PERMUTE_LANES.name)
     knobs = root.op.knobs
+    # Idempotence: the policy is recorded as the PERMUTE_LANES knob (every path
+    # stamps it now), so a re-scan of the rebound op skips here.
+    if PERMUTE_LANES.name in knobs:
+        raise RuleSkipped("PERMUTE_LANES already decided (idempotence via knob)")
+
+    def _off() -> TileOp:
+        """Record the off decision: PERMUTE_LANES=False, body unchanged. This pass
+        is obsolete (affine-collapse staging subsumes it), so this is the path
+        every kernel takes — kept for a uniform knob set."""
+        return TileOp(body=root.op.body, name=root.op.name, knobs={**knobs, PERMUTE_LANES.name: False})
+
+    if not PERMUTE_LANES.narrow((True,))[0]:
+        return _off()
     if knobs.get("MMA"):
         # MMA path: the s16816 ``ldmatrix`` consumer applies its own per-lane
         # swizzle XOR — the per-thread LDS.128 permute doesn't apply. Skip per
         # plans/mma-fragment-factorization.md M7.
-        raise RuleSkipped("MMA kernel — ldmatrix handles its own swizzling")
+        return _off()
     if "FN" not in knobs:
-        raise RuleSkipped("no FN knob on TileOp (split_register_axes hasn't run)")
+        return _off()
     F = int(knobs["FN"])
-    new_body = _maybe_rewrite(root.op.body, lds128_bytes=ctx.lds128_bytes, F=F)
+    # ``_maybe_rewrite`` signals "no fixable conflict" via RuleSkipped — catch it
+    # and record the off decision rather than leaving the knob unset.
+    try:
+        new_body = _maybe_rewrite(root.op.body, lds128_bytes=ctx.lds128_bytes, F=F)
+    except RuleSkipped:
+        return _off()
     if new_body is None:
-        raise RuleSkipped("rewrite helper returned no change")
-    return TileOp(body=new_body, name=root.op.name, knobs=dict(knobs))
+        return _off()
+    return TileOp(body=new_body, name=root.op.name, knobs={**knobs, PERMUTE_LANES.name: True})
 
 
 def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:

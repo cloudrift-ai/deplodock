@@ -104,16 +104,20 @@ VECTORIZE_LOADS = Knob(
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
+    top: TileOp = root.op
+    # Idempotence: the policy is recorded as the VECTORIZE_LOADS knob (every path
+    # stamps it now), so a re-scan of the rebound op skips here.
+    if VECTORIZE_LOADS.name in top.knobs:
+        raise RuleSkipped("VECTORIZE_LOADS already decided (idempotence via knob)")
     # Only ``True`` is enumerated, so the autotuner never forks on this knob;
     # ``DEPLODOCK_VECTORIZE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
     # pin authoritatively, even when it is not in the candidate set).
     if not VECTORIZE_LOADS.narrow((True,))[0]:
-        raise RuleSkipped("VECTORIZE_LOADS=0 pinned")
-    top: TileOp = root.op
+        return TileOp(body=top.body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: False})
+    # Stamp the policy (True) even when no run is foldable — the realized config
+    # records that vectorization was enabled, keeping a uniform knob set.
     new_body = _vectorize_body(top, top.body)
-    if new_body == top.body:
-        raise RuleSkipped("no vectorizable Load runs found")
-    return TileOp(body=new_body, name=top.name)
+    return TileOp(body=new_body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: True})
 
 
 def _vectorize_body(top: TileOp, body: Body) -> Body:

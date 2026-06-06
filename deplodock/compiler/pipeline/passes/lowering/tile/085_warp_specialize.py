@@ -369,14 +369,15 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
     if not ok:
         # Fail loudly if the user explicitly pinned ``DEPLODOCK_WARP_SPECIALIZE=1``
         # but the kernel can't be warp-specialized (e.g. a warp-tier MMA matmul
-        # — ``no ThreadTile in body``, WS+MMA is out of v1 scope). Silently
-        # RuleSkipping would hand back the *non-WS* kernel with no signal, so a
+        # — ``no ThreadTile in body``, WS+MMA is out of v1 scope). A
         # pinned-but-unhonorable knob raises — same policy as the BUFFER_COUNT /
         # TMA pins.
         pin = config.knob_raw(WARP_SPECIALIZE.name)
         if pin is not None and WARP_SPECIALIZE.parse(pin):
             raise ValueError(f"DEPLODOCK_WARP_SPECIALIZE=1 pinned but warp specialization cannot fire: {reason}")
-        raise RuleSkipped(reason)
+        # Ineligible (not pinned on) — record the off decision (body unchanged) so
+        # the realized config keeps a uniform knob set instead of leaving it absent.
+        return TileOp(body=op.body, name=op.name, knobs={**op.knobs, WARP_SPECIALIZE.name: False})
 
     ws_choices = WARP_SPECIALIZE.narrow(WARP_SPECIALIZE.hints)
     if not ws_choices:

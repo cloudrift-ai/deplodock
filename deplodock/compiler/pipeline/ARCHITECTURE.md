@@ -242,6 +242,25 @@ The return type discriminates the rewrite flavor:
 Raise `RuleSkipped(reason)` to decline a match — the engine logs the
 reason at DEBUG and moves on.
 
+**Knob-stamp invariant.** A knob-owning pass MUST record its decision on every
+non-idempotency path — the chosen value when it acts, an explicit off/default
+when it declines or is gated off (e.g. staging nothing stamps `STAGE` with the
+all-zero mask, an arch-gated TMA stamps `TMA=False`, a no-fit ring stamps
+`BUFFER_COUNT=1`). It must NOT `RuleSkipped` *without* stamping — the only
+`RuleSkipped` a knob pass keeps is the idempotency guard (`if KNOB.name in
+op.knobs`), which means the knob is already present. So a non-acting pass returns
+`replace(op, knobs={**op.knobs, KNOB: <off>})` (body unchanged), which the
+knob-merge carries forward and which the idempotency guard then short-circuits on
+the re-scan. The reason: realized configs must carry a **complete, uniform** knob
+set, because the learned prior (`knob.knob_features`) 0-fills absent feature
+columns — an absent knob is then indistinguishable from one explicitly set to
+off, conflating "the deciding pass hasn't run" with "decided off" and letting
+optimistic value-of-position branch rows drag the greedy pick onto degenerate
+all-default configs. Branch (partial-prefix) rows stay partial by design — that
+is the correct value-of-position descent signal — and no longer mislead, because
+no realized leaf lands in the partial region. Verified end-to-end by
+`tests/compiler/passes/test_knob_stamp_invariant.py`.
+
 A rewrite that *returns* an op which fails `Op.validate(ctx)` (e.g. a
 `100_materialize_tile` `KernelOp` whose smem exceeds `ctx.max_dynamic_smem`)
 is filtered by `Candidate.try_rewrite` — correct as **fork pruning** (sibling
