@@ -28,10 +28,12 @@ from collections.abc import Callable
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import enumerate_cartesian
 
-# Occupancy reference. RTX 5090 / sm_120 has 170 SMs; the golden set was measured
-# there. The dominant heuristic term targets ~2 waves of CTAs over this count, so
-# the right value matters for the absolute occupancy band (a future planner-side
-# wiring should pass the live device's SM count instead of this constant).
+# Occupancy reference fallback when no ``Context`` SM count is threaded through
+# (direct ``score_matmul_thread`` callers / GPU-less hosts). RTX 5090 / sm_120 has
+# 170 SMs; the golden set was measured there. The dominant heuristic term targets
+# ~2 waves of CTAs over this count. The live pipeline now passes the device's real
+# count via ``ctx.sm_count`` (see :data:`deplodock.compiler.context.DEFAULT_SM_COUNT`,
+# the same fallback), so this constant only applies to no-context calls.
 DEFAULT_SM_COUNT = 170
 
 # Knobs the thread-tier / warp-tier enumeration actually decides — the only ones
@@ -161,7 +163,7 @@ def evaluate_golden(
     dtype: str,
     golden_knobs: dict,
     ctx: Context,
-    sm_count: int = DEFAULT_SM_COUNT,
+    sm_count: int | None = None,
     scorer: Callable[[dict], float] | None = None,
 ) -> tuple[dict, int | None, int]:
     """Score a matmul shape's full enumeration and return ``(pick, rank, pool)``:
@@ -172,7 +174,12 @@ def evaluate_golden(
     reach. ``scorer`` overrides the default ranker (the hardcoded heuristic for the
     thread tier, enumeration order for the warp tier) with any ``row → float``
     (e.g. a learned prior's ``mean_score``), applied to both tiers. Returns
-    ``({}, None, 0)`` if nothing enumerates."""
+    ``({}, None, 0)`` if nothing enumerates. ``sm_count`` defaults to the live
+    device's count off ``ctx`` (``ctx.sm_count``) — the occupancy reference for
+    the tile-sizing terms — falling back to :data:`DEFAULT_SM_COUNT` only when a
+    bare cap-only context carries none."""
+    if sm_count is None:
+        sm_count = getattr(ctx, "sm_count", None) or DEFAULT_SM_COUNT
     rows, match_keys, score_key = _enumerate(M, N, K, dtype, ctx)
     if not rows:
         return {}, None, 0
@@ -189,8 +196,9 @@ def evaluate_golden(
     return rows[best], rank, len(rows)
 
 
-def pick_matmul(M: int, N: int, K: int, dtype: str, ctx: Context, sm_count: int = DEFAULT_SM_COUNT) -> dict:
+def pick_matmul(M: int, N: int, K: int, dtype: str, ctx: Context, sm_count: int | None = None) -> dict:
     """Best knob row for an ``(M, K) @ (K, N)`` matmul under the hardcoded
     heuristic — no prior, no measurements. Thin wrapper over :func:`evaluate_golden`
-    (no golden to match). Returns ``{}`` if nothing enumerates."""
+    (no golden to match; ``sm_count`` defaults to ``ctx.sm_count``). Returns ``{}``
+    if nothing enumerates."""
     return evaluate_golden(M, N, K, dtype, {}, ctx, sm_count)[0]

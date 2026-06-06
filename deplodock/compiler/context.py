@@ -24,6 +24,15 @@ from deplodock import config
 # Universal across every arch we target.
 STATIC_SMEM_CAP = 48 * 1024
 
+# Fallback SM (streaming-multiprocessor) count when no live CUDA device is
+# present (GPU-less CI / offline eval). RTX 5090 / sm_120 = 170 — the device the
+# golden configs were measured on, so offline golden ranking matches. The live
+# count (``target.live_device_features``) overrides this in ``from_target`` /
+# ``probe``. Consumed by the occupancy-aware matmul heuristics
+# (``search/heuristic.score_matmul_thread``, ``_enumeration._priority_matmul_warp``)
+# to size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
+DEFAULT_SM_COUNT = 170
+
 # Per-block dynamic-smem opt-in cap by compute capability. NVIDIA assigns
 # different sm_XX numbers to datacenter vs consumer SKUs within the same
 # arch family (sm_80 A100 vs sm_86 RTX 30xx; sm_90 H100 vs sm_120 RTX
@@ -69,6 +78,16 @@ def _max_dynamic_smem_for(cc: tuple[int, int]) -> int:
     return _MAX_DYNAMIC_SMEM_BY_CC.get(cc, STATIC_SMEM_CAP)
 
 
+def _live_sm_count() -> int:
+    """The live device's SM count (``target.live_device_features``), or
+    :data:`DEFAULT_SM_COUNT` on a GPU-less host. Surfaced onto ``Context`` so the
+    occupancy-aware tile heuristics size to the actual device instead of a
+    hardcoded constant."""
+    from deplodock.compiler.target import live_device_features  # noqa: PLC0415
+
+    return int(live_device_features().get("sm_count") or DEFAULT_SM_COUNT)
+
+
 @dataclass(frozen=True)
 class Context:
     """Per-compilation state visible to rules.
@@ -99,6 +118,15 @@ class Context:
     # pick the per-thread N-chunk width that keeps each LDS.128 phase
     # bank-conflict-free.
     lds128_bytes: int = 16
+    # Live device SM (streaming-multiprocessor) count, or ``DEFAULT_SM_COUNT`` on
+    # a GPU-less host. Physical SKU fact (an sm_120 laptop and an sm_120 RTX 5090
+    # differ), so it can't be derived from ``compute_capability``. Read by the
+    # occupancy-aware matmul tile heuristics to size the tile to the device — keep
+    # the CTA count near ~1-2 waves over the SMs. Populated from
+    # ``target.live_device_features`` by :meth:`from_target` / :meth:`probe`. NOT
+    # in ``structural_key`` (device-physical, like ``max_dynamic_smem``: it steers
+    # the option-0 pick, but the resulting knobs already key the perf cache).
+    sm_count: int = DEFAULT_SM_COUNT
     # Identifies which backend's perf rows this compile reads/writes — the
     # tune DB keys ``perf`` by ``(context_key, op_key, backend)``. Defaults to
     # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
@@ -115,7 +143,12 @@ class Context:
 
     @classmethod
     def from_target(cls, cap: tuple[int, int]) -> Context:
-        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap), compile_flags=_env_compile_flags())
+        return cls(
+            compute_capability=cap,
+            max_dynamic_smem=_max_dynamic_smem_for(cap),
+            sm_count=_live_sm_count(),
+            compile_flags=_env_compile_flags(),
+        )
 
     def structural_key(self) -> str:
         """Implements :class:`deplodock.compiler.structural.Structural`.
@@ -190,4 +223,4 @@ class Context:
             smem = _max_dynamic_smem_for(cap)
         else:
             smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
-        return cls(compute_capability=cap, max_dynamic_smem=smem, compile_flags=_env_compile_flags())
+        return cls(compute_capability=cap, max_dynamic_smem=smem, sm_count=_live_sm_count(), compile_flags=_env_compile_flags())

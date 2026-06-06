@@ -264,7 +264,9 @@ def _priority_matmul_thread(p: dict) -> tuple[int, ...]:
     )
 
 
-def _priority_matmul_warp(p: dict, *, ctx: Context | None = None) -> tuple[int, ...]:
+def _priority_matmul_warp(
+    p: dict, *, ctx: Context | None = None, E_M: int | None = None, E_N: int | None = None, E_K: int | None = None
+) -> tuple[int, ...]:
     # Warp-tier ranking for tensor-core MMA matmul (fp16 / bf16 with f32
     # accumulator, swizzled s16816 ``mma_m16n8k16_*`` atom on sm_90+).
     #
@@ -296,14 +298,22 @@ def _priority_matmul_warp(p: dict, *, ctx: Context | None = None) -> tuple[int, 
     # (``|m_tile − n_tile|``), a 4-warp CTA, a balanced warp grid, then BK=2.
     # (Same-tile warp splits — WM2 WN2 vs WM1 WN4, both 64×64 — are perf-equal;
     # which one wins the residual tie is not load-bearing.)
+    #
+    # **Occupancy regime-split.** The 64×64 target above is the deployable winner
+    # only when the problem is big enough to *fill* the GPU with 64×64 CTAs. On a
+    # small problem a 64×64 tile starves the device — 512² fp16 yields just
+    # ceil(512/64)²=64 CTAs < the SM count, under one wave, and its golden is the
+    # higher-occupancy 64×32 tile (128 CTAs), not 64×64. So when the 64×64 tile
+    # is under one wave over ``ctx.sm_count``, rank by CTA count nearest one wave
+    # instead (shrink the tile to fill the device); otherwise (1024²/2048²/4096²
+    # and up — the measured-winner regime) keep targeting 64×64 byte-identically.
     threads = p["WN"] * p["WM"] * 32
     cells = p["FM"] * p["FN"]
     tma_capable = ctx is not None and ctx.compute_capability >= (9, 0)
     if tma_capable:
         m_tile = p["WM"] * p["FM"] * 16
         n_tile = p["WN"] * p["FN"] * 8
-        return (
-            -abs(m_tile * n_tile - 64 * 64),  # 64×64 output tile (4096 elems/CTA)
+        secondary = (
             -abs(m_tile - n_tile),  # square tile beats skewed same-area
             -abs(threads - 128),  # 4-warp CTA
             -abs(p["WM"] - p["WN"]),  # balanced warp grid (avoid WN1/WM1 skew)
@@ -312,6 +322,13 @@ def _priority_matmul_warp(p: dict, *, ctx: Context | None = None) -> tuple[int, 
             -p["SPLITK"],
             -len(p.get("OVERHANG", ())),
         )
+        sm = ctx.sm_count  # type: ignore[union-attr]  # ctx is not None under tma_capable
+        if E_M is not None and E_N is not None:
+            ctas_64 = -(-E_M // 64) * (-(-E_N // 64))  # ceil-div CTA count at the 64×64 tile
+            if ctas_64 < sm:  # starved: 64×64 doesn't fill one wave → shrink to fit
+                ctas = -(-E_M // m_tile) * (-(-E_N // n_tile))
+                return (-abs(ctas - sm), *secondary)
+        return (-abs(m_tile * n_tile - 64 * 64), *secondary)  # 64×64 output tile (4096 elems/CTA)
     return (-abs(cells - 16), -abs(p["FM"] - p["FN"]), -abs(256 - threads), p["BK"], -p["SPLITK"], -len(p.get("OVERHANG", ())))
 
 
@@ -452,7 +469,7 @@ def enumerate_cartesian(
         from deplodock.compiler.pipeline.search.heuristic import score_matmul_thread  # noqa: PLC0415
 
         def priority_fn(p: dict) -> float:  # type: ignore[misc]  # shape-bound key; other modes assign tuple-returning fns
-            return score_matmul_thread(p, E_M, E_N, E_K)
+            return score_matmul_thread(p, E_M, E_N, E_K, ctx.sm_count)
 
         window_fk = fp16_window
     elif mode_kind == "reduce":
@@ -875,5 +892,5 @@ def _enumerate_warp_matmul_impl(
                                     }
                                 )
 
-    out.sort(key=lambda p: _priority_matmul_warp(p, ctx=ctx), reverse=True)
+    out.sort(key=lambda p: _priority_matmul_warp(p, ctx=ctx, E_M=E_M, E_N=E_N, E_K=E_K), reverse=True)
     return out
