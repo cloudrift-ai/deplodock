@@ -97,7 +97,7 @@ def register_eval_command(subparsers) -> None:
 
     pg = sub.add_parser(
         "golden",
-        help="Combined golden report: the prior-free heuristic's rank + the learned prior's greedy pick, per golden config",
+        help="Greedy pipeline pick vs recorded golden, per golden config (the reproduction check; no heuristic/rank diagnostics)",
     )
     pg.add_argument("--prior", help="Learned-prior JSON to load (default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json).")
     pg.add_argument("--kernel", help="Filter golden configs by name substring.")
@@ -158,18 +158,19 @@ def handle_eval_prior(args) -> None:
 
 
 def handle_eval_golden(args) -> None:
-    """``eval golden`` — the combined golden-reproduction report: the prior-free
-    heuristic's rank of each golden, then the learned prior's greedy pick + rank.
-    The view to watch while iteratively tuning golden shapes one at a time
-    (``deplodock tune --golden <name>``)."""
+    """``eval golden`` — the greedy pipeline pick vs recorded golden per config (the
+    actionable "did the pipeline reproduce the golden knobs?" view). Watch it while
+    iteratively tuning golden shapes one at a time (``deplodock tune --golden
+    <name>``). Use ``eval heuristic`` / ``eval prior`` for the heuristic rank and the
+    rank-under-prior diagnostics."""
     if args.prior:
         from deplodock import config  # noqa: PLC0415
 
         os.environ[config.PRIOR_FILE] = str(Path(args.prior).expanduser())
     if args.features:
         _emit_golden_features(args.kernel)
-    _emit_heuristic_eval(args.kernel)
-    _emit_prior_eval(args.kernel)
+    configs, nw = _golden_configs(args.kernel)
+    _emit_prior_golden_check(configs, nw, title=False)
 
 
 def _emit_registry() -> None:
@@ -388,12 +389,14 @@ def _emit_prior_eval(kernel_filter: str | None) -> None:
     _emit_prior_golden_check(configs, nw)
 
 
-def _emit_prior_golden_check(configs: list, nw: int) -> None:
+def _emit_prior_golden_check(configs: list, nw: int, *, title: bool = True) -> None:
     """Greedy fork pick through the tile pipeline vs recorded golden. The pick reads
     the learned-prior JSON (``config.prior_path()``: ``DEPLODOCK_PRIOR_FILE`` /
     ``--prior``); option-0 with no fitted prior. Stops at the tile dialect (every
     knob fork resolves there: no codegen / nvcc). Rows are collected, then printed
-    with column-aligned ``found/golden`` knobs (canonical order)."""
+    with column-aligned ``found/golden`` knobs (canonical order). ``title`` prints
+    the ``Golden reproduction — … prior: <path>`` banner (``eval prior``);
+    ``eval golden`` passes ``title=False`` for just the table."""
     import logging as _logging  # noqa: PLC0415
 
     from deplodock import config  # noqa: PLC0415
@@ -413,13 +416,14 @@ def _emit_prior_golden_check(configs: list, nw: int) -> None:
                 knobs.update(k)
         return tunable(knobs)
 
-    prior_path = config.prior_path()
-    logger.info("")
-    logger.info(
-        "Golden reproduction — greedy pipeline pick vs recorded golden; prior: %s (%s):",
-        prior_path,
-        "loaded" if prior_path.exists() else "MISSING → option-0",
-    )
+    if title:
+        prior_path = config.prior_path()
+        logger.info("")
+        logger.info(
+            "Golden reproduction — greedy pipeline pick vs recorded golden; prior: %s (%s):",
+            prior_path,
+            "loaded" if prior_path.exists() else "MISSING → option-0",
+        )
     logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + "knobs (found/golden)")
     # Silence the trace/compile chatter (different logger subtrees) so this
     # function's own ``logger`` can stream one clean result line per config.
@@ -447,6 +451,7 @@ def _emit_prior_golden_check(configs: list, nw: int) -> None:
     knob_lines = iter(_aligned_knob_cells([(p[2], p[3]) for p in entries if p[0] == "row"]))
     for p in entries:
         logger.info("  " + (p[1] if p[0] == "err" else p[1] + next(knob_lines)))
+    logger.info("")
     logger.info("  pipeline reproduced golden knobs exactly: %d/%d", n_match, len(configs))
 
 

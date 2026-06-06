@@ -128,8 +128,10 @@ same worker.
   **not** the `--db` tune DB. `--features` also prints the exact regressor input per golden config (`knob.knob_features`:
   `S_*` structural/shape + `H_*` regime + tuning knobs; note the shape enters only as coarse `S_ext_*` products/maxes,
   so the occupancy/CTA/reuse terms `heuristic.py` computes are added as engineered `D_*` features).
-- `deplodock eval golden [--prior PATH] [--kernel SUBSTR] [--features]` — the combined golden report (heuristic rank +
-  prior greedy pick), i.e. `eval heuristic` then `eval prior`. The view to watch while iteratively tuning golden shapes.
+- `deplodock eval golden [--prior PATH] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs recorded golden,
+  per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no heuristic-rank or
+  rank-under-prior diagnostics; use `eval heuristic` / `eval prior` for those). The view to watch while iteratively
+  tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
 - `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
   the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
   `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.
