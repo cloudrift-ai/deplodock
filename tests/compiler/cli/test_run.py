@@ -48,6 +48,34 @@ def test_run_input_and_code_mutually_exclusive(run_cli):
     assert "mutually exclusive" in (stdout + stderr).lower()
 
 
+def test_pinned_knobs_sets_and_restores_env(monkeypatch):
+    """``_pinned_knobs`` pins ``DEPLODOCK_<KNOB>`` for the block, then restores the
+    prior environment — removing keys that were unset, restoring preexisting ones
+    (the golden-bench A/B relies on this to compile a pinned variant cleanly)."""
+    import os
+
+    from deplodock.commands.run import _pinned_knobs
+
+    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    monkeypatch.setenv("DEPLODOCK_BN", "preexisting")
+    with _pinned_knobs({"BM": 8, "BN": 32, "WARP_SPECIALIZE": False}):
+        assert os.environ["DEPLODOCK_BM"] == "8"
+        assert os.environ["DEPLODOCK_BN"] == "32"
+        assert os.environ["DEPLODOCK_WARP_SPECIALIZE"] == "False"
+    assert "DEPLODOCK_BM" not in os.environ  # was unset → removed
+    assert os.environ["DEPLODOCK_BN"] == "preexisting"  # restored
+    assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
+
+
+@requires_cuda
+def test_run_golden_bench_shows_benched_golden_row(run_cli):
+    """``run --golden NAME --bench`` compiles + benches the recorded golden (knobs
+    pinned) and prints it as a ``(golden NAME)``-tagged row in the kernel table."""
+    rc, stdout, stderr = run_cli("run", "--golden", "square.512", "--bench")
+    assert rc == 0, f"stderr: {stderr}"
+    assert "(golden square.512)" in stdout, stdout
+
+
 @requires_cuda
 def test_run_code_rmsnorm_accuracy(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(64)({_randn('1,8,64', dtype)})")

@@ -8,9 +8,11 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 from deplodock import config
@@ -279,8 +281,14 @@ def handle_run(args):
         dump.dump_benchmark(bench)
         _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
+    # ``--golden NAME``: compile + bench each recorded golden config (knobs pinned)
+    # so the kernel table can show it as a live A/B row beside the greedy pick.
+    golden_benches = None
+    if getattr(args, "golden_configs", None):
+        golden_benches = _bench_golden_variants(backend, graph, args.golden_configs, warmup=args.warmup, iters=args.iters)
+
     _print_table(results)
-    _print_kernel_stats(compiled, bench, golden_configs=getattr(args, "golden_configs", None))
+    _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
@@ -353,7 +361,51 @@ def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> Non
     out.write_text(_json.dumps(payload, indent=2, default=str))
 
 
-def _print_kernel_stats(graph, bench, golden_configs=None):
+# One recorded golden config compiled + benched with its knobs pinned this run.
+_GoldenBench = namedtuple("_GoldenBench", "config graph bench")
+
+
+@contextlib.contextmanager
+def _pinned_knobs(knobs: dict):
+    """Pin ``DEPLODOCK_<KNOB>`` env vars for the duration of one compile, restoring
+    the prior environment on exit. A pinned knob collapses its fork to that value
+    (``Knob.narrow``), so ``backend.compile`` lowers exactly these knobs."""
+    saved: dict[str, str | None] = {}
+    try:
+        for name, value in knobs.items():
+            key = config.knob_var(name)
+            saved[key] = os.environ.get(key)
+            os.environ[key] = str(value)
+        yield
+    finally:
+        for key, prev in saved.items():
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+def _bench_golden_variants(backend, graph, golden_configs, *, warmup, iters):
+    """Compile + bench each recorded golden config with its knobs pinned, returning
+    a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
+    measured row beside the greedy pick. Only the tunable knobs are pinned (``S_*``
+    / ``H_*`` features are not knobs). Best-effort: a golden whose pinned knobs fail
+    to compile / bench for the live device is skipped with a warning."""
+    out = []
+    for cfg in golden_configs or []:
+        pins = {k: v for k, v in cfg.knobs.items() if not k.startswith(("S_", "H_"))}
+        try:
+            with _pinned_knobs(pins):
+                g_compiled = backend.compile(graph)  # knobs baked into the kernel source here
+            g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
+        except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
+            logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", cfg.name, exc)
+            continue
+        out.append(_GoldenBench(cfg, g_compiled, g_bench))
+    return out
+
+
+def _print_kernel_stats(graph, bench, golden_benches=None):
     """Per-kernel breakdown. Pulls structural stats off each ``CudaOp``
     (block / grid / smem), per-launch timings from ``bench.per_launch``,
     and per-kernel hardware attributes from the compiled cupy RawKernels
@@ -361,12 +413,14 @@ def _print_kernel_stats(graph, bench, golden_configs=None):
     — quick at-a-glance for spotting which kernel dominates, whether
     register pressure is killing occupancy, etc.
 
-    ``golden_configs`` (from ``run --golden NAME``, possibly several configs)
-    are echoed as indented ``↳ golden`` rows under each kernel whose shape
-    matches — the recorded best to compare the greedy pick against."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp
+    ``golden_benches`` (from ``run --golden NAME``, see :func:`_bench_golden_variants`)
+    are each their own live compile+bench of a recorded golden config's pinned
+    knobs; their kernels print as ``(golden NAME)``-tagged rows beneath the
+    greedy kernel of matching shape — a real A/B, not the recorded number. Their
+    ``%`` column is ``--`` (they're not part of the deplodock TOTAL)."""
+    from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
 
-    cuda_nodes = [(nid, node) for nid, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
+    cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
         return
 
@@ -389,39 +443,40 @@ def _print_kernel_stats(graph, bench, golden_configs=None):
 
     from deplodock.compiler.pipeline.knob import format_tuning_knobs  # noqa: PLC0415
 
-    def _matching_goldens(op):
-        """Recorded goldens whose matmul shape matches this kernel — keyed on the
-        op's ``S_*`` structural features (``S_ext_free_prod = M*N``,
-        ``S_ext_reduce_max = K``), the same shape signature the prior diagnostics
-        match goldens on."""
-        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
-        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
-        return [g for g in (golden_configs or []) if g.M * g.N == free_prod and g.K == reduce_max]
-
-    print()
-    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
-    print("-" * 90)
-    for idx, (_, node) in enumerate(cuda_nodes):
-        op = node.op
-        t_us = times_by_idx.get(idx, 0.0)
-        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
-        from deplodock.compiler.ir.cuda.ir import resolve_dim
-
+    def _emit(op, t_us: float, pct_cell: str, attrs: dict, suffix: str = "") -> None:
         block_dims = [resolve_dim(d, sym_env) for d in op.block]
         grid_dims = [resolve_dim(d, sym_env) for d in op.grid]
         block_threads = block_dims[0] * block_dims[1] * block_dims[2]
         grid_total = grid_dims[0] * grid_dims[1] * grid_dims[2]
-        smem_kb = op.smem_bytes / 1024
-        kname = op.kernel_name[:42]
-        attrs = attrs_by_kname.get(op.kernel_name) or {}
-        regs = attrs.get("num_regs", 0)
+        regs = (attrs.get(op.kernel_name) or {}).get("num_regs", 0)
         occ_pct = _theoretical_occupancy(regs, op.smem_bytes, block_threads, occ_limits)
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
-        knobs = format_tuning_knobs(getattr(op, "knobs", {}) or {})  # the greedy-picked tuning knobs for this kernel
-        print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}  {knobs}")
-        for g in _matching_goldens(op):
-            ratio = f" ({g.ratio:.2f}x cuBLAS)" if g.cublas_us else ""
-            print(f"  ↳ golden {g.name}: {g.deplodock_us:.1f}us{ratio}  {format_tuning_knobs(g.knobs)}")
+        knobs = format_tuning_knobs(getattr(op, "knobs", {}) or {})
+        print(
+            f"{op.kernel_name[:42]:<44s} {t_us:>7.1f} {pct_cell:>5s} {grid_total:>7d} "
+            f"{block_threads:>5d} {op.smem_bytes / 1024:>5.1f}K {regs:>4d} {occ_str}  {knobs}{suffix}"
+        )
+
+    def _matching(op):
+        """Benched golden variants whose matmul shape matches this kernel — keyed
+        on the op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max
+        = K``), the same shape signature the prior diagnostics match goldens on."""
+        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
+        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
+        return [gb for gb in (golden_benches or []) if gb.config.M * gb.config.N == free_prod and gb.config.K == reduce_max]
+
+    print()
+    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
+    print("-" * 90)
+    for idx, node in enumerate(cuda_nodes):
+        t_us = times_by_idx.get(idx, 0.0)
+        _emit(node.op, t_us, f"{(t_us / total_us * 100) if total_us > 0 else 0.0:.1f}%", attrs_by_kname)
+        for gb in _matching(node.op):
+            g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
+            g_attrs = _collect_kernel_attrs(gb.graph)
+            g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
+            for gidx, gnode in enumerate(g_nodes):
+                _emit(gnode.op, g_times.get(gidx, 0.0), "--", g_attrs, suffix=f"  (golden {gb.config.name})")
     print(f"{'TOTAL':<44s} {total_us:>7.1f}")
 
 
