@@ -114,6 +114,11 @@ same worker.
 - `deplodock knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB.
   Joins `perf` with `cuda_op` and prints per-knob regret + a knob-interaction matrix sorted by geomean impact —
   use the rankings to drive Fork-tree knob ordering in the planner.
+- `deplodock knobs --golden [--kernel SUBSTR]` — for each `GOLDEN_CONFIGS` shape, report (a) the **hardcoded
+  prior-free heuristic** (`compiler/pipeline/search/heuristic.py`) — the golden's **rank** in that heuristic's
+  enumeration order (no GPU, no prior, no measurements; the metric the tuner's patience must reach), summarized as
+  median + top-k coverage; and (b) the greedy pipeline pick (prior / option-0) vs golden, per-knob `found/golden`.
+  The heuristic weights are fit offline by `scripts/golden_knob_heuristics.py` (learning-to-rank the golden set).
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

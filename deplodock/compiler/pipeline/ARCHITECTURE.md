@@ -16,7 +16,8 @@ pipeline/
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
 │   ├── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
-│   └── golden_configs.py  # GoldenConfig / MatmulGoldenConfig: autotuned knobs + cuBLAS-ratio per shape, fp32 (CUDA-core) + fp16 (WMMA) (a tuning-prior ground truth)
+│   ├── golden_configs.py  # GoldenConfig / MatmulGoldenConfig: autotuned knobs + cuBLAS-ratio per shape, fp32 (CUDA-core) + fp16 (WMMA) (a tuning-prior ground truth)
+│   └── heuristic.py  # hardcoded prior-free matmul knob ranker (score_matmul_thread / evaluate_golden): ranks goldens near top of the enumeration without measurements (weights fit by scripts/golden_knob_heuristics.py)
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
