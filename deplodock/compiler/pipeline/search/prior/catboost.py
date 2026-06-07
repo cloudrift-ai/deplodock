@@ -52,10 +52,16 @@ class CatBoostPrior(Prior):
     def fit(self) -> None:
         """Refit a fresh CatBoostRegressor on the whole bounded dataset (RMSE on
         ``log(latency µs)``). Columns are the sorted union of feature keys; an
-        absent knob 0-fills to a fixed coordinate. Non-positive labels (a stale
-        pre-latency checkpoint stored log-reward rows) are dropped so ``log``
-        never sees a non-positive latency — rebuild such a prior with
-        ``tune --clean``."""
+        absent knob fills to ``NaN`` (NOT ``0.0``) so CatBoost's native
+        missing-value handling (``nan_mode="Min"``) can split "this knob isn't
+        present on this row" off from a knob that is present *and* legitimately
+        zero (a BOOL ``False`` → ``0.0``, ``STAGE="00"`` → ``popcount 0.0``).
+        With a 0-fill those two collapsed to the same coordinate; ``NaN`` keeps
+        them distinct (cross-op missing knobs — ``MMA`` on an fp32 row — and the
+        partial-prefix descent rows are the cases that differ). Non-positive
+        labels (a stale pre-latency checkpoint stored log-reward rows) are
+        dropped so ``log`` never sees a non-positive latency — rebuild such a
+        prior with ``tune --clean``."""
         from catboost import CatBoostRegressor  # noqa: PLC0415
 
         rows = [(k, lab) for k, lab in self._dataset if lab > 0]
@@ -63,7 +69,7 @@ class CatBoostPrior(Prior):
         cols = sorted({c for f in feats for c in f})
         if not cols:
             return
-        x = np.array([[f.get(c, 0.0) for c in cols] for f in feats], dtype=float)
+        x = np.array([[f.get(c, np.nan) for c in cols] for f in feats], dtype=float)
         y = np.log(np.array([lab for _, lab in rows], dtype=float))
         model = CatBoostRegressor(
             iterations=self._iterations,
@@ -72,6 +78,7 @@ class CatBoostPrior(Prior):
             loss_function="RMSE",
             random_seed=self._seed,
             thread_count=-1,
+            nan_mode="Min",  # treat absent (NaN) features as their own split-off bucket
             verbose=False,
             allow_writing_files=False,  # don't litter a catboost_info/ dir at the cwd
         )
@@ -87,7 +94,7 @@ class CatBoostPrior(Prior):
         if self._model is None:
             return 0.0
         f = knob.knob_features(knobs)
-        x = np.array([[f.get(c, 0.0) for c in self._cols]], dtype=float)
+        x = np.array([[f.get(c, np.nan) for c in self._cols]], dtype=float)  # absent → NaN, matching fit (see fit docstring)
         return float(np.exp(self._model.predict(x)[0]))
 
     # --- persistence ------------------------------------------------------
