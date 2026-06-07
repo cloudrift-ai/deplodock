@@ -24,8 +24,8 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock tune` reads from / writes to this path. NOTE: the greedy DB→fork replay (`_best_fork`) that let `compile` / `run` pick a previously-tuned variant was **removed** in the learned-prior work; `compile` / `run` now pick forks from the global learned `CatBoostPrior` (the `mean_score` argmin — lowest predicted latency — option-0 when no prior is loaded) — not the DB. The prior is a separate JSON checkpoint (`DEPLODOCK_PRIOR_FILE` → `~/.cache/deplodock/prior.json`); `tune` writes it, `compile` / `run` read it.
 
 All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
-`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`,
-`DEPLODOCK_GPU_LOCK`,
+`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_TUNE_EPS`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`,
+`DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
 …) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
 layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
@@ -78,7 +78,7 @@ same worker.
   dataset (no GPU, no benching) and print diagnostics — per-op **pick reachability** (does the prior's predicted-fastest
   config recover each op's measured-best config?), median ranking calibration (Spearman), and golden-matmul coverage. Use it to see
   whether the prior can actually reach the best configs it's been tuned on (`compiler/pipeline/search/prior/diagnostics.py`).
-- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--bench] [-q]` — **two-level** autotune (see
+- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--bench] [-q]` — **two-level** autotune (see
   `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over fusion forks (graph-changing `frontend`+`loop` passes;
   today deterministic → one terminal) whose reward is `Σ best-per-op time` from an inner search that tunes each
   post-fusion kernel **independently** in its own single-node slice (`lowering` passes only, so `Σ_k n_k` benches not

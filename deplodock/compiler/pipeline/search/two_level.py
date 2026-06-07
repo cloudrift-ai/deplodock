@@ -140,6 +140,8 @@ def inner_reward(
     backend,
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
+    explore_eps: float = 0.0,
+    seed: int = 0,
     progress=None,
     prior=None,
 ) -> InnerReward:
@@ -207,7 +209,7 @@ def inner_reward(
             unique[key] = (nid, op, 1)
     if progress is not None:
         progress.start_terminal(len(unique))
-    for key, (nid, op, count) in unique.items():
+    for op_idx, (key, (nid, op, count)) in enumerate(unique.items()):
         name = getattr(op, "name", None) or nid
         if progress is not None:
             progress.op_start(name)
@@ -217,7 +219,17 @@ def inner_reward(
         # regime (GPU + nvcc opt level), so one global prior spans ops and
         # regimes from the feature vector alone.
         base_knobs = {**ctx.features(), **op.knobs}
-        inner = TuningSearch(patience=patience, ucb_c=ucb_c, score_cache=score_cache, prior_model=prior, base_knobs=base_knobs)
+        # Per-op RNG seed so each kernel's ε-greedy stream differs yet the whole
+        # run is reproducible (no wall-clock seeding).
+        inner = TuningSearch(
+            patience=patience,
+            ucb_c=ucb_c,
+            explore_eps=explore_eps,
+            seed=seed + op_idx,
+            score_cache=score_cache,
+            prior_model=prior,
+            base_knobs=base_knobs,
+        )
         for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
             if progress is not None:
                 st = inner.last_stats
@@ -265,6 +277,7 @@ def run_two_level_tune(
     backend,
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
+    explore_eps: float = 0.0,
     dump=None,
     progress=None,
     prior_seed: int = 0,
@@ -307,6 +320,8 @@ def run_two_level_tune(
             backend=backend,
             patience=patience,
             ucb_c=ucb_c,
+            explore_eps=explore_eps,
+            seed=prior_seed,
             progress=progress,
             prior=prior,
         )

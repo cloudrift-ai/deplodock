@@ -39,6 +39,7 @@ DEBUG = "DEPLODOCK_DEBUG"
 DUMP_DIR = "DEPLODOCK_DUMP_DIR"
 KNOBS = "DEPLODOCK_KNOBS"
 TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
+TUNE_EPS = "DEPLODOCK_TUNE_EPS"
 O3_TOL = "DEPLODOCK_O3_TOL"
 BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
 CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
@@ -186,6 +187,17 @@ def dump_dir() -> Path | None:
 def tune_patience(default: int = 50) -> int:
     """``DEPLODOCK_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
     return int_env(TUNE_PATIENCE, default)
+
+
+def tune_eps(default: float = 0.0) -> float:
+    """``DEPLODOCK_TUNE_EPS`` — inner-MCTS ε-greedy exploration fraction: the
+    probability a selection step descends a uniformly random child instead of the
+    PUCT argmax. Opt-in (default ``0`` = deterministic PUCT): on the fp16 sweep it
+    didn't recover the lost configs (the gap is a tune-path eligibility issue, not
+    selection — see ``plans/golden-sweep-report.md``) and pure randomness regresses
+    tuning, so it's a knob for shapes where the heuristic order is known-bad, not a
+    default."""
+    return float_env(TUNE_EPS, default)
 
 
 def o3_tol(default: float = 0.10) -> float:

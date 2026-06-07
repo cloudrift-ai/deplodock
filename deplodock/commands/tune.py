@@ -55,6 +55,17 @@ def register_tune_command(subparsers):
         ),
     )
     parser.add_argument(
+        "--explore-eps",
+        type=float,
+        default=None,
+        help=(
+            "ε-greedy exploration: probability a selection step descends a uniformly random child "
+            "instead of the PUCT argmax, perturbing (not replacing) the heuristic order for shapes "
+            "where it's known-bad. Falls back to ``DEPLODOCK_TUNE_EPS`` env var, then to 0.0 "
+            "(deterministic PUCT) — opt-in; see plans/golden-sweep-report.md."
+        ),
+    )
+    parser.add_argument(
         "--bench-timeout",
         type=float,
         default=20.0,
@@ -202,6 +213,7 @@ def handle_tune(args):
     )
 
     patience = args.patience if args.patience is not None else config.tune_patience(50)
+    explore_eps = args.explore_eps if args.explore_eps is not None else config.tune_eps(0.0)
     ctx = Context.probe()
     t0 = time.monotonic()
     try:
@@ -212,6 +224,7 @@ def handle_tune(args):
             backend=backend,
             patience=patience,
             ucb_c=args.ucb_c,
+            explore_eps=explore_eps,
             dump=dump,
             progress=progress,
             prior_seed=args.seed,

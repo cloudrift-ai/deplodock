@@ -30,6 +30,7 @@ best so the exploration constant ``c`` is unit-free.
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -107,6 +108,8 @@ class TuningSearch(Search):
         *,
         patience: int = 50,
         ucb_c: float = DEFAULT_UCB_C,
+        explore_eps: float = 0.0,
+        seed: int = 0,
         max_visits: int | None = None,
         score_cache: dict[Hashable, float] | None = None,
         prior_model: Prior | None = None,
@@ -115,6 +118,19 @@ class TuningSearch(Search):
         super().__init__(score_cache=score_cache)
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
+        # ε-greedy exploration: with probability ``explore_eps`` a selection step
+        # descends a UNIFORMLY RANDOM live child instead of the PUCT argmax. PUCT
+        # alone is deterministic — a tie (cold prior → uniform ``P``) always goes
+        # to the first-in-list (= heuristic enumeration order), so each fork is
+        # visited once and takes its heuristic-preferred child; a binary fork like
+        # ``WARPSPEC`` then never benches its option-1 branch even when that's the
+        # real win. ε-randomness makes ~half the visits to such a fork take the
+        # other branch, so tuning finds good configs WITHOUT relying on the
+        # heuristic/prior ordering. ``0.0`` (the default) restores deterministic
+        # PUCT — kept for the unit tests and single-shot compile. Seeded for
+        # reproducibility (vary ``seed`` per op/run upstream, not via wall clock).
+        self._explore_eps = explore_eps
+        self._rng = random.Random(seed)
         self._patience = patience
         self._max_visits = max_visits
         # Learned prior driving PUCT selection — a fixed global model for the run
@@ -273,7 +289,19 @@ class TuningSearch(Search):
         deprioritized rather than force-visited. There is no ``+∞``-unvisited rule
         (no forced breadth): a cold or absent prior yields a uniform ``P = 1``, so
         PUCT still explores via the exploration term (and a single-shot compile
-        with no prior descends emission-order). ``c_ucb`` is ``--ucb-c``."""
+        with no prior descends emission-order). ``c_ucb`` is ``--ucb-c``. With
+        ``explore_eps > 0`` a fraction of steps instead descend a uniformly
+        random live child (ε-greedy), so exploration doesn't depend on the
+        prior/heuristic ordering. ``explore_eps > 0`` (tune, opt-in) adds an ε-greedy
+        hook: with probability ``explore_eps`` descend a uniformly random live
+        child. Off by default so a single-shot compile / the unit tests stay
+        deterministic. NOTE: a *random tie-break* under a cold prior (when every
+        child ties) was tried and reverted — it discards the heuristic
+        enumeration order, which does real work, and regressed fp16 tuning ~2×
+        (random walk into degenerate wide-FM/FN tiles). The heuristic order is a
+        load-bearing prior; exploration must perturb it, not replace it."""
+        if self._explore_eps and self._rng.random() < self._explore_eps:
+            return self._rng.choice(children)
         global_best = self.tree.best_reward or 1.0
         fitted = self.prior_model is not None and self.prior_model.fitted
         sqrt_parent = math.sqrt(parent.visits + 1)

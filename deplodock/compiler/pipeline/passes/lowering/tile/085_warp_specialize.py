@@ -394,15 +394,20 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
     if len(ws_choices) == 1:
         return _stamp(ws_choices[0])
 
-    # Prior (rank-only — the MCTS still measures both). For the warp-tier MMA
-    # tower, WS=1 is a measured win (≈17% at 64×64, neutral at 128×128 — see
-    # the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``), so score
-    # the WS=1 fork higher and the greedy/first-guess path takes it. The scalar
-    # (pointwise / coop-reduce) tier has no such consensus, so it stays neutral
-    # (0.0) and greedy follows the hint order (a score tie keeps emission
-    # order). The score alone drives both pickers: greedy takes the max-prior
-    # sibling (``Search.score_of``), MCTS uses it as the UCB unvisited tiebreak.
+    # For the warp-tier MMA tower, WS=1 is a measured win (≈17% at 64×64, neutral
+    # at 128×128 — see the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``),
+    # so it should be the first guess. The ``_ws_score`` below ranks WS=1 higher,
+    # but that only steers a *fitted* prior — a cold MCTS (a fresh ``tune --clean``)
+    # and a no-prior greedy ``compile`` both fall back to **emission order** (the
+    # PUCT tie / option-0 pick), which would take WS=0 and, under patience, never
+    # bench WS=1 at all (the measured fp16 gap in ``plans/golden-sweep-report.md``).
+    # So emit WS=1 FIRST for the warp tier — emission order then deploys the win
+    # cold, and the -O3 re-bench tolerance feeds the prior its deployable latency.
+    # The scalar (pointwise / coop-reduce) tier has no such consensus → keep the
+    # hint order (WS=0 first) and the neutral score.
     _, is_warp = _find_consumer_tile(op.body)
+    if is_warp and set(ws_choices) == {False, True}:
+        ws_choices = (True, False)
 
     def _ws_expand(knobs: dict) -> list[TileOp]:
         return [_stamp(knobs[WARP_SPECIALIZE.name])]

@@ -176,3 +176,43 @@ features.**
    (mirroring `heuristic`), so the prior can pick skewed-vs-square per shape.
 3. **Fix offline golden coverage match** (`prior/diagnostics.py`): key on dtype + per-axis extents so fp16 shapes are
    recognized — needed to *measure* that (1)/(2) worked.
+
+## Resolution (2026-06-07): the fp16 win was a fork-ordering bug, not exploration
+
+Implementing the exploration work (above) and validating it on `square.2048.fp16` overturned the "add randomness"
+hypothesis and found the real cause:
+
+- **ε-greedy** (random child with prob ε): implemented as an opt-in knob (`--explore-eps` / `DEPLODOCK_TUNE_EPS`,
+  **default 0**). At ε=0.2 it did **not** surface `WARPSPEC=True` (still 0 benched) — the random budget is diluted
+  across ~10–15 fork levels per descent, so it rarely lands on one specific deep fork.
+- **Random tie-break** (randomize among equal-PUCT children under a cold prior): **tried and reverted** — it discards
+  the heuristic enumeration order, which does real work, and **regressed 2048² tuning ~2×** (random walk into degenerate
+  wide-`FM/FN` tiles; best 238 µs vs ~104 deterministic) while *still* benching 0 `WARPSPEC=True`.
+- That 0-under-full-random was the tell: `WARPSPEC=True` wasn't a *selection* casualty, it was barely a *candidate*.
+  Pinning `DEPLODOCK_WARPSPEC=1` during tune **benched it for `WM=2/WN=2`** (and crashed on tiles where WS is
+  ineligible — `producer_threads(32)` must divide the inner thread-axes product). So for *eligible* warp tiles the
+  `WS=True` child exists; for ineligible ones the pass stamps `False` (no fork).
+
+**Root cause.** `085_warp_specialize` emits the `WS` fork `False`-first and relies on its `score_fn` (`WS=1 → 1.0`) to
+make pickers prefer `True`. But `TuningSearch._select` consults the **CatBoost prior**, not the fork `score_fn`; a cold
+/ unfit prior (a fresh `tune --clean`, and every no-prior `compile`) falls back to uniform `P` → PUCT tie → **emission
+order** → `WS=False`. Under patience the search then advances to the next tile and never benches `WS=True`. So both the
+deployed greedy pick and the tuner missed the warp win.
+
+**Fix (`085_warp_specialize.py`): emit `WARPSPEC=True` FIRST for the warp tier.** Emission order now deploys the win
+cold, and the -O3 tolerance feeds the prior its deployable latency.
+
+**Measured (`run --golden square.2048.fp16 --bench`, no prior → heuristic pick):**
+
+| | before | after |
+|---|---:|---:|
+| deployed greedy fp16 2048² | `WS=False` **110 µs** (0.88× eager) | `WS=True` **93.4 µs** (1.05× eager) |
+
+The deployed pick now **beats** the recorded golden (94.6 µs) and eager. The earlier three changes (-O3 tolerance, warp
+occupancy features) still matter — they let the prior *rank* the explored warp configs by deployable cost and pick the
+skewed tile — but the fp16 cliff was this ordering bug. ε-greedy stays as opt-in infrastructure for shapes where the
+heuristic order is known-bad; it is not the fp16 fix.
+
+Remaining follow-ups still open: warp-tier `producer_threads` divisibility narrows WS eligibility for some tiles (a
+pinned `DEPLODOCK_WARPSPEC=1` hard-fails rather than pruning during a sweep — worth softening); and the offline golden
+coverage match (#3 above) still conflates fp16/fp32.
