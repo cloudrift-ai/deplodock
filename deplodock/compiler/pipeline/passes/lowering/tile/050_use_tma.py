@@ -103,6 +103,7 @@ TMA = Knob(
     KnobType.BOOL,
     hints=(True, False),
     help="Promote BUFFERED/ASYNC bundles to TMA. 1 = force (hard-fail on ineligibility), 0 = skip pass.",
+    off=False,
 )
 
 

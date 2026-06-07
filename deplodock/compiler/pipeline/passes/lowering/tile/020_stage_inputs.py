@@ -104,7 +104,7 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import Knob, KnobType, mma_atom
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     parallel_tile_of,
     replace_parallel_tile_body,
@@ -157,7 +157,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
-    atom_kind = root.op.knobs.get("MMA")
+    atom_kind = mma_atom(root.op.knobs)  # None for scalar (incl. the "0" OFF sentinel)
     # Per-buffer bytes-per-elem so ``_classify``'s slab-cap check sizes
     # fp16 slabs at 2 B/elem instead of the BYTES_PER_ELEM=4 hardcoded
     # over-count. Without this the half-precision MMA path rejects every

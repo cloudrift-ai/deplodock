@@ -17,6 +17,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
     ATOM_REGISTRY,
     Atom,
@@ -494,7 +495,7 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(9, 0)), kernel_name="c", graph=g)
     assert plan is not None
     assert plan.params, "expected ≥1 enumerated variant"
-    warp_rows = [p for p in plan.params if "MMA" in p]
+    warp_rows = [p for p in plan.params if is_warp(p)]
     assert warp_rows, "expected ≥1 warp-tier row when DEPLODOCK_MMA=1"
 
     # Materialize the first warp row and verify the tower shape.
@@ -513,7 +514,9 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     assert any(isinstance(s, GridTile) for s in tile_op.body), "warp variant must keep the GridTile outer wrapper"
     # Knobs reflect the warp tier.
     assert tile_op.knobs["MMA"] == "mma_m16n8k16_f16"
-    assert "BR" not in tile_op.knobs  # warp tier doesn't carry BR
+    # Warp tier doesn't use BR — it carries the OFF sentinel (0), not absence:
+    # every emitted variant stamps every planner knob explicitly.
+    assert tile_op.knobs["BR"] == 0
 
 
 def test_planner_scalar_only_when_mma_disabled(monkeypatch):
@@ -525,8 +528,10 @@ def test_planner_scalar_only_when_mma_disabled(monkeypatch):
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    assert all("MMA" not in p for p in plan.params)
-    assert not any("MMA" in p for p in plan.params)
+    # Scalar-only: every row carries the MMA OFF sentinel ("0"), none names a
+    # real atom kind (warp tier). ``is_warp`` is the value-based discriminator.
+    assert all(p["MMA"] == "0" for p in plan.params)
+    assert not any(is_warp(p) for p in plan.params)
 
 
 def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
@@ -542,6 +547,6 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    warp_rows = [p for p in plan.params if "MMA" in p]
+    warp_rows = [p for p in plan.params if is_warp(p)]
     assert warp_rows, "MMA=<kind> must enable the warp tier on a pin-only arch"
     assert all(p["MMA"] == "mma_m16n8k16_f16" for p in warp_rows)

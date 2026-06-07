@@ -91,6 +91,7 @@ from deplodock.compiler.ir.stmt.blocks import (
     _render_thread_axis_decode,
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
+from deplodock.compiler.pipeline.knob import is_warp, mma_atom
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
 
@@ -1541,7 +1542,7 @@ def score_tile_geometry(
     # Empirical sweep at 2048² fp16 on sm_120 (RTX 5090): the 4-warp / 128-
     # thread 64×64 tile (+WS) wins at 94 µs; 8-warp/256-thread variants land
     # at 106+ µs. See the warp-tier MMA block below for the tile-shape reward.
-    tma_capable_warp = "MMA" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0)
+    tma_capable_warp = is_warp(knobs) and isinstance(compute_capability, tuple) and compute_capability >= (9, 0)
     target_threads = 128 if tma_capable_warp else 256
     target_ctas = 128
     score = 0.0
@@ -1571,7 +1572,7 @@ def score_tile_geometry(
 
     if cells == 1:
         score -= 1.0
-    elif "MMA" in knobs:
+    elif is_warp(knobs):
         # Tensor-core MMA (warp-tier mma.sync path). The measured perf sweet
         # spot (2026 pinned sweep on RTX 5090 over 1024²/2048²/4096² fp16, each
         # tile paired with WARP_SPECIALIZE) is a **square 64×64 OUTPUT tile on
@@ -1729,8 +1730,9 @@ def score_tile_geometry(
         # advantage that pushed the picker to the FM=1 FN=32 spill
         # corner (see ``plans/mma-warp-scoring.md`` for the 2048² fp16
         # sweep).
-        if "MMA" in knobs:
-            _atom_n = ATOM_REGISTRY[str(knobs["MMA"])].shape[1]
+        _atom = mma_atom(knobs)
+        if _atom is not None:
+            _atom_n = ATOM_REGISTRY[_atom].shape[1]
             n_stride_elems = int(knobs.get("WN", 1)) * fn * _atom_n
             # Warp-tier MMA: the actual TMA-pipelined band on sm_90+ /
             # sm_120 is ``BK ≤ 4`` (BK=2 is the empirical sweet spot —
@@ -1771,8 +1773,9 @@ def score_tile_geometry(
     # earn the bonus. Keyed only off planner knobs (WM/WN/FM/FN/BK) so lazy_score
     # and the post-materialization score agree (the lazy/eager parity check).
     # See project_cublas_gap_ncu_2026-05-31 memory.
-    if "MMA" in knobs and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
-        atom_m, atom_n, atom_k = ATOM_REGISTRY[str(knobs["MMA"])].shape
+    _atom = mma_atom(knobs)
+    if _atom is not None and isinstance(compute_capability, tuple) and compute_capability >= (9, 0) and smem_cap_bytes:
+        atom_m, atom_n, atom_k = ATOM_REGISTRY[_atom].shape
         bm = int(knobs.get("WM", 1)) * int(knobs.get("FM", 1)) * atom_m
         bn = int(knobs.get("WN", 1)) * int(knobs.get("FN", 1)) * atom_n
         bk_k = int(knobs.get("BK", 1))
@@ -1969,8 +1972,9 @@ class TileOp(BodyOp):
         fm = int(knobs.get("FM", 1))
         fn = int(knobs.get("FN", 1))
         splitk = int(knobs.get("SPLITK", 1))
-        if "MMA" in knobs:
-            atom_m, atom_n, _ = ATOM_REGISTRY[str(knobs["MMA"])].shape
+        _atom = mma_atom(knobs)
+        if _atom is not None:
+            atom_m, atom_n, _ = ATOM_REGISTRY[_atom].shape
             wm = int(knobs.get("WM", 1))
             wn = int(knobs.get("WN", 1))
             per_m = wm * fm * atom_m
@@ -2060,11 +2064,12 @@ class TileOp(BodyOp):
         from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
 
         thread_extent: dict[str, int] = {}
-        if "MMA" in knobs:
+        _atom = mma_atom(knobs)
+        if _atom is not None:
             # Warp-tier: the "thread" axes are warps × lanes. Treat the
             # WN × 32 contribution as the inner-stride coalescer along N,
             # mirroring the scalar BN role.
-            atom_m, atom_n, _ = ATOM_REGISTRY[str(knobs["MMA"])].shape
+            atom_m, atom_n, _ = ATOM_REGISTRY[_atom].shape
             wm = int(knobs.get("WM", 1))
             wn = int(knobs.get("WN", 1))
             if shape.outer_m is not None and wm > 1:

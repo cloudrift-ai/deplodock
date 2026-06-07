@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.pipeline.knob import format_tuning_knobs
+from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -161,6 +161,12 @@ class Pass:
     name: str
     rules: list[Rule]
     index: int = 0
+    # Every ``Knob`` declared (or imported) by this pass's rule modules — the
+    # knobs this pass "owns". Populated by :meth:`load` (scans each rule
+    # module's ``vars()`` for ``Knob`` instances, so imported knobs like the
+    # planner's ``_enumeration`` set count too). :meth:`Cursor.advance` stamps
+    # any of these with a defined ``off`` onto the variant at the pass boundary.
+    declared_knobs: tuple[Knob, ...] = ()
 
     def __post_init__(self) -> None:
         for r in self.rules:
@@ -175,6 +181,7 @@ class Pass:
         pass_dir = _PASSES_DIR / name
         rule_files = sorted(f for f in pass_dir.glob("*.py") if f.name != "__init__.py" and not f.name.startswith("_"))
         rules: list[Rule] = []
+        declared: dict[str, Knob] = {}  # knob name → Knob, deduped across rule modules
         for path in rule_files:
             if select is not None and path.stem not in select and _strip_rule_prefix(path.stem) not in select:
                 continue
@@ -197,7 +204,13 @@ class Pass:
                 raise ValueError(f"Rule {path} missing rewrite() function")
             param_names = tuple(inspect.signature(rewrite_fn).parameters.keys())
             rules.append(Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names))
-        return cls(name=name, rules=rules, index=index)
+            # Collect the knobs this rule module declares OR imports (e.g. the
+            # planner imports the ``_enumeration`` tier knobs) — ``Cursor.advance``
+            # uses them to OFF-fill the pass's variants.
+            for v in vars(module).values():
+                if isinstance(v, Knob):
+                    declared.setdefault(v.name, v)
+        return cls(name=name, rules=rules, index=index, declared_knobs=tuple(declared.values()))
 
 
 @dataclass
@@ -292,6 +305,27 @@ class Match:
         )
 
 
+def _off_fill_pass(graph: Graph, pass_: Pass) -> None:
+    """Stamp every OFF-declared knob of ``pass_`` that a variant left unspecified
+    onto that variant — the "every emitted variant carries an explicit value for
+    every knob the pass declares" rule, realized once at the pass boundary (so
+    all the pass's rules — including a declined / no-variant rule — have had
+    their turn). Rebuilds the op via :func:`dataclasses.replace` (a fresh
+    ``knobs`` dict, never an in-place mutation) so a structurally shared op isn't
+    corrupted across sibling candidates. Only ops that already carry tuning
+    knobs (a realized kernel variant) are touched — inputs / constants with an
+    empty ``knobs`` are left alone."""
+    if not pass_.declared_knobs:
+        return
+    for node in graph.nodes.values():
+        knobs = getattr(node.op, "knobs", None)
+        if not knobs:
+            continue
+        filled = apply_off_defaults(dict(knobs), pass_.declared_knobs)
+        if filled != knobs:
+            node.op = replace(node.op, knobs=filled)
+
+
 @dataclass
 class Cursor:
     """Pipeline resume state for a candidate. Owns the entire advance
@@ -348,6 +382,7 @@ class Cursor:
         self.n_applied = 0
         if finished:
             if pass_.name:
+                _off_fill_pass(graph, pass_)
                 logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(graph.nodes))
                 if self.run.dump is not None:
                     self.run.dump.on_pass(pass_, graph)

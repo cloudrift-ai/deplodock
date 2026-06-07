@@ -100,6 +100,7 @@ VECTORIZE_LOADS = Knob(
     KnobType.BOOL,
     hints=(True,),  # on by default; not a search dimension — manual override only via the env var
     help="Fold runs of consecutive scalar Loads into one wide vector Load (float4 / __half2).",
+    off=False,
 )
 
 

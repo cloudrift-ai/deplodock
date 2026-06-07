@@ -45,6 +45,68 @@ STRUCT_PREFIX = "S_"
 CTX_PREFIX = "H_"
 
 
+class _Unset:
+    """Sentinel for ``Knob.off`` meaning "no OFF value declared" — the knob is
+    expected to always be stamped by its owning pass (universal knobs like
+    ``BN`` / ``BM``), so :func:`apply_off_defaults` never auto-fills it."""
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+# --- MMA tier decode -------------------------------------------------------
+# The ``MMA`` knob (declared in ``lowering/tile/_enumeration.py``) selects the
+# tensor-core "warp" tier: a falsy / empty value is scalar-only, an atom-kind
+# name (e.g. ``mma_m16n8k16_f16``) is the warp tier, ``1``/``true`` is the
+# pre-enumeration auto control. These live here (not with the knob) so every
+# layer — the tile passes, the ``ir/tile/ir.py`` scorer, and ``_tile_features``
+# below — shares ONE tier test without importing the pipeline (knob.py has no
+# pipeline deps). ``_enumeration.mma_mode`` delegates to :func:`mma_decode`.
+_MMA_FALSY = frozenset({"0", "false", "no", "off"})
+_MMA_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def mma_decode(raw: str | None) -> tuple[bool, str | None]:
+    """Decode a raw ``MMA`` value into ``(enabled, pinned_kind)``.
+
+    Unset / empty / truthy → ``(True, None)`` (auto-enumerate); falsy →
+    ``(False, None)`` (scalar-only); any other string is an atom-kind name →
+    ``(True, name)``."""
+    if raw is None:
+        return True, None
+    s = raw.strip()
+    if not s or s.lower() in _MMA_TRUTHY:
+        return True, None
+    if s.lower() in _MMA_FALSY:
+        return False, None
+    return True, s
+
+
+def mma_atom(knobs: dict) -> str | None:
+    """The concrete tensor-core atom-kind name carried by ``knobs``, or ``None``
+    for the scalar tier (``MMA`` absent, the ``"0"`` OFF sentinel, any falsy
+    value, or the pre-enumeration ``1``/auto control — none of which name an
+    atom). Value-based, so it is safe once scalar variants carry ``MMA="0"`` (a
+    truthy *string* that the old ``knobs.get("MMA")`` presence/​truthiness checks
+    misread)."""
+    v = knobs.get("MMA")
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in _MMA_FALSY or s.lower() in _MMA_TRUTHY:
+        return None
+    return s
+
+
+def is_warp(knobs: dict) -> bool:
+    """True if ``knobs`` is a warp-tier (tensor-core MMA) variant — i.e. it
+    names a concrete atom kind. The single tier discriminator shared by the tile
+    passes, the scorer, and the featurizer."""
+    return mma_atom(knobs) is not None
+
+
 class KnobType(Enum):
     """Knob value type — drives ``Knob.parse`` and ``Knob.pretty``."""
 
@@ -77,6 +139,15 @@ class Knob:
     # ``knob_features`` needs no per-knob special-casing. ``None`` → encode by
     # ``type`` (INT → float, BOOL → 0/1, BINMASK → popcount/width/frac).
     features: Callable[[Any], dict[str, float]] | None = None
+    # The "unused / declined" OFF value. When a knob doesn't apply to a variant
+    # (a tier-foreign knob like ``WM`` on a scalar kernel) or its owning pass
+    # declines / is skipped, :func:`apply_off_defaults` stamps this value so the
+    # realized variant carries an *explicit* decision rather than an absent key —
+    # letting the learned prior tell "decided: unused" (an OFF value) from
+    # "not-yet-decided" (still absent → NaN-filled). ``_UNSET`` (the default)
+    # means the knob is always stamped by its pass and is never auto-filled
+    # (universal knobs like ``BN`` / ``BM``).
+    off: Any = _UNSET
 
     @property
     def env(self) -> str:
@@ -238,6 +309,27 @@ def reset_registry() -> None:
     _REGISTRY = None
 
 
+def apply_off_defaults(knobs: dict, declared: Iterable[Knob]) -> dict:
+    """Fill any ``declared`` knob with a defined ``off`` value into ``knobs``
+    when it is absent — the "every emitted variant carries an explicit value for
+    every declared knob" rule. Mutates and returns ``knobs``.
+
+    Used in two places: the pipeline stamps a pass's declared OFF knobs on the
+    realized variant at the pass boundary (so a declined / skipped / no-variant
+    pass still records its OFF decision), and the partition planner stamps the
+    tier-foreign knobs (``WM``/``WN``/``MMA`` on a scalar row; ``BM``/``BN``/…
+    on a warp row) on each enumerated row so the OFF value rides the variant
+    identity from enumeration → score → DB → materialized ``TileOp.knobs``.
+    Idempotent: a knob already present (real value *or* a prior OFF fill) is left
+    untouched; knobs whose ``off`` is ``_UNSET`` are never filled."""
+    for knob in declared:
+        if knob.off is _UNSET:
+            continue
+        if knob.name not in knobs:
+            knobs[knob.name] = knob.off
+    return knobs
+
+
 # --- Aggregate env var ------------------------------------------------------
 
 
@@ -320,14 +412,29 @@ def format_tuning_knobs(knobs: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in items) if items else "-"
 
 
+# Tier-foreign knobs hidden from the tuning *display* (not the feature vector,
+# the DB row, or the repro env): a scalar kernel shouldn't show the warp knobs
+# (their OFF sentinels ``WM=0 WN=0 MMA=0``) and a warp kernel shouldn't show the
+# scalar thread-tile knobs (``BM=0 BN=0 BR=0 FK=0``) — those carry OFF values so
+# the learned prior sees them, but rendering them is pure noise in the bench /
+# eval tables. Kept here as plain name sets (knob.py has no pipeline deps); the
+# tier is picked value-based via :func:`is_warp`.
+_WARP_TIER_KNOBS = frozenset({"WM", "WN", "MMA"})
+_SCALAR_TIER_KNOBS = frozenset({"BM", "BN", "BR", "FK"})
+
+
 def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
     """The filtered, canonically-ordered ``(name, str(value))`` tuning knobs —
     the same view :func:`format_tuning_knobs` renders, but as items so callers can
     build aligned columns. ``STRUCT_PREFIX`` / ``CTX_PREFIX`` features and marker
-    booleans are dropped; the rest is sorted by :func:`knob_sort_key`."""
+    booleans are dropped, as are the tier-foreign OFF knobs (warp knobs on a
+    scalar kernel and vice-versa); the rest is sorted by :func:`knob_sort_key`."""
+    foreign = _SCALAR_TIER_KNOBS if is_warp(knobs) else _WARP_TIER_KNOBS
     rendered: list[tuple[str, str]] = []
     for k, v in knobs.items():
         if k.startswith(STRUCT_PREFIX) or k.startswith(CTX_PREFIX):
+            continue
+        if k in foreign:
             continue
         knob = get(k)
         if knob is not None and knob.type is KnobType.BOOL:
@@ -396,9 +503,15 @@ def _tile_features(knobs: dict) -> dict[str, float]:
     rank the goldens well, giving the learned prior the same derived signal
     instead of forcing it to discover the products/ratios from axis-aligned
     splits. Empty unless the core tile knobs (``BN/BM/FM/FN``) are present, so
-    pointwise / non-tiled kernels are unaffected."""
+    pointwise / non-tiled kernels are unaffected. Warp-tier (tensor-core) rows
+    are skipped: these ``D_*`` terms model the *scalar* thread tile (``BN·BM``
+    threads, ``BM·FM × BN·FN`` output), which is meaningless for a warp tile —
+    and now that warp rows carry the ``BM=BN=0`` OFF sentinels (so the old
+    ``KeyError`` guard no longer fires) the gate is what keeps them out."""
     import math  # noqa: PLC0415
 
+    if is_warp(knobs):
+        return {}
     try:
         bn, bm, fm, fn = int(knobs["BN"]), int(knobs["BM"]), int(knobs["FM"]), int(knobs["FN"])
     except (KeyError, TypeError, ValueError):

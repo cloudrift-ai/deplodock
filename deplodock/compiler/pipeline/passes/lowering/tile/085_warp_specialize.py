@@ -111,6 +111,7 @@ WARP_SPECIALIZE = Knob(
     hints=(False, True),
     help="Warp-specialize TMA staging: producer warps issue TMA, consumer warps wait + reduce",
     aliases=("WARP_SPECIALIZE",),
+    off=False,
 )
 
 # v1 — single producer warp on sm_90+ (warp size 32). If WS_PRODUCER_WARPS

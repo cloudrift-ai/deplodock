@@ -50,6 +50,7 @@ ASYNC_COPY = Knob(
     KnobType.BOOL,
     hints=(True, False),
     help="Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). 0 = keep synchronous double-buffer.",
+    off=False,
 )
 
 

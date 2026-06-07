@@ -242,24 +242,34 @@ The return type discriminates the rewrite flavor:
 Raise `RuleSkipped(reason)` to decline a match — the engine logs the
 reason at DEBUG and moves on.
 
-**Knob-stamp invariant.** A knob-owning pass MUST record its decision on every
-non-idempotency path — the chosen value when it acts, an explicit off/default
-when it declines or is gated off (e.g. staging nothing stamps `STAGE` with the
-all-zero mask, an arch-gated TMA stamps `TMA=False`, a no-fit ring stamps
-`RING=1`). It must NOT `RuleSkipped` *without* stamping — the only
-`RuleSkipped` a knob pass keeps is the idempotency guard (`if KNOB.name in
-op.knobs`), which means the knob is already present. So a non-acting pass returns
-`replace(op, knobs={**op.knobs, KNOB: <off>})` (body unchanged), which the
-knob-merge carries forward and which the idempotency guard then short-circuits on
-the re-scan. The reason: realized configs must carry a **complete, uniform** knob
-set, because the learned prior (`knob.knob_features`) 0-fills absent feature
-columns — an absent knob is then indistinguishable from one explicitly set to
-off, conflating "the deciding pass hasn't run" with "decided off" and letting
-optimistic value-of-position branch rows drag the greedy pick onto degenerate
-all-default configs. Branch (partial-prefix) rows stay partial by design — that
-is the correct value-of-position descent signal — and no longer mislead, because
-no realized leaf lands in the partial region. Verified end-to-end by
-`tests/compiler/passes/test_knob_stamp_invariant.py`.
+**Knob-stamp invariant.** Every emitted variant carries an **explicit value for
+every declared knob** — no realized leaf has an absent knob. This is enforced
+declaratively: each `Knob` declares an `off` value (its "unused / declined"
+sentinel — `TMA.off=False`, `RING.off=1`, the tier-foreign `WM.off=WN.off=0`,
+`MMA.off="0"`, `BM.off=BN.off=BR.off=FK.off=0`), and the pipeline fills any of a
+pass's declared knobs the variant left unspecified at the **pass boundary**
+(`Cursor.advance` → `_off_fill_pass`, via `knob.apply_off_defaults`) — covering a
+pass that acted, declined, was skipped, or returned no variants alike. `Pass.load`
+discovers a pass's declared knobs by scanning its rule modules' `vars()` (so an
+imported knob, like the planner's `_enumeration` tier set, counts). Scoping the
+fill to the just-finished pass avoids prematurely stamping a *later* pass's knob
+(which would trip that pass's `if KNOB.name in op.knobs` idempotency guard). The
+partition planner additionally OFF-fills its tier knobs **at enumeration** (in
+`_enumeration`'s two impls) so the sentinel rides the variant identity from the
+fork-tree keys + score input through to `TileOp.knobs` and the DB — the value the
+prior is *queried* on during greedy descent matches the value it's *trained* on.
+
+The reason it matters: the learned prior (`knob.knob_features`) NaN-fills absent
+feature columns. With explicit OFF values, NaN now means **only** "not-yet-decided"
+(a partial fork prefix during descent), distinct from "decided: unused" (an OFF
+value on a complete leaf) — the prior no longer conflates a tier-foreign knob with
+an undecided one and is no longer dragged onto degenerate all-default configs. A
+knob with no `off` (the `_UNSET` default — universal knobs like `BN`/`BM` always
+set by their pass) is never auto-filled. `BINMASK` `STAGE` keeps stamping its own
+width-correct all-zero off mask (a static OFF can't encode the per-kernel width).
+Tier discrimination is value-based throughout (`knob.is_warp` / `knob.mma_atom`,
+since a scalar leaf now carries the truthy *string* `MMA="0"`). Verified
+end-to-end by `tests/compiler/passes/test_knob_stamp_invariant.py`.
 
 A rewrite that *returns* an op which fails `Op.validate(ctx)` (e.g. a
 `100_materialize_tile` `KernelOp` whose smem exceeds `ctx.max_dynamic_smem`)

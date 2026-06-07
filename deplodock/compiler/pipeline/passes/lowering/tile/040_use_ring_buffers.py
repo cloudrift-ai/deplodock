@@ -32,7 +32,7 @@ from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import SerialTile, StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -49,6 +49,7 @@ BUFFER_COUNT = Knob(
     hints=(2, 3, 4),
     help="Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops",
     aliases=("BUFFER_COUNT",),
+    off=1,  # single buffer = no ring (the value 040 already stamps when no ring fits)
 )
 
 
@@ -141,7 +142,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # deepest 2-block ring — right for scalar / 128×128, but here it picks a
     # depth that disqualifies the better WS kernel). The autotuner still sees
     # every depth.
-    if "MMA" in root.op.knobs:
+    if is_warp(root.op.knobs):
         variants.sort(key=lambda bv: (bv[0] != 2, bv[0]))
         return [v for _, v in variants]
 

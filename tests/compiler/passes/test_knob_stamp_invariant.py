@@ -102,10 +102,11 @@ def test_buffer_count_fallback_when_nothing_fits():
 # --- holistic: a compiled matmul leaf carries every knob ---------------------
 
 # Knobs every matmul TileOp must carry after lowering — the planner's tile
-# geometry plus every staging / transport / structural decision. (MMA / WM / WN
-# are tensor-core-path only, so they're not in this scalar-fp32 universal set.)
+# geometry plus every staging / transport / structural decision. The tensor-core
+# tier knobs (MMA / WM / WN) are now mandatory too: a scalar-fp32 leaf carries
+# their OFF sentinels (MMA="0", WM=WN=0), so the universal set is tier-complete.
 _TILE_KNOBS = {
-    "BM", "BN", "BK", "BR", "FM", "FN", "FK", "SPLITK",
+    "BM", "BN", "BK", "BR", "FM", "FN", "FK", "SPLITK", "WM", "WN", "MMA",
     "STAGE", "GROUP_M", "NOATOMIC", "HOIST_COMPUTE",
     "RING", "TMA", "ASYNC_COPY", "PAD_SMEM", "PIPELINE_STAGES", "WARPSPEC",
 }  # fmt: skip
@@ -136,3 +137,8 @@ def test_compiled_matmul_leaf_has_complete_knob_set():
     knobs = _matmul_kernel_knobs(out)
     missing = (_TILE_KNOBS | _KERNEL_MARKERS) - set(knobs)
     assert not missing, f"matmul leaf missing knobs: {sorted(missing)} (has {sorted(knobs)})"
+    # The fp32 scalar leaf carries the warp-tier knobs as explicit OFF sentinels
+    # (not absent) — that explicitness is the whole point of the knob.off rule.
+    assert knobs["MMA"] == "0"
+    assert knobs["WM"] == 0
+    assert knobs["WN"] == 0

@@ -56,9 +56,13 @@ class CatBoostPrior(Prior):
         missing-value handling (``nan_mode="Min"``) can split "this knob isn't
         present on this row" off from a knob that is present *and* legitimately
         zero (a BOOL ``False`` → ``0.0``, ``STAGE="00"`` → ``popcount 0.0``).
-        With a 0-fill those two collapsed to the same coordinate; ``NaN`` keeps
-        them distinct (cross-op missing knobs — ``MMA`` on an fp32 row — and the
-        partial-prefix descent rows are the cases that differ). Non-positive
+        Since every *realized leaf* now stamps every declared knob (tier-foreign
+        knobs get an explicit OFF value via ``knob.apply_off_defaults`` — see the
+        knob-stamp invariant), an absent feature means **only** "not-yet-decided"
+        — a partial fork-prefix row scored / collected mid-descent (``_node_knobs``).
+        ``NaN`` keeps that distinct from a decided-unused OFF value (``WM=0`` /
+        ``MMA="0"`` → ``MMA_tier=0``), which a 0-fill would have collapsed onto a
+        present-and-zero knob. Non-positive
         labels (a stale pre-latency checkpoint stored log-reward rows) are
         dropped so ``log`` never sees a non-positive latency — rebuild such a
         prior with ``tune --clean``."""

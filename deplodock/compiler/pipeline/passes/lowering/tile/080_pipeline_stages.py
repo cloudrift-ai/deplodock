@@ -97,6 +97,7 @@ PIPELINE_STAGES = Knob(
     KnobType.BOOL,
     hints=(True, False),
     help="Software-pipeline async-staged K-outer loops into prologue/main/epilogue. 0 = keep the depth-1 staged loop.",
+    off=False,
 )
 
 

@@ -71,6 +71,7 @@ HOIST_COMPUTE = Knob(
         "True — keep the multi-source transport bundle and attach a StageBundle.compute "
         "phase so the cone chain runs once per cell instead of per (N) thread per K_i. Autotune fork."
     ),
+    off=False,
 )
 
 

@@ -5,7 +5,17 @@ from __future__ import annotations
 import pytest
 
 import deplodock.compiler.pipeline.knob as knob_mod
-from deplodock.compiler.pipeline.knob import Knob, KnobType, apply_knobs_env, format_tuning_knobs, knob_features
+from deplodock.compiler.pipeline.knob import (
+    Knob,
+    KnobType,
+    apply_knobs_env,
+    apply_off_defaults,
+    format_tuning_knobs,
+    is_warp,
+    knob_features,
+    mma_atom,
+    mma_decode,
+)
 
 
 def test_int_parse():
@@ -148,6 +158,58 @@ def test_narrow_reads_alias(monkeypatch):
     monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
     monkeypatch.setenv("DEPLODOCK_OLDNAME", "8")
     assert k.narrow((1, 2)) == (8,)
+
+
+# ---------------------------------------------------------------------------
+# OFF defaults + tier (is_warp / mma_atom)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_off_defaults_fills_only_unspecified_off_knobs():
+    """``apply_off_defaults`` stamps a declared knob's ``off`` when absent, leaves
+    present values (incl. a prior OFF fill) untouched, and never fills a knob
+    whose ``off`` is unset (the default)."""
+    wm = Knob("WM", KnobType.INT, off=0)
+    bk = Knob("BK", KnobType.INT)  # no off → never auto-filled
+    knobs = {"BK": 64}
+    apply_off_defaults(knobs, [wm, bk])
+    assert knobs == {"BK": 64, "WM": 0}  # WM filled to off, BK untouched (no off)
+    # Idempotent + respects a present (non-OFF) value.
+    knobs2 = {"WM": 2, "BK": 64}
+    apply_off_defaults(knobs2, [wm, bk])
+    assert knobs2 == {"WM": 2, "BK": 64}
+
+
+def test_mma_decode_value_semantics():
+    """``mma_decode`` maps unset/empty/truthy → auto, falsy → scalar-only, an
+    atom name → pinned warp."""
+    assert mma_decode(None) == (True, None)
+    assert mma_decode("") == (True, None)
+    assert mma_decode("1") == (True, None)
+    assert mma_decode("0") == (False, None)
+    assert mma_decode("false") == (False, None)
+    assert mma_decode("mma_m16n8k16_f16") == (True, "mma_m16n8k16_f16")
+
+
+def test_is_warp_and_mma_atom_tier_discriminator():
+    """The ``"0"`` OFF sentinel (and absent / falsy / auto) read as scalar; only a
+    concrete atom name is the warp tier. Guards the truthy-string footgun: the
+    old ``knobs.get("MMA")`` check misread ``"0"`` as warp."""
+    assert not is_warp({}) and mma_atom({}) is None
+    assert not is_warp({"MMA": "0"}) and mma_atom({"MMA": "0"}) is None
+    assert not is_warp({"MMA": "1"})  # pre-enumeration auto control, not an atom
+    assert is_warp({"MMA": "mma_m16n8k16_f16"})
+    assert mma_atom({"MMA": "mma_m16n8k16_f16"}) == "mma_m16n8k16_f16"
+
+
+def test_tile_features_skipped_for_warp_tier():
+    """``knob_features`` emits the engineered ``D_*`` scalar-tile features for a
+    scalar row but skips them for a warp row (whose ``BM``/``BN`` are OFF=0) —
+    those terms model the scalar thread tile only."""
+    scalar = {"BN": 32, "BM": 8, "FM": 4, "FN": 2, "MMA": "0", "WM": 0, "WN": 0}
+    warp = {"BN": 0, "BM": 0, "FM": 2, "FN": 2, "MMA": "mma_m16n8k16_f16", "WM": 2, "WN": 2}
+    assert any(k.startswith("D_") for k in knob_features(scalar))
+    assert not any(k.startswith("D_") for k in knob_features(warp))
 
 
 # ---------------------------------------------------------------------------
@@ -297,9 +359,11 @@ def test_format_tuning_knobs_skips_struct():
 
 def test_format_tuning_knobs_canonical_order():
     """Knobs render in canonical tile-geometry order (``KNOB_ORDER``), not
-    alphabetical — shared with the ``deplodock eval`` golden tables."""
-    out = format_tuning_knobs({"SPLITK": 1, "BN": 32, "BM": 8, "BK": 64, "MMA": "x", "FM": 4})
-    assert out == "BM=8, BN=32, BK=64, FM=4, SPLITK=1, MMA=x"
+    alphabetical — shared with the ``deplodock eval`` golden tables. (Uses a
+    tier-consistent warp dict so the tier-foreign display filter doesn't drop
+    anything — a warp variant carries WM/WN/MMA, not BM/BN.)"""
+    out = format_tuning_knobs({"SPLITK": 1, "WN": 4, "WM": 2, "BK": 64, "MMA": "x", "FM": 4})
+    assert out == "BK=64, FM=4, WM=2, WN=4, SPLITK=1, MMA=x"
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):

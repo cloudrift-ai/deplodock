@@ -141,6 +141,7 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     BM,
     BN,
@@ -280,7 +281,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     return build_fork_tree(
         params=plan.params,
         levels=[
-            Level((MMA.name,), lambda p: (p["MMA"],) if "MMA" in p else ()),
+            Level((MMA.name,), lambda p: (p["MMA"],) if is_warp(p) else ()),
             Level((BR.name,), lambda p: (p.get("BR", 1),)),
             Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
             Level((WM.name, WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
@@ -863,7 +864,7 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     :func:`_build_split_body_warp` (M3); the rest of this function handles
     the scalar tier.
     """
-    if "MMA" in params:
+    if is_warp(params):
         return _build_split_body_warp(shape, params)
     sigma_map: dict[str, object] = {}
 

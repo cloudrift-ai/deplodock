@@ -40,6 +40,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.pipeline import knob
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 if TYPE_CHECKING:
@@ -73,14 +74,16 @@ _MAX_CELLS_PER_THREAD: int = 128
 
 # Scalar-tier knobs (THREAD-binding). MMA warp-tier rows don't carry these —
 # their per-axis warp count lives on WM/WN below.
-BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)")
-BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)")
-BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)")
-# Warp-tier knobs (WARP-binding, MMA matmul only). Plumbed at M1; populated
-# with real choices in M3 when the warp enumerator goes live.
+# ``off=0`` on the THREAD-binding knobs: a warp-tier row has no scalar thread
+# tile, so the planner stamps the OFF sentinel 0 (see ``apply_off_defaults``).
+BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (matmul output N tile)", off=0)
+BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (matmul output M tile)", off=0)
+BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)", off=0)
+# Warp-tier knobs (WARP-binding, MMA matmul only); ``off=0`` is the scalar-tier
+# OFF sentinel (a scalar row has no warp grid).
 _TUNE_WARP_AXIS_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
-WN = Knob("WN", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA innermost WARP count along matmul output N")
-WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WARP count along matmul output M")
+WN = Knob("WN", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA innermost WARP count along matmul output N", off=0)
+WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WARP count along matmul output M", off=0)
 
 
 def _mma_features(mma: object) -> dict[str, float]:
@@ -115,30 +118,16 @@ MMA = Knob(
     help="Warp-tier MMA control: 0 = scalar-only; 1/true (default) = auto-enumerate; hardware matmul atom kind (MMA/wgmma/...)",
     aliases=("ATOM_KIND",),
     features=_mma_features,
+    off="0",  # scalar-tier OFF sentinel — ``mma_decode("0") == (False, None)``
 )
-
-_MMA_FALSY = frozenset({"0", "false", "no", "off"})
-_MMA_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def mma_mode() -> tuple[bool, str | None]:
-    """Decode the ``MMA`` knob into ``(enabled, pinned_kind)``.
-
-    Unset / empty / truthy → ``(True, None)`` (auto-enumerate, the default);
-    falsy → ``(False, None)`` (scalar-only); any other string is an atom-kind
-    name → ``(True, name)``. A name the registry doesn't know simply narrows
-    the eligible atoms to nothing and the warp tier falls to scalar. Reads
-    through :meth:`Knob.raw`, so the ``ATOM_KIND`` alias spelling decodes
-    identically."""
-    raw = MMA.raw()
-    if raw is None:
-        return True, None
-    s = raw.strip()
-    if not s or s.lower() in _MMA_TRUTHY:
-        return True, None
-    if s.lower() in _MMA_FALSY:
-        return False, None
-    return True, s
+    """Decode the ``MMA`` knob env pin into ``(enabled, pinned_kind)`` — a thin
+    wrapper over :func:`deplodock.compiler.pipeline.knob.mma_decode` reading
+    through :meth:`Knob.raw` (so the ``ATOM_KIND`` alias spelling decodes
+    identically). See ``mma_decode`` for the value semantics."""
+    return knob.mma_decode(MMA.raw())
 
 
 # Tier-shared knobs (same arithmetic role in both scalar and warp tiers).
@@ -148,7 +137,9 @@ FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells 
 # accumulators strip-mine the K (reduce) axis for multiple-accumulator ILP —
 # see ``plans/fk-register-tile-reductions.md``. Matmul gets the same win
 # through FM/FN replicating output cells, so it keeps FK=1.
-FK = Knob("FK", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread independent accumulators along the reduce (K) axis (1 = single)")
+FK = Knob(
+    "FK", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread independent accumulators along the reduce (K) axis (1 = single)", off=0
+)
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 
@@ -176,22 +167,30 @@ def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
 
 # A planner variant row IS its knob dict — the exact keys the materialized
 # TileOp will carry (the planner merges it over the LoopOp's carry-forward
-# knobs when stamping / scoring):
+# knobs when stamping / scoring). Each impl tier sets its own knobs, then both
+# return through ``apply_off_defaults(row, _PLANNER_KNOBS)`` so EVERY row carries
+# the full planner set — the tier-foreign knobs get an explicit OFF sentinel
+# rather than being absent:
 #
-#   scalar tier  {BN, BM, FM, FN, FK, BK, SPLITK, BR}
+#   scalar tier  real {BN, BM, FM, FN, FK, BK, SPLITK, BR} + OFF {WN=WM=0, MMA="0"}
 #                (+ ``FKWIN``: the fp16 half2 accumulation-window length —
 #                disambiguates window ``FK`` from the reduce strip-mine, see
 #                ``plans/fk-half2-fp16-matmul.md``; + ``OVERHANG``: tuple of
-#                masked output-axis names for non-divisor tiles)
-#   warp tier    {WN, WM, FM, FN, BK, SPLITK, MMA}
-#                (``"MMA" in row`` discriminates the tier; the ``Atom`` spec
-#                is ``ATOM_REGISTRY[row["MMA"]]``)
+#                masked output-axis names for non-divisor tiles — both stay
+#                conditional, no OFF)
+#   warp tier    real {WN, WM, FM, FN, BK, SPLITK, MMA} + OFF {BM=BN=BR=FK=0}
+#                (``knob.is_warp(row)`` discriminates the tier — value-based, since
+#                a scalar row now carries ``MMA="0"``; the ``Atom`` spec is
+#                ``ATOM_REGISTRY[knob.mma_atom(row)]``)
 #
 # There is deliberately no row class: one representation flows end-to-end —
 # enumeration → fork-tree levels → ``TileOp.lazy_score`` → body builder →
 # ``TileOp.knobs`` → DB rows — so any recorded knob dict is directly
-# scoreable and materializable. De-dup inside the impls keys on
-# ``frozenset(row.items())``.
+# scoreable and materializable. The OFF fill makes that identity tier-complete,
+# so the learned prior reads "decided: unused" (an OFF value) distinctly from
+# "not-yet-decided" (a knob still absent on a partial fork prefix → NaN). De-dup
+# inside the impls keys on ``frozenset(row.items())`` (before the OFF fill, which
+# adds the same keys to every row of a tier — no new collisions).
 
 
 def _matmul_thread_gate(r: dict) -> bool:
@@ -772,6 +771,13 @@ def _enumerate_cartesian_impl(
                                     ordered.append(params)
 
     ordered.sort(key=priority_fn, reverse=True)
+    # Stamp the OFF sentinel for every planner knob a scalar/reduce/pointwise row
+    # didn't set — the warp-tier ``WM``/``WN``/``MMA``. Done here (the single row
+    # producer) so every consumer — the planner fork tree, the heuristic, and
+    # ``eval`` — sees the same complete variant identity, and the learned prior
+    # reads an explicit "unused" value rather than an absent (NaN) feature.
+    for row in ordered:
+        knob.apply_off_defaults(row, _PLANNER_KNOBS)
     return ordered
 
 
@@ -893,4 +899,9 @@ def _enumerate_warp_matmul_impl(
                                 )
 
     out.sort(key=lambda p: _priority_matmul_warp(p, ctx=ctx, E_M=E_M, E_N=E_N, E_K=E_K), reverse=True)
+    # OFF-fill the scalar-tier knobs (``BM``/``BN``/``BR``/``FK``) a warp row
+    # never sets — symmetric with the scalar impl above so warp variants carry
+    # the full planner knob set too.
+    for row in out:
+        knob.apply_off_defaults(row, _PLANNER_KNOBS)
     return out

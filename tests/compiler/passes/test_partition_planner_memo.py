@@ -23,7 +23,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import fork as fork_mod
 from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
-from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
+from deplodock.compiler.pipeline.knob import STRUCT_PREFIX, is_warp
 from deplodock.compiler.tensor import Tensor
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
@@ -100,7 +100,7 @@ def _build_tree(plan, ctx: Context) -> Fork:
     return build_fork_tree(
         params=plan.params,
         levels=[
-            Level((_planner.MMA.name,), lambda p: (p["MMA"],) if "MMA" in p else ()),
+            Level((_planner.MMA.name,), lambda p: (p["MMA"],) if is_warp(p) else ()),
             Level((BR.name,), lambda p: (p.get("BR", 1),)),
             Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
             Level((_planner.WM.name, _planner.WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),

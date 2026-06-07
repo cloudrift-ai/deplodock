@@ -117,6 +117,7 @@ INTERLEAVE_LOADS = Knob(
     KnobType.BOOL,
     hints=(True,),  # on by default; not a search dimension — manual override only via the env var
     help="Sink each Load to just before its first SSA-consumer in flat compute blocks.",
+    off=False,
 )
 
 

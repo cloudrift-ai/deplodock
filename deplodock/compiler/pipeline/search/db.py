@@ -115,7 +115,11 @@ class SearchDB:
     # Version log:
     #   1: M9.4 — planner-hoisted FM / FN / BN / BM forks. Parent-tree
     #       topology shifted vs. the legacy downstream forks.
-    _SCHEMA_VERSION = 1
+    #   2: explicit-knob OFF sentinels — every variant now stamps every planner
+    #       knob (tier-foreign ones get an OFF value: WM/WN/MMA on scalar,
+    #       BM/BN/BR/FK on warp), so ``op_cache_key`` (which folds the knob dict)
+    #       shifts for every TileOp/KernelOp. Stale ``lowering`` rows won't match.
+    _SCHEMA_VERSION = 2
 
     _SCHEMA = [
         """

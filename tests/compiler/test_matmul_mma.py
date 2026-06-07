@@ -22,6 +22,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+from deplodock.compiler.pipeline.knob import is_warp
 
 from .conftest import requires_cuda
 
@@ -208,7 +209,9 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("MMA") is None, "MMA variant should not be emitted when DEPLODOCK_MMA=0"
+    # Scalar fallback: the leaf carries the MMA OFF sentinel ("0"), not a real
+    # atom kind — ``is_warp`` is False (no warp-tier variant emitted).
+    assert not is_warp(kop.knobs) and kop.knobs.get("MMA") == "0", "warp variant should not be emitted when DEPLODOCK_MMA=0"
     # Scalar path should stamp BN/BM.
     assert "BN" in kop.knobs and "BM" in kop.knobs
 

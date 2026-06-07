@@ -56,6 +56,7 @@ GROUP_M = Knob(
     KnobType.INT,
     hints=(1, 2, 4, 8, 16),
     help="CTA-swizzle row-group size (1 = disable; renderer falls back to row-major decode)",
+    off=1,  # 1 = no swizzle (row-major decode)
 )
 _GROUP_M_DEFAULT = 8
 
@@ -105,8 +106,10 @@ def _is_matmul(op: TileOp) -> bool:
     partition planner.
 
     The planner stamps ``BK`` / ``BR`` for every kernel: matmul kernels
-    have ``BK > 1`` (per-stage K-chunk) and ``BR == 1`` (no cooperative
-    thread reduction). Pointwise kernels stamp ``BK == 1`` (no K loop);
+    have ``BK > 1`` (per-stage K-chunk) and no cooperative thread reduction —
+    scalar matmuls stamp ``BR == 1``, warp-tier (MMA) matmuls carry the
+    ``BR == 0`` OFF sentinel (cooperative-K doesn't apply to the warp grid), so
+    ``BR <= 1`` covers both. Pointwise kernels stamp ``BK == 1`` (no K loop);
     cooperative-reduce kernels stamp ``BR > 1``. SDPA's fused-prologue
     matmul matches this signature too — out of scope for the first cut,
     so we additionally require ``SPLITK == 1`` since the planner forces
@@ -115,7 +118,7 @@ def _is_matmul(op: TileOp) -> bool:
     """
     bk = op.knobs.get("BK", 1)
     br = op.knobs.get("BR", 1)
-    return bk > 1 and br == 1
+    return bk > 1 and br <= 1
 
 
 def _stamp_top_grid(body: Body, group_m: int) -> tuple[Body, bool]:

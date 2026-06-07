@@ -87,6 +87,7 @@ PAD_SMEM = Knob(
         "leaves the slab dense. Variants are only emitted when at least one Source "
         "actually benefits."
     ),
+    off=False,
 )
 
 

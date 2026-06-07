@@ -94,7 +94,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.stmt import Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     loads_reading,
     parallel_tile_of,
@@ -116,6 +116,7 @@ PERMUTE_LANES = Knob(
     KnobType.BOOL,
     hints=(True,),
     help="Spread each lane's LDS.128 chunks across the N-tile to break the FN>V stride-FN bank conflict.",
+    off=False,
 )
 
 
@@ -134,7 +135,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
 
     if not PERMUTE_LANES.narrow((True,))[0]:
         return _off()
-    if knobs.get("MMA"):
+    if is_warp(knobs):
         # MMA path: the s16816 ``ldmatrix`` consumer applies its own per-lane
         # swizzle XOR — the per-thread LDS.128 permute doesn't apply. Skip per
         # plans/mma-fragment-factorization.md M7.

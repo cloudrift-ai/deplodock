@@ -44,7 +44,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import find_split_k_axis_name
 from deplodock.compiler.tensor import Tensor
 
@@ -59,6 +59,7 @@ ATOMIC_FREE_SPLITK = Knob(
     hints=(False, True),
     help="Replace SPLITK > 1's atomicAdd output with a workspace + sibling reduce kernel",
     aliases=("ATOMIC_FREE_SPLITK",),
+    off=False,
 )
 
 # Fixed schedule for the reduce TileOp — bandwidth-bound at any
@@ -278,7 +279,7 @@ def rewrite(ctx: Context, match: Match, root: Node) -> list[TileOp | Graph] | No
         unchanged, so the realized config keeps a uniform knob set."""
         return TileOp(body=op.body, name=op.name, knobs={**op.knobs, ATOMIC_FREE_SPLITK.name: False})
 
-    if op.knobs.get("MMA"):
+    if is_warp(op.knobs):
         # MMA path: fragment-accumulation; the C-fragment Write isn't a
         # scalar Write we can rewire here, and split-K on MMA stays on
         # the codegen-derived atomic rewrite path.

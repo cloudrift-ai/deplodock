@@ -10,6 +10,7 @@ and that the priority keeps ``FK=1`` first so the greedy default is unchanged.
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     _MAX_CELLS_PER_THREAD,
     enumerate_cartesian,
@@ -26,7 +27,7 @@ def test_reduce_sweeps_fk_above_one():
     """A reduce with a chunkable K (per-thread K-chunk count > 1) surfaces
     FK > 1 variants in the enumeration."""
     combos = _reduce(e_k=2048)
-    fks = {p["FK"] for p in combos if "MMA" not in p}
+    fks = {p["FK"] for p in combos if not is_warp(p)}
     assert fks - {1}, f"reduce enumeration produced no FK>1 variant; saw {sorted(fks)}"
 
 
@@ -34,7 +35,7 @@ def test_fk_divides_k_o_ext():
     """Every emitted FK divides the per-thread serial-loop extent
     (K_o_ext = E_K // (splitk·br·bk·fk) must be a whole number)."""
     for p in _reduce(e_k=2048):
-        assert "MMA" not in p, f"reduce enumeration must stay scalar-tier: {p}"
+        assert not is_warp(p), f"reduce enumeration must stay scalar-tier: {p}"
         k_chunks_per_thread = (2048 // p["BR"]) // p["BK"]  # the extent FK strip-mines
         assert k_chunks_per_thread % p["FK"] == 0, f"FK={p['FK']} does not divide K_o_ext for {p}"
 
