@@ -106,8 +106,8 @@ def test_buffer_count_fallback_when_nothing_fits():
 # are tensor-core-path only, so they're not in this scalar-fp32 universal set.)
 _TILE_KNOBS = {
     "BM", "BN", "BK", "BR", "FM", "FN", "FK", "SPLITK",
-    "STAGE", "GROUP_M", "ATOMIC_FREE_SPLITK", "HOIST_COMPUTE",
-    "BUFFER_COUNT", "TMA", "ASYNC_COPY", "PAD_SMEM", "PIPELINE_STAGES", "WARP_SPECIALIZE",
+    "STAGE", "GROUP_M", "NOATOMIC", "HOIST_COMPUTE",
+    "RING", "TMA", "ASYNC_COPY", "PAD_SMEM", "PIPELINE_STAGES", "WARPSPEC",
 }  # fmt: skip
 _KERNEL_MARKERS = {"VECTORIZE_LOADS", "INTERLEAVE_LOADS", "PERMUTE_LANES"}
 

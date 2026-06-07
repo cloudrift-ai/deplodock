@@ -295,7 +295,7 @@ apply_knobs_env()
 # tile, split, pipeline), then everything else alphabetically. Shared by the
 # ``run --bench`` kernel table and the ``deplodock eval`` golden tables so knob
 # columns read in a stable, comparable order everywhere.
-KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "BUFFER_COUNT", "STAGE", "MMA")
+KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 

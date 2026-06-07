@@ -26,7 +26,6 @@ Idempotence: any K_o whose bundles are already non-SYNC is left alone.
 
 from __future__ import annotations
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Literal, Var
@@ -45,10 +44,11 @@ PATTERN = [Pattern("root", TileOp)]
 # the bundle (no separate PIPE knob — ring depth and pipeline depth are coupled
 # by construction in CUTLASS-style multistage matmul).
 BUFFER_COUNT = Knob(
-    "BUFFER_COUNT",
+    "RING",
     KnobType.INT,
     hints=(2, 3, 4),
     help="Ring-buffer depth (and pipeline stages) for BUFFERED/ASYNC/TMA staged K-outer loops",
+    aliases=("BUFFER_COUNT",),
 )
 
 
@@ -67,7 +67,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # all gate on a BUFFERED/ASYNC/TMA bundle) — kernel runs as plain
     # SYNC with no staging benefit, looks ~50 % slower than the auto
     # variant. Surface the constraint instead of swallowing it.
-    pinned = config.knob_raw(BUFFER_COUNT.name) is not None
+    pinned = BUFFER_COUNT.raw() is not None
     # Real per-buffer element bytes, keyed by gmem source name. At this tile-stage
     # ``Source.dtype`` is unstamped (``030_stamp_types`` is a downstream kernel
     # pass), so ``Source.smem_bytes`` falls back to the fp32-assuming
@@ -99,7 +99,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     if not variants:
         msg = "; ".join(fail_reasons) if fail_reasons else "no candidate fit"
         if pinned:
-            raise ValueError(f"DEPLODOCK_BUFFER_COUNT={candidates[0]} pinned but cannot fire: {msg}")
+            raise ValueError(f"{BUFFER_COUNT.env}={candidates[0]} pinned but cannot fire: {msg}")
         # No buffered ring fits (smem cap / K-outer extent / no eligible SYNC
         # bundle). Record the declined decision as BUFFER_COUNT=1 (single buffer
         # = no ring) on the unchanged SYNC body so the realized config carries a

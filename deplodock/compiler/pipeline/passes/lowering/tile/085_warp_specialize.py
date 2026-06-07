@@ -81,7 +81,6 @@ the fork via ``WARP_SPECIALIZE.narrow``.
 
 from __future__ import annotations
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Node
@@ -107,10 +106,11 @@ PATTERN = [Pattern("root", TileOp)]
 
 
 WARP_SPECIALIZE = Knob(
-    "WARP_SPECIALIZE",
+    "WARPSPEC",
     KnobType.BOOL,
     hints=(False, True),
     help="Warp-specialize TMA staging: producer warps issue TMA, consumer warps wait + reduce",
+    aliases=("WARP_SPECIALIZE",),
 )
 
 # v1 — single producer warp on sm_90+ (warp size 32). If WS_PRODUCER_WARPS
@@ -372,9 +372,9 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
         # — ``no ThreadTile in body``, WS+MMA is out of v1 scope). A
         # pinned-but-unhonorable knob raises — same policy as the BUFFER_COUNT /
         # TMA pins.
-        pin = config.knob_raw(WARP_SPECIALIZE.name)
+        pin = WARP_SPECIALIZE.raw()
         if pin is not None and WARP_SPECIALIZE.parse(pin):
-            raise ValueError(f"DEPLODOCK_WARP_SPECIALIZE=1 pinned but warp specialization cannot fire: {reason}")
+            raise ValueError(f"{WARP_SPECIALIZE.env}=1 pinned but warp specialization cannot fire: {reason}")
         # Ineligible (not pinned on) — record the off decision (body unchanged) so
         # the realized config keeps a uniform knob set instead of leaving it absent.
         return TileOp(body=op.body, name=op.name, knobs={**op.knobs, WARP_SPECIALIZE.name: False})

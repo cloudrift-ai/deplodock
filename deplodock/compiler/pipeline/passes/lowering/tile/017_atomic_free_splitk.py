@@ -54,10 +54,11 @@ PATTERN = [Pattern("root", TileOp)]
 # (False) and the two-kernel atomic-free path (True). Per-shape pin via
 # ``DEPLODOCK_ATOMIC_FREE_SPLITK=1`` for deterministic A/B benches.
 ATOMIC_FREE_SPLITK = Knob(
-    "ATOMIC_FREE_SPLITK",
+    "NOATOMIC",
     KnobType.BOOL,
     hints=(False, True),
     help="Replace SPLITK > 1's atomicAdd output with a workspace + sibling reduce kernel",
+    aliases=("ATOMIC_FREE_SPLITK",),
 )
 
 # Fixed schedule for the reduce TileOp — bandwidth-bound at any

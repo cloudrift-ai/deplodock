@@ -148,13 +148,13 @@ def test_pinned_ws1_on_ineligible_fails_loudly(monkeypatch):
     pin the same op RuleSkips cleanly (see ``test_rule_skipped_on_pointwise``)."""
     monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
     op = _tile_op_pointwise()
-    with pytest.raises(ValueError, match="WARP_SPECIALIZE=1 pinned but warp specialization cannot fire"):
+    with pytest.raises(ValueError, match="WARPSPEC=1 pinned but warp specialization cannot fire"):
         _run_rule(op)
 
 
 def test_rule_skipped_when_ws_already_set():
     op = _tile_op_tma_pipelined()
-    op_with_ws = TileOp(body=op.body, name=op.name, knobs={"WARP_SPECIALIZE": True})
+    op_with_ws = TileOp(body=op.body, name=op.name, knobs={"WARPSPEC": True})
     with pytest.raises(RuleSkipped, match="WARP_SPECIALIZE knob already set"):
         _run_rule(op_with_ws)
 
@@ -164,7 +164,7 @@ def test_emits_two_child_fork_on_tma_pipelined():
     result = _run_rule(op)
     assert isinstance(result, list), f"expected list[Fork], got {type(result).__name__}"
     assert len(result) == 2, f"expected 2 forks, got {len(result)}"
-    knob_values = sorted(f.knobs["WARP_SPECIALIZE"] for f in result)
+    knob_values = sorted(f.knobs["WARPSPEC"] for f in result)
     assert knob_values == [False, True]
     for fork in result:
         assert isinstance(fork, Fork)
@@ -173,7 +173,7 @@ def test_emits_two_child_fork_on_tma_pipelined():
         children = fork.expand()
         assert len(children) == 1
         assert isinstance(children[0], TileOp)
-        assert children[0].knobs["WARP_SPECIALIZE"] == fork.knobs["WARP_SPECIALIZE"]
+        assert children[0].knobs["WARPSPEC"] == fork.knobs["WARPSPEC"]
 
 
 def test_env_pin_narrows_to_single_choice(monkeypatch):
@@ -182,7 +182,7 @@ def test_env_pin_narrows_to_single_choice(monkeypatch):
     result = _run_rule(op)
     # Single-choice short-circuit: return a bare TileOp, not a Fork list.
     assert isinstance(result, TileOp)
-    assert result.knobs["WARP_SPECIALIZE"] is True
+    assert result.knobs["WARPSPEC"] is True
 
 
 def test_env_pin_zero_returns_bare_tileop(monkeypatch):
@@ -190,7 +190,7 @@ def test_env_pin_zero_returns_bare_tileop(monkeypatch):
     op = _tile_op_tma_pipelined()
     result = _run_rule(op)
     assert isinstance(result, TileOp)
-    assert result.knobs["WARP_SPECIALIZE"] is False
+    assert result.knobs["WARPSPEC"] is False
 
 
 def test_warp_tier_ws1_sets_consumer_is_warp(monkeypatch):
@@ -218,7 +218,7 @@ def test_warp_tier_pinned_ws1_eligible_does_not_raise(monkeypatch):
     op = _tile_op_warp_tma_pipelined()
     result = _run_rule(op)  # must not raise
     assert isinstance(result, TileOp)
-    assert result.knobs["WARP_SPECIALIZE"] is True
+    assert result.knobs["WARPSPEC"] is True
 
 
 # ---------------------------------------------------------------------------
