@@ -34,12 +34,22 @@ from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from deplodock import config
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
 from deplodock.compiler.pipeline.search.policy.base import Search
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.search.prior import Prior
+
+# Re-bench at -O3 any config whose -O1 latency is within this fraction of the best
+# -O1 so far (not just a strict new best). -O1 is the fast ranking compile but
+# ties configs that diverge at -O3 (deployable) — e.g. a warp-tier WARPSPEC /
+# occupancy split where the -O1 latencies are within ~1% but -O3 differs ~15%.
+# Widening the deployable-sample net to this band feeds the prior -O3 truth for
+# every near-best contender, so it can rank by -O3 cost. Env-overridable via
+# ``DEPLODOCK_O3_TOL`` (a fraction, e.g. ``0.10`` for 10%).
+O3_REBENCH_TOL = 0.10
 
 
 @dataclass
@@ -127,10 +137,19 @@ class TuningSearch(Search):
         # yielding). Carries no role in the search itself.
         self.last_stats: PerfStats | None = None
         self.last_status: str | None = None
-        # Set in ``observe`` when a bench sets a new global best; the engine reads
-        # it to trigger an -O3 re-bench (``observe_o3``). ``o3_rows`` holds those
-        # deployable winner samples (knobs tagged ``H_opt=3``) for the prior.
+        # Set in ``observe`` when a bench sets a new global best.
         self.last_improved_best = False
+        # Set in ``observe`` when the just-benched config is a *deployable-bench
+        # candidate* — within ``O3_REBENCH_TOL`` of the best -O1 so far and not
+        # already re-benched. The engine reads it to trigger an -O3 re-bench
+        # (``observe_o3``). Widening from "strict new best" to a tolerance band is
+        # what lets configs that TIE at -O1 but differ at -O3 (the warp-tier
+        # WARPSPEC / occupancy split is the motivating case) get a deployable
+        # sample, so the prior can rank them by -O3 cost. ``_o3_done`` dedups so
+        # each config is -O3'd at most once; ``o3_rows`` holds the samples
+        # (knobs tagged ``H_opt=3``) for the prior.
+        self.last_o3_worthy = False
+        self._o3_done: set[tuple] = set()
         self.o3_rows: list[tuple[dict, float]] = []
 
     def observe(self, token: object | None, stats: PerfStats, status: str, candidate: object | None = None) -> None:
@@ -145,10 +164,20 @@ class TuningSearch(Search):
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
         prev_best = self.tree.best_reward
         self.tree.record_terminal(token, reward)
-        # Flag a new global best so the engine can re-bench this winner at -O3 for
-        # a deployable prior sample (the -O1 sweep ranks but is not deployable;
-        # -O1 ties configs that differ at -O3 — e.g. FK on a reduction).
         self.last_improved_best = status == "ok" and self.tree.best_reward > prev_best
+        # Re-bench at -O3 not only a strict new best but any config within the
+        # tolerance band of the best -O1 so far — configs that tie at -O1 can
+        # differ sharply at -O3 (the warp WARPSPEC / occupancy split), so the
+        # prior needs an -O3 sample for every near-best contender, not just the
+        # winner. Dedup via ``_o3_done`` so each config is -O3'd at most once.
+        self.last_o3_worthy = False
+        if status == "ok" and stats.median > 0 and self.tree.best_reward > 0:
+            best_lat = 1.0 / self.tree.best_reward
+            tol = config.o3_tol(O3_REBENCH_TOL)
+            sig = self._o3_sig(token.realized_knobs)
+            if stats.median <= best_lat * (1.0 + tol) and sig not in self._o3_done:
+                self._o3_done.add(sig)
+                self.last_o3_worthy = True
         if self.prior_model is not None:
             # Record the leaf for the end-of-run stats. The model itself is fixed
             # during a run — it refits in batches between ops (see ``Prior``), not
@@ -169,6 +198,16 @@ class TuningSearch(Search):
         self.o3_rows.append((knobs, o3_us))
         if self.prior_model is not None:
             self.prior_model.record_bench(knobs, o3_us, "ok")
+
+    @staticmethod
+    def _o3_sig(knobs: dict | None) -> tuple:
+        """A hashable signature of a realized knob set for -O3 dedup. Values are
+        ``str()``-ified (some knobs — ``OVERHANG`` — carry list values that aren't
+        hashable), and the ``H_opt`` regime tag is excluded so the -O1 row and its
+        -O3 re-bench share one signature."""
+        if not knobs:
+            return ()
+        return tuple(sorted((k, str(v)) for k, v in knobs.items() if k != "H_opt"))
 
     def _realized_knobs(self, candidate: object) -> dict:
         """The terminal's complete knob set: the kernel's ``base_knobs`` (``S_*``

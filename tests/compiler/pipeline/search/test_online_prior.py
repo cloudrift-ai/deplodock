@@ -238,6 +238,35 @@ def test_collect_rows_skips_unbenched_nodes():
     assert (("BM", 64), ("BR", 2)) not in knob_sets
 
 
+def _stats(median: float):
+    from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+
+    return PerfStats(median=median, min=median, max=median, mean=median, variance=0.0, n_samples=1)
+
+
+def test_o3_worthy_within_tolerance_band_and_dedup(monkeypatch):
+    """``observe`` flags ``last_o3_worthy`` for the new best AND any later config
+    within ``DEPLODOCK_O3_TOL`` of the best -O1 — not just strict improvements —
+    and dedups so each config is -O3'd at most once."""
+    monkeypatch.setenv("DEPLODOCK_O3_TOL", "0.10")
+    tree = SearchTree()
+    best = _node({"WM": 1, "WN": 4}, tree.root)  # the fast one
+    near = _node({"WM": 2, "WN": 2}, tree.root)  # within 10%
+    far = _node({"WM": 8, "WN": 1}, tree.root)  # outside 10%
+    tree.root.children = [best, near, far]
+    s = TuningSearch(tree=tree)
+
+    s.observe(best, _stats(100.0), "ok")
+    assert s.last_o3_worthy is True and s.last_improved_best is True  # new best
+    s.observe(near, _stats(108.0), "ok")
+    assert s.last_o3_worthy is True and s.last_improved_best is False  # within 10%, not a new best
+    s.observe(far, _stats(130.0), "ok")
+    assert s.last_o3_worthy is False  # 30% > tol
+    # Re-benching the same config again does not re-flag (dedup).
+    s.observe(near, _stats(108.0), "ok")
+    assert s.last_o3_worthy is False
+
+
 def test_node_knobs_accumulates_along_path():
     tree = SearchTree()
     b1 = _node({"BR": 2}, tree.root)

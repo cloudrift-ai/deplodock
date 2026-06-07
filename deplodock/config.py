@@ -39,6 +39,7 @@ DEBUG = "DEPLODOCK_DEBUG"
 DUMP_DIR = "DEPLODOCK_DUMP_DIR"
 KNOBS = "DEPLODOCK_KNOBS"
 TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
+O3_TOL = "DEPLODOCK_O3_TOL"
 BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
 CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
@@ -101,6 +102,17 @@ def int_env(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def float_env(name: str, default: float) -> float:
+    """Float env read. Empty / unset / unparseable → ``default``."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 
@@ -174,6 +186,13 @@ def dump_dir() -> Path | None:
 def tune_patience(default: int = 50) -> int:
     """``DEPLODOCK_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
     return int_env(TUNE_PATIENCE, default)
+
+
+def o3_tol(default: float = 0.10) -> float:
+    """``DEPLODOCK_O3_TOL`` — tolerance band (fraction of the best -O1 latency)
+    within which a tuned config is also re-benched at -O3 for a deployable prior
+    sample. ``0.10`` = re-bench everything within 10% of the best -O1."""
+    return float_env(O3_TOL, default)
 
 
 def bench_backends_raw(cli_value: str | None) -> str:

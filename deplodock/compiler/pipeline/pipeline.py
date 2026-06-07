@@ -549,10 +549,13 @@ class Pipeline:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
             stats, status = _bench_terminal(cand, backend=backend, db=run.db)
             search.observe(token, stats, status, candidate=cand)
-            # A new -O1 best → re-bench it at -O3 for a deployable prior sample
-            # (the -O1 sweep ranks but isn't deployable; it ties configs that
-            # differ at -O3). Best-effort, winners only, so the cost is bounded.
-            if backend is not None and getattr(search, "last_improved_best", False):
+            # Re-bench at -O3 for a deployable prior sample any config the search
+            # flags as -O3-worthy — every config within the -O1 tolerance band of
+            # the best (see ``TuningSearch.observe`` / ``O3_REBENCH_TOL``), not
+            # just a strict new best, so configs that tie at -O1 but differ at -O3
+            # (the warp WARPSPEC / occupancy split) each get an -O3 truth sample.
+            # Best-effort + deduped, so the cost stays bounded.
+            if backend is not None and getattr(search, "last_o3_worthy", False):
                 o3_us = _rebench_o3(cand, backend)
                 if o3_us is not None:
                     search.observe_o3(token, o3_us)

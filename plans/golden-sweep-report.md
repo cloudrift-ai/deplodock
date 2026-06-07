@@ -93,3 +93,86 @@ That gap (isolated search ≪ warm greedy) is itself a tuner-quality signal wort
 2. **Isolated-search vs warm-greedy gap** — `find_golden_configs.py`'s cold `-O1` search can't reach configs the warm
    greedy deploys. Closing this would let the authoritative regen capture wins directly.
 3. **fp32 large squares** (`2048`/`4096`, +20–38%) and several qwen `s32`/`s128` shapes remain off golden.
+
+---
+
+# fp16 warp-tier deep-dive (2026-06-07 follow-up — Next-target #1)
+
+Investigation of the report's #1 gap (fp16 tensor-core mis-pick, up to +193%). The cause is **not one thing**, and it
+is **not** a regression from the explicit-knob-OFF work (a fresh no-prior greedy still picks `WM=2/WN=2,
+WARPSPEC=False`, exactly what the heuristic dictates).
+
+## What the numbers show (RTX 5090, sm_120)
+
+- `eval heuristic --kernel fp16`: goldens sit at **median rank 7** in the enumeration (decent, not 1). Not the
+  bottleneck on its own.
+- `tune --golden square.512.fp16 --clean`: finds **6.17 µs** vs golden 6.1 / cuBLAS 6.2 — *isolated* tune is fine, but
+  **91% of benches are `silly` (≥2× best)** → very wasteful exploration. (The report's *final* 17.9 µs for this shape is
+  the warm-prior-over-all-shapes pick — the prior generalizes the warp tier badly; see cause C.)
+- `tune --golden square.2048.fp16 --clean`: settles at **104–106 µs**; golden is **94.3 µs**. Decomposing it:
+
+  | config | tile | -O1 (rank pass) | -O3 (deployable) |
+  |---|---|---:|---:|
+  | greedy pick `WM=2 WN=2 FM=2 FN=4` | 64×64 square | 163.1 | 110 |
+  | golden-shape `WM=1 WN=4 FM=4 FN=2` **WS=False** | 16×32 skew | 162.2 (fastest -O1) | 112 |
+  | **golden** `WM=1 WN=4 FM=4 FN=2` **WARPSPEC=True** | 16×32 skew | *never benched* | **94.3** |
+
+## Root causes (ranked)
+
+**A. `WARPSPEC=True` is never explored (dominant).** A full 2048² tune benched **0 of ~59 configs with
+`WARPSPEC=True`**. The inner MCTS (`search/policy/mcts.py`) is fully deterministic — one PUCT exploration term, strict
+`>` tie-break (ties → first-in-list = heuristic order), no sampling/noise/forced-visit. With a cold prior it fans out
+in heuristic order and `patience` (~60 benches) fires before the `085_warp_specialize` option-1 branch (deep under the
+planner forks) is ever selected. The 94.3 µs golden lives behind that unexplored fork, so the search cannot reach it.
+
+**B. The -O1 ranking pass is blind to the -O3 win (fixed, see below).** The golden-shape tile (162.2 µs) and the
+heuristic tile (163.1 µs) tie within 0.5% at -O1 but are 94.3 vs 110 at -O3. `tune` ranks at -O1 and previously
+re-benched at -O3 only a *strict new -O1 best*, so near-tied contenders never got a deployable sample and the prior
+trained on flattened -O1 numbers.
+
+**C. Warp tier has no occupancy features.** `knob._tile_features` early-returns `{}` for warp rows (the `is_warp`
+gate). A warp config's vector is only `WM/WN/FM/FN/BK/SPLITK` + `MMA_*` + coarse `S_ext_*`/`H_*` — **no CTA-count /
+waves / occupancy**, which is exactly the quantity that picks skewed-vs-square per shape. So even with -O3 truth for a
+few configs the prior generalizes the warp tier poorly — the mechanism behind the report's catastrophic *final* fp16
+picks (17.9 µs @ 512²) vs the healthy *isolated* tune (6.17 µs).
+
+**D. Heuristic prefers the square 64×64 tile** (`_priority_matmul_warp`), so greedy/cold-start deploys `WM=2/WN=2`
+while goldens are skewed (rank ~7). The warp priority is hand-tuned, not learned (`golden_knob_heuristics.py` fits the
+scalar tier only).
+
+**E. (minor) Offline diagnostics can't match fp16 data to fp16 goldens** — `tune` offline reports `golden coverage
+0/32` after tuning an fp16 shape (coverage keys on free·reduce product, conflating fp16/fp32 and not recognizing the
+warp signature). Hides whether the prior learned the shape; not a perf cause.
+
+## Implemented: -O3 re-bench tolerance (fixes cause B)
+
+Re-bench at -O3 any config **within `DEPLODOCK_O3_TOL` (default 10%) of the best -O1 so far**, not just a strict new
+best — so configs that tie at -O1 but diverge at -O3 each get a deployable prior sample.
+
+- `search/policy/mcts.py`: `observe` sets `last_o3_worthy` when `median ≤ best_-O1·(1+tol)`, deduped via `_o3_done`
+  (`_o3_sig` str-ifies values so list-valued `OVERHANG` stays hashable, excludes `H_opt`). `O3_REBENCH_TOL = 0.10`.
+- `pipeline.py`: drive loop triggers `_rebench_o3` on `last_o3_worthy` (was `last_improved_best`).
+- `config.py`: `float_env` + `o3_tol()` (`DEPLODOCK_O3_TOL`).
+
+**Validated**: re-tuning `square.2048.fp16 --clean` captures **4 `H_opt=3` (-O3) rows** (was 1); among explored configs
+the prior now ranks by deployable cost and correctly prefers the genuine -O3 best (`WM=2/WN=2 @105.9`). The residual gap
+to 94.3 µs is entirely cause A — `WARPSPEC=True` is still unexplored — which the exploration work must close.
+
+## "Add randomness" — necessary but not sufficient
+
+Stochastic/forced exploration is the highest-leverage next change and directly fixes cause A (surfaces `WARPSPEC=True`
+and skewed tiles). But alone it doesn't fix B (the prior would still mis-rank by -O1 — now fixed) or C (the prior can't
+*generalize* warp tiles without occupancy features). Recommended order: **exploration → -O3 tolerance [done] → warp
+features.**
+
+## Recommended next steps
+
+1. **Stochastic / forced exploration in `mcts.py`.** MVP: force every live fork child to be visited once before
+   patience can fire (guarantees both `WARPSPEC` branches + all `WM/WN` siblings get a bench). Stronger: softmax/
+   Boltzmann sampling over PUCT values, or Dirichlet noise on `P`, seeded reproducibly by op + round (no `random`/
+   `Date.now` — counter-seed an RNG). Re-validate: 2048² benches `WARPSPEC=True` and reaches ≤95 µs.
+2. **Warp occupancy features** (`knob._tile_features`): drop the blanket warp early-return; compute warp `D_*` from
+   `tile_m=WM·FM·atom_m`, `tile_n=WN·FN·atom_n`, CTAs≈`S_ext_free_prod/(tile_m·tile_n)`, waves vs `H_sm_count`
+   (mirroring `heuristic`), so the prior can pick skewed-vs-square per shape.
+3. **Fix offline golden coverage match** (`prior/diagnostics.py`): key on dtype + per-axis extents so fp16 shapes are
+   recognized — needed to *measure* that (1)/(2) worked.

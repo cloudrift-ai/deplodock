@@ -24,7 +24,8 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock tune` reads from / writes to this path. NOTE: the greedy DB→fork replay (`_best_fork`) that let `compile` / `run` pick a previously-tuned variant was **removed** in the learned-prior work; `compile` / `run` now pick forks from the global learned `CatBoostPrior` (the `mean_score` argmin — lowest predicted latency — option-0 when no prior is loaded) — not the DB. The prior is a separate JSON checkpoint (`DEPLODOCK_PRIOR_FILE` → `~/.cache/deplodock/prior.json`); `tune` writes it, `compile` / `run` read it.
 
 All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
-`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
+`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`,
+`DEPLODOCK_GPU_LOCK`,
 …) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
 layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
@@ -92,9 +93,12 @@ same worker.
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
-  `--bench` below, or `run --bench`). To keep the **learned prior** deployable anyway, the engine **re-benches every new
-  global-best at `-Xcicc -O3`** and feeds that as an extra training row tagged `H_opt=3` (so `compile` / `run`, which run
-  at -O3, rank by the deployable numbers — the -O1 sweep alone ties configs that differ at -O3, e.g. a reduction's `FK`).
+  `--bench` below, or `run --bench`). To keep the **learned prior** deployable anyway, the engine **re-benches at
+  `-Xcicc -O3`** every config **within `DEPLODOCK_O3_TOL` (default 10%) of the best -O1 so far** — not just a strict new
+  global-best — and feeds each as an extra training row tagged `H_opt=3` (so `compile` / `run`, which run at -O3, rank by
+  the deployable numbers — the -O1 sweep alone ties configs that differ at -O3, e.g. a reduction's `FK` or a warp tile's
+  `WARPSPEC`). The tolerance band gives the prior an -O3 truth sample for every near-best contender, not only the winner;
+  each config is re-benched at most once. See `plans/golden-sweep-report.md`.
   Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
   flags are folded into the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
   On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
