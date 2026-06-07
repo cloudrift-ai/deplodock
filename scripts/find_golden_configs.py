@@ -7,7 +7,7 @@ the winning knobs off the assembled ``CudaOp`` graph, re-benches the winner at
 ``-O3`` (deployable) against cuBLAS (``torch.matmul``, TF32 pinned off), and
 records a :class:`MatmulGoldenConfig`. The collected list is spliced into the
 ``BEGIN/END GENERATED`` region of
-``deplodock/compiler/pipeline/search/golden_configs.py``.
+``deplodock/compiler/pipeline/search/golden.py``.
 
 Usage:
     python scripts/find_golden_configs.py                       # all shapes
@@ -42,7 +42,7 @@ from deplodock.compiler.pipeline.search.golden import (  # noqa: E402
     matmul_snippet,
 )
 
-_DATA_MODULE = Path(__file__).resolve().parent.parent / "deplodock" / "compiler" / "pipeline" / "search" / "golden_configs.py"
+_DATA_MODULE = Path(__file__).resolve().parent.parent / "deplodock" / "compiler" / "pipeline" / "search" / "golden.py"
 _BEGIN = "# --- BEGIN GENERATED (scripts/find_golden_configs.py) ---"
 _END = "# --- END GENERATED ---"
 
@@ -105,14 +105,46 @@ def _clear_mma_pins() -> None:
         os.environ.pop(var, None)
 
 
+# Transport / codegen flags the planner re-derives from the core search knobs +
+# target — excluded from a recorded golden so it carries the same compact
+# search-knob set (BM/BN/BK/.../STAGE/RING/WARPSPEC/MMA/OVERHANG/...) the set has
+# always used. WARPSPEC stays (it's a real search fork the planner branches on).
+CONTROL_KNOBS = frozenset(
+    {
+        "GROUP_M",
+        "NOATOMIC",
+        "HOIST_COMPUTE",
+        "TMA",
+        "ASYNC_COPY",
+        "PAD_SMEM",
+        "PIPELINE_STAGES",
+        "VECTORIZE_LOADS",
+        "PERMUTE_LANES",
+        "INTERLEAVE_LOADS",
+    }
+)
+
+
 def _extract_knobs(assembled) -> dict:
     """Pull the matmul kernel's knobs off the assembled ``Graph[CudaOp]``. Knobs are
     merged forward onto the final CudaOp, so this is the full picked config. A split-K
     winner has a 2nd (combine) CudaOp — pick the one carrying ``BM`` (the main matmul);
     fall back to the richest knob dict."""
     from deplodock.compiler.ir.cuda.ir import CudaOp
+    from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX
 
-    cuda_knobs = [dict(n.op.knobs) for n in assembled.nodes.values() if isinstance(n.op, CudaOp) and n.op.knobs]
+    def _config_only(knobs: dict) -> dict:
+        # Drop derived feature columns (``S_`` structural, ``H_`` regime) — they're
+        # regressor inputs stamped onto the knobs dict, not part of the kernel
+        # config a golden reproduces. Also drop the transport/codegen control flags
+        # (``CONTROL_KNOBS``) the planner re-derives deterministically from the core
+        # search knobs + target, so a golden records the same compact search-knob set
+        # the set has always used — not the full stamped dict.
+        return {
+            k: v for k, v in knobs.items() if not k.startswith(STRUCT_PREFIX) and not k.startswith(CTX_PREFIX) and k not in CONTROL_KNOBS
+        }
+
+    cuda_knobs = [_config_only(dict(n.op.knobs)) for n in assembled.nodes.values() if isinstance(n.op, CudaOp) and n.op.knobs]
     if not cuda_knobs:
         return {}
     for k in cuda_knobs:
@@ -197,6 +229,48 @@ def _gpu_name() -> str:
     return _GPU_NAME_CACHE[0]
 
 
+def _canon_knobs(knobs: dict) -> dict:
+    """Map knob names to their canonical form (resolving aliases like the renamed
+    ``BUFFER_COUNT`` → ``RING`` / ``WARP_SPECIALIZE`` → ``WARPSPEC``) so a config
+    tuned post-rename compares equal to a pre-rename golden that means the same
+    thing. Unknown names pass through unchanged."""
+    from deplodock.compiler.pipeline.knob import get
+
+    out: dict = {}
+    for k, v in knobs.items():
+        knob = get(k)
+        out[knob.name if knob is not None else k] = v
+    return out
+
+
+def _merge_with_existing(name: str, new: MatmulGoldenConfig) -> list[MatmulGoldenConfig]:
+    """Combine a freshly-tuned config with the recorded golden(s) for the same
+    shape, following the same semantics the manual sweep used: a >3%-faster config
+    *replaces* the shape's goldens; a within-3% config with *different* knobs is
+    *added* alongside; a within-3% config that reproduces an existing knob set, or
+    a slower one, leaves the recorded set untouched. So a weak tune (low patience,
+    bench noise) can never degrade a known-good golden — only improve or extend
+    it."""
+    from deplodock.compiler.pipeline.search.golden import goldens_by_name
+
+    existing = goldens_by_name(name)
+    if not existing:
+        return [new]
+    best = min(existing, key=lambda c: c.deplodock_us)
+    if new.deplodock_us < best.deplodock_us * 0.97:
+        logger.info("    -> replaces golden (%.1fus < %.1fus)", new.deplodock_us, best.deplodock_us)
+        return [new]
+    if new.deplodock_us <= best.deplodock_us * 1.03:
+        new_k = _canon_knobs(new.knobs)
+        if all(_canon_knobs(c.knobs) != new_k for c in existing):
+            logger.info("    -> parity, new knobs — added alongside (%.1fus ~ %.1fus)", new.deplodock_us, best.deplodock_us)
+            return [*existing, new]
+        logger.info("    -> parity, reproduces an existing golden — kept as-is")
+        return existing
+    logger.info("    -> slower than golden (%.1fus > %.1fus) — kept existing", new.deplodock_us, best.deplodock_us)
+    return existing
+
+
 def _render(configs: list[MatmulGoldenConfig]) -> str:
     """Render the ``GOLDEN_CONFIGS = [...]`` assignment for the data module."""
     lines = ["GOLDEN_CONFIGS: list[GoldenConfig] = ["]
@@ -275,7 +349,7 @@ def main() -> None:
             logger.error("  %s: failed (%s); skipping", name, exc)
             continue
         if cfg is not None:
-            configs.append(cfg)
+            configs.extend(_merge_with_existing(name, cfg))
 
     if not configs:
         logger.error("no configs produced")
