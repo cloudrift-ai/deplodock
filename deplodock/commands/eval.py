@@ -472,6 +472,14 @@ def _load_variants(db_path: Path, *, kernel_filter: str | None) -> dict[str, lis
     return out
 
 
+def _hashable(v: object) -> object:
+    """Coerce a knob value to a hashable form so it can key a dict / join a set.
+    Most knob values are already scalars (int / bool / str), but some carry a
+    list (e.g. ``OVERHANG=['a0']``) which would raise ``TypeError: unhashable
+    type: 'list'`` when used as a grouping key. Lists become tuples (recursively)."""
+    return tuple(_hashable(x) for x in v) if isinstance(v, list) else v
+
+
 def _compute_knob_regret(kernels: dict[str, list[tuple[dict, float]]]) -> list[KnobRow]:
     per_knob_regret: dict[str, list[float]] = defaultdict(list)
     per_knob_n_values: dict[str, list[int]] = defaultdict(list)
@@ -485,6 +493,7 @@ def _compute_knob_regret(kernels: dict[str, list[tuple[dict, float]]]) -> list[K
                 v = knobs.get(K)
                 if v is None:
                     continue
+                v = _hashable(v)
                 if v not in best_by_value or us < best_by_value[v]:
                     best_by_value[v] = us
             if len(best_by_value) < 2:
@@ -530,6 +539,7 @@ def _compute_interactions(
                     v2 = knobs_dict.get(K2)
                     if v1 is None or v2 is None:
                         continue
+                    v1, v2 = _hashable(v1), _hashable(v2)
                     prev = argmin_by_v1.get(v1)
                     if prev is None or us < prev[1]:
                         argmin_by_v1[v1] = (v2, us)
