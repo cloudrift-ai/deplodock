@@ -147,8 +147,8 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         K=1024,
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
-        knobs={"BN": 32, "BM": 16, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "STAGE": "11", "RING": 2, "WARPSPEC": False},
-        deplodock_us=69.2,
+        knobs={"BN": 32, "BM": 8, "FM": 8, "FN": 4, "FK": 1, "BK": 64, "SPLITK": 1, "BR": 1, "STAGE": "11", "RING": 2},
+        deplodock_us=55.3,
         cublas_us=53.3,
     ),
     MatmulGoldenConfig(
@@ -453,8 +453,8 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
         K=1024,
         gpu_name="NVIDIA GeForce RTX 5090",
         compute_cap=(12, 0),
-        knobs={"BN": 64, "BM": 8, "FM": 8, "FN": 2, "BK": 32, "SPLITK": 1, "BR": 1, "STAGE": "11", "RING": 2},
-        deplodock_us=69.6,
+        knobs={"BN": 32, "BM": 8, "FM": 8, "FN": 4, "FK": 1, "BK": 64, "SPLITK": 1, "BR": 1, "STAGE": "11", "RING": 2},
+        deplodock_us=55.4,
         cublas_us=53.5,
     ),
     MatmulGoldenConfig(
