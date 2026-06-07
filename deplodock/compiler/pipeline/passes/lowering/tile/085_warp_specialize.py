@@ -396,15 +396,16 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
 
     # For the warp-tier MMA tower, WS=1 is a measured win (≈17% at 64×64, neutral
     # at 128×128 — see the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``),
-    # so it should be the first guess. The ``_ws_score`` below ranks WS=1 higher,
-    # but that only steers a *fitted* prior — a cold MCTS (a fresh ``tune --clean``)
-    # and a no-prior greedy ``compile`` both fall back to **emission order** (the
-    # PUCT tie / option-0 pick), which would take WS=0 and, under patience, never
-    # bench WS=1 at all (the measured fp16 gap in ``plans/golden-sweep-report.md``).
-    # So emit WS=1 FIRST for the warp tier — emission order then deploys the win
-    # cold, and the -O3 re-bench tolerance feeds the prior its deployable latency.
-    # The scalar (pointwise / coop-reduce) tier has no such consensus → keep the
-    # hint order (WS=0 first) and the neutral score.
+    # so it should be the first guess. Ordering is the ONLY lever that does this:
+    # the policies select on the learned prior when fitted and on **emission
+    # order** otherwise (option-0 / PUCT tie) — they do NOT consult a fork's
+    # ``score_fn`` (``Search.score_of`` is latent infra now, see
+    # ``policy/base.py``). So a cold MCTS (a fresh ``tune --clean``) and a no-prior
+    # greedy ``compile`` would take WS=0 and, under patience, never bench WS=1
+    # (the measured fp16 gap in ``plans/golden-sweep-report.md``). Emit WS=1 FIRST
+    # for the warp tier — emission order deploys the win cold, and the -O3 re-bench
+    # tolerance feeds the prior its deployable latency. The scalar (pointwise /
+    # coop-reduce) tier has no such consensus → keep the hint order (WS=0 first).
     _, is_warp = _find_consumer_tile(op.body)
     if is_warp and set(ws_choices) == {False, True}:
         ws_choices = (True, False)
@@ -412,7 +413,4 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
     def _ws_expand(knobs: dict) -> list[TileOp]:
         return [_stamp(knobs[WARP_SPECIALIZE.name])]
 
-    def _ws_score(knobs: dict) -> float:
-        return 1.0 if (knobs[WARP_SPECIALIZE.name] and is_warp) else 0.0
-
-    return [ThunkFork(knobs={WARP_SPECIALIZE.name: ws}, expand_fn=_ws_expand, score_fn=_ws_score, is_leaf=True) for ws in ws_choices]
+    return [ThunkFork(knobs={WARP_SPECIALIZE.name: ws}, expand_fn=_ws_expand, is_leaf=True) for ws in ws_choices]
