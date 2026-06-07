@@ -202,14 +202,29 @@ def test_is_warp_and_mma_atom_tier_discriminator():
     assert mma_atom({"MMA": "mma_m16n8k16_f16"}) == "mma_m16n8k16_f16"
 
 
-def test_tile_features_skipped_for_warp_tier():
-    """``knob_features`` emits the engineered ``D_*`` scalar-tile features for a
-    scalar row but skips them for a warp row (whose ``BM``/``BN`` are OFF=0) —
-    those terms model the scalar thread tile only."""
-    scalar = {"BN": 32, "BM": 8, "FM": 4, "FN": 2, "MMA": "0", "WM": 0, "WN": 0}
-    warp = {"BN": 0, "BM": 0, "FM": 2, "FN": 2, "MMA": "mma_m16n8k16_f16", "WM": 2, "WN": 2}
-    assert any(k.startswith("D_") for k in knob_features(scalar))
-    assert not any(k.startswith("D_") for k in knob_features(warp))
+def test_scalar_tile_features_from_thread_tile():
+    """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from
+    its thread tile (``BN·BM`` threads, ``BM·FM × BN·FN`` output)."""
+    sf = knob_features({"BN": 32, "BM": 8, "FM": 4, "FN": 2, "MMA": "0", "WM": 0, "WN": 0})
+    assert any(k.startswith("D_") for k in sf)
+    assert sf["D_threads"] == 32 * 8
+    assert sf["D_tile_m"] == 8 * 4 and sf["D_tile_n"] == 32 * 2
+
+
+def test_warp_tile_features_from_warp_tile():
+    """``_warp_tile_features`` builds the ``D_*`` family from the warp tile
+    (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the warp
+    ``BM=BN=0`` OFF sentinels never feed a scalar tile. Atom dims (16×8 for
+    ``m16n8k16``) come from the MMA featurizer in the real pipeline; here passed
+    directly to avoid needing the registry loaded."""
+    from deplodock.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
+
+    wf = _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2, "SPLITK": 1, "S_ext_free_prod": 2048 * 2048}, 16.0, 8.0)
+    assert wf["D_threads"] == 128.0  # WM·WN·32
+    assert wf["D_tile_m"] == 2 * 2 * 16  # WM·FM·atom_m
+    assert wf["D_tile_n"] == 2 * 2 * 8  # WN·FN·atom_n
+    assert "D_log2_ctas" in wf and "D_log2_waves" in wf  # occupancy present (free_prod given)
+    assert _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2}, None, None) == {}  # missing atom dims → empty
 
 
 # ---------------------------------------------------------------------------

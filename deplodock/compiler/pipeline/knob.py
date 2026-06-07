@@ -490,26 +490,56 @@ def knob_features(knobs: dict) -> dict[str, float]:
         # STR knobs with no custom featurizer: no generic numeric encoding.
     feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom-kind knob present
     feats.update(_tile_features(knobs))
+    # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread
+    # tile (``BN·BM``) and skips warp rows, so compute the SAME ``D_*`` family
+    # from the warp tile geometry instead — using the atom cell dims the MMA
+    # featurizer already put in ``feats`` (``MMA_atom_m`` / ``_n``), since knob.py
+    # can't import ``ATOM_REGISTRY``. Shared ``D_*`` names across tiers let the
+    # prior learn occupancy / CTA-count uniformly (the signal that picks the
+    # skewed-vs-square warp tile per shape — the fp16 mis-pick in
+    # ``plans/golden-sweep-report.md``).
+    if is_warp(knobs):
+        feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
     return feats
 
 
-def _tile_features(knobs: dict) -> dict[str, float]:
-    """Engineered shape×knob interaction features (``D_*``) for tiled matmul/reduce
-    kernels — the occupancy / tile-geometry quantities a tree can't cheaply
-    reconstruct from the raw knobs plus the *coarse* ``S_ext_*`` extents: the CTA
-    count needs ``M·N / tile_area``, operand reuse needs the tile perimeter. These
-    mirror the analytic terms in
-    :func:`deplodock.compiler.pipeline.search.heuristic.score_matmul_thread` that
-    rank the goldens well, giving the learned prior the same derived signal
-    instead of forcing it to discover the products/ratios from axis-aligned
-    splits. Empty unless the core tile knobs (``BN/BM/FM/FN``) are present, so
-    pointwise / non-tiled kernels are unaffected. Warp-tier (tensor-core) rows
-    are skipped: these ``D_*`` terms model the *scalar* thread tile (``BN·BM``
-    threads, ``BM·FM × BN·FN`` output), which is meaningless for a warp tile —
-    and now that warp rows carry the ``BM=BN=0`` OFF sentinels (so the old
-    ``KeyError`` guard no longer fires) the gate is what keeps them out."""
+def _geom_feats(*, threads: int, cells: int, tile_m: int, tile_n: int, splitk: int, free_prod, sm: float) -> dict[str, float]:
+    """The engineered ``D_*`` occupancy / tile-geometry features shared by both
+    tiers — the quantities a tree can't cheaply reconstruct from the raw knobs +
+    the *coarse* ``S_ext_*`` extents: the CTA count needs ``M·N / tile_area``,
+    operand reuse needs the tile perimeter. Mirrors the analytic terms in
+    :mod:`deplodock.compiler.pipeline.search.heuristic` that rank the goldens
+    well. ``free_prod`` is the output free-dim product (``S_ext_free_prod``);
+    when present the occupancy terms (``D_log2_ctas`` / ``D_log2_waves``) are
+    added — ``#CTAs ≈ M·N / tile_area · SPLITK`` (ceil-free, needs only the
+    product the ``S_*`` features carry, not the per-axis split)."""
     import math  # noqa: PLC0415
 
+    area = max(tile_m * tile_n, 1)
+    out = {
+        "D_threads": float(threads),
+        "D_cells": float(cells),
+        "D_tile_m": float(tile_m),
+        "D_tile_n": float(tile_n),
+        "D_log2_area": math.log2(area),
+        "D_reuse": area / (tile_m + tile_n) if (tile_m + tile_n) else 0.0,
+        "D_aspect": math.log2(max(tile_m, 1)) - math.log2(max(tile_n, 1)),  # tile squareness
+    }
+    if free_prod:
+        ctas = float(free_prod) / area * splitk
+        out["D_log2_ctas"] = math.log2(max(ctas, 1.0))
+        out["D_log2_waves"] = math.log2(max(ctas / sm, 1e-3))  # CTAs relative to SM count
+    return out
+
+
+def _tile_features(knobs: dict) -> dict[str, float]:
+    """Scalar thread-tile ``D_*`` features (``BN·BM`` threads, ``BM·FM × BN·FN``
+    output). Empty unless the core tile knobs (``BN/BM/FM/FN``) are present, so
+    pointwise / non-tiled kernels are unaffected. Warp-tier (tensor-core) rows
+    are skipped here — :func:`knob_features` computes their occupancy via
+    :func:`_warp_tile_features` (the warp tile is ``WM·WN·32`` threads,
+    ``WM·FM·atom_m × WN·FN·atom_n`` output), so the warp ``BM=BN=0`` OFF
+    sentinels don't feed a meaningless scalar tile."""
     if is_warp(knobs):
         return {}
     try:
@@ -518,28 +548,39 @@ def _tile_features(knobs: dict) -> dict[str, float]:
         return {}
     br = int(knobs.get("BR", 1) or 1)
     splitk = int(knobs.get("SPLITK", 1) or 1)
-    threads = bn * bm * br
-    tile_m, tile_n = bm * fm, bn * fn
-    area = max(tile_m * tile_n, 1)
-    out = {
-        "D_threads": float(threads),
-        "D_cells": float(fm * fn),
-        "D_tile_m": float(tile_m),
-        "D_tile_n": float(tile_n),
-        "D_log2_area": math.log2(area),
-        "D_reuse": area / (tile_m + tile_n) if (tile_m + tile_n) else 0.0,
-        "D_aspect": math.log2(max(tile_m, 1)) - math.log2(max(tile_n, 1)),  # tile squareness
-    }
-    # Occupancy needs the output extent: approximate #CTAs as M·N/tile_area·SPLITK
-    # (the ceil-free product, which — unlike ceil(M/tile_m)·ceil(N/tile_n) — needs
-    # only the M·N product the S_* features carry, not the per-axis M/N split).
-    free_prod = knobs.get("S_ext_free_prod")
-    if free_prod:
-        ctas = float(free_prod) / area * splitk
-        sm = float(knobs.get("H_sm_count") or 170.0)
-        out["D_log2_ctas"] = math.log2(max(ctas, 1.0))
-        out["D_log2_waves"] = math.log2(max(ctas / sm, 1e-3))  # CTAs relative to SM count
-    return out
+    return _geom_feats(
+        threads=bn * bm * br,
+        cells=fm * fn,
+        tile_m=bm * fm,
+        tile_n=bn * fn,
+        splitk=splitk,
+        free_prod=knobs.get("S_ext_free_prod"),
+        sm=float(knobs.get("H_sm_count") or 170.0),
+    )
+
+
+def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None) -> dict[str, float]:
+    """Warp-tier (tensor-core MMA) tile ``D_*`` features — the warp analogue of
+    :func:`_tile_features`. The CTA runs ``WM·WN`` warps (``·32`` lanes) over a
+    ``WM·FM·atom_m × WN·FN·atom_n`` output tile, where ``atom_m/atom_n`` are the
+    MMA cell dims the featurizer already derived. Empty if the warp knobs or atom
+    dims are missing (so a malformed row degrades gracefully)."""
+    try:
+        wm, wn, fm, fn = int(knobs["WM"]), int(knobs["WN"]), int(knobs["FM"]), int(knobs["FN"])
+        am, an = int(atom_m), int(atom_n)
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if wm <= 0 or wn <= 0:
+        return {}
+    return _geom_feats(
+        threads=wm * wn * 32,
+        cells=fm * fn,
+        tile_m=wm * fm * am,
+        tile_n=wn * fn * an,
+        splitk=int(knobs.get("SPLITK", 1) or 1),
+        free_prod=knobs.get("S_ext_free_prod"),
+        sm=float(knobs.get("H_sm_count") or 170.0),
+    )
 
 
 def _as_bool(v: object) -> bool:
