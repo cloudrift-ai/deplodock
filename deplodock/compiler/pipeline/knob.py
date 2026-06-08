@@ -503,32 +503,92 @@ def knob_features(knobs: dict) -> dict[str, float]:
     return feats
 
 
-def _geom_feats(*, threads: int, cells: int, tile_m: int, tile_n: int, splitk: int, free_prod, sm: float) -> dict[str, float]:
-    """The engineered ``D_*`` occupancy / tile-geometry features shared by both
-    tiers — the quantities a tree can't cheaply reconstruct from the raw knobs +
-    the *coarse* ``S_ext_*`` extents: the CTA count needs ``M·N / tile_area``,
-    operand reuse needs the tile perimeter. Mirrors the analytic terms in
-    :mod:`deplodock.compiler.pipeline.search.heuristic` that rank the goldens
-    well. ``free_prod`` is the output free-dim product (``S_ext_free_prod``);
-    when present the occupancy terms (``D_log2_ctas`` / ``D_log2_waves``) are
-    added — ``#CTAs ≈ M·N / tile_area · SPLITK`` (ceil-free, needs only the
-    product the ``S_*`` features carry, not the per-axis split)."""
+def _geom_feats(
+    knobs: dict, *, threads: int, cells: int, tile_m: int, tile_n: int, splitk: int, free_prod, sm: float, warp: bool
+) -> dict[str, float]:
+    """The engineered ``D_*`` tile-geometry / occupancy feature family — the
+    single featurization the priors rank on. It folds in everything the old
+    hand-coded matmul heuristic scored (occupancy waves, tile-area / thread /
+    aspect targets, the geometry "bands", K-chunk depth), so a fixed linear model
+    over these features (:class:`~deplodock.compiler.pipeline.search.prior.AnalyticPrior`)
+    reproduces that heuristic and the learned ``CatBoostPrior`` sees the same
+    derived signal a tree can't cheaply reconstruct from raw knobs + the *coarse*
+    ``S_ext_*`` extents.
+
+    Tier-aware: the "ideal" tile / thread targets differ between the scalar thread
+    tile (256 threads, 8192-elem area) and the warp tile (128 threads = 4 warps,
+    64×64 = 4096 area), selected by ``warp``. ``free_prod`` is the output free-dim
+    product (``S_ext_free_prod``); when present the occupancy terms are added —
+    ``#CTAs ≈ M·N / tile_area · SPLITK`` (ceil-free, needs only the product the
+    ``S_*`` features carry, not the per-axis split). The ``BN``/``BM`` band
+    features are the OFF sentinel ``0`` on a warp row (so they don't fire there);
+    ``BK`` is a real knob on both tiers but pulls opposite ways, so it rides
+    tier-split features (``D_*_bk`` scalar vs ``D_w_*_bk`` warp). The rest of the
+    warp tier's signal rides the geometry / occupancy terms via the tier-aware
+    targets."""
     import math  # noqa: PLC0415
 
+    def l2(x: float) -> float:
+        return math.log2(max(float(x), 1.0))
+
     area = max(tile_m * tile_n, 1)
+    reuse = area / (tile_m + tile_n) if (tile_m + tile_n) else 0.0
+    aspect = l2(tile_m) - l2(tile_n)
+    thr_target = 7.0 if warp else 8.0  # log2 threads: 128 (4-warp) vs 256
+    area_target = 12.0 if warp else 13.0  # log2 area: 64×64=4096 vs 8192
+    bn = int(knobs.get("BN", 0) or 0)
+    bm = int(knobs.get("BM", 0) or 0)
+    bk = int(knobs.get("BK", 1) or 1)
+    overhang = len(knobs.get("OVERHANG", ()) or ())
+    k_ext = float(knobs.get("S_ext_reduce_prod") or 0.0)
+    br = int(knobs.get("BR", 1) or 1)
+    kchunks = max((k_ext / br) / bk, 1.0) if k_ext > 0 else 1.0
     out = {
+        # core geometry
         "D_threads": float(threads),
         "D_cells": float(cells),
         "D_tile_m": float(tile_m),
         "D_tile_n": float(tile_n),
-        "D_log2_area": math.log2(area),
-        "D_reuse": area / (tile_m + tile_n) if (tile_m + tile_n) else 0.0,
-        "D_aspect": math.log2(max(tile_m, 1)) - math.log2(max(tile_n, 1)),  # tile squareness
+        "D_log2_area": l2(area),
+        "D_reuse": reuse,
+        "D_aspect": aspect,
+        # analytic (ex-heuristic) terms — tier-aware targets
+        "D_l2_threads": l2(threads),
+        "D_near_threads": -abs(l2(threads) - thr_target),
+        "D_pow2_threads": 1.0 if threads > 0 and (threads & (threads - 1)) == 0 else 0.0,
+        "D_cells_cap": min(float(cells), 128.0),
+        "D_near_cells": -abs(float(cells) - 16.0),
+        "D_near_area": -abs(l2(area) - area_target),
+        "D_square": -abs(aspect),
+        "D_l2_reuse": l2(reuse),
+        "D_near_intensity": -abs(l2(reuse) - 5.0),
+        "D_near_kchunks": -abs(l2(kchunks) - 5.0),
+        "D_neg_overhang": float(-overhang),
+        # thread-tier geometry bands (raw BN/BM/BK/SPLITK; 0 on a warp row)
+        "D_l2_bn": l2(bn),
+        "D_l2_bm": l2(bm),
+        "D_bn_ge_bm": 1.0 if bn > 0 and bn >= bm else 0.0,
+        "D_bn_band": 1.0 if 16 <= bn <= 64 else 0.0,
+        "D_bm_band": 1.0 if 8 <= bm <= 16 else 0.0,
+        # BK bands are tier-specific: the scalar tile wants deep K-chunks (BK≥32)
+        # while the warp / TMA tile wants a shallow pipelined BK≈2 — opposite
+        # directions, so they ride separate features (one weight can't serve both).
+        "D_l2_bk": 0.0 if warp else l2(bk),
+        "D_bk_ge32": 0.0 if warp else (1.0 if bk >= 32 else 0.0),
+        "D_w_l2_bk": l2(bk) if warp else 0.0,
+        "D_w_near_bk": (-abs(l2(bk) - 1.0)) if warp else 0.0,
+        "D_splitk": float(splitk),
+        "D_splitk_le2": 1.0 if splitk <= 2 else 0.0,
+        "D_tilen_clean": 1.0 if tile_n in (32, 64, 128) else 0.0,
+        "D_near_tilen": -abs(l2(tile_n) - 6.0),
     }
     if free_prod:
         ctas = float(free_prod) / area * splitk
-        out["D_log2_ctas"] = math.log2(max(ctas, 1.0))
-        out["D_log2_waves"] = math.log2(max(ctas / sm, 1e-3))  # CTAs relative to SM count
+        waves = math.log2(max(ctas / sm, 1e-3))
+        out["D_log2_ctas"] = l2(ctas)
+        out["D_log2_waves"] = waves  # CTAs relative to SM count
+        out["D_near_waves"] = -abs(waves - 1.0)  # target ~2 waves
+        out["D_ctas_ge_sm"] = 1.0 if ctas >= sm else 0.0
     return out
 
 
@@ -549,6 +609,7 @@ def _tile_features(knobs: dict) -> dict[str, float]:
     br = int(knobs.get("BR", 1) or 1)
     splitk = int(knobs.get("SPLITK", 1) or 1)
     return _geom_feats(
+        knobs,
         threads=bn * bm * br,
         cells=fm * fn,
         tile_m=bm * fm,
@@ -556,6 +617,7 @@ def _tile_features(knobs: dict) -> dict[str, float]:
         splitk=splitk,
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
+        warp=False,
     )
 
 
@@ -573,6 +635,7 @@ def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None)
     if wm <= 0 or wn <= 0:
         return {}
     return _geom_feats(
+        knobs,
         threads=wm * wn * 32,
         cells=fm * fn,
         tile_m=wm * fm * am,
@@ -580,6 +643,7 @@ def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None)
         splitk=int(knobs.get("SPLITK", 1) or 1),
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
+        warp=True,
     )
 
 

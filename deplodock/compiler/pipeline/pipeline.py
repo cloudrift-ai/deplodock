@@ -41,6 +41,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("deplodock.compiler.pipeline")
 
+# Greedy compile validity-fallback cap: how many times ``Pipeline.run`` re-drives
+# blocklisting a tile that failed ``validate(ctx)``. Each retry blocks ≥1 fresh
+# tile or stops, so this only bounds pathological cases (every sibling unviable).
+_MAX_GREEDY_RETRIES = 8
+
 
 _PASSES_DIR = Path(__file__).resolve().parent / "passes"
 _RULE_PREFIX_RE = re.compile(r"^\d+[a-z]?_")
@@ -475,11 +480,27 @@ class Pipeline:
 
         # Single-shot compile uses the O(1)-per-step ``GreedySearch`` driver, NOT
         # the MCTS tree: ``TuningSearch.pop`` re-descends from the root each call,
-        # so a whole-model compile through it would be O(N²) and hang. Greedy
-        # emits a single option-0 lowering (no prior — nothing to fit without
-        # benches). Exploration (the learned prior / PUCT) stays in ``tune``.
-        rejections: list[tuple[str, str, str]] = []
-        cand = next(self.tune(graph, search=GreedySearch(), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
+        # so a whole-model compile through it would be O(N²) and hang. Greedy picks
+        # each fork by the prior's ``mean_score`` argmin (no benching — it can only
+        # use a prior, never train one). Exploration (PUCT) stays in ``tune``.
+        #
+        # Validity fallback: the prior ranks by predicted latency and can rank a
+        # tile that fails ``validate(ctx)`` (smem / thread budget) first — ``tune``
+        # benches-and-skips it, but greedy benches nothing, so on a left-un-lowered
+        # node we blocklist its tile and re-drive, falling back to the next
+        # prior-ranked sibling. Bounded retries (each adds ≥1 block or stops).
+        blocked: dict[str, set[frozenset]] = {}
+        for _attempt in range(_MAX_GREEDY_RETRIES):
+            rejections: list[tuple[str, str, str]] = []
+            cand = next(
+                self.tune(graph, search=GreedySearch(blocked=blocked), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
+            )
+            failed = _unlowered_tiles(cand.graph, rejections)
+            new = {nid: ident for nid, ident in failed.items() if ident not in blocked.get(nid, set())}
+            if not new:  # success, or no fresh info to retry on → report below
+                break
+            for nid, ident in new.items():
+                blocked.setdefault(nid, set()).add(ident)
         _raise_on_unlowered(cand.graph, rejections, cand.ctx)
         return cand.graph
 
@@ -680,6 +701,25 @@ class Run:
                 continue
 
             search.push(cand.lazy(), parent=token)
+
+
+def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:
+    """``{node_id: tile_identity}`` for every node a ``validate(ctx)`` rejection
+    left un-lowered (still a ``LoopOp`` / ``TileOp`` at the terminal). The
+    ``tile_identity`` is the offending tile's planner knobs — what ``Pipeline.run``
+    blocklists so the greedy retry falls back to the next prior-ranked sibling."""
+    if not rejections:
+        return {}
+    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.policy.greedy import tile_identity  # noqa: PLC0415
+
+    out: dict[str, frozenset] = {}
+    for nid, _pass_label, _reason in rejections:
+        node = graph.nodes.get(nid)
+        if node is not None and isinstance(node.op, (LoopOp, TileOp)):
+            out[nid] = tile_identity(node.op.knobs)
+    return out
 
 
 def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ctx: Context) -> None:

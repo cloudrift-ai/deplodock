@@ -159,12 +159,19 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
     assert not any(isinstance(s, TreeHalve) for s in stmts)
 
 
-def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
-    """K=256 cooperative tile → ``materialize_tile._emit_combine`` picks
-    the hierarchical path: ``WarpShuffle`` reduces lanes within each
-    warp, then a tiny ``TreeHalve(length=n_warps)`` collapses across
-    warps. Both Stmts are present; the TreeHalve's length is far
-    smaller than the legacy ``length=n_threads`` form."""
+def test_block_cooperative_emits_hierarchical_reduce(recording_dump, monkeypatch):
+    """A 2-warp (BR=64) cooperative K=256 tile → ``materialize_tile._emit_combine``
+    picks the hierarchical path: ``WarpShuffle`` reduces lanes within each warp,
+    then a tiny ``TreeHalve(length=n_warps)`` collapses across warps. Both Stmts
+    are present; the TreeHalve's length is far smaller than the legacy
+    ``length=n_threads`` form. The tile is PINNED (``BR=64`` forces 2 cooperative
+    warps): the cold default is now ranked by the ``AnalyticPrior`` (GPU/shape
+    dependent — it picks a sub-warp BR for this tiny reduce), so the multi-warp
+    code path must be pinned to be exercised deterministically."""
+    monkeypatch.setenv("DEPLODOCK_BN", "1")
+    monkeypatch.setenv("DEPLODOCK_BM", "4")
+    monkeypatch.setenv("DEPLODOCK_BR", "64")
+    monkeypatch.setenv("DEPLODOCK_BK", "4")
     g = Graph()
     _input(g, "x", (4, 256))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")

@@ -46,7 +46,7 @@ def _no_stray_pins(monkeypatch):
 
 
 def _ctx() -> Context:
-    return Context(compute_capability="sm_80")
+    return Context(compute_capability=(8, 0))
 
 
 def _loop_op_matmul(*, a: str = "a", b: str = "b", o: str = "o", i: str = "i", j: str = "j", k: str = "k") -> LoopOp:

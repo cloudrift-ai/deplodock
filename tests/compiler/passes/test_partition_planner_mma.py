@@ -336,43 +336,21 @@ def test_warp_enumerator_rejects_indivisible_extents():
     assert _enum_warp(M=64, N=64, K=15) == []
 
 
-def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
-    """Cells-near-16 ranks first; cells-far-from-16 ranks last. The
-    register-budget sweet spot for ``mma_m16n8k16_*`` on sm_8x/9x/12x
-    is FM·FN ≈ 16 (~120 regs/lane → 2 blocks/SM occupancy). The
-    pre-2026 prior rewarded ``min(fm·fn, 64)`` monotonically and
-    pushed the picker to FM=1 FN=32 cells=32 — 3.0× slower than cuBLAS
-    on 2048² fp16. See ``plans/mma-warp-scoring.md``."""
-    rows = _enum_warp(M=128, N=128, K=128)
-    assert len(rows) >= 2
-    first_dist = abs(rows[0]["FM"] * rows[0]["FN"] - 16)
-    last_dist = abs(rows[-1]["FM"] * rows[-1]["FN"] - 16)
-    assert first_dist <= last_dist
+def test_warp_analytic_prior_ranks_golden_above_degenerate():
+    """The :class:`AnalyticPrior` ranks a recorded warp golden (2048² fp16:
+    ``WM=1 WN=4 FM=4 FN=2 BK=2`` — a TMA-pipelined, shallow-BK tile) strictly
+    better (LOWER latency proxy) than a degenerate single-cell ``BK=64`` tile.
+    The warp tile geometry + the tier-split BK target the old
+    ``_priority_matmul_warp`` enumeration sort encoded now ride the single
+    ranking path (the prior over ``knob_features``), not an enumeration order."""
+    from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
-
-# --- Warp-tier scoring on TMA-capable hardware ----------------------
-
-
-def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
-    """On TMA-capable arches (sm_90+) ``_priority_matmul_warp`` lifts
-    ``BK ≈ 2`` (and tied 128-thread CTAs) above the sm_80-era larger-BK
-    + 256-thread preference. Bench-validated at 2048² fp16 on RTX 5090:
-    ``WM=1 WN=4 FM=FN=4 BK=2`` runs 84 µs vs ``WM=1 WN=8 FM=FN=4 BK=32``
-    at 108 µs — TMA-pipelined beats gmem-direct by ~22 %.
-    """
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
-
-    gold = {"WN": 4, "WM": 1, "FM": 4, "FN": 4, "BK": 2, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
-    baseline = {"WN": 8, "WM": 1, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
-    # On sm_90+ the gold tile must outscore the gmem-direct sibling.
-    gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
-    baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
-    assert gold_score > baseline_score, f"gold {gold_score!r} should beat baseline {baseline_score!r} on sm_90"
-    # The same call on sm_80 (no TMA) should KEEP preferring large BK and
-    # 256-thread CTAs — the pre-2026 behavior is unchanged off-Hopper.
-    gold_score_80 = _priority_matmul_warp(gold, ctx=_ctx(cc=(8, 0)))
-    baseline_score_80 = _priority_matmul_warp(baseline, ctx=_ctx(cc=(8, 0)))
-    assert baseline_score_80 > gold_score_80, "non-TMA arches must retain the legacy 256-thread + large-BK prior"
+    ctx = _ctx(cc=(12, 0))
+    base = {**ctx.features(), "S_ext_free_prod": float(2048 * 2048), "S_ext_reduce_prod": 2048.0, "S_ext_reduce_max": 2048.0}
+    ap = AnalyticPrior()
+    golden = {"WM": 1, "WN": 4, "FM": 4, "FN": 2, "BK": 2, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
+    degenerate = {"WM": 1, "WN": 1, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
+    assert ap.score({**base, **golden}) < ap.score({**base, **degenerate})
 
 
 # --- Warp-tier knob narrow (M1, plans/mma-perf-closures.md) ----------

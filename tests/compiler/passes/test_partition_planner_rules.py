@@ -169,7 +169,7 @@ def test_replicator_keeps_n_invariant_loads_once():
         ),
     )
 
-    plan = planner._plan_kernel(loop_op, Context(compute_capability="sm_80"), kernel_name="k_blk")
+    plan = planner._plan_kernel(loop_op, Context(compute_capability=(8, 0)), kernel_name="k_blk")
     assert plan is not None
     # Need BOTH FM > 1 and FN > 1 to exercise the blocked-layout invariant
     # (``a + b < a·b``); a single-axis register tile (FM=1 or FN=1) trivially

@@ -82,15 +82,16 @@ def _calibration(prior, groups: dict) -> float | None:
 def _golden_coverage(groups: dict) -> tuple[int, int]:
     """How many golden matmul shapes have measured data in the dataset (matched by
     the op's free-dim product + reduce extent from its ``S_*`` features)."""
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     have = set()
     for sig in groups:
         d = dict(sig)
         if d.get("S_n_mma", 0) > 0:
             have.add((int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0))))
-    covered = sum(1 for g in GOLDEN_CONFIGS if (getattr(g, "M", 0) * getattr(g, "N", 0), getattr(g, "K", 0)) in have)
-    return covered, len(GOLDEN_CONFIGS)
+    matmuls = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    covered = sum(1 for g in matmuls if (g.M * g.N, g.K) in have)
+    return covered, len(matmuls)
 
 
 def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:

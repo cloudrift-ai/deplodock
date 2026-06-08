@@ -35,7 +35,7 @@ _ws = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.
 
 
 def _ctx() -> Context:
-    return Context(compute_capability="sm_90")
+    return Context(compute_capability=(9, 0))
 
 
 def _tile_op_pointwise() -> TileOp:

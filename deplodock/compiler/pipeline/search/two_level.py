@@ -288,11 +288,14 @@ def run_two_level_tune(
     from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     provenance.seed(graph)
-    # ONE global prior for the whole run — warm-started from its own checkpoint
-    # file (lazy import keeps catboost off non-tune callers).
-    from deplodock.compiler.pipeline.search.prior import CatBoostPrior  # noqa: PLC0415
+    # ONE global prior for the whole run — the learned ``CatBoostPrior`` (warm-
+    # started from its checkpoint) behind an ``AnalyticPrior`` cold-start
+    # fallback, so the first op's inner search is heuristic-guided, not uniform.
+    # Training (add_rows / maybe_refit / checkpoint) delegates to the learned half
+    # (lazy import keeps catboost off non-tune callers).
+    from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
-    prior = CatBoostPrior.load(seed=prior_seed)
+    prior = load_prior(seed=prior_seed)
     outer = TuningSearch(patience=patience, ucb_c=ucb_c)
     # The outer drives only the graph-changing passes — no dump on this Run;
     # the winning config's full stage artifacts (incl. per-kernel

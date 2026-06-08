@@ -52,7 +52,7 @@ def _build_fork_tree_lazy(plan) -> Fork:
 
 def _ctx() -> Context:
     """Pinned sm_80 context — keeps variant counts stable across CI hosts."""
-    return Context(compute_capability="sm_80")
+    return Context(compute_capability=(8, 0))
 
 
 def _loop_op_matmul(*, m: int = 128, n: int = 128, k: int = 64) -> LoopOp:

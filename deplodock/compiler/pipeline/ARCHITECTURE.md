@@ -11,13 +11,14 @@ pipeline/
 ├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
-│   ├── policy/       # Search ABC (base.py) + TuningSearch (mcts.py) — the only policy
+│   ├── policy/       # Search ABC (base.py) + GreedySearch (greedy.py, compile/run) + TuningSearch (mcts.py, tune); both rank via the Prior
 │   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf (per-variant replay cache)
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
 │   ├── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
-│   ├── golden_configs.py  # GoldenConfig / MatmulGoldenConfig: autotuned knobs + cuBLAS-ratio per shape, fp32 (CUDA-core) + fp16 (WMMA) (a tuning-prior ground truth)
-│   └── heuristic.py  # hardcoded prior-free matmul knob ranker (score_matmul_thread / evaluate_golden): ranks goldens near top of the enumeration without measurements (weights fit by scripts/golden_knob_heuristics.py)
+│   ├── golden_configs.py  # GoldenConfig + Matmul/Reduce/Pointwise subclasses: autotuned knobs per shape (matmul fp32/fp16, cooperative reduce, pointwise) — the AnalyticPrior fit's ground truth across all kernel regimes
+│   ├── prior/        # the ONE ranking path: Prior ABC + AnalyticPrior (cold heuristic) + CatBoostPrior (learned) composed behind FallbackPrior (load_prior)
+│   └── heuristic.py  # golden-config eval harness (evaluate_golden / pick_matmul): ranks a shape's enumeration via a Prior (AnalyticPrior by default) — drives eval heuristic / eval prior (weights fit by scripts/golden_knob_heuristics.py)
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
@@ -71,11 +72,14 @@ matched `Node` objects. Anything else binds positionally to
 
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
-parent's graph snapshot) and hands them ALL to the single `TuningSearch` policy, which ranks them by PUCT over
-its learned `CatBoostPrior` (`search/prior/`). A single-shot compile has no prior → uniform PUCT → it keeps
-the first (option-0) sibling; a `tune` sweep explores every fork. (DB-best replay `_best_fork`, the static
-`score_of` prior, and `GreedySearch` were all removed.) Single-option returns (or bare `Graph` / `Op`)
-are the deterministic case — no fork.
+parent's graph snapshot) and hands them ALL to a `Search` policy, which ranks them via a `Prior`
+(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `GreedySearch` (`compile`/`run`) by `mean_score` argmin.
+There is ONE ranking path — the `Prior` is the hand-coded `AnalyticPrior` cold (a real heuristic *score* over
+`knob.knob_features`, not emission order) and the learned `CatBoostPrior` once trained, composed behind
+`FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold; a `tune` sweep explores
+every fork. (DB-best replay `_best_fork` and the static `score_of` prior were removed; the old `_priority_*`
+enumeration sort that ranked the cold path by emission order is gone — the `AnalyticPrior` ranks it now.)
+Single-option returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
 **Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
 the fork pins), `is_leaf`, and `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
@@ -83,9 +87,9 @@ leaves, or a mix; exactly `[option]` for a leaf). The search loop pops a Fork-pe
 invokes `expand()` to materialize the children, pushes them back, and continues; cursor advance only fires
 when the lineage resolves to a concrete leaf. Lets a rule expose a hierarchy of decisions lazily — only the
 subtrees the search actually walks into get materialized. `Fork.knobs` is the knob delta a fork pins — the
-variant identity the perf DB and the learned prior key on — read without expanding. Forks carry NO score:
-ranking is the policy's job (the learned prior over `fork.knobs`), and siblings are emitted in grouping
-order, which is the cold / no-prior fallback pick.
+variant identity the perf DB and the prior key on — read without expanding. Forks carry NO score:
+ranking is the policy's job (the `Prior` over `fork.knobs` — `AnalyticPrior` cold, `CatBoostPrior` trained),
+never grouping order.
 Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
 `LazyCandidate.from_option`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` a function of the fork's
 own knob delta, so siblings share one function instead of per-instance capture lambdas; used by
@@ -99,10 +103,10 @@ hierarchical Fork tree over both tiers:
 splices up as siblings of the atom branches — no `MMA` knob ever pins a scalar path), and the builder's
 single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 0`, scalar rows
 `wm = wn = 0` — the OFF sentinels), so a pure-scalar kernel's tree is exactly the classic
-`BR → (BM,BN) → (FM,FN)` over full-row leaves. Warp-vs-scalar ranking is the learned prior's job (siblings
-emit in enumeration order — `_priority_matmul_*` — which is the cold/no-prior pick); an explicit
-`DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so the search can't sidestep
-it). No variant is scored or materialized to rank it — the prior featurizes the row knobs directly
+`BR → (BM,BN) → (FM,FN)` over full-row leaves. Warp-vs-scalar ranking is the `Prior`'s job (siblings emit in
+enumeration construction order — the `AnalyticPrior` ranks them cold, the `CatBoostPrior` once trained); an
+explicit `DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so the search can't
+sidestep it). No variant is scored or materialized to rank it — the prior featurizes the row knobs directly
 (`knob.knob_features`).
 
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
@@ -189,14 +193,17 @@ which include the `S_*` structural features stamped by `loop/fusion/992_stamp_st
 histogram + loop extents + operand dtypes, so a structure or dtype change is an identity change), + the
 hardware context + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`)
 — so a pin / ctx / structure change invalidates it. The same `S_*` knobs ride every variant's knob dict, so
-`knob.knob_features` turns each row into the learned prior's feature vector and structurally identical
+`knob.knob_features` turns each row into the prior's feature vector and structurally identical
 kernels — the same layer repeated through a whole model — featurize alike and share the prior's rows.
 
-Variant ranking is the learned prior alone (`search/prior/CatBoostPrior`): greedy picks the `mean_score`
-argmin, MCTS ranks the PUCT frontier, and a cold / no-prior fallback keeps emission order. There is NO
-analytic per-variant scorer — the old `Op.lazy_score` / `TileOp.score_tile_geometry` formula and the
-`Fork.score` / `Search.score_of` plumbing were removed when the learned prior replaced them; nothing
-materializes or scores a TileOp just to rank it.
+Variant ranking is a single `Prior` over `knob.knob_features` (`search/prior/`): greedy picks the
+`mean_score` argmin, MCTS ranks the PUCT frontier. The `Prior` is the hand-coded `AnalyticPrior` cold (a
+fixed linear model over the engineered `D_*` geometry / occupancy features — the cold path is ranked by a real
+heuristic *score*, not emission order) and the learned `CatBoostPrior` once trained, composed behind
+`FallbackPrior` (`load_prior`). There is ONE ranking path: the old per-variant `Op.lazy_score` /
+`TileOp.score_tile_geometry` formula, the `Fork.score` / `Search.score_of` plumbing, AND the `_priority_*`
+enumeration sort that ranked the cold path were all removed — nothing materializes or scores a TileOp just to
+rank it; the prior featurizes the row knobs directly.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
@@ -272,8 +279,9 @@ rules — they're shared helpers for the pass's rule modules.
 three entry points:
 
 - `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
-  compile via `TuningSearch(max_visits=1)` with no prior (uniform PUCT →
-  emission-order descent). Stops at the first terminal candidate.
+  compile via `GreedySearch` (picks each fork by the `Prior`'s `mean_score`
+  argmin — `AnalyticPrior` cold, `CatBoostPrior` once trained). Stops at the
+  first terminal candidate.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
   yields one terminal `Candidate` per fully-explored rollout.
@@ -492,22 +500,34 @@ the `+∞`-unvisited UCB rule are gone.
 `Q = best_reward/global_best` (0 if unvisited); `P` is the prior's **predicted reward** on the same scale — the prior
 predicts latency `û(c)`, which `_select` converts to reward (`1/û`) and normalizes by the same `global_best` as `Q` (no
 softmax); `c = --ucb-c`. A confidently-slow sibling (large `û` → small `P`) gets a tiny exploration term → it is
-deprioritized instead of force-benched (no forced breadth). A cold or absent prior yields a uniform `P = 1`, so PUCT still
-explores via the exploration term — and a single-shot compile descends emission-order (the option-0 pick) when no prior is
-loaded. The end-of-run sanity block (silly-pick rate warmup-vs-post, self-calibration) prints once for the global prior.
+deprioritized instead of force-benched (no forced breadth). The prior is ALWAYS consulted — the `FallbackPrior` returns
+the learned `CatBoostPrior`'s prediction once trained and the `AnalyticPrior`'s heuristic cold (only a non-positive score
+falls back to a uniform `P = 1`). The enumeration is itself ordered by the `AnalyticPrior` (`_prior_order`), so the cold
+MCTS front-loads good variants and a single `tune` pass reaches the prior-best within patience. The end-of-run sanity
+block (silly-pick rate warmup-vs-post, self-calibration) prints once for the global prior.
 
 **Greedy uses the prior too.** `Pipeline.run`'s `GreedySearch` (the O(1)-per-step `compile` / `run` driver) lazy-loads the
-same global `CatBoostPrior` and picks each fork by `mean_score` argmin (lowest predicted latency) over the candidate's
-`{H_* , S_* , path-deltas, fork-delta}` feature vector — the exact base the prior trained on. With no trained prior it falls back to the first emitted
-sibling (option-0). (Greedy benches nothing, so it can only *use* a prior, never train one; routing whole-model compile
-through `TuningSearch` would be O(N²).)
+global `Prior` via `load_prior` (the `FallbackPrior` over `CatBoostPrior` + `AnalyticPrior`) and picks each fork by
+`mean_score` argmin (lowest predicted latency) over the candidate's `{H_* , S_* , path-deltas, fork-delta}` feature
+vector — the exact base the prior trained on. Cold (no trained `CatBoostPrior`) the `AnalyticPrior` ranks; only if
+`load_prior` returns nothing does it take option-0. (Greedy benches nothing, so it can only *use* a prior, never train
+one; routing whole-model compile through `TuningSearch` would be O(N²).)
+
+**Greedy validity fallback.** The prior ranks by *predicted latency*, which can rank a tile that fails `validate(ctx)`
+(smem / thread budget) first — `tune` benches-and-skips it, but greedy benches nothing. So when a deterministic compile
+leaves a node un-lowered (its only lowering rejected at `validate`), `Pipeline.run` blocklists that tile's
+`tile_identity` (its planner knobs) and **re-drives**: `GreedySearch(blocked=…)` skips the matching leaf and falls back
+to the next prior-ranked sibling (the valid runner-up is usually ranked right below). Bounded by `_MAX_GREEDY_RETRIES`
+(each retry blocks ≥1 fresh tile or stops). Only the offending leaf is skipped — a branch fork's partial knobs never
+match a full-row blocklist entry, so whole subtrees are never pruned.
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
 adds the whole-slice total under the LoopOp key) — the bench record / training data. A subsequent `deplodock compile` /
 `deplodock run` does NOT replay these DB forks (the greedy DB→fork replay was removed with the learned prior); instead
-`GreedySearch` picks each fork from the global `CatBoostPrior` (`mean_score` argmin — lowest predicted latency — option-0
-when no prior is loaded) — see "Greedy uses the prior too" above. `run_two_level_tune` assembles its final graph the same way.
+`GreedySearch` picks each fork from the global `Prior` (`FallbackPrior`: learned `CatBoostPrior` once trained, else the
+`AnalyticPrior`'s `mean_score` argmin — lowest predicted latency) — see "Greedy uses the prior too" above.
+`run_two_level_tune` assembles its final graph the same way.
 
 **Stub backend.** With `backend=None`, `_bench_terminal` short-circuits to `latency_us=1.0` and persists nothing — used by
 test fixtures so `Pipeline.run`'s greedy compile doesn't clobber tuned rows with a stub when no GPU is available.
@@ -567,7 +587,7 @@ incompatible divisibility still get a sensible default.
 | `TMA`                | BOOL      | `050_use_tma`                 | Promote BUFFERED/ASYNC bundles to TMA. `1` = force (hard-fail on ineligibility), `0` = skip the pass. Default on for Hopper+.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `ASYNC_COPY`         | BOOL      | `060_use_async_copy`          | Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). `0` = keep the synchronous double-buffer. Default on for sm_80+.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `PIPELINE_STAGES`    | BOOL      | `080_pipeline_stages`         | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `WARPSPEC`           | BOOL      | `085_warp_specialize`         | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `RING=2` on the warp tier to keep it eligible). Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is **emitted first** for the warp tier (option-0), so a cold / no-prior picker — which falls back to emission order because `_select` only steers on a *fitted* prior, not the fork `score_fn` — deploys the win cold instead of taking WS=0 and never benching WS=1 (the fp16 cliff in `plans/golden-sweep-report.md`). `DEPLODOCK_WARP_SPECIALIZE` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `WARPSPEC`           | BOOL      | `085_warp_specialize`         | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `RING=2` on the warp tier to keep it eligible). Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is **emitted first** for the warp tier (option-0), the deterministic tie-break the cold picker takes when the prior ties WS=0/WS=1 (the `AnalyticPrior` has no WARPSPEC feature), so it deploys the win cold instead of taking WS=0 and never benching WS=1 (the fp16 cliff in `plans/golden-sweep-report.md`). `DEPLODOCK_WARP_SPECIALIZE` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `NOATOMIC`           | BOOL      | `017_atomic_free_splitk`      | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). `DEPLODOCK_ATOMIC_FREE_SPLITK` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,

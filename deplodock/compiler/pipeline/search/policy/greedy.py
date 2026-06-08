@@ -21,16 +21,47 @@ from __future__ import annotations
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.policy.base import Search
 
+# Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
+# that fully determine a tile (so two leaves are "the same tile" iff these match).
+# Excludes the post-lowering staging knobs (RING / STAGE), which are stamped after
+# the greedy fork pick and differ between the leaf and the rejected node.
+_TILE_IDENTITY = ("BN", "BM", "FM", "FN", "BK", "FK", "SPLITK", "BR", "WM", "WN", "MMA")
+
+
+def tile_identity(knobs: dict) -> frozenset:
+    """The blocklist key for a tile — its planner-chosen knobs as a hashable set.
+    Computed identically for a greedy leaf's fork knobs and for a rejected node's
+    realized knobs, so :class:`GreedySearch` can skip a leaf that already failed
+    ``validate(ctx)`` downstream (the smem / thread-budget gate)."""
+    return frozenset((k, str(knobs[k])) for k in _TILE_IDENTITY if k in knobs)
+
+
+def _tile_blocked(fork_knobs: dict, blocked: set[frozenset]) -> bool:
+    """True if a leaf's complete knob row matches a blocklisted tile. Only a leaf
+    fork carries every identity knob, so a partial (branch) fork — whose identity
+    is a strict subset — never equals a full-row entry and is never skipped."""
+    return tile_identity(fork_knobs) in blocked
+
 
 class GreedySearch(Search):
-    """Keep one pending candidate; pick it by the learned prior (argmax) or, with
-    no trained prior, by emission order (option-0)."""
+    """Keep one pending candidate; pick it by the prior's ``mean_score`` argmin —
+    the learned ``CatBoostPrior`` once trained, the ``AnalyticPrior`` cold-start
+    heuristic otherwise (both behind ``load_prior``'s ``FallbackPrior``). Falls
+    to emission order (option-0) only if the prior fails to load entirely.
 
-    def __init__(self) -> None:
+    ``blocked`` (``{node_id: {tile_identity, ...}}``) lists tiles that failed
+    ``validate(ctx)`` on a previous compile attempt — ``Pipeline.run`` retries the
+    deterministic compile with the failed leaf blocklisted so greedy falls back to
+    the next prior-ranked sibling (the analogue of how ``tune`` benches-and-skips
+    an unviable tile; greedy benches nothing, so the validity signal must come from
+    the retry)."""
+
+    def __init__(self, blocked: dict[str, set[frozenset]] | None = None) -> None:
         super().__init__()
         self._pending: LazyCandidate | None = None
         self._prior = None  # lazily loaded on first push (the regime's checkpoint)
         self._prior_loaded = False
+        self._blocked = blocked or {}
         # Fork-tree state: ``_cur_inner`` is the shared ``inner`` Candidate of the
         # current fork tree (changes only when a leaf resolves into a new fork
         # point); ``_path_knobs`` accumulates the deltas chosen down that tree (the
@@ -44,20 +75,30 @@ class GreedySearch(Search):
             self._pending = None
             return
         prior = self._ensure_prior(cands[0])
-        if prior is None or not prior.fitted:
-            self._pending = cands[0]  # no trained prior → option-0
+        if prior is None:
+            self._pending = cands[0]  # prior failed to load → emission order
             return
         c0 = cands[0]
         if c0.inner is not self._cur_inner:  # new fork point → reset the path
             self._cur_inner = c0.inner
             self._path_knobs = {}
         base = self._base_knobs(c0)
-        best, best_v = cands[0], float("inf")
+        # Tiles this node already failed to lower on an earlier attempt — skip the
+        # matching leaf so greedy falls back to the next prior-ranked sibling. A
+        # non-leaf fork's partial knobs never match a full-row entry, so only the
+        # offending leaf is skipped, never a whole branch.
+        blocked = self._blocked.get(self._node_id(c0)) if self._blocked else None
+        best, best_v = None, float("inf")
         for c in cands:
-            full = {**base, **self._path_knobs, **(c.fork.knobs if c.fork is not None else {})}
+            fork_knobs = c.fork.knobs if c.fork is not None else {}
+            if blocked is not None and _tile_blocked(fork_knobs, blocked):
+                continue
+            full = {**base, **self._path_knobs, **fork_knobs}
             v = prior.mean_score(full)  # predicted latency µs — lower is better
             if v < best_v:
                 best_v, best = v, c
+        if best is None:  # every sibling blocklisted → no valid alternative left
+            best = cands[0]
         self._pending = best
         if best.fork is not None:
             self._path_knobs.update(best.fork.knobs)
@@ -67,19 +108,27 @@ class GreedySearch(Search):
         return (None, c) if c is not None else None
 
     def _ensure_prior(self, c: LazyCandidate):
-        """Load the one global prior once (warm if a checkpoint exists, else an
-        unfit prior → option-0). Best-effort: any load failure falls back to no
-        prior."""
+        """Load the one global prior once: the learned ``CatBoostPrior`` (warm if a
+        checkpoint exists) behind an ``AnalyticPrior`` cold-start fallback
+        (``load_prior``), so a fresh compile still ranks by the analytic heuristic
+        rather than raw emission order. Best-effort: any load failure → no prior →
+        emission order."""
         if self._prior_loaded:
             return self._prior
         self._prior_loaded = True
         try:
-            from deplodock.compiler.pipeline.search.prior import CatBoostPrior  # noqa: PLC0415
+            from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
-            self._prior = CatBoostPrior.load()
+            self._prior = load_prior()
         except Exception:  # noqa: BLE001 — a bad/missing prior must never break compile
             self._prior = None
         return self._prior
+
+    @staticmethod
+    def _node_id(c: LazyCandidate) -> str | None:
+        """The graph node this fork tree is lowering — the blocklist key. ``None``
+        for the root candidate (no pending match)."""
+        return c.pending[0].root_node_id if c.pending else None
 
     @staticmethod
     def _base_knobs(c: LazyCandidate) -> dict:

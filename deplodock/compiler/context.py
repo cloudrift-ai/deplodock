@@ -28,8 +28,8 @@ STATIC_SMEM_CAP = 48 * 1024
 # present (GPU-less CI / offline eval). RTX 5090 / sm_120 = 170 — the device the
 # golden configs were measured on, so offline golden ranking matches. The live
 # count (``target.live_device_features``) overrides this in ``from_target`` /
-# ``probe``. Consumed by the occupancy-aware matmul heuristics
-# (``search/heuristic.score_matmul_thread``, ``_enumeration._priority_matmul_warp``)
+# ``probe``. Consumed by the occupancy-aware analytic prior (the ``D_*`` CTA /
+# waves features in ``knob.knob_features``, ranked by ``search/prior/AnalyticPrior``)
 # to size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
 DEFAULT_SM_COUNT = 170
 

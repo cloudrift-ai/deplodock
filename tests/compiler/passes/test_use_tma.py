@@ -262,8 +262,18 @@ def test_force_tma_errors_on_sub_aligned_inner_extent(monkeypatch):
     from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
     from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
 
+    # Pin the full staged tile (not just BK): the cold default is now ranked by
+    # the ``AnalyticPrior`` (GPU/shape dependent), so the staged-but-sub-aligned
+    # tile that hits the *materialize* alignment gate must be pinned. BN=64 BM=8
+    # FM=8 FN=4 BK=16 stages a BUFFERED bundle whose 64 B inner extent is below
+    # the 128 B TMA-destination alignment → "not TMA-eligible" (vs the sibling
+    # ``test_force_tma_errors_on_pointwise``, which has no bundle at all).
     monkeypatch.setenv("DEPLODOCK_TMA", "1")
     monkeypatch.setenv("DEPLODOCK_BK", "16")
+    monkeypatch.setenv("DEPLODOCK_BN", "64")
+    monkeypatch.setenv("DEPLODOCK_BM", "8")
+    monkeypatch.setenv("DEPLODOCK_FM", "8")
+    monkeypatch.setenv("DEPLODOCK_FN", "4")
     M = K = N = 2048
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")

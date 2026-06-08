@@ -30,8 +30,9 @@ GEMM. On sm_120 the warp-tier prior + greedy now land on a square
 **64×64 output tile on a 4-warp CTA with WARP_SPECIALIZE=1** (producer warp issues
 TMA, consumer warps run the mma chain), measured at / above cuBLAS across the
 squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See the
-warp-tier ordering in ``_enumeration._priority_matmul_warp`` and the WS=1-first
-emission order in ``085_warp_specialize``.
+warp-tier ranking in ``search/prior/AnalyticPrior`` (the ``D_*`` geometry features
+over ``knob.knob_features``) and the WS=1-first emission order in
+``085_warp_specialize``.
 """
 
 from __future__ import annotations
@@ -115,6 +116,36 @@ class MatmulGoldenConfig(GoldenConfig):
         e.g. ``DEPLODOCK_KNOBS="BM=8,..." deplodock compile -c "torch.matmul(...)" --ir cuda``
         """
         return f'DEPLODOCK_KNOBS="{_knobs_env(self.knobs)}" deplodock compile -c "{self.snippet()}" --ir {ir}'
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReduceGoldenConfig(GoldenConfig):
+    """A golden config for a row-reduce ``(M, K) → (M,)`` (``torch.sum(dim=-1)``).
+
+    The good config is cooperative: ``BR > 1`` threads reduce each row in parallel
+    (then a WarpShuffle / TreeHalve combine), so the prior must rank cooperative
+    ``BR`` above the serial ``BR=1`` tile — the signal the matmul-only fit lacked.
+    Enumerated by ``priority_mode="reduce"`` (``E_N=1``, free=M, reduce=K)."""
+
+    M: int
+    K: int
+
+    def snippet(self) -> str:
+        return f"torch.sum(torch.randn({self.M},{self.K}),dim=-1)"
+
+
+@dataclass(frozen=True, kw_only=True)
+class PointwiseGoldenConfig(GoldenConfig):
+    """A golden config for an elementwise map ``(M, N) → (M, N)`` (``torch.relu``).
+
+    Memory-bound: the good config is a wide coalesced tile (large ``BN`` / ``FM``,
+    no reduce). Enumerated by ``priority_mode="pointwise"`` (``E_K=1``, free=M·N)."""
+
+    M: int
+    N: int
+
+    def snippet(self) -> str:
+        return f"torch.relu(torch.randn({self.M},{self.N}))"
 
 
 # --- BEGIN GENERATED (scripts/find_golden_configs.py) ---
@@ -554,6 +585,55 @@ GOLDEN_CONFIGS: list[GoldenConfig] = [
     ),
 ]
 # --- END GENERATED ---
+
+# Reduce / pointwise goldens — measured on the RTX 5090 (``deplodock tune --bench``,
+# deployable -O3). Hand-maintained (NOT in the generated matmul block): they extend
+# the single ranking path to non-matmul kernels so the cold ``AnalyticPrior`` ranks
+# a cooperative reduce / wide pointwise tile first (the matmul-only fit picked a
+# serial ``BR=1`` reduce). Each reduce's good tile is cooperative (``BR``=8–32).
+REDUCE_POINTWISE_GOLDENS: list[GoldenConfig] = [
+    ReduceGoldenConfig(
+        name="reduce.2048x2048",
+        M=2048,
+        K=2048,
+        knobs={"BN": 1, "BM": 1, "BR": 16, "BK": 64, "FM": 1, "FN": 1, "FK": 1, "SPLITK": 1},
+        deplodock_us=4.12,
+        cublas_us=6.13,
+    ),
+    ReduceGoldenConfig(
+        name="reduce.1024x512",
+        M=1024,
+        K=512,
+        knobs={"BN": 1, "BM": 1, "BR": 32, "BK": 16, "FM": 1, "FN": 2, "FK": 1, "SPLITK": 1},
+        deplodock_us=2.05,
+        cublas_us=2.05,
+    ),
+    ReduceGoldenConfig(
+        name="reduce.2048x128",
+        M=2048,
+        K=128,
+        knobs={"BN": 1, "BM": 1, "BR": 8, "BK": 16, "FM": 1, "FN": 2, "FK": 1, "SPLITK": 1},
+        deplodock_us=2.05,
+        cublas_us=2.05,
+    ),
+    PointwiseGoldenConfig(
+        name="pointwise.2048x2048",
+        M=2048,
+        N=2048,
+        knobs={"BN": 128, "BM": 8, "BR": 1, "BK": 1, "FM": 8, "FN": 1, "FK": 1, "SPLITK": 1},
+        deplodock_us=8.0,
+        cublas_us=8.0,
+    ),
+    PointwiseGoldenConfig(
+        name="pointwise.512x4096",
+        M=512,
+        N=4096,
+        knobs={"BN": 128, "BM": 8, "BR": 1, "BK": 1, "FM": 16, "FN": 1, "FK": 1, "SPLITK": 1},
+        deplodock_us=6.15,
+        cublas_us=6.15,
+    ),
+]
+GOLDEN_CONFIGS = GOLDEN_CONFIGS + REDUCE_POINTWISE_GOLDENS
 
 
 def goldens_by_name(name: str) -> list[MatmulGoldenConfig]:

@@ -179,7 +179,7 @@ def _fused_loops(graph: Graph):
     from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
 
-    fused = Pipeline.build(LOOP_PASSES).run(graph, ctx=Context(compute_capability="sm_80"), db=SearchDB())
+    fused = Pipeline.build(LOOP_PASSES).run(graph, ctx=Context(compute_capability=(8, 0)), db=SearchDB())
     return fused, [n.op for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
 
 

@@ -14,6 +14,8 @@ from deplodock.compiler.pipeline.search.golden import (
     GOLDEN_CONFIGS,
     GoldenConfig,
     MatmulGoldenConfig,
+    PointwiseGoldenConfig,
+    ReduceGoldenConfig,
     matmul_snippet,
 )
 
@@ -48,12 +50,20 @@ def test_repro_command_round_trips_knobs_and_snippet():
 
 def test_golden_configs_set_is_well_formed():
     for c in GOLDEN_CONFIGS:
-        assert isinstance(c, MatmulGoldenConfig), c.name
-        assert c.M > 0 and c.N > 0 and c.K > 0, c.name
+        # Every regime: matmul (M,N,K), reduce (M,K), pointwise (M,N).
+        assert isinstance(c, (MatmulGoldenConfig, ReduceGoldenConfig, PointwiseGoldenConfig)), c.name
+        if isinstance(c, MatmulGoldenConfig):
+            assert c.M > 0 and c.N > 0 and c.K > 0, c.name
+        elif isinstance(c, ReduceGoldenConfig):
+            assert c.M > 0 and c.K > 0, c.name
+            assert c.knobs.get("BR", 1) > 1, f"{c.name} reduce golden must be cooperative (BR>1)"
+        else:
+            assert c.M > 0 and c.N > 0, c.name
         assert c.deplodock_us > 0 and c.cublas_us > 0, c.name
         assert c.ratio >= 0.0, c.name
         assert c.golden == (c.ratio >= 0.95), c.name
         assert c.knobs, f"{c.name} has no recorded knobs"
+        assert c.snippet(), c.name
 
 
 def _dup(knobs, us):

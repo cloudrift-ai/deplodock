@@ -1,39 +1,47 @@
-"""Hardcoded prior-free knob heuristic (``search/heuristic``).
+"""Golden-config evaluation harness (``search/heuristic``) + the cold-start
+:class:`AnalyticPrior` it ranks with.
 
-CPU-only (no CUDA): the heuristic reconstructs the planner's enumeration and
-scores it analytically. These pin the load-bearing properties — degenerate tiles
-score below golden-shaped ones, picks land in the geometry band, and the warp
-tier dispatches by dtype — without re-running the offline weight fit (that lives
-in ``scripts/golden_knob_heuristics.py``).
+CPU-only (no CUDA): ``heuristic`` reconstructs a matmul shape's enumeration and
+ranks it with a ``Prior`` (the :class:`AnalyticPrior` by default — the fixed
+linear model over ``knob.knob_features`` that replaced the old
+``score_matmul_thread`` / ``_priority_matmul_*`` heuristic). These pin the
+load-bearing properties — degenerate tiles score *above* (slower than) golden
+ones, picks land in the geometry band, and the warp tier dispatches by dtype —
+without re-running the offline weight fit (that lives in
+``scripts/golden_knob_heuristics.py``).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline.search.heuristic import (
-    THREAD_KNOBS,
-    pick_matmul,
-    score_matmul_thread,
-)
+from deplodock.compiler.pipeline.search.heuristic import THREAD_KNOBS, pick_matmul
+from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
 
 def _ctx() -> Context:
-    # sm_120 (RTX 5090) — the regime the golden set + heuristic weights target.
+    # sm_120 (RTX 5090) — the regime the golden set + prior weights target.
     return Context.from_target((12, 0))
 
 
+def _score(knobs: dict, M: int, N: int, K: int) -> float:
+    """AnalyticPrior latency proxy (lower = better) with the shape / regime
+    features the prior featurizes merged in — mirrors what the planner stamps."""
+    base = {**_ctx().features(), "S_ext_free_prod": float(M * N), "S_ext_reduce_prod": float(K), "S_ext_reduce_max": float(K)}
+    return AnalyticPrior().score({**base, **knobs})
+
+
 def test_golden_row_outscores_degenerate_tile():
-    # The current static priority's top pick for 2048² is the degenerate
-    # BN=1, BM=256 tile; the recorded golden is BN=32, BM=8, FM=26, FN=4.
-    # The heuristic must rank the golden strictly above the degenerate one.
+    # The recorded golden for 2048² is BN=32, BM=8; a degenerate BN=1, BM=256 tile
+    # is far slower. The analytic prior must rank the golden strictly better —
+    # i.e. its latency proxy is LOWER (lower = better, matching CatBoostPrior).
     shape = (2048, 2048, 2048)
     golden = {"BN": 32, "BM": 8, "FM": 26, "FN": 4, "FK": 1, "BK": 32, "SPLITK": 1, "BR": 1}
     degenerate = {"BN": 1, "BM": 256, "FM": 1, "FN": 128, "FK": 1, "BK": 32, "SPLITK": 1, "BR": 1}
-    assert score_matmul_thread(golden, *shape) > score_matmul_thread(degenerate, *shape)
+    assert _score(golden, *shape) < _score(degenerate, *shape)
 
 
 def test_pick_matmul_lands_in_geometry_band():
-    # Across a spread of shapes the argmax pick should respect the heuristic's
+    # Across a spread of shapes the argmin pick should respect the prior's
     # dominant bands: coalesced inner axis 16..64, short outer axis 8..16,
     # large K-chunk, light split-K — never a degenerate BN=1 / BM=256 tile.
     ctx = _ctx()

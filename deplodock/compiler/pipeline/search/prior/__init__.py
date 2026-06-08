@@ -3,8 +3,10 @@ refit, end-of-run sanity stats) and the concrete :class:`CatBoostPrior`."""
 
 from __future__ import annotations
 
+from deplodock.compiler.pipeline.search.prior.analytic import AnalyticPrior
 from deplodock.compiler.pipeline.search.prior.base import Prior
 from deplodock.compiler.pipeline.search.prior.catboost import CatBoostPrior
+from deplodock.compiler.pipeline.search.prior.fallback import FallbackPrior, load_prior
 
 
 def prior_from_json(obj: dict) -> Prior:
@@ -13,4 +15,4 @@ def prior_from_json(obj: dict) -> Prior:
     return CatBoostPrior.from_json(obj)
 
 
-__all__ = ["CatBoostPrior", "Prior", "prior_from_json"]
+__all__ = ["AnalyticPrior", "CatBoostPrior", "FallbackPrior", "Prior", "load_prior", "prior_from_json"]

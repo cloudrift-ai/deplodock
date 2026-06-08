@@ -395,7 +395,7 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
         return _stamp(ws_choices[0])
 
     # For the warp-tier MMA tower, WS=1 is a measured win (≈17% at 64×64, neutral
-    # at 128×128 — see the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``),
+    # at 128×128 — the RTX 5090 warp sweep, see ``plans/golden-sweep-report.md``),
     # so it should be the first guess. Ordering is the ONLY lever that does this:
     # the policies select on the learned prior when fitted and on **emission
     # order** otherwise (option-0 / PUCT tie) — Forks carry no heuristic score.

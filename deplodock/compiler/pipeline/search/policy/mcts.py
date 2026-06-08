@@ -284,31 +284,28 @@ class TuningSearch(Search):
         predicts latency ``û(c)``, which this loop converts to reward (``1/û``)
         and normalizes by the same ``global_best`` as ``Q`` — no softmax. A
         confidently-bad sibling gets a small ``P`` → tiny exploration term → it is
-        deprioritized rather than force-visited. There is no ``+∞``-unvisited rule
-        (no forced breadth): a cold or absent prior yields a uniform ``P = 1``, so
-        PUCT still explores via the exploration term (and a single-shot compile
-        with no prior descends emission-order). ``c_ucb`` is ``--ucb-c``. With
-        ``explore_eps > 0`` a fraction of steps instead descend a uniformly
-        random live child (ε-greedy), so exploration doesn't depend on the
-        prior/heuristic ordering. ``explore_eps > 0`` (tune, opt-in) adds an ε-greedy
-        hook: with probability ``explore_eps`` descend a uniformly random live
-        child. Off by default so a single-shot compile / the unit tests stay
-        deterministic. NOTE: a *random tie-break* under a cold prior (when every
-        child ties) was tried and reverted — it discards the heuristic
-        enumeration order, which does real work, and regressed fp16 tuning ~2×
-        (random walk into degenerate wide-FM/FN tiles). The heuristic order is a
-        load-bearing prior; exploration must perturb it, not replace it."""
+        deprioritized rather than force-visited. The prior is always consulted —
+        the ``FallbackPrior`` returns the learned model's prediction once trained
+        and the ``AnalyticPrior`` heuristic cold, so even a fresh ``tune`` is
+        prior-guided, not uniform. Only when there is NO usable prediction (no
+        prior attached, or a non-positive score) does ``P`` fall to a uniform
+        ``1`` so the exploration term still drives breadth. ``c_ucb`` is
+        ``--ucb-c``. With ``explore_eps > 0`` (tune, opt-in) a fraction of steps
+        instead descend a uniformly random live child (ε-greedy); off by default
+        so a single-shot compile / the unit tests stay deterministic. NOTE: a
+        *random tie-break* under a cold prior was tried and reverted — it discarded
+        the heuristic ordering and regressed fp16 tuning ~2×; exploration must
+        perturb the prior order, not replace it."""
         if self._explore_eps and self._rng.random() < self._explore_eps:
             return self._rng.choice(children)
         global_best = self.tree.best_reward or 1.0
-        fitted = self.prior_model is not None and self.prior_model.fitted
         sqrt_parent = math.sqrt(parent.visits + 1)
         best, best_v = children[0], float("-inf")
         for c in children:
             q = (c.best_reward / global_best) if c.visits > 0 else 0.0
-            if fitted:
-                pred_us = self._prior_score(c)
-                p = (1.0 / pred_us) / global_best if pred_us > 0 else 0.0
+            pred_us = self._prior_score(c)
+            if pred_us > 0:
+                p = (1.0 / pred_us) / global_best
             else:
                 p = 1.0  # cold / absent prior → uniform exploration
             v = q + self._ucb_c * p * sqrt_parent / (1 + c.visits)
