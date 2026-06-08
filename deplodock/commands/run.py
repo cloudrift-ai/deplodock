@@ -362,7 +362,7 @@ def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> Non
 
 
 # One recorded golden config compiled + benched with its knobs pinned this run.
-_GoldenBench = namedtuple("_GoldenBench", "config graph bench")
+_GoldenBench = namedtuple("_GoldenBench", "sample graph bench")
 
 
 @contextlib.contextmanager
@@ -388,26 +388,26 @@ def _pinned_knobs(knobs: dict):
 def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
     """Compile + bench each recorded golden config with its knobs pinned, returning
     a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
-    measured row beside the greedy pick. Only the tunable knobs are pinned (``S_*``
-    / ``H_*`` features are not knobs). Each config re-traces a **fresh** graph from
-    ``code`` — a frontend graph can't be re-compiled (the first lowering mutates it
-    in place, so a reused graph would yield the first config's kernel every time).
-    Best-effort: a golden whose pinned knobs fail to compile / bench for the live
-    device is skipped with a warning."""
+    measured row beside the greedy pick. ``golden_configs`` are
+    :class:`~deplodock.compiler.pipeline.search.data.Sample`s, whose ``knobs`` are
+    already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs).
+    Each config re-traces a **fresh** graph from ``code`` — a frontend graph can't be
+    re-compiled (the first lowering mutates it in place, so a reused graph would
+    yield the first config's kernel every time). Best-effort: a golden whose pinned
+    knobs fail to compile / bench for the live device is skipped with a warning."""
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
 
     out = []
-    for cfg in golden_configs or []:
-        pins = {k: v for k, v in cfg.knobs.items() if not k.startswith(("S_", "H_"))}
+    for sample in golden_configs or []:
         try:
-            with _pinned_knobs(pins):
+            with _pinned_knobs(sample.knobs):
                 graph, _, _ = graph_from_code(code)  # fresh graph; knobs baked into the kernel source here
                 g_compiled = backend.compile(graph)
             g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
         except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
-            logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", cfg.name, exc)
+            logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
             continue
-        out.append(_GoldenBench(cfg, g_compiled, g_bench))
+        out.append(_GoldenBench(sample, g_compiled, g_bench))
     return out
 
 
@@ -465,7 +465,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         = K``), the same shape signature the prior diagnostics match goldens on."""
         free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
         reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
-        return [gb for gb in (golden_benches or []) if gb.config.M * gb.config.N == free_prod and gb.config.K == reduce_max]
+        return [gb for gb in (golden_benches or []) if gb.sample.shape.free_prod == free_prod and gb.sample.shape.reduce_max == reduce_max]
 
     # Build row records first (the knob columns are aligned across all rows, so we
     # can't stream): (name, t_us, pct_cell, geom, knobs, ref_knobs_or_None). A
@@ -484,7 +484,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
             g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
             for gidx, gnode in enumerate(g_nodes):
                 gk = dict(tuning_knob_items(gnode.op.knobs or {}))
-                records.append((f"golden {gb.config.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
+                records.append((f"golden {gb.sample.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
 
     knob_lines = align_knob_columns(
         [{k: (f"{k}={v}", ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]

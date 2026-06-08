@@ -83,20 +83,24 @@ def test_goldens_by_name_returns_every_config_under_a_name(monkeypatch):
 
 def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
     """``--golden NAME`` stashes *every* recorded config under NAME on
-    ``args.golden_configs`` (all share the shape, so ``args.code`` is the snippet
-    of the first); no ``--golden`` leaves an empty list."""
+    ``args.golden_configs`` as :class:`Sample`s (all share the shape, so ``args.code``
+    is the snippet of the first); no ``--golden`` leaves an empty list."""
     from argparse import Namespace
 
-    from deplodock.commands import compile as cmod
     from deplodock.compiler.pipeline.search import golden as gmod
 
     a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    # Dataset.from_golden reads golden.GOLDEN_CONFIGS via a lazy import, so this patch is seen.
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
+
+    from deplodock.commands import compile as cmod
 
     args = Namespace(golden="dup.512", code=None, input=None, ir=None)
     cmod.resolve_golden_arg(args)
-    assert args.golden_configs == [a, b]
+    assert [s.name for s in args.golden_configs] == ["dup.512", "dup.512"]
+    assert [s.knobs for s in args.golden_configs] == [{"BM": 8}, {"BM": 16}]
     assert args.code == a.snippet()
+    assert all(s.source == "golden" for s in args.golden_configs)
 
     none = Namespace(golden=None, code=None, input=None, ir=None)
     cmod.resolve_golden_arg(none)

@@ -14,22 +14,12 @@ from __future__ import annotations
 
 import math
 import statistics
-from collections import defaultdict
 
-
-def _op_sig(knobs: dict) -> tuple:
-    return tuple(sorted((k, v) for k, v in knobs.items() if k.startswith("S_")))
+from deplodock.compiler.pipeline.search.data import Dataset
 
 
 def _n_tunable(knobs: dict) -> int:
     return sum(1 for k in knobs if not k.startswith(("S_", "H_")))
-
-
-def group_by_op(dataset: list[tuple[dict, float]]) -> dict[tuple, list[tuple[dict, float]]]:
-    g: dict[tuple, list] = defaultdict(list)
-    for k, v in dataset:
-        g[_op_sig(k)].append((k, v))
-    return dict(g)
 
 
 def _op_label(sig: tuple) -> str:
@@ -48,15 +38,16 @@ def reachability(prior, groups: dict) -> list[tuple]:
     """Per op: ``(label, best_us, pick_us, ratio, n_leaf_configs)`` — the config the
     prior predicts fastest (``mean_score`` argmin) over the op's measured *leaf*
     configs vs the measured best (ratio = the picked config's latency / the best's;
-    1.0 = recovers the optimum)."""
+    1.0 = recovers the optimum). ``groups`` maps an ``S_*`` signature to its
+    :class:`Sample`s (from :meth:`Dataset.group_by_op`)."""
     out = []
     for sig, grp in groups.items():
-        kmax = max(_n_tunable(k) for k, _ in grp)
-        leaves = [(k, v) for k, v in grp if _n_tunable(k) == kmax]
+        kmax = max(_n_tunable(s.all_knobs()) for s in grp)
+        leaves = [s for s in grp if _n_tunable(s.all_knobs()) == kmax]
         if len(leaves) < 2:
             continue
-        best_us = min(v for _, v in leaves)  # labels are latency µs — lower is better
-        pick_us = min(leaves, key=lambda t: prior.mean_score(t[0]))[1]
+        best_us = min(s.latency_us for s in leaves)  # labels are latency µs — lower is better
+        pick_us = min(leaves, key=lambda s: prior.mean_score(s.all_knobs())).latency_us
         out.append((_op_label(sig), best_us, pick_us, pick_us / best_us, len(leaves)))
     return out
 
@@ -69,11 +60,11 @@ def _calibration(prior, groups: dict) -> float | None:
 
     rhos = []
     for grp in groups.values():
-        kmax = max(_n_tunable(k) for k, _ in grp)
-        leaves = [(k, v) for k, v in grp if _n_tunable(k) == kmax]
+        kmax = max(_n_tunable(s.all_knobs()) for s in grp)
+        leaves = [s for s in grp if _n_tunable(s.all_knobs()) == kmax]
         if len(leaves) < 3:
             continue
-        rho = spearmanr([prior.mean_score(k) for k, _ in leaves], [v for _, v in leaves]).statistic
+        rho = spearmanr([prior.mean_score(s.all_knobs()) for s in leaves], [s.latency_us for s in leaves]).statistic
         if not math.isnan(rho):
             rhos.append(rho)
     return statistics.median(rhos) if rhos else None
@@ -111,7 +102,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     # Index op groups by (free-dim product, reduce extent, is-matmul) so each
     # golden shape maps to the S_* signature it was tuned under.
     index: dict[tuple, dict] = {}
-    for sig in group_by_op(prior._dataset):
+    for sig in Dataset.from_prior(prior).group_by_op():
         d = dict(sig)
         key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_n_mma", 0) > 0)
         index.setdefault(key, {k: v for k, v in d.items() if k.startswith("S_")})
@@ -151,7 +142,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
 def report(prior) -> str:
     """The full offline diagnostics block for a (re)fit prior."""
     dataset = prior._dataset
-    groups = group_by_op(dataset)
+    groups = Dataset.from_prior(prior).group_by_op()
     lines = [f"[prior] dataset: {len(dataset)} rows, {len(groups)} op-structures, fitted={prior.fitted}"]
     if not prior.fitted:
         lines.append("  no model — dataset below min_rows; run `deplodock tune <model>` to gather more")

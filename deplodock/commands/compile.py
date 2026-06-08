@@ -138,19 +138,21 @@ def resolve_golden_arg(args) -> None:
     args.golden_configs = []
     if not name:
         return
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig, goldens_by_name
+    from deplodock.compiler.pipeline.search.data import Dataset
 
     if args.code or args.input or getattr(args, "ir", None):
         logger.error("--golden is mutually exclusive with --code / positional input / --ir")
         sys.exit(2)
-    matches = goldens_by_name(name)
+    matches = Dataset.from_golden(name=name).samples
     if not matches:
+        from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
+
         names = ", ".join(sorted({g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}))
         logger.error("unknown golden config %r.\nAvailable: %s", name, names)
         sys.exit(2)
     # All configs under one name share the shape, so any snippet is interchangeable.
     args.golden_configs = matches
-    args.code = matches[0].snippet()
+    args.code = matches[0].snippet
     logger.info("[golden] %s → --code %s (%d recorded config%s)", name, args.code, len(matches), "" if len(matches) == 1 else "s")
 
 

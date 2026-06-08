@@ -179,12 +179,13 @@ def test_load_tolerates_stale_checkpoint(tmp_path):
 def test_diagnostics_report_reachability():
     """``diagnostics.report`` groups by op and reports argmax reachability — on a
     perfectly-rankable synthetic op the prior recovers the best (ratio 1.0)."""
+    from deplodock.compiler.pipeline.search.data import Dataset
     from deplodock.compiler.pipeline.search.prior import diagnostics
 
     # one op-structure (S_kind), bigger BM = lower latency (label = µs)
     rows = [({"S_kind": 1.0, "BM": bm}, 100.0 / bm) for bm in (2, 4, 8, 16, 32, 64) for _ in range(6)]
     p = _fit(rows)
-    groups = diagnostics.group_by_op(p._dataset)
+    groups = Dataset.from_prior(p).group_by_op()
     assert len(groups) == 1
     rr = diagnostics.reachability(p, groups)
     assert len(rr) == 1
