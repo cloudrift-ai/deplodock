@@ -7,11 +7,19 @@ Loop→Tile), and a backend-partitioned generic ``perf`` table.
 
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 
 
 def _stats(median: float) -> PerfStats:
     return PerfStats(median=median, min=median, max=median, mean=median, variance=0.0, n_samples=1)
+
+
+def _seed_cuda(db: SearchDB, key: str, pretty: str) -> None:
+    db.record_cuda_op(key, kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty=pretty)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +82,54 @@ def test_min_latency_filters_by_backend() -> None:
     assert db.min_latency_for_context("ctx", backend="cuda") == 10.0
     assert db.min_latency_for_context("ctx", backend="loop") == 1.0
     assert db.min_latency_for_context("ctx") == 1.0  # aggregates across backends
+
+
+# ---------------------------------------------------------------------------
+# read-only open + perf ⋈ cuda_op samples
+# ---------------------------------------------------------------------------
+
+
+def test_iter_perf_samples_joins_cuda_op() -> None:
+    db = SearchDB()
+    _seed_cuda(db, "k1", "void k_matmul(float*)")
+    _seed_cuda(db, "k2", "void k_rms(float*)")
+    db.record_perf("ctx", "k1", backend="cuda", status="ok", stats=_stats(10.0), knobs={"BM": 8, "S_n_mma": 1.0})
+    db.record_perf("ctx", "k2", backend="cuda", status="ok", stats=_stats(5.0), knobs={"BN": 1})
+    db.record_perf("ctx", "k1", backend="cuda", status="bench_fail", stats=_stats(1.0))  # ok stays; fail not yielded
+
+    samples = sorted(db.iter_perf_samples(), key=lambda s: s.latency_us)
+    assert [(s.pretty, s.latency_us) for s in samples] == [("void k_rms(float*)", 5.0), ("void k_matmul(float*)", 10.0)]
+    assert samples[1].knobs == {"BM": 8, "S_n_mma": 1.0}
+
+
+def test_iter_perf_samples_backend_and_min_latency() -> None:
+    db = SearchDB()
+    _seed_cuda(db, "k1", "void k(float*)")
+    _seed_cuda(db, "k2", "void k(float*)")
+    db.record_perf("ctx", "k1", backend="cuda", status="ok", stats=_stats(10.0))
+    db.record_perf("ctx", "k2", backend="loop", status="ok", stats=_stats(2.0))
+    assert {s.latency_us for s in db.iter_perf_samples(backend="cuda")} == {10.0}
+    assert {s.latency_us for s in db.iter_perf_samples(backend=None)} == {10.0, 2.0}
+    assert {s.latency_us for s in db.iter_perf_samples(backend=None, min_latency_us=5.0)} == {10.0}
+
+
+def test_open_readonly_reads_without_mutating(tmp_path) -> None:
+    path = tmp_path / "tune.db"
+    db = SearchDB(path)
+    _seed_cuda(db, "k1", "void k_matmul(float*)")
+    db.record_perf("ctx", "k1", backend="cuda", status="ok", stats=_stats(7.0), knobs={"BM": 8})
+    db.close()
+
+    ro = SearchDB.open_readonly(path)
+    assert [s.latency_us for s in ro.iter_perf_samples()] == [7.0]
+    with pytest.raises(sqlite3.OperationalError):  # ?mode=ro rejects writes
+        ro.record_perf("ctx", "k2", backend="cuda", status="ok", stats=_stats(1.0))
+    ro.close()
+
+
+def test_open_readonly_missing_file_raises(tmp_path) -> None:
+    with pytest.raises(sqlite3.OperationalError):
+        SearchDB.open_readonly(tmp_path / "nope.db")
 
 
 # ---------------------------------------------------------------------------

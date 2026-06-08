@@ -118,25 +118,37 @@ same worker.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock eval knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB:
-  the registered knob schema, then (with a tune DB) per-knob regret + a knob-interaction matrix sorted by geomean
-  impact (joins `perf` with `cuda_op`) — use the rankings to drive Fork-tree knob ordering in the planner.
-- `deplodock eval analytic [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the hand-coded linear model
-  over `knob.knob_features` that replaced `score_matmul_thread` / the `_priority_matmul_*` enumeration sort; the cold half
+The `eval` subcommands share a `--dataset {golden,db}` vocabulary (`commands/dataset_args.py`): `golden` reads the
+recorded `GOLDEN_CONFIGS`, `db` reads the tune DB's measured `perf` rows. Both flow through one read-view —
+`compiler/pipeline/search/data/` (`Sample` / `Dataset` / `ShapeKey`) — which also backs the prior `fit` featurization
+and the diagnostics grouping, so golden filtering, the DB join, and `knob_features` live in one place. Source is
+orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) fails fast with a specific message.
+
+- `deplodock eval knobs [--dataset db] [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the
+  autotune DB (`--dataset db`, the default; `--dataset golden` is rejected — goldens carry no kernel C identity): the
+  registered knob schema, then (with a tune DB) per-knob regret + a knob-interaction matrix sorted by geomean impact
+  (joins `perf` with `cuda_op` via `Dataset.from_db().group_by_kernel_name()`) — drives Fork-tree knob ordering.
+- `deplodock eval analytic [--dataset golden] [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the
+  hand-coded linear model over `knob.knob_features` that replaced `score_matmul_thread` / the `_priority_matmul_*`
+  enumeration sort; the cold half
   of the ONE ranking path — see `compiler/pipeline/search/prior/`) on each `GOLDEN_CONFIGS` shape: the golden's **rank**
   under the prior over the shape's full enumeration (no GPU, no learned data, no measurements; the metric the tuner's
   patience must reach) + per-knob `found/golden` (mismatches in red), summarized as median + top-k. The
   `search/analytic.py` module is now just the golden-eval glue (`evaluate_golden` / `pick_matmul`) around the prior
   (`eval analytic` shows the matmul goldens; the prior also ranks the cooperative-reduce / pointwise goldens). Weights fit
   offline by `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
-- `deplodock eval prior [--prior PATH] [--kernel SUBSTR] [--features]` — evaluate the learned `CatBoostPrior` on the
-  golden configs: the golden's rank under the prior over the full enumeration, then the greedy pipeline pick vs golden
-  (per-knob `found/golden`). Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded) —
-  **not** the `--db` tune DB. `--features` also prints the exact regressor input per golden config (`knob.knob_features`:
-  `S_*` structural/shape + `H_*` regime + tuning knobs; note the shape enters only as coarse `S_ext_*` products/maxes,
-  so the occupancy/CTA/reuse terms the prior needs are added as engineered `D_*` features in `knob.knob_features`).
-- `deplodock eval golden [--prior PATH] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs recorded golden,
-  per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
+- `deplodock eval prior [--prior PATH] [--dataset {golden,db}] [--db PATH] [--kernel SUBSTR] [--features]` — evaluate the
+  learned `CatBoostPrior`. Default `--dataset golden`: the golden's rank under the prior over the full enumeration, then
+  the greedy pipeline pick vs golden (per-knob `found/golden`). `--dataset db` instead reports the prior's pick
+  **reachability** over the tune DB's *measured* variants (does the prior recover each op's measured-best leaf?) — the
+  orthogonal counterpart to the golden views, reusing `diagnostics.reachability` over `Dataset.from_db().group_by_op()`.
+  Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also
+  prints the exact regressor input per golden config (`knob.knob_features`: `S_*` structural/shape + `H_*` regime +
+  tuning knobs; the shape enters only as coarse `S_ext_*` products/maxes, so the occupancy/CTA/reuse terms the prior
+  needs are added as engineered `D_*` features). The golden `S_*` here is the full histogram (the shape's snippet is
+  compiled and cached via `data.Sample.from_golden(compile_s_feats=True)`), matching what a DB-trained prior saw.
+- `deplodock eval golden [--prior PATH] [--dataset golden] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs
+  recorded golden, per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
   rank-under-prior diagnostics; use `eval analytic` / `eval prior` for those). The view to watch while iteratively
   tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
 - `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so

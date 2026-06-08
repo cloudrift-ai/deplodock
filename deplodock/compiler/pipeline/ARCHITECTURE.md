@@ -12,7 +12,8 @@ pipeline/
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
 │   ├── policy/       # Search ABC (base.py) + GreedySearch (greedy.py, compile/run) + TuningSearch (mcts.py, tune); both rank via the Prior
-│   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf (per-variant replay cache)
+│   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf (per-variant replay cache); open_readonly + iter_perf_samples (perf ⋈ cuda_op) back the data layer
+│   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path), Dataset (from_golden/from_db/from_prior + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity)
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
 │   ├── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
