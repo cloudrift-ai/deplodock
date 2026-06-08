@@ -221,16 +221,16 @@ configs:
     M: 512
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 10, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2, WARPSPEC: true}
-    deplodock_us: 36.9
+    knobs: {BN: 32, BM: 8, FM: 16, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
+    deplodock_us: 32.8
     cublas_us: 39.6
   - kernel: matmul
     name: qwen3_06b.o_proj.s512
     M: 512
     N: 1024
     K: 2048
-    knobs: {BN: 16, BM: 8, FM: 10, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2, WARPSPEC: true}
-    deplodock_us: 67.7
+    knobs: {BN: 32, BM: 8, FM: 16, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
+    deplodock_us: 59.4
     cublas_us: 58.6
   - kernel: matmul
     name: qwen3_06b.gate_up_proj.s512
@@ -245,8 +245,8 @@ configs:
     M: 512
     N: 1024
     K: 3072
-    knobs: {BN: 64, BM: 8, FM: 8, FN: 2, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
-    deplodock_us: 103.4
+    knobs: {BN: 32, BM: 8, FM: 16, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
+    deplodock_us: 86.1
     cublas_us: 79.6
   - kernel: reduce
     name: reduce.2048x2048
