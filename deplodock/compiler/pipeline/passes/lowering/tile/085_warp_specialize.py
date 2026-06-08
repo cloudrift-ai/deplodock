@@ -398,9 +398,8 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
     # at 128×128 — see the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``),
     # so it should be the first guess. Ordering is the ONLY lever that does this:
     # the policies select on the learned prior when fitted and on **emission
-    # order** otherwise (option-0 / PUCT tie) — they do NOT consult a fork's
-    # ``score_fn`` (``Search.score_of`` is latent infra now, see
-    # ``policy/base.py``). So a cold MCTS (a fresh ``tune --clean``) and a no-prior
+    # order** otherwise (option-0 / PUCT tie) — Forks carry no heuristic score.
+    # So a cold MCTS (a fresh ``tune --clean``) and a no-prior
     # greedy ``compile`` would take WS=0 and, under patience, never bench WS=1
     # (the measured fp16 gap in ``plans/golden-sweep-report.md``). Emit WS=1 FIRST
     # for the warp tier — emission order deploys the win cold, and the -O3 re-bench

@@ -78,25 +78,18 @@ the first (option-0) sibling; a `tune` sweep explores every fork. (DB-best repla
 are the deterministic case — no fork.
 
 **Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
-the fork pins), `is_leaf`, `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
-leaves, or a mix; exactly `[option]` for a leaf), and `score(cache)` (the lazy planner prior — see below).
-The search loop pops a Fork-pending `LazyCandidate`, invokes `expand()` to materialize the children,
-pushes them back, and continues; cursor advance only fires when the lineage resolves to a concrete leaf.
-Lets a rule expose a hierarchy of decisions lazily — only the subtrees the search actually walks into get
-materialized. `Fork.knobs` is the knob delta a fork pins — the variant identity the perf DB keys on — read
-without expanding.
+the fork pins), `is_leaf`, and `expand()` (the next level of options — more Forks, concrete `Op`/`Graph`
+leaves, or a mix; exactly `[option]` for a leaf). The search loop pops a Fork-pending `LazyCandidate`,
+invokes `expand()` to materialize the children, pushes them back, and continues; cursor advance only fires
+when the lineage resolves to a concrete leaf. Lets a rule expose a hierarchy of decisions lazily — only the
+subtrees the search actually walks into get materialized. `Fork.knobs` is the knob delta a fork pins — the
+variant identity the perf DB and the learned prior key on — read without expanding. Forks carry NO score:
+ranking is the policy's job (the learned prior over `fork.knobs`), and siblings are emitted in grouping
+order, which is the cold / no-prior fallback pick.
 Implementations hold their producer's state as data: `OptionFork` (a concrete `Op`/`Graph` leaf, built by
-`LazyCandidate.from_option`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` /
-`score_fn(knobs)` functions of the fork's own knob delta, so siblings share one function instead of
-per-instance capture lambdas; used by `085_warp_specialize`), and the tree builder's branch / leaf node
-classes.
-
-**The planner score compute (no longer drives selection).** The static prior was nuked from selection in
-favor of the learned prior (`CatBoostPrior`); `Search.score_of(fork) = fork.score(self.score_cache)` is retained as
-latent compute (exercised directly by the partition-planner tests). It still keys cleanly: the search owns
-the value-keyed score cache, and the partition planner keys each variant by `(ctx fields, frozenset(merged
-knobs))`, complete because the `S_*` structural-feature knobs ride the dict, so structurally identical
-kernels share every score. The same `S_*` features are what the learned prior featurizes (`knob.knob_features`).
+`LazyCandidate.from_option`), `ThunkFork` (generic flat forks — `expand_fn(knobs)` a function of the fork's
+own knob delta, so siblings share one function instead of per-instance capture lambdas; used by
+`085_warp_specialize`), and the tree builder's branch / leaf node classes.
 
 The partition planner (`lowering/tile/010_partition_loops`) emits one
 hierarchical Fork tree over both tiers:
@@ -104,13 +97,13 @@ hierarchical Fork tree over both tiers:
 (incl. `BK` / `SPLITK` / `FK` / `OVERHANG`, which live in no level), the DB-matchable variant identity. The root
 `MMA` level keys warp rows by atom kind; scalar rows return an empty key and skip the level (their subtree
 splices up as siblings of the atom branches — no `MMA` knob ever pins a scalar path), and the builder's
-single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 1`, scalar rows
-`wm = wn = 1`), so a pure-scalar kernel's tree is exactly the classic
-`BR → (BM,BN) → (FM,FN)` over full-row leaves. Warp-vs-scalar ranking is score-driven; an explicit
-`DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so score can't sidestep it).
-The per-variant prior is `TileOp.lazy_score(ctx, knobs=..., shapes=...)` — a pure formula over cheap
-inputs (the variant's stamped knob dict + planner shape) so siblings rank without anyone instantiating a
-TileOp. The branch tree's `score()` propagates max from leaves, matching MCTS's max-Q semantics.
+single-value collapse erases tier-foreign levels (warp rows carry `br = bm = bn = 0`, scalar rows
+`wm = wn = 0` — the OFF sentinels), so a pure-scalar kernel's tree is exactly the classic
+`BR → (BM,BN) → (FM,FN)` over full-row leaves. Warp-vs-scalar ranking is the learned prior's job (siblings
+emit in enumeration order — `_priority_matmul_*` — which is the cold/no-prior pick); an explicit
+`DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scalar tier so the search can't sidestep
+it). No variant is scored or materialized to rank it — the prior featurizes the row knobs directly
+(`knob.knob_features`).
 
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
@@ -148,16 +141,13 @@ arm is for parity / investigation and Hopper-class parts.
 The tree-building algorithm itself (group params by per-level knob keys, collapse single-key levels, skip
 empty-key levels, defer leaf materialization to `expand()`) lives in `pipeline/fork.py` (next to the
 `Fork` interface and its flat implementations) as the
-reusable `Level` + `build_fork_tree` pair — `partition_loops` supplies the `Level`s + `materialize=` +
-`score=` callables and returns the result. Nodes are real classes holding data, not closures: every
-`_Branch` / `_Leaf` references one shared `_Tree` (levels + callables). The
+reusable `Level` + `build_fork_tree` pair — `partition_loops` supplies the `Level`s + `materialize=`
+callable and returns the result. Nodes are real classes holding data, not closures: every
+`_Branch` / `_Leaf` references one shared `_Tree` (levels + materialize). The
 builder hands back the lazy ROOT `_Branch` and nothing else exists yet: a branch's `expand()` builds its
-children on demand (in grouping order — ranking is the search's job), its `score(cache)` takes `max` over
-the per-param scores of its subgroup (provably the same max-propagation as an eager build, without
-instantiating the subtree), and the per-param scorer — `score(p, cache)`, which receives the search-owned
-value-keyed cache and owns its own keying — fires only when a score is actually read; the builder adds no
-caching of its own. Future rules with multi-level knob-cartesian forks should reuse the builder; one-shot flat
-forks (e.g. `lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element `ThunkFork` list) stay inline.
+children on demand in grouping order (ranking is the search's job — Forks carry no score). Future rules with
+multi-level knob-cartesian forks should reuse the builder; one-shot flat forks (e.g.
+`lowering/tile/085_warp_specialize`'s `WS={0,1}` 2-element `ThunkFork` list) stay inline.
 
 **FN > 1 lowering.** The partition planner always emits the per-cell
 shape — one `RegisterTile(N_r)` wrapping the whole
@@ -198,25 +188,15 @@ and enumeration included). The stamp is validated against `_plan_cache_key` — 
 which include the `S_*` structural features stamped by `loop/fusion/992_stamp_structural_features` (a stmt/op
 histogram + loop extents + operand dtypes, so a structure or dtype change is an identity change), + the
 hardware context + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enumeration via `Knob.narrow`)
-— so a pin / ctx / structure change invalidates it. The `S_*` knobs also power the search-owned
-value-keyed score cache (see "Scoring is search policy" above): `_score_variant` keys each variant by
-`(ctx fields, frozenset(merged knobs))`, complete because the `S_*` features ride the knob dict, so
-structurally identical kernels — the same layer repeated through a whole model — share every score with no
-object-identity bookkeeping, and entries can never go stale because the score is a pure function of the key.
+— so a pin / ctx / structure change invalidates it. The same `S_*` knobs ride every variant's knob dict, so
+`knob.knob_features` turns each row into the learned prior's feature vector and structurally identical
+kernels — the same layer repeated through a whole model — featurize alike and share the prior's rows.
 
-For rules that want a custom scorer, override
-`Op.lazy_score(cls, ctx, *, knobs=None, shapes=None)` on the producing Op class. The base implementation
-returns `None` (no prior available). This is the ONLY scorer — there is deliberately no
-post-materialization `Op.score`; every ranking decision flows through the same cheap (knobs, shapes)
-formula, so an op never needs to exist just to be ranked (the old eager walk also contributed nothing to
-search decisions: fork siblings share their `inner` snapshot by reference and UCB only compares children of
-one parent, so an inner-graph term was a constant offset within every comparison set). `TileOp.lazy_score`
-is the reference implementation — it consumes `KernelShape` + the variant's stamped knob dict (the
-planner's `_variant_knobs` builds the exact dict `_materialize` stamps; any knob source — DB rows, golden
-configs, pin sets — is scoreable, and via `_materialize` buildable, as-is) and computes
-`score_tile_geometry` on the launch-geometry + cells + coalescing keys, with the smem-fit penalty's
-input-buffer count derived from `KernelShape` (walking `outer_m` / `extra_outer` / `prologue` for distinct
-`Load.input`).
+Variant ranking is the learned prior alone (`search/prior/CatBoostPrior`): greedy picks the `mean_score`
+argmin, MCTS ranks the PUCT frontier, and a cold / no-prior fallback keeps emission order. There is NO
+analytic per-variant scorer — the old `Op.lazy_score` / `TileOp.score_tile_geometry` formula and the
+`Fork.score` / `Search.score_of` plumbing were removed when the learned prior replaced them; nothing
+materializes or scores a TileOp just to rank it.
 
 **Idempotence requirement.** Every rule MUST be idempotent on its own
 output. The engine re-runs the entire pipeline on each popped candidate
@@ -320,9 +300,9 @@ table, pick one; don't invent a third:
 
 - **Variant identity = `(context, knobs)`** — anything *predictive or replayable*. The `S_*` structural
   features (`loop/fusion/992_stamp_structural_features`: a stmt/op histogram + loop extents + operand dtypes) make
-  the merged knob dict a COMPLETE identity, so a prior is a pure function of it: the score cache keys
-  `(ctx fields, frozenset(merged knobs))`, the planner's op-metadata plan stamp keys the same plus the
-  `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration). The *learned*
+  the merged knob dict a COMPLETE identity, so a prior is a pure function of it: the `perf` row keys on the
+  realized op digest, the planner's op-metadata plan stamp keys `(ctx fields, frozenset(merged knobs))` plus
+  the `DEPLODOCK_*` pin snapshot (pins are context-side: environment that gates enumeration). The *learned*
   prior is exactly `score(features(ctx, knobs))`: the structural facts (op histogram, extents, dtypes) are
   already in the knob dict, so `knob.knob_features` turns it straight into the model feature vector (the
   `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props). See the learned-prior
@@ -578,7 +558,7 @@ incompatible divisibility still get a sensible default.
 | `FK`                 | INT       | `010_partition_loops`         | Reduce-axis multiple-accumulator factor (non-matmul reduces). Strip-mines the per-thread K serial loop into `FK` independent accumulators (a `RegisterTile(K_f, reduce=True)` inside `K_i`) for ILP; `010_split_register_axes` replicates the wrapped `Accum` into `acc_0..acc_{FK-1}` and appends a cross-accumulator tree-fold after the K serial loops, so the materializer/combine see one `acc`. Swept only as a divisor of the per-thread K-chunk extent, capped by `FK·FM·FN ≤ _MAX_CELLS_PER_THREAD`. **fp16 scalar matmul** reuses `FK` as the half2 accumulation-window length (= even `bk`): the planner keeps the FK=1 fp32 structure + stamps `FKWIN`, and `kernel/015_pack_fk_window` rewrites the window K loop into `__hfma2` packed multiply-adds over a `__half2` accumulator with a widen+horizontal-sum flush into the fp32 master each stage — bounded fp16 error for 2× packed throughput. `FK=1` (and fp32/bf16/MMA) is byte-identical to the pre-FK planner (it ranks first in the greedy tiebreak). See `plans/fk-register-tile-reductions.md` and `plans/fk-half2-fp16-matmul.md`. |
 | `WN`                 | INT       | `010_partition_loops`         | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `WM`                 | INT       | `010_partition_loops`         | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `S_*`                | FLOAT     | `loop/fusion/992_stamp_structural_features` | The LoopOp's structural features (`ir/features.py:structure_features`): a flat `S_`-prefixed dict — stmt/op histogram (`S_n_load`, `S_pw_*`, `S_reduce_*`, …) + loop extents (`S_ext_*`) + operand dtype multiset (`S_dtype_*`). Not tunable — identity facts that make a knob dict a complete variant identity (the planner's value-keyed score cache). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, search-tree comparisons) sees one consistent knob set; `knob_features` turns the whole knob dict into the model feature vector. Skipped by `format_tuning_knobs` (facts, not tuning decisions). |
+| `S_*`                | FLOAT     | `loop/fusion/992_stamp_structural_features` | The LoopOp's structural features (`ir/features.py:structure_features`): a flat `S_`-prefixed dict — stmt/op histogram (`S_n_load`, `S_pw_*`, `S_reduce_*`, …) + loop extents (`S_ext_*`) + operand dtype multiset (`S_dtype_*`). Not tunable — identity facts that make a knob dict a complete variant identity (the learned prior's feature vector). Stamped last in the loop dialect so every downstream keying (op_cache_key, tune DB, plan-stamp) sees one consistent knob set; `knob_features` turns the whole knob dict into the model feature vector. Skipped by `format_tuning_knobs` (facts, not tuning decisions). |
 | `MMA`                | STR       | `010_partition_loops`         | Three-way control for warp-tier MMA (tensor-core) matmul enumeration: falsy (`0`/`false`/…) forces the scalar-only path (debug / fallback); truthy (`1`/`true`/…) or unset (the default) auto-enumerates every eligible atom kind; any other value names an atom kind (e.g. `mma_m16n8k16_f16`) — enable **and** pin that kind, incl. the force-at-any-arch pin-only path. `DEPLODOCK_ATOM_KIND` is its env **alias** (`Knob.aliases` — either spelling works; the primary `DEPLODOCK_MMA` wins when both are set). Not an autotune fork: the tuner picks warp-vs-scalar through the `ATOM_KIND` sibling subtree. Declared in `_enumeration.py`, decoded by `mma_mode()`; sits in `_PLANNER_KNOBS` so the enumeration-memo pin snapshot covers it (alias included, via `Knob.raw`).                                                                                                                                                                                                                                                                                                                          |
 | `HOIST_COMPUTE`      | BOOL      | `030_hoist_invariant_compute` | False (default) → inline-fuse Stage; True → single transport Stage + a `StageBundle.compute` phase. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `PAD_SMEM`           | BOOL      | `070_pad_smem`                | True → apply per-source ``+1`` smem pad to break bank conflicts; False → leave the slab dense. Autotune fork.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |

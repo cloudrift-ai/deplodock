@@ -56,10 +56,9 @@ _BK_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
 # (``BM=8`` for the article's 256-thread ``8×32`` layout; ``FM/FN=6, 10, 12,
 # 14, 20, 24, 26, 28, 40, 48, 96`` for register-budget-bound matmul tiles)
 # that used to sit behind ``DEPLODOCK_WIDE_FM_FN=1``. Greedy now surfaces
-# them by default — the score signals introduced alongside this (smem-fit
-# safety + TMA-eligibility bonus + SPLITK penalty in
-# ``score_tile_geometry``, plus the ``LoweringError`` that ``pipeline.py``
-# raises when a chosen variant fails ``validate(ctx)``) keep greedy from
+# them by default — the ``_matmul_thread_gate`` band (below) prunes the
+# degenerate tail, and the ``LoweringError`` that ``pipeline.py`` raises when a
+# chosen variant fails ``validate(ctx)`` keeps greedy from
 # silently picking a wider variant whose downstream lowering doesn't
 # validate; the wider candidate set just adds 18 % more leaves to the
 # enumeration cartesian for a couple of extra seconds of autotune wall.
@@ -184,9 +183,9 @@ def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
 #                ``ATOM_REGISTRY[knob.mma_atom(row)]``)
 #
 # There is deliberately no row class: one representation flows end-to-end —
-# enumeration → fork-tree levels → ``TileOp.lazy_score`` → body builder →
-# ``TileOp.knobs`` → DB rows — so any recorded knob dict is directly
-# scoreable and materializable. The OFF fill makes that identity tier-complete,
+# enumeration → fork-tree levels → body builder → ``TileOp.knobs`` → DB rows /
+# learned-prior features — so any recorded knob dict is directly rankable and
+# materializable. The OFF fill makes that identity tier-complete,
 # so the learned prior reads "decided: unused" (an OFF value) distinctly from
 # "not-yet-decided" (a knob still absent on a partial fork prefix → NaN). De-dup
 # inside the impls keys on ``frozenset(row.items())`` (before the OFF fill, which
@@ -226,10 +225,9 @@ def _divisors_up_to(n: int, cap: int) -> tuple[int, ...]:
 
 
 def _priority_matmul_thread(p: dict) -> tuple[int, ...]:
-    # Tiebreaker for the enumeration sort. The Fork-tree builder re-sorts
-    # each level by ``score_tile_geometry`` (the MCTS prior) — see
-    # ``compiler/pipeline/fork.py`` — so this ordering only affects
-    # ties within a score band.
+    # Enumeration sort key. The fork tree emits siblings in this order and the
+    # search ranks them with the learned prior; with a cold / no-prior fallback
+    # the emission order IS the pick, so this ordering is the heuristic default.
     #
     # Fat-tile regime (macro area ≥ 8192 cells): keep the explicit BK
     # preference but flatten ``{16, 32, 8}`` to a near-tie — earlier tuning

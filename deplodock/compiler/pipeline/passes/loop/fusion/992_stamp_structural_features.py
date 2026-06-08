@@ -13,23 +13,20 @@ and any search-tree comparison that crosses the stamp point.
 a stmt-type / op-multiset histogram (the extent-free "skeleton") plus the
 loop-axis extents (``S_ext_*`` — the M/N/K shapes). Stamped into the knobs and
 carried forward by the engine's knob-merge, they ARE the kernel's structural
-identity: the partition planner's score cache keys on ``(ctx, frozenset(merged
-knobs))`` by VALUE (``_score_variant``), so structurally identical kernels (the
-same layer repeated through a model) carry the same ``S_*`` knobs and share
-entries with no object-identity bookkeeping — and ``knob.knob_features`` turns
-the whole knob dict into the planner-prior feature vector. The reserved ``S_``
-prefix keeps them out of the tuning-knob view (``format_tuning_knobs``).
+identity: ``knob.knob_features`` turns the whole knob dict (the row knobs plus
+these ``S_*`` features) into the learned-prior feature vector, so structurally
+identical kernels (the same layer repeated through a model) featurize alike and
+share the prior's rows. The reserved ``S_`` prefix keeps them out of the
+tuning-knob view (``format_tuning_knobs``).
 
 This pass is the ONLY producer of the structural features — callers that need a
 finalized identity stamp run it (idempotent: a LoopOp already carrying any
 ``S_`` knob is skipped, so the rewrite engine reaches fixed-point in one pass).
 
-Known limitation: ``TileOp.lazy_score`` reads write-index *coalescing*
-(``_coalescing_inner_extent_from_writes``), which a stmt histogram does not
-capture — two kernels with identical histograms but different write-index
-layouts collide on this identity and share a score. Accepted for now (such
-kernels are near-identical and score-interchangeable); the first feature to add
-if collisions prove too coarse.
+Known limitation: the histogram is extent-free except for ``S_ext_*`` — two
+kernels with identical histograms but different write-index coalescing layouts
+featurize identically. Accepted for now (such kernels are near-identical); the
+first feature to add if it proves too coarse.
 """
 
 from __future__ import annotations

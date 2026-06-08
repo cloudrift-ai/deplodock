@@ -258,9 +258,9 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     Fork's ``expand`` thunk, so greedy compile only builds the one
     chosen variant per LoopOp. ``_plan_kernel`` runs the cheap up-front
     classification + enumeration and produces a ``_Plan`` with bare
-    knob rows; sibling ranking (the search's job, via the Forks' score
-    thunks) uses :meth:`TileOp.lazy_score` — the only scorer — so it
-    never needs a materialized TileOp.
+    knob rows; sibling ranking is the search policy's job (the learned
+    prior over the row knobs — Forks carry no score), so the planner
+    never materializes or scores a variant itself.
 
     ``build_fork_tree`` constructs branch Forks lazily — a whole-model
     compile builds O(path) Forks per kernel instead of one per enumerated
@@ -288,43 +288,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
             Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
         ],
         materialize=lambda p: _materialize(plan, p),
-        score=lambda p, cache: _score_variant(plan, p, ctx, cache),
     )
-
-
-def _score_variant(plan: _Plan, params: dict, ctx: Context, cache: dict | None = None) -> float:
-    """Score one variant: the row IS the knob delta the materialized TileOp
-    will carry, so ``lazy_score`` consumes ``base_knobs`` merged with the
-    row verbatim. Scoring MUST stay materialization-free — this runs once
-    per enumerated variant (~40k+ per matmul kernel), and a single
-    ``_materialize`` is ~1.5 ms of body building + normalization; a
-    ``None`` here means ``lazy_score``'s contract was broken, not a
-    fallback case.
-
-    ``cache`` is the search-owned value-keyed score store (handed down via
-    ``Search.score_of`` → ``Fork.score``; ``None`` outside a search). The
-    key is ``(ctx fields, frozenset(merged knobs))`` — complete because
-    the ``S_*`` structural-feature knobs (``loop/fusion/992_stamp_structural_features``)
-    make the knob dict a full variant identity — so structurally identical kernels,
-    the same layer repeated through a whole model, share entries with no
-    object-identity bookkeeping, and entries can never go stale: the score
-    is a pure function of the key."""
-    knobs = {**plan.base_knobs, **params} if plan.base_knobs else params
-    key = (
-        ctx.compute_capability,
-        ctx.warp_size,
-        ctx.max_dynamic_smem,
-        ctx.max_threads_per_cta,
-        frozenset(knobs.items()),
-    )
-    if cache is not None and (cached := cache.get(key)) is not None:
-        return cached
-    lazy = TileOp.lazy_score(ctx, knobs=knobs, shapes=plan.shape)
-    if lazy is None:
-        raise AssertionError(f"TileOp.lazy_score returned None for kernel {plan.kernel_name!r} — the variant scorer must not materialize")
-    if cache is not None:
-        cache[key] = lazy
-    return lazy
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:

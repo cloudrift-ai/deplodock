@@ -857,7 +857,8 @@ def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: s
 # while still rejecting truly degenerate launches that would saturate
 # the GPU command processor with light per-CTA work. The autotune-side
 # guard against pathological tiny-CTA × huge-grid variants is the
-# graduated penalty in ``TileOp.lazy_score``, not this cap.
+# enumeration gate (``_enumeration._matmul_thread_gate``) + the learned
+# prior, not this cap.
 _MAX_CTAS = 65536
 
 

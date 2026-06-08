@@ -3,7 +3,7 @@ features (``010_partition_loops`` / ``fork.build_fork_tree`` /
 ``992_stamp_structural_features``).
 
 The lazy tree builds branch Forks only along the explored path; the structural
-``S_*`` features are the variant identity the score cache keys on. All
+``S_*`` features are the variant identity the learned prior keys on. All
 assertions are call-count / identity based — no wall-time flakiness.
 """
 
@@ -20,7 +20,6 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import fork as fork_mod
 from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from deplodock.compiler.pipeline.knob import STRUCT_PREFIX, is_warp
@@ -95,8 +94,8 @@ def _stamped(loop_op: LoopOp, graph: Graph | None = None) -> LoopOp:
     return replace(loop_op, knobs={**loop_op.knobs, **structure_features(loop_op.body, graph)})
 
 
-def _build_tree(plan, ctx: Context) -> Fork:
-    """The planner's canonical scalar level layout (mirrors ``rewrite()``)."""
+def _build_tree(plan) -> Fork:
+    """The planner's canonical level layout (mirrors ``rewrite()``)."""
     return build_fork_tree(
         params=plan.params,
         levels=[
@@ -107,7 +106,6 @@ def _build_tree(plan, ctx: Context) -> Fork:
             Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
         ],
         materialize=lambda p: _planner._materialize(plan, p),
-        score=lambda p, cache: _planner._score_variant(plan, p, ctx, cache),
     )
 
 
@@ -127,9 +125,7 @@ def test_dtype_signature_separates_structural_features():
 
 def test_lazy_tree_builds_only_expanded_path(monkeypatch):
     """Walking only one root→leaf path must instantiate O(path · level
-    fanout) Forks, not one per param — and each branch's lazily computed
-    score must equal the max over its expanded children (exactness vs the
-    eager build)."""
+    fanout) Forks, not one per param — the tree is lazy."""
     created = {"n": 0}
 
     def _counting(cls):
@@ -145,27 +141,14 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
     ctx = _ctx()
     plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
     assert plan is not None and len(plan.params) > 8
-    tree = _build_tree(plan, ctx)
+    tree = _build_tree(plan)
 
     node = tree
     path: list[Fork] = [node]
     while not node.is_leaf:
-        children = node.expand()
-        assert node.score() == pytest.approx(max(c.score() for c in children)), "lazy branch score != max over expanded children"
-        node = children[0]
+        node = node.expand()[0]
         path.append(node)
     assert created["n"] < len(plan.params), f"lazy tree created {created['n']} Forks for a single-path walk over {len(plan.params)} params"
-
-
-def test_score_variant_matches_lazy_score():
-    """``_score_variant`` is a thin wrapper over ``TileOp.lazy_score`` — the
-    two must agree for every variant when fed the same stamped knob dict."""
-    ctx = _ctx()
-    plan = _planner._plan_kernel(_loop_op_matmul(), ctx, kernel_name="k_l0")
-    assert plan is not None
-    for p in plan.params:
-        lazy = TileOp.lazy_score(ctx, knobs={**plan.base_knobs, **p}, shapes=plan.shape)
-        assert _planner._score_variant(plan, p, ctx) == pytest.approx(lazy)
 
 
 def test_structural_features_stamped_by_last_loop_pass():
@@ -192,24 +175,10 @@ def test_structural_features_stamped_by_last_loop_pass():
         assert struct == structure_features(op.body, fused)
 
 
-def test_scores_shared_across_identical_loop_ops(monkeypatch):
-    """The search-owned value-keyed score cache (the planner keys each
-    variant by ``(ctx, merged knobs)`` — complete thanks to the ``S_*``
-    structural-feature knobs) makes structurally identical LoopOps — different
-    SSA / buffer / axis names — share every score: scoring the second kernel's tree
-    through the SAME search computes ZERO new scores. (Expansion alone
-    never scores — ranking is search policy, so the read happens via
-    ``Search.score_of``.)"""
-    from deplodock.compiler.pipeline.search.policy import TuningSearch
-
-    calls = {"n": 0}
-    real = TileOp.lazy_score
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(TileOp, "lazy_score", staticmethod(counting))
+def test_structurally_identical_ops_share_features():
+    """Structurally identical LoopOps (different SSA / buffer / axis names) get
+    the SAME ``S_*`` structural features — the variant identity the prior keys
+    on, so the same layer repeated through a model shares rows."""
     ctx = _ctx()
     plan_1 = _planner._plan_kernel(_stamped(_loop_op_matmul()), ctx, kernel_name="k_l0")
     plan_2 = _planner._plan_kernel(_stamped(_loop_op_matmul(a="w", b="x", o="y", i="i2", j="j2", k="k2")), ctx, kernel_name="k_l1")
@@ -217,13 +186,3 @@ def test_scores_shared_across_identical_loop_ops(monkeypatch):
     struct_1 = {k: v for k, v in plan_1.base_knobs.items() if k.startswith("S_")}
     struct_2 = {k: v for k, v in plan_2.base_knobs.items() if k.startswith("S_")}
     assert struct_1 and struct_1 == struct_2, "structurally identical ops must share structural features"
-    search = TuningSearch()
-    tree_1 = _build_tree(plan_1, ctx)
-    assert calls["n"] == 0, "building a tree must not score"
-    tree_1.expand()
-    assert calls["n"] == 0, "expansion must not score — ranking is the search's job"
-    search.score_of(tree_1)  # root prior = max over every param
-    n_first = calls["n"]
-    assert n_first == len(plan_1.params)
-    search.score_of(_build_tree(plan_2, ctx))
-    assert calls["n"] == n_first, "second kernel's tree re-scored rows instead of hitting the search's value-keyed cache"

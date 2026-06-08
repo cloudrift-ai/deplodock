@@ -93,31 +93,6 @@ class Op:
         """
         return True
 
-    @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:  # noqa: ARG004
-        """Cheap pre-instantiation scorer. Lets a rule rank variants
-        without ever building the op — the instantiation may be the bulk
-        of the lowering cost (e.g. ``TileOp.__post_init__`` runs full
-        body normalization).
-
-        Subclasses override to implement when the score formula can be
-        evaluated from precomputed inputs:
-
-        - ``knobs`` — the variant's knob dict, exactly what the
-          materialized op would carry in ``Op.knobs`` (so DB rows /
-          golden configs / pin sets are scoreable without
-          reconstructing any rule-internal variant type)
-        - ``shapes`` — op-defined shape descriptor (e.g. ``KernelShape``
-          for ``TileOp`` — the static per-LoopOp planning state)
-
-        Return ``None`` when the lazy path isn't implementable for
-        these inputs. This is the ONLY scorer — there is deliberately no
-        post-materialization ``Op.score``: every ranking decision the
-        search makes flows through the same cheap (knobs, shapes)
-        formula, so an op never needs to exist just to be ranked.
-        """
-        return None
-
 
 @dataclass
 class InputOp(Op):

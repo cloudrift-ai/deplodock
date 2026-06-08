@@ -150,11 +150,11 @@ def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
     CUDA device needed — just inspects the generated source.
 
     Pins a FULL clean (no-overhang) knob set + ``--target sm_90`` so the variant
-    is fully determined: the greedy pick keys off ``compute_capability`` via
-    ``score_tile_geometry``, so without the target override a GPU-less CI runner
-    resolves a different capability, picks a masked non-window variant, and the
-    FK-only pin falls back to FK=1 (no window). The full pin + fixed target make
-    the single FK=bk window variant the only candidate on any runner."""
+    is fully determined: enumeration / lowering gate on ``compute_capability``,
+    so without the target override a GPU-less CI runner resolves a different
+    capability, picks a masked non-window variant, and the FK-only pin falls back
+    to FK=1 (no window). The full pin + fixed target make the single FK=bk window
+    variant the only candidate on any runner."""
     monkeypatch.setenv("DEPLODOCK_KNOBS", "MMA=0,BN=16,BM=16,FM=1,FN=1,BK=4,SPLITK=1,FK=4")
     rc, stdout, stderr = run_cli(
         "compile",

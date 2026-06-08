@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -111,11 +110,10 @@ class TuningSearch(Search):
         explore_eps: float = 0.0,
         seed: int = 0,
         max_visits: int | None = None,
-        score_cache: dict[Hashable, float] | None = None,
         prior_model: Prior | None = None,
         base_knobs: dict | None = None,
     ) -> None:
-        super().__init__(score_cache=score_cache)
+        super().__init__()
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
         # ε-greedy exploration: with probability ``explore_eps`` a selection step
