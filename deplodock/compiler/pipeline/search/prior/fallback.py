@@ -43,6 +43,9 @@ class FallbackPrior(Prior):
     def mean_score(self, knobs: dict) -> float:
         return self.learned.mean_score(knobs) if self.learned.fitted else self.analytic.mean_score(knobs)
 
+    def mean_scores(self, knobs_list: list[dict]) -> list[float]:
+        return self.learned.mean_scores(knobs_list) if self.learned.fitted else self.analytic.mean_scores(knobs_list)
+
     # --- training + inspection: delegate to the learned half ------------------
     def fit(self) -> None:
         self.learned.fit()

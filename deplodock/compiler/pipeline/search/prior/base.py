@@ -87,6 +87,13 @@ class Prior(ABC):
         """Prediction for the greedy argmax + calibration (same as :meth:`score`
         for a deterministic model)."""
 
+    def mean_scores(self, knobs_list: list[dict]) -> list[float]:
+        """Batched :meth:`mean_score` — the greedy driver flattens a kernel's whole
+        candidate set into one scoring pass, so a model with a vectorized predict
+        (``CatBoostPrior``) overrides this to score the lot in a single call. The
+        default maps element-wise (fine for the cheap analytic prior)."""
+        return [self.mean_score(k) for k in knobs_list]
+
     # --- dataset + batched refit ------------------------------------------
 
     def add_rows(self, rows: list[tuple[dict, float]]) -> None:

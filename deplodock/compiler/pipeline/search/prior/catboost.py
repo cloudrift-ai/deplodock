@@ -101,6 +101,19 @@ class CatBoostPrior(Prior):
         x = np.array([[f.get(c, np.nan) for c in self._cols]], dtype=float)  # absent → NaN, matching fit (see fit docstring)
         return float(np.exp(self._model.predict(x)[0]))
 
+    def mean_scores(self, knobs_list: list[dict]) -> list[float]:
+        """Batched :meth:`mean_score` — featurize every candidate, then one
+        vectorized ``model.predict`` over the whole ``N×cols`` matrix (CatBoost
+        amortizes the per-call overhead that makes ``N`` separate ``mean_score``
+        calls slow). The greedy flatten scores ~1k tiles per matmul this way."""
+        if self._model is None:
+            return [0.0] * len(knobs_list)
+        if not knobs_list:
+            return []
+        feats = [knob.knob_features(k) for k in knobs_list]
+        x = np.array([[f.get(c, np.nan) for c in self._cols] for f in feats], dtype=float)
+        return [float(v) for v in np.exp(self._model.predict(x))]
+
     # --- persistence ------------------------------------------------------
 
     def to_json(self) -> dict | None:

@@ -1,22 +1,31 @@
-"""Single-shot compile driver — picks each fork via the global learned prior
-when one is trained, else option-0.
+"""Single-shot compile driver — picks each fork point's globally-best **complete**
+leaf via the global learned prior when one is trained, else option-0.
 
 This is the deterministic ``Pipeline.run`` driver for ``compile`` / ``run`` and
-the assembled-graph lowering, with **O(1) work per step** (a single pending
-slot, no MCTS tree — routing a whole-model compile through ``TuningSearch``
-would be O(N²) and hang). It is NOT an exploration policy: it benches nothing,
-so it can only *use* a prior trained earlier by ``tune``, never train one.
+the assembled-graph lowering, with a single pending slot and no MCTS tree
+(routing a whole-model compile through ``TuningSearch`` would be O(N²) and hang).
+It is NOT an exploration policy: it benches nothing, so it can only *use* a prior
+trained earlier by ``tune``, never train one.
 
-When a trained global prior exists (``CatBoostPrior.load`` finds a
-checkpoint), it picks the sibling with the lowest :meth:`Prior.mean_score` (the
-prior predicts latency µs — lower is better) over the same feature vector the
-prior was trained on: the ``H_*`` host/hardware regime + the op's ``S_*``
-structural knobs (read off the parent op) + the deltas chosen so far down this
-fork tree + the candidate's own delta. With no trained prior the model is unfit →
-it falls back to the first emitted sibling (option-0).
+**Flatten, don't descend.** The lazy fork tree (``lowering/tile`` planner) is an
+MCTS data structure — it stages knob choices across levels (``BR`` → ``BM/BN`` →
+``FM/FN``) so MCTS pays one node per pop. Greedy must NOT walk it level-by-level:
+a branch carries only a *partial* tile, and ``knob.knob_features`` can't compute
+the tile's area / occupancy until ``FM/FN`` are pinned — so the prior is blind at
+the ``BM/BN`` choice and defaults to ``BN=16`` for every shape. Instead greedy
+**flattens** each fork point to its complete leaves (cheap — ``expand`` builds
+only knob dicts; materialization stays deferred to the single chosen leaf's
+``resolve``) and picks the one with the lowest :meth:`Prior.mean_scores` over the
+full feature vector the prior trained on: the ``H_*`` host/hardware regime + the
+op's ``S_*`` structural knobs (read off the parent op) + the leaf's complete knob
+row. The pick equals scoring the flat candidate set, invariant to the tree's
+level order. With no trained prior the model is unfit → it falls back to the first
+emitted sibling (option-0).
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.policy.base import Search
@@ -43,17 +52,37 @@ def _tile_blocked(fork_knobs: dict, blocked: set[frozenset]) -> bool:
     return tile_identity(fork_knobs) in blocked
 
 
+def _leaves(cands: Sequence[LazyCandidate]) -> list[LazyCandidate]:
+    """Expand every offered candidate down to its leaf candidates, **depth-first
+    in emission order** — each candidate's leaves precede the next's, so a tie in
+    the prior's scores still falls to enumeration order (option-0 first), the
+    no-information fallback the old per-level descent kept. Branch forks expand via
+    ``LazyCandidate.expand`` — cheap, building only the next level's knob-dict
+    forks; leaf candidates (``is_expandable`` False) terminate. Nothing is
+    materialized: ``resolve`` (the one expensive build) runs only on the single
+    leaf greedy ultimately pends. So the whole lazy tree collapses to its flat
+    leaf set for one scoring pass."""
+    out: list[LazyCandidate] = []
+    for c in cands:
+        if c.is_expandable():
+            out.extend(_leaves(c.expand()))
+        else:
+            out.append(c)
+    return out
+
+
 class GreedySearch(Search):
-    """Keep one pending candidate; pick it by the prior's ``mean_score`` argmin —
-    the learned ``CatBoostPrior`` once trained, the ``AnalyticPrior`` cold-start
-    heuristic otherwise (both behind ``load_prior``'s ``FallbackPrior``). Falls
-    to emission order (option-0) only if the prior fails to load entirely.
+    """Keep one pending candidate; pick it by the prior's ``mean_scores`` argmin
+    over the fork point's flattened complete leaves — the learned ``CatBoostPrior``
+    once trained, the ``AnalyticPrior`` cold-start heuristic otherwise (both behind
+    ``load_prior``'s ``FallbackPrior``). Falls to emission order (option-0) only if
+    the prior fails to load entirely.
 
     ``blocked`` (``{node_id: {tile_identity, ...}}``) lists tiles that failed
     ``validate(ctx)`` on a previous compile attempt — ``Pipeline.run`` retries the
-    deterministic compile with the failed leaf blocklisted so greedy falls back to
-    the next prior-ranked sibling (the analogue of how ``tune`` benches-and-skips
-    an unviable tile; greedy benches nothing, so the validity signal must come from
+    deterministic compile with the failed leaf blocklisted so greedy picks the next
+    best non-blocked leaf (the analogue of how ``tune`` benches-and-skips an
+    unviable tile; greedy benches nothing, so the validity signal must come from
     the retry)."""
 
     def __init__(self, blocked: dict[str, set[frozenset]] | None = None) -> None:
@@ -62,12 +91,6 @@ class GreedySearch(Search):
         self._prior = None  # lazily loaded on first push (the regime's checkpoint)
         self._prior_loaded = False
         self._blocked = blocked or {}
-        # Fork-tree state: ``_cur_inner`` is the shared ``inner`` Candidate of the
-        # current fork tree (changes only when a leaf resolves into a new fork
-        # point); ``_path_knobs`` accumulates the deltas chosen down that tree (the
-        # branch slices aren't applied to the graph until a leaf resolves).
-        self._cur_inner = None
-        self._path_knobs: dict = {}
 
     def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
         del parent  # greedy keeps no lineage — one pending slot, no tree
@@ -78,30 +101,35 @@ class GreedySearch(Search):
         if prior is None:
             self._pending = cands[0]  # prior failed to load → emission order
             return
-        c0 = cands[0]
-        if c0.inner is not self._cur_inner:  # new fork point → reset the path
-            self._cur_inner = c0.inner
-            self._path_knobs = {}
-        base = self._base_knobs(c0)
+        # Flatten: greedy benches nothing, so it must pick the globally best
+        # COMPLETE tile, not a partial branch. The lazy fork tree exists for MCTS
+        # (one node per pop); descending it level-by-level here would score the
+        # ``BM/BN`` branch before ``FM/FN`` exist, so ``knob_features`` can't yet
+        # compute the tile's area / occupancy and the prior is blind at the BN
+        # choice (it defaults to ``BN=16`` for every shape — see the fork-tree
+        # ``Level`` order in ``lowering/tile/010_partition_loops``). So instead
+        # expand the offered fork(s) fully to their leaves — cheap, since
+        # ``expand`` only builds knob dicts (materialization stays deferred to
+        # ``resolve``) — and score every complete row in one batched ``predict``,
+        # resolving straight to the argmin. The pick then equals scoring the flat
+        # candidate set, invariant to how the tree's levels are arranged.
+        leaves = _leaves(cands)
+        if len(leaves) <= 1:
+            self._pending = leaves[0] if leaves else cands[0]
+            return
+        base = self._base_knobs(leaves[0])
         # Tiles this node already failed to lower on an earlier attempt — skip the
-        # matching leaf so greedy falls back to the next prior-ranked sibling. A
-        # non-leaf fork's partial knobs never match a full-row entry, so only the
-        # offending leaf is skipped, never a whole branch.
-        blocked = self._blocked.get(self._node_id(c0)) if self._blocked else None
-        best, best_v = None, float("inf")
-        for c in cands:
-            fork_knobs = c.fork.knobs if c.fork is not None else {}
-            if blocked is not None and _tile_blocked(fork_knobs, blocked):
-                continue
-            full = {**base, **self._path_knobs, **fork_knobs}
-            v = prior.mean_score(full)  # predicted latency µs — lower is better
-            if v < best_v:
-                best_v, best = v, c
-        if best is None:  # every sibling blocklisted → no valid alternative left
-            best = cands[0]
-        self._pending = best
-        if best.fork is not None:
-            self._path_knobs.update(best.fork.knobs)
+        # matching leaf so greedy falls back to the next prior-ranked candidate.
+        blocked = self._blocked.get(self._node_id(leaves[0])) if self._blocked else None
+        live = [(c, c.fork.knobs if c.fork is not None else {}) for c in leaves]
+        if blocked is not None:
+            live = [(c, k) for c, k in live if not _tile_blocked(k, blocked)]
+        if not live:  # every leaf blocklisted → no valid alternative left
+            self._pending = leaves[0]
+            return
+        scores = prior.mean_scores([{**base, **k} for _, k in live])  # predicted µs — lower is better
+        best_i = min(range(len(live)), key=scores.__getitem__)
+        self._pending = live[best_i][0]
 
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
         c, self._pending = self._pending, None
