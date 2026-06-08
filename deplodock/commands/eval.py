@@ -46,11 +46,10 @@ from statistics import median
 
 from deplodock.commands.compile import resolve_tune_db
 from deplodock.commands.dataset_args import add_dataset_args, require_source, resolve_prior_arg
-from deplodock.commands.knobfmt import GREEN as _GREEN
-from deplodock.commands.knobfmt import RED as _RED
-from deplodock.commands.knobfmt import RESET as _RESET
-from deplodock.commands.knobfmt import YELLOW as _YELLOW
-from deplodock.commands.knobfmt import align_knob_columns
+from deplodock.commands.table import GREEN as _GREEN
+from deplodock.commands.table import RED as _RED
+from deplodock.commands.table import YELLOW as _YELLOW
+from deplodock.commands.table import Col, col_widths, knob_columns, render_table
 from deplodock.compiler.pipeline.search.data import Dataset
 
 logger = logging.getLogger(__name__)
@@ -170,8 +169,8 @@ def handle_eval_golden(args) -> None:
     resolve_prior_arg(args)
     if args.features:
         _emit_golden_features(args.kernel)
-    configs, nw = _golden_configs(args.kernel)
-    _emit_prior_golden_check(configs, nw, title=False)
+    configs = _golden_configs(args.kernel)
+    _emit_prior_golden_check(configs, title=False)
 
 
 def _emit_registry() -> None:
@@ -219,18 +218,31 @@ def _ratio_color(matched: int, total: int) -> str:
     return _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
 
 
-def _cell(visible: str, width: int, color: str = "") -> str:
-    """Left-justify ``visible`` to ``width`` columns, padding by its *visible*
-    length so embedded ANSI colour codes don't throw off the alignment."""
-    body = f"{color}{visible}{_RESET}" if color else visible
-    return body + " " * max(1, width - len(visible))
+def _golden_knob_rows(pairs: list[tuple[dict, dict]]) -> list[dict[str, tuple[str, bool]]]:
+    """Per-row ``{knob: (value_text, red?)}`` for golden ``(gold, got)`` pairs: the value is
+    ``found/golden`` (no ``NAME=`` prefix — :func:`~deplodock.commands.table.knob_columns`
+    puts the name in the column header), red where the two differ."""
+    return [{k: (f"{got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold} for gold, got in pairs]
 
 
-def _aligned_knob_cells(rows: list[tuple[dict, dict]]) -> list[str]:
-    """Render the ``K=found/golden`` knob columns for a set of ``(gold, got)`` rows,
-    aligned (canonical order, padded to the widest cell), mismatches red — via the
-    shared :func:`align_knob_columns`."""
-    return align_knob_columns([{k: (f"{k}={got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold} for gold, got in rows])
+def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str) -> None:
+    """Stream a golden table via ``logger``: ``lead_cols`` (kernel, m/t, …) plus the aligned
+    ``found/golden`` knob columns (knob name in the header, value-only cells). ``entries``
+    preserves config order — each is ``("row", lead_cells, gold, got)`` or
+    ``("err", kernel_name, message)``; an error row prints its kernel name (aligned to the
+    kernel column) then the raw message in place. ``caption`` is printed above the table."""
+    rows = [e for e in entries if e[0] == "row"]
+    kcols, kcells = knob_columns(_golden_knob_rows([(g, got) for _, _, g, got in rows]))
+    columns = lead_cols + kcols
+    data = [lead + kc for (_, lead, _, _), kc in zip(rows, kcells, strict=True)]
+    # Floor the kernel column to the widest error-row name so error rows align with the table.
+    floor = [max((len(e[1]) for e in entries if e[0] == "err"), default=0)] + [0] * (len(columns) - 1)
+    kernel_w = col_widths(columns, data, floor)[0]
+    lines = iter(render_table(columns, data, indent="  ", min_widths=floor))
+    logger.info("  " + caption)
+    logger.info(next(lines))  # header row (column names, knobs included)
+    for e in entries:
+        logger.info("  " + e[1].ljust(kernel_w) + "  ERR  " + e[2] if e[0] == "err" else next(lines))
 
 
 def _emit_golden_features(kernel_filter: str | None) -> None:
@@ -281,14 +293,13 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 
 
 def _golden_configs(kernel_filter: str | None):
-    """The matmul golden configs, optionally filtered by name substring, plus the
-    kernel-name column width for aligned tables."""
+    """The matmul golden configs, optionally filtered by name substring."""
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
-    return configs, max((len(g.name) for g in configs), default=10) + 2
+    return configs
 
 
 def _emit_analytic_eval(kernel_filter: str | None) -> None:
@@ -302,30 +313,23 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
 
-    configs, nw = _golden_configs(kernel_filter)
-    logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + _cell("rank", 8) + _cell("pool", 9) + "knobs (found/golden; red = mismatch)")
+    configs = _golden_configs(kernel_filter)
     ranks: list[int] = []
-    entries: list[tuple] = []  # ("row", prefix, gold, got) | ("err", text)
+    entries: list[tuple] = []  # ("row", lead_cells, gold, got) | ("err", name, message)
     for g in configs:
         gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
         try:
             got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-            entries.append(("err", _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100]))
+            entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
             continue
         matched = sum(1 for k in gold if got.get(k) == gold[k])
-        prefix = (
-            _cell(g.name, nw)
-            + _cell(f"{matched}/{len(gold)}", 6, _ratio_color(matched, len(gold)))
-            + _cell(str(rank) if rank is not None else "?", 8)
-            + _cell(str(pool), 9)
-        )
-        entries.append(("row", prefix, gold, got))
+        lead = [g.name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold))), str(rank) if rank is not None else "?", str(pool)]
+        entries.append(("row", lead, gold, got))
         if rank is not None:
             ranks.append(rank)
-    knob_lines = iter(_aligned_knob_cells([(p[2], p[3]) for p in entries if p[0] == "row"]))
-    for p in entries:
-        logger.info("  " + (p[1] if p[0] == "err" else p[1] + next(knob_lines)))
+    cols = [Col("kernel"), Col("m/t"), Col("rank"), Col("pool")]
+    _emit_golden_table(cols, entries, "knobs (found/golden; red = mismatch)")
     if ranks:
         n = len(ranks)
         cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50, 100))
@@ -348,8 +352,8 @@ def _emit_prior_eval(kernel_filter: str | None) -> None:
     else:
         logger.info("No fitted prior at %s — greedy falls to option-0 (run `deplodock tune`).", config.prior_path())
 
-    configs, nw = _golden_configs(kernel_filter)
-    _emit_prior_golden_check(configs, nw)
+    configs = _golden_configs(kernel_filter)
+    _emit_prior_golden_check(configs)
 
 
 def _emit_prior_db_reachability(args) -> None:
@@ -393,7 +397,7 @@ def _mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def _emit_prior_golden_check(configs: list, nw: int, *, title: bool = True) -> None:
+def _emit_prior_golden_check(configs: list, *, title: bool = True) -> None:
     """Greedy fork pick through the tile pipeline vs recorded golden. The pick reads
     the learned-prior JSON (``config.prior_path()``: ``DEPLODOCK_PRIOR_FILE`` /
     ``--prior``); option-0 with no fitted prior. Stops at the tile dialect (every
@@ -428,7 +432,6 @@ def _emit_prior_golden_check(configs: list, nw: int, *, title: bool = True) -> N
             prior_path,
             "loaded" if prior_path.exists() else "MISSING → option-0",
         )
-    logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + "knobs (found/golden)")
     # Silence the trace/compile chatter (different logger subtrees) so this
     # function's own ``logger`` can stream one clean result line per config.
     quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
@@ -436,25 +439,23 @@ def _emit_prior_golden_check(configs: list, nw: int, *, title: bool = True) -> N
     for lg in quiet:
         lg.setLevel(_logging.WARNING)
     n_match = 0
-    entries: list[tuple] = []  # ("row", prefix, gold, got) | ("err", text)
+    entries: list[tuple] = []  # ("row", lead_cells, gold, got) | ("err", name, message)
     try:
         for g in configs:
             gold = tunable(g.knobs)
             try:
                 got = picked(g.snippet())
             except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-                entries.append(("err", _cell(g.name, nw) + "ERR  " + " ".join(f"{type(e).__name__}: {e}".split())[:100]))
+                entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
                 continue
             matched = sum(1 for k in gold if got.get(k) == gold[k])
             n_match += matched == len(gold)
-            prefix = _cell(g.name, nw) + _cell(f"{matched}/{len(gold)}", 6, _ratio_color(matched, len(gold)))
-            entries.append(("row", prefix, gold, got))
+            lead = [g.name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
+            entries.append(("row", lead, gold, got))
     finally:
         for lg, lv in zip(quiet, prev, strict=True):
             lg.setLevel(lv)
-    knob_lines = iter(_aligned_knob_cells([(p[2], p[3]) for p in entries if p[0] == "row"]))
-    for p in entries:
-        logger.info("  " + (p[1] if p[0] == "err" else p[1] + next(knob_lines)))
+    _emit_golden_table([Col("kernel"), Col("m/t")], entries, "knobs (found/golden)")
     logger.info("")
     logger.info("  pipeline reproduced golden knobs exactly: %d/%d", n_match, len(configs))
 
@@ -550,35 +551,36 @@ def _compute_interactions(
 
 
 def _emit_regret_table(rows: list[KnobRow]) -> None:
-    header = f"{'knob':<10} {'n_kernels':>10} {'median_n_vals':>14} {'median_regret':>14} {'p90_regret':>11} {'geomean_regret':>15}"
-    logger.info(header)
-    logger.info("-" * len(header))
-    for r in rows:
-        logger.info(
-            "%-10s %10d %14d %13.2fx %10.2fx %14.2fx",
-            r.knob,
-            r.n_kernels,
-            r.median_values,
-            r.median_regret,
-            r.p90_regret,
-            r.geomean_regret,
-        )
+    cols = [
+        Col("knob"),
+        Col("n_kernels", "r"),
+        Col("median_n_vals", "r"),
+        Col("median_regret", "r"),
+        Col("p90_regret", "r"),
+        Col("geomean_regret", "r"),
+    ]
+    data = [
+        [r.knob, str(r.n_kernels), str(r.median_values), f"{r.median_regret:.2f}x", f"{r.p90_regret:.2f}x", f"{r.geomean_regret:.2f}x"]
+        for r in rows
+    ]
+    for line in render_table(cols, data, rule=True):
+        logger.info(line)
 
 
 def _emit_interaction_matrix(knobs: list[str], interactions: dict[tuple[str, str], float | None]) -> None:
     logger.info("")
     logger.info("knob interaction — frac of kernels where argmin(K2) changes across K1 values")
     logger.info("(high value = knobs are coupled; can't commit to K1 then search K2 independently)")
-    logger.info("K1\\K2".ljust(10) + "".join(f"{k:>10}" for k in knobs))
+    cols = [Col("K1\\K2"), *(Col(k, "r") for k in knobs)]
+    data = []
     for K1 in knobs:
-        cells = []
+        row = [K1]
         for K2 in knobs:
-            if K1 == K2:
-                cells.append(f"{'-':>10}")
-                continue
-            v = interactions.get((K1, K2))
-            cells.append(f"{v:>10.2f}" if v is not None else f"{'-':>10}")
-        logger.info(f"{K1:<10}" + "".join(cells))
+            v = None if K1 == K2 else interactions.get((K1, K2))
+            row.append(f"{v:.2f}" if v is not None else "-")
+        data.append(row)
+    for line in render_table(cols, data):
+        logger.info(line)
 
 
 def _percentile(xs: list[float], p: float) -> float:
