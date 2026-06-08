@@ -425,7 +425,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
     ``golden NAME`` in the Kernel column — a real A/B, not the recorded number. Their
     ``%`` column is ``--`` (they're not part of the deplodock TOTAL), and their knob
     cells are colored red where they differ from the greedy pick (like ``eval``)."""
-    from deplodock.commands.knobfmt import align_knob_columns  # noqa: PLC0415
+    from deplodock.commands.table import Col, knob_columns, render_table  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
     from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
     from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
@@ -477,7 +477,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         t_us = times_by_idx.get(idx, 0.0)
         pct = (t_us / total_us * 100) if total_us > 0 else 0.0
         gknobs = dict(tuning_knob_items(op.knobs or {}))
-        records.append((op.kernel_name[:42], t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
+        records.append((op.kernel_name, t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
         for gb in _matching(op):
             g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
             g_attrs = _collect_kernel_attrs(gb.graph)
@@ -486,19 +486,32 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
                 gk = dict(tuning_knob_items(gnode.op.knobs or {}))
                 records.append((f"golden {gb.sample.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
 
-    knob_lines = align_knob_columns(
-        [{k: (f"{k}={v}", ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
+    kcols, kcells = knob_columns(
+        [{k: (str(v), ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
     )
+    columns = [
+        Col("Kernel"),
+        Col("us", "r"),
+        Col("%", "r"),
+        Col("grid", "r"),
+        Col("block", "r"),
+        Col("smem", "r"),
+        Col("regs", "r"),
+        Col("occ", "r"),
+        *kcols,
+    ]
+    data = []
+    for rec, kc in zip(records, kcells, strict=True):
+        name, t_us, pct_cell, (grid_total, block_threads, smem_kb, regs, occ_str) = rec[:4]
+        data.append(
+            [name, f"{t_us:.1f}", pct_cell, str(grid_total), str(block_threads), f"{smem_kb:.1f}K", str(regs), occ_str.strip(), *kc]
+        )
+    data.append(["TOTAL", f"{total_us:.1f}", *[""] * (len(columns) - 2)])
 
     print()
-    print(f"{'Kernel':<44s} {'us':>7s} {'%':>6s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
-    print("-" * 90)
-    for rec, kline in zip(records, knob_lines, strict=True):
-        name, t_us, pct_cell, (grid_total, block_threads, smem_kb, regs, occ_str) = rec[:4]
-        print(
-            f"{name:<44s} {t_us:>7.1f} {pct_cell:>6s} {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}  {kline}"
-        )
-    print(f"{'TOTAL':<44s} {total_us:>7.1f}")
+    print("knobs (greedy pick); golden rows are red where they differ from the greedy pick:")
+    for line in render_table(columns, data):
+        print(line)
 
 
 def _collect_kernel_attrs(graph) -> dict[str, dict]:
@@ -965,10 +978,11 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             _print_table(results)
         else:
             # Non-frontend IR (loop/tile/…): no torch twin → deplodock-only.
+            from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
             print()
-            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-            print("-" * 38)
-            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+            for line in render_table([Col("Backend"), Col("Latency (us)", "r")], [["Deplodock", f"{bench.time_ms * 1000:.0f}"]], rule=True):
+                print(line)
         _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -1281,10 +1295,11 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
 
 
 def _print_table(results):
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
     eager_us = results.get("Eager PyTorch", 0)
+    cols = [Col("Backend"), Col("Latency (us)", "r"), Col("vs Eager", "r")]
+    rows = [[name, f"{us:.0f}", f"{eager_us / us:.2f}x" if us > 0 else "-"] for name, us in results.items()]
     print()
-    print(f"{'Backend':<24s} {'Latency (us)':>12s} {'vs Eager':>10s}")
-    print("-" * 48)
-    for name, us in results.items():
-        speedup = eager_us / us if us > 0 else 0
-        print(f"{name:<24s} {us:>12.0f} {speedup:>10.2f}x")
+    for line in render_table(cols, rows, rule=True):
+        print(line)

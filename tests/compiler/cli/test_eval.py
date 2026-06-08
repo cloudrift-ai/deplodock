@@ -183,18 +183,34 @@ def test_knobs_tolerates_list_valued_knob(run_cli, tmp_path):
     assert "knob interaction" in stdout  # full report rendered, no crash
 
 
-def test_align_knob_columns_orders_and_aligns():
-    """``align_knob_columns`` orders columns canonically (knob_sort_key), pads each
-    knob to its widest cell so columns line up, and blanks where a row lacks a knob.
-    (Colour is tty-gated, off under pytest, so the cells render plain.)"""
-    from deplodock.commands.knobfmt import align_knob_columns
+def test_knob_columns_names_in_header_values_in_cells():
+    """``knob_columns`` puts the knob name in the column header (canonical knob_sort_key
+    order) and value-only cells (no ``NAME=`` prefix), blank where a row lacks a knob;
+    ``render_table`` aligns the columns to the widest of header + cells."""
+    from deplodock.commands.table import knob_columns, render_table
 
-    lines = align_knob_columns(
+    cols, cells = knob_columns(
         [
-            {"BN": ("BN=16", False), "BK": ("BK=32", False)},
-            {"BN": ("BN=32", True), "MMA": ("MMA=x", False)},
+            {"BN": ("16", False), "BK": ("32", False)},
+            {"BN": ("32", False), "MMA": ("x", False)},
         ]
     )
-    assert lines[0] == "BN=16  BK=32"  # canonical order BN before BK; trailing MMA blank stripped
-    assert lines[1].startswith("BN=32") and lines[1].endswith("MMA=x")  # BK column blank between
-    assert "BK" not in lines[1]
+    assert [c.name for c in cols] == ["BN", "BK", "MMA"]  # canonical order BN, BK, MMA
+    lines = render_table(cols, cells)
+    assert lines[0].split() == ["BN", "BK", "MMA"]  # header row carries the names
+    assert lines[1].split() == ["16", "32"]  # values only, no "BN=" prefix; trailing MMA blank stripped
+    assert "BN=" not in lines[1]
+    assert lines[2].split() == ["32", "x"]  # BK column blank between BN and MMA
+
+
+def test_render_table_ansi_aware_width():
+    """A coloured cell is padded by its *visible* length, so embedded ANSI codes never
+    throw off column alignment (right- and left-aligned columns both line up)."""
+    import re  # noqa: PLC0415
+
+    from deplodock.commands.table import Col, render_table
+
+    lines = render_table([Col("a", "r"), Col("b")], [["1", "x"], [("22", "\033[31m"), "y"]])
+    plain = [re.sub(r"\033\[[0-9]+m", "", line) for line in lines]
+    assert plain[1] == " 1  x"  # "1" right-aligned in a width-2 column
+    assert plain[2] == "22  y"  # coloured "22" fills the column; "y" still aligns under "x"

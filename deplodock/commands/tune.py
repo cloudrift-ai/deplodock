@@ -450,14 +450,18 @@ def _fmt_us(us) -> str:
 
 
 def _print_per_kernel_table(rows) -> None:
-    print()
-    print(f"{'Kernel':<40s} {'eager':>10s} {'tcompile':>10s} {'deplodock':>10s} {'vs eager':>9s}")
-    print("-" * 84)
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
+    cols = [Col("Kernel"), Col("eager", "r"), Col("tcompile", "r"), Col("deplodock", "r"), Col("vs eager", "r")]
+    data = []
     for label, res in sorted(rows, key=lambda kv: kv[1].get("Deplodock") or 0.0, reverse=True):
         eager = res.get("Eager PyTorch")
         dp = res.get("Deplodock")
         spd = f"{eager / dp:.2f}x" if (eager and dp) else "-"
-        print(f"{label[:40]:<40s} {_fmt_us(eager):>10s} {_fmt_us(res.get('torch.compile')):>10s} {_fmt_us(dp):>10s} {spd:>9s}")
+        data.append([label, _fmt_us(eager), _fmt_us(res.get("torch.compile")), _fmt_us(dp), spd])
+    print()
+    for line in render_table(cols, data, rule=True):
+        print(line)
 
 
 def render_kernel_chart(rows, out_html) -> None:
