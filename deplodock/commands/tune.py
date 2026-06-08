@@ -20,6 +20,7 @@ from deplodock.commands.compile import (
     resolve_tune_db,
     setup_pipeline_runtime,
 )
+from deplodock.commands.dataset_args import add_dataset_args, require_source
 from deplodock.compiler.pipeline import TuningSearch
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,10 @@ def register_tune_command(subparsers):
     )
     add_input_args(parser)
     add_golden_arg(parser)
+    # ``--dataset golden`` tunes every golden shape in sequence (the built-in
+    # equivalent of looping ``--golden NAME`` over GOLDEN_CONFIGS); ``--kernel``
+    # narrows to a name substring. Default None → ordinary single-op tune.
+    add_dataset_args(parser, default=None)
     parser.add_argument("--output", "-o", help="Output path for the tuned CUDA IR")
     parser.add_argument(
         "--patience",
@@ -129,7 +134,72 @@ def _tune_offline(args):
     sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
 
 
+def _tune_golden_dataset(args) -> None:
+    """``deplodock tune --dataset golden``: tune every golden shape in sequence.
+
+    Each shape runs as its own ``deplodock tune --golden NAME`` subprocess — the
+    same per-shape isolation the single-shape path already relies on (a bench
+    timeout dirties the CUDA context and forces ``os._exit``; a subprocess
+    boundary keeps one bad shape from aborting the rest of the sweep). ``--clean``
+    fires only on the first shape so the prior is rebuilt fresh then accumulated
+    across the set. ``--kernel SUBSTR`` narrows to matching names."""
+    import subprocess
+
+    require_source(args, {"golden"}, "tune --dataset only supports 'golden' (db rows have no shape to tune)")
+    if args.code or args.input or getattr(args, "golden", None):
+        logger.error("--dataset golden is mutually exclusive with --code / positional input / --golden NAME")
+        sys.exit(2)
+
+    from deplodock.compiler.pipeline.search.data import Dataset
+
+    names: list[str] = []
+    for s in Dataset.from_golden(kernel=args.kernel).samples:
+        if s.name not in names:
+            names.append(s.name)
+    if not names:
+        logger.error("no golden shapes matched --kernel %r", args.kernel)
+        sys.exit(2)
+
+    # Flags forwarded verbatim to each per-shape tune (omit dataset/golden/clean —
+    # those are owned by this orchestrator).
+    fwd: list[str] = ["--ucb-c", str(args.ucb_c), "--bench-timeout", str(args.bench_timeout), "--seed", str(args.seed)]
+    if args.patience is not None:
+        fwd += ["--patience", str(args.patience)]
+    if args.explore_eps is not None:
+        fwd += ["--explore-eps", str(args.explore_eps)]
+    if args.nvcc_flags:
+        fwd += ["--nvcc-flags", args.nvcc_flags]
+    if args.dump_dir:
+        fwd += ["--dump-dir", args.dump_dir]
+    if getattr(args, "quiet", False):
+        fwd.append("-q")
+    elif getattr(args, "verbose", 0):
+        fwd += ["-v"] * args.verbose
+    if args.bench:
+        fwd += ["--bench", "--bench-backends", args.bench_backends, "--warmup", str(args.warmup), "--iters", str(args.iters)]
+
+    dd = [sys.executable, "-m", "deplodock.deplodock"]
+    sys.stderr.write(f"[tune] dataset golden: {len(names)} shape(s){' (--clean on first)' if args.clean else ''}\n")
+    failures: list[tuple[str, int]] = []
+    for i, name in enumerate(names):
+        cmd = [*dd, "tune", "--golden", name, *fwd]
+        if i == 0 and args.clean:
+            cmd.append("--clean")
+        sys.stderr.write(f"\n[tune] === golden {i + 1}/{len(names)}: {name} ===\n")
+        sys.stderr.flush()
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            failures.append((name, rc))
+            sys.stderr.write(f"[tune] {name} exited rc={rc} (continuing)\n")
+    sys.stderr.write(f"\n[tune] dataset golden done: {len(names) - len(failures)}/{len(names)} ok\n")
+    if failures:
+        sys.stderr.write("[tune] failed: " + ", ".join(f"{n}(rc={rc})" for n, rc in failures) + "\n")
+    sys.exit(1 if failures else 0)
+
+
 def handle_tune(args):
+    if getattr(args, "dataset", None):
+        return _tune_golden_dataset(args)
     resolve_golden_arg(args)  # --golden NAME → --code <snippet>
     if args.code and args.input:
         logger.error("--code and positional input are mutually exclusive")
