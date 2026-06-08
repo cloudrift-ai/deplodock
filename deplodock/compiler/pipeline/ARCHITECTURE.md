@@ -280,9 +280,9 @@ rules — they're shared helpers for the pass's rule modules.
 three entry points:
 
 - `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
-  compile via `GreedySearch` (picks each fork by the `Prior`'s `mean_score`
-  argmin — `AnalyticPrior` cold, `CatBoostPrior` once trained). Stops at the
-  first terminal candidate.
+  compile via `GreedySearch` (flattens each fork point to its complete leaves and
+  picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
+  once trained). Stops at the first terminal candidate.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
   yields one terminal `Candidate` per fully-explored rollout.
@@ -507,20 +507,27 @@ falls back to a uniform `P = 1`). The enumeration is itself ordered by the `Anal
 MCTS front-loads good variants and a single `tune` pass reaches the prior-best within patience. The end-of-run sanity
 block (silly-pick rate warmup-vs-post, self-calibration) prints once for the global prior.
 
-**Greedy uses the prior too.** `Pipeline.run`'s `GreedySearch` (the O(1)-per-step `compile` / `run` driver) lazy-loads the
-global `Prior` via `load_prior` (the `FallbackPrior` over `CatBoostPrior` + `AnalyticPrior`) and picks each fork by
-`mean_score` argmin (lowest predicted latency) over the candidate's `{H_* , S_* , path-deltas, fork-delta}` feature
-vector — the exact base the prior trained on. Cold (no trained `CatBoostPrior`) the `AnalyticPrior` ranks; only if
-`load_prior` returns nothing does it take option-0. (Greedy benches nothing, so it can only *use* a prior, never train
-one; routing whole-model compile through `TuningSearch` would be O(N²).)
+**Greedy uses the prior too — and flattens.** `Pipeline.run`'s `GreedySearch` (the `compile` / `run` driver) lazy-loads
+the global `Prior` via `load_prior` (the `FallbackPrior` over `CatBoostPrior` + `AnalyticPrior`). The lazy fork tree is an
+**MCTS** structure — it stages knob choices across levels (`BR` → `BM/BN` → `FM/FN`) so MCTS pays one node per pop.
+Greedy must NOT walk it level-by-level: a branch carries only a *partial* tile, and `knob.knob_features` can't compute the
+tile's area / occupancy until `FM/FN` are pinned, so the prior is **blind at the `BM/BN` choice** and defaults to `BN=16`
+for every shape (it also defaulted the warp-vs-scalar tier by emission order, not the prior). Instead greedy **flattens**
+each fork point to its complete leaves — `_leaves` expands branches depth-first (cheap; only knob dicts, materialization
+stays deferred to the one chosen leaf's `resolve`) — and picks the lowest `Prior.mean_scores` over the full
+`{H_*, S_*, complete-knob-row}` vector the prior trained on, in **one batched `predict`**. The pick equals scoring the
+flat candidate set, invariant to the tree's level order. Cold (no trained `CatBoostPrior`) the `AnalyticPrior` ranks
+(including the positive `MMA_tier` warp-preference that replaced the old warp-first emission order); only if `load_prior`
+returns nothing does it take option-0. (Greedy benches nothing, so it can only *use* a prior, never train one; routing
+whole-model compile through `TuningSearch` would be O(N²).)
 
 **Greedy validity fallback.** The prior ranks by *predicted latency*, which can rank a tile that fails `validate(ctx)`
 (smem / thread budget) first — `tune` benches-and-skips it, but greedy benches nothing. So when a deterministic compile
 leaves a node un-lowered (its only lowering rejected at `validate`), `Pipeline.run` blocklists that tile's
-`tile_identity` (its planner knobs) and **re-drives**: `GreedySearch(blocked=…)` skips the matching leaf and falls back
-to the next prior-ranked sibling (the valid runner-up is usually ranked right below). Bounded by `_MAX_GREEDY_RETRIES`
-(each retry blocks ≥1 fresh tile or stops). Only the offending leaf is skipped — a branch fork's partial knobs never
-match a full-row blocklist entry, so whole subtrees are never pruned.
+`tile_identity` (its planner knobs) and **re-drives**: `GreedySearch(blocked=…)` drops the matching leaf from the
+flattened set and picks the next-best (the valid runner-up is usually ranked right below). Bounded by
+`_MAX_GREEDY_RETRIES` (each retry blocks ≥1 fresh tile or stops). Only the offending leaf is dropped — its full-row
+`tile_identity` never matches a different tile, so no other candidate is pruned.
 
 **Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search

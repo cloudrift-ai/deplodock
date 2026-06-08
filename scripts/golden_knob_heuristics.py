@@ -17,9 +17,14 @@ regime**: fp32-scalar + fp16/bf16-warp matmul, cooperative reduce, and pointwise
 
   1. For every golden (matmul thread / warp, reduce, pointwise), reconstruct the
      planner's exact candidate enumeration for that mode and locate the golden row.
-  2. Featurize every candidate via ``knob.knob_features`` (restricted to the ``D_*``
-     engineered features — the ``S_*``/``H_*`` shape/regime features are constant
-     within a shape, so they drop out of a within-shape ranking).
+     fp16/bf16 (warp) goldens enumerate BOTH tiers — scalar + warp — since a real
+     fp16 matmul does, so the fit ranks the warp golden against the scalar tile it
+     competes with (the warp-first default greedy's flatten no longer gets from
+     enumeration order).
+  2. Featurize every candidate via ``knob.knob_features`` (the ``D_*`` engineered
+     features plus ``MMA_tier``, the warp/scalar tier discriminator — the ``S_*`` /
+     ``H_*`` shape/regime features are constant within a shape, so they drop out of
+     a within-shape ranking).
   3. Score candidates with a parameterized linear model and measure the golden's
      rank (top-k coverage, median rank).
   4. Random-search + coordinate-descent the weights to minimize mean ``log2(rank+1)``
@@ -71,7 +76,7 @@ def build_cases(ctx: Context) -> list[tuple[str, str, int, list[dict[str, float]
     """Reconstruct each matmul golden's candidate enumeration (both tiers), pin the
     golden's index, and featurize every row. Returns ``(name, tier, golden_idx,
     feats)`` where ``tier`` is ``"thread"``/``"warp"`` and ``feats`` is the per-row
-    ``D_*`` feature dict."""
+    ``D_*`` (+ ``MMA_tier``) feature dict."""
     cases = []
     for g in GOLDEN_CONFIGS:
         if isinstance(g, ReduceGoldenConfig):
@@ -93,11 +98,21 @@ def build_cases(ctx: Context) -> list[tuple[str, str, int, list[dict[str, float]
             atom = ATOM_REGISTRY.get(g.knobs.get("MMA", ""))
             if atom is None:
                 continue
-            rows = _enumerate_warp_matmul_impl(
+            warp_rows = _enumerate_warp_matmul_impl(
                 E_M=g.M, E_N=g.N, E_K=g.K, ctx=ctx, force_splitk_one=False,
                 atoms=(atom,), m_axis_name="m", n_axis_name="n", m_forced_mask=False, n_forced_mask=False,
             )  # fmt: skip
-            rows = [r for r in rows if r["WM"] * r["WN"] != 1]
+            warp_rows = [r for r in warp_rows if r["WM"] * r["WN"] != 1]
+            # Include the SCALAR tier in the candidate pool: a real fp16 matmul
+            # enumerates both tiers as leaves under one fork tree, so greedy's
+            # flattened pick ranks warp vs scalar directly. Enumerating warp-only
+            # here hid that competition, so the fit never learned to prefer tensor
+            # cores — the cold analytic ranked the scalar tile first for fp16. With
+            # both tiers in the pool the rank objective penalizes "scalar outranks
+            # the warp golden", so the joint fit learns the warp preference (via
+            # ``MMA_tier``, kept below).
+            scalar_rows = enumerate_cartesian(E_M=g.M, E_N=g.N, E_K=g.K, ctx=ctx, priority_mode="matmul", m_axis_name="m", n_axis_name="n")
+            rows = list(scalar_rows) + warp_rows
             keys, tier = _WARP_KEYS, "warp"
         else:
             continue
@@ -106,7 +121,12 @@ def build_cases(ctx: Context) -> list[tuple[str, str, int, list[dict[str, float]
         if gidx is None:
             print(f"  !! {g.name}: golden not in {len(rows)} candidates — skipping")
             continue
-        feats = [{k: v for k, v in knob.knob_features({**base, **r}).items() if k.startswith("D_")} for r in rows]
+        # Keep ``D_*`` geometry/occupancy plus ``MMA_tier`` (the warp/scalar tier
+        # discriminator) — the only non-``D_`` feature the tier choice rides on.
+        # It's constant 0 within a scalar-only shape (fp32 / reduce / pointwise),
+        # so it drops out of those within-shape rankings and only fires where both
+        # tiers compete (fp16 / bf16).
+        feats = [{k: v for k, v in knob.knob_features({**base, **r}).items() if k.startswith("D_") or k == "MMA_tier"} for r in rows]
         cases.append((g.name, tier, gidx, feats))
     return cases
 
