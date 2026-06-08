@@ -1,9 +1,9 @@
 """Schema + invariants for the golden matmul config set.
 
-These are pure-data checks (no GPU): the records load, the derived ``ratio`` /
-``golden`` properties stay consistent, and ``matmul_snippet`` / ``repro_command``
-render the canonical form. The actual latencies are produced by
-``scripts/find_golden_configs.py`` on a CUDA device.
+These are pure-data checks (no GPU): the records load from the per-GPU YAML files,
+the derived ``ratio`` / ``golden`` properties stay consistent, and ``matmul_snippet``
+/ ``repro_command`` render the canonical form. The actual latencies are measured on
+a CUDA device via ``deplodock tune --golden NAME --bench`` and recorded into the YAML.
 """
 
 from __future__ import annotations
@@ -11,11 +11,14 @@ from __future__ import annotations
 import pytest
 
 from deplodock.compiler.pipeline.search.golden import (
+    _GOLDENS_DIR,
+    _KERNEL_CLASSES,
     GOLDEN_CONFIGS,
     GoldenConfig,
     MatmulGoldenConfig,
     PointwiseGoldenConfig,
     ReduceGoldenConfig,
+    _load_goldens,
     matmul_snippet,
 )
 
@@ -64,6 +67,25 @@ def test_golden_configs_set_is_well_formed():
         assert c.golden == (c.ratio >= 0.95), c.name
         assert c.knobs, f"{c.name} has no recorded knobs"
         assert c.snippet(), c.name
+
+
+def test_goldens_load_from_yaml():
+    """The per-GPU YAML files are the source of truth: at least one file exists,
+    every config carries a known ``kernel`` discriminator, and the loaded set is
+    non-empty and identical to the import-time :data:`GOLDEN_CONFIGS`."""
+    import yaml
+
+    files = sorted(_GOLDENS_DIR.glob("*.yaml"))
+    assert files, f"no golden YAML files under {_GOLDENS_DIR}"
+    for path in files:
+        doc = yaml.safe_load(path.read_text())
+        assert isinstance(doc["gpu_name"], str) and len(doc["compute_cap"]) == 2, path.name
+        for c in doc["configs"]:
+            assert c["kernel"] in _KERNEL_CLASSES, f"{path.name}: unknown kernel {c.get('kernel')!r}"
+
+    loaded = _load_goldens()
+    assert loaded  # non-empty
+    assert len(loaded) == len(GOLDEN_CONFIGS)
 
 
 def _dup(knobs, us):

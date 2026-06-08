@@ -26,6 +26,9 @@ dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphv
 [tool.setuptools.packages.find]
 include = ["deplodock*"]
 
+[tool.setuptools.package-data]
+"deplodock.compiler.pipeline.search" = ["goldens/*.yaml"]
+
 [project.scripts]
 deplodock = "deplodock.deplodock:main"
 
