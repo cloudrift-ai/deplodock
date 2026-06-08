@@ -60,16 +60,6 @@ class Op:
     # autotune knob picked along the chain. Excluded from structural
     # identity and equality — pure attribution metadata.
     knobs: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
-    # Free-form per-op-instance scratch metadata for passes that derive
-    # expensive analysis from the op and want it to ride the op instead of
-    # being threaded through call chains (e.g. the partition planner caches
-    # its ``_Plan`` under ``meta["plan"]``). Ops are shared by reference
-    # across ``Graph.copy`` snapshots and ``single_node_graph`` slices, so
-    # an entry stamped once is visible to every later consumer of the same
-    # op object — entries MUST therefore be keyed/validated by their owner
-    # against anything environmental they depend on. Never serialized,
-    # never part of structural identity or equality.
-    meta: dict = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     inputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
     outputs: dict[str, Tensor] = field(default_factory=dict, kw_only=True, repr=False, compare=False)
 
@@ -102,31 +92,6 @@ class Op:
         post-register-tile thread count fits the hardware launch budget.
         """
         return True
-
-    @staticmethod
-    def lazy_score(ctx, *, knobs=None, shapes=None) -> float | None:  # noqa: ARG004
-        """Cheap pre-instantiation scorer. Lets a rule rank variants
-        without ever building the op — the instantiation may be the bulk
-        of the lowering cost (e.g. ``TileOp.__post_init__`` runs full
-        body normalization).
-
-        Subclasses override to implement when the score formula can be
-        evaluated from precomputed inputs:
-
-        - ``knobs`` — the variant's knob dict, exactly what the
-          materialized op would carry in ``Op.knobs`` (so DB rows /
-          golden configs / pin sets are scoreable without
-          reconstructing any rule-internal variant type)
-        - ``shapes`` — op-defined shape descriptor (e.g. ``KernelShape``
-          for ``TileOp`` — the static per-LoopOp planning state)
-
-        Return ``None`` when the lazy path isn't implementable for
-        these inputs. This is the ONLY scorer — there is deliberately no
-        post-materialization ``Op.score``: every ranking decision the
-        search makes flows through the same cheap (knobs, shapes)
-        formula, so an op never needs to exist just to be ranked.
-        """
-        return None
 
 
 @dataclass

@@ -79,11 +79,13 @@ def test_default_on_stamps_8(monkeypatch):
 
 
 def test_env_pin_disables(monkeypatch):
-    """DEPLODOCK_GROUP_M=1 → escape hatch fires, pass skips with reason."""
+    """DEPLODOCK_GROUP_M=1 → escape hatch: records GROUP_M=1 (no swizzle), grid untouched."""
     monkeypatch.setenv("DEPLODOCK_GROUP_M", "1")
     op = _tile_op(_matmul_grid())
-    with pytest.raises(RuleSkipped, match="disables CTA swizzle"):
-        swizzle.rewrite(_StubNode(op))
+    new = swizzle.rewrite(_StubNode(op))
+    assert isinstance(new, TileOp)
+    assert new.knobs[swizzle.GROUP_M.name] == 1
+    assert new.body[0].swizzle_group_m == 1
 
 
 def test_env_pin_picks_explicit_value(monkeypatch):
@@ -95,45 +97,49 @@ def test_env_pin_picks_explicit_value(monkeypatch):
 
 
 def test_idempotent(monkeypatch):
-    """Already-stamped GridTile → second pass invocation is a skip."""
+    """Already-decided GROUP_M (knob present) → second invocation skips."""
     monkeypatch.delenv("DEPLODOCK_GROUP_M", raising=False)
     op = _tile_op(_matmul_grid())
     once = swizzle.rewrite(_StubNode(op))
-    with pytest.raises(RuleSkipped, match="no eligible top-level GridTile"):
+    assert once.knobs[swizzle.GROUP_M.name] == 8
+    with pytest.raises(RuleSkipped, match="GROUP_M already decided"):
         swizzle.rewrite(_StubNode(once))
 
 
 # ---------------------------------------------------------------------------
-# Skip conditions
+# Non-acting paths now record GROUP_M=1 (no swizzle) instead of RuleSkipped,
+# so the realized config keeps a uniform knob set for the learned prior.
 # ---------------------------------------------------------------------------
 
 
-def test_skip_pointwise_knobs(monkeypatch):
-    """Pointwise kernel (BK == 1) → skip — no K-reduce, no L2 A-row reuse story."""
+def _assert_off(op: TileOp) -> None:
+    new = swizzle.rewrite(_StubNode(op))
+    assert isinstance(new, TileOp)
+    assert new.knobs[swizzle.GROUP_M.name] == 1
+    assert all(g.swizzle_group_m == 1 for g in new.body if isinstance(g, GridTile))
+
+
+def test_off_stamped_pointwise_knobs(monkeypatch):
+    """Pointwise kernel (BK == 1) → records GROUP_M=1 (no L2 A-row reuse story)."""
     monkeypatch.delenv("DEPLODOCK_GROUP_M", raising=False)
-    grid = _matmul_grid()
-    op = TileOp(body=Body((grid,)), name="k", knobs={**_MATMUL_KNOBS, "BK": 1})
-    with pytest.raises(RuleSkipped, match="not a matmul-priority TileOp"):
-        swizzle.rewrite(_StubNode(op))
+    op = TileOp(body=Body((_matmul_grid(),)), name="k", knobs={**_MATMUL_KNOBS, "BK": 1})
+    _assert_off(op)
 
 
-def test_skip_cooperative_reduce_knobs(monkeypatch):
-    """Cooperative-reduce kernel (BR > 1) → skip — different axis topology."""
+def test_off_stamped_cooperative_reduce_knobs(monkeypatch):
+    """Cooperative-reduce kernel (BR > 1) → records GROUP_M=1 (different axis topology)."""
     monkeypatch.delenv("DEPLODOCK_GROUP_M", raising=False)
-    grid = _matmul_grid()
-    op = TileOp(body=Body((grid,)), name="k", knobs={**_MATMUL_KNOBS, "BR": 4})
-    with pytest.raises(RuleSkipped, match="not a matmul-priority TileOp"):
-        swizzle.rewrite(_StubNode(op))
+    op = TileOp(body=Body((_matmul_grid(),)), name="k", knobs={**_MATMUL_KNOBS, "BR": 4})
+    _assert_off(op)
 
 
-def test_skip_single_axis_grid(monkeypatch):
-    """Matmul knobs but a single-block-axis GridTile (degenerate shape)
-    → no eligible top-level grid, skip."""
+def test_off_stamped_single_axis_grid(monkeypatch):
+    """Matmul knobs but a single-block-axis GridTile (degenerate shape) → no
+    eligible top-level grid, records GROUP_M=1."""
     monkeypatch.delenv("DEPLODOCK_GROUP_M", raising=False)
     grid = GridTile(axes=(Axis("seq_b", 32),), body=Body((ThreadTile(axes=(Axis("t", 1),), body=Body(())),)))
     op = TileOp(body=Body((grid,)), name="k", knobs=_MATMUL_KNOBS)
-    with pytest.raises(RuleSkipped, match="no eligible top-level GridTile"):
-        swizzle.rewrite(_StubNode(op))
+    _assert_off(op)
 
 
 # ---------------------------------------------------------------------------

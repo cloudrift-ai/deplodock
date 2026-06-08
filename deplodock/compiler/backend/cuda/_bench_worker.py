@@ -78,9 +78,14 @@ def main() -> None:
         dirty = False
         try:
             req = pickle.loads(body)
+            from deplodock import config
             from deplodock.compiler.backend.cuda.program import benchmark_program
 
-            result = benchmark_program(req["graph"], **req["kwargs"])
+            # ``nvcc_flags`` (optional) re-points this one compile at a different
+            # opt level (e.g. -O3 re-bench of a tune winner) — the cubin cache key
+            # folds it in, so the right (separately-cached) cubin is built/served.
+            with config.nvcc_flags_override(req.get("nvcc_flags")):
+                result = benchmark_program(req["graph"], **req["kwargs"])
             resp = {"ok": True, "result": result}
         except BaseException as exc:  # noqa: BLE001 — surface every failure mode to the parent
             resp = {"ok": False, "error": repr(exc), "traceback": traceback.format_exc()}

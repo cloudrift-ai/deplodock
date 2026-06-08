@@ -10,6 +10,7 @@ and that the priority keeps ``FK=1`` first so the greedy default is unchanged.
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     _MAX_CELLS_PER_THREAD,
     enumerate_cartesian,
@@ -26,7 +27,7 @@ def test_reduce_sweeps_fk_above_one():
     """A reduce with a chunkable K (per-thread K-chunk count > 1) surfaces
     FK > 1 variants in the enumeration."""
     combos = _reduce(e_k=2048)
-    fks = {p["FK"] for p in combos if "MMA" not in p}
+    fks = {p["FK"] for p in combos if not is_warp(p)}
     assert fks - {1}, f"reduce enumeration produced no FK>1 variant; saw {sorted(fks)}"
 
 
@@ -34,7 +35,7 @@ def test_fk_divides_k_o_ext():
     """Every emitted FK divides the per-thread serial-loop extent
     (K_o_ext = E_K // (splitk·br·bk·fk) must be a whole number)."""
     for p in _reduce(e_k=2048):
-        assert "MMA" not in p, f"reduce enumeration must stay scalar-tier: {p}"
+        assert not is_warp(p), f"reduce enumeration must stay scalar-tier: {p}"
         k_chunks_per_thread = (2048 // p["BR"]) // p["BK"]  # the extent FK strip-mines
         assert k_chunks_per_thread % p["FK"] == 0, f"FK={p['FK']} does not divide K_o_ext for {p}"
 
@@ -72,19 +73,21 @@ def test_matmul_fp16_window_off_keeps_fk_one():
 
 
 def test_matmul_fp16_window_greedy_default_is_fk_one():
-    """The greedy (first-by-priority) fp16 matmul pick stays FK=1 so the
-    non-tuned ``compile`` is byte-identical to the fp32-accumulate path."""
+    """The greedy (option-0) fp16 matmul pick stays FK=1 so the non-tuned
+    ``compile`` is byte-identical to the fp32-accumulate path. The enumeration
+    emits in construction order (FK swept 1, 2, …), so FK=1 leads."""
     combos = enumerate_cartesian(E_M=512, E_N=512, E_K=512, ctx=_CTX, priority_mode="matmul", fp16_window=True)
     assert combos[0]["FK"] == 1, f"greedy default must be FK=1, got {combos[0]['FK']}"
 
 
 def test_fk_one_ranks_first_in_priority():
-    """For the greedy (non-tuned) default the FK=1 variant must outrank its
+    """For the greedy (option-0) default the FK=1 variant must precede its
     FK>1 siblings sharing the same BR / thread geometry, so ``compile`` stays
     byte-identical to the pre-FK planner (golden criterion)."""
     combos = _reduce(e_k=2048)
-    # The enumeration is sorted by priority DESC. Find the first variant for a
-    # representative (br, bn, bm, bk, splitk) group and confirm it's FK=1.
+    # The enumeration emits in construction order (FK swept 1, 2, …). Find the
+    # first variant for a representative (br, bn, bm, bk, splitk) group and
+    # confirm it's FK=1.
     seen_group: set[tuple] = set()
     for p in combos:
         key = (p["BR"], p["BN"], p["BM"], p["BK"], p["SPLITK"])

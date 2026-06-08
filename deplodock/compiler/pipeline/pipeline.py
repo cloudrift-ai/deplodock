@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.pipeline.knob import format_tuning_knobs
+from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -40,6 +40,11 @@ if TYPE_CHECKING:
     from deplodock.compiler.pipeline.search.policy import Search
 
 logger = logging.getLogger("deplodock.compiler.pipeline")
+
+# Greedy compile validity-fallback cap: how many times ``Pipeline.run`` re-drives
+# blocklisting a tile that failed ``validate(ctx)``. Each retry blocks ≥1 fresh
+# tile or stops, so this only bounds pathological cases (every sibling unviable).
+_MAX_GREEDY_RETRIES = 8
 
 
 _PASSES_DIR = Path(__file__).resolve().parent / "passes"
@@ -161,6 +166,12 @@ class Pass:
     name: str
     rules: list[Rule]
     index: int = 0
+    # Every ``Knob`` declared (or imported) by this pass's rule modules — the
+    # knobs this pass "owns". Populated by :meth:`load` (scans each rule
+    # module's ``vars()`` for ``Knob`` instances, so imported knobs like the
+    # planner's ``_enumeration`` set count too). :meth:`Cursor.advance` stamps
+    # any of these with a defined ``off`` onto the variant at the pass boundary.
+    declared_knobs: tuple[Knob, ...] = ()
 
     def __post_init__(self) -> None:
         for r in self.rules:
@@ -175,6 +186,7 @@ class Pass:
         pass_dir = _PASSES_DIR / name
         rule_files = sorted(f for f in pass_dir.glob("*.py") if f.name != "__init__.py" and not f.name.startswith("_"))
         rules: list[Rule] = []
+        declared: dict[str, Knob] = {}  # knob name → Knob, deduped across rule modules
         for path in rule_files:
             if select is not None and path.stem not in select and _strip_rule_prefix(path.stem) not in select:
                 continue
@@ -197,7 +209,13 @@ class Pass:
                 raise ValueError(f"Rule {path} missing rewrite() function")
             param_names = tuple(inspect.signature(rewrite_fn).parameters.keys())
             rules.append(Rule(name=path.stem, pattern=pattern, rewrite=rewrite_fn, param_names=param_names))
-        return cls(name=name, rules=rules, index=index)
+            # Collect the knobs this rule module declares OR imports (e.g. the
+            # planner imports the ``_enumeration`` tier knobs) — ``Cursor.advance``
+            # uses them to OFF-fill the pass's variants.
+            for v in vars(module).values():
+                if isinstance(v, Knob):
+                    declared.setdefault(v.name, v)
+        return cls(name=name, rules=rules, index=index, declared_knobs=tuple(declared.values()))
 
 
 @dataclass
@@ -292,6 +310,27 @@ class Match:
         )
 
 
+def _off_fill_pass(graph: Graph, pass_: Pass) -> None:
+    """Stamp every OFF-declared knob of ``pass_`` that a variant left unspecified
+    onto that variant — the "every emitted variant carries an explicit value for
+    every knob the pass declares" rule, realized once at the pass boundary (so
+    all the pass's rules — including a declined / no-variant rule — have had
+    their turn). Rebuilds the op via :func:`dataclasses.replace` (a fresh
+    ``knobs`` dict, never an in-place mutation) so a structurally shared op isn't
+    corrupted across sibling candidates. Only ops that already carry tuning
+    knobs (a realized kernel variant) are touched — inputs / constants with an
+    empty ``knobs`` are left alone."""
+    if not pass_.declared_knobs:
+        return
+    for node in graph.nodes.values():
+        knobs = getattr(node.op, "knobs", None)
+        if not knobs:
+            continue
+        filled = apply_off_defaults(dict(knobs), pass_.declared_knobs)
+        if filled != knobs:
+            node.op = replace(node.op, knobs=filled)
+
+
 @dataclass
 class Cursor:
     """Pipeline resume state for a candidate. Owns the entire advance
@@ -348,6 +387,7 @@ class Cursor:
         self.n_applied = 0
         if finished:
             if pass_.name:
+                _off_fill_pass(graph, pass_)
                 logger.debug("compile: %-18s done (%d nodes)", pass_.name, len(graph.nodes))
                 if self.run.dump is not None:
                     self.run.dump.on_pass(pass_, graph)
@@ -438,8 +478,29 @@ class Pipeline:
         instead of a downstream ``CudaBackend`` mystery."""
         from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
 
-        rejections: list[tuple[str, str, str]] = []
-        cand = next(self.tune(graph, search=GreedySearch(), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
+        # Single-shot compile uses the O(1)-per-step ``GreedySearch`` driver, NOT
+        # the MCTS tree: ``TuningSearch.pop`` re-descends from the root each call,
+        # so a whole-model compile through it would be O(N²) and hang. Greedy picks
+        # each fork by the prior's ``mean_score`` argmin (no benching — it can only
+        # use a prior, never train one). Exploration (PUCT) stays in ``tune``.
+        #
+        # Validity fallback: the prior ranks by predicted latency and can rank a
+        # tile that fails ``validate(ctx)`` (smem / thread budget) first — ``tune``
+        # benches-and-skips it, but greedy benches nothing, so on a left-un-lowered
+        # node we blocklist its tile and re-drive, falling back to the next
+        # prior-ranked sibling. Bounded retries (each adds ≥1 block or stops).
+        blocked: dict[str, set[frozenset]] = {}
+        for _attempt in range(_MAX_GREEDY_RETRIES):
+            rejections: list[tuple[str, str, str]] = []
+            cand = next(
+                self.tune(graph, search=GreedySearch(blocked=blocked), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
+            )
+            failed = _unlowered_tiles(cand.graph, rejections)
+            new = {nid: ident for nid, ident in failed.items() if ident not in blocked.get(nid, set())}
+            if not new:  # success, or no fresh info to retry on → report below
+                break
+            for nid, ident in new.items():
+                blocked.setdefault(nid, set()).add(ident)
         _raise_on_unlowered(cand.graph, rejections, cand.ctx)
         return cand.graph
 
@@ -508,7 +569,17 @@ class Pipeline:
             if backend is not None:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
             stats, status = _bench_terminal(cand, backend=backend, db=run.db)
-            search.observe(token, stats, status)
+            search.observe(token, stats, status, candidate=cand)
+            # Re-bench at -O3 for a deployable prior sample any config the search
+            # flags as -O3-worthy — every config within the -O1 tolerance band of
+            # the best (see ``TuningSearch.observe`` / ``O3_REBENCH_TOL``), not
+            # just a strict new best, so configs that tie at -O1 but differ at -O3
+            # (the warp WARPSPEC / occupancy split) each get an -O3 truth sample.
+            # Best-effort + deduped, so the cost stays bounded.
+            if backend is not None and getattr(search, "last_o3_worthy", False):
+                o3_us = _rebench_o3(cand, backend)
+                if o3_us is not None:
+                    search.observe_o3(token, o3_us)
             yield cand
         logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
 
@@ -524,8 +595,8 @@ class Run:
     * ``ctx`` — the resolved hardware context, shared by every candidate
       (reached as ``cand.ctx``).
     * ``search`` — the policy (greedy / MCTS) ordering the exploration.
-    * ``db`` — the autotune store ``_best_fork`` replays and
-      ``_bench_terminal`` persists into.
+    * ``db`` — the autotune store ``_bench_terminal`` persists into (the
+      training data for the learned prior).
     * ``backend`` — optional measurement backend (``None`` = stub bench,
       no persistence).
     * ``dump`` — optional artifact collector: :meth:`Candidate._log_apply`
@@ -582,7 +653,7 @@ class Run:
             # cursor advance is deferred until a leaf actually resolves.
             if lc.is_expandable():
                 children = lc.expand()
-                search.push(*children, parent=token, best=_best_fork(children, lc.inner, self.db))
+                search.push(*children, parent=token)
                 continue
             cand = lc.resolve()
             cur = cand.cursor
@@ -612,9 +683,10 @@ class Run:
                 if options is None:
                     continue
                 # Multi-option fork point: spawn one ``LazyCandidate`` per
-                # option, in rule-emission order (the search ranks them
-                # via ``score_of``; rules need not pre-sort). Each shares
-                # ``cand`` as ``inner`` so siblings don't duplicate the
+                # option, in rule-emission order. Selection is the search's
+                # job (greedy keeps option-0; tuning explores every fork and
+                # ranks the unvisited frontier with its learned prior). Each
+                # shares ``cand`` as ``inner`` so siblings don't duplicate the
                 # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
                 # options into leaf Forks so every LazyCandidate's pending
                 # carries a uniform Fork shape. The fork's apply on
@@ -625,10 +697,29 @@ class Run:
                 break
 
             if forks is not None:
-                search.push(*forks, parent=token, best=_best_fork(forks, cand, self.db))
+                search.push(*forks, parent=token)
                 continue
 
             search.push(cand.lazy(), parent=token)
+
+
+def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:
+    """``{node_id: tile_identity}`` for every node a ``validate(ctx)`` rejection
+    left un-lowered (still a ``LoopOp`` / ``TileOp`` at the terminal). The
+    ``tile_identity`` is the offending tile's planner knobs — what ``Pipeline.run``
+    blocklists so the greedy retry falls back to the next prior-ranked sibling."""
+    if not rejections:
+        return {}
+    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.policy.greedy import tile_identity  # noqa: PLC0415
+
+    out: dict[str, frozenset] = {}
+    for nid, _pass_label, _reason in rejections:
+        node = graph.nodes.get(nid)
+        if node is not None and isinstance(node.op, (LoopOp, TileOp)):
+            out[nid] = tile_identity(node.op.knobs)
+    return out
 
 
 def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ctx: Context) -> None:
@@ -707,57 +798,21 @@ def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
 # ---------------------------------------------------------------------------
 
 
-def _knob_eq(a, b) -> bool:
-    """Knob-value equality across the DB's JSON round-trip: tuples come
-    back as lists (e.g. the planner's ``OVERHANG``), so compare with
-    tuples canonicalized to lists."""
-    if isinstance(a, tuple):
-        a = list(a)
-    if isinstance(b, tuple):
-        b = list(b)
-    return a == b
+def _rebench_o3(cand, backend):
+    """Re-bench an already-lowered tune winner at ``-Xcicc -O3`` (deployable
+    codegen) for a clean prior sample. Returns the -O3 median latency in µs, or
+    ``None`` when the sweep is already at -O3 or the bench errors (best-effort —
+    a re-bench hiccup must never abort the sweep). The winner already benched OK
+    at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
+    from deplodock import config  # noqa: PLC0415
 
-
-def _best_fork(forks, parent_cand, db):
-    """Pick the fork whose knob delta matches the lowering DB's
-    best-known child for the parent op. Returns ``None`` when no row
-    exists (untuned site), the parent op has no cache key, or no fork's
-    knobs agree with the recorded delta (variant drifted).
-
-    Matching is on KNOBS ALONE — the variant identity is ``(ctx,
-    knobs)`` (the ``SID`` knob makes the dict complete), so branch and
-    leaf forks match uniformly and nothing is ever materialized just to
-    be compared. ``row.knobs`` is the full child-minus-parent delta
-    recorded by ``_bench_terminal``; a fork wins iff at least one of its
-    pinned knobs is constrained by the row and every constrained one
-    agrees. Distinct siblings always differ in a recorded knob — branch
-    siblings pin distinct level keys, and tree leaves carry their
-    complete knob row — so at most one sibling matches. The DB's
-    structural ``child_key`` is measurement linkage (inventory / perf),
-    not a replay key."""
-    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
-
-    first = forks[0]
-    if first.pending is None:
+    if "-O3" in config.nvcc_flags():
+        return None  # already deployable codegen — nothing to re-bench
+    try:
+        result = backend.benchmark(cand.graph, nvcc_flags="-Xcicc -O3")
+    except Exception:  # noqa: BLE001 — a re-bench failure is non-fatal to tuning
         return None
-    match, _ = first.pending
-    parent_node = parent_cand.graph.nodes.get(match.root_node_id)
-    if parent_node is None:
-        return None
-    parent_key = op_cache_key(parent_node.op)
-    if parent_key is None:
-        return None
-    row = db.lookup_lowering(parent_key)
-    if row is None:
-        return None
-    for f in forks:
-        if f.pending is None:
-            continue
-        _, fork = f.pending  # always a Fork after the constructor unification
-        constraining = [k for k in fork.knobs if k in row.knobs]
-        if constraining and all(_knob_eq(row.knobs[k], fork.knobs[k]) for k in constraining):
-            return f
-    return None
+    return result.time_ms * 1000.0 if result.time_ms else None
 
 
 def _bench_terminal(cand, *, backend, db):

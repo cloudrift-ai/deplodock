@@ -143,7 +143,7 @@ def _materialize(tile_op: TileOp) -> KernelOp:
     g = Graph()
     g.add_node(op=tile_op, inputs=[], output=Tensor(tile_op.name, ()), node_id="op")
     node = g.nodes["op"]
-    ctx = Context(compute_capability="sm_80")
+    ctx = Context(compute_capability=(8, 0))
     result = _mat.rewrite(ctx, node)
     assert isinstance(result, KernelOp), f"expected KernelOp, got {type(result).__name__}"
     return result

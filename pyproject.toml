@@ -12,6 +12,7 @@ dependencies = [
     "httpx",
     "numpy",
     "pyyaml",
+    "catboost",
 ]
 
 [project.optional-dependencies]

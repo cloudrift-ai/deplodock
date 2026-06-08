@@ -21,10 +21,11 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
 - `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `deplodock run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
-- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock compile` / `run` / `tune` all read from / write to this path so a tuned variant picked up by one command shows up in the next.
+- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock tune` reads from / writes to this path. NOTE: the greedy DB→fork replay (`_best_fork`) that let `compile` / `run` pick a previously-tuned variant was **removed** in the learned-prior work; `compile` / `run` now pick forks from the global `Prior` — a `FallbackPrior` (`search/prior/`) that ranks by the learned `CatBoostPrior` once trained and the hand-coded `AnalyticPrior` cold (the `mean_score` argmin — lowest predicted latency; option-0 only if no prior loads at all) — not the DB. The learned half is a separate JSON checkpoint (`DEPLODOCK_PRIOR_FILE` → `~/.cache/deplodock/prior.json`); `tune` writes it, `compile` / `run` read it (the `AnalyticPrior` is fixed code, no file).
 
 All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
-`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
+`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_TUNE_EPS`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`,
+`DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
 …) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
 layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
@@ -73,20 +74,32 @@ same worker.
 - `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
 - `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
 - `deplodock compile ... --dynamic NAME@INPUT:AXIS` (repeatable) — make axis `AXIS` of the traced input named `INPUT` symbolic. Forwards to `torch.export(..., dynamic_shapes={INPUT: {AXIS: Dim(NAME)}})`; torch's SymInt propagation threads `Dim(NAME)` through every downstream FX tensor. The compiled CUDA kernel signature gains an `int <NAME>` runtime arg per dim; the launch resolves NAME from input array shapes (one cached kernel runs at any seq_len). A symbolic free axis is tiled for its `Dim` hint (`DEFAULT_SEQ_HINT=512`) and emitted as a **masked tile**: a ceil-div grid over the symbolic extent plus an `if (coord < NAME)` boundary guard, so the hint-sized tile shape stays correct at any runtime size (`tune` benches and `compile` picks the hint-sized variant; the backend benches symbolic graphs at the hint when no inputs are supplied). Cooperative-reduce (RMSNorm/softmax) and SDPA-prologue matmuls keep the symbolic axis degenerate — masking would register-tile a per-row reduction whose accumulator can't be shared across cells. Multiple specs sharing a NAME use the same `torch.export.Dim` instance (required so torch recognises e.g. `input_ids:1` and `attention_mask:2` as the same symbol). Examples: `--code` form `--dynamic seq_len@x:1`; whole HF model `--dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 --dynamic seq_len@attention_mask:3 --dynamic seq_len@position_ids:1` (the whole-model wrapper switches to `dynamic=True` so mask + position_ids flow in as arg-positions). `--seq-len` only sizes the example tensors handed to `torch.export.export` (defaults to 32); skip it unless you want larger trace inputs. Per-layer trace specialises `cos/sin` and currently rejects `--dynamic`. Same flag accepted by `tune` and `run --code`. See `plans/dynamic-shapes.md`.
-- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--bench] [-q]` — **two-level** autotune (see
+- `deplodock tune` (no model / `--code`) — **offline mode**: refit the global learned prior on its persisted reservoir
+  dataset (no GPU, no benching) and print diagnostics — per-op **pick reachability** (does the prior's predicted-fastest
+  config recover each op's measured-best config?), median ranking calibration (Spearman), and golden-matmul coverage. Use it to see
+  whether the prior can actually reach the best configs it's been tuned on (`compiler/pipeline/search/prior/diagnostics.py`).
+- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--bench] [-q]` — **two-level** autotune (see
   `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over fusion forks (graph-changing `frontend`+`loop` passes;
   today deterministic → one terminal) whose reward is `Σ best-per-op time` from an inner search that tunes each
   post-fusion kernel **independently** in its own single-node slice (`lowering` passes only, so `Σ_k n_k` benches not
-  the product). Per-op results key structurally (`op_cache_key`) so they transfer/share; an op already tuned to
-  `>= patience` (or exhausted, recorded `∞`) is skipped via the `op_effort` table — re-runs idempotent, higher patience
-  re-deepens.
-  Persists `perf` / `lowering` / `op_effort` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
-  `~/.cache/deplodock/autotune.db`). The inner MCTS (max-Q normalized UCB1, rank-only `TileOp.lazy_score` prior) stops on
+  the product). Per-op results key structurally (`op_cache_key`) so they transfer/share. The inner search runs for
+  **every** op on every pass — never skipped on prior effort; replay is cheap, not gated: each benched terminal hits the
+  per-variant `perf` cache, so an identical re-run (same prior) replays every variant with no GPU bench, while the
+  ever-changing global prior can steer the same-patience search down a new trajectory and bench only the genuinely-new
+  variants it surfaces (the old `op_effort` skip-already-tuned gate, which suppressed that re-exploration, is gone).
+  Persists `perf` / `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
+  `~/.cache/deplodock/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
   patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
-  `--bench` below, or `run --bench`). Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
+  `--bench` below, or `run --bench`). To keep the **learned prior** deployable anyway, the engine **re-benches at
+  `-Xcicc -O3`** every config **within `DEPLODOCK_O3_TOL` (default 10%) of the best -O1 so far** — not just a strict new
+  global-best — and feeds each as an extra training row tagged `H_opt=3` (so `compile` / `run`, which run at -O3, rank by
+  the deployable numbers — the -O1 sweep alone ties configs that differ at -O3, e.g. a reduction's `FK` or a warp tile's
+  `WARPSPEC`). The tolerance band gives the prior an -O3 truth sample for every near-best contender, not only the winner;
+  each config is re-benched at most once. See `plans/golden-sweep-report.md`.
+  Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
   flags are folded into the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
   On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
   `<kernel> <current us> (best <best us>) <knobs>` tail — the current latency is fixed-width and the knobs sit
@@ -100,13 +113,35 @@ same worker.
   the ~0.8 s JIT is worth paying for the deployable comparison). `--warmup`/`--iters`/`--seed` mirror `run`. When a
   dump dir is set (`--dump-dir`/`DEPLODOCK_DUMP_DIR`) it also writes an HTML per-kernel chart to
   `<dump-dir>/kernels.html` (+ best-effort `.png`).
-- `deplodock run <model> [--layer N] [--seq-len N] [--bench] [--target sm_NN]` — trace + compile + execute a whole HuggingFace model (or one `--layer`) on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock end-to-end against the real torch module. Same positional / `--layer` / `--seq-len` grammar as `compile` / `tune`; reads the autotune DB, so the same command shows baseline numbers before `tune <model>` and tuned numbers after. A `.json` positional behaves like `--ir`.
+- `deplodock run <model> [--layer N] [--seq-len N] [--bench] [--target sm_NN]` — trace + compile + execute a whole HuggingFace model (or one `--layer`) on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock end-to-end against the real torch module. Same positional / `--layer` / `--seq-len` grammar as `compile` / `tune`. NOTE: greedy `run` / `compile` pick forks from the global `Prior` (`FallbackPrior`: learned `CatBoostPrior` once trained, else the cold `AnalyticPrior`; `mean_score` argmin — lowest predicted latency), not the DB — so `run` numbers reflect the prior trained by a prior `tune` (and a sensible analytic cold pick before any `tune`). A `.json` positional behaves like `--ir`.
+- `deplodock run --golden NAME [--bench]` — run the named golden config (shorthand for `--code <its snippet>`, same flag as `tune --golden`; unknown NAME lists the names). With `--bench` each recorded golden for the kernel's shape is **compiled with its knobs pinned and benched live this run** (`_bench_golden_variants`), then printed as a row labeled `golden NAME` in the Kernel column (its own measured µs / grid / block / smem / regs / occ; `%` column `--`, since it's not part of the deplodock TOTAL) right beneath the matching greedy-pick kernel — a real A/B, not the stored number. The knob columns are aligned across rows and colored like `deplodock eval` (shared `commands/knobfmt.align_knob_columns`): a golden cell is red where it differs from the greedy pick. A golden NAME may map to **multiple** configs (one shape can carry several knob sets, e.g. a newly found faster variant beside the old); each is benched and shown (each re-traces a fresh graph — a frontend graph can't be re-compiled in place).
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code`; non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB.
-  Joins `perf` with `cuda_op` and prints per-knob regret + a knob-interaction matrix sorted by geomean impact —
-  use the rankings to drive Fork-tree knob ordering in the planner.
+- `deplodock eval knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB:
+  the registered knob schema, then (with a tune DB) per-knob regret + a knob-interaction matrix sorted by geomean
+  impact (joins `perf` with `cuda_op`) — use the rankings to drive Fork-tree knob ordering in the planner.
+- `deplodock eval analytic [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the hand-coded linear model
+  over `knob.knob_features` that replaced `score_matmul_thread` / the `_priority_matmul_*` enumeration sort; the cold half
+  of the ONE ranking path — see `compiler/pipeline/search/prior/`) on each `GOLDEN_CONFIGS` shape: the golden's **rank**
+  under the prior over the shape's full enumeration (no GPU, no learned data, no measurements; the metric the tuner's
+  patience must reach) + per-knob `found/golden` (mismatches in red), summarized as median + top-k. The
+  `search/analytic.py` module is now just the golden-eval glue (`evaluate_golden` / `pick_matmul`) around the prior
+  (`eval analytic` shows the matmul goldens; the prior also ranks the cooperative-reduce / pointwise goldens). Weights fit
+  offline by `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
+- `deplodock eval prior [--prior PATH] [--kernel SUBSTR] [--features]` — evaluate the learned `CatBoostPrior` on the
+  golden configs: the golden's rank under the prior over the full enumeration, then the greedy pipeline pick vs golden
+  (per-knob `found/golden`). Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded) —
+  **not** the `--db` tune DB. `--features` also prints the exact regressor input per golden config (`knob.knob_features`:
+  `S_*` structural/shape + `H_*` regime + tuning knobs; note the shape enters only as coarse `S_ext_*` products/maxes,
+  so the occupancy/CTA/reuse terms the prior needs are added as engineered `D_*` features in `knob.knob_features`).
+- `deplodock eval golden [--prior PATH] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs recorded golden,
+  per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
+  rank-under-prior diagnostics; use `eval analytic` / `eval prior` for those). The view to watch while iteratively
+  tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
+- `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
+  the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
+  `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`

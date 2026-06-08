@@ -71,6 +71,7 @@ HOIST_COMPUTE = Knob(
         "True — keep the multi-source transport bundle and attach a StageBundle.compute "
         "phase so the cone chain runs once per cell instead of per (N) thread per K_i. Autotune fork."
     ),
+    off=False,
 )
 
 
@@ -80,7 +81,9 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
 
     target = _find_first_cone_target(root.op.body)
     if target is None:
-        raise RuleSkipped("no multi-source Stage with a hoistable cone")
+        # No hoistable cone — record the off decision (body unchanged) so the
+        # realized config keeps a uniform knob set instead of leaving it absent.
+        return [TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, HOIST_COMPUTE.name: False})]
 
     variants: list[TileOp] = []
     for polarity in HOIST_COMPUTE.narrow((False, True)):

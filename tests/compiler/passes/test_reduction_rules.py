@@ -16,7 +16,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.ir.tile.ir import ThreadTile
+from deplodock.compiler.ir.tile.ir import StageBundle, ThreadTile
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import accums_independent as _accums_independent
 
@@ -116,9 +116,21 @@ def test_warp_cooperative_skips_stage_inputs(recording_dump):
     g.outputs = ["o"]
 
     out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
     assert _tile_has_combine(out)
-    assert "stage_inputs" not in fired
+    # stage_inputs now records its no-stage decision (empty STAGE) on every
+    # kernel for a uniform knob set, so it "fires" — but the kernel must still be
+    # smem-free: no StageBundle is emitted.
+    assert not _has_stage_bundle(out)
+
+
+def _has_stage_bundle(g: Graph) -> bool:
+    """True iff any kernel body carries a ``StageBundle`` — the smem-staging
+    structure. The no-stage ``STAGE`` decision adds only a knob, no bundle."""
+    for node in g.nodes.values():
+        body = getattr(node.op, "body", None)
+        if body is not None and any(isinstance(s, StageBundle) for s in body.iter()):
+            return True
+    return False
 
 
 def _kernel_body_stmts(g: Graph):
@@ -147,12 +159,19 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
     assert not any(isinstance(s, TreeHalve) for s in stmts)
 
 
-def test_block_cooperative_emits_hierarchical_reduce(recording_dump):
-    """K=256 cooperative tile → ``materialize_tile._emit_combine`` picks
-    the hierarchical path: ``WarpShuffle`` reduces lanes within each
-    warp, then a tiny ``TreeHalve(length=n_warps)`` collapses across
-    warps. Both Stmts are present; the TreeHalve's length is far
-    smaller than the legacy ``length=n_threads`` form."""
+def test_block_cooperative_emits_hierarchical_reduce(recording_dump, monkeypatch):
+    """A 2-warp (BR=64) cooperative K=256 tile → ``materialize_tile._emit_combine``
+    picks the hierarchical path: ``WarpShuffle`` reduces lanes within each warp,
+    then a tiny ``TreeHalve(length=n_warps)`` collapses across warps. Both Stmts
+    are present; the TreeHalve's length is far smaller than the legacy
+    ``length=n_threads`` form. The tile is PINNED (``BR=64`` forces 2 cooperative
+    warps): the cold default is now ranked by the ``AnalyticPrior`` (GPU/shape
+    dependent — it picks a sub-warp BR for this tiny reduce), so the multi-warp
+    code path must be pinned to be exercised deterministically."""
+    monkeypatch.setenv("DEPLODOCK_BN", "1")
+    monkeypatch.setenv("DEPLODOCK_BM", "4")
+    monkeypatch.setenv("DEPLODOCK_BR", "64")
+    monkeypatch.setenv("DEPLODOCK_BK", "4")
     g = Graph()
     _input(g, "x", (4, 256))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -183,9 +202,10 @@ def test_block_cooperative_skips_stage_inputs(recording_dump):
     g.outputs = ["o"]
 
     out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
     assert _tile_has_combine(out)
-    assert "stage_inputs" not in fired
+    # stage_inputs records its no-stage decision (knob only) but emits no
+    # StageBundle — the cooperative reduce stays smem-free.
+    assert not _has_stage_bundle(out)
 
 
 def test_matmul_does_not_fire_cooperative_reduce(recording_dump):

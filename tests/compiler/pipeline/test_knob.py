@@ -4,7 +4,18 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.knob import Knob, KnobType, apply_knobs_env
+import deplodock.compiler.pipeline.knob as knob_mod
+from deplodock.compiler.pipeline.knob import (
+    Knob,
+    KnobType,
+    apply_knobs_env,
+    apply_off_defaults,
+    format_tuning_knobs,
+    is_warp,
+    knob_features,
+    mma_atom,
+    mma_decode,
+)
 
 
 def test_int_parse():
@@ -150,6 +161,73 @@ def test_narrow_reads_alias(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# OFF defaults + tier (is_warp / mma_atom)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_off_defaults_fills_only_unspecified_off_knobs():
+    """``apply_off_defaults`` stamps a declared knob's ``off`` when absent, leaves
+    present values (incl. a prior OFF fill) untouched, and never fills a knob
+    whose ``off`` is unset (the default)."""
+    wm = Knob("WM", KnobType.INT, off=0)
+    bk = Knob("BK", KnobType.INT)  # no off → never auto-filled
+    knobs = {"BK": 64}
+    apply_off_defaults(knobs, [wm, bk])
+    assert knobs == {"BK": 64, "WM": 0}  # WM filled to off, BK untouched (no off)
+    # Idempotent + respects a present (non-OFF) value.
+    knobs2 = {"WM": 2, "BK": 64}
+    apply_off_defaults(knobs2, [wm, bk])
+    assert knobs2 == {"WM": 2, "BK": 64}
+
+
+def test_mma_decode_value_semantics():
+    """``mma_decode`` maps unset/empty/truthy → auto, falsy → scalar-only, an
+    atom name → pinned warp."""
+    assert mma_decode(None) == (True, None)
+    assert mma_decode("") == (True, None)
+    assert mma_decode("1") == (True, None)
+    assert mma_decode("0") == (False, None)
+    assert mma_decode("false") == (False, None)
+    assert mma_decode("mma_m16n8k16_f16") == (True, "mma_m16n8k16_f16")
+
+
+def test_is_warp_and_mma_atom_tier_discriminator():
+    """The ``"0"`` OFF sentinel (and absent / falsy / auto) read as scalar; only a
+    concrete atom name is the warp tier. Guards the truthy-string footgun: the
+    old ``knobs.get("MMA")`` check misread ``"0"`` as warp."""
+    assert not is_warp({}) and mma_atom({}) is None
+    assert not is_warp({"MMA": "0"}) and mma_atom({"MMA": "0"}) is None
+    assert not is_warp({"MMA": "1"})  # pre-enumeration auto control, not an atom
+    assert is_warp({"MMA": "mma_m16n8k16_f16"})
+    assert mma_atom({"MMA": "mma_m16n8k16_f16"}) == "mma_m16n8k16_f16"
+
+
+def test_scalar_tile_features_from_thread_tile():
+    """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from
+    its thread tile (``BN·BM`` threads, ``BM·FM × BN·FN`` output)."""
+    sf = knob_features({"BN": 32, "BM": 8, "FM": 4, "FN": 2, "MMA": "0", "WM": 0, "WN": 0})
+    assert any(k.startswith("D_") for k in sf)
+    assert sf["D_threads"] == 32 * 8
+    assert sf["D_tile_m"] == 8 * 4 and sf["D_tile_n"] == 32 * 2
+
+
+def test_warp_tile_features_from_warp_tile():
+    """``_warp_tile_features`` builds the ``D_*`` family from the warp tile
+    (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the warp
+    ``BM=BN=0`` OFF sentinels never feed a scalar tile. Atom dims (16×8 for
+    ``m16n8k16``) come from the MMA featurizer in the real pipeline; here passed
+    directly to avoid needing the registry loaded."""
+    from deplodock.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
+
+    wf = _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2, "SPLITK": 1, "S_ext_free_prod": 2048 * 2048}, 16.0, 8.0)
+    assert wf["D_threads"] == 128.0  # WM·WN·32
+    assert wf["D_tile_m"] == 2 * 2 * 16  # WM·FM·atom_m
+    assert wf["D_tile_n"] == 2 * 2 * 8  # WN·FN·atom_n
+    assert "D_log2_ctas" in wf and "D_log2_waves" in wf  # occupancy present (free_prod given)
+    assert _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2}, None, None) == {}  # missing atom dims → empty
+
+
+# ---------------------------------------------------------------------------
 # DEPLODOCK_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
 
@@ -226,6 +304,81 @@ def test_apply_knobs_env_uppercases_key(monkeypatch):
     monkeypatch.delenv("DEPLODOCK_BK", raising=False)
     applied = apply_knobs_env("bk=2")
     assert applied == {"DEPLODOCK_BK": "2"}
+
+
+# ---------------------------------------------------------------------------
+# knob_features — knob dict → flat numeric feature vector
+# ---------------------------------------------------------------------------
+
+
+def test_knob_features_struct_passthrough():
+    feats = knob_features({"S_n_load": 3.0, "S_ext_free_prod": 512.0})
+    assert feats["S_n_load"] == 3.0
+    assert feats["S_ext_free_prod"] == 512.0
+
+
+def test_knob_features_typed_knobs(monkeypatch):
+    monkeypatch.setattr(
+        knob_mod,
+        "_REGISTRY",
+        {
+            "BN": Knob("BN", KnobType.INT),
+            "FLAG": Knob("FLAG", KnobType.BOOL),
+            "STAGE": Knob("STAGE", KnobType.BINMASK),
+        },
+    )
+    feats = knob_features({"BN": 64, "FLAG": True, "STAGE": "101"})
+    assert feats["BN"] == 64.0
+    assert feats["FLAG"] == 1.0
+    assert feats["STAGE_popcount"] == 2.0
+    assert feats["STAGE_width"] == 3.0
+    assert feats["STAGE_frac"] == 2 / 3
+
+
+def test_knob_features_mma_expansion():
+    # MMA expansion now dispatches through the MMA Knob's ``features`` callable,
+    # so the declaring module must be loaded + present in the registry.
+    from deplodock.compiler.pipeline.passes.lowering.tile import _enumeration  # noqa: F401, PLC0415
+
+    knob_mod.reset_registry()
+    feats = knob_features({"MMA": "mma_m16n8k16_f16"})
+    assert feats["MMA_tier"] == 1.0
+    assert (feats["MMA_atom_m"], feats["MMA_atom_n"], feats["MMA_atom_k"]) == (16.0, 8.0, 16.0)
+    assert feats["MMA_a_bits"] == 16.0  # f16 operand
+    assert feats["MMA_acc_bits"] == 32.0  # f32 accumulator
+
+
+def test_knob_features_scalar_tier_default():
+    feats = knob_features({"S_n_load": 2.0})
+    assert feats["MMA_tier"] == 0.0  # no atom selected
+
+
+def test_knob_features_unregistered_numeric_vs_string():
+    feats = knob_features({"weird_num": 7, "weird_str": "not_a_number"})
+    assert feats["weird_num"] == 7.0
+    assert "weird_str" not in feats
+
+
+def test_knob_features_differs_by_one_knob():
+    a = knob_features({"S_n_load": 2.0, "S_n_write": 1.0})
+    b = knob_features({"S_n_load": 3.0, "S_n_write": 1.0})
+    assert a["S_n_load"] != b["S_n_load"]
+    assert a["S_n_write"] == b["S_n_write"]
+
+
+def test_format_tuning_knobs_skips_struct():
+    out = format_tuning_knobs({"BN": 64, "S_n_load": 3.0, "S_ext_free_prod": 512.0})
+    assert "S_n_load" not in out and "S_ext_free_prod" not in out
+    assert "BN=64" in out
+
+
+def test_format_tuning_knobs_canonical_order():
+    """Knobs render in canonical tile-geometry order (``KNOB_ORDER``), not
+    alphabetical — shared with the ``deplodock eval`` golden tables. (Uses a
+    tier-consistent warp dict so the tier-foreign display filter doesn't drop
+    anything — a warp variant carries WM/WN/MMA, not BM/BN.)"""
+    out = format_tuning_knobs({"SPLITK": 1, "WN": 4, "WM": 2, "BK": 64, "MMA": "x", "FM": 4})
+    assert out == "BK=64, FM=4, WM=2, WN=4, SPLITK=1, MMA=x"
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):

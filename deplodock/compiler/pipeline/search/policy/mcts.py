@@ -1,13 +1,19 @@
-"""Single-player MCTS for ``deplodock tune`` with max-reward propagation
-and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
+"""Single-player MCTS for ``deplodock tune`` with max-reward propagation and
+**PUCT** selection — the learned
+:class:`~deplodock.compiler.pipeline.search.prior.Prior` is the *only* selection
+signal (greedy and the ``+∞``-unvisited UCB rule are gone).
 
     select   — descend from root, picking at each level
-               ``argmax_c [ Q_norm(c) + c · √(ln N_parent / N_c) ]``
-               where ``Q_norm = best_reward / global_best``. Unvisited
-               children get ``+∞``, breaking ties on the fork prior
-               (``Search.score_of`` — value-keyed, cached on the
-               search). Live-count filtering skips subtrees whose
-               frontier has been fully drained.
+               ``argmax_c [ Q(c) + c · P(c) · √(N_parent+1) / (1+N_c) ]``
+               where ``Q = best_reward / global_best`` and ``P`` is the prior's
+               *predicted* reward on the same scale: the prior predicts latency,
+               which this loop converts to reward (``1/û``) and normalizes by the
+               same ``global_best`` as ``Q``. No softmax, no ``+∞``-unvisited rule
+               → no forced breadth: a confidently-bad sibling gets a small ``P``
+               and is skipped. A cold or absent prior gives a uniform ``P = 1``
+               (PUCT still explores via the exploration term; a single-shot
+               compile with no prior descends emission-order). Live-count
+               filtering skips drained subtrees.
     expand   — :meth:`TuningSearch.push` adds the engine's spawned
                candidates as children of the ``parent`` token (the
                ``SearchNode`` their spawning candidate was popped with);
@@ -17,20 +23,33 @@ and normalized UCB1 selection (Schadd et al. 2008, SP-MCTS).
                ``visits`` and updating
                ``best_reward = max(best_reward, leaf_reward)``.
 
-Reward is normalized to [0,1] against the global best so the UCB
-exploration constant is unit-free. The prior never enters arithmetic
-with the reward — it only breaks ties among unvisited siblings.
+Reward — both measured and prior-predicted — is normalized against the global
+best so the exploration constant ``c`` is unit-free.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Hashable
+import random
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
+from deplodock import config
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
 from deplodock.compiler.pipeline.search.policy.base import Search
+
+if TYPE_CHECKING:
+    from deplodock.compiler.pipeline.search.prior import Prior
+
+# Re-bench at -O3 any config whose -O1 latency is within this fraction of the best
+# -O1 so far (not just a strict new best). -O1 is the fast ranking compile but
+# ties configs that diverge at -O3 (deployable) — e.g. a warp-tier WARPSPEC /
+# occupancy split where the -O1 latencies are within ~1% but -O3 differs ~15%.
+# Widening the deployable-sample net to this band feeds the prior -O3 truth for
+# every near-best contender, so it can rank by -O3 cost. Env-overridable via
+# ``DEPLODOCK_O3_TOL`` (a fraction, e.g. ``0.10`` for 10%).
+O3_REBENCH_TOL = 0.10
 
 
 @dataclass
@@ -41,12 +60,11 @@ class SearchNode:
     visits: int = 0
     best_reward: float = 0.0  # max reward over this subtree's measured leaves
     live: int = 0  # count of un-popped frontier leaves in this subtree
-    # Memoized ``Search.score_of`` read (filled by ``_ucb_key``) — UCB
-    # descent reads the prior on every unvisited sibling at every level
-    # per pop, and a branch fork's prior is a max over its param
-    # subgroup, so the per-node memo keeps repeated descents O(1). Sound
-    # because the fork's score is frozen once the SearchNode is attached.
-    prior: float | None = field(default=None, repr=False)
+    # The benched terminal's FULL realized knob set (S_/H_ base + every tunable
+    # knob, incl. those stamped at deterministic lowering steps that never fork).
+    # Set on directly-benched leaves in ``observe``; ``None`` on branches, which
+    # keep their partial fork-prefix for value-of-position.
+    realized_knobs: dict | None = field(default=None, repr=False)
 
 
 class SearchTree:
@@ -79,7 +97,7 @@ class SearchTree:
 
 
 class TuningSearch(Search):
-    """SP-MCTS: max-Q normalized UCB1 with a rank-only prior."""
+    """SP-MCTS with PUCT selection — the learned prior is the sole signal."""
 
     DEFAULT_UCB_C = math.sqrt(2)
 
@@ -87,16 +105,40 @@ class TuningSearch(Search):
         self,
         tree: SearchTree | None = None,
         *,
-        patience: int = 20,
+        patience: int = 50,
         ucb_c: float = DEFAULT_UCB_C,
+        explore_eps: float = 0.0,
+        seed: int = 0,
         max_visits: int | None = None,
-        score_cache: dict[Hashable, float] | None = None,
+        prior_model: Prior | None = None,
+        base_knobs: dict | None = None,
     ) -> None:
-        super().__init__(score_cache=score_cache)
+        super().__init__()
         self.tree = tree if tree is not None else SearchTree()
         self._ucb_c = ucb_c
+        # ε-greedy exploration: with probability ``explore_eps`` a selection step
+        # descends a UNIFORMLY RANDOM live child instead of the PUCT argmax. PUCT
+        # alone is deterministic — a tie (cold prior → uniform ``P``) always goes
+        # to the first-in-list (= heuristic enumeration order), so each fork is
+        # visited once and takes its heuristic-preferred child; a binary fork like
+        # ``WARPSPEC`` then never benches its option-1 branch even when that's the
+        # real win. ε-randomness makes ~half the visits to such a fork take the
+        # other branch, so tuning finds good configs WITHOUT relying on the
+        # heuristic/prior ordering. ``0.0`` (the default) restores deterministic
+        # PUCT — kept for the unit tests and single-shot compile. Seeded for
+        # reproducibility (vary ``seed`` per op/run upstream, not via wall clock).
+        self._explore_eps = explore_eps
+        self._rng = random.Random(seed)
         self._patience = patience
         self._max_visits = max_visits
+        # Learned prior driving PUCT selection — a fixed global model for the run
+        # (it refits in batches between ops, not within one). ``None`` for a
+        # single-shot compile (no benching) → uniform PUCT → emission-order pick.
+        self.prior_model = prior_model
+        # The kernel's identity knobs (the ``S_*`` structural features stamped on
+        # the LoopOp) — merged under every node's accumulated fork deltas so the
+        # GLOBAL prior sees op-structure and can tell kernels apart.
+        self._base_knobs = dict(base_knobs) if base_knobs else {}
         self._best_reward = 0.0
         self._visits_at_best = 0
         # Why the search stopped (set by ``_should_stop``): a patience /
@@ -109,16 +151,94 @@ class TuningSearch(Search):
         # yielding). Carries no role in the search itself.
         self.last_stats: PerfStats | None = None
         self.last_status: str | None = None
+        # Set in ``observe`` when a bench sets a new global best.
+        self.last_improved_best = False
+        # Set in ``observe`` when the just-benched config is a *deployable-bench
+        # candidate* — within ``O3_REBENCH_TOL`` of the best -O1 so far and not
+        # already re-benched. The engine reads it to trigger an -O3 re-bench
+        # (``observe_o3``). Widening from "strict new best" to a tolerance band is
+        # what lets configs that TIE at -O1 but differ at -O3 (the warp-tier
+        # WARPSPEC / occupancy split is the motivating case) get a deployable
+        # sample, so the prior can rank them by -O3 cost. ``_o3_done`` dedups so
+        # each config is -O3'd at most once; ``o3_rows`` holds the samples
+        # (knobs tagged ``H_opt=3``) for the prior.
+        self.last_o3_worthy = False
+        self._o3_done: set[tuple] = set()
+        self.o3_rows: list[tuple[dict, float]] = []
 
-    def observe(self, token: object | None, stats: PerfStats, status: str) -> None:
+    def observe(self, token: object | None, stats: PerfStats, status: str, candidate: object | None = None) -> None:
         self.last_stats = stats
         self.last_status = status
         assert isinstance(token, SearchNode), f"TuningSearch.observe needs the terminal's pop token, got {type(token).__name__}"
+        # Record the benched leaf's FULL realized knobs (from the resolved graph),
+        # not just its fork-prefix — so knobs stamped at deterministic lowering
+        # steps (FK / BK / STAGE / …) reach the prior. Falls back to the
+        # fork-prefix when no candidate is supplied.
+        token.realized_knobs = self._realized_knobs(candidate) if candidate is not None else self._node_knobs(token)
         reward = (1.0 / stats.median) if status == "ok" and stats.median > 0 else 0.0
+        prev_best = self.tree.best_reward
         self.tree.record_terminal(token, reward)
+        self.last_improved_best = status == "ok" and self.tree.best_reward > prev_best
+        # Re-bench at -O3 not only a strict new best but any config within the
+        # tolerance band of the best -O1 so far — configs that tie at -O1 can
+        # differ sharply at -O3 (the warp WARPSPEC / occupancy split), so the
+        # prior needs an -O3 sample for every near-best contender, not just the
+        # winner. Dedup via ``_o3_done`` so each config is -O3'd at most once.
+        self.last_o3_worthy = False
+        if status == "ok" and stats.median > 0 and self.tree.best_reward > 0:
+            best_lat = 1.0 / self.tree.best_reward
+            tol = config.o3_tol(O3_REBENCH_TOL)
+            sig = self._o3_sig(token.realized_knobs)
+            if stats.median <= best_lat * (1.0 + tol) and sig not in self._o3_done:
+                self._o3_done.add(sig)
+                self.last_o3_worthy = True
+        if self.prior_model is not None:
+            # Record the leaf for the end-of-run stats. The model itself is fixed
+            # during a run — it refits in batches between ops (see ``Prior``), not
+            # per bench — so there is nothing to refit here.
+            self.prior_model.record_bench(token.realized_knobs, stats.median, status)
 
-    def push(self, *cands: LazyCandidate, parent: object | None = None, best: LazyCandidate | None = None) -> None:
-        del best  # tuning explores every fork — DB hint is for greedy
+    def observe_o3(self, token: object | None, o3_us: float) -> None:
+        """Record an extra training row for an -O1 winner re-benched at -O3: the
+        same realized knobs but tagged ``H_opt=3`` (the deployable regime) and
+        labeled with the -O3 median latency (µs) — the prior's regression target
+        is latency, converted to reward only in the MCTS selection loop. The prior
+        can then rank winners by -O3 cost where -O1 ties them; ``H_opt`` lets the
+        -O1 and -O3 rows coexist."""
+        if o3_us <= 0 or not isinstance(token, SearchNode) or token.realized_knobs is None:
+            return
+        knobs = dict(token.realized_knobs)
+        knobs["H_opt"] = 3.0
+        self.o3_rows.append((knobs, o3_us))
+        if self.prior_model is not None:
+            self.prior_model.record_bench(knobs, o3_us, "ok")
+
+    @staticmethod
+    def _o3_sig(knobs: dict | None) -> tuple:
+        """A hashable signature of a realized knob set for -O3 dedup. Values are
+        ``str()``-ified (some knobs — ``OVERHANG`` — carry list values that aren't
+        hashable), and the ``H_opt`` regime tag is excluded so the -O1 row and its
+        -O3 re-bench share one signature."""
+        if not knobs:
+            return ()
+        return tuple(sorted((k, str(v)) for k, v in knobs.items() if k != "H_opt"))
+
+    def _realized_knobs(self, candidate: object) -> dict:
+        """The terminal's complete knob set: the kernel's ``base_knobs`` (``S_*``
+        identity + ``H_*`` regime) merged with the realized op ``knobs`` off the
+        resolved graph (every tunable knob, including deterministically-stamped
+        ones that ``_node_knobs`` can't see). Unions all op knob dicts — a
+        single-kernel slice has one kernel-bearing op, constants carry none."""
+        merged: dict = dict(self._base_knobs)
+        graph = getattr(candidate, "graph", None)
+        if graph is not None:
+            for node in graph.nodes.values():
+                knobs = getattr(node.op, "knobs", None)
+                if knobs:
+                    merged.update(knobs)
+        return merged
+
+    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
         # ``parent`` is the token the spawning candidate was popped with;
         # ``None`` seeds the run under the root sentinel.
         assert parent is None or isinstance(parent, SearchNode), f"TuningSearch.push needs a SearchNode token, got {type(parent).__name__}"
@@ -127,6 +247,8 @@ class TuningSearch(Search):
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
         if self._should_stop():
             return None
+        # The prior is a fixed global model during a run (it refits in batches
+        # between ops, not per descent), so selection just reads its scores.
         node = self.tree.root
         if node.live == 0:
             return None
@@ -134,7 +256,7 @@ class TuningSearch(Search):
             descendable = [c for c in node.children if c.live > 0]
             if not descendable:
                 return None
-            node = max(descendable, key=lambda c: self._ucb_key(c, node))
+            node = self._select(descendable, node)
         # Frontier just got handed off — drop it from the live count
         # on every ancestor. The engine may push children of this node
         # before the next pop; those pushes re-grow the count.
@@ -144,22 +266,92 @@ class TuningSearch(Search):
             cur = cur.parent
         return node, node.candidate
 
-    def _ucb_key(self, child: SearchNode, parent: SearchNode) -> tuple[float, float]:
-        """Selection score = (UCB1 value, score-as-tiebreak). Returned as
-        a tuple so unvisited siblings (UCB1 = +∞) are ranked by their
-        prior (``Search.score_of``, memoized per node — see
-        ``SearchNode.prior``). Reward is normalized against the global
-        best so the ``c`` constant is unit-free."""
-        prior = child.prior
-        if prior is None:
-            prior = self.score_of(child.candidate.fork) if child.candidate is not None else float("-inf")
-            child.prior = prior
-        if child.visits == 0:
-            return float("inf"), prior
-        global_best = self.tree.best_reward
-        q_norm = (child.best_reward / global_best) if global_best > 0 else 0.0
-        bonus = self._ucb_c * math.sqrt(math.log(max(parent.visits, 1)) / child.visits)
-        return q_norm + bonus, prior
+    def _prior_score(self, child: SearchNode) -> float:
+        """The prior's predicted *latency* (µs) for a child (``0`` when no model
+        is attached, the model is unfit, or the child is the root sentinel — the
+        ``_select`` loop treats a non-positive prediction as a uniform ``P``)."""
+        if self.prior_model is None or child.candidate is None:
+            return 0.0
+        return self.prior_model.score(self._node_knobs(child))
+
+    def _select(self, children: list[SearchNode], parent: SearchNode) -> SearchNode:
+        """PUCT is the *only* selection rule — the prior is the sole signal.
+
+            score(c) = Q(c) + c_ucb · P(c) · √(N_parent + 1) / (1 + N_c)
+
+        where ``Q = best_reward / global_best`` (``0`` for an unvisited child) and
+        ``P`` is the prior's *predicted reward* on the same scale: the prior
+        predicts latency ``û(c)``, which this loop converts to reward (``1/û``)
+        and normalizes by the same ``global_best`` as ``Q`` — no softmax. A
+        confidently-bad sibling gets a small ``P`` → tiny exploration term → it is
+        deprioritized rather than force-visited. The prior is always consulted —
+        the ``FallbackPrior`` returns the learned model's prediction once trained
+        and the ``AnalyticPrior`` heuristic cold, so even a fresh ``tune`` is
+        prior-guided, not uniform. Only when there is NO usable prediction (no
+        prior attached, or a non-positive score) does ``P`` fall to a uniform
+        ``1`` so the exploration term still drives breadth. ``c_ucb`` is
+        ``--ucb-c``. With ``explore_eps > 0`` (tune, opt-in) a fraction of steps
+        instead descend a uniformly random live child (ε-greedy); off by default
+        so a single-shot compile / the unit tests stay deterministic. NOTE: a
+        *random tie-break* under a cold prior was tried and reverted — it discarded
+        the heuristic ordering and regressed fp16 tuning ~2×; exploration must
+        perturb the prior order, not replace it."""
+        if self._explore_eps and self._rng.random() < self._explore_eps:
+            return self._rng.choice(children)
+        global_best = self.tree.best_reward or 1.0
+        sqrt_parent = math.sqrt(parent.visits + 1)
+        best, best_v = children[0], float("-inf")
+        for c in children:
+            q = (c.best_reward / global_best) if c.visits > 0 else 0.0
+            pred_us = self._prior_score(c)
+            if pred_us > 0:
+                p = (1.0 / pred_us) / global_best
+            else:
+                p = 1.0  # cold / absent prior → uniform exploration
+            v = q + self._ucb_c * p * sqrt_parent / (1 + c.visits)
+            if v > best_v:
+                best_v, best = v, c
+        return best
+
+    def _node_knobs(self, node: SearchNode) -> dict:
+        """Accumulated knob dict for a node — the kernel's ``base_knobs`` (its
+        ``S_*`` structural identity) merged with every ``fork.knobs`` delta from
+        the root down to ``node``. A branch pins its level slice; a leaf carries
+        the complete row, so deeper nodes hold a superset. This is the
+        (partial-or-full) feature input the prior featurizes."""
+        chain: list[dict] = []
+        cur: SearchNode | None = node
+        while cur is not None and cur.candidate is not None:
+            fork = cur.candidate.fork
+            if fork is not None:
+                chain.append(fork.knobs)
+            cur = cur.parent
+        merged: dict = dict(self._base_knobs)
+        for knobs in reversed(chain):
+            merged.update(knobs)
+        return merged
+
+    def _collect_rows(self) -> list[tuple[dict, float]]:
+        """Value-of-position training rows from the live tree: every node with
+        a benched descendant (``visits > 0`` and ``best_reward > 0``) — leaves
+        *and* branches — labeled with the best (min) median latency µs over its
+        subtree (``1/best_reward``; the prior regresses on latency, and the
+        reward conversion lives in the MCTS selection loop). Re-read each refit
+        since labels only fall.
+
+        A directly-benched leaf uses its ``realized_knobs`` (the FULL config);
+        a branch (no realized knobs of its own) uses its partial fork-prefix
+        (``_node_knobs``) — the value-of-position label still rides on it."""
+        rows: list[tuple[dict, float]] = []
+        stack = list(self.tree.root.children)
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            if node.candidate is None or node.visits == 0 or node.best_reward <= 0:
+                continue
+            knobs = node.realized_knobs if node.realized_knobs is not None else self._node_knobs(node)
+            rows.append((knobs, 1.0 / node.best_reward))
+        return rows
 
     def _should_stop(self) -> bool:
         if self.stop_reason is not None:

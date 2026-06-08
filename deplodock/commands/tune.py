@@ -10,11 +10,13 @@ from pathlib import Path
 from deplodock import config
 from deplodock.commands.compile import (
     add_diagnostics_args,
+    add_golden_arg,
     add_input_args,
     add_nvcc_args,
     apply_nvcc_flags,
     format_stage,
     load_or_trace,
+    resolve_golden_arg,
     resolve_tune_db,
     setup_pipeline_runtime,
 )
@@ -32,6 +34,7 @@ def register_tune_command(subparsers):
         ),
     )
     add_input_args(parser)
+    add_golden_arg(parser)
     parser.add_argument("--output", "-o", help="Output path for the tuned CUDA IR")
     parser.add_argument(
         "--patience",
@@ -49,6 +52,17 @@ def register_tune_command(subparsers):
         help=(
             "UCB1 exploration constant. The canonical value is sqrt(2) ≈ 1.414; larger values "
             f"shift the walk toward exploration. Default: {TuningSearch.DEFAULT_UCB_C:.4f}."
+        ),
+    )
+    parser.add_argument(
+        "--explore-eps",
+        type=float,
+        default=None,
+        help=(
+            "ε-greedy exploration: probability a selection step descends a uniformly random child "
+            "instead of the PUCT argmax, perturbing (not replacing) the heuristic order for shapes "
+            "where it's known-bad. Falls back to ``DEPLODOCK_TUNE_EPS`` env var, then to 0.0 "
+            "(deterministic PUCT) — opt-in; see plans/golden-sweep-report.md."
         ),
     )
     parser.add_argument(
@@ -96,13 +110,35 @@ def register_tune_command(subparsers):
     parser.set_defaults(func=handle_tune)
 
 
+def _tune_offline(args):
+    """``deplodock tune`` with no op: refit the global learned prior on its
+    persisted reservoir dataset and print offline diagnostics — no GPU, no
+    benching. Answers "can the prior reach the best configs?" over everything
+    tuned so far."""
+    from deplodock import config
+    from deplodock.compiler.pipeline.search.prior import CatBoostPrior, diagnostics
+
+    prior = CatBoostPrior.load(seed=args.seed)
+    if not prior._dataset:
+        logger.error("no prior dataset at %s — run `deplodock tune <model>` first", config.prior_path())
+        sys.exit(1)
+    sys.stderr.write(f"[tune] offline refit on {len(prior._dataset)} rows from {config.prior_path()}\n")
+    prior.fit()  # unconditional re-fit on the whole accumulated dataset
+    prior.checkpoint()
+    sys.stderr.write(diagnostics.report(prior) + "\n")
+    sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
+
+
 def handle_tune(args):
+    resolve_golden_arg(args)  # --golden NAME → --code <snippet>
     if args.code and args.input:
         logger.error("--code and positional input are mutually exclusive")
         sys.exit(2)
     if not args.code and not args.input:
-        logger.error("either a positional model ID / IR file or --code is required")
-        sys.exit(2)
+        # No op to tune → offline mode: refit the learned prior on its persisted
+        # dataset and print diagnostics (reachability, calibration, golden coverage).
+        _tune_offline(args)
+        return
 
     import time
 
@@ -177,11 +213,21 @@ def handle_tune(args):
     )
 
     patience = args.patience if args.patience is not None else config.tune_patience(50)
+    explore_eps = args.explore_eps if args.explore_eps is not None else config.tune_eps(0.0)
     ctx = Context.probe()
     t0 = time.monotonic()
     try:
         result = run_two_level_tune(
-            graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=args.ucb_c, dump=dump, progress=progress
+            graph,
+            ctx=ctx,
+            db=db,
+            backend=backend,
+            patience=patience,
+            ucb_c=args.ucb_c,
+            explore_eps=explore_eps,
+            dump=dump,
+            progress=progress,
+            prior_seed=args.seed,
         )
     except KeyboardInterrupt:
         # Manual abort: per-op bests already landed in the DB as they were
@@ -205,6 +251,8 @@ def handle_tune(args):
 
     elapsed = time.monotonic() - t0
     sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {elapsed:.1f}s\n")
+    for block in result.prior_summaries:  # learned-prior pick-quality sanity stats
+        sys.stderr.write(block + "\n")
     if result.best_reward is None:
         sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
         sys.stdout.flush()
@@ -252,6 +300,11 @@ def _clean_caches(db_path) -> None:
             if p.exists():
                 p.unlink()
                 removed.append(str(p))
+    # The learned-prior checkpoint file (a fresh sweep should start cold).
+    for p in (config.prior_path(), config.prior_path().with_suffix(config.prior_path().suffix + ".tmp")):
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
     nvcc.clear_cubin_cache()
     removed.append(str(nvcc.cubin_cache_dir()))
     try:

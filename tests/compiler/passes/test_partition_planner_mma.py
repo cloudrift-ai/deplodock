@@ -17,6 +17,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
     ATOM_REGISTRY,
     Atom,
@@ -335,43 +336,21 @@ def test_warp_enumerator_rejects_indivisible_extents():
     assert _enum_warp(M=64, N=64, K=15) == []
 
 
-def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
-    """Cells-near-16 ranks first; cells-far-from-16 ranks last. The
-    register-budget sweet spot for ``mma_m16n8k16_*`` on sm_8x/9x/12x
-    is FM·FN ≈ 16 (~120 regs/lane → 2 blocks/SM occupancy). The
-    pre-2026 prior rewarded ``min(fm·fn, 64)`` monotonically and
-    pushed the picker to FM=1 FN=32 cells=32 — 3.0× slower than cuBLAS
-    on 2048² fp16. See ``plans/mma-warp-scoring.md``."""
-    rows = _enum_warp(M=128, N=128, K=128)
-    assert len(rows) >= 2
-    first_dist = abs(rows[0]["FM"] * rows[0]["FN"] - 16)
-    last_dist = abs(rows[-1]["FM"] * rows[-1]["FN"] - 16)
-    assert first_dist <= last_dist
+def test_warp_analytic_prior_ranks_golden_above_degenerate():
+    """The :class:`AnalyticPrior` ranks a recorded warp golden (2048² fp16:
+    ``WM=1 WN=4 FM=4 FN=2 BK=2`` — a TMA-pipelined, shallow-BK tile) strictly
+    better (LOWER latency proxy) than a degenerate single-cell ``BK=64`` tile.
+    The warp tile geometry + the tier-split BK target the old
+    ``_priority_matmul_warp`` enumeration sort encoded now ride the single
+    ranking path (the prior over ``knob_features``), not an enumeration order."""
+    from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
-
-# --- Warp-tier scoring on TMA-capable hardware ----------------------
-
-
-def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
-    """On TMA-capable arches (sm_90+) ``_priority_matmul_warp`` lifts
-    ``BK ≈ 2`` (and tied 128-thread CTAs) above the sm_80-era larger-BK
-    + 256-thread preference. Bench-validated at 2048² fp16 on RTX 5090:
-    ``WM=1 WN=4 FM=FN=4 BK=2`` runs 84 µs vs ``WM=1 WN=8 FM=FN=4 BK=32``
-    at 108 µs — TMA-pipelined beats gmem-direct by ~22 %.
-    """
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
-
-    gold = {"WN": 4, "WM": 1, "FM": 4, "FN": 4, "BK": 2, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
-    baseline = {"WN": 8, "WM": 1, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
-    # On sm_90+ the gold tile must outscore the gmem-direct sibling.
-    gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
-    baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
-    assert gold_score > baseline_score, f"gold {gold_score!r} should beat baseline {baseline_score!r} on sm_90"
-    # The same call on sm_80 (no TMA) should KEEP preferring large BK and
-    # 256-thread CTAs — the pre-2026 behavior is unchanged off-Hopper.
-    gold_score_80 = _priority_matmul_warp(gold, ctx=_ctx(cc=(8, 0)))
-    baseline_score_80 = _priority_matmul_warp(baseline, ctx=_ctx(cc=(8, 0)))
-    assert baseline_score_80 > gold_score_80, "non-TMA arches must retain the legacy 256-thread + large-BK prior"
+    ctx = _ctx(cc=(12, 0))
+    base = {**ctx.features(), "S_ext_free_prod": float(2048 * 2048), "S_ext_reduce_prod": 2048.0, "S_ext_reduce_max": 2048.0}
+    ap = AnalyticPrior()
+    golden = {"WM": 1, "WN": 4, "FM": 4, "FN": 2, "BK": 2, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
+    degenerate = {"WM": 1, "WN": 1, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
+    assert ap.score({**base, **golden}) < ap.score({**base, **degenerate})
 
 
 # --- Warp-tier knob narrow (M1, plans/mma-perf-closures.md) ----------
@@ -494,7 +473,7 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(9, 0)), kernel_name="c", graph=g)
     assert plan is not None
     assert plan.params, "expected ≥1 enumerated variant"
-    warp_rows = [p for p in plan.params if "MMA" in p]
+    warp_rows = [p for p in plan.params if is_warp(p)]
     assert warp_rows, "expected ≥1 warp-tier row when DEPLODOCK_MMA=1"
 
     # Materialize the first warp row and verify the tower shape.
@@ -513,7 +492,9 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     assert any(isinstance(s, GridTile) for s in tile_op.body), "warp variant must keep the GridTile outer wrapper"
     # Knobs reflect the warp tier.
     assert tile_op.knobs["MMA"] == "mma_m16n8k16_f16"
-    assert "BR" not in tile_op.knobs  # warp tier doesn't carry BR
+    # Warp tier doesn't use BR — it carries the OFF sentinel (0), not absence:
+    # every emitted variant stamps every planner knob explicitly.
+    assert tile_op.knobs["BR"] == 0
 
 
 def test_planner_scalar_only_when_mma_disabled(monkeypatch):
@@ -525,8 +506,10 @@ def test_planner_scalar_only_when_mma_disabled(monkeypatch):
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    assert all("MMA" not in p for p in plan.params)
-    assert not any("MMA" in p for p in plan.params)
+    # Scalar-only: every row carries the MMA OFF sentinel ("0"), none names a
+    # real atom kind (warp tier). ``is_warp`` is the value-based discriminator.
+    assert all(p["MMA"] == "0" for p in plan.params)
+    assert not any(is_warp(p) for p in plan.params)
 
 
 def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
@@ -542,6 +525,6 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    warp_rows = [p for p in plan.params if "MMA" in p]
+    warp_rows = [p for p in plan.params if is_warp(p)]
     assert warp_rows, "MMA=<kind> must enable the warp tier on a pin-only arch"
     assert all(p["MMA"] == "mma_m16n8k16_f16" for p in warp_rows)

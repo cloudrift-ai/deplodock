@@ -8,9 +8,11 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 from deplodock import config
@@ -47,6 +49,9 @@ def register_run_command(subparsers):
             "Equivalent to passing the same .json path as the positional input."
         ),
     )
+    from deplodock.commands.compile import add_golden_arg
+
+    add_golden_arg(parser)
     parser.add_argument(
         "--layer",
         type=int,
@@ -137,10 +142,11 @@ def handle_run(args):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.commands.compile import load_or_trace
+    from deplodock.commands.compile import load_or_trace, resolve_golden_arg
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline.dump import CompilerDump
 
+    resolve_golden_arg(args)  # --golden NAME → --code <snippet>
     if sum(x is not None for x in (args.input, args.code, args.ir)) > 1:
         logger.error("input / --code / --ir are mutually exclusive")
         sys.exit(1)
@@ -275,8 +281,14 @@ def handle_run(args):
         dump.dump_benchmark(bench)
         _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
+    # ``--golden NAME``: compile + bench each recorded golden config (knobs pinned)
+    # so the kernel table can show it as a live A/B row beside the greedy pick.
+    golden_benches = None
+    if getattr(args, "golden_configs", None):
+        golden_benches = _bench_golden_variants(backend, args.code, args.golden_configs, warmup=args.warmup, iters=args.iters)
+
     _print_table(results)
-    _print_kernel_stats(compiled, bench)
+    _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
@@ -349,55 +361,143 @@ def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> Non
     out.write_text(_json.dumps(payload, indent=2, default=str))
 
 
-def _print_kernel_stats(graph, bench):
+# One recorded golden config compiled + benched with its knobs pinned this run.
+_GoldenBench = namedtuple("_GoldenBench", "config graph bench")
+
+
+@contextlib.contextmanager
+def _pinned_knobs(knobs: dict):
+    """Pin ``DEPLODOCK_<KNOB>`` env vars for the duration of one compile, restoring
+    the prior environment on exit. A pinned knob collapses its fork to that value
+    (``Knob.narrow``), so ``backend.compile`` lowers exactly these knobs."""
+    saved: dict[str, str | None] = {}
+    try:
+        for name, value in knobs.items():
+            key = config.knob_var(name)
+            saved[key] = os.environ.get(key)
+            os.environ[key] = str(value)
+        yield
+    finally:
+        for key, prev in saved.items():
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
+    """Compile + bench each recorded golden config with its knobs pinned, returning
+    a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
+    measured row beside the greedy pick. Only the tunable knobs are pinned (``S_*``
+    / ``H_*`` features are not knobs). Each config re-traces a **fresh** graph from
+    ``code`` — a frontend graph can't be re-compiled (the first lowering mutates it
+    in place, so a reused graph would yield the first config's kernel every time).
+    Best-effort: a golden whose pinned knobs fail to compile / bench for the live
+    device is skipped with a warning."""
+    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+
+    out = []
+    for cfg in golden_configs or []:
+        pins = {k: v for k, v in cfg.knobs.items() if not k.startswith(("S_", "H_"))}
+        try:
+            with _pinned_knobs(pins):
+                graph, _, _ = graph_from_code(code)  # fresh graph; knobs baked into the kernel source here
+                g_compiled = backend.compile(graph)
+            g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
+        except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
+            logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", cfg.name, exc)
+            continue
+        out.append(_GoldenBench(cfg, g_compiled, g_bench))
+    return out
+
+
+def _print_kernel_stats(graph, bench, golden_benches=None):
     """Per-kernel breakdown. Pulls structural stats off each ``CudaOp``
     (block / grid / smem), per-launch timings from ``bench.per_launch``,
     and per-kernel hardware attributes from the compiled cupy RawKernels
     (register count, achieved theoretical occupancy). One row per kernel
     — quick at-a-glance for spotting which kernel dominates, whether
-    register pressure is killing occupancy, etc."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp
+    register pressure is killing occupancy, etc.
 
-    cuda_nodes = [(nid, node) for nid, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
+    ``golden_benches`` (from ``run --golden NAME``, see :func:`_bench_golden_variants`)
+    are each their own live compile+bench of a recorded golden config's pinned
+    knobs; their kernels print beneath the greedy kernel of matching shape, labeled
+    ``golden NAME`` in the Kernel column — a real A/B, not the recorded number. Their
+    ``%`` column is ``--`` (they're not part of the deplodock TOTAL), and their knob
+    cells are colored red where they differ from the greedy pick (like ``eval``)."""
+    from deplodock.commands.knobfmt import align_knob_columns  # noqa: PLC0415
+    from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+
+    cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
         return
 
-    times_by_idx = {lt.idx: lt.time_ms * 1000 for lt in (bench.per_launch or [])}
-    total_us = bench.time_ms * 1000
+    # Per-kernel best-case (min) to match the min-based comparison table.
+    times_by_idx = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (bench.per_launch or [])}
+    total_us = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
     attrs_by_kname = _collect_kernel_attrs(graph)
     occ_limits = _occupancy_limits()
 
     # Symbolic grids (ceil-div over a dynamic axis) need a concrete env to
     # resolve for display — use each symbolic input dim's hint, so the printed
     # geometry reflects the hint-sized tile the kernel was tuned for.
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-
     sym_env: dict[str, int] = {}
     for nid in graph.inputs:
         for dim in graph.nodes[nid].output.shape:
             if isinstance(dim.expr, Var) and dim.hint is not None:
                 sym_env.setdefault(dim.expr.name, dim.hint)
 
-    print()
-    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}")
-    print("-" * 90)
-    for idx, (_, node) in enumerate(cuda_nodes):
-        op = node.op
-        t_us = times_by_idx.get(idx, 0.0)
-        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
-        from deplodock.compiler.ir.cuda.ir import resolve_dim
-
+    def _geom(op, attrs: dict):
         block_dims = [resolve_dim(d, sym_env) for d in op.block]
         grid_dims = [resolve_dim(d, sym_env) for d in op.grid]
         block_threads = block_dims[0] * block_dims[1] * block_dims[2]
         grid_total = grid_dims[0] * grid_dims[1] * grid_dims[2]
-        smem_kb = op.smem_bytes / 1024
-        kname = op.kernel_name[:42]
-        attrs = attrs_by_kname.get(op.kernel_name) or {}
-        regs = attrs.get("num_regs", 0)
+        regs = (attrs.get(op.kernel_name) or {}).get("num_regs", 0)
         occ_pct = _theoretical_occupancy(regs, op.smem_bytes, block_threads, occ_limits)
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
-        print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}")
+        return grid_total, block_threads, op.smem_bytes / 1024, regs, occ_str
+
+    def _matching(op):
+        """Benched golden variants whose matmul shape matches this kernel — keyed
+        on the op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max
+        = K``), the same shape signature the prior diagnostics match goldens on."""
+        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
+        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
+        return [gb for gb in (golden_benches or []) if gb.config.M * gb.config.N == free_prod and gb.config.K == reduce_max]
+
+    # Build row records first (the knob columns are aligned across all rows, so we
+    # can't stream): (name, t_us, pct_cell, geom, knobs, ref_knobs_or_None). A
+    # golden row's ``ref`` is its matching greedy kernel's knobs — cells that differ
+    # are colored red.
+    records: list[tuple] = []
+    for idx, node in enumerate(cuda_nodes):
+        op = node.op
+        t_us = times_by_idx.get(idx, 0.0)
+        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
+        gknobs = dict(tuning_knob_items(op.knobs or {}))
+        records.append((op.kernel_name[:42], t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
+        for gb in _matching(op):
+            g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
+            g_attrs = _collect_kernel_attrs(gb.graph)
+            g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
+            for gidx, gnode in enumerate(g_nodes):
+                gk = dict(tuning_knob_items(gnode.op.knobs or {}))
+                records.append((f"golden {gb.config.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
+
+    knob_lines = align_knob_columns(
+        [{k: (f"{k}={v}", ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
+    )
+
+    print()
+    print(f"{'Kernel':<44s} {'us':>7s} {'%':>6s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}  knobs (greedy pick)")
+    print("-" * 90)
+    for rec, kline in zip(records, knob_lines, strict=True):
+        name, t_us, pct_cell, (grid_total, block_threads, smem_kb, regs, occ_str) = rec[:4]
+        print(
+            f"{name:<44s} {t_us:>7.1f} {pct_cell:>6s} {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}  {kline}"
+        )
     print(f"{'TOTAL':<44s} {total_us:>7.1f}")
 
 
@@ -841,9 +941,10 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         db = SearchDB(path=backend.tune_db)
         logger.info("Using tuning DB: %s", backend.tune_db)
     if tail:
-        # Thread the tune DB through the tail lowering so greedy fork selection
-        # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered
-        # at rule defaults and tuned results never showed up here.
+        # Finish the tail lowering. NOTE: the single-shot ``Pipeline.run`` has no
+        # prior (uniform PUCT → emission-order, option-0) and does not replay tuned
+        # variants from the DB; ``db=`` is kept for perf recording only. Wiring a
+        # warm-started prior into single-shot compile is a deferred follow-up.
         graph = Pipeline.build(tail).run(graph, db=db, dump=dump)
 
     results, bench, torch_available = bench_lowered_vs_torch(
@@ -1164,21 +1265,18 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
 
-    import statistics as _stats  # noqa: PLC0415
-
     results: dict[str, float] = {}
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
             # ``elapsed_time`` is in ms across the whole batch; divide
             # by the batch size and multiply by 1000 to get per-call us.
-            # Median (not mean) for symmetry with deplodock's reduction
-            # in ``benchmark_program`` — keeps a single thermal-blip or
-            # lock-contention outlier from dragging eager's reported
-            # latency up.
+            # ``min`` (best-case iter) for both torch and deplodock — the
+            # least-noise latency, matching tune's min-over-variants reporting
+            # so tune and run numbers are comparable.
             per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
-            results[name] = _stats.median(per_iter_us)
-    results["Deplodock"] = bench.time_ms * 1000
+            results[name] = min(per_iter_us)
+    results["Deplodock"] = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
     return results, bench
 
 

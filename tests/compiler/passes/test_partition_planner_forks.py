@@ -2,62 +2,57 @@
 
 The planner emits one ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) →
 TileOp leaf`` Fork tree from a ``_Plan`` (cheap-to-build
-pre-materialization state); tier-foreign levels collapse (single value).
-Levels with a single value collapse (no Fork wrapper). Branch scores
-propagate ``max`` from leaves so the search picks high-Q subtrees first.
-Leaf ``expand`` thunks materialize the chosen TileOp on demand —
-:func:`_materialize` runs ``_build_split_body`` + body normalization
-only when the leaf is actually resolved.
+pre-materialization state); tier-foreign / single-value levels collapse
+(no Fork wrapper). Siblings are unranked — ranking is the search policy's
+job (the learned prior), not the tree's. Leaf ``expand`` thunks
+materialize the chosen TileOp on demand — :func:`_materialize` runs
+``_build_split_body`` + body normalization only when the leaf is resolved.
 
 We exercise the builder directly via importlib (the module name has a
 ``000_`` numeric prefix and isn't importable with normal syntax) on
 real planner-emitted plans rather than synthetic stubs — that way we
-catch knob-name drift and score-formula shape changes.
+catch knob-name drift.
 """
 
 from __future__ import annotations
 
 import importlib
 
-import pytest
-
 from deplodock.compiler.context import Context
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
+from deplodock.compiler.pipeline.knob import is_warp
 
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
 _plan_kernel = _planner._plan_kernel
 _materialize = _planner._materialize
-_score_variant = _planner._score_variant
 BR, BM, BN, FM, FN = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN)
 
 
-def _build_fork_tree_lazy(plan, ctx: Context) -> Fork:
+def _build_fork_tree_lazy(plan) -> Fork:
     """Mirror the planner's own call site in ``rewrite()`` — builds the same
-    Fork tree from a ``_Plan`` + ``ctx`` via the shared
-    ``pipeline/fork.py`` builder, with the planner's canonical level
-    layout. Single source of truth for the test assertions below."""
+    Fork tree from a ``_Plan`` via the shared ``pipeline/fork.py`` builder,
+    with the planner's canonical level layout. Single source of truth for the
+    test assertions below."""
     return build_fork_tree(
         params=plan.params,
         levels=[
-            Level((_planner.MMA.name,), lambda p: (p["MMA"],) if "MMA" in p else ()),
+            Level((_planner.MMA.name,), lambda p: (p["MMA"],) if is_warp(p) else ()),
             Level((BR.name,), lambda p: (p.get("BR", 1),)),
             Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
             Level((_planner.WM.name, _planner.WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
             Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
         ],
         materialize=lambda p: _materialize(plan, p),
-        score=lambda p, cache: _score_variant(plan, p, ctx, cache),
     )
 
 
 def _ctx() -> Context:
     """Pinned sm_80 context — keeps variant counts stable across CI hosts."""
-    return Context(compute_capability="sm_80")
+    return Context(compute_capability=(8, 0))
 
 
 def _loop_op_matmul(*, m: int = 128, n: int = 128, k: int = 64) -> LoopOp:
@@ -168,7 +163,7 @@ def test_single_variant_collapses_to_single_leaf_on_expand():
         kernel_name=plan.kernel_name,
         params=plan.params[:1],
     )
-    tree = _build_fork_tree_lazy(one_plan, _ctx())
+    tree = _build_fork_tree_lazy(one_plan)
     assert isinstance(tree, Fork)
     assert not tree.is_leaf and tree.knobs == {}
     (leaf,) = tree.expand()
@@ -177,7 +172,7 @@ def test_single_variant_collapses_to_single_leaf_on_expand():
 
 def test_multi_variant_matmul_emits_branch_forks():
     plan = _matmul_plan()
-    tree = _build_fork_tree_lazy(plan, _ctx())
+    tree = _build_fork_tree_lazy(plan)
     branches = _walk_branches(tree)
     assert branches, "expected branch Forks for a multi-variant matmul"
 
@@ -185,7 +180,7 @@ def test_multi_variant_matmul_emits_branch_forks():
 def test_leaves_preserve_every_variant():
     """Tree's leaf set must equal the planner's enumerated params (no dup/drop)."""
     plan = _matmul_plan()
-    tree = _build_fork_tree_lazy(plan, _ctx())
+    tree = _build_fork_tree_lazy(plan)
     leaves = _walk_leaves(tree)
     assert len(leaves) == len(plan.params), f"leaf count {len(leaves)} doesn't match variant count {len(plan.params)}"
 
@@ -196,52 +191,17 @@ def test_leaf_knobs_are_the_complete_row():
     DB replay (``_best_fork``) disambiguates leaf siblings by knobs
     alone, never by materializing them."""
     plan = _matmul_plan()
-    tree = _build_fork_tree_lazy(plan, _ctx())
+    tree = _build_fork_tree_lazy(plan)
     rows = {tuple(sorted((k, str(v)) for k, v in p.items())) for p in plan.params}
     for leaf in _walk_leaves(tree):
         assert tuple(sorted((k, str(v)) for k, v in leaf.knobs.items())) in rows, f"leaf knobs are not an enumerated row: {leaf.knobs}"
-
-
-def test_branch_score_is_max_of_children():
-    """Max-propagated scores: each branch Fork's score equals the max
-    score among its direct children (branches or leaves)."""
-    plan = _matmul_plan()
-    tree = _build_fork_tree_lazy(plan, _ctx())
-    for branch in _walk_branches(tree):
-        children = branch.expand()
-        assert children
-        expected = max(c.score() for c in children)
-        assert branch.score() == pytest.approx(expected), f"branch.score {branch.score()} != max(child scores) {expected}"
-
-
-def test_max_score_descent_reaches_best_variant():
-    """Siblings are unranked (the search picks the max prior via
-    ``Search.score_of``); descending by max score at every level must
-    land on the leaf whose prior equals the global best over the whole
-    enumeration — i.e. greedy's pick = argmax ``TileOp.lazy_score``.
-    ``lazy_score`` is the ONLY scorer (there is no post-materialization
-    ``Op.score``), so the picked leaf's fork prior is compared against
-    a from-scratch argmax over every enumerated variant."""
-    plan = _matmul_plan()
-    ctx = _ctx()
-    tree = _build_fork_tree_lazy(plan, ctx)
-
-    node = tree
-    while not node.is_leaf:
-        node = max(node.expand(), key=lambda f: f.score())
-
-    def _lazy(p):
-        return TileOp.lazy_score(ctx, knobs={**plan.base_knobs, **p}, shapes=plan.shape)
-
-    best = max(_lazy(p) for p in plan.params)
-    assert node.score() == pytest.approx(best), f"max-descent leaf prior {node.score()} != best lazy_score {best}"
 
 
 def test_pointwise_collapses_br_layer():
     """Pointwise kernels have BR=1 fixed, so the BR Fork layer must
     collapse — no branch Fork should ever pin BR for them."""
     plan = _pointwise_plan()
-    tree = _build_fork_tree_lazy(plan, _ctx())
+    tree = _build_fork_tree_lazy(plan)
     for branch in _walk_branches(tree):
         assert "BR" not in branch.knobs, f"BR leaked into branch for pointwise: {branch.knobs}"
 
@@ -252,7 +212,7 @@ def test_branch_knobs_partition_cleanly():
     no knob duplicated across levels (tier-foreign levels collapse) —
     and the leaf's complete row must agree with every pinned value."""
     plan = _matmul_plan()
-    tree = _build_fork_tree_lazy(plan, _ctx())
+    tree = _build_fork_tree_lazy(plan)
     expected = {"MMA", "BR", "BM", "BN", "WM", "WN", "FM", "FN"}
 
     # Walk one root→leaf path and check.

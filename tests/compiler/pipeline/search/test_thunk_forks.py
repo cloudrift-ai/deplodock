@@ -5,7 +5,7 @@ leaf op exactly once.
 Tests build a small custom Pipeline with a single rule whose ``rewrite``
 returns ``Fork`` options. Each Fork's ``expand`` either returns more Forks
 (branch level) or a concrete ``Op`` (leaf level). The harness then drives
-the pipeline through both :class:`GreedySearch` and :class:`TuningSearch`
+the pipeline through both single-shot `Pipeline.run` and the `TuningSearch` sweep
 and asserts the cursor advances exactly once and the resolved leaf carries
 the expected knob delta.
 """
@@ -110,7 +110,7 @@ def test_two_level_fork_chain_resolves_leaf() -> None:
     pipeline = _build_pipeline(rewrite)
     out = pipeline.run(_make_graph())
     op = _final_op(out)
-    # Greedy picks option 0 at every fork → A=1, B=10.
+    # Single-shot (uniform PUCT) picks option 0 at every fork → A=1, B=10.
     assert op.knobs.get("A") == 1
     assert op.knobs.get("B") == 10
     assert op.tag == "leaf-1-10"
@@ -142,7 +142,7 @@ def test_tuning_enumerates_thunk_leaves() -> None:
 
 
 def test_mixed_fork_and_concrete_op_siblings() -> None:
-    """One rule batch returns a mix of Forks and concrete Ops. Greedy
+    """One rule batch returns a mix of Forks and concrete Ops. Single-shot
     picks option 0 (a Fork that expands to a leaf), but both branches
     must be valid for tune to enumerate."""
     from deplodock.compiler.pipeline import TuningSearch
@@ -159,7 +159,7 @@ def test_mixed_fork_and_concrete_op_siblings() -> None:
         ]
 
     pipeline = _build_pipeline(rewrite)
-    # Greedy: option 0 → Fork → leaf K=1.
+    # Single-shot: option 0 → Fork → leaf K=1.
     out_greedy = pipeline.run(_make_graph())
     assert _final_op(out_greedy).knobs.get("K") == 1
 
@@ -184,11 +184,11 @@ def test_is_expandable_discriminates_fork_vs_op() -> None:
     # via Pipeline.match to get a real Match.
     cur = pipeline.passes[0].rules[0]
     from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline import TuningSearch
     from deplodock.compiler.pipeline.pipeline import Run
     from deplodock.compiler.pipeline.search.db import SearchDB
-    from deplodock.compiler.pipeline.search.policy import GreedySearch
 
-    run = Run(pipeline=pipeline, ctx=Context.probe(), search=GreedySearch(), db=SearchDB())
+    run = Run(pipeline=pipeline, ctx=Context.probe(), search=TuningSearch(), db=SearchDB())
     cand = Candidate(run=run, graph=graph, cursor=None)  # cursor unused for these calls
 
     matches = pipeline.match(graph, cur)

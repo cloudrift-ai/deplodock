@@ -3,9 +3,9 @@ on-disk inventory + perf store, and the in-memory MCTS tree.
 
 - :mod:`.candidate` — :class:`Candidate` / :class:`LazyCandidate` /
   :class:`Cursor` data classes.
-- :mod:`.policy` — :class:`Search` ABC (``base``) plus
-  :class:`GreedySearch` (``greedy``) / :class:`TuningSearch` (``mcts``)
-  concrete strategies.
+- :mod:`.policy` — :class:`Search` ABC (``base``), :class:`TuningSearch`
+  (``mcts``, PUCT — the exploration policy), and :class:`GreedySearch`
+  (``greedy``, the O(1) single-shot compile driver).
 - :mod:`.db` — :class:`SearchDB` SQLite store (op inventory, lowering
   edges, ``perf`` table).
 - :mod:`.policy.mcts` — :class:`TuningSearch` + the in-memory

@@ -237,7 +237,7 @@ class LazyCandidate:
         and :meth:`expand`): a rule-emitted ``Fork`` passes through; a
         concrete ``Op`` / ``Graph`` (already validated upstream in
         ``try_rewrite``'s filter) is lifted into an :class:`OptionFork`
-        leaf — an ``Op``'s knob delta rides along for ``_best_fork``."""
+        leaf — an ``Op``'s knob delta rides along as the fork's ``knobs``."""
         if not isinstance(option, Fork):
             knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
             option = OptionFork(option=option, knobs=knobs)
@@ -300,11 +300,10 @@ class LazyCandidate:
 
     @property
     def fork(self) -> Fork | None:
-        """The pending :class:`Fork`, or ``None`` for a no-pending
-        wrapper. Scoring/ranking is search policy — the policies read
-        ``Search.score_of(cand.fork)`` (which owns the value-keyed
-        cache and the why-prior-only rationale); this accessor is just
-        the unwrap."""
+        """The pending :class:`Fork`, or ``None`` for a no-pending wrapper.
+        Ranking is search policy — the policies score ``cand.fork.knobs`` with
+        the learned prior (Forks carry no score); this accessor is just the
+        unwrap."""
         return self.pending[1] if self.pending is not None else None
 
 

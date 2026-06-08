@@ -97,17 +97,30 @@ PIPELINE_STAGES = Knob(
     KnobType.BOOL,
     hints=(True, False),
     help="Software-pipeline async-staged K-outer loops into prologue/main/epilogue. 0 = keep the depth-1 staged loop.",
+    off=False,
 )
 
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:  # noqa: ARG001 — ctx required by rule dispatch signature
+    # Idempotence: the decision is recorded as the PIPELINE_STAGES knob (every
+    # path stamps it now), so a re-scan of the rebound op skips here.
+    if PIPELINE_STAGES.name in root.op.knobs:
+        raise RuleSkipped("PIPELINE_STAGES already decided (idempotence via knob)")
+
+    def _off() -> TileOp:
+        """Record the declined decision: PIPELINE_STAGES=False, body unchanged
+        (keeps the depth-1 staged loop, or no staging at all)."""
+        return TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, PIPELINE_STAGES.name: False})
+
     if not PIPELINE_STAGES.narrow(PIPELINE_STAGES.hints)[0]:
-        raise RuleSkipped("PIPELINE_STAGES=0 pinned")
+        return _off()
     body = root.op.body
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no eligible serial_outer with ASYNC/TMA StageBundle to pipeline")
-    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
+        # No eligible serial_outer with an ASYNC/TMA bundle to pipeline — record
+        # the declined decision rather than leaving the knob unset.
+        return _off()
+    return TileOp(body=new_body, name=root.op.name, knobs={**root.op.knobs, PIPELINE_STAGES.name: True})
 
 
 def _walk(body: Body) -> tuple[Body, bool]:

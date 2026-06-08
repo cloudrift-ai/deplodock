@@ -81,7 +81,6 @@ the fork via ``WARP_SPECIALIZE.narrow``.
 
 from __future__ import annotations
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Node
@@ -107,10 +106,12 @@ PATTERN = [Pattern("root", TileOp)]
 
 
 WARP_SPECIALIZE = Knob(
-    "WARP_SPECIALIZE",
+    "WARPSPEC",
     KnobType.BOOL,
     hints=(False, True),
     help="Warp-specialize TMA staging: producer warps issue TMA, consumer warps wait + reduce",
+    aliases=("WARP_SPECIALIZE",),
+    off=False,
 )
 
 # v1 — single producer warp on sm_90+ (warp size 32). If WS_PRODUCER_WARPS
@@ -369,14 +370,15 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
     if not ok:
         # Fail loudly if the user explicitly pinned ``DEPLODOCK_WARP_SPECIALIZE=1``
         # but the kernel can't be warp-specialized (e.g. a warp-tier MMA matmul
-        # — ``no ThreadTile in body``, WS+MMA is out of v1 scope). Silently
-        # RuleSkipping would hand back the *non-WS* kernel with no signal, so a
+        # — ``no ThreadTile in body``, WS+MMA is out of v1 scope). A
         # pinned-but-unhonorable knob raises — same policy as the BUFFER_COUNT /
         # TMA pins.
-        pin = config.knob_raw(WARP_SPECIALIZE.name)
+        pin = WARP_SPECIALIZE.raw()
         if pin is not None and WARP_SPECIALIZE.parse(pin):
-            raise ValueError(f"DEPLODOCK_WARP_SPECIALIZE=1 pinned but warp specialization cannot fire: {reason}")
-        raise RuleSkipped(reason)
+            raise ValueError(f"{WARP_SPECIALIZE.env}=1 pinned but warp specialization cannot fire: {reason}")
+        # Ineligible (not pinned on) — record the off decision (body unchanged) so
+        # the realized config keeps a uniform knob set instead of leaving it absent.
+        return TileOp(body=op.body, name=op.name, knobs={**op.knobs, WARP_SPECIALIZE.name: False})
 
     ws_choices = WARP_SPECIALIZE.narrow(WARP_SPECIALIZE.hints)
     if not ws_choices:
@@ -392,20 +394,22 @@ def rewrite(ctx: Context, root: Node) -> TileOp | ThunkFork | list[ThunkFork] | 
     if len(ws_choices) == 1:
         return _stamp(ws_choices[0])
 
-    # Prior (rank-only — the MCTS still measures both). For the warp-tier MMA
-    # tower, WS=1 is a measured win (≈17% at 64×64, neutral at 128×128 — see
-    # the RTX 5090 sweep in ``_enumeration._priority_matmul_warp``), so score
-    # the WS=1 fork higher and the greedy/first-guess path takes it. The scalar
-    # (pointwise / coop-reduce) tier has no such consensus, so it stays neutral
-    # (0.0) and greedy follows the hint order (a score tie keeps emission
-    # order). The score alone drives both pickers: greedy takes the max-prior
-    # sibling (``Search.score_of``), MCTS uses it as the UCB unvisited tiebreak.
+    # For the warp-tier MMA tower, WS=1 is a measured win (≈17% at 64×64, neutral
+    # at 128×128 — the RTX 5090 warp sweep, see ``plans/golden-sweep-report.md``),
+    # so it should be the first guess. Ordering is the ONLY lever that does this:
+    # the policies select on the learned prior when fitted and on **emission
+    # order** otherwise (option-0 / PUCT tie) — Forks carry no heuristic score.
+    # So a cold MCTS (a fresh ``tune --clean``) and a no-prior
+    # greedy ``compile`` would take WS=0 and, under patience, never bench WS=1
+    # (the measured fp16 gap in ``plans/golden-sweep-report.md``). Emit WS=1 FIRST
+    # for the warp tier — emission order deploys the win cold, and the -O3 re-bench
+    # tolerance feeds the prior its deployable latency. The scalar (pointwise /
+    # coop-reduce) tier has no such consensus → keep the hint order (WS=0 first).
     _, is_warp = _find_consumer_tile(op.body)
+    if is_warp and set(ws_choices) == {False, True}:
+        ws_choices = (True, False)
 
     def _ws_expand(knobs: dict) -> list[TileOp]:
         return [_stamp(knobs[WARP_SPECIALIZE.name])]
 
-    def _ws_score(knobs: dict) -> float:
-        return 1.0 if (knobs[WARP_SPECIALIZE.name] and is_warp) else 0.0
-
-    return [ThunkFork(knobs={WARP_SPECIALIZE.name: ws}, expand_fn=_ws_expand, score_fn=_ws_score, is_leaf=True) for ws in ws_choices]
+    return [ThunkFork(knobs={WARP_SPECIALIZE.name: ws}, expand_fn=_ws_expand, is_leaf=True) for ws in ws_choices]

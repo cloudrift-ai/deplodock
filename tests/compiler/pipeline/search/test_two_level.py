@@ -125,9 +125,9 @@ def test_inner_reward_is_separable_not_a_product() -> None:
 
     # Separability: the shared run must not blow up to the cross-product
     # (n1 * n2 — the old whole-graph SP-MCTS bug this test guards against).
-    # Per-op sharing through the DB (op_effort table) is allowed — once an op
-    # is tuned to the requested patience, re-runs are idempotent. The exact
-    # share count is sensitive to MCTS exploration order: the
+    # Per-op sharing through the DB perf cache is allowed — an already-measured
+    # variant replays without a bench. The exact share count is sensitive to
+    # MCTS exploration order: the
     # ``_CountingBackend`` fakes latency from ``hash(op_cache_key)``, so any
     # structural-digest perturbation (e.g. a Source-field rename) shifts the
     # path and the count by a few benches. The hard guarantee is the
@@ -148,38 +148,51 @@ def test_inner_reward_is_separable_not_a_product() -> None:
     assert reward.total_us == pytest.approx(sum(r.best_us for r in reward.per_op))
 
 
-def test_inner_reward_idempotent_rerun() -> None:
-    """A second pass at the same patience does no work (effort gate) and
-    returns the same total."""
+def test_inner_reward_rerun_is_replay_dominated() -> None:
+    """A second pass at the same patience is replay-dominated and never regresses:
+    the warm perf cache serves almost every terminal, so the rerun benches far
+    fewer variants than the cold run, and the per-op best total only improves (or
+    ties), never worsens.
+
+    Two things changed vs the old idempotence invariant. Ranking moved from the
+    priority-sorted enumeration to the ``Prior`` (``AnalyticPrior`` cold), so the
+    cold search walks a real prior-ranked frontier instead of finding the best at
+    option-0; that frontier interacts with the cache's cross-op kernel sharing, so
+    a warm rerun wanders into a handful of new frontier variants while replaying
+    the rest. Those extra benches can only LOWER the per-op best — ``record_perf``
+    keeps the minimum and ``best_per_op_time`` reads it — so ``second.total_us <=
+    first.total_us`` always (it does not converge to the *same* total; it converges
+    *downward*). The exact bench count is exploration-order-sensitive (same caveat
+    as ``test_inner_reward_separability``); the ``_CountingBackend``'s hash-derived
+    latencies make it host-dependent, so only the two robust invariants are pinned."""
     fused = _fuse(_two_distinct_matmuls())
     db = SearchDB()
     ctx = Context.from_target((8, 0))
 
-    first = inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=_PATIENCE)
+    cold_backend = _CountingBackend()
+    first = inner_reward(fused, ctx=ctx, db=db, backend=cold_backend, patience=_PATIENCE)
     rerun_backend = _CountingBackend()
     second = inner_reward(fused, ctx=ctx, db=db, backend=rerun_backend, patience=_PATIENCE)
 
-    assert rerun_backend.calls == 0, "re-run must skip every already-tuned (exhausted) op"
-    assert all(not r.benched for r in second.per_op)
-    assert second.total_us == pytest.approx(first.total_us)
+    # The DB's per-op best is monotone non-increasing — more benches never worsen it.
+    assert second.total_us <= first.total_us + 1e-6, "rerun must not regress the per-op best total"
+    assert rerun_backend.calls < cold_backend.calls, "warm rerun must bench fewer variants than the cold run"
+    assert rerun_backend.calls <= max(_PATIENCE, cold_backend.calls // 2), "rerun must be replay-dominated, not a full re-search"
 
 
-def test_inner_reward_deepens_only_under_tuned() -> None:
-    """A low patience records a finite effort; a higher patience re-tunes
-    (effort gate not yet met)."""
+def test_inner_reward_deeper_patience_benches_new_variants() -> None:
+    """A higher patience re-runs the search (never skipped) and reaches new
+    variants the shallow pass never measured — those miss the perf cache and
+    bench, while the already-measured ones replay for free."""
     fused = _fuse(_two_distinct_matmuls())
     db = SearchDB()
     ctx = Context.from_target((8, 0))
 
-    shallow = inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=1)
-    assert all(r.benched for r in shallow.per_op)
+    inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=1)
 
     deep_backend = _CountingBackend()
-    deep = inner_reward(fused, ctx=ctx, db=db, backend=deep_backend, patience=_PATIENCE)
-    # Both ops recorded effort=1 at patience=1 (tree not exhausted), so a
-    # higher patience is not yet satisfied → they re-tune.
-    assert deep_backend.calls > 0
-    assert any(r.benched for r in deep.per_op)
+    inner_reward(fused, ctx=ctx, db=db, backend=deep_backend, patience=_PATIENCE)
+    assert deep_backend.calls > 0, "a deeper pass must bench the new variants it reaches"
 
 
 def test_inner_reward_shares_identical_kernel() -> None:

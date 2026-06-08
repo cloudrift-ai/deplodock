@@ -784,6 +784,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
         ParallelTile,
         SerialTileBase,
         StageBundle,
+        WarpSpecialize,
     )
 
     stmts = Body.coerce(stmts)
@@ -847,6 +848,19 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             # the tuple before any nested Stage's cache axes so the
             # parallel coords keep their pre-order rename slots.
             for ax in stmt.axes:
+                _record_axis(ax.name)
+        elif isinstance(stmt, WarpSpecialize):
+            # The consumer thread/warp coords live only as free Vars in the
+            # consumer body plus this off-body field — the ThreadTile is
+            # re-synthesised later by the materializer, so no ParallelTile binds
+            # them here. Record them (pre-order, before the nested StageBundle
+            # cache axes) so each gets its own canonical slot. Without this, an
+            # *unstaged* coord (e.g. the N-thread index of a matmul whose B
+            # operand isn't TMA-staged, hence absent from every cache axis) is
+            # never recorded, keeps an uncontrolled name, and can collide with a
+            # renamed cache axis — emitting two identically-named thread loops
+            # (a duplicate ``int aN`` declaration that fails to compile).
+            for ax in stmt.consumer_thread_axes:
                 _record_axis(ax.name)
         elif isinstance(stmt, StageBundle):
             for src in stmt.sources:

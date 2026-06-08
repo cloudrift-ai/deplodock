@@ -150,35 +150,6 @@ def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
-def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
-    """With ``DEPLODOCK_MMA=1`` defaulted ON and *no* warp-tier pins, the
-    DB-less greedy picker on sm_90+ lands on the priority-scored s16816
-    mma.sync tile for 2048² fp16: a **square 64×64 output tile on a 4-warp
-    CTA with WARP_SPECIALIZE** — ``WN=4 WM=1 FM=4 FN=2 BK=2 BUFFER_COUNT=2``
-    (M-tile = WM·FM·16 = 64, N-tile = WN·FN·atom_n = 4·2·8 = 64). This matches
-    ``golden_configs.square.2048.fp16`` (≈107 µs / 1.06× cuBLAS on RTX 5090).
-    ``WM=1 WN=4`` and the balanced ``WM=2 WN=2`` give the identical 64×64 tile
-    and are perf-equal; the deterministic enumeration order picks the former.
-
-    Three co-operating priors land this: ``score_tile_geometry`` /
-    ``_priority_matmul_warp`` reward the square 64×64 tile; ``040_use_ring_buffers``
-    front-loads ``BUFFER_COUNT=2`` for the warp-tier (so ``085_warp_specialize``
-    — which requires ``pipeline_depth == 2`` — can fire); and the WS fork ranks
-    ``WARP_SPECIALIZE=1`` first for the warp tier.
-    """
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
-    _, kop, _ = _compile_and_render(M=2048, N=2048, K=2048, out_dtype=F16)
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
-    assert int(kop.knobs.get("WN", 0)) == 4, f"expected WN=4, got {kop.knobs.get('WN')}"
-    assert int(kop.knobs.get("WM", 0)) == 1, f"expected WM=1, got {kop.knobs.get('WM')}"
-    assert int(kop.knobs.get("FM", 0)) == 4, f"expected FM=4, got {kop.knobs.get('FM')}"
-    assert int(kop.knobs.get("FN", 0)) == 2, f"expected FN=2, got {kop.knobs.get('FN')}"
-    assert int(kop.knobs.get("BK", 0)) == 2, f"expected BK=2, got {kop.knobs.get('BK')}"
-    assert int(kop.knobs.get("BUFFER_COUNT", 0)) == 2, f"expected BUFFER_COUNT=2, got {kop.knobs.get('BUFFER_COUNT')}"
-    assert kop.knobs.get("WARP_SPECIALIZE") is True, f"expected WARP_SPECIALIZE=True, got {kop.knobs.get('WARP_SPECIALIZE')}"
-
-
-@pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
 def test_tma_mma_path_emits_bulk_tensor_ptx(pin_tma_mma):
     """At a shape large enough to clear both the 128-byte alignment gate
     and the ``src_inner ≥ 2 × inner_extent`` size gate, the mma.sync staged

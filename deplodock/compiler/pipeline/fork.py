@@ -2,8 +2,8 @@
 engine ranks and resolves, and the hierarchical Fork-tree builder shared by
 pipeline rules that enumerate a knob cartesian.
 
-:class:`Fork` is the interface — ``knobs``, ``is_leaf``, ``expand()``,
-``score(cache)``. Implementations hold their producer's state as data:
+:class:`Fork` is the interface — ``knobs``, ``is_leaf``, ``expand()``.
+Implementations hold their producer's state as data:
 :class:`OptionFork` (a concrete ``Op``/``Graph`` leaf), :class:`ThunkFork`
 (generic flat forks), and the tree node classes :class:`_Branch` /
 :class:`_Leaf` built by :func:`build_fork_tree`.
@@ -14,20 +14,16 @@ siblings by a (sub)tuple of knob values and collapses levels whose key has
 a single distinct value across the group (rows with an empty key skip the
 level). Below the last level every row becomes one :class:`_Leaf` carrying
 its COMPLETE row as ``knobs`` — the row IS the variant identity (the
-``SID`` structural-id knob rides the merged dict), so the engine's
-DB-replay (``_best_fork``) matches leaves and branches by knobs alone, no
-structural probing. ``expand()`` yields ``materialize(row)`` once the
-search engine resolves a leaf.
-Everything is lazy: no Fork below the root exists and no row is scored
-until the search reads a fork's score. Siblings are emitted in grouping
-order — RANKING IS SEARCH POLICY: each node carries a lazy max-propagated
-``score(cache)``, read by the policies via ``Search.score_of`` (which
-passes the search-owned value-keyed cache down to the caller's per-param
-scorer, so structurally identical kernels across a model share every
-score).
+``S_*`` structural-feature knobs ride the merged dict), so the perf DB and
+the learned prior key leaves and branches by knobs alone, no structural
+probing. ``expand()`` yields ``materialize(row)`` once the search engine
+resolves a leaf.
+Everything is lazy: no Fork below the root exists until the search expands
+it. Siblings are emitted in grouping order — RANKING IS SEARCH POLICY: the
+policies rank the frontier with the learned prior (Forks carry no score).
 
 Use the builder when a rule produces ≥2 hierarchical levels of knob
-bundling with score-propagated ranking (today:
+bundling (today:
 ``passes/lowering/tile/010_partition_loops``). For flat 2-element forks
 with no hierarchy (e.g. ``passes/lowering/tile/085_warp_specialize``) a
 bare ``[ThunkFork(...), ThunkFork(...)]`` list comp is shorter and clearer
@@ -66,30 +62,23 @@ class Fork(ABC):
 
     Sharing one interface lets ``LazyCandidate.pending`` carry just
     ``Fork`` (no tagged union) — the search loop branches on
-    ``Fork.is_leaf`` to decide expand-vs-resolve, and ``_best_fork``
-    reads ``Fork.knobs`` polymorphically without isinstance.
+    ``Fork.is_leaf`` to decide expand-vs-resolve.
 
-    ``knobs`` is the knob-delta this Fork pins (used by ``_best_fork``
-    to match the lowering DB without expanding). ``score(cache)`` is the
-    LAZY planner-prior compute — typically the score of the best-reachable
-    leaf under a branch. Ranking is SEARCH policy, not the producer's: the
-    engine hands unranked siblings to ``Search.push`` and the policy reads
-    ``Search.score_of``, which passes the search-owned ``score_cache``
-    dict down to the compute. A scorer with a value identity memoizes its
-    unit of work into that dict under its own key — the partition planner
-    keys each variant by ``(ctx, merged knobs)``, complete because the
-    ``SID`` structural-identity knob rides the dict — so structurally
-    identical kernels across a model share every score. Scorers with
-    nothing worth caching just ignore ``cache``."""
+    ``knobs`` is the knob-delta this Fork pins (the variant identity the
+    perf DB and the learned prior key on, read without expanding). Ranking
+    is SEARCH policy: the engine hands unranked siblings to ``Search.push``
+    and the policy ranks them with the learned
+    :class:`~deplodock.compiler.pipeline.search.prior.Prior` (greedy
+    ``mean_score`` argmin; MCTS PUCT). Forks carry no score of their own —
+    the analytic per-fork scorer was removed when the learned prior replaced
+    it; siblings are emitted in grouping order and the cold/no-prior fallback
+    is that emission order."""
 
     knobs: dict
     is_leaf: bool = False
 
     @abstractmethod
     def expand(self) -> list[Op | Graph | Fork]: ...
-
-    def score(self, cache: dict | None = None) -> float:  # noqa: ARG002 — uniform signature; default prior is neutral
-        return 0.0
 
 
 @dataclass(frozen=True)
@@ -109,24 +98,17 @@ class OptionFork(Fork):
 @dataclass(frozen=True)
 class ThunkFork(Fork):
     """Generic implementation for flat one-off forks (e.g.
-    ``tile/085_warp_specialize``'s two-element WS fork): behavior as
-    plain functions of the fork's ``knobs`` — ``expand_fn(knobs)`` /
-    ``score_fn(knobs)`` — so siblings share ONE function instead of
-    per-instance capture lambdas (the knob delta is the only thing that
-    varies). Trivial computes — nothing worth the score cache. A
-    producer with real per-node state should define a dedicated ``Fork``
-    subclass instead (see :class:`_Branch` / :class:`_Leaf` below)."""
+    ``tile/085_warp_specialize``'s two-element WS fork): ``expand_fn(knobs)``
+    as a plain function of the fork's ``knobs`` so siblings share ONE function
+    instead of per-instance capture lambdas (the knob delta is the only thing
+    that varies)."""
 
     knobs: dict
     expand_fn: Callable[[dict], list[Op | Graph | Fork]]
-    score_fn: Callable[[dict], float] | None = None
     is_leaf: bool = False
 
     def expand(self) -> list[Op | Graph | Fork]:
         return self.expand_fn(self.knobs)
-
-    def score(self, cache: dict | None = None) -> float:  # noqa: ARG002
-        return self.score_fn(self.knobs) if self.score_fn is not None else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +139,10 @@ class Level:
 class _Tree[P]:
     """One tree's shared builder state — every :class:`_Branch` /
     :class:`_Leaf` node holds a reference back here instead of capturing
-    closures. All caching is the scorer's own job against the search-owned
-    ``cache`` it receives — repeat reads across overlapping branch
-    subgroups re-pay only the scorer's cache-key lookup."""
+    closures."""
 
     levels: tuple[Level, ...]
     materialize: Callable[[dict], Op | Graph]
-    score: Callable[[dict, dict | None], float]
 
     def build_level(self, group: list[dict], depth: int) -> list[Fork]:
         """Build the sibling Forks one level down from a branch at
@@ -215,11 +194,6 @@ class _Branch(Fork):
     def expand(self) -> list[Op | Graph | Fork]:
         return self.tree.build_level(self.group, self.next_depth)
 
-    def score(self, cache: dict | None = None) -> float:
-        # Max over the row subgroup — provably equal to eager
-        # max-of-children propagation without instantiating the subtree.
-        return max(self.tree.score(row, cache) for row in self.group)
-
 
 @dataclass(frozen=True)
 class _Leaf(Fork):
@@ -233,16 +207,12 @@ class _Leaf(Fork):
     def expand(self) -> list[Op | Graph | Fork]:
         return [self.tree.materialize(self.knobs)]
 
-    def score(self, cache: dict | None = None) -> float:
-        return self.tree.score(self.knobs, cache)
-
 
 def build_fork_tree(
     *,
     params: Sequence[dict],
     levels: Sequence[Level],
     materialize: Callable[[dict], Op | Graph],
-    score: Callable[[dict, dict | None], float],
 ) -> Fork:
     """Return the ROOT branch ``Fork`` of a lazy tree grouping the knob
     rows ``params`` per ``levels`` (outermost first); below the last
@@ -251,22 +221,16 @@ def build_fork_tree(
     enumerate has no fork point — skip the rule instead) and ``levels``
     non-empty; both raise ``ValueError``.
 
-    Nothing is built or scored at call time — the root is a
-    :class:`_Branch` over the whole row list; each branch's ``expand()``
-    builds the next level on demand, so greedy descent instantiates
-    O(path) Forks instead of one per row (~42k for a matmul-class
-    kernel) and MCTS pays one level per pop. Scores are equally lazy:
-    nothing is scored until the search reads a fork's score.
-
-    ``score`` receives the search-owned value-keyed ``cache`` dict
-    alongside the row (``None`` when read outside a search) and owns
-    its own keying — the partition planner keys each variant by
-    ``(ctx, merged knobs)``, so the per-row work transfers across the
-    trees of structurally identical kernels.
+    Nothing is built at call time — the root is a :class:`_Branch` over
+    the whole row list; each branch's ``expand()`` builds the next level
+    on demand, so greedy descent instantiates O(path) Forks instead of
+    one per row (~42k for a matmul-class kernel) and MCTS pays one level
+    per pop. Siblings are emitted in grouping order; ranking is the
+    search policy's job (the learned prior), not the tree's.
     """
     if not params:
         raise ValueError("build_fork_tree: params must be non-empty")
     if not levels:
         raise ValueError("build_fork_tree: at least one Level required")
-    tree = _Tree(levels=tuple(levels), materialize=materialize, score=score)
+    tree = _Tree(levels=tuple(levels), materialize=materialize)
     return _Branch(tree=tree, group=list(params), next_depth=0, knobs={})
