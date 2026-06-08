@@ -7,7 +7,7 @@ hand-coded :class:`AnalyticPrior` (the cold-start linear model over
 path. This module is just the offline *evaluation* glue — given a recorded golden
 it enumerates the shape's candidate rows and reports the golden's rank under a
 scorer (the ``AnalyticPrior`` by default; ``eval prior`` passes the learned one).
-Used by ``deplodock eval heuristic`` / ``eval prior`` and the prior diagnostics.
+Used by ``deplodock eval analytic`` / ``eval prior`` and the prior diagnostics.
 """
 
 from __future__ import annotations

@@ -1,12 +1,12 @@
-"""``deplodock eval <knobs|prior|heuristic>`` — evaluate the tuning machinery.
+"""``deplodock eval <knobs|prior|analytic>`` — evaluate the tuning machinery.
 
 Three subcommands:
 
 - ``eval knobs``     — print the registered knob schema, then (with a tune DB)
   per-knob **regret** + a knob-interaction matrix (the analysis below).
-- ``eval heuristic`` — evaluate the hardcoded prior-free heuristic
-  (``search/heuristic``) on the golden configs: the golden's **rank** in the
-  heuristic's enumeration order (the position the tuner's patience must reach).
+- ``eval analytic``  — evaluate the cold-start ``AnalyticPrior`` (``search/analytic``
+  is the golden-eval glue around it) on the golden configs: the golden's **rank**
+  under the prior over the enumeration (the position the tuner's patience must reach).
 - ``eval prior``     — evaluate the learned ``CatBoostPrior`` on the golden
   configs: the greedy pipeline pick vs golden (per-knob ``found/golden``), the
   golden's rank under the prior, and (``--features``) the regressor input vector.
@@ -61,11 +61,11 @@ _KERNEL_NAME_RE = re.compile(r"void\s+(\w+)\s*\(")
 
 
 def register_eval_command(subparsers) -> None:
-    """``deplodock eval <knobs|prior|heuristic>`` — evaluate the tuning knobs, the
-    learned prior, or the hardcoded heuristic against the golden configs."""
+    """``deplodock eval <knobs|prior|analytic>`` — evaluate the tuning knobs, the
+    learned prior, or the cold-start AnalyticPrior against the golden configs."""
     parser = subparsers.add_parser(
         "eval",
-        help="Evaluate tuning knobs / the learned prior / the heuristic against golden configs",
+        help="Evaluate tuning knobs / the learned prior / the analytic prior against golden configs",
     )
     sub = parser.add_subparsers(dest="eval_target", required=True)
 
@@ -76,11 +76,11 @@ def register_eval_command(subparsers) -> None:
     pk.set_defaults(func=handle_eval_knobs)
 
     ph = sub.add_parser(
-        "heuristic",
-        help="Evaluate the hardcoded prior-free heuristic on the golden configs (golden's rank in its enumeration order)",
+        "analytic",
+        help="Evaluate the cold-start AnalyticPrior on the golden configs (golden's rank under the prior over the enumeration)",
     )
     ph.add_argument("--kernel", help="Filter golden configs by name substring (e.g. 'square', 'q_proj').")
-    ph.set_defaults(func=handle_eval_heuristic)
+    ph.set_defaults(func=handle_eval_analytic)
 
     pp = sub.add_parser(
         "prior",
@@ -143,9 +143,9 @@ def handle_eval_knobs(args) -> None:
     _emit_interaction_matrix([r.knob for r in rows], interactions)
 
 
-def handle_eval_heuristic(args) -> None:
-    """``eval heuristic`` — the hardcoded prior-free heuristic's rank of each golden."""
-    _emit_heuristic_eval(args.kernel)
+def handle_eval_analytic(args) -> None:
+    """``eval analytic`` — the cold-start AnalyticPrior's rank of each golden."""
+    _emit_analytic_eval(args.kernel)
 
 
 def handle_eval_prior(args) -> None:
@@ -165,8 +165,8 @@ def handle_eval_golden(args) -> None:
     """``eval golden`` — the greedy pipeline pick vs recorded golden per config (the
     actionable "did the pipeline reproduce the golden knobs?" view). Watch it while
     iteratively tuning golden shapes one at a time (``deplodock tune --golden
-    <name>``). Use ``eval heuristic`` / ``eval prior`` for the heuristic rank and the
-    rank-under-prior diagnostics."""
+    <name>``). Use ``eval analytic`` / ``eval prior`` for the analytic-prior rank and
+    the learned rank-under-prior diagnostics."""
     if args.prior:
         from deplodock import config  # noqa: PLC0415
 
@@ -244,7 +244,7 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
     ``992_stamp_structural_features`` runs) + the golden tuning knobs. This is
     the model's *input* for that shape+config — note the shape enters only as the
     coarse ``S_ext_*`` extent products/maxes; the occupancy / CTA-count / reuse
-    terms that drive matmul perf (and that the heuristic computes) are NOT here."""
+    terms that drive matmul perf (the engineered ``D_*`` features) are NOT here."""
     import logging as _logging  # noqa: PLC0415
 
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
@@ -301,16 +301,16 @@ def _golden_configs(kernel_filter: str | None):
     return configs, max((len(g.name) for g in configs), default=10) + 2
 
 
-def _emit_heuristic_eval(kernel_filter: str | None) -> None:
-    """``eval heuristic`` body: the hardcoded prior-free heuristic
-    (``search/heuristic``) — no prior, no GPU, no measurements. One streamed line
-    per golden config with the golden's **rank** in the heuristic's enumeration
-    order (the position the tuner's patience must reach) + per-knob ``found/golden``
-    (mismatches red), summarized as median + top-k coverage."""
+def _emit_analytic_eval(kernel_filter: str | None) -> None:
+    """``eval analytic`` body: the cold-start ``AnalyticPrior`` (``search/analytic``
+    is the golden-eval glue around it) — no learned data, no GPU, no measurements.
+    One streamed line per golden config with the golden's **rank** under the prior
+    over the enumeration (the position the tuner's patience must reach) + per-knob
+    ``found/golden`` (mismatches red), summarized as median + top-k coverage."""
     from statistics import median  # noqa: PLC0415
 
     from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.heuristic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
 
     configs, nw = _golden_configs(kernel_filter)
     logger.info("  " + _cell("kernel", nw) + _cell("m/t", 6) + _cell("rank", 8) + _cell("pool", 9) + "knobs (found/golden; red = mismatch)")
@@ -340,7 +340,7 @@ def _emit_heuristic_eval(kernel_filter: str | None) -> None:
         n = len(ranks)
         cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50, 100))
         logger.info("")
-        logger.info("  heuristic golden rank — median=%d  %s", int(median(ranks)), cov)
+        logger.info("  analytic golden rank — median=%d  %s", int(median(ranks)), cov)
 
 
 def _emit_prior_eval(kernel_filter: str | None) -> None:

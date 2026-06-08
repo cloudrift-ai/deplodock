@@ -105,7 +105,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     ``H_opt=3``) the greedy ``compile`` / ``run`` actually queries with.
     ``kernel_filter`` restricts to golden configs whose name contains it."""
     from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search import heuristic  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search import analytic  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     # Index op groups by (free-dim product, reduce extent, is-matmul) so each
@@ -131,7 +131,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
         gold = {k: v for k, v in g.knobs.items() if k in (thread if g.dtype == "fp32" else warp)}
         # ``evaluate_golden`` ranks by descending score; the prior predicts latency
         # (lower = better), so negate to rank the predicted-fastest config first.
-        _, rank, pool = heuristic.evaluate_golden(
+        _, rank, pool = analytic.evaluate_golden(
             g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), scorer=lambda r, b=base: -prior.mean_score({**b, **r})
         )
         if rank is not None:

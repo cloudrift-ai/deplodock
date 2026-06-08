@@ -1,8 +1,8 @@
-"""Golden-config evaluation harness (``search/heuristic``) + the cold-start
+"""Golden-config evaluation harness (``search/analytic``) + the cold-start
 :class:`AnalyticPrior` it ranks with.
 
-CPU-only (no CUDA): ``heuristic`` reconstructs a matmul shape's enumeration and
-ranks it with a ``Prior`` (the :class:`AnalyticPrior` by default — the fixed
+CPU-only (no CUDA): ``search/analytic`` reconstructs a matmul shape's enumeration
+and ranks it with a ``Prior`` (the :class:`AnalyticPrior` by default — the fixed
 linear model over ``knob.knob_features`` that replaced the old
 ``score_matmul_thread`` / ``_priority_matmul_*`` heuristic). These pin the
 load-bearing properties — degenerate tiles score *above* (slower than) golden
@@ -14,7 +14,7 @@ without re-running the offline weight fit (that lives in
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline.search.heuristic import THREAD_KNOBS, pick_matmul
+from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, pick_matmul
 from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
 

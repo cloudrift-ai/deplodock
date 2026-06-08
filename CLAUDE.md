@@ -121,23 +121,23 @@ same worker.
 - `deplodock eval knobs [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the autotune DB:
   the registered knob schema, then (with a tune DB) per-knob regret + a knob-interaction matrix sorted by geomean
   impact (joins `perf` with `cuda_op`) — use the rankings to drive Fork-tree knob ordering in the planner.
-- `deplodock eval heuristic [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the hand-coded linear model
+- `deplodock eval analytic [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the hand-coded linear model
   over `knob.knob_features` that replaced `score_matmul_thread` / the `_priority_matmul_*` enumeration sort; the cold half
   of the ONE ranking path — see `compiler/pipeline/search/prior/`) on each `GOLDEN_CONFIGS` shape: the golden's **rank**
   under the prior over the shape's full enumeration (no GPU, no learned data, no measurements; the metric the tuner's
-  patience must reach) + per-knob `found/golden` (mismatches in red), summarized as median + top-k. The `heuristic.py`
-  module is now just the golden-eval glue (`evaluate_golden` / `pick_matmul`) around the prior (`eval heuristic` shows
-  the matmul goldens; the prior also ranks the cooperative-reduce / pointwise goldens). Weights fit offline by
-  `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
+  patience must reach) + per-knob `found/golden` (mismatches in red), summarized as median + top-k. The
+  `search/analytic.py` module is now just the golden-eval glue (`evaluate_golden` / `pick_matmul`) around the prior
+  (`eval analytic` shows the matmul goldens; the prior also ranks the cooperative-reduce / pointwise goldens). Weights fit
+  offline by `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
 - `deplodock eval prior [--prior PATH] [--kernel SUBSTR] [--features]` — evaluate the learned `CatBoostPrior` on the
   golden configs: the golden's rank under the prior over the full enumeration, then the greedy pipeline pick vs golden
   (per-knob `found/golden`). Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded) —
   **not** the `--db` tune DB. `--features` also prints the exact regressor input per golden config (`knob.knob_features`:
   `S_*` structural/shape + `H_*` regime + tuning knobs; note the shape enters only as coarse `S_ext_*` products/maxes,
-  so the occupancy/CTA/reuse terms `heuristic.py` computes are added as engineered `D_*` features).
+  so the occupancy/CTA/reuse terms the prior needs are added as engineered `D_*` features in `knob.knob_features`).
 - `deplodock eval golden [--prior PATH] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs recorded golden,
-  per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no heuristic-rank or
-  rank-under-prior diagnostics; use `eval heuristic` / `eval prior` for those). The view to watch while iteratively
+  per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
+  rank-under-prior diagnostics; use `eval analytic` / `eval prior` for those). The view to watch while iteratively
   tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
 - `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
   the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
