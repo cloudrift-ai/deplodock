@@ -358,7 +358,10 @@ def _emit_prior_eval(kernel_filter: str | None) -> None:
         logger.info("No fitted prior at %s — greedy falls to option-0 (run `deplodock tune`).", config.prior_path())
 
     configs = _golden_configs(kernel_filter)
-    _emit_prior_golden_check(configs)
+    # Deployable (-O3) perf of the prior's pick vs golden, read from the reservoir (no
+    # re-bench); empty when there's no tuned -O3 data (column shows '—').
+    perf = diagnostics.golden_deploy_perf(prior, kernel_filter) if prior.fitted else {}
+    _emit_prior_golden_check(configs, perf=perf)
 
 
 def _emit_prior_db_reachability(args) -> None:
@@ -402,7 +405,31 @@ def _mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def _emit_prior_golden_check(configs: list, *, title: bool = True) -> None:
+def _perf_color(ratio: float) -> str:
+    """``vs gold`` colour: green = pick beats golden by >3%, **default (no colour)**
+    within 3% (the expected outcome — shouldn't stand out), yellow = up to 20% slower,
+    red = worse."""
+    if ratio < 0.97:
+        return _GREEN
+    if ratio <= 1.03:
+        return ""
+    return _YELLOW if ratio <= 1.2 else _RED
+
+
+def _perf_cell(perf: dict | None, name: str) -> tuple[str, str] | None:
+    """The ``vs gold`` lead cell for one shape: ``pick_us/golden_us`` as ``N.NNx``
+    (green >3% faster, white within 3%, yellow/red slower), ``—`` when the shape has no
+    -O3 measurement. ``None`` when ``perf`` wasn't supplied (column absent — e.g.
+    ``eval golden``)."""
+    if perf is None:
+        return None
+    ratio = perf.get(name)
+    if ratio is None:
+        return ("—", "")
+    return (f"{ratio:.2f}x", _perf_color(ratio))
+
+
+def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | None = None) -> None:
     """Greedy fork pick through the tile pipeline vs recorded golden. The pick reads
     the learned-prior JSON (``config.prior_path()``: ``DEPLODOCK_PRIOR_FILE`` /
     ``--prior``); option-0 with no fitted prior. Stops at the tile dialect (every
@@ -473,6 +500,9 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True) -> None:
                 knob_total[k] = knob_total.get(k, 0) + 1
                 knob_match[k] = knob_match.get(k, 0) + (got.get(k) == gold[k])
             lead = [name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
+            pc = _perf_cell(perf, name)
+            if pc is not None:
+                lead.append(pc)
             entries.append(("row", lead, gold, got))
     finally:
         for lg, lv in zip(quiet, prev, strict=True):
@@ -481,8 +511,18 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True) -> None:
     # rows, plus the exactly-reproduced row count in the m/t column.
     total_cells = {k: (f"{knob_match[k]}/{knob_total[k]}", knob_match[k] != knob_total[k]) for k in knob_total}
     total_lead = ["TOTAL", (f"{n_match}/{n_rows}", _ratio_color(n_match, n_rows))]
+    if perf is not None:
+        vals = list(perf.values())
+        if vals:
+            import statistics  # noqa: PLC0415
+
+            geo = statistics.geometric_mean(vals)
+            total_lead.append((f"{geo:.2f}x", _perf_color(geo)))
+        else:
+            total_lead.append(("—", ""))
     entries.append(("total", total_lead, total_cells))
-    _emit_golden_table([Col("kernel"), Col("m/t")], entries, "knobs (found/golden)")
+    lead_cols = [Col("kernel"), Col("m/t")] + ([Col("vs gold", "r")] if perf is not None else [])
+    _emit_golden_table(lead_cols, entries, "knobs (found/golden)")
 
 
 @dataclass(frozen=True)
