@@ -218,23 +218,28 @@ def _ratio_color(matched: int, total: int) -> str:
     return _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
 
 
-def _golden_knob_rows(pairs: list[tuple[dict, dict]]) -> list[dict[str, tuple[str, bool]]]:
-    """Per-row ``{knob: (value_text, red?)}`` for golden ``(gold, got)`` pairs: the value is
-    ``found/golden`` (no ``NAME=`` prefix — :func:`~deplodock.commands.table.knob_columns`
-    puts the name in the column header), red where the two differ."""
-    return [{k: (f"{got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold} for gold, got in pairs]
+def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
+    """``{knob: (value_text, red?)}`` for one renderable entry (no ``NAME=`` prefix —
+    :func:`~deplodock.commands.table.knob_columns` puts the name in the column header).
+    A ``("row", lead, gold, got)`` entry renders ``found/golden`` per knob, red where the
+    two differ; a ``("total", lead, cells)`` entry carries its cells pre-built."""
+    if entry[0] == "total":
+        return entry[2]
+    _, _, gold, got = entry
+    return {k: (f"{got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold}
 
 
 def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str) -> None:
     """Stream a golden table via ``logger``: ``lead_cols`` (kernel, m/t, …) plus the aligned
     ``found/golden`` knob columns (knob name in the header, value-only cells). ``entries``
-    preserves config order — each is ``("row", lead_cells, gold, got)`` or
+    preserves config order — each is ``("row", lead_cells, gold, got)``,
+    ``("total", lead_cells, knob_cells)`` (a pre-built aggregate row), or
     ``("err", kernel_name, message)``; an error row prints its kernel name (aligned to the
     kernel column) then the raw message in place. ``caption`` is printed above the table."""
-    rows = [e for e in entries if e[0] == "row"]
-    kcols, kcells = knob_columns(_golden_knob_rows([(g, got) for _, _, g, got in rows]))
+    body = [e for e in entries if e[0] != "err"]
+    kcols, kcells = knob_columns([_knob_cells(e) for e in body])
     columns = lead_cols + kcols
-    data = [lead + kc for (_, lead, _, _), kc in zip(rows, kcells, strict=True)]
+    data = [e[1] + kc for e, kc in zip(body, kcells, strict=True)]
     # Floor the kernel column to the widest error-row name so error rows align with the table.
     floor = [max((len(e[1]) for e in entries if e[0] == "err"), default=0)] + [0] * (len(columns) - 1)
     kernel_w = col_widths(columns, data, floor)[0]
@@ -401,10 +406,14 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True) -> None:
     """Greedy fork pick through the tile pipeline vs recorded golden. The pick reads
     the learned-prior JSON (``config.prior_path()``: ``DEPLODOCK_PRIOR_FILE`` /
     ``--prior``); option-0 with no fitted prior. Stops at the tile dialect (every
-    knob fork resolves there: no codegen / nvcc). Rows are collected, then printed
-    with column-aligned ``found/golden`` knobs (canonical order). ``title`` prints
-    the ``Golden reproduction — … prior: <path>`` banner (``eval prior``);
-    ``eval golden`` passes ``title=False`` for just the table."""
+    knob fork resolves there: no codegen / nvcc). One row per shape (configs sharing a
+    name share a snippet → one greedy pick): the pick is scored against the shape's
+    *closest* recorded golden (most knobs reproduced), so multiple goldens for a shape
+    don't duplicate rows. A trailing ``TOTAL`` row carries per-knob match counts over the
+    deduped rows + the exactly-reproduced row count. Rows print with column-aligned
+    ``found/golden`` knobs (canonical order). ``title`` prints the
+    ``Golden reproduction — … prior: <path>`` banner (``eval prior``); ``eval golden``
+    passes ``title=False`` for just the table."""
     import logging as _logging  # noqa: PLC0415
 
     from deplodock import config  # noqa: PLC0415
@@ -438,26 +447,42 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True) -> None:
     prev = [lg.level for lg in quiet]
     for lg in quiet:
         lg.setLevel(_logging.WARNING)
-    n_match = 0
+    # Group configs sharing a shape (same name → same snippet → same greedy pick) so the
+    # table carries one row per shape, not one per recorded golden. Each shape's pick is
+    # compared against its *closest* golden (the config it reproduces the most knobs of).
+    groups: dict[str, list] = {}
+    for g in configs:
+        groups.setdefault(g.name, []).append(g)
+    n_match = n_rows = 0
+    knob_match: dict[str, int] = {}  # deduped rows where the pick matched this knob
+    knob_total: dict[str, int] = {}  # deduped rows whose golden carries this knob
     entries: list[tuple] = []  # ("row", lead_cells, gold, got) | ("err", name, message)
     try:
-        for g in configs:
-            gold = tunable(g.knobs)
+        for name, group in groups.items():
             try:
-                got = picked(g.snippet())
+                got = picked(group[0].snippet())
             except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
-                entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
+                entries.append(("err", name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
                 continue
-            matched = sum(1 for k in gold if got.get(k) == gold[k])
+            # Closest golden: most knobs reproduced, tie-broken by match fraction.
+            scored = [(sum(1 for k in gd if got.get(k) == gd[k]), gd) for gd in (tunable(c.knobs) for c in group)]
+            matched, gold = max(scored, key=lambda t: (t[0], t[0] / len(t[1]) if t[1] else 1.0))
             n_match += matched == len(gold)
-            lead = [g.name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
+            n_rows += 1
+            for k in gold:
+                knob_total[k] = knob_total.get(k, 0) + 1
+                knob_match[k] = knob_match.get(k, 0) + (got.get(k) == gold[k])
+            lead = [name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
             entries.append(("row", lead, gold, got))
     finally:
         for lg, lv in zip(quiet, prev, strict=True):
             lg.setLevel(lv)
+    # Totals row (replaces a trailing summary line): per-knob match counts over the deduped
+    # rows, plus the exactly-reproduced row count in the m/t column.
+    total_cells = {k: (f"{knob_match[k]}/{knob_total[k]}", knob_match[k] != knob_total[k]) for k in knob_total}
+    total_lead = ["TOTAL", (f"{n_match}/{n_rows}", _ratio_color(n_match, n_rows))]
+    entries.append(("total", total_lead, total_cells))
     _emit_golden_table([Col("kernel"), Col("m/t")], entries, "knobs (found/golden)")
-    logger.info("")
-    logger.info("  pipeline reproduced golden knobs exactly: %d/%d", n_match, len(configs))
 
 
 @dataclass(frozen=True)
