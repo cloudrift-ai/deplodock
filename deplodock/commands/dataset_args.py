@@ -1,7 +1,8 @@
 """Shared ``--dataset`` CLI vocabulary for the commands that consume measurement
-data (``eval`` today): one place registers the source flags (``--dataset`` /
-``--db`` / ``--kernel`` / ``--min-variants``), one helper publishes ``--prior``, and
-one guard fails loud on a degenerate source. Handlers then build the actual
+data (``eval`` for analysis; ``tune --dataset golden`` to tune every golden shape):
+one place registers the source flags (``--dataset`` / ``--db`` / ``--kernel`` /
+``--min-variants``), one helper publishes ``--prior``, and one guard fails loud on a
+degenerate source. Handlers then build the actual
 :class:`~deplodock.compiler.pipeline.search.data.Dataset` via its ``from_golden`` /
 ``from_db`` adapters — so every command selects a golden / DB dataset (and a subset)
 through the same vocabulary instead of reimplementing golden filtering or opening

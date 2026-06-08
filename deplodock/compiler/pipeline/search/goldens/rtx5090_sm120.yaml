@@ -6,16 +6,8 @@ configs:
     M: 512
     N: 512
     K: 512
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, BK: 64, SPLITK: 1, BR: 1, FK: 1, STAGE: '11', RING: 2, WARPSPEC: false}
-    deplodock_us: 12.3
-    cublas_us: 14.5
-  - kernel: matmul
-    name: square.512
-    M: 512
-    N: 512
-    K: 512
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 4, BK: 32, SPLITK: 1, BR: 1, FK: 1, STAGE: '11', RING: 4}
-    deplodock_us: 12.3
+    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, BK: 64, SPLITK: 1, BR: 1, FK: 1, STAGE: '11', RING: 3}
+    deplodock_us: 10.2
     cublas_us: 14.5
   - kernel: matmul
     name: square.1024
@@ -109,8 +101,8 @@ configs:
     M: 32
     N: 2048
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 3}
-    deplodock_us: 10.3
+    knobs: {BN: 16, BM: 8, FM: 2, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 4}
+    deplodock_us: 8.3
     cublas_us: 12.4
   - kernel: matmul
     name: qwen3_06b.kv_proj.s32
@@ -165,8 +157,8 @@ configs:
     M: 128
     N: 2048
     K: 1024
-    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, WARPSPEC: false}
-    deplodock_us: 26.3
+    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3}
+    deplodock_us: 18.4
     cublas_us: 20.9
   - kernel: matmul
     name: qwen3_06b.kv_proj.s128
@@ -245,16 +237,8 @@ configs:
     M: 512
     N: 3072
     K: 1024
-    knobs: {BN: 32, BM: 16, FM: 6, FN: 4, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, WARPSPEC: false}
-    deplodock_us: 83.4
-    cublas_us: 82.2
-  - kernel: matmul
-    name: qwen3_06b.gate_up_proj.s512
-    M: 512
-    N: 3072
-    K: 1024
     knobs: {BN: 16, BM: 8, FM: 10, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2, WARPSPEC: false}
-    deplodock_us: 82.6
+    deplodock_us: 65.5
     cublas_us: 82.2
   - kernel: matmul
     name: qwen3_06b.down_proj.s512

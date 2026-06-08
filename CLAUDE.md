@@ -113,6 +113,19 @@ same worker.
   the ~0.8 s JIT is worth paying for the deployable comparison). `--warmup`/`--iters`/`--seed` mirror `run`. When a
   dump dir is set (`--dump-dir`/`DEPLODOCK_DUMP_DIR`) it also writes an HTML per-kernel chart to
   `<dump-dir>/kernels.html` (+ best-effort `.png`).
+- `deplodock tune --dataset golden [--kernel SUBSTR] [--clean] [...]` — tune **every golden shape** (the built-in
+  equivalent of looping `--golden NAME` over `GOLDEN_CONFIGS`; `--kernel SUBSTR` narrows by name). Single-shape and
+  golden-set tune go through the **same** codepath: `handle_tune` builds a list of `(label, code, input)` targets via
+  `_tune_targets` — the **only** place the two diverge (one target from `--code`/positional/`--golden NAME`, or the
+  whole golden set from `--dataset golden`) — then loops, calling the shared `_tune_one` per target. The loop runs
+  **in-process** with one shared tune DB, one bench worker, and the in-memory learned prior (no per-shape re-import):
+  benching is already subprocess-isolated (`_tune_backend` sets `bench_wall_timeout_s` → each variant runs in a
+  SIGKILL-able `_bench_worker`), so a wedged kernel dies with its worker and the parent stays clean shape-to-shape. A
+  saturated-queue `RuntimeError` (dirty parent stream) aborts the remaining sweep (per-op bests are already in the DB; a
+  re-run resumes). `--clean` clears the DB + prior **once** up front, then accumulates across shapes; `--bench`
+  re-benches each tuned shape at -O3 (works per target — `os._exit` only fires at process end). `--dataset db` is
+  rejected (DB rows have no shape to tune). Reuses the shared `--dataset` vocabulary from `commands/dataset_args.py`;
+  drives the `update-goldens` skill's tune step.
 - `deplodock run <model> [--layer N] [--seq-len N] [--bench] [--target sm_NN]` — trace + compile + execute a whole HuggingFace model (or one `--layer`) on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock end-to-end against the real torch module. Same positional / `--layer` / `--seq-len` grammar as `compile` / `tune`. NOTE: greedy `run` / `compile` pick forks from the global `Prior` (`FallbackPrior`: learned `CatBoostPrior` once trained, else the cold `AnalyticPrior`; `mean_score` argmin — lowest predicted latency), not the DB — so `run` numbers reflect the prior trained by a prior `tune` (and a sensible analytic cold pick before any `tune`). A `.json` positional behaves like `--ir`.
 - `deplodock run --golden NAME [--bench]` — run the named golden config (shorthand for `--code <its snippet>`, same flag as `tune --golden`; unknown NAME lists the names). With `--bench` each recorded golden for the kernel's shape is **compiled with its knobs pinned and benched live this run** (`_bench_golden_variants`), then printed as a row labeled `golden NAME` in the Kernel column (its own measured µs / grid / block / smem / regs / occ; `%` column `--`, since it's not part of the deplodock TOTAL) right beneath the matching greedy-pick kernel — a real A/B, not the stored number. The knob columns are aligned across rows and colored like `deplodock eval` (shared `commands/table` — the knob name is the column header, cells carry the value only): a golden cell is red where it differs from the greedy pick. A golden NAME may map to **multiple** configs (one shape can carry several knob sets, e.g. a newly found faster variant beside the old); each is benched and shown (each re-traces a fresh graph — a frontend graph can't be re-compiled in place).
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
@@ -139,7 +152,12 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   offline by `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
 - `deplodock eval prior [--prior PATH] [--dataset {golden,db}] [--db PATH] [--kernel SUBSTR] [--features]` — evaluate the
   learned `CatBoostPrior`. Default `--dataset golden`: the golden's rank under the prior over the full enumeration, then
-  the greedy pipeline pick vs golden (per-knob `found/golden`). `--dataset db` instead reports the prior's pick
+  the greedy pipeline pick vs golden (per-knob `found/golden`) with a **`vs gold`** perf column — the deployable (-O3)
+  latency of the prior's predicted-best **measured** config over the golden's recorded `deplodock_us`, read from the
+  prior's reservoir with **no re-bench** (`diagnostics.golden_deploy_perf`). Both sides are -O3 (tuning re-benches every
+  winner at `H_opt=3`), so the ratio is a real deployable comparison (<1.0 = the prior's pick beats golden); a shape with
+  no -O3 reservoir row shows `—`. The shape key splits on `S_dtype_f32`, so an fp32 square and its `.fp16` twin (same
+  free-dim product / reduce extent) don't merge. `--dataset db` instead reports the prior's pick
   **reachability** over the tune DB's *measured* variants (does the prior recover each op's measured-best leaf?) — the
   orthogonal counterpart to the golden views, reusing `diagnostics.reachability` over `Dataset.from_db().group_by_op()`.
   Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also

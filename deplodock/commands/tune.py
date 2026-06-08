@@ -20,6 +20,7 @@ from deplodock.commands.compile import (
     resolve_tune_db,
     setup_pipeline_runtime,
 )
+from deplodock.commands.dataset_args import add_dataset_args, require_source
 from deplodock.compiler.pipeline import TuningSearch
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,10 @@ def register_tune_command(subparsers):
     )
     add_input_args(parser)
     add_golden_arg(parser)
+    # ``--dataset golden`` tunes every golden shape in sequence (the built-in
+    # equivalent of looping ``--golden NAME`` over GOLDEN_CONFIGS); ``--kernel``
+    # narrows to a name substring. Default None → ordinary single-op tune.
+    add_dataset_args(parser, default=None)
     parser.add_argument("--output", "-o", help="Output path for the tuned CUDA IR")
     parser.add_argument(
         "--patience",
@@ -129,92 +134,42 @@ def _tune_offline(args):
     sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
 
 
-def handle_tune(args):
-    resolve_golden_arg(args)  # --golden NAME → --code <snippet>
-    if args.code and args.input:
-        logger.error("--code and positional input are mutually exclusive")
-        sys.exit(2)
-    if not args.code and not args.input:
-        # No op to tune → offline mode: refit the learned prior on its persisted
-        # dataset and print diagnostics (reachability, calibration, golden coverage).
-        _tune_offline(args)
-        return
+def _tune_backend():
+    """The autotune-sweep ``CudaBackend``: benches each variant in a SIGKILL-able
+    ``_bench_worker`` **subprocess** (``bench_wall_timeout_s`` set → the isolated
+    path in ``backend.benchmark``), so a wedged kernel dies with the worker and the
+    **parent** CUDA stream stays clean. Tight per-variant budgets: tune benches
+    isolated single kernels at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample
+    and the 6 s wall SIGKILLs any runaway."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
 
+    return CudaBackend(bench_compile_timeout_s=2.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=6.0)
+
+
+def _tune_one(args, *, backend, db, ctx, dump):
+    """Trace ``args.code`` / ``args.input`` and run the two-level tune on that one
+    graph; return ``(result, bench_bundle)``. Manages the live progress bar (closed
+    in ``finally``) and prints the per-op ``done`` summary. Lets ``KeyboardInterrupt``
+    and the saturated-queue ``RuntimeError`` (dirty parent stream) **propagate** so
+    the caller decides how to exit — called once per target by ``handle_tune``'s
+    loop (one shape or the whole golden set). Benching itself is subprocess-isolated
+    (see ``_tune_backend``), so the parent process is safe to reuse shape-to-shape."""
     import time
 
     from deplodock.commands.tune_progress import TuneProgress
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.search import SearchDB
     from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
 
-    setup_pipeline_runtime(args)
-    # tune compiles at -Xcicc -O1 by default to dodge a cicc/LLVM blowup on big
-    # unrolled register-tile kernels (up to ~200x faster compile). The trade-off:
-    # -O1 latencies are a RANKING signal, NOT -O3-optimal — reduction / attention
-    # kernels can run 1.5-3x slower. Re-bench the winner at -O3 (``tune --bench``,
-    # or ``deplodock run --bench``) for deployable numbers.
-    nvcc_flags = apply_nvcc_flags(args, default="-Xcicc -O1")
-    if "-O1" in nvcc_flags or "-O0" in nvcc_flags:
-        logger.info(
-            "tune compiling at cicc %s — latencies are a RANKING signal, not -O3-optimal",
-            "-O1" if "-O1" in nvcc_flags else "-O0",
-        )
-
     graph, _, bench_bundle = load_or_trace(args)
-
-    # ``--bench`` benches the assembled tuned graph against the **real torch module**
-    # end-to-end (eager / torch.compile / deplodock). ``bench_bundle`` carries the
-    # runnable module + its trace-time example inputs from ``load_or_trace`` — None
-    # only when the input was an ``--ir`` JSON file (no module). With a bundle we
-    # use the real module; without, the full-model bench is skipped (only the
-    # per-kernel table runs).
-
-    dump = CompilerDump.resolve(args.dump_dir)
-    # Per-kernel bench reads the ``.torch.json`` provenance reproducers the assembled
-    # run emits into the dump dir. When --bench is set but no dump dir was given, route
-    # them through a temp dir (HTML is only written when the user gave a real
-    # --dump-dir / DEPLODOCK_DUMP_DIR).
-    html_dir = dump.dir if dump is not None else None
-    tmp_dump_dir = None
-    if args.bench and dump is None:
-        import tempfile
-
-        tmp_dump_dir = Path(tempfile.mkdtemp(prefix="deplodock-tune-bench-"))
-        dump = CompilerDump(dir=tmp_dump_dir)
     if dump:
         dump.dump_input_graph(graph)
-
-    # Tight per-variant budgets: tune benches isolated single kernels compiled
-    # at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample and the 6 s wall
-    # SIGKILLs any runaway. (nvcc compiles eagerly in ``CompiledProgram.build``,
-    # so the compile budget now genuinely bounds compilation — unlike cupy's
-    # lazy NVRTC, where only the wall did.)
-    _compile_timeout = 2.0
-    _run_timeout = 2.0
-    backend = CudaBackend(
-        bench_compile_timeout_s=_compile_timeout,
-        bench_run_timeout_s=_run_timeout,
-        bench_wall_timeout_s=_compile_timeout + _run_timeout + 2.0,
-    )
-    # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
-    db_path = resolve_tune_db()
-    if args.clean:
-        _clean_caches(db_path)
-    db = SearchDB(path=db_path)
-    logger.info("Tuning DB: %s", db_path)
-
-    # Live progress bar — default verbosity on a tty only. Disabled under -v
-    # (the [tune] INFO lines show progress instead) and -q (errors only), and
-    # when stderr is redirected (no \r smearing in piped logs).
+    # Live progress bar — default verbosity on a tty only. Disabled under -v (the
+    # [tune] INFO lines show progress instead), -q (errors only), and when stderr is
+    # redirected (no \r smearing in piped logs).
     progress = TuneProgress(
         enabled=getattr(args, "verbose", 0) == 0 and not getattr(args, "quiet", False) and sys.stderr.isatty(),
     )
-
     patience = args.patience if args.patience is not None else config.tune_patience(50)
     explore_eps = args.explore_eps if args.explore_eps is not None else config.tune_eps(0.0)
-    ctx = Context.probe()
     t0 = time.monotonic()
     try:
         result = run_two_level_tune(
@@ -229,61 +184,148 @@ def handle_tune(args):
             progress=progress,
             prior_seed=args.seed,
         )
-    except KeyboardInterrupt:
-        # Manual abort: per-op bests already landed in the DB as they were
-        # measured, so a re-run resumes. Nothing structured to print here.
+    finally:
         progress.close()
-        sys.stderr.write("\n[tune] interrupted (Ctrl-C) — partial per-op results are persisted in the DB\n")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
-    except RuntimeError as exc:
-        # An autotune-internal raise (bench watchdog couldn't bail in time
-        # because the GPU queue is saturated). The CUDA stream is dirty —
-        # bypass Python cleanup so cupy's atexit doesn't deadlock on the
-        # still-running launch.
-        progress.close()
-        sys.stderr.write(f"\n[tune] aborted: {exc}\n")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(1)
-    progress.close()
-
-    elapsed = time.monotonic() - t0
-    sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {elapsed:.1f}s\n")
+    sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {time.monotonic() - t0:.1f}s\n")
     for block in result.prior_summaries:  # learned-prior pick-quality sanity stats
         sys.stderr.write(block + "\n")
-    if result.best_reward is None:
-        sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
+    return result, bench_bundle
 
-    # Only write the assembled (DB-best) CUDA source when ``--output`` is
-    # given. Dumping a multi-kB kernel to stdout after a long tune is noise —
-    # callers that want it can pass ``-o`` (or re-run ``deplodock compile``,
-    # which replays the same cached forks).
-    if args.output and result.assembled is not None:
-        Path(args.output).write_text(format_stage(result.assembled, "cuda"))
-        logger.info("Saved cuda IR: %s", args.output)
 
-    if args.bench and result.assembled is not None:
-        _run_bench(args, bench_bundle, result.assembled, dump, html_dir=html_dir)
-    if tmp_dump_dir is not None:
-        import shutil
-
-        shutil.rmtree(tmp_dump_dir, ignore_errors=True)
-
-    # A bench-timeout abandons its NVRTC worker thread (see
-    # ``_benchmark_with_timeout``) which is still holding the CUDA
-    # context. Python finalization (cupy memory-pool teardown, CUDA
-    # context release) deadlocks against that live worker, so the
-    # process hangs after all output has been written. Skip Python's
-    # cleanup with ``os._exit`` once we know output is flushed — there
-    # is nothing left to do and the daemon thread dies with the process.
+def _exit_flushed(code: int) -> None:
+    """Flush stdio and ``os._exit`` — the tune teardown skips Python finalization
+    because a bench-timeout can leave a daemon NVRTC worker thread holding the CUDA
+    context, which deadlocks cupy's atexit pool teardown."""
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    os._exit(code)
+
+
+def _tune_targets(args) -> list[tuple[str, str | None, str | None]]:
+    """The ``(label, code, input)`` shapes this invocation tunes — the **only** place
+    golden and non-golden diverge. ``--dataset golden`` expands to every recorded
+    golden shape (deduped by name, ``--kernel SUBSTR`` narrowing); otherwise it's the
+    single ``--code`` / positional input / ``--golden NAME`` target. ``handle_tune``
+    then loops over this list uniformly, so one shape and the whole golden set share
+    one codepath. Exits 2 on a degenerate / conflicting source."""
+    if getattr(args, "dataset", None):
+        from deplodock.compiler.pipeline.search.data import Dataset
+
+        require_source(args, {"golden"}, "tune --dataset only supports 'golden' (db rows have no shape to tune)")
+        if args.code or args.input or getattr(args, "golden", None):
+            logger.error("--dataset golden is mutually exclusive with --code / positional input / --golden NAME")
+            sys.exit(2)
+        # Configs under one name share the shape, so any one's snippet is interchangeable.
+        by_name: dict[str, str] = {}
+        for s in Dataset.from_golden(kernel=args.kernel).samples:
+            by_name.setdefault(s.name, s.snippet)
+        if not by_name:
+            logger.error("no golden shapes matched --kernel %r", args.kernel)
+            sys.exit(2)
+        return [(name, code, None) for name, code in by_name.items()]
+
+    resolve_golden_arg(args)  # --golden NAME → args.code
+    if args.code and args.input:
+        logger.error("--code and positional input are mutually exclusive")
+        sys.exit(2)
+    return [(args.code or args.input, args.code, args.input)]
+
+
+def _bench_dump(args):
+    """Per-target dump dir. ``--bench`` reads the ``.torch.json`` provenance
+    reproducers from a dump dir; route through a temp dir when no ``--dump-dir`` was
+    given (HTML is only written for a real ``--dump-dir`` / ``DEPLODOCK_DUMP_DIR``).
+    Returns ``(dump, tmp_dir_or_None)``."""
+    from deplodock.compiler.pipeline.dump import CompilerDump
+
+    dump = CompilerDump.resolve(args.dump_dir)
+    if args.bench and dump is None:
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp(prefix="deplodock-tune-bench-"))
+        return CompilerDump(dir=tmp), tmp
+    return dump, None
+
+
+def handle_tune(args):
+    if not getattr(args, "dataset", None) and not args.code and not args.input and not getattr(args, "golden", None):
+        # No op to tune → offline mode: refit the learned prior on its persisted
+        # dataset and print diagnostics (reachability, calibration, golden coverage).
+        _tune_offline(args)
+        return
+
+    targets = _tune_targets(args)  # one shape, or the whole golden set — same loop below
+
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline.search import SearchDB
+
+    setup_pipeline_runtime(args)
+    # tune compiles at -Xcicc -O1 by default to dodge a cicc/LLVM blowup on big
+    # unrolled register-tile kernels (up to ~200x faster compile). The trade-off:
+    # -O1 latencies are a RANKING signal, NOT -O3-optimal — reduction / attention
+    # kernels can run 1.5-3x slower. Re-bench the winner at -O3 (``tune --bench``,
+    # or ``deplodock run --bench``) for deployable numbers.
+    nvcc_flags = apply_nvcc_flags(args, default="-Xcicc -O1")
+    if "-O1" in nvcc_flags or "-O0" in nvcc_flags:
+        logger.info(
+            "tune compiling at cicc %s — latencies are a RANKING signal, not -O3-optimal",
+            "-O1" if "-O1" in nvcc_flags else "-O0",
+        )
+
+    db_path = resolve_tune_db()  # ``DEPLODOCK_TUNE_DB`` env overrides the default path
+    if args.clean:  # one shape or many: a fresh sweep clears once, then accumulates
+        _clean_caches(db_path)
+    db = SearchDB(path=db_path)
+    logger.info("Tuning DB: %s", db_path)
+    # One bench worker (subprocess-isolated) + one prior shared across every target —
+    # benching can't dirty the parent, so a single long-lived process loops cleanly.
+    backend = _tune_backend()
+    ctx = Context.probe()
+
+    multi = len(targets) > 1
+    if multi:
+        sys.stderr.write(f"[tune] {len(targets)} shape(s) into {db_path}{' (--clean)' if args.clean else ''}\n")
+    done = 0
+    for i, (label, code, inp) in enumerate(targets):
+        args.code, args.input = code, inp
+        if multi:
+            sys.stderr.write(f"\n[tune] === {i + 1}/{len(targets)}: {label} → {code} ===\n")
+        dump, tmp_dump = _bench_dump(args)
+        try:
+            result, bench_bundle = _tune_one(args, backend=backend, db=db, ctx=ctx, dump=dump)
+        except KeyboardInterrupt:
+            # Per-op bests already landed in the DB as they were measured, so a re-run resumes.
+            sys.stderr.write(f"\n[tune] interrupted{f' at {label}' if multi else ''} — partial per-op results are in the DB\n")
+            _exit_flushed(0)
+        except RuntimeError as exc:
+            # Bench watchdog couldn't bail (GPU queue saturated) → the parent CUDA stream
+            # is dirty, so the rest of the sweep can't run reliably here. Abort (the DB has
+            # the per-op bests; a re-run resumes). os._exit bypasses the cupy atexit deadlock.
+            sys.stderr.write(f"\n[tune] aborted{f' at {label}' if multi else ''}: {exc}\n")
+            _exit_flushed(1)
+
+        if result.best_reward is None:
+            if not multi:
+                sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
+        else:
+            # Only write the assembled CUDA when ``--output`` is given (a multi-kB dump
+            # to stdout after a long tune is noise; ``-o`` or ``compile`` replays it).
+            if args.output and result.assembled is not None:
+                Path(args.output).write_text(format_stage(result.assembled, "cuda"))
+                logger.info("Saved cuda IR: %s", args.output)
+            if args.bench and result.assembled is not None:
+                _run_bench(args, bench_bundle, result.assembled, dump, html_dir=(dump.dir if dump and tmp_dump is None else None))
+        if tmp_dump is not None:
+            import shutil
+
+            shutil.rmtree(tmp_dump, ignore_errors=True)
+        done += 1
+
+    if multi:
+        sys.stderr.write(f"\n[tune] done: {done}/{len(targets)} shape(s)\n")
+    _exit_flushed(0)
+
+    _exit_flushed(0)
 
 
 def _clean_caches(db_path) -> None:

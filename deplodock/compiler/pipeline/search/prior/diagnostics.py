@@ -139,6 +139,50 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, float]:
+    """Per golden shape, ``pick_us / golden_us`` — the deployable (-O3) latency of the
+    prior's predicted-best **measured** config over the golden's recorded latency, read
+    from the prior's reservoir with **no re-bench**.
+
+    Tuning re-benches every winner at -O3 (``H_opt=3``) and feeds it to the prior, so
+    each tuned shape's best config has a deployable row in the reservoir. For each
+    golden shape we take the op group's ``H_opt=3`` rows, pick the one the prior ranks
+    fastest (``mean_score`` argmin), and divide its measured latency by the golden's
+    recorded ``deplodock_us`` (also -O3 → same regime, so the ratio is a real
+    deployable speed comparison; <1.0 = the prior's pick is faster than golden). Shapes
+    with no -O3 reservoir row are omitted (the caller renders ``—``). The reservoir is
+    used rather than the raw ``perf`` table because only it carries the ``H_*`` regime
+    columns needed to isolate the deployable measurements."""
+    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+
+    # Deployable (-O3) measured rows per op group, indexed by the shape signature
+    # (free-dim product, reduce extent, is-fp32). The dtype flag must use the
+    # ``S_dtype_f32`` feature, not ``S_n_mma``: an fp32 square and its ``.fp16`` twin
+    # share (free_prod, reduce) and the fp16 row may not carry an mma marker, so keying
+    # on mma would merge them and steal the fp16 latency for the fp32 row.
+    index: dict[tuple, list] = {}
+    for sig, samples in Dataset.from_prior(prior).group_by_op().items():
+        o3 = [s for s in samples if int(s.all_knobs().get("H_opt", 0)) == 3]
+        if not o3:
+            continue
+        d = dict(sig)
+        key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_dtype_f32", 0) > 0)
+        index.setdefault(key, []).extend(o3)
+
+    out: dict[str, float] = {}
+    for g in GOLDEN_CONFIGS:
+        if not isinstance(g, MatmulGoldenConfig) or not g.deplodock_us:
+            continue
+        if kernel_filter and kernel_filter not in g.name:
+            continue
+        leaves = index.get((g.M * g.N, g.K, g.dtype == "fp32"))
+        if not leaves:
+            continue
+        pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
+        out[g.name] = pick.latency_us / g.deplodock_us
+    return out
+
+
 def report(prior) -> str:
     """The full offline diagnostics block for a (re)fit prior."""
     dataset = prior._dataset
