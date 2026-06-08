@@ -149,17 +149,22 @@ def test_inner_reward_is_separable_not_a_product() -> None:
 
 
 def test_inner_reward_rerun_is_replay_dominated() -> None:
-    """A second pass at the same patience converges to the SAME outcome and is
-    replay-dominated: the warm perf cache serves almost every terminal, so the
-    rerun benches far fewer variants than the cold run. It is NOT exactly zero —
-    ranking moved from the old priority-sorted enumeration to the ``Prior``
-    (``AnalyticPrior`` cold), so the cold search now walks a real prior-ranked
-    frontier instead of finding the best at option-0; that frontier interacts
-    with the cache's cross-op kernel sharing, so a warm rerun wanders into a
-    handful of new frontier variants while replaying the rest. The outcome (the
-    per-op best total) is rock-stable regardless — that's the invariant that
-    matters; the exact bench count is exploration-order-sensitive (same caveat as
-    ``test_inner_reward_separability``)."""
+    """A second pass at the same patience is replay-dominated and never regresses:
+    the warm perf cache serves almost every terminal, so the rerun benches far
+    fewer variants than the cold run, and the per-op best total only improves (or
+    ties), never worsens.
+
+    Two things changed vs the old idempotence invariant. Ranking moved from the
+    priority-sorted enumeration to the ``Prior`` (``AnalyticPrior`` cold), so the
+    cold search walks a real prior-ranked frontier instead of finding the best at
+    option-0; that frontier interacts with the cache's cross-op kernel sharing, so
+    a warm rerun wanders into a handful of new frontier variants while replaying
+    the rest. Those extra benches can only LOWER the per-op best — ``record_perf``
+    keeps the minimum and ``best_per_op_time`` reads it — so ``second.total_us <=
+    first.total_us`` always (it does not converge to the *same* total; it converges
+    *downward*). The exact bench count is exploration-order-sensitive (same caveat
+    as ``test_inner_reward_separability``); the ``_CountingBackend``'s hash-derived
+    latencies make it host-dependent, so only the two robust invariants are pinned."""
     fused = _fuse(_two_distinct_matmuls())
     db = SearchDB()
     ctx = Context.from_target((8, 0))
@@ -169,7 +174,8 @@ def test_inner_reward_rerun_is_replay_dominated() -> None:
     rerun_backend = _CountingBackend()
     second = inner_reward(fused, ctx=ctx, db=db, backend=rerun_backend, patience=_PATIENCE)
 
-    assert second.total_us == pytest.approx(first.total_us), "rerun must converge to the same per-op best total"
+    # The DB's per-op best is monotone non-increasing — more benches never worsen it.
+    assert second.total_us <= first.total_us + 1e-6, "rerun must not regress the per-op best total"
     assert rerun_backend.calls < cold_backend.calls, "warm rerun must bench fewer variants than the cold run"
     assert rerun_backend.calls <= max(_PATIENCE, cold_backend.calls // 2), "rerun must be replay-dominated, not a full re-search"
 
