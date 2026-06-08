@@ -20,10 +20,10 @@ PyYAML (it destroys the flow-style `{BN: 16, ...}` knob dicts and key order); ed
 deplodock tune --dataset golden --clean
 ```
 
-This fans out one `deplodock tune --golden NAME` subprocess per shape (isolated so one bad shape can't abort the sweep),
-`--clean` on the first so the learned prior is rebuilt fresh then accumulated across the set. Narrow with
-`--kernel SUBSTR` (e.g. `--kernel square` or `--kernel q_proj`) to re-tune a subset. This trains the prior; it does not
-update goldens.
+This tunes every golden shape in one in-process loop (`handle_tune` over `_tune_targets` — the same codepath as a
+single-shape tune, differing only in the dataset it builds), sharing one tune DB / bench worker / prior. `--clean`
+clears the DB + prior once up front, then accumulates across shapes. Narrow with `--kernel SUBSTR` (e.g.
+`--kernel square` or `--kernel q_proj`) to re-tune a subset. This trains the prior; it does not update goldens.
 
 ## Step 2 — A/B the greedy pick vs the recorded golden, per shape
 
