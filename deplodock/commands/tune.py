@@ -71,18 +71,6 @@ def register_tune_command(subparsers):
         ),
     )
     parser.add_argument(
-        "--bench-timeout",
-        type=float,
-        default=20.0,
-        help=(
-            "Per-variant GPU-time budget (seconds) for the run stage of each bench; exceeding it marks the "
-            "variant bench_fail. The default 20s suits single-kernel sweeps but is too tight for whole-model "
-            "graphs: the first variant pays a one-time cold-start (hundreds of first-launch kernel loads) that "
-            "can exceed 20s even though steady-state is milliseconds, so every variant fails. Bump to ~90 for "
-            "full-model tuning. Default: 20."
-        ),
-    )
-    parser.add_argument(
         "--clean",
         action="store_true",
         help="Before tuning, delete the tuning DB and the cubin/kernel caches for a fresh sweep.",
@@ -369,6 +357,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     skipped and only the per-kernel table runs."""
     from deplodock.commands.run import _print_table, bench_full_model_real
     from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import HungKernelError
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     # Re-bench at -O3 (deployable) unless the user explicitly pinned --nvcc-flags;
@@ -410,6 +399,18 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
                 bench_backends=args.bench_backends,
             )
             _print_table(full)
+        except HungKernelError as exc:
+            # A hung kernel stays resident on the device — the in-process deployable bench
+            # can't SIGKILL-reset it (only the isolated tuning worker can). Marching into the
+            # per-kernel sweep would launch its torch peer-bench behind the still-running
+            # kernel and block forever on ``synchronize()``. The device is unrecoverable here,
+            # so skip per-kernel entirely; process exit tears the context down and resets it.
+            sys.stderr.write(
+                f"[tune] full-model bench hung ({exc}); the kernel is still resident and has poisoned "
+                f"the CUDA device — skipping per-kernel bench (it would block on it). Re-run after the "
+                f"kernel is fixed.\n"
+            )
+            return
         except RuntimeError as exc:
             # A whole-graph compile/bench failure (e.g. a slow-compiling kernel) must not
             # cost the per-kernel table — report and fall through.

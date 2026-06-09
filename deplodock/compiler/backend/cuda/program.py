@@ -441,9 +441,23 @@ def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) ->
 
 # Per-launch wall-clock cap. Any single kernel launch exceeding this is
 # considered "broken" — too many threads, infinite loop, hung GPU — and
-# we bail out via ``RuntimeError`` so the autotune sweep doesn't stall
+# we bail out via ``HungKernelError`` so the autotune sweep doesn't stall
 # on one bad variant.
 _KERNEL_TIMEOUT_MS = 1000.0
+
+
+class HungKernelError(RuntimeError):
+    """A kernel launch did not complete within the per-launch watchdog window.
+
+    Distinct from a plain ``RuntimeError`` (a slow-but-completing variant) because a hung
+    kernel stays **resident on the device** after we give up polling for it — the in-process
+    bench has no way to evict it (only the SIGKILL-isolated tuning worker can reset the
+    device). A caller that runs further benches on the same device after catching this must
+    treat the device as poisoned and stop, or the next blocking ``synchronize()`` (e.g. the
+    torch peer-bench) will block behind the still-running kernel. Subclasses ``RuntimeError``
+    so existing ``except RuntimeError`` handlers (the autotune sweep) keep marking the variant
+    ``bench_fail`` unchanged."""
+
 
 _AUTO_BUDGET_MS = 100.0
 # Iter-count cap on ``num_iters="auto"``. Combined with the GPU-time
@@ -473,7 +487,7 @@ _WARMUP_TARGET_MS = 10.0
 
 def _wait_for_event(event, timeout_ms: float, label: str) -> None:
     """Block until ``event`` completes, polling rather than calling the
-    blocking ``synchronize()``. Raises ``RuntimeError`` on timeout —
+    blocking ``synchronize()``. Raises ``HungKernelError`` on timeout —
     necessary because once a CUDA kernel is hung, ``synchronize()``
     blocks indefinitely (the driver only resets after minutes), which
     stalls the autotune sweep on a single bad variant.
@@ -493,7 +507,7 @@ def _wait_for_event(event, timeout_ms: float, label: str) -> None:
     while not event.done:
         now = _time.perf_counter()
         if now > deadline:
-            raise RuntimeError(f"kernel {label!r} did not complete within {timeout_ms:.0f} ms — variant marked bench_fail")
+            raise HungKernelError(f"kernel {label!r} did not complete within {timeout_ms:.0f} ms — variant marked bench_fail")
         if now > next_warn:
             logger.warning("[cuda] kernel %r still pending after %.2fs (timeout %.1fs)", label, now - start, timeout_ms / 1000.0)
             warned = True

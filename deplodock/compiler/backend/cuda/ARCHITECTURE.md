@@ -70,7 +70,18 @@ arg_order).
 `benchmark_program(graph, input_data, warmup, num_iters)` adds a
 warmup loop + timed loop wrapped in `cupy.cuda.Event` pairs — one
 global pair for `BenchmarkResult.time_ms`, one pair per launch index
-(averaged over iters) for `BenchmarkResult.per_launch`.
+(averaged over iters) for `BenchmarkResult.per_launch`. This is the **in-process** path (no
+subprocess backstop), used by the deployable benches (`run --bench`, `tune --bench`) where
+interleaved `on_iter` peer-benching can't cross a subprocess boundary. Each launch is awaited via
+the polling `_wait_for_event` (`_KERNEL_TIMEOUT_MS`, 1 s) rather than a blocking `synchronize()`,
+which would hang forever on a non-terminating kernel; on overrun it raises **`HungKernelError`**
+(a `RuntimeError` subclass, so the autotune sweep's `except RuntimeError → bench_fail` still
+catches it). Caveat: in-process there is no SIGKILL, so a hung kernel **stays resident and poisons
+the device** — a subsequent blocking sync (e.g. the torch peer-bench) would wedge behind it. So
+`tune --bench` (`commands/tune.py` `_run_bench`) treats a `HungKernelError` from the full-model
+bench as device-poisoning and **skips the per-kernel sweep** rather than marching into it; process
+exit resets the device. See `tests/compiler/backend/test_hung_kernel_watchdog.py` (watchdog raises
+promptly on a real hung kernel) and `tests/compiler/cli/test_tune_bench_hung_kernel.py` (the skip).
 
 `benchmark_program_isolated(...)` (the autotune path, gated on
 `bench_wall_timeout_s`) runs the bench in a **persistent** subprocess
