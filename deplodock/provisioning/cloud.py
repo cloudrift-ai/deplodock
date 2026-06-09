@@ -128,6 +128,7 @@ async def provision_cloud_vm(
     logger=None,
     provider=None,
     extra_authorized_keys=None,
+    provisioning_model=None,
 ):
     """Provision a cloud VM for the given GPU requirements.
 
@@ -143,6 +144,9 @@ async def provision_cloud_vm(
         extra_authorized_keys: optional list of SSH public key strings to
             install in the VM's authorized_keys alongside ``ssh_key``'s own
             ``.pub`` (use :func:`read_public_key_files` to resolve paths first).
+        provisioning_model: GCP-only override for the hardware-table
+            provisioning model (FLEX_START / SPOT / STANDARD). ``None`` keeps
+            the per-GPU default; ignored for CloudRift candidates.
 
     Returns:
         VMConnectionInfo on success, None when every candidate is exhausted.
@@ -163,7 +167,16 @@ async def provision_cloud_vm(
         for attempt in range(1, SAME_CANDIDATE_RETRIES + 1):
             try:
                 conn = await _provision_candidate(
-                    cand, gpu_name, gpu_count, ssh_key, providers_config, server_name, dry_run, logger, extra_authorized_keys
+                    cand,
+                    gpu_name,
+                    gpu_count,
+                    ssh_key,
+                    providers_config,
+                    server_name,
+                    dry_run,
+                    logger,
+                    extra_authorized_keys,
+                    provisioning_model,
                 )
             except CapacityExhausted as exc:
                 logger.warning(f"{cand.describe()}: capacity exhausted ({exc}); advancing to next candidate.")
@@ -206,6 +219,7 @@ async def _provision_candidate(
     dry_run: bool,
     logger,
     extra_authorized_keys=None,
+    provisioning_model=None,
 ):
     """Single provisioning attempt for one resolved candidate.
 
@@ -217,7 +231,9 @@ async def _provision_candidate(
     if cand.provider == "cloudrift":
         return await _provision_cloudrift(cand, ssh_key, providers_config, dry_run, logger, extra_authorized_keys)
     if cand.provider == "gcp":
-        return await _provision_gcp(cand, gpu_name, ssh_key, providers_config, server_name, dry_run, logger, extra_authorized_keys)
+        return await _provision_gcp(
+            cand, gpu_name, ssh_key, providers_config, server_name, dry_run, logger, extra_authorized_keys, provisioning_model
+        )
     raise ValueError(f"Unknown provider: {cand.provider}")
 
 
@@ -254,9 +270,19 @@ async def _provision_cloudrift(cand: VmCandidate, ssh_key, providers_config, dry
     )
 
 
-async def _provision_gcp(cand: VmCandidate, gpu_name, ssh_key, providers_config, server_name, dry_run, logger, extra_authorized_keys=None):
+async def _provision_gcp(
+    cand: VmCandidate,
+    gpu_name,
+    ssh_key,
+    providers_config,
+    server_name,
+    dry_run,
+    logger,
+    extra_authorized_keys=None,
+    provisioning_model=None,
+):
     gcp_config = (providers_config or {}).get("gcp", {})
-    provisioning_model = GPU_GCP_PROVISIONING_MODEL.get(gpu_name, DEFAULT_GCP_PROVISIONING_MODEL)
+    provisioning_model = provisioning_model or GPU_GCP_PROVISIONING_MODEL.get(gpu_name, DEFAULT_GCP_PROVISIONING_MODEL)
     ssh_user = gcp_config.get("ssh_user", os.environ.get("USER", "deploy"))
     ts = datetime.now().strftime("%m%d-%H%M")
     suffix = secrets.token_hex(2)

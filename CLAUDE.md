@@ -62,7 +62,7 @@ same worker.
 - `deplodock bench recipes/* --filter "KEY=PATTERN"` — run only variants matching the filter (fnmatch glob, repeatable, AND logic)
 - `deplodock bench experiments/...` — run an experiment (results stored in the experiment dir)
 - `deplodock teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
-- `deplodock vm create gpu --gpu NAME --gpu-count N [--provider X] [--authorized-key PATH ...]` — create a VM by GPU name (orchestrator: retries, candidate fallback, orphan cleanup). `--authorized-key` (repeatable, also on `deploy cloud`) installs extra SSH public keys in the VM's authorized_keys alongside `--ssh-key`'s own `.pub`
+- `deplodock vm create gpu --gpu NAME --gpu-count N [--provider X] [--provisioning-model {FLEX_START,SPOT,STANDARD}] [--authorized-key PATH ...]` — create a VM by GPU name (orchestrator: retries, candidate fallback, orphan cleanup). `--provisioning-model` overrides the per-GPU hardware-table default (`STANDARD` = on-demand) while keeping the orchestrator's full config.yaml/SSH treatment; GCP-only, ignored for CloudRift. `--authorized-key` (repeatable, also on `deploy cloud`) installs extra SSH public keys in the VM's authorized_keys alongside `--ssh-key`'s own `.pub`
 - `deplodock vm create gcp ...` — create a specific GCP GPU VM (single-shot manual)
 - `deplodock vm create cloudrift ...` — create a specific CloudRift GPU VM (single-shot manual)
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM

@@ -61,6 +61,7 @@ async def _handle_create(args):
             dry_run=args.dry_run,
             provider=args.provider,
             extra_authorized_keys=extra_authorized_keys,
+            provisioning_model=args.provisioning_model,
         )
     except (CapacityExhausted, TerminalProvisionError) as exc:
         logger.error(f"{exc}")
@@ -95,6 +96,12 @@ def register_create_target(subparsers):
         choices=["cloudrift", "gcp"],
         default=None,
         help="Restrict candidates to one provider (default: hardware-table preference order)",
+    )
+    parser.add_argument(
+        "--provisioning-model",
+        choices=["FLEX_START", "SPOT", "STANDARD"],
+        default=None,
+        help="GCP provisioning model override (default: hardware-table default per GPU); STANDARD = on-demand",
     )
     parser.add_argument(
         "--config",
