@@ -12,6 +12,7 @@ tests/
 ├── test_detect.py               # deplodock.detect (GPU detection via PCI sysfs)
 ├── test_hardware.py         # deplodock.hardware (top-level module)
 ├── test_redact.py           # deplodock.redact (secret redaction)
+├── test_new_models.py       # scripts/new_models.py (model discovery: base-key match, dedup, arena linking)
 ├── benchmark/
 │   ├── test_bench_dryrun.py # bench CLI dry-run
 │   ├── test_code_hash.py    # BenchmarkTask.compute_code_hash()
