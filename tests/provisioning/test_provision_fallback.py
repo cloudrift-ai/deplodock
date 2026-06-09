@@ -101,6 +101,28 @@ async def test_gcp_iterates_zones_before_giving_up(mock_create, ssh_key):
     assert zones_tried == ["asia-southeast1-b", "asia-northeast1-b"]
 
 
+@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+async def test_provisioning_model_override_flows_to_gcp(mock_create, ssh_key):
+    """An explicit --provisioning-model override reaches gcp_provider.create_instance."""
+    mock_create.return_value = VMConnectionInfo(host="10.0.0.1", username="", ssh_port=22)
+    await provision_cloud_vm(
+        gpu_name="NVIDIA B200",
+        gpu_count=8,
+        ssh_key=ssh_key,
+        provider="gcp",
+        provisioning_model="STANDARD",
+    )
+    assert mock_create.await_args_list[0].kwargs["provisioning_model"] == "STANDARD"
+
+
+@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+async def test_provisioning_model_defaults_to_hardware_table(mock_create, ssh_key):
+    """Without an override, B200 falls back to the hardware-table default (FLEX_START)."""
+    mock_create.return_value = VMConnectionInfo(host="10.0.0.1", username="", ssh_port=22)
+    await provision_cloud_vm(gpu_name="NVIDIA B200", gpu_count=8, ssh_key=ssh_key, provider="gcp")
+    assert mock_create.await_args_list[0].kwargs["provisioning_model"] == "FLEX_START"
+
+
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
 @patch("deplodock.provisioning.cloud.asyncio.sleep", new_callable=AsyncMock)
 @patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
