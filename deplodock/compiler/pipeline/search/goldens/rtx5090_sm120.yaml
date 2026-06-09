@@ -39,17 +39,8 @@ configs:
     N: 512
     K: 512
     dtype: fp16
-    knobs: {WN: 2, WM: 2, FM: 2, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', STAGE: '11', RING: 4}
-    deplodock_us: 6.1
-    cublas_us: 6.2
-  - kernel: matmul
-    name: square.512.fp16
-    M: 512
-    N: 512
-    K: 512
-    dtype: fp16
-    knobs: {WN: 1, WM: 8, FM: 1, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', STAGE: '11', RING: 2}
-    deplodock_us: 6.1
+    knobs: {WN: 4, WM: 4, FM: 1, FN: 1, BK: 4, SPLITK: 1, MMA: 'mma_m16n8k16_f16', STAGE: '11', RING: 2}
+    deplodock_us: 4.1
     cublas_us: 6.2
   - kernel: matmul
     name: square.1024.fp16
