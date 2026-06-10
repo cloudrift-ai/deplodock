@@ -3,7 +3,10 @@
 Runs before ``010_partition_loops`` so the body is still un-tiled (the only dialect where
 both halves of a split can re-enter planning with their own tilings). This rule owns only
 the OFFER; the cut itself — slicing the computed A-operand cone (with its prologue deps)
-into an ``xn`` producer + the clean gemm — lives in ``_split_demoted.try_split_demoted``,
+into an ``xn`` producer + the clean gemm, or BOTH cones into two producers when neither
+multiply operand is a plain Load (rotary QK^T; the N-indexed cone materializes at [K, N]
+so the consumer keeps the canonical B layout) — lives in
+``_split_demoted.try_split_demoted``,
 whose checks are the cut's well-formedness conditions, not a profitability prediction.
 Whether the split pays is the search's question: the tuner measures both branches inside
 the op's slice; greedy ``compile`` / ``run`` never pick the structural option while an Op
@@ -65,7 +68,7 @@ SPLIT_CONE = Knob(
     "SPLIT_CONE",
     KnobType.BOOL,
     hints=(False, True),
-    help="Split a demoted matmul's computed A-operand cone into its own kernel (xn producer + clean gemm)",
+    help="Split a demoted matmul's computed operand cone(s) into producer kernel(s) (xn producer(s) + clean gemm)",
 )
 
 

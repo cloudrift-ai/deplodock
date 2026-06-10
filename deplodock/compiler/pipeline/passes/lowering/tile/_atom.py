@@ -117,6 +117,17 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
                 return False
             if accum.value != multiply.name:
                 return False
+            # Operand layout: ``011_lower_atom_cell._classify_ab`` recovers A
+            # as the load with K in its LAST index dim and B as the one whose
+            # K lands earlier (``020_stage_inputs`` collapses it to a [K, N]
+            # smem tile, after which the tagger's K-in-first test passes). A
+            # transposed-B cell — BOTH operands K-in-last, e.g. Q @ K^T — is
+            # unclassifiable in any staging order: the AtomTile would survive
+            # to render unconsumed and crash. Mirror the tagger here so those
+            # shapes fall to the scalar register-tile path instead.
+            k_in_last = [K_name in ld.index[-1].free_vars() for ld in loads if ld.index]
+            if sorted(k_in_last) != [False, True]:
+                return False
             accum_names.add(accum.name)
         # Post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the mma
         # accumulator *fragment* straight to the output, so scalar epilogue

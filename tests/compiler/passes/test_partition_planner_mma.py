@@ -146,6 +146,46 @@ def test_mma_eligibility_rejects_indivisible_extents():
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
+def test_mma_eligibility_rejects_transposed_b():
+    """A transposed-B matmul (``Q @ K^T`` — both operands carry K in their
+    LAST index dim) is unclassifiable by ``011_lower_atom_cell._classify_ab``
+    in any staging order: the AtomTile would reach render unconsumed. The
+    eligibility gate mirrors the tagger so the shape falls to the scalar
+    register-tile path."""
+    g = Graph()
+    _input(g, "a", (64, 64), dtype=F16)
+    _input(g, "b", (64, 64), dtype=F16)
+    i, j, k = Axis("i", 64), Axis("j", 64), Axis("k", 64)
+    op = LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("j"), Var("k"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    g.add_node(op=op, inputs=["a", "b"], output=Tensor("c", (64, 64), dtype=F32), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
 def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64, epilogue_op: str = "add") -> LoopOp:
     """Matmul whose accumulator feeds a post-reduce ``epilogue_op(acc, r)``
     before the Write. ``add`` is the foldable ``matmul_add`` residual the
