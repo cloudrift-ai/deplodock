@@ -746,26 +746,73 @@ class RegStore(Stmt):
     ``float c[4]``; when the destination buffer is narrower (``__half*``)
     each value is converted via ``__float2half`` (mirrors
     :class:`MmaStore`'s downconvert). ``ldm`` is the output row stride
-    (N) — ``0`` auto-resolves from the buffer's inner extent."""
+    (N) — ``0`` auto-resolves from the buffer's inner extent.
+
+    ``res_buffer`` / ``res_index`` carry an optional fused **residual-add
+    epilogue** (the ``matmul_add`` shape: ``out = acc + r`` with ``r``
+    indexed exactly like the Write). The scalar accumulator has no SSA name
+    on the fragment path, so ``kernel/005_lower_atom_tile`` folds the
+    epilogue here instead: each lane already knows the (row, col) of every
+    fragment element, so the residual is loaded at those same coordinates,
+    added in f32, and downconverted with the store (the CUTLASS
+    epilogue-functor pattern). ``res_index`` is the residual's tile-base
+    index (same shape as ``dst_index``); per-element offsets reuse the
+    lane arithmetic with the residual buffer's own row stride."""
 
     dst_buffer: str
     dst_index: tuple
     frag: str
     shape: tuple[int, int, int]
     ldm: int = 0
+    res_buffer: str | None = None
+    res_index: tuple = ()
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
+
+    def external_reads(self) -> tuple[str, ...]:
+        # The fused residual is a gmem read this stmt performs directly (its
+        # original Load was stripped by 005_lower_atom_tile), so it must be
+        # declared here for the kernel signature / render shapes to include
+        # the buffer.
+        return (self.res_buffer,) if self.res_buffer is not None else ()
 
     def external_writes(self) -> tuple[str, ...]:
         return (self.dst_buffer,)
 
     def exprs(self) -> tuple[Expr, ...]:
-        return tuple(self.dst_index)
+        return (*self.dst_index, *self.res_index)
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.dst_index)
-        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag} (ldm={self.ldm or 'auto'})"]
+        res = ""
+        if self.res_buffer is not None:
+            ridx = ", ".join(e.pretty() for e in self.res_index)
+            res = f" + {self.res_buffer}[{ridx}]"
+        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag}{res} (ldm={self.ldm or 'auto'})"]
+
+    def _element_values(self, ctx: RenderCtx) -> list[str]:
+        """The four per-lane store values: ``frag[i]``, plus the residual at
+        the element's own (row, col) when the fused epilogue is present. The
+        residual loads are scalar (the conversion intrinsic differs per
+        dtype); lanes ``_t = 0..3`` cover 8 contiguous columns, so the warp's
+        accesses coalesce regardless."""
+        vals = [f"{self.frag}[{i}]" for i in range(4)]
+        if self.res_buffer is None:
+            return vals
+        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+
+        flat_r = render_index(self.res_buffer, self.res_index, ctx)
+        ldm_r = _resolve_ldm(self.res_buffer, ctx)
+        res_dt = ctx.buffer_dtypes.get(self.res_buffer, "f32")
+        conv = {"f16": "__half2float({})", "bf16": "__bfloat162float({})"}.get(res_dt, "{}")
+        offs = (
+            f"_g * {ldm_r} + _t * 2 + 0",
+            f"_g * {ldm_r} + _t * 2 + 1",
+            f"(_g + 8) * {ldm_r} + _t * 2 + 0",
+            f"(_g + 8) * {ldm_r} + _t * 2 + 1",
+        )
+        return [f"({v} + {conv.format(f'{self.res_buffer}[{flat_r} + {off}]')})" for v, off in zip(vals, offs, strict=True)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
@@ -775,6 +822,7 @@ class RegStore(Stmt):
         dst_dt = ctx.buffer_dtypes.get(self.dst_buffer, "f32")
         pad = _pad(ctx.indent)
         lane = "(threadIdx.x & 31)"
+        vals = self._element_values(ctx)
         # C is 16×8: lane owns (row g, cols 2t,2t+1) and (row g+8, cols 2t,2t+1)
         # with g = lane/4, t = lane%4. The two cols per row are CONTIGUOUS, so
         # each row's pair is one vectorized 4-byte store (``__half2`` / ``float2``)
@@ -789,16 +837,16 @@ class RegStore(Stmt):
             hi = f"{flat} + (_g + 8) * {ldm} + _t * 2"
             return [
                 f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
-                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{lo}]) = {packer}({self.frag}[0], {self.frag}[1]);",
-                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{hi}]) = {packer}({self.frag}[2], {self.frag}[3]); }}",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{lo}]) = {packer}({vals[0]}, {vals[1]});",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{hi}]) = {packer}({vals[2]}, {vals[3]}); }}",
             ]
         # Fallback: per-element scalar stores (dtypes without a 2-vector packer).
         return [
             f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
-            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {self.frag}[0];",
-            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {self.frag}[1];",
-            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {self.frag}[2];",
-            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {self.frag}[3]; }}",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {vals[0]};",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {vals[1]};",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {vals[2]};",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {vals[3]}; }}",
         ]
 
 
@@ -1188,4 +1236,6 @@ def _(s: RegStore, rename, sigma, axis_fn):
         frag=rename(s.frag),
         shape=s.shape,
         ldm=s.ldm,
+        res_buffer=s.res_buffer,
+        res_index=tuple(sigma.apply(e) for e in s.res_index),
     )

@@ -2,7 +2,10 @@
 
 **Status:** findings 1–2 (codegen failures / hangs) **fixed** — two TMA eligibility gates in `050_use_tma.py`
 plus a defensive box check in `backend/cuda/_tma.py`, locked in by `tests/compiler/passes/test_use_tma_gates.py`.
-Findings 3–6 (perf: scalar-tier matmuls) remain open. Findings from a clean tune + -O3 kernel bench on 2026-06-10.
+Finding 3 (down_proj tensor-core lockout) **fixed** — the `matmul_add` residual epilogue now folds into the mma
+fragment store (`tests/compiler/test_matmul_mma_residual.py`); the real reproducer went 29 → 9.9 µs tuned
+(0.28x → 0.83x vs cuBLAS). Findings 4–6 (gated-MLP purity, SDPA prologue matmuls) remain open. Findings from a
+clean tune + -O3 kernel bench on 2026-06-10.
 Run: `deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --clean --bench --dump-dir <dump>` (859 s, 930 benched
 variants, 810 ok / 28 `bench_fail` in the tune DB). Numbers below are the `--bench` -O3 re-bench (CUDA-graph
 captured); tune-DB latencies quoted for ranking context are -O1.
@@ -84,7 +87,7 @@ cross-iteration phase state) serves the FM>1 design point. Tests: `test_use_tma_
 pinned-raise + FM=1 control + GPU run-to-completion of the previously-hanging knob family). The rejected
 alternative (carry phase parity across outer iterations) stays open if FM>1 TMA ever looks like a win here.
 
-## Finding 3 — down_proj is locked out of the tensor-core tier by its fused residual add (0.28x vs eager)
+## Finding 3 — down_proj is locked out of the tensor-core tier by its fused residual add (0.28x vs eager) — FIXED
 
 `k_linear_reduce_86a525` is `add_7 = add_5 + linear_6(mul_12, W_down)` — fusion pulled the residual add into the
 matmul kernel as a post-reduce epilogue (`v1 = add(acc0, in0)`). The MMA eligibility predicate
@@ -97,10 +100,14 @@ cuBLAS-backed eager/tcompile. By contrast q/k/v_proj (plain linears, K=1024) aut
 The outer fusion search is deterministic today (one terminal), so the tuner cannot un-fuse the add to reach the
 warp tier — the fusion pass commits to a kernel the best backend path can't serve.
 
-**Fix candidates:** (a) teach the mma store path to thread the accumulator fragment through a *linear* epilogue
-(the SPLITK residual-hoist in `010_partition_loops.py` already classifies `matmul_add` as linear — reuse that
-classification); or (b) make the fusion pass aware of the warp-tier eligibility loss (a real fusion fork for the
-outer search once it stops being deterministic).
+**Fix (landed):** option (a), the CUTLASS epilogue-functor pattern — the `matmul_add` residual folds into the
+fragment store. `tile/_atom._is_foldable_residual_epilogue` admits exactly the single-add / identically-indexed
+shape to the warp tier; `kernel/005_lower_atom_tile._scan_epilogue` strips the scalar Load + Assign and rides the
+residual on the `RegStore`, which loads it at each fragment element's own (row, col), adds in f32, and
+downconverts with the store. Measured on the real dumped reproducer: greedy cold pick 11.3 µs, tuned 9.9 µs vs
+eager/cuBLAS 8 µs (was 29 µs scalar) — and the tune ran with zero bench_fails. Non-add / differently-indexed
+epilogues still gate to the scalar tier; the warp tier's v1 SPLITK=1 invariant covers the `Cond(K_s == 0)`
+interaction. Tests: `tests/compiler/test_matmul_mma_residual.py`.
 
 ## Finding 4 — fused RMSNorm + gate/up + silu kernel is scalar and re-reads everything (0.91x eager, 5.4x behind torch.compile)
 

@@ -117,16 +117,23 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
             if accum.value != multiply.name:
                 return False
             accum_names.add(accum.name)
-        # No fused post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the
-        # mma accumulator *fragment* straight to the output, so any compute that
-        # consumes the scalar accumulator after the K-loop (e.g. a fused residual
-        # ``add(acc, residual)`` or activation) is both dropped from the store and
-        # left referencing an SSA name the fragment path never defines (``acc0``
-        # undefined at nvcc time). Gate those to the scalar register-tile path,
-        # which threads the accumulator through the epilogue correctly.
-        for s in loop_op.body.iter_of_type(Assign):
-            if accum_names & set(s.args):
-                return False
+        # Post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the mma
+        # accumulator *fragment* straight to the output, so scalar epilogue
+        # Assigns have no accumulator SSA name to read (each lane holds 4
+        # elements of the C tile, not one ``acc0``). ONE shape is foldable
+        # into the fragment store — the ``matmul_add`` residual
+        # ``v = add(acc, r)`` with ``r`` loaded at exactly the Write's index:
+        # every fragment element owns a known (row, col) of the output, so
+        # ``RegStore`` loads the residual at the same coordinates and adds it
+        # per element before the downconvert (the CUTLASS-epilogue pattern;
+        # the Qwen3 down_proj+residual fusion that previously locked the
+        # whole op out of the tensor-core tier). Anything else — scaling,
+        # activations, multi-step chains — still gates to the scalar
+        # register-tile path, which threads the scalar accumulator through
+        # the epilogue correctly.
+        epilogue_assigns = [s for s in loop_op.body.iter_of_type(Assign) if accum_names & set(s.args)]
+        if epilogue_assigns and not _is_foldable_residual_epilogue(loop_op, accum_names, epilogue_assigns):
+            return False
         # Each output free-axis extent must divide cleanly. The body's outer
         # free Loops contribute the M (outer) / N (inner) extents the planner
         # will partition into output cells; gate the outermost-to-inner
@@ -144,6 +151,36 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
         return True
 
     return predicate
+
+
+def _is_foldable_residual_epilogue(loop_op: LoopOp, accum_names: set[str], epilogue_assigns: list) -> bool:
+    """True iff the post-reduce epilogue is exactly the ``matmul_add`` shape
+    the mma fragment store can fold: a single ``v = add(acc, r)`` where ``r``
+    is a Load at exactly the (single, scalar) Write's index, and the Write
+    stores ``v``. Mirrors ``_splitk_residual.is_linear_in_accum``'s linearity
+    but is deliberately narrower — one add, one residual operand, identical
+    index space — because ``RegStore`` reads the residual at the fragment
+    element's own output coordinates (a differently-indexed operand, e.g. a
+    bias broadcast by column, would need per-operand index substitution the
+    render doesn't do yet)."""
+    from deplodock.compiler.ir.stmt import Load, Write  # noqa: PLC0415
+
+    if len(epilogue_assigns) != 1 or len(accum_names) != 1:
+        return False
+    assign = epilogue_assigns[0]
+    if assign.op.name != "add" or len(assign.args) != 2:
+        return False
+    acc = next(iter(accum_names))
+    others = [arg for arg in assign.args if arg != acc]
+    if len(others) != 1:
+        return False
+    writes = list(loop_op.body.iter_of_type(Write))
+    if len(writes) != 1 or writes[0].value != assign.name or writes[0].is_vector:
+        return False
+    residual_loads = [ld for ld in loop_op.body.iter_of_type(Load) if ld.names and ld.names[0] == others[0]]
+    if len(residual_loads) != 1:
+        return False
+    return tuple(residual_loads[0].index) == tuple(writes[0].index)
 
 
 # Per-atom eligibility predicates, keyed by the ``Atom`` itself (cell shape +

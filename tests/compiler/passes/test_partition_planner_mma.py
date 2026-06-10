@@ -146,9 +146,10 @@ def test_mma_eligibility_rejects_indivisible_extents():
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
-def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
-    """Matmul whose accumulator feeds a post-reduce ``add(acc, r)`` (fused
-    residual) before the Write — the mma fragment-store can't apply it."""
+def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64, epilogue_op: str = "add") -> LoopOp:
+    """Matmul whose accumulator feeds a post-reduce ``epilogue_op(acc, r)``
+    before the Write. ``add`` is the foldable ``matmul_add`` residual the
+    fragment store applies per element; anything else stays scalar-gated."""
     i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
     return LoopOp(
         body=(
@@ -168,7 +169,7 @@ def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> L
                                 ),
                             ),
                             Load(name="r", input="r", index=(Var("i"), Var("j"))),
-                            Assign(name="e", op=ElementwiseImpl("add"), args=("acc", "r")),
+                            Assign(name="e", op=ElementwiseImpl(epilogue_op), args=("acc", "r")),
                             Write(output="c", index=(Var("i"), Var("j")), value="e"),
                         ),
                     ),
@@ -208,12 +209,22 @@ def _matmul_collapsed_k_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> Loo
     )
 
 
-def test_mma_eligibility_rejects_fused_epilogue():
-    """A matmul whose accumulator feeds a post-reduce ``add`` (fused residual)
-    is gated off — the mma fragment-store path drops the epilogue and leaves
-    the scalar accumulator undefined at codegen."""
+def test_mma_eligibility_admits_foldable_residual_epilogue():
+    """The ``matmul_add`` residual (single post-reduce ``add(acc, r)`` with
+    ``r`` loaded at exactly the Write's index) is warp-tier eligible — the
+    fragment store folds it per element (``RegStore.res_buffer``; see
+    ``test_matmul_mma_residual.py`` for the end-to-end lowering)."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     op = _matmul_with_epilogue_loop_op()
+    g.nodes["c"].op = op
+    assert is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
+def test_mma_eligibility_rejects_nonlinear_epilogue():
+    """A non-``add`` accumulator-consuming epilogue (``multiply(acc, r)``) is
+    not the foldable shape — gated off to the scalar register-tile path."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    op = _matmul_with_epilogue_loop_op(epilogue_op="multiply")
     g.nodes["c"].op = op
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
 
