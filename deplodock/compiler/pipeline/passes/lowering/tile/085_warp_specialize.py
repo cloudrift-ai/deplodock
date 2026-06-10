@@ -64,6 +64,16 @@ Eligibility:
 
 - TMA policy + ``pipeline_depth == 2`` (the producer/consumer split
   only buys schedule overlap on a depth-2 ring).
+- The TMA bundle must be **reachable by the producer split**: ``_split_by_role``
+  recurses only through ``SerialTile(serial_outer)`` / ``RegisterTile`` /
+  ``AtomTile`` from the consumer tile's top level, so a bundle nested under any
+  other wrapper (e.g. the ``SerialTile(kind='plain')`` per-thread M-fragment
+  loop of a fused linear+mean kernel) would be stranded in the **consumer**
+  branch — where its ``threadIdx.x == issuer`` TMA guard can never fire (thread
+  0 is a producer-warp thread) — and every consumer ``mbarrier.wait`` would
+  deadlock (the Qwen3 ``k_linear_mean_reduce`` hang). ``_eligible`` runs the
+  same split the transform uses and rejects when no TMA depth-2 bundle lands
+  producer-side.
 - No cooperative ``Accum`` in the body — SDPA cooperative reductions
   need per-thread index remap that doesn't compose cleanly with the
   role-split decode; deferred.
@@ -177,6 +187,15 @@ def _find_consumer_tile(body: Body) -> tuple[ThreadTile | WarpTile | None, bool]
     return None, False
 
 
+def _has_tma_depth2(stmts: tuple[Stmt, ...] | list[Stmt]) -> bool:
+    """True if a TMA ``StageBundle`` with ``pipeline_depth == 2`` appears
+    anywhere under ``stmts``."""
+    for s in Body(tuple(stmts)).iter():
+        if isinstance(s, StageBundle) and s.policy == StagePolicy.TMA and s.pipeline_depth == 2:
+            return True
+    return False
+
+
 def _eligible(op: TileOp) -> tuple[bool, str]:
     """Return ``(True, "")`` if WS=1 can fire, otherwise
     ``(False, reason)``."""
@@ -199,6 +218,16 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
     tile, is_warp = _find_consumer_tile(op.body)
     if tile is None:
         return False, "no ThreadTile or WarpTile in body"
+
+    # The bundle must actually land producer-side under the same split the
+    # transform performs — `_split_by_role` only recurses through
+    # serial_outer / RegisterTile / AtomTile, so a bundle nested under any
+    # other wrapper (e.g. a `SerialTile(kind='plain')` fragment loop) stays
+    # in the consumer branch, whose `threadIdx.x == issuer` TMA guard is
+    # unreachable from consumer warps: every mbarrier.wait would deadlock.
+    prod_stmts, _ = _split_by_role(tuple(tile.body))
+    if not _has_tma_depth2(prod_stmts):
+        return False, "TMA StageBundle not reachable by the producer split — TMA issues would strand in the consumer branch"
     for ax in tile.axes:
         if not ax.extent.is_static:
             return False, "consumer tile axis has symbolic extent"
@@ -323,6 +352,7 @@ def _ws_transform(op: TileOp) -> TileOp:
     # RegisterTile / AtomTile (see ``_split_by_role``); the consumer keeps the
     # RegisterTile > AtomTile > reduce tower the MMA lowering expects.
     prod_stmts, cons_stmts = _split_by_role(tuple(tile.body))
+    assert _has_tma_depth2(prod_stmts), "WS split stranded every TMA StageBundle in the consumer branch — _eligible should have caught this"
 
     ws = WarpSpecialize(
         producer_body=Body(tuple(prod_stmts)),
