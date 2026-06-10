@@ -26,6 +26,14 @@ Eligibility (per ``Source``):
 - Box-inner and source-inner extents both 16 B-aligned, with source
   inner at least 2× the box inner.
 - Source rank ≤ 5 (TMA descriptor limit).
+- Every collapsed per-dim box extent ≤ 256 (``cuTensorMapEncodeTiled``'s
+  ``boxDim`` limit — violations only surface at launch, as CUresult=1).
+
+Additionally (per tile): the ``serial_outer`` K loop holding the bundles
+must not be nested inside a serial loop with trip count > 1 — the
+materializer initializes the ring mbarriers once at kernel entry, so a
+re-entered pipeline starts from stale slot parities and deadlocks (see
+``_reenters_pipeline``).
 
 A multi-source bundle (e.g. matmul A+B emitted by ``020_stage_inputs`` as
 ``StageBundle(sources=(A, B))``) needs no splitting: the materializer
@@ -60,6 +68,7 @@ from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
     AtomTile,
     SerialTile,
+    SerialTileBase,
     Source,
     StageBundle,
     StagePolicy,
@@ -73,6 +82,11 @@ PATTERN = [Pattern("root", TileOp)]
 
 _MIN_CAPABILITY = (9, 0)
 _MAX_RANK = 5
+# Hardware limit of ``cuTensorMapEncodeTiled``: each ``boxDim[i]`` must be
+# <= 256 elements. Violations are launch-time failures (CUresult=1), so the
+# eligibility gate filters them while declining can still fall back to
+# cp.async.
+_TMA_MAX_BOX_DIM = 256
 # NVIDIA's recommended TMA-destination alignment for box copies. TMA's hardware
 # minimum is 16 B, but ``100_materialize_tile`` pads each ring slot's inner
 # extent up to 128 B to keep ``cp.async.bulk.tensor`` from issuing misaligned
@@ -144,6 +158,25 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
 
     body = root.op.body
+    # A TMA ring pipeline must start from freshly-initialized mbarriers: the
+    # materializer emits ``MbarrierInit`` once at kernel entry, and the
+    # pipeline's parity schedule (steady-state wait at ``(k / RING) % 2``,
+    # drain waits hardcoded to parity 0) assumes every slot begins at phase 0.
+    # When the ``serial_outer`` K loop is itself nested inside a serial loop
+    # with trip count > 1 (e.g. the FM register-cell loop of a fused
+    # norm+matmul kernel, where the per-row norm reduction forces the K
+    # pipeline under the cell loop), the second iteration re-enters the
+    # pipeline with stale slot parities (K-tiles % RING != 0 leaves the slots
+    # at mixed phase) and a parity wait eventually blocks on a phase that
+    # never completes — a deterministic device hang (Qwen3-Embedding layer 0
+    # ``k_linear_mean_reduce`` at FM=2 RING=3, 6 HungKernelErrors per tune).
+    # Decline TMA for the whole tile; the cp.async path (commit/wait_prior —
+    # no cross-iteration phase state) handles re-entry correctly.
+    if _reenters_pipeline(body):
+        return _decline(
+            "serial_outer pipeline is nested inside a serial loop with trip count > 1; "
+            "the once-initialized mbarrier ring would be re-entered at stale phase parity (device hang)"
+        )
     # All-or-nothing per tile (see module docstring): if any
     # promotable-policy bundle is not TMA-eligible, leave the whole
     # tile on cp.async — 060_use_async_copy promotes the BUFFERED
@@ -181,6 +214,31 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     if not changed and not already_tma:
         return _decline("no BUFFERED/ASYNC StageBundle inside SerialTile(serial_outer) eligible for TMA")
     return TileOp(body=new_body, name=root.op.name, knobs={**root.op.knobs, TMA.name: True})
+
+
+def _reenters_pipeline(body: Body, *, in_serial: bool = False) -> bool:
+    """True if a promotable ``StageBundle``'s ``serial_outer`` K loop is nested
+    inside a serial loop (``SerialTile`` / ``StridedTile``) with trip count > 1
+    — i.e. the ring pipeline would run more than once over mbarriers the
+    materializer initializes only once at kernel entry. A symbolic enclosing
+    extent is treated as > 1 (conservative). Extent-1 cell loops (FM/FN = 1)
+    stay eligible — the pipeline runs exactly once."""
+    for s in body:
+        if (
+            in_serial
+            and isinstance(s, SerialTile)
+            and s.kind == "serial_outer"
+            and any(isinstance(x, StageBundle) and x.policy in _PROMOTABLE for x in s.body)
+        ):
+            return True
+        child_serial = in_serial
+        if isinstance(s, SerialTileBase):
+            ext = s.axis.extent
+            if not ext.is_static or ext.as_static() > 1:
+                child_serial = True
+        if any(_reenters_pipeline(b, in_serial=child_serial) for b in s.nested()):
+            return True
+    return False
 
 
 def _walk(body: Body, *, swizzle: bool = False, dtype_bytes: dict[str, int] | None = None) -> tuple[Body, bool]:
@@ -319,13 +377,12 @@ def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]]) -> boo
     for d in range(dims[0], src_rank):
         if d not in dims_set and src_shape[d] != 1:
             return False
-    # Inner extent for alignment checks is the COLLAPSED box width at the
-    # last source dim — product of the (cache_extent × block) of every cache
-    # axis mapping to ``dims[-1]``. Mirrors the materializer's ``box_per_dim``
-    # collapse so a tile with cache ``(a3=32, a5=4)`` both mapping to dim 1
-    # gets the right 128-cell inner extent (vs the legacy
-    # ``cache_axes[-1].extent`` = 4 that always failed the 128 B alignment
-    # gate for collapse cases).
+    # COLLAPSED box extent per source dim — product of the (cache_extent ×
+    # block) of every cache axis mapping to that dim. Mirrors the
+    # materializer's ``box_per_dim`` collapse so a tile with cache
+    # ``(a3=32, a5=4)`` both mapping to dim 1 gets the right 128-cell extent
+    # (vs the legacy ``cache_axes[-1].extent`` = 4 that always failed the
+    # 128 B alignment gate for collapse cases).
     #
     # The per-axis ``AffineAddressing.block`` multiplier encodes per-cell
     # strides (e.g. ``atom_n = 8`` on the N side of the m16n8k16 atom) —
@@ -335,13 +392,26 @@ def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]]) -> boo
     # ``WN·FN·atom_n`` of 64-128 elements. Pre-fix the warp tier was
     # silently TMA-ineligible at every shape, so the picker could only fall
     # back to a slower non-TMA staging path.
-    inner_dim = dims[-1]
     block = src.addressing.block
-    inner_extent = 1
+    box_per_dim: dict[int, int] = {}
     for i, (d, ax) in enumerate(zip(dims, cache_axes, strict=True)):
-        if d == inner_dim:
-            b = block[i] if block else 1
-            inner_extent *= ax.extent.as_static() * b
+        b = block[i] if block else 1
+        box_per_dim[d] = box_per_dim.get(d, 1) * ax.extent.as_static() * b
+    # ``cuTensorMapEncodeTiled`` enforces ``boxDim[i] <= 256``; an oversized
+    # collapsed box compiles fine and only fails at LAUNCH (the descriptor
+    # embeds the device pointer) with ``CUDA_ERROR_INVALID_VALUE`` — so it
+    # must be filtered here, where declining falls back to cp.async. Hit by
+    # the scalar register-tile matmul at ``BM·FM > 256`` (e.g. the
+    # Qwen3-Embedding down_proj tuned up to BM·FM = 768; 16 launch-time
+    # bench_fails per tune). The swizzle-atom reshape later *splits* the
+    # inner dim smaller, so this cap is conservative there — acceptable: the
+    # autotune space tops out at exactly 256 per dim, and the fallback is
+    # cp.async, not a crash.
+    if any(ext > _TMA_MAX_BOX_DIM for ext in box_per_dim.values()):
+        return False
+    # Inner extent for alignment checks is the collapsed box width at the
+    # last source dim.
+    inner_extent = box_per_dim[dims[-1]]
     if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
     src_inner = src_shape[-1]
