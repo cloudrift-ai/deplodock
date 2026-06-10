@@ -23,7 +23,7 @@ pipeline/
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
 ├── dump.py        # CompilerDump + on_pass dispatch
 ├── rule_diff.py   # Per-rule unified-diff renderer for ``compile -vv`` output
-└── passes/
+└── passes/        # pass-authoring invariants (no shape-specific pattern matching) → passes/ARCHITECTURE.md
     ├── frontend/
     │   ├── decomposition/  # frontend ops → tensor-IR primitives
     │   └── optimization/   # IndexMap fusion before lift-to-loop
