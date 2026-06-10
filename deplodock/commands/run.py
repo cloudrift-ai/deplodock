@@ -1094,8 +1094,9 @@ def _to_cuda_tensor(arr, dtype):
     """numpy array → CUDA torch tensor in the node's dtype (default fp32)."""
     import torch
 
-    td = getattr(torch, str(dtype), torch.float32)
-    return torch.from_numpy(arr).to("cuda").to(td)
+    from deplodock.compiler.backend.torch_ref import torch_dtype
+
+    return torch.from_numpy(arr).to("cuda").to(torch_dtype(dtype) or torch.float32)
 
 
 def _to_cuda_kwargs(kwargs):

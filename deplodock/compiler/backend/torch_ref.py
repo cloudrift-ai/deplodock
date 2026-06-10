@@ -44,7 +44,22 @@ SUPPORTED = frozenset(
     }
 )
 
-_TORCH_DTYPE = {"float32": "float32", "float16": "float16", "bfloat16": "bfloat16", "float64": "float64"}
+
+def torch_dtype(dtype) -> torch.dtype | None:
+    """Graph ``DataType`` token → torch dtype, ``None`` for unknown tokens.
+
+    The graph tokens (``f16`` / ``bf16`` / …) are not torch attribute names,
+    and ``DataType.np`` can't be used either (bf16's numpy carrier is uint16) —
+    map explicitly."""
+    import torch  # noqa: PLC0415
+
+    return {
+        "f32": torch.float32,
+        "f16": torch.float16,
+        "bf16": torch.bfloat16,
+        "i32": torch.int32,
+        "i64": torch.int64,
+    }.get(str(dtype))
 
 
 def is_runnable(graph: Graph) -> bool:
@@ -298,11 +313,16 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
         for nid in order
         if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is not None
     }
-    # Pre-resolve a flat list of (nid, op_callable, input_ids). ElementwiseOps get
-    # the table lookup once here (the main recompile source); other op kinds wrap
-    # ``_eval`` with the node bound so the traced ``fn`` invokes a uniform
-    # ``op(ins) -> tensor`` callable per step without per-call string dispatch.
-    compute_steps: list[tuple[str, Callable, list[str]]] = []
+    # Pre-resolve a flat list of (nid, op_callable, input_ids, out_dtype).
+    # ElementwiseOps get the table lookup once here (the main recompile source);
+    # other op kinds wrap ``_eval`` with the node bound so the traced ``fn``
+    # invokes a uniform ``op(ins) -> tensor`` callable per step without per-call
+    # string dispatch. ``out_dtype`` is the node's declared output dtype: the
+    # trace folds HF's explicit casts (e.g. the fp32 RMSNorm body casting back
+    # to fp16) into the declared dtype, and the CUDA backend honors it via typed
+    # buffers — the torch ref must cast too, or torch's promotion silently runs
+    # everything downstream of a mixed-dtype op at fp32.
+    compute_steps: list[tuple[str, Callable, list[str], torch.dtype | None]] = []
     for nid in order:
         node = graph.nodes[nid]
         if is_boundary(node.op):
@@ -311,14 +331,15 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
             op_callable = _elementwise_callable(node.op.op.name)
         else:
             op_callable = (lambda n: lambda ins: _eval(n, ins))(node)
-        compute_steps.append((nid, op_callable, list(node.inputs)))
+        compute_steps.append((nid, op_callable, list(node.inputs), torch_dtype(node.output.dtype)))
     out_id = graph.outputs[0]
 
     def fn(*tensors):
         env = dict(scalars)
         env.update(zip(tensor_ids, tensors, strict=True))
-        for nid, op_callable, in_ids in compute_steps:
-            env[nid] = op_callable([env[i] for i in in_ids])
+        for nid, op_callable, in_ids, out_dtype in compute_steps:
+            v = op_callable([env[i] for i in in_ids])
+            env[nid] = v if out_dtype is None else v.to(out_dtype)
         return env[out_id]
 
     return fn, [input_tensors[i] for i in tensor_ids]
