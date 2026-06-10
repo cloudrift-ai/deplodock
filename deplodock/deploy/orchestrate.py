@@ -9,9 +9,17 @@ from deplodock.deploy.compose import (
     generate_compose,
     generate_nginx_conf,
 )
+from deplodock.deploy.log_phases import decompose_model_load, parse_engine_load_phases
 from deplodock.deploy.params import DeployParams
 from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file
 from deplodock.recipe.types import Recipe
+from deplodock.timing import (
+    PHASE_IMAGE_PULL,
+    PHASE_MODEL_DOWNLOAD,
+    PHASE_MODEL_LOAD_AND_WARMUP,
+    PHASE_SMOKE_TEST,
+    PhaseTimer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +34,7 @@ async def run_deploy(
     dry_run=False,
     gpu_device_ids=None,
     port_mappings=None,
+    timer: PhaseTimer | None = None,
 ):
     """Shared deploy orchestration.
 
@@ -39,7 +48,10 @@ async def run_deploy(
         dry_run: if True, skip sleep in health polling
         gpu_device_ids: optional list of GPU device IDs to restrict visibility
         port_mappings: optional list of (internal, external) port tuples
+        timer: optional PhaseTimer; deploy step durations are recorded into it. A
+            throwaway timer is used when None, so the timing log lines still print.
     """
+    timer = timer or PhaseTimer()
     num_instances = calculate_num_instances(recipe)
 
     model_name = recipe.model_name
@@ -62,7 +74,8 @@ async def run_deploy(
 
     # Step 1: Pull images
     logger.info("Pulling images...")
-    rc, _, _ = await run_cmd("docker compose pull", timeout=1800, log_output=True)
+    async with timer.ameasure(PHASE_IMAGE_PULL):
+        rc, _, _ = await run_cmd("docker compose pull", timeout=1800, log_output=True)
     if rc != 0:
         logger.error("Failed to pull images")
         return False
@@ -78,7 +91,8 @@ async def run_deploy(
         f" {image}"
         f" -c 'HF_HUB_ENABLE_HF_TRANSFER=1 hf download {model_name}'"
     )
-    rc, _, _ = await run_cmd(dl_cmd, timeout=7200, log_output=True)
+    async with timer.ameasure(PHASE_MODEL_DOWNLOAD):
+        rc, _, _ = await run_cmd(dl_cmd, timeout=7200, log_output=True)
     if rc != 0:
         logger.error("Failed to download model")
         return False
@@ -87,14 +101,27 @@ async def run_deploy(
     logger.info("Cleaning up old containers...")
     await run_cmd("docker compose down", timeout=300, log_output=True)
 
-    # Step 4: Start services
+    # Step 4: Start services (blocks until /health passes, so this window covers
+    # container start + weight load into GPU + CUDA graph capture + warmup)
     logger.info("Starting services...")
-    rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 3600", timeout=3600, log_output=True)
+    async with timer.ameasure(PHASE_MODEL_LOAD_AND_WARMUP):
+        rc, _, _ = await run_cmd("docker compose up -d --wait --wait-timeout 3600", timeout=3600, log_output=True)
     if rc != 0:
         logger.error("Failed to start services")
         logger.error("Container logs:")
         await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
         return False
+
+    # Best-effort: break the warmup window into startup / weights_load / torch_compile /
+    # engine_warmup / cuda_graph_capture by scraping the container logs. The leaves sum to
+    # model_load_and_warmup; absent/degraded to a single `other` when the format differs.
+    if not dry_run:
+        rc_logs, logs, _ = await run_cmd("docker compose logs --no-color", stream=False, timeout=120)
+        if rc_logs == 0 and logs:
+            raw = parse_engine_load_phases(logs, recipe.engine.llm.engine_name)
+            mlw = timer.phases.get(PHASE_MODEL_LOAD_AND_WARMUP, 0.0)
+            for name, seconds in decompose_model_load(raw, mlw).items():
+                timer.record(name, seconds)
 
     # Step 5: Poll health
     logger.info("Waiting for health check...")
@@ -126,45 +153,46 @@ async def run_deploy(
     # (e.g. wrong quantization producing garbage output).
     if not dry_run:
         logger.info("\nRunning smoke test...")
-        prompt = "What is 2+2? Answer with just the number."
-        smoke_cmd = (
-            f"curl -s http://localhost:{internal_port}/v1/chat/completions"
-            f" -H 'Content-Type: application/json'"
-            f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":128}}' '''
-        )
-        smoke_timeout = 600
-        smoke_interval = 10
-        deadline = asyncio.get_event_loop().time() + smoke_timeout
-        while asyncio.get_event_loop().time() < deadline:
-            rc, stdout, _ = await run_cmd(smoke_cmd, stream=False, timeout=180)
-            if rc != 0 or not stdout.strip():
-                # Server not ready yet, keep retrying
-                await asyncio.sleep(smoke_interval)
-                continue
-            try:
-                body = json.loads(stdout)
-                message = body["choices"][0]["message"]
-                answer = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
-            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                # Malformed response, server may still be starting
-                await asyncio.sleep(smoke_interval)
-                continue
-            if not answer:
-                await asyncio.sleep(smoke_interval)
-                continue
-            if "4" in answer:
-                logger.info("Smoke test passed.")
-                break
-            # Model returned a valid response but wrong answer — broken model
-            logger.error(f"Smoke test failed: model returned wrong answer: {answer!r}")
-            logger.error("Container logs:")
-            await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
-            return False
-        else:
-            logger.error(f"Smoke test timed out after {smoke_timeout}s. The endpoint is not ready.")
-            logger.error("Container logs:")
-            await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
-            return False
+        async with timer.ameasure(PHASE_SMOKE_TEST):
+            prompt = "What is 2+2? Answer with just the number."
+            smoke_cmd = (
+                f"curl -s http://localhost:{internal_port}/v1/chat/completions"
+                f" -H 'Content-Type: application/json'"
+                f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":128}}' '''
+            )
+            smoke_timeout = 600
+            smoke_interval = 10
+            deadline = asyncio.get_event_loop().time() + smoke_timeout
+            while asyncio.get_event_loop().time() < deadline:
+                rc, stdout, _ = await run_cmd(smoke_cmd, stream=False, timeout=180)
+                if rc != 0 or not stdout.strip():
+                    # Server not ready yet, keep retrying
+                    await asyncio.sleep(smoke_interval)
+                    continue
+                try:
+                    body = json.loads(stdout)
+                    message = body["choices"][0]["message"]
+                    answer = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
+                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                    # Malformed response, server may still be starting
+                    await asyncio.sleep(smoke_interval)
+                    continue
+                if not answer:
+                    await asyncio.sleep(smoke_interval)
+                    continue
+                if "4" in answer:
+                    logger.info("Smoke test passed.")
+                    break
+                # Model returned a valid response but wrong answer — broken model
+                logger.error(f"Smoke test failed: model returned wrong answer: {answer!r}")
+                logger.error("Container logs:")
+                await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
+                return False
+            else:
+                logger.error(f"Smoke test timed out after {smoke_timeout}s. The endpoint is not ready.")
+                logger.error("Container logs:")
+                await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
+                return False
 
     # Print curl example
     logger.info("\nExample curl:")
@@ -192,7 +220,7 @@ async def run_teardown(run_cmd):
     return rc == 0
 
 
-async def deploy(params: DeployParams) -> bool:
+async def deploy(params: DeployParams, timer: PhaseTimer | None = None) -> bool:
     """Deploy a recipe to a server via SSH. Single entry point."""
     run_cmd = make_run_cmd(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
     write_file = make_write_file(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
@@ -207,6 +235,7 @@ async def deploy(params: DeployParams) -> bool:
         params.dry_run,
         gpu_device_ids=params.gpu_device_ids,
         port_mappings=params.port_mappings,
+        timer=timer,
     )
 
 

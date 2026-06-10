@@ -32,6 +32,14 @@ from deplodock.provisioning.remote import provision_remote
 from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR, make_run_cmd
 from deplodock.provisioning.staging import stage_to_remote
 from deplodock.redact import register_secret
+from deplodock.timing import (
+    PHASE_BENCHMARK,
+    PHASE_COMMAND,
+    PHASE_REMOTE_PROVISION,
+    PHASE_TEARDOWN,
+    PHASE_VM_PROVISION,
+    PhaseTimer,
+)
 
 OnTaskDone = Callable[[BenchmarkTask, bool], Awaitable[None]]
 
@@ -80,7 +88,7 @@ async def run_execution_group(
     on_task_done: OnTaskDone | None = None,
     preallocated_conn=None,
     provider: str | None = None,
-) -> tuple[list[tuple[BenchmarkTask, bool]], dict | None]:
+) -> tuple[list[tuple[BenchmarkTask, bool, dict]], dict | None]:
     """Run all benchmark tasks for one execution group.
 
     Provisions a VM with group.gpu_count GPUs, then runs each task.
@@ -98,10 +106,11 @@ async def run_execution_group(
 
     Returns:
         A tuple of (task_results, instance_info). task_results is a list of
-        (BenchmarkTask, bool) pairs. instance_info is non-None only when
+        (BenchmarkTask, bool, timing) triples, where timing is a phase->seconds dict
+        (``{}`` for early-failure paths). instance_info is non-None only when
         no_teardown is set and the VM was kept alive.
     """
-    task_results: list[tuple[BenchmarkTask, bool]] = []
+    task_results: list[tuple[BenchmarkTask, bool, dict]] = []
     instance_info = None
     model_dir = config["benchmark"].get("model_dir", "/hf_models")
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -125,25 +134,30 @@ async def run_execution_group(
         active_run_dir.set(group.tasks[0].run_dir)
 
     conn = None
+    # Per-group provisioning durations (shared across the group's tasks). Seeded into
+    # each task's timer so every task's result reflects what it cost to stand up its
+    # host. vm_provision is omitted for pre-allocated/fixed/local hosts (no VM created).
+    group_timer = PhaseTimer()
     try:
         if preallocated_conn is not None:
             conn = preallocated_conn
             logger.info(f"Using pre-allocated host: {conn.address}:{conn.ssh_port}")
         else:
-            conn = await provision_cloud_vm(
-                group.gpu_name,
-                group.gpu_count,
-                ssh_key,
-                providers_config,
-                server_name=group_label,
-                dry_run=dry_run,
-                logger=logger,
-                provider=provider,
-            )
+            async with group_timer.ameasure(PHASE_VM_PROVISION):
+                conn = await provision_cloud_vm(
+                    group.gpu_name,
+                    group.gpu_count,
+                    ssh_key,
+                    providers_config,
+                    server_name=group_label,
+                    dry_run=dry_run,
+                    logger=logger,
+                    provider=provider,
+                )
             if conn is None:
                 logger.error("VM provisioning failed")
                 for task in group.tasks:
-                    task_results.append((task, False))
+                    task_results.append((task, False, {}))
                     await _invoke_callback(on_task_done, task, False, logger)
                 return task_results, None
 
@@ -152,11 +166,12 @@ async def run_execution_group(
 
         first_recipe = group.tasks[0].recipe if group.tasks else None
         host = RemoteHost(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-        await provision_remote(
-            host,
-            driver_version=first_recipe.deploy.driver_version if first_recipe else None,
-            cuda_version=first_recipe.deploy.cuda_version if first_recipe else None,
-        )
+        async with group_timer.ameasure(PHASE_REMOTE_PROVISION):
+            await provision_remote(
+                host,
+                driver_version=first_recipe.deploy.driver_version if first_recipe else None,
+                cuda_version=first_recipe.deploy.cuda_version if first_recipe else None,
+            )
 
         # Collect system info once per execution group
         sysinfo_run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
@@ -185,7 +200,7 @@ async def run_execution_group(
             except Exception as e:
                 logger.error(f"Staging failed: {e}")
                 for task in group.tasks:
-                    task_results.append((task, False))
+                    task_results.append((task, False, {}))
                     await _invoke_callback(on_task_done, task, False, logger)
                 return task_results, None
 
@@ -200,6 +215,11 @@ async def run_execution_group(
 
             task_logger = _get_group_logger(group, model_name)
             task_logger.info(f"Recipe: {task.recipe_dir} (variant: {task.variant})")
+
+            # Per-task timer, seeded (silently) with the group's provisioning durations.
+            task_timer = PhaseTimer()
+            for phase_name, seconds in group_timer.phases.items():
+                task_timer.record(phase_name, seconds, log=False)
 
             # Always set explicit GPU device IDs so the container only sees
             # the GPUs the task needs — the provisioned VM may have more GPUs
@@ -216,21 +236,22 @@ async def run_execution_group(
                 run_suffix = task.run_dir.name if task.run_dir is not None else "default"
                 task_dir_remote = f"{REMOTE_DEPLOY_DIR}/{group_label}/{task.variant}/{run_suffix}"
                 try:
-                    cmd_success, _info = await run_command_workload(
-                        task,
-                        run_cmd,
-                        repo_dir=repo_dir_remote,
-                        task_dir=task_dir_remote,
-                        gpu_device_ids=gpu_device_ids,
-                        server=conn.address,
-                        ssh_key=ssh_key,
-                        ssh_port=conn.ssh_port,
-                        dry_run=dry_run,
-                    )
+                    async with task_timer.ameasure(PHASE_COMMAND):
+                        cmd_success, _info = await run_command_workload(
+                            task,
+                            run_cmd,
+                            repo_dir=repo_dir_remote,
+                            task_dir=task_dir_remote,
+                            gpu_device_ids=gpu_device_ids,
+                            server=conn.address,
+                            ssh_key=ssh_key,
+                            ssh_port=conn.ssh_port,
+                            dry_run=dry_run,
+                        )
                 except Exception as e:
                     task_logger.error(f"Command workload error: {e}")
                     cmd_success = False
-                task_results.append((task, cmd_success))
+                task_results.append((task, cmd_success, task_timer.as_dict()))
                 await _invoke_callback(on_task_done, task, cmd_success, task_logger)
                 continue
 
@@ -246,34 +267,43 @@ async def run_execution_group(
                 port_mappings=conn.port_mappings,
             )
             task_logger.info("Deploying model...")
-            success = await deploy_entry(params)
+            success = await deploy_entry(params, timer=task_timer)
 
             if not success:
                 task_logger.error("Deploy failed, skipping benchmark")
-                task_results.append((task, False))
+                task_results.append((task, False, task_timer.as_dict()))
                 await _invoke_callback(on_task_done, task, False, task_logger)
                 continue
 
             task_logger.info("Running benchmark...")
             run_cmd = make_run_cmd(conn.address, ssh_key, conn.ssh_port, dry_run=dry_run)
-            bench_success, output, stderr, bench_command = await run_benchmark_workload(
-                run_cmd,
-                recipe,
-                dry_run=dry_run,
-            )
+            async with task_timer.ameasure(PHASE_BENCHMARK):
+                bench_success, output, stderr, bench_command = await run_benchmark_workload(
+                    run_cmd,
+                    recipe,
+                    dry_run=dry_run,
+                )
 
+            # Tear down before persisting results so the teardown duration is captured
+            # in the stored timing. The benchmark output is already in memory.
+            if not no_teardown:
+                task_logger.info("Tearing down...")
+                async with task_timer.ameasure(PHASE_TEARDOWN):
+                    await teardown_entry(params)
+
+            timing = task_timer.as_dict()
             if bench_success or dry_run:
                 if not dry_run:
                     benchmark_output = extract_benchmark_results(output)
                     compose_content = generate_compose(recipe, model_dir, hf_token, gpu_device_ids=gpu_device_ids)
-                    full_result = compose_result(task, benchmark_output, compose_content, bench_command, system_info)
+                    full_result = compose_result(task, benchmark_output, compose_content, bench_command, system_info, timing=timing)
                     result_path.write_text(full_result)
-                    json_data = compose_json_result(task, benchmark_output, compose_content, bench_command, system_info)
+                    json_data = compose_json_result(task, benchmark_output, compose_content, bench_command, system_info, timing=timing)
                     task.json_result_path().write_text(json.dumps(json_data, indent=2) + "\n")
                     task_logger.info(f"Results saved to: {result_path}")
                 else:
                     task_logger.info(f"[dry-run] Would save results to: {result_path}")
-                task_results.append((task, True))
+                task_results.append((task, True, timing))
                 await _invoke_callback(on_task_done, task, True, task_logger)
             else:
                 task_logger.error("Benchmark failed")
@@ -281,12 +311,8 @@ async def run_execution_group(
                     task_logger.error(output)
                 if stderr:
                     task_logger.error(stderr)
-                task_results.append((task, False))
+                task_results.append((task, False, timing))
                 await _invoke_callback(on_task_done, task, False, task_logger)
-
-            if not no_teardown:
-                task_logger.info("Tearing down...")
-                await teardown_entry(params)
 
     finally:
         active_run_dir.set(None)

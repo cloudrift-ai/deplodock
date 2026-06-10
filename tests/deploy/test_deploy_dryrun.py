@@ -96,6 +96,24 @@ def test_local_deploy(run_cli, recipes_dir):
     assert "docker compose up -d" in stdout
 
 
+def test_local_deploy_reports_timing(run_cli, recipes_dir):
+    rc, stdout, _ = run_cli(
+        "deploy",
+        "local",
+        "--recipe",
+        os.path.join(recipes_dir, "Qwen3-Coder-30B-A3B-Instruct-AWQ"),
+        "--gpu",
+        "NVIDIA GeForce RTX 5090",
+        "--gpu-count",
+        "1",
+        "--dry-run",
+    )
+    assert rc == 0
+    # Per-phase [timing] log lines and the final breakdown table both render.
+    assert "[timing] image_pull" in stdout
+    assert "Timing:" in stdout
+
+
 def test_local_teardown(run_cli, recipes_dir):
     rc, stdout, _ = run_cli(
         "deploy",

@@ -17,6 +17,7 @@ from deplodock.provisioning.host import RemoteHost
 from deplodock.provisioning.remote import provision_remote
 from deplodock.recipe import resolve_for_hardware
 from deplodock.redact import register_secret
+from deplodock.timing import PHASE_REMOTE_PROVISION, PHASE_VM_PROVISION, PhaseTimer
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +51,18 @@ async def _handle_cloud(args):
         if args.network:
             providers_config["cloudrift"]["network"] = args.network
 
-    conn = await provision_cloud_vm(
-        gpu_name=recipe.deploy.gpu,
-        gpu_count=recipe.deploy.gpu_count,
-        ssh_key=ssh_key,
-        providers_config=providers_config,
-        server_name=args.name,
-        dry_run=args.dry_run,
-        provider=args.provider,
-        extra_authorized_keys=extra_authorized_keys,
-    )
+    timer = PhaseTimer()
+    async with timer.ameasure(PHASE_VM_PROVISION):
+        conn = await provision_cloud_vm(
+            gpu_name=recipe.deploy.gpu,
+            gpu_count=recipe.deploy.gpu_count,
+            ssh_key=ssh_key,
+            providers_config=providers_config,
+            server_name=args.name,
+            dry_run=args.dry_run,
+            provider=args.provider,
+            extra_authorized_keys=extra_authorized_keys,
+        )
     if conn is None:
         logger.error("Error: VM provisioning failed.")
         sys.exit(1)
@@ -75,14 +78,19 @@ async def _handle_cloud(args):
         port_mappings=conn.port_mappings,
     )
     host = RemoteHost(params.server, params.ssh_key, params.ssh_port, dry_run=params.dry_run)
-    await provision_remote(
-        host,
-        driver_version=recipe.deploy.driver_version,
-        cuda_version=recipe.deploy.cuda_version,
-    )
+    async with timer.ameasure(PHASE_REMOTE_PROVISION):
+        await provision_remote(
+            host,
+            driver_version=recipe.deploy.driver_version,
+            cuda_version=recipe.deploy.cuda_version,
+        )
 
-    if not await deploy_entry(params):
+    if not await deploy_entry(params, timer=timer):
         sys.exit(1)
+
+    logger.info("\nTiming:")
+    for line in timer.format_table().splitlines():
+        logger.info(line)
 
 
 def register_cloud_target(subparsers):

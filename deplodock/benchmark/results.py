@@ -198,9 +198,19 @@ def compose_json_result(
     compose_content: str,
     bench_command: str,
     system_info_raw: str,
+    timing: dict[str, float] | None = None,
 ) -> dict:
-    """Assemble the structured JSON result dict from all benchmark data."""
-    return {
+    """Assemble the structured JSON result dict from all benchmark data.
+
+    ``timing`` (a flat ``phase -> seconds`` dict plus a ``total`` key) is added under
+    a ``"timing"`` key only when provided. ``model_load_and_warmup`` is the deploy
+    window that covers weight load + CUDA graph capture; the optional
+    ``weights_load`` / ``cuda_graph_capture`` keys break it down (best-effort) and are
+    excluded from ``total``. Note ``timing["benchmark"]`` is wall-clock (incl. docker
+    bench-client startup), distinct from ``metrics.benchmark_duration_s`` (the
+    server-measured window).
+    """
+    result = {
         "task": {
             "recipe_dir": task.recipe_dir,
             "variant": str(task.variant),
@@ -214,3 +224,6 @@ def compose_json_result(
         "compose": redact_secrets(compose_content),
         "bench_command": bench_command,
     }
+    if timing is not None:
+        result["timing"] = timing
+    return result

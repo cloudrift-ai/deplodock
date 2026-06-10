@@ -29,6 +29,40 @@ from deplodock.benchmark.fixed_hosts import (
 from deplodock.planner import BenchmarkTask
 from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
+# Each summary column aggregates these timing phase keys (seconds). A column is shown
+# only when at least one task has a non-zero value for it, so command-recipe runs (which
+# only record `command`) and deploy+bench runs render the columns that apply to them.
+_TIMING_COLUMNS = [
+    ("provision", ("vm_provision", "remote_provision")),
+    ("deploy", ("image_pull", "model_download", "model_load_and_warmup", "smoke_test")),
+    ("bench", ("benchmark",)),
+    ("teardown", ("teardown",)),
+    ("command", ("command",)),
+]
+
+
+def _format_timing_table(rows: list[tuple[BenchmarkTask, dict]]) -> str:
+    """Render a per-task timing breakdown (seconds) as an aligned table.
+
+    Returns '' when there are no rows. Columns with no data across all rows are dropped.
+    """
+    if not rows:
+        return ""
+    columns: list[tuple[str, list[float]]] = []
+    for name, keys in _TIMING_COLUMNS:
+        vals = [sum(tm.get(k, 0.0) for k in keys) for _, tm in rows]
+        if any(v > 0 for v in vals):
+            columns.append((name, vals))
+    columns.append(("total", [tm.get("total", 0.0) for _, tm in rows]))
+
+    id_width = max(len("task"), max(len(t.task_id) for t, _ in rows))
+    col_width = 11
+    header = "task".ljust(id_width) + "".join(name.rjust(col_width) for name, _ in columns)
+    lines = [header]
+    for i, (t, _) in enumerate(rows):
+        lines.append(t.task_id.ljust(id_width) + "".join(f"{vals[i]:>{col_width}.1f}" for _, vals in columns))
+    return "\n".join(lines)
+
 
 def handle_bench(args):
     """Handle the bench command."""
@@ -155,12 +189,12 @@ def handle_bench(args):
         )
 
     # Flatten results, handling exceptions
-    all_results: list[tuple[BenchmarkTask, bool]] = []
+    all_results: list[tuple[BenchmarkTask, bool, dict]] = []
     all_instance_infos = []
     for i, r in enumerate(raw_results):
         if isinstance(r, Exception):
             root_logger.error(f"Group {i} generated an exception: {r}")
-            all_results.extend((t, False) for t in groups[i].tasks)
+            all_results.extend((t, False, {}) for t in groups[i].tasks)
         else:
             task_results, instance_info = r
             all_results.extend(task_results)
@@ -207,8 +241,8 @@ def handle_bench(args):
     root_logger.info("")
     root_logger.info("SUMMARY")
 
-    successful = [t for t, ok in all_results if ok]
-    failed = [t for t, ok in all_results if not ok]
+    successful = [t for t, ok, _ in all_results if ok]
+    failed = [t for t, ok, _ in all_results if not ok]
 
     root_logger.info(f"Successful: {len(successful)}/{len(all_results)}")
     if successful:
@@ -220,6 +254,14 @@ def handle_bench(args):
         root_logger.info(f"Failed: {len(failed)}/{len(all_results)}")
         for t in failed:
             root_logger.info(f"   - {t.task_id}")
+
+    # Timing breakdown table (successful tasks that recorded timing)
+    timing_table = _format_timing_table([(t, tm) for t, ok, tm in all_results if ok and tm])
+    if timing_table:
+        root_logger.info("")
+        root_logger.info("TIMING")
+        for line in timing_table.splitlines():
+            root_logger.info(line)
 
     root_logger.info("")
     root_logger.info("All done!")

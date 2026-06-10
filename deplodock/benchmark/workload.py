@@ -9,6 +9,7 @@ from deplodock.deploy.compose import calculate_num_instances
 from deplodock.planner import BenchmarkTask
 from deplodock.recipe.types import Recipe, VllmConfig
 from deplodock.redact import redact_secrets
+from deplodock.timing import format_timing
 
 SECTION_DELIMITER = "=" * 50
 
@@ -71,6 +72,7 @@ def compose_result(
     compose_content: str,
     bench_command: str,
     system_info: str,
+    timing: dict[str, float] | None = None,
 ) -> str:
     """Assemble the full result file from all sections."""
     sections = [
@@ -79,6 +81,8 @@ def compose_result(
         _section("Docker Compose Configuration", redact_secrets(compose_content.rstrip())),
         _section("Benchmark Command", bench_command),
     ]
+    if timing:
+        sections.append(_section("Timing", format_timing(timing)))
     if system_info:
         sections.append(_section("System Information", system_info.rstrip()))
     return "\n\n".join(sections) + "\n"
