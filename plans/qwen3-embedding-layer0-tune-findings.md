@@ -2,10 +2,13 @@
 
 **Status:** findings 1–2 (codegen failures / hangs) **fixed** — two TMA eligibility gates in `050_use_tma.py`
 plus a defensive box check in `backend/cuda/_tma.py`, locked in by `tests/compiler/passes/test_use_tma_gates.py`.
-Finding 3 (down_proj tensor-core lockout) **fixed** — the `matmul_add` residual epilogue now folds into the mma
-fragment store (`tests/compiler/test_matmul_mma_residual.py`); the real reproducer went 29 → 9.9 µs tuned
-(0.28x → 0.83x vs cuBLAS). Findings 4–6 (gated-MLP purity, SDPA prologue matmuls) remain open. Findings from a
-clean tune + -O3 kernel bench on 2026-06-10.
+Finding 3 (down_proj tensor-core lockout) **fixed** — pointwise epilogues (residual adds, bias/scale broadcasts,
+activation chains) now fold into the mma fragment store, gated by the negative-form
+`tile/_atom.classify_fragment_epilogue` (the slice folds unless it has an ineligible op/dependency) and locked in
+by `tests/compiler/test_matmul_mma_residual.py`; the real down_proj reproducer went 29 → 8 µs tuned (0.28x →
+1.04x, cuBLAS parity). Findings 4–6 (gated-MLP purity, SDPA prologue matmuls) remain open — note finding 4's
+combine (`silu(acc_g)·acc_u`) is now blocked only by the multi-accumulator rule + reduce-body purity, not the
+epilogue rule. Findings from a clean tune + -O3 kernel bench on 2026-06-10.
 Run: `deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --clean --bench --dump-dir <dump>` (859 s, 930 benched
 variants, 810 ok / 28 `bench_fail` in the tune DB). Numbers below are the `--bench` -O3 re-bench (CUDA-graph
 captured); tune-DB latencies quoted for ranking context are -O1.

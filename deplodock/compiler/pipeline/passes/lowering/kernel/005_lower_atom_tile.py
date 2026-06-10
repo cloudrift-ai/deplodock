@@ -49,7 +49,7 @@ from __future__ import annotations
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment, RegStore
+from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore
 from deplodock.compiler.ir.stmt import Body, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
@@ -71,13 +71,13 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     # No knob lookup: each cell's atom spec is read off its ``Mma`` (the
     # ``AtomTile`` presence is the signal). Scalar / already-lowered TileOps
     # have no ``AtomTile`` → found is False → skip.
-    lowered, found = lower_atom_cells(op.body, smem_sources={})
+    lowered, found = lower_atom_cells(op.body, smem_sources={}, graph=match.graph)
     if not found:
         raise RuleSkipped("no AtomTile in body (scalar, or already lowered)")
     return TileOp(body=lowered, name=op.name, knobs=op.knobs)
 
 
-def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Body, bool]:
+def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source], graph: Graph | None = None) -> tuple[Body, bool]:
     """For each ``AtomTile`` in ``body``, lower its matmul cell to the kernel-IR
     fragment chain and strip the wrapper. Runs through the shared
     :func:`~deplodock.compiler.ir.tile.ir.map_staged` traversal, which threads
@@ -91,13 +91,13 @@ def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source]) -> tuple[Bo
         nonlocal found
         if isinstance(s, AtomTile):
             found = True
-            return _lower_cell(s.body, smem_sources=sources)
+            return _lower_cell(s.body, smem_sources=sources, graph=graph)
         return None
 
     return map_staged(body, handler, sources=smem_sources), found
 
 
-def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[Stmt, ...]:
+def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source], graph: Graph | None = None) -> tuple[Stmt, ...]:
     """Lower one AtomTile body (operand Loads + ``Mma``) to the fragment chain.
 
     The atom :class:`Atom` spec comes from the cell's ``Mma``. Prepends the
@@ -127,7 +127,7 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
         raise RuleSkipped("AtomTile body unrecognised — no Write")
     if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
-    res_load, epi_assign = _scan_epilogue(atom_body, write_stmt=write_stmt, acc_name=c_seed)
+    epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph)
 
     c_frag, a_frag, b_frag = f"{c_seed}_frag", f"{a_seed}_frag", f"{b_seed}_frag"
     fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=spec.operand_dtype("c"))
@@ -135,13 +135,13 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
     if has_reduce:
 
         def handler(s: Stmt, sources: dict[str, Source]) -> tuple[Stmt, ...] | None:
-            # The fused residual epilogue rides the RegStore (see _scan_epilogue);
-            # its scalar Load / Assign would reference the accumulator SSA name
-            # the fragment path never defines — drop them here.
-            if s is res_load or s is epi_assign:
+            # The fused pointwise epilogue rides the RegStore (see
+            # _scan_epilogue); its scalar Loads / Assigns would reference the
+            # accumulator SSA name the fragment path never defines — drop them.
+            if id(s) in strip_ids:
                 return ()
             if isinstance(s, Write):
-                return (_emit_store(spec, dst_buffer=s.output, dst_index=s.index, c_frag=c_frag, res_load=res_load),)
+                return (_emit_store(spec, dst_buffer=s.output, dst_index=s.index, c_frag=c_frag, epilogue=epilogue),)
             if isinstance(s, SerialTile) and s.is_reduce:
                 chain = _build_chain(s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=sources, spec=spec)
                 return (s.with_bodies((Body(chain),)),)
@@ -155,7 +155,7 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source]) -> tuple[St
     if a_load is None or b_load is None:
         raise RuleSkipped("Atom body (shape C) missing its Mma / A/B loads")
     chain = _emit_chain(spec, a_load=a_load, b_load=b_load, a_frag=a_frag, b_frag=b_frag, c_frag=c_frag, smem_sources=bundle_sources)
-    store = _emit_store(spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag, res_load=res_load)
+    store = _emit_store(spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag, epilogue=epilogue)
     return (*fragments, *chain, store)
 
 
@@ -194,46 +194,43 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
     return write_stmt, a_seed, b_seed, c_seed, has_reduce, spec
 
 
-def _scan_epilogue(body: Body, *, write_stmt: Write, acc_name: str) -> tuple[Load | None, Stmt | None]:
-    """Find the foldable ``matmul_add`` residual epilogue in the AtomTile body:
-    a single ``Assign(v = add(acc, r))`` feeding the Write, with ``r`` loaded at
-    exactly the Write's index. Returns ``(residual_load, epilogue_assign)`` —
-    the two stmts the caller strips, with the residual riding the ``RegStore``
-    (each lane reads it at its fragment elements' own (row, col) coordinates).
+def _scan_epilogue(body: Body, *, acc_name: str, graph: Graph | None) -> tuple[RegEpilogue | None, frozenset[int]]:
+    """Classify the AtomTile body's post-reduce epilogue via the shared
+    negative-form classifier (``tile/_atom.classify_fragment_epilogue`` — the
+    same walk the planner gate ran on the Loop-IR body, here on the staged
+    Tile-IR body where the indices carry the partition decomposition). Returns
+    the :class:`RegEpilogue` payload for the store plus the ``id()`` set of
+    the scalar stmts to strip (the slice Assigns + leaf Loads, whose
+    accumulator SSA name doesn't exist on the fragment path).
 
-    The planner gate (``tile/_atom._is_foldable_residual_epilogue``) admits only
-    this shape to the warp tier, so any accumulator-consuming Assign that does
-    NOT match here means the gate and this fold disagree — fail loud rather
-    than emit a kernel referencing the undefined scalar accumulator."""
-    from deplodock.compiler.ir.stmt import Assign  # noqa: PLC0415
+    The gate admits a shape only when the classifier reports no blocker, so a
+    blocker here means the gate and this fold disagree — fail loud rather than
+    emit a kernel referencing the undefined scalar accumulator."""
+    from deplodock.compiler.ir.stmt import Write  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile._atom import classify_fragment_epilogue  # noqa: PLC0415
 
-    assigns: list[Assign] = []
-    loads_by_name: dict[str, Load] = {}
+    produced = {w.output for w in body.iter_of_type(Write)}
 
-    def _walk(stmts: Body) -> None:
-        for s in stmts:
-            if isinstance(s, Assign) and acc_name in s.args:
-                assigns.append(s)
-            elif isinstance(s, Load) and s.names:
-                loads_by_name[s.names[0]] = s
-            for sub in s.nested():
-                _walk(sub)
+    def _leaf_dtype(buf: str) -> str | None:
+        if graph is None or buf not in graph.nodes:
+            return None
+        return graph.nodes[buf].output.dtype.name
 
-    _walk(body)
-    # The in-reduce multiply consumes operand loads, not the accumulator;
-    # ``tile/011_lower_atom_cell`` already collapsed Assign+Accum into the Mma,
-    # so any surviving acc-consuming Assign is post-reduce epilogue.
-    if not assigns:
-        return None, None
-    epilogue = [a for a in assigns if a.name == write_stmt.value]
-    if len(assigns) == 1 and len(epilogue) == 1:
-        assign = epilogue[0]
-        others = [arg for arg in assign.args if arg != acc_name]
-        if assign.op.name == "add" and len(assign.args) == 2 and len(others) == 1:
-            res = loads_by_name.get(others[0])
-            if res is not None and tuple(res.index) == tuple(write_stmt.index):
-                return res, assign
-    raise RuleSkipped(f"AtomTile epilogue consuming {acc_name!r} is not the foldable matmul_add shape (gate out of sync?)")
+    slice_, blocker = classify_fragment_epilogue(body, {acc_name}, produced=produced, leaf_dtype=_leaf_dtype)
+    if blocker is not None:
+        raise RuleSkipped(f"AtomTile epilogue consuming {acc_name!r} is not foldable ({blocker}) — gate out of sync?")
+    if slice_ is None:
+        return None, frozenset()
+    epilogue = RegEpilogue(
+        acc=slice_.acc,
+        loads=tuple(
+            EpilogueLoad(name=ld.names[0], buffer=ld.input, index=tuple(ld.index), roles=roles)
+            for ld, roles in zip(slice_.loads, slice_.load_roles, strict=True)
+        ),
+        ops=tuple((a.name, a.op.name, tuple(a.args)) for a in slice_.assigns),
+        result=slice_.write.value,
+    )
+    return epilogue, frozenset(map(id, (*slice_.assigns, *slice_.loads)))
 
 
 def _find_role_loads(body: Body) -> tuple[Load | None, Load | None]:
@@ -310,19 +307,11 @@ def _emit_chain(
     )
 
 
-def _emit_store(spec: Atom, *, dst_buffer: str, dst_index: tuple, c_frag: str, res_load: Load | None = None) -> Stmt:
+def _emit_store(spec: Atom, *, dst_buffer: str, dst_index: tuple, c_frag: str, epilogue: RegEpilogue | None = None) -> Stmt:
     """The accumulator → output store (with epilogue downconvert), carrying
-    the fused residual-add when ``_scan_epilogue`` found one — the residual's
-    tile-base index equals the Write's, so the RegStore reads it with the
-    same lane arithmetic at the residual buffer's own row stride."""
-    return RegStore(
-        dst_buffer=dst_buffer,
-        dst_index=dst_index,
-        frag=c_frag,
-        shape=spec.shape,
-        res_buffer=res_load.input if res_load is not None else None,
-        res_index=tuple(res_load.index) if res_load is not None else (),
-    )
+    the fused pointwise chain when ``_scan_epilogue`` found one — the RegStore
+    evaluates it per fragment element at the element's own coordinates."""
+    return RegStore(dst_buffer=dst_buffer, dst_index=dst_index, frag=c_frag, shape=spec.shape, epilogue=epilogue)
 
 
 def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
