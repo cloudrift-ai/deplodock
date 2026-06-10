@@ -1247,6 +1247,16 @@ def _build_torch_fns(module, args, kwargs, warmup, *, backends: set[str]):
         torch_fns["Eager PyTorch"] = lambda: module(*args, **kwargs)
     if "tcompile" in backends:
         try:
+            # Persistent bench processes (the SIGKILL-able worker, ``tune
+            # --dataset golden``'s in-process loop) compile a fresh closure of
+            # the SAME ``torch_ref`` ``fn`` code object per row; dynamo's
+            # recompile limit is keyed per code object, so after ~8 rows it
+            # silently stops compiling and the tcompile column quietly measures
+            # eager (observed: 8 µs rows reading 55-80 µs). Reset dynamo so
+            # every bench compiles fresh.
+            import torch._dynamo  # noqa: PLC0415
+
+            torch._dynamo.reset()
             compiled_module = torch.compile(module)
             for _ in range(warmup + 5):
                 with torch.no_grad():

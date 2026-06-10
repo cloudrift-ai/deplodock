@@ -94,6 +94,35 @@ class _HangWorker:
         return self._impl._proc
 
 
+def test_run_job_send_times_out_on_unresponsive_worker() -> None:
+    """A worker that is alive but never reads stdin — e.g. wedged in CUDA-context
+    teardown behind a hung kernel after a dirty exit — must trip the wall budget
+    during the request SEND. Previously the parent blocked forever in the pipe
+    write once the request exceeded the ~64 KB pipe buffer (the wall budget only
+    bounded the response read). No CUDA needed: the deaf child is plain Python."""
+    import pytest
+
+    from deplodock.compiler.backend.cuda.program import _BenchWorker
+
+    worker = _BenchWorker()
+
+    def _spawn_deaf() -> None:
+        worker._proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+
+    worker._spawn = _spawn_deaf  # type: ignore[method-assign]
+    t0 = time.time()
+    with pytest.raises(RuntimeError, match="did not accept the request"):
+        worker.run_job({"blob": b"x" * (1 << 20)}, wall_timeout_s=2.0)  # 1 MB >> pipe buffer
+    assert time.time() - t0 < 20.0, "send must respect the wall budget, not block on the pipe"
+    assert worker._proc is None, "the unresponsive worker must be killed and its handle released"
+
+
 @requires_cuda
 def test_worker_hang_is_sigkilled_not_wedged() -> None:
     import pytest

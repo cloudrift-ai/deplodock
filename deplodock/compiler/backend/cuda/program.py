@@ -1050,12 +1050,40 @@ class _BenchWorker:
     def __del__(self) -> None:
         self._kill()
 
+    @staticmethod
+    def _send_with_deadline(proc: subprocess.Popen, request: bytes, deadline: float) -> None:
+        """Write the length-prefixed request without blocking past ``deadline``.
+
+        The worker's stdin is a pipe with a ~64 KB kernel buffer; requests carry
+        pickled graphs and routinely exceed it. A blocking write to a worker
+        that is alive but not reading wedges the parent indefinitely — so write
+        through a non-blocking fd, gated on ``select`` writability with the
+        remaining budget, and raise ``_BenchTimeout`` when it runs out."""
+        import fcntl  # noqa: PLC0415
+
+        fd = proc.stdin.fileno()
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | _os.O_NONBLOCK)
+        data = memoryview(len(request).to_bytes(8, "little") + request)
+        while data:
+            remaining = deadline - _time_module.perf_counter()
+            if remaining <= 0:
+                raise _BenchTimeout()
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable:
+                raise _BenchTimeout()
+            try:
+                n = _os.write(fd, data)
+            except BlockingIOError:  # raced a re-filled buffer between select and write
+                continue
+            data = data[n:]
+
     def run_job(self, request_obj: dict, *, wall_timeout_s: float) -> dict:
         """Send one length-prefixed pickle request, read the response within ``wall_timeout_s``
         (else SIGKILL the worker and raise ``RuntimeError``), and return the unpickled response.
         The single transport for both the deplodock-only bench and the deployable comparison — the
         request's ``torch_spec`` decides which (see ``_bench_worker._run_job``)."""
         request = pickle.dumps(request_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        deadline = _time_module.perf_counter() + wall_timeout_s
         # A previous worker may have exited between our last interaction
         # and this request — most commonly through the dirty-context exit
         # path in ``_bench_worker.main``. ``poll()`` has a brief window
@@ -1070,17 +1098,24 @@ class _BenchWorker:
             assert self._proc is not None  # for type narrowing
             proc = self._proc
             try:
-                proc.stdin.write(len(request).to_bytes(8, "little"))
-                proc.stdin.write(request)
-                proc.stdin.flush()
+                self._send_with_deadline(proc, request, deadline)
                 break
+            except _BenchTimeout as exc:
+                # The worker is alive but not reading — e.g. wedged in CUDA
+                # context teardown behind a hung kernel after a dirty exit.
+                # Before the send had its own deadline, the parent blocked
+                # forever in this pipe write (the wall budget only bounded
+                # the response read).
+                self._kill()
+                raise RuntimeError(
+                    f"bench worker did not accept the request within {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned"
+                ) from exc
             except (BrokenPipeError, OSError) as exc:
                 self._kill()
                 if attempt == 1:
                     raise RuntimeError(f"bench worker died during request send: {exc}") from exc
                 logger.info("[bench-worker] stale worker on send (%s) — respawning", exc)
 
-        deadline = _time_module.perf_counter() + wall_timeout_s
         out_fd = proc.stdout.fileno()
 
         def _read_with_deadline(n: int) -> bytes:

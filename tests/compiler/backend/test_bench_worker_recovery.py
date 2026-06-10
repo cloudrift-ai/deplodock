@@ -139,18 +139,20 @@ def test_bench_retries_after_broken_pipe_on_first_write(monkeypatch) -> None:
     spawn_count = 0
 
     class _FakeStdin:
-        def __init__(self, *, fail_first: bool) -> None:
-            self._fail_first = fail_first
-            self._writes = 0
+        """A real pipe write end (the send path uses ``fileno()`` + ``os.write``).
+        ``broken=True`` closes the read end up front, so the first ``os.write``
+        raises ``BrokenPipeError`` organically — the stale-worker race."""
 
-        def write(self, data: bytes) -> int:
-            self._writes += 1
-            if self._fail_first and self._writes == 1:
-                raise BrokenPipeError(32, "Broken pipe")
-            return len(data)
+        def __init__(self, *, broken: bool) -> None:
+            r, w = os.pipe()
+            self._w = w
+            if broken:
+                os.close(r)
+            else:
+                self._r = r  # keep the read end open; the small request fits the pipe buffer
 
-        def flush(self) -> None:
-            pass
+        def fileno(self) -> int:
+            return self._w
 
     class _FakeStderr:
         def read(self) -> bytes:
@@ -159,7 +161,7 @@ def test_bench_retries_after_broken_pipe_on_first_write(monkeypatch) -> None:
     class _FakeProc:
         def __init__(self, *, fail_first_write: bool) -> None:
             self.pid = 1000 + (0 if fail_first_write else 1)
-            self.stdin = _FakeStdin(fail_first=fail_first_write)
+            self.stdin = _FakeStdin(broken=fail_first_write)
             self.stdout = type("S", (), {"fileno": lambda self: -1})()
             self.stderr = _FakeStderr()
             self._alive = True
@@ -190,7 +192,7 @@ def test_bench_retries_after_broken_pipe_on_first_write(monkeypatch) -> None:
     read_pos = [0]
 
     def fake_select(rlist, wlist, xlist, timeout):  # noqa: ARG001
-        return rlist, [], []
+        return rlist, wlist, []  # writes (real pipe fds) and reads (faked below) both "ready"
 
     def fake_read(fd: int, n: int) -> bytes:  # noqa: ARG001
         chunk = response_wire[read_pos[0] : read_pos[0] + n]
