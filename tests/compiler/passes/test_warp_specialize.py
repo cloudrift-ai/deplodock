@@ -94,6 +94,41 @@ def _tile_op_tma_pipelined() -> TileOp:
     return TileOp(body=body, name="k_tma_pipelined")
 
 
+def _tile_op_tma_under_plain_serial() -> TileOp:
+    """The Qwen3 ``k_linear_mean_reduce`` deadlock shape: the TMA-pipelined
+    ``serial_outer`` nested under a ``SerialTile(kind='plain')`` per-thread
+    fragment loop. ``_split_by_role`` does not recurse through ``plain``
+    SerialTiles, so the bundle would strand in the consumer branch (empty
+    producer → every consumer ``mbarrier.wait`` deadlocks). Must be
+    ineligible."""
+    k_outer = Axis("k_outer", 8)
+    src = Source(
+        name="a_smem",
+        buf="a",
+        cache_axes=(Axis("a_c0", 16), Axis("a_c1", 16)),
+        origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
+    )
+    tma_bundle = StageBundle(
+        sources=(src,),
+        body=Body(()),
+        policy=StagePolicy.TMA,
+        buffer_count=2,
+        phase=Var("k_outer") % Literal(2, "int"),
+        pipeline_depth=2,
+    )
+    outer_loop = SerialTile(axis=k_outer, body=Body((tma_bundle,)), kind="serial_outer")
+    frag_loop = SerialTile(axis=Axis("m_f", 1), body=Body((outer_loop,)), kind="plain")
+    body = Body(
+        (
+            ThreadTile(
+                axes=(Axis("m_i", 16), Axis("n_i", 16)),
+                body=Body((frag_loop,)),
+            ),
+        )
+    )
+    return TileOp(body=body, name="k_tma_under_plain")
+
+
 def _tile_op_warp_tma_pipelined() -> TileOp:
     """Warp-tier shape: ``WarpTile(WM,WN)`` consumer tower (the planner-emitted
     MMA matmul shape) wrapping a ``SerialTile(serial_outer)`` with a TMA
@@ -149,6 +184,30 @@ def test_pinned_ws1_on_ineligible_fails_loudly(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
     op = _tile_op_pointwise()
     with pytest.raises(ValueError, match="WARPSPEC=1 pinned but warp specialization cannot fire"):
+        _run_rule(op)
+
+
+def test_off_stamped_when_bundle_under_plain_serial():
+    """A TMA depth-2 bundle that the producer split can't reach (nested under a
+    ``SerialTile(kind='plain')`` fragment loop — the Qwen3
+    ``k_linear_mean_reduce`` shape) must stamp WARPSPEC=False instead of
+    emitting a WS=1 variant whose producer branch is empty: that kernel
+    deadlocks at runtime (TMA issues stranded behind a ``threadIdx.x == 0``
+    guard inside the consumer branch, which thread 0 never enters)."""
+    op = _tile_op_tma_under_plain_serial()
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_ws.WARP_SPECIALIZE.name] is False
+    assert result.body == op.body
+
+
+def test_pinned_ws1_under_plain_serial_fails_loudly(monkeypatch):
+    """Pinned ``DEPLODOCK_WARP_SPECIALIZE=1`` on the unreachable-bundle shape
+    raises (same loud-fail policy as other unhonorable pins) rather than
+    emitting the deadlocking empty-producer kernel."""
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
+    op = _tile_op_tma_under_plain_serial()
+    with pytest.raises(ValueError, match="not reachable by the producer split"):
         _run_rule(op)
 
 

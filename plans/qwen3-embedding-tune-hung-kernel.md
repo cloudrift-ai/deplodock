@@ -1,75 +1,81 @@
-# Qwen3-Embedding-0.6B: `k_linear_mean_reduce` generates a non-terminating -O3 kernel (OPEN)
+# Qwen3-Embedding-0.6B: `k_linear_mean_reduce` WS=1 deadlock (FIXED)
 
-Status: **unfixed codegen bug, escalated**. First seen as an occasional pick during the original two-layer tune; since
-the 2026-06-09 layer-0 tune into the default caches (`~/.cache/deplodock/autotune.db` + prior), the hanging config is
-the prior's **greedy pick** for this op — every `run` / `compile` / bench that deploys this kernel at -O3 now hangs
-deterministically. The bench harness survives it (watchdog → `bench_fail`, worker SIGKILL — see "already hardened"
-below), but the kernel itself still needs a codegen fix, and real deployments of Qwen3-class models would hang.
+Status: **root-caused and fixed**. The hang was not an -O3 miscompile — the WS=1 (warp-specialized) variant of this
+kernel was emitted with an **empty producer branch**, a structural deadlock at every nvcc opt level. The
+`085_warp_specialize` eligibility check now runs the same producer/consumer split the transform uses and rejects the
+shape, so WS=1 is no longer in this op's enumeration; the deployed greedy pick compiles and completes (123 µs at -O3).
 
 ## 1. The kernel
 
 The slice is the decoder MLP path: post-attention RMSNorm (`pow → mean → +eps → rsqrt → mul → weight-mul`) feeding the
 gate/up projections (1024 → 3072, fp16) and the SwiGLU combine (`silu(gate) * up`), output `mul_12` of shape
-`(1, 32, 3072)`. Healthy picks lower it to a register-tiled fused linear+mean kernel (e.g. the pre-tune greedy config
-ran 88 µs; a cold-prior pick ran 185 µs); the hanging variant is in the same register-tiled family.
+`(1, 32, 3072)`. Healthy picks lower it to a register-tiled fused linear+mean kernel; the hanging variant was the same
+tile family (BM=8 BN=32 BK=64 RING=2 STAGE=100) **plus WARPSPEC=1**.
 
-## 2. Symptom
+## 2. Root cause (the real one)
 
-- The -O1 tuning sweep benches the variant fine — the hang only manifests when the winner is **recompiled at -O3**
-  (the deployable default). The kernel never returns: GPU pinned at 100 %, host spin-waiting.
-- The per-launch watchdog catches it (`kernel 'k_linear_mean_reduce_23ab9c' did not complete within 1000 ms — variant
-  marked bench_fail`), but the launched kernel **stays resident on the device until the owning process exits** — CUDA
-  context teardown blocks behind it, and any other process creating a context meanwhile stalls too.
-- Almost certainly a miscompile or a loop bound that -O3 (`cicc`) optimization turns non-terminating in the unrolled
-  register-tile reduce loop. The pick came out of the -O1 ranking sweep, whose latencies don't reflect (or exercise)
-  the -O3 codegen.
+`085_warp_specialize` splits the consumer tile's body into producer (TMA `StageBundle`s) and consumer (waits + reduce +
+writes) halves via `_split_by_role`, which recurses only through `SerialTile(serial_outer)` / `RegisterTile` /
+`AtomTile`. This fused linear+mean kernel wraps its whole body in a `SerialTile(kind='plain')` per-thread M-fragment
+loop, which the splitter classifies consumer wholesale. But `_eligible` used a **deep** walk (`op.body.iter()`) to find
+the TMA depth-2 bundle, so it declared WS=1 eligible anyway. Result: a `WarpSpecialize` with `producer_body=()` — the
+producer warp ran only `setmaxnreg.dec` and exited, while the TMA issues landed in the **consumer** branch behind an
+`if (threadIdx.x == 0)` guard that no consumer-branch thread can satisfy (thread 0 is a producer-warp thread). Nobody
+ever issued the TMA loads; every consumer `mbarrier.wait` spun forever. GPU pinned at 100 %, the launched kernel
+resident until the owning process exits, CUDA context teardown blocked behind it.
 
-## 3. Reproduction (deterministic, current default caches)
+Two earlier claims in this doc were wrong, in instructive ways:
+
+- **"The -O1 tuning sweep benches the variant fine"** — it was never benched. The tune DB has **zero** WS=1 `perf`
+  rows for this op's shape (`S_ext_free_prod=98304`); the sweep's patience ran out before the WS=1 fork was explored.
+  Re-run under `--nvcc-flags "-Xcicc -O1"`, the variant hangs identically (verified): the deadlock is structural, not
+  an optimizer artifact.
+- **"-O3 turns a loop non-terminating"** — the opt level was a red herring. The deploy path compiles at -O3, the
+  tuning sweep at -O1, so the hang *correlated* with -O3 only because the deploy path was the only one that ever
+  launched the variant.
+
+How the prior came to pick it: the learned `CatBoostPrior` generalizes across ops. WS=1 is a measured win on warp-tier
+MMA matmuls (12–14 µs bests in the same DB), so the prior predicted WS=1 fast for this scalar-path op too — a config
+no bench had ever executed. The DB also holds 21 `bench_fail` rows (2 s watchdog) for WS=1 on non-MMA square shapes:
+the same stranded-TMA deadlock, already caught by the tuner on other shapes without anyone connecting them.
+
+## 3. The fix
+
+`085_warp_specialize._eligible` now runs `_split_by_role` (the exact split `_ws_transform` performs) and rejects when
+no TMA depth-2 bundle lands producer-side ("TMA StageBundle not reachable by the producer split"); `_ws_transform`
+asserts the same invariant as defense in depth. Ineligible shapes stamp `WARPSPEC=False` as before; a pinned
+`DEPLODOCK_WARP_SPECIALIZE=1` fails loudly with the reachability reason.
+
+Regression tests:
+
+- `tests/compiler/passes/test_warp_specialize.py` — unit: the plain-SerialTile-wrapped synthetic shape stamps
+  WS=False / raises on a WS=1 pin.
+- `tests/compiler/passes/test_warp_specialize_deadlock.py` — the real fused RMSNorm + gate/up + SwiGLU slice with the
+  hanging knob family pinned: compile-only (GPU-less, `set_target(sm_120)`) WS=1-pin raise + never-offers-WS=1
+  stamping, plus a CUDA test that the family compiles, completes under the watchdog, and matches numpy.
+
+## 4. Verification
 
 ```bash
-DEPLODOCK_DUMP_DIR=/tmp/dd deplodock compile Qwen/Qwen3-Embedding-0.6B --layer 0   # writes the reproducer + .cu
-timeout 300 deplodock run --ir /tmp/dd/07_lowering_cuda.kernels/k_linear_mean_reduce_*.torch.json --bench
-# → HungKernelError within ~1 s of the first -O3 launch; GPU stays busy until the process exits
+DEPLODOCK_DUMP_DIR=/tmp/dd deplodock compile Qwen/Qwen3-Embedding-0.6B --layer 0
+deplodock run --ir /tmp/dd/07_lowering_cuda.kernels/k_linear_mean_reduce_*.torch.json --bench
+# pre-fix: HungKernelError within ~1 s (at -O3 AND -O1); post-fix: completes, 123 µs vs eager 70 µs
 ```
 
-`deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --bench` reproduces it twice: the full-model -O3 bench fails with
-the watchdog message above, and the per-kernel row for this kernel is skipped. Bench this kernel **last** and under
-`timeout` when sweeping reproducers — the resident kernel outlives the bench attempt.
+The op remains deplodock's worst on this model (torch.compile 14 µs / eager 63–70 µs on the healthy picks) — that's a
+performance gap, not a correctness bug, and is out of scope here.
 
-## 4. Already hardened (the bug no longer wedges runs)
+## 5. Hardening that already landed (kept from the original report)
 
 - Per-launch watchdog + SIGKILL-able bench worker (#215): a hung kernel fails one variant/row, not the run.
-- PR #216 follow-ups, found while reproducing this: the parent previously wedged forever **writing the next request**
-  to a worker stuck in CUDA teardown behind the immortal kernel (the wall budget only bounded the response read — now
-  the send has the same deadline), and the persistent worker silently degraded torch.compile comparisons to eager via
-  dynamo's per-code-object recompile limit (now reset before every bench compile).
-- Measurement fixes in #216 also corrected this doc's old per-kernel numbers: timings are CUDA-graph-captured (pure
-  GPU), the torch reference runs fp16 like the real model (a dtype bug ran it fp32), and reproducer slices keep
-  constant-derived boundaries (the old NaN rows now pass accuracy). The previously-reported "deplodock wins most
-  per-kernel rows" conclusion was a measurement artifact; honestly measured, torch.compile wins or ties most rows and
-  this kernel is deplodock's worst (eager 63 µs / torch.compile 14 µs / deplodock 88 µs on the healthy pre-tune pick —
-  and a hang on the current tuned pick).
+- PR #216: the parent no longer wedges writing to a worker stuck in CUDA teardown; dynamo's recompile limit is reset
+  before every bench compile; bench timings are CUDA-graph-captured; the torch reference honors declared dtypes;
+  reproducer slices keep constant-derived boundaries.
 
-## 5. Root-cause plan
+## 6. Remaining
 
-1. **Pin the hanging variant.** `compile` with a dump now picks it by default: read its knob row from the dump's
-   kernel stats / `cuda_op` table and capture the exact knob set (suspect family: degenerate `BK` / `STAGE` / `FK`
-   register-tile combinations).
-2. **Inspect the -O3 codegen.** Diff the dumped `.cu`'s reduce loop bounds against a healthy variant; compare -O1 vs
-   -O3 SASS (`cuobjdump -sass` on the cached cubins) for the loop that never exits — look for a hoisted/folded exit
-   condition or an induction variable the unroller wraps.
-3. **Bisect knobs.** Re-compile with `DEPLODOCK_<KNOB>` pinning (`_pinned_knobs`), flipping one knob at a time from the
-   hanging set toward a healthy set to find the minimal trigger.
-4. **Fix + regression-test.** Fix the emitter (or reject the degenerate combination at enumeration time); add a
-   compile-only CUDA-assert test with the full knob set + `--target` pinned so GPU-less CI checks the emitted source,
-   plus a GPU test that the variant completes under the watchdog.
-5. **Unblock the prior.** Once the config is fixed or rejected, re-tune layer 0 so the DB/prior rows for this op stop
-   pointing at it.
-
-## 6. Fixed since the original report (for the record)
-
-- The RMSNorm reproducer (`k_mean`) standalone-lowering failure is gone — it lowers and benches (1 µs, 37× vs eager).
-- The three NaN reproducers (Q-norm / K-norm / SwiGLU) verify accuracy now: slice boundaries that are pure functions
-  of constants (the pow exponent, eps) keep their constant chains instead of being fed random bench data.
-- The `k_reshape_linear_mean_reduce` 113 µs / 56 µs mispicks (grid=1 single-block norm) were prior cold-start gaps;
-  tuning the shape fixed them (11 / 10 µs — 5.4–5.6× faster than eager, within 1.4× of torch.compile's 8 µs).
+- Re-tune layer 0 into the default caches so the DB/prior rows for this op reflect the post-fix enumeration (the
+  greedy pick already deploys fine — WS=1 simply no longer exists for the shape — so this is about prior hygiene, not
+  correctness).
+- The 21 WS=1 `bench_fail` square-shape rows in the tune DB are the same bug; they'll fall out of the enumeration the
+  same way on their next tune.
