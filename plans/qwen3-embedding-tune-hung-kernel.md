@@ -3,7 +3,8 @@
 Status: **root-caused and fixed**. The hang was not an -O3 miscompile — the WS=1 (warp-specialized) variant of this
 kernel was emitted with an **empty producer branch**, a structural deadlock at every nvcc opt level. The
 `085_warp_specialize` eligibility check now runs the same producer/consumer split the transform uses and rejects the
-shape, so WS=1 is no longer in this op's enumeration; the deployed greedy pick compiles and completes (123 µs at -O3).
+shape, so WS=1 is no longer in this op's enumeration; layer 0 is re-tuned into the default caches and the deployed
+greedy pick compiles and completes (92 µs standalone at -O3; the full layer-0 `run --bench` finishes hang-free).
 
 ## 1. The kernel
 
@@ -59,10 +60,12 @@ Regression tests:
 ```bash
 DEPLODOCK_DUMP_DIR=/tmp/dd deplodock compile Qwen/Qwen3-Embedding-0.6B --layer 0
 deplodock run --ir /tmp/dd/07_lowering_cuda.kernels/k_linear_mean_reduce_*.torch.json --bench
-# pre-fix: HungKernelError within ~1 s (at -O3 AND -O1); post-fix: completes, 123 µs vs eager 70 µs
+# pre-fix: HungKernelError within ~1 s (at -O3 AND -O1); post-fix + re-tune: completes, 92 µs vs eager 70 µs
+deplodock run Qwen/Qwen3-Embedding-0.6B --layer 0 --bench
+# whole layer deploys hang-free: 183 µs vs eager 98 µs, k_linear_mean_reduce at 25.3 µs in the per-kernel table
 ```
 
-The op remains deplodock's worst on this model (torch.compile 14 µs / eager 63–70 µs on the healthy picks) — that's a
+The op remains deplodock's worst on this model standalone (torch.compile 14 µs / eager 63–70 µs) — that's a
 performance gap, not a correctness bug, and is out of scope here.
 
 ## 5. Hardening that already landed (kept from the original report)
@@ -72,10 +75,9 @@ performance gap, not a correctness bug, and is out of scope here.
   before every bench compile; bench timings are CUDA-graph-captured; the torch reference honors declared dtypes;
   reproducer slices keep constant-derived boundaries.
 
-## 6. Remaining
+## 6. Re-tune (done)
 
-- Re-tune layer 0 into the default caches so the DB/prior rows for this op reflect the post-fix enumeration (the
-  greedy pick already deploys fine — WS=1 simply no longer exists for the shape — so this is about prior hygiene, not
-  correctness).
-- The 21 WS=1 `bench_fail` square-shape rows in the tune DB are the same bug; they'll fall out of the enumeration the
-  same way on their next tune.
+Layer 0 was re-tuned into the default caches post-fix (648 s, 81 terminals for the fused op, zero bench_fails, prior
+refit at +0.99 Spearman calibration). The greedy pick moved from the post-fix cold 123 µs to 92 µs (STAGE=111). The 21
+WS=1 `bench_fail` square-shape rows still in the tune DB were the same bug on other shapes; they fall out of the
+enumeration the same way on their next tune.
