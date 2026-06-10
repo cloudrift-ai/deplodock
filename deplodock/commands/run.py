@@ -8,9 +8,11 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 from deplodock import config
@@ -19,14 +21,23 @@ logger = logging.getLogger(__name__)
 
 
 def register_run_command(subparsers):
-    parser = subparsers.add_parser("run", help="Compile + run an inline torch expression on the CUDA backend")
+    parser = subparsers.add_parser("run", help="Compile + run a model / inline torch expression on the CUDA backend")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        help=(
+            "HuggingFace model ID or .json IR file. A model ID is traced + compiled + executed and "
+            "(with --bench) timed end-to-end against the real torch module; a .json IR file behaves "
+            "like --ir. Mutually exclusive with --code / --ir."
+        ),
+    )
     parser.add_argument(
         "--code",
         "-c",
         help=(
             "Inline Python expression whose last statement is a call (same grammar as "
             "``compile --code``). Example: 'torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))'. "
-            "Mutually exclusive with --ir."
+            "Mutually exclusive with the positional input / --ir."
         ),
     )
     parser.add_argument(
@@ -34,8 +45,24 @@ def register_run_command(subparsers):
         help=(
             "Path to a JSON IR dump (any stage: torch / tensor / loop / tile / kernel / cuda). "
             "The remaining lowering passes are run, then the kernel(s) are executed with random "
-            "inputs and benchmarked. Skips eager accuracy check (no reference model available)."
+            "inputs and benchmarked. Skips eager accuracy check (no reference model available). "
+            "Equivalent to passing the same .json path as the positional input."
         ),
+    )
+    from deplodock.commands.compile import add_golden_arg
+
+    add_golden_arg(parser)
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=None,
+        help="Layer index (when the positional input is a model ID). Omit to run the whole model.",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=32,
+        help="Sequence length for full-model tracing when the input is a model ID (default: 32).",
     )
     parser.add_argument(
         "--bench", "-b", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table."
@@ -44,7 +71,7 @@ def register_run_command(subparsers):
         "--profile",
         action="store_true",
         help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
-        "(SM-active %, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %). Skipped if "
+        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%). Skipped if "
         "ncu is not on PATH or the user lacks performance-counter permissions.",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
@@ -115,31 +142,37 @@ def handle_run(args):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.commands.trace import trace_inline_code
+    from deplodock.commands.compile import load_or_trace, resolve_golden_arg
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.pipeline.dump import CompilerDump
 
-    if args.ir is not None and args.code is not None:
-        logger.error("--ir and --code are mutually exclusive")
+    resolve_golden_arg(args)  # --golden NAME → --code <snippet>
+    if sum(x is not None for x in (args.input, args.code, args.ir)) > 1:
+        logger.error("input / --code / --ir are mutually exclusive")
         sys.exit(1)
 
     if not torch.cuda.is_available():
         logger.error("CUDA GPU required")
         sys.exit(1)
 
-    if args.ir is not None:
+    # A .json input (via --ir or as the positional) takes the IR path: finish
+    # lowering an arbitrary-stage dump, no traced module to bench against torch.
+    ir_path = args.ir
+    if ir_path is None and args.input is not None and Path(args.input).suffix == ".json" and Path(args.input).exists():
+        ir_path = args.input
+    if ir_path is not None:
+        args.ir = ir_path
         _handle_run_ir(args, CudaBackend, CompilerDump)
         return
 
-    if args.code is None:
-        logger.error("Either --code or --ir is required")
+    if args.input is None and args.code is None:
+        logger.error("Either a model ID / .json input, --code, or --ir is required")
         sys.exit(1)
 
-    info = trace_inline_code(args.code, dynamic_shapes=_resolve_dynamic_shapes(args))
-    graph = info["graph"]
-    module = info["module"]
-    example_args = info["args"]
-    example_kwargs = info["kwargs"]
+    # Model ID or --code: trace to a frontend graph + keep the runnable module
+    # (+ example inputs) so accuracy / --bench compare against real torch.
+    graph, _base_name, bundle = load_or_trace(args)
+    module, example_args, example_kwargs = bundle
 
     dump = CompilerDump.resolve(args.dump_dir)
     if dump:
@@ -248,8 +281,14 @@ def handle_run(args):
         dump.dump_benchmark(bench)
         _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
+    # ``--golden NAME``: compile + bench each recorded golden config (knobs pinned)
+    # so the kernel table can show it as a live A/B row beside the greedy pick.
+    golden_benches = None
+    if getattr(args, "golden_configs", None):
+        golden_benches = _bench_golden_variants(backend, args.code, args.golden_configs, warmup=args.warmup, iters=args.iters)
+
     _print_table(results)
-    _print_kernel_stats(compiled, bench)
+    _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
@@ -302,23 +341,6 @@ def _reset_persisting_l2_cache() -> None:
         logger.debug("cudaCtxResetPersistingL2Cache unavailable: %s", e)
 
 
-def _resolve_dynamic_shapes(args) -> dict | None:
-    """Parse ``--dynamic NAME@INPUT:AXIS`` specs into a torch.export
-    ``dynamic_shapes`` dict. Returns ``None`` when no specs were passed.
-    Mirrors :func:`deplodock.commands.compile._resolve_dynamic_shapes`."""
-    specs_raw = getattr(args, "dynamic", None)
-    if not specs_raw:
-        return None
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
-
-    try:
-        specs = parse_position_specs(specs_raw)
-    except ValueError as e:
-        logger.error(str(e))
-        sys.exit(2)
-    return build_torch_dynamic_shapes(specs)
-
-
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
     """Persist the eager / torch.compile / deplodock comparison table
     so downstream tooling (``make bench-kernels``) can parse one file
@@ -339,56 +361,157 @@ def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> Non
     out.write_text(_json.dumps(payload, indent=2, default=str))
 
 
-def _print_kernel_stats(graph, bench):
+# One recorded golden config compiled + benched with its knobs pinned this run.
+_GoldenBench = namedtuple("_GoldenBench", "sample graph bench")
+
+
+@contextlib.contextmanager
+def _pinned_knobs(knobs: dict):
+    """Pin ``DEPLODOCK_<KNOB>`` env vars for the duration of one compile, restoring
+    the prior environment on exit. A pinned knob collapses its fork to that value
+    (``Knob.narrow``), so ``backend.compile`` lowers exactly these knobs."""
+    saved: dict[str, str | None] = {}
+    try:
+        for name, value in knobs.items():
+            key = config.knob_var(name)
+            saved[key] = os.environ.get(key)
+            os.environ[key] = str(value)
+        yield
+    finally:
+        for key, prev in saved.items():
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+
+def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
+    """Compile + bench each recorded golden config with its knobs pinned, returning
+    a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
+    measured row beside the greedy pick. ``golden_configs`` are
+    :class:`~deplodock.compiler.pipeline.search.data.Sample`s, whose ``knobs`` are
+    already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs).
+    Each config re-traces a **fresh** graph from ``code`` — a frontend graph can't be
+    re-compiled (the first lowering mutates it in place, so a reused graph would
+    yield the first config's kernel every time). Best-effort: a golden whose pinned
+    knobs fail to compile / bench for the live device is skipped with a warning."""
+    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+
+    out = []
+    for sample in golden_configs or []:
+        try:
+            with _pinned_knobs(sample.knobs):
+                graph, _, _ = graph_from_code(code)  # fresh graph; knobs baked into the kernel source here
+                g_compiled = backend.compile(graph)
+            g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
+        except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
+            logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
+            continue
+        out.append(_GoldenBench(sample, g_compiled, g_bench))
+    return out
+
+
+def _print_kernel_stats(graph, bench, golden_benches=None):
     """Per-kernel breakdown. Pulls structural stats off each ``CudaOp``
     (block / grid / smem), per-launch timings from ``bench.per_launch``,
     and per-kernel hardware attributes from the compiled cupy RawKernels
     (register count, achieved theoretical occupancy). One row per kernel
     — quick at-a-glance for spotting which kernel dominates, whether
-    register pressure is killing occupancy, etc."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp
+    register pressure is killing occupancy, etc.
 
-    cuda_nodes = [(nid, node) for nid, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
+    ``golden_benches`` (from ``run --golden NAME``, see :func:`_bench_golden_variants`)
+    are each their own live compile+bench of a recorded golden config's pinned
+    knobs; their kernels print beneath the greedy kernel of matching shape, labeled
+    ``golden NAME`` in the Kernel column — a real A/B, not the recorded number. Their
+    ``%`` column is ``--`` (they're not part of the deplodock TOTAL), and their knob
+    cells are colored red where they differ from the greedy pick (like ``eval``)."""
+    from deplodock.commands.table import Col, knob_columns, render_table  # noqa: PLC0415
+    from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+
+    cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
         return
 
-    times_by_idx = {lt.idx: lt.time_ms * 1000 for lt in (bench.per_launch or [])}
-    total_us = bench.time_ms * 1000
+    # Per-kernel best-case (min) to match the min-based comparison table.
+    times_by_idx = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (bench.per_launch or [])}
+    total_us = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
     attrs_by_kname = _collect_kernel_attrs(graph)
     occ_limits = _occupancy_limits()
 
     # Symbolic grids (ceil-div over a dynamic axis) need a concrete env to
     # resolve for display — use each symbolic input dim's hint, so the printed
     # geometry reflects the hint-sized tile the kernel was tuned for.
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-
     sym_env: dict[str, int] = {}
     for nid in graph.inputs:
         for dim in graph.nodes[nid].output.shape:
             if isinstance(dim.expr, Var) and dim.hint is not None:
                 sym_env.setdefault(dim.expr.name, dim.hint)
 
-    print()
-    print(f"{'Kernel':<44s} {'us':>7s} {'%':>5s} {'grid':>7s} {'block':>5s} {'smem':>6s} {'regs':>4s} {'occ':>4s}")
-    print("-" * 90)
-    for idx, (_, node) in enumerate(cuda_nodes):
-        op = node.op
-        t_us = times_by_idx.get(idx, 0.0)
-        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
-        from deplodock.compiler.ir.cuda.ir import resolve_dim
-
+    def _geom(op, attrs: dict):
         block_dims = [resolve_dim(d, sym_env) for d in op.block]
         grid_dims = [resolve_dim(d, sym_env) for d in op.grid]
         block_threads = block_dims[0] * block_dims[1] * block_dims[2]
         grid_total = grid_dims[0] * grid_dims[1] * grid_dims[2]
-        smem_kb = op.smem_bytes / 1024
-        kname = op.kernel_name[:42]
-        attrs = attrs_by_kname.get(op.kernel_name) or {}
-        regs = attrs.get("num_regs", 0)
+        regs = (attrs.get(op.kernel_name) or {}).get("num_regs", 0)
         occ_pct = _theoretical_occupancy(regs, op.smem_bytes, block_threads, occ_limits)
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
-        print(f"{kname:<44s} {t_us:>7.1f} {pct:>4.1f}% {grid_total:>7d} {block_threads:>5d} {smem_kb:>5.1f}K {regs:>4d} {occ_str}")
-    print(f"{'TOTAL':<44s} {total_us:>7.1f}")
+        return grid_total, block_threads, op.smem_bytes / 1024, regs, occ_str
+
+    def _matching(op):
+        """Benched golden variants whose matmul shape matches this kernel — keyed
+        on the op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max
+        = K``), the same shape signature the prior diagnostics match goldens on."""
+        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
+        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
+        return [gb for gb in (golden_benches or []) if gb.sample.shape.free_prod == free_prod and gb.sample.shape.reduce_max == reduce_max]
+
+    # Build row records first (the knob columns are aligned across all rows, so we
+    # can't stream): (name, t_us, pct_cell, geom, knobs, ref_knobs_or_None). A
+    # golden row's ``ref`` is its matching greedy kernel's knobs — cells that differ
+    # are colored red.
+    records: list[tuple] = []
+    for idx, node in enumerate(cuda_nodes):
+        op = node.op
+        t_us = times_by_idx.get(idx, 0.0)
+        pct = (t_us / total_us * 100) if total_us > 0 else 0.0
+        gknobs = dict(tuning_knob_items(op.knobs or {}))
+        records.append((op.kernel_name, t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
+        for gb in _matching(op):
+            g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
+            g_attrs = _collect_kernel_attrs(gb.graph)
+            g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
+            for gidx, gnode in enumerate(g_nodes):
+                gk = dict(tuning_knob_items(gnode.op.knobs or {}))
+                records.append((f"golden {gb.sample.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
+
+    kcols, kcells = knob_columns(
+        [{k: (str(v), ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
+    )
+    columns = [
+        Col("Kernel"),
+        Col("us", "r"),
+        Col("%", "r"),
+        Col("grid", "r"),
+        Col("block", "r"),
+        Col("smem", "r"),
+        Col("regs", "r"),
+        Col("occ", "r"),
+        *kcols,
+    ]
+    data = []
+    for rec, kc in zip(records, kcells, strict=True):
+        name, t_us, pct_cell, (grid_total, block_threads, smem_kb, regs, occ_str) = rec[:4]
+        data.append(
+            [name, f"{t_us:.1f}", pct_cell, str(grid_total), str(block_threads), f"{smem_kb:.1f}K", str(regs), occ_str.strip(), *kc]
+        )
+    data.append(["TOTAL", f"{total_us:.1f}", *[""] * (len(columns) - 2)])
+
+    print()
+    print("knobs (greedy pick); golden rows are red where they differ from the greedy pick:")
+    for line in render_table(columns, data):
+        print(line)
 
 
 def _collect_kernel_attrs(graph) -> dict[str, dict]:
@@ -831,10 +954,11 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         db = SearchDB(path=backend.tune_db)
         logger.info("Using tuning DB: %s", backend.tune_db)
     if tail:
-        # Thread the tune DB through the tail lowering so greedy fork selection
-        # (``_best_fork``) picks tuned variants. Without ``db=`` run --ir lowered
-        # at rule defaults and tuned results never showed up here.
-        graph = Pipeline.build(tail, dump=dump).run(graph, db=db)
+        # Finish the tail lowering. NOTE: the single-shot ``Pipeline.run`` has no
+        # prior (uniform PUCT → emission-order, option-0) and does not replay tuned
+        # variants from the DB; ``db=`` is kept for perf recording only. Wiring a
+        # warm-started prior into single-shot compile is a deferred follow-up.
+        graph = Pipeline.build(tail).run(graph, db=db, dump=dump)
 
     results, bench, torch_available = bench_lowered_vs_torch(
         frontend,
@@ -854,10 +978,11 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             _print_table(results)
         else:
             # Non-frontend IR (loop/tile/…): no torch twin → deplodock-only.
+            from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
             print()
-            print(f"{'Backend':<24s} {'Latency (us)':>12s}")
-            print("-" * 38)
-            print(f"{'Deplodock':<24s} {bench.time_ms * 1000:>12.0f}")
+            for line in render_table([Col("Backend"), Col("Latency (us)", "r")], [["Deplodock", f"{bench.time_ms * 1000:.0f}"]], rule=True):
+                print(line)
         _print_kernel_stats(graph, bench)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -895,10 +1020,14 @@ def _bind_inputs(compiled, module, example_args, example_kwargs):
         np_dtype = compiled.nodes[nid].output.dtype.np
         input_data[nid] = tensor.detach().cpu().numpy().astype(np_dtype, copy=False)
 
+    # ``remove_duplicate=False`` so tied weights (e.g. a model whose lm_head
+    # shares the embedding matrix) are surfaced under *every* name, including
+    # the ``source_path`` the tracer recorded — otherwise the alias the trace
+    # picked may be the one torch dedups away and the constant won't bind.
     sources: dict[str, np.ndarray] = {}
-    for path, tensor in module.named_parameters():
+    for path, tensor in module.named_parameters(remove_duplicate=False):
         sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
-    for path, tensor in module.named_buffers():
+    for path, tensor in module.named_buffers(remove_duplicate=False):
         sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
 
     input_data.update(bind_constants(compiled, sources))
@@ -1150,29 +1279,27 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
     torch.cuda.synchronize()
 
-    import statistics as _stats  # noqa: PLC0415
-
     results: dict[str, float] = {}
     for name, evt in torch_events.items():
         measured = evt[warmup:]
         if measured:
             # ``elapsed_time`` is in ms across the whole batch; divide
             # by the batch size and multiply by 1000 to get per-call us.
-            # Median (not mean) for symmetry with deplodock's reduction
-            # in ``benchmark_program`` — keeps a single thermal-blip or
-            # lock-contention outlier from dragging eager's reported
-            # latency up.
+            # ``min`` (best-case iter) for both torch and deplodock — the
+            # least-noise latency, matching tune's min-over-variants reporting
+            # so tune and run numbers are comparable.
             per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
-            results[name] = _stats.median(per_iter_us)
-    results["Deplodock"] = bench.time_ms * 1000
+            results[name] = min(per_iter_us)
+    results["Deplodock"] = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
     return results, bench
 
 
 def _print_table(results):
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
     eager_us = results.get("Eager PyTorch", 0)
+    cols = [Col("Backend"), Col("Latency (us)", "r"), Col("vs Eager", "r")]
+    rows = [[name, f"{us:.0f}", f"{eager_us / us:.2f}x" if us > 0 else "-"] for name, us in results.items()]
     print()
-    print(f"{'Backend':<24s} {'Latency (us)':>12s} {'vs Eager':>10s}")
-    print("-" * 48)
-    for name, us in results.items():
-        speedup = eager_us / us if us > 0 else 0
-        print(f"{name:<24s} {us:>12.0f} {speedup:>10.2f}x")
+    for line in render_table(cols, rows, rule=True):
+        print(line)

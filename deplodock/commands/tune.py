@@ -10,14 +10,17 @@ from pathlib import Path
 from deplodock import config
 from deplodock.commands.compile import (
     add_diagnostics_args,
+    add_golden_arg,
     add_input_args,
     add_nvcc_args,
     apply_nvcc_flags,
     format_stage,
     load_or_trace,
+    resolve_golden_arg,
     resolve_tune_db,
     setup_pipeline_runtime,
 )
+from deplodock.commands.dataset_args import add_dataset_args, require_source
 from deplodock.compiler.pipeline import TuningSearch
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,11 @@ def register_tune_command(subparsers):
         ),
     )
     add_input_args(parser)
+    add_golden_arg(parser)
+    # ``--dataset golden`` tunes every golden shape in sequence (the built-in
+    # equivalent of looping ``--golden NAME`` over GOLDEN_CONFIGS); ``--kernel``
+    # narrows to a name substring. Default None → ordinary single-op tune.
+    add_dataset_args(parser, default=None)
     parser.add_argument("--output", "-o", help="Output path for the tuned CUDA IR")
     parser.add_argument(
         "--patience",
@@ -52,15 +60,14 @@ def register_tune_command(subparsers):
         ),
     )
     parser.add_argument(
-        "--bench-timeout",
+        "--explore-eps",
         type=float,
-        default=20.0,
+        default=None,
         help=(
-            "Per-variant GPU-time budget (seconds) for the run stage of each bench; exceeding it marks the "
-            "variant bench_fail. The default 20s suits single-kernel sweeps but is too tight for whole-model "
-            "graphs: the first variant pays a one-time cold-start (hundreds of first-launch kernel loads) that "
-            "can exceed 20s even though steady-state is milliseconds, so every variant fails. Bump to ~90 for "
-            "full-model tuning. Default: 20."
+            "ε-greedy exploration: probability a selection step descends a uniformly random child "
+            "instead of the PUCT argmax, perturbing (not replacing) the heuristic order for shapes "
+            "where it's known-bad. Falls back to ``DEPLODOCK_TUNE_EPS`` env var, then to 0.0 "
+            "(deterministic PUCT) — opt-in; see plans/golden-sweep-report.md."
         ),
     )
     parser.add_argument(
@@ -96,22 +103,149 @@ def register_tune_command(subparsers):
     parser.set_defaults(func=handle_tune)
 
 
-def handle_tune(args):
-    if args.code and args.input:
-        logger.error("--code and positional input are mutually exclusive")
-        sys.exit(2)
-    if not args.code and not args.input:
-        logger.error("either a positional model ID / IR file or --code is required")
-        sys.exit(2)
+def _tune_offline(args):
+    """``deplodock tune`` with no op: refit the global learned prior on its
+    persisted reservoir dataset and print offline diagnostics — no GPU, no
+    benching. Answers "can the prior reach the best configs?" over everything
+    tuned so far."""
+    from deplodock import config
+    from deplodock.compiler.pipeline.search.prior import CatBoostPrior, diagnostics
 
+    prior = CatBoostPrior.load(seed=args.seed)
+    if not prior._dataset:
+        logger.error("no prior dataset at %s — run `deplodock tune <model>` first", config.prior_path())
+        sys.exit(1)
+    sys.stderr.write(f"[tune] offline refit on {len(prior._dataset)} rows from {config.prior_path()}\n")
+    prior.fit()  # unconditional re-fit on the whole accumulated dataset
+    prior.checkpoint()
+    sys.stderr.write(diagnostics.report(prior) + "\n")
+    sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
+
+
+def _tune_backend():
+    """The autotune-sweep ``CudaBackend``: benches each variant in a SIGKILL-able
+    ``_bench_worker`` **subprocess** (``bench_wall_timeout_s`` set → the isolated
+    path in ``backend.benchmark``), so a wedged kernel dies with the worker and the
+    **parent** CUDA stream stays clean. Tight per-variant budgets: tune benches
+    isolated single kernels at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample
+    and the 6 s wall SIGKILLs any runaway."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+
+    return CudaBackend(bench_compile_timeout_s=2.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=6.0)
+
+
+def _tune_one(args, *, backend, db, ctx, dump):
+    """Trace ``args.code`` / ``args.input`` and run the two-level tune on that one
+    graph; return ``(result, bench_bundle)``. Manages the live progress bar (closed
+    in ``finally``) and prints the per-op ``done`` summary. Lets ``KeyboardInterrupt``
+    and the saturated-queue ``RuntimeError`` (dirty parent stream) **propagate** so
+    the caller decides how to exit — called once per target by ``handle_tune``'s
+    loop (one shape or the whole golden set). Benching itself is subprocess-isolated
+    (see ``_tune_backend``), so the parent process is safe to reuse shape-to-shape."""
     import time
 
     from deplodock.commands.tune_progress import TuneProgress
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.search import SearchDB
     from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
+
+    graph, _, bench_bundle = load_or_trace(args)
+    if dump:
+        dump.dump_input_graph(graph)
+    # Live progress bar — default verbosity on a tty only. Disabled under -v (the
+    # [tune] INFO lines show progress instead), -q (errors only), and when stderr is
+    # redirected (no \r smearing in piped logs).
+    progress = TuneProgress(
+        enabled=getattr(args, "verbose", 0) == 0 and not getattr(args, "quiet", False) and sys.stderr.isatty(),
+    )
+    patience = args.patience if args.patience is not None else config.tune_patience(50)
+    explore_eps = args.explore_eps if args.explore_eps is not None else config.tune_eps(0.0)
+    t0 = time.monotonic()
+    try:
+        result = run_two_level_tune(
+            graph,
+            ctx=ctx,
+            db=db,
+            backend=backend,
+            patience=patience,
+            ucb_c=args.ucb_c,
+            explore_eps=explore_eps,
+            dump=dump,
+            progress=progress,
+            prior_seed=args.seed,
+        )
+    finally:
+        progress.close()
+    sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {time.monotonic() - t0:.1f}s\n")
+    for block in result.prior_summaries:  # learned-prior pick-quality sanity stats
+        sys.stderr.write(block + "\n")
+    return result, bench_bundle
+
+
+def _exit_flushed(code: int) -> None:
+    """Flush stdio and ``os._exit`` — the tune teardown skips Python finalization
+    because a bench-timeout can leave a daemon NVRTC worker thread holding the CUDA
+    context, which deadlocks cupy's atexit pool teardown."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def _tune_targets(args) -> list[tuple[str, str | None, str | None]]:
+    """The ``(label, code, input)`` shapes this invocation tunes — the **only** place
+    golden and non-golden diverge. ``--dataset golden`` expands to every recorded
+    golden shape (deduped by name, ``--kernel SUBSTR`` narrowing); otherwise it's the
+    single ``--code`` / positional input / ``--golden NAME`` target. ``handle_tune``
+    then loops over this list uniformly, so one shape and the whole golden set share
+    one codepath. Exits 2 on a degenerate / conflicting source."""
+    if getattr(args, "dataset", None):
+        from deplodock.compiler.pipeline.search.data import Dataset
+
+        require_source(args, {"golden"}, "tune --dataset only supports 'golden' (db rows have no shape to tune)")
+        if args.code or args.input or getattr(args, "golden", None):
+            logger.error("--dataset golden is mutually exclusive with --code / positional input / --golden NAME")
+            sys.exit(2)
+        # Configs under one name share the shape, so any one's snippet is interchangeable.
+        by_name: dict[str, str] = {}
+        for s in Dataset.from_golden(kernel=args.kernel).samples:
+            by_name.setdefault(s.name, s.snippet)
+        if not by_name:
+            logger.error("no golden shapes matched --kernel %r", args.kernel)
+            sys.exit(2)
+        return [(name, code, None) for name, code in by_name.items()]
+
+    resolve_golden_arg(args)  # --golden NAME → args.code
+    if args.code and args.input:
+        logger.error("--code and positional input are mutually exclusive")
+        sys.exit(2)
+    return [(args.code or args.input, args.code, args.input)]
+
+
+def _bench_dump(args):
+    """Per-target dump dir. ``--bench`` reads the ``.torch.json`` provenance
+    reproducers from a dump dir; route through a temp dir when no ``--dump-dir`` was
+    given (HTML is only written for a real ``--dump-dir`` / ``DEPLODOCK_DUMP_DIR``).
+    Returns ``(dump, tmp_dir_or_None)``."""
+    from deplodock.compiler.pipeline.dump import CompilerDump
+
+    dump = CompilerDump.resolve(args.dump_dir)
+    if args.bench and dump is None:
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp(prefix="deplodock-tune-bench-"))
+        return CompilerDump(dir=tmp), tmp
+    return dump, None
+
+
+def handle_tune(args):
+    if not getattr(args, "dataset", None) and not args.code and not args.input and not getattr(args, "golden", None):
+        # No op to tune → offline mode: refit the learned prior on its persisted
+        # dataset and print diagnostics (reachability, calibration, golden coverage).
+        _tune_offline(args)
+        return
+
+    targets = _tune_targets(args)  # one shape, or the whole golden set — same loop below
+
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline.search import SearchDB
 
     setup_pipeline_runtime(args)
     # tune compiles at -Xcicc -O1 by default to dodge a cicc/LLVM blowup on big
@@ -126,116 +260,60 @@ def handle_tune(args):
             "-O1" if "-O1" in nvcc_flags else "-O0",
         )
 
-    graph, _, bench_bundle = load_or_trace(args)
-
-    # ``--bench`` benches the assembled tuned graph against the **real torch module**
-    # end-to-end (eager / torch.compile / deplodock). ``bench_bundle`` carries the
-    # runnable module + its trace-time example inputs from ``load_or_trace`` — None
-    # only when the input was an ``--ir`` JSON file (no module). With a bundle we
-    # use the real module; without, the full-model bench is skipped (only the
-    # per-kernel table runs).
-
-    dump = CompilerDump.resolve(args.dump_dir)
-    # Per-kernel bench reads the ``.torch.json`` provenance reproducers the assembled
-    # run emits into the dump dir. When --bench is set but no dump dir was given, route
-    # them through a temp dir (HTML is only written when the user gave a real
-    # --dump-dir / DEPLODOCK_DUMP_DIR).
-    html_dir = dump.dir if dump is not None else None
-    tmp_dump_dir = None
-    if args.bench and dump is None:
-        import tempfile
-
-        tmp_dump_dir = Path(tempfile.mkdtemp(prefix="deplodock-tune-bench-"))
-        dump = CompilerDump(dir=tmp_dump_dir)
-    if dump:
-        dump.dump_input_graph(graph)
-
-    # Tight per-variant budgets: tune benches isolated single kernels compiled
-    # at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample and the 6 s wall
-    # SIGKILLs any runaway. (nvcc compiles eagerly in ``CompiledProgram.build``,
-    # so the compile budget now genuinely bounds compilation — unlike cupy's
-    # lazy NVRTC, where only the wall did.)
-    _compile_timeout = 2.0
-    _run_timeout = 2.0
-    backend = CudaBackend(
-        bench_compile_timeout_s=_compile_timeout,
-        bench_run_timeout_s=_run_timeout,
-        bench_wall_timeout_s=_compile_timeout + _run_timeout + 2.0,
-    )
-    # ``DEPLODOCK_TUNE_DB`` env overrides the default cache path.
-    db_path = resolve_tune_db()
-    if args.clean:
+    db_path = resolve_tune_db()  # ``DEPLODOCK_TUNE_DB`` env overrides the default path
+    if args.clean:  # one shape or many: a fresh sweep clears once, then accumulates
         _clean_caches(db_path)
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
-
-    # Live progress bar — default verbosity on a tty only. Disabled under -v
-    # (the [tune] INFO lines show progress instead) and -q (errors only), and
-    # when stderr is redirected (no \r smearing in piped logs).
-    progress = TuneProgress(
-        enabled=getattr(args, "verbose", 0) == 0 and not getattr(args, "quiet", False) and sys.stderr.isatty(),
-    )
-
-    patience = args.patience if args.patience is not None else config.tune_patience(50)
+    # One bench worker (subprocess-isolated) + one prior shared across every target —
+    # benching can't dirty the parent, so a single long-lived process loops cleanly.
+    backend = _tune_backend()
     ctx = Context.probe()
-    t0 = time.monotonic()
-    try:
-        result = run_two_level_tune(
-            graph, ctx=ctx, db=db, backend=backend, patience=patience, ucb_c=args.ucb_c, dump=dump, progress=progress
-        )
-    except KeyboardInterrupt:
-        # Manual abort: per-op bests already landed in the DB as they were
-        # measured, so a re-run resumes. Nothing structured to print here.
-        progress.close()
-        sys.stderr.write("\n[tune] interrupted (Ctrl-C) — partial per-op results are persisted in the DB\n")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
-    except RuntimeError as exc:
-        # An autotune-internal raise (bench watchdog couldn't bail in time
-        # because the GPU queue is saturated). The CUDA stream is dirty —
-        # bypass Python cleanup so cupy's atexit doesn't deadlock on the
-        # still-running launch.
-        progress.close()
-        sys.stderr.write(f"\n[tune] aborted: {exc}\n")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(1)
-    progress.close()
 
-    elapsed = time.monotonic() - t0
-    sys.stderr.write(f"\n[tune] done: {result.n_terminals} fused terminal(s) in {elapsed:.1f}s\n")
-    if result.best_reward is None:
-        sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
+    multi = len(targets) > 1
+    if multi:
+        sys.stderr.write(f"[tune] {len(targets)} shape(s) into {db_path}{' (--clean)' if args.clean else ''}\n")
+    done = 0
+    for i, (label, code, inp) in enumerate(targets):
+        args.code, args.input = code, inp
+        if multi:
+            sys.stderr.write(f"\n[tune] === {i + 1}/{len(targets)}: {label} → {code} ===\n")
+        dump, tmp_dump = _bench_dump(args)
+        try:
+            result, bench_bundle = _tune_one(args, backend=backend, db=db, ctx=ctx, dump=dump)
+        except KeyboardInterrupt:
+            # Per-op bests already landed in the DB as they were measured, so a re-run resumes.
+            sys.stderr.write(f"\n[tune] interrupted{f' at {label}' if multi else ''} — partial per-op results are in the DB\n")
+            _exit_flushed(0)
+        except RuntimeError as exc:
+            # Bench watchdog couldn't bail (GPU queue saturated) → the parent CUDA stream
+            # is dirty, so the rest of the sweep can't run reliably here. Abort (the DB has
+            # the per-op bests; a re-run resumes). os._exit bypasses the cupy atexit deadlock.
+            sys.stderr.write(f"\n[tune] aborted{f' at {label}' if multi else ''}: {exc}\n")
+            _exit_flushed(1)
 
-    # Only write the assembled (DB-best) CUDA source when ``--output`` is
-    # given. Dumping a multi-kB kernel to stdout after a long tune is noise —
-    # callers that want it can pass ``-o`` (or re-run ``deplodock compile``,
-    # which replays the same cached forks).
-    if args.output and result.assembled is not None:
-        Path(args.output).write_text(format_stage(result.assembled, "cuda"))
-        logger.info("Saved cuda IR: %s", args.output)
+        if result.best_reward is None:
+            if not multi:
+                sys.stderr.write("[tune] no kernels tuned — exiting without output\n")
+        else:
+            # Only write the assembled CUDA when ``--output`` is given (a multi-kB dump
+            # to stdout after a long tune is noise; ``-o`` or ``compile`` replays it).
+            if args.output and result.assembled is not None:
+                Path(args.output).write_text(format_stage(result.assembled, "cuda"))
+                logger.info("Saved cuda IR: %s", args.output)
+            if args.bench and result.assembled is not None:
+                _run_bench(args, bench_bundle, result.assembled, dump, html_dir=(dump.dir if dump and tmp_dump is None else None))
+        if tmp_dump is not None:
+            import shutil
 
-    if args.bench and result.assembled is not None:
-        _run_bench(args, bench_bundle, result.assembled, dump, html_dir=html_dir)
-    if tmp_dump_dir is not None:
-        import shutil
+            shutil.rmtree(tmp_dump, ignore_errors=True)
+        done += 1
 
-        shutil.rmtree(tmp_dump_dir, ignore_errors=True)
+    if multi:
+        sys.stderr.write(f"\n[tune] done: {done}/{len(targets)} shape(s)\n")
+    _exit_flushed(0)
 
-    # A bench-timeout abandons its NVRTC worker thread (see
-    # ``_benchmark_with_timeout``) which is still holding the CUDA
-    # context. Python finalization (cupy memory-pool teardown, CUDA
-    # context release) deadlocks against that live worker, so the
-    # process hangs after all output has been written. Skip Python's
-    # cleanup with ``os._exit`` once we know output is flushed — there
-    # is nothing left to do and the daemon thread dies with the process.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    _exit_flushed(0)
 
 
 def _clean_caches(db_path) -> None:
@@ -252,6 +330,11 @@ def _clean_caches(db_path) -> None:
             if p.exists():
                 p.unlink()
                 removed.append(str(p))
+    # The learned-prior checkpoint file (a fresh sweep should start cold).
+    for p in (config.prior_path(), config.prior_path().with_suffix(config.prior_path().suffix + ".tmp")):
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
     nvcc.clear_cubin_cache()
     removed.append(str(nvcc.cubin_cache_dir()))
     try:
@@ -264,16 +347,26 @@ def _clean_caches(db_path) -> None:
     sys.stderr.write(f"[tune] --clean: removed tuning DB + kernel caches ({', '.join(removed)})\n")
 
 
+# Parent wall-clock caps for the isolated deployable benches: on overrun the worker is SIGKILLed
+# (frees the device, parent stays clean). Generous over real cold-start — a hung kernel is caught
+# far sooner by the worker's own 1 s per-launch watchdog, which exits the child promptly. Full-model
+# is larger: it reloads the HF module + traces + JITs torch.compile in the child.
+_FULL_MODEL_BENCH_WALL_S = 300.0
+_PER_KERNEL_BENCH_WALL_S = 120.0
+
+
 def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     """``tune --bench``: re-bench the tuned winner at -O3 (deployable numbers, NOT the
     -O1 ranking pass) — full model **against the real torch module** (eager /
     torch.compile / Deplodock) and each per-kernel ``.torch.json`` reproducer against
-    its torch-ref reconstruction. Prints both tables and (when ``html_dir`` is set)
-    writes an HTML per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``;
-    when ``None`` (an ``--ir`` JSON tune with no module) the full-model bench is
-    skipped and only the per-kernel table runs."""
-    from deplodock.commands.run import _print_table, bench_full_model_real
+    its torch-ref reconstruction, each in the SIGKILL-able bench worker so a hung kernel
+    can't wedge the run. Prints both tables and (when ``html_dir`` is set) writes an HTML
+    per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``; when ``None`` (an
+    ``--ir`` JSON tune with no module) the full-model bench is skipped and only the
+    per-kernel table runs."""
+    from deplodock.commands.run import _print_table
     from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     # Re-bench at -O3 (deployable) unless the user explicitly pinned --nvcc-flags;
@@ -290,61 +383,71 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     # (and which the per-kernel bench reads). Clearing it also avoids per-launch dump
     # noise during benching. (No-op when tuning used a temp dump — the env wasn't set.)
     saved_dump_env = os.environ.pop(config.DUMP_DIR, None)
-    # Generous per-stage budgets: a whole-model bench compiles 100s of -O3 kernels
-    # (the lm-head alone can take ~5-10 s) and the first iteration warms DRAM / L2 /
-    # cubin loads for the full weights, so the default 10 s run + 30 s compile are
-    # tight. Bump both to 60 s so first-iter cold-start doesn't bench_fail. The
-    # bench is in-process (on_iter callback) — bench_wall_timeout_s stays None.
-    backend = CudaBackend(tune_db="auto", bench_compile_timeout_s=60.0, bench_run_timeout_s=60.0)
+    # ``backend`` here is only the handle to resolve the tune DB (for the per-kernel re-lowering);
+    # the benches themselves run in the SIGKILL-able worker (``benchmark_compare_isolated``), which
+    # builds its own backend. DUMP_DIR is cleared so CudaBackend's default CompilerDump doesn't
+    # rmtree the reproducer dir the per-kernel bench reads.
+    backend = CudaBackend(tune_db="auto")
     if saved_dump_env is not None:
         os.environ[config.DUMP_DIR] = saved_dump_env
     db = SearchDB(path=backend.tune_db) if (backend.tune_db is not None and backend.tune_db.exists()) else None
 
     if bench_bundle is not None:
-        module, ex_args, ex_kwargs = bench_bundle
         sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / deplodock):\n")
+        # The worker rebuilds the real module from these args via ``load_or_trace`` (no live module
+        # crosses the pipe) and runs the comparison in-child — a hung deplodock kernel hangs the
+        # child, which the parent SIGKILLs, instead of wedging the run.
+        trace_args = {
+            "code": args.code,
+            "input": args.input,
+            "layer": args.layer,
+            "seq_len": args.seq_len,
+            "dynamic": getattr(args, "dynamic", None),
+        }
         try:
-            full, _ = bench_full_model_real(
-                module,
-                ex_args,
-                ex_kwargs,
-                assembled,
-                backend,
+            full, _, _ = benchmark_compare_isolated(
+                lowered=assembled,
+                torch_spec=("trace_args", trace_args),
+                bench_backends=args.bench_backends,
+                wall_timeout_s=_FULL_MODEL_BENCH_WALL_S,
                 warmup=args.warmup,
                 iters=args.iters,
-                bench_backends=args.bench_backends,
+                seed=args.seed,
+                nvcc_flags=bench_flags,
             )
             _print_table(full)
         except RuntimeError as exc:
-            # A whole-graph compile/bench failure (e.g. a slow-compiling kernel) must not
-            # cost the per-kernel table — report and fall through.
+            # Any worker failure (incl. a SIGKILL on a hung kernel) surfaces as RuntimeError. The
+            # parent device stays clean — per-kernel runs in its own worker — so continue.
             sys.stderr.write(f"[tune] full-model bench failed ({exc}); continuing to per-kernel\n")
     else:
         sys.stderr.write("\n[tune] full-model bench skipped (no runnable module — --ir JSON path)\n")
 
-    rows = _bench_per_kernel(args, dump.dir, backend, db)
+    rows = _bench_per_kernel(args, dump.dir, db)
     if rows:
         _print_per_kernel_table(rows)
         if html_dir is not None:
             render_kernel_chart(rows, Path(html_dir) / "kernels.html")
 
 
-def _bench_per_kernel(args, dump_dir, backend, db):
-    """Bench each kernel's ``.torch.json`` provenance reproducer (re-lowered greedily
-    so the tuned DB-best forks are picked) vs eager / torch.compile / deplodock at -O3.
-    Returns ``[(label, {backend: us})]``. Per-kernel failures are skipped; a bench
-    watchdog ``RuntimeError`` dirties the CUDA context unrecoverably, so it stops the
-    per-kernel sweep (we still report what we have)."""
+def _bench_per_kernel(args, dump_dir, db):
+    """Bench each kernel's ``.torch.json`` provenance reproducer (re-lowered greedily so the tuned
+    DB-best forks are picked) vs eager / torch.compile / deplodock at -O3 — each in the SIGKILL-able
+    worker (``benchmark_compare_isolated``). Re-lowering runs in the parent (CPU; greedy forks read
+    the DB); only the GPU bench is isolated, so a hung / failed kernel skips just that reproducer and
+    the sweep continues. Returns ``[(label, {backend: us})]``."""
     import json
 
-    from deplodock.commands.run import _detect_stage, _passes_after_stage, bench_lowered_vs_torch
+    from deplodock.commands.run import _detect_stage, _passes_after_stage
     from deplodock.compiler.backend import torch_ref
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline import Pipeline
 
     repros = final_kernel_repros(dump_dir)
     if not repros:
         return []
+    bench_flags = os.environ.get(config.NVCC_FLAGS, "")
     sys.stderr.write(f"\n[tune] per-kernel bench: {len(repros)} reproducer(s) at -O3\n")
     rows: list[tuple[str, dict]] = []
     for repro in repros:
@@ -356,20 +459,17 @@ def _bench_per_kernel(args, dump_dir, backend, db):
             tail = _passes_after_stage(_detect_stage(g))
             # No dump here — re-creating a CompilerDump on the repro dir would rmtree it.
             lowered = Pipeline.build(tail).run(g, db=db) if tail else g
-            results, _, _ = bench_lowered_vs_torch(
-                fe,
-                lowered,
-                backend,
-                seed=args.seed,
-                do_bench=True,
+            results, _, _ = benchmark_compare_isolated(
+                lowered=lowered,
+                torch_spec=("frontend_graph", fe),
+                bench_backends=args.bench_backends,
+                wall_timeout_s=_PER_KERNEL_BENCH_WALL_S,
                 warmup=args.warmup,
                 iters=args.iters,
-                bench_backends=args.bench_backends,
+                seed=args.seed,
+                nvcc_flags=bench_flags,
             )
-        except RuntimeError as exc:
-            sys.stderr.write(f"[tune]   {label}: bench aborted ({exc}); stopping per-kernel sweep\n")
-            break
-        except Exception as exc:  # noqa: BLE001 — skip a kernel that fails to lower / run
+        except Exception as exc:  # noqa: BLE001 — isolated, so a hung / failed kernel skips just this one
             sys.stderr.write(f"[tune]   {label}: skipped ({exc})\n")
             continue
         rows.append((label, results))
@@ -397,14 +497,18 @@ def _fmt_us(us) -> str:
 
 
 def _print_per_kernel_table(rows) -> None:
-    print()
-    print(f"{'Kernel':<40s} {'eager':>10s} {'tcompile':>10s} {'deplodock':>10s} {'vs eager':>9s}")
-    print("-" * 84)
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
+    cols = [Col("Kernel"), Col("eager", "r"), Col("tcompile", "r"), Col("deplodock", "r"), Col("vs eager", "r")]
+    data = []
     for label, res in sorted(rows, key=lambda kv: kv[1].get("Deplodock") or 0.0, reverse=True):
         eager = res.get("Eager PyTorch")
         dp = res.get("Deplodock")
         spd = f"{eager / dp:.2f}x" if (eager and dp) else "-"
-        print(f"{label[:40]:<40s} {_fmt_us(eager):>10s} {_fmt_us(res.get('torch.compile')):>10s} {_fmt_us(dp):>10s} {spd:>9s}")
+        data.append([label, _fmt_us(eager), _fmt_us(res.get("torch.compile")), _fmt_us(dp), spd])
+    print()
+    for line in render_table(cols, data, rule=True):
+        print(line)
 
 
 def render_kernel_chart(rows, out_html) -> None:

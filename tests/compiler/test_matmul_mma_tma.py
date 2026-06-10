@@ -129,9 +129,8 @@ def pin_tma_mma(monkeypatch):
     K-stage_inner trip count. ``DEPLODOCK_TMA=1`` forces ``050_use_tma`` to
     promote eligible buffered bundles (the block-aware ``_stage_eligible``).
     """
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_TMA", "1")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")
@@ -148,35 +147,6 @@ def _compile_and_render(*, M: int, N: int, K: int, out_dtype: DataType):
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
     return g, kop, src
-
-
-@pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
-def test_default_picker_lands_on_tma_golden_at_2048_fp16(monkeypatch):
-    """With ``DEPLODOCK_MMA=1`` defaulted ON and *no* warp-tier pins, the
-    DB-less greedy picker on sm_90+ lands on the priority-scored s16816
-    mma.sync tile for 2048² fp16: a **square 64×64 output tile on a 4-warp
-    CTA with WARP_SPECIALIZE** — ``WN=4 WM=1 FM=4 FN=2 BK=2 BUFFER_COUNT=2``
-    (M-tile = WM·FM·16 = 64, N-tile = WN·FN·atom_n = 4·2·8 = 64). This matches
-    ``golden_configs.square.2048.fp16`` (≈107 µs / 1.06× cuBLAS on RTX 5090).
-    ``WM=1 WN=4`` and the balanced ``WM=2 WN=2`` give the identical 64×64 tile
-    and are perf-equal; the deterministic enumeration order picks the former.
-
-    Three co-operating priors land this: ``score_tile_geometry`` /
-    ``_priority_matmul_warp`` reward the square 64×64 tile; ``040_use_ring_buffers``
-    front-loads ``BUFFER_COUNT=2`` for the warp-tier (so ``085_warp_specialize``
-    — which requires ``pipeline_depth == 2`` — can fire); and the WS fork ranks
-    ``WARP_SPECIALIZE=1`` first for the warp tier.
-    """
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
-    _, kop, _ = _compile_and_render(M=2048, N=2048, K=2048, out_dtype=F16)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
-    assert int(kop.knobs.get("WN", 0)) == 4, f"expected WN=4, got {kop.knobs.get('WN')}"
-    assert int(kop.knobs.get("WM", 0)) == 1, f"expected WM=1, got {kop.knobs.get('WM')}"
-    assert int(kop.knobs.get("FM", 0)) == 4, f"expected FM=4, got {kop.knobs.get('FM')}"
-    assert int(kop.knobs.get("FN", 0)) == 2, f"expected FN=2, got {kop.knobs.get('FN')}"
-    assert int(kop.knobs.get("BK", 0)) == 2, f"expected BK=2, got {kop.knobs.get('BK')}"
-    assert int(kop.knobs.get("BUFFER_COUNT", 0)) == 2, f"expected BUFFER_COUNT=2, got {kop.knobs.get('BUFFER_COUNT')}"
-    assert kop.knobs.get("WARP_SPECIALIZE") is True, f"expected WARP_SPECIALIZE=True, got {kop.knobs.get('WARP_SPECIALIZE')}"
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
@@ -216,7 +186,7 @@ def test_tma_mma_matches_f32_reference(pin_tma_mma, M: int, N: int, K: int):
     the regression that motivated routing the launch through the backend,
     which binds every ``CUtensorMap`` via ``_prebuild_descriptors``."""
     _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "cp.async.bulk.tensor" in src  # smoke-check the TMA path actually fired
 
     # Launch through the real backend so ``_prebuild_descriptors`` binds the
@@ -273,15 +243,14 @@ def test_tma_swizzle_smem_aligns_to_atom(pin_tma_mma):
 def pin_mma_sync(monkeypatch):
     """Pin the modern warp-level MMA atom + a staged 128×128 warp tile.
 
-    ``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` opts the s16816 path into the
+    ``DEPLODOCK_MMA=mma_m16n8k16_f16`` opts the s16816 path into the
     enumeration (it's a registered ``ATOM_REGISTRY`` kind but not auto-selected
     until perf-promoted). ``WM=2 FM=4`` → M-tile 128 (``2·4·atom_m=16``);
     ``WN=2 FN=8`` → N-tile 128 (``2·8·atom_n=8``); ``BK=2`` → 32-element
     K-stage. ``DEPLODOCK_TMA=1`` lets the staged bundle promote to TMA on
     sm_90+ (ldmatrix still reads from the staged smem slab either way)."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_TMA", "1")
-    monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     monkeypatch.setenv("DEPLODOCK_FM", "4")
@@ -295,7 +264,7 @@ def test_mma_sync_path_emits_ldmatrix_and_mma_ptx(pin_mma_sync):
     inline PTX (the s16816 path) and emits zero ``nvcuda::wmma`` intrinsics —
     a clean swap of the tensor-core instruction family, not a mix."""
     _, kop, src = _compile_and_render(M=256, N=256, K=128, out_dtype=F16)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "ldmatrix.sync.aligned" in src, "mma.sync operands must load via ldmatrix"
     assert "mma.sync.aligned.m16n8k16" in src, "the s16816 mma.sync instruction must be emitted"
     assert "wmma::" not in src, "the mma.sync path must not mix in legacy wmma intrinsics"
@@ -315,7 +284,7 @@ def test_mma_sync_matches_reference(pin_mma_sync, M: int, N: int, K: int, out_dt
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=out_dtype)
-    assert kop.knobs.get("ATOM_KIND") == "mma_m16n8k16_f16"
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "mma.sync.aligned.m16n8k16" in src
 
     np.random.seed(7)

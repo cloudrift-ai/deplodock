@@ -87,6 +87,7 @@ PAD_SMEM = Knob(
         "leaves the slab dense. Variants are only emitted when at least one Source "
         "actually benefits."
     ),
+    off=False,
 )
 
 
@@ -96,7 +97,9 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
 
     pad_plan = _plan_pad(root.op.body)
     if pad_plan is None:
-        raise RuleSkipped("no Source has a fixable bank conflict")
+        # No fixable bank conflict — record the off decision (body unchanged) so
+        # the realized config keeps a uniform knob set instead of leaving it absent.
+        return [TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, PAD_SMEM.name: False})]
 
     # Emission order: pad-on first as the greedy default (matches the
     # pre-refactor behavior where padding fired whenever it could).

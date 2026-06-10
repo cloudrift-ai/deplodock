@@ -12,6 +12,7 @@ tests/
 ├── test_detect.py               # deplodock.detect (GPU detection via PCI sysfs)
 ├── test_hardware.py         # deplodock.hardware (top-level module)
 ├── test_redact.py           # deplodock.redact (secret redaction)
+├── test_new_models.py       # scripts/new_models.py (model discovery: base-key match, dedup, arena linking)
 ├── benchmark/
 │   ├── test_bench_dryrun.py # bench CLI dry-run
 │   ├── test_code_hash.py    # BenchmarkTask.compute_code_hash()
@@ -68,6 +69,7 @@ tests/
 │   │   ├── test_matcher.py                     # Pattern matcher unit tests
 │   │   ├── test_matmul_rules.py / test_reduction_rules.py / test_register_tile_rules.py
 │   │   ├── test_partition_planner_rules.py / test_partition_planner_forks.py
+│   │   ├── test_partition_planner_memo.py      # enumeration memo + lazy fork-tree call counts
 │   │   ├── test_launch_geometry_rules.py / test_masked_tile.py
 │   │   ├── test_stage_inputs_classify.py
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
@@ -176,3 +178,11 @@ pytest tests/deploy/test_recipe.py -v  # single file
 pytest tests/planner/ -v               # single directory
 pytest tests/perf/ -m perf -v          # GPU perf suite (see tests/perf/ARCHITECTURE.md)
 ```
+
+Under `make test` (`-n auto --dist=loadgroup`) the root `conftest.py` routes every CUDA-touching test onto two
+serial chains via dynamic `xdist_group` markers — `cuda` for in-process device work (one shared context, keeps
+the attention-chain accuracy thresholds deterministic) and `cuda-cli` for `run_cli` subprocess tests (each owns a
+fresh CUDA context; bounding their concurrency prevents GPU OOM from ~30 simultaneous subprocesses). The hook is
+`tryfirst` because xdist's worker-side hook bakes group names into nodeids before plain conftest hooks run —
+without it the markers land too late and CUDA tests silently scatter across workers. Non-CUDA tests are
+LPT-bucketed across the remaining workers using the cached duration table.

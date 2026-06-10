@@ -1,4 +1,4 @@
-"""Loop-dialect naming rule (``loop/fusion/030_stamp_loop_names``).
+"""Loop-dialect naming rule (``loop/fusion/991_stamp_loop_names``).
 
 Companion to ``test_tile_naming``: that file checks the name lands on the
 final TileOp; this one checks the stamping rule itself — every LoopOp gets
@@ -19,7 +19,7 @@ from deplodock.compiler.ir.frontend.ir import RmsNormOp
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
-_STAMP_MODULE = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.030_stamp_loop_names")
+_STAMP_MODULE = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.991_stamp_loop_names")
 
 
 def _pointwise_loop() -> LoopOp:

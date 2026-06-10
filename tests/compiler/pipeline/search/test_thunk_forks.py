@@ -5,7 +5,7 @@ leaf op exactly once.
 Tests build a small custom Pipeline with a single rule whose ``rewrite``
 returns ``Fork`` options. Each Fork's ``expand`` either returns more Forks
 (branch level) or a concrete ``Op`` (leaf level). The harness then drives
-the pipeline through both :class:`GreedySearch` and :class:`TuningSearch`
+the pipeline through both single-shot `Pipeline.run` and the `TuningSearch` sweep
 and asserts the cursor advances exactly once and the resolved leaf carries
 the expected knob delta.
 """
@@ -18,7 +18,8 @@ from typing import Any
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
-from deplodock.compiler.pipeline.pipeline import Fork, Pass, Pattern, Pipeline, Rule
+from deplodock.compiler.pipeline.fork import ThunkFork
+from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule
 
 
 # A tiny stub Op for testing. Carries an arbitrary ``knobs`` dict that the
@@ -83,7 +84,7 @@ def test_single_level_fork_resolves_leaf() -> None:
     def rewrite(root):  # noqa: ARG001
         leaf = _StubOp(tag="leaf", knobs={"L": 1})
         # Single-level fork: expand returns [leaf]
-        return [Fork(knobs={"L": 1}, expand=lambda: [leaf])]
+        return [ThunkFork(knobs={"L": 1}, expand_fn=lambda knobs: [leaf])]
 
     pipeline = _build_pipeline(rewrite)
     out = pipeline.run(_make_graph())
@@ -99,17 +100,17 @@ def test_two_level_fork_chain_resolves_leaf() -> None:
 
     def rewrite(root):  # noqa: ARG001
         def make_inner(outer_v: int):
-            return [
-                Fork(knobs={"B": b}, expand=lambda b=b, ov=outer_v: [_StubOp(tag=f"leaf-{ov}-{b}", knobs={"A": ov, "B": b})])
-                for b in (10, 20)
-            ]
+            def leaf(knobs: dict, ov: int = outer_v) -> list[_StubOp]:
+                return [_StubOp(tag=f"leaf-{ov}-{knobs['B']}", knobs={"A": ov, "B": knobs["B"]})]
 
-        return [Fork(knobs={"A": a}, expand=lambda a=a: make_inner(a)) for a in (1, 2)]
+            return [ThunkFork(knobs={"B": b}, expand_fn=leaf) for b in (10, 20)]
+
+        return [ThunkFork(knobs={"A": a}, expand_fn=lambda knobs: make_inner(knobs["A"])) for a in (1, 2)]
 
     pipeline = _build_pipeline(rewrite)
     out = pipeline.run(_make_graph())
     op = _final_op(out)
-    # Greedy picks option 0 at every fork → A=1, B=10.
+    # Single-shot (uniform PUCT) picks option 0 at every fork → A=1, B=10.
     assert op.knobs.get("A") == 1
     assert op.knobs.get("B") == 10
     assert op.tag == "leaf-1-10"
@@ -123,12 +124,12 @@ def test_tuning_enumerates_thunk_leaves() -> None:
 
     def rewrite(root):  # noqa: ARG001
         def make_inner(outer_v: int):
-            return [
-                Fork(knobs={"B": b}, expand=lambda b=b, ov=outer_v: [_StubOp(tag=f"leaf-{ov}-{b}", knobs={"A": ov, "B": b})])
-                for b in (10, 20)
-            ]
+            def leaf(knobs: dict, ov: int = outer_v) -> list[_StubOp]:
+                return [_StubOp(tag=f"leaf-{ov}-{knobs['B']}", knobs={"A": ov, "B": knobs["B"]})]
 
-        return [Fork(knobs={"A": a}, expand=lambda a=a: make_inner(a)) for a in (1, 2)]
+            return [ThunkFork(knobs={"B": b}, expand_fn=leaf) for b in (10, 20)]
+
+        return [ThunkFork(knobs={"A": a}, expand_fn=lambda knobs: make_inner(knobs["A"])) for a in (1, 2)]
 
     pipeline = _build_pipeline(rewrite)
     search = TuningSearch(patience=10**6)
@@ -141,7 +142,7 @@ def test_tuning_enumerates_thunk_leaves() -> None:
 
 
 def test_mixed_fork_and_concrete_op_siblings() -> None:
-    """One rule batch returns a mix of Forks and concrete Ops. Greedy
+    """One rule batch returns a mix of Forks and concrete Ops. Single-shot
     picks option 0 (a Fork that expands to a leaf), but both branches
     must be valid for tune to enumerate."""
     from deplodock.compiler.pipeline import TuningSearch
@@ -153,12 +154,12 @@ def test_mixed_fork_and_concrete_op_siblings() -> None:
         # Option 0: Fork that expands to a leaf with K=1.
         # Option 1: concrete Op already (K=99).
         return [
-            Fork(knobs={"K": 1}, expand=lambda: [_StubOp(tag="via-fork", knobs={"K": 1})]),
+            ThunkFork(knobs={"K": 1}, expand_fn=lambda knobs: [_StubOp(tag="via-fork", knobs=dict(knobs))]),
             direct_leaf,
         ]
 
     pipeline = _build_pipeline(rewrite)
-    # Greedy: option 0 → Fork → leaf K=1.
+    # Single-shot: option 0 → Fork → leaf K=1.
     out_greedy = pipeline.run(_make_graph())
     assert _final_op(out_greedy).knobs.get("K") == 1
 
@@ -183,20 +184,24 @@ def test_is_expandable_discriminates_fork_vs_op() -> None:
     # via Pipeline.match to get a real Match.
     cur = pipeline.passes[0].rules[0]
     from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline import TuningSearch
+    from deplodock.compiler.pipeline.pipeline import Run
+    from deplodock.compiler.pipeline.search.db import SearchDB
 
-    ctx = Context.probe()
-    cand = Candidate(ctx=ctx, graph=graph, cursor=None)  # cursor unused for these calls
+    run = Run(pipeline=pipeline, ctx=Context.probe(), search=TuningSearch(), db=SearchDB())
+    cand = Candidate(run=run, graph=graph, cursor=None)  # cursor unused for these calls
 
     matches = pipeline.match(graph, cur)
     assert matches, "pattern must match the stub node"
     match = matches[0]
 
     # Branch Fork → True
-    lc_fork = LazyCandidate.from_fork(inner=cand, cursor=cand.cursor, match=match, fork=Fork(knobs={"X": 1}, expand=lambda: [_StubOp()]))
+    branch = ThunkFork(knobs={"X": 1}, expand_fn=lambda knobs: [_StubOp()])
+    lc_fork = LazyCandidate.from_option(inner=cand, cursor=cand.cursor, match=match, option=branch)
     assert lc_fork.is_expandable() is True
 
-    # Leaf-wrapped Op → False (resolves directly, no expand needed)
-    lc_op = LazyCandidate.from_op(inner=cand, cursor=cand.cursor, match=match, op=_StubOp(tag="leaf"))
+    # Op option → lifted into a leaf OptionFork → False (resolves directly)
+    lc_op = LazyCandidate.from_option(inner=cand, cursor=cand.cursor, match=match, option=_StubOp(tag="leaf"))
     assert lc_op.is_expandable() is False
 
     # None pending → False

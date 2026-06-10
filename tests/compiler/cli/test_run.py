@@ -42,9 +42,54 @@ def test_run_code_and_ir_mutually_exclusive(run_cli, tmp_path):
     assert "mutually exclusive" in (stdout + stderr).lower()
 
 
+def test_run_input_and_code_mutually_exclusive(run_cli):
+    rc, stdout, stderr = run_cli("run", "some/model", "--code", "torch.zeros(4)")
+    assert rc != 0
+    assert "mutually exclusive" in (stdout + stderr).lower()
+
+
+def test_pinned_knobs_sets_and_restores_env(monkeypatch):
+    """``_pinned_knobs`` pins ``DEPLODOCK_<KNOB>`` for the block, then restores the
+    prior environment — removing keys that were unset, restoring preexisting ones
+    (the golden-bench A/B relies on this to compile a pinned variant cleanly)."""
+    import os
+
+    from deplodock.commands.run import _pinned_knobs
+
+    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    monkeypatch.setenv("DEPLODOCK_BN", "preexisting")
+    with _pinned_knobs({"BM": 8, "BN": 32, "WARP_SPECIALIZE": False}):
+        assert os.environ["DEPLODOCK_BM"] == "8"
+        assert os.environ["DEPLODOCK_BN"] == "32"
+        assert os.environ["DEPLODOCK_WARP_SPECIALIZE"] == "False"
+    assert "DEPLODOCK_BM" not in os.environ  # was unset → removed
+    assert os.environ["DEPLODOCK_BN"] == "preexisting"  # restored
+    assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
+
+
+@requires_cuda
+def test_run_golden_bench_shows_benched_golden_row(run_cli):
+    """``run --golden NAME --bench`` compiles + benches the recorded golden (knobs
+    pinned) and prints it as a ``golden NAME``-labeled row in the kernel table."""
+    rc, stdout, stderr = run_cli("run", "--golden", "square.512", "--bench")
+    assert rc == 0, f"stderr: {stderr}"
+    assert "golden square.512" in stdout, stdout
+
+
 @requires_cuda
 def test_run_code_rmsnorm_accuracy(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(64)({_randn('1,8,64', dtype)})")
+    assert rc == 0, f"stderr: {stderr}"
+
+
+@requires_cuda
+def test_run_code_rmsnorm_via_pow_neg_half(run_cli):
+    """Gemma-style RMSNorm normalization uses ``torch.pow(ms, -0.5)`` (not
+    ``rsqrt``); the exponent arrives as a broadcast constant. Guards the
+    ``030_pow`` regression where every ``pow`` was squared — here that would
+    compute ``x * (mean+eps)²`` and fail the eager comparison."""
+    code = "x = torch.randn(2,64,256); torch.mul(x, torch.pow(torch.mean(torch.pow(x,2),-1,keepdim=True)+1e-6, -0.5))"
+    rc, _, stderr = run_cli("run", "--code", code)
     assert rc == 0, f"stderr: {stderr}"
 
 
@@ -105,11 +150,11 @@ def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
     CUDA device needed — just inspects the generated source.
 
     Pins a FULL clean (no-overhang) knob set + ``--target sm_90`` so the variant
-    is fully determined: the greedy pick keys off ``compute_capability`` via
-    ``score_tile_geometry``, so without the target override a GPU-less CI runner
-    resolves a different capability, picks a masked non-window variant, and the
-    FK-only pin falls back to FK=1 (no window). The full pin + fixed target make
-    the single FK=bk window variant the only candidate on any runner."""
+    is fully determined: enumeration / lowering gate on ``compute_capability``,
+    so without the target override a GPU-less CI runner resolves a different
+    capability, picks a masked non-window variant, and the FK-only pin falls back
+    to FK=1 (no window). The full pin + fixed target make the single FK=bk window
+    variant the only candidate on any runner."""
     monkeypatch.setenv("DEPLODOCK_KNOBS", "MMA=0,BN=16,BM=16,FM=1,FN=1,BK=4,SPLITK=1,FK=4")
     rc, stdout, stderr = run_cli(
         "compile",
@@ -273,6 +318,15 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
 
 
 @requires_cuda
+def test_run_positional_json_like_ir(run_cli, project_root, tmp_path):
+    """A ``.json`` passed as the positional input takes the same IR path as ``--ir``."""
+    ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "loop", tmp_path)
+    rc, stdout, stderr = run_cli("run", "-v", str(ir_path))
+    assert rc == 0, f"stderr: {stderr}"
+    assert "Loaded loop IR" in (stdout + stderr)
+
+
+@requires_cuda
 def test_run_ir_tile_stage(run_cli, project_root, tmp_path):
     """Tile-IR JSON loads and runs only the kernel + cuda tail."""
     ir_path = _dump_ir(project_root, "torch.nn.RMSNorm(64)(torch.randn(1,8,64))", "tile", tmp_path)
@@ -387,10 +441,10 @@ def test_bind_inputs_preserves_int_dtype():
     g.inputs = ["input_ids", "position_ids", "activations"]
 
     class _EmptyModule:
-        def named_parameters(self):
+        def named_parameters(self, remove_duplicate=True):
             return iter(())
 
-        def named_buffers(self):
+        def named_buffers(self, remove_duplicate=True):
             return iter(())
 
     input_ids = torch.zeros((1, 8), dtype=torch.long)

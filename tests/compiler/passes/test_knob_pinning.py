@@ -271,20 +271,38 @@ def test_scalar_matmul_f16(monkeypatch):
 
 
 @requires_cuda
-def test_unstageable_atom_raises_clear_error(monkeypatch):
-    """When the greedy compile picks the tensor-core atom variant but its
-    operands aren't staged for ``ldmatrix`` (``TMA=0``, no ``DEPLODOCK_MMA=0``),
-    ``005_lower_atom_tile`` must raise an actionable ``LoweringError`` naming the
-    remedies — not leak the unconsumed ``AtomTile`` to render and crash with the
-    opaque ``NotImplementedError`` (compile-only; the error fires during lowering)."""
+def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
+    """When the greedy compile picks the tensor-core atom variant but its operands
+    aren't staged for ``ldmatrix`` (``TMA=0`` + scalar-tile geometry), ``005_lower_atom_tile``
+    now lowers them to a **gmem-direct fragment load** (``dpl_mma_load_{a,b}_gmem``)
+    instead of raising — ldmatrix is smem-only, so the gmem path lets an unstageable
+    MMA tile compile rather than crash. Compile-only (inspects the kernel source)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import LoweringError
+    from deplodock.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
     for k, v in _SCALAR_F16_KNOBS.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
-    with pytest.raises(LoweringError, match="DEPLODOCK_MMA=0"):
-        CudaBackend().compile(g)
+    # A DEPLODOCK_MMA=<kind> pin is authoritative (the planner drops the scalar
+    # tier), so greedy MUST take the atom variant — and with TMA=0 + this geometry
+    # the staging passes decline, so the operands hit the gmem-direct path.
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    compiled = CudaBackend().compile(g)  # no longer raises
+    src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
+    assert "dpl_mma_load_a_gmem" in src and "dpl_mma_load_b_gmem" in src, "unstaged operands not loaded gmem-direct"
+    assert "mma.sync.aligned.m16n8k16" in src, "tensor-core path not taken (scalar fallback?)"
+
+
+@requires_cuda
+def test_unstaged_atom_mma_accuracy(monkeypatch):
+    """The gmem-direct mma fragment load must produce CORRECT results — a wrong
+    lane→element map silently corrupts the matmul. Force an unstaged tensor-core
+    matmul (a full warp pin + ``STAGE=00`` stages nothing) and verify it matches
+    the numpy reference. Guards the m16n8k16 fragment layout in the gmem helpers."""
+    g, inputs, ref = _build_f16_matmul_graph(128, 128, 128)
+    knobs = {"MMA": "mma_m16n8k16_f16", "WN": 2, "WM": 2, "FM": 2, "FN": 2, "BK": 2, "SPLITK": 1, "STAGE": "00"}
+    forced = _run_with_knobs(g, inputs, "c", knobs, monkeypatch)
+    _assert_match(forced.astype(np.float32), ref.astype(np.float32))
 
 
 # Regressions for the article-reproduction work (see plans + git log

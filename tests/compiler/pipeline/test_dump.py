@@ -143,7 +143,7 @@ def test_torch_repro_is_whole_op_and_loadable(tmp_path):
     g = _rms_graph()
     dump = CompilerDump(dir=tmp_path)
     dump.dump_input_graph(g)
-    Pipeline.build(TILE_PASSES, dump=dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=dump)
 
     repros = sorted(tmp_path.glob("*.kernels/*.torch.json"))
     assert repros, "expected a per-kernel .torch.json reproducer"
@@ -161,7 +161,7 @@ def test_torch_repro_coverage_header(tmp_path):
     g = _rms_graph()
     dump = CompilerDump(dir=tmp_path)
     dump.dump_input_graph(g)
-    Pipeline.build(TILE_PASSES, dump=dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=dump)
 
     txts = sorted(tmp_path.glob("*.kernels/*.torch.txt"))
     assert txts
@@ -175,5 +175,5 @@ def test_no_repro_without_input_graph(tmp_path):
     """A dump that never captured the input graph writes no reproducers."""
     g = _rms_graph()
     dump = CompilerDump(dir=tmp_path)  # no dump_input_graph call
-    Pipeline.build(TILE_PASSES, dump=dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=dump)
     assert not list(tmp_path.glob("*.kernels/*.torch.json"))

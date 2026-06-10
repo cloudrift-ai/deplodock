@@ -57,7 +57,7 @@ def resolve_tune_db() -> Path:
 
     Callers should treat the path as advisory — the engine only opens
     it when the file actually exists; otherwise the compile falls back
-    to rule defaults (greedy option-0)."""
+    to rule defaults (single-shot option-0)."""
     return config.tune_db_path()
 
 
@@ -111,6 +111,49 @@ def add_input_args(parser) -> None:
     from deplodock.compiler.target import add_target_arg
 
     add_target_arg(parser)
+
+
+def add_golden_arg(parser) -> None:
+    """Register ``--golden NAME`` (shared by ``tune`` and ``run``) — a shorthand
+    that resolves to ``--code <the named golden config's snippet>``. Pair with
+    :func:`resolve_golden_arg` in the handler."""
+    parser.add_argument(
+        "--golden",
+        metavar="NAME",
+        help=(
+            "Tune / run the named golden config from GOLDEN_CONFIGS (shorthand for --code <its snippet>) — lets you "
+            "build the learned prior up one shape at a time and `deplodock eval golden` between runs. An unknown NAME "
+            "lists the available names. Mutually exclusive with --code / positional input / --ir."
+        ),
+    )
+
+
+def resolve_golden_arg(args) -> None:
+    """If ``--golden NAME`` is set, resolve it to ``args.code = <golden snippet>``
+    and stash every config recorded under NAME on ``args.golden_configs`` (a list —
+    one shape may carry several golden knob sets; ``run --bench`` echoes each under
+    its matching kernel). Exits 2 on an unknown name (listing the available names)
+    or a conflict with ``--code`` / positional input / ``--ir``."""
+    name = getattr(args, "golden", None)
+    args.golden_configs = []
+    if not name:
+        return
+    from deplodock.compiler.pipeline.search.data import Dataset
+
+    if args.code or args.input or getattr(args, "ir", None):
+        logger.error("--golden is mutually exclusive with --code / positional input / --ir")
+        sys.exit(2)
+    matches = Dataset.from_golden(name=name).samples
+    if not matches:
+        from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
+
+        names = ", ".join(sorted({g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}))
+        logger.error("unknown golden config %r.\nAvailable: %s", name, names)
+        sys.exit(2)
+    # All configs under one name share the shape, so any snippet is interchangeable.
+    args.golden_configs = matches
+    args.code = matches[0].snippet
+    logger.info("[golden] %s → --code %s (%d recorded config%s)", name, args.code, len(matches), "" if len(matches) == 1 else "s")
 
 
 def add_diagnostics_args(parser) -> None:
@@ -263,7 +306,7 @@ def handle_compile(args):
         dump.dump_input_graph(graph)
 
     # Pick tuned forks from the DB when one is reachable; otherwise the
-    # engine falls back to rule defaults (greedy option-0). Compile never
+    # engine falls back to rule defaults (single-shot option-0). Compile never
     # errors on a missing DB — that's only a hint, not a requirement.
     # ``DEPLODOCK_TUNE_DB`` env var overrides the default path.
     tune_db_path = resolve_tune_db()
@@ -273,7 +316,7 @@ def handle_compile(args):
     else:
         logger.debug("No tuning DB at %s — using rule defaults", tune_db_path)
 
-    result = Pipeline.build(passes, dump=dump).run(graph, db=db)
+    result = Pipeline.build(passes).run(graph, db=db, dump=dump)
 
     n_compute = sum(1 for n in result.nodes.values() if not _is_boundary(n.op))
     logger.info("Lowered: %d graph nodes -> %d kernels", initial_count, n_compute)
@@ -401,7 +444,8 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
         graph = trace_module(wrapper, (input_ids,), dynamic_shapes=dynamic_shapes)
         return graph, (wrapper, (input_ids,), {})
 
-    layers = model.model.layers
+    decoder = _find_text_decoder(model)
+    layers = decoder.layers
     if layer >= len(layers):
         logger.error("Layer %d not found (model has %d layers)", layer, len(layers))
         sys.exit(1)
@@ -409,10 +453,34 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
     block = layers[layer]
     logger.info("Tracing layer %d...", layer)
 
-    hidden_size = model.config.hidden_size
+    hidden_size = decoder.config.hidden_size
     x = torch.randn(1, seq_len, hidden_size, dtype=dtype)
     position_ids = torch.arange(seq_len).unsqueeze(0)
-    cos, sin = model.model.rotary_emb(x, position_ids)
+    # Some architectures (e.g. Gemma's sliding/global split) key RoPE on the
+    # layer's attention type; pass it when the rotary module / layer expose it.
+    layer_type = getattr(getattr(block, "self_attn", None), "layer_type", None)
+    try:
+        cos, sin = decoder.rotary_emb(x, position_ids, layer_type)
+    except TypeError:
+        cos, sin = decoder.rotary_emb(x, position_ids)
 
     graph = trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)}, dynamic_shapes=dynamic_shapes)
     return graph, (block, (x,), {"position_embeddings": (cos, sin)})
+
+
+def _find_text_decoder(model):
+    """Locate the text transformer stack (the module owning the decoder
+    ``layers`` ModuleList + its ``rotary_emb``). Handles both the flat
+    ``model.model`` layout (Llama / Qwen) and nested multimodal layouts where
+    the language model sits under e.g. ``model.model.language_model`` (Gemma's
+    unified vision/audio/text models). Returns the deepest matching module."""
+    import torch.nn as nn
+
+    best = None
+    for _name, mod in model.named_modules():
+        if isinstance(getattr(mod, "layers", None), nn.ModuleList) and hasattr(mod, "rotary_emb") and hasattr(mod, "config"):
+            best = mod  # deepest wins (named_modules yields parents before children)
+    if best is None:
+        logger.error("Could not locate a text decoder (a module with `.layers` + `.rotary_emb`) in %s", type(model).__name__)
+        sys.exit(1)
+    return best

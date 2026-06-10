@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
+from deplodock.compiler.ir.expr import BinaryExpr, CastExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
 
 if TYPE_CHECKING:
@@ -238,11 +238,19 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
 
 
 def select_to_ternary(s: Select) -> Expr:
-    """Build a chained ternary from a ``Select``'s branch list."""
+    """Build a chained ternary from a ``Select``'s branch list.
+
+    Each branch value is cast to ``float`` to match the ``float`` result
+    ``Select.render`` declares. Without it, a branch list mixing ``__half``
+    SSA values (a raw smem/gmem load) with ``float`` ones (a computed value)
+    makes the C++ conditional operator's common type ambiguous
+    (``cond ? float : __half`` — each converts to the other), which nvcc
+    rejects. The casts are no-ops when a value is already ``float``.
+    """
     branches = list(s.branches)
-    result: Expr = Var(branches[-1].value)
+    result: Expr = CastExpr("float", Var(branches[-1].value))
     for b in reversed(branches[:-1]):
-        result = TernaryExpr(cond=b.select, if_true=Var(b.value), if_false=result)
+        result = TernaryExpr(cond=b.select, if_true=CastExpr("float", Var(b.value)), if_false=result)
     return result
 
 

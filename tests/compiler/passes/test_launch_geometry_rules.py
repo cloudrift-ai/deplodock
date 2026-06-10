@@ -25,7 +25,7 @@ def test_launch_geometry_fires_on_pointwise(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "partition_loops" in recording_dump.fired_rules("lowering/tile")
 
 
@@ -36,5 +36,5 @@ def test_launch_geometry_fires_on_reduction(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "partition_loops" in recording_dump.fired_rules("lowering/tile")

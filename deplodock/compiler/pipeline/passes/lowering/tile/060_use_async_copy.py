@@ -25,7 +25,6 @@ left alone — already promoted past sync transport.
 
 from __future__ import annotations
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
@@ -51,24 +50,34 @@ ASYNC_COPY = Knob(
     KnobType.BOOL,
     hints=(True, False),
     help="Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). 0 = keep synchronous double-buffer.",
+    off=False,
 )
 
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:
+    # Idempotence: the decision is recorded as the ASYNC_COPY knob (every path
+    # stamps it now), so a re-scan of the rebound op skips here.
+    if ASYNC_COPY.name in root.op.knobs:
+        raise RuleSkipped("ASYNC_COPY already decided (idempotence via knob)")
     # Arch-gated default: cp.async needs sm_80+. Narrow the full hint tuple on
-    # supported arch, ``(False,)`` otherwise; an explicit ``=0`` pin is honoured
-    # at any arch.
+    # supported arch, ``(False,)`` otherwise; an explicit pin is honoured at any arch.
     candidates = ASYNC_COPY.hints if ctx.compute_capability >= _MIN_CAPABILITY else (False,)
+
+    def _off() -> TileOp:
+        """Record the declined decision: ASYNC_COPY=False, body unchanged (stays
+        on synchronous double-buffer / SYNC). Keeps the realized knob set uniform."""
+        return TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, ASYNC_COPY.name: False})
+
     if not ASYNC_COPY.narrow(candidates)[0]:
-        if config.knob_raw(ASYNC_COPY.name) is not None:
-            raise RuleSkipped("ASYNC_COPY=0 pinned")
-        raise RuleSkipped(f"cp.async requires compute capability >= {_MIN_CAPABILITY}, got {ctx.compute_capability}")
+        return _off()
 
     body = root.op.body
     new_body, changed = _walk(body)
     if not changed:
-        raise RuleSkipped("no BUFFERED StageBundle inside SerialTile(serial_outer) eligible for cp.async")
-    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
+        # No BUFFERED bundle to promote (e.g. a SYNC-only / unstaged kernel) —
+        # nothing for cp.async to act on, so record the declined decision.
+        return _off()
+    return TileOp(body=new_body, name=root.op.name, knobs={**root.op.knobs, ASYNC_COPY.name: True})
 
 
 def _walk(body: Body) -> tuple[Body, bool]:

@@ -1,15 +1,17 @@
 """Compiler pipeline: rewrite engine + pass directories + dump hooks.
 
 - :mod:`.pipeline` — value types (``Pattern``, ``Match``, ``Rule``,
-  ``RuleSkipped``, ``Pass``, ``Pipeline``) and the compile entry
-  points (``Pipeline.build``, ``.run``, ``.tune``, ``.search``).
-  Pattern matching goes through ``pipeline.match(graph, rule)``; tests
-  can use ``Pipeline.from_pattern(...)`` for a one-rule shim. The same
-  greedy / autotune semantics apply to every caller.
+  ``RuleSkipped``, ``Pass``, ``Pipeline``), the per-run state object
+  ``Run`` (ctx / search / db / backend / dump / rejections + the engine
+  loop, ``Run.drive``), and the compile entry points
+  (``Pipeline.build``, ``.run``, ``.tune``). Pattern matching goes
+  through ``pipeline.match(graph, rule)``; tests can use
+  ``Pipeline.from_pattern(...)`` for a one-rule shim. The same greedy /
+  autotune semantics apply to every caller.
 - :mod:`.search` — search policies (``Candidate`` / ``Search`` /
   ``GreedySearch`` / ``TuningSearch``) and persistent measurement
   cache. ``Candidate.apply`` owns the per-rule logging + dump hooks
-  (reads ``match.pipeline.dump``).
+  (reads ``cand.run.dump``).
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
   dispatch that routes post-pass dumps by pass name.
 - :mod:`.passes` — pass directories grouped by IR level:

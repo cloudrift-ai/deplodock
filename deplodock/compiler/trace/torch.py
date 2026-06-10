@@ -480,6 +480,13 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
         "mul": "multiply",
         "div": "divide",
         "neg": "negative",
+        # In-place variants (``*=`` / ``+=`` / … — e.g. Gemma's
+        # ``hidden_states *= self.layer_scalar``). The trace is functional, so
+        # they lower to the same out-of-place numpy op.
+        "mul_": "multiply",
+        "add_": "add",
+        "sub_": "subtract",
+        "div_": "divide",
     }
     _ELEMENTWISE_SOURCES = frozenset(_ATEN_TO_NUMPY) | {
         "add",
@@ -683,7 +690,11 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
         return
 
     # --- Pass-through ---
-    if op_name in ("to", "contiguous", "_assert_tensor_metadata", "clone", "detach", "alias"):
+    # ``type_as`` is a dtype cast to another tensor's dtype (e.g. Gemma's
+    # ``self._norm(x.float()).type_as(x)``) — like ``to``/``clone`` it's an
+    # identity in the dtype-unified numeric pipeline (the traced dtype carries
+    # through), so map it to its first input.
+    if op_name in ("to", "contiguous", "_assert_tensor_metadata", "clone", "detach", "alias", "type_as"):
         if input_ids:
             node_map[name] = input_ids[0]
         return

@@ -38,7 +38,7 @@ def test_planner_fires_on_pointwise(recording_dump, monkeypatch):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     assert "partition_loops" in recording_dump.fired_rules("lowering/tile")
 
 
@@ -169,14 +169,14 @@ def test_replicator_keeps_n_invariant_loads_once():
         ),
     )
 
-    plan = planner._plan_kernel(loop_op, Context(compute_capability="sm_80"), kernel_name="k_blk")
+    plan = planner._plan_kernel(loop_op, Context(compute_capability=(8, 0)), kernel_name="k_blk")
     assert plan is not None
     # Need BOTH FM > 1 and FN > 1 to exercise the blocked-layout invariant
     # (``a + b < a·b``); a single-axis register tile (FM=1 or FN=1) trivially
     # satisfies the equality, and (FM=2, FN=2) is the degenerate ``a·b == a+b``
     # boundary. Pin to (FM=4, FN=4) so the strict ``<`` assertion fires and
     # the test stays decoupled from sibling-ordering changes in the prior.
-    candidates = [p for p in plan.params if p.fm == 4 and p.fn == 4 and p.splitk == 1 and p.br == 1]
+    candidates = [p for p in plan.params if p["FM"] == 4 and p["FN"] == 4 and p["SPLITK"] == 1 and p["BR"] == 1]
     assert candidates, "no FM=4, FN=4 variant enumerated for matmul"
     chosen = candidates[0]
     tile_op = planner._materialize(plan, chosen)
@@ -198,8 +198,8 @@ def test_replicator_keeps_n_invariant_loads_once():
     for s in after.body.iter():
         if isinstance(s, _Load):
             loads_by_buf[s.input] = loads_by_buf.get(s.input, 0) + 1
-    assert loads_by_buf.get("a") == chosen.fm, f"expected {chosen.fm} Load a (FM-replicated, N-invariant), got {loads_by_buf}"
-    assert loads_by_buf.get("b") == chosen.fn, f"expected {chosen.fn} Load b (FN-replicated, M-invariant), got {loads_by_buf}"
+    assert loads_by_buf.get("a") == chosen["FM"], f"expected {chosen['FM']} Load a (FM-replicated, N-invariant), got {loads_by_buf}"
+    assert loads_by_buf.get("b") == chosen["FN"], f"expected {chosen['FN']} Load b (FN-replicated, M-invariant), got {loads_by_buf}"
     # The blocked-layout invariant: total Loads (FM + FN) is much less than
     # the naive product (FM · FN) — what a non-smart replicator would emit.
-    assert loads_by_buf["a"] + loads_by_buf["b"] < chosen.fm * chosen.fn or chosen.fm * chosen.fn <= 2
+    assert loads_by_buf["a"] + loads_by_buf["b"] < chosen["FM"] * chosen["FN"] or chosen["FM"] * chosen["FN"] <= 2

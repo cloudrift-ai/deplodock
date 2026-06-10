@@ -26,17 +26,21 @@ the parse primitives here but keeps its own descriptor logic.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 # --- Var-name constants (the single source of truth for spellings) ---------
 
 PREFIX = "DEPLODOCK_"
 TUNE_DB = "DEPLODOCK_TUNE_DB"
+PRIOR_FILE = "DEPLODOCK_PRIOR_FILE"
 NVCC_FLAGS = "DEPLODOCK_NVCC_FLAGS"
 DEBUG = "DEPLODOCK_DEBUG"
 DUMP_DIR = "DEPLODOCK_DUMP_DIR"
 KNOBS = "DEPLODOCK_KNOBS"
 TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
+TUNE_EPS = "DEPLODOCK_TUNE_EPS"
+O3_TOL = "DEPLODOCK_O3_TOL"
 BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
 CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
@@ -103,6 +107,17 @@ def int_env(name: str, default: int) -> int:
         return default
 
 
+def float_env(name: str, default: float) -> float:
+    """Float env read. Empty / unset / unparseable → ``default``."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _str(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
@@ -120,6 +135,14 @@ def tune_db_path() -> Path:
     return Path(override) if override else _CACHE_ROOT / "autotune.db"
 
 
+def prior_path() -> Path:
+    """Learned-prior checkpoint file: ``DEPLODOCK_PRIOR_FILE`` →
+    ``~/.cache/deplodock/prior.json``. A single JSON file (not the tune DB)
+    holding the one global prior; ``tune`` writes it, ``compile`` / ``run`` read it."""
+    override = os.environ.get(PRIOR_FILE)
+    return Path(override) if override else _CACHE_ROOT / "prior.json"
+
+
 def nvcc_flags() -> str:
     """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``, ``""`` if unset).
 
@@ -129,18 +152,25 @@ def nvcc_flags() -> str:
     return _str(NVCC_FLAGS)
 
 
-def mma_enabled() -> bool:
-    """``DEPLODOCK_MMA`` — enable the MMA fragment-factorization planner.
-
-    Default ON: the planner emits warp-tier MMA variants alongside scalar
-    register-tile variants for every eligible matmul. The autotune /
-    GreedySearch picks per-shape between the two; on sm_70+ with f16 /
-    bf16 operands and divisible extents the MMA path is typically faster
-    (warp-cooperative tensor-core ops vs per-thread FMA register tiles).
-    Set ``DEPLODOCK_MMA=0`` to force the scalar-only path (debug /
-    pre-Volta hardware / fallback).
-    """
-    return _bool(knob_var("MMA"), default=True)
+@contextmanager
+def nvcc_flags_override(flags: str | None):
+    """Temporarily swap ``DEPLODOCK_NVCC_FLAGS`` for one compile (e.g. re-benching
+    a tune winner at ``-Xcicc -O3``). ``None`` is a no-op. Since ``nvcc_flags`` is
+    read fresh and folds into the cubin cache key, this transparently selects the
+    right (and separately-cached) cubin. Applied in whichever process compiles —
+    the bench worker reads it off the request and wraps its own compile."""
+    if flags is None:
+        yield
+        return
+    prev = os.environ.get(NVCC_FLAGS)
+    os.environ[NVCC_FLAGS] = flags
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(NVCC_FLAGS, None)
+        else:
+            os.environ[NVCC_FLAGS] = prev
 
 
 def debug_enabled() -> bool:
@@ -157,6 +187,24 @@ def dump_dir() -> Path | None:
 def tune_patience(default: int = 50) -> int:
     """``DEPLODOCK_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
     return int_env(TUNE_PATIENCE, default)
+
+
+def tune_eps(default: float = 0.0) -> float:
+    """``DEPLODOCK_TUNE_EPS`` — inner-MCTS ε-greedy exploration fraction: the
+    probability a selection step descends a uniformly random child instead of the
+    PUCT argmax. Opt-in (default ``0`` = deterministic PUCT): on the fp16 sweep it
+    didn't recover the lost configs (the gap is a tune-path eligibility issue, not
+    selection — see ``plans/golden-sweep-report.md``) and pure randomness regresses
+    tuning, so it's a knob for shapes where the heuristic order is known-bad, not a
+    default."""
+    return float_env(TUNE_EPS, default)
+
+
+def o3_tol(default: float = 0.10) -> float:
+    """``DEPLODOCK_O3_TOL`` — tolerance band (fraction of the best -O1 latency)
+    within which a tuned config is also re-benched at -O3 for a deployable prior
+    sample. ``0.10`` = re-bench everything within 10% of the best -O1."""
+    return float_env(O3_TOL, default)
 
 
 def bench_backends_raw(cli_value: str | None) -> str:

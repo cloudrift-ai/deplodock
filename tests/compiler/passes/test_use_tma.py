@@ -95,7 +95,7 @@ def _run_rule(op: TileOp, g: Graph):
     node = g.nodes["op"]
     # Build a minimal Match — the rule only reads ``match.graph`` for
     # the static-shape probe; no need to populate the full match tree.
-    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", pipeline=None, rule=None, is_last=True)  # type: ignore[arg-type]
+    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", rule=None, is_last=True)  # type: ignore[arg-type]
     return _use_tma.rewrite(_ctx(), match, node)
 
 
@@ -129,31 +129,56 @@ def test_rule_fires_on_async_eligible():
     assert bundles[0].policy == StagePolicy.TMA
 
 
-# --- eligibility-negative cases (RuleSkipped) ------------------------
+# --- eligibility-negative cases (decline → stamp TMA=False) ----------
+# The rule now records its decision on every non-idempotency path: a declined
+# promotion stamps ``TMA=False`` (body unchanged) so the realized config keeps a
+# uniform knob set, instead of leaving TMA absent (which 0-filled ambiguously in
+# the learned prior). A hard ``ValueError`` is reserved for ``DEPLODOCK_TMA=1``
+# pinned on infeasible ground.
 
 
-def test_skipped_on_pre_hopper_target():
+def _bundle_policies(op: TileOp) -> list[StagePolicy]:
+    return [s.policy for s in op.body.iter() if isinstance(s, StageBundle)]
+
+
+def test_off_stamped_on_pre_hopper_target():
+    """Pre-Hopper: TMA defaults off → records ``TMA=False``, body unchanged."""
     op, g = _tile_op_buffered(policy=StagePolicy.BUFFERED)
     from deplodock.compiler.pipeline.pipeline import Match  # noqa: PLC0415
 
-    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", pipeline=None, rule=None, is_last=True)  # type: ignore[arg-type]
-    with pytest.raises(RuleSkipped, match="TMA requires compute capability"):
-        _use_tma.rewrite(Context(compute_capability=(8, 0)), match, g.nodes["op"])
+    match = Match(graph=g, nodes={"root": "op"}, consumed=set(), root_node_id="op", rule=None, is_last=True)  # type: ignore[arg-type]
+    result = _use_tma.rewrite(Context(compute_capability=(8, 0)), match, g.nodes["op"])
+    assert isinstance(result, TileOp)
+    assert result.knobs[_use_tma.TMA.name] is False
+    assert _bundle_policies(result) == [StagePolicy.BUFFERED]  # untouched
 
 
-def test_skipped_when_no_promotable_bundle():
-    """SYNC bundles aren't in ``_PROMOTABLE`` — rule skips."""
+def test_off_stamped_when_no_promotable_bundle():
+    """SYNC bundles aren't in ``_PROMOTABLE`` — the rule records ``TMA=False``."""
     op, g = _tile_op_buffered(policy=StagePolicy.SYNC, buffer_count=1)
-    with pytest.raises(RuleSkipped, match="no BUFFERED/ASYNC StageBundle"):
-        _run_rule(op, g)
+    result = _run_rule(op, g)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_use_tma.TMA.name] is False
+    assert _bundle_policies(result) == [StagePolicy.SYNC]
 
 
-def test_idempotent_when_already_tma():
-    """Re-running on a TileOp whose bundle is already TMA: nothing to
-    promote, rule skips cleanly (no double-promote, no error)."""
+def test_already_tma_stamps_true():
+    """A body already carrying a TMA bundle (no knob yet) records ``TMA=True`` —
+    no double-promote, no error."""
     op, g = _tile_op_buffered(policy=StagePolicy.TMA)
-    with pytest.raises(RuleSkipped, match="no BUFFERED/ASYNC StageBundle"):
-        _run_rule(op, g)
+    result = _run_rule(op, g)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_use_tma.TMA.name] is True
+    assert _bundle_policies(result) == [StagePolicy.TMA]
+
+
+def test_idempotent_when_knob_present():
+    """Once TMA is decided (knob present), a re-scan skips cleanly."""
+    op, g = _tile_op_buffered(policy=StagePolicy.BUFFERED)
+    stamped = TileOp(body=op.body, name=op.name, knobs={_use_tma.TMA.name: False})
+    g.nodes["op"].op = stamped
+    with pytest.raises(RuleSkipped, match="TMA already decided"):
+        _run_rule(stamped, g)
 
 
 # --- end-to-end staging-chain regression -----------------------------
@@ -237,8 +262,18 @@ def test_force_tma_errors_on_sub_aligned_inner_extent(monkeypatch):
     from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
     from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
 
+    # Pin the full staged tile (not just BK): the cold default is now ranked by
+    # the ``AnalyticPrior`` (GPU/shape dependent), so the staged-but-sub-aligned
+    # tile that hits the *materialize* alignment gate must be pinned. BN=64 BM=8
+    # FM=8 FN=4 BK=16 stages a BUFFERED bundle whose 64 B inner extent is below
+    # the 128 B TMA-destination alignment → "not TMA-eligible" (vs the sibling
+    # ``test_force_tma_errors_on_pointwise``, which has no bundle at all).
     monkeypatch.setenv("DEPLODOCK_TMA", "1")
     monkeypatch.setenv("DEPLODOCK_BK", "16")
+    monkeypatch.setenv("DEPLODOCK_BN", "64")
+    monkeypatch.setenv("DEPLODOCK_BM", "8")
+    monkeypatch.setenv("DEPLODOCK_FM", "8")
+    monkeypatch.setenv("DEPLODOCK_FN", "4")
     M = K = N = 2048
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (M, K)), node_id="a")

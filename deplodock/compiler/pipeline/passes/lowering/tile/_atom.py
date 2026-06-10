@@ -55,20 +55,39 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
     operand_dtype = atom.operand_dtype("a")
 
     def predicate(loop_op: LoopOp, ctx: Context, graph: Graph) -> bool:
-        from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, StridedLoop  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, StridedLoop, Write  # noqa: PLC0415
 
         if ctx.compute_capability < min_cc:
             return False
         matmul_reduces = [lp for lp in loop_op.body.iter_of_type(Loop, StridedLoop) if lp.is_reduce and is_matmul_reduce(lp)]
         if not matmul_reduces:
             return False
+        # Buffers produced *inside* this fused kernel (e.g. an attention output
+        # feeding the o_proj matmul). ``ldmatrix`` is smem→register only and
+        # ``020_stage_inputs`` stages external gmem inputs, not register-resident
+        # intermediates — so a matmul whose operand is produced here can't have
+        # that operand staged, and the mma path would crash in ``kernel/005``.
+        # Gate it off so the scalar register-tile path picks it up.
+        produced = {w.output for w in loop_op.body.iter_of_type(Write)}
+        accum_names: set[str] = set()
         for k_loop in matmul_reduces:
             K_name = k_loop.axis.name
             if k_loop.axis.extent.is_static and k_loop.axis.extent.as_static() % cell_k != 0:
                 return False
             for load in k_loop.body.iter_of_type(Load):
-                if K_name not in {v for e in load.index for v in e.free_vars()}:
+                k_dims = [d for d, e in enumerate(load.index) if K_name in e.free_vars()]
+                if not k_dims:
                     continue
+                # The mma path needs both operands staged for ``ldmatrix``.
+                # ``020_stage_inputs._classify`` only stages a load whose cache
+                # var (the K axis here) lands in a *single* index dim; a
+                # collapsed-reshape operand (e.g. an attention output reaching
+                # the o_proj via ``[(a/128)%16, …, a%128]`` — K split across two
+                # dims) is rejected there, leaving it gmem-direct. Mirror that
+                # rejection so the atom isn't offered for an operand the stager
+                # can't serve; same for a fused intermediate produced in-kernel.
+                if len(k_dims) > 1 or load.input in produced:
+                    return False
                 node = graph.nodes.get(load.input)
                 if node is None or node.output.dtype != operand_dtype:
                     return False
@@ -96,6 +115,17 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
             if set(multiply.args) != load_names:
                 return False
             if accum.value != multiply.name:
+                return False
+            accum_names.add(accum.name)
+        # No fused post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the
+        # mma accumulator *fragment* straight to the output, so any compute that
+        # consumes the scalar accumulator after the K-loop (e.g. a fused residual
+        # ``add(acc, residual)`` or activation) is both dropped from the store and
+        # left referencing an SSA name the fragment path never defines (``acc0``
+        # undefined at nvcc time). Gate those to the scalar register-tile path,
+        # which threads the accumulator through the epilogue correctly.
+        for s in loop_op.body.iter_of_type(Assign):
+            if accum_names & set(s.args):
                 return False
         # Each output free-axis extent must divide cleanly. The body's outer
         # free Loops contribute the M (outer) / N (inner) extents the planner

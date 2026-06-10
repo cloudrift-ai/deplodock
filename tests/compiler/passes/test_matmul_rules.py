@@ -74,28 +74,28 @@ def _make_matmul_then_elwise() -> Graph:
 
 
 def test_plain_matmul_fires_split_k_and_blockify(recording_dump):
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_plain_matmul())
+    Pipeline.build(TILE_PASSES).run(_make_plain_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
     assert "partition_loops" in fired
 
 
 def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_elwise_lhs_matmul())
+    Pipeline.build(TILE_PASSES).run(_make_elwise_lhs_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
     assert "partition_loops" in fired
 
 
 def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_two_elwise_lhs_matmul())
+    Pipeline.build(TILE_PASSES).run(_make_two_elwise_lhs_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
     assert "partition_loops" in fired
 
 
 def test_matmul_then_elwise_fires_split_k_and_blockify(recording_dump):
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(_make_matmul_then_elwise())
+    Pipeline.build(TILE_PASSES).run(_make_matmul_then_elwise(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
     assert "partition_loops" in fired
@@ -110,7 +110,7 @@ def test_pure_elementwise_does_not_fire_split_k(recording_dump):
     g.inputs = ["x"]
     g.outputs = ["o"]
 
-    Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile")
     assert "chunk_matmul_k" not in fired
     # M16: planner owns partition for both matmul and pointwise.

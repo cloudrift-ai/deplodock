@@ -80,6 +80,20 @@ class PerfRow:
 
 
 @dataclass(frozen=True)
+class PerfSample:
+    """One measured terminal kernel — a ``perf`` row joined to its ``cuda_op``.
+
+    The minimal row the dataset layer reads: the kernel's pretty source (for the C
+    identifier), the recorded knobs (which already carry the ``S_*`` / ``H_*``
+    features the variant was stamped with), and the median latency. Backs
+    :meth:`SearchDB.iter_perf_samples`."""
+
+    pretty: str
+    knobs: dict
+    latency_us: float
+
+
+@dataclass(frozen=True)
 class LoweringRow:
     """One ``lowering`` row — best-known child for a parent op.
 
@@ -115,7 +129,11 @@ class SearchDB:
     # Version log:
     #   1: M9.4 — planner-hoisted FM / FN / BN / BM forks. Parent-tree
     #       topology shifted vs. the legacy downstream forks.
-    _SCHEMA_VERSION = 1
+    #   2: explicit-knob OFF sentinels — every variant now stamps every planner
+    #       knob (tier-foreign ones get an OFF value: WM/WN/MMA on scalar,
+    #       BM/BN/BR/FK on warp), so ``op_cache_key`` (which folds the knob dict)
+    #       shifts for every TileOp/KernelOp. Stale ``lowering`` rows won't match.
+    _SCHEMA_VERSION = 2
 
     _SCHEMA = [
         """
@@ -177,22 +195,6 @@ class SearchDB:
             PRIMARY KEY (context_key, op_key, backend)
         )
         """,
-        # ``op_effort`` — how hard the per-op inner search has tried each
-        # op, keyed by ``(context_key, op_key)``. ``effort`` is the
-        # patience the inner ``TuningSearch`` ran with, or ``inf`` once
-        # that search EXHAUSTED the op's variant tree (no more depth
-        # possible). The two-level driver's "skip already-tuned" gate
-        # reads this: an op is ``terminated`` when its recorded effort
-        # meets the requested patience, so re-runs are idempotent and a
-        # higher patience re-deepens only under-tuned ops. Max-kept.
-        """
-        CREATE TABLE IF NOT EXISTS op_effort (
-            context_key  TEXT NOT NULL,
-            op_key       TEXT NOT NULL,
-            effort       REAL NOT NULL,
-            PRIMARY KEY (context_key, op_key)
-        )
-        """,
     ]
 
     def __init__(self, path: Path | str | None = None) -> None:
@@ -211,6 +213,19 @@ class SearchDB:
             self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
         for stmt in self._SCHEMA:
             self._conn.execute(stmt)
+
+    @classmethod
+    def open_readonly(cls, path: Path | str) -> SearchDB:
+        """Open an existing DB **read-only** — no schema creation, no version
+        check, no ``DROP TABLE lowering``, no WAL pragma — so a read-side consumer
+        (``eval``, the dataset layer) never contends with a concurrent ``tune``
+        writer or mutates the file. The read methods (``iter_perf`` /
+        ``iter_perf_samples`` / ``lookup_*``) work; any write raises (the
+        connection is ``?mode=ro``). Raises ``sqlite3.OperationalError`` if the
+        file is absent."""
+        self = cls.__new__(cls)
+        self._conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False)
+        return self
 
     # ------------------------------------------------------------------
     # Op-inventory writes (idempotent INSERT OR IGNORE)
@@ -418,40 +433,31 @@ class SearchDB:
         for row in cur:
             yield _row_to_perf(row)
 
-    # ------------------------------------------------------------------
-    # Per-op tuning effort ("skip already-tuned" gate)
-    # ------------------------------------------------------------------
-
-    def record_effort(self, context_key: str, op_key: str, effort: float) -> None:
-        """Record how hard the inner search tuned ``op_key`` under
-        ``context_key``. Max-kept: a deeper run (higher patience, or the
-        ``inf`` exhausted sentinel) wins; a shallower re-run never lowers
-        a recorded effort. ``inf`` round-trips through SQLite as a REAL
-        and compares correctly, so the exhausted sentinel needs no special
-        encoding."""
-        existing = self.effort_for(context_key, op_key)
-        if effort <= existing:
-            return
-        self._conn.execute(
-            "INSERT OR REPLACE INTO op_effort (context_key, op_key, effort) VALUES (?, ?, ?)",
-            (context_key, op_key, float(effort)),
+    def iter_perf_samples(self, *, backend: str | None = "cuda", status: str = "ok", min_latency_us: float = 0.0) -> Iterator[PerfSample]:
+        """Yield one :class:`PerfSample` per measured terminal kernel — ``perf``
+        joined to ``cuda_op`` on ``op_key = key``. The single place the two tables
+        are joined; backs ``Dataset.from_db``. ``backend=None`` spans every backend.
+        Filters to ``status`` (default ``ok``) and ``latency_us_median >
+        min_latency_us`` so callers don't re-filter stale / failed rows."""
+        sql = (
+            "SELECT cuda_op.pretty, perf.knobs, perf.latency_us_median "
+            "FROM perf JOIN cuda_op ON perf.op_key = cuda_op.key "
+            "WHERE perf.status = ? AND perf.latency_us_median > ?"
         )
+        params: list = [status, min_latency_us]
+        if backend is not None:
+            sql += " AND perf.backend = ?"
+            params.append(backend)
+        for pretty, knobs_json, us in self._conn.execute(sql, params):
+            try:
+                knobs = json.loads(knobs_json) if knobs_json else {}
+            except (TypeError, json.JSONDecodeError):
+                continue
+            yield PerfSample(pretty=pretty, knobs=knobs, latency_us=us)
 
-    def effort_for(self, context_key: str, op_key: str) -> float:
-        """Recorded inner-search effort for ``op_key``, or ``0.0`` when the
-        op has never been tuned in this context."""
-        row = self._conn.execute(
-            "SELECT effort FROM op_effort WHERE context_key = ? AND op_key = ?",
-            (context_key, op_key),
-        ).fetchone()
-        return row[0] if row is not None else 0.0
-
-    def terminated(self, context_key: str, op_key: str, patience: float) -> bool:
-        """``True`` when ``op_key`` has already been tuned in this context
-        to at least ``patience`` effort (an exhausted op records ``inf``,
-        so it is terminated at every patience). The two-level driver skips
-        the inner search for terminated ops."""
-        return self.effort_for(context_key, op_key) >= patience
+    # ------------------------------------------------------------------
+    # Per-op best time (summed into the outer terminal reward)
+    # ------------------------------------------------------------------
 
     def best_per_op_time(self, context_key: str, op_key: str, *, backend: str = "cuda") -> float | None:
         """Best measured median (us) for the kernel that ``op_key`` lowers

@@ -24,6 +24,15 @@ from deplodock import config
 # Universal across every arch we target.
 STATIC_SMEM_CAP = 48 * 1024
 
+# Fallback SM (streaming-multiprocessor) count when no live CUDA device is
+# present (GPU-less CI / offline eval). RTX 5090 / sm_120 = 170 — the device the
+# golden configs were measured on, so offline golden ranking matches. The live
+# count (``target.live_device_features``) overrides this in ``from_target`` /
+# ``probe``. Consumed by the occupancy-aware analytic prior (the ``D_*`` CTA /
+# waves features in ``knob.knob_features``, ranked by ``search/prior/AnalyticPrior``)
+# to size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
+DEFAULT_SM_COUNT = 170
+
 # Per-block dynamic-smem opt-in cap by compute capability. NVIDIA assigns
 # different sm_XX numbers to datacenter vs consumer SKUs within the same
 # arch family (sm_80 A100 vs sm_86 RTX 30xx; sm_90 H100 vs sm_120 RTX
@@ -39,6 +48,21 @@ _MAX_DYNAMIC_SMEM_BY_CC: dict[tuple[int, int], int] = {
     (12, 0): 99 * 1024,
 }
 
+# Tensor-core generation by compute capability — Volta(1)/Turing(2)/Ampere+Ada(3)
+# /Hopper(4)/Blackwell(5). A coarse arch-capability axis for the learned prior's
+# regime features (e.g. which mma shapes / dtypes the SM can issue); unknown ccs
+# fall back to the major version.
+_TENSOR_CORE_GEN: dict[tuple[int, int], int] = {
+    (7, 0): 1,
+    (7, 5): 2,
+    (8, 0): 3,
+    (8, 6): 3,
+    (8, 9): 3,
+    (9, 0): 4,
+    (10, 0): 5,
+    (12, 0): 5,
+}
+
 
 def _env_compile_flags() -> str:
     """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``). Set by the
@@ -52,6 +76,16 @@ def _max_dynamic_smem_for(cc: tuple[int, int]) -> int:
     ``STATIC_SMEM_CAP`` for unknown / no-hardware caps so callers that
     use it as a budget naturally degrade to the static-only ceiling."""
     return _MAX_DYNAMIC_SMEM_BY_CC.get(cc, STATIC_SMEM_CAP)
+
+
+def _live_sm_count() -> int:
+    """The live device's SM count (``target.live_device_features``), or
+    :data:`DEFAULT_SM_COUNT` on a GPU-less host. Surfaced onto ``Context`` so the
+    occupancy-aware tile heuristics size to the actual device instead of a
+    hardcoded constant."""
+    from deplodock.compiler.target import live_device_features  # noqa: PLC0415
+
+    return int(live_device_features().get("sm_count") or DEFAULT_SM_COUNT)
 
 
 @dataclass(frozen=True)
@@ -84,11 +118,19 @@ class Context:
     # pick the per-thread N-chunk width that keeps each LDS.128 phase
     # bank-conflict-free.
     lds128_bytes: int = 16
-    # Identifies which backend's perf rows this compile should consult
-    # for DB-driven decisions (``GreedySearch`` looks up ``perf`` by
-    # ``(context_key, op_key, backend)``). Defaults to ``"cuda"`` — the
-    # canonical autotune target. ``run_autotune`` replaces this when a
-    # live :class:`Backend` is supplied.
+    # Live device SM (streaming-multiprocessor) count, or ``DEFAULT_SM_COUNT`` on
+    # a GPU-less host. Physical SKU fact (an sm_120 laptop and an sm_120 RTX 5090
+    # differ), so it can't be derived from ``compute_capability``. Read by the
+    # occupancy-aware matmul tile heuristics to size the tile to the device — keep
+    # the CTA count near ~1-2 waves over the SMs. Populated from
+    # ``target.live_device_features`` by :meth:`from_target` / :meth:`probe`. NOT
+    # in ``structural_key`` (device-physical, like ``max_dynamic_smem``: it steers
+    # the option-0 pick, but the resulting knobs already key the perf cache).
+    sm_count: int = DEFAULT_SM_COUNT
+    # Identifies which backend's perf rows this compile reads/writes — the
+    # tune DB keys ``perf`` by ``(context_key, op_key, backend)``. Defaults to
+    # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
+    # this when a live :class:`Backend` is supplied.
     backend_name: str = "cuda"
     # Extra nvcc flags this compile uses (from ``DEPLODOCK_NVCC_FLAGS`` — e.g.
     # tune's ``-Xcicc -O1`` vs compile/run's -O3). Folded into
@@ -101,7 +143,12 @@ class Context:
 
     @classmethod
     def from_target(cls, cap: tuple[int, int]) -> Context:
-        return cls(compute_capability=cap, max_dynamic_smem=_max_dynamic_smem_for(cap), compile_flags=_env_compile_flags())
+        return cls(
+            compute_capability=cap,
+            max_dynamic_smem=_max_dynamic_smem_for(cap),
+            sm_count=_live_sm_count(),
+            compile_flags=_env_compile_flags(),
+        )
 
     def structural_key(self) -> str:
         """Implements :class:`deplodock.compiler.structural.Structural`.
@@ -118,6 +165,39 @@ class Context:
         from deplodock.compiler.structural import digest  # noqa: PLC0415
 
         return digest("Context", self.compute_capability, self.compile_flags)
+
+    def features(self) -> dict[str, float]:
+        """Host/hardware regime as ``H_*`` features for the learned prior, so a
+        SINGLE global prior spans every GPU and nvcc opt level (these are
+        constant across a compile's sibling candidates → they never change the
+        argmax; they only let the model fit per-regime offsets instead of
+        averaging across regimes). Combines capability-derived facts with the
+        live device's physical SKU properties:
+
+        - ``H_cc`` — compute capability ``major*10 + minor``
+        - ``H_tc_gen`` — tensor-core generation (``_TENSOR_CORE_GEN``)
+        - ``H_smem_optin`` — per-block dynamic-smem opt-in cap (bytes)
+        - ``H_opt`` — nvcc cicc opt level from ``compile_flags`` (tune's
+          ``-Xcicc -O1`` → 1; compile/run's default → 3)
+        - ``H_sm_count`` / ``H_smem_per_sm`` / ``H_smem_per_block`` /
+          ``H_regs_per_block`` / ``H_warp_size`` — live device props
+          (:func:`target.live_device_features`; absent on GPU-less hosts)
+        """
+        import re  # noqa: PLC0415
+
+        from deplodock.compiler.target import live_device_features  # noqa: PLC0415
+
+        major, minor = self.compute_capability
+        m = re.search(r"-O(\d)", self.compile_flags)
+        feats = {
+            "H_cc": float(major * 10 + minor),
+            "H_tc_gen": float(_TENSOR_CORE_GEN.get((major, minor), major)),
+            "H_smem_optin": float(self.max_dynamic_smem),
+            "H_opt": float(m.group(1)) if m else 3.0,
+        }
+        for k, v in live_device_features().items():
+            feats[f"H_{k}"] = v
+        return feats
 
     @classmethod
     def probe(cls) -> Context:
@@ -143,4 +223,4 @@ class Context:
             smem = _max_dynamic_smem_for(cap)
         else:
             smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
-        return cls(compute_capability=cap, max_dynamic_smem=smem, compile_flags=_env_compile_flags())
+        return cls(compute_capability=cap, max_dynamic_smem=smem, sm_count=_live_sm_count(), compile_flags=_env_compile_flags())

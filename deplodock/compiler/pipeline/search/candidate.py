@@ -16,11 +16,11 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor, _fmt_op
 from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
 from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.pipeline import Cursor, Fork
+from deplodock.compiler.pipeline.fork import Fork, OptionFork
+from deplodock.compiler.pipeline.pipeline import Cursor
 from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-
@@ -29,39 +29,32 @@ from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
 _logger = logging.getLogger("deplodock.compiler.pipeline")
 
 if TYPE_CHECKING:
-    from deplodock.compiler.pipeline.pipeline import Match
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.pipeline.pipeline import Match, Run
 
 
 @dataclass
 class Candidate:
     """A concrete point in the search space — owns a real ``graph``.
 
-    ``ctx`` is shared by reference across siblings. ``cursor`` tracks
-    pipeline resume state. The candidate reads any logging / dump sink
-    off ``match.pipeline.dump`` inside :meth:`apply` and the
-    end-of-pass hook inside :meth:`_advance_batch` — no separate
-    callback wiring is needed.
+    ``run`` is the :class:`Run` this candidate belongs to, shared by
+    reference across siblings — it resolves the hardware ``ctx``
+    (exposed as :attr:`ctx`) and the run-scoped sinks the candidate
+    reports into (``run.dump`` inside :meth:`_log_apply`, the
+    ``run.rejections`` list inside :meth:`try_rewrite`). ``cursor``
+    tracks pipeline resume state.
 
     :class:`LazyCandidate` is the deferred-apply counterpart used for
-    autotune fork siblings; both expose :meth:`resolve` so the search
-    loop can treat them uniformly."""
+    autotune fork siblings — the search queue holds only LazyCandidates;
+    a concrete Candidate enters it via :meth:`lazy`."""
 
-    ctx: Context
+    run: Run
     graph: Graph
     cursor: Cursor
 
-    def resolve(self) -> Candidate:
-        """Identity — already concrete. Provided so callers can resolve
-        any candidate uniformly."""
-        return self
-
-    def score(self) -> float:
-        """Mean of every node's ``op.score(ctx)`` over the ops that
-        return a non-``None`` score. Used as the MCTS prior for
-        ordering unmeasured siblings. Returns ``0.0`` when no op in
-        the graph provides a score."""
-        scores = [s for n in self.graph.nodes.values() if (s := n.op.score(self.ctx)) is not None]
-        return sum(scores) / len(scores) if scores else 0.0
+    @property
+    def ctx(self) -> Context:
+        return self.run.ctx
 
     def lazy(self) -> LazyCandidate:
         """Wrap in a no-op :class:`LazyCandidate` (``pending=None``). The search
@@ -120,13 +113,13 @@ class Candidate:
             # deterministic single-path compile it leaves the node
             # un-lowered with no recourse — so we both (a) emit a debug
             # "filtered" line and (b) record the rejection into the
-            # pipeline's optional sink. ``Pipeline.run`` (greedy) reads the
+            # run's optional sink. ``Pipeline.run`` (greedy) reads the
             # sink after the terminal settles and raises a loud
             # ``LoweringError`` if any recorded node is still un-lowered,
             # turning the old "CudaBackend: non-CudaOp TileOp" mystery into
             # an actionable error. The sink is absent under ``tune`` so the
             # fork-pruning path keeps its zero-overhead silent behavior.
-            sink = getattr(match.pipeline, "_lowering_rejections", None)
+            sink = self.run.rejections
             if raw_options and (sink is not None or _logger.isEnabledFor(logging.DEBUG)):
                 rejected = [o for o in raw_options if isinstance(o, Op)]
                 reasons = [r for r in (_validate_reason(o, self.ctx) for o in rejected) if r]
@@ -156,8 +149,7 @@ class Candidate:
         internally by :meth:`try_rewrite` for single-option matches):
         apply the specific ``option`` to this candidate's graph.
         Mutates the graph, logs the rewrite (debug diff +
-        ``pipeline.dump.on_rule`` snapshot, both read off
-        ``match.pipeline``), bumps cursor ``n_applied`` for functional
+        ``run.dump.on_rule`` snapshot), bumps cursor ``n_applied`` for functional
         splices, and advances the rule-batch cursor when
         ``match.is_last``.
 
@@ -191,13 +183,13 @@ class Candidate:
 
     def _log_apply(self, match: Match, option: Op | Graph) -> None:
         """Render a per-rule diff at DEBUG and route a structured
-        record to ``match.pipeline.dump`` when set. Returns early when
+        record to ``run.dump`` when set. Returns early when
         neither sink is active."""
         from deplodock.compiler.pipeline.rule_diff import emit  # noqa: PLC0415
 
         rule = match.rule
         pass_ = rule.pass_
-        dump = match.pipeline.dump
+        dump = self.run.dump
         debug_on = _logger.isEnabledFor(logging.DEBUG)
         if not (debug_on or dump is not None):
             return
@@ -225,12 +217,12 @@ class LazyCandidate:
     Sibling forks at the same rewrite point share ``inner`` by reference
     — only one snapshot is ever held in memory per fork point. Each
     sibling's ``pending`` carries its own :class:`Fork` (branch or leaf;
-    see :class:`deplodock.compiler.pipeline.pipeline.Fork`).
+    see :class:`deplodock.compiler.pipeline.fork.Fork`).
 
-    The constructor classmethods (:meth:`from_op` / :meth:`from_graph` /
-    :meth:`from_fork` / :meth:`from_option`) are the supported way to
-    spawn a non-trivial LazyCandidate — they handle the Op/Graph-to-Fork
-    leaf-wrapping uniformly so callers don't have to.
+    :meth:`from_option` is the supported way to spawn a non-trivial
+    LazyCandidate — it lifts concrete ``Op`` / ``Graph`` options into
+    :class:`OptionFork` leaves so ``pending`` always carries a uniform
+    Fork shape.
 
     ``cursor`` is the lazy candidate's own pipeline cursor (typically a
     copy of the parent's cursor at fork-creation time)."""
@@ -240,36 +232,16 @@ class LazyCandidate:
     pending: tuple[Match, Fork] | None
 
     @classmethod
-    def from_op(cls, *, inner: Candidate, cursor: Cursor, match: Match, op: Op) -> LazyCandidate:
-        """Wrap a concrete ``Op`` rewrite as a leaf-Fork-pending LazyCandidate.
-        Validation has already happened upstream (in ``try_rewrite``'s
-        filter) — the constructor just lifts the option into the Fork
-        shape so resolve / expand / _best_fork can treat it uniformly."""
-        knobs = dict(getattr(op, "knobs", None) or {})
-        leaf = Fork(knobs=knobs, expand=lambda: [op], is_leaf=True)
-        return cls(inner=inner, cursor=cursor, pending=(match, leaf))
-
-    @classmethod
-    def from_graph(cls, *, inner: Candidate, cursor: Cursor, match: Match, graph: Graph) -> LazyCandidate:
-        """Wrap a ``Graph`` fragment splice as a leaf-Fork-pending LazyCandidate."""
-        leaf = Fork(knobs={}, expand=lambda: [graph], is_leaf=True)
-        return cls(inner=inner, cursor=cursor, pending=(match, leaf))
-
-    @classmethod
-    def from_fork(cls, *, inner: Candidate, cursor: Cursor, match: Match, fork: Fork) -> LazyCandidate:
-        """Direct wrap for an explicit branch ``Fork`` produced by a rule."""
-        return cls(inner=inner, cursor=cursor, pending=(match, fork))
-
-    @classmethod
     def from_option(cls, *, inner: Candidate, cursor: Cursor, match: Match, option: Op | Graph | Fork) -> LazyCandidate:
-        """Dispatch on the option's type. The single entry point used by
-        ``Pipeline.search``'s fork-spawn site so every option gets lifted
-        consistently into a Fork-pending LazyCandidate."""
-        if isinstance(option, Fork):
-            return cls.from_fork(inner=inner, cursor=cursor, match=match, fork=option)
-        if isinstance(option, Op):
-            return cls.from_op(inner=inner, cursor=cursor, match=match, op=option)
-        return cls.from_graph(inner=inner, cursor=cursor, match=match, graph=option)
+        """The single fork-spawn constructor (used by ``Pipeline.search``
+        and :meth:`expand`): a rule-emitted ``Fork`` passes through; a
+        concrete ``Op`` / ``Graph`` (already validated upstream in
+        ``try_rewrite``'s filter) is lifted into an :class:`OptionFork`
+        leaf — an ``Op``'s knob delta rides along as the fork's ``knobs``."""
+        if not isinstance(option, Fork):
+            knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
+            option = OptionFork(option=option, knobs=knobs)
+        return cls(inner=inner, cursor=cursor, pending=(match, option))
 
     def is_expandable(self) -> bool:
         """``True`` iff ``pending`` carries a *branch* :class:`Fork` —
@@ -320,38 +292,19 @@ class LazyCandidate:
         leaves = fork.expand()
         assert len(leaves) == 1, f"leaf Fork must expand to a single option, got {len(leaves)}"
         option = leaves[0]
-        resolved = Candidate(ctx=self.inner.ctx, graph=self.inner.graph.copy(), cursor=self.cursor)
+        resolved = Candidate(run=self.inner.run, graph=self.inner.graph.copy(), cursor=self.cursor)
         resolved.apply(match.remap(resolved.graph), option)
         self.pending = None
         self.inner = resolved
         return resolved
 
-    def score(self) -> float:
-        """Mean of every node's ``op.score(ctx)`` in the candidate's
-        graph, with the pending Fork's planner prior added on top.
-
-        Branch and leaf Forks score identically: ``inner.score() +
-        fork.score``. ``fork.score`` is the planner-computed prior the
-        rule attached (for partition leaves, that's
-        ``TileOp.lazy_score(ctx, shapes=..., params=...)`` — the same
-        formula ``TileOp.score`` runs post-materialization, but cheap).
-
-        We deliberately do NOT fire ``fork.expand()`` here to recover
-        the option and re-score it: ``expand()`` for a partition leaf
-        runs ``_build_split_body`` + ``TileOp.__post_init__`` (full body
-        normalization), and MCTS's ``_ucb_key`` reads this score for
-        every unvisited sibling at every descent level. Materializing
-        every leaf just to rank them defeats the whole lazy-planner
-        design. The leaf's planner-side score is already an accurate
-        equivalent of what its post-materialization
-        ``TileOp.score(ctx)`` would return (the lazy/eager parity
-        check in ``test_lazy_score_matches_tile_op_score`` enforces
-        this), so the cheap signal is the right one to use.
-        """
-        if self.pending is None:
-            return self.inner.score()
-        _, fork = self.pending
-        return self.inner.score() + fork.score
+    @property
+    def fork(self) -> Fork | None:
+        """The pending :class:`Fork`, or ``None`` for a no-pending wrapper.
+        Ranking is search policy — the policies score ``cand.fork.knobs`` with
+        the learned prior (Forks carry no score); this accessor is just the
+        unwrap."""
+        return self.pending[1] if self.pending is not None else None
 
 
 # ---------------------------------------------------------------------------

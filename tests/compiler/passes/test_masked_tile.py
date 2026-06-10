@@ -49,7 +49,7 @@ def test_planner_admits_non_divisor_n_with_real_extent(recording_dump, monkeypat
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
 
     # Find any axis with real_extent set — should be the N block axis at 47.
@@ -142,7 +142,7 @@ def test_planner_masks_symbolic_m_axis_at_hint(recording_dump):
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
 
     # A block axis should carry a composite ceil-div extent over seq_len (not a
@@ -258,7 +258,7 @@ def test_masked_n_uses_interleaved_thread_minor_decode(recording_dump, monkeypat
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (32, 8191)), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     t_coeff, r_coeff = _n_decode_coeffs(tile_op)
     # Interleaved: thread axis is the minor one (coeff 1), register strides by BN.
@@ -299,7 +299,7 @@ def test_masked_n_clamps_cooperative_load_index(recording_dump, monkeypatch):
     # Pin a concrete sm_80 target so the smem budget is deterministic and the
     # weight stages regardless of the runner (the CPU-only CI host has no GPU
     # to probe, so the default Context's budget wouldn't admit staging).
-    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g, ctx=Context.from_target((8, 0)))
+    out = Pipeline.build(KERNEL_PASSES).run(g, ctx=Context.from_target((8, 0)), dump=recording_dump)
     kop = out.nodes["o"].op
     tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
@@ -326,7 +326,7 @@ def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatc
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (256, 64)), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
 
-    out = Pipeline.build(KERNEL_PASSES, dump=recording_dump).run(g, ctx=Context.from_target((8, 0)))
+    out = Pipeline.build(KERNEL_PASSES).run(g, ctx=Context.from_target((8, 0)), dump=recording_dump)
     kop = out.nodes["o"].op
     tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
@@ -345,7 +345,7 @@ def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (32, 8192)), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
 
-    out = Pipeline.build(TILE_PASSES, dump=recording_dump).run(g)
+    out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     t_coeff, r_coeff = _n_decode_coeffs(tile_op)
     # Blocked: the register cell is the minor axis (coeff 1); the thread axis

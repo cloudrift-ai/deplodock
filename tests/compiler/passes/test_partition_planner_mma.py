@@ -17,13 +17,13 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
     ATOM_REGISTRY,
     Atom,
     is_atom_eligible,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
-    WarpTileParams,
     _enumerate_warp_matmul_impl,
 )
 
@@ -146,11 +146,128 @@ def test_mma_eligibility_rejects_indivisible_extents():
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
+def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
+    """Matmul whose accumulator feeds a post-reduce ``add(acc, r)`` (fused
+    residual) before the Write — the mma fragment-store can't apply it."""
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Load(name="r", input="r", index=(Var("i"), Var("j"))),
+                            Assign(name="e", op=ElementwiseImpl("add"), args=("acc", "r")),
+                            Write(output="c", index=(Var("i"), Var("j")), value="e"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _matmul_collapsed_k_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
+    """Matmul whose A operand spreads the K axis across two index dims (a
+    collapsed-reshape access ``020_stage_inputs`` can't stage)."""
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("k"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_mma_eligibility_rejects_fused_epilogue():
+    """A matmul whose accumulator feeds a post-reduce ``add`` (fused residual)
+    is gated off — the mma fragment-store path drops the epilogue and leaves
+    the scalar accumulator undefined at codegen."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    op = _matmul_with_epilogue_loop_op()
+    g.nodes["c"].op = op
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
+def test_mma_eligibility_rejects_collapsed_k_operand():
+    """An operand whose K axis spans two index dims (collapsed reshape, e.g.
+    an attention output reaching the o_proj) can't be staged for ldmatrix."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    op = _matmul_collapsed_k_loop_op()
+    g.nodes["c"].op = op
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
+def test_mma_eligibility_rejects_in_kernel_intermediate():
+    """An operand buffer also produced (Written) inside the same kernel is a
+    register-resident intermediate — not a stage-able gmem input."""
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    i, j, k = Axis("i", 64), Axis("j", 64), Axis("k", 64)
+    op = LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            # Produce buffer "a" in-kernel, then consume it as a matmul operand.
+                            Load(name="bv", input="b", index=(Var("i"), Var("j"))),
+                            Write(output="a", index=(Var("i"), Var("j")), value="bv"),
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b2", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b2")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    g.nodes["c"].op = op
+    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+
+
 def test_unregistered_kind_raises():
     """The dispatcher has no fallback — an unknown kind surfaces a
     ``KeyError`` rather than silently returning False. "scalar" is the
     canonical example: it's the *absence* of an atom (modelled by
-    ``ScalarTileParams``), not a registered kind."""
+    a scalar-tier ``TileParams``), not a registered kind."""
     g = _matmul_graph(dtype=F16)
     loop_op = g.nodes["c"].op
     with pytest.raises(KeyError):
@@ -181,7 +298,7 @@ def test_registry_spec_shape_and_group_size():
 # --- Warp-tier enumerator (M3) ---------------------------------------
 
 
-def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("mma_m16n8k16_f16",)) -> list[WarpTileParams]:
+def _enum_warp(*, M: int, N: int, K: int, kinds: tuple[str, ...] = ("mma_m16n8k16_f16",)) -> list[dict]:
     return _enumerate_warp_matmul_impl(
         E_M=M,
         E_N=N,
@@ -206,9 +323,9 @@ def test_warp_enumerator_emits_rows_for_aligned_matmul():
     warp-tier variant (M%16==0, N%8==0, K%16==0)."""
     rows = _enum_warp(M=64, N=64, K=64)
     assert rows, "expected ≥1 row for a 64-square mma.sync-aligned matmul"
-    assert all(r.atom.name == "mma_m16n8k16_f16" for r in rows)
+    assert all(r["MMA"] == "mma_m16n8k16_f16" for r in rows)
     # Every row's WM·WN·32 must fit in the per-CTA thread budget (1024).
-    assert all(r.wm * r.wn * 32 <= 1024 for r in rows)
+    assert all(r["WM"] * r["WN"] * 32 <= 1024 for r in rows)
 
 
 def test_warp_enumerator_rejects_indivisible_extents():
@@ -219,43 +336,21 @@ def test_warp_enumerator_rejects_indivisible_extents():
     assert _enum_warp(M=64, N=64, K=15) == []
 
 
-def test_warp_enumerator_priority_orders_by_cells_sweet_spot():
-    """Cells-near-16 ranks first; cells-far-from-16 ranks last. The
-    register-budget sweet spot for ``mma_m16n8k16_*`` on sm_8x/9x/12x
-    is FM·FN ≈ 16 (~120 regs/lane → 2 blocks/SM occupancy). The
-    pre-2026 prior rewarded ``min(fm·fn, 64)`` monotonically and
-    pushed the picker to FM=1 FN=32 cells=32 — 3.0× slower than cuBLAS
-    on 2048² fp16. See ``plans/mma-warp-scoring.md``."""
-    rows = _enum_warp(M=128, N=128, K=128)
-    assert len(rows) >= 2
-    first_dist = abs(rows[0].fm * rows[0].fn - 16)
-    last_dist = abs(rows[-1].fm * rows[-1].fn - 16)
-    assert first_dist <= last_dist
+def test_warp_analytic_prior_ranks_golden_above_degenerate():
+    """The :class:`AnalyticPrior` ranks a recorded warp golden (2048² fp16:
+    ``WM=1 WN=4 FM=4 FN=2 BK=2`` — a TMA-pipelined, shallow-BK tile) strictly
+    better (LOWER latency proxy) than a degenerate single-cell ``BK=64`` tile.
+    The warp tile geometry + the tier-split BK target the old
+    ``_priority_matmul_warp`` enumeration sort encoded now ride the single
+    ranking path (the prior over ``knob_features``), not an enumeration order."""
+    from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
-
-# --- Warp-tier scoring on TMA-capable hardware ----------------------
-
-
-def test_warp_priority_prefers_small_bk_on_sm_90(monkeypatch):
-    """On TMA-capable arches (sm_90+) ``_priority_matmul_warp`` lifts
-    ``BK ≈ 2`` (and tied 128-thread CTAs) above the sm_80-era larger-BK
-    + 256-thread preference. Bench-validated at 2048² fp16 on RTX 5090:
-    ``WM=1 WN=4 FM=FN=4 BK=2`` runs 84 µs vs ``WM=1 WN=8 FM=FN=4 BK=32``
-    at 108 µs — TMA-pipelined beats gmem-direct by ~22 %.
-    """
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _priority_matmul_warp
-
-    gold = WarpTileParams(wn=4, wm=1, fm=4, fn=4, bk=2, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
-    baseline = WarpTileParams(wn=8, wm=1, fm=4, fn=4, bk=32, splitk=1, atom=ATOM_REGISTRY["mma_m16n8k16_f16"])
-    # On sm_90+ the gold tile must outscore the gmem-direct sibling.
-    gold_score = _priority_matmul_warp(gold, ctx=_ctx(cc=(9, 0)))
-    baseline_score = _priority_matmul_warp(baseline, ctx=_ctx(cc=(9, 0)))
-    assert gold_score > baseline_score, f"gold {gold_score!r} should beat baseline {baseline_score!r} on sm_90"
-    # The same call on sm_80 (no TMA) should KEEP preferring large BK and
-    # 256-thread CTAs — the pre-2026 behavior is unchanged off-Hopper.
-    gold_score_80 = _priority_matmul_warp(gold, ctx=_ctx(cc=(8, 0)))
-    baseline_score_80 = _priority_matmul_warp(baseline, ctx=_ctx(cc=(8, 0)))
-    assert baseline_score_80 > gold_score_80, "non-TMA arches must retain the legacy 256-thread + large-BK prior"
+    ctx = _ctx(cc=(12, 0))
+    base = {**ctx.features(), "S_ext_free_prod": float(2048 * 2048), "S_ext_reduce_prod": 2048.0, "S_ext_reduce_max": 2048.0}
+    ap = AnalyticPrior()
+    golden = {"WM": 1, "WN": 4, "FM": 4, "FN": 2, "BK": 2, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
+    degenerate = {"WM": 1, "WN": 1, "FM": 1, "FN": 1, "BK": 64, "SPLITK": 1, "MMA": "mma_m16n8k16_f16"}
+    assert ap.score({**base, **golden}) < ap.score({**base, **degenerate})
 
 
 # --- Warp-tier knob narrow (M1, plans/mma-perf-closures.md) ----------
@@ -269,7 +364,7 @@ def test_warp_enumerator_wm_narrow(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_WM", "2")
     rows = _enum_warp(M=128, N=128, K=128)
     assert rows, "WM=2 should leave at least one variant at 128-square"
-    assert all(r.wm == 2 for r in rows)
+    assert all(r["WM"] == 2 for r in rows)
 
 
 def test_warp_enumerator_wn_narrow(monkeypatch):
@@ -277,7 +372,7 @@ def test_warp_enumerator_wn_narrow(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_WN", "2")
     rows = _enum_warp(M=128, N=128, K=128)
     assert rows
-    assert all(r.wn == 2 for r in rows)
+    assert all(r["WN"] == 2 for r in rows)
 
 
 def test_warp_enumerator_bk_narrow(monkeypatch):
@@ -287,17 +382,53 @@ def test_warp_enumerator_bk_narrow(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_BK", "2")
     rows = _enum_warp(M=128, N=128, K=128)
     assert rows
-    assert all(r.bk == 2 for r in rows)
+    assert all(r["BK"] == 2 for r in rows)
 
 
-def test_warp_enumerator_atom_kind_narrow(monkeypatch):
-    """``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` pins the kind even
-    when the caller passes a multi-kind tuple — scopes the picker to a
-    single tensor-core family."""
+def test_warp_enumerator_atom_kind_alias_narrow(monkeypatch):
+    """``DEPLODOCK_ATOM_KIND=mma_m16n8k16_f16`` — the ``MMA`` knob's alias
+    spelling — pins the kind even when the caller passes a multi-kind tuple,
+    scoping the picker to a single tensor-core family."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
+    assert rows
+    assert all(r["MMA"] == "mma_m16n8k16_f16" for r in rows)
+
+
+def test_mma_mode_decodes_three_way(monkeypatch):
+    """``MMA`` knob string decode: unset / truthy → auto-enumerate, falsy →
+    disabled, anything else → enabled with that atom kind pinned."""
+    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import mma_mode
+
+    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
+    assert mma_mode() == (True, None)
+    for truthy in ("1", "true", "True", "yes", "on", ""):
+        monkeypatch.setenv("DEPLODOCK_MMA", truthy)
+        assert mma_mode() == (True, None), f"MMA={truthy!r} should auto-enumerate"
+    for falsy in ("0", "false", "False", "no", "off"):
+        monkeypatch.setenv("DEPLODOCK_MMA", falsy)
+        assert mma_mode() == (False, None), f"MMA={falsy!r} should disable"
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    assert mma_mode() == (True, "mma_m16n8k16_f16")
+
+
+def test_warp_enumerator_mma_name_pins_kind(monkeypatch):
+    """``DEPLODOCK_MMA=<kind name>`` pins the atom kind exactly like
+    ``DEPLODOCK_ATOM_KIND`` — one knob enables + pins in one go."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
+    assert rows
+    assert all(r["MMA"] == "mma_m16n8k16_f16" for r in rows)
+
+
+def test_mma_primary_wins_over_atom_kind_alias(monkeypatch):
+    """When both spellings are set, the primary ``DEPLODOCK_MMA`` wins over
+    its ``DEPLODOCK_ATOM_KIND`` alias (``Knob.raw`` checks primary first)."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_bf16")
     monkeypatch.setenv("DEPLODOCK_ATOM_KIND", "mma_m16n8k16_f16")
     rows = _enum_warp(M=128, N=128, K=128, kinds=("mma_m16n8k16_f16", "mma_m16n8k16_bf16"))
     assert rows
-    assert all(r.atom.name == "mma_m16n8k16_f16" for r in rows)
+    assert all(r["MMA"] == "mma_m16n8k16_bf16" for r in rows)
 
 
 def test_warp_enumerator_force_splitk_one():
@@ -316,7 +447,7 @@ def test_warp_enumerator_force_splitk_one():
         n_forced_mask=False,
     )
     assert rows
-    assert all(r.splitk == 1 for r in rows)
+    assert all(r["SPLITK"] == 1 for r in rows)
 
 
 # --- Planner end-to-end (M3) -----------------------------------------
@@ -332,7 +463,6 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     sm_90 here; the single-warp variant is pruned (ldmatrix needs staged
     smem) so a multi-warp pin (WM=WN=2) keeps the tower."""
     from deplodock.compiler.ir.tile.ir import AtomTile, GridTile, TileOp, WarpTile
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import WarpTileParams
 
     monkeypatch.setenv("DEPLODOCK_MMA", "1")
     monkeypatch.setenv("DEPLODOCK_WM", "2")
@@ -343,8 +473,8 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(9, 0)), kernel_name="c", graph=g)
     assert plan is not None
     assert plan.params, "expected ≥1 enumerated variant"
-    warp_rows = [p for p in plan.params if isinstance(p, WarpTileParams)]
-    assert warp_rows, "expected ≥1 WarpTileParams row when DEPLODOCK_MMA=1"
+    warp_rows = [p for p in plan.params if is_warp(p)]
+    assert warp_rows, "expected ≥1 warp-tier row when DEPLODOCK_MMA=1"
 
     # Materialize the first warp row and verify the tower shape.
     tile_op = _planner._materialize(plan, warp_rows[0])
@@ -361,20 +491,40 @@ def test_planner_emits_warp_tower_when_mma_enabled(monkeypatch):
     # GridTile should still be the outermost tier.
     assert any(isinstance(s, GridTile) for s in tile_op.body), "warp variant must keep the GridTile outer wrapper"
     # Knobs reflect the warp tier.
-    assert tile_op.knobs["ATOM_KIND"] == "mma_m16n8k16_f16"
-    assert "BR" not in tile_op.knobs  # warp tier doesn't carry BR
+    assert tile_op.knobs["MMA"] == "mma_m16n8k16_f16"
+    # Warp tier doesn't use BR — it carries the OFF sentinel (0), not absence:
+    # every emitted variant stamps every planner knob explicitly.
+    assert tile_op.knobs["BR"] == 0
 
 
 def test_planner_scalar_only_when_mma_disabled(monkeypatch):
     """With ``DEPLODOCK_MMA=0`` set explicitly, the planner emits only
     scalar variants. (Default is now ON; setting ``0`` is the opt-out.)"""
-    from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import ScalarTileParams, WarpTileParams
-
     monkeypatch.setenv("DEPLODOCK_MMA", "0")
 
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
     loop_op = g.nodes["c"].op
     plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
     assert plan is not None
-    assert all(isinstance(p, ScalarTileParams) for p in plan.params)
-    assert not any(isinstance(p, WarpTileParams) for p in plan.params)
+    # Scalar-only: every row carries the MMA OFF sentinel ("0"), none names a
+    # real atom kind (warp tier). ``is_warp`` is the value-based discriminator.
+    assert all(p["MMA"] == "0" for p in plan.params)
+    assert not any(is_warp(p) for p in plan.params)
+
+
+def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
+    """``DEPLODOCK_MMA=<kind name>`` behaves like an atom-kind pin: it forces
+    the kind on a pin-only arch (sm_80-89, where mma.sync doesn't
+    auto-enumerate) — previously this took a separate ``DEPLODOCK_ATOM_KIND``
+    pin on top of the gate."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "2")
+
+    g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+    loop_op = g.nodes["c"].op
+    plan = _planner._plan_kernel(loop_op, _ctx(cc=(8, 0)), kernel_name="c", graph=g)
+    assert plan is not None
+    warp_rows = [p for p in plan.params if is_warp(p)]
+    assert warp_rows, "MMA=<kind> must enable the warp tier on a pin-only arch"
+    assert all(p["MMA"] == "mma_m16n8k16_f16" for p in warp_rows)

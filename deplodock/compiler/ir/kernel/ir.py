@@ -633,9 +633,15 @@ class LdmatrixLoad(Stmt):
     address from its warp lane id (``threadIdx.x & 31``): the 16×K ``a``
     tile uses ``x4`` (``row = lane%16``, K-col block ``(lane/16)*8``); the
     K×8 ``b`` tile uses ``x2.trans`` (``row = lane%16``) so a row-major
-    smem slab feeds the mma's col-major B operand. ldmatrix is **smem
-    only** — the mma.sync path never loads from gmem (``005_lower_atom_tile``
-    requires a staged source)."""
+    smem slab feeds the mma's col-major B operand.
+
+    ``staged`` (default ``True``) selects the transport: ``ldmatrix`` is **smem
+    only**, so when the operand was NOT staged into shared memory
+    (``staged=False``, ``src_buffer`` is the gmem operand) the render emits the
+    ``dpl_mma_load_{a,b}_gmem`` helper instead — a gmem-direct fragment load that
+    replicates the same lane→element map without ldmatrix. Slower (no smem reuse)
+    but correct; ``005_lower_atom_tile`` picks per operand based on whether an
+    enclosing ``StageBundle`` staged it."""
 
     frag: str
     src_buffer: str
@@ -643,6 +649,7 @@ class LdmatrixLoad(Stmt):
     role: str  # "a" → x4; "b" → x2.trans
     ldm: int = 0
     swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
+    staged: bool = True  # False → gmem-direct fragment load (operand not in smem)
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -658,7 +665,7 @@ class LdmatrixLoad(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.src_index)
-        variant = "x4" if self.role == "a" else "x2.trans"
+        variant = ("x4" if self.role == "a" else "x2.trans") if self.staged else "gmem-direct"
         return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}, ldm={self.ldm or 'auto'})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -666,6 +673,12 @@ class LdmatrixLoad(Stmt):
 
         flat = render_index(self.src_buffer, self.src_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.src_buffer, ctx)
+        if not self.staged:
+            # Operand not staged in smem — ldmatrix can't reach gmem, so read the
+            # fragment straight from gmem (each lane adds its own (row,col) inside
+            # the helper). No swizzle: that's a TMA-smem-layout concern only.
+            helper = "dpl_mma_load_a_gmem" if self.role == "a" else "dpl_mma_load_b_gmem"
+            return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm});"]
         lane = "(threadIdx.x & 31)"
         if self.role == "a":
             # 16×16 A: x4 — lane addresses M-row (lane%16), K-col block (lane/16)*8.
@@ -844,7 +857,8 @@ def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: s
 # while still rejecting truly degenerate launches that would saturate
 # the GPU command processor with light per-CTA work. The autotune-side
 # guard against pathological tiny-CTA × huge-grid variants is the
-# graduated penalty in ``TileOp.score``, not this cap.
+# enumeration gate (``_enumeration._matmul_thread_gate``) + the learned
+# prior, not this cap.
 _MAX_CTAS = 65536
 
 
@@ -1157,6 +1171,7 @@ def _(s: LdmatrixLoad, rename, sigma, axis_fn):
         role=s.role,
         ldm=s.ldm,
         swizzle=s.swizzle,
+        staged=s.staged,
     )
 
 

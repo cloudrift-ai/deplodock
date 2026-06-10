@@ -31,6 +31,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import (
     find_split_k_axis_name,
     gate_linear_epilogue_on_k_s_zero,
@@ -68,7 +69,7 @@ def _walk_apply_gate(stmts: tuple[Stmt, ...], k_s_name: str) -> tuple[Stmt, ...]
 
 def rewrite(ctx: Context, root: Node) -> TileOp | None:
     op: TileOp = root.op
-    if op.knobs.get("ATOM_KIND"):
+    if is_warp(op.knobs):
         # MMA path: accumulation flows through the C fragment (one
         # per cell), not through scalar Init/Accum stmts; the
         # linear-residual gate has no surface to hoist here. SplitK on

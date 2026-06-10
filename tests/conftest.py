@@ -26,6 +26,15 @@ os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
 
 
 @pytest.fixture(autouse=True)
+def _isolate_prior_file(tmp_path, monkeypatch):
+    """Point the learned-prior checkpoint at a per-test temp path so the
+    greedy compile driver (which loads the global prior) never picks up a
+    dev machine's ``~/.cache/deplodock/prior.json`` — tests stay deterministic
+    (empty prior → option-0), and a test that tunes writes only its own file."""
+    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+
+
+@pytest.fixture(autouse=True)
 def _seed_rng():
     """Pin RNGs for every test so numerical-tolerance assertions
     (e.g. ``test_torch_ops.test_unary``) don't flake on inputs that
@@ -119,7 +128,7 @@ def _is_cuda_item(item) -> bool:
     return "[cuda" in nid or "-cuda-" in nid or nid.endswith("-cuda]")
 
 
-# Single xdist_group used for every CUDA-touching test. The host only has
+# xdist_group for every IN-PROCESS CUDA-touching test. The host only has
 # one GPU; running CUDA tests across multiple xdist workers concurrently
 # would mean two processes pushing kernels onto the same device. Even
 # with ``DEPLODOCK_GPU_LOCK`` serializing the kernel-launch window and
@@ -128,22 +137,47 @@ def _is_cuda_item(item) -> bool:
 # enough across worker contexts (per-context SM scheduling differs, and
 # fp32 atomic-add commit order with it) to break the
 # ``test_attention_chains`` / ``test_block_accuracy`` 1e-4 thresholds.
-# Pinning all CUDA tests to one group makes them run sequentially on
-# one worker; non-CUDA tests still parallelize via the LPT buckets below.
+# Pinning all in-process CUDA tests to one group makes them run
+# sequentially on one worker; non-CUDA tests still parallelize via the
+# LPT buckets below.
 _CUDA_GROUP = "cuda"
 
+# Separate group for CUDA tests that drive the CLI through the ``run_cli``
+# fixture: each spawns a FRESH subprocess with its own CUDA context, so
+# they don't share the in-process worker's context and don't need to ride
+# the (long) ``cuda`` chain. They still need bounded concurrency — left
+# ungrouped, ~30 workers can each hold a live CUDA subprocess (~1 GB a
+# piece) and OOM the card — so they serialize among themselves on a
+# second worker, in parallel with the in-process chain. (Sharding this
+# chain 3-way was tried and bought only ~5 s — the in-process ``cuda``
+# chain is the critical path — so one shard keeps it simple.)
+_CUDA_CLI_GROUP = "cuda-cli"
 
+
+# ``tryfirst``: xdist's worker-side ``WorkerInteractor.pytest_collection_modifyitems``
+# bakes each item's ``xdist_group`` into the nodeid it reports to the
+# controller's loadgroup scheduler — and pluggy calls it BEFORE a plain
+# conftest hook (the interactor registers after conftests, so LIFO order
+# puts it first). Without ``tryfirst`` every marker added here lands too
+# late: the routing silently degrades to plain ``load`` and CUDA tests
+# scatter across workers (concurrent CUDA contexts → flaky GPU OOM in
+# the ``run_cli`` subprocess tests, accuracy drift in attention chains).
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
     import heapq
 
-    # Step 1: pin every CUDA-touching item to a single xdist_group so
-    # they all land on one worker and run sequentially. Skip the LPT
-    # bucketing for those items entirely — they're already grouped.
+    # Step 1: pin every CUDA-touching item to an xdist_group so each
+    # chain lands on one worker and runs sequentially — ``cuda`` for
+    # in-process device work, ``cuda-cli`` for ``run_cli`` subprocess
+    # tests (own CUDA context per subprocess; see the group comments
+    # above). Skip the LPT bucketing for those items entirely — they're
+    # already grouped.
     cuda_items: list = []
     other_items: list = []
     for it in items:
         if _is_cuda_item(it):
-            it.add_marker(pytest.mark.xdist_group(_CUDA_GROUP))
+            group = _CUDA_CLI_GROUP if "run_cli" in getattr(it, "fixturenames", ()) else _CUDA_GROUP
+            it.add_marker(pytest.mark.xdist_group(group))
             cuda_items.append(it)
         else:
             other_items.append(it)
@@ -166,12 +200,13 @@ def pytest_collection_modifyitems(config, items):
 
     sorted_others = sorted(other_items, key=dur, reverse=True)
 
-    # Reserve one worker for the CUDA group; LPT-bucket the rest across
-    # the remaining workers. With nworkers == 1 we fall back to a single
-    # bucket (no-op grouping). Sum CUDA-item durations into the CUDA
-    # bucket so it competes for ordering with the other heavy buckets.
+    # Reserve one worker per CUDA group (``cuda`` + ``cuda-cli``);
+    # LPT-bucket the rest across the remaining workers. With small
+    # nworkers we fall back to a single bucket (no-op grouping). Sum
+    # CUDA-item durations into one CUDA load so it competes for ordering
+    # with the other heavy buckets.
     cuda_load = sum(dur(it) for it in cuda_items)
-    other_workers = max(1, nworkers - 1)
+    other_workers = max(1, nworkers - 2)
 
     # LPT: pop the lightest bucket, add this item, push back.
     buckets: list[tuple[float, int, list]] = [(0.0, w, []) for w in range(other_workers)]
@@ -182,8 +217,8 @@ def pytest_collection_modifyitems(config, items):
         heapq.heappush(buckets, (load + dur(it), wid, bucket))
 
     # Tag non-CUDA items with their bucket's xdist_group so loadgroup
-    # routes them together. CUDA items keep their pre-applied ``cuda``
-    # group from step 1.
+    # routes them together. CUDA items keep their pre-applied ``cuda`` /
+    # ``cuda-cli`` group from step 1.
     buckets_sorted = sorted(buckets, key=lambda b: -b[0])
     reordered: list = []
     for _load, wid, bucket in buckets_sorted:

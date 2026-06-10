@@ -103,7 +103,6 @@ Idempotent — a body already in interleaved form is a no-op.
 
 from __future__ import annotations
 
-from deplodock import config
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.stmt.leaves import Assign, Load
@@ -118,23 +117,25 @@ INTERLEAVE_LOADS = Knob(
     KnobType.BOOL,
     hints=(True,),  # on by default; not a search dimension — manual override only via the env var
     help="Sink each Load to just before its first SSA-consumer in flat compute blocks.",
+    off=False,
 )
 
 
 def rewrite(root: Node) -> TileOp | None:
+    op: TileOp = root.op
+    # Idempotence: the policy is recorded as the INTERLEAVE_LOADS knob (every path
+    # stamps it now), so a re-scan of the rebound op skips here.
+    if INTERLEAVE_LOADS.name in op.knobs:
+        raise RuleSkipped("INTERLEAVE_LOADS already decided (idempotence via knob)")
     # Only ``True`` is enumerated, so the autotuner never forks on this knob;
     # ``DEPLODOCK_INTERLEAVE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
     # pin authoritatively, even when it is not in the candidate set).
     if not INTERLEAVE_LOADS.narrow((True,))[0]:
-        raise RuleSkipped("INTERLEAVE_LOADS=0 pinned")
-    # Touch ``config`` so the import isn't optimized out — keeps the knob's
-    # env read on the standard path (the env var → knob_raw path).
-    _ = config.knob_raw(INTERLEAVE_LOADS.name)
-
-    new_body, changed = _walk(root.op.body)
-    if not changed:
-        raise RuleSkipped("no Load+Assign cluster benefits from sinking")
-    return TileOp(body=new_body, name=root.op.name, knobs=dict(root.op.knobs))
+        return TileOp(body=op.body, name=op.name, knobs={**op.knobs, INTERLEAVE_LOADS.name: False})
+    # Stamp the policy (True) even when no cluster benefits — the realized config
+    # records that interleaving was enabled, keeping a uniform knob set.
+    new_body, _changed = _walk(op.body)
+    return TileOp(body=new_body, name=op.name, knobs={**op.knobs, INTERLEAVE_LOADS.name: True})
 
 
 def _walk(body: Body) -> tuple[Body, bool]:

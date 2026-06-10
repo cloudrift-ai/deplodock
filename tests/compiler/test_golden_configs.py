@@ -1,19 +1,24 @@
 """Schema + invariants for the golden matmul config set.
 
-These are pure-data checks (no GPU): the records load, the derived ``ratio`` /
-``golden`` properties stay consistent, and ``matmul_snippet`` / ``repro_command``
-render the canonical form. The actual latencies are produced by
-``scripts/find_golden_configs.py`` on a CUDA device.
+These are pure-data checks (no GPU): the records load from the per-GPU YAML files,
+the derived ``ratio`` / ``golden`` properties stay consistent, and ``matmul_snippet``
+/ ``repro_command`` render the canonical form. The actual latencies are measured on
+a CUDA device via ``deplodock tune --golden NAME --bench`` and recorded into the YAML.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.search.golden_configs import (
+from deplodock.compiler.pipeline.search.golden import (
+    _GOLDENS_DIR,
+    _KERNEL_CLASSES,
     GOLDEN_CONFIGS,
     GoldenConfig,
     MatmulGoldenConfig,
+    PointwiseGoldenConfig,
+    ReduceGoldenConfig,
+    _load_goldens,
     matmul_snippet,
 )
 
@@ -48,9 +53,77 @@ def test_repro_command_round_trips_knobs_and_snippet():
 
 def test_golden_configs_set_is_well_formed():
     for c in GOLDEN_CONFIGS:
-        assert isinstance(c, MatmulGoldenConfig), c.name
-        assert c.M > 0 and c.N > 0 and c.K > 0, c.name
+        # Every regime: matmul (M,N,K), reduce (M,K), pointwise (M,N).
+        assert isinstance(c, (MatmulGoldenConfig, ReduceGoldenConfig, PointwiseGoldenConfig)), c.name
+        if isinstance(c, MatmulGoldenConfig):
+            assert c.M > 0 and c.N > 0 and c.K > 0, c.name
+        elif isinstance(c, ReduceGoldenConfig):
+            assert c.M > 0 and c.K > 0, c.name
+            assert c.knobs.get("BR", 1) > 1, f"{c.name} reduce golden must be cooperative (BR>1)"
+        else:
+            assert c.M > 0 and c.N > 0, c.name
         assert c.deplodock_us > 0 and c.cublas_us > 0, c.name
         assert c.ratio >= 0.0, c.name
         assert c.golden == (c.ratio >= 0.95), c.name
         assert c.knobs, f"{c.name} has no recorded knobs"
+        assert c.snippet(), c.name
+
+
+def test_goldens_load_from_yaml():
+    """The per-GPU YAML files are the source of truth: at least one file exists,
+    every config carries a known ``kernel`` discriminator, and the loaded set is
+    non-empty and identical to the import-time :data:`GOLDEN_CONFIGS`."""
+    import yaml
+
+    files = sorted(_GOLDENS_DIR.glob("*.yaml"))
+    assert files, f"no golden YAML files under {_GOLDENS_DIR}"
+    for path in files:
+        doc = yaml.safe_load(path.read_text())
+        assert isinstance(doc["gpu_name"], str) and len(doc["compute_cap"]) == 2, path.name
+        for c in doc["configs"]:
+            assert c["kernel"] in _KERNEL_CLASSES, f"{path.name}: unknown kernel {c.get('kernel')!r}"
+
+    loaded = _load_goldens()
+    assert loaded  # non-empty
+    assert len(loaded) == len(GOLDEN_CONFIGS)
+
+
+def _dup(knobs, us):
+    return MatmulGoldenConfig(name="dup.512", M=512, N=512, K=512, knobs=knobs, deplodock_us=us, cublas_us=14.0)
+
+
+def test_goldens_by_name_returns_every_config_under_a_name(monkeypatch):
+    """A name may carry several configs (e.g. a newly found faster variant beside
+    the old one); ``goldens_by_name`` returns them all, empty for an unknown name."""
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
+    assert gmod.goldens_by_name("dup.512") == [a, b]
+    assert gmod.goldens_by_name("nope") == []
+
+
+def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
+    """``--golden NAME`` stashes *every* recorded config under NAME on
+    ``args.golden_configs`` as :class:`Sample`s (all share the shape, so ``args.code``
+    is the snippet of the first); no ``--golden`` leaves an empty list."""
+    from argparse import Namespace
+
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    # Dataset.from_golden reads golden.GOLDEN_CONFIGS via a lazy import, so this patch is seen.
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
+
+    from deplodock.commands import compile as cmod
+
+    args = Namespace(golden="dup.512", code=None, input=None, ir=None)
+    cmod.resolve_golden_arg(args)
+    assert [s.name for s in args.golden_configs] == ["dup.512", "dup.512"]
+    assert [s.knobs for s in args.golden_configs] == [{"BM": 8}, {"BM": 16}]
+    assert args.code == a.snippet()
+    assert all(s.source == "golden" for s in args.golden_configs)
+
+    none = Namespace(golden=None, code=None, input=None, ir=None)
+    cmod.resolve_golden_arg(none)
+    assert none.golden_configs == []

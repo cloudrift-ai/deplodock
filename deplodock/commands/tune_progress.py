@@ -26,6 +26,7 @@ class TuneProgress:
         self.bar_width = bar_width
         self.total = 0
         self.done = 0
+        self._variants = 0  # benched variants for the current op (visible activity within a single-op tune)
         self._drawn = False
 
     def start_terminal(self, n_ops: int) -> None:
@@ -38,6 +39,7 @@ class TuneProgress:
     def op_start(self, name: str) -> None:
         if not self.enabled:
             return
+        self._variants = 0
         self._redraw(tail=f"{name}  …")
 
     def variant(self, kernel: str, knobs_label: str, *, median_us: float | None, status: str, best_us: float | None) -> None:
@@ -50,9 +52,10 @@ class TuneProgress:
         nudges the trailing part."""
         if not self.enabled:
             return
+        self._variants += 1
         cur = f"{median_us:8.1f}us" if (median_us is not None and status == "ok") else f"{status or '—':>10}"
         best = f"{best_us:.1f}us" if (best_us is not None and best_us != float("inf")) else "—"
-        self._redraw(tail=f"{kernel} {cur} (best {best})  {knobs_label}")
+        self._redraw(tail=f"{kernel} #{self._variants} {cur} (best {best})  {knobs_label}")
 
     def op_done(self, name: str) -> None:
         if not self.enabled:

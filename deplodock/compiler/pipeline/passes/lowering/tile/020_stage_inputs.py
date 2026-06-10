@@ -43,7 +43,7 @@ consumer ``body`` / compute phase descend).
      and compare to ``origin[d] + 1``. Admits scalar paths (matmul,
      RMSNorm, softmax) byte-clean; stamps
      ``AffineAddressing(dims=..., block=())``.
-  2. **Block-stamped composite** (only when parent has ``ATOM_KIND``):
+  2. **Block-stamped composite** (only when parent has ``MMA``):
      extract the literal coefficient on each cache var, divide out the
      running ``extent · block`` suffix product, and stamp
      ``AffineAddressing(dims=..., block=(c_0, c_1, ...))``. The slab
@@ -51,7 +51,7 @@ consumer ``body`` / compute phase descend).
      read a full ``atom_M × atom_K`` cell.
 
   Scalar paths that hit a non-1 σ coef fall through to template — the
-  block path is gated on ATOM_KIND so a register-axis sitting between
+  block path is gated on MMA so a register-axis sitting between
   origin and cache doesn't get misread as a block multiplier.
 
 **Reuse.** A Load qualifies for staging iff at least one bound axis
@@ -104,7 +104,7 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import Knob, KnobType, mma_atom
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
     parallel_tile_of,
     replace_parallel_tile_body,
@@ -157,7 +157,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     if STAGE.name in root.op.knobs:
         raise RuleSkipped("stage already applied (idempotence via knob)")
     budget = ctx.max_dynamic_smem
-    atom_kind = root.op.knobs.get("ATOM_KIND")
+    atom_kind = mma_atom(root.op.knobs)  # None for scalar (incl. the "0" OFF sentinel)
     # Per-buffer bytes-per-elem so ``_classify``'s slab-cap check sizes
     # fp16 slabs at 2 B/elem instead of the BYTES_PER_ELEM=4 hardcoded
     # over-count. Without this the half-precision MMA path rejects every
@@ -174,7 +174,10 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         bytes_per_elem=bytes_per_elem,
     )
     if not variants:
-        raise RuleSkipped("no Load qualifies for staging")
+        # No qualifying Load to stage (no candidate buffers): record the explicit
+        # no-stage decision (empty STAGE mask, body unchanged) so the realized
+        # config keeps a uniform knob set instead of leaving STAGE absent.
+        return [TileOp(body=root.op.body, name=root.op.name, knobs={**root.op.knobs, STAGE.name: STAGE.pretty(0, width=0)})]
     return variants
 
 
@@ -204,6 +207,14 @@ def _enumerate_variants(
     forced = _forced_stage_mask(n)
     if forced is not None:
         masks = [forced]
+    elif atom_kind is not None:
+        # MMA operands feed ``ldmatrix`` (smem→register only — no gmem-direct
+        # path), so every staged candidate of an atom kernel MUST land in smem.
+        # The no-stage / partial masks the scalar path enumerates would leave an
+        # operand gmem-direct and crash in ``kernel/005_lower_atom_tile``; the
+        # greedy picker, ranking by prior alone, would otherwise be free to pick
+        # one. Offer only the fully-staged variant for the atom path.
+        masks = [(1 << n) - 1]
     else:
         masks = sorted(range(1 << n), key=lambda m: (-bin(m).count("1"), m))
     variants: list[TileOp] = []
@@ -836,7 +847,7 @@ def _classify(
         expected_unit = sorted(t.pretty() for t in _flatten_add((origin[d] + composite_unit).simplify(ctx)))
         if actual == expected_unit:
             continue
-        # Tier 2: try block-stamped composite, only under ATOM_KIND. Per-
+        # Tier 2: try block-stamped composite, only under MMA. Per-
         # axis coef probe: zero every cache var EXCEPT the one we're
         # probing, σ-reduce, pluck the literal multiplier on ``Var(ax)``
         # via ``_extract_var_coef``.
