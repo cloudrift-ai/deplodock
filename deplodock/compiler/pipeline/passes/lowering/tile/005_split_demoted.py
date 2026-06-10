@@ -9,33 +9,38 @@ Whether the split pays is the search's question: the tuner measures both branche
 the op's slice; greedy ``compile`` / ``run`` never pick the structural option while an Op
 variant exists (``policy/greedy._is_structural``), so cold kernel sets are unchanged.
 
-Emission order is load-bearing: the keep-fused option (a no-op rebind of ``root.op`` to
-itself — ``Graph.copy`` shares ops, so apply short-circuits) comes FIRST, the documented
+Emission order is load-bearing: the keep-fused option comes FIRST, the documented
 greedy/no-prior fallback. ``DEPLODOCK_SPLIT_CONE=1/0`` pins either branch.
 
-Termination (all measured, not assumed). The split branch terminates structurally: its two
+Both branches stamp the decision into ``op.knobs`` — keep-fused carries ``SPLIT_CONE:
+False``, the split fragment's two kernels carry ``SPLIT_CONE: True`` — the standard
+considered-vs-declined idiom (``020_stage_inputs``'s declined ``STAGE`` row; see
+``search/keys.py``): the knob is the rule's idempotence guard AND the learned prior's
+training signal (absent = never offered → NaN-filled; ``False`` / ``True`` = the measured
+decision), and it keeps each decision state's ``op_cache_key`` distinct from its parent so
+the search tree never self-parents. The stamp is deterministic per offer site, so
+structurally identical kernels across graphs stamp identically and keep sharing perf rows.
+
+Termination (measured, not assumed). The split branch terminates structurally: its two
 LoopOps re-match this rule but fail the cut classification (the gemm has no cone; the
 producer has no matmul reduce) — or, if a piece is itself still cuttable, a further split
-is a legitimate offer, not a loop. A SINGLE demotion site also self-terminates without
-help: its match is the batch's last, so the keep-fused child's apply advances the cursor
-and partition consumes the LoopOp before this rule re-runs. The hazard is MULTIPLE
-demotion sites in one batch: the fork fires on a non-last match, every child re-enumerates
-the batch against a graph where the keep-fused node is unchanged, and the re-offers
-compound combinatorially (measured: a two-site graph stops yielding terminals entirely) —
-the engine's quiescence contract explicitly relies on rule-side idempotence guards
-(``Candidate.try_rewrite`` docstring). So the rule stamps a ``tile.split_cone.offered``
-node hint before returning the fork and skips marked nodes. Hints are advisory metadata,
-excluded from structural digests — zero ``op_cache_key`` churn. A node CAN still be
-offered once per *sibling branch* of an earlier fork point (each branch copied the graph
-before the later node's hint was stamped) — that's the intended cross-product of
-independent decisions, bounded at one offer per node per branch.
+is a legitimate offer, not a loop. The keep-fused branch terminates via the knob guard:
+without it, a multi-demotion-site batch re-offers compoundingly in fork children (the fork
+fires on a non-last match and every child re-enumerates the batch; measured: a two-site
+graph stops yielding terminals entirely) — the engine's quiescence contract explicitly
+relies on rule-side idempotence guards (``Candidate.try_rewrite`` docstring). A node CAN
+still be offered once per *sibling branch* of an earlier fork point (each branch copied
+the graph before the later node's stamp) — the intended cross-product of independent
+decisions, bounded at one offer per node per branch.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork import OptionFork
@@ -50,11 +55,12 @@ PATTERN = [Pattern("root", LoopOp)]
 # BOOL knob: at a demoted matmul (a fused computed-operand cone keeps the warp
 # tier structurally unreachable — e.g. the gated-MLP norm prologue) this rule
 # forks between keeping the fused kernel (False, emitted first = the greedy
-# cold pick) and splitting it in two (True). Search-layer identity only — it
-# rides ``OptionFork.knobs``, never ``op.knobs``. DELIBERATELY no ``off=``:
-# ``_off_fill_pass`` would stamp an off-default onto every knob-bearing TileOp
-# at the pass boundary and change every tile-dialect ``op_cache_key`` (busting
-# the tune DB).
+# cold pick) and splitting it in two (True). Stamped into ``op.knobs`` on both
+# branches (decision = idempotence guard = prior training signal — see the
+# module docstring). DELIBERATELY no ``off=``: ``_off_fill_pass`` would stamp
+# an off-default onto every knob-bearing TileOp at the pass boundary, erasing
+# the absent-vs-declined distinction the prior trains on (and churning every
+# tile-dialect ``op_cache_key``).
 SPLIT_CONE = Knob(
     "SPLIT_CONE",
     KnobType.BOOL,
@@ -62,26 +68,30 @@ SPLIT_CONE = Knob(
     help="Split a demoted matmul's computed A-operand cone into its own kernel (xn producer + clean gemm)",
 )
 
-# Idempotence marker (see "Termination" above): the keep-fused branch leaves the
-# LoopOp matchable, so the offered fork is remembered on the node.
-_OFFERED_HINT = "tile.split_cone.offered"
+
+def _stamp(split: Graph) -> Graph:
+    """Stamp ``SPLIT_CONE: True`` onto both split kernels' ``op.knobs``."""
+    for node in split.nodes.values():
+        if isinstance(node.op, LoopOp):
+            node.op.knobs = {**node.op.knobs, SPLIT_CONE.name: True}
+    return split
 
 
-def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | list[OptionFork]:
-    if root.hints.get(_OFFERED_HINT):
-        raise RuleSkipped("split fork already offered for this node")
-    pinned = SPLIT_CONE.narrow((False, True))
-    if pinned == (False,):
-        raise RuleSkipped("SPLIT_CONE pinned off — keep the fused kernel")
+def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
+    if SPLIT_CONE.name in root.op.knobs:
+        raise RuleSkipped("split fork already considered for this kernel")
     split = try_split_demoted(root.op, ctx, graph=match.graph, node_id=root.id, out_tensor=root.output)
     if split is None:
         raise RuleSkipped("not a cuttable demoted matmul")
+    # Only genuine offer sites carry the decision knob — never-offered kernels
+    # stay knob-free (the prior's "not considered" NaN state).
+    keep_fused = replace(root.op, knobs={**root.op.knobs, SPLIT_CONE.name: False})
+    pinned = SPLIT_CONE.narrow((False, True))
+    if pinned == (False,):
+        return keep_fused
     if pinned == (True,):
-        return split
-    # Mark before returning: both fork children inherit the parent snapshot, so
-    # neither branch re-offers on the next pass rescan.
-    root.hints.set(_OFFERED_HINT, True)
+        return _stamp(split)
     return [
-        OptionFork(option=root.op, knobs={SPLIT_CONE.name: False}),
-        OptionFork(option=split, knobs={SPLIT_CONE.name: True}),
+        keep_fused,
+        OptionFork(option=_stamp(split), knobs={SPLIT_CONE.name: True}),
     ]

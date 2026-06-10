@@ -207,20 +207,30 @@ def test_rule_offers_fused_first_then_split() -> None:
     assert isinstance(options, list) and len(options) == 2
     keep, split = options
     # Fused FIRST — the greedy cold pick keeps today's kernel sets. The
-    # keep-fused option is a no-op rebind of the very same op object.
-    assert isinstance(keep, OptionFork) and keep.option is node.op
-    assert keep.knobs == {split_rule.SPLIT_CONE.name: False}
+    # keep-fused option is the same body with the decision knob stamped:
+    # SPLIT_CONE=False ("considered, declined") vs absent ("never offered") is
+    # the learned prior's training signal AND the rule's idempotence guard.
+    assert isinstance(keep, LoopOp)
+    assert keep.knobs[split_rule.SPLIT_CONE.name] is False
+    assert keep.body.structural_key() == node.op.body.structural_key()
     assert isinstance(split, OptionFork) and isinstance(split.option, Graph)
     assert split.knobs == {split_rule.SPLIT_CONE.name: True}
-    # The offered-marker is stamped so batch re-enumeration in fork children
-    # doesn't re-offer (multi-site graphs compound combinatorially otherwise).
-    assert node.hints.get(split_rule._OFFERED_HINT) is True
+    # Both split kernels carry the decision on op.knobs too — their perf rows
+    # train the prior with SPLIT_CONE=1.
+    for n in split.option.nodes.values():
+        if isinstance(n.op, LoopOp):
+            assert n.op.knobs[split_rule.SPLIT_CONE.name] is True
 
 
-def test_rule_marker_skips_reoffer() -> None:
+def test_rule_knob_guard_skips_reconsider() -> None:
+    """Once a branch's decision is applied (knob on op.knobs), batch
+    re-enumeration in fork children skips the kernel instead of re-offering
+    (multi-site graphs compound combinatorially otherwise)."""
     fused = _fuse(_norm_linear_graph())
-    _rule_rewrite(fused)  # first call offers + stamps
-    with pytest.raises(RuleSkipped, match="already offered"):
+    node = _fused_loop_node(fused)
+    keep = _rule_rewrite(fused)[0]
+    node.op = keep  # what Candidate.apply does when the keep-fused option resolves
+    with pytest.raises(RuleSkipped, match="already considered"):
         _rule_rewrite(fused)
 
 
@@ -236,15 +246,17 @@ def test_rule_skips_uncuttable() -> None:
     pure = _fuse(g)
     with pytest.raises(RuleSkipped, match="not a cuttable"):
         _rule_rewrite(pure)
-    assert not _fused_loop_node(pure).hints.get(split_rule._OFFERED_HINT)
+    # Never-offered kernels stay knob-free — the prior's "not considered" state.
+    assert split_rule.SPLIT_CONE.name not in _fused_loop_node(pure).op.knobs
 
 
 def test_pin_split_cone_forces_each_branch(monkeypatch) -> None:
     monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     assert isinstance(_rule_rewrite(_fuse(_norm_linear_graph())), Graph)
     monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")
-    with pytest.raises(RuleSkipped, match="pinned off"):
-        _rule_rewrite(_fuse(_norm_linear_graph()))
+    declined = _rule_rewrite(_fuse(_norm_linear_graph()))
+    assert isinstance(declined, LoopOp)
+    assert declined.knobs[split_rule.SPLIT_CONE.name] is False
 
 
 # ---------------------------------------------------------------------------
