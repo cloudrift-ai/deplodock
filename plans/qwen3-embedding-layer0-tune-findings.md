@@ -145,6 +145,19 @@ variant (10.1 us), yet the deployed -O3 pick lands at 9 us vs eager 6. Not a cod
 -O1-vs--O3 rank inversion plus small-M (32 rows) underutilization of the m16 atom. Re-check after finding 3's
 fix changes the prior's training mix. Low priority.
 
+## Post-fix clean re-tune (2026-06-10, same command)
+
+- **Zero `bench_fail` rows** across 887 benched variants (was 28) — the boxDim and re-entered-pipeline gates hold
+  through a full tune; the ~28 wasted bench slots now go to real variants.
+- **down_proj at cuBLAS parity**: 8 us vs eager 8 us (**1.04x**, was 0.28x / 29 us) — the mma residual-epilogue
+  fold landed it on `mma_m16n8k16_f16`; q/k/v also tune to MMA picks.
+- Caveat for cross-run comparisons: the two SDPA-prologue kernels (still scalar-by-design — finding 5) drew worse
+  tuned picks this run (P@V 102 us vs 26 us in the baseline tune; rotary+QK^T 50 vs 28), dragging the full-model
+  total to 352 us. Their knob space is untouched by this branch (the `not prologue` warp gate precedes every
+  change here); the variance is tune-trajectory / prior-pick reachability on the scalar tier — the
+  `eval prior --dataset db` reachability view is the diagnostic for it. Treat per-kernel rows, not the full-model
+  total, as the before/after signal for findings 1–3.
+
 ## Repro / artifacts
 
 - Tune log: 16× `cuTensorMapEncodeTiled` + 6× `HungKernelError` lines (also recoverable from the tune DB:
