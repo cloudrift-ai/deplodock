@@ -211,8 +211,12 @@ class CompilerDump:
 
         A frontend op feeding an origin but not itself an origin becomes a
         synthetic ``InputOp`` boundary (so the slice is standalone); constants
-        and real graph inputs are kept. Outputs are the sink origins — those no
-        other kept node consumes."""
+        and real graph inputs are kept. A feed that is a pure function of
+        constants (e.g. the broadcast of an RMSNorm's pow-exponent scalar) keeps
+        its whole constant chain instead — demoting it to an input would feed it
+        random bench data, which is out of domain (``pow(x, random)`` → NaN) and
+        breaks the reproducer's accuracy check. Outputs are the sink origins —
+        those no other kept node consumes."""
         from deplodock.compiler.graph import Graph as _Graph  # noqa: PLC0415
         from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.slice import topo_order  # noqa: PLC0415
@@ -225,10 +229,15 @@ class CompilerDump:
             cur = stack.pop()
             if cur in keep or cur not in src.nodes:
                 continue
-            keep.add(cur)
             if isinstance(src.nodes[cur].op, (ConstantOp, InputOp)):
+                keep.add(cur)
                 stack.extend(src.nodes[cur].inputs)
+                continue
+            const_chain = self._constant_closure(src, cur)
+            if const_chain is not None:
+                keep |= const_chain
             else:
+                keep.add(cur)
                 synthetic.add(cur)  # frontend op feeding an origin → boundary
 
         consumed = {inp for nid in keep for inp in src.nodes[nid].inputs if inp in keep}
@@ -244,6 +253,28 @@ class CompilerDump:
                     sub.inputs.append(kid)
         sub.outputs = [oid for oid in origins if oid not in consumed]
         return sub
+
+    @staticmethod
+    def _constant_closure(src: Graph, root: str) -> set[str] | None:
+        """The transitive-input closure of ``root`` iff it is constant-derived —
+        every leaf a ``ConstantOp`` — else ``None``. An ``InputOp`` anywhere in
+        the closure means ``root`` carries runtime data and must stay a synthetic
+        boundary."""
+        from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
+
+        closure: set[str] = set()
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            if cur in closure:
+                continue
+            node = src.nodes.get(cur)
+            if node is None or isinstance(node.op, InputOp):
+                return None
+            closure.add(cur)
+            if not isinstance(node.op, ConstantOp):
+                stack.extend(node.inputs)
+        return closure
 
     def _collect_subgraph(self, graph: Graph, root_id: str) -> set[str]:
         """Transitive-input closure for a compute node: itself + every
