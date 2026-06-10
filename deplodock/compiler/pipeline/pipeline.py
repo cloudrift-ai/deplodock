@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.pipeline.fork import OptionFork
 from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
@@ -678,6 +679,7 @@ class Run:
                 continue
 
             forks: list[LazyCandidate] | None = None
+            structural = False
             for match in matches:
                 options = cand.try_rewrite(match)
                 if options is None:
@@ -693,14 +695,35 @@ class Run:
                 # resolve advances the cursor when ``match.is_last`` (the
                 # cursor advance the eager loop didn't do here, since we
                 # deferred to forks).
+                #
+                # The fork is classified here, where the raw ``options`` list
+                # is concrete (no thunk fired): any ``Graph`` option makes the
+                # fork **structural** (kernel-set-changing); pure ``Op``
+                # rebinds (and the partition planner's branch Forks) are
+                # op-variant. The flag rides ``Search.push`` so policies can
+                # treat kernel-set decisions specially.
+                structural = any(_is_structural_option(o) for o in options)
                 forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
                 break
 
             if forks is not None:
-                search.push(*forks, parent=token)
+                search.push(*forks, parent=token, structural=structural)
                 continue
 
             search.push(cand.lazy(), parent=token)
+
+
+def _is_structural_option(option: object) -> bool:
+    """Classify one raw rewrite option by its effect (see
+    ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
+    changes which ops exist — **structural**; an ``Op`` rebind is in-place —
+    **op-variant**. The Op/Graph return type IS the classification; rules wrap
+    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/005_split_demoted``),
+    whose ``option`` is readable without firing any thunk. A *branch* ``Fork``
+    reads op-variant: the sole branch-Fork emitter today is the partition
+    planner (all ``TileOp`` leaves), and typing it would require ``expand()`` —
+    the body-normalizing build the lazy tree exists to avoid."""
+    return isinstance(option, Graph) or (isinstance(option, OptionFork) and isinstance(option.option, Graph))
 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:

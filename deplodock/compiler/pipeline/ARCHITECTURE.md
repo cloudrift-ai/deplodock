@@ -342,7 +342,12 @@ three entry points:
   `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. Selection is
   `TuningSearch`'s job (PUCT over the learned prior; a single-shot compile, prior absent, descends
   emission-order). (The DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
-  selection" above; the perf DB still *records* every bench as the prior's training data.)
+  selection" above; the perf DB still *records* every bench as the prior's training data.) Each fork push is
+  classified by effect at the spawn site, where the raw option list is concrete: any `Graph`-splicing option
+  (a kernel-set change — `tile/005_split_demoted`'s split, `tile/017_atomic_free_splitk`'s combine) marks the
+  push `structural=True`; `Op` rebinds and the partition planner's branch Forks are op-variant (`False`).
+  The flag rides `Search.push(structural=)` so policies can treat kernel-set decisions specially (see
+  `plans/structural-forks-in-two-level.md`).
 
 ### The keying map: two identities
 

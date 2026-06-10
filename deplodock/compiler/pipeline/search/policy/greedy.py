@@ -101,8 +101,8 @@ class GreedySearch(Search):
         self._prior_loaded = False
         self._blocked = blocked or {}
 
-    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
-        del parent  # greedy keeps no lineage — one pending slot, no tree
+    def push(self, *cands: LazyCandidate, parent: object | None = None, structural: bool = False) -> None:
+        del parent, structural  # greedy keeps no lineage — one pending slot, no tree; structural leaves are filtered below
         if not cands:
             self._pending = None
             return

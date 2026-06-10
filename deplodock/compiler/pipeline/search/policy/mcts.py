@@ -238,9 +238,12 @@ class TuningSearch(Search):
                     merged.update(knobs)
         return merged
 
-    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None, structural: bool = False) -> None:
         # ``parent`` is the token the spawning candidate was popped with;
-        # ``None`` seeds the run under the root sentinel.
+        # ``None`` seeds the run under the root sentinel. ``structural``
+        # (kernel-set-changing fork) is accepted for protocol uniformity;
+        # MCTS explores structural siblings like any other fork.
+        del structural
         assert parent is None or isinstance(parent, SearchNode), f"TuningSearch.push needs a SearchNode token, got {type(parent).__name__}"
         self.tree.attach(list(cands), parent=parent if parent is not None else self.tree.root)
 

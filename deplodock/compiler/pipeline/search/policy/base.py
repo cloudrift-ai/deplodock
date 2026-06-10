@@ -32,7 +32,7 @@ from deplodock.compiler.pipeline.search.db import PerfStats
 
 class Search(ABC):
     @abstractmethod
-    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None, structural: bool = False) -> None:
         """Enqueue the spawned candidates — all siblings of one fork
         point, in rule-emission order.
 
@@ -40,7 +40,14 @@ class Search(ABC):
         spawned these siblings, or ``None`` for the seed candidate that
         starts a run. Selection is the policy's job: :class:`TuningSearch`
         ranks the frontier by PUCT over its learned prior (a single-shot
-        compile, prior absent, descends emission-order)."""
+        compile, prior absent, descends emission-order).
+
+        ``structural`` marks a fork whose options include a ``Graph``
+        splice — a kernel-set-changing (structural) decision, classified
+        at the spawn site in ``Run.drive`` where the raw option list is
+        concrete (see ``plans/structural-forks-in-two-level.md`` step 1).
+        ``False`` for op-variant forks, engine continuation pushes, and
+        the seed candidate."""
 
     @abstractmethod
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
