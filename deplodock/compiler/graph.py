@@ -878,7 +878,11 @@ class Graph:
 def _rename_buf_in_op(op, old: str, new: str):
     """Rewrite ``Load.source`` / ``Write.output`` references inside a
     ``LoopOp`` body from ``old`` to ``new`` (recursively into nested Loops).
-    Pass-through for op types without internal buf refs."""
+    Pass-through for op types without internal buf refs. Preserves the op's
+    ``name`` / ``knobs`` identity — a rename after ``991_stamp_loop_names`` /
+    ``992_stamp_structural_features`` (e.g. the splice id-promotion of a
+    lowering-phase fragment like the demoted-matmul split) must not strip the
+    stamped kernel name or the ``S_*`` features."""
     from deplodock.compiler.ir.loop import Load, LoopOp, Write
 
     if not isinstance(op, LoopOp):
@@ -891,7 +895,10 @@ def _rename_buf_in_op(op, old: str, new: str):
             return Write(output=new, index=s.index, value=s.value)
         return s
 
-    return LoopOp(body=op.body.map(fn))
+    renamed = LoopOp(body=op.body.map(fn))
+    renamed.name = op.name
+    renamed.knobs = dict(op.knobs)
+    return renamed
 
 
 # ---------------------------------------------------------------------------

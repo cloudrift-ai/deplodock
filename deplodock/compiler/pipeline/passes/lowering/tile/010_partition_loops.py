@@ -140,8 +140,8 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
-from deplodock.compiler.pipeline.knob import is_warp
+from deplodock.compiler.pipeline.fork import Fork, Level, OptionFork, build_fork_tree
+from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     BM,
     BN,
@@ -155,7 +155,25 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     mma_mode,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._split_demoted import try_split_demoted
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
+
+# BOOL knob: at a warp-tier-demoted matmul (a fused computed-operand cone keeps
+# ``is_atom_eligible`` from ever passing — e.g. the gated-MLP norm prologue) the
+# planner forks between lowering the fused body as-is (False, emitted first =
+# the greedy cold pick) and SPLITTING the kernel in two (True): a producer that
+# materializes the cone to an ``xn`` intermediate + the clean gemm, which then
+# re-enters this rule warp-tier-eligible (see ``_split_demoted``). Search-layer
+# identity only — it rides ``OptionFork.knobs``, never ``op.knobs``.
+# DELIBERATELY no ``off=``: ``_off_fill_pass`` would stamp an off-default onto
+# every knob-bearing TileOp at the pass boundary and change every tile-dialect
+# ``op_cache_key`` (busting the tune DB).
+UNFUSE = Knob(
+    "UNFUSE",
+    KnobType.BOOL,
+    hints=(False, True),
+    help="Split a demoted matmul's computed A-operand cone into its own kernel so the gemm reaches the warp tier",
+)
 
 
 class Role(enum.Enum):
@@ -231,11 +249,20 @@ class _Plan:
     params: tuple[dict, ...]
 
 
-def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
+def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork | list:
     """Emit one hierarchical Fork tree over knob bundles:
     ``MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → TileOp leaf`` — each leaf
     carries its COMPLETE knob row (incl. ``BK`` / ``SPLITK`` / ``FK`` /
     ``OVERHANG``), the DB-matchable variant identity.
+
+    A warp-tier-DEMOTED matmul (fused computed-operand cone — see
+    ``_split_demoted``) additionally offers a structural sibling option: a
+    two-kernel ``Graph`` splitting the cone into an ``xn`` producer + the
+    clean gemm (``[fused tree, OptionFork(split, UNFUSE=True)]`` — fused
+    first = greedy cold pick). Each split kernel re-enters this rule as an
+    ordinary LoopOp: the gemm is clean (warp rows enumerate), the producer
+    has no matmul reduce — so the split branch terminates structurally,
+    same as the TileOp rebind does for the fused branch.
 
     Both tiers live in the one tree: the root ``MMA`` level keys the warp
     rows by atom kind while scalar rows return an empty key and SKIP the
@@ -276,19 +303,35 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
         raise RuleSkipped("kernel shape not handled by planner (or already planned)")
 
     if len(plan.params) == 1:
-        return _materialize(plan, plan.params[0])
+        fused: TileOp | Fork = _materialize(plan, plan.params[0])
+    else:
+        fused = build_fork_tree(
+            params=plan.params,
+            levels=[
+                Level((MMA.name,), lambda p: (p["MMA"],) if is_warp(p) else ()),
+                Level((BR.name,), lambda p: (p.get("BR", 1),)),
+                Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
+                Level((WM.name, WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
+                Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
+            ],
+            materialize=lambda p: _materialize(plan, p),
+        )
 
-    return build_fork_tree(
-        params=plan.params,
-        levels=[
-            Level((MMA.name,), lambda p: (p["MMA"],) if is_warp(p) else ()),
-            Level((BR.name,), lambda p: (p.get("BR", 1),)),
-            Level((BM.name, BN.name), lambda p: (p.get("BM", 1), p.get("BN", 1))),
-            Level((WM.name, WN.name), lambda p: (p.get("WM", 1), p.get("WN", 1))),
-            Level((FM.name, FN.name), lambda p: (p["FM"], p["FN"])),
-        ],
-        materialize=lambda p: _materialize(plan, p),
-    )
+    # Demoted-matmul structural fork: when a fused computed-operand cone keeps
+    # the matmul off the warp tier AND the clean gemm would actually reach it,
+    # offer the two-kernel split as a sibling option. Fused stays FIRST — the
+    # greedy cold pick (the prior can't rank the Graph option until trained),
+    # so ``compile`` / ``run`` keep today's kernel sets; ``tune`` measures
+    # both inside this op's slice. ``DEPLODOCK_UNFUSE`` pins either branch.
+    split = try_split_demoted(loop_op, ctx, graph=match.graph, node_id=root.id, out_tensor=root.output)
+    if split is None:
+        return fused
+    pinned = UNFUSE.narrow((False, True))
+    if pinned == (False,):
+        return fused
+    if pinned == (True,):
+        return split
+    return [fused, OptionFork(option=split, knobs={UNFUSE.name: True})]
 
 
 def _split_leading_non_loops(body) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:

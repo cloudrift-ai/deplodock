@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from deplodock.compiler.graph import Graph
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.policy.base import Search
 
@@ -50,6 +51,14 @@ def _tile_blocked(fork_knobs: dict, blocked: set[frozenset]) -> bool:
     fork carries every identity knob, so a partial (branch) fork — whose identity
     is a strict subset — never equals a full-row entry and is never skipped."""
     return tile_identity(fork_knobs) in blocked
+
+
+def _is_structural(c: LazyCandidate) -> bool:
+    """True for a leaf wrapping a ``Graph`` rewrite option — a kernel-set-changing
+    (structural) choice, per the Op-rebind / Graph-splice classification of
+    ``plans/structural-forks-in-two-level.md`` step 1."""
+    fork = c.fork
+    return fork is not None and getattr(fork, "is_leaf", False) and isinstance(getattr(fork, "option", None), Graph)
 
 
 def _leaves(cands: Sequence[LazyCandidate]) -> list[LazyCandidate]:
@@ -114,6 +123,17 @@ class GreedySearch(Search):
         # resolving straight to the argmin. The pick then equals scoring the flat
         # candidate set, invariant to how the tree's levels are arranged.
         leaves = _leaves(cands)
+        # Structural options (Graph splices that change the kernel set — the
+        # demoted-matmul split in ``lowering/tile/010_partition_loops``, 017's
+        # atomic-free combine) are never greedy-picked while an in-place Op
+        # variant exists: the per-op prior prices ONE kernel's knob row, so its
+        # score for a multi-kernel Graph option is meaningless and the "pick"
+        # would be prior noise. ``tune`` explores them (MCTS walks every
+        # sibling); an env pin makes the Graph the rule's only option, which
+        # passes through here untouched.
+        op_leaves = [c for c in leaves if not _is_structural(c)]
+        if op_leaves:
+            leaves = op_leaves
         if len(leaves) <= 1:
             self._pending = leaves[0] if leaves else cands[0]
             return
