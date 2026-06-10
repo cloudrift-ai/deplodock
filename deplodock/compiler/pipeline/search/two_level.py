@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
+from deplodock.compiler.pipeline.search.policy.greedy import PARTITION_RULE
 from deplodock.compiler.pipeline.search.slice import single_node_graph
 
 if TYPE_CHECKING:
@@ -69,10 +70,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The rule that finalizes the kernel set: everything in ``lowering/tile``
-# *before* it is a structural (kernel-set-changing) decision the outer search
-# owns; everything from it on is op-variant lowering the inner search tunes.
-PARTITION_RULE = "010_partition_loops"
+# ``PARTITION_RULE`` (imported from the greedy policy, which prices kernels at
+# that fork) is the rule that finalizes the kernel set: everything in
+# ``lowering/tile`` *before* it is a structural (kernel-set-changing) decision
+# the outer search owns; everything from it on is op-variant lowering the
+# inner search tunes.
 
 # Lowering-only passes (post-fusion): ``tile → kernel → cuda``. The inner
 # per-op search runs these on a single-node slice so the finalized LoopOp body

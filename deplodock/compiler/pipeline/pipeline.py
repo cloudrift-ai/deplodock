@@ -490,15 +490,26 @@ class Pipeline:
         # benches-and-skips it, but greedy benches nothing, so on a left-un-lowered
         # node we blocklist its tile and re-drive, falling back to the next
         # prior-ranked sibling. Bounded retries (each adds ≥1 block or stops).
+        # A drive that took a *structural* pick (a prior-priced kernel-set
+        # change — see ``GreedySearch._pick_structural``) gets one coarser
+        # fallback first: any lowering failure on such a drive retires
+        # structural picks wholesale and re-drives down the keep-fused branch,
+        # since a fragment kernel's failure can't be blocklisted at the fork
+        # site (the splice minted fresh node ids).
         blocked: dict[str, set[frozenset]] = {}
+        allow_structural = True
         for _attempt in range(_MAX_GREEDY_RETRIES):
             rejections: list[tuple[str, str, str]] = []
-            cand = next(
-                self.tune(graph, search=GreedySearch(blocked=blocked), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
-            )
+            search = GreedySearch(blocked=blocked, price_structural=allow_structural)
+            cand = next(self.tune(graph, search=search, ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
             failed = _unlowered_tiles(cand.graph, rejections)
+            if not failed:
+                break
+            if allow_structural and search.picked_structural:
+                allow_structural = False
+                continue
             new = {nid: ident for nid, ident in failed.items() if ident not in blocked.get(nid, set())}
-            if not new:  # success, or no fresh info to retry on → report below
+            if not new:  # no fresh info to retry on → report below
                 break
             for nid, ident in new.items():
                 blocked.setdefault(nid, set()).add(ident)

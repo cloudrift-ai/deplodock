@@ -26,16 +26,33 @@ emitted sibling (option-0).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.policy.base import Search
+
+
+@lru_cache(maxsize=1)
+def _tile_pipeline():
+    """The ``lowering/tile``-only pipeline the structural price probes drive —
+    frozen and shareable, so one load serves every nested descent."""
+    from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
+
+    return Pipeline.build(["lowering/tile"])
+
 
 # Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
 # that fully determine a tile (so two leaves are "the same tile" iff these match).
 # Excludes the post-lowering staging knobs (RING / STAGE), which are stamped after
 # the greedy fork pick and differ between the leaf and the rejected node.
 _TILE_IDENTITY = ("BN", "BM", "FM", "FN", "BK", "FK", "SPLITK", "BR", "WM", "WN", "MMA")
+
+# The rule whose fork prices a kernel: the prior's predicted µs for the chosen
+# complete tile row at the partition fork is the per-kernel cost the structural
+# pricing sums (defined here, not in ``two_level``, because that module imports
+# this package at module scope — the reverse would cycle).
+PARTITION_RULE = "010_partition_loops"
 
 
 def tile_identity(knobs: dict) -> frozenset:
@@ -92,17 +109,39 @@ class GreedySearch(Search):
     deterministic compile with the failed leaf blocklisted so greedy picks the next
     best non-blocked leaf (the analogue of how ``tune`` benches-and-skips an
     unviable tile; greedy benches nothing, so the validity signal must come from
-    the retry)."""
+    the retry).
 
-    def __init__(self, blocked: dict[str, set[frozenset]] | None = None) -> None:
+    Structural (``Graph``-splicing) options are priced with the trained prior —
+    see :meth:`_pick_structural` — so an unpinned ``compile`` / ``run`` can
+    deploy the kernel sets ``tune`` measured best (the demoted-matmul split);
+    cold, the structural leaf is filtered and kernel sets stay unchanged."""
+
+    def __init__(self, blocked: dict[str, set[frozenset]] | None = None, *, prior=None, price_structural: bool = True) -> None:
         super().__init__()
         self._pending: LazyCandidate | None = None
-        self._prior = None  # lazily loaded on first push (the regime's checkpoint)
-        self._prior_loaded = False
+        self._prior = prior  # injected, or lazily loaded on first push (the regime's checkpoint)
+        self._prior_loaded = prior is not None
         self._blocked = blocked or {}
+        # Structural-option pricing (plans/structural-forks-in-two-level.md step
+        # 3): with the *trained* prior loaded, a ``Graph``-splicing option is
+        # priced as the Σ of its kernels' predicted-best µs (nested greedy
+        # descent per kernel) against the keep-fused side's predicted-best, and
+        # the cheaper kernel set wins. ``price_structural=False`` keeps the old
+        # filter behavior — used by ``Pipeline.run``'s retry after a structural
+        # pick failed to lower, and by the nested pricing descents themselves
+        # (no recursive splitting inside a price probe).
+        self._price_structural = price_structural
+        self._price_memo: dict[str, float | None] = {}  # op_cache_key → predicted µs (None = unpriceable)
+        # True once this run pended a structural (kernel-set-changing) leaf —
+        # ``Pipeline.run`` reads it to retire structural picks when the drive
+        # leaves a node un-lowered.
+        self.picked_structural = False
+        # The prior's predicted µs for the chosen leaf at each partition fork,
+        # by node id — the per-kernel price a nested pricing descent reads off.
+        self.partition_scores: dict[str, float] = {}
 
     def push(self, *cands: LazyCandidate, parent: object | None = None, structural: bool = False) -> None:
-        del parent, structural  # greedy keeps no lineage — one pending slot, no tree; structural leaves are filtered below
+        del parent, structural  # greedy keeps no lineage — one pending slot, no tree; structural leaves are priced (or filtered) below
         if not cands:
             self._pending = None
             return
@@ -125,15 +164,25 @@ class GreedySearch(Search):
         leaves = _leaves(cands)
         # Structural options (Graph splices that change the kernel set — the
         # demoted-matmul split in ``lowering/tile/005_split_demoted``, 017's
-        # atomic-free combine) are never greedy-picked while an in-place Op
-        # variant exists: the per-op prior prices ONE kernel's knob row, so its
-        # score for a multi-kernel Graph option is meaningless and the "pick"
-        # would be prior noise. ``tune`` explores them (MCTS walks every
-        # sibling); an env pin makes the Graph the rule's only option, which
-        # passes through here untouched.
-        op_leaves = [c for c in leaves if not _is_structural(c)]
-        if op_leaves:
-            leaves = op_leaves
+        # atomic-free combine): the per-op prior prices ONE kernel's knob row,
+        # so its score for a multi-kernel Graph option is meaningless. With the
+        # *trained* prior loaded, :meth:`_pick_structural` prices the option
+        # properly — Σ of nested per-kernel predicted-bests vs the keep-fused
+        # side — and pends the split when it predicts faster. Cold (analytic /
+        # no prior), or when an option can't be priced, the structural leaf is
+        # filtered as before so a cold compile never changes kernel sets.
+        # ``tune`` explores them regardless (MCTS walks every sibling); an env
+        # pin makes the Graph the rule's only option, which passes through
+        # here untouched.
+        if any(_is_structural(c) for c in leaves):
+            pick = self._pick_structural(leaves, prior)
+            if pick is not None:
+                self.picked_structural = True
+                self._pending = pick
+                return
+            op_leaves = [c for c in leaves if not _is_structural(c)]
+            if op_leaves:
+                leaves = op_leaves
         if len(leaves) <= 1:
             self._pending = leaves[0] if leaves else cands[0]
             return
@@ -150,10 +199,98 @@ class GreedySearch(Search):
         scores = prior.mean_scores([{**base, **k} for _, k in live])  # predicted µs — lower is better
         best_i = min(range(len(live)), key=scores.__getitem__)
         self._pending = live[best_i][0]
+        # Record the chosen tile's predicted µs at the kernel's partition fork —
+        # the per-kernel price :meth:`_price_kernel`'s nested descent reads off.
+        rule = leaves[0].pending[0].rule if leaves[0].pending is not None else None
+        if rule is not None and rule.name == PARTITION_RULE:
+            nid = self._node_id(leaves[0])
+            if nid is not None:
+                self.partition_scores[nid] = scores[best_i]
 
     def pop(self) -> tuple[object | None, LazyCandidate] | None:
         c, self._pending = self._pending, None
         return (None, c) if c is not None else None
+
+    def _pick_structural(self, leaves: list[LazyCandidate], prior) -> LazyCandidate | None:
+        """Price the structural (``Graph``-splicing) leaves of one fork against
+        the keep-fused ``Op`` side and return the winning structural leaf, or
+        ``None`` to keep the op-variant path (cold prior, unpriceable option,
+        or fused predicted faster).
+
+        Both sides are priced the same way: the prior's predicted-best µs at
+        each kernel's partition fork, obtained by a nested greedy descent over
+        the kernel's single-node slice (``lowering/tile`` only, no backend,
+        CPU-only — see :meth:`_price_kernel`); a structural option's price is
+        the Σ over its fragment's kernels. Gated on the *trained*
+        ``CatBoostPrior`` (``prior.fitted``): Σ-comparisons through the
+        analytic cold-start model are unvalidated, and a cold compile must
+        never change kernel sets. Greedy is prior-only by design — the price
+        never reads the DB (the learned-prior work removed ``_best_fork``
+        replay deliberately)."""
+        if not self._price_structural or prior is None or not getattr(prior, "fitted", False):
+            return None
+        op_leaves = [c for c in leaves if not _is_structural(c)]
+        if not op_leaves:
+            return None  # nothing to compare against — the no-op-variant edge keeps today's scoring path
+        fused_prices = [self._price_op_leaf(c) for c in op_leaves]
+        if any(p is None for p in fused_prices):
+            return None
+        split_prices = [(c, self._price_graph(c.fork.option, c.inner.ctx)) for c in leaves if _is_structural(c)]
+        split_prices = [(c, p) for c, p in split_prices if p is not None]
+        if not split_prices:
+            return None
+        best_split, best_split_us = min(split_prices, key=lambda cp: cp[1])
+        return best_split if best_split_us < min(fused_prices) else None
+
+    def _price_op_leaf(self, c: LazyCandidate) -> float | None:
+        """The keep-fused side's price: the leaf's ``Op`` rebound into a
+        single-node slice of the current graph, priced like any kernel."""
+        from deplodock.compiler.ir.base import Op  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
+
+        option = getattr(c.fork, "option", None)
+        node_id = self._node_id(c)
+        if not isinstance(option, Op) or node_id is None:
+            return None
+        sub = single_node_graph(c.inner.graph, node_id)
+        sub.nodes[node_id].op = option
+        return self._price_graph(sub, c.inner.ctx)
+
+    def _price_graph(self, graph: Graph, ctx) -> float | None:
+        """Σ of per-kernel predicted-best µs over ``graph``'s kernel-bearing
+        nodes, or ``None`` when any kernel is unpriceable (no partition fork —
+        e.g. a pre-tiled combine ``TileOp`` — or a failed nested descent)."""
+        from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+
+        prices = [self._price_kernel(graph, nid, ctx) for nid, n in graph.nodes.items() if op_cache_key(n.op) is not None]
+        if not prices or any(p is None for p in prices):
+            return None
+        return sum(prices)
+
+    def _price_kernel(self, graph: Graph, nid: str, ctx) -> float | None:
+        """One kernel's price: a nested greedy descent over its single-node
+        slice through ``lowering/tile`` only (the partition fork is where the
+        prior prices a complete tile row; the kernel/cuda passes add nothing
+        and cost real CPU), reading the chosen leaf's predicted µs off
+        ``partition_scores``. Memoized per ``op_cache_key`` so 28 identical
+        per-layer kernels price once. Best-effort: any descent failure prices
+        as ``None`` (→ the caller keeps the op-variant path)."""
+        from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
+
+        key = op_cache_key(graph.nodes[nid].op)
+        if key in self._price_memo:
+            return self._price_memo[key]
+        us: float | None = None
+        try:
+            nested = GreedySearch(prior=self._prior, price_structural=False)
+            next(_tile_pipeline().tune(single_node_graph(graph, nid), search=nested, ctx=ctx, db=SearchDB()), None)
+            us = nested.partition_scores.get(nid)
+        except Exception:  # noqa: BLE001 — a price-probe failure must never break compile
+            us = None
+        self._price_memo[key] = us
+        return us
 
     def _ensure_prior(self, c: LazyCandidate):
         """Load the one global prior once: the learned ``CatBoostPrior`` (warm if a

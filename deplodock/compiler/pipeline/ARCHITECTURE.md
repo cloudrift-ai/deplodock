@@ -136,8 +136,8 @@ eligibility-simulating gate immediately drifted from what the cell tagger accept
 the offer as an **outer structural fork** (`plans/structural-forks-in-two-level.md` step 2): keep-vs-split
 branches the outer tree, each side's kernels are tuned in first-class per-op slices, and the Σ-per-op
 terminal rewards compare the kernel sets (017's sub-partition splice still sums inside the op's slice);
-greedy never picks the structural option (see `Pipeline.run` above). The split decision lives in the tile
-phase, not as a fusion guard: by partition time
+greedy deploys the split only via the trained prior's structural pricing (see `Pipeline.run` above) — never
+cold. The split decision lives in the tile phase, not as a fusion guard: by partition time
 the fused body is final, so the demotion is visible order-independently (decomposed chains assemble the
 matmul multiply-last — no standalone node is ever eligible mid-fusion). The `op.knobs` stamp is the
 considered-vs-declined idiom (`020_stage_inputs`'s declined `STAGE` row, `search/keys.py`): it is
@@ -322,10 +322,20 @@ three entry points:
   compile via `GreedySearch` (flattens each fork point to its complete leaves and
   picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
   once trained). Stops at the first terminal candidate. **Structural options are
-  never the greedy pick**: a leaf wrapping a `Graph` splice (the `SPLIT_CONE` split,
-  017's atomic-free combine) is filtered out whenever an in-place `Op` variant
-  exists — the per-op prior prices one kernel's knob row, so its score for a
-  multi-kernel Graph option is noise. `tune` explores them; an env pin makes the
+  priced, never raw-scored**: the per-op prior prices one kernel's knob row, so its
+  score for a multi-kernel `Graph` splice (the `SPLIT_CONE` split, 017's atomic-free
+  combine) is noise. With the *trained* prior loaded, `GreedySearch._pick_structural`
+  prices each side properly — a nested greedy descent per kernel (`lowering/tile`
+  only, CPU, no backend) records the prior's predicted µs for the chosen tile at the
+  kernel's partition fork; the structural side is the Σ over its fragment's kernels,
+  memoized per `op_cache_key` — and the cheaper kernel set wins, so an unpinned
+  compile deploys the splits `tune` measured best. Cold (analytic / no prior), or
+  when a side is unpriceable (a pre-tiled combine has no partition fork), the
+  structural leaf is filtered as before — a cold compile never changes kernel sets.
+  If a structural pick leaves a fragment kernel un-lowered (`validate(ctx)`
+  rejection), `Pipeline.run`'s retry retires structural picks wholesale and
+  re-drives down the keep-fused branch before falling back to tile blocklisting.
+  `tune` explores structural forks regardless; an env pin makes the
   Graph the rule's only option, which passes through untouched.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
