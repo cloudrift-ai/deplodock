@@ -49,7 +49,6 @@ matmul's own volume — the materialization that defeats the split).
 from __future__ import annotations
 
 import importlib
-from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -58,27 +57,33 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_reduce
+from deplodock.compiler.ir.stmt.body import Cone
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
 
 
 @dataclass
-class _Cone:
-    """One computed multiply operand: its backward slice over the three scopes,
-    the axes it reads (recursively, prologue/leading deps included), and the
-    uniform leaf dtype its ``xn`` buffer materializes at."""
+class _RootCone:
+    """One computed multiply operand: its chained backward :class:`Cone`\\ s
+    over the cell / prologue / leading scope levels, the axes it reads
+    (recursively, prologue/leading deps included), and the uniform leaf
+    dtype its ``xn`` buffer materializes at."""
 
     root: str
-    cell_used: set[int]
-    pro_used: set[int]
-    lead_used: set[int]
-    cell_stmts: list[Stmt]
-    pro_stmts: list[Stmt]
-    lead_stmts: list[Stmt]
-    axes: set[str]
+    cell: Cone
+    pro: Cone
+    lead: Cone
+    axes: frozenset[str]
     dtype: object
+
+    @property
+    def moved(self) -> tuple[Stmt, ...]:
+        """Members the cut MOVES into the producer — cell + prologue.
+        Leading stmts are copied, not moved (a shared one stays in both
+        kernels), so they're excluded from the escape check."""
+        return (*self.cell.members, *self.pro.members)
 
 
 def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: str, out_tensor: Tensor) -> Graph | None:
@@ -99,12 +104,12 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     if not accums:
         return None
     roots: tuple[str, ...] | None = None
-    mul_ids: set[int] = set()
+    muls: list[Assign] = []
     for acc in accums:
         mul = cell_def.get(acc.value)
         if not isinstance(mul, Assign) or mul.op.name != "multiply" or len(mul.args) != 2:
             return None
-        mul_ids.add(id(mul))
+        muls.append(mul)
         cone_args: dict[str, None] = {}  # ordered de-dup (a squared cone appears twice)
         for a in mul.args:
             d = cell_def.get(a)
@@ -126,43 +131,39 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     assert roots is not None
 
     # --- backward-slice each cone over the cell / prologue / leading scopes --
+    # Three chained Body.backward_cone calls, one per scope level: each
+    # level's unresolved external reads seed the next. After the last level
+    # only axis vars may remain unresolved.
     axis_names = {a.name for a in loop_op.axes}
-    pro_def = _prologue_defs(prologue_level)
-    lead_def = {n: s for s in leading for n in s.defines()}
-    cones: list[_Cone] = []
+    cones: list[_RootCone] = []
     for root in roots:
-        sliced = _slice_cone(root, cell_def=cell_def, pro_def=pro_def, lead_def=lead_def, axis_names=axis_names)
-        if sliced is None:
-            return None
-        cell_used, pro_used, lead_used = sliced
-        cell_stmts = [s for s in top if id(s) in cell_used]
-        if not cell_stmts:
+        cell_cone = k_loop.body.backward_cone((root,))
+        if not cell_cone.members:
             return None  # cone root must live in the cell (a K-invariant operand isn't this pattern)
-        pro_stmts = [s for s in prologue_level if id(s) in pro_used]
-        lead_stmts = [s for s in leading if id(s) in lead_used]
+        if any(isinstance(m, Accum) for m in cell_cone.members):
+            return None  # cone reads the matmul's own running accumulator — not cuttable
+        pro_cone = Body(prologue_level).backward_cone(cell_cone.external_reads)
+        lead_cone = Body(leading).backward_cone(pro_cone.external_reads)
+        if lead_cone.external_reads - axis_names:
+            return None  # name from an unmodeled scope — bail conservatively
         # Axes the materialization must cover: everything the moved stmts read
         # (prologue deps included — their row loops rebuild around the xn Write).
-        axes = _axes_read((*cell_stmts, *pro_stmts, *lead_stmts), axis_names)
+        axes = lead_cone.external_reads & axis_names
         if not axes <= set(row_names) | {k_name, n_name}:
             return None
-        dtype = _cone_dtype((cell_stmts, pro_stmts, lead_stmts), graph)
+        dtype = _cone_dtype((*cell_cone.loads, *pro_cone.loads, *lead_cone.loads), graph)
         if dtype is None:
             return None
-        cones.append(_Cone(root, cell_used, pro_used, lead_used, cell_stmts, pro_stmts, lead_stmts, axes, dtype))
+        cones.append(_RootCone(root, cell_cone, pro_cone, lead_cone, axes, dtype))
     if sum(1 for c in cones if n_name in c.axes) > 1:
         return None  # two (…, K, N) buffers would re-do the matmul's own volume
     for i, a in enumerate(cones):
         for b in cones[i + 1 :]:
-            if (a.cell_used & b.cell_used) or (a.pro_used & b.pro_used):
+            if {id(m) for m in a.moved} & {id(m) for m in b.moved}:
                 return None  # cones sharing a stmt would compute it in both producers
 
     # --- escape check: moved values must die at the multiplies ----------------
-    moved_ids = set().union(*(c.cell_used | c.pro_used for c in cones))
-    moved_defs: set[str] = set()
-    for c in cones:
-        for s in (*c.cell_stmts, *c.pro_stmts):
-            moved_defs |= collect_invariant_names(s)
-    if not _moved_defs_die_at_cone(Body(loop_op.body), moved_ids, moved_defs, frozenset(roots), mul_ids):
+    if not loop_op.body.defs_die_at((m for c in cones for m in c.moved), roots=roots, allowed=muls):
         return None
 
     # --- build one producer per cone -------------------------------------------
@@ -178,16 +179,16 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         row_vars = tuple(Var(lp.axis.name) for lp in rows_used)
         reads_n = n_name in c.axes
         index = (*row_vars, Var(k_name), *((Var(n_name),) if reads_n else ()))
-        inner: tuple[Stmt, ...] = (*c.cell_stmts, Write(output=xn_id, index=index, values=(c.root,)))
+        inner: tuple[Stmt, ...] = (*c.cell.members, Write(output=xn_id, index=index, values=(c.root,)))
         if reads_n:
             # N innermost: the Write walks the buffer's last dim (coalesced) and
             # K lands second-to-last — the canonical B layout, even when the
             # original access was transposed [n, k].
             inner = (Loop(axis=outer_n.axis, body=Body(inner)),)
-        level: tuple[Stmt, ...] = (*c.pro_stmts, Loop(axis=k_loop.axis, body=Body(inner)))
+        level: tuple[Stmt, ...] = (*c.pro.members, Loop(axis=k_loop.axis, body=Body(inner)))
         for lp in reversed(rows_used):
             level = (Loop(axis=lp.axis, body=Body(level)),)
-        producer = LoopOp(body=Body((*c.lead_stmts, *level)))
+        producer = LoopOp(body=Body((*c.lead.members, *level)))
         producer.name = f"{loop_op.name}_xn{sfx}" if loop_op.name else ""
         shape = tuple(lp.axis.extent.as_static() for lp in rows_used) + (k_loop.axis.extent.as_static(),)
         if reads_n:
@@ -196,7 +197,7 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         cone_loads[id(cell_def[c.root])] = Load(names=(c.root,), input=xn_id, index=index)
 
     # --- build the consumer ----------------------------------------------------
-    moved_cell = set().union(*(c.cell_used for c in cones))
+    moved_cell = {id(m) for c in cones for m in c.cell.members}
     new_top: list[Stmt] = []
     for s in top:
         repl = cone_loads.get(id(s))
@@ -212,12 +213,12 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         body=Body(tuple(new_k_loop if s is k_loop else s for s in outer_n.body)),
         unroll=outer_n.unroll,
     )
-    pro_used_all = set().union(*(c.pro_used for c in cones))
+    pro_used_all = {id(m) for c in cones for m in c.pro.members}
     level = tuple(new_outer_n if s is outer_n else s for s in prologue_level if id(s) not in pro_used_all or s is outer_n)
     for lp in reversed(rows):
         level = (Loop(axis=lp.axis, body=Body(level)),)
     cons_id = f"{node_id}__mm"
-    lead_used_all = set().union(*(c.lead_used for c in cones))
+    lead_used_all = {id(m) for c in cones for m in c.lead.members}
     kept_lead = tuple(s for s in leading if id(s) not in lead_used_all)
     consumer_op = LoopOp(body=Body((*kept_lead, *level)))
     consumer_op = _rename_write_output(consumer_op, old=node_id, new=cons_id)
@@ -311,121 +312,14 @@ def _contains_matmul_reduce_loop(stmt: Stmt) -> bool:
     return any(_contains_matmul_reduce_loop(c) for body in stmt.nested() for c in body)
 
 
-def _external_reads(stmt: Stmt, axis_names: set[str]) -> set[str]:
-    """Names ``stmt`` (incl. a whole Loop subtree) reads from its enclosing
-    scope — all nested deps minus internally-defined names and loop axes."""
-    reads: set[str] = set()
-    defs: set[str] = set()
-
-    def walk(s: Stmt) -> None:
-        reads.update(s.deps())
-        defs.update(s.defines())
-        for body in s.nested():
-            if isinstance(s, Loop):
-                defs.add(s.axis.name)
-            for c in body:
-                walk(c)
-
-    walk(stmt)
-    return reads - defs - axis_names
-
-
-def _moved_defs_die_at_cone(
-    body: Body, moved_ids: set[int], moved_defs: set[str], cone_roots: frozenset[str], allowed_ids: set[int]
-) -> bool:
-    """True iff no stmt outside the moved set reads a moved def — except the
-    multiplies (``allowed_ids``) reading only ``cone_roots``."""
-
-    def walk(stmts) -> bool:
-        for s in stmts:
-            if id(s) in moved_ids:
-                continue  # the whole subtree moves; internal uses are fine
-            reads = set(s.deps()) & moved_defs
-            if reads and not (id(s) in allowed_ids and reads <= cone_roots):
-                return False
-            for sub in s.nested():
-                if not walk(sub):
-                    return False
-        return True
-
-    return walk(body)
-
-
-def _prologue_defs(prologue_level) -> dict[str, Stmt]:
-    """Map every cross-scope SSA name a prologue-level stmt exposes to that
-    stmt (a whole reduce Loop exposes its Accum names)."""
-    pro_def: dict[str, Stmt] = {}
-    for s in prologue_level:
-        for n in collect_invariant_names(s):
-            pro_def[n] = s
-    return pro_def
-
-
-def _slice_cone(
-    root: str, *, cell_def: dict[str, Stmt], pro_def: dict[str, Stmt], lead_def: dict[str, Stmt], axis_names: set[str]
-) -> tuple[set[int], set[int], set[int]] | None:
-    """Backward-slice ``root`` over the cell / prologue / leading scopes.
-    Returns the ``(cell, prologue, leading)`` used-stmt id-sets, or ``None``
-    when the cone reads the matmul's own running accumulator or a name from
-    an unmodeled scope."""
-    cell_used: set[int] = set()
-    pro_used: set[int] = set()
-    lead_used: set[int] = set()
-    pending = deque([root])
-    seen: set[str] = set()
-    while pending:
-        n = pending.popleft()
-        if n in seen or n in axis_names:
-            continue
-        seen.add(n)
-        s = cell_def.get(n)
-        if s is not None:
-            if isinstance(s, Accum):
-                return None  # cone reads the matmul's own running accumulator — not cuttable
-            cell_used.add(id(s))
-            pending.extend(s.deps())
-            continue
-        s = pro_def.get(n)
-        if s is not None:
-            pro_used.add(id(s))
-            pending.extend(_external_reads(s, axis_names))
-            continue
-        s = lead_def.get(n)
-        if s is not None:
-            lead_used.add(id(s))
-            pending.extend(s.deps())
-            continue
-        return None  # name from an unmodeled scope — bail conservatively
-    return cell_used, pro_used, lead_used
-
-
-def _axes_read(stmts, axis_names: set[str]) -> set[str]:
-    """Axis names appearing in the stmts' carried Exprs (Load / Write indices,
-    Select predicates), recursively — internally-bound axes (a prologue
-    reduce's own loop var) excluded. This is the data the cut uses to size
-    each cone's ``xn`` buffer and to tell row cones from N-reading cones."""
-    out: set[str] = set()
-
-    def walk(s: Stmt, bound: frozenset[str]) -> None:
-        out.update({v for e in s.exprs() for v in e.free_vars()} - bound)
-        inner_bound = bound | s.binds_axes()
-        for body in s.nested():
-            for child in body:
-                walk(child, inner_bound)
-
-    for s in stmts:
-        walk(s, frozenset())
-    return out & axis_names
-
-
-def _cone_dtype(stmts_triple, graph: Graph):
+def _cone_dtype(loads, graph: Graph):
     """The uniform dtype of every graph-resolvable Load in the cone's moved
     stmts — the dtype its ``xn`` buffer materializes at (value-preserving;
     identical to the multiply's other-operand dtype on every shape seen so
     far). ``None`` (bail) when a Load source is unresolvable or the leaf
     dtypes disagree."""
     dtypes = set()
-    for ld in Body(tuple(s for group in stmts_triple for s in group)).iter_of_type(Load):
+    for ld in loads:
         node = graph.nodes.get(ld.input)
         if node is None:
             return None

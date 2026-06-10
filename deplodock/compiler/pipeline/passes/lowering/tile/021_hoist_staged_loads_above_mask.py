@@ -273,23 +273,12 @@ def _guard_unsafe_loads_in_body(body: Body, predicate, gated_vars: frozenset[str
     if not unsafe_idxs:
         return Body(tuple(stmts))
 
-    # Compute forward SSA cone seeded by the unsafe Loads' defined names.
-    # A stmt joins the cone when any of its ``deps()`` is already in the
-    # cone's defined-names set. Iterate to fixpoint.
-    cone_names: set[str] = set()
-    cone_idxs: set[int] = set(unsafe_idxs)
-    for i in unsafe_idxs:
-        cone_names.update(stmts[i].defines())
-    changed = True
-    while changed:
-        changed = False
-        for i, s in enumerate(stmts):
-            if i in cone_idxs:
-                continue
-            if any(d in cone_names for d in s.deps()):
-                cone_idxs.add(i)
-                cone_names.update(s.defines())
-                changed = True
+    # Forward SSA cone seeded by the unsafe Loads — everything transitively
+    # reading them joins (``Body.forward_cone``; subtree-aware, so a wrapper
+    # whose interior reads a cone name joins as a unit).
+    cone = Body(stmts).forward_cone([stmts[i] for i in unsafe_idxs])
+    pos = {id(s): i for i, s in enumerate(stmts)}
+    cone_idxs = {pos[id(m)] for m in cone.members}
 
     # Wrap the contiguous range covering all cone stmts in a Cond.
     # The cone is typically contiguous for matmul-style bodies (Load

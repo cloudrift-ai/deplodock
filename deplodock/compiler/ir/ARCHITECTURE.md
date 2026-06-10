@@ -146,6 +146,18 @@ Body walkers: `iter_body(body)` (pre-order; powers `for s in loop_op`),
 `Stmt.pretty(indent)` (rendered lines for kernel dumps; block stmts
 recurse via `pretty_body`).
 
+Dependence cones (`ir/stmt/body.py`): `Body.backward_cone(roots)` / `Body.forward_cone(seeds)` build a `Cone` —
+the subset of the body's immediate stmts closed under SSA dependence (a wrapper joins as a unit; internally-bound
+axes excluded), plus `external_reads`, the names read from outside (axis vars and enclosing/sibling scopes alike).
+Construction never fails: unresolved names are data, and chaining scope levels means seeding the next level's
+`backward_cone` with the previous one's `external_reads`. `Body.defs_die_at(members, roots=…, allowed=…)` is the
+matching escape check (may the cone be cut out, with only the designated consumers reading its roots?). This is
+the shared substrate behind the rules that slice cones (`_split_demoted`'s producer cut, `021`'s masked-load
+guard) — eligibility judgments stay in the rules, per `pipeline/passes/ARCHITECTURE.md`. Two dataflow walks
+deliberately do NOT use it: `classify_fragment_epilogue` (single pass interleaving reduce-scope flags with its
+negative-form blocker reporting) and `030_hoist_invariant_compute` (all-deps saturation under an axis-invariance
+predicate — a different operator than the cone's any-dep taint).
+
 `rewrite` has two distinct rename channels that must stay disjoint:
 `rename_ssa` carries **SSA-name** renames, `sigma` carries **axis**
 substitutions. `Load`/`Write` index exprs apply *both*
