@@ -146,9 +146,10 @@ def test_mma_eligibility_rejects_indivisible_extents():
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
-def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> LoopOp:
-    """Matmul whose accumulator feeds a post-reduce ``add(acc, r)`` (fused
-    residual) before the Write — the mma fragment-store can't apply it."""
+def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64, epilogue_op: str = "add") -> LoopOp:
+    """Matmul whose accumulator feeds a post-reduce ``epilogue_op(acc, r)``
+    before the Write. ``add`` is the foldable ``matmul_add`` residual the
+    fragment store applies per element; anything else stays scalar-gated."""
     i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
     return LoopOp(
         body=(
@@ -168,7 +169,7 @@ def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> L
                                 ),
                             ),
                             Load(name="r", input="r", index=(Var("i"), Var("j"))),
-                            Assign(name="e", op=ElementwiseImpl("add"), args=("acc", "r")),
+                            Assign(name="e", op=ElementwiseImpl(epilogue_op), args=("acc", "r")),
                             Write(output="c", index=(Var("i"), Var("j")), value="e"),
                         ),
                     ),
@@ -208,12 +209,52 @@ def _matmul_collapsed_k_loop_op(*, M: int = 64, N: int = 64, K: int = 64) -> Loo
     )
 
 
-def test_mma_eligibility_rejects_fused_epilogue():
-    """A matmul whose accumulator feeds a post-reduce ``add`` (fused residual)
-    is gated off — the mma fragment-store path drops the epilogue and leaves
-    the scalar accumulator undefined at codegen."""
+def test_mma_eligibility_admits_pointwise_epilogue():
+    """A pointwise accumulator-consuming epilogue — ``add(acc, r)`` (the
+    matmul_add residual) and ``multiply(acc, r)`` alike — is warp-tier
+    eligible: the fragment store folds the chain per element
+    (``RegStore.epilogue``; see ``test_matmul_mma_residual.py`` for the
+    end-to-end lowering and ``tile/_atom.classify_fragment_epilogue`` for the
+    negative-form rule)."""
+    for op_name in ("add", "multiply"):
+        g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
+        op = _matmul_with_epilogue_loop_op(epilogue_op=op_name)
+        g.nodes["c"].op = op
+        assert is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g), op_name
+
+
+def test_mma_eligibility_rejects_in_kernel_epilogue_operand():
+    """An epilogue leaf loaded from a buffer the kernel itself writes is a
+    register-resident intermediate — an ineligible dependency, gated off."""
     g = _matmul_graph(M=64, N=64, K=64, dtype=F16)
-    op = _matmul_with_epilogue_loop_op()
+    i, j, k = Axis("i", 64), Axis("j", 64), Axis("k", 64)
+    op = LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            # The epilogue operand reads the kernel's own output.
+                            Load(name="r", input="c", index=(Var("i"), Var("j"))),
+                            Assign(name="e", op=ElementwiseImpl("add"), args=("acc", "r")),
+                            Write(output="c", index=(Var("i"), Var("j")), value="e"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
     g.nodes["c"].op = op
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
 

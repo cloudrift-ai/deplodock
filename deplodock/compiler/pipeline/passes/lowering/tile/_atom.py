@@ -20,6 +20,7 @@ Prefixed ``_`` so the pipeline rule loader (``_load_rules``) skips it.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
@@ -117,16 +118,27 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
             if accum.value != multiply.name:
                 return False
             accum_names.add(accum.name)
-        # No fused post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the
-        # mma accumulator *fragment* straight to the output, so any compute that
-        # consumes the scalar accumulator after the K-loop (e.g. a fused residual
-        # ``add(acc, residual)`` or activation) is both dropped from the store and
-        # left referencing an SSA name the fragment path never defines (``acc0``
-        # undefined at nvcc time). Gate those to the scalar register-tile path,
-        # which threads the accumulator through the epilogue correctly.
-        for s in loop_op.body.iter_of_type(Assign):
-            if accum_names & set(s.args):
-                return False
+        # Post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the mma
+        # accumulator *fragment* straight to the output, so scalar epilogue
+        # Assigns have no accumulator SSA name to read (each lane holds 4
+        # elements of the C tile, not one ``acc0``). The fragment store can
+        # fold any PURE POINTWISE epilogue — each fragment element owns a
+        # known (row, col) of the output, so ``RegStore`` evaluates the chain
+        # per element in f32, loading leaf operands at the element's own
+        # coordinates (the CUTLASS epilogue-visitor pattern). Eligibility is
+        # checked in the negative — :func:`classify_fragment_epilogue` walks
+        # the backward slice from the Write to the accumulator and reports the
+        # first ineligible operation / dependency; anything blocked gates to
+        # the scalar register-tile path, which threads the scalar accumulator
+        # through arbitrary epilogues correctly.
+        _slice, blocker = classify_fragment_epilogue(
+            loop_op.body,
+            accum_names,
+            produced=produced,
+            leaf_dtype=lambda buf: graph.nodes[buf].output.dtype.name if buf in graph.nodes else None,
+        )
+        if blocker is not None:
+            return False
         # Each output free-axis extent must divide cleanly. The body's outer
         # free Loops contribute the M (outer) / N (inner) extents the planner
         # will partition into output cells; gate the outermost-to-inner
@@ -144,6 +156,197 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
         return True
 
     return predicate
+
+
+# Leaf-load dtypes the fragment epilogue can convert to f32 at render time
+# (``RegStore._epilogue_lines`` — ``__half2float`` / ``__bfloat162float`` /
+# identity). Anything else blocks the fold.
+_EPILOGUE_LEAF_DTYPES = frozenset({"f16", "bf16", "f32"})
+
+
+@dataclass(frozen=True)
+class EpilogueSlice:
+    """The foldable post-reduce epilogue of a matmul body: the backward slice
+    from the (single) ``Write`` to the accumulator. ``assigns`` are in body
+    (SSA/topological) order; ``loads`` are the leaf operand Loads with
+    ``load_roles`` classifying each load's index dims as ``"m"`` / ``"n"``
+    (struct-equal to the Write's M / N index expr — the fragment element's row
+    / col offset applies there at that buffer's own stride) or ``"fixed"``
+    (uniform across the cell: literals, batch/grid vars, broadcasts)."""
+
+    acc: str
+    assigns: tuple
+    loads: tuple
+    load_roles: tuple[tuple[str, ...], ...]
+    write: object
+
+
+def classify_fragment_epilogue(body, accum_names: set[str], *, produced: set[str], leaf_dtype) -> tuple[EpilogueSlice | None, str | None]:
+    """Classify the post-reduce epilogue for the mma fragment-store fold.
+
+    Returns ``(slice, None)`` when a foldable epilogue exists, ``(None, None)``
+    when there is no epilogue at all (the Write stores the accumulator
+    directly), and ``(None, reason)`` when the epilogue contains an ineligible
+    operation or dependency.
+
+    The rule is written in the NEGATIVE: the fold can render any pure
+    pointwise SSA chain from the accumulator to the Write whose leaf Loads are
+    addressable at a fragment element's own (row, col) — so instead of
+    pattern-matching admissible shapes, this walks the slice and reports the
+    first thing the fold fundamentally cannot do:
+
+    - the accumulator is consumed *inside* a reduce loop (a mid-reduction use,
+      e.g. online softmax rescale — needs a scheduled phase, not a store fold);
+    - the slice depends on more than one accumulator (multi-fragment epilogue
+      — the doorway to the gated-MLP combine, not wired yet);
+    - the slice feeds zero / multiple Writes, a vector Write, or the
+      accumulator is also written directly alongside the epilogue;
+    - a slice value escapes (consumed by a statement outside the slice) —
+      stripping the scalar stmts would break the consumer;
+    - a leaf operand is not a (scalar, gmem, not-produced-in-kernel) Load with
+      an f32-convertible dtype — e.g. a cooperative-reduce scalar, a Select
+      result, or an in-kernel intermediate;
+    - a leaf Load index dim is not addressable per element: indexed by a
+      reduce axis, or mixing the output cell axes in an expression that isn't
+      struct-equal to the Write's own M / N index expr (the lane arithmetic
+      can only reproduce those two motions, plus cell-uniform terms).
+
+    Dialect-agnostic: works on Loop-IR (the eligibility gate) and Tile-IR (the
+    ``005_lower_atom_tile`` fold) bodies — both carry ``Assign`` / ``Load`` /
+    ``Write`` leaves and reduce loops duck-typed on ``.is_reduce`` / ``.axis``.
+    ``leaf_dtype`` maps a buffer name to its dtype name (graph lookup)."""
+    from deplodock.compiler.ir.stmt import Assign, Load, Write  # noqa: PLC0415
+
+    # One deep walk in body order: stmts with their inside-a-reduce-loop flag,
+    # plus the reduce axis names (for the index check).
+    stmts: list[tuple[object, bool]] = []
+    reduce_axes: set[str] = set()
+
+    def _walk(stmt_iter, in_reduce: bool) -> None:
+        for s in stmt_iter:
+            stmts.append((s, in_reduce))
+            is_red = bool(getattr(s, "is_reduce", False))
+            if is_red and hasattr(s, "axis"):
+                reduce_axes.add(s.axis.name)
+            for sub in s.nested():
+                _walk(sub, in_reduce or is_red)
+
+    _walk(body, False)
+
+    # Backward slice = forward closure from the accumulators over Assigns
+    # (body order is SSA order, so one pass converges).
+    closure: set[str] = set()
+    slice_assigns: list = []
+    slice_in_reduce = False
+    for s, in_reduce in stmts:
+        if isinstance(s, Assign) and set(s.args) & (accum_names | closure):
+            closure.add(s.name)
+            slice_assigns.append(s)
+            slice_in_reduce = slice_in_reduce or in_reduce
+    if not slice_assigns:
+        return None, None
+
+    if slice_in_reduce:
+        return None, "the accumulator is consumed inside a reduce loop (mid-reduction use, not a store-time fold)"
+    # Renderability probe: the fold translates each chain op exactly like the
+    # scalar Assign render does (``op_to_expr``) — an op that translation
+    # doesn't cover (or with the wrong arity) is an ineligible operation.
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+
+    for a in slice_assigns:
+        try:
+            op_to_expr(a.op.name, [Var(x) for x in a.args])
+        except (NotImplementedError, IndexError):
+            return None, f"epilogue op {a.op.name!r} has no fragment-store rendering"
+    accs_used = set()
+    for a in slice_assigns:
+        accs_used |= set(a.args) & accum_names
+    if len(accs_used) > 1:
+        return None, f"the epilogue depends on {len(accs_used)} accumulators (multi-fragment fold not supported)"
+
+    writes = [s for s, _ in stmts if isinstance(s, Write)]
+    fed_writes = [w for w in writes if w.value in closure]
+    if len(fed_writes) != 1:
+        return None, f"the epilogue feeds {len(fed_writes)} Writes (need exactly 1)"
+    write = fed_writes[0]
+    if write.is_vector:
+        return None, "the epilogue feeds a vector Write"
+    if any(w is not write and w.value in accs_used for w in writes):
+        return None, "the accumulator is also written directly alongside the epilogue"
+
+    slice_set = set(map(id, slice_assigns))
+    for s, _ in stmts:
+        if id(s) in slice_set or s is write:
+            continue
+        if set(s.deps()) & closure:
+            return None, f"an epilogue value escapes the slice (consumed by {type(s).__name__})"
+
+    # Leaf operands: every arg that is neither an accumulator nor a slice value.
+    loads_by_name: dict[str, object] = {}
+    loads_in_reduce: set[str] = set()
+    for s, in_reduce in stmts:
+        if isinstance(s, Load) and len(s.names) == 1:
+            loads_by_name.setdefault(s.names[0], s)
+            if in_reduce:
+                loads_in_reduce.add(s.names[0])
+    leaf_names: list[str] = []
+    for a in slice_assigns:
+        for arg in a.args:
+            if arg not in accum_names and arg not in closure and arg not in leaf_names:
+                leaf_names.append(arg)
+    leaf_loads = []
+    for name in leaf_names:
+        ld = loads_by_name.get(name)
+        if ld is None:
+            return None, f"epilogue operand {name!r} is not a scalar Load or the accumulator"
+        if name in loads_in_reduce:
+            return None, f"epilogue operand {name!r} is loaded inside a reduce loop"
+        if ld.input in produced:
+            return None, f"epilogue operand buffer {ld.input!r} is produced in-kernel (register-resident intermediate)"
+        dt = leaf_dtype(ld.input)
+        if dt is not None and dt not in _EPILOGUE_LEAF_DTYPES:
+            return None, f"epilogue operand buffer {ld.input!r} dtype {dt!r} has no f32 conversion"
+        leaf_loads.append(ld)
+
+    # Per-dim addressability: the Write's var-bearing index dims give the M
+    # (second-to-last) / N (last) cell motions; every leaf index dim must be
+    # struct-equal to one of those, or be uniform across the cell.
+    w_var_dims = [d for d, e in enumerate(write.index) if e.free_vars()]
+    if not w_var_dims:
+        return None, "the Write index has no free axes (not a matmul output)"
+    n_expr = write.index[w_var_dims[-1]]
+    m_expr = write.index[w_var_dims[-2]] if len(w_var_dims) >= 2 else None
+    cell_vars = frozenset(n_expr.free_vars()) | (frozenset(m_expr.free_vars()) if m_expr is not None else frozenset())
+    load_roles: list[tuple[str, ...]] = []
+    for ld in leaf_loads:
+        roles: list[str] = []
+        for e in ld.index:
+            if m_expr is not None and e == m_expr:
+                roles.append("m")
+                continue
+            if e == n_expr:
+                roles.append("n")
+                continue
+            fv = e.free_vars()
+            if fv & reduce_axes:
+                return None, f"epilogue operand {ld.input!r} is indexed by a reduce axis ({e.pretty()})"
+            if fv & cell_vars:
+                return None, f"epilogue operand {ld.input!r} index {e.pretty()} mixes output cell axes (lane arithmetic can't reproduce it)"
+            roles.append("fixed")
+        load_roles.append(tuple(roles))
+
+    acc = next(iter(accs_used))
+    return (
+        EpilogueSlice(
+            acc=acc,
+            assigns=tuple(slice_assigns),
+            loads=tuple(leaf_loads),
+            load_roles=tuple(load_roles),
+            write=write,
+        ),
+        None,
+    )
 
 
 # Per-atom eligibility predicates, keyed by the ``Atom`` itself (cell shape +

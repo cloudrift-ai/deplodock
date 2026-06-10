@@ -736,6 +736,44 @@ class MmaSyncPtx(Stmt):
 
 
 @dataclass(frozen=True)
+class EpilogueLoad:
+    """One leaf operand of a fused pointwise epilogue (see :class:`RegEpilogue`).
+
+    Not a body :class:`Stmt` — a payload riding the :class:`RegStore`.
+    ``index`` is the cell-base coordinate tuple (struct-shared with the
+    epilogue's Write); per fragment element the render adds the element's own
+    row / col motion on every dim whose ``role`` is ``"m"`` / ``"n"`` (at
+    *this* buffer's dim stride — so a transposed or broadcast operand reads
+    correctly), and nothing on ``"fixed"`` dims (literals, batch / grid vars —
+    uniform across the cell)."""
+
+    name: str
+    buffer: str
+    index: tuple
+    roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RegEpilogue:
+    """A pure pointwise SSA chain folded into the fragment store.
+
+    Captured by ``kernel/005_lower_atom_tile`` from the backward slice between
+    the accumulator and the Write (the scalar Load / Assign stmts are stripped
+    — the accumulator has no scalar SSA name on the fragment path). The render
+    evaluates the chain per fragment element in f32 with ``acc`` substituted
+    by the element and each leaf loaded at the element's own (row, col); the
+    chain ops reuse the scalar renderer's ``op_to_expr`` translation, so any
+    elementwise op with a CUDA spelling works. ``ops`` are ``(name, op_name,
+    args)`` in topological (body) order; ``result`` is the SSA name the Write
+    stored."""
+
+    acc: str
+    loads: tuple[EpilogueLoad, ...]
+    ops: tuple[tuple[str, str, tuple[str, ...]], ...]
+    result: str
+
+
+@dataclass(frozen=True)
 class RegStore(Stmt):
     """Store an mma.sync f32 accumulator array to the output buffer with a
     per-lane epilogue downconvert.
@@ -746,26 +784,97 @@ class RegStore(Stmt):
     ``float c[4]``; when the destination buffer is narrower (``__half*``)
     each value is converted via ``__float2half`` (mirrors
     :class:`MmaStore`'s downconvert). ``ldm`` is the output row stride
-    (N) — ``0`` auto-resolves from the buffer's inner extent."""
+    (N) — ``0`` auto-resolves from the buffer's inner extent.
+
+    ``epilogue`` optionally carries a fused pointwise chain
+    (:class:`RegEpilogue` — residual adds, bias / scale broadcasts,
+    activations): evaluated per fragment element in f32 right before the
+    downconvert (the CUTLASS epilogue-visitor pattern)."""
 
     dst_buffer: str
     dst_index: tuple
     frag: str
     shape: tuple[int, int, int]
     ldm: int = 0
+    epilogue: RegEpilogue | None = None
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
+
+    def external_reads(self) -> tuple[str, ...]:
+        # The fused epilogue's leaf loads are gmem reads this stmt performs
+        # directly (their original Load stmts were stripped by
+        # 005_lower_atom_tile), so they must be declared here for the kernel
+        # signature / render shapes to include the buffers.
+        if self.epilogue is None:
+            return ()
+        return tuple(ld.buffer for ld in self.epilogue.loads)
 
     def external_writes(self) -> tuple[str, ...]:
         return (self.dst_buffer,)
 
     def exprs(self) -> tuple[Expr, ...]:
-        return tuple(self.dst_index)
+        epi = () if self.epilogue is None else tuple(e for ld in self.epilogue.loads for e in ld.index)
+        return (*self.dst_index, *epi)
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.dst_index)
-        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag} (ldm={self.ldm or 'auto'})"]
+        epi = ""
+        if self.epilogue is not None:
+            chain = ", ".join(op for _, op, _ in self.epilogue.ops)
+            bufs = ", ".join(ld.buffer for ld in self.epilogue.loads)
+            epi = f" epilogue[{chain}]({bufs or 'no loads'})"
+        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag}{epi} (ldm={self.ldm or 'auto'})"]
+
+    def _element_values(self, ctx: RenderCtx) -> tuple[list[str], list[str]]:
+        """``(preamble_lines, values)``: the four per-lane store values, plus
+        the per-element leaf-load / chain-op declarations they need. Without
+        an epilogue the values are the bare ``frag[i]`` and the preamble is
+        empty. With one, each element ``i`` (row ``_g``/``_g+8``, col
+        ``2_t+{0,1}``) declares its leaf loads (converted to f32; offsets per
+        the dim roles at each buffer's own stride) and the chain ops (via
+        ``op_to_expr`` — the same translation the scalar ``Assign`` render
+        uses), all scoped inside the store's ``{ }`` block. Leaf loads are
+        scalar; lanes ``_t = 0..3`` cover 8 contiguous columns, so the warp's
+        accesses coalesce regardless."""
+        if self.epilogue is None:
+            return [], [f"{self.frag}[{i}]" for i in range(4)]
+        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+
+        epi = self.epilogue
+        conv = {"f16": "__half2float({})", "bf16": "__bfloat162float({})"}
+        lines: list[str] = []
+        vals: list[str] = []
+        for i in range(4):
+            row = "_g" if i < 2 else "(_g + 8)"
+            col = f"(_t * 2 + {i & 1})"
+            env = {epi.acc: f"{self.frag}[{i}]"}
+            for ld in epi.loads:
+                temp = f"{ld.name}_e{i}"
+                if ld.buffer in ctx.literal_constants:
+                    lines.append(f"const float {temp} = {float(ctx.literal_constants[ld.buffer])!r}f;")
+                    env[ld.name] = temp
+                    continue
+                flat = render_index(ld.buffer, ld.index, ctx)
+                parts = [flat]
+                for d, role in enumerate(ld.roles):
+                    if role == "fixed":
+                        continue
+                    stride = _dim_stride(ld.buffer, d, ctx)
+                    motion = row if role == "m" else col
+                    parts.append(motion if stride == 1 else f"{motion} * {stride}")
+                addr = " + ".join(parts)
+                dt = ctx.buffer_dtypes.get(ld.buffer, "f32")
+                lines.append(f"const float {temp} = {conv.get(dt, '{}').format(f'{ld.buffer}[{addr}]')};")
+                env[ld.name] = temp
+            for name, op_name, args in epi.ops:
+                expr = op_to_expr(op_name, [Var(env[a]) for a in args])
+                lines.append(f"const float {name}_e{i} = {expr.render(ctx)};")
+                env[name] = f"{name}_e{i}"
+            vals.append(env[epi.result])
+        return lines, vals
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
@@ -775,31 +884,50 @@ class RegStore(Stmt):
         dst_dt = ctx.buffer_dtypes.get(self.dst_buffer, "f32")
         pad = _pad(ctx.indent)
         lane = "(threadIdx.x & 31)"
+        pre, vals = self._element_values(ctx)
         # C is 16×8: lane owns (row g, cols 2t,2t+1) and (row g+8, cols 2t,2t+1)
         # with g = lane/4, t = lane%4. The two cols per row are CONTIGUOUS, so
         # each row's pair is one vectorized 4-byte store (``__half2`` / ``float2``)
         # rather than two scalar stores — halves the epilogue store count and
         # the address arithmetic. ldm strides over N (the output row width). The
         # base ``flat`` is tile-aligned and ``2t`` is even, so the pair is
-        # 4-/8-byte aligned. The ``{ }`` block scopes _g/_t per RegStore.
+        # 4-/8-byte aligned. The ``{ }`` block scopes _g/_t (and the per-element
+        # epilogue temps) per RegStore.
+        lines = [f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;"]
+        lines += [f"{pad}  {ln}" for ln in pre]
         vec2 = {"f16": "__half2", "bf16": "__nv_bfloat162", "f32": "float2"}.get(dst_dt)
         if vec2 is not None:
             packer = {"f16": "__floats2half2_rn", "bf16": "__floats2bfloat162_rn", "f32": "make_float2"}[dst_dt]
             lo = f"{flat} + _g * {ldm} + _t * 2"
             hi = f"{flat} + (_g + 8) * {ldm} + _t * 2"
-            return [
-                f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
-                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{lo}]) = {packer}({self.frag}[0], {self.frag}[1]);",
-                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{hi}]) = {packer}({self.frag}[2], {self.frag}[3]); }}",
+            lines += [
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{lo}]) = {packer}({vals[0]}, {vals[1]});",
+                f"{pad}  *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{hi}]) = {packer}({vals[2]}, {vals[3]}); }}",
             ]
+            return lines
         # Fallback: per-element scalar stores (dtypes without a 2-vector packer).
-        return [
-            f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;",
-            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {self.frag}[0];",
-            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {self.frag}[1];",
-            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {self.frag}[2];",
-            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {self.frag}[3]; }}",
+        lines += [
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 0] = {vals[0]};",
+            f"{pad}  {self.dst_buffer}[{flat} + _g * {ldm} + _t * 2 + 1] = {vals[1]};",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 0] = {vals[2]};",
+            f"{pad}  {self.dst_buffer}[{flat} + (_g + 8) * {ldm} + _t * 2 + 1] = {vals[3]}; }}",
         ]
+        return lines
+
+
+def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int:
+    """Row-major element stride of ``buffer``'s dim ``dim`` — the product of
+    the trailing extents. Used by the fragment-epilogue render to apply a
+    fragment element's row / col motion on an operand dim at that operand's
+    own layout (a transposed residual's "n" dim strides by its row width,
+    not by 1)."""
+    shape = ctx.shapes.get(buffer)
+    if shape is None:
+        raise ValueError(f"RegStore epilogue: buffer {buffer!r} not in ctx.shapes (no shape registered)")
+    stride = 1
+    for ext in shape[dim + 1 :]:
+        stride *= ext.as_static() if hasattr(ext, "as_static") else int(ext)
+    return stride
 
 
 def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int:
@@ -1182,10 +1310,26 @@ def _(s: MmaSyncPtx, rename, sigma, axis_fn):
 
 @_rewrite.register
 def _(s: RegStore, rename, sigma, axis_fn):
+    # The epilogue's chain SSA names are render-local (scoped per element
+    # inside the store's block), so only the load index Exprs σ-substitute —
+    # that threads the per-cell replication offsets through, exactly like
+    # ``dst_index``.
+    epilogue = s.epilogue
+    if epilogue is not None:
+        epilogue = RegEpilogue(
+            acc=epilogue.acc,
+            loads=tuple(
+                EpilogueLoad(name=ld.name, buffer=ld.buffer, index=tuple(sigma.apply(e) for e in ld.index), roles=ld.roles)
+                for ld in epilogue.loads
+            ),
+            ops=epilogue.ops,
+            result=epilogue.result,
+        )
     return RegStore(
         dst_buffer=s.dst_buffer,
         dst_index=tuple(sigma.apply(e) for e in s.dst_index),
         frag=rename(s.frag),
         shape=s.shape,
         ldm=s.ldm,
+        epilogue=epilogue,
     )
