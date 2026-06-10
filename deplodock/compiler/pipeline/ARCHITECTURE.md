@@ -110,24 +110,27 @@ explicit `DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scal
 sidestep it). No variant is scored or materialized to rank it — the prior featurizes the row knobs directly
 (`knob.knob_features`).
 
-**Demoted-matmul split (`UNFUSE`).** A fused computed-operand cone (the gated-MLP norm prologue, an
-elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments from staged smem and a
-computed A operand has no buffer to stage, so `is_atom_eligible` never passes on the fused body. When the
-*clean* gemm would actually reach the warp tier (`_split_demoted.try_split_demoted`: `MMA` mode on, sm_90+
-or a `DEPLODOCK_MMA` pin, and `is_atom_eligible` passing on the rebuilt consumer), the planner offers a
-structural sibling option next to the fused tree: `[fused tree, OptionFork(Graph, {UNFUSE: True})]` — a
-two-kernel fragment with a producer materializing the cone to an `xn` intermediate (operand dtype; carries
-the cone's prologue deps, e.g. the norm's row-stat reduce) and the consumer gemm loading `xn` under the cone
-root's SSA name (the multiply and epilogue are untouched). Both re-enter the planner as ordinary LoopOps —
-the gemm is clean (warp rows enumerate), the producer has no matmul reduce — so the split branch terminates
-structurally, like the fused branch's TileOp rebind does. The split decision lives HERE, not as a fusion
-guard: by partition time the fused body is final, so the demotion is visible order-independently (decomposed
-chains assemble the matmul multiply-last — no standalone node is ever eligible mid-fusion), and only this
-tier knows whether the clean gemm reaches the warp tier. Under `tune` the fork is explored inside the op's
-slice (017-style: both kernels' costs sum into the op's reward; first-class slices come with
-`plans/structural-forks-in-two-level.md`). The split builder bails to `None` — fused stays the only outcome —
-on anything it doesn't fully understand: multiple K loops, a multiply with zero/two computed sides, accums
-with different cones, cone values escaping past the multiply, an N-indexed cone, symbolic extents.
+**Demoted-matmul split (`SPLIT_CONE`, rule `005_split_demoted`).** A fused computed-operand cone (the
+gated-MLP norm prologue, an elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments
+from staged smem and a computed A operand has no buffer to stage, so `is_atom_eligible` never passes on the
+fused body. Rule `005_split_demoted` (its own pass unit, running before partition so the body is still
+un-tiled) offers a structural fork: `[OptionFork(keep-fused, {SPLIT_CONE: False}), OptionFork(Graph,
+{SPLIT_CONE: True})]` — the split is a two-kernel fragment with a producer materializing the cone to an `xn`
+intermediate (operand dtype; carries the cone's prologue deps, e.g. the norm's row-stat reduce) and the
+consumer gemm loading `xn` under the cone root's SSA name (the multiply and epilogue are untouched). Both
+re-enter the planner as ordinary LoopOps with their own fork trees. The offer is gated ONLY on the cut's
+well-formedness (`_split_demoted.try_split_demoted` bails on multiple K loops, a multiply with zero/two
+computed sides, accums with different cones, escaping cone values, N-indexed cones, symbolic extents) —
+deliberately NOT on a predicted tier for the clean gemm: profitability is the search's question (an earlier
+eligibility-simulating gate immediately drifted from what the cell tagger accepts). The tuner measures both
+branches inside the op's slice (017-style: both kernels' costs sum into the op's reward; first-class slices
+come with `plans/structural-forks-in-two-level.md`); greedy never picks the structural option (see
+`Pipeline.run` above). The split decision lives in the tile phase, not as a fusion guard: by partition time
+the fused body is final, so the demotion is visible order-independently (decomposed chains assemble the
+matmul multiply-last — no standalone node is ever eligible mid-fusion). Idempotence: the rule stamps a
+`tile.split_cone.offered` node hint before forking — a multi-site batch otherwise re-offers combinatorially
+in fork children (measured); a node may still be offered once per sibling branch of an earlier fork point,
+the intended cross-product of independent decisions.
 
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
@@ -302,7 +305,7 @@ three entry points:
   compile via `GreedySearch` (flattens each fork point to its complete leaves and
   picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
   once trained). Stops at the first terminal candidate. **Structural options are
-  never the greedy pick**: a leaf wrapping a `Graph` splice (the `UNFUSE` split,
+  never the greedy pick**: a leaf wrapping a `Graph` splice (the `SPLIT_CONE` split,
   017's atomic-free combine) is filtered out whenever an in-place `Op` variant
   exists — the per-op prior prices one kernel's knob row, so its score for a
   multi-kernel Graph option is noise. `tune` explores them; an env pin makes the
@@ -630,7 +633,7 @@ incompatible divisibility still get a sensible default.
 | `PIPELINE_STAGES`    | BOOL      | `080_pipeline_stages`         | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `WARPSPEC`           | BOOL      | `085_warp_specialize`         | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `RING=2` on the warp tier to keep it eligible). Eligibility also requires the bundle be **reachable by the producer split** — `_split_by_role` recurses only through `serial_outer` / `RegisterTile` / `AtomTile`, so a bundle under any other wrapper (e.g. the fused linear+mean kernel's `SerialTile(kind='plain')` fragment loop) would strand the TMA issues in the consumer branch and deadlock every consumer `mbarrier.wait` (the Qwen3 `k_linear_mean_reduce` hang — `plans/qwen3-embedding-tune-hung-kernel.md`); such shapes stamp WS=False. Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is **emitted first** for the warp tier (option-0), the deterministic tie-break the cold picker takes when the prior ties WS=0/WS=1 (the `AnalyticPrior` has no WARPSPEC feature), so it deploys the win cold instead of taking WS=0 and never benching WS=1 (the fp16 cliff in `plans/golden-sweep-report.md`). `DEPLODOCK_WARP_SPECIALIZE` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `NOATOMIC`           | BOOL      | `017_atomic_free_splitk`      | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). `DEPLODOCK_ATOMIC_FREE_SPLITK` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `UNFUSE`             | BOOL      | `010_partition_loops`         | Split a warp-tier-demoted matmul (fused computed-operand cone — gated-MLP norm, elementwise scale) into an `xn` producer + the clean gemm (see the demoted-matmul split section above). Search-layer identity only: it rides `OptionFork.knobs`, never `op.knobs` (no `op_cache_key` churn), and deliberately declares no `off=` value — `_off_fill_pass` would stamp an off-default onto every knob-bearing TileOp at the pass boundary and change every tile-dialect cache key. `DEPLODOCK_UNFUSE=1/0` pins the branch.                                                                                                |
+| `SPLIT_CONE`         | BOOL      | `005_split_demoted`           | Split a demoted matmul (fused computed-operand cone — gated-MLP norm, elementwise scale) into an `xn` producer + the clean gemm (see the demoted-matmul split section above). Search-layer identity only: it rides `OptionFork.knobs`, never `op.knobs` (no `op_cache_key` churn), and deliberately declares no `off=` value — `_off_fill_pass` would stamp an off-default onto every knob-bearing TileOp at the pass boundary and change every tile-dialect cache key. `DEPLODOCK_SPLIT_CONE=1/0` pins the branch.                                                                                                |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered

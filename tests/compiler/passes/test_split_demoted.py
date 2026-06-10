@@ -1,10 +1,12 @@
-"""Tests for the demoted-matmul split (``lowering/tile/_split_demoted`` + the
-``UNFUSE`` fork option in ``010_partition_loops``).
+"""Tests for the demoted-matmul split (``lowering/tile/005_split_demoted`` + the
+``_split_demoted`` cut builder).
 
 A fused computed-operand cone (gated-MLP norm prologue, elementwise scale) keeps a matmul
-off the warp tier; the planner offers a structural fork splitting the kernel into an ``xn``
-producer + the clean gemm. Covers: the split builder's offered / not-offered gates, the
-fragment's structure, the partition rewrite's option list (fused first), ``DEPLODOCK_UNFUSE``
+off the warp tier; rule 005 offers a structural fork splitting the kernel into an ``xn``
+producer + the clean gemm before partition tiles anything. The offer is gated only on the
+cut's WELL-FORMEDNESS (signal-driven design: profitability is the tuner's question, never a
+predicate's). Covers: offered / not-offered cuttability gates, the fragment's structure,
+the rule's option list (fused first) + the offered-marker idempotence, ``DEPLODOCK_SPLIT_CONE``
 pinning, greedy never picking the structural option (compile keeps today's kernel sets),
 tune exploring both branches, no-GPU numpy accuracy of the spliced graph, and CUDA accuracy
 of both the scalar-tier and mma.sync split paths.
@@ -26,16 +28,16 @@ from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileOp
-from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, TILE_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.fork import Fork, OptionFork
+from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, TILE_PASSES, Pipeline, RuleSkipped, TuningSearch
+from deplodock.compiler.pipeline.fork import OptionFork
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile._split_demoted import try_split_demoted
 from deplodock.compiler.pipeline.search.db import SearchDB
 
 from ..conftest import requires_cuda
 
-partition = importlib.import_module(
-    "deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops",
+split_rule = importlib.import_module(
+    "deplodock.compiler.pipeline.passes.lowering.tile.005_split_demoted",
 )
 
 _S, _H, _I = 32, 1024, 3072
@@ -43,8 +45,9 @@ _S, _H, _I = 32, 1024, 3072
 
 @pytest.fixture(autouse=True)
 def _force_sm120(monkeypatch, tmp_path):
-    """sm_120 target (auto-mma enumerates) + an isolated, untrained prior so
-    greedy picks are deterministic regardless of the host's checkpoint."""
+    """sm_120 target (auto-mma enumerates for the split gemm) + an isolated,
+    untrained prior so greedy picks are deterministic regardless of the host's
+    checkpoint."""
     monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
     target_mod.set_target((12, 0))
     yield
@@ -98,7 +101,7 @@ def _split(graph_or_fused: Graph, cc=(12, 0)) -> Graph | None:
 
 
 # ---------------------------------------------------------------------------
-# The split builder: offered / not offered
+# The cut builder: well-formedness gates (no profitability prediction)
 # ---------------------------------------------------------------------------
 
 
@@ -116,7 +119,8 @@ def test_split_offered_for_prologue_demotion() -> None:
     assert tuple(d.as_static() for d in xn.output.shape) == (_S, _H)
     assert xn.output.dtype == _dt.get("f16")
     assert xn.op.name.endswith("_xn")
-    # Consumer: loads xn + the weight, and is genuinely warp-tier eligible.
+    # Consumer: loads xn + the weight; the rebuilt gemm is genuinely clean —
+    # warp-tier eligible (informational here, NOT a gate the builder applies).
     assert xn.id in mm.inputs
     ctx = Context.from_target((12, 0))
     assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
@@ -133,25 +137,10 @@ def test_split_offered_for_in_cell_cone() -> None:
     assert sum(1 for n in frag.nodes.values() if isinstance(n.op, LoopOp)) == 2
 
 
-def test_no_split_for_f32() -> None:
-    """The atom registry is f16/bf16-only — an f32 twin never reaches the warp
-    tier, so splitting buys nothing."""
-    assert _split(_fuse(_norm_linear_graph("f32"))) is None
-
-
-def test_no_split_below_sm90_without_pin(monkeypatch) -> None:
-    """Auto-enumerated mma.sync is Hopper+; on sm_80 the split is offered only
-    under an explicit DEPLODOCK_MMA pin (mirrors the planner's warp-row gate)."""
-    target_mod.set_target((8, 0))
-    fused = _fuse(_norm_linear_graph(), cc=(8, 0))
-    assert _split(fused, cc=(8, 0)) is None
-    monkeypatch.setenv("DEPLODOCK_MMA", next(iter(ATOM_REGISTRY)))
-    assert _split(fused, cc=(8, 0)) is not None
-
-
-def test_no_split_with_mma_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    assert _split(_fuse(_norm_linear_graph())) is None
+def test_split_offered_for_f32_too() -> None:
+    """Signal-driven: the builder checks cuttability only — no dtype / device /
+    tier prediction. Whether an f32 split pays is the tuner's question."""
+    assert _split(_fuse(_norm_linear_graph("f32"))) is not None
 
 
 def test_no_split_when_cone_escapes() -> None:
@@ -197,7 +186,7 @@ def test_no_split_when_cone_escapes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The partition rewrite: option list + pins
+# The 005 rule: option list, marker idempotence, pins
 # ---------------------------------------------------------------------------
 
 
@@ -206,32 +195,56 @@ class _StubMatch:
         self.graph = graph
 
 
-def _partition_rewrite(fused: Graph, cc=(12, 0)):
+def _rule_rewrite(fused: Graph, cc=(12, 0)):
     node = _fused_loop_node(fused)
-    return partition.rewrite(Context.from_target(cc), node, _StubMatch(fused))
+    return split_rule.rewrite(Context.from_target(cc), _StubMatch(fused), node)
 
 
-def test_partition_offers_fused_first_then_split() -> None:
-    options = _partition_rewrite(_fuse(_norm_linear_graph()))
+def test_rule_offers_fused_first_then_split() -> None:
+    fused = _fuse(_norm_linear_graph())
+    node = _fused_loop_node(fused)
+    options = _rule_rewrite(fused)
     assert isinstance(options, list) and len(options) == 2
-    fused_opt, split_opt = options
-    # Fused FIRST — the greedy cold pick keeps today's kernel sets.
-    assert isinstance(fused_opt, (Fork, TileOp)) and not isinstance(fused_opt, OptionFork)
-    assert isinstance(split_opt, OptionFork)
-    assert split_opt.knobs == {partition.UNFUSE.name: True}
-    assert isinstance(split_opt.option, Graph)
+    keep, split = options
+    # Fused FIRST — the greedy cold pick keeps today's kernel sets. The
+    # keep-fused option is a no-op rebind of the very same op object.
+    assert isinstance(keep, OptionFork) and keep.option is node.op
+    assert keep.knobs == {split_rule.SPLIT_CONE.name: False}
+    assert isinstance(split, OptionFork) and isinstance(split.option, Graph)
+    assert split.knobs == {split_rule.SPLIT_CONE.name: True}
+    # The offered-marker is stamped so batch re-enumeration in fork children
+    # doesn't re-offer (multi-site graphs compound combinatorially otherwise).
+    assert node.hints.get(split_rule._OFFERED_HINT) is True
 
 
-def test_partition_no_split_for_f32() -> None:
-    result = _partition_rewrite(_fuse(_norm_linear_graph("f32")))
-    assert not isinstance(result, list), "f32 keeps today's single fused outcome"
+def test_rule_marker_skips_reoffer() -> None:
+    fused = _fuse(_norm_linear_graph())
+    _rule_rewrite(fused)  # first call offers + stamps
+    with pytest.raises(RuleSkipped, match="already offered"):
+        _rule_rewrite(fused)
 
 
-def test_pin_unfuse_forces_each_branch(monkeypatch) -> None:
-    monkeypatch.setenv("DEPLODOCK_UNFUSE", "1")
-    assert isinstance(_partition_rewrite(_fuse(_norm_linear_graph())), Graph)
-    monkeypatch.setenv("DEPLODOCK_UNFUSE", "0")
-    assert not isinstance(_partition_rewrite(_fuse(_norm_linear_graph())), (list, Graph))
+def test_rule_skips_uncuttable() -> None:
+    # A pure matmul (no cone) is not cuttable — the rule skips, no marker.
+    g = Graph()
+    f16 = _dt.get("f16")
+    g.add_node(InputOp(), [], Tensor("x", (128, 128), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("w", (128, 128), f16), node_id="w")
+    g.add_node(MatmulOp(), ["x", "w"], Tensor("o", (128, 128), f16), node_id="o")
+    g.inputs = ["x", "w"]
+    g.outputs = ["o"]
+    pure = _fuse(g)
+    with pytest.raises(RuleSkipped, match="not a cuttable"):
+        _rule_rewrite(pure)
+    assert not _fused_loop_node(pure).hints.get(split_rule._OFFERED_HINT)
+
+
+def test_pin_split_cone_forces_each_branch(monkeypatch) -> None:
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    assert isinstance(_rule_rewrite(_fuse(_norm_linear_graph())), Graph)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")
+    with pytest.raises(RuleSkipped, match="pinned off"):
+        _rule_rewrite(_fuse(_norm_linear_graph()))
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +263,11 @@ def test_greedy_compile_keeps_fused_kernel() -> None:
     assert len(_lowered_kernel_ids(out)) == 1, "greedy must never pick the structural split"
 
 
-def test_pinned_unfuse_lowers_two_kernels(monkeypatch) -> None:
+def test_pinned_split_lowers_two_kernels(monkeypatch) -> None:
     # WM=WN=1 prunes the warp rows (single-warp mma is unservable), keeping the
     # gemm on the scalar tier — the mma materializer can't lower the
     # Linear-derived transposed-B operand yet (pre-existing; see PR notes).
-    monkeypatch.setenv("DEPLODOCK_UNFUSE", "1")
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     monkeypatch.setenv("DEPLODOCK_WM", "1")
     monkeypatch.setenv("DEPLODOCK_WN", "1")
     out = Pipeline.build(CUDA_PASSES).run(_norm_linear_graph(), ctx=Context.from_target((12, 0)), db=SearchDB())
@@ -272,20 +285,20 @@ def test_tune_explores_fused_and_split_terminals(monkeypatch) -> None:
     """Through TILE_PASSES (no render — keeps the test off the kernel/cuda
     stages) the tuning search reaches terminals on both sides of the fork:
     one-kernel (fused) and two-kernel (split) tile graphs. Knob pins shrink
-    the variant space so the full drain stays fast."""
+    the variant space; the loop early-exits once both kinds are seen."""
     for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    terminals = list(
-        Pipeline.build(TILE_PASSES).tune(
-            _norm_linear_graph(),
-            search=TuningSearch(patience=10**6),
-            ctx=Context.from_target((12, 0)),
-            db=SearchDB(),
-        )
-    )
-    sizes = sorted(sum(1 for n in t.graph.nodes.values() if isinstance(n.op, TileOp)) for t in terminals)
-    assert 1 in sizes, "the fused branch must reach a terminal"
-    assert 2 in sizes, "the split branch must reach a terminal"
+    seen: set[int] = set()
+    for t in Pipeline.build(TILE_PASSES).tune(
+        _norm_linear_graph(),
+        search=TuningSearch(patience=10**6),
+        ctx=Context.from_target((12, 0)),
+        db=SearchDB(),
+    ):
+        seen.add(sum(1 for n in t.graph.nodes.values() if isinstance(n.op, TileOp)))
+        if {1, 2} <= seen:
+            break
+    assert {1, 2} <= seen, f"both fused (1-kernel) and split (2-kernel) terminals must appear, saw {seen}"
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +349,7 @@ def test_split_scalar_accuracy_cuda(monkeypatch) -> None:
     from deplodock.compiler.backend.numpy import NumpyBackend
 
     target_mod.set_target(None)  # live device
-    monkeypatch.setenv("DEPLODOCK_UNFUSE", "1")
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     monkeypatch.setenv("DEPLODOCK_WM", "1")
     monkeypatch.setenv("DEPLODOCK_WN", "1")
     rng = np.random.default_rng(0)
@@ -360,7 +373,7 @@ def test_split_mma_accuracy_cuda(monkeypatch) -> None:
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     target_mod.set_target(None)
-    for k, v in {"UNFUSE": "1", "MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "4", "FN": "8", "BK": "2"}.items():
+    for k, v in {"SPLIT_CONE": "1", "MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "4", "FN": "8", "BK": "2"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     M, K, N = 128, 128, 128
     rng = np.random.default_rng(0)

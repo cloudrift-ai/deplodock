@@ -75,7 +75,7 @@ tests/
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
 │   │   ├── test_lowering_blocked_gemm.py       # FN > 1 matmul accuracy (per-cell + replicator)
 │   │   ├── test_knob_pinning.py                # DEPLODOCK_KNOBS regression configs
-│   │   ├── test_split_demoted.py               # demoted-matmul split (UNFUSE fork) + accuracy
+│   │   ├── test_split_demoted.py               # demoted-matmul split (SPLIT_CONE fork) + accuracy
 │   │   ├── test_tile_naming.py                 # provenance-driven kernel naming
 │   │   └── test_pipeline_semantics.py          # full pass chain vs numpy
 │   ├── pipeline/                       # pipeline-level tests (knob, dump, rule_diff)

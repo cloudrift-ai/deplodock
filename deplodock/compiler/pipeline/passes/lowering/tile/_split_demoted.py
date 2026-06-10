@@ -8,26 +8,25 @@ fragments from staged smem, and a computed operand has no buffer to stage
 demotion is visible order-independently — which is why this lives here and not as a fusion
 guard: only this tier knows whether the clean matmul would actually reach the warp tier.
 
-:func:`try_split_demoted` inspects a ``LoopOp`` and, when profitable, builds a two-kernel
-``Graph`` fragment ``010_partition_loops`` offers as a structural fork option:
+:func:`try_split_demoted` inspects a ``LoopOp`` and, when the cut is expressible, builds a
+two-kernel ``Graph`` fragment ``005_split_demoted`` offers as a structural fork option:
 
 - **producer** — computes the cone for every ``(row, k)`` and writes an ``xn`` intermediate
-  (operand dtype, so the gemm's loads stay atom-eligible). It carries the cone's prologue
-  dependencies too (e.g. the norm's row-stat reduce), nested back at row level.
+  (operand dtype, so the gemm's loads keep their tier eligibility). It carries the cone's
+  prologue dependencies too (e.g. the norm's row-stat reduce), nested back at row level.
 - **consumer** — the original kernel with the cone replaced by ``Load xn[row, k]`` (reusing
   the cone root's SSA name, so the multiply and everything downstream are untouched).
 
-The split is offered only when the clean consumer would actually enumerate warp rows: the
-``MMA`` knob on, sm_90+ (or an explicit ``DEPLODOCK_MMA`` pin), and ``is_atom_eligible``
-passing on the rebuilt consumer — splitting buys ~nothing when the gemm stays scalar.
-Conservative bails (return ``None``, never raise) keep the fused path the default for any
-shape the cut doesn't fully understand: multiple K loops, a multiply with zero or two
-computed sides, accums with different cones, cone values escaping past the multiply,
-symbolic extents, or a cone indexed by the output N axis.
-
-No re-match marker is needed: the fused branch rebinds the root to a ``TileOp`` (pattern no
-longer matches) and the split branch replaces it with two clean LoopOps — the consumer has
-no cone (not demoted) and the producer has no matmul reduce, so neither re-splits.
+The checks here are the cut's own WELL-FORMEDNESS conditions, not a profitability gate:
+this module deliberately does not predict whether the clean gemm will reach the warp tier
+(an earlier version simulated ``is_atom_eligible`` on the rebuilt consumer and immediately
+drifted from what the cell tagger actually accepts). Whether the split pays is the search's
+question — the tuner measures both branches, greedy never picks the structural option
+(``policy/greedy._is_structural``), and a lowering failure on either side must surface as a
+rejection. Conservative bails (return ``None``, never raise) keep the fused path the only
+outcome for any shape the cut doesn't fully understand: multiple K loops, a multiply with
+zero or two computed sides, accums with different cones, cone values escaping past the
+multiply, symbolic extents, or a cone indexed by the output N axis.
 """
 
 from __future__ import annotations
@@ -41,9 +40,6 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
-from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
-from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import mma_mode
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import collect_invariant_names, is_matmul_reduce
 
 if TYPE_CHECKING:
@@ -52,15 +48,7 @@ if TYPE_CHECKING:
 
 def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: str, out_tensor: Tensor) -> Graph | None:
     """Build the producer+consumer split fragment for a demoted matmul ``LoopOp``,
-    or ``None`` when the kernel isn't a profitable, cleanly-cuttable demotion."""
-    mma_on, pinned_atom = mma_mode()
-    if not mma_on:
-        return None
-    if pinned_atom not in ATOM_REGISTRY and ctx.compute_capability < (9, 0):
-        # Auto-enumerated mma.sync needs the Hopper+ swizzled-TMA fast path
-        # (mirrors the 010 planner gate); a DEPLODOCK_MMA pin is authoritative.
-        return None
-
+    or ``None`` when the body isn't a cleanly-cuttable demotion."""
     cut = _classify_cut(loop_op)
     if cut is None:
         return None
@@ -218,9 +206,6 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     frag.add_node(producer_op, list(producer_op.inputs), Tensor(xn_id, xn_shape, weight_dtype), node_id=xn_id)
     frag.add_node(consumer_op, list(consumer_op.inputs), Tensor(out_tensor.name, out_tensor.shape, out_tensor.dtype), node_id=cons_id)
     frag.outputs = [cons_id]
-
-    if not any(is_atom_eligible(atom, consumer_op, ctx, graph=frag) for atom in ATOM_REGISTRY.values()):
-        return None
 
     # Both new bodies differ from the fused one — restamp the structural
     # identity (992 ran at fusion end and never re-runs; stale S_* would make

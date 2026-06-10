@@ -124,7 +124,7 @@ class GreedySearch(Search):
         # candidate set, invariant to how the tree's levels are arranged.
         leaves = _leaves(cands)
         # Structural options (Graph splices that change the kernel set — the
-        # demoted-matmul split in ``lowering/tile/010_partition_loops``, 017's
+        # demoted-matmul split in ``lowering/tile/005_split_demoted``, 017's
         # atomic-free combine) are never greedy-picked while an in-place Op
         # variant exists: the per-op prior prices ONE kernel's knob row, so its
         # score for a multi-kernel Graph option is meaningless and the "pick"
