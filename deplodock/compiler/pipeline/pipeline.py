@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.pipeline.fork import OptionFork
+from deplodock.compiler.pipeline.fork import Fork, OptionFork
 from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
@@ -703,7 +703,33 @@ class Run:
                 # op-variant. The flag rides ``Search.push`` so policies can
                 # treat kernel-set decisions specially.
                 structural = any(_is_structural_option(o) for o in options)
-                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
+                memo_key: tuple[str, str] | None = None
+                if structural:
+                    # Structural decisions memoize per ``(rule, op_cache_key)``
+                    # within a trajectory: a structurally identical offer site
+                    # seen again on this path takes the same side inline (no
+                    # fork), so the search tree stays linear in *unique*
+                    # kernels instead of ``2^sites`` (e.g. one decision for 28
+                    # identical per-layer splits). Sibling branches keep
+                    # independent memos — each resolve copies the dict.
+                    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+
+                    key = op_cache_key(match.root.op)
+                    memo_key = (match.rule.name, key) if key is not None else None
+                    decided = cand.structural_memo.get(memo_key) if memo_key is not None else None
+                    if decided is not None and (chosen := _concrete_option(options[decided])) is not None:
+                        cand.apply(match, chosen)
+                        continue
+                forks = [
+                    LazyCandidate.from_option(
+                        inner=cand,
+                        cursor=replace(cur),
+                        match=match,
+                        option=opt,
+                        memo=(*memo_key, i) if memo_key is not None else None,
+                    )
+                    for i, opt in enumerate(options)
+                ]
                 break
 
             if forks is not None:
@@ -724,6 +750,17 @@ def _is_structural_option(option: object) -> bool:
     planner (all ``TileOp`` leaves), and typing it would require ``expand()`` —
     the body-normalizing build the lazy tree exists to avoid."""
     return isinstance(option, Graph) or (isinstance(option, OptionFork) and isinstance(option.option, Graph))
+
+
+def _concrete_option(option: object) -> object | None:
+    """Unwrap one raw rewrite option to the concrete ``Op`` / ``Graph`` a
+    memo-replayed structural decision can apply inline: leaf Forks fire their
+    single-element thunk, concrete options pass through, and a *branch* Fork
+    returns ``None`` (un-applyable without a full expand — the caller falls
+    back to forking normally; no structural branch Fork exists today)."""
+    if isinstance(option, Fork):
+        return option.expand()[0] if option.is_leaf else None
+    return option
 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:

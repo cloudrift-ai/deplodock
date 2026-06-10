@@ -13,7 +13,7 @@ copy the inner's graph once, replay ``pending`` through
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Tensor, _fmt_op
@@ -51,6 +51,15 @@ class Candidate:
     run: Run
     graph: Graph
     cursor: Cursor
+    # Per-trajectory memo of structural-fork decisions: ``(rule_name,
+    # op_cache_key) → option index``. Recorded when a structural fork's
+    # sibling resolves (see ``LazyCandidate.memo``) and consulted by
+    # ``Run.drive`` so a structurally identical offer site later in the SAME
+    # trajectory takes the same side inline instead of forking again — the
+    # outer tree stays linear in *unique* kernels instead of ``2^sites``
+    # (``plans/structural-forks-in-two-level.md`` step 2). Copied per resolve,
+    # so sibling branches keep independent decisions.
+    structural_memo: dict[tuple[str, str], int] = field(default_factory=dict)
 
     @property
     def ctx(self) -> Context:
@@ -230,9 +239,17 @@ class LazyCandidate:
     inner: Candidate
     cursor: Cursor
     pending: tuple[Match, Fork] | None
+    # Structural-fork decision to record on resolve: ``(rule_name,
+    # op_cache_key, option_index)``. Set by ``Run.drive`` on the siblings of a
+    # structural fork; :meth:`resolve` stamps it into the resolved candidate's
+    # ``structural_memo`` so identical later offer sites in the same
+    # trajectory take this side inline. ``None`` for op-variant forks.
+    memo: tuple[str, str, int] | None = None
 
     @classmethod
-    def from_option(cls, *, inner: Candidate, cursor: Cursor, match: Match, option: Op | Graph | Fork) -> LazyCandidate:
+    def from_option(
+        cls, *, inner: Candidate, cursor: Cursor, match: Match, option: Op | Graph | Fork, memo: tuple[str, str, int] | None = None
+    ) -> LazyCandidate:
         """The single fork-spawn constructor (used by ``Pipeline.search``
         and :meth:`expand`): a rule-emitted ``Fork`` passes through; a
         concrete ``Op`` / ``Graph`` (already validated upstream in
@@ -241,7 +258,7 @@ class LazyCandidate:
         if not isinstance(option, Fork):
             knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
             option = OptionFork(option=option, knobs=knobs)
-        return cls(inner=inner, cursor=cursor, pending=(match, option))
+        return cls(inner=inner, cursor=cursor, pending=(match, option), memo=memo)
 
     def is_expandable(self) -> bool:
         """``True`` iff ``pending`` carries a *branch* :class:`Fork` —
@@ -292,8 +309,13 @@ class LazyCandidate:
         leaves = fork.expand()
         assert len(leaves) == 1, f"leaf Fork must expand to a single option, got {len(leaves)}"
         option = leaves[0]
-        resolved = Candidate(run=self.inner.run, graph=self.inner.graph.copy(), cursor=self.cursor)
+        resolved = Candidate(
+            run=self.inner.run, graph=self.inner.graph.copy(), cursor=self.cursor, structural_memo=dict(self.inner.structural_memo)
+        )
         resolved.apply(match.remap(resolved.graph), option)
+        if self.memo is not None:
+            rule_name, op_key, idx = self.memo
+            resolved.structural_memo[(rule_name, op_key)] = idx
         self.pending = None
         self.inner = resolved
         return resolved

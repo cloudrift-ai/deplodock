@@ -15,18 +15,19 @@ from __future__ import annotations
 
 import pytest
 
+from deplodock.compiler import dtype as _dt
 from deplodock.compiler.backend.base import BenchmarkResult, LaunchTime
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
+from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.pipeline.search.two_level import LOWERING_PASSES, inner_reward, run_two_level_tune
+from deplodock.compiler.pipeline.search.two_level import LOWERING_PASSES, inner_reward, outer_pipeline, run_two_level_tune
 
 # Moderate patience: each kernel explores several variants then stops on
 # stagnation (the fake backend gives a stable but arbitrary per-variant
@@ -36,9 +37,13 @@ _PATIENCE = 8
 
 
 @pytest.fixture(autouse=True)
-def _force_target():
+def _force_target(monkeypatch, tmp_path):
     from deplodock.compiler import target as target_mod
 
+    # Isolate the learned-prior checkpoint: ``run_two_level_tune`` trains and
+    # checkpoints the global prior, and these fake-backend rows must never
+    # pollute the host's real ``~/.cache/deplodock/prior.json``.
+    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
     target_mod.set_target((8, 0))
     yield
     target_mod.set_target(None)
@@ -219,6 +224,82 @@ def test_inner_reward_shares_identical_kernel() -> None:
     assert reward.per_op[0].multiplicity == 2, "both node positions are counted"
     # Total weights the shared best by its multiplicity — both kernels still cost time.
     assert reward.total_us == pytest.approx(2 * reward.per_op[0].best_us)
+
+
+def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
+    """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
+    keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
+    f16 = _dt.get("f16")
+    g = g if g is not None else Graph()
+    x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
+    g.add_node(InputOp(), [], Tensor(x, (1, 32, 1024), f16), node_id=x)
+    g.add_node(InputOp(), [], Tensor(nw, (1024,), f16), node_id=nw)
+    g.add_node(InputOp(), [], Tensor(wg, (3072, 1024), f16), node_id=wg)
+    g.add_node(RmsNormOp(eps=1e-6), [x, nw], Tensor(xn, (1, 32, 1024), f16), node_id=xn)
+    g.add_node(LinearOp(), [xn, wg], Tensor(o, (1, 32, 3072), f16), node_id=o)
+    g.inputs += [x, nw, wg]
+    g.outputs += [o]
+    return g
+
+
+class _RecordingProgress:
+    """Duck-typed ``TuneProgress``: captures per-terminal op denominators and
+    the tuned op-leaf names."""
+
+    def __init__(self) -> None:
+        self.terminal_sizes: list[int] = []
+        self.ops: list[str] = []
+
+    def start_terminal(self, n_ops: int) -> None:
+        self.terminal_sizes.append(n_ops)
+
+    def op_start(self, name: str) -> None:
+        self.ops.append(name)
+
+    def variant(self, *a, **kw) -> None:  # noqa: ANN002
+        pass
+
+    def op_done(self, name: str) -> None:
+        pass
+
+
+def test_outer_branches_on_structural_fork(monkeypatch) -> None:
+    """The outer drives through the pre-partition tile head: 005's keep-vs-split
+    offer branches the OUTER tree, so both kernel sets appear as outer terminals
+    and the split producer/consumer are their own tuned op leaves (own progress
+    denominator), not sub-explorations inside the fused kernel's slice."""
+    from deplodock.compiler import target as target_mod
+
+    for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    target_mod.set_target((12, 0))
+    progress = _RecordingProgress()
+    result = run_two_level_tune(
+        _norm_linear("a"),
+        ctx=Context.from_target((12, 0)),
+        db=SearchDB(),
+        backend=_CountingBackend(),
+        patience=4,
+        progress=progress,
+    )
+    assert result.n_terminals == 2, "keep-vs-split must branch the outer tree into two terminals"
+    # One terminal carries the fused kernel (1 op leaf), the other the split
+    # producer + consumer (2 op leaves) — the denominators the progress bar sees.
+    assert sorted(progress.terminal_sizes) == [1, 2]
+    assert any(name.endswith("_xn") for name in progress.ops), f"split producer must be its own op leaf, got {progress.ops}"
+
+
+def test_structural_memo_collapses_identical_sites() -> None:
+    """Two structurally identical offer sites take the same side within a
+    trajectory (the per-``(rule, op_cache_key)`` decision memo): the outer tree
+    yields 2 terminals (all-fused, all-split), not the 2^sites cross-product."""
+    g = _norm_linear("b", _norm_linear("a"))
+    terminals = [
+        cand.graph
+        for cand in outer_pipeline().tune(g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
+    ]
+    sizes = sorted(sum(1 for n in t.nodes.values() if isinstance(n.op, LoopOp)) for t in terminals)
+    assert sizes == [2, 4], f"expected all-fused (2 kernels) and all-split (4) terminals only, got {sizes}"
 
 
 def test_run_two_level_tune_single_terminal_assembles_bests() -> None:
