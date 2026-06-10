@@ -2,9 +2,10 @@
 ``_split_demoted`` cut builder).
 
 A fused computed-operand cone (gated-MLP norm prologue, elementwise scale) keeps a matmul
-off the warp tier; rule 005 offers a structural fork splitting the kernel into an ``xn``
-producer + the clean gemm before partition tiles anything — or TWO producers when both
-multiply operands are cones (rotary QK^T). The offer is gated only on the
+off the warp tier; rule 005 offers a structural fork splitting the kernel into ``xn``
+producer(s) + the clean gemm before partition tiles anything — one producer per computed
+multiply operand (rotary QK^T gets two; a weight-side scale's N cone gets a [K, N]
+buffer). The offer is gated only on the
 cut's WELL-FORMEDNESS (signal-driven design: profitability is the tuner's question, never a
 predicate's). Covers: offered / not-offered cuttability gates, the fragment's structure,
 the rule's option list (fused first) + the offered-marker idempotence, ``DEPLODOCK_SPLIT_CONE``
@@ -171,6 +172,35 @@ def test_split_offered_for_f32_too() -> None:
     """Signal-driven: the builder checks cuttability only — no dtype / device /
     tier prediction. Whether an f32 split pays is the tuner's question."""
     assert _split(_fuse(_norm_linear_graph("f32"))) is not None
+
+
+def test_split_offered_for_weight_side_cone() -> None:
+    """An N-reading cone beside a plain Load (a weight-side scale — the
+    dequant shape): one producer materializing at [K, N], consumer warp-tier
+    eligible. Falls out of the unified per-operand rule; the old A-side-only
+    dispatch bailed here."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (128, 128), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("w", (128, 128), f16), node_id="w")
+    g.add_node(InputOp(), [], Tensor("sw", (128, 128), f16), node_id="sw")
+    g.add_node(ElementwiseOp("multiply"), ["w", "sw"], Tensor("ws", (128, 128), f16), node_id="ws")
+    g.add_node(MatmulOp(), ["x", "ws"], Tensor("o", (128, 128), f16), node_id="o")
+    g.inputs = ["x", "w", "sw"]
+    g.outputs = ["o"]
+    fused = _fuse(g)
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    loops = {nid for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
+    assert loops == {f"{node.id}__xn", f"{node.id}__mm"}
+    xn = frag.nodes[f"{node.id}__xn"]
+    # The cone reads (k, n) and no rows — a 2-D [K, N] buffer, K NOT in the
+    # last dim, so the consumer's B load keeps the canonical layout.
+    assert tuple(d.as_static() for d in xn.output.shape) == (128, 128)
+    mm = frag.nodes[f"{node.id}__mm"]
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
 
 
 def test_two_sided_split_offered_for_double_cone() -> None:

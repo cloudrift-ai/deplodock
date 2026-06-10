@@ -2,12 +2,11 @@
 
 Runs before ``010_partition_loops`` so the body is still un-tiled (the only dialect where
 both halves of a split can re-enter planning with their own tilings). This rule owns only
-the OFFER; the cut itself — slicing the computed A-operand cone (with its prologue deps)
-into an ``xn`` producer + the clean gemm, or BOTH cones into two producers when neither
-multiply operand is a plain Load (rotary QK^T; the N-indexed cone materializes at [K, N]
-so the consumer keeps the canonical B layout) — lives in
-``_split_demoted.try_split_demoted``,
-whose checks are the cut's well-formedness conditions, not a profitability prediction.
+the OFFER; the cut itself lives in ``_split_demoted.try_split_demoted`` — one rule, no
+per-shape cases: each multiply operand is independently a plain Load (stays put) or a
+computed cone (becomes an ``xn`` producer materialized over exactly the axes it reads,
+with K second-to-last for an N-reading cone so the consumer keeps the canonical B layout).
+Its checks are the cut's well-formedness conditions, not a profitability prediction.
 Whether the split pays is the search's question: the tuner measures both branches inside
 the op's slice; greedy ``compile`` / ``run`` never pick the structural option while an Op
 variant exists (``policy/greedy._is_structural``), so cold kernel sets are unchanged.

@@ -1,30 +1,36 @@
-"""Demoted-matmul split — un-fuse a computed A-operand cone into its own kernel.
+"""Demoted-matmul split — un-fuse computed multiply-operand cones into producer kernels.
 
 Loop fusion can merge a producer chain INTO a matmul's reduce body (the gated-MLP norm, an
-elementwise scale, softmax stats): the multiply feeding the ``Accum`` then reads a computed
-SSA cone instead of a plain ``Load``, and the warp tier dies — ``ldmatrix`` feeds MMA
-fragments from staged smem, and a computed operand has no buffer to stage
-(``plans/gated-mlp-tensor-cores.md``). By partition time the fused body is final, so the
-demotion is visible order-independently — which is why this lives here and not as a fusion
-guard: only this tier knows whether the clean matmul would actually reach the warp tier.
+elementwise scale, softmax stats, rotary): a multiply operand feeding the ``Accum`` then
+reads a computed SSA cone instead of a plain ``Load``, and the warp tier dies —
+``ldmatrix`` feeds MMA fragments from staged smem, and a computed operand has no buffer to
+stage (``plans/gated-mlp-tensor-cores.md``). By partition time the fused body is final, so
+the demotion is visible order-independently — which is why this lives here and not as a
+fusion guard: only this tier knows whether the clean matmul would actually reach the warp
+tier.
 
 :func:`try_split_demoted` inspects a ``LoopOp`` and, when the cut is expressible, builds a
-``Graph`` fragment ``005_split_demoted`` offers as a structural fork option:
+``Graph`` fragment ``005_split_demoted`` offers as a structural fork option. ONE rule, no
+per-shape cases: each multiply operand is independently a plain ``Load`` (stays put) or a
+computed cone (becomes a producer kernel); every distinct cone materializes an ``xn``
+intermediate over exactly the axes it reads —
 
-- **producer** — computes the cone for every ``(row, k)`` and writes an ``xn`` intermediate
-  (operand dtype, so the gemm's loads keep their tier eligibility). It carries the cone's
-  prologue dependencies too (e.g. the norm's row-stat reduce), nested back at row level.
-- **consumer** — the original kernel with the cone replaced by ``Load xn[row, k]`` (reusing
-  the cone root's SSA name, so the multiply and everything downstream are untouched).
+    ``xn[row axes read…, k]``        (a row cone — the A operand)
+    ``xn[row axes read…, k, n]``     (an N-reading cone — the B operand)
 
-When BOTH multiply operands are computed cones (rotary + QK^T: rotary chains on Q and K
-feed the reduce directly, so neither side is a plain ``Load``), the cut generalizes to two
-producers: the cone that avoids the output N axis materializes as ``xn_a[rows…, k]`` (the
-A operand), the N-indexed cone as ``xn_b[rows…, k, n]`` — K deliberately NOT in the last
-index dim, the canonical B layout the cell tagger / stager can serve, so the consumer gemm
-keeps its warp-tier shape even though the original B access was transposed ``[n, k]``. A
-B cone that reads a row axis (the GQA ``head / 2`` shared-KV access) keeps that axis as a
-leading ``xn_b`` dim — duplicated across the sharing heads, simple over minimal.
+— and the consumer is the original kernel with each cone-root def replaced by
+``Load xn[…]`` under the same SSA name, so the multiply and everything downstream are
+untouched. K deliberately lands second-to-last in an N-reading cone's buffer: the original
+access may be transposed ``[n, k]`` (rotary QK^T), which the cell tagger / stager cannot
+serve, but the producer's Write order is ours to choose, so the consumer's B load comes
+out canonical. Each producer carries its cone's prologue dependencies (e.g. the norm's
+row-stat reduce, P@V's softmax stats), nested back at row level, and its ``xn``
+materializes at the cone's own (uniform) leaf-Load dtype — value-preserving, and identical
+to the old "other operand's dtype" rule on every shape seen so far. The familiar shapes
+are instances of the one rule: norm→linear / scale→matmul = one row cone beside a Load;
+SDPA P@V = one row cone with prologue deps; rotary QK^T = a row cone + an N cone (the GQA
+``head / 2`` shared-KV read keeps that row axis as a leading dim — duplicated across the
+sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load.
 
 The checks here are the cut's own WELL-FORMEDNESS conditions, not a profitability gate:
 this module deliberately does not predict whether the clean gemm will reach the warp tier
@@ -33,15 +39,18 @@ drifted from what the cell tagger actually accepts). Whether the split pays is t
 question — the tuner measures both branches, greedy never picks the structural option
 (``policy/greedy._is_structural``), and a lowering failure on either side must surface as a
 rejection. Conservative bails (return ``None``, never raise) keep the fused path the only
-outcome for any shape the cut doesn't fully understand: multiple K loops, a multiply with
-zero or two computed sides, accums with different cones, cone values escaping past the
-multiply, symbolic extents, or a cone indexed by the output N axis.
+outcome for any shape the cut doesn't fully understand: multiple K loops, no computed
+operand, a K-invariant Load operand, accums not sharing one cone set, cones sharing stmts,
+cone values escaping past the multiply, mixed-dtype cone leaves, symbolic extents, or more
+than one cone reading the output N axis (two ``(…, K, N)`` buffers would re-do the
+matmul's own volume — the materialization that defeats the split).
 """
 
 from __future__ import annotations
 
 import importlib
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Tensor
@@ -55,243 +64,144 @@ if TYPE_CHECKING:
     from deplodock.compiler.context import Context
 
 
+@dataclass
+class _Cone:
+    """One computed multiply operand: its backward slice over the three scopes,
+    the axes it reads (recursively, prologue/leading deps included), and the
+    uniform leaf dtype its ``xn`` buffer materializes at."""
+
+    root: str
+    cell_used: set[int]
+    pro_used: set[int]
+    lead_used: set[int]
+    cell_stmts: list[Stmt]
+    pro_stmts: list[Stmt]
+    lead_stmts: list[Stmt]
+    axes: set[str]
+    dtype: object
+
+
 def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: str, out_tensor: Tensor) -> Graph | None:
-    """Build the producer+consumer split fragment for a demoted matmul ``LoopOp``,
-    or ``None`` when the body isn't a cleanly-cuttable demotion."""
+    """Build the producer(s)+consumer split fragment for a demoted matmul
+    ``LoopOp``, or ``None`` when the body isn't a cleanly-cuttable demotion."""
     cut = _classify_cut(loop_op)
     if cut is None:
         return None
     leading, rows, prologue_level, outer_n, k_loop = cut
+    k_name = k_loop.axis.name
+    n_name = outer_n.axis.name
+    row_names = [lp.axis.name for lp in rows]
 
-    # --- locate the computed operand cone(s) ----------------------------------
+    # --- classify each accum's multiply: Load operands stay, cones split out --
     top = tuple(k_loop.body)
     cell_def = {n: s for s in top for n in s.defines()}
     accums = [s for s in top if isinstance(s, Accum)]
     if not accums:
         return None
-    first_mul = cell_def.get(accums[0].value)
-    if (
-        len(accums) == 1
-        and isinstance(first_mul, Assign)
-        and first_mul.op.name == "multiply"
-        and len(first_mul.args) == 2
-        and all(isinstance(cell_def.get(a), Assign) for a in first_mul.args)
-    ):
-        # Both operands computed (rotary QK^T) — the two-producer cut.
-        return _split_two_cones(loop_op, cut, graph=graph, node_id=node_id, out_tensor=out_tensor, mul=first_mul)
-    cone_root: str | None = None
-    weight_dtype = None
+    roots: tuple[str, ...] | None = None
+    mul_ids: set[int] = set()
     for acc in accums:
         mul = cell_def.get(acc.value)
         if not isinstance(mul, Assign) or mul.op.name != "multiply" or len(mul.args) != 2:
             return None
-        arg_defs = [cell_def.get(a) for a in mul.args]
-        load_args = [a for a, d in zip(mul.args, arg_defs, strict=True) if isinstance(d, Load)]
-        cone_args = [a for a, d in zip(mul.args, arg_defs, strict=True) if isinstance(d, Assign)]
-        if len(load_args) != 1 or len(cone_args) != 1:
-            return None  # pure cell (not demoted) or doubly-computed (ambiguous)
-        weight = cell_def[load_args[0]]
-        if k_loop.axis.name not in {v for e in weight.index for v in e.free_vars()}:
-            return None
-        wnode = graph.nodes.get(weight.input)
-        if wnode is None:
-            return None
-        weight_dtype = wnode.output.dtype
-        if cone_root is None:
-            cone_root = cone_args[0]
-        elif cone_root != cone_args[0]:
-            return None  # accums with different cones — no shared operand to materialize
-    assert cone_root is not None
+        mul_ids.add(id(mul))
+        cone_args: dict[str, None] = {}  # ordered de-dup (a squared cone appears twice)
+        for a in mul.args:
+            d = cell_def.get(a)
+            if isinstance(d, Assign):
+                cone_args[a] = None
+            elif isinstance(d, Load):
+                # A Load operand must be the matmul's own K-indexed read — a
+                # K-invariant Load means this multiply isn't the A×B cell.
+                if k_name not in {v for e in d.index for v in e.free_vars()}:
+                    return None
+            else:
+                return None
+        if not cone_args:
+            return None  # pure cell (not demoted)
+        if roots is None:
+            roots = tuple(cone_args)
+        elif set(roots) != set(cone_args):
+            return None  # accums with different cones — no shared operand set to materialize
+    assert roots is not None
 
-    # --- backward-slice the cone over the cell / prologue / leading scopes ---
+    # --- backward-slice each cone over the cell / prologue / leading scopes --
     axis_names = {a.name for a in loop_op.axes}
     pro_def = _prologue_defs(prologue_level)
     lead_def = {n: s for s in leading for n in s.defines()}
-
-    sliced = _slice_cone(cone_root, cell_def=cell_def, pro_def=pro_def, lead_def=lead_def, axis_names=axis_names)
-    if sliced is None:
-        return None
-    cell_used, pro_used, lead_used = sliced
-
-    cell_stmts = [s for s in top if id(s) in cell_used]
-    pro_stmts = [s for s in prologue_level if id(s) in pro_used]
-    lead_stmts = [s for s in leading if id(s) in lead_used]
-    if not cell_stmts:
-        return None  # cone root must live in the cell (a K-invariant operand isn't this pattern)
-
-    # The cone may only address row axes and K — an N-indexed cone would
-    # materialize an (M, N, K) buffer, defeating the split.
-    row_names = [lp.axis.name for lp in rows]
-    allowed = set(row_names) | {k_loop.axis.name}
-    for s in cell_stmts:
-        if isinstance(s, Load) and any(v not in allowed for e in s.index for v in e.free_vars()):
-            return None
-
-    # --- escape check: moved values must die at the multiply -----------------
-    moved_ids = cell_used | pro_used
-    moved_defs: set[str] = set()
-    for s in (*cell_stmts, *pro_stmts):
-        moved_defs |= collect_invariant_names(s)
-    consumers_of_root = {id(cell_def[a.value]) for a in accums}  # the multiplies
-    if not _moved_defs_die_at_cone(Body(loop_op.body), moved_ids, moved_defs, frozenset({cone_root}), consumers_of_root):
-        return None
-
-    # --- build the producer ---------------------------------------------------
-    xn_id = f"{node_id}__xn"
-    row_vars = tuple(Var(n) for n in row_names)
-    k_free = Loop(
-        axis=k_loop.axis,
-        body=Body((*cell_stmts, Write(output=xn_id, index=(*row_vars, Var(k_loop.axis.name)), values=(cone_root,)))),
-    )
-    level: tuple[Stmt, ...] = (*pro_stmts, k_free)
-    for lp in reversed(rows):
-        level = (Loop(axis=lp.axis, body=Body(level)),)
-    producer_op = LoopOp(body=Body((*lead_stmts, *level)))
-    producer_op.name = f"{loop_op.name}_xn" if loop_op.name else ""
-
-    # --- build the consumer ---------------------------------------------------
-    cone_def_stmt = cell_def[cone_root]
-    xn_load = Load(names=(cone_root,), input=xn_id, index=(*row_vars, Var(k_loop.axis.name)))
-    new_top: list[Stmt] = []
-    for s in top:
-        if s is cone_def_stmt:
-            new_top.append(xn_load)
-        elif id(s) in cell_used:
-            continue
-        else:
-            new_top.append(s)
-    new_k_loop = Loop(axis=k_loop.axis, body=Body(tuple(new_top)), unroll=k_loop.unroll)
-    new_outer_n = Loop(
-        axis=outer_n.axis,
-        body=Body(tuple(new_k_loop if s is k_loop else s for s in outer_n.body)),
-        unroll=outer_n.unroll,
-    )
-    level = tuple(new_outer_n if s is outer_n else s for s in prologue_level if id(s) not in pro_used or s is outer_n)
-    for lp in reversed(rows):
-        level = (Loop(axis=lp.axis, body=Body(level)),)
-    cons_id = f"{node_id}__mm"
-    kept_lead = tuple(s for s in leading if id(s) not in lead_used)
-    consumer_op = LoopOp(body=Body((*kept_lead, *level)))
-    consumer_op = _rename_write_output(consumer_op, old=node_id, new=cons_id)
-    consumer_op.name = loop_op.name
-    consumer_op = _drop_dangling_leads(consumer_op, kept_lead)
-
-    # --- assemble the fragment -------------------------------------------------
-    xn_shape = tuple(lp.axis.extent.as_static() for lp in rows) + (k_loop.axis.extent.as_static(),)
-    return _assemble_fragment(
-        graph,
-        producers=((producer_op, Tensor(xn_id, xn_shape, weight_dtype)),),
-        consumer_op=consumer_op,
-        cons_id=cons_id,
-        out_tensor=out_tensor,
-    )
-
-
-def _split_two_cones(loop_op: LoopOp, cut, *, graph: Graph, node_id: str, out_tensor: Tensor, mul: Assign) -> Graph | None:
-    """The two-producer cut for a multiply whose BOTH operands are computed
-    cones (rotary QK^T). The cone avoiding the output N axis materializes as
-    ``xn_a[rows…, k]`` (the A operand); the N-indexed cone as
-    ``xn_b[rows…, k, n]`` — K kept out of the last index dim so the consumer's
-    B load has the canonical layout the cell tagger / stager serve (the
-    original transposed ``[n, k]`` access would be warp-tier-unclassifiable).
-    Same conservative-bail contract as the one-sided cut."""
-    leading, rows, prologue_level, outer_n, k_loop = cut
-    top = tuple(k_loop.body)
-    cell_def = {n: s for s in top for n in s.defines()}
-    axis_names = {a.name for a in loop_op.axes}
-    pro_def = _prologue_defs(prologue_level)
-    lead_def = {n: s for s in leading for n in s.defines()}
-    k_name = k_loop.axis.name
-    n_name = outer_n.axis.name
-    row_names = [lp.axis.name for lp in rows]
-
-    # --- slice both cones; assign A/B by output-N usage -----------------------
-    slices = []
-    for root in mul.args:
+    cones: list[_Cone] = []
+    for root in roots:
         sliced = _slice_cone(root, cell_def=cell_def, pro_def=pro_def, lead_def=lead_def, axis_names=axis_names)
         if sliced is None:
             return None
         cell_used, pro_used, lead_used = sliced
-        stmts = (
-            [s for s in top if id(s) in cell_used],
-            [s for s in prologue_level if id(s) in pro_used],
-            [s for s in leading if id(s) in lead_used],
-        )
-        if not stmts[0]:
-            return None  # cone root must live in the cell
-        slices.append((root, sliced, stmts))
-    (root_1, sliced_1, stmts_1), (root_2, sliced_2, stmts_2) = slices
-    # A shared cell / prologue stmt would have to compute in both producers —
-    # bail rather than duplicate work the original kernel did once.
-    if (sliced_1[0] & sliced_2[0]) or (sliced_1[1] & sliced_2[1]):
-        return None
-    axes_1 = _axes_read(stmts_1[0], axis_names)
-    axes_2 = _axes_read(stmts_2[0], axis_names)
-    if n_name in axes_2 and n_name not in axes_1:
-        (root_a, sliced_a, stmts_a), (root_b, sliced_b, stmts_b) = slices
-        axes_a, axes_b = axes_1, axes_2
-    elif n_name in axes_1 and n_name not in axes_2:
-        (root_b, sliced_b, stmts_b), (root_a, sliced_a, stmts_a) = slices
-        axes_a, axes_b = axes_2, axes_1
-    else:
-        return None  # both (or neither) cone reads the output N axis — no A/B assignment
-    allowed = set(row_names) | {k_name}
-    if not axes_a <= allowed or not axes_b <= allowed | {n_name}:
-        return None
-    dtype_a = _cone_dtype(stmts_a, graph)
-    dtype_b = _cone_dtype(stmts_b, graph)
-    if dtype_a is None or dtype_b is None:
-        return None
+        cell_stmts = [s for s in top if id(s) in cell_used]
+        if not cell_stmts:
+            return None  # cone root must live in the cell (a K-invariant operand isn't this pattern)
+        pro_stmts = [s for s in prologue_level if id(s) in pro_used]
+        lead_stmts = [s for s in leading if id(s) in lead_used]
+        # Axes the materialization must cover: everything the moved stmts read
+        # (prologue deps included — their row loops rebuild around the xn Write).
+        axes = _axes_read((*cell_stmts, *pro_stmts, *lead_stmts), axis_names)
+        if not axes <= set(row_names) | {k_name, n_name}:
+            return None
+        dtype = _cone_dtype((cell_stmts, pro_stmts, lead_stmts), graph)
+        if dtype is None:
+            return None
+        cones.append(_Cone(root, cell_used, pro_used, lead_used, cell_stmts, pro_stmts, lead_stmts, axes, dtype))
+    if sum(1 for c in cones if n_name in c.axes) > 1:
+        return None  # two (…, K, N) buffers would re-do the matmul's own volume
+    for i, a in enumerate(cones):
+        for b in cones[i + 1 :]:
+            if (a.cell_used & b.cell_used) or (a.pro_used & b.pro_used):
+                return None  # cones sharing a stmt would compute it in both producers
 
-    # --- escape check: moved values must die at the multiply ------------------
-    moved_ids = sliced_a[0] | sliced_a[1] | sliced_b[0] | sliced_b[1]
+    # --- escape check: moved values must die at the multiplies ----------------
+    moved_ids = set().union(*(c.cell_used | c.pro_used for c in cones))
     moved_defs: set[str] = set()
-    for s in (*stmts_a[0], *stmts_a[1], *stmts_b[0], *stmts_b[1]):
-        moved_defs |= collect_invariant_names(s)
-    if not _moved_defs_die_at_cone(Body(loop_op.body), moved_ids, moved_defs, frozenset({root_a, root_b}), {id(mul)}):
+    for c in cones:
+        for s in (*c.cell_stmts, *c.pro_stmts):
+            moved_defs |= collect_invariant_names(s)
+    if not _moved_defs_die_at_cone(Body(loop_op.body), moved_ids, moved_defs, frozenset(roots), mul_ids):
         return None
 
-    # --- build the producers ----------------------------------------------------
-    # A: every row axis (matches the one-sided cut), K innermost.
-    xn_a_id = f"{node_id}__xna"
-    row_vars = tuple(Var(n) for n in row_names)
-    k_free_a = Loop(
-        axis=k_loop.axis,
-        body=Body((*stmts_a[0], Write(output=xn_a_id, index=(*row_vars, Var(k_name)), values=(root_a,)))),
-    )
-    level: tuple[Stmt, ...] = (*stmts_a[1], k_free_a)
-    for lp in reversed(rows):
-        level = (Loop(axis=lp.axis, body=Body(level)),)
-    producer_a = LoopOp(body=Body((*stmts_a[2], *level)))
-    producer_a.name = f"{loop_op.name}_xna" if loop_op.name else ""
+    # --- build one producer per cone -------------------------------------------
+    # The N-reading cone sorts last so it is always the "b" suffix; a single
+    # cone keeps the plain "__xn" name.
+    cones.sort(key=lambda c: n_name in c.axes)
+    suffixes = ("",) if len(cones) == 1 else ("a", "b")
+    producers: list[tuple[LoopOp, Tensor]] = []
+    cone_loads: dict[int, Load] = {}  # id(cone root's def stmt) → replacement Load
+    for c, sfx in zip(cones, suffixes, strict=True):
+        xn_id = f"{node_id}__xn{sfx}"
+        rows_used = [lp for lp in rows if lp.axis.name in c.axes]
+        row_vars = tuple(Var(lp.axis.name) for lp in rows_used)
+        reads_n = n_name in c.axes
+        index = (*row_vars, Var(k_name), *((Var(n_name),) if reads_n else ()))
+        inner: tuple[Stmt, ...] = (*c.cell_stmts, Write(output=xn_id, index=index, values=(c.root,)))
+        if reads_n:
+            # N innermost: the Write walks the buffer's last dim (coalesced) and
+            # K lands second-to-last — the canonical B layout, even when the
+            # original access was transposed [n, k].
+            inner = (Loop(axis=outer_n.axis, body=Body(inner)),)
+        level: tuple[Stmt, ...] = (*c.pro_stmts, Loop(axis=k_loop.axis, body=Body(inner)))
+        for lp in reversed(rows_used):
+            level = (Loop(axis=lp.axis, body=Body(level)),)
+        producer = LoopOp(body=Body((*c.lead_stmts, *level)))
+        producer.name = f"{loop_op.name}_xn{sfx}" if loop_op.name else ""
+        shape = tuple(lp.axis.extent.as_static() for lp in rows_used) + (k_loop.axis.extent.as_static(),)
+        if reads_n:
+            shape += (outer_n.axis.extent.as_static(),)
+        producers.append((producer, Tensor(xn_id, shape, c.dtype)))
+        cone_loads[id(cell_def[c.root])] = Load(names=(c.root,), input=xn_id, index=index)
 
-    # B: only the row axes the cone actually reads (a row-free rotary K side
-    # stays 2-D), then K, then N — N innermost so the Write is coalesced and
-    # the K dim lands second-to-last (the canonical B layout).
-    xn_b_id = f"{node_id}__xnb"
-    rows_b = [lp for lp in rows if lp.axis.name in axes_b]
-    row_b_vars = tuple(Var(lp.axis.name) for lp in rows_b)
-    n_free = Loop(
-        axis=outer_n.axis,
-        body=Body((*stmts_b[0], Write(output=xn_b_id, index=(*row_b_vars, Var(k_name), Var(n_name)), values=(root_b,)))),
-    )
-    level = (*stmts_b[1], Loop(axis=k_loop.axis, body=Body((n_free,))))
-    for lp in reversed(rows_b):
-        level = (Loop(axis=lp.axis, body=Body(level)),)
-    producer_b = LoopOp(body=Body((*stmts_b[2], *level)))
-    producer_b.name = f"{loop_op.name}_xnb" if loop_op.name else ""
-
-    # --- build the consumer ------------------------------------------------------
-    def_a, def_b = cell_def[root_a], cell_def[root_b]
-    load_a = Load(names=(root_a,), input=xn_a_id, index=(*row_vars, Var(k_name)))
-    load_b = Load(names=(root_b,), input=xn_b_id, index=(*row_b_vars, Var(k_name), Var(n_name)))
-    moved_cell = sliced_a[0] | sliced_b[0]
+    # --- build the consumer ----------------------------------------------------
+    moved_cell = set().union(*(c.cell_used for c in cones))
     new_top: list[Stmt] = []
     for s in top:
-        if s is def_a:
-            new_top.append(load_a)
-        elif s is def_b:
-            new_top.append(load_b)
+        repl = cone_loads.get(id(s))
+        if repl is not None:
+            new_top.append(repl)
         elif id(s) in moved_cell:
             continue
         else:
@@ -302,29 +212,19 @@ def _split_two_cones(loop_op: LoopOp, cut, *, graph: Graph, node_id: str, out_te
         body=Body(tuple(new_k_loop if s is k_loop else s for s in outer_n.body)),
         unroll=outer_n.unroll,
     )
-    pro_used_all = sliced_a[1] | sliced_b[1]
+    pro_used_all = set().union(*(c.pro_used for c in cones))
     level = tuple(new_outer_n if s is outer_n else s for s in prologue_level if id(s) not in pro_used_all or s is outer_n)
     for lp in reversed(rows):
         level = (Loop(axis=lp.axis, body=Body(level)),)
     cons_id = f"{node_id}__mm"
-    lead_used_all = {id(s) for s in (*stmts_a[2], *stmts_b[2])}
+    lead_used_all = set().union(*(c.lead_used for c in cones))
     kept_lead = tuple(s for s in leading if id(s) not in lead_used_all)
     consumer_op = LoopOp(body=Body((*kept_lead, *level)))
     consumer_op = _rename_write_output(consumer_op, old=node_id, new=cons_id)
     consumer_op.name = loop_op.name
     consumer_op = _drop_dangling_leads(consumer_op, kept_lead)
 
-    # --- assemble the fragment -----------------------------------------------------
-    E_K = k_loop.axis.extent.as_static()
-    xn_a_shape = tuple(lp.axis.extent.as_static() for lp in rows) + (E_K,)
-    xn_b_shape = tuple(lp.axis.extent.as_static() for lp in rows_b) + (E_K, outer_n.axis.extent.as_static())
-    return _assemble_fragment(
-        graph,
-        producers=((producer_a, Tensor(xn_a_id, xn_a_shape, dtype_a)), (producer_b, Tensor(xn_b_id, xn_b_shape, dtype_b))),
-        consumer_op=consumer_op,
-        cons_id=cons_id,
-        out_tensor=out_tensor,
-    )
+    return _assemble_fragment(graph, producers=tuple(producers), consumer_op=consumer_op, cons_id=cons_id, out_tensor=out_tensor)
 
 
 def _assemble_fragment(graph: Graph, *, producers, consumer_op: LoopOp, cons_id: str, out_tensor: Tensor) -> Graph | None:
@@ -501,16 +401,29 @@ def _slice_cone(
 
 def _axes_read(stmts, axis_names: set[str]) -> set[str]:
     """Axis names appearing in the stmts' carried Exprs (Load / Write indices,
-    Select predicates) — the data the cut uses to tell the row-only A cone
-    from the N-indexed B cone."""
-    return {v for s in stmts for e in s.exprs() for v in e.free_vars()} & axis_names
+    Select predicates), recursively — internally-bound axes (a prologue
+    reduce's own loop var) excluded. This is the data the cut uses to size
+    each cone's ``xn`` buffer and to tell row cones from N-reading cones."""
+    out: set[str] = set()
+
+    def walk(s: Stmt, bound: frozenset[str]) -> None:
+        out.update({v for e in s.exprs() for v in e.free_vars()} - bound)
+        inner_bound = bound | s.binds_axes()
+        for body in s.nested():
+            for child in body:
+                walk(child, inner_bound)
+
+    for s in stmts:
+        walk(s, frozenset())
+    return out & axis_names
 
 
 def _cone_dtype(stmts_triple, graph: Graph):
     """The uniform dtype of every graph-resolvable Load in the cone's moved
-    stmts — the dtype its ``xn`` buffer materializes at (mirrors the
-    one-sided cut's operand-dtype rule). ``None`` (bail) when a Load source
-    is unresolvable or the leaf dtypes disagree."""
+    stmts — the dtype its ``xn`` buffer materializes at (value-preserving;
+    identical to the multiply's other-operand dtype on every shape seen so
+    far). ``None`` (bail) when a Load source is unresolvable or the leaf
+    dtypes disagree."""
     dtypes = set()
     for ld in Body(tuple(s for group in stmts_triple for s in group)).iter_of_type(Load):
         node = graph.nodes.get(ld.input)
