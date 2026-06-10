@@ -429,7 +429,13 @@ the assembled full model **against the real torch module** (eager / `torch.compi
 plumbed from `load_or_trace` → `commands/run.bench_full_model_real`) and each kernel's `.torch.json` provenance
 reproducer (re-lowered greedily so the tuned forks are picked) vs eager / `torch.compile` / Deplodock via
 `commands/run.bench_lowered_vs_torch`, printing
-full-model + per-kernel tables and (when a dump dir is set) an HTML chart at `<dump-dir>/kernels.html`.
+full-model + per-kernel tables and (when a dump dir is set) an HTML chart at `<dump-dir>/kernels.html`. The per-kernel
+comparison times every backend under **CUDA graph capture** (pure GPU time — the torch side replays the frontend graph
+op-by-op and would otherwise be dispatch-bound, with the GPU starving between aten launches; deplodock's cupy launch
+loop has the same exposure for small kernels). Capture is all-or-nothing per row: if any backend fails to capture, that
+row's bench retries fully uncaptured and the table prints a fallback note naming the kernels. The full-model table keeps
+uncaptured wall semantics — launch/dispatch overhead is real deployment cost there. See the `capture_graphs` section in
+`backend/cuda/ARCHITECTURE.md`.
 
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner
 over one op's forks — with max-Q normalized UCB1:

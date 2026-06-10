@@ -405,7 +405,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
             "dynamic": getattr(args, "dynamic", None),
         }
         try:
-            full, _, _ = benchmark_compare_isolated(
+            full, _, _, _ = benchmark_compare_isolated(
                 lowered=assembled,
                 torch_spec=("trace_args", trace_args),
                 bench_backends=args.bench_backends,
@@ -423,9 +423,11 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     else:
         sys.stderr.write("\n[tune] full-model bench skipped (no runnable module — --ir JSON path)\n")
 
-    rows = _bench_per_kernel(args, dump.dir, db)
+    rows, fallback = _bench_per_kernel(args, dump.dir, db)
     if rows:
         _print_per_kernel_table(rows)
+        if fallback:
+            print(f"note: timed without CUDA graph capture (host dispatch included): {', '.join(fallback)}")
         if html_dir is not None:
             render_kernel_chart(rows, Path(html_dir) / "kernels.html")
 
@@ -435,7 +437,8 @@ def _bench_per_kernel(args, dump_dir, db):
     DB-best forks are picked) vs eager / torch.compile / deplodock at -O3 — each in the SIGKILL-able
     worker (``benchmark_compare_isolated``). Re-lowering runs in the parent (CPU; greedy forks read
     the DB); only the GPU bench is isolated, so a hung / failed kernel skips just that reproducer and
-    the sweep continues. Returns ``[(label, {backend: us})]``."""
+    the sweep continues. Returns ``(rows, fallback)`` — ``rows`` is ``[(label, {backend: us})]``,
+    ``fallback`` the labels that benched without CUDA graph capture (dispatch-inclusive timings)."""
     import json
 
     from deplodock.commands.run import _detect_stage, _passes_after_stage
@@ -446,10 +449,11 @@ def _bench_per_kernel(args, dump_dir, db):
 
     repros = final_kernel_repros(dump_dir)
     if not repros:
-        return []
+        return [], []
     bench_flags = os.environ.get(config.NVCC_FLAGS, "")
     sys.stderr.write(f"\n[tune] per-kernel bench: {len(repros)} reproducer(s) at -O3\n")
     rows: list[tuple[str, dict]] = []
+    fallback: list[str] = []
     for repro in repros:
         label = _short_kernel(repro.name)
         try:
@@ -459,7 +463,7 @@ def _bench_per_kernel(args, dump_dir, db):
             tail = _passes_after_stage(_detect_stage(g))
             # No dump here — re-creating a CompilerDump on the repro dir would rmtree it.
             lowered = Pipeline.build(tail).run(g, db=db) if tail else g
-            results, _, _ = benchmark_compare_isolated(
+            results, _, _, captured = benchmark_compare_isolated(
                 lowered=lowered,
                 torch_spec=("frontend_graph", fe),
                 bench_backends=args.bench_backends,
@@ -473,9 +477,11 @@ def _bench_per_kernel(args, dump_dir, db):
             sys.stderr.write(f"[tune]   {label}: skipped ({exc})\n")
             continue
         rows.append((label, results))
+        if not captured:
+            fallback.append(label)
         dp = results.get("Deplodock")
         sys.stderr.write(f"[tune]   {label}: deplodock={dp:.0f}us\n" if dp is not None else f"[tune]   {label}: (no result)\n")
-    return rows
+    return rows, fallback
 
 
 def final_kernel_repros(dump_dir):

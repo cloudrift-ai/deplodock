@@ -35,7 +35,7 @@ def test_compare_in_worker_returns_torch_and_deplodock() -> None:
     tail = _passes_after_stage(_detect_stage(g))
     lowered = Pipeline.build(tail).run(g) if tail else g
 
-    results, bench, torch_available = benchmark_compare_isolated(
+    results, bench, torch_available, _captured = benchmark_compare_isolated(
         lowered=lowered,
         torch_spec=("frontend_graph", fe),
         bench_backends="eager,deplodock",

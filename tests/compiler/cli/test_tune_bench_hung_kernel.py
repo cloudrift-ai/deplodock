@@ -50,11 +50,11 @@ def _patch_common(monkeypatch, *, compare_raises: Exception | None) -> list[bool
     def _fake_compare(**_kw):
         if compare_raises is not None:
             raise compare_raises
-        return {"Deplodock": 1.0}, object(), True  # (results, bench, torch_available)
+        return {"Deplodock": 1.0}, object(), True, False  # (results, bench, torch_available, captured)
 
     def _fake_per_kernel(*_a, **_k):
         per_kernel_ran[0] = True
-        return []
+        return [], []
 
     monkeypatch.setattr(backend_mod, "CudaBackend", _DummyBackend)
     monkeypatch.setattr(program_mod, "benchmark_compare_isolated", _fake_compare)
