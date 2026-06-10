@@ -1,153 +1,75 @@
-# Qwen3-Embedding-0.6B layer tune: bench-cache reuse, per-kernel-vs-torch, and a hung-kernel codegen bug
+# Qwen3-Embedding-0.6B: `k_linear_mean_reduce` generates a non-terminating -O3 kernel (OPEN)
 
-Context: a clean, isolated two-layer tune of `Qwen/Qwen3-Embedding-0.6B` on an RTX 5090 (sm_120) to (a) confirm the
-two-level autotuner's per-op bench cache transfers between structurally-identical layers, and (b) see which kernels are
-well-tuned vs lagging torch. The run surfaced a **codegen bug** (a generated kernel that never terminates) and a
-**bench-harness robustness gap** (the deployable `--bench` hung on it ~109 min). This doc records the findings; the fix
-landed alongside it (branch `fix/bench-hung-kernel-watchdog`).
+Status: **unfixed codegen bug, escalated**. First seen as an occasional pick during the original two-layer tune; since
+the 2026-06-09 layer-0 tune into the default caches (`~/.cache/deplodock/autotune.db` + prior), the hanging config is
+the prior's **greedy pick** for this op — every `run` / `compile` / bench that deploys this kernel at -O3 now hangs
+deterministically. The bench harness survives it (watchdog → `bench_fail`, worker SIGKILL — see "already hardened"
+below), but the kernel itself still needs a codegen fix, and real deployments of Qwen3-class models would hang.
 
-All runs used isolated cache paths (`DEPLODOCK_TUNE_DB` / `DEPLODOCK_PRIOR_FILE` / `DEPLODOCK_CUBIN_CACHE` → a temp dir)
-so the developer's accumulated 725 MB tune DB and golden prior were never touched.
+## 1. The kernel
 
-## 1. Model shape
+The slice is the decoder MLP path: post-attention RMSNorm (`pow → mean → +eps → rsqrt → mul → weight-mul`) feeding the
+gate/up projections (1024 → 3072, fp16) and the SwiGLU combine (`silu(gate) * up`), output `mul_12` of shape
+`(1, 32, 3072)`. Healthy picks lower it to a register-tiled fused linear+mean kernel (e.g. the pre-tune greedy config
+ran 88 µs; a cold-prior pick ran 185 µs); the hanging variant is in the same register-tiled family.
 
-All 28 decoder layers are structurally identical (dense Qwen3: `sliding_window: null`, no `mlp_only_layers` /
-`layer_types`, shared RoPE). hidden 1024, 16 q-heads / 8 kv-heads (GQA), head_dim 128, intermediate 3072. Layers differ
-only in weight *values*, which don't affect kernel selection — so a kernel tuned for layer 0 transfers to all 28 via the
-structural `op_cache_key`.
+## 2. Symptom
 
-## 2. Bench-cache reuse (layer 0 cold → layer 1 warm)
+- The -O1 tuning sweep benches the variant fine — the hang only manifests when the winner is **recompiled at -O3**
+  (the deployable default). The kernel never returns: GPU pinned at 100 %, host spin-waiting.
+- The per-launch watchdog catches it (`kernel 'k_linear_mean_reduce_23ab9c' did not complete within 1000 ms — variant
+  marked bench_fail`), but the launched kernel **stays resident on the device until the owning process exits** — CUDA
+  context teardown blocks behind it, and any other process creating a context meanwhile stalls too.
+- Almost certainly a miscompile or a loop bound that -O3 (`cicc`) optimization turns non-terminating in the unrolled
+  register-tile reduce loop. The pick came out of the -O1 ranking sweep, whose latencies don't reflect (or exercise)
+  the -O3 codegen.
 
-Each layer fused to one terminal: 10 unique kernels over 11 positions; `Σ best-per-op` ≈ 640 µs (an **-O1 ranking**
-sum, not deployable). The inner per-op search explored ~the same number of terminals both times, but layer 1 replayed a
-third of them from layer 0's DB:
+## 3. Reproduction (deterministic, current default caches)
 
-| | Layer 0 (cold) | Layer 1 (warm) |
-|---|---|---|
-| Terminals explored | 767 | 746 |
-| **New GPU benches** | 753 | **509** |
-| **Cache-hit replays** (`ok, cached`) | 13 | **236** |
-| Tune wall-clock | 751.6 s | 705.8 s |
-
-So **~32% (236/746)** of layer 1's configs were served from cache with no GPU bench (log: `cache hit for 1 kernel(s) —
-skipping bench`). Reuse is *partial by design*: the kernels are structurally identical (same `op_cache_key`) so configs
-transfer, but the global learned prior absorbed ~850 benches during layer 0, so the warm search steers down a new
-trajectory and benches the genuinely-new configs it surfaces while replaying the ones it has already seen. Wall-clock
-dropped only ~6% because the 509 new configs still pay nvcc compile cost, which dominates the per-variant time.
-
-## 3. Per-kernel vs torch (layer 0, deployable -O3)
-
-`tune --bench` re-benches each kernel's `.torch.json` reproducer at -O3 vs eager / `torch.compile`. Sorted by deplodock
-latency:
-
-| Kernel | eager µs | tcompile µs | deplodock µs | vs eager |
-|---|---|---|---|---|
-| k_linear_mean_reduce | 215 | **47** | **135** | 1.59x |
-| k_linear_reshape_transpose_sdpa_reduce | 79 | 93 | 46 | 1.70x |
-| k_reshape_linear_mean_reduce | 218 | 310 | 39 | 5.60x |
-| k_sdpa_transpose_unsqueeze_cat_slice_reduce | 426 | 583 | 37 | 11.62x |
-| k_reshape_linear_mean_reduce | 219 | 303 | 27 | 8.20x |
-| k_linear_reduce | 20 | 20 | 20 | 1.00x |
-| k_sdpa_transpose_reshape_linear_reduce | 71 | 71 | 16 | 4.44x |
-| k_linear_reduce | 14 | 14 | 10 | 1.40x |
-| k_linear_reduce | 10 | 12 | 6 | 1.74x |
-
-End-to-end full model (layer 0): **eager 240 µs · torch.compile 89 µs · Deplodock 271 µs (0.89× eager)**.
-
-### Reading these honestly
-
-- **The end-to-end number is the truth: Deplodock (271 µs) is ~3× behind torch.compile (89 µs) and slightly behind
-  eager** for the whole layer. The per-kernel table *flatters* Deplodock because each reproducer is benched in
-  isolation, which strips torch.compile of its cross-kernel fusion — so its per-kernel µs are inflated and the per-kernel
-  "wins" don't translate to the fused end-to-end result. The gap is dominated by 11 separate kernel launches (dispatch
-  overhead torch.compile fuses away) plus the slow `k_linear_mean_reduce`.
-- **The one kernel lagging torch even in isolation is `k_linear_mean_reduce`** — 135 µs vs torch.compile's 47 µs
-  (~2.9× slower), and it's also Deplodock's single slowest kernel. Every other kernel matches or beats torch.compile
-  in isolation. This is the kernel to optimize.
-
-## 4. Codegen bug: `k_linear_mean_reduce` can generate a non-terminating -O3 kernel
-
-On the **layer 1** deployable bench, the greedy -O3 pick for `k_linear_mean_reduce_23ab9c` produced a kernel that
-**never returns**: GPU pinned at 100% utilization, host spin-waiting. The full-model bench's per-launch watchdog caught
-it (`kernel 'k_linear_mean_reduce_23ab9c' did not complete within 1000 ms — variant marked bench_fail`), but the kernel
-stayed resident on the device.
-
-Key facts:
-
-- **It's a pick divergence, not a fixed defect.** Layer 0's pick for the same structural kernel ran fine (135 µs). The
-  prior evolved after layer 0 and led layer 1's search to a *different* best -O1 config that, recompiled at -O3, hangs.
-  A later re-run picked yet another (healthy) config and completed — so the bad config is reachable but not always
-  chosen. This matches the standing `fp16-prior-needs-o3-coverage` note: with sparse -O3 reservoir data the prior can
-  select an -O3-pathological config. Here the failure mode is worse than "deploys slow" — it's a hang.
-- **-O1 vs -O3.** Tuning compiles at `-Xcicc -O1` (a ranking signal). The hang only manifests at -O3 (the deployable
-  recompile), so the -O1 sweep never saw it. The kernel is almost certainly miscompiled or has a loop bound that -O3
-  optimization turns non-terminating (a register-tiled linear+mean reduce — consistent with the BK1/STAGE1 collapse
-  family).
-- **Status: unfixed.** This doc and the accompanying PR make the bench *robust* to the hang; the kernel itself still
-  needs a codegen fix. Root-cause next step: pin the exact knobs of the hanging variant (re-tune layer 1 to reproduce,
-  read its `cuda_op` row), dump its `.cu` at -O3, and inspect the reduce loop bound.
-
-## 5. Second codegen issue: RMSNorm reproducer fails to lower in isolation
-
-`k_mean_b6c7b1` is the input RMSNorm (`pow → mean → +eps → rsqrt → mul → weight-mul`, output `mul_1`). It tunes and runs
-fine *inside the full-model graph*, but its isolated `.torch.json` reproducer fails the -O3 re-bench:
-
-```
-k_mean: skipped (CudaBackend: node 'mul_1' has non-CudaOp 'LoopOp'; lowering must produce Graph[CudaOp].)
+```bash
+DEPLODOCK_DUMP_DIR=/tmp/dd deplodock compile Qwen/Qwen3-Embedding-0.6B --layer 0   # writes the reproducer + .cu
+timeout 300 deplodock run --ir /tmp/dd/07_lowering_cuda.kernels/k_linear_mean_reduce_*.torch.json --bench
+# → HungKernelError within ~1 s of the first -O3 launch; GPU stays busy until the process exits
 ```
 
-The trailing weight-multiply (`mul_1`) doesn't lower to a `CudaOp` when the kernel is re-compiled standalone, so there's
-no deployable per-kernel number for RMSNorm. Path-specific (reproducer re-lowering only); lower priority than the hang.
+`deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --bench` reproduces it twice: the full-model -O3 bench fails with
+the watchdog message above, and the per-kernel row for this kernel is skipped. Bench this kernel **last** and under
+`timeout` when sweeping reproducers — the resident kernel outlives the bench attempt.
 
-Minor, non-fatal: three reproducers (`mul_12` SwiGLU 3072, `mul_3`/`mul_5` Q/K-proj+RoPE) produce NaN on random inputs
-(out-of-domain for RoPE/activation), so their per-kernel accuracy is unverified — full-model accuracy passed.
+## 4. Already hardened (the bug no longer wedges runs)
 
-## 6. Bench-harness robustness gap (fixed in this PR)
+- Per-launch watchdog + SIGKILL-able bench worker (#215): a hung kernel fails one variant/row, not the run.
+- PR #216 follow-ups, found while reproducing this: the parent previously wedged forever **writing the next request**
+  to a worker stuck in CUDA teardown behind the immortal kernel (the wall budget only bounded the response read — now
+  the send has the same deadline), and the persistent worker silently degraded torch.compile comparisons to eager via
+  dynamo's per-code-object recompile limit (now reset before every bench compile).
+- Measurement fixes in #216 also corrected this doc's old per-kernel numbers: timings are CUDA-graph-captured (pure
+  GPU), the torch reference runs fp16 like the real model (a dtype bug ran it fp32), and reproducer slices keep
+  constant-derived boundaries (the old NaN rows now pass accuracy). The previously-reported "deplodock wins most
+  per-kernel rows" conclusion was a measurement artifact; honestly measured, torch.compile wins or ties most rows and
+  this kernel is deplodock's worst (eager 63 µs / torch.compile 14 µs / deplodock 88 µs on the healthy pre-tune pick —
+  and a hang on the current tuned pick).
 
-Why the hang wedged the whole run for ~109 min:
+## 5. Root-cause plan
 
-- **Tuning sweep** runs each variant in a SIGKILL-able subprocess (`bench_wall_timeout_s` → `benchmark_program_isolated`)
-  — a hung kernel dies with its worker and the device resets. Tuning never wedged.
-- **Deployable `--bench`** runs **in-process** (`benchmark_program`) — required because its interleaved `on_iter`
-  peer-bench can't cross a subprocess boundary — so there is **no SIGKILL backstop**. Its per-launch polling watchdog
-  (`_KERNEL_TIMEOUT_MS`, 1 s) *did* fire and abort the *measurement*, but in-process it can't *evict* the kernel, so the
-  device stayed poisoned (the watchdog's own caveat: "a hung kernel is still queued on the device after we give up").
-- The per-kernel sweep then launched into the poisoned device, and the torch peer-bench's **blocking
-  `torch.cuda.synchronize()`** (no polling watchdog) queued behind the still-running kernel and blocked indefinitely.
+1. **Pin the hanging variant.** `compile` with a dump now picks it by default: read its knob row from the dump's
+   kernel stats / `cuda_op` table and capture the exact knob set (suspect family: degenerate `BK` / `STAGE` / `FK`
+   register-tile combinations).
+2. **Inspect the -O3 codegen.** Diff the dumped `.cu`'s reduce loop bounds against a healthy variant; compare -O1 vs
+   -O3 SASS (`cuobjdump -sass` on the cached cubins) for the loop that never exits — look for a hoisted/folded exit
+   condition or an induction variable the unroller wraps.
+3. **Bisect knobs.** Re-compile with `DEPLODOCK_<KNOB>` pinning (`_pinned_knobs`), flipping one knob at a time from the
+   hanging set toward a healthy set to find the minimal trigger.
+4. **Fix + regression-test.** Fix the emitter (or reject the degenerate combination at enumeration time); add a
+   compile-only CUDA-assert test with the full knob set + `--target` pinned so GPU-less CI checks the emitted source,
+   plus a GPU test that the variant completes under the watchdog.
+5. **Unblock the prior.** Once the config is fixed or rejected, re-tune layer 0 so the DB/prior rows for this op stop
+   pointing at it.
 
-**Fix (`fix/bench-hung-kernel-watchdog`) — isolate the deployable comparison (Option B).** The root reason the deployable
-bench couldn't use the existing SIGKILL-able worker was that the worker only benched deplodock (graph → result), while
-the comparison interleaves a live torch module via an `on_iter` callback that can't cross the pipe. The fix removes that
-constraint by rebuilding the torch side **in the child** from a recipe instead of shipping a live module:
+## 6. Fixed since the original report (for the record)
 
-- The worker gained **one** job entry, `_run_job`, keyed on `torch_spec`: `None` is the old deplodock-only bench;
-  `("trace_args", {code/input/layer/seq_len/dynamic})` → `load_or_trace` rebuilds the real module (HF id or `--code`
-  expr) → `bench_full_model_real`; `("frontend_graph", Graph|None)` → `bench_lowered_vs_torch`. A pure benchmark is just
-  the comparison with a no-op torch request. The parent transport is a single `_BenchWorker.run_job`, with
-  `benchmark_program_isolated` / `benchmark_compare_isolated` as thin adapters.
-- `tune --bench` (`_run_bench` full-model + `_bench_per_kernel`) now routes every deployable bench through
-  `benchmark_compare_isolated`. A hung kernel hangs the **child**; the parent SIGKILLs it at `wall_timeout_s`, frees the
-  device, and the per-kernel sweep **continues to the next reproducer** (the `break`-on-failure became `continue`). This
-  also closes the multi-shape `--dataset golden --bench` gap — recovery is real, not "skip + rely on process exit."
-- The watchdog still raises a distinct `HungKernelError(RuntimeError)`; the worker treats it as definitely-dirty and
-  exits **without** the blocking `_context_dirty` probe (which would itself hang on the live kernel), so the parent gets
-  a prompt failure.
-
-Verified: a real-GPU test runs the full comparison in the worker and gets eager + deplodock numbers back; a worker that
-hangs on a genuine non-terminating kernel is SIGKILLed at the wall budget and surfaces a `RuntimeError` in seconds, not a
-wedge (`tests/compiler/backend/test_bench_worker_compare.py`); `test_hung_kernel_watchdog.py` (watchdog raises in 0.9 s)
-and `test_tune_bench_hung_kernel.py` (the `_run_bench` control flow) round it out. End-to-end `tune --code … --bench`
-prints both the full-model and per-kernel tables through the worker.
-
-Also removed in this PR: the `tune --bench-timeout` CLI flag, which was parsed and documented but **consumed nowhere**
-(dead — the value in effect was the hardcoded 1 s watchdog constant). The separate, functional `--bench-timeout` args in
-`scripts/bench_full_model.py` / `scripts/tune_golden_set.py` are unrelated and untouched.
-
-## 7. Follow-ups
-
-1. **Fix the `k_linear_mean_reduce` -O3 hang** (the real codegen bug) — pin the variant, dump -O3 `.cu`, inspect the
-   reduce loop bound. Highest priority.
-2. **Give the prior -O3 coverage for this shape** so it stops selecting -O3-pathological configs (`tune --patience 40
-   DEPLODOCK_O3_TOL=0.30`, per the fp16 note).
-3. **Close the RMSNorm reproducer lowering gap** (`mul_1` LoopOp → CudaOp in the standalone re-lower path).
-4. **Reduce per-layer launch overhead** — the end-to-end gap vs torch.compile is largely 11 unfused launches.
+- The RMSNorm reproducer (`k_mean`) standalone-lowering failure is gone — it lowers and benches (1 µs, 37× vs eager).
+- The three NaN reproducers (Q-norm / K-norm / SwiGLU) verify accuracy now: slice boundaries that are pure functions
+  of constants (the pow exponent, eps) keep their constant chains instead of being fed random bench data.
+- The `k_reshape_linear_mean_reduce` 113 µs / 56 µs mispicks (grid=1 single-block norm) were prior cold-start gaps;
+  tuning the shape fixed them (11 / 10 µs — 5.4–5.6× faster than eager, within 1.4× of torch.compile's 8 µs).
