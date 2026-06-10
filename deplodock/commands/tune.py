@@ -71,18 +71,6 @@ def register_tune_command(subparsers):
         ),
     )
     parser.add_argument(
-        "--bench-timeout",
-        type=float,
-        default=20.0,
-        help=(
-            "Per-variant GPU-time budget (seconds) for the run stage of each bench; exceeding it marks the "
-            "variant bench_fail. The default 20s suits single-kernel sweeps but is too tight for whole-model "
-            "graphs: the first variant pays a one-time cold-start (hundreds of first-launch kernel loads) that "
-            "can exceed 20s even though steady-state is milliseconds, so every variant fails. Bump to ~90 for "
-            "full-model tuning. Default: 20."
-        ),
-    )
-    parser.add_argument(
         "--clean",
         action="store_true",
         help="Before tuning, delete the tuning DB and the cubin/kernel caches for a fresh sweep.",
@@ -359,16 +347,26 @@ def _clean_caches(db_path) -> None:
     sys.stderr.write(f"[tune] --clean: removed tuning DB + kernel caches ({', '.join(removed)})\n")
 
 
+# Parent wall-clock caps for the isolated deployable benches: on overrun the worker is SIGKILLed
+# (frees the device, parent stays clean). Generous over real cold-start — a hung kernel is caught
+# far sooner by the worker's own 1 s per-launch watchdog, which exits the child promptly. Full-model
+# is larger: it reloads the HF module + traces + JITs torch.compile in the child.
+_FULL_MODEL_BENCH_WALL_S = 300.0
+_PER_KERNEL_BENCH_WALL_S = 120.0
+
+
 def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     """``tune --bench``: re-bench the tuned winner at -O3 (deployable numbers, NOT the
     -O1 ranking pass) — full model **against the real torch module** (eager /
     torch.compile / Deplodock) and each per-kernel ``.torch.json`` reproducer against
-    its torch-ref reconstruction. Prints both tables and (when ``html_dir`` is set)
-    writes an HTML per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``;
-    when ``None`` (an ``--ir`` JSON tune with no module) the full-model bench is
-    skipped and only the per-kernel table runs."""
-    from deplodock.commands.run import _print_table, bench_full_model_real
+    its torch-ref reconstruction, each in the SIGKILL-able bench worker so a hung kernel
+    can't wedge the run. Prints both tables and (when ``html_dir`` is set) writes an HTML
+    per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``; when ``None`` (an
+    ``--ir`` JSON tune with no module) the full-model bench is skipped and only the
+    per-kernel table runs."""
+    from deplodock.commands.run import _print_table
     from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     # Re-bench at -O3 (deployable) unless the user explicitly pinned --nvcc-flags;
@@ -385,61 +383,71 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     # (and which the per-kernel bench reads). Clearing it also avoids per-launch dump
     # noise during benching. (No-op when tuning used a temp dump — the env wasn't set.)
     saved_dump_env = os.environ.pop(config.DUMP_DIR, None)
-    # Generous per-stage budgets: a whole-model bench compiles 100s of -O3 kernels
-    # (the lm-head alone can take ~5-10 s) and the first iteration warms DRAM / L2 /
-    # cubin loads for the full weights, so the default 10 s run + 30 s compile are
-    # tight. Bump both to 60 s so first-iter cold-start doesn't bench_fail. The
-    # bench is in-process (on_iter callback) — bench_wall_timeout_s stays None.
-    backend = CudaBackend(tune_db="auto", bench_compile_timeout_s=60.0, bench_run_timeout_s=60.0)
+    # ``backend`` here is only the handle to resolve the tune DB (for the per-kernel re-lowering);
+    # the benches themselves run in the SIGKILL-able worker (``benchmark_compare_isolated``), which
+    # builds its own backend. DUMP_DIR is cleared so CudaBackend's default CompilerDump doesn't
+    # rmtree the reproducer dir the per-kernel bench reads.
+    backend = CudaBackend(tune_db="auto")
     if saved_dump_env is not None:
         os.environ[config.DUMP_DIR] = saved_dump_env
     db = SearchDB(path=backend.tune_db) if (backend.tune_db is not None and backend.tune_db.exists()) else None
 
     if bench_bundle is not None:
-        module, ex_args, ex_kwargs = bench_bundle
         sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / deplodock):\n")
+        # The worker rebuilds the real module from these args via ``load_or_trace`` (no live module
+        # crosses the pipe) and runs the comparison in-child — a hung deplodock kernel hangs the
+        # child, which the parent SIGKILLs, instead of wedging the run.
+        trace_args = {
+            "code": args.code,
+            "input": args.input,
+            "layer": args.layer,
+            "seq_len": args.seq_len,
+            "dynamic": getattr(args, "dynamic", None),
+        }
         try:
-            full, _ = bench_full_model_real(
-                module,
-                ex_args,
-                ex_kwargs,
-                assembled,
-                backend,
+            full, _, _ = benchmark_compare_isolated(
+                lowered=assembled,
+                torch_spec=("trace_args", trace_args),
+                bench_backends=args.bench_backends,
+                wall_timeout_s=_FULL_MODEL_BENCH_WALL_S,
                 warmup=args.warmup,
                 iters=args.iters,
-                bench_backends=args.bench_backends,
+                seed=args.seed,
+                nvcc_flags=bench_flags,
             )
             _print_table(full)
         except RuntimeError as exc:
-            # A whole-graph compile/bench failure (e.g. a slow-compiling kernel) must not
-            # cost the per-kernel table — report and fall through.
+            # Any worker failure (incl. a SIGKILL on a hung kernel) surfaces as RuntimeError. The
+            # parent device stays clean — per-kernel runs in its own worker — so continue.
             sys.stderr.write(f"[tune] full-model bench failed ({exc}); continuing to per-kernel\n")
     else:
         sys.stderr.write("\n[tune] full-model bench skipped (no runnable module — --ir JSON path)\n")
 
-    rows = _bench_per_kernel(args, dump.dir, backend, db)
+    rows = _bench_per_kernel(args, dump.dir, db)
     if rows:
         _print_per_kernel_table(rows)
         if html_dir is not None:
             render_kernel_chart(rows, Path(html_dir) / "kernels.html")
 
 
-def _bench_per_kernel(args, dump_dir, backend, db):
-    """Bench each kernel's ``.torch.json`` provenance reproducer (re-lowered greedily
-    so the tuned DB-best forks are picked) vs eager / torch.compile / deplodock at -O3.
-    Returns ``[(label, {backend: us})]``. Per-kernel failures are skipped; a bench
-    watchdog ``RuntimeError`` dirties the CUDA context unrecoverably, so it stops the
-    per-kernel sweep (we still report what we have)."""
+def _bench_per_kernel(args, dump_dir, db):
+    """Bench each kernel's ``.torch.json`` provenance reproducer (re-lowered greedily so the tuned
+    DB-best forks are picked) vs eager / torch.compile / deplodock at -O3 — each in the SIGKILL-able
+    worker (``benchmark_compare_isolated``). Re-lowering runs in the parent (CPU; greedy forks read
+    the DB); only the GPU bench is isolated, so a hung / failed kernel skips just that reproducer and
+    the sweep continues. Returns ``[(label, {backend: us})]``."""
     import json
 
-    from deplodock.commands.run import _detect_stage, _passes_after_stage, bench_lowered_vs_torch
+    from deplodock.commands.run import _detect_stage, _passes_after_stage
     from deplodock.compiler.backend import torch_ref
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline import Pipeline
 
     repros = final_kernel_repros(dump_dir)
     if not repros:
         return []
+    bench_flags = os.environ.get(config.NVCC_FLAGS, "")
     sys.stderr.write(f"\n[tune] per-kernel bench: {len(repros)} reproducer(s) at -O3\n")
     rows: list[tuple[str, dict]] = []
     for repro in repros:
@@ -451,20 +459,17 @@ def _bench_per_kernel(args, dump_dir, backend, db):
             tail = _passes_after_stage(_detect_stage(g))
             # No dump here — re-creating a CompilerDump on the repro dir would rmtree it.
             lowered = Pipeline.build(tail).run(g, db=db) if tail else g
-            results, _, _ = bench_lowered_vs_torch(
-                fe,
-                lowered,
-                backend,
-                seed=args.seed,
-                do_bench=True,
+            results, _, _ = benchmark_compare_isolated(
+                lowered=lowered,
+                torch_spec=("frontend_graph", fe),
+                bench_backends=args.bench_backends,
+                wall_timeout_s=_PER_KERNEL_BENCH_WALL_S,
                 warmup=args.warmup,
                 iters=args.iters,
-                bench_backends=args.bench_backends,
+                seed=args.seed,
+                nvcc_flags=bench_flags,
             )
-        except RuntimeError as exc:
-            sys.stderr.write(f"[tune]   {label}: bench aborted ({exc}); stopping per-kernel sweep\n")
-            break
-        except Exception as exc:  # noqa: BLE001 — skip a kernel that fails to lower / run
+        except Exception as exc:  # noqa: BLE001 — isolated, so a hung / failed kernel skips just this one
             sys.stderr.write(f"[tune]   {label}: skipped ({exc})\n")
             continue
         rows.append((label, results))

@@ -70,7 +70,27 @@ arg_order).
 `benchmark_program(graph, input_data, warmup, num_iters)` adds a
 warmup loop + timed loop wrapped in `cupy.cuda.Event` pairs — one
 global pair for `BenchmarkResult.time_ms`, one pair per launch index
-(averaged over iters) for `BenchmarkResult.per_launch`.
+(averaged over iters) for `BenchmarkResult.per_launch`. Each launch is awaited via the polling
+`_wait_for_event` (`_KERNEL_TIMEOUT_MS`, 1 s) rather than a blocking `synchronize()`, which would
+hang forever on a non-terminating kernel; on overrun it raises **`HungKernelError`** (a
+`RuntimeError` subclass, so callers' `except RuntimeError → bench_fail` still catch it). This is the
+in-process timing core; both the autotune bench and the deployable comparison run it **inside the
+worker** (below), so a hung kernel hangs the child, not the parent.
+
+**One worker, two jobs.** `_bench_worker.py`'s `_run_job` dispatches on `torch_spec`: `None` is the
+deplodock-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /
+torch.compile / deplodock comparison — `("trace_args", {code/input/layer/seq_len/dynamic})` →
+`load_or_trace` rebuilds the real module (HF id or `--code` expr) → `bench_full_model_real`;
+`("frontend_graph", Graph|None)` → `bench_lowered_vs_torch`. Rebuilding the torch side **in the
+child** (not pickling a live module) is what lets the interleaved comparison — which couldn't cross a
+subprocess boundary before — run isolated. So `tune --bench` (`commands/tune.py` `_run_bench` /
+`_bench_per_kernel`) and any deployable bench go through `benchmark_compare_isolated`: a hung kernel
+hangs the child, the parent SIGKILLs it at `wall_timeout_s`, the device is freed, and the per-kernel
+sweep **continues** to the next reproducer (no device-poisoning wedge, no skip). The parent transport
+is the single `_BenchWorker.run_job`; `benchmark_program_isolated` / `benchmark_compare_isolated` are
+its two thin adapters. See `tests/compiler/backend/test_bench_worker_compare.py` (compare-in-worker +
+SIGKILL recovery), `test_hung_kernel_watchdog.py` (watchdog raises promptly), and
+`tests/compiler/cli/test_tune_bench_hung_kernel.py` (the `_run_bench` control flow).
 
 `benchmark_program_isolated(...)` (the autotune path, gated on
 `bench_wall_timeout_s`) runs the bench in a **persistent** subprocess

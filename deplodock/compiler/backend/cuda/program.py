@@ -441,9 +441,23 @@ def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) ->
 
 # Per-launch wall-clock cap. Any single kernel launch exceeding this is
 # considered "broken" — too many threads, infinite loop, hung GPU — and
-# we bail out via ``RuntimeError`` so the autotune sweep doesn't stall
+# we bail out via ``HungKernelError`` so the autotune sweep doesn't stall
 # on one bad variant.
 _KERNEL_TIMEOUT_MS = 1000.0
+
+
+class HungKernelError(RuntimeError):
+    """A kernel launch did not complete within the per-launch watchdog window.
+
+    Distinct from a plain ``RuntimeError`` (a slow-but-completing variant) because a hung
+    kernel stays **resident on the device** after we give up polling for it — the in-process
+    bench has no way to evict it (only the SIGKILL-isolated tuning worker can reset the
+    device). A caller that runs further benches on the same device after catching this must
+    treat the device as poisoned and stop, or the next blocking ``synchronize()`` (e.g. the
+    torch peer-bench) will block behind the still-running kernel. Subclasses ``RuntimeError``
+    so existing ``except RuntimeError`` handlers (the autotune sweep) keep marking the variant
+    ``bench_fail`` unchanged."""
+
 
 _AUTO_BUDGET_MS = 100.0
 # Iter-count cap on ``num_iters="auto"``. Combined with the GPU-time
@@ -473,7 +487,7 @@ _WARMUP_TARGET_MS = 10.0
 
 def _wait_for_event(event, timeout_ms: float, label: str) -> None:
     """Block until ``event`` completes, polling rather than calling the
-    blocking ``synchronize()``. Raises ``RuntimeError`` on timeout —
+    blocking ``synchronize()``. Raises ``HungKernelError`` on timeout —
     necessary because once a CUDA kernel is hung, ``synchronize()``
     blocks indefinitely (the driver only resets after minutes), which
     stalls the autotune sweep on a single bad variant.
@@ -493,7 +507,7 @@ def _wait_for_event(event, timeout_ms: float, label: str) -> None:
     while not event.done:
         now = _time.perf_counter()
         if now > deadline:
-            raise RuntimeError(f"kernel {label!r} did not complete within {timeout_ms:.0f} ms — variant marked bench_fail")
+            raise HungKernelError(f"kernel {label!r} did not complete within {timeout_ms:.0f} ms — variant marked bench_fail")
         if now > next_warn:
             logger.warning("[cuda] kernel %r still pending after %.2fs (timeout %.1fs)", label, now - start, timeout_ms / 1000.0)
             warned = True
@@ -926,8 +940,12 @@ class _BenchWorker:
     def __del__(self) -> None:
         self._kill()
 
-    def bench(self, graph: Graph, *, wall_timeout_s: float, nvcc_flags: str | None = None, **kwargs) -> BenchmarkResult:
-        request = pickle.dumps({"graph": graph, "kwargs": kwargs, "nvcc_flags": nvcc_flags}, protocol=pickle.HIGHEST_PROTOCOL)
+    def run_job(self, request_obj: dict, *, wall_timeout_s: float) -> dict:
+        """Send one length-prefixed pickle request, read the response within ``wall_timeout_s``
+        (else SIGKILL the worker and raise ``RuntimeError``), and return the unpickled response.
+        The single transport for both the deplodock-only bench and the deployable comparison — the
+        request's ``torch_spec`` decides which (see ``_bench_worker._run_job``)."""
+        request = pickle.dumps(request_obj, protocol=pickle.HIGHEST_PROTOCOL)
         # A previous worker may have exited between our last interaction
         # and this request — most commonly through the dirty-context exit
         # path in ``_bench_worker.main``. ``poll()`` has a brief window
@@ -988,11 +1006,10 @@ class _BenchWorker:
 
         resp = pickle.loads(body)
         if not resp.get("ok"):
-            # Surface the worker-side exception verbatim.
-            # ``Pipeline._bench_terminal`` treats this as a generic bench
-            # failure and pins ``bench_fail``.
+            # Surface the worker-side exception verbatim. ``Pipeline._bench_terminal`` treats a
+            # failed deplodock bench as ``bench_fail``; the deployable callers report + continue.
             raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
-        return resp["result"]
+        return resp
 
 
 class _BenchTimeout(Exception):
@@ -1041,12 +1058,60 @@ def benchmark_program_isolated(
     / deplodock) needs the bench to share a Python process with torch
     and must use ``benchmark_program`` directly instead.
     """
-    return _bench_worker().bench(
-        graph,
+    resp = _bench_worker().run_job(
+        {
+            "graph": graph,
+            "nvcc_flags": nvcc_flags,
+            "torch_spec": None,  # no torch comparison — pure deplodock bench
+            "kwargs": {
+                "warmup": warmup,
+                "num_iters": num_iters,
+                "compile_timeout_s": compile_timeout_s,
+                "run_timeout_s": run_timeout_s,
+            },
+        },
         wall_timeout_s=wall_timeout_s,
-        nvcc_flags=nvcc_flags,
-        warmup=warmup,
-        num_iters=num_iters,
-        compile_timeout_s=compile_timeout_s,
-        run_timeout_s=run_timeout_s,
     )
+    return resp["result"]
+
+
+def benchmark_compare_isolated(
+    *,
+    lowered: Graph,
+    torch_spec: tuple,
+    bench_backends: str,
+    wall_timeout_s: float,
+    warmup: int,
+    iters: int,
+    seed: int,
+    nvcc_flags: str | None = None,
+) -> tuple:
+    """Run the deployable eager / torch.compile / deplodock comparison in the SIGKILL-able worker.
+
+    Unlike the deplodock-only autotune bench, the deployable comparison interleaves deplodock with
+    real torch in one process and so couldn't be isolated before — a hung generated kernel wedged
+    the whole run. This ships the *entire* comparison to the worker: a hung kernel hangs the child,
+    which the parent SIGKILLs on ``wall_timeout_s``, freeing the device and leaving the parent clean.
+
+    ``torch_spec`` rebuilds the torch side **in the child** (no live module crosses the pipe), reusing
+    the same core functions the in-process path uses:
+
+    - ``("trace_args", {code, input, layer, seq_len, dynamic})`` → ``load_or_trace`` rebuilds the real
+      module (an HF model id or a ``--code`` expression), benched via ``bench_full_model_real``.
+    - ``("frontend_graph", Graph | None)`` → ``bench_lowered_vs_torch`` (per-kernel reproducer; ``None``
+      benches deplodock-only when the graph isn't torch-runnable).
+
+    Returns ``(results, bench, torch_available)`` — the shape ``bench_lowered_vs_torch`` returns."""
+    resp = _bench_worker().run_job(
+        {
+            "graph": lowered,
+            "nvcc_flags": nvcc_flags,
+            "torch_spec": torch_spec,
+            "bench_backends": bench_backends,
+            "warmup": warmup,
+            "iters": iters,
+            "seed": seed,
+        },
+        wall_timeout_s=wall_timeout_s,
+    )
+    return resp["results"], resp["result"], resp["torch_available"]

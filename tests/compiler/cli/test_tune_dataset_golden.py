@@ -24,7 +24,6 @@ def _args(**over):
         golden=None,
         output=None,
         ucb_c=1.4142,
-        bench_timeout=20.0,
         seed=0,
         patience=None,
         explore_eps=None,
