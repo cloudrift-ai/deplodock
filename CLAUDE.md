@@ -101,9 +101,10 @@ same worker.
   each config is re-benched at most once. See `plans/golden-sweep-report.md`.
   Override the opt level / flags with `--nvcc-flags "…"` (e.g. `-Xcicc -O3`); the
   flags are folded into the cubin cache key and the `perf` context key, so -O1-tuned and -O3 rows never clobber.
-  All tune/bench timings are **CUDA-graph-captured** (pure GPU time, no per-launch dispatch gaps); the capture epoch is
-  folded into the `perf` context key too, so wall-semantics rows from before the capture change never replay into
-  captured rankings (they re-bench once). Recorded goldens keep their original numbers until the next re-record.
+  All tune/bench timings are **CUDA-graph-captured** (pure GPU time, no per-launch dispatch gaps); each `perf` row
+  records its measurement mode in a `captured` column, and on write a captured measurement supersedes a wall-semantics
+  one for the same key (never the reverse) — old rows keep serving replay/prior training and upgrade in place.
+  Recorded goldens keep their original numbers until the next re-record.
   On default verbosity (tty) a live single-line **progress bar** tracks completed/total tuned op leaves with a
   `<kernel> <current us> (best <best us>) <knobs>` tail — the current latency is fixed-width and the knobs sit
   last, so the prefix stays put as the per-variant latency changes (no flicker); `-v` shows the per-`[tune]` INFO

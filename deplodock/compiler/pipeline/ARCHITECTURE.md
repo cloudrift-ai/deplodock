@@ -434,9 +434,11 @@ the tuning sweep, the full-model table, and the per-kernel rows — times under 
 GPU time): the torch side replays the frontend graph op-by-op and would otherwise be dispatch-bound, with the GPU
 starving between aten launches; deplodock's cupy launch loop has the same exposure for small kernels. Capture is
 all-or-nothing per comparison: if any backend fails to capture, that bench retries fully uncaptured and the table
-prints a fallback note. The capture epoch is folded into the perf `context_key` (`Context.structural_key`), so
-pre-capture wall-semantics DB rows never replay into captured rankings (recorded goldens keep their original numbers
-until the next `update-goldens` re-record). See the `capture_graphs` section in `backend/cuda/ARCHITECTURE.md`.
+prints a fallback note. Each `perf` row records whether its measurement was captured (the `captured` column); on write,
+a captured measurement supersedes a wall-semantics one for the same key regardless of median (never the reverse), so
+old rows keep serving replay and prior training and upgrade in place as re-tunes measure them captured. Recorded
+goldens keep their original numbers until the next `update-goldens` re-record. See the `capture_graphs` section in
+`backend/cuda/ARCHITECTURE.md`.
 
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner
 over one op's forks — with max-Q normalized UCB1:

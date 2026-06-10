@@ -67,6 +67,69 @@ def test_ok_overrides_prior_bench_fail() -> None:
     assert row.status == "ok" and row.stats.median == 10.0
 
 
+def test_captured_overrides_uncaptured_even_if_slower() -> None:
+    # Captured (pure-GPU) and uncaptured (wall) numbers aren't comparable;
+    # the captured measurement is the better truth and replaces the wall one.
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(3.0), captured=False)
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row.captured is True and row.stats.median == 5.0
+
+
+def test_uncaptured_never_overrides_captured() -> None:
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(1.0), captured=False)
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row.captured is True and row.stats.median == 5.0
+
+
+def test_captured_rows_keep_best_among_themselves() -> None:
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(3.0), captured=True)
+    assert db.lookup_perf("ctx", "k", backend="cuda").stats.median == 3.0
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(9.0), captured=True)
+    assert db.lookup_perf("ctx", "k", backend="cuda").stats.median == 3.0
+
+
+def test_bench_fail_never_overrides_captured_ok() -> None:
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    db.record_perf("ctx", "k", backend="cuda", status="bench_fail", stats=_stats(1.0), captured=True)
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row.status == "ok" and row.captured is True
+
+
+def test_captured_column_migration(tmp_path) -> None:
+    # A DB created before the ``captured`` column gains it on open (old rows
+    # read back as uncaptured); read-only open of an unmigrated DB selects a
+    # 0 literal instead of failing.
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE perf (context_key TEXT NOT NULL, op_key TEXT NOT NULL, backend TEXT NOT NULL,"
+        " status TEXT NOT NULL, latency_us_median REAL NOT NULL, latency_us_min REAL NOT NULL,"
+        " latency_us_max REAL NOT NULL, latency_us_mean REAL NOT NULL, latency_us_variance REAL NOT NULL,"
+        " n_samples INTEGER NOT NULL, measured_at TEXT NOT NULL, knobs TEXT NOT NULL DEFAULT '{}',"
+        " PRIMARY KEY (context_key, op_key, backend))"
+    )
+    conn.execute("INSERT INTO perf VALUES ('ctx', 'k', 'cuda', 'ok', 7.0, 7.0, 7.0, 7.0, 0.0, 1, 'then', '{}')")
+    conn.commit()
+
+    ro = SearchDB.open_readonly(path)  # before migration: no ``captured`` column
+    row = ro.lookup_perf("ctx", "k", backend="cuda")
+    assert row is not None and row.captured is False
+    ro._conn.close()
+
+    db = SearchDB(path=path)  # writer open migrates
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row is not None and row.captured is False
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(9.0), captured=True)
+    assert db.lookup_perf("ctx", "k", backend="cuda").captured is True
+
+
 def test_different_backends_dont_clobber() -> None:
     db = SearchDB()
     db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(10.0))

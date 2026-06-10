@@ -865,10 +865,9 @@ def benchmark_program(
     non-fatal: the bench logs a warning and continues uncaptured, reporting it
     via ``BenchmarkResult.captured`` — callers pairing this result with peer
     torch timings (``bench_lowered_vs_torch`` / the e2e comparison) use that
-    flag to re-run all-or-nothing so one table never mixes semantics. The
-    capture epoch is folded into the perf ``context_key``
-    (``Context.structural_key``), so pre-capture DB rows never mix into
-    captured rankings."""
+    flag to re-run all-or-nothing so one table never mixes semantics, and the
+    tune sweep persists it on each ``perf`` row (captured measurements
+    supersede wall-semantics ones on write — see ``SearchDB.record_perf``)."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)

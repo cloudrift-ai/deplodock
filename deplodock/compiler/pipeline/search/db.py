@@ -68,7 +68,13 @@ class PerfStats:
 
 @dataclass(frozen=True)
 class PerfRow:
-    """One ``perf`` row."""
+    """One ``perf`` row.
+
+    ``captured``: the measurement ran under CUDA graph capture (pure GPU time);
+    False = wall semantics including per-launch dispatch (all pre-capture rows).
+    Both kinds stay usable (replay, prior training); on write, a captured
+    measurement supersedes an uncaptured one for the same key — see
+    :meth:`SearchDB.record_perf`."""
 
     context_key: str
     op_key: str
@@ -77,6 +83,7 @@ class PerfRow:
     stats: PerfStats
     measured_at: str
     knobs: dict
+    captured: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +199,7 @@ class SearchDB:
             n_samples            INTEGER NOT NULL,
             measured_at          TEXT NOT NULL,
             knobs                TEXT NOT NULL DEFAULT '{}',
+            captured             INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (context_key, op_key, backend)
         )
         """,
@@ -213,6 +221,13 @@ class SearchDB:
             self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
         for stmt in self._SCHEMA:
             self._conn.execute(stmt)
+        # Column migration for DBs created before the ``captured`` column
+        # (CREATE IF NOT EXISTS doesn't alter existing tables). Old rows
+        # default to 0 — correct: they were measured without graph capture.
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(perf)")}
+        if "captured" not in cols:
+            self._conn.execute("ALTER TABLE perf ADD COLUMN captured INTEGER NOT NULL DEFAULT 0")
+        self._has_captured = True
 
     @classmethod
     def open_readonly(cls, path: Path | str) -> SearchDB:
@@ -225,6 +240,9 @@ class SearchDB:
         file is absent."""
         self = cls.__new__(cls)
         self._conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True, check_same_thread=False)
+        # Read-only never migrates; a pre-``captured`` DB selects a 0 literal instead.
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(perf)")}
+        self._has_captured = "captured" in cols
         return self
 
     # ------------------------------------------------------------------
@@ -339,21 +357,29 @@ class SearchDB:
         status: str,
         stats: PerfStats,
         knobs: dict | None = None,
+        captured: bool = False,
     ) -> None:
-        """Upsert one ``perf`` row. Preserves the old keep-best-``ok``
-        policy: a ``bench_fail`` never overwrites a prior ``ok`` row,
-        and among ``ok`` rows the lowest median wins."""
+        """Upsert one ``perf`` row. Keep-best-``ok`` policy: a ``bench_fail``
+        never overwrites a prior ``ok`` row, and among same-semantics ``ok``
+        rows the lowest median wins. ``captured`` (CUDA-graph-captured, pure GPU
+        time) adds a precedence axis: a captured measurement supersedes an
+        uncaptured (wall-semantics) one regardless of median — the numbers
+        aren't comparable, and captured is the better truth — while an
+        uncaptured measurement never overwrites a captured one."""
         existing = self.lookup_perf(context_key, op_key, backend=backend)
-        keep_existing_ok = existing is not None and existing.status == "ok" and status != "ok"
-        keep_best = existing is not None and existing.status == "ok" and status == "ok" and stats.median >= existing.stats.median
-        if keep_best or keep_existing_ok:
-            return
+        if existing is not None and existing.status == "ok":
+            if status != "ok":
+                return  # a failure never replaces a good measurement
+            if existing.captured and not captured:
+                return  # wall semantics never overwrites a captured row
+            if not (captured and not existing.captured) and stats.median >= existing.stats.median:
+                return  # same semantics: keep the best median
         knobs_json = json.dumps(knobs or {}, sort_keys=True, default=str)
         self._conn.execute(
             "INSERT OR REPLACE INTO perf "
             "(context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
-            " latency_us_mean, latency_us_variance, n_samples, measured_at, knobs) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " latency_us_mean, latency_us_variance, n_samples, measured_at, knobs, captured) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 context_key,
                 op_key,
@@ -367,6 +393,7 @@ class SearchDB:
                 stats.n_samples,
                 datetime.now(UTC).isoformat(),
                 knobs_json,
+                int(captured),
             ),
         )
 
@@ -393,11 +420,19 @@ class SearchDB:
             best_median_us=row[5],
         )
 
+    @property
+    def _perf_cols(self) -> str:
+        """The ``perf`` SELECT column list. A pre-``captured`` DB opened
+        read-only can't be migrated — select a 0 literal in its place."""
+        captured = "captured" if self._has_captured else "0"
+        return (
+            "context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
+            f"latency_us_mean, latency_us_variance, n_samples, measured_at, knobs, {captured}"
+        )
+
     def lookup_perf(self, context_key: str, op_key: str, *, backend: str) -> PerfRow | None:
         row = self._conn.execute(
-            "SELECT context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
-            "latency_us_mean, latency_us_variance, n_samples, measured_at, knobs "
-            "FROM perf WHERE context_key = ? AND op_key = ? AND backend = ?",
+            f"SELECT {self._perf_cols} FROM perf WHERE context_key = ? AND op_key = ? AND backend = ?",  # noqa: S608
             (context_key, op_key, backend),
         ).fetchone()
         return _row_to_perf(row) if row else None
@@ -418,16 +453,12 @@ class SearchDB:
     def iter_perf(self, context_key: str, *, backend: str | None = None) -> Iterator[PerfRow]:
         if backend is None:
             cur = self._conn.execute(
-                "SELECT context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
-                "latency_us_mean, latency_us_variance, n_samples, measured_at, knobs "
-                "FROM perf WHERE context_key = ?",
+                f"SELECT {self._perf_cols} FROM perf WHERE context_key = ?",  # noqa: S608
                 (context_key,),
             )
         else:
             cur = self._conn.execute(
-                "SELECT context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
-                "latency_us_mean, latency_us_variance, n_samples, measured_at, knobs "
-                "FROM perf WHERE context_key = ? AND backend = ?",
+                f"SELECT {self._perf_cols} FROM perf WHERE context_key = ? AND backend = ?",  # noqa: S608
                 (context_key, backend),
             )
         for row in cur:
@@ -521,4 +552,5 @@ def _row_to_perf(row: tuple) -> PerfRow:
         stats=stats,
         measured_at=row[10],
         knobs=knobs,
+        captured=bool(row[12]),
     )
