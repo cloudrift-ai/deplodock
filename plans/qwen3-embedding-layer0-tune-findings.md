@@ -41,24 +41,6 @@ Per-kernel (-O3, sorted by Deplodock latency; mapping to layer ops added from th
 The 193 us total is dominated by four kernels: the fused norm+MLP prologue (76), down_proj (29), rotary+QK^T (28)
 and P@V (26) — 159 us of 193. All four are scalar-tier (no tensor cores); see findings 3–5.
 
-## Finding 4 — fused RMSNorm + gate/up + silu kernel is scalar and re-reads everything (0.91x eager, 5.4x behind torch.compile)
-
-`k_linear_mean_reduce_23ab9c` fuses post-attn RMSNorm + gate_proj + up_proj + silu·mul into one kernel
-(out (32, 3072), two chained reductions over 1024). Three compounding problems:
-
-- **No tensor cores:** the gated-MLP reduce body has 4 Loads / 2 Accums (gate and up share the K loop), failing
-  the MMA gate's body-purity rule (`_atom.py:106`, canonical 2-Load/1-Assign/1-Accum cell), independent of the
-  epilogue rule. Scalar FMA against tcompile's tensor-core gemms is most of the 76 us vs 14 us gap.
-- **Redundant traffic:** the winner re-reads the activation row from gmem three times (norm pass + main loop +
-  epilogue tiles) and, when FM>1, re-stages the full weight K-strip per cell iteration (the TMA coords in the
-  generated CUDA don't depend on `a4`).
-- **Search loss:** the FM=2 region of the TMA space hangs (finding 2), so part of the design space was benched
-  as `bench_fail @ 2e6 us`.
-
-Worth a fusion-policy look: at this shape, norm+matmul fusion buys one gmem round-trip of (32, 1024) but costs
-tensor-core eligibility on a (32, 3072, 1024)-pair of gemms. tcompile's choice (norm separate, gemms on tensor
-cores) is 5.4x faster.
-
 ## Finding 5 — both SDPA matmul kernels are warp-tier-ineligible by design (prologue rule)
 
 - `k_linear_reshape_transpose_sdpa_reduce_38c877` (P@V fused with softmax stats): 26 us vs 16 eager (0.64x).
