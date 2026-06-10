@@ -23,6 +23,23 @@ def test_benchmark_program_capture_graphs_returns_timing():
     assert captured.time_ms > 0
     assert captured.num_launches == 1
     assert captured.per_launch is not None and len(captured.per_launch) == 1
+    assert captured.captured is True
+
+
+@requires_cuda
+def test_benchmark_program_capture_failure_falls_back_in_place(monkeypatch):
+    """A capture failure inside ``benchmark_program`` must not raise (the autotune
+    sweep would mark the variant bench_fail) — it continues uncaptured and reports
+    it via ``result.captured``."""
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+
+    def _boom(self, batch_sizes):
+        raise GraphCaptureError("forced capture failure")
+
+    monkeypatch.setattr(CompiledProgram, "capture_launch_graphs", _boom)
+    result = benchmark_program(_make_add_graph(1024), warmup=2, num_iters=5, capture_graphs=True)
+    assert result.time_ms > 0
+    assert result.captured is False
 
 
 @requires_cuda

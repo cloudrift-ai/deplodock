@@ -349,7 +349,9 @@ def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
             stop.record()
             torch_events[name].append((start, stop, batch_size))
 
-    bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter)
+    # capture_graphs=False: this script's torch closures run uncaptured, so the
+    # deplodock side must too — one loop, one timing semantics (wall, incl. dispatch).
+    bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=False)
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}

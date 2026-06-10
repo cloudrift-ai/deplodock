@@ -164,7 +164,12 @@ class Context:
         """
         from deplodock.compiler.structural import digest  # noqa: PLC0415
 
-        return digest("Context", self.compute_capability, self.compile_flags)
+        # "graph-capture" is a measurement-semantics epoch: bench timings are
+        # CUDA-graph-captured (pure GPU time) since the capture-by-default
+        # change. Pre-capture perf rows measured wall time including per-launch
+        # dispatch -- systematically higher for small kernels -- so they must
+        # never replay into captured rankings. Folding the epoch retires them.
+        return digest("Context", self.compute_capability, self.compile_flags, "graph-capture")
 
     def features(self) -> dict[str, float]:
         """Host/hardware regime as ``H_*`` features for the learned prior, so a

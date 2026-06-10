@@ -167,7 +167,7 @@ class CudaBackend(Backend):
         num_iters: int | str = 20,
         on_iter=None,
         nvcc_flags: str | None = None,
-        capture_graphs: bool = False,
+        capture_graphs: bool = True,
     ) -> BenchmarkResult:
         del input_data
         # ``nvcc_flags`` re-points this one bench's compile at a different opt
@@ -214,4 +214,5 @@ class CudaBackend(Backend):
             min_ms=result.min_ms,
             num_launches=result.num_launches,
             per_launch=result.per_launch,
+            captured=result.captured,
         )

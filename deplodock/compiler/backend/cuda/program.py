@@ -815,7 +815,7 @@ def benchmark_program(
     on_iter=None,
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
-    capture_graphs: bool = False,
+    capture_graphs: bool = True,
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
 
@@ -856,15 +856,19 @@ def benchmark_program(
     Checked between iters so no in-flight launch is mid-kernel when
     the function raises.
 
-    ``capture_graphs`` captures each launch's batch into a CUDA graph
-    (:meth:`CompiledProgram.capture_launch_graphs`) once batch sizes are
+    ``capture_graphs`` (default on) captures each launch's batch into a CUDA
+    graph (:meth:`CompiledProgram.capture_launch_graphs`) once batch sizes are
     calibrated, so the event windows measure dense GPU work instead of
-    per-launch dispatch gaps. Only the per-kernel reproducer bench
-    (``bench_lowered_vs_torch``) enables it — the autotune sweep and the
-    e2e full-model bench stay uncaptured so tune-DB / prior / golden rows
-    keep their established timing semantics. ``GraphCaptureError``
-    propagates to the caller (capture runs between iters with no work in
-    flight); the caller retries uncaptured."""
+    per-launch dispatch gaps. Warmup iters always run uncaptured, which keeps
+    the zero-elapsed degenerate-launch guard and the hung-kernel watchdog
+    probing real launches before any graph is built. A capture failure is
+    non-fatal: the bench logs a warning and continues uncaptured, reporting it
+    via ``BenchmarkResult.captured`` — callers pairing this result with peer
+    torch timings (``bench_lowered_vs_torch`` / the e2e comparison) use that
+    flag to re-run all-or-nothing so one table never mixes semantics. The
+    capture epoch is folded into the perf ``context_key``
+    (``Context.structural_key``), so pre-capture DB rows never mix into
+    captured rankings."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
@@ -883,10 +887,20 @@ def benchmark_program(
         measured = 0
         cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
         total_gpu_ms = 0.0  # all-iter GPU time (incl. warmup), for the run-stage budget
+
+        def _try_capture(sizes: list[int]) -> bool:
+            """Best-effort capture; a failure logs + continues uncaptured."""
+            try:
+                prog.capture_launch_graphs(sizes)
+            except GraphCaptureError as exc:
+                logger.warning("[cuda] %s — continuing with uncaptured (dispatch-inclusive) timing", exc)
+                return False
+            return True
+
         if capture_graphs and warmup == 0:
             # No warmup → the calibration below never fires; capture the
             # uncalibrated all-1 batches so measurement is still dense.
-            prog.capture_launch_graphs(batch_sizes)
+            capture_graphs = _try_capture(batch_sizes)
         while True:
             iter_dts = prog.iter_once(batch_sizes=batch_sizes, pre_iter=on_iter)
             iters_run += 1
@@ -907,7 +921,7 @@ def benchmark_program(
                     # branch with new batch sizes — ``capture_launch_graphs``
                     # no-ops when they're unchanged and re-captures when not,
                     # so graphs and batches never go out of sync.
-                    prog.capture_launch_graphs(batch_sizes)
+                    capture_graphs = _try_capture(batch_sizes)
                 # Extend warmup until total warmup GPU time clears the
                 # clock-ramp floor. Post-batching, each subsequent
                 # warmup iter spends roughly
@@ -933,7 +947,7 @@ def benchmark_program(
             if auto and cumulative_gpu_ms >= target_total_ms:
                 break
 
-    return _samples_to_result(samples, prog.compiled.launches)
+    return _samples_to_result(samples, prog.compiled.launches, captured=capture_graphs)
 
 
 def _resolve_iter_budget(num_iters: int | str) -> tuple[float, int, bool]:
@@ -952,7 +966,7 @@ def _calibrate_batch_sizes(iter_dts: list[float]) -> list[int]:
     return [max(1, int(round(_BATCH_TARGET_MS / dt))) if 0 < dt < _BATCH_TARGET_MS else 1 for dt in iter_dts]
 
 
-def _samples_to_result(samples: list[list[float]], launches: list[_Launch]) -> BenchmarkResult:
+def _samples_to_result(samples: list[list[float]], launches: list[_Launch], *, captured: bool = False) -> BenchmarkResult:
     """Collapse per-launch sample lists to a ``BenchmarkResult`` keyed
     on the median of each launch's measured iters."""
     import statistics as _stats  # noqa: PLC0415
@@ -972,7 +986,9 @@ def _samples_to_result(samples: list[list[float]], launches: list[_Launch]) -> B
     # ``time_ms`` is the per-launch median (stable for tune's ranking); ``min_ms``
     # is the per-launch best-case (least OS/thermal noise — what ``run --bench``
     # reports, matching tune's min-over-variants reporting).
-    return BenchmarkResult(time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None)
+    return BenchmarkResult(
+        time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None, captured=captured
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1136,7 +1152,7 @@ def benchmark_program_isolated(
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
     nvcc_flags: str | None = None,
-    capture_graphs: bool = False,
+    capture_graphs: bool = True,
 ) -> BenchmarkResult:
     """Wall-time-bounded ``benchmark_program``. Runs the bench in a
     persistent subprocess; on ``wall_timeout_s`` overrun the worker is
@@ -1199,7 +1215,8 @@ def benchmark_compare_isolated(
       benches deplodock-only when the graph isn't torch-runnable).
 
     Returns ``(results, bench, torch_available, captured)`` — the shape ``bench_lowered_vs_torch``
-    returns (``captured`` is always False for ``trace_args``: the e2e bench stays uncaptured)."""
+    returns (``captured``: all backends were timed under CUDA graph capture; False means the
+    all-or-nothing fallback ran and the timings include host dispatch)."""
     resp = _bench_worker().run_job(
         {
             "graph": lowered,

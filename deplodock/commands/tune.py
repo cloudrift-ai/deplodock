@@ -405,7 +405,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
             "dynamic": getattr(args, "dynamic", None),
         }
         try:
-            full, _, _, _ = benchmark_compare_isolated(
+            full, _, _, full_captured = benchmark_compare_isolated(
                 lowered=assembled,
                 torch_spec=("trace_args", trace_args),
                 bench_backends=args.bench_backends,
@@ -415,7 +415,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
                 seed=args.seed,
                 nvcc_flags=bench_flags,
             )
-            _print_table(full)
+            _print_table(full, note=None if full_captured else "(graph-capture fallback: timings include host launch overhead)")
         except RuntimeError as exc:
             # Any worker failure (incl. a SIGKILL on a hung kernel) surfaces as RuntimeError. The
             # parent device stays clean — per-kernel runs in its own worker — so continue.

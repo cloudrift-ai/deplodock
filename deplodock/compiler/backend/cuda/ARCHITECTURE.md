@@ -77,21 +77,24 @@ hang forever on a non-terminating kernel; on overrun it raises **`HungKernelErro
 in-process timing core; both the autotune bench and the deployable comparison run it **inside the
 worker** (below), so a hung kernel hangs the child, not the parent.
 
-`benchmark_program(..., capture_graphs=True)` additionally captures each launch position's batch into
-a CUDA graph (`CompiledProgram.capture_launch_graphs`) right after batch-size calibration, and
-`iter_once` replays `graph_i.launch()` — one host call per event window — instead of the Python launch
-loop. CUDA events measure *stream elapsed* time, which only equals GPU time when the stream is
+`benchmark_program` captures each launch position's batch into a CUDA graph **by default**
+(`capture_graphs=True` → `CompiledProgram.capture_launch_graphs`, right after batch-size calibration),
+and `iter_once` replays `graph_i.launch()` — one host call per event window — instead of the Python
+launch loop. CUDA events measure *stream elapsed* time, which only equals GPU time when the stream is
 saturated; for sub-10 µs kernels the per-launch cupy dispatch starves the stream and the events time
 the starvation. The graph replay keeps the stream dense, so the same event windows become pure-GPU
 measurements. Capture happens on a temporary side stream (stream capture is illegal on the legacy NULL
 stream); replay targets the current (NULL) stream, so cupy/torch event interleaving is unchanged, and
 so is the `_wait_for_event` watchdog (a hung kernel inside a graph still never completes its stop
-event). Re-fires of the calibration branch (warmup extension) re-capture when batch sizes change. Any
-capture failure drains the capture state and raises **`GraphCaptureError`**; the caller
-(`bench_lowered_vs_torch`) retries the whole bench uncaptured. Only the per-kernel reproducer bench
-enables capture — the autotune sweep and the e2e full-model bench keep uncaptured (dispatch-inclusive)
-semantics so tune-DB / prior / golden rows stay comparable. See
-`tests/compiler/backend/test_graph_capture.py`.
+event). Warmup iters always run uncaptured, so the zero-elapsed degenerate-launch guard and the
+watchdog probe real launches before any graph exists. Re-fires of the calibration branch (warmup
+extension) re-capture when batch sizes change. A capture failure (`GraphCaptureError`, raised by
+`capture_launch_graphs` after draining the capture state) is caught in place: the bench warns,
+continues uncaptured, and reports it via `BenchmarkResult.captured` — comparison callers
+(`bench_lowered_vs_torch` / `bench_full_model_real`) pair that flag with their torch-side capture and
+re-run all-or-nothing so one table never mixes semantics. The capture epoch is folded into
+`Context.structural_key`, so pre-capture (wall-semantics) perf rows never replay into captured
+rankings. See `tests/compiler/backend/test_graph_capture.py`.
 
 **One worker, two jobs.** `_bench_worker.py`'s `_run_job` dispatches on `torch_spec`: `None` is the
 deplodock-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /
