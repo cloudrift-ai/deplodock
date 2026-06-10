@@ -13,11 +13,13 @@ Phase 1 surface (this file): the protocol that lets every
 ``tuple[Stmt, ...]`` site accept Body, plus :meth:`iter` / :meth:`map`
 as method-shaped wrappers around the existing free functions.
 
-Phase 2 (follow-up): def-use queries (``def_table``,
-``external_reads``, ``backward_slice_names``), type-filtered lookups
-(``loops``, ``loads``, ``stages``), region transforms
-(``replace_at``, ``partition_at``). Add as needed; the storage shape
-is already in place.
+Phase 2 surface: def-use queries (``definitions``, ``deps_closure``,
+``depends_on`` / ``independent``, ``deps_of``), type-filtered lookups
+(``loads``, ``writes``, ``accums``, …), and dependence cones
+(:class:`Cone`, :meth:`Body.backward_cone` / :meth:`Body.forward_cone`
+/ :meth:`Body.defs_die_at`) — the shared substrate behind the rules
+that slice computed-operand cones. Region transforms (``replace_at``,
+``partition_at``) remain follow-ups; add as needed.
 """
 
 from __future__ import annotations
@@ -31,6 +33,75 @@ from deplodock.compiler.ir.stmt.base import Stmt
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.stmt.leaves import Write
+
+
+@dataclass(frozen=True)
+class Cone:
+    """A dependence cone over ONE scope level: the subset of a Body's
+    immediate stmts closed under SSA dependence (in body order), plus every
+    name the cone reads from outside itself — sibling/enclosing scopes and
+    axis vars alike. Built by :meth:`Body.backward_cone` /
+    :meth:`Body.forward_cone`.
+
+    Construction never fails and applies no eligibility judgment: an
+    unresolved name is data (``external_reads``), not an error. Which
+    external reads are acceptable, which member kinds are cuttable, and
+    whether the cone's values escape (:meth:`Body.defs_die_at`) are the
+    calling rule's conditions — bail decisions stay in rules, the dataflow
+    walk lives here (``passes/ARCHITECTURE.md``: phrase conditions over cone
+    properties instead of re-walking shapes).
+
+    A member is a whole top-level stmt: a wrapper (Loop / Cond / Tile) joins
+    as a unit, exposing names per :func:`_exposed_defines` and reading per
+    :func:`_member_reads` (subtree rolled up, internally-bound axes
+    excluded). Axis vars from enclosing scopes survive into
+    ``external_reads`` — intersect with an axis-name set to get the cone's
+    axis usage, subtract it to get the SSA names that must resolve
+    elsewhere."""
+
+    members: tuple[Stmt, ...]
+    external_reads: frozenset[str]
+
+    @property
+    def loads(self) -> tuple[Stmt, ...]:
+        """Every ``Load`` in the members, nested included, body order —
+        the cone's leaf operands (dtype checks, graph resolution)."""
+        return Body(self.members).loads
+
+
+def _exposed_defines(s: Stmt) -> set[str]:
+    """SSA names ``s`` makes visible at its own scope level — own defines
+    plus every nested define. Deliberately identical to the tile helpers'
+    ``collect_invariant_names`` over-approximation: nested non-Accum names
+    don't truly cross a Loop boundary, but well-formed SSA never reads them
+    from outside, so resolving through them is harmless and cheap."""
+    out = set(s.defines())
+    for body in s.nested():
+        for c in body.iter():
+            out.update(c.defines())
+    return out
+
+
+def _member_reads(s: Stmt) -> frozenset[str]:
+    """Names ``s`` (incl. a whole wrapper subtree) reads from its enclosing
+    scope: SSA deps + Expr free vars (Load/Write indices, Select predicates,
+    Cond conditions), recursive, minus internally-defined names and axes
+    bound inside the subtree."""
+    reads: set[str] = set()
+    defs: set[str] = set()
+
+    def walk(st: Stmt, bound: frozenset[str]) -> None:
+        reads.update(set(st.deps()) - bound)
+        for e in st.exprs():
+            reads.update(e.free_vars() - bound)
+        defs.update(st.defines())
+        inner_bound = bound | st.binds_axes()
+        for body in st.nested():
+            for c in body:
+                walk(c, inner_bound)
+
+    walk(s, frozenset())
+    return frozenset(reads - defs)
 
 
 class Body(tuple[Stmt, ...]):
@@ -374,6 +445,96 @@ class Body(tuple[Stmt, ...]):
         ``s is None`` explicitly when the gate cares about externals."""
         defs = self.definitions
         return tuple(defs.get(d) for d in stmt.deps())
+
+    # -- dependence cones --------------------------------------------------
+
+    def backward_cone(self, roots: Iterable[str]) -> Cone:
+        """The backward dependence :class:`Cone` of ``roots`` over THIS
+        body's immediate stmts: every top-level member whose exposed names
+        transitively feed a root, in body order. Names resolving to no
+        member here (axis vars, enclosing/sibling scopes, buffer constants)
+        surface in ``external_reads`` — chain another scope level by seeding
+        its ``backward_cone`` with them. A root not defined at this level is
+        itself an external read (members come out empty)."""
+        by_name: dict[str, Stmt] = {}
+        for s in self:
+            for n in _exposed_defines(s):
+                by_name[n] = s
+        member_ids: set[int] = set()
+        external: set[str] = set()
+        pending = list(roots)
+        seen: set[str] = set()
+        while pending:
+            n = pending.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            s = by_name.get(n)
+            if s is None:
+                external.add(n)
+                continue
+            if id(s) in member_ids:
+                continue
+            member_ids.add(id(s))
+            pending.extend(_member_reads(s))
+        return Cone(members=tuple(s for s in self if id(s) in member_ids), external_reads=frozenset(external))
+
+    def forward_cone(self, seeds: Iterable[Stmt]) -> Cone:
+        """The forward (taint) :class:`Cone` of the ``seeds`` — top-level
+        stmts of this body — over THIS body's immediate stmts: the seeds
+        plus every member transitively reading a name they expose, to
+        fixpoint, in body order. ``external_reads`` are the member reads not
+        produced inside the cone (reads of earlier non-member siblings
+        included)."""
+        member_ids = {id(s) for s in seeds}
+        names: set[str] = set()
+        for s in seeds:
+            names.update(_exposed_defines(s))
+        reads = {id(s): _member_reads(s) for s in self}
+        changed = True
+        while changed:
+            changed = False
+            for s in self:
+                if id(s) in member_ids:
+                    continue
+                if reads[id(s)] & names:
+                    member_ids.add(id(s))
+                    names.update(_exposed_defines(s))
+                    changed = True
+        members = tuple(s for s in self if id(s) in member_ids)
+        external = set().union(*(reads.get(id(s), _member_reads(s)) for s in members)) if members else set()
+        return Cone(members=members, external_reads=frozenset(external - names))
+
+    def defs_die_at(self, members: Iterable[Stmt], *, roots: Iterable[str], allowed: Iterable[Stmt]) -> bool:
+        """True iff no stmt in this body outside ``members`` reads a name
+        they expose — except the ``allowed`` stmts, which may read names in
+        ``roots`` (and nothing else from the cone). The escape check for
+        cutting a cone out: its values must die at the designated consumers
+        (e.g. the matmul multiplies) or the cut would break a reader left
+        behind. ``members`` may span several scope levels of this body
+        (a cell cone plus its prologue deps); each member's whole subtree
+        counts as inside."""
+        members = tuple(members)  # may arrive as a generator; iterated twice
+        member_ids = {id(s) for s in members}
+        moved_defs: set[str] = set()
+        for s in members:
+            moved_defs |= _exposed_defines(s)
+        root_set = frozenset(roots)
+        allowed_ids = {id(s) for s in allowed}
+
+        def walk(stmts: Iterable[Stmt]) -> bool:
+            for s in stmts:
+                if id(s) in member_ids:
+                    continue  # the whole subtree moves; internal uses are fine
+                reads = set(s.deps()) & moved_defs
+                if reads and not (id(s) in allowed_ids and reads <= root_set):
+                    return False
+                for sub in s.nested():
+                    if not walk(sub):
+                        return False
+            return True
+
+        return walk(self)
 
     # -- type-filtered lookups -------------------------------------------
 
