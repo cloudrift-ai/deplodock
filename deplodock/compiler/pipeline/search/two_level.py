@@ -240,7 +240,11 @@ def inner_reward(
         # key so ``best_per_op_time`` reads the true per-op cost.
         best_total = 1.0 / inner.tree.best_reward if inner.tree.best_reward > 0 else None
         if best_total is not None:
-            db.record_perf(ctx_key, key, backend=backend_name, status="ok", stats=_point_stats(best_total))
+            # captured=True: the sweep benches under graph capture by default, so
+            # this Σ-best bookkeeping row derives from captured measurements (a
+            # rare per-variant capture fallback can contaminate the min — accepted;
+            # the capture-wins overwrite then lets a re-tune upgrade it).
+            db.record_perf(ctx_key, key, backend=backend_name, status="ok", stats=_point_stats(best_total), captured=True)
         if prior is not None:
             # Stream this op's value-of-position rows (-O1) plus any -O3 winner
             # samples into the global (reservoir-bounded) dataset; refit +

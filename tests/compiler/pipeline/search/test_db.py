@@ -67,6 +67,41 @@ def test_ok_overrides_prior_bench_fail() -> None:
     assert row.status == "ok" and row.stats.median == 10.0
 
 
+def test_captured_overrides_uncaptured_even_if_slower() -> None:
+    # Captured (pure-GPU) and uncaptured (wall) numbers aren't comparable;
+    # the captured measurement is the better truth and replaces the wall one.
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(3.0), captured=False)
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row.captured is True and row.stats.median == 5.0
+
+
+def test_uncaptured_never_overrides_captured() -> None:
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(1.0), captured=False)
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row.captured is True and row.stats.median == 5.0
+
+
+def test_captured_rows_keep_best_among_themselves() -> None:
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(3.0), captured=True)
+    assert db.lookup_perf("ctx", "k", backend="cuda").stats.median == 3.0
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(9.0), captured=True)
+    assert db.lookup_perf("ctx", "k", backend="cuda").stats.median == 3.0
+
+
+def test_bench_fail_never_overrides_captured_ok() -> None:
+    db = SearchDB()
+    db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(5.0), captured=True)
+    db.record_perf("ctx", "k", backend="cuda", status="bench_fail", stats=_stats(1.0), captured=True)
+    row = db.lookup_perf("ctx", "k", backend="cuda")
+    assert row.status == "ok" and row.captured is True
+
+
 def test_different_backends_dont_clobber() -> None:
     db = SearchDB()
     db.record_perf("ctx", "k", backend="cuda", status="ok", stats=_stats(10.0))

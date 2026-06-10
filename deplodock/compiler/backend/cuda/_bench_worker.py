@@ -60,7 +60,8 @@ def _hung(exc: BaseException) -> bool:
 
 def _run_job(req: dict) -> dict:
     """Run one bench job; return ``{"result": BenchmarkResult, "results": dict|None,
-    "torch_available": bool}``.
+    "torch_available": bool, "captured": bool}`` (``captured``: timings came from
+    CUDA-graph-captured windows; False = the all-or-nothing uncaptured fallback ran).
 
     ``req["torch_spec"]`` picks the work — a pure deplodock bench is just the comparison with a
     no-op torch request:
@@ -80,7 +81,8 @@ def _run_job(req: dict) -> dict:
         if spec is None:
             from deplodock.compiler.backend.cuda.program import benchmark_program
 
-            return {"result": benchmark_program(req["graph"], **req["kwargs"]), "results": None, "torch_available": False}
+            result = benchmark_program(req["graph"], **req["kwargs"])
+            return {"result": result, "results": None, "torch_available": False, "captured": result.captured}
 
         from deplodock.compiler.backend.cuda.backend import CudaBackend
 
@@ -90,7 +92,7 @@ def _run_job(req: dict) -> dict:
         if kind == "frontend_graph":
             from deplodock.commands.run import bench_lowered_vs_torch
 
-            results, bench, avail = bench_lowered_vs_torch(
+            results, bench, avail, captured = bench_lowered_vs_torch(
                 payload,
                 req["graph"],
                 backend,
@@ -110,7 +112,7 @@ def _run_job(req: dict) -> dict:
             if bundle is None:
                 raise RuntimeError("trace_args produced no runnable module (--ir JSON path has none)")
             module, args_t, kwargs = bundle
-            results, bench = bench_full_model_real(
+            results, bench, captured = bench_full_model_real(
                 module,
                 args_t,
                 kwargs,
@@ -123,7 +125,7 @@ def _run_job(req: dict) -> dict:
             avail = True
         else:
             raise ValueError(f"unknown torch_spec kind: {kind!r}")
-        return {"result": bench, "results": results, "torch_available": avail}
+        return {"result": bench, "results": results, "torch_available": avail, "captured": captured}
 
 
 def _context_dirty() -> bool:

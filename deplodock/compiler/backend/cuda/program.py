@@ -459,6 +459,16 @@ class HungKernelError(RuntimeError):
     ``bench_fail`` unchanged."""
 
 
+class GraphCaptureError(RuntimeError):
+    """CUDA graph capture of the bench launch loop failed.
+
+    Raised by :meth:`CompiledProgram.capture_launch_graphs` after draining any
+    in-progress capture state, so the stream is clean and the caller can simply
+    retry the bench uncaptured. Only the per-kernel reproducer bench enables
+    capture (the autotune sweep never does), so this can't be misclassified as
+    a ``bench_fail`` there."""
+
+
 _AUTO_BUDGET_MS = 100.0
 # Iter-count cap on ``num_iters="auto"``. Combined with the GPU-time
 # target above: whichever fires first wins. The cap is the binding
@@ -560,6 +570,15 @@ class CompiledProgram:
     # caused ``test_tuned_variant_matches_reference`` to flake ~30%).
     _starts: list = field(default_factory=list, repr=False)
     _stops: list = field(default_factory=list, repr=False)
+    # Per-launch CUDA graphs (one per launch position, each containing that
+    # launch's whole batch) captured by :meth:`capture_launch_graphs`. When
+    # set, ``iter_once`` replays ``_graphs[i]`` with one host call instead of
+    # the ``batch_sizes[i]``-long Python launch loop, so the CUDA event window
+    # measures dense GPU work rather than per-launch dispatch gaps. ``None``
+    # (the default) keeps the plain launch loop — ``run_program`` /
+    # ``run_program_debug`` and the autotune sweep never capture.
+    _graphs: list | None = field(default=None, repr=False)
+    _graph_batch_sizes: list[int] | None = field(default=None, repr=False)
 
     @classmethod
     def build(
@@ -592,6 +611,53 @@ class CompiledProgram:
             ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
         )
         return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values)
+
+    def capture_launch_graphs(self, batch_sizes: list[int]) -> None:
+        """Capture each launch position's batch into one CUDA graph.
+
+        Stream capture is illegal on the legacy default stream, so each batch is
+        captured on a temporary side stream; ``iter_once`` then replays the graph
+        on the default stream (``Graph.launch`` targets the *current* stream), so
+        the existing cupy/torch event interleaving is untouched. The capture
+        window holds only ``_launch`` work — output zeroing + kernel launches on
+        prebuilt buffers/descriptors — no allocations, no sync, no event records
+        (the dynamic-smem attribute is already set by the uncaptured warmup iters
+        that always precede capture).
+
+        Safe to call again when batch sizes change (warmup extension re-fires the
+        calibration); a no-op when they match the captured ones. Raises
+        :class:`GraphCaptureError` on any failure, after draining the capture
+        state so the stream isn't left wedged — the caller retries uncaptured."""
+        import cupy as cp
+
+        if self._graphs is not None and self._graph_batch_sizes == list(batch_sizes):
+            return
+        self._graphs = None
+        side = cp.cuda.Stream(non_blocking=True)
+        graphs = []
+        for i, launch in enumerate(self.compiled.launches):
+            try:
+                with side:
+                    side.begin_capture()
+                    for _ in range(batch_sizes[i]):
+                        _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
+                    graphs.append(side.end_capture())
+            except Exception as exc:
+                if side.is_capturing():
+                    try:
+                        with side:
+                            side.end_capture()  # drain capture state; discard the partial graph
+                    except Exception:  # noqa: BLE001, S110 — already raising the original failure
+                        pass
+                raise GraphCaptureError(f"capture failed for launch {i} ({launch.kernel_name!r}): {exc}") from exc
+        # One throwaway replay per graph absorbs graphExec instantiation /
+        # upload cost so the first measured iter is clean. Buffers get
+        # clobbered, which is fine: accuracy was checked before benching.
+        for g in graphs:
+            g.launch()
+        cp.cuda.runtime.deviceSynchronize()
+        self._graphs = graphs
+        self._graph_batch_sizes = list(batch_sizes)
 
     def iter_once(
         self,
@@ -640,8 +706,15 @@ class CompiledProgram:
         for i, launch in enumerate(self.compiled.launches):
             b = batch_sizes[i]
             starts[i].record()
-            for _ in range(b):
-                _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
+            if self._graphs is not None:
+                # Captured-graph replay: one host call enqueues the whole
+                # batch, so the event window measures dense GPU work. The
+                # caller (``benchmark_program``) re-captures whenever the
+                # batch sizes change, so ``_graphs[i]`` always matches ``b``.
+                self._graphs[i].launch()
+            else:
+                for _ in range(b):
+                    _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
             stops[i].record()
             _wait_for_event(stops[i], _KERNEL_TIMEOUT_MS * b, launch.kernel_name)
             elapsed_ms = cp.cuda.get_elapsed_time(starts[i], stops[i])
@@ -742,6 +815,7 @@ def benchmark_program(
     on_iter=None,
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
+    capture_graphs: bool = True,
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
 
@@ -780,7 +854,20 @@ def benchmark_program(
     watchdog: a variant where every launch fits under the watchdog but
     summed across iters exceeds the budget (e.g. 999 ms × N iters).
     Checked between iters so no in-flight launch is mid-kernel when
-    the function raises."""
+    the function raises.
+
+    ``capture_graphs`` (default on) captures each launch's batch into a CUDA
+    graph (:meth:`CompiledProgram.capture_launch_graphs`) once batch sizes are
+    calibrated, so the event windows measure dense GPU work instead of
+    per-launch dispatch gaps. Warmup iters always run uncaptured, which keeps
+    the zero-elapsed degenerate-launch guard and the hung-kernel watchdog
+    probing real launches before any graph is built. A capture failure is
+    non-fatal: the bench logs a warning and continues uncaptured, reporting it
+    via ``BenchmarkResult.captured`` — callers pairing this result with peer
+    torch timings (``bench_lowered_vs_torch`` / the e2e comparison) use that
+    flag to re-run all-or-nothing so one table never mixes semantics, and the
+    tune sweep persists it on each ``perf`` row (captured measurements
+    supersede wall-semantics ones on write — see ``SearchDB.record_perf``)."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
@@ -799,6 +886,20 @@ def benchmark_program(
         measured = 0
         cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
         total_gpu_ms = 0.0  # all-iter GPU time (incl. warmup), for the run-stage budget
+
+        def _try_capture(sizes: list[int]) -> bool:
+            """Best-effort capture; a failure logs + continues uncaptured."""
+            try:
+                prog.capture_launch_graphs(sizes)
+            except GraphCaptureError as exc:
+                logger.warning("[cuda] %s — continuing with uncaptured (dispatch-inclusive) timing", exc)
+                return False
+            return True
+
+        if capture_graphs and warmup == 0:
+            # No warmup → the calibration below never fires; capture the
+            # uncalibrated all-1 batches so measurement is still dense.
+            capture_graphs = _try_capture(batch_sizes)
         while True:
             iter_dts = prog.iter_once(batch_sizes=batch_sizes, pre_iter=on_iter)
             iters_run += 1
@@ -813,6 +914,13 @@ def benchmark_program(
                 raise RuntimeError(f"benchmark run stage exceeded {run_timeout_s:.1f}s of GPU time — variant marked bench_fail")
             if iters_run == warmup:
                 batch_sizes = _calibrate_batch_sizes(iter_dts)
+                if capture_graphs:
+                    # Capture (or re-capture) at the calibrated batch sizes.
+                    # The warmup extension below can re-fire this calibration
+                    # branch with new batch sizes — ``capture_launch_graphs``
+                    # no-ops when they're unchanged and re-captures when not,
+                    # so graphs and batches never go out of sync.
+                    capture_graphs = _try_capture(batch_sizes)
                 # Extend warmup until total warmup GPU time clears the
                 # clock-ramp floor. Post-batching, each subsequent
                 # warmup iter spends roughly
@@ -838,7 +946,7 @@ def benchmark_program(
             if auto and cumulative_gpu_ms >= target_total_ms:
                 break
 
-    return _samples_to_result(samples, prog.compiled.launches)
+    return _samples_to_result(samples, prog.compiled.launches, captured=capture_graphs)
 
 
 def _resolve_iter_budget(num_iters: int | str) -> tuple[float, int, bool]:
@@ -857,7 +965,7 @@ def _calibrate_batch_sizes(iter_dts: list[float]) -> list[int]:
     return [max(1, int(round(_BATCH_TARGET_MS / dt))) if 0 < dt < _BATCH_TARGET_MS else 1 for dt in iter_dts]
 
 
-def _samples_to_result(samples: list[list[float]], launches: list[_Launch]) -> BenchmarkResult:
+def _samples_to_result(samples: list[list[float]], launches: list[_Launch], *, captured: bool = False) -> BenchmarkResult:
     """Collapse per-launch sample lists to a ``BenchmarkResult`` keyed
     on the median of each launch's measured iters."""
     import statistics as _stats  # noqa: PLC0415
@@ -877,7 +985,9 @@ def _samples_to_result(samples: list[list[float]], launches: list[_Launch]) -> B
     # ``time_ms`` is the per-launch median (stable for tune's ranking); ``min_ms``
     # is the per-launch best-case (least OS/thermal noise — what ``run --bench``
     # reports, matching tune's min-over-variants reporting).
-    return BenchmarkResult(time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None)
+    return BenchmarkResult(
+        time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None, captured=captured
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -940,12 +1050,40 @@ class _BenchWorker:
     def __del__(self) -> None:
         self._kill()
 
+    @staticmethod
+    def _send_with_deadline(proc: subprocess.Popen, request: bytes, deadline: float) -> None:
+        """Write the length-prefixed request without blocking past ``deadline``.
+
+        The worker's stdin is a pipe with a ~64 KB kernel buffer; requests carry
+        pickled graphs and routinely exceed it. A blocking write to a worker
+        that is alive but not reading wedges the parent indefinitely — so write
+        through a non-blocking fd, gated on ``select`` writability with the
+        remaining budget, and raise ``_BenchTimeout`` when it runs out."""
+        import fcntl  # noqa: PLC0415
+
+        fd = proc.stdin.fileno()
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | _os.O_NONBLOCK)
+        data = memoryview(len(request).to_bytes(8, "little") + request)
+        while data:
+            remaining = deadline - _time_module.perf_counter()
+            if remaining <= 0:
+                raise _BenchTimeout()
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable:
+                raise _BenchTimeout()
+            try:
+                n = _os.write(fd, data)
+            except BlockingIOError:  # raced a re-filled buffer between select and write
+                continue
+            data = data[n:]
+
     def run_job(self, request_obj: dict, *, wall_timeout_s: float) -> dict:
         """Send one length-prefixed pickle request, read the response within ``wall_timeout_s``
         (else SIGKILL the worker and raise ``RuntimeError``), and return the unpickled response.
         The single transport for both the deplodock-only bench and the deployable comparison — the
         request's ``torch_spec`` decides which (see ``_bench_worker._run_job``)."""
         request = pickle.dumps(request_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        deadline = _time_module.perf_counter() + wall_timeout_s
         # A previous worker may have exited between our last interaction
         # and this request — most commonly through the dirty-context exit
         # path in ``_bench_worker.main``. ``poll()`` has a brief window
@@ -960,17 +1098,24 @@ class _BenchWorker:
             assert self._proc is not None  # for type narrowing
             proc = self._proc
             try:
-                proc.stdin.write(len(request).to_bytes(8, "little"))
-                proc.stdin.write(request)
-                proc.stdin.flush()
+                self._send_with_deadline(proc, request, deadline)
                 break
+            except _BenchTimeout as exc:
+                # The worker is alive but not reading — e.g. wedged in CUDA
+                # context teardown behind a hung kernel after a dirty exit.
+                # Before the send had its own deadline, the parent blocked
+                # forever in this pipe write (the wall budget only bounded
+                # the response read).
+                self._kill()
+                raise RuntimeError(
+                    f"bench worker did not accept the request within {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned"
+                ) from exc
             except (BrokenPipeError, OSError) as exc:
                 self._kill()
                 if attempt == 1:
                     raise RuntimeError(f"bench worker died during request send: {exc}") from exc
                 logger.info("[bench-worker] stale worker on send (%s) — respawning", exc)
 
-        deadline = _time_module.perf_counter() + wall_timeout_s
         out_fd = proc.stdout.fileno()
 
         def _read_with_deadline(n: int) -> bytes:
@@ -1041,6 +1186,7 @@ def benchmark_program_isolated(
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
     nvcc_flags: str | None = None,
+    capture_graphs: bool = True,
 ) -> BenchmarkResult:
     """Wall-time-bounded ``benchmark_program``. Runs the bench in a
     persistent subprocess; on ``wall_timeout_s`` overrun the worker is
@@ -1068,6 +1214,7 @@ def benchmark_program_isolated(
                 "num_iters": num_iters,
                 "compile_timeout_s": compile_timeout_s,
                 "run_timeout_s": run_timeout_s,
+                "capture_graphs": capture_graphs,
             },
         },
         wall_timeout_s=wall_timeout_s,
@@ -1101,7 +1248,9 @@ def benchmark_compare_isolated(
     - ``("frontend_graph", Graph | None)`` → ``bench_lowered_vs_torch`` (per-kernel reproducer; ``None``
       benches deplodock-only when the graph isn't torch-runnable).
 
-    Returns ``(results, bench, torch_available)`` — the shape ``bench_lowered_vs_torch`` returns."""
+    Returns ``(results, bench, torch_available, captured)`` — the shape ``bench_lowered_vs_torch``
+    returns (``captured``: all backends were timed under CUDA graph capture; False means the
+    all-or-nothing fallback ran and the timings include host dispatch)."""
     resp = _bench_worker().run_job(
         {
             "graph": lowered,
@@ -1114,4 +1263,4 @@ def benchmark_compare_isolated(
         },
         wall_timeout_s=wall_timeout_s,
     )
-    return resp["results"], resp["result"], resp["torch_available"]
+    return resp["results"], resp["result"], resp["torch_available"], resp.get("captured", False)

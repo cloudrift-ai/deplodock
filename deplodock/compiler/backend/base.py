@@ -74,6 +74,11 @@ class BenchmarkResult:
     max_ms: float | None = None
     num_launches: int = 0
     per_launch: list[LaunchTime] | None = None
+    # Timings came from CUDA-graph-captured launch windows (pure GPU time, no
+    # per-launch dispatch gaps). False when capture was disabled or failed and
+    # the bench fell back to plain launches — callers that pair this result
+    # with peer torch timings use the flag to keep one table single-semantics.
+    captured: bool = False
 
 
 class Backend(ABC):

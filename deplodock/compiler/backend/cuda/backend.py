@@ -167,6 +167,7 @@ class CudaBackend(Backend):
         num_iters: int | str = 20,
         on_iter=None,
         nvcc_flags: str | None = None,
+        capture_graphs: bool = True,
     ) -> BenchmarkResult:
         del input_data
         # ``nvcc_flags`` re-points this one bench's compile at a different opt
@@ -195,6 +196,7 @@ class CudaBackend(Backend):
                 compile_timeout_s=self.bench_compile_timeout_s,
                 run_timeout_s=self.bench_run_timeout_s,
                 nvcc_flags=nvcc_flags,
+                capture_graphs=capture_graphs,
             )
         else:
             with config.nvcc_flags_override(nvcc_flags):
@@ -205,10 +207,12 @@ class CudaBackend(Backend):
                     on_iter=on_iter,
                     compile_timeout_s=self.bench_compile_timeout_s,
                     run_timeout_s=self.bench_run_timeout_s,
+                    capture_graphs=capture_graphs,
                 )
         return BenchmarkResult(
             time_ms=result.time_ms,
             min_ms=result.min_ms,
             num_launches=result.num_launches,
             per_launch=result.per_launch,
+            captured=result.captured,
         )

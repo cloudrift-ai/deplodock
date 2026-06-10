@@ -67,6 +67,30 @@ def test_pinned_knobs_sets_and_restores_env(monkeypatch):
     assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
 
 
+def test_build_torch_fns_resets_dynamo_before_compile(monkeypatch):
+    """Persistent bench processes compile a fresh closure of the SAME torch_ref
+    ``fn`` code object per row; dynamo's per-code-object recompile limit then
+    silently degrades torch.compile to eager after ~8 rows, corrupting the
+    tcompile column. ``_build_torch_fns`` must reset dynamo before each compile."""
+    import torch._dynamo
+
+    from deplodock.commands.run import _build_torch_fns
+
+    calls: list[bool] = []
+    real_reset = torch._dynamo.reset
+    monkeypatch.setattr(torch._dynamo, "reset", lambda: (calls.append(True), real_reset())[1])
+
+    module = torch.nn.Linear(4, 4)
+    fns = _build_torch_fns(module, (torch.randn(2, 4),), {}, warmup=0, backends={"tcompile"})
+    assert calls, "dynamo must be reset before the bench compile"
+    assert "torch.compile" in fns
+
+    calls.clear()
+    fns = _build_torch_fns(module, (torch.randn(2, 4),), {}, warmup=0, backends={"eager"})
+    assert not calls, "eager-only benches must not touch dynamo"
+    assert "Eager PyTorch" in fns
+
+
 @requires_cuda
 def test_run_golden_bench_shows_benched_golden_row(run_cli):
     """``run --golden NAME --bench`` compiles + benches the recorded golden (knobs

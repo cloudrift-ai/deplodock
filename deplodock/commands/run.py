@@ -263,7 +263,7 @@ def handle_run(args):
     # every other GPU entry point) via ``gpu_lock()`` — no need to wrap
     # the whole bench block here. Print/dump are pure CPU work.
     try:
-        results, bench = _bench_interleaved(
+        results, bench, captured = _bench_interleaved_captured(
             cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
         )
     except RuntimeError as exc:
@@ -287,7 +287,7 @@ def handle_run(args):
     if getattr(args, "golden_configs", None):
         golden_benches = _bench_golden_variants(backend, args.code, args.golden_configs, warmup=args.warmup, iters=args.iters)
 
-    _print_table(results)
+    _print_table(results, note=None if captured else "(graph-capture fallback: timings include host launch overhead)")
     _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -805,7 +805,7 @@ def _passes_after_stage(stage: str) -> list[str]:
     return [p for p in CUDA_PASSES if p not in completed]
 
 
-def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends):
+def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends, capture_graphs=True):
     """Run + (optionally) benchmark a lowered graph against its torch reference on
     shared random inputs. The common bench primitive behind ``run --ir`` and
     ``tune --bench``.
@@ -819,11 +819,20 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
     when ``do_bench``, the selected backends are timed — interleaved when a torch ref
     exists (full ``warmup``/``iters``), else deplodock-only at reduced iters.
 
-    Returns ``(results, bench, torch_available)``: ``results`` is the
+    ``capture_graphs`` (default on — this function's callers are the per-kernel
+    reproducer paths, where the torch side replays the frontend graph op-by-op and
+    would otherwise be dispatch-bound) wraps every timed backend in a CUDA graph so
+    the event windows measure pure GPU time. All-or-nothing: if any torch backend
+    or the deplodock launch loop fails to capture, the whole bench retries
+    uncaptured (warning logged) so one table never mixes timing semantics. The
+    accuracy check always runs uncaptured, before any capture.
+
+    Returns ``(results, bench, torch_available, captured)``: ``results`` is the
     ``{backend: latency_us}`` dict (``None`` when ``do_bench`` is False), ``bench`` the
-    deplodock ``BenchmarkResult`` (``None`` when ``do_bench`` is False), and
-    ``torch_available`` whether an eager/torch.compile reference was built. Does no
-    printing / dumping — callers own that."""
+    deplodock ``BenchmarkResult`` (``None`` when ``do_bench`` is False),
+    ``torch_available`` whether an eager/torch.compile reference was built, and
+    ``captured`` whether the timings came from graph-captured (pure-GPU) windows.
+    Does no printing / dumping — callers own that."""
     import numpy as np
     import torch
 
@@ -888,24 +897,36 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
 
     torch_available = torch_fn is not None
     if not do_bench:
-        return None, None, torch_available
+        return None, None, torch_available, False
 
     if torch_available:
         backends = _resolve_backends(bench_backends)
         torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, warmup, backends=backends)
-        results, bench = _bench_interleaved(torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns)
-        return results, bench, True
-    bench = backend.benchmark(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5))
-    return {"Deplodock": bench.time_ms * 1000}, bench, False
+        if capture_graphs:
+            results, bench, captured = _bench_interleaved_captured(
+                torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns
+            )
+        else:
+            results, bench = _bench_interleaved(
+                torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False
+            )
+            captured = False
+        return results, bench, True, captured
+    # Deplodock-only: a capture failure falls back inside ``benchmark_program``
+    # (warned + reported via ``bench.captured``) — nothing to de-mix.
+    bench = backend.benchmark(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5), capture_graphs=capture_graphs)
+    return {"Deplodock": bench.time_ms * 1000}, bench, False, bench.captured
 
 
 def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
     """End-to-end full-model bench against the **real torch module** — eager /
-    ``torch.compile`` / Deplodock — using ``_bench_interleaved``. The module + its
+    ``torch.compile`` / Deplodock — using the all-or-nothing CUDA-graph-captured
+    interleaved bench (real modules occasionally resist capture; those fall back
+    to uncaptured wall timing, flagged in ``captured``). The module + its
     trace-time inputs come from ``load_or_trace``'s bundle. Skips the accuracy
     check (deplodock's bench uses synthetic activations vs torch's bound inputs, so
     only latency is comparable here — accuracy lives in the per-kernel path).
-    Returns ``(results, bench)``."""
+    Returns ``(results, bench, captured)``."""
     import torch
 
     cuda_module = module.to("cuda")
@@ -913,7 +934,7 @@ def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, i
     cuda_kwargs = _to_cuda_kwargs(kwargs)
     backends = _resolve_backends(bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, warmup, backends=backends)
-    return _bench_interleaved(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
+    return _bench_interleaved_captured(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
 
 
 def _handle_run_ir(args, CudaBackend, CompilerDump):
@@ -960,7 +981,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         # warm-started prior into single-shot compile is a deferred follow-up.
         graph = Pipeline.build(tail).run(graph, db=db, dump=dump)
 
-    results, bench, torch_available = bench_lowered_vs_torch(
+    results, bench, torch_available, captured = bench_lowered_vs_torch(
         frontend,
         graph,
         backend,
@@ -975,7 +996,8 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         if dump:
             dump.dump_benchmark(bench)
         if torch_available:
-            _print_table(results)
+            note = None if captured else "(graph-capture fallback: timings include host launch overhead)"
+            _print_table(results, note=note)
         else:
             # Non-frontend IR (loop/tile/…): no torch twin → deplodock-only.
             from deplodock.commands.table import Col, render_table  # noqa: PLC0415
@@ -1072,8 +1094,9 @@ def _to_cuda_tensor(arr, dtype):
     """numpy array → CUDA torch tensor in the node's dtype (default fp32)."""
     import torch
 
-    td = getattr(torch, str(dtype), torch.float32)
-    return torch.from_numpy(arr).to("cuda").to(td)
+    from deplodock.compiler.backend.torch_ref import torch_dtype
+
+    return torch.from_numpy(arr).to("cuda").to(torch_dtype(dtype) or torch.float32)
 
 
 def _to_cuda_kwargs(kwargs):
@@ -1224,6 +1247,16 @@ def _build_torch_fns(module, args, kwargs, warmup, *, backends: set[str]):
         torch_fns["Eager PyTorch"] = lambda: module(*args, **kwargs)
     if "tcompile" in backends:
         try:
+            # Persistent bench processes (the SIGKILL-able worker, ``tune
+            # --dataset golden``'s in-process loop) compile a fresh closure of
+            # the SAME ``torch_ref`` ``fn`` code object per row; dynamo's
+            # recompile limit is keyed per code object, so after ~8 rows it
+            # silently stops compiling and the tcompile column quietly measures
+            # eager (observed: 8 µs rows reading 55-80 µs). Reset dynamo so
+            # every bench compiles fresh.
+            import torch._dynamo  # noqa: PLC0415
+
+            torch._dynamo.reset()
             compiled_module = torch.compile(module)
             for _ in range(warmup + 5):
                 with torch.no_grad():
@@ -1234,7 +1267,76 @@ def _build_torch_fns(module, args, kwargs, warmup, *, backends: set[str]):
     return torch_fns
 
 
-def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns):
+def _capture_torch_fn(fn):
+    """Warm ``fn`` on a side stream, capture one call into a CUDA graph, and
+    return the (host-cheap) replay closure.
+
+    The replay slots straight into ``_bench_interleaved``'s ``on_iter`` window:
+    each ``g.replay()`` is one host call that enqueues every captured kernel, so
+    the stream stays dense and the CUDA events measure pure GPU time instead of
+    per-op Python dispatch gaps. Requires static inputs/outputs — true for the
+    bench closures, which close over fixed CUDA tensors. The returned bound
+    method keeps the graph (and its private memory pool, holding any tensors the
+    fn allocates per call) alive for the bench's lifetime."""
+    import torch
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side), torch.no_grad():
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(side)
+    g = torch.cuda.CUDAGraph()
+    # Default ``capture_error_mode`` (global): the bench is single-threaded and
+    # no cupy call happens between begin/end. If CI ever flakes on concurrent
+    # CUDA activity, ``capture_error_mode="thread_local"`` is the one-line knob.
+    with torch.no_grad(), torch.cuda.graph(g):
+        fn()
+    return g.replay
+
+
+def _capture_torch_fns(torch_fns: dict) -> dict | None:
+    """Capture every backend closure into a CUDA graph; ``None`` if ANY fails.
+
+    All-or-nothing by design: a comparison table must not mix captured
+    (pure-GPU) and uncaptured (dispatch-inclusive) timings, so a single
+    backend resisting capture (e.g. torch.compile guard machinery) falls the
+    whole invocation back to uncaptured timing."""
+    captured: dict = {}
+    for name, fn in torch_fns.items():
+        try:
+            captured[name] = _capture_torch_fn(fn)
+        except Exception as exc:  # noqa: BLE001 — capture is best-effort, fallback covers
+            logger.warning("CUDA graph capture failed for %s (%s) — benching all backends uncaptured", name, exc)
+            return None
+    return captured
+
+
+def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, iters, *, torch_fns):
+    """All-or-nothing CUDA-graph-captured interleaved bench.
+
+    Captures every torch closure (``_capture_torch_fns``) and runs the
+    interleaved loop with the deplodock side captured too. If ANY side fails —
+    a torch backend resists capture, or the deplodock launch loop fell back
+    (``bench.captured`` False) — the whole bench re-runs uncaptured with the
+    original closures, so one table never mixes timing semantics. Returns
+    ``(results, bench, captured)``."""
+    captured_fns = _capture_torch_fns(torch_fns)
+    if captured_fns is not None:
+        results, bench = _bench_interleaved(
+            module, args, kwargs, backend, lowered, warmup, iters, torch_fns=captured_fns, capture_graphs=True
+        )
+        if bench.captured:
+            return results, bench, True
+        if not torch_fns:
+            return results, bench, False  # deplodock-only: nothing to de-mix
+        # benchmark_program already logged the capture failure; re-run only to de-mix the table.
+        logger.warning("deplodock side fell back to uncaptured timing — re-benching all backends uncaptured")
+    results, bench = _bench_interleaved(module, args, kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False)
+    return results, bench, False
+
+
+def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns, capture_graphs=False):
     """Time the selected backends by alternating one iter of each per
     loop step. All backends see the same warm GPU state across the
     measurement window — same clocks, same caches, same thermal drift
@@ -1255,6 +1357,11 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     :func:`_build_torch_fns` (``handle_run`` builds it outside the
     GPU lock so the slow ``torch.compile`` JIT runs concurrently with
     peer workers; the lock then wraps only this measurement loop).
+
+    ``capture_graphs`` forwards to the deplodock side only; the torch
+    closures must be pre-captured by the caller to keep one timing
+    semantics per table — use :func:`_bench_interleaved_captured`,
+    which owns that all-or-nothing pairing.
     """
     import torch
 
@@ -1276,7 +1383,7 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
                 stop.record()
             torch_events[name].append((start, stop, batch_size))
 
-    bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter)
+    bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}
@@ -1294,7 +1401,7 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
     return results, bench
 
 
-def _print_table(results):
+def _print_table(results, note: str | None = None):
     from deplodock.commands.table import Col, render_table  # noqa: PLC0415
 
     eager_us = results.get("Eager PyTorch", 0)
@@ -1303,3 +1410,5 @@ def _print_table(results):
     print()
     for line in render_table(cols, rows, rule=True):
         print(line)
+    if note:
+        print(note)

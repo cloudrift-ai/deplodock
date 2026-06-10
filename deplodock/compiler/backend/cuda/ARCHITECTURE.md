@@ -77,6 +77,26 @@ hang forever on a non-terminating kernel; on overrun it raises **`HungKernelErro
 in-process timing core; both the autotune bench and the deployable comparison run it **inside the
 worker** (below), so a hung kernel hangs the child, not the parent.
 
+`benchmark_program` captures each launch position's batch into a CUDA graph **by default**
+(`capture_graphs=True` → `CompiledProgram.capture_launch_graphs`, right after batch-size calibration),
+and `iter_once` replays `graph_i.launch()` — one host call per event window — instead of the Python
+launch loop. CUDA events measure *stream elapsed* time, which only equals GPU time when the stream is
+saturated; for sub-10 µs kernels the per-launch cupy dispatch starves the stream and the events time
+the starvation. The graph replay keeps the stream dense, so the same event windows become pure-GPU
+measurements. Capture happens on a temporary side stream (stream capture is illegal on the legacy NULL
+stream); replay targets the current (NULL) stream, so cupy/torch event interleaving is unchanged, and
+so is the `_wait_for_event` watchdog (a hung kernel inside a graph still never completes its stop
+event). Warmup iters always run uncaptured, so the zero-elapsed degenerate-launch guard and the
+watchdog probe real launches before any graph exists. Re-fires of the calibration branch (warmup
+extension) re-capture when batch sizes change. A capture failure (`GraphCaptureError`, raised by
+`capture_launch_graphs` after draining the capture state) is caught in place: the bench warns,
+continues uncaptured, and reports it via `BenchmarkResult.captured` — comparison callers
+(`bench_lowered_vs_torch` / `bench_full_model_real`) pair that flag with their torch-side capture and
+re-run all-or-nothing so one table never mixes semantics. The tune sweep persists the flag per `perf`
+row (`SearchDB.record_perf`): captured measurements supersede wall-semantics ones for the same key
+regardless of median, never the reverse — old rows stay usable (replay, prior training) and upgrade
+in place as re-tunes measure them captured. See `tests/compiler/backend/test_graph_capture.py`.
+
 **One worker, two jobs.** `_bench_worker.py`'s `_run_job` dispatches on `torch_spec`: `None` is the
 deplodock-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /
 torch.compile / deplodock comparison — `("trace_args", {code/input/layer/seq_len/dynamic})` →

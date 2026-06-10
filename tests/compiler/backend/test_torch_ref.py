@@ -56,6 +56,32 @@ def test_linear_and_elementwise():
     _assert_matches_numpy(g, {"x": r.standard_normal((4, 8)), "w": r.standard_normal((16, 8))})
 
 
+def test_declared_dtype_cast_is_enforced():
+    """The trace folds HF's explicit casts (e.g. the fp32 RMSNorm body casting
+    back to fp16) into each node's declared output dtype; ``build_callable``
+    must cast accordingly — torch promotion alone would carry the f16×f32 mix
+    forward at fp32 and ``F.linear`` would reject the f32×f16 operands."""
+    from deplodock.compiler.dtype import F16, F32
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8), F16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("s", (4, 8), F32), node_id="s")
+    g.add_node(ElementwiseOp(op="multiply"), ["x", "s"], Tensor("m", (4, 8), F16), node_id="m")  # declared f16 = the cast
+    g.add_node(InputOp(), [], Tensor("w", (16, 8), F16), node_id="w")
+    g.add_node(LinearOp(), ["m", "w"], Tensor("o", (4, 16), F16), node_id="o")
+    g.inputs, g.outputs = ["x", "s", "w"], ["o"]
+
+    tin = {
+        "x": torch.randn(4, 8, dtype=torch.float16),
+        "s": torch.randn(4, 8),
+        "w": torch.randn(16, 8, dtype=torch.float16),
+    }
+    fn, inputs = torch_ref.build_callable(g, tin)
+    with torch.no_grad():
+        out = fn(*inputs)
+    assert out.dtype == torch.float16
+
+
 def test_matmul_softmax():
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")

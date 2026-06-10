@@ -177,3 +177,36 @@ def test_no_repro_without_input_graph(tmp_path):
     dump = CompilerDump(dir=tmp_path)  # no dump_input_graph call
     Pipeline.build(TILE_PASSES).run(g, dump=dump)
     assert not list(tmp_path.glob("*.kernels/*.torch.json"))
+
+
+def test_repro_keeps_constant_derived_boundaries(tmp_path):
+    """A non-origin feed that is a pure function of constants (e.g. the
+    broadcast of a pow-exponent scalar) keeps its constant chain in the slice;
+    demoting it to an ``InputOp`` would feed it random bench data — out of
+    domain (``pow(x, random)`` → NaN). A feed computed from a real input still
+    becomes a synthetic boundary."""
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (4, 8)), node_id="x")
+    # Constant-derived feed: scalar exponent → broadcast.
+    g.add_node(ConstantOp(name="exp_c", value=2.0), [], Tensor("exp_c", (1,), value=2.0, constant=True), node_id="exp_c")
+    g.add_node(
+        IndexMapOp(out_shape=(4, 8), sources=(IndexSource(input_idx=0, coord_map=(placeholder(0),)),)),
+        ["exp_c"],
+        Tensor("exp_bc", (4, 8)),
+        node_id="exp_bc",
+    )
+    # Input-derived feed: must stay a synthetic boundary.
+    g.add_node(ElementwiseOp(op="silu"), ["x"], Tensor("act", (4, 8)), node_id="act")
+    g.add_node(ElementwiseOp(op="pow"), ["act", "exp_bc"], Tensor("p", (4, 8)), node_id="p")
+    g.inputs, g.outputs = ["x"], ["p"]
+
+    dump = CompilerDump(dir=tmp_path)
+    dump.dump_input_graph(g)
+    sub = dump._torch_repro_subgraph({"p"})  # slice to the pow op only
+
+    kinds = {nid: type(n.op).__name__ for nid, n in sub.nodes.items()}
+    assert kinds["exp_c"] == "ConstantOp", "constant leaf must be preserved"
+    assert kinds["exp_bc"] == "IndexMapOp", "constant-derived broadcast must be kept, not demoted"
+    assert kinds["act"] == "InputOp", "input-derived feed must become a synthetic boundary"
+    assert sub.inputs == ["act"]
+    assert sub.outputs == ["p"]
