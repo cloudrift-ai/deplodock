@@ -110,6 +110,34 @@ explicit `DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scal
 sidestep it). No variant is scored or materialized to rank it — the prior featurizes the row knobs directly
 (`knob.knob_features`).
 
+**Demoted-matmul split (`SPLIT_CONE`, rule `005_split_demoted`).** A fused computed-operand cone (the
+gated-MLP norm prologue, an elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments
+from staged smem and a computed A operand has no buffer to stage, so `is_atom_eligible` never passes on the
+fused body. Rule `005_split_demoted` (its own pass unit, running before partition so the body is still
+un-tiled) offers a structural fork: `[keep-fused Op ({SPLIT_CONE: False} stamped), OptionFork(Graph whose
+kernels carry {SPLIT_CONE: True})]` — the split is a two-kernel fragment with a producer materializing the
+cone to an `xn` intermediate (operand dtype; carries the cone's prologue deps, e.g. the norm's row-stat
+reduce) and the consumer gemm loading `xn` under the cone root's SSA name (the multiply and epilogue are
+untouched). Both
+re-enter the planner as ordinary LoopOps with their own fork trees. The offer is gated ONLY on the cut's
+well-formedness (`_split_demoted.try_split_demoted` bails on multiple K loops, a multiply with zero/two
+computed sides, accums with different cones, escaping cone values, N-indexed cones, symbolic extents) —
+deliberately NOT on a predicted tier for the clean gemm: profitability is the search's question (an earlier
+eligibility-simulating gate immediately drifted from what the cell tagger accepts). The tuner measures both
+branches inside the op's slice (017-style: both kernels' costs sum into the op's reward; first-class slices
+come with `plans/structural-forks-in-two-level.md`); greedy never picks the structural option (see
+`Pipeline.run` above). The split decision lives in the tile phase, not as a fusion guard: by partition time
+the fused body is final, so the demotion is visible order-independently (decomposed chains assemble the
+matmul multiply-last — no standalone node is ever eligible mid-fusion). The `op.knobs` stamp is the
+considered-vs-declined idiom (`020_stage_inputs`'s declined `STAGE` row, `search/keys.py`): it is
+simultaneously the rule's idempotence guard (without it a multi-site batch re-offers combinatorially in fork
+children — measured; a node may still be offered once per sibling branch of an earlier fork point, the
+intended cross-product of independent decisions), the learned prior's training signal (absent = never
+offered → NaN-filled; `False`/`True` = the decision, riding every perf row), and the `op_cache_key`
+separation that keeps each decision state distinct from its parent in the search tree. The stamp is
+deterministic per offer site, so identical kernels across graphs stamp identically and keep sharing perf
+rows.
+
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
 `Role.WARP` (→ `WarpTile`) and `Role.ATOM` (→ `AtomTile`, the
@@ -282,7 +310,12 @@ three entry points:
 - `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
   compile via `GreedySearch` (flattens each fork point to its complete leaves and
   picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
-  once trained). Stops at the first terminal candidate.
+  once trained). Stops at the first terminal candidate. **Structural options are
+  never the greedy pick**: a leaf wrapping a `Graph` splice (the `SPLIT_CONE` split,
+  017's atomic-free combine) is filtered out whenever an in-place `Op` variant
+  exists — the per-op prior prices one kernel's knob row, so its score for a
+  multi-kernel Graph option is noise. `tune` explores them; an env pin makes the
+  Graph the rule's only option, which passes through untouched.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
   yields one terminal `Candidate` per fully-explored rollout.
@@ -605,7 +638,8 @@ incompatible divisibility still get a sensible default.
 | `ASYNC_COPY`         | BOOL      | `060_use_async_copy`          | Promote double-buffered (BUFFERED) bundles to cp.async (ASYNC). `0` = keep the synchronous double-buffer. Default on for sm_80+.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `PIPELINE_STAGES`    | BOOL      | `080_pipeline_stages`         | Software-pipeline async-staged K-outer loops into prologue/main/epilogue. `0` = keep the depth-1 staged loop.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `WARPSPEC`           | BOOL      | `085_warp_specialize`         | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `RING=2` on the warp tier to keep it eligible). Eligibility also requires the bundle be **reachable by the producer split** — `_split_by_role` recurses only through `serial_outer` / `RegisterTile` / `AtomTile`, so a bundle under any other wrapper (e.g. the fused linear+mean kernel's `SerialTile(kind='plain')` fragment loop) would strand the TMA issues in the consumer branch and deadlock every consumer `mbarrier.wait` (the Qwen3 `k_linear_mean_reduce` hang — `plans/qwen3-embedding-tune-hung-kernel.md`); such shapes stamp WS=False. Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is **emitted first** for the warp tier (option-0), the deterministic tie-break the cold picker takes when the prior ties WS=0/WS=1 (the `AnalyticPrior` has no WARPSPEC feature), so it deploys the win cold instead of taking WS=0 and never benching WS=1 (the fp16 cliff in `plans/golden-sweep-report.md`). `DEPLODOCK_WARP_SPECIALIZE` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `NOATOMIC`           | BOOL      | `017_atomic_free_splitk`      | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). `DEPLODOCK_ATOMIC_FREE_SPLITK` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `NOATOMIC`           | BOOL      | `017_atomic_free_splitk`      | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). `DEPLODOCK_ATOMIC_FREE_SPLITK` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `SPLIT_CONE`         | BOOL      | `005_split_demoted`           | Split a demoted matmul (fused computed-operand cone — gated-MLP norm, elementwise scale) into an `xn` producer + the clean gemm (see the demoted-matmul split section above). Stamped on `op.knobs` at offer sites only — `False` = considered-and-declined, `True` = both split kernels — the rule's idempotence guard and the prior's training signal (absent = never offered). Deliberately declares no `off=` value: `_off_fill_pass` would stamp an off-default onto every knob-bearing TileOp at the pass boundary, erasing the absent-vs-declined distinction. `DEPLODOCK_SPLIT_CONE=1/0` pins the branch.                                                                                                |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered
