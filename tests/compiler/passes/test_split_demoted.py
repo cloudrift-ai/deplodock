@@ -2,8 +2,10 @@
 ``_split_demoted`` cut builder).
 
 A fused computed-operand cone (gated-MLP norm prologue, elementwise scale) keeps a matmul
-off the warp tier; rule 005 offers a structural fork splitting the kernel into an ``xn``
-producer + the clean gemm before partition tiles anything. The offer is gated only on the
+off the warp tier; rule 005 offers a structural fork splitting the kernel into ``xn``
+producer(s) + the clean gemm before partition tiles anything — one producer per computed
+multiply operand (rotary QK^T gets two; a weight-side scale's N cone gets a [K, N]
+buffer). The offer is gated only on the
 cut's WELL-FORMEDNESS (signal-driven design: profitability is the tuner's question, never a
 predicate's). Covers: offered / not-offered cuttability gates, the fragment's structure,
 the rule's option list (fused first) + the offered-marker idempotence, ``DEPLODOCK_SPLIT_CONE``
@@ -84,6 +86,26 @@ def _scale_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
     return g
 
 
+def _double_scale_linear_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
+    """Elementwise scale on BOTH operands → Linear ([N, K] weight): fusion
+    produces a doubly-computed matmul cell (the rotary-QK^T shape). The
+    two-producer cut materializes the N-indexed cone at [K, N], so the
+    consumer gemm gets the canonical B layout — warp-tier eligible even
+    though the original Linear access was transposed [n, k]."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (M, K), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("sx", (M, K), f16), node_id="sx")
+    g.add_node(InputOp(), [], Tensor("w", (N, K), f16), node_id="w")
+    g.add_node(InputOp(), [], Tensor("sw", (N, K), f16), node_id="sw")
+    g.add_node(ElementwiseOp("multiply"), ["x", "sx"], Tensor("xs", (M, K), f16), node_id="xs")
+    g.add_node(ElementwiseOp("multiply"), ["w", "sw"], Tensor("ws", (N, K), f16), node_id="ws")
+    g.add_node(LinearOp(), ["xs", "ws"], Tensor("o", (M, N), f16), node_id="o")
+    g.inputs = ["x", "sx", "w", "sw"]
+    g.outputs = ["o"]
+    return g
+
+
 def _fuse(graph: Graph, cc=(12, 0)) -> Graph:
     return Pipeline.build(LOOP_PASSES).run(graph, ctx=Context.from_target(cc), db=SearchDB())
 
@@ -119,11 +141,15 @@ def test_split_offered_for_prologue_demotion() -> None:
     assert tuple(d.as_static() for d in xn.output.shape) == (_S, _H)
     assert xn.output.dtype == _dt.get("f16")
     assert xn.op.name.endswith("_xn")
-    # Consumer: loads xn + the weight; the rebuilt gemm is genuinely clean —
-    # warp-tier eligible (informational here, NOT a gate the builder applies).
+    # Consumer: loads xn + the weight. The Linear-derived gemm keeps its
+    # transposed-B operand (wg is [N, K] — K in the last index dim of BOTH
+    # loads), which ``011_lower_atom_cell._classify_ab`` cannot tag — the
+    # eligibility gate mirrors that honestly, so this split lands on the
+    # scalar register-tile tier (informational here, NOT a gate the builder
+    # applies; the MatmulOp-derived split below reaches the warp tier).
     assert xn.id in mm.inputs
     ctx = Context.from_target((12, 0))
-    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    assert not any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
     assert frag.outputs == [mm.id]
     # Structural features restamped per body — the split kernels must not
     # featurize as the fused kernel for the learned prior.
@@ -135,12 +161,97 @@ def test_split_offered_for_in_cell_cone() -> None:
     frag = _split(_fuse(_scale_matmul_graph()))
     assert frag is not None
     assert sum(1 for n in frag.nodes.values() if isinstance(n.op, LoopOp)) == 2
+    # The MatmulOp-derived gemm keeps its canonical [K, N] B operand — the
+    # rebuilt consumer is genuinely warp-tier eligible.
+    mm = next(n for nid, n in frag.nodes.items() if nid.endswith("__mm"))
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
 
 
 def test_split_offered_for_f32_too() -> None:
     """Signal-driven: the builder checks cuttability only — no dtype / device /
     tier prediction. Whether an f32 split pays is the tuner's question."""
     assert _split(_fuse(_norm_linear_graph("f32"))) is not None
+
+
+def test_split_offered_for_weight_side_cone() -> None:
+    """An N-reading cone beside a plain Load (a weight-side scale — the
+    dequant shape): one producer materializing at [K, N], consumer warp-tier
+    eligible. Falls out of the unified per-operand rule; the old A-side-only
+    dispatch bailed here."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (128, 128), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("w", (128, 128), f16), node_id="w")
+    g.add_node(InputOp(), [], Tensor("sw", (128, 128), f16), node_id="sw")
+    g.add_node(ElementwiseOp("multiply"), ["w", "sw"], Tensor("ws", (128, 128), f16), node_id="ws")
+    g.add_node(MatmulOp(), ["x", "ws"], Tensor("o", (128, 128), f16), node_id="o")
+    g.inputs = ["x", "w", "sw"]
+    g.outputs = ["o"]
+    fused = _fuse(g)
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    loops = {nid for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
+    assert loops == {f"{node.id}__xn", f"{node.id}__mm"}
+    xn = frag.nodes[f"{node.id}__xn"]
+    # The cone reads (k, n) and no rows — a 2-D [K, N] buffer, K NOT in the
+    # last dim, so the consumer's B load keeps the canonical layout.
+    assert tuple(d.as_static() for d in xn.output.shape) == (128, 128)
+    mm = frag.nodes[f"{node.id}__mm"]
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+
+
+def test_two_sided_split_offered_for_double_cone() -> None:
+    """Both multiply operands computed (rotary QK^T's shape): the cut builds
+    TWO producers. The N-indexed cone lands at [K, N] — K out of the last
+    index dim — so the consumer gemm is genuinely warp-tier eligible, which
+    the one-sided Linear split can never be (transposed-B)."""
+    fused = _fuse(_double_scale_linear_graph())
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    loops = {nid: n for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
+    assert set(loops) == {f"{node.id}__xna", f"{node.id}__xnb", f"{node.id}__mm"}
+    xna = frag.nodes[f"{node.id}__xna"]
+    xnb = frag.nodes[f"{node.id}__xnb"]
+    mm = frag.nodes[f"{node.id}__mm"]
+    # A at (rows, K); B at (K, N) — the row-free scale cone stays 2-D.
+    assert tuple(d.as_static() for d in xna.output.shape) == (128, 128)
+    assert tuple(d.as_static() for d in xnb.output.shape) == (128, 128)
+    assert xna.op.name.endswith("_xna") and xnb.op.name.endswith("_xnb")
+    assert xna.id in mm.inputs and xnb.id in mm.inputs
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    assert frag.outputs == [mm.id]
+    # Structural features restamped per body.
+    assert mm.op.knobs.get("S_n_load") == 2.0
+
+
+def test_two_sided_split_matches_fused_on_numpy() -> None:
+    from deplodock.compiler.backend.numpy import NumpyBackend
+
+    fused = _fuse(_double_scale_linear_graph())
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    split_graph = fused.copy()
+    split_graph.splice(frag, consumed={node.id}, output=node.id)
+    assert sum(1 for n in split_graph.nodes.values() if isinstance(n.op, LoopOp)) == 3
+
+    rng = np.random.default_rng(0)
+    npf16 = np.dtype(np.float16)
+    inputs = {
+        "x": rng.standard_normal((128, 128), dtype=np.float32).astype(npf16),
+        "sx": rng.standard_normal((128, 128), dtype=np.float32).astype(npf16),
+        "w": (rng.standard_normal((128, 128), dtype=np.float32) * 0.05).astype(npf16),
+        "sw": rng.standard_normal((128, 128), dtype=np.float32).astype(npf16),
+    }
+    be = NumpyBackend()
+    ref = be.run(be.compile(_double_scale_linear_graph()), input_data=dict(inputs))[0].outputs["o"]
+    out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
 
 
 def test_no_split_when_cone_escapes() -> None:
@@ -276,12 +387,10 @@ def test_greedy_compile_keeps_fused_kernel() -> None:
 
 
 def test_pinned_split_lowers_two_kernels(monkeypatch) -> None:
-    # WM=WN=1 prunes the warp rows (single-warp mma is unservable), keeping the
-    # gemm on the scalar tier — the mma materializer can't lower the
-    # Linear-derived transposed-B operand yet (pre-existing; see PR notes).
+    # The Linear-derived transposed-B gemm is atom-ineligible (mirrors the
+    # cell tagger), so no warp rows enumerate — the split lowers on the
+    # scalar tier with no knob pins needed.
     monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
-    monkeypatch.setenv("DEPLODOCK_WM", "1")
-    monkeypatch.setenv("DEPLODOCK_WN", "1")
     out = Pipeline.build(CUDA_PASSES).run(_norm_linear_graph(), ctx=Context.from_target((12, 0)), db=SearchDB())
     ids = _lowered_kernel_ids(out)
     assert len(ids) == 2
@@ -362,8 +471,6 @@ def test_split_scalar_accuracy_cuda(monkeypatch) -> None:
 
     target_mod.set_target(None)  # live device
     monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
-    monkeypatch.setenv("DEPLODOCK_WM", "1")
-    monkeypatch.setenv("DEPLODOCK_WN", "1")
     rng = np.random.default_rng(0)
     inputs = _norm_linear_inputs(rng)
     ref_be = NumpyBackend()
@@ -378,8 +485,9 @@ def test_split_scalar_accuracy_cuda(monkeypatch) -> None:
 @requires_cuda
 def test_split_mma_accuracy_cuda(monkeypatch) -> None:
     """Pinned split on a MatmulOp-derived demotion: the clean gemm runs on
-    mma.sync and matches numpy. (Linear-derived gemms can't mma-lower yet —
-    the transposed-B operand is rejected by the cell tagger; pre-existing.)"""
+    mma.sync and matches numpy. (Linear-derived gemms can't mma-lower — the
+    transposed-B operand is unclassifiable by the cell tagger, and the
+    eligibility gate now mirrors that, keeping them off the warp tier.)"""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.numpy import NumpyBackend
     from deplodock.compiler.ir.cuda.ir import CudaOp
@@ -401,5 +509,37 @@ def test_split_mma_accuracy_cuda(monkeypatch) -> None:
     compiled = be.compile(_scale_matmul_graph(M, K, N))
     mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
     assert len(mma_kernels) == 1, "the split gemm must lower on the warp tier"
+    out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+@requires_cuda
+def test_two_sided_split_mma_accuracy_cuda(monkeypatch) -> None:
+    """Pinned two-sided split: three kernels, the consumer gemm runs on
+    mma.sync (the [K, N] xn_b materialization fixes the Linear-transposed
+    B layout), and the output matches numpy."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.numpy import NumpyBackend
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+
+    target_mod.set_target(None)
+    for k, v in {"SPLIT_CONE": "1", "MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "4", "FN": "8", "BK": "2"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    rng = np.random.default_rng(0)
+    npf16 = np.dtype(np.float16)
+    inputs = {
+        "x": rng.standard_normal((128, 128), dtype=np.float32).astype(npf16),
+        "sx": rng.standard_normal((128, 128), dtype=np.float32).astype(npf16),
+        "w": (rng.standard_normal((128, 128), dtype=np.float32) * 0.05).astype(npf16),
+        "sw": rng.standard_normal((128, 128), dtype=np.float32).astype(npf16),
+    }
+    ref_be = NumpyBackend()
+    ref = ref_be.run(ref_be.compile(_double_scale_linear_graph()), input_data=dict(inputs))[0].outputs["o"]
+    be = CudaBackend()
+    compiled = be.compile(_double_scale_linear_graph())
+    ids = _lowered_kernel_ids(compiled)
+    assert len(ids) == 3
+    mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
+    assert len(mma_kernels) == 1, "the two-sided split gemm must lower on the warp tier"
     out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)
