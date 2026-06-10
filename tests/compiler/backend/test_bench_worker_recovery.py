@@ -202,10 +202,10 @@ def test_bench_retries_after_broken_pipe_on_first_write(monkeypatch) -> None:
     monkeypatch.setattr(P._os, "read", fake_read)
 
     w = P._BenchWorker()
-    result = w.bench(graph=None, wall_timeout_s=5.0)
+    resp = w.run_job({"graph": None, "torch_spec": None, "kwargs": {}}, wall_timeout_s=5.0)
 
     assert spawn_count == 2, "BrokenPipeError on first write must trigger one respawn"
-    assert result.time_ms == 42.0
+    assert resp["result"].time_ms == 42.0
 
 
 def test_worker_survives_benign_error() -> None:

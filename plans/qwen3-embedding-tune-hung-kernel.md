@@ -115,12 +115,29 @@ Why the hang wedged the whole run for ~109 min:
 - The per-kernel sweep then launched into the poisoned device, and the torch peer-bench's **blocking
   `torch.cuda.synchronize()`** (no polling watchdog) queued behind the still-running kernel and blocked indefinitely.
 
-**Fix (`fix/bench-hung-kernel-watchdog`):** the watchdog now raises a distinct `HungKernelError(RuntimeError)`, and
-`_run_bench` treats a `HungKernelError` from the full-model bench as device-poisoning and **skips the per-kernel sweep**
-(process exit resets the device) instead of marching into it. A benign `RuntimeError` (slow compile, healthy device)
-still falls through to per-kernel. Verified by a real-GPU test (`test_hung_kernel_watchdog.py`: watchdog raises in 0.9 s
-on a genuine non-terminating kernel) and control-flow tests (`test_tune_bench_hung_kernel.py`); the wedging invocation
-now completes in 637 s.
+**Fix (`fix/bench-hung-kernel-watchdog`) — isolate the deployable comparison (Option B).** The root reason the deployable
+bench couldn't use the existing SIGKILL-able worker was that the worker only benched deplodock (graph → result), while
+the comparison interleaves a live torch module via an `on_iter` callback that can't cross the pipe. The fix removes that
+constraint by rebuilding the torch side **in the child** from a recipe instead of shipping a live module:
+
+- The worker gained **one** job entry, `_run_job`, keyed on `torch_spec`: `None` is the old deplodock-only bench;
+  `("trace_args", {code/input/layer/seq_len/dynamic})` → `load_or_trace` rebuilds the real module (HF id or `--code`
+  expr) → `bench_full_model_real`; `("frontend_graph", Graph|None)` → `bench_lowered_vs_torch`. A pure benchmark is just
+  the comparison with a no-op torch request. The parent transport is a single `_BenchWorker.run_job`, with
+  `benchmark_program_isolated` / `benchmark_compare_isolated` as thin adapters.
+- `tune --bench` (`_run_bench` full-model + `_bench_per_kernel`) now routes every deployable bench through
+  `benchmark_compare_isolated`. A hung kernel hangs the **child**; the parent SIGKILLs it at `wall_timeout_s`, frees the
+  device, and the per-kernel sweep **continues to the next reproducer** (the `break`-on-failure became `continue`). This
+  also closes the multi-shape `--dataset golden --bench` gap — recovery is real, not "skip + rely on process exit."
+- The watchdog still raises a distinct `HungKernelError(RuntimeError)`; the worker treats it as definitely-dirty and
+  exits **without** the blocking `_context_dirty` probe (which would itself hang on the live kernel), so the parent gets
+  a prompt failure.
+
+Verified: a real-GPU test runs the full comparison in the worker and gets eager + deplodock numbers back; a worker that
+hangs on a genuine non-terminating kernel is SIGKILLed at the wall budget and surfaces a `RuntimeError` in seconds, not a
+wedge (`tests/compiler/backend/test_bench_worker_compare.py`); `test_hung_kernel_watchdog.py` (watchdog raises in 0.9 s)
+and `test_tune_bench_hung_kernel.py` (the `_run_bench` control flow) round it out. End-to-end `tune --code … --bench`
+prints both the full-model and per-kernel tables through the worker.
 
 Also removed in this PR: the `tune --bench-timeout` CLI flag, which was parsed and documented but **consumed nowhere**
 (dead — the value in effect was the hardcoded 1 s watchdog constant). The separate, functional `--bench-timeout` args in
