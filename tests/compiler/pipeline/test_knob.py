@@ -299,6 +299,18 @@ def test_apply_knobs_env_rejects_empty_key():
         apply_knobs_env("=4")
 
 
+def test_parse_knob_spec_grammar():
+    """``parse_knob_spec`` is the one owner of the ``K1=V1,K2=V2`` grammar
+    (``DEPLODOCK_KNOBS`` splat + ``run --ab``): uppercased keys in spec order,
+    whitespace tolerated, empties skipped, values kept as raw strings."""
+    from deplodock.compiler.pipeline.knob import parse_knob_spec
+
+    assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=110 ") == {"BK": "2", "BM": "16", "STAGE": "110"}
+    assert parse_knob_spec("") == {}
+    with pytest.raises(ValueError, match="missing '='"):
+        parse_knob_spec("BK2")
+
+
 def test_apply_knobs_env_uppercases_key(monkeypatch):
     """Lowercased keys round-trip to the upper-case env-var convention."""
     monkeypatch.delenv("DEPLODOCK_BK", raising=False)

@@ -100,6 +100,46 @@ def test_run_golden_bench_shows_benched_golden_row(run_cli):
     assert "golden square.512" in stdout, stdout
 
 
+def test_run_ab_requires_bench(run_cli):
+    rc, stdout, stderr = run_cli("run", "--code", "torch.zeros(4)", "--ab", "BM=8")
+    assert rc == 2
+    assert "--ab requires --bench" in (stdout + stderr)
+
+
+def test_run_ab_requires_relowerable_input(run_cli):
+    """``--ab`` on a model-ID positional has no code / IR to re-lower per config."""
+    rc, stdout, stderr = run_cli("run", "some/model", "--ab", "BM=8", "--bench")
+    assert rc == 2
+    assert "re-lowerable" in (stdout + stderr)
+
+
+def test_run_ab_rejects_malformed_spec(run_cli):
+    rc, stdout, stderr = run_cli("run", "--code", "torch.zeros(4)", "--bench", "--ab", "BM8")
+    assert rc == 2
+    assert "missing '='" in (stdout + stderr)
+
+
+def test_ab_samples_parse_label_and_shape():
+    """``_ab_samples`` parses each spec with the ``DEPLODOCK_KNOBS`` grammar, labels
+    the row with the raw spec, and marks it shapeless (the ``_print_kernel_stats``
+    cue to nest by kernel ``S_*`` signature instead of a golden matmul shape)."""
+    from deplodock.commands.run import _ab_samples
+
+    (s,) = _ab_samples(["bm=8, BN=16"])
+    assert s.knobs == {"BM": "8", "BN": "16"}  # names uppercased, whitespace tolerated
+    assert s.name == "ab bm=8, BN=16"
+    assert s.shape is None
+
+
+@requires_cuda
+def test_run_ab_bench_shows_pinned_row(run_cli):
+    """``run --code ... --bench --ab KNOBS`` benches the pinned config and prints it
+    as an ``ab KNOBS``-labeled row in the kernel table."""
+    rc, stdout, stderr = run_cli("run", "--code", "torch.matmul(torch.randn(64, 64), torch.randn(64, 64))", "--bench", "--ab", "BM=8,BN=16")
+    assert rc == 0, f"stderr: {stderr}"
+    assert "ab BM=8,BN=16" in stdout, stdout
+
+
 @requires_cuda
 def test_run_code_rmsnorm_accuracy(run_cli, dtype):
     rc, _, stderr = run_cli("run", "--code", f"torch.nn.RMSNorm(64)({_randn('1,8,64', dtype)})")
