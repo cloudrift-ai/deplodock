@@ -46,9 +46,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("deplodock.compiler.pipeline")
 
-# Greedy compile validity-fallback cap: how many times ``Pipeline.run`` re-drives
-# blocklisting a tile that failed ``validate(ctx)``. Each retry blocks ≥1 fresh
-# tile or stops, so this only bounds pathological cases (every sibling unviable).
+# Greedy compile validity-fallback cap: how many times ``Pipeline.run``
+# re-resolves blocklisting a tile that failed ``validate(ctx)``. Each retry
+# blocks ≥1 fresh tile or stops, so this only bounds pathological cases (every
+# sibling unviable).
 _MAX_GREEDY_RETRIES = 8
 
 
@@ -553,14 +554,13 @@ class Pipeline:
         rejections: list[tuple[str, str, str]] | None = None,
     ) -> Iterator[Candidate]:
         """Drive the autotune search. Yields one terminal ``Candidate``
-        per fully-explored branch. With deterministic rules (no
-        list-returning rewrites) the search yields exactly one — same
-        shape as :meth:`run`.
+        per fully-explored branch.
 
-        ``search`` chooses both the order and the stopping condition:
-        :class:`GreedySearch` for single-shot compiles (stops at the
-        first terminal); :class:`TuningSearch` for ``deplodock tune`` (runs the
-        queue dry, exploring every fork).
+        ``search`` chooses both the order and the stopping condition —
+        :class:`TuningSearch` for ``deplodock tune`` (runs the queue dry,
+        exploring every fork). Single-shot compiles don't come through
+        here: :meth:`run` is a deterministic resolution
+        (:meth:`Run.resolve`), not a search.
 
         When ``search`` exposes a ``tree: SearchTree``
         (:class:`TuningSearch` does), each yielded terminal candidate

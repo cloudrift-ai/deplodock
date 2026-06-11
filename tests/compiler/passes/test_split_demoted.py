@@ -393,7 +393,7 @@ def test_greedy_compile_keeps_fused_kernel() -> None:
 class _SplitFavoringPrior:
     """Stub 'trained' prior: every knob row carrying ``SPLIT_CONE=True`` (the
     split fragment's kernels) prices cheap, everything else expensive — so the
-    structural pricing (`GreedySearch._pick_structural`) predicts the split's
+    structural pricing (`policy/greedy._pick_structural`) predicts the split's
     Σ (2 kernels × 1.0) below the fused side's 100.0 and deploys it. Constant
     within a side, so ordinary tile picks tie and fall to emission order."""
 
@@ -410,14 +410,17 @@ class _ColdPrior(_SplitFavoringPrior):
 def test_greedy_trained_prior_deploys_split() -> None:
     """With the trained prior predicting the split kernels cheaper, unpinned
     greedy prices the structural option and deploys the two-kernel split
-    (plans/structural-forks-in-two-level.md step 3 — the deploy path)."""
+    (plans/structural-forks-in-two-level.md step 3 — the deploy path). The
+    structural pick is a trace fact: a ``Decision`` with ``chosen_kind ==
+    "graph"``."""
     from deplodock.compiler.pipeline import TILE_PASSES
-    from deplodock.compiler.pipeline.search.policy import GreedySearch
+    from deplodock.compiler.pipeline.pipeline import Run
+    from deplodock.compiler.pipeline.search.policy import greedy_decide
 
-    search = GreedySearch(prior=_SplitFavoringPrior())
-    cand = next(Pipeline.build(TILE_PASSES).tune(_norm_linear_graph(), search=search, ctx=Context.from_target((12, 0)), db=SearchDB()))
-    tiles = [nid for nid, n in cand.graph.nodes.items() if isinstance(n.op, TileOp)]
-    assert search.picked_structural
+    run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((12, 0)))
+    terminal, trace = run.resolve(_norm_linear_graph(), greedy_decide(prior=_SplitFavoringPrior()))
+    tiles = [nid for nid, n in terminal.nodes.items() if isinstance(n.op, TileOp)]
+    assert any(d.chosen_kind == "graph" for d in trace), "the structural pick must appear in the trace"
     assert len(tiles) == 2, f"the trained-prior pick must deploy the split, got {tiles}"
     assert any(nid.endswith("__xn") for nid in tiles)
 
@@ -426,12 +429,13 @@ def test_greedy_cold_stub_prior_keeps_fused() -> None:
     """The same prediction surface but unfitted: pricing is gated on the
     trained model, so the structural leaf stays filtered."""
     from deplodock.compiler.pipeline import TILE_PASSES
-    from deplodock.compiler.pipeline.search.policy import GreedySearch
+    from deplodock.compiler.pipeline.pipeline import Run
+    from deplodock.compiler.pipeline.search.policy import greedy_decide
 
-    search = GreedySearch(prior=_ColdPrior())
-    cand = next(Pipeline.build(TILE_PASSES).tune(_norm_linear_graph(), search=search, ctx=Context.from_target((12, 0)), db=SearchDB()))
-    assert not search.picked_structural
-    assert sum(1 for n in cand.graph.nodes.values() if isinstance(n.op, TileOp)) == 1
+    run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((12, 0)))
+    terminal, trace = run.resolve(_norm_linear_graph(), greedy_decide(prior=_ColdPrior()))
+    assert not any(d.chosen_kind == "graph" for d in trace)
+    assert sum(1 for n in terminal.nodes.values() if isinstance(n.op, TileOp)) == 1
 
 
 def test_greedy_structural_pick_falls_back_on_lowering_failure(monkeypatch) -> None:

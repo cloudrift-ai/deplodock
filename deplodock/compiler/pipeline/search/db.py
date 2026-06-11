@@ -9,9 +9,10 @@ Pure persistence layer — no MCTS state, no propagation walks. Tables:
 - ``lowering`` — best-known child for each parent op, one row per
   rewrite hop along the lowering chain (Loop→Tile, every intra-Tile
   autotune step, Tile→Kernel, Kernel→Cuda). Each row carries the knob
-  delta the rule stamped at that hop, so :class:`GreedySearch` can
-  replay the full chain by matching forks against the recorded delta
-  at every fork point. ``record_lowering`` upserts uniformly across
+  delta the rule stamped at that hop plus a best-median upsert — the
+  chain :meth:`SearchDB.best_per_op_time` walks to resolve a pre-final
+  op's measured cost (greedy fork picks come from the ``Prior``, never
+  DB replay). ``record_lowering`` upserts uniformly across
   dialects: a strictly better measured median replaces the row; a
   None measurement (bench_fail terminal) never overwrites a
   known-good row. Deterministic rewrites (single option) trivially
@@ -400,8 +401,8 @@ class SearchDB:
 
     def lookup_lowering(self, parent_key: str) -> LoweringRow | None:
         """Return the best-known child for ``parent_key``, or ``None``
-        when no row exists. Used by :class:`GreedySearch` to pick the
-        DB-preferred fork at each fork point."""
+        when no row exists. Used by :meth:`best_per_op_time`'s chain
+        walk to resolve a pre-final op's measured cost."""
         row = self._conn.execute(
             "SELECT parent_key, parent_dialect, child_key, child_dialect, knobs, best_median_us FROM lowering WHERE parent_key = ?",
             (parent_key,),
@@ -491,9 +492,9 @@ class SearchDB:
            main + combine are both counted) under the LoopOp key itself.
            Preferred when present.
         2. **Chain walk** — otherwise follow the ``lowering`` best-known child
-           links (the same chain :class:`GreedySearch` replays) down to the
-           ``cuda`` dialect and read that terminal's context-keyed median. A
-           ``CudaOp`` key resolves here directly (no lowering row as parent).
+           links down to the ``cuda`` dialect and read that terminal's
+           context-keyed median. A ``CudaOp`` key resolves here directly (no
+           lowering row as parent).
         """
         direct = self.lookup_perf(context_key, op_key, backend=backend)
         if direct is not None and direct.status == "ok":

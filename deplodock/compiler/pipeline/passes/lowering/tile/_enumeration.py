@@ -233,8 +233,8 @@ def _prior_order(rows: list[dict], *, E_M: int, E_N: int, E_K: int, ctx: Context
     the SAME single ranking path the policies use (the analytic prior over
     ``knob.knob_features``), applied at enumeration time so the cold MCTS
     front-loads good variants (reaches the prior-best within patience on pass 1,
-    so a single ``tune`` pass is as good as a rerun) and ``GreedySearch``'s
-    option-0 is the prior-best. The sort is stable, so ties keep cartesian
+    so a single ``tune`` pass is as good as a rerun) and the greedy no-prior
+    fallback's option-0 is the prior-best. The sort is stable, so ties keep cartesian
     construction order. Replaces the old hand-coded ``_priority_*`` sort; the
     learned ``CatBoostPrior``, when trained, re-ranks on top via the policy's
     PUCT / argmin — this only seeds the order."""

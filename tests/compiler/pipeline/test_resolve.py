@@ -23,7 +23,6 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.pipeline import Run, _is_structural_option
-from deplodock.compiler.pipeline.search.db import SearchDB
 
 
 @pytest.fixture(autouse=True)
@@ -96,14 +95,15 @@ def test_resolve_applies_in_place() -> None:
 
 
 def test_option0_decide_matches_no_prior_greedy() -> None:
-    """A decide that always takes option-0 reproduces today's no-prior compile
-    (``GreedySearch(prior=None)`` falls to emission order at every fork)."""
-    from deplodock.compiler.pipeline.search.policy import GreedySearch
+    """A decide that always takes option-0 reproduces the no-prior greedy
+    compile (``greedy_decide(prior=None)`` falls to emission order at every
+    fork — the same first leaf)."""
+    from deplodock.compiler.pipeline.search.policy import greedy_decide
 
     ctx = Context.from_target((8, 0))
-    old = next(Pipeline.build(TILE_PASSES).tune(_f32_matmul_graph(), search=GreedySearch(prior=None), ctx=ctx, db=SearchDB())).graph
-    new, _ = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_f32_matmul_graph(), _option0)
-    assert _graph_signature(new) == _graph_signature(old)
+    greedy, _ = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_f32_matmul_graph(), greedy_decide(prior=None))
+    plain, _ = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_f32_matmul_graph(), _option0)
+    assert _graph_signature(plain) == _graph_signature(greedy)
 
 
 # ---------------------------------------------------------------------------

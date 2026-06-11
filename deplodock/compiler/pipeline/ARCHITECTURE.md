@@ -11,7 +11,7 @@ pipeline/
 ├── knobs.py       # format_tuning_knobs: render real knobs (drop pass-marker booleans) for tune output
 ├── search/        # Autotune state: Candidate, Search policies, SearchDB + SearchTree
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
-│   ├── policy/       # Search ABC (base.py) + GreedySearch (greedy.py, compile/run) + TuningSearch (mcts.py, tune); both rank via the Prior
+│   ├── policy/       # Search ABC (base.py) + TuningSearch (mcts.py, tune) + greedy_decide (greedy.py, the Run.resolve pick for compile/run); both rank via the Prior
 │   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf (per-variant replay cache); open_readonly + iter_perf_samples (perf ⋈ cuda_op) back the data layer
 │   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path), Dataset (from_golden/from_db/from_prior + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity)
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
@@ -74,7 +74,7 @@ matched `Node` objects. Anything else binds positionally to
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
 parent's graph snapshot) and hands them ALL to a `Search` policy, which ranks them via a `Prior`
-(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `GreedySearch` (`compile`/`run`) by `mean_score` argmin.
+(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `greedy_decide` (`compile`/`run`, via `Run.resolve`) by `mean_score` argmin.
 There is ONE ranking path — the `Prior` is the hand-coded `AnalyticPrior` cold (a real heuristic *score* over
 `knob.knob_features`, not emission order) and the learned `CatBoostPrior` once trained, composed behind
 `FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold; a `tune` sweep explores
@@ -355,14 +355,14 @@ loops (`drive` for exploration, `resolve` for deterministic resolution):
   `backend=None` the bench is stubbed to `latency_us=1.0` and nothing
   is persisted, so a backend-less sweep never overwrites tuned
   `best_median_us` rows with the stub.
-- `Run.drive(graph) -> Iterator[tuple[token, Candidate]]` — the inner engine loop both wrappers drive.
+- `Run.drive(graph) -> Iterator[tuple[token, Candidate]]` — the exploration engine loop (`tune`).
   `Run` is the per-run state object (`pipeline` + `ctx` + `search` + `db` + `backend` + `dump` +
   `rejections`): `Pipeline` stays a frozen, shareable pass layout while every run-scoped sink and service
   lives on the Run, reached from engine-adjacent code through the candidate (`cand.run.dump`,
   `cand.run.rejections`, `cand.ctx`). `drive` seeds the root candidate, then per iteration pops a
-  `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. Selection is
-  `TuningSearch`'s job (PUCT over the learned prior; a single-shot compile, prior absent, descends
-  emission-order). (The DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
+  `LazyCandidate`, resolves it, runs one rule batch (`Run._step`, shared with `resolve`), pushes successors
+  under the pop's token. Selection is
+  `TuningSearch`'s job (PUCT over the learned prior). (The DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
   selection" above; the perf DB still *records* every bench as the prior's training data.) Each fork push is
   classified by effect at the spawn site, where the raw option list is concrete: any `Graph`-splicing option
   (a kernel-set change — `tile/005_split_demoted`'s split, `tile/017_atomic_free_splitk`'s combine) marks the
@@ -409,9 +409,9 @@ The autotune state is split across two cooperating modules:
   tables: `loop_op`, `tile_op`, `kernel_op`, `cuda_op` (one row per op
   encountered along any lowering chain, keyed by `op_cache_key`), a
   `lowering` edge table (one row per rewrite hop carrying the knob
-  delta the rule stamped at that hop plus a best-median upsert, so
-  `GreedySearch` can replay the chain by matching forks against the
-  delta at each step — loop→loop source hops are skipped: those are
+  delta the rule stamped at that hop plus a best-median upsert — the
+  chain `best_per_op_time` walks to resolve a pre-final op's measured
+  cost — loop→loop source hops are skipped: those are
   structural/decision hops, and a one-best-child row would let a
   multi-kernel decomposition's parent resolve through ONE fragment
   kernel's median), and a backend-partitioned `perf` table carrying
@@ -429,8 +429,8 @@ The autotune state is split across two cooperating modules:
   and observes the terminal's measurement with the same token, so the
   tree stays correct however the engine interleaves pops / pushes /
   observes. Rebuilt fresh each process; cached `perf` rows in the DB
-  ensure no re-bench on warm starts. `GreedySearch` has no tree (its
-  tokens are `None`).
+  ensure no re-bench on warm starts. Greedy compiles build no tree at
+  all — they don't go through a `Search` (see `Run.resolve`).
 
 `Pipeline._bench_terminal` is the only function that knows about all
 four parts (graph, DB, tree-through-`search.observe`, backend). It
@@ -617,24 +617,26 @@ falls back to a uniform `P = 1`). The enumeration is itself ordered by the `Anal
 MCTS front-loads good variants and a single `tune` pass reaches the prior-best within patience. The end-of-run sanity
 block (silly-pick rate warmup-vs-post, self-calibration) prints once for the global prior.
 
-**Greedy uses the prior too — and flattens.** `Pipeline.run`'s `GreedySearch` (the `compile` / `run` driver) lazy-loads
+**Greedy uses the prior too — and flattens.** `Pipeline.run`'s `greedy_decide` (the `Run.resolve` decide for
+`compile` / `run`) lazy-loads
 the global `Prior` via `load_prior` (the `FallbackPrior` over `CatBoostPrior` + `AnalyticPrior`). The lazy fork tree is an
 **MCTS** structure — it stages knob choices across levels (`BR` → `BM/BN` → `FM/FN`) so MCTS pays one node per pop.
 Greedy must NOT walk it level-by-level: a branch carries only a *partial* tile, and `knob.knob_features` can't compute the
 tile's area / occupancy until `FM/FN` are pinned, so the prior is **blind at the `BM/BN` choice** and defaults to `BN=16`
 for every shape (it also defaulted the warp-vs-scalar tier by emission order, not the prior). Instead greedy **flattens**
-each fork point to its complete leaves — `_leaves` expands branches depth-first (cheap; only knob dicts, materialization
-stays deferred to the one chosen leaf's `resolve`) — and picks the lowest `Prior.mean_scores` over the full
+each fork point to its complete leaves — `fork.flatten_leaves` expands branches depth-first (cheap; only knob dicts,
+materialization stays deferred to the one chosen leaf) — and picks the lowest `Prior.mean_scores` over the full
 `{H_*, S_*, complete-knob-row}` vector the prior trained on, in **one batched `predict`**. The pick equals scoring the
 flat candidate set, invariant to the tree's level order. Cold (no trained `CatBoostPrior`) the `AnalyticPrior` ranks
 (including the positive `MMA_tier` warp-preference that replaced the old warp-first emission order); only if `load_prior`
-returns nothing does it take option-0. (Greedy benches nothing, so it can only *use* a prior, never train one; routing
-whole-model compile through `TuningSearch` would be O(N²).)
+returns nothing does it take option-0 (the first leaf). (Greedy benches nothing, so it can only *use* a prior, never
+train one — and it is not a `Search` at all: a deterministic resolution has no frontier, so its process facts live on
+the returned `Decision` trace, never on policy-object state.)
 
 **Greedy validity fallback.** The prior ranks by *predicted latency*, which can rank a tile that fails `validate(ctx)`
 (smem / thread budget) first — `tune` benches-and-skips it, but greedy benches nothing. So when a deterministic compile
 leaves a node un-lowered (its only lowering rejected at `validate`), `Pipeline.run` blocklists that tile's
-`tile_identity` (its planner knobs) and **re-drives**: `GreedySearch(blocked=…)` drops the matching leaf from the
+`tile_identity` (its planner knobs) and **re-resolves**: `greedy_decide(blocked=…)` drops the matching leaf from the
 flattened set and picks the next-best (the valid runner-up is usually ranked right below). Bounded by
 `_MAX_GREEDY_RETRIES` (each retry blocks ≥1 fresh tile or stops). Only the offending leaf is dropped — its full-row
 `tile_identity` never matches a different tile, so no other candidate is pruned.
@@ -643,12 +645,13 @@ flattened set and picks the next-best (the valid runner-up is usually ranked rig
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
 adds the whole-slice total under the LoopOp key) — the bench record / training data. A subsequent `deplodock compile` /
 `deplodock run` does NOT replay these DB forks (the greedy DB→fork replay was removed with the learned prior); instead
-`GreedySearch` picks each fork from the global `Prior` (`FallbackPrior`: learned `CatBoostPrior` once trained, else the
+`greedy_decide` picks each fork from the global `Prior` (`FallbackPrior`: learned `CatBoostPrior` once trained, else the
 `AnalyticPrior`'s `mean_score` argmin — lowest predicted latency) — see "Greedy uses the prior too" above.
 `run_two_level_tune` assembles its final graph the same way.
 
-**Stub backend.** With `backend=None`, `_bench_terminal` short-circuits to `latency_us=1.0` and persists nothing — used by
-test fixtures so `Pipeline.run`'s greedy compile doesn't clobber tuned rows with a stub when no GPU is available.
+**Stub backend.** With `backend=None`, `Pipeline.tune`'s `_bench_terminal` short-circuits to `latency_us=1.0` and
+persists nothing (`Pipeline.run` skips benching entirely without a backend) — so a GPU-less compile or sweep never
+clobbers tuned rows with a stub.
 
 ## Tunable knobs
 
