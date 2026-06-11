@@ -18,6 +18,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
+    LayerNormOp,
     LinearOp,
     MatmulOp,
     MeanOp,
@@ -755,6 +756,24 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
                 eps_value = float(eps_node.op.value)
                 input_ids = input_ids[:2]
         nid = g.add_node(op=RmsNormOp(eps=eps_value), inputs=input_ids, output=Tensor(name, shape, dtype), node_id=name)
+        node_map[name] = nid
+        return
+
+    if op_name == "layer_norm":
+        # aten.layer_norm: (x, normalized_shape, weight?, bias?, eps, cudnn_enable).
+        # The tracer drops normalized_shape (a list literal), None affine
+        # params, and the bool flag, leaving (x [, weight [, bias]]) plus a
+        # trailing eps ConstantOp. eps is the op's own field, not a graph
+        # input, so we peel it off here. The affine params are real
+        # parameter ConstantOps (value=None, source_path set), so the
+        # scalar-value check can't mistake one for eps.
+        eps_value = 1e-5
+        if len(input_ids) >= 2:
+            eps_node = g.nodes.get(input_ids[-1])
+            if eps_node and isinstance(eps_node.op, ConstantOp) and isinstance(eps_node.op.value, (int, float)):
+                eps_value = float(eps_node.op.value)
+                input_ids = input_ids[:-1]
+        nid = g.add_node(op=LayerNormOp(eps=eps_value), inputs=input_ids, output=Tensor(name, shape, dtype), node_id=name)
         node_map[name] = nid
         return
 

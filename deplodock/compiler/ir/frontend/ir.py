@@ -298,6 +298,33 @@ class RmsNormOp(Op):
 
 
 @dataclass
+class LayerNormOp(Op):
+    """PyTorch aten.layer_norm: ``(x - mean(x)) * rsqrt(var(x) + eps) * weight + bias``.
+
+    Inputs are ``(x [, weight [, bias]])`` — the affine params are optional
+    (``elementwise_affine=False`` drops both, ``bias=False`` drops the bias);
+    the tracer peels the trailing ``eps`` constant into the op's own field.
+    Decomposed by ``passes/frontend/decomposition/085_layer_norm.py``.
+    """
+
+    eps: float = 1e-5
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(input_shapes[0])
+
+    def forward(self, *inputs):
+        x = inputs[0]
+        mu = np.mean(x, axis=-1, keepdims=True)
+        var = np.mean((x - mu) * (x - mu), axis=-1, keepdims=True)
+        out = (x - mu) / np.sqrt(var + self.eps)
+        if len(inputs) >= 2:
+            out = out * inputs[1]
+        if len(inputs) >= 3:
+            out = out + inputs[2]
+        return out
+
+
+@dataclass
 class SoftmaxOp(Op):
     """PyTorch aten.softmax.int: ``exp(x - max(x, dim)) / sum(exp(...), dim)``.
 

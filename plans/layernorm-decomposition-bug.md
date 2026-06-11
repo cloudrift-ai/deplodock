@@ -1,7 +1,11 @@
 # Bug: `LayerNorm` has no decomposition path (`unknown elementwise op 'layer_norm'`)
 
-**Status:** open — discovered 2026-06-05 while generating a multi-op tuning dataset for the learned-prior model
-bake-off (`scripts/gen_prior_data.sh`). Not related to the prior work; a standalone front-end gap.
+**Status:** fixed 2026-06-10 — implemented as sketched below: `LayerNormOp` in `ir/frontend/ir.py`, a `layer_norm`
+capture in `trace/torch.py` (eps peeled into the op field; optional weight/bias by arity, so
+`elementwise_affine=False` / `bias=False` work too), `passes/frontend/decomposition/085_layer_norm.py`, and a
+`LayerNormOp`→`F.layer_norm` mapping in `backend/torch_ref.py` for the `.torch.json` reproducer path. Discovered
+2026-06-05 while generating a multi-op tuning dataset for the learned-prior model bake-off
+(`scripts/gen_prior_data.sh`). Not related to the prior work; a standalone front-end gap.
 
 ## Symptom
 
@@ -66,6 +70,7 @@ LoweringError: compile: 1 node(s) left un-lowered — the chosen tile shape prod
 validate(ctx) and the deterministic compile had no fallback
 ```
 
-This is the greedy-uses-prior path (the just-trained linear prior's argmax picking an *invalid* tile shape, no
-fallback to option-0). It is part of the in-flight learned-prior work — tracked there, not here — but it argues
-for a `validate(ctx)` fallback in the greedy driver regardless of the prior model chosen.
+This was the greedy-uses-prior path (the just-trained linear prior's argmax picking an *invalid* tile shape, no
+fallback to option-0). Since fixed by the resolve-trace-driver work: the greedy driver now blocklists a tile whose
+kernel fails `validate(ctx)` and re-resolves to the next prior-ranked leaf (see the validity-fallback retries in
+`pipeline/pipeline.py::Pipeline.run`); the `LoweringError` only fires after retries are exhausted.
