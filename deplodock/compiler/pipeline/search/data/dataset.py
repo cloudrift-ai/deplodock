@@ -54,16 +54,22 @@ class Dataset:
         return cls([Sample.from_golden(g, compile_s_feats=compile_s_feats) for g in configs])
 
     @classmethod
-    def from_db(cls, path: Path | str, *, kernel: str | None = None, min_latency: float = 0.0, backend: str | None = None) -> Dataset:
+    def from_db(
+        cls, path: Path | str, *, kernel: str | None = None, min_latency: float = 0.0, backend: str | None = None, status: str = "ok"
+    ) -> Dataset:
         """Every measured ``ok`` variant in the tune DB (``perf ⋈ cuda_op``), opened
         read-only so a concurrent ``tune`` writer isn't blocked. ``backend=None``
         spans every backend (matching the legacy ``eval knobs`` query); ``kernel``
-        filters on the parsed C identifier."""
+        filters on the parsed C identifier. ``status`` selects the row status
+        (``bench_fail`` rows carry the watchdog-timeout sentinel latency, so the
+        default ``min_latency`` admits them)."""
         from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
 
         db = SearchDB.open_readonly(path)
         try:
-            samples = [Sample.from_perf_sample(ps) for ps in db.iter_perf_samples(backend=backend, min_latency_us=min_latency)]
+            samples = [
+                Sample.from_perf_sample(ps) for ps in db.iter_perf_samples(backend=backend, status=status, min_latency_us=min_latency)
+            ]
         finally:
             db.close()
         if kernel:

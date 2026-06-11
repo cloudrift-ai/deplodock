@@ -355,24 +355,32 @@ def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
     if raw is None:
         raw = config.knobs_aggregate()
     applied: dict[str, str] = {}
-    if not raw:
-        return applied
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if "=" not in entry:
-            raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} is missing '=' (expected KEY=VALUE)")
-        key, _, value = entry.partition("=")
-        key = key.strip().upper()
-        value = value.strip()
-        if not key:
-            raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} has empty KEY")
+    for key, value in parse_knob_spec(raw).items():
         # Individual per-knob env vars win — don't clobber an explicit
         # ``DEPLODOCK_BK=4`` with whatever the aggregate says.
         if config.set_knob(key, value, overwrite=False):
             applied[config.knob_var(key)] = value
     return applied
+
+
+def parse_knob_spec(raw: str) -> dict[str, str]:
+    """Parse the shared ``K1=V1,K2=V2`` knob-spec grammar (the ``DEPLODOCK_KNOBS``
+    aggregate, ``run --ab``) into an ordered ``{NAME: value}`` dict — names
+    uppercased, whitespace tolerated, empty entries skipped. A malformed entry
+    (missing ``=`` / empty KEY) raises ``ValueError``."""
+    out: dict[str, str] = {}
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(f"knob spec entry {entry!r} is missing '=' (expected KEY=VALUE)")
+        key, _, value = entry.partition("=")
+        key = key.strip().upper()
+        if not key:
+            raise ValueError(f"knob spec entry {entry!r} has empty KEY")
+        out[key] = value.strip()
+    return out
 
 
 # Splat ``DEPLODOCK_KNOBS`` once at import so every later per-knob reader

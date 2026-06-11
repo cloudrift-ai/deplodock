@@ -71,8 +71,9 @@ def register_run_command(subparsers):
         "--profile",
         action="store_true",
         help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
-        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%). Skipped if "
-        "ncu is not on PATH or the user lacks performance-counter permissions.",
+        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%) and print a "
+        "side-by-side table of the deplodock kernels vs the torch/cuBLAS reference kernels. "
+        "Skipped if ncu is not on PATH or the user lacks performance-counter permissions.",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
@@ -89,6 +90,18 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
+    parser.add_argument(
+        "--ab",
+        action="append",
+        default=None,
+        metavar="KNOBS",
+        help=(
+            "Compile + bench an extra variant with these knobs pinned (``K1=V1,K2=V2`` — the "
+            "``DEPLODOCK_KNOBS`` grammar) and show it as a live A/B row beneath the matching greedy "
+            "kernel in the --bench kernel table, knob diffs red. Repeatable. Requires --bench and a "
+            "re-lowerable input (--code / --golden / --ir)."
+        ),
+    )
     parser.add_argument(
         "--dynamic",
         action="append",
@@ -151,15 +164,28 @@ def handle_run(args):
         logger.error("input / --code / --ir are mutually exclusive")
         sys.exit(1)
 
-    if not torch.cuda.is_available():
-        logger.error("CUDA GPU required")
-        sys.exit(1)
-
     # A .json input (via --ir or as the positional) takes the IR path: finish
     # lowering an arbitrary-stage dump, no traced module to bench against torch.
     ir_path = args.ir
     if ir_path is None and args.input is not None and Path(args.input).suffix == ".json" and Path(args.input).exists():
         ir_path = args.input
+    if args.ab:
+        if not args.bench:
+            logger.error("--ab requires --bench (the A/B rows render in the kernel table)")
+            sys.exit(2)
+        if args.code is None and ir_path is None:
+            logger.error("--ab requires a re-lowerable input: --code, --golden, or --ir (each config re-lowers a fresh graph)")
+            sys.exit(2)
+        try:
+            _ab_samples(args.ab)  # fail fast on a malformed KNOBS spec
+        except ValueError as exc:
+            logger.error("--ab: %s", exc)
+            sys.exit(2)
+
+    if not torch.cuda.is_available():
+        logger.error("CUDA GPU required")
+        sys.exit(1)
+
     if ir_path is not None:
         args.ir = ir_path
         _handle_run_ir(args, CudaBackend, CompilerDump)
@@ -188,13 +214,11 @@ def handle_run(args):
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
-    # Skip the accuracy check + eager forward when running as the ncu
-    # child of a ``--profile`` invocation: the parent already verified
-    # accuracy outside ncu, and re-running the eager reference under
-    # ncu (a) wastes ~5-10 s of ncu overhead per cuBLAS launch and
-    # (b) pollutes the captured CSV with cutlass / cuBLAS kernel rows
-    # the perf summary then has to filter out. The child only needs to
-    # launch the deplodock kernels so ncu can sample our metrics.
+    # The ncu child of a ``--profile`` invocation skips the accuracy *check*
+    # (the parent already verified it) but still launches both sides once —
+    # the deplodock program AND the eager reference — because the comparison
+    # table needs the cuBLAS / aten kernel rows in the captured CSV beside
+    # the ``k_*`` rows.
     skip_accuracy = config.ncu_child()
 
     try:
@@ -206,9 +230,10 @@ def handle_run(args):
             eager_out = _eager_output(module, example_args, example_kwargs)
             _check_accuracy(run_result.outputs, eager_out)
         else:
-            # ncu child needs at least one deplodock launch for metrics
-            # to populate; skip the eager comparison.
+            # ncu child: one deplodock launch (our metrics) + one eager forward
+            # (the reference rows for the comparison table); no accuracy diff.
             backend.run(compiled, input_data=input_data)
+            _eager_output(module, example_args, example_kwargs)
     except RuntimeError as exc:
         # Per-launch watchdog fired in ``run_program`` (kernel >1 s).
         # The CUDA context is dirty — bypass Python cleanup so cupy's
@@ -281,11 +306,12 @@ def handle_run(args):
         dump.dump_benchmark(bench)
         _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
-    # ``--golden NAME``: compile + bench each recorded golden config (knobs pinned)
-    # so the kernel table can show it as a live A/B row beside the greedy pick.
+    # ``--golden NAME`` / ``--ab KNOBS``: compile + bench each pinned config so the
+    # kernel table can show it as a live A/B row beside the greedy pick.
     golden_benches = None
-    if getattr(args, "golden_configs", None):
-        golden_benches = _bench_golden_variants(backend, args.code, args.golden_configs, warmup=args.warmup, iters=args.iters)
+    pinned = list(getattr(args, "golden_configs", None) or []) + (_ab_samples(args.ab) if args.ab else [])
+    if pinned:
+        golden_benches = _bench_golden_variants(backend, args.code, pinned, warmup=args.warmup, iters=args.iters)
 
     _print_table(results, note=None if captured else "(graph-capture fallback: timings include host launch overhead)")
     _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
@@ -385,16 +411,30 @@ def _pinned_knobs(knobs: dict):
                 os.environ[key] = prev
 
 
+def _ab_samples(specs):
+    """One shapeless pseudo-sample per ``--ab "K1=V1,K2=V2"`` spec: ``.knobs`` to pin
+    (the ``DEPLODOCK_KNOBS`` grammar), ``.name`` the table label, ``.shape None`` —
+    the marker :func:`_print_kernel_stats` uses to nest the row by the benched
+    kernel's own ``S_*`` signature instead of a golden's matmul shape."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from deplodock.compiler.pipeline.knob import parse_knob_spec  # noqa: PLC0415
+
+    return [SimpleNamespace(name=f"ab {raw}", knobs=parse_knob_spec(raw), shape=None) for raw in specs]
+
+
 def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
     """Compile + bench each recorded golden config with its knobs pinned, returning
     a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
     measured row beside the greedy pick. ``golden_configs`` are
     :class:`~deplodock.compiler.pipeline.search.data.Sample`s, whose ``knobs`` are
-    already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs).
-    Each config re-traces a **fresh** graph from ``code`` — a frontend graph can't be
-    re-compiled (the first lowering mutates it in place, so a reused graph would
-    yield the first config's kernel every time). Best-effort: a golden whose pinned
-    knobs fail to compile / bench for the live device is skipped with a warning."""
+    already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs) —
+    or the shapeless ``--ab`` pseudo-samples from :func:`_ab_samples` (same duck
+    type). Each config re-traces a **fresh** graph from ``code`` — a frontend graph
+    can't be re-compiled (the first lowering mutates it in place, so a reused graph
+    would yield the first config's kernel every time). Best-effort: a config whose
+    pinned knobs fail to compile / bench for the live device is skipped with a
+    warning."""
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
 
     out = []
@@ -459,19 +499,48 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
         return grid_total, block_threads, op.smem_bytes / 1024, regs, occ_str
 
+    def _op_sig(op):
+        knobs = getattr(op, "knobs", {}) or {}
+        return (int(knobs.get("S_ext_free_prod", 0)), int(knobs.get("S_ext_reduce_max", 0)))
+
+    used_ab: set[int] = set()
+
     def _matching(op):
-        """Benched golden variants whose matmul shape matches this kernel — keyed
-        on the op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max
-        = K``), the same shape signature the prior diagnostics match goldens on."""
-        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
-        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
-        return [gb for gb in (golden_benches or []) if gb.sample.shape.free_prod == free_prod and gb.sample.shape.reduce_max == reduce_max]
+        """Benched pinned variants whose shape matches this kernel — keyed on the
+        op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max = K``),
+        the same shape signature the prior diagnostics match goldens on. A golden
+        carries its matmul shape on ``sample.shape``; a shapeless ``--ab`` entry
+        matches through its own benched kernels' signatures and nests under the
+        first greedy kernel it matches (``used_ab`` dedups; unmatched entries are
+        appended after the greedy rows so a row is never silently dropped)."""
+        sig = _op_sig(op)
+        out = []
+        for gb in golden_benches or []:
+            if gb.sample.shape is not None:
+                if (gb.sample.shape.free_prod, gb.sample.shape.reduce_max) == sig:
+                    out.append(gb)
+            elif id(gb) not in used_ab and any(_op_sig(n.op) == sig for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)):
+                used_ab.add(id(gb))
+                out.append(gb)
+        return out
 
     # Build row records first (the knob columns are aligned across all rows, so we
     # can't stream): (name, t_us, pct_cell, geom, knobs, ref_knobs_or_None). A
     # golden row's ``ref`` is its matching greedy kernel's knobs — cells that differ
     # are colored red.
     records: list[tuple] = []
+
+    def _gb_rows(gb, ref):
+        """Append the rows of one benched pinned variant (golden / --ab), each
+        kernel's knobs diffed red against ``ref`` (the greedy pick's knobs)."""
+        label = f"golden {gb.sample.name}" if gb.sample.shape is not None else gb.sample.name
+        g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
+        g_attrs = _collect_kernel_attrs(gb.graph)
+        g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
+        for gidx, gnode in enumerate(g_nodes):
+            gk = dict(tuning_knob_items(gnode.op.knobs or {}))
+            records.append((label, g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, ref))
+
     for idx, node in enumerate(cuda_nodes):
         op = node.op
         t_us = times_by_idx.get(idx, 0.0)
@@ -479,12 +548,10 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         gknobs = dict(tuning_knob_items(op.knobs or {}))
         records.append((op.kernel_name, t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
         for gb in _matching(op):
-            g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
-            g_attrs = _collect_kernel_attrs(gb.graph)
-            g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
-            for gidx, gnode in enumerate(g_nodes):
-                gk = dict(tuning_knob_items(gnode.op.knobs or {}))
-                records.append((f"golden {gb.sample.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
+            _gb_rows(gb, gknobs)
+    for gb in golden_benches or []:
+        if gb.sample.shape is None and id(gb) not in used_ab:
+            _gb_rows(gb, None)
 
     kcols, kcells = knob_columns(
         [{k: (str(v), ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
@@ -509,7 +576,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
     data.append(["TOTAL", f"{total_us:.1f}", *[""] * (len(columns) - 2)])
 
     print()
-    print("knobs (greedy pick); golden rows are red where they differ from the greedy pick:")
+    print("knobs (greedy pick); golden / ab rows are red where they differ from the greedy pick:")
     for line in render_table(columns, data):
         print(line)
 
@@ -695,6 +762,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
     status_text = "\n".join(lines[:csv_start])
 
     parsed = _parse_ncu_csv(csv_text)
+    _print_ncu_compare(parsed, _ncu_units(csv_text))
 
     if dump_dir is not None:
         out_dir = _Path(dump_dir)
@@ -703,17 +771,85 @@ def _run_ncu_profile(args, *, dump_dir=None):
         (out_dir / "61_ncu_metrics.json").write_text(_json.dumps(parsed, indent=2, default=str))
         print(f"ncu metrics → {out_dir / '61_ncu_metrics.csv'}")
         print(f"ncu metrics → {out_dir / '61_ncu_metrics.json'}")
-    else:
-        # No dump dir: relay the CSV (and status lines) so ad-hoc
-        # ``deplodock run --profile`` invocations still surface the data.
-        if status_text.strip():
-            print(status_text)
-        print(csv_text)
+    elif status_text.strip():
+        # No dump dir: the comparison table above is the product; relay the
+        # ==PROF== status lines for diagnostics (the raw CSV lands in the dump
+        # dir when one is set).
+        print(status_text)
 
     if result.returncode != 0:
         logger.warning("ncu exit=%d", result.returncode)
         if result.stderr.strip():
             print(result.stderr, file=sys.stderr)
+
+
+# Display order + short labels for the per-kernel comparison table — keys are
+# entries of the curated ``_NCU_METRICS`` set.
+_NCU_COMPARE_COLS = (
+    ("gpu__time_duration.sum", "dur"),
+    ("sm__warps_active.avg.pct_of_peak_sustained_active", "occ%"),
+    ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "sm%"),
+    ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "dram%"),
+    ("sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active", "fma%"),
+    ("smsp__inst_executed_pipe_lsu.sum", "lsu.inst"),
+    ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum", "ld.cnflct"),
+    ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum", "st.cnflct"),
+    ("launch__registers_per_thread", "regs"),
+)
+
+_NCU_REF_ROWS_MAX = 12  # eager forwards can launch dozens of tiny aten kernels
+
+
+def _print_ncu_compare(parsed: dict, units: dict[str, str] | None = None) -> None:
+    """One aligned table over the parsed ncu metrics: the deplodock ``k_*``
+    kernels first, then the reference backend's kernels (cuBLAS / cutlass /
+    aten) — so the counter deltas (occupancy, SM/DRAM/FMA utilization, smem
+    bank conflicts, register pressure) read straight down a column instead of
+    across two CSV dumps. Each side sorts by duration; reference rows truncate
+    to the :data:`_NCU_REF_ROWS_MAX` slowest with a count of the rest."""
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
+    if not parsed:
+        return
+    dur_key = _NCU_COMPARE_COLS[0][0]
+    dep = sorted((k for k in parsed if k.startswith("k_")), key=lambda k: -parsed[k].get(dur_key, 0.0))
+    ref = sorted((k for k in parsed if not k.startswith("k_")), key=lambda k: -parsed[k].get(dur_key, 0.0))
+    hidden_ref = max(0, len(ref) - _NCU_REF_ROWS_MAX)
+    ref = ref[:_NCU_REF_ROWS_MAX]
+
+    def fmt(v) -> str:
+        if v is None:
+            return "-"
+        return f"{v:,.0f}" if abs(v) >= 100 or v == int(v) else f"{v:.1f}"
+
+    def row(side: str, kname: str) -> list[str]:
+        shown = kname if len(kname) <= 60 else kname[:57] + "..."
+        return [side, shown, *(fmt(parsed[kname].get(metric)) for metric, _ in _NCU_COMPARE_COLS)]
+
+    unit = (units or {}).get(dur_key, "")
+    cols = [Col("side"), Col("kernel")] + [
+        Col(f"dur ({unit})" if label == "dur" and unit else label, "r") for _, label in _NCU_COMPARE_COLS
+    ]
+    data = [row("dep", k) for k in dep] + [row("ref", k) for k in ref]
+    print()
+    print("ncu compare — deplodock kernels vs the torch/cuBLAS reference (same counters, one table):")
+    for line in render_table(cols, data, rule=True):
+        print(line)
+    if hidden_ref:
+        print(f"  … {hidden_ref} more reference kernel(s) below the duration cut")
+
+
+def _ncu_units(csv_text: str) -> dict[str, str]:
+    """``{metric: unit}`` from the CSV's ``Metric Unit`` column (first seen wins)."""
+    import csv as _csv  # noqa: PLC0415
+    import io as _io  # noqa: PLC0415
+
+    units: dict[str, str] = {}
+    for row in _csv.DictReader(_io.StringIO(csv_text)):
+        metric, unit = row.get("Metric Name", ""), row.get("Metric Unit", "")
+        if metric and unit and metric not in units:
+            units[metric] = unit
+    return units
 
 
 def _parse_ncu_csv(csv_text: str) -> dict:
@@ -726,10 +862,10 @@ def _parse_ncu_csv(csv_text: str) -> dict:
     ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
     with the bench-comparison JSON downstream.
 
-    Filters to deplodock-emitted kernels (``k_*`` naming convention) —
-    the ncu child runs in the same process as the eager-reference
-    accuracy check, which would otherwise contribute cutlass / cuBLAS
-    rows that contaminate the per-row aggregate.
+    Keeps every kernel — the deplodock ``k_*`` rows AND the reference
+    backend's (cuBLAS / cutlass / aten) rows the child's eager forward
+    contributes — so :func:`_print_ncu_compare` can put the two sides in
+    one table. Consumers split the sides on the ``k_*`` naming convention.
     """
     import csv as _csv
     import io as _io
@@ -741,8 +877,6 @@ def _parse_ncu_csv(csv_text: str) -> dict:
         metric = row.get("Metric Name", "")
         raw = row.get("Metric Value", "").replace(",", "")
         if not (kname and metric and raw):
-            continue
-        if not kname.startswith("k_"):
             continue
         try:
             val = float(raw)
@@ -1005,9 +1139,41 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             print()
             for line in render_table([Col("Backend"), Col("Latency (us)", "r")], [["Deplodock", f"{bench.time_ms * 1000:.0f}"]], rule=True):
                 print(line)
-        _print_kernel_stats(graph, bench)
+        ab_benches = None
+        if args.ab:
+            if tail:
+                ab_benches = _bench_ab_variants_ir(backend, path, tail, args.ab, warmup=args.warmup, iters=args.iters, db=db)
+            else:
+                logger.warning("--ab ignored: %s IR is fully lowered (no forks left to pin)", stage)
+        _print_kernel_stats(graph, bench, golden_benches=ab_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+def _bench_ab_variants_ir(backend, ir_path, tail, specs, *, warmup, iters, db=None):
+    """The ``--ab`` counterpart of :func:`_bench_golden_variants` for the ``--ir``
+    path: each config reloads the IR file fresh (the tail lowering mutates the graph
+    in place) and re-lowers it with the knobs pinned, so the pin collapses every
+    remaining fork. Best-effort like the golden path: a config that fails to
+    compile / bench is skipped with a warning."""
+    import json as _json  # noqa: PLC0415
+
+    from deplodock.compiler.graph import Graph  # noqa: PLC0415
+    from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
+
+    out = []
+    for sample in _ab_samples(specs):
+        try:
+            with _pinned_knobs(sample.knobs):
+                g = Graph.from_dict(_json.loads(Path(ir_path).read_text()))
+                if tail:
+                    g = Pipeline.build(tail).run(g, db=db)
+            g_bench = backend.benchmark(g, warmup=warmup, num_iters=iters)
+        except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own table
+            logger.warning("[ab] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
+            continue
+        out.append(_GoldenBench(sample, g, g_bench))
+    return out
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):

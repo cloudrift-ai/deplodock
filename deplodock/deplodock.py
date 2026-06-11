@@ -4,6 +4,7 @@
 import argparse
 
 from deplodock.commands.bench import register_bench_command
+from deplodock.commands.compare import register_compare_command
 from deplodock.commands.compile import register_compile_command
 from deplodock.commands.deploy.cloud import register_cloud_target
 from deplodock.commands.deploy.local import register_local_target
@@ -44,6 +45,7 @@ def main():
     register_run_command(subparsers)
     register_inspect_command(subparsers)
     register_eval_command(subparsers)
+    register_compare_command(subparsers)
 
     args = parser.parse_args()
     setup_cli_logging()

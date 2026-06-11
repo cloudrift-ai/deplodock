@@ -99,6 +99,7 @@ class PerfSample:
     pretty: str
     knobs: dict
     latency_us: float
+    error: str | None = None  # bench_fail failure text (None on ok rows / pre-error-column DBs)
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,7 @@ class SearchDB:
             measured_at          TEXT NOT NULL,
             knobs                TEXT NOT NULL DEFAULT '{}',
             captured             INTEGER NOT NULL DEFAULT 0,
+            error                TEXT,
             PRIMARY KEY (context_key, op_key, backend)
         )
         """,
@@ -229,6 +231,14 @@ class SearchDB:
             self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
         for stmt in self._SCHEMA:
             self._conn.execute(stmt)
+        # Additive migration: pre-existing DBs lack the ``error`` column
+        # (``CREATE TABLE IF NOT EXISTS`` never alters). Writer-side only —
+        # read-only consumers tolerate its absence instead.
+        if not self._has_perf_error_column():
+            self._conn.execute("ALTER TABLE perf ADD COLUMN error TEXT")
+
+    def _has_perf_error_column(self) -> bool:
+        return any(r[1] == "error" for r in self._conn.execute("PRAGMA table_info(perf)"))
 
     @classmethod
     def open_readonly(cls, path: Path | str) -> SearchDB:
@@ -356,6 +366,7 @@ class SearchDB:
         stats: PerfStats,
         knobs: dict | None = None,
         captured: bool = False,
+        error: str | None = None,
     ) -> None:
         """Upsert one ``perf`` row. Keep-best-``ok`` policy: a ``bench_fail``
         never overwrites a prior ``ok`` row, and among same-semantics ``ok``
@@ -363,7 +374,9 @@ class SearchDB:
         time) adds a precedence axis: a captured measurement supersedes an
         uncaptured (wall-semantics) one regardless of median — the numbers
         aren't comparable, and captured is the better truth — while an
-        uncaptured measurement never overwrites a captured one."""
+        uncaptured measurement never overwrites a captured one. ``error`` is the
+        failure text for a ``bench_fail`` row (whitespace-collapsed, truncated)
+        so failure forensics (``eval failures``) need no tune-log grepping."""
         existing = self.lookup_perf(context_key, op_key, backend=backend)
         if existing is not None and existing.status == "ok":
             if status != "ok":
@@ -373,11 +386,13 @@ class SearchDB:
             if not (captured and not existing.captured) and stats.median >= existing.stats.median:
                 return  # same semantics: keep the best median
         knobs_json = json.dumps(knobs or {}, sort_keys=True, default=str)
+        if error is not None:
+            error = " ".join(str(error).split())[:300] or None
         self._conn.execute(
             "INSERT OR REPLACE INTO perf "
             "(context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
-            " latency_us_mean, latency_us_variance, n_samples, measured_at, knobs, captured) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " latency_us_mean, latency_us_variance, n_samples, measured_at, knobs, captured, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 context_key,
                 op_key,
@@ -392,6 +407,7 @@ class SearchDB:
                 datetime.now(UTC).isoformat(),
                 knobs_json,
                 int(captured),
+                error,
             ),
         )
 
@@ -457,9 +473,12 @@ class SearchDB:
         joined to ``cuda_op`` on ``op_key = key``. The single place the two tables
         are joined; backs ``Dataset.from_db``. ``backend=None`` spans every backend.
         Filters to ``status`` (default ``ok``) and ``latency_us_median >
-        min_latency_us`` so callers don't re-filter stale / failed rows."""
+        min_latency_us`` so callers don't re-filter stale / failed rows. The
+        ``error`` select degrades to ``NULL`` on a pre-error-column DB opened
+        read-only (the additive migration runs writer-side only)."""
+        error_col = "perf.error" if self._has_perf_error_column() else "NULL"
         sql = (
-            "SELECT cuda_op.pretty, perf.knobs, perf.latency_us_median "
+            f"SELECT cuda_op.pretty, perf.knobs, perf.latency_us_median, {error_col} "  # noqa: S608 — column name from a fixed two-way choice
             "FROM perf JOIN cuda_op ON perf.op_key = cuda_op.key "
             "WHERE perf.status = ? AND perf.latency_us_median > ?"
         )
@@ -467,12 +486,12 @@ class SearchDB:
         if backend is not None:
             sql += " AND perf.backend = ?"
             params.append(backend)
-        for pretty, knobs_json, us in self._conn.execute(sql, params):
+        for pretty, knobs_json, us, error in self._conn.execute(sql, params):
             try:
                 knobs = json.loads(knobs_json) if knobs_json else {}
             except (TypeError, json.JSONDecodeError):
                 continue
-            yield PerfSample(pretty=pretty, knobs=knobs, latency_us=us)
+            yield PerfSample(pretty=pretty, knobs=knobs, latency_us=us, error=error)
 
     # ------------------------------------------------------------------
     # Per-op best time (summed into the outer terminal reward)

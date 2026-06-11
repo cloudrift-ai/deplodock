@@ -88,6 +88,7 @@ class Sample:
     snippet: str | None = None
     source: str = "db"
     s_full: dict | None = None  # full compiled S_* histogram when known (db/prior rows, or golden compile_s_feats)
+    error: str | None = None  # bench_fail failure text (db rows only; None on ok rows)
 
     def s_features(self) -> dict[str, float]:
         """The ``S_*`` features this sample featurizes on: the full stamped histogram
@@ -146,6 +147,7 @@ class Sample:
             pretty=ps.pretty,
             source="db",
             s_full=s,
+            error=ps.error,
         )
 
     @classmethod

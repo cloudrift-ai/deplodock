@@ -146,9 +146,29 @@ same worker.
   drives the `update-goldens` skill's tune step.
 - `deplodock run <model> [--layer N] [--seq-len N] [--bench] [--target sm_NN]` — trace + compile + execute a whole HuggingFace model (or one `--layer`) on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock end-to-end against the real torch module. Same positional / `--layer` / `--seq-len` grammar as `compile` / `tune`. NOTE: greedy `run` / `compile` pick forks from the global `Prior` (`FallbackPrior`: learned `CatBoostPrior` once trained, else the cold `AnalyticPrior`; `mean_score` argmin — lowest predicted latency), not the DB — so `run` numbers reflect the prior trained by a prior `tune` (and a sensible analytic cold pick before any `tune`). A `.json` positional behaves like `--ir`.
 - `deplodock run --golden NAME [--bench]` — run the named golden config (shorthand for `--code <its snippet>`, same flag as `tune --golden`; unknown NAME lists the names). With `--bench` each recorded golden for the kernel's shape is **compiled with its knobs pinned and benched live this run** (`_bench_golden_variants`), then printed as a row labeled `golden NAME` in the Kernel column (its own measured µs / grid / block / smem / regs / occ; `%` column `--`, since it's not part of the deplodock TOTAL) right beneath the matching greedy-pick kernel — a real A/B, not the stored number. The knob columns are aligned across rows and colored like `deplodock eval` (shared `commands/table` — the knob name is the column header, cells carry the value only): a golden cell is red where it differs from the greedy pick. A golden NAME may map to **multiple** configs (one shape can carry several knob sets, e.g. a newly found faster variant beside the old); each is benched and shown (each re-traces a fresh graph — a frontend graph can't be re-compiled in place).
+- `deplodock run ... --bench --profile` — re-launch the run under `ncu` (curated counter set,
+  `commands/run.py::_NCU_METRICS`) and print an **`ncu compare`** table: the deplodock `k_*` kernels and the
+  torch/cuBLAS reference kernels side by side in one aligned table (duration, occupancy, SM/DRAM/FMA throughput, LSU
+  inst count, smem bank conflicts, regs/thread) — the ncu child launches the eager forward too, so the reference rows
+  are in the same capture. With a dump dir the raw CSV + parsed JSON also land in `61_ncu_metrics.{csv,json}`.
+  Silently skipped when `ncu` isn't on PATH; typical failure is the NVIDIA perf-counter permission gate.
+- `deplodock run ... --bench --ab "K1=V1,K2=V2"` (repeatable) — bench an extra variant with these knobs pinned (the
+  `DEPLODOCK_KNOBS` grammar, `compiler/pipeline/knob.py::parse_knob_spec`) and print it as a live `ab KNOBS` row in the
+  kernel table beneath the greedy kernel with the matching `S_*` shape signature (knob cells red where they differ from
+  the greedy pick — the same machinery as the `--golden` A/B rows, generalized to ad-hoc knob dicts, so a tune-DB
+  variant from `eval variants` can be A/B'd in one process instead of one `DEPLODOCK_KNOBS=...` run per config). Works
+  with `--code` / `--golden` (fresh re-trace per config) and `--ir` (fresh reload + tail re-lowering per config;
+  ignored with a warning on fully-lowered cuda IR — no forks left to pin). Requires `--bench`.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code` — timed under CUDA graph capture (pure GPU time; falls back to uncaptured timing with a printed note if capture fails); non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
+- `deplodock compare <dumpA> <dumpB> [--tol 0.10]` — diff two dump dirs' bench results: the full-model backend table
+  (`60_bench_compare.json`), the per-kernel deplodock -O3 latencies (`62_kernel_bench.json`, machine-readable per-kernel
+  rows `tune --bench` now writes beside `kernels.html`), and the raw per-launch times (`60_benchmark.json`) as fallback.
+  Kernels match by exact provenance name first, then base name with the trailing content hash stripped (order of
+  appearance), so a re-tuned kernel whose hash moved still pairs and prints as `old -> new`; one-side-only kernels are
+  listed as kernel-set changes (structural fork / fusion differences). Ratios outside `--tol` color green/red. The
+  before/after view for compiler changes — per-kernel rows, not the full-model total, are the stable cross-tune signal.
 The `eval` subcommands share a `--dataset {golden,db}` vocabulary (`commands/dataset_args.py`): `golden` reads the
 recorded `GOLDEN_CONFIGS`, `db` reads the tune DB's measured `perf` rows. Both flow through one read-view —
 `compiler/pipeline/search/data/` (`Sample` / `Dataset` / `ShapeKey`) — which also backs the prior `fit` featurization
@@ -187,6 +207,20 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   recorded golden, per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
   rank-under-prior diagnostics; use `eval analytic` / `eval prior` for those). The view to watch while iteratively
   tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
+- `deplodock eval variants [--dataset db] [--db PATH] [--kernel SUBSTR] [--prior PATH] [--top N]` — per-kernel
+  leaderboard of the tune DB's measured variants (leaf configs only, fastest first, knob columns in the shared
+  `commands/table` view), with the config the global `Prior` would deploy marked `◄` + ranked (`pick: rank R/N, X.XXx
+  of best`, flagged when >1.2x — the per-kernel drill-down behind `eval prior --dataset db`'s aggregate reachability),
+  the kernel's `bench_fail` count in the header, and a `-O3 us` column where the prior reservoir holds an `H_opt=3`
+  re-bench for the config (the -O3 re-bench feeds only the reservoir, never a `perf` row, so DB latencies are the
+  tune's -O1 ranking numbers). `--dataset golden` is rejected (goldens carry no per-variant measurements). The view
+  that answers "did the search/prior reach the best measured config for this kernel, and which knobs distinguish it?"
+  without hand-written SQL.
+- `deplodock eval failures [--dataset db] [--db PATH] [--kernel SUBSTR]` — the tune DB's `bench_fail` rows clustered by
+  `(kernel, error)`, each cluster with its row count and the tunable knob assignments shared by EVERY failing row (the
+  "all 28 failures have `TMA=1`" signal). The failure text comes from the `perf` table's `error` column (recorded by
+  `_bench_terminal` on bench failure, whitespace-collapsed + truncated; pre-error-column DBs migrate additively on the
+  next writer open and their old rows cluster under `(no error recorded)`) — no more tune-log grepping.
 - `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
   the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
   `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.
