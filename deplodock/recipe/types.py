@@ -99,6 +99,9 @@ class ModelConfig:
     """Model configuration."""
 
     huggingface: str = ""
+    # What the model serves: "generate" (completion/chat, the default) or
+    # "embed" (/v1/embeddings). Drives the smoke test and the bench workload.
+    task: str = "generate"
 
 
 @dataclass
@@ -180,7 +183,7 @@ class Recipe:
     def from_dict(cls, d: dict) -> "Recipe":
         """Build a Recipe from a (post-merge, post-migrate) config dict."""
         model_dict = d.get("model", {})
-        model = ModelConfig(huggingface=model_dict.get("huggingface", ""))
+        model = ModelConfig(huggingface=model_dict.get("huggingface", ""), task=model_dict.get("task", "generate"))
 
         engine_dict = d.get("engine", {})
         llm_dict = engine_dict.get("llm", {})
@@ -251,3 +254,9 @@ class Recipe:
     def model_name(self) -> str:
         """Shortcut for model.huggingface."""
         return self.model.huggingface
+
+    @property
+    def is_embedding(self) -> bool:
+        """True for embedding recipes (``model.task: embed``) — /v1/embeddings
+        smoke test + ``vllm bench serve --backend openai-embeddings`` workload."""
+        return self.model.task == "embed"

@@ -64,6 +64,21 @@ def test_load_recipe_missing_file_raises(tmp_path):
         load_recipe(str(tmp_path / "does_not_exist"))
 
 
+def test_load_recipe_rejects_unknown_model_task(tmp_path):
+    recipe_dir = tmp_path / "r"
+    recipe_dir.mkdir()
+    (recipe_dir / "recipe.yaml").write_text(yaml.dump({"model": {"huggingface": "org/m", "task": "rerank"}, "engine": {"llm": {}}}))
+    with pytest.raises(ValueError, match="model.task"):
+        load_recipe(str(recipe_dir))
+
+
+def test_load_recipe_accepts_embed_task(tmp_path):
+    recipe_dir = tmp_path / "r"
+    recipe_dir.mkdir()
+    (recipe_dir / "recipe.yaml").write_text(yaml.dump({"model": {"huggingface": "org/m", "task": "embed"}, "engine": {"llm": {}}}))
+    assert load_recipe(str(recipe_dir)).is_embedding
+
+
 def test_load_recipe_no_deploy_gpu(tmp_recipe_dir):
     """Base recipe has no deploy.gpu (it comes from matrices)."""
     recipe = load_recipe(tmp_recipe_dir)

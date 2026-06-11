@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 
 from deplodock.deploy.compose import (
     calculate_num_instances,
@@ -149,17 +150,27 @@ async def run_deploy(
     logger.info(f"Status: {status}")
 
     # Step 7: Smoke test inference (retry — first request may be slow due to warmup)
-    # Asks a trivial factual question and checks the answer to detect broken models
-    # (e.g. wrong quantization producing garbage output).
+    # Chat models: asks a trivial factual question and checks the answer to detect
+    # broken models (e.g. wrong quantization producing garbage output). Embedding
+    # models: requests one embedding and checks it's a unit-norm finite vector.
     if not dry_run:
         logger.info("\nRunning smoke test...")
         async with timer.ameasure(PHASE_SMOKE_TEST):
-            prompt = "What is 2+2? Answer with just the number."
-            smoke_cmd = (
-                f"curl -s http://localhost:{internal_port}/v1/chat/completions"
-                f" -H 'Content-Type: application/json'"
-                f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":128}}' '''
-            )
+            if recipe.is_embedding:
+                smoke_cmd = (
+                    f"curl -s http://localhost:{internal_port}/v1/embeddings"
+                    f" -H 'Content-Type: application/json'"
+                    f''' -d '{{"model":"{model_name}","input":"What is 2+2?"}}' '''
+                )
+                check = _check_embedding_response
+            else:
+                prompt = "What is 2+2? Answer with just the number."
+                smoke_cmd = (
+                    f"curl -s http://localhost:{internal_port}/v1/chat/completions"
+                    f" -H 'Content-Type: application/json'"
+                    f''' -d '{{"model":"{model_name}","messages":[{{"role":"user","content":"{prompt}"}}],"max_tokens":128}}' '''
+                )
+                check = _check_chat_response
             smoke_timeout = 600
             smoke_interval = 10
             deadline = asyncio.get_event_loop().time() + smoke_timeout
@@ -169,22 +180,16 @@ async def run_deploy(
                     # Server not ready yet, keep retrying
                     await asyncio.sleep(smoke_interval)
                     continue
-                try:
-                    body = json.loads(stdout)
-                    message = body["choices"][0]["message"]
-                    answer = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                    # Malformed response, server may still be starting
+                verdict, detail = check(stdout)
+                if verdict == "retry":
+                    # Malformed/empty response, server may still be starting
                     await asyncio.sleep(smoke_interval)
                     continue
-                if not answer:
-                    await asyncio.sleep(smoke_interval)
-                    continue
-                if "4" in answer:
+                if verdict == "pass":
                     logger.info("Smoke test passed.")
                     break
-                # Model returned a valid response but wrong answer — broken model
-                logger.error(f"Smoke test failed: model returned wrong answer: {answer!r}")
+                # Valid response, wrong content — broken model
+                logger.error(f"Smoke test failed: {detail}")
                 logger.error("Container logs:")
                 await run_cmd("docker compose logs --tail=100", timeout=60, log_output=True)
                 return False
@@ -196,17 +201,63 @@ async def run_deploy(
 
     # Print curl example
     logger.info("\nExample curl:")
-    logger.info(
-        f"  curl http://{host}:{external_port}/v1/chat/completions \\\n"
-        f"    -H 'Content-Type: application/json' \\\n"
-        f"    -d '{{\n"
-        f'      "model": "{model_name}",\n'
-        f'      "messages": [{{"role": "user", "content": "Hello"}}],\n'
-        f'      "max_tokens": 64\n'
-        f"    }}'"
-    )
+    if recipe.is_embedding:
+        logger.info(
+            f"  curl http://{host}:{external_port}/v1/embeddings \\\n"
+            f"    -H 'Content-Type: application/json' \\\n"
+            f"    -d '{{\n"
+            f'      "model": "{model_name}",\n'
+            f'      "input": "Hello"\n'
+            f"    }}'"
+        )
+    else:
+        logger.info(
+            f"  curl http://{host}:{external_port}/v1/chat/completions \\\n"
+            f"    -H 'Content-Type: application/json' \\\n"
+            f"    -d '{{\n"
+            f'      "model": "{model_name}",\n'
+            f'      "messages": [{{"role": "user", "content": "Hello"}}],\n'
+            f'      "max_tokens": 64\n'
+            f"    }}'"
+        )
 
     return True
+
+
+def _check_chat_response(stdout: str) -> tuple[str, str]:
+    """Validate a /v1/chat/completions smoke response.
+
+    Returns ``("pass" | "fail" | "retry", detail)`` — ``retry`` means the
+    response was malformed/empty (server may still be starting)."""
+    try:
+        body = json.loads(stdout)
+        message = body["choices"][0]["message"]
+        answer = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return "retry", ""
+    if not answer:
+        return "retry", ""
+    if "4" in answer:
+        return "pass", ""
+    return "fail", f"model returned wrong answer: {answer!r}"
+
+
+def _check_embedding_response(stdout: str) -> tuple[str, str]:
+    """Validate a /v1/embeddings smoke response: a non-empty vector of finite
+    floats with L2 norm ≈ 1 (the pooler normalizes; garbage/NaN models fail)."""
+    try:
+        body = json.loads(stdout)
+        vec = body["data"][0]["embedding"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return "retry", ""
+    if not isinstance(vec, list) or not vec:
+        return "retry", ""
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in vec):
+        return "fail", "embedding contains non-finite values"
+    norm = math.sqrt(sum(v * v for v in vec))
+    if not 0.9 <= norm <= 1.1:
+        return "fail", f"embedding L2 norm {norm:.4f} outside [0.9, 1.1] (dim={len(vec)})"
+    return "pass", ""
 
 
 async def run_teardown(run_cmd):

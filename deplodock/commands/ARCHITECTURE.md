@@ -47,7 +47,11 @@ The central orchestration layer. Provides a single entry point for deploying rec
 - `params.py` — `DeployParams` dataclass (holds `recipe: Recipe`, `gpu_device_ids`, etc.)
 - `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
 - `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`. `run_deploy()` / `deploy()` accept an
-  optional `timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics))
+  optional `timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics)). The
+  post-health smoke test branches on `recipe.is_embedding` (`model.task: embed`): chat models POST
+  `/v1/chat/completions` ("What is 2+2?" must contain "4"); embedding models POST `/v1/embeddings` and require a
+  non-empty finite vector with L2 norm in [0.9, 1.1] (the pooler normalizes — garbage/NaN models fail). Same
+  retry/timeout/log-dump loop either way (`_check_chat_response` / `_check_embedding_response`).
 - `log_phases.py` — `parse_engine_load_phases()` (best-effort `weights_load` / `cuda_graph_capture` from container logs)
 - `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
 - `scale_out.py` — `ScaleOutStrategy` ABC, `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy`, `STRATEGIES`, `DEFAULT_STRATEGY`
@@ -76,7 +80,10 @@ Benchmark configuration, task enumeration, and execution.
 **Modules:**
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
 - `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `add_group_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_GroupNameFilter`, `_BenchConsoleFormatter`
-- `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
+- `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`. Embedding recipes
+  (`model.task: embed`) bench with `vllm bench serve --backend openai-embeddings --endpoint /v1/embeddings` and drop
+  `--random-output-len` (nothing is generated); the output's labels (request/token throughput, E2EL percentiles — no
+  TTFT/TPOT/ITL) already parse via `parse_benchmark_metrics`' missing-field-tolerant label regexes
 - `tasks.py` — `enumerate_tasks()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type. Times provisioning (per
   group) + deploy/bench/teardown (per task); task results are `(task, ok, timing)` triples

@@ -84,6 +84,10 @@ def _validate_and_build(config: dict) -> Recipe:
     if has_command and has_engine_llm:
         raise ValueError("Recipe must specify exactly one of 'engine.llm' or 'command', not both.")
 
+    task = config.get("model", {}).get("task", "generate")
+    if task not in ("generate", "embed"):
+        raise ValueError(f"model.task must be 'generate' or 'embed', got {task!r}")
+
     if has_command:
         # Command recipes don't go through engine extra_args validation.
         return Recipe.from_dict(config)
