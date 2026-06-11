@@ -111,6 +111,26 @@ class ThunkFork(Fork):
         return self.expand_fn(self.knobs)
 
 
+def flatten_leaves(options: Sequence[Op | Graph | Fork]) -> list[Op | Graph | Fork]:
+    """Expand every option down to its leaf options, **depth-first in emission
+    order** — each option's leaves precede the next's, so a tie in a prior's
+    scores still falls to enumeration order (option-0 first). Branch Forks
+    expand recursively — cheap, building only the next levels' knob dicts;
+    leaf Forks and concrete ``Op`` / ``Graph`` options terminate, their
+    materialization deferred to whoever applies the one chosen leaf. Used by
+    deciders that must rank COMPLETE knob rows (the greedy compile pick): a
+    branch pins only a partial tile, and the prior can't featurize the tile's
+    area / occupancy until the row is complete — so the lazy tree collapses to
+    its flat leaf set for one scoring pass."""
+    out: list[Op | Graph | Fork] = []
+    for o in options:
+        if isinstance(o, Fork) and not o.is_leaf:
+            out.extend(flatten_leaves(o.expand()))
+        else:
+            out.append(o)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Hierarchical Fork-tree builder (``Level`` + ``build_fork_tree``).
 # ---------------------------------------------------------------------------

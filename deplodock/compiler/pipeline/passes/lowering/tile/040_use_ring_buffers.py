@@ -109,10 +109,10 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         # then see SYNC and likewise record their off decisions.
         return [TileOp(body=body, name=root.op.name, knobs={**root.op.knobs, BUFFER_COUNT.name: 1})]
 
-    # Occupancy-optimal ordering for the GREEDY default. ``GreedySearch`` keeps
-    # only option-0 of a rule's fork and drops the rest (it does NOT re-score the
-    # buffer variants), so the *order* here is what greedy picks at an untuned
-    # site. A deeper ring hides the TMA/cp.async load latency, but only pays when
+    # Occupancy-optimal ordering for the GREEDY default. The no-prior greedy
+    # fallback (``greedy_decide``) keeps only option-0 of a rule's fork and drops
+    # the rest (it does NOT re-score the buffer variants), so the *order* here is
+    # what greedy picks at an untuned site. A deeper ring hides the TMA/cp.async load latency, but only pays when
     # the deeper slab still leaves ≥ 2 CTA-blocks resident on one SM — past that
     # the kernel drops to 1 block/SM and runs slower (measured 2048² fp16: 128×128
     # depth 3 = 113 µs at 2 blocks vs depth 4 = 141 µs at 1 block). So front-load

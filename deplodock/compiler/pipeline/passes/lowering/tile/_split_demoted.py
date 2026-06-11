@@ -36,9 +36,10 @@ The checks here are the cut's own WELL-FORMEDNESS conditions, not a profitabilit
 this module deliberately does not predict whether the clean gemm will reach the warp tier
 (an earlier version simulated ``is_atom_eligible`` on the rebuilt consumer and immediately
 drifted from what the cell tagger actually accepts). Whether the split pays is the search's
-question — the tuner measures both branches, greedy never picks the structural option
-(``policy/greedy._is_structural``), and a lowering failure on either side must surface as a
-rejection. Conservative bails (return ``None``, never raise) keep the fused path the only
+question — the tuner measures both branches, greedy deploys the structural option only when
+the trained prior prices its kernel set cheaper (``policy/greedy._pick_structural``; never
+cold), and a lowering failure on either side must surface as a rejection.
+Conservative bails (return ``None``, never raise) keep the fused path the only
 outcome for any shape the cut doesn't fully understand: multiple K loops, no computed
 operand, a K-invariant Load operand, accums not sharing one cone set, cones sharing stmts,
 cone values escaping past the multiply, mixed-dtype cone leaves, symbolic extents, or more

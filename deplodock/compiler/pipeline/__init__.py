@@ -9,7 +9,8 @@
   ``Pipeline.from_pattern(...)`` for a one-rule shim. The same greedy /
   autotune semantics apply to every caller.
 - :mod:`.search` — search policies (``Candidate`` / ``Search`` /
-  ``GreedySearch`` / ``TuningSearch``) and persistent measurement
+  ``TuningSearch``; ``greedy_decide`` is the deterministic ``Run.resolve``
+  pick, not a policy) and persistent measurement
   cache. ``Candidate.apply`` owns the per-rule logging + dump hooks
   (reads ``cand.run.dump``).
 - :mod:`.dump` — ``CompilerDump`` artifact collector + ``on_pass``
@@ -33,7 +34,6 @@ from deplodock.compiler.pipeline.pipeline import (
 )
 from deplodock.compiler.pipeline.search import (
     Candidate,
-    GreedySearch,
     Search,
     TuningSearch,
 )
@@ -50,7 +50,6 @@ __all__ = [
     "CUDA_PASSES",
     "Candidate",
     "CompilerDump",
-    "GreedySearch",
     "KERNEL_PASSES",
     "LOOP_PASSES",
     "LoweringError",

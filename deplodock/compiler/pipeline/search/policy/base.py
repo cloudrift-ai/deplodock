@@ -39,8 +39,9 @@ class Search(ABC):
         ``parent`` is the token of the :meth:`pop` whose candidate
         spawned these siblings, or ``None`` for the seed candidate that
         starts a run. Selection is the policy's job: :class:`TuningSearch`
-        ranks the frontier by PUCT over its learned prior (a single-shot
-        compile, prior absent, descends emission-order).
+        ranks the frontier by PUCT over its learned prior. (Single-shot
+        compiles never come through a ``Search`` — ``Pipeline.run`` is a
+        deterministic resolution, ``Run.resolve``.)
 
         ``structural`` marks a fork whose options include a ``Graph``
         splice — a kernel-set-changing (structural) decision, classified
