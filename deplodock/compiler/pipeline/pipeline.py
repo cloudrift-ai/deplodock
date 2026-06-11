@@ -457,59 +457,77 @@ class Pipeline:
         db: SearchDB | None = None,
         dump: CompilerDump | None = None,
     ) -> Graph:
-        """Single-shot greedy compile — run each pass in order, picking
-        the DB-best (or, untuned, the max-prior) fork at every fork
-        point. Convenience wrapper around :meth:`tune` that yields the
-        first terminal.
+        """Single-shot greedy compile — a deterministic resolution
+        (:meth:`Run.resolve`) with the greedy pick
+        (:func:`~deplodock.compiler.pipeline.search.policy.greedy.greedy_decide`):
+        at every fork point, flatten to complete leaves and take the
+        ``Prior``'s ``mean_scores`` argmin. Not a search — no frontier,
+        no tree, no benching (it can only *use* a prior trained earlier
+        by ``tune``, never train one); exploration (PUCT) stays in
+        :meth:`tune`. The input ``graph`` is copied once per attempt and
+        resolved in place — no per-fork graph copies.
 
         ``ctx`` is built once (probing the live device if not provided)
         and passed to every rule that takes a ``ctx`` parameter.
 
         ``backend`` (typically :class:`CudaBackend`) opts the run into
-        real GPU measurement: every terminal graph's per-kernel latency
-        is recorded to ``db`` and attributed to every ancestor along
-        the ``Op.source`` chain. ``db`` defaults to a fresh in-memory
-        store; pass an explicit :class:`SearchDB` to persist
-        measurements across runs.
+        real GPU measurement: the terminal graph's per-kernel latency is
+        recorded to ``db`` (via :func:`_bench_terminal`, once after the
+        resolution settles) and attributed to every ancestor along the
+        ``Op.source`` chain. ``db`` defaults to a fresh in-memory store;
+        pass an explicit :class:`SearchDB` to persist measurements
+        across runs.
 
-        For exhaustive autotuning, call :meth:`tune` directly with
-        :class:`TuningSearch` and iterate every yielded candidate.
+        Retries are ``decide`` wrappers over a deterministic re-resolve
+        — cheap non-chronological backtracking with no graph snapshots
+        or undo log, since every other choice replays identically:
+
+        * **Validity fallback** — the prior ranks by predicted latency
+          and can rank a tile that fails ``validate(ctx)`` (smem /
+          thread budget) first; ``tune`` benches-and-skips it, but
+          greedy benches nothing, so on a left-un-lowered node we
+          blocklist its tile and re-resolve, falling back to the next
+          prior-ranked leaf. Bounded retries (each adds ≥1 block or
+          stops).
+        * **Structural retirement** — a resolution that took a
+          *structural* pick (a prior-priced kernel-set change; the trace
+          contains a ``Graph`` decision) gets one coarser fallback
+          first: any lowering failure retires structural picks wholesale
+          (``price_structural=False``) and re-resolves down the
+          keep-fused branch, since a fragment kernel's failure can't be
+          blocklisted at the fork site (the splice minted fresh node
+          ids).
 
         Installs a per-run ``rejections`` sink (on the :class:`Run`) so
         :func:`Candidate.try_rewrite` records any rewrite whose every
-        option failed ``validate(ctx)``. After the single terminal
-        settles, :func:`_raise_on_unlowered` turns a recorded rejection
-        that left its node un-lowered into a loud :class:`LoweringError`
-        instead of a downstream ``CudaBackend`` mystery."""
-        from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
+        option failed ``validate(ctx)``. After the resolution settles,
+        :func:`_raise_on_unlowered` turns a recorded rejection that left
+        its node un-lowered into a loud :class:`LoweringError` instead
+        of a downstream ``CudaBackend`` mystery."""
+        from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.candidate import Candidate  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.policy.greedy import greedy_decide  # noqa: PLC0415
 
-        # Single-shot compile uses the O(1)-per-step ``GreedySearch`` driver, NOT
-        # the MCTS tree: ``TuningSearch.pop`` re-descends from the root each call,
-        # so a whole-model compile through it would be O(N²) and hang. Greedy picks
-        # each fork by the prior's ``mean_score`` argmin (no benching — it can only
-        # use a prior, never train one). Exploration (PUCT) stays in ``tune``.
-        #
-        # Validity fallback: the prior ranks by predicted latency and can rank a
-        # tile that fails ``validate(ctx)`` (smem / thread budget) first — ``tune``
-        # benches-and-skips it, but greedy benches nothing, so on a left-un-lowered
-        # node we blocklist its tile and re-drive, falling back to the next
-        # prior-ranked sibling. Bounded retries (each adds ≥1 block or stops).
-        # A drive that took a *structural* pick (a prior-priced kernel-set
-        # change — see ``GreedySearch._pick_structural``) gets one coarser
-        # fallback first: any lowering failure on such a drive retires
-        # structural picks wholesale and re-drives down the keep-fused branch,
-        # since a fragment kernel's failure can't be blocklisted at the fork
-        # site (the splice minted fresh node ids).
+        if ctx is None:
+            ctx = _Context.probe()
+        backend_name = getattr(backend, "name", "cuda")
+        if ctx.backend_name != backend_name:
+            ctx = replace(ctx, backend_name=backend_name)
+        db = db if db is not None else _SearchDB()
+        t_start = time.monotonic()
+
         blocked: dict[str, set[frozenset]] = {}
         allow_structural = True
         for _attempt in range(_MAX_GREEDY_RETRIES):
             rejections: list[tuple[str, str, str]] = []
-            search = GreedySearch(blocked=blocked, price_structural=allow_structural)
-            cand = next(self.tune(graph, search=search, ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
-            failed = _unlowered_tiles(cand.graph, rejections)
+            run = Run(pipeline=self, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
+            decide = greedy_decide(blocked=blocked, price_structural=allow_structural)
+            terminal, trace = run.resolve(graph.copy(), decide)
+            failed = _unlowered_tiles(terminal, rejections)
             if not failed:
                 break
-            if allow_structural and search.picked_structural:
+            if allow_structural and any(d.chosen_kind == "graph" for d in trace):
                 allow_structural = False
                 continue
             new = {nid: ident for nid, ident in failed.items() if ident not in blocked.get(nid, set())}
@@ -517,8 +535,11 @@ class Pipeline:
                 break
             for nid, ident in new.items():
                 blocked.setdefault(nid, set()).add(ident)
-        _raise_on_unlowered(cand.graph, rejections, cand.ctx)
-        return cand.graph
+        _raise_on_unlowered(terminal, rejections, ctx)
+        if backend is not None:
+            _bench_terminal(Candidate(run=run, graph=terminal, cursor=Cursor(run=run)), backend=backend, db=db)
+        logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
+        return terminal
 
     def tune(
         self,

@@ -319,25 +319,33 @@ rules — they're shared helpers for the pass's rule modules.
 compile entry points (`run` / `tune`), each driving one of the `Run` engine
 loops (`drive` for exploration, `resolve` for deterministic resolution):
 
-- `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
-  compile via `GreedySearch` (flattens each fork point to its complete leaves and
-  picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
-  once trained). Stops at the first terminal candidate. **Structural options are
+- `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot greedy compile: a deterministic
+  resolution (`Run.resolve`, below) with the greedy pick (`policy/greedy.greedy_decide`), NOT a search — no
+  frontier, no tree, no benching. The decide flattens each fork point to its complete leaves
+  (`fork.flatten_leaves`) and picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
+  once trained; option-0 (first leaf, emission order) only if the prior fails to load entirely. The input graph
+  is copied once per attempt and resolved in place — no per-fork copies (a whole-model compile used to pay one
+  full graph copy per fork point for sibling snapshots it immediately dropped). **Structural options are
   priced, never raw-scored**: the per-op prior prices one kernel's knob row, so its
   score for a multi-kernel `Graph` splice (the `SPLIT_CONE` split, 017's atomic-free
-  combine) is noise. With the *trained* prior loaded, `GreedySearch._pick_structural`
-  prices each side properly — a nested greedy descent per kernel (`lowering/tile`
-  only, CPU, no backend) records the prior's predicted µs for the chosen tile at the
-  kernel's partition fork; the structural side is the Σ over its fragment's kernels,
+  combine) is noise. With the *trained* prior loaded, `greedy_decide`'s `_pick_structural`
+  prices each side properly — a nested `resolve` per kernel over a `lowering/tile`-only pipeline (CPU, no
+  backend) and a trace query: the kernel's price is the `score` of its slice-resolve's `Decision` at the
+  partition fork; the structural side is the Σ over its fragment's kernels,
   memoized per `op_cache_key` — and the cheaper kernel set wins, so an unpinned
   compile deploys the splits `tune` measured best. Cold (analytic / no prior), or
   when a side is unpriceable (a pre-tiled combine has no partition fork), the
   structural leaf is filtered as before — a cold compile never changes kernel sets.
-  If a structural pick leaves a fragment kernel un-lowered (`validate(ctx)`
-  rejection), `Pipeline.run`'s retry retires structural picks wholesale and
-  re-drives down the keep-fused branch before falling back to tile blocklisting.
+  Retries are decide-wrappers over a deterministic re-resolve (every other choice replays identically — cheap
+  non-chronological backtracking, no snapshots or undo log): if a structural pick leaves a fragment kernel
+  un-lowered (`validate(ctx)` rejection — "did this resolution take a structural pick" is a trace query, `any
+  Decision with chosen_kind == "graph"`), the retry retires structural picks wholesale
+  (`price_structural=False`) and re-resolves down the keep-fused branch before falling back to tile
+  blocklisting (`blocked=`).
   `tune` explores structural forks regardless; an env pin makes the
-  Graph the rule's only option, which passes through untouched.
+  Graph the rule's only option, which applies inline and never reaches a decide. With a `backend`,
+  `Pipeline.run` benches the settled terminal once via `_bench_terminal` (per-kernel `perf` / lowering /
+  inventory rows); with `backend=None` nothing is benched or persisted.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
   yields one terminal `Candidate` per fully-explored rollout.
@@ -345,8 +353,8 @@ loops (`drive` for exploration, `resolve` for deterministic resolution):
   per-kernel `perf` / `lowering` / inventory rows, returns the aggregate
   `PerfStats`), then calls `search.observe(stats, status)`. With
   `backend=None` the bench is stubbed to `latency_us=1.0` and nothing
-  is persisted — otherwise `Pipeline.run` (also routed through `tune`)
-  would overwrite tuned `best_median_us` rows with the stub.
+  is persisted, so a backend-less sweep never overwrites tuned
+  `best_median_us` rows with the stub.
 - `Run.drive(graph) -> Iterator[tuple[token, Candidate]]` — the inner engine loop both wrappers drive.
   `Run` is the per-run state object (`pipeline` + `ctx` + `search` + `db` + `backend` + `dump` +
   `rejections`): `Pipeline` stays a frozen, shareable pass layout while every run-scoped sink and service
