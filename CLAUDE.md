@@ -203,6 +203,11 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   tune's -O1 ranking numbers). `--dataset golden` is rejected (goldens carry no per-variant measurements). The view
   that answers "did the search/prior reach the best measured config for this kernel, and which knobs distinguish it?"
   without hand-written SQL.
+- `deplodock eval failures [--dataset db] [--db PATH] [--kernel SUBSTR]` — the tune DB's `bench_fail` rows clustered by
+  `(kernel, error)`, each cluster with its row count and the tunable knob assignments shared by EVERY failing row (the
+  "all 28 failures have `TMA=1`" signal). The failure text comes from the `perf` table's `error` column (recorded by
+  `_bench_terminal` on bench failure, whitespace-collapsed + truncated; pre-error-column DBs migrate additively on the
+  next writer open and their old rows cluster under `(no error recorded)`) — no more tune-log grepping.
 - `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
   the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
   `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.

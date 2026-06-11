@@ -1,6 +1,6 @@
-"""``deplodock eval <knobs|prior|analytic|golden|variants>`` — evaluate the tuning machinery.
+"""``deplodock eval <knobs|prior|analytic|golden|variants|failures>`` — evaluate the tuning machinery.
 
-Five subcommands:
+Six subcommands:
 
 - ``eval knobs``     — print the registered knob schema, then (with a tune DB)
   per-knob **regret** + a knob-interaction matrix (the analysis below).
@@ -15,6 +15,8 @@ Five subcommands:
 - ``eval variants``  — per-kernel leaderboard of the tune DB's measured variants
   (fastest first), the config the prior deploys marked + ranked, and the -O3
   re-bench latency from the prior reservoir where one was recorded.
+- ``eval failures``  — the tune DB's ``bench_fail`` rows clustered by
+  ``(kernel, error)`` with the knob values shared by every failing row.
 
 The ``eval knobs`` regret analysis: for each kernel (grouped by the kernel C
 identifier extracted from ``cuda_op.pretty``), compute per-knob regret:
@@ -120,6 +122,13 @@ def register_eval_command(subparsers) -> None:
     )
     pv.set_defaults(func=handle_eval_variants)
 
+    pf = sub.add_parser(
+        "failures",
+        help="Cluster the tune DB's bench_fail rows by kernel + error, with the knob values shared by every failing row",
+    )
+    add_dataset_args(pf, default="db")
+    pf.set_defaults(func=handle_eval_failures)
+
 
 def handle_eval_knobs(args) -> None:
     """``eval knobs`` — the registered knob schema, then (with a tune DB) per-knob
@@ -220,6 +229,37 @@ def handle_eval_variants(args) -> None:
     o3 = _o3_reservoir_index(prior)
     for name in sorted(groups):
         _emit_variant_table(name, groups[name], prior, n_fail=fails.get(name, 0), o3=o3, top=args.top)
+
+
+def handle_eval_failures(args) -> None:
+    """``eval failures`` — the tune DB's ``bench_fail`` rows clustered by
+    ``(kernel, error)``, each cluster with its count and the tunable knob
+    assignments shared by EVERY failing row (the "all 28 rows have ``TMA=1``"
+    signal). Replaces grepping the tune log against hand-written SQL; rows from
+    pre-error-column DBs cluster under ``(no error recorded)``."""
+    require_source(args, {"db"}, "eval failures reads tune-DB bench_fail rows — --dataset golden records no failures.")
+    db_path = Path(args.db) if args.db else resolve_tune_db()
+    if not db_path.exists():
+        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        return
+    fails = [s for s in Dataset.from_db(db_path, kernel=args.kernel, status="bench_fail") if s.name]
+    n_ok = len(Dataset.from_db(db_path, kernel=args.kernel))
+    if not fails:
+        logger.info("No bench_fail rows%s in %s (%d ok rows).", f" matching --kernel '{args.kernel}'" if args.kernel else "", db_path, n_ok)
+        return
+    clusters: dict[tuple, list] = defaultdict(list)
+    for s in fails:
+        clusters[(s.name, s.error or "(no error recorded)")].append(s)
+    logger.info("%d bench_fail rows (beside %d ok) in %s:", len(fails), n_ok, db_path)
+    for (name, error), grp in sorted(clusters.items(), key=lambda kv: -len(kv[1])):
+        shared = dict(grp[0].knobs)
+        for s in grp[1:]:
+            shared = {k: v for k, v in shared.items() if s.knobs.get(k) == v}
+        knob_txt = ", ".join(f"{k}={v}" for k, v in sorted(shared.items())) or "(no shared knobs)"
+        logger.info("")
+        logger.info("  %s — %d row(s)", name, len(grp))
+        logger.info("    error: %s", error)
+        logger.info("    shared knobs: %s", knob_txt)
 
 
 def _variant_key(s) -> tuple:

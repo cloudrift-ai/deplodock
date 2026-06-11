@@ -1148,7 +1148,7 @@ def _bench_terminal(cand, *, backend, db):
         elif isinstance(op, LoopOp):
             db.record_loop_op(key, _body_json(op, "loop"), op.pretty_body())
 
-    def _persist(cuda_op, *, stats: PerfStats, status: str, backend_name: str, captured: bool = False) -> None:
+    def _persist(cuda_op, *, stats: PerfStats, status: str, backend_name: str, captured: bool = False, error: str | None = None) -> None:
         cuda_key = op_cache_key(cuda_op)
         if cuda_key is None:
             return
@@ -1188,7 +1188,7 @@ def _bench_terminal(cand, *, backend, db):
                 measured_median_us=stats.median if status == "ok" else None,
             )
         knobs = getattr(cuda_op, "knobs", None) or {}
-        db.record_perf(context_key, cuda_key, backend=backend_name, status=status, stats=stats, knobs=knobs, captured=captured)
+        db.record_perf(context_key, cuda_key, backend=backend_name, status=status, stats=stats, knobs=knobs, captured=captured, error=error)
         logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), stats.median, status)
 
     def _accumulate(acc: PerfStats | None, s: PerfStats) -> PerfStats:
@@ -1262,7 +1262,7 @@ def _bench_terminal(cand, *, backend, db):
             )
             s = _point_stats(fail_us)
             for node in cuda_nodes:
-                _persist(node.op, stats=s, status="bench_fail", backend_name=backend_name)
+                _persist(node.op, stats=s, status="bench_fail", backend_name=backend_name, error=f"{type(exc).__name__}: {exc}")
                 agg = _accumulate(agg, s)
             status = "bench_fail"
         else:

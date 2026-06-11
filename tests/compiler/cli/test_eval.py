@@ -267,6 +267,62 @@ def test_variants_counts_bench_fail_rows(run_cli, tmp_path):
     assert "k_matmul — 2 measured configs, 1 bench_fail" in stdout
 
 
+def test_failures_clusters_by_kernel_and_error(run_cli, tmp_path):
+    """``eval failures`` clusters bench_fail rows by (kernel, error) and reports
+    the knob values shared by every failing row in a cluster (the 'all rows have
+    TMA=1' forensics signal). Built with the real ``SearchDB`` write path so the
+    error column round-trips end to end."""
+    from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
+
+    def stats(median):
+        return PerfStats(median=median, min=median, max=median, mean=median, variance=0.0, n_samples=1)
+
+    db_path = tmp_path / "f.db"
+    db = SearchDB(db_path)
+    for i, bm in enumerate((8, 16)):
+        db.record_cuda_op(
+            f"f{i}", kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty="void k_mm(float*)"
+        )
+        db.record_perf(
+            "ctx",
+            f"f{i}",
+            backend="cuda",
+            status="bench_fail",
+            stats=stats(1.0),
+            knobs={"BM": bm, "TMA": True},
+            error="cuTensorMapEncodeTiled failed",
+        )
+    db.record_cuda_op("ok1", kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty="void k_mm(float*)")
+    db.record_perf("ctx", "ok1", backend="cuda", status="ok", stats=stats(10.0), knobs={"BM": 8, "TMA": False})
+    db.close()
+
+    rc, stdout, stderr = run_cli("eval", "failures", "--db", str(db_path))
+    assert rc == 0, f"stderr: {stderr}"
+    assert "2 bench_fail rows (beside 1 ok)" in stdout
+    assert "k_mm — 2 row(s)" in stdout
+    assert "cuTensorMapEncodeTiled failed" in stdout
+    assert "TMA=True" in stdout and "BM=" not in stdout  # shared knob only — BM differs across the rows
+
+
+def test_failures_old_db_without_error_column(run_cli, tmp_path):
+    """bench_fail rows from a pre-error-column DB cluster under a placeholder
+    instead of failing the read."""
+    db = tmp_path / "old.db"
+    _make_tune_db(db, [("a", "k_mm", {"BM": 8}, 10.0)])
+    _add_perf_row(db, "x", "k_mm", {"BM": 64, "TMA": True}, 2_000_000.0, status="bench_fail")
+    rc, stdout, stderr = run_cli("eval", "failures", "--db", str(db))
+    assert rc == 0, f"stderr: {stderr}"
+    assert "(no error recorded)" in stdout
+
+
+def test_failures_none_recorded(run_cli, tmp_path):
+    db = tmp_path / "clean.db"
+    _make_tune_db(db, [("a", "k_mm", {"BM": 8}, 10.0)])
+    rc, stdout, stderr = run_cli("eval", "failures", "--db", str(db))
+    assert rc == 0, f"stderr: {stderr}"
+    assert "No bench_fail rows" in stdout
+
+
 def test_o3_reservoir_index_joins_db_rows_by_sig_and_knobs():
     """``_o3_reservoir_index`` keeps only ``H_opt=3`` reservoir rows and keys them
     so a DB sample with the same ``S_*`` signature + tunable knobs joins (the -O3
