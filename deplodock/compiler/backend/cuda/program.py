@@ -579,6 +579,13 @@ class CompiledProgram:
     # ``run_program_debug`` and the autotune sweep never capture.
     _graphs: list | None = field(default=None, repr=False)
     _graph_batch_sizes: list[int] | None = field(default=None, repr=False)
+    # One CUDA graph holding EVERY launch in program order (batch 1 each),
+    # captured by :meth:`capture_program_graph` for the whole-program (e2e)
+    # timing windows — the deplodock analogue of timing a captured torch
+    # forward, so the backend-comparison table is like-for-like.
+    _e2e_graph: Any | None = field(default=None, repr=False)
+    _e2e_start: Any | None = field(default=None, repr=False)
+    _e2e_stop: Any | None = field(default=None, repr=False)
 
     @classmethod
     def build(
@@ -658,6 +665,60 @@ class CompiledProgram:
         cp.cuda.runtime.deviceSynchronize()
         self._graphs = graphs
         self._graph_batch_sizes = list(batch_sizes)
+
+    def capture_program_graph(self) -> None:
+        """Capture every launch (batch 1, program order) into ONE CUDA graph.
+
+        The whole-program graph backs :meth:`time_program_window` — an event
+        window around N replays of the full program, which is the same
+        semantics the captured torch closures get in the interleaved bench
+        (one graph per forward, replayed back-to-back inside one window).
+        Per-launch capture (:meth:`capture_launch_graphs`) can't provide this:
+        summing isolated single-kernel windows drops cross-kernel cache
+        effects and inter-kernel gaps, so the sum is not an end-to-end time.
+
+        No-op when already captured. Same error contract as
+        :meth:`capture_launch_graphs`: raises :class:`GraphCaptureError` after
+        draining any partial capture state."""
+        import cupy as cp
+
+        if self._e2e_graph is not None:
+            return
+        side = cp.cuda.Stream(non_blocking=True)
+        try:
+            with side:
+                side.begin_capture()
+                for i, launch in enumerate(self.compiled.launches):
+                    _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
+                graph = side.end_capture()
+        except Exception as exc:
+            if side.is_capturing():
+                try:
+                    with side:
+                        side.end_capture()  # drain capture state; discard the partial graph
+                except Exception:  # noqa: BLE001, S110 — already raising the original failure
+                    pass
+            raise GraphCaptureError(f"whole-program capture failed: {exc}") from exc
+        # Throwaway replay absorbs graphExec instantiation/upload cost.
+        graph.launch()
+        cp.cuda.runtime.deviceSynchronize()
+        self._e2e_graph = graph
+
+    def time_program_window(self, replays: int) -> float:
+        """One event window around ``replays`` back-to-back whole-program
+        replays of the captured e2e graph; returns per-replay ms. Caller
+        must have run :meth:`capture_program_graph` first."""
+        import cupy as cp
+
+        if self._e2e_start is None:
+            self._e2e_start, self._e2e_stop = cp.cuda.Event(), cp.cuda.Event()
+        self._e2e_start.record()
+        for _ in range(replays):
+            self._e2e_graph.launch()
+        self._e2e_stop.record()
+        n = max(1, len(self.compiled.launches))
+        _wait_for_event(self._e2e_stop, _KERNEL_TIMEOUT_MS * n * replays, "<whole-program e2e window>")
+        return cp.cuda.get_elapsed_time(self._e2e_start, self._e2e_stop) / replays
 
     def iter_once(
         self,
@@ -816,6 +877,7 @@ def benchmark_program(
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
     capture_graphs: bool = True,
+    measure_e2e: bool = False,
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
 
@@ -867,7 +929,21 @@ def benchmark_program(
     torch timings (``bench_lowered_vs_torch`` / the e2e comparison) use that
     flag to re-run all-or-nothing so one table never mixes semantics, and the
     tune sweep persists it on each ``perf`` row (captured measurements
-    supersede wall-semantics ones on write — see ``SearchDB.record_perf``)."""
+    supersede wall-semantics ones on write — see ``SearchDB.record_perf``).
+
+    ``measure_e2e`` additionally times the WHOLE program per measured iter —
+    one event window around back-to-back replays of a single CUDA graph
+    holding every launch in program order
+    (:meth:`CompiledProgram.time_program_window`) — and reports it as
+    ``BenchmarkResult.e2e_ms`` / ``e2e_min_ms``. The per-launch windows each
+    replay one kernel solo, so their sum misses cross-kernel cache effects;
+    only the whole-program window is comparable against a captured torch
+    forward. Requires capture (silently skipped — fields stay ``None`` —
+    when capture is off or fell back). Off by default: the autotune sweep
+    ranks variants on the per-op sum (per-op results key structurally and
+    transfer across graphs) and never reads e2e, so measuring it there would
+    spend GPU-time budget on an unread statistic; every comparison-table
+    caller passes it via ``_bench_interleaved_captured``."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
@@ -882,6 +958,8 @@ def benchmark_program(
         # one-off outliers the autotune's variant ranking previously
         # got confused by; see ``project_..._noise`` write-ups).
         samples: list[list[float]] = [[] for _ in range(n)]
+        e2e_samples: list[float] = []
+        e2e_replays = 0  # calibrated lazily on the first measured iter
         iters_run = 0
         measured = 0
         cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
@@ -941,12 +1019,30 @@ def benchmark_program(
                 samples[i].append(iter_dts[i])
             cumulative_gpu_ms += sum(iter_dts[i] * batch_sizes[i] for i in range(n))
             measured += 1
+            # Whole-program window, one per measured iter — shares the same
+            # warm GPU state as the per-launch windows and the ``on_iter``
+            # torch closures. Counted toward the run-stage GPU budget but NOT
+            # the auto-stop target, so it never starves per-launch sampling.
+            if measure_e2e and capture_graphs:
+                if e2e_replays == 0:
+                    try:
+                        prog.capture_program_graph()
+                    except GraphCaptureError as exc:
+                        logger.warning("[cuda] %s — skipping whole-program e2e timing", exc)
+                        measure_e2e = False
+                    else:
+                        iter_ms = sum(iter_dts)
+                        e2e_replays = max(1, int(round(_BATCH_TARGET_MS / iter_ms))) if 0 < iter_ms < _BATCH_TARGET_MS else 1
+                if measure_e2e:
+                    e2e_dt = prog.time_program_window(e2e_replays)
+                    e2e_samples.append(e2e_dt)
+                    total_gpu_ms += e2e_dt * e2e_replays
             if measured >= max_measured:
                 break
             if auto and cumulative_gpu_ms >= target_total_ms:
                 break
 
-    return _samples_to_result(samples, prog.compiled.launches, captured=capture_graphs)
+    return _samples_to_result(samples, prog.compiled.launches, captured=capture_graphs, e2e_samples=e2e_samples)
 
 
 def _resolve_iter_budget(num_iters: int | str) -> tuple[float, int, bool]:
@@ -965,7 +1061,9 @@ def _calibrate_batch_sizes(iter_dts: list[float]) -> list[int]:
     return [max(1, int(round(_BATCH_TARGET_MS / dt))) if 0 < dt < _BATCH_TARGET_MS else 1 for dt in iter_dts]
 
 
-def _samples_to_result(samples: list[list[float]], launches: list[_Launch], *, captured: bool = False) -> BenchmarkResult:
+def _samples_to_result(
+    samples: list[list[float]], launches: list[_Launch], *, captured: bool = False, e2e_samples: list[float] | None = None
+) -> BenchmarkResult:
     """Collapse per-launch sample lists to a ``BenchmarkResult`` keyed
     on the median of each launch's measured iters."""
     import statistics as _stats  # noqa: PLC0415
@@ -986,7 +1084,13 @@ def _samples_to_result(samples: list[list[float]], launches: list[_Launch], *, c
     # is the per-launch best-case (least OS/thermal noise — what ``run --bench``
     # reports, matching tune's min-over-variants reporting).
     return BenchmarkResult(
-        time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None, captured=captured
+        time_ms=sum(medians),
+        min_ms=sum(mins),
+        num_launches=n,
+        per_launch=per_launch if per_launch else None,
+        captured=captured,
+        e2e_ms=_stats.median(e2e_samples) if e2e_samples else None,
+        e2e_min_ms=min(e2e_samples) if e2e_samples else None,
     )
 
 

@@ -238,13 +238,37 @@ data-layer harmonization — and the function (correctly) expects `Sample`s. The
 `Dataset.from_db(...).group_by_op()` straight through. Smoke test on a 2-row DB in
 `tests/compiler/cli/test_eval.py::test_prior_db_reachability_smoke`.
 
-## Finding 6 — the end-to-end gap is bigger than the per-kernel gaps (note, no deep dive)
+## Finding 6 — the end-to-end gap is bigger than the per-kernel gaps (resolved: measurement artifact + findings 2–3)
 
-Full-model deplodock is 138 µs but the per-kernel Σ is 121 µs (~12% inter-kernel overhead under CUDA-graph capture).
-More telling: even if every losing kernel matched torch.compile's per-op time, the Σ would be ~72 µs — still 1.6x
-behind tcompile's 45 µs end-to-end. torch.compile wins partly on kernel *granularity* (e.g. one flash-attention
-kernel vs deplodock's 4-kernel SDPA decomposition, norm folded into neighbors). That's a fusion/kernel-set question
-beyond any single finding here; the two-level structural search is the right home for it once findings 2–3 land.
+Original note: full-model deplodock 138 µs vs per-kernel Σ 121 µs read as ~12% inter-kernel overhead, and a
+per-op-parity estimate put deplodock at ~72 µs vs tcompile's 45 µs end-to-end, blamed on kernel *granularity* (one
+flash-attention kernel vs deplodock's 4-kernel SDPA decomposition). Investigated on `fix/finding6-e2e-bench`
+(2026-06-11, findings 2–3 landed); both halves dissolve:
+
+**The "~12% overhead" compared two different measurement families.** The "end-to-end" 138 µs was never a single
+measurement: `benchmark_program` reported `time_ms = Σ per-launch medians`, where each launch is timed in its own
+captured window replaying that ONE kernel back-to-back; the 121 µs Σ came from the *isolated reproducer* benches
+(different compilation slices). Neither is an end-to-end number, and their difference isn't overhead. Worse, the
+solo windows mis-attribute at the µs scale: the two gated-MLP gemms `23ab9c_mm0`/`_mm1` do **identical work**
+(same shape, same knobs; NCU durations 10.3 vs 10.5 µs at locked base clock) yet the per-launch bench splits them
+5.1 µs vs 0.8 µs run after run.
+
+**Fix (this branch).** `benchmark_program(measure_e2e=True)` captures one CUDA graph holding every launch in
+program order and times whole-program replay windows — the exact semantics the captured torch closures get — and
+`run --bench` reports it as the Deplodock row (`BenchmarkResult.e2e_ms`/`e2e_min_ms`; the kernel table prints a
+`whole-program (e2e)` footer beside the per-launch `TOTAL`, and `60_benchmark.json` carries both). Measured: e2e
+51.2 µs vs per-launch Σ 48.7 µs — the *real* inter-kernel overhead is ~2.5 µs (~5%), and the honest standings are
+eager 99 / tcompile 46 / deplodock 51 µs. Tests in `tests/compiler/backend/test_graph_capture.py` (fields under
+capture, `None` without capture, capture-failure non-fatal).
+
+**The granularity claim is gone post findings 2–3.** A torch-profiler sweep of the compiled layer shows tcompile
+launches **16 kernels/iter (45.0 µs)** vs deplodock's 18 (48.7 µs Σ) — same granularity class, not coarser. And
+tcompile's matmuls cost **33 µs** of its 45 (cutlass wmma 17.0 + 13.5, splitK reduce 2.6) vs deplodock's ~21 µs of
+mma kernels — deplodock now *wins* the matmuls and loses the glue: the `_xn` materialization copies + the SiLU·up
+combine carry ~16 µs (`38c877_xn` 5.5, `23ab9c_xn` 5.1, combine 8.0, `0a1109_xn` 2.3), several of which the NCU
+durations price at a fraction of the benched number (combine: 2.75 µs at base clock + flushed cache). Shrinking
+the glue (fusing the combine into mm1's epilogue, cheaper xn layouts) is the remaining structural-search work —
+the SDPA decomposition itself benches *faster* than tcompile's flash kernel cluster (6.6 vs ~8 µs).
 
 ## Repro / artifacts
 
@@ -274,6 +298,14 @@ beyond any single finding here; the two-level structural search is the right hom
   scale gap is 137x. The `-O3 us` column in `eval variants` was empty for every row of both dominators — the
   `DEPLODOCK_O3_TOL` re-bench band evidently didn't cover them; worth checking why (it should have re-benched
   everything within 10% of the running -O1 best).
+- **`--profile` dropped the model** (found during finding 6): the ncu child argv only forwarded `--code`/`--ir`, so
+  `run <model> --layer N --bench --profile` died with "Either a model ID / .json input, --code, or --ir is required".
+  Fixed on `fix/finding6-e2e-bench` (forward the positional input + `--layer`/`--seq-len`, and `--target` for all
+  forms).
+- **`run --ir` on a dumped cuda-stage graph crashes** when the graph has prebuilt TMA descriptors:
+  `_prebuild_descriptors` gets a `str` where it expects `TmaDescMeta` (`arrays[desc.src_buf]` → AttributeError) — the
+  descriptor metadata doesn't survive the JSON round-trip. Open defect; blocked profiling the deployed assembly via
+  `--ir 07_lowering_cuda.json` during finding 6 (worked around by re-tracing from the model ID).
 - **Reproducer re-fusion**: `compile <38c877-reproducer>.torch.json --ir loop` re-fuses the slice into a *different*
   kernel set (3 SDPA kernels) than the deployed one — fine for op-level evidence, but it means the isolated
   reproducer can't NCU-profile the *deployed* fused kernel for SDPA-adjacent slices. The `tune --bench` per-kernel

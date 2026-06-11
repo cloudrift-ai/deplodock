@@ -168,6 +168,7 @@ class CudaBackend(Backend):
         on_iter=None,
         nvcc_flags: str | None = None,
         capture_graphs: bool = True,
+        measure_e2e: bool = False,
     ) -> BenchmarkResult:
         del input_data
         # ``nvcc_flags`` re-points this one bench's compile at a different opt
@@ -187,6 +188,9 @@ class CudaBackend(Backend):
         # subprocess boundary. The autotune sweep never passes
         # ``on_iter``, so this fallback only fires for ``--tune --bench``
         # where the post-tune interleaved bench reuses the same backend.
+        # ``measure_e2e`` only rides the in-process path: its sole caller is
+        # the interleaved ``run --bench`` comparison, which always passes
+        # ``on_iter``. The isolated worker (autotune sweep) never needs it.
         if self.bench_wall_timeout_s is not None and on_iter is None:
             result = benchmark_program_isolated(
                 compiled,
@@ -208,6 +212,7 @@ class CudaBackend(Backend):
                     compile_timeout_s=self.bench_compile_timeout_s,
                     run_timeout_s=self.bench_run_timeout_s,
                     capture_graphs=capture_graphs,
+                    measure_e2e=measure_e2e,
                 )
         return BenchmarkResult(
             time_ms=result.time_ms,
@@ -215,4 +220,6 @@ class CudaBackend(Backend):
             num_launches=result.num_launches,
             per_launch=result.per_launch,
             captured=result.captured,
+            e2e_ms=result.e2e_ms,
+            e2e_min_ms=result.e2e_min_ms,
         )

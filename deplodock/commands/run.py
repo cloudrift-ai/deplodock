@@ -574,6 +574,11 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
             [name, f"{t_us:.1f}", pct_cell, str(grid_total), str(block_threads), f"{smem_kb:.1f}K", str(regs), occ_str.strip(), *kc]
         )
     data.append(["TOTAL", f"{total_us:.1f}", *[""] * (len(columns) - 2)])
+    # TOTAL sums per-launch solo windows (each kernel replayed back-to-back in
+    # its own event window); the whole-program row is one window around the
+    # full launch sequence — the number the backend comparison table reports.
+    if bench.e2e_min_ms is not None:
+        data.append(["whole-program (e2e)", f"{bench.e2e_min_ms * 1000:.1f}", *[""] * (len(columns) - 2)])
 
     print()
     print("knobs (greedy pick); golden / ab rows are red where they differ from the greedy pick:")
@@ -722,6 +727,16 @@ def _run_ncu_profile(args, *, dump_dir=None):
         cmd.extend(["--code", args.code])
     elif args.ir is not None:
         cmd.extend(["--ir", args.ir])
+    else:
+        # Positional model ID / .json path (``--golden`` was already rewritten
+        # to ``--code`` by ``resolve_golden_arg``). Forward the trace shape
+        # flags so the child profiles the same graph the parent benched.
+        cmd.append(args.input)
+        if args.layer is not None:
+            cmd.extend(["--layer", str(args.layer)])
+        cmd.extend(["--seq-len", str(args.seq_len)])
+    if args.target is not None:
+        cmd.extend(["--target", args.target])
     # ncu's per-launch overhead means we want one or two launches per
     # kernel — enough for the counters to populate, not so many that
     # the run drags out. Match ``deplodock run --bench``'s minimal
@@ -1549,7 +1564,9 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
                 stop.record()
             torch_events[name].append((start, stop, batch_size))
 
-    bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
+    bench = backend.benchmark(
+        compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs, measure_e2e=capture_graphs
+    )
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}
@@ -1563,7 +1580,13 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
             # so tune and run numbers are comparable.
             per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
             results[name] = min(per_iter_us)
-    results["Deplodock"] = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
+    # Whole-program (e2e) time when available — windows around replays of one
+    # all-launches CUDA graph, the same semantics the captured torch closures
+    # above get. The fallback sums per-launch solo windows, which is not an
+    # end-to-end number (no cross-kernel cache effects) — see finding 6 of
+    # plans/qwen3-embedding-layer0-tune-findings.md.
+    dep_ms = bench.e2e_min_ms if bench.e2e_min_ms is not None else (bench.min_ms if bench.min_ms is not None else bench.time_ms)
+    results["Deplodock"] = dep_ms * 1000
     return results, bench
 
 
