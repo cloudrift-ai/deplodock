@@ -2,7 +2,8 @@
 
 Status: **clean tune completes; deplodock loses end-to-end (0.70x eager, 0.33x torch.compile), two scalar-locked
 kernels carry 63% of the total.** The first tune attempt crashed ~35 min in on a compiler contract bug (finding 1) —
-fixed on this branch (`fix/atom-cell-ab-classify`, commit `41c871a6`), then re-run clean.
+fixed on this branch (`fix/atom-cell-ab-classify`, commit `41c871a6`), then re-run clean. Finding 2 (the bigger
+dominator, 51 µs → 12.7 µs) is also fixed on this branch — see its section.
 
 - Command: `deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --clean --bench --dump-dir <dir>/dump`
 - Hardware: RTX 5090 (sm_120), ncu 2025.3.1 (perf counters permitted)
@@ -89,7 +90,7 @@ open — worth its own change.
 **Result.** The tune completes, and the unlocked kernel set wins: attn@V deploys with 3 `mma.sync` sites at 10 µs vs
 12/12 µs eager/tcompile (run 1's scalar picks for the same op ranked ~573 µs at -O1).
 
-## Finding 2 — MLP gate+up kernel is scalar-locked: 51 µs vs torch.compile's 14 µs (~37 µs at stake)
+## Finding 2 — MLP gate+up kernel is scalar-locked: 51 µs vs torch.compile's 14 µs (fixed on this branch)
 
 **Symptom.** The biggest kernel (42% of Σ) fuses post-attn RMSNorm + gate (linear_4) + up (linear_5) + SiLU·up into
 one kernel and runs 3.6x behind torch.compile. All 54 tune-DB variants are scalar (no `MMA` column in
@@ -147,6 +148,20 @@ tier lockout, not search.
 (or CSE the duplicate before the offer); (b) extend the mma cell gate + `011`/`005` emit to the dual-accum
 shared-A/two-B cell (two C fragments, one A fragment per K step), or have the split offer also cut gate and up into
 separate single-matmul kernels. (b) is the larger change but is what torch.compile effectively does.
+
+**Fix (this branch).** (a) + the separate-kernels arm of (b), both inside `_split_demoted.try_split_demoted`: the
+K-cell is value-numbered so the SSA-duplicated norm chains count as ONE cone class sharing a single `xn`
+materialization, and a multi-accum K loop extracts each accum's matmul into its own clean gemm producer
+(`__mm0`/`__mm1`, written at `[rows, N]` f32 — the accumulator's own precision) with the consumer rebuilt as the
+pointwise combine (each K loop replaced by Loads re-reading the `mm_i` buffers under the accums' SSA names; the
+SiLU·up epilogue untouched). Each gemm is then the canonical pure cell, so the existing mma gate/tagger/emit apply
+unchanged. A third stacked gate surfaced on the real reproducer: the cone-dtype vote included the prologue's f32
+`mean_count`/`eps` scalar constants beside the f16 cell leaves ("mixed-dtype cone leaves" bail) — the vote now
+covers cell leaves only (prologue/lead loads need only resolve). Everything stays under the existing binary
+`SPLIT_CONE` offer; greedy cold still keeps the fused kernel. Result on the 23ab9c reproducer (RTX 5090, -O3,
+CUDA-graph captured): `xn` 2.0 µs + 2 × ~5 µs `mma_m16n8k16_f16` gemms + 0.8 µs combine = **12.7 µs vs the deployed
+51 µs (4.0x)** — ahead of torch.compile's 14 µs. Regression tests in `tests/compiler/passes/test_split_demoted.py`
+(`test_gated_mlp_*`, stray-stmt bail).
 
 ## Finding 3 — o_proj kernel scalar-locked by a collapsed-reshape K operand: 25 µs, loses to eager (~11 µs at stake)
 

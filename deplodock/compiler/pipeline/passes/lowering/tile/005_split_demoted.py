@@ -1,11 +1,14 @@
 """Offer the demoted-matmul split as a structural fork — see ``_split_demoted``.
 
 Runs before ``010_partition_loops`` so the body is still un-tiled (the only dialect where
-both halves of a split can re-enter planning with their own tilings). This rule owns only
+every piece of a split can re-enter planning with its own tiling). This rule owns only
 the OFFER; the cut itself lives in ``_split_demoted.try_split_demoted`` — one rule, no
 per-shape cases: each multiply operand is independently a plain Load (stays put) or a
 computed cone (becomes an ``xn`` producer materialized over exactly the axes it reads,
-with K second-to-last for an N-reading cone so the consumer keeps the canonical B layout).
+with K second-to-last for an N-reading cone so the consumer keeps the canonical B layout);
+value-identical duplicated cones share one ``xn``, and a multi-accum K loop (the gated-MLP
+gate+up) additionally extracts each accum's matmul into its own clean gemm producer with
+the consumer rebuilt as the pointwise combine.
 Its checks are the cut's well-formedness conditions, not a profitability prediction.
 Whether the split pays is the search's question: the tuner compares both branches as outer
 terminals (``search/two_level.py``); greedy ``compile`` / ``run`` deploy the split only when
@@ -16,7 +19,7 @@ Emission order is load-bearing: the keep-fused option comes FIRST, the documente
 greedy/no-prior fallback. ``DEPLODOCK_SPLIT_CONE=1/0`` pins either branch.
 
 Both branches stamp the decision into ``op.knobs`` — keep-fused carries ``SPLIT_CONE:
-False``, the split fragment's two kernels carry ``SPLIT_CONE: True`` — the standard
+False``, every split-fragment kernel carries ``SPLIT_CONE: True`` — the standard
 considered-vs-declined idiom (``020_stage_inputs``'s declined ``STAGE`` row; see
 ``search/keys.py``): the knob is the rule's idempotence guard AND the learned prior's
 training signal (absent = never offered → NaN-filled; ``False`` / ``True`` = the measured
@@ -24,9 +27,9 @@ decision), and it keeps each decision state's ``op_cache_key`` distinct from its
 the search tree never self-parents. The stamp is deterministic per offer site, so
 structurally identical kernels across graphs stamp identically and keep sharing perf rows.
 
-Termination (measured, not assumed). The split branch terminates structurally: its two
+Termination (measured, not assumed). The split branch terminates structurally: its
 LoopOps re-match this rule but fail the cut classification (the gemm has no cone; the
-producer has no matmul reduce) — or, if a piece is itself still cuttable, a further split
+producer has no matmul reduce; the combine has no matmul) — or, if a piece is itself still cuttable, a further split
 is a legitimate offer, not a loop. The keep-fused branch terminates via the knob guard:
 without it, a multi-demotion-site batch re-offers compoundingly in fork children (the fork
 fires on a non-last match and every child re-enumerates the batch; measured: a two-site
@@ -58,7 +61,7 @@ PATTERN = [Pattern("root", LoopOp)]
 # BOOL knob: at a demoted matmul (a fused computed-operand cone keeps the warp
 # tier structurally unreachable — e.g. the gated-MLP norm prologue) this rule
 # forks between keeping the fused kernel (False, emitted first = the greedy
-# cold pick) and splitting it in two (True). Stamped into ``op.knobs`` on both
+# cold pick) and splitting it apart (True). Stamped into ``op.knobs`` on both
 # branches (decision = idempotence guard = prior training signal — see the
 # module docstring). DELIBERATELY no ``off=``: ``_off_fill_pass`` would stamp
 # an off-default onto every knob-bearing TileOp at the pass boundary, erasing
@@ -68,7 +71,8 @@ SPLIT_CONE = Knob(
     "SPLIT_CONE",
     KnobType.BOOL,
     hints=(False, True),
-    help="Split a demoted matmul's computed operand cone(s) into producer kernel(s) (xn producer(s) + clean gemm)",
+    help="Split a demoted matmul's computed operand cone(s) into producer kernel(s) "
+    "(xn producer(s) + clean gemm; multi-accum also extracts one gemm per accum + the pointwise combine)",
 )
 
 

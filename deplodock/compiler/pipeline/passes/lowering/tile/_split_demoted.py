@@ -32,6 +32,17 @@ SDPA P@V = one row cone with prologue deps; rotary QK^T = a row cone + an N cone
 ``head / 2`` shared-KV read keeps that row axis as a leading dim — duplicated across the
 sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load.
 
+Cones compare by VALUE, not SSA name: fusion inlines a shared producer chain once per
+consuming matmul (the gated-MLP norm feeds gate AND up as two structurally identical
+chains), so the cell is value-numbered and roots in the same class share one ``xn``
+materialization. A MULTI-accum K loop (gate+up sharing the reduce) additionally extracts
+each accum's matmul into its own clean single-matmul gemm producer — the mma cell gate
+admits exactly one matmul per K loop, so the fused pair could never reach the warp tier —
+writing the accumulator at ``mm_i[rows…, n]`` in f32 (its own precision), and the consumer
+becomes the pointwise combine: each K loop replaced by ``Load``\\ s that re-read the
+``mm_i`` buffers under the accums' SSA names, the epilogue (SiLU·up) untouched. The
+single-accum consumer keeps its matmul inline as before.
+
 The checks here are the cut's own WELL-FORMEDNESS conditions, not a profitability gate:
 this module deliberately does not predict whether the clean gemm will reach the warp tier
 (an earlier version simulated ``is_atom_eligible`` on the rebuilt consumer and immediately
@@ -41,18 +52,21 @@ the trained prior prices its kernel set cheaper (``policy/greedy._pick_structura
 cold), and a lowering failure on either side must surface as a rejection.
 Conservative bails (return ``None``, never raise) keep the fused path the only
 outcome for any shape the cut doesn't fully understand: multiple K loops, no computed
-operand, a K-invariant Load operand, accums not sharing one cone set, cones sharing stmts,
-cone values escaping past the multiply, mixed-dtype cone leaves, symbolic extents, or more
+operand, a K-invariant Load operand, distinct-class cones sharing stmts,
+cone values escaping past the multiply, mixed-dtype cell leaves, symbolic extents, more
 than one cone reading the output N axis (two ``(…, K, N)`` buffers would re-do the
-matmul's own volume — the materialization that defeats the split).
+matmul's own volume — the materialization that defeats the split), or — multi-accum only —
+a cell stmt claimed by no gemm / an operand Load doubling as a cone member.
 """
 
 from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
+from string import ascii_lowercase
 from typing import TYPE_CHECKING
 
+from deplodock.compiler import dtype as dtype_mod
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
@@ -104,13 +118,11 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     accums = [s for s in top if isinstance(s, Accum)]
     if not accums:
         return None
-    roots: tuple[str, ...] | None = None
-    muls: list[Assign] = []
+    per_acc: list[tuple[Accum, Assign, tuple[str, ...]]] = []
     for acc in accums:
         mul = cell_def.get(acc.value)
         if not isinstance(mul, Assign) or mul.op.name != "multiply" or len(mul.args) != 2:
             return None
-        muls.append(mul)
         cone_args: dict[str, None] = {}  # ordered de-dup (a squared cone appears twice)
         for a in mul.args:
             d = cell_def.get(a)
@@ -125,18 +137,34 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
                 return None
         if not cone_args:
             return None  # pure cell (not demoted)
-        if roots is None:
-            roots = tuple(cone_args)
-        elif set(roots) != set(cone_args):
-            return None  # accums with different cones — no shared operand set to materialize
-    assert roots is not None
+        per_acc.append((acc, mul, tuple(cone_args)))
+    muls = [m for _, m, _ in per_acc]
+
+    # Value-number the cell so SSA-duplicated cones count as ONE: fusion
+    # inlines a shared producer chain once per consuming matmul (the gated-MLP
+    # norm feeds gate AND up as two structurally identical chains), and roots
+    # in the same value class share a single xn materialization. An external
+    # name is its own class (same SSA name = same value).
+    vn: dict[str, object] = {}
+    for s in top:
+        if isinstance(s, Load) and len(s.names) == 1:
+            vn[s.names[0]] = ("load", s.input, tuple(e.pretty() for e in s.index))
+        elif isinstance(s, Assign):
+            vn[s.name] = (s.op.name, tuple(vn.get(a, a) for a in s.args))
+    rep_of: dict[object, str] = {}  # value class → representative root, first in body order
+    for _, _, rs in per_acc:
+        for r in rs:
+            rep_of.setdefault(vn[r], r)
+    roots = tuple(dict.fromkeys(r for _, _, rs in per_acc for r in rs))
 
     # --- backward-slice each cone over the cell / prologue / leading scopes --
     # Three chained Body.backward_cone calls, one per scope level: each
     # level's unresolved external reads seed the next. After the last level
-    # only axis vars may remain unresolved.
+    # only axis vars may remain unresolved. Every root is sliced (the escape
+    # check and the consumer rebuild need each duplicate chain's stmts); only
+    # the class representatives materialize producers.
     axis_names = {a.name for a in loop_op.axes}
-    cones: list[_RootCone] = []
+    cone_of: dict[str, _RootCone] = {}
     for root in roots:
         cell_cone = k_loop.body.backward_cone((root,))
         if not cell_cone.members:
@@ -152,26 +180,55 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         axes = lead_cone.external_reads & axis_names
         if not axes <= set(row_names) | {k_name, n_name}:
             return None
-        dtype = _cone_dtype((*cell_cone.loads, *pro_cone.loads, *lead_cone.loads), graph)
+        # The xn element dtype is the CELL leaves' (the chain the materialized
+        # value is computed from); prologue/lead loads only feed row stats —
+        # e.g. an f32 mean-count scalar beside an f16 norm chain — and need
+        # only resolve, not match.
+        dtype = _cone_dtype(cell_cone.loads, graph)
         if dtype is None:
             return None
-        cones.append(_RootCone(root, cell_cone, pro_cone, lead_cone, axes, dtype))
+        if any(graph.nodes.get(ld.input) is None for ld in (*pro_cone.loads, *lead_cone.loads)):
+            return None  # prologue/lead load from a buffer the graph doesn't know
+        cone_of[root] = _RootCone(root, cell_cone, pro_cone, lead_cone, axes, dtype)
+    cones = [cone_of[r] for r in rep_of.values()]
     if sum(1 for c in cones if n_name in c.axes) > 1:
         return None  # two (…, K, N) buffers would re-do the matmul's own volume
     for i, a in enumerate(cones):
         for b in cones[i + 1 :]:
             if {id(m) for m in a.moved} & {id(m) for m in b.moved}:
-                return None  # cones sharing a stmt would compute it in both producers
+                return None  # distinct-class cones sharing a stmt would compute it in both producers
 
     # --- escape check: moved values must die at the multiplies ----------------
-    if not loop_op.body.defs_die_at((m for c in cones for m in c.moved), roots=roots, allowed=muls):
+    if not loop_op.body.defs_die_at((m for r in roots for m in cone_of[r].moved), roots=roots, allowed=muls):
         return None
 
-    # --- build one producer per cone -------------------------------------------
+    # A multi-accum cell (the gated-MLP gate+up) cannot stay one kernel and
+    # reach the warp tier (the mma cell gate admits exactly one matmul per K
+    # loop), so the split also extracts each accum's matmul into its own clean
+    # gemm producer and rebuilds the consumer as the pointwise combine. Every
+    # cell stmt must then have a home in some gemm: bail on strays, and on an
+    # operand Load doubling as a cone member (it would be both kept and moved).
+    moved_cell = {id(m) for r in roots for m in cone_of[r].cell.members}
+    if len(accums) > 1:
+        claimed = moved_cell | {id(m) for m in muls} | {id(a) for a in accums}
+        for _, mul, _ in per_acc:
+            for a in mul.args:
+                d = cell_def[a]
+                if isinstance(d, Load):
+                    if id(d) in moved_cell:
+                        return None
+                    claimed.add(id(d))
+        if any(id(s) not in claimed for s in top):
+            return None
+
+    # --- build one producer per cone class --------------------------------------
     # The N-reading cone sorts last so it is always the "b" suffix; a single
-    # cone keeps the plain "__xn" name.
+    # cone keeps the plain "__xn" name. Every root of the class — duplicates
+    # included — re-reads the one shared buffer under its own SSA name.
     cones.sort(key=lambda c: n_name in c.axes)
-    suffixes = ("",) if len(cones) == 1 else ("a", "b")
+    suffixes = ("",) if len(cones) == 1 else tuple(ascii_lowercase[: len(cones)])
+    if len(suffixes) != len(cones):
+        return None  # more cone classes than suffix letters — not a real shape
     producers: list[tuple[LoopOp, Tensor]] = []
     cone_loads: dict[int, Load] = {}  # id(cone root's def stmt) → replacement Load
     for c, sfx in zip(cones, suffixes, strict=True):
@@ -195,31 +252,63 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         if reads_n:
             shape += (outer_n.axis.extent.as_static(),)
         producers.append((producer, Tensor(xn_id, shape, c.dtype)))
-        cone_loads[id(cell_def[c.root])] = Load(names=(c.root,), input=xn_id, index=index)
+        for root in roots:
+            if vn[root] == vn[c.root]:
+                cone_loads[id(cell_def[root])] = Load(names=(root,), input=xn_id, index=index)
+
+    # --- multi-accum: one clean gemm producer per accum -------------------------
+    # Each gemm materializes its accumulator at (rows…, N) in f32 — the
+    # accumulator's own precision, value-preserving — and the consumer re-reads
+    # it under the accum's SSA name, so the epilogue is untouched.
+    acc_loads: list[Load] = []
+    if len(accums) > 1:
+        mm_index = (*(Var(lp.axis.name) for lp in rows), Var(n_name))
+        mm_shape = tuple(lp.axis.extent.as_static() for lp in rows) + (outer_n.axis.extent.as_static(),)
+        for i, (acc, mul, _) in enumerate(per_acc):
+            mm_id = f"{node_id}__mm{i}"
+            cell: list[Stmt] = []
+            for a in mul.args:
+                d = cell_def[a]
+                cell.append(cone_loads[id(d)] if isinstance(d, Assign) else d)
+            inner_mm: tuple[Stmt, ...] = (
+                Loop(axis=k_loop.axis, body=Body((*cell, mul, acc)), unroll=k_loop.unroll),
+                Write(output=mm_id, index=mm_index, values=(acc.name,)),
+            )
+            level_mm: tuple[Stmt, ...] = (Loop(axis=outer_n.axis, body=Body(inner_mm), unroll=outer_n.unroll),)
+            for lp in reversed(rows):
+                level_mm = (Loop(axis=lp.axis, body=Body(level_mm)),)
+            gemm = LoopOp(body=Body(level_mm))
+            gemm.name = f"{loop_op.name}_mm{i}" if loop_op.name else ""
+            producers.append((gemm, Tensor(mm_id, mm_shape, dtype_mod.get("f32"))))
+            acc_loads.append(Load(names=(acc.name,), input=mm_id, index=mm_index))
 
     # --- build the consumer ----------------------------------------------------
-    moved_cell = {id(m) for c in cones for m in c.cell.members}
-    new_top: list[Stmt] = []
-    for s in top:
-        repl = cone_loads.get(id(s))
-        if repl is not None:
-            new_top.append(repl)
-        elif id(s) in moved_cell:
-            continue
+    if len(accums) == 1:
+        new_top: list[Stmt] = []
+        for s in top:
+            repl = cone_loads.get(id(s))
+            if repl is not None:
+                new_top.append(repl)
+            elif id(s) in moved_cell:
+                continue
+            else:
+                new_top.append(s)
+        cell_repl: tuple[Stmt, ...] = (Loop(axis=k_loop.axis, body=Body(tuple(new_top)), unroll=k_loop.unroll),)
+    else:
+        cell_repl = tuple(acc_loads)
+    cons_inner: list[Stmt] = []
+    for s in outer_n.body:
+        if s is k_loop:
+            cons_inner.extend(cell_repl)
         else:
-            new_top.append(s)
-    new_k_loop = Loop(axis=k_loop.axis, body=Body(tuple(new_top)), unroll=k_loop.unroll)
-    new_outer_n = Loop(
-        axis=outer_n.axis,
-        body=Body(tuple(new_k_loop if s is k_loop else s for s in outer_n.body)),
-        unroll=outer_n.unroll,
-    )
-    pro_used_all = {id(m) for c in cones for m in c.pro.members}
+            cons_inner.append(s)
+    new_outer_n = Loop(axis=outer_n.axis, body=Body(tuple(cons_inner)), unroll=outer_n.unroll)
+    pro_used_all = {id(m) for r in roots for m in cone_of[r].pro.members}
     level = tuple(new_outer_n if s is outer_n else s for s in prologue_level if id(s) not in pro_used_all or s is outer_n)
     for lp in reversed(rows):
         level = (Loop(axis=lp.axis, body=Body(level)),)
     cons_id = f"{node_id}__mm"
-    lead_used_all = {id(m) for c in cones for m in c.lead.members}
+    lead_used_all = {id(m) for r in roots for m in cone_of[r].lead.members}
     kept_lead = tuple(s for s in leading if id(s) not in lead_used_all)
     consumer_op = LoopOp(body=Body((*kept_lead, *level)))
     consumer_op = _rename_write_output(consumer_op, old=node_id, new=cons_id)
@@ -314,11 +403,12 @@ def _contains_matmul_reduce_loop(stmt: Stmt) -> bool:
 
 
 def _cone_dtype(loads, graph: Graph):
-    """The uniform dtype of every graph-resolvable Load in the cone's moved
+    """The uniform dtype of every graph-resolvable Load in the cone's CELL
     stmts — the dtype its ``xn`` buffer materializes at (value-preserving;
     identical to the multiply's other-operand dtype on every shape seen so
-    far). ``None`` (bail) when a Load source is unresolvable or the leaf
-    dtypes disagree."""
+    far). Prologue/lead loads don't vote: they feed row stats (an f32
+    mean-count scalar must not block an f16 norm chain). ``None`` (bail) when
+    a Load source is unresolvable or the leaf dtypes disagree."""
     dtypes = set()
     for ld in loads:
         node = graph.nodes.get(ld.input)

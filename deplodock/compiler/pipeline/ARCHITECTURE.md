@@ -121,16 +121,25 @@ materializing an `xn` intermediate over exactly the axes it reads — `xn[rows r
 A operand), `xn[rows read…, k, n]` for an N-reading cone (the B operand; N innermost, so K lands
 second-to-last and the consumer's B load carries the canonical layout the cell tagger / stager serve even
 when the original access was transposed `[n, k]`). Producers carry their cone's prologue deps (the norm's
-row-stat reduce, P@V's softmax stats) and materialize at the cone's uniform leaf-Load dtype; the consumer
-loads each `xn` under the cone root's SSA name, so the multiply and epilogue are untouched. The familiar
-shapes are instances: norm→linear / scale→matmul = one row cone beside a Load; SDPA P@V = one row cone with
-prologue deps; rotary QK^T = a row cone + an N cone (the GQA `head / 2` shared-KV read stays a leading dim,
-duplicated across the sharing heads); a weight-side scale = one N cone beside a Load. All pieces
+row-stat reduce, P@V's softmax stats) and materialize at the cone's uniform CELL-leaf dtype (prologue/lead
+loads only feed row stats — an f32 mean-count scalar must not block an f16 norm chain); the consumer
+loads each `xn` under the cone root's SSA name, so the multiply and epilogue are untouched. Cones compare
+by VALUE, not SSA name: fusion inlines a shared chain once per consuming matmul (the gated-MLP norm feeds
+gate AND up as two structurally identical chains), so the cell is value-numbered and same-class roots share
+one `xn`. A MULTI-accum K loop (gate+up sharing the reduce) additionally extracts each accum's matmul into
+its own clean single-matmul gemm producer (`__mm0`, `__mm1`, …) writing `mm_i[rows…, n]` at f32 (the
+accumulator's own precision) — the mma cell gate admits exactly one matmul per K loop, so the fused pair
+could never reach the warp tier — and the consumer becomes the pointwise combine: each K loop replaced by
+Loads re-reading the `mm_i` buffers under the accums' SSA names, the epilogue (SiLU·up) untouched. The
+familiar shapes are instances: norm→linear / scale→matmul = one row cone beside a Load; SDPA P@V = one row
+cone with prologue deps; rotary QK^T = a row cone + an N cone (the GQA `head / 2` shared-KV read stays a
+leading dim, duplicated across the sharing heads); a weight-side scale = one N cone beside a Load; the
+gated MLP = one value-shared row cone + two extracted gemms + the combine. All pieces
 re-enter the planner as ordinary LoopOps with their own fork trees. The offer is gated ONLY on the cut's
 well-formedness (`_split_demoted.try_split_demoted` bails on multiple K loops, no computed operand, a
-K-invariant Load operand, accums not sharing one cone set, cones sharing stmts, escaping cone values,
-mixed-dtype cone leaves, symbolic extents, or more than one N-reading cone — two `(…, K, N)` buffers would
-re-do the matmul's own volume) —
+K-invariant Load operand, distinct-class cones sharing stmts, escaping cone values,
+mixed-dtype cell leaves, symbolic extents, more than one N-reading cone — two `(…, K, N)` buffers would
+re-do the matmul's own volume — or, multi-accum only, a cell stmt no gemm claims) —
 deliberately NOT on a predicted tier for the clean gemm: profitability is the search's question (an earlier
 eligibility-simulating gate immediately drifted from what the cell tagger accepts). The two-level tuner owns
 the offer as an **outer structural fork** (`plans/structural-forks-in-two-level.md` step 2): keep-vs-split
