@@ -1,0 +1,53 @@
+# Qwen3-Embedding-4B: stock vLLM pooling vs vLLM + deplodock compiled-kernel plugin
+# (deplodock/serving — same OpenAI /v1/embeddings shell, different kernels).
+#
+# context_length is pinned to 4096 on BOTH engines for an apples-to-apples comparison —
+# 4096 is deplodock's dynamic-dim max (compiler/trace/dynamic.py DYNAMIC_DIM_MAX); the
+# model natively supports 32k.
+#
+# The deplodock variant compiles the whole model at engine start (~3 min first boot,
+# faster after — DEPLODOCK_CUBIN_CACHE persists compiled cubins on the model volume).
+# Stock vLLM ignores that env var, so it sits at the base level for both variants.
+model:
+  huggingface: "Qwen/Qwen3-Embedding-4B"
+  task: embed
+
+engine:
+  llm:
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    # High on purpose: the deplodock variant's cupy-held weights are non-torch memory
+    # that vLLM's profiler subtracts from this budget, and the attention-free plugin
+    # needs no KV cache anyway.
+    gpu_memory_utilization: 0.9
+    context_length: 4096
+    max_concurrent_requests: 32
+    vllm:
+      extra_env:
+        DEPLODOCK_CUBIN_CACHE: "/hf_models/deplodock-cubins"
+
+benchmark:
+  max_concurrency: 32
+  num_prompts: 256
+  random_input_len: 512   # overridden per regime by the matrix
+  random_output_len: 1    # unused for task: embed (flag omitted from the bench command)
+
+matrices:
+  cross:
+    deploy.gpu:
+      - "NVIDIA GeForce RTX 5090"
+      - "NVIDIA GeForce RTX 4090"
+    deploy.gpu_count: 1
+    benchmark.random_input_len: [32, 512]   # short-query + document regimes
+    zip:
+      engine.llm.vllm.image:
+        - "vllm/vllm-openai:v0.22.1"
+        - "cloudriftai/vllm-deplodock:0.22.1-8c7b0e9b"
+      engine.llm.vllm.extra_args:
+        - "--runner pooling"
+        - "--runner pooling --enforce-eager --hf-overrides '{\"architectures\":[\"DeplodockEmbedModel\"]}'"
+
+aggregate:
+  run: |
+    ./venv/bin/python scripts/aggregate_embedding.py $run_dir --output $run_dir/report.md
+  timeout: 120

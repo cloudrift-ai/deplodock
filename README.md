@@ -286,11 +286,13 @@ make format    # auto-fix
       - [cuda/](deplodock/compiler/backend/cuda/) — CUDA backend internals (see [ARCHITECTURE.md](deplodock/compiler/backend/cuda/ARCHITECTURE.md))
     - [tuning.py](deplodock/compiler/tuning.py) — autotuning utilities
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
+  - [serving/](deplodock/serving/) — vLLM out-of-tree embedding plugin (see [ARCHITECTURE.md](deplodock/serving/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
   - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
+- [docker/](docker/) — Custom image builds ([vllm-deplodock](docker/vllm-deplodock/) — vLLM + the deplodock plugin)
 - [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
 - [kernels/](kernels/) — Standalone CUDA kernel sources
 - [docs/](docs/) — Technical notes and engine-specific guides

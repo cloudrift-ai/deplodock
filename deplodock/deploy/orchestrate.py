@@ -73,10 +73,13 @@ async def run_deploy(
     port_map = dict(port_mappings or [])
     external_port = port_map.get(internal_port, internal_port)
 
-    # Step 1: Pull images
+    # Step 1: Pull images. --ignore-pull-failures keeps a locally-built image
+    # usable before it's pushed to a registry (e.g. testing a fresh
+    # vllm-deplodock build with `bench --local`); a genuinely missing image
+    # still fails clearly at `docker compose up`.
     logger.info("Pulling images...")
     async with timer.ameasure(PHASE_IMAGE_PULL):
-        rc, _, _ = await run_cmd("docker compose pull", timeout=1800, log_output=True)
+        rc, _, _ = await run_cmd("docker compose pull --ignore-pull-failures", timeout=1800, log_output=True)
     if rc != 0:
         logger.error("Failed to pull images")
         return False
