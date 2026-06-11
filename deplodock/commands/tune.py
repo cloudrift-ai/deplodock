@@ -286,6 +286,11 @@ def handle_tune(args):
             sys.stderr.write(f"\n[tune] interrupted{f' at {label}' if multi else ''} — partial per-op results are in the DB\n")
             _exit_flushed(0)
         except RuntimeError as exc:
+            # A NotImplementedError is never the watchdog signal — it's a
+            # compiler contract bug (e.g. an unconsumed AtomTile reaching
+            # render); re-raise so the traceback isn't swallowed.
+            if isinstance(exc, NotImplementedError):
+                raise
             # Bench watchdog couldn't bail (GPU queue saturated) → the parent CUDA stream
             # is dirty, so the rest of the sweep can't run reliably here. Abort (the DB has
             # the per-op bests; a re-run resumes). os._exit bypasses the cupy atexit deadlock.

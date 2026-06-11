@@ -279,10 +279,9 @@ def test_failures_clusters_by_kernel_and_error(run_cli, tmp_path):
 
     db_path = tmp_path / "f.db"
     db = SearchDB(db_path)
+    pretty = 'extern "C" __global__\n__launch_bounds__(256) void k_mm(const float* x) { }\n'
     for i, bm in enumerate((8, 16)):
-        db.record_cuda_op(
-            f"f{i}", kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty="void k_mm(float*)"
-        )
+        db.record_cuda_op(f"f{i}", kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty=pretty)
         db.record_perf(
             "ctx",
             f"f{i}",
@@ -292,7 +291,7 @@ def test_failures_clusters_by_kernel_and_error(run_cli, tmp_path):
             knobs={"BM": bm, "TMA": True},
             error="cuTensorMapEncodeTiled failed",
         )
-    db.record_cuda_op("ok1", kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty="void k_mm(float*)")
+    db.record_cuda_op("ok1", kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty=pretty)
     db.record_perf("ctx", "ok1", backend="cuda", status="ok", stats=stats(10.0), knobs={"BM": 8, "TMA": False})
     db.close()
 
@@ -313,6 +312,28 @@ def test_failures_old_db_without_error_column(run_cli, tmp_path):
     rc, stdout, stderr = run_cli("eval", "failures", "--db", str(db))
     assert rc == 0, f"stderr: {stderr}"
     assert "(no error recorded)" in stdout
+
+
+# --- eval prior --dataset db --------------------------------------------------
+
+
+def test_prior_db_reachability_smoke(run_cli, tmp_path):
+    """``eval prior --dataset db`` on a 2-row DB renders the aggregate reachability
+    view — the groups must reach ``diagnostics.reachability`` as ``Sample``s, not
+    ``(knobs, latency)`` tuples (the shape mismatch that crashed it)."""
+    db = tmp_path / "r.db"
+    _make_tune_db(
+        db,
+        [
+            ("a", "k_matmul", {"BM": 8, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 30.0),
+            ("b", "k_matmul", {"BM": 16, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 10.0),
+        ],
+    )
+    rc, stdout, stderr = run_cli("eval", "prior", "--dataset", "db", "--db", str(db), "--prior", str(tmp_path / "missing.json"))
+    assert rc == 0, f"stderr: {stderr}"
+    assert "pick reachability over DB variants" in stdout
+    assert "matmul" in stdout  # the op-label row rendered
+    assert "traceback" not in (stdout + stderr).lower()
 
 
 def test_failures_none_recorded(run_cli, tmp_path):
@@ -342,7 +363,7 @@ def test_o3_reservoir_index_joins_db_rows_by_sig_and_knobs():
 
     o3 = _o3_reservoir_index(_P())
     assert len(o3) == 2
-    db_sample = Sample.from_perf_sample(PerfSample(pretty="void k_m(float*)", knobs=stamped, latency_us=12.5))
+    db_sample = Sample.from_perf_sample(PerfSample(pretty="__global__ void k_m(float*)", knobs=stamped, latency_us=12.5))
     assert o3[_variant_key(db_sample)] == 9.0
 
 
@@ -356,8 +377,8 @@ def test_emit_variant_table_o3_column_and_deterministic_pick(caplog):
     from deplodock.compiler.pipeline.search.db import PerfSample
 
     samples = [
-        Sample.from_perf_sample(PerfSample(pretty="void k_m(float*)", knobs={"BM": 8, "BN": 16}, latency_us=30.0)),
-        Sample.from_perf_sample(PerfSample(pretty="void k_m(float*)", knobs={"BM": 16, "BN": 16}, latency_us=10.0)),
+        Sample.from_perf_sample(PerfSample(pretty="__global__ void k_m(float*)", knobs={"BM": 8, "BN": 16}, latency_us=30.0)),
+        Sample.from_perf_sample(PerfSample(pretty="__global__ void k_m(float*)", knobs={"BM": 16, "BN": 16}, latency_us=10.0)),
     ]
 
     class _P:  # predicts the slow BM=8 config fastest → pick is rank 2

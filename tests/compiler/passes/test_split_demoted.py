@@ -27,7 +27,7 @@ from deplodock.compiler import target as target_mod
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, ReshapeOp, RmsNormOp, TransposeOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileOp
@@ -103,6 +103,61 @@ def _double_scale_linear_graph(M: int = 128, K: int = 128, N: int = 128) -> Grap
     g.add_node(ElementwiseOp("multiply"), ["w", "sw"], Tensor("ws", (N, K), f16), node_id="ws")
     g.add_node(LinearOp(), ["xs", "ws"], Tensor("o", (M, N), f16), node_id="o")
     g.inputs = ["x", "sx", "w", "sw"]
+    g.outputs = ["o"]
+    return g
+
+
+def _gated_mlp_graph(S: int = 32, H: int = 256, I: int = 512) -> Graph:  # noqa: E741
+    """RMSNorm → (gate Matmul, up Matmul) → multiply: fusion inlines the norm
+    chain once per matmul (two SSA-duplicated cones sharing the leaf Loads)
+    into ONE dual-accum K loop — the Qwen3 gated-MLP kernel of
+    plans/qwen3-embedding-layer0-tune-findings.md finding 2. [K, N] weights
+    (the trace pre-transposes Linear weights), so the split gemms are
+    warp-tier eligible."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (1, S, H), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("nw", (H,), f16), node_id="nw")
+    g.add_node(InputOp(), [], Tensor("wg", (H, I), f16), node_id="wg")
+    g.add_node(InputOp(), [], Tensor("wu", (H, I), f16), node_id="wu")
+    g.add_node(RmsNormOp(eps=1e-6), ["x", "nw"], Tensor("xn", (1, S, H), f16), node_id="xn")
+    g.add_node(MatmulOp(), ["xn", "wg"], Tensor("gate", (1, S, I), f16), node_id="gate")
+    g.add_node(MatmulOp(), ["xn", "wu"], Tensor("up", (1, S, I), f16), node_id="up")
+    g.add_node(ElementwiseOp("multiply"), ["gate", "up"], Tensor("o", (1, S, I), f16), node_id="o")
+    g.inputs = ["x", "nw", "wg", "wu"]
+    g.outputs = ["o"]
+    return g
+
+
+def _pure_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
+    """Plain Matmul, both operands stageable Loads — no cut applies."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (M, K), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("w", (K, N), f16), node_id="w")
+    g.add_node(MatmulOp(), ["x", "w"], Tensor("o", (M, N), f16), node_id="o")
+    g.inputs = ["x", "w"]
+    g.outputs = ["o"]
+    return g
+
+
+def _collapsed_matmul_graph(HD: int = 4, S: int = 32, D: int = 64, N: int = 64) -> Graph:
+    """Transpose+reshape → Matmul (+ residual): fusion collapses the layout ops
+    into the matmul's A load, whose K then folds across TWO index dims
+    (`attn[0, ((m*K + k)/D) % HD, m, (m*K + k) % D]`) — the o_proj attn-out
+    shape of plans/qwen3-embedding-layer0-tune-findings.md finding 3. Both
+    operands are plain Loads, so only the layout-materializing cut applies."""
+    f16 = _dt.get("f16")
+    K = HD * D
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("attn", (1, HD, S, D), f16), node_id="attn")
+    g.add_node(InputOp(), [], Tensor("w", (K, N), f16), node_id="w")
+    g.add_node(InputOp(), [], Tensor("res", (1, S, N), f16), node_id="res")
+    g.add_node(TransposeOp(axes=(1, 2)), ["attn"], Tensor("at", (1, S, HD, D), f16), node_id="at")
+    g.add_node(ReshapeOp(shape=(1, S, K)), ["at"], Tensor("ar", (1, S, K), f16), node_id="ar")
+    g.add_node(MatmulOp(), ["ar", "w"], Tensor("mm", (1, S, N), f16), node_id="mm")
+    g.add_node(ElementwiseOp("add"), ["mm", "res"], Tensor("o", (1, S, N), f16), node_id="o")
+    g.inputs = ["attn", "w", "res"]
     g.outputs = ["o"]
     return g
 
@@ -253,6 +308,142 @@ def test_two_sided_split_matches_fused_on_numpy() -> None:
     ref = be.run(be.compile(_double_scale_linear_graph()), input_data=dict(inputs))[0].outputs["o"]
     out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)
+
+
+def test_gated_mlp_split_offered_with_duplicated_cones() -> None:
+    """The dual-accum gate+up kernel splits into ONE shared xn producer (the
+    two SSA-duplicated norm chains value-number to a single class), one clean
+    gemm per accum, and the pointwise combine consumer — finding 2's fix: the
+    fused dual-matmul cell can never pass the one-matmul-per-K-loop mma gate,
+    but each extracted gemm is genuinely warp-tier eligible."""
+    S, H, I = 32, 256, 512  # noqa: E741
+    fused = _fuse(_gated_mlp_graph(S, H, I))
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    loops = {nid: n for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
+    assert set(loops) == {f"{node.id}__xn", f"{node.id}__mm0", f"{node.id}__mm1", f"{node.id}__mm"}
+    # ONE xn (the duplicated chains share it), materialized at the cell-leaf dtype.
+    xn = frag.nodes[f"{node.id}__xn"]
+    assert tuple(d.as_static() for d in xn.output.shape) == (S, H)
+    assert xn.output.dtype == _dt.get("f16")
+    # Per-accum gemms: (rows, N) f32 — the accumulator's own precision.
+    ctx = Context.from_target((12, 0))
+    for i in (0, 1):
+        mm = frag.nodes[f"{node.id}__mm{i}"]
+        assert tuple(d.as_static() for d in mm.output.shape) == (S, I)
+        assert mm.output.dtype == _dt.get("f32")
+        assert xn.id in mm.inputs
+        assert mm.op.name.endswith(f"_mm{i}")
+        assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    # The consumer is the pointwise combine: reads both mm buffers, no reduce.
+    cons = frag.nodes[f"{node.id}__mm"]
+    assert {f"{node.id}__mm0", f"{node.id}__mm1"} <= set(cons.inputs)
+    assert cons.op.knobs.get("S_n_accum") == 0.0
+    assert frag.outputs == [cons.id]
+    # Structural features restamped per body — each gemm featurizes as a
+    # clean 2-load matmul, not as the fused kernel.
+    for i in (0, 1):
+        mm = frag.nodes[f"{node.id}__mm{i}"]
+        assert mm.op.knobs.get("S_n_accum") == 1.0 and mm.op.knobs.get("S_n_load") == 2.0
+
+
+def test_gated_mlp_split_matches_fused_on_numpy() -> None:
+    from deplodock.compiler.backend.numpy import NumpyBackend
+
+    fused = _fuse(_gated_mlp_graph())
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    split_graph = fused.copy()
+    split_graph.splice(frag, consumed={node.id}, output=node.id)
+    assert sum(1 for n in split_graph.nodes.values() if isinstance(n.op, LoopOp)) == 4
+
+    rng = np.random.default_rng(0)
+    inputs = _gated_mlp_inputs(rng)
+    be = NumpyBackend()
+    ref = be.run(be.compile(_gated_mlp_graph()), input_data=dict(inputs))[0].outputs["o"]
+    out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+def test_layout_split_offered_for_folded_k_load() -> None:
+    """A plain-Load matmul operand whose K folds across index dims (the
+    collapsed reshape/transpose o_proj read) is a DEGENERATE cone — the split
+    materializes it through a contiguizing copy producer, and the consumer
+    gemm (canonical [rows, K] A load, residual epilogue intact) is genuinely
+    warp-tier eligible. Finding 3's fix: without the offer, no structural
+    escape existed (both operands plain Loads = 'pure cell')."""
+    HD, S, D, N = 4, 32, 64, 64
+    fused = _fuse(_collapsed_matmul_graph(HD, S, D, N))
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    loops = {nid: n for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
+    assert set(loops) == {f"{node.id}__xn", f"{node.id}__mm"}
+    xn = frag.nodes[f"{node.id}__xn"]
+    # The producer is the pure contiguizing copy: [rows, K] at the operand
+    # dtype, no compute (one load, no assigns).
+    assert tuple(d.as_static() for d in xn.output.shape) == (S, HD * D)
+    assert xn.output.dtype == _dt.get("f16")
+    assert xn.op.knobs.get("S_n_load") == 1.0 and xn.op.knobs.get("S_n_assign") == 0.0
+    mm = frag.nodes[f"{node.id}__mm"]
+    assert xn.id in mm.inputs
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    assert frag.outputs == [mm.id]
+
+
+def test_no_layout_split_for_single_k_dim_load() -> None:
+    """A pure matmul whose A load keeps K in one index dim is already
+    stageable — no cut applies (materializing it would be pure overhead)."""
+    fused = _fuse(_pure_matmul_graph())
+    node = _fused_loop_node(fused)
+    assert try_split_demoted(node.op, Context.from_target((12, 0)), graph=fused, node_id=node.id, out_tensor=node.output) is None
+
+
+def test_layout_split_matches_fused_on_numpy() -> None:
+    from deplodock.compiler.backend.numpy import NumpyBackend
+
+    fused = _fuse(_collapsed_matmul_graph())
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    split_graph = fused.copy()
+    split_graph.splice(frag, consumed={node.id}, output=node.id)
+    assert sum(1 for n in split_graph.nodes.values() if isinstance(n.op, LoopOp)) == 2
+
+    rng = np.random.default_rng(0)
+    inputs = _collapsed_matmul_inputs(rng)
+    be = NumpyBackend()
+    ref = be.run(be.compile(_collapsed_matmul_graph()), input_data=dict(inputs))[0].outputs["o"]
+    out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+def test_no_split_when_multi_accum_cell_has_stray_stmt() -> None:
+    """Multi-accum extraction must claim every cell stmt into some gemm; a
+    stray Assign in the K loop (no gemm home) bails conservatively."""
+    fused = _fuse(_gated_mlp_graph())
+    node = _fused_loop_node(fused)
+    from deplodock.compiler.ir.stmt import Assign, Body, Load, Loop, Stmt
+
+    def add_stray(stmts) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, Loop):
+                if s.is_reduce and any(isinstance(c, Load) and c.input == "wg" for c in s.body):
+                    ld = next(c for c in s.body if isinstance(c, Load) and c.input == "wg")
+                    stray = Assign(name="stray", op="negative", args=(ld.names[0],))
+                    out.append(Loop(axis=s.axis, body=Body((*s.body, stray)), unroll=s.unroll))
+                else:
+                    out.append(Loop(axis=s.axis, body=Body(add_stray(s.body)), unroll=s.unroll))
+            else:
+                out.append(s)
+        return tuple(out)
+
+    strayed = LoopOp(body=Body(add_stray(node.op.body)))
+    assert try_split_demoted(strayed, Context.from_target((12, 0)), graph=fused, node_id=node.id, out_tensor=node.output) is None
 
 
 def test_no_split_when_cone_escapes() -> None:
@@ -505,6 +696,25 @@ def _norm_linear_inputs(rng) -> dict:
     }
 
 
+def _collapsed_matmul_inputs(rng, HD: int = 4, S: int = 32, D: int = 64, N: int = 64) -> dict:
+    npf16 = np.dtype(np.float16)
+    return {
+        "attn": rng.standard_normal((1, HD, S, D), dtype=np.float32).astype(npf16),
+        "w": (rng.standard_normal((HD * D, N), dtype=np.float32) * 0.05).astype(npf16),
+        "res": rng.standard_normal((1, S, N), dtype=np.float32).astype(npf16),
+    }
+
+
+def _gated_mlp_inputs(rng, S: int = 32, H: int = 256, I: int = 512) -> dict:  # noqa: E741
+    npf16 = np.dtype(np.float16)
+    return {
+        "x": rng.standard_normal((1, S, H), dtype=np.float32).astype(npf16),
+        "nw": rng.standard_normal((H,), dtype=np.float32).astype(npf16),
+        "wg": (rng.standard_normal((H, I), dtype=np.float32) * 0.05).astype(npf16),
+        "wu": (rng.standard_normal((H, I), dtype=np.float32) * 0.05).astype(npf16),
+    }
+
+
 def _assert_close(out, ref) -> None:
     assert out.shape == ref.shape
     assert np.all(np.isfinite(out.astype(np.float32)))
@@ -610,5 +820,59 @@ def test_two_sided_split_mma_accuracy_cuda(monkeypatch) -> None:
     assert len(ids) == 3
     mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
     assert len(mma_kernels) == 1, "the two-sided split gemm must lower on the warp tier"
+    out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+@requires_cuda
+def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
+    """Pinned split on the gated-MLP dual-accum kernel: four kernels, BOTH
+    extracted gemms run on mma.sync, and the output matches numpy (finding 2's
+    end-to-end shape — the real Qwen3 kernel goes 51 µs scalar-fused →
+    ~13 µs split on an RTX 5090)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.numpy import NumpyBackend
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+
+    target_mod.set_target(None)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    rng = np.random.default_rng(0)
+    inputs = _gated_mlp_inputs(rng)
+    ref_be = NumpyBackend()
+    ref = ref_be.run(ref_be.compile(_gated_mlp_graph()), input_data=dict(inputs))[0].outputs["o"]
+    be = CudaBackend()
+    compiled = be.compile(_gated_mlp_graph())
+    ids = _lowered_kernel_ids(compiled)
+    assert len(ids) == 4
+    mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
+    assert len(mma_kernels) == 2, "both extracted gemms must lower on the warp tier"
+    out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+@requires_cuda
+def test_layout_split_mma_accuracy_cuda(monkeypatch) -> None:
+    """Pinned split on the collapsed-layout matmul (finding 3's o_proj shape):
+    the contiguizing copy producer + the clean gemm on mma.sync, output
+    matches numpy (the real o_proj kernel goes 25 µs scalar-fused → ~6 µs
+    split on an RTX 5090)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.numpy import NumpyBackend
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+
+    target_mod.set_target(None)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    rng = np.random.default_rng(0)
+    inputs = _collapsed_matmul_inputs(rng)
+    ref_be = NumpyBackend()
+    ref = ref_be.run(ref_be.compile(_collapsed_matmul_graph()), input_data=dict(inputs))[0].outputs["o"]
+    be = CudaBackend()
+    compiled = be.compile(_collapsed_matmul_graph())
+    ids = _lowered_kernel_ids(compiled)
+    assert len(ids) == 2
+    mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
+    assert len(mma_kernels) == 1, "the layout-split gemm must lower on the warp tier"
     out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)

@@ -1023,7 +1023,9 @@ class AtomTile(ParallelTile):
     def render(self, ctx: RenderCtx) -> list[str]:
         raise NotImplementedError(
             "AtomTile must be consumed by the MMA materializer "
-            "(kernel/010_split_register_axes MMA arm) before render — "
+            "(kernel/005_lower_atom_tile) before render — an AtomTile here "
+            "usually means tile/011_lower_atom_cell could not tag the cell "
+            "(operand A/B classification failed) — "
             f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
         )
 

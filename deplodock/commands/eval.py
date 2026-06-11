@@ -540,12 +540,9 @@ def _emit_prior_db_reachability(args) -> None:
         return
     # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
     prior = load_prior()
-    # Group DB variants by their full S_* signature and feed diagnostics.reachability
-    # the (full-knob-dict, latency) shape it expects.
-    groups = {
-        sig: [(s.all_knobs(), s.latency_us) for s in samples]
-        for sig, samples in Dataset.from_db(db_path, kernel=args.kernel).group_by_op().items()
-    }
+    # Group DB variants by their full S_* signature — the (sig → Samples) mapping
+    # diagnostics.reachability scores.
+    groups = Dataset.from_db(db_path, kernel=args.kernel).group_by_op()
     logger.info("")
     if not prior.fitted:
         logger.info("No fitted prior at %s — run `deplodock tune`; the cold AnalyticPrior ranks by D_* geometry only.", config.prior_path())
