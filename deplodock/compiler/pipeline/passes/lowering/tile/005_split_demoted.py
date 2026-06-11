@@ -3,7 +3,8 @@
 Runs before ``010_partition_loops`` so the body is still un-tiled (the only dialect where
 every piece of a split can re-enter planning with its own tiling). This rule owns only
 the OFFER; the cut itself lives in ``_split_demoted.try_split_demoted`` — one rule, no
-per-shape cases: each multiply operand is independently a plain Load (stays put) or a
+per-shape cases: each multiply operand is independently a stageable plain Load (stays put),
+a K-folded Load (a degenerate cone: the producer is the contiguizing copy), or a
 computed cone (becomes an ``xn`` producer materialized over exactly the axes it reads,
 with K second-to-last for an N-reading cone so the consumer keeps the canonical B layout);
 value-identical duplicated cones share one ``xn``, and a multi-accum K loop (the gated-MLP
@@ -71,7 +72,7 @@ SPLIT_CONE = Knob(
     "SPLIT_CONE",
     KnobType.BOOL,
     hints=(False, True),
-    help="Split a demoted matmul's computed operand cone(s) into producer kernel(s) "
+    help="Split a demoted matmul's computed / K-folded operand cone(s) into producer kernel(s) "
     "(xn producer(s) + clean gemm; multi-accum also extracts one gemm per accum + the pointwise combine)",
 )
 

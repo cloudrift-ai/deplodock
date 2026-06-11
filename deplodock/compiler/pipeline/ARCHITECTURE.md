@@ -116,7 +116,10 @@ from staged smem and a computed A operand has no buffer to stage, so `is_atom_el
 fused body. Rule `005_split_demoted` (its own pass unit, running before partition so the body is still
 un-tiled) offers a structural fork: `[keep-fused Op ({SPLIT_CONE: False} stamped), OptionFork(Graph whose
 kernels carry {SPLIT_CONE: True})]`. The cut is ONE rule with no per-shape cases: each multiply operand is
-independently a plain Load (stays put) or a computed cone, and every distinct cone becomes a producer
+independently a stageable plain Load (K in one index dim — stays put), a K-FOLDED Load (K across several
+dims, the collapsed reshape/transpose o_proj attn-out read; `020_stage_inputs` can only stage a single-K-dim
+slab, so the warp tier is structurally unreachable — a degenerate cone whose only member is the Load itself,
+its producer the contiguizing copy), or a computed cone, and every distinct cone becomes a producer
 materializing an `xn` intermediate over exactly the axes it reads — `xn[rows read…, k]` for a row cone (the
 A operand), `xn[rows read…, k, n]` for an N-reading cone (the B operand; N innermost, so K lands
 second-to-last and the consumer's B load carries the canonical layout the cell tagger / stager serve even
@@ -134,10 +137,11 @@ Loads re-reading the `mm_i` buffers under the accums' SSA names, the epilogue (S
 familiar shapes are instances: norm→linear / scale→matmul = one row cone beside a Load; SDPA P@V = one row
 cone with prologue deps; rotary QK^T = a row cone + an N cone (the GQA `head / 2` shared-KV read stays a
 leading dim, duplicated across the sharing heads); a weight-side scale = one N cone beside a Load; the
-gated MLP = one value-shared row cone + two extracted gemms + the combine. All pieces
+gated MLP = one value-shared row cone + two extracted gemms + the combine; o_proj's collapsed attn-out =
+one degenerate Load cone beside a Load. All pieces
 re-enter the planner as ordinary LoopOps with their own fork trees. The offer is gated ONLY on the cut's
-well-formedness (`_split_demoted.try_split_demoted` bails on multiple K loops, no computed operand, a
-K-invariant Load operand, distinct-class cones sharing stmts, escaping cone values,
+well-formedness (`_split_demoted.try_split_demoted` bails on multiple K loops, no computed or K-folded
+operand, a K-invariant Load operand, distinct-class cones sharing stmts, escaping cone values,
 mixed-dtype cell leaves, symbolic extents, more than one N-reading cone — two `(…, K, N)` buffers would
 re-do the matmul's own volume — or, multi-accum only, a cell stmt no gemm claims) —
 deliberately NOT on a predicted tier for the clean gemm: profitability is the search's question (an earlier

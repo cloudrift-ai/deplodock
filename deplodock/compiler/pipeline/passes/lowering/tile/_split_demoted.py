@@ -11,7 +11,10 @@ tier.
 
 :func:`try_split_demoted` inspects a ``LoopOp`` and, when the cut is expressible, builds a
 ``Graph`` fragment ``005_split_demoted`` offers as a structural fork option. ONE rule, no
-per-shape cases: each multiply operand is independently a plain ``Load`` (stays put) or a
+per-shape cases: each multiply operand is independently a stageable plain ``Load`` (K in
+one index dim — stays put), a K-FOLDED ``Load`` (K across several dims, the collapsed
+reshape/transpose o_proj attn-out read — a degenerate cone whose only member is the Load,
+its producer the contiguizing copy), or a
 computed cone (becomes a producer kernel); every distinct cone materializes an ``xn``
 intermediate over exactly the axes it reads —
 
@@ -30,7 +33,8 @@ to the old "other operand's dtype" rule on every shape seen so far. The familiar
 are instances of the one rule: norm→linear / scale→matmul = one row cone beside a Load;
 SDPA P@V = one row cone with prologue deps; rotary QK^T = a row cone + an N cone (the GQA
 ``head / 2`` shared-KV read keeps that row axis as a leading dim — duplicated across the
-sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load.
+sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load;
+o_proj's collapsed attn-out = one degenerate Load cone beside a Load.
 
 Cones compare by VALUE, not SSA name: fusion inlines a shared producer chain once per
 consuming matmul (the gated-MLP norm feeds gate AND up as two structurally identical
@@ -52,7 +56,7 @@ the trained prior prices its kernel set cheaper (``policy/greedy._pick_structura
 cold), and a lowering failure on either side must surface as a rejection.
 Conservative bails (return ``None``, never raise) keep the fused path the only
 outcome for any shape the cut doesn't fully understand: multiple K loops, no computed
-operand, a K-invariant Load operand, distinct-class cones sharing stmts,
+or K-folded operand, a K-invariant Load operand, distinct-class cones sharing stmts,
 cone values escaping past the multiply, mixed-dtype cell leaves, symbolic extents, more
 than one cone reading the output N axis (two ``(…, K, N)`` buffers would re-do the
 matmul's own volume — the materialization that defeats the split), or — multi-accum only —
@@ -131,8 +135,18 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
             elif isinstance(d, Load):
                 # A Load operand must be the matmul's own K-indexed read — a
                 # K-invariant Load means this multiply isn't the A×B cell.
-                if k_name not in {v for e in d.index for v in e.free_vars()}:
+                k_dims = [i for i, e in enumerate(d.index) if k_name in e.free_vars()]
+                if not k_dims:
                     return None
+                # K folded across index dims (a collapsed reshape/transpose
+                # layout — the o_proj attn-out read): ``020_stage_inputs`` can
+                # only stage a single-K-dim slab, so the warp tier is
+                # structurally unreachable. The Load is a DEGENERATE cone (its
+                # only member is itself): the producer is the contiguizing
+                # copy, materializing the operand as a plain ``xn[rows…, K]``.
+                # A single-K-dim Load is already stageable and stays put.
+                if len(k_dims) > 1:
+                    cone_args[a] = None
             else:
                 return None
         if not cone_args:
@@ -211,8 +225,10 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     moved_cell = {id(m) for r in roots for m in cone_of[r].cell.members}
     if len(accums) > 1:
         claimed = moved_cell | {id(m) for m in muls} | {id(a) for a in accums}
-        for _, mul, _ in per_acc:
+        for _, mul, rs in per_acc:
             for a in mul.args:
+                if a in rs:
+                    continue  # a cone root (incl. a K-folded Load) — moved and replaced
                 d = cell_def[a]
                 if isinstance(d, Load):
                     if id(d) in moved_cell:
@@ -269,7 +285,8 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
             cell: list[Stmt] = []
             for a in mul.args:
                 d = cell_def[a]
-                cell.append(cone_loads[id(d)] if isinstance(d, Assign) else d)
+                repl = cone_loads.get(id(d))  # any cone root — Assign or K-folded Load
+                cell.append(repl if repl is not None else d)
             inner_mm: tuple[Stmt, ...] = (
                 Loop(axis=k_loop.axis, body=Body((*cell, mul, acc)), unroll=k_loop.unroll),
                 Write(output=mm_id, index=mm_index, values=(acc.name,)),

@@ -27,7 +27,7 @@ from deplodock.compiler import target as target_mod
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, ReshapeOp, RmsNormOp, TransposeOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileOp
@@ -125,6 +125,39 @@ def _gated_mlp_graph(S: int = 32, H: int = 256, I: int = 512) -> Graph:  # noqa:
     g.add_node(MatmulOp(), ["xn", "wu"], Tensor("up", (1, S, I), f16), node_id="up")
     g.add_node(ElementwiseOp("multiply"), ["gate", "up"], Tensor("o", (1, S, I), f16), node_id="o")
     g.inputs = ["x", "nw", "wg", "wu"]
+    g.outputs = ["o"]
+    return g
+
+
+def _pure_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
+    """Plain Matmul, both operands stageable Loads — no cut applies."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (M, K), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("w", (K, N), f16), node_id="w")
+    g.add_node(MatmulOp(), ["x", "w"], Tensor("o", (M, N), f16), node_id="o")
+    g.inputs = ["x", "w"]
+    g.outputs = ["o"]
+    return g
+
+
+def _collapsed_matmul_graph(HD: int = 4, S: int = 32, D: int = 64, N: int = 64) -> Graph:
+    """Transpose+reshape → Matmul (+ residual): fusion collapses the layout ops
+    into the matmul's A load, whose K then folds across TWO index dims
+    (`attn[0, ((m*K + k)/D) % HD, m, (m*K + k) % D]`) — the o_proj attn-out
+    shape of plans/qwen3-embedding-layer0-tune-findings.md finding 3. Both
+    operands are plain Loads, so only the layout-materializing cut applies."""
+    f16 = _dt.get("f16")
+    K = HD * D
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("attn", (1, HD, S, D), f16), node_id="attn")
+    g.add_node(InputOp(), [], Tensor("w", (K, N), f16), node_id="w")
+    g.add_node(InputOp(), [], Tensor("res", (1, S, N), f16), node_id="res")
+    g.add_node(TransposeOp(axes=(1, 2)), ["attn"], Tensor("at", (1, S, HD, D), f16), node_id="at")
+    g.add_node(ReshapeOp(shape=(1, S, K)), ["at"], Tensor("ar", (1, S, K), f16), node_id="ar")
+    g.add_node(MatmulOp(), ["ar", "w"], Tensor("mm", (1, S, N), f16), node_id="mm")
+    g.add_node(ElementwiseOp("add"), ["mm", "res"], Tensor("o", (1, S, N), f16), node_id="o")
+    g.inputs = ["attn", "w", "res"]
     g.outputs = ["o"]
     return g
 
@@ -330,6 +363,60 @@ def test_gated_mlp_split_matches_fused_on_numpy() -> None:
     inputs = _gated_mlp_inputs(rng)
     be = NumpyBackend()
     ref = be.run(be.compile(_gated_mlp_graph()), input_data=dict(inputs))[0].outputs["o"]
+    out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+def test_layout_split_offered_for_folded_k_load() -> None:
+    """A plain-Load matmul operand whose K folds across index dims (the
+    collapsed reshape/transpose o_proj read) is a DEGENERATE cone — the split
+    materializes it through a contiguizing copy producer, and the consumer
+    gemm (canonical [rows, K] A load, residual epilogue intact) is genuinely
+    warp-tier eligible. Finding 3's fix: without the offer, no structural
+    escape existed (both operands plain Loads = 'pure cell')."""
+    HD, S, D, N = 4, 32, 64, 64
+    fused = _fuse(_collapsed_matmul_graph(HD, S, D, N))
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    loops = {nid: n for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
+    assert set(loops) == {f"{node.id}__xn", f"{node.id}__mm"}
+    xn = frag.nodes[f"{node.id}__xn"]
+    # The producer is the pure contiguizing copy: [rows, K] at the operand
+    # dtype, no compute (one load, no assigns).
+    assert tuple(d.as_static() for d in xn.output.shape) == (S, HD * D)
+    assert xn.output.dtype == _dt.get("f16")
+    assert xn.op.knobs.get("S_n_load") == 1.0 and xn.op.knobs.get("S_n_assign") == 0.0
+    mm = frag.nodes[f"{node.id}__mm"]
+    assert xn.id in mm.inputs
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    assert frag.outputs == [mm.id]
+
+
+def test_no_layout_split_for_single_k_dim_load() -> None:
+    """A pure matmul whose A load keeps K in one index dim is already
+    stageable — no cut applies (materializing it would be pure overhead)."""
+    fused = _fuse(_pure_matmul_graph())
+    node = _fused_loop_node(fused)
+    assert try_split_demoted(node.op, Context.from_target((12, 0)), graph=fused, node_id=node.id, out_tensor=node.output) is None
+
+
+def test_layout_split_matches_fused_on_numpy() -> None:
+    from deplodock.compiler.backend.numpy import NumpyBackend
+
+    fused = _fuse(_collapsed_matmul_graph())
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    split_graph = fused.copy()
+    split_graph.splice(frag, consumed={node.id}, output=node.id)
+    assert sum(1 for n in split_graph.nodes.values() if isinstance(n.op, LoopOp)) == 2
+
+    rng = np.random.default_rng(0)
+    inputs = _collapsed_matmul_inputs(rng)
+    be = NumpyBackend()
+    ref = be.run(be.compile(_collapsed_matmul_graph()), input_data=dict(inputs))[0].outputs["o"]
     out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)
 
@@ -609,6 +696,15 @@ def _norm_linear_inputs(rng) -> dict:
     }
 
 
+def _collapsed_matmul_inputs(rng, HD: int = 4, S: int = 32, D: int = 64, N: int = 64) -> dict:
+    npf16 = np.dtype(np.float16)
+    return {
+        "attn": rng.standard_normal((1, HD, S, D), dtype=np.float32).astype(npf16),
+        "w": (rng.standard_normal((HD * D, N), dtype=np.float32) * 0.05).astype(npf16),
+        "res": rng.standard_normal((1, S, N), dtype=np.float32).astype(npf16),
+    }
+
+
 def _gated_mlp_inputs(rng, S: int = 32, H: int = 256, I: int = 512) -> dict:  # noqa: E741
     npf16 = np.dtype(np.float16)
     return {
@@ -751,5 +847,32 @@ def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
     assert len(ids) == 4
     mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
     assert len(mma_kernels) == 2, "both extracted gemms must lower on the warp tier"
+    out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+@requires_cuda
+def test_layout_split_mma_accuracy_cuda(monkeypatch) -> None:
+    """Pinned split on the collapsed-layout matmul (finding 3's o_proj shape):
+    the contiguizing copy producer + the clean gemm on mma.sync, output
+    matches numpy (the real o_proj kernel goes 25 µs scalar-fused → ~6 µs
+    split on an RTX 5090)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.numpy import NumpyBackend
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+
+    target_mod.set_target(None)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    rng = np.random.default_rng(0)
+    inputs = _collapsed_matmul_inputs(rng)
+    ref_be = NumpyBackend()
+    ref = ref_be.run(ref_be.compile(_collapsed_matmul_graph()), input_data=dict(inputs))[0].outputs["o"]
+    be = CudaBackend()
+    compiled = be.compile(_collapsed_matmul_graph())
+    ids = _lowered_kernel_ids(compiled)
+    assert len(ids) == 2
+    mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
+    assert len(mma_kernels) == 1, "the layout-split gemm must lower on the warp tier"
     out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)

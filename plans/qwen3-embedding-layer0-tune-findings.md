@@ -2,8 +2,11 @@
 
 Status: **clean tune completes; deplodock loses end-to-end (0.70x eager, 0.33x torch.compile), two scalar-locked
 kernels carry 63% of the total.** The first tune attempt crashed ~35 min in on a compiler contract bug (finding 1) —
-fixed on this branch (`fix/atom-cell-ab-classify`, commit `41c871a6`), then re-run clean. Finding 2 (the bigger
-dominator, 51 µs → 12.7 µs) is also fixed on this branch — see its section.
+fixed on this branch (`fix/atom-cell-ab-classify`, commit `41c871a6`), then re-run clean. Findings 2 and 3 (the two
+scalar-locked dominators: gate+up 51 µs → 12.7 µs, o_proj 25 µs → 6.2 µs) are also fixed on this branch — see their
+sections. With both landed, a greedy `run --layer 0 --bench` under the tune-trained prior deploys the splits
+everywhere and the full layer goes **138 µs (0.70x eager) → 48 µs (2.04x eager)** — parity with torch.compile's
+45 µs, from 3x behind.
 
 - Command: `deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --clean --bench --dump-dir <dir>/dump`
 - Hardware: RTX 5090 (sm_120), ncu 2025.3.1 (perf counters permitted)
@@ -163,7 +166,7 @@ CUDA-graph captured): `xn` 2.0 µs + 2 × ~5 µs `mma_m16n8k16_f16` gemms + 0.8 
 51 µs (4.0x)** — ahead of torch.compile's 14 µs. Regression tests in `tests/compiler/passes/test_split_demoted.py`
 (`test_gated_mlp_*`, stray-stmt bail).
 
-## Finding 3 — o_proj kernel scalar-locked by a collapsed-reshape K operand: 25 µs, loses to eager (~11 µs at stake)
+## Finding 3 — o_proj kernel scalar-locked by a collapsed-reshape K operand (fixed on this branch)
 
 **Symptom.** `k_linear_reshape_…_38c877` (attn-out reshape/transpose + o_proj + residual) runs 25 µs vs eager 16 µs
 (cuBLAS) / tcompile 14 µs — the only kernel losing to *eager*. All 32 DB variants scalar (`FK` register-tile rows);
@@ -188,6 +191,17 @@ nothing — the cone split only materializes *computed* operands, not collapsed-
 matmul operand is a plain Load whose K folds across dims, offer an `xn`-style producer that writes it contiguized as
 `[M, K]` (the same machinery the cone split already has for computed operands — `_split_demoted` builds exactly such
 producers, K second-to-last). The tuner then prices scalar-fused vs split+mma, per the established two-level design.
+
+**Fix (this branch).** Exactly the suggested offer, expressed inside the existing per-operand rule: a plain-Load
+multiply operand whose K spans more than one index dim (the `020_stage_inputs` single-K-dim-slab mirror — a
+single-K-dim Load is already stageable and stays put) classifies as a **degenerate cone whose only member is the
+Load itself**, so the entire existing machinery — cone slicing, escape check, xn producer build, consumer
+replacement, fragment assembly — applies unchanged; the producer comes out as the contiguizing copy
+`xn[rows…, K] = load attn[collapsed]`. Composes with the finding-2 multi-accum extraction for free. Result on the
+38c877 reproducer (RTX 5090, -O3, graph-captured): the o_proj op runs **0.7 µs copy + 5.5 µs `mma_m16n8k16_f16`
+gemm = 6.2 µs vs the deployed 25 µs (4.0x)** — now ahead of eager's 16 µs and tcompile's 14 µs; the whole
+reproducer slice (SDPA producers included, all splits pinned) benches 11.4 µs vs eager 14. Regression tests in
+`tests/compiler/passes/test_split_demoted.py` (`test_layout_split_*`, single-K-dim negative).
 
 ## Finding 4 — kernel-name extraction mangles MMA kernels in the tune DB (triage blind spot)
 
