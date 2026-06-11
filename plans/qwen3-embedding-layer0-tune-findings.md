@@ -203,7 +203,7 @@ gemm = 6.2 µs vs the deployed 25 µs (4.0x)** — now ahead of eager's 16 µs a
 reproducer slice (SDPA producers included, all splits pinned) benches 11.4 µs vs eager 14. Regression tests in
 `tests/compiler/passes/test_split_demoted.py` (`test_layout_split_*`, single-K-dim negative).
 
-## Finding 4 — kernel-name extraction mangles MMA kernels in the tune DB (triage blind spot)
+## Finding 4 — kernel-name extraction mangles MMA kernels in the tune DB (fixed on this branch)
 
 `eval variants` lists `dpl_ldmatrix_x4 — 26 measured configs` and `mbarrier_init — 1` as if they were kernels, while
 the three deployed tensor-core linears (q/v/down: `k_linear_reduce_735349/bcc194/86a525`) have **no rows at all**.
@@ -211,10 +211,16 @@ the three deployed tensor-core linears (q/v/down: `k_linear_reduce_735349/bcc194
 `cuda_op.pretty` — for any MMA/TMA kernel that's a `__device__` helper (`dpl_ldmatrix_x4`, `mbarrier_init`), not the
 `__global__ k_*` entry. Effects: several distinct kernels collapse into one leaderboard bucket (the run-1 DB had 446
 rows under `dpl_ldmatrix_x4`), their per-kernel pick-reachability is unverifiable, and `--kernel k_linear_reduce`
-filters find nothing. Fix: anchor the regex on `__global__` (tolerating `__launch_bounds__`), e.g.
-`__global__\s+void(?:\s+__launch_bounds__\([^)]*\))?\s+(\w+)\s*\(`. Cheap, high triage value.
+filters find nothing. Fix: anchor the regex on `__global__` (tolerating `__launch_bounds__`). Cheap, high triage value.
 
-## Finding 5 — `eval prior --dataset db` crashes (reachability aggregate unusable)
+**Fix (this branch).** Exactly that: `KERNEL_NAME_RE` is now anchored on the `__global__` entry point, with the
+renderer's `__launch_bounds__(N)` qualifier (which sits between `__global__` and `void`) tolerated —
+`__global__\s+(?:__launch_bounds__\([^)]*\)\s+)?void\s+(\w+)\s*\(`. The `__device__` helper preludes can no longer
+shadow the `k_*` name, so MMA/TMA kernels group under their real names in `eval variants` / `eval knobs` / `eval
+failures` and `--kernel` filters reach them. Regression test (prelude-bearing source, with and without
+`__launch_bounds__`) in `tests/compiler/pipeline/search/test_data.py::test_kernel_name_skips_device_helper_preludes`.
+
+## Finding 5 — `eval prior --dataset db` crashes (fixed on this branch)
 
 ```
 File "deplodock/compiler/pipeline/search/prior/diagnostics.py", line 45, in reachability
@@ -225,6 +231,12 @@ AttributeError: 'tuple' object has no attribute 'all_knobs'
 `reachability` iterates group values that are `(key, samples)` tuples (or a dict-items view) where it expects
 `Sample`s. The aggregate pick-reachability view was unusable this run (the per-kernel `eval variants` ranks stood
 in). Fix: unwrap the grouping in `diagnostics.reachability` (and add a smoke test that runs it on a 2-row DB).
+
+**Fix (this branch).** The mismatch was on the caller's side: `_emit_prior_db_reachability` (`commands/eval.py`)
+re-packed each group's `Sample`s into `(all_knobs, latency)` tuples — the shape `reachability` took *before* the
+data-layer harmonization — and the function (correctly) expects `Sample`s. The caller now passes
+`Dataset.from_db(...).group_by_op()` straight through. Smoke test on a 2-row DB in
+`tests/compiler/cli/test_eval.py::test_prior_db_reachability_smoke`.
 
 ## Finding 6 — the end-to-end gap is bigger than the per-kernel gaps (note, no deep dive)
 

@@ -18,6 +18,12 @@ def _stats(median: float) -> PerfStats:
     return PerfStats(median=median, min=median, max=median, mean=median, variance=0.0, n_samples=1)
 
 
+def _pretty(kernel_name: str) -> str:
+    """A realistic ``cuda_op.pretty`` header — the renderer's
+    ``extern "C" __global__\\n__launch_bounds__(N) void name(`` form."""
+    return f'extern "C" __global__\n__launch_bounds__(256) void {kernel_name}(const float* x) {{ }}\n'
+
+
 def _seed(db: SearchDB, key: str, pretty: str, knobs: dict, us: float) -> None:
     db.record_cuda_op(key, kernel_source="", arg_order=[], grid=[1, 1, 1], block=[1, 1, 1], smem_bytes=0, pretty=pretty)
     db.record_perf("ctx", key, backend="cuda", status="ok", stats=_stats(us), knobs=knobs)
@@ -42,11 +48,27 @@ def test_db_row_round_trip_is_lossless() -> None:
     the raw dict — so the prior sees an identical vector and regret sees identical
     rows."""
     raw = {"BN": 32, "BM": 8, "SPLITK": 1, "S_ext_free_prod": 4194304.0, "S_n_mma": 1.0, "H_cc": 120.0, "H_opt": 3.0}
-    s = Sample.from_perf_sample(PerfSample(pretty="void k_matmul(float*)", knobs=raw, latency_us=42.0))
+    s = Sample.from_perf_sample(PerfSample(pretty=_pretty("k_matmul"), knobs=raw, latency_us=42.0))
     assert s.all_knobs() == raw
     assert s.features() == knob.knob_features(raw)
     assert s.name == "k_matmul"
     assert s.knobs == {"BN": 32, "BM": 8, "SPLITK": 1}  # tunable only
+
+
+def test_kernel_name_skips_device_helper_preludes() -> None:
+    """MMA/TMA kernel sources open with ``__device__`` helper preludes; the name
+    must come from the ``__global__`` entry point, not the first ``void name(``
+    in the source (which would be the helper)."""
+    src = (
+        "static __device__ __forceinline__ void dpl_ldmatrix_x4(unsigned* r, const void* smem) { }\n"
+        "static __device__ __forceinline__ void mbarrier_init(unsigned long long* mbar, int count) { }\n"
+        'extern "C" __global__\n__launch_bounds__(128) void k_linear_reduce_735349(const __half* x) { }\n'
+    )
+    s = Sample.from_perf_sample(PerfSample(pretty=src, knobs={"WM": 16}, latency_us=5.0))
+    assert s.name == "k_linear_reduce_735349"
+    # No __launch_bounds__ qualifier is also fine.
+    s2 = Sample.from_perf_sample(PerfSample(pretty='extern "C" __global__ void k_mean(float* x) { }', knobs={}, latency_us=1.0))
+    assert s2.name == "k_mean"
 
 
 def test_prior_row_round_trip_is_lossless() -> None:
@@ -100,9 +122,9 @@ def test_from_db_grouping(tmp_path) -> None:
     path = tmp_path / "t.db"
     db = SearchDB(path)
     # two shapes of one kernel name (different S_ext_free_prod) + a second kernel
-    _seed(db, "a1", "void k_matmul(float*)", {"BM": 8, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 10.0)
-    _seed(db, "a2", "void k_matmul(float*)", {"BM": 16, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 8.0)
-    _seed(db, "b1", "void k_rms(float*)", {"FK": 4, "S_ext_free_prod": 64.0, "S_reduce_add": 1.0}, 3.0)
+    _seed(db, "a1", _pretty("k_matmul"), {"BM": 8, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 10.0)
+    _seed(db, "a2", _pretty("k_matmul"), {"BM": 16, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 8.0)
+    _seed(db, "b1", _pretty("k_rms"), {"FK": 4, "S_ext_free_prod": 64.0, "S_reduce_add": 1.0}, 3.0)
     ds = Dataset.from_db(path)
 
     by_name = ds.group_by_kernel_name()
