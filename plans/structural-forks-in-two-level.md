@@ -183,6 +183,16 @@ pinned (via the existing `Knob.narrow` pin path) before partition runs. With `SP
    pick retires structural picks on `Pipeline.run`'s retry and re-drives keep-fused
    (`test_greedy_structural_pick_falls_back_on_lowering_failure`). Verified live: after the tune above, unpinned
    `run --code` deploys the two-kernel split.
+3b. **M3b — composed Σ rows + informed outer PUCT (follow-up, landed).** Each outer terminal feeds the prior one
+   value-of-position row per structural decision — features `{ctx, pre-decision op knobs, decision delta}`, label =
+   the side's kernel-set Σ — attributed through `Op.source` decomposition links (stamped by `Candidate.apply` on
+   loop-dialect lowering splices; 005 sets it explicitly on the keep rebind; `_rename_buf_in_op` preserves it).
+   The outer `TuningSearch` now carries the global prior, and `LazyCandidate.resolved_knobs` keeps a resolved
+   ancestor's fork delta visible to descendants' `_node_knobs` (previously the structural branch's continuation was
+   scored as a knob-less row — a noisy coin-flip against the unresolved sibling). Verified live: a warm re-tune
+   descends the split kernel set first. Deploy decisions are unchanged — composed rows order exploration only;
+   greedy keeps the compositional probe. The decision hop is excluded from the `lowering` table (one-best-child
+   semantics can't carry a multi-kernel Σ).
 4. **M4 — `SPLITK` hoist (Step 4).** Remaining. Re-express 017's combine emission pre-partition; validate accuracy
    parity with today's atomic / atomic-free paths (`test_atomic_free_splitk` + new e2e coverage); confirm the outer
    enumerates one terminal per combine strategy and Σ-per-op ranks them. Retire the inner slice-sum tolerance + the

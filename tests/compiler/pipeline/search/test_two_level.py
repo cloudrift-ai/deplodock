@@ -27,7 +27,14 @@ from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.pipeline.search.two_level import LOWERING_PASSES, inner_reward, outer_pipeline, run_two_level_tune
+from deplodock.compiler.pipeline.search.two_level import (
+    LOWERING_PASSES,
+    OpResult,
+    _decomposition_rows,
+    inner_reward,
+    outer_pipeline,
+    run_two_level_tune,
+)
 
 # Moderate patience: each kernel explores several variants then stops on
 # stagnation (the fake backend gives a stable but arbitrary per-variant
@@ -263,21 +270,68 @@ class _RecordingProgress:
         pass
 
 
+class _RecordingPrior:
+    """Minimal ``Prior`` stand-in for ``load_prior`` monkeypatching: unfitted
+    (uniform PUCT, greedy keeps cold behavior), captures ``add_rows`` traffic."""
+
+    fitted = False
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[dict, float]] = []
+        self.trajectory: list = []
+
+    def add_rows(self, rows) -> None:
+        self.rows.extend(rows)
+
+    def maybe_refit(self, *, force: bool = False) -> bool:
+        return False
+
+    def checkpoint(self) -> None:
+        pass
+
+    def record_bench(self, knobs, median, status) -> None:
+        pass
+
+    def score(self, knobs) -> float:
+        return 0.0
+
+    def mean_score(self, knobs) -> float:
+        return 0.0
+
+    def mean_scores(self, rows) -> list[float]:
+        return [0.0] * len(rows)
+
+    def summary(self, label) -> str:
+        return ""
+
+
+def _is_decomposition_row(knobs: dict) -> bool:
+    """Composed Σ rows carry the decision knob but no tile-level knobs — every
+    inner per-kernel / branch row carries at least one partition-level knob."""
+    return "SPLIT_CONE" in knobs and not any(k in knobs for k in ("BM", "BN", "BR", "MMA", "WM", "FM"))
+
+
 def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     """The outer drives through the pre-partition tile head: 005's keep-vs-split
     offer branches the OUTER tree, so both kernel sets appear as outer terminals
     and the split producer/consumer are their own tuned op leaves (own progress
-    denominator), not sub-explorations inside the fused kernel's slice."""
+    denominator), not sub-explorations inside the fused kernel's slice. Each
+    terminal also feeds the prior one composed Σ row per structural decision —
+    the kernel-set cost of the side it realized."""
     from deplodock.compiler import target as target_mod
+    from deplodock.compiler.pipeline.search import prior as prior_pkg
 
     for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     target_mod.set_target((12, 0))
+    rec = _RecordingPrior()
+    monkeypatch.setattr(prior_pkg, "load_prior", lambda *a, **kw: rec)
     progress = _RecordingProgress()
+    db = SearchDB()
     result = run_two_level_tune(
         _norm_linear("a"),
         ctx=Context.from_target((12, 0)),
-        db=SearchDB(),
+        db=db,
         backend=_CountingBackend(),
         patience=4,
         progress=progress,
@@ -287,6 +341,87 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     # producer + consumer (2 op leaves) — the denominators the progress bar sees.
     assert sorted(progress.terminal_sizes) == [1, 2]
     assert any(name.endswith("_xn") for name in progress.ops), f"split producer must be its own op leaf, got {progress.ops}"
+    # Both sides' composed rows reached the prior: SPLIT_CONE=False labeled
+    # with the fused best, SPLIT_CONE=True with the split kernels' Σ.
+    decomp = [(k, us) for k, us in rec.rows if _is_decomposition_row(k)]
+    assert {k["SPLIT_CONE"] for k, _ in decomp} == {False, True}
+    assert all(us > 0 for _, us in decomp)
+    # The decision hop never enters the ``lowering`` table (one best child per
+    # parent — a multi-kernel decomposition's parent must not resolve through
+    # ONE fragment kernel's median): the pre-decision op has no lowering row.
+    site = next(n.op.source for n in result.best_fused.nodes.values() if isinstance(n.op, LoopOp) and n.op.source is not None)
+    assert db.lookup_lowering(op_cache_key(site)) is None
+
+
+def _outer_terminals(graph: Graph) -> list[Graph]:
+    return [
+        cand.graph
+        for cand in outer_pipeline().tune(graph, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
+    ]
+
+
+def _loops(graph: Graph) -> list:
+    return [n.op for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
+
+
+def test_split_kernels_attribute_to_pre_decision_op() -> None:
+    """The structural splice stamps the pre-decision op as each fragment
+    kernel's ``Op.source`` — the decomposition link the composed Σ rows group
+    by: both split kernels share ONE loop-dialect ancestor whose knobs lack
+    the decision."""
+    terminals = _outer_terminals(_norm_linear("a"))
+    split = next(t for t in terminals if len(_loops(t)) == 2)
+    kernels = _loops(split)
+    assert all(k.knobs.get("SPLIT_CONE") is True for k in kernels)
+    assert all(k.source is not None for k in kernels)
+    assert len({id(k.source) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
+    assert "SPLIT_CONE" not in kernels[0].source.knobs
+
+
+def test_outer_descends_prior_preferred_branch_first() -> None:
+    """With a prior ranking the split side cheaper, the outer PUCT explores it
+    FIRST — including past the fork's resolve: the resolved branch's
+    continuation keeps its ``SPLIT_CONE`` delta (``LazyCandidate.resolved_knobs``),
+    so it isn't out-scored by the unresolved keep-fused sibling as a knob-less
+    generic row (the regression this test pins)."""
+
+    class _SplitCheapPrior(_RecordingPrior):
+        def score(self, knobs) -> float:
+            if knobs.get("SPLIT_CONE") is True:
+                return 1.0
+            return 2.0 if "SPLIT_CONE" in knobs else 3.0
+
+    search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=Context.from_target((12, 0)).features())
+    first = next(outer_pipeline().tune(_norm_linear("a"), search=search, ctx=Context.from_target((12, 0)), db=SearchDB()))
+    assert len(_loops(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
+
+
+def test_decomposition_rows_sum_kernel_set_costs() -> None:
+    """One composed row per structural decision: features = the offer site's
+    knobs + the decision delta (never the kids' restamped ``S_*``), label =
+    the Σ of the side's per-kernel bests."""
+    terminals = _outer_terminals(_norm_linear("a"))
+    by_size = {len(_loops(t)): t for t in terminals}
+    ctx = Context.from_target((12, 0))
+
+    split = by_size[2]
+    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_loops(split), (7.0, 13.0), strict=True)]
+    rows = _decomposition_rows(split, per_op, ctx)
+    assert len(rows) == 1
+    feats, label = rows[0]
+    assert label == pytest.approx(20.0), "the split side's price is the kernel-set Σ"
+    assert feats["SPLIT_CONE"] is True
+    site = _loops(split)[0].source
+    site_s_feats = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
+    assert site_s_feats and all(feats[k] == v for k, v in site_s_feats.items()), "the row rides the SITE's S_* identity"
+
+    fused = by_size[1]
+    fop = _loops(fused)[0]
+    rows = _decomposition_rows(fused, [OpResult(name="k", op_key=op_cache_key(fop), best_us=42.0)], ctx)
+    assert len(rows) == 1
+    feats, label = rows[0]
+    assert label == pytest.approx(42.0)
+    assert feats["SPLIT_CONE"] is False
 
 
 def test_structural_memo_collapses_identical_sites() -> None:

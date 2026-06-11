@@ -321,13 +321,19 @@ class TuningSearch(Search):
         ``S_*`` structural identity) merged with every ``fork.knobs`` delta from
         the root down to ``node``. A branch pins its level slice; a leaf carries
         the complete row, so deeper nodes hold a superset. This is the
-        (partial-or-full) feature input the prior featurizes."""
+        (partial-or-full) feature input the prior featurizes. A RESOLVED
+        ancestor's pending fork is gone (``resolve`` drops it) — its delta is
+        read from ``LazyCandidate.resolved_knobs`` instead, so descendants of
+        a resolved branch keep the full feature prefix (else a structural
+        branch's continuation would score as a knob-less generic row against
+        its fully-knobed unresolved sibling)."""
         chain: list[dict] = []
         cur: SearchNode | None = node
         while cur is not None and cur.candidate is not None:
             fork = cur.candidate.fork
-            if fork is not None:
-                chain.append(fork.knobs)
+            knobs = fork.knobs if fork is not None else cur.candidate.resolved_knobs
+            if knobs:
+                chain.append(knobs)
             cur = cur.parent
         merged: dict = dict(self._base_knobs)
         for knobs in reversed(chain):

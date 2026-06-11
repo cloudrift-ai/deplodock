@@ -390,7 +390,10 @@ The autotune state is split across two cooperating modules:
   `lowering` edge table (one row per rewrite hop carrying the knob
   delta the rule stamped at that hop plus a best-median upsert, so
   `GreedySearch` can replay the chain by matching forks against the
-  delta at each step), and a backend-partitioned `perf` table carrying
+  delta at each step — loop→loop source hops are skipped: those are
+  structural/decision hops, and a one-best-child row would let a
+  multi-kernel decomposition's parent resolve through ONE fragment
+  kernel's median), and a backend-partitioned `perf` table carrying
   full stats (`latency_us_{median,min,max,mean,variance}`,
   `n_samples`, `backend`, `status`, `knobs`). Selection statistic is
   the median.
@@ -444,7 +447,18 @@ fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — 
   linear in *unique* kernels instead of `2^sites`; a terminal whose ops are all known is a pure DB read. **Fusion
   itself is still deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`); a graph
   with no structural offers yields one terminal and this reduces to "tune each op once, sum, assemble". The outer uses
-  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
+  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`. The global
+  prior also drives the outer PUCT (the outer `TuningSearch` carries `prior_model` + ctx `base_knobs`): each terminal
+  emits one **composed Σ row** per structural decision it realized — features `{ctx, pre-decision op knobs, decision
+  delta}`, label = the Σ of that side's per-kernel bests (`_decomposition_rows`) — attributed through the `Op.source`
+  decomposition links `Candidate.apply` stamps on loop-dialect lowering splices (005 sets it explicitly on its
+  keep-fused rebind too, since `replace` would copy the pre-decision op's own source past the offer site;
+  `_rename_buf_in_op` preserves `source` through the splice id-promotion). The row's feature shape is exactly what the
+  outer's `_node_knobs` produces at the fork's siblings (`LazyCandidate.resolved_knobs` keeps a resolved ancestor's
+  delta visible to its descendants — without it the structural branch's continuation would score as a knob-less
+  generic row against its fully-knobed unresolved sibling), so a warm re-tune descends the predicted-cheaper kernel
+  set first instead of emission order. Composed rows are derived value-of-position estimates that *order
+  exploration*; greedy's deploy decision keeps the sharper compositional probe (complete-row predictions per kernel).
 - **Inner search** (`inner_reward`) tunes each finalized kernel **independently** in its own single-node slice
   (`single_node_graph`, `search/slice.py`) with a plain `TuningSearch` over `LOWERING_PASSES` only (`tile → kernel →
   cuda`). The slice keeps the root kernel + its leaf-op closure and turns every other kernel-input into a synthetic

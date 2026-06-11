@@ -89,12 +89,25 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
     # Only genuine offer sites carry the decision knob — never-offered kernels
     # stay knob-free (the prior's "not considered" NaN state).
     keep_fused = replace(root.op, knobs={**root.op.knobs, SPLIT_CONE.name: False})
+    # ``replace`` copies ``source`` (the pre-S_*-stamp ancestor), which would
+    # stop ``Candidate.apply`` from stamping the op being replaced — pointing
+    # the keep side's decomposition link past the offer site, at a knob-less
+    # grandparent. Both branches must attribute to THIS op (the two-level
+    # tuner's composed Σ rows group by it), so set it explicitly.
+    keep_fused.source = root.op
     pinned = SPLIT_CONE.narrow((False, True))
     if pinned == (False,):
         return keep_fused
     if pinned == (True,):
         return _stamp(split)
+    # The split fork's ranking knobs carry the offer site's full knob base
+    # (its ``S_*`` identity) under the decision delta — mirroring the keep
+    # side, whose lifted OptionFork copies the Op's knob dict — so the outer
+    # search's ``_node_knobs`` at the two siblings is feature-identical to
+    # the composed Σ rows ``two_level._decomposition_rows`` trains the prior
+    # on. Ranking metadata only; the spliced kernels' own knobs are stamped
+    # by ``_stamp`` / the cut builder.
     return [
         keep_fused,
-        OptionFork(option=_stamp(split), knobs={SPLIT_CONE.name: True}),
+        OptionFork(option=_stamp(split), knobs={**root.op.knobs, SPLIT_CONE.name: True}),
     ]

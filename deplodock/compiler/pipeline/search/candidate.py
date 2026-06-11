@@ -167,7 +167,16 @@ class Candidate:
         ``Op`` path the chain ``Op.source`` is stamped with the op
         being replaced (unless the rule already set it) and the
         predecessor's ``knobs`` are merged forward — so the rewrite
-        chain threads through every in-place rebind for free."""
+        chain threads through every in-place rebind for free. A
+        lowering-tier ``Graph`` splice of a loop-dialect kernel (a
+        structural decomposition — ``tile/005_split_demoted``'s split)
+        stamps the consumed root op as each fragment kernel's
+        ``source``, so the chain also records *which op a decomposition
+        came from*: the two-level tuner groups a terminal's kernels by
+        that ancestor to emit composed Σ training rows for the prior
+        (``two_level._decomposition_rows``). Knobs are NOT merged
+        forward on this path — fragment kernels carry their own
+        restamped structural features."""
         self._log_apply(match, option)
         if isinstance(option, Op):
             old_op = self.graph.nodes[match.root_node_id].op
@@ -181,6 +190,14 @@ class Candidate:
             # every other fragment splice aggregates the consumed pieces.
             pass_ = match.rule.pass_
             mint_pieces = pass_ is not None and pass_.name.startswith("frontend/decomposition")
+            if pass_ is not None and pass_.name.startswith("lowering/"):
+                from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+
+                root_op = self.graph.nodes[match.root_node_id].op
+                if dialect_of(root_op) == "loop":
+                    for frag_node in option.nodes.values():
+                        if frag_node.op.source is None and dialect_of(frag_node.op) == "loop":
+                            frag_node.op.source = root_op
             self.graph.splice(
                 option,
                 consumed=match.consumed,
@@ -245,6 +262,15 @@ class LazyCandidate:
     # ``structural_memo`` so identical later offer sites in the same
     # trajectory take this side inline. ``None`` for op-variant forks.
     memo: tuple[str, str, int] | None = None
+    # The pending fork's knob delta, preserved by :meth:`resolve` (which drops
+    # ``pending`` itself). ``TuningSearch._node_knobs`` accumulates fork knobs
+    # down the tree to featurize a node for the prior — without this, a
+    # RESOLVED ancestor's delta would vanish from every descendant's feature
+    # vector, so e.g. the structural branch's continuation would be scored
+    # without its ``SPLIT_CONE`` (an off-distribution generic row) while the
+    # unresolved keep-fused sibling keeps full knobs — an asymmetric, noisy
+    # PUCT comparison.
+    resolved_knobs: dict | None = None
 
     @classmethod
     def from_option(
@@ -316,6 +342,7 @@ class LazyCandidate:
         if self.memo is not None:
             rule_name, op_key, idx = self.memo
             resolved.structural_memo[(rule_name, op_key)] = idx
+        self.resolved_knobs = dict(fork.knobs)
         self.pending = None
         self.inner = resolved
         return resolved

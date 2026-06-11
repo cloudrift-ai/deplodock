@@ -176,6 +176,49 @@ def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
     return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)]
 
 
+def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> list[tuple[dict, float]]:
+    """Composed value-of-position training rows for structural decompositions.
+
+    A terminal's kernels attribute back to the op a structural decision was
+    taken on via ``Op.source`` (``Candidate.apply`` stamps loop→loop splice
+    hops; the keep-side ``Op`` rebind stamps as always). Group the terminal's
+    unique kernels by that pre-decision ancestor + the decision-knob delta the
+    hop stamped (``SPLIT_CONE: True/False``, never the per-body ``S_*``
+    restamps), and label each group with the **Σ of its kernels' tuned bests**
+    — the kernel-set cost of taking that side. The row's features
+    (``{ctx, pre-decision op knobs, decision delta}``) are exactly what the
+    outer MCTS's PUCT queries at the structural fork's siblings, so these rows
+    are what make that selection informed instead of uniform. They are
+    estimates for *search ordering*; greedy's deploy decision keeps the sharper
+    compositional probe (``policy/greedy._pick_structural``)."""
+    from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+
+    best = {r.op_key: r.best_us for r in per_op}
+    unique: dict[str, object] = {}
+    for _nid, op in _kernel_nodes(graph):
+        key = op_cache_key(op)
+        if key is not None and key not in unique:
+            unique[key] = op
+    groups: dict[tuple, tuple[dict, list[float | None]]] = {}
+    for key, op in unique.items():
+        site = op.source
+        if site is None or dialect_of(site) != "loop":
+            continue
+        site_key = op_cache_key(site)
+        if site_key is None:
+            continue
+        # The decision delta: knobs this hop introduced. ``S_*`` keys are
+        # excluded — fragment kernels restamp their own structural features,
+        # which describe the child body, not the decision.
+        delta = {k: v for k, v in op.knobs.items() if k not in site.knobs and not k.startswith("S_")}
+        if not delta:
+            continue  # not a decision hop (e.g. a name-only rebind ancestor)
+        gkey = (site_key, tuple(sorted((k, str(v)) for k, v in delta.items())))
+        feats, labels = groups.setdefault(gkey, ({**ctx.features(), **site.knobs, **delta}, []))
+        labels.append(best.get(key))
+    return [(feats, float(sum(labels))) for feats, labels in groups.values() if labels and all(us is not None for us in labels)]
+
+
 def inner_reward(
     fused_graph: Graph,
     *,
@@ -350,7 +393,12 @@ def run_two_level_tune(
     from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
     prior = load_prior(seed=prior_seed)
-    outer = TuningSearch(patience=patience, ucb_c=ucb_c)
+    # The global prior drives the outer PUCT too: at a structural fork the
+    # siblings' ``_node_knobs`` are ``{ctx, pre-decision op knobs, decision
+    # knob}`` — the exact feature shape :func:`_decomposition_rows` trains on
+    # below — so once composed Σ rows accumulate, the outer descends the
+    # predicted-cheaper kernel set first instead of emission order.
+    outer = TuningSearch(patience=patience, ucb_c=ucb_c, prior_model=prior, base_knobs=ctx.features())
     # The outer drives only the graph-changing passes (through the
     # pre-partition tile head) — no dump on this Run; the winning config's
     # full stage artifacts (incl. per-kernel ``.torch.json`` reproducers) come
@@ -377,6 +425,13 @@ def run_two_level_tune(
         )
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(token, stats, "ok" if reward.ok else "bench_fail")
+        # Composed Σ rows per structural decision this terminal realized —
+        # the kernel-set cost of each side, attributed via the ``Op.source``
+        # decomposition links. Re-emitted every terminal evaluation, so the
+        # reservoir keeps refreshing the sum as per-kernel bests fall.
+        rows = _decomposition_rows(fused.graph, reward.per_op, ctx)
+        if rows:
+            prior.add_rows(rows)
         positions = sum(r.multiplicity for r in reward.per_op)
         logger.info(
             "[tune] fused terminal #%d: Σ per-op = %.2f us (%d unique kernels, %d positions)",

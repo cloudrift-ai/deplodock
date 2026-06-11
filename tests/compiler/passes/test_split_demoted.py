@@ -326,7 +326,10 @@ def test_rule_offers_fused_first_then_split() -> None:
     assert keep.knobs[split_rule.SPLIT_CONE.name] is False
     assert keep.body.structural_key() == node.op.body.structural_key()
     assert isinstance(split, OptionFork) and isinstance(split.option, Graph)
-    assert split.knobs == {split_rule.SPLIT_CONE.name: True}
+    # Ranking knobs carry the offer site's full knob base under the decision
+    # delta — feature-identical to the keep side's lifted fork (and to the
+    # composed Σ rows the two-level tuner trains the prior on).
+    assert split.knobs == {**node.op.knobs, split_rule.SPLIT_CONE.name: True}
     # Both split kernels carry the decision on op.knobs too — their perf rows
     # train the prior with SPLIT_CONE=1.
     for n in split.option.nodes.values():

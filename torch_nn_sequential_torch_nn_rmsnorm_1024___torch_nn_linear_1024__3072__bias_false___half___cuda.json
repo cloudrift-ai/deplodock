@@ -1,0 +1,103 @@
+{
+  "inputs": [
+    "input"
+  ],
+  "outputs": [
+    "linear"
+  ],
+  "nodes": {
+    "p_0_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_0_weight",
+        "value": null,
+        "load_ops": [],
+        "source_path": "0.weight",
+        "source_shape": [
+          1024
+        ],
+        "source_dtype": "float16"
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_0_weight",
+        "shape": [
+          1024
+        ],
+        "dtype": "f16"
+      }
+    },
+    "p_1_weight": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "p_1_weight",
+        "value": null,
+        "load_ops": [],
+        "source_path": "1.weight",
+        "source_shape": [
+          3072,
+          1024
+        ],
+        "source_dtype": "float16"
+      },
+      "inputs": [],
+      "output": {
+        "name": "p_1_weight",
+        "shape": [
+          3072,
+          1024
+        ],
+        "dtype": "f16"
+      }
+    },
+    "input": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "output": {
+        "name": "input",
+        "shape": [
+          32,
+          1024
+        ],
+        "dtype": "f16"
+      }
+    },
+    "rms_norm": {
+      "op": "RmsNormOp",
+      "op_fields": {
+        "eps": 1e-06
+      },
+      "inputs": [
+        "input",
+        "p_0_weight"
+      ],
+      "output": {
+        "name": "rms_norm",
+        "shape": [
+          32,
+          1024
+        ],
+        "dtype": "f16"
+      }
+    },
+    "linear": {
+      "op": "LinearOp",
+      "op_fields": {
+        "has_bias": false
+      },
+      "inputs": [
+        "rms_norm",
+        "p_1_weight"
+      ],
+      "output": {
+        "name": "linear",
+        "shape": [
+          32,
+          3072
+        ],
+        "dtype": "f16"
+      }
+    }
+  }
+}

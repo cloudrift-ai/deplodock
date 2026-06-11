@@ -966,6 +966,18 @@ def _bench_terminal(cand, *, backend, db):
             c_dialect = dialect_of(child_op)
             if p_dialect is None or c_dialect is None:
                 continue
+            if p_dialect == c_dialect == "loop":
+                # loop→loop source hops are structural/decision hops, not
+                # lowering rewrites: the splice attribution stamped by
+                # ``Candidate.apply`` (a decomposition's kernels → the
+                # pre-split op), 005's keep-vs-split rebind, name stamps.
+                # A ``lowering`` row holds ONE best child per parent, so
+                # recording a multi-kernel decomposition's hops would let
+                # ``best_per_op_time``'s chain walk resolve the pre-split
+                # op to a single fragment kernel's median — half the work
+                # masquerading as the whole op. The decomposition's cost
+                # is a Σ, owned by the two-level tuner, never this table.
+                continue
             p_key = op_cache_key(parent_op)
             c_key = op_cache_key(child_op)
             if p_key is None or c_key is None:
