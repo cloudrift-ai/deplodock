@@ -37,6 +37,7 @@ SUPPORTED = frozenset(
         "SdpaOp",
         "MeanOp",
         "RmsNormOp",
+        "LayerNormOp",
         "SoftmaxOp",
         "ElementwiseOp",
         "ReduceOp",
@@ -170,6 +171,11 @@ def _eval(node, ins: list):
             return F.rms_norm(x, (x.shape[-1],), w, op.eps)
         except (AttributeError, RuntimeError):
             return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + op.eps) * w
+    if name == "LayerNormOp":
+        x = ins[0]
+        w = ins[1] if len(ins) > 1 else None
+        b = ins[2] if len(ins) > 2 else None
+        return F.layer_norm(x, (x.shape[-1],), w, b, op.eps)
     if name == "SoftmaxOp":
         return torch.softmax(ins[0], dim=op.axis)
     if name == "TransposeOp":

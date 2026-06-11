@@ -98,7 +98,7 @@ remain.
 | Group         | Ops                                                                                       |
 |---------------|-------------------------------------------------------------------------------------------|
 | Layout-only   | `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp`, `UnsqueezeOp` — rewrite to `IndexMapOp`.  |
-| Compound math | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp` — rewrite to elementwise + reduce chains.      |
+| Compound math | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `RmsNormOp`, `LayerNormOp`, `SoftmaxOp` — rewrite to elementwise + reduce chains. |
 
 ## `tensor/ir.py`
 

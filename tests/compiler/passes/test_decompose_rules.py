@@ -14,6 +14,7 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
+    LayerNormOp,
     LinearOp,
     MatmulOp,
     MeanOp,
@@ -262,6 +263,82 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
     for n in decomposed.nodes.values():
         assert not isinstance(n.op, RmsNormOp), f"rms_norm survived decomposition at {n.output.name}"
+
+
+# ===================================================================
+# LayerNorm decomposition:
+# layer_norm(x, w, b) → (x - mean(x)) * rsqrt(mean((x-mean(x))^2) + eps) * w + b
+# ===================================================================
+
+
+def _make_layer_norm_graph(dim=64, seq_len=8, eps=1e-5, *, weight=True, bias=True):
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, seq_len, dim)), node_id="x")
+    input_ids = ["x"]
+    if weight:
+        g.add_node(op=ConstantOp(name="w"), inputs=[], output=Tensor("w", (dim,)), node_id="w")
+        input_ids.append("w")
+    if bias:
+        g.add_node(op=ConstantOp(name="b"), inputs=[], output=Tensor("b", (dim,)), node_id="b")
+        input_ids.append("b")
+    g.add_node(op=LayerNormOp(eps=eps), inputs=input_ids, output=Tensor("out", (1, seq_len, dim)), node_id="out")
+    g.inputs, g.outputs = ["x"], ["out"]
+    return g
+
+
+def test_layer_norm_decomposes():
+    result = _apply(_make_layer_norm_graph(), "085_layer_norm.py")
+    assert not any(isinstance(n.op, LayerNormOp) for n in result.nodes.values())
+    fns = {n.op.name for n in result.nodes.values() if isinstance(n.op, ElementwiseOp)}
+    assert {"subtract", "multiply", "add", "rsqrt"} <= fns
+    assert sum(isinstance(n.op, MeanOp) for n in result.nodes.values()) == 2
+
+
+def test_layer_norm_no_affine_decomposes():
+    """elementwise_affine=False: no weight/bias inputs, no scale/shift nodes."""
+    result = _apply(_make_layer_norm_graph(weight=False, bias=False), "085_layer_norm.py")
+    assert not any(isinstance(n.op, LayerNormOp) for n in result.nodes.values())
+    out_node = result.nodes[result.outputs[0]]
+    assert out_node.op.name == "multiply"  # centered * rsqrt, no affine tail
+
+
+def test_layer_norm_weight_only_decomposes():
+    """bias=False: weight scale applied, no bias add."""
+    result = _apply(_make_layer_norm_graph(bias=False), "085_layer_norm.py")
+    assert not any(isinstance(n.op, LayerNormOp) for n in result.nodes.values())
+
+
+def test_layer_norm_preserves_io_shape():
+    g = _make_layer_norm_graph(dim=64, seq_len=8)
+    result = _apply(g, "085_layer_norm.py")
+    assert result.nodes[result.outputs[0]].output.shape == (1, 8, 64)
+
+
+def test_layer_norm_trace_captures_eps():
+    """The tracer peels the trailing eps constant into LayerNormOp.eps."""
+    import torch
+
+    from deplodock.compiler.trace.torch import trace_module
+
+    graph = trace_module(torch.nn.LayerNorm(64, eps=1e-3), (torch.randn(1, 8, 64),))
+    ln = [n for n in graph.nodes.values() if isinstance(n.op, LayerNormOp)]
+    assert len(ln) == 1
+    assert ln[0].op.eps == 1e-3
+    assert len(ln[0].inputs) == 3  # x, weight, bias — eps peeled
+
+
+def test_layer_norm_trace_to_tensor_ir_primitives_only():
+    """End-to-end protection: torch.nn.LayerNorm → trace → compile through decomposition
+    must yield a graph of primitives only (no layer_norm fused op).
+    """
+    import torch
+
+    from deplodock.compiler.trace.torch import trace_module
+
+    graph = trace_module(torch.nn.LayerNorm(64), (torch.randn(1, 8, 64),))
+    decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
+    for n in decomposed.nodes.values():
+        assert not isinstance(n.op, LayerNormOp), f"layer_norm survived decomposition at {n.output.name}"
 
 
 # ===================================================================
