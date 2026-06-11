@@ -615,7 +615,8 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
 
 def _sdpa_av_loop_op(*, B0: int = 16, M: int = 32, N: int = 128, K: int = 32) -> LoopOp:
     """The SDPA cone-split attn@V cell shape that crashed the whole-layer
-    tune (k_sdpa_transpose_reshape_linear_reduce under ``SPLIT_CONE=1`` +
+    tune (k_sdpa_linear_reduce — k_sdpa_transpose_reshape_linear_reduce
+    before layout ops were dropped from labels — under ``SPLIT_CONE=1`` +
     ``MMA``): A is 3-D ``(batch, m, k)`` — K in the LAST dim — and B is the
     4-D V slab ``(0, k, 0, n)`` — K in a MIDDLE dim (dim 1 of 4), matched by
     neither the K-in-first nor the K-in-last test. The 5-D Write's leading

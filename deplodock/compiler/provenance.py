@@ -51,8 +51,12 @@ def get(node: Node) -> dict:
 
 
 def put(node: Node, prov: dict) -> None:
-    """Store ``prov`` on ``node``, dropping the hint entirely when empty."""
-    if prov:
+    """Store ``prov`` on ``node``, dropping the hint entirely when empty.
+
+    Boundary sentinels never carry provenance (see :data:`_SKIP`): storing onto
+    one clears any stale hint instead — e.g. prov copied by ``Graph.splice``'s
+    generic hint merge when a fold collapses a compute op into a constant."""
+    if prov and not is_boundary(node.op):
         node.hints.set(PROV, prov)
     else:
         node.hints.remove(PROV)
@@ -130,7 +134,18 @@ def propagate(
       fragment output inherits its own consumed node's pieces unioned with the
       ``shared`` pieces of every *dissolved* consumed node (those not in
       ``output_map`` — e.g. a producer inlined into all its consumers), so no
-      origin is dropped at a multi-output splice."""
+      origin is dropped at a multi-output splice.
+
+    A fragment output that is a boundary sentinel (e.g. a fold collapsing a
+    transpose into its parameter ``ConstantOp``) gets its prov scrubbed instead:
+    the splice's generic hint merge copied the consumed node's hints — prov
+    included — onto it, and a boundary must never carry provenance (its pieces
+    would inflate :func:`totals` and make every other kernel of the origin read
+    as partial coverage)."""
+    for new_out in new_by_old.values():
+        node = graph.nodes[new_out]
+        if is_boundary(node.op):
+            node.hints.remove(PROV)
     if mint_pieces:
         origins_kind = origins(union(*consumed_prov.values())) if consumed_prov else {}
         for nid in new_compute_ids:
@@ -163,6 +178,12 @@ def coverage(node_prov: dict, all_totals: dict[str, set[str]]) -> dict[str, tupl
 # sdpa / …) is also present, the glue is dropped from the label.
 _GENERIC_KINDS = frozenset({"ElementwiseOp", "ReduceOp", "ScanOp", "IndexMapOp", "GatherOp", "ScatterOp"})
 
+# Frontend layout/plumbing ops label a kernel only when no strong op is present:
+# an attention kernel that also absorbs RoPE's cat/slice/unsqueeze plumbing
+# stays ``k_sdpa_…``, while a standalone copy kernel (e.g. a cat feeding a graph
+# output) still reads ``k_cat_…`` instead of the node-id fallback.
+_WEAK_KINDS = frozenset({"TransposeOp", "ReshapeOp", "UnsqueezeOp", "CatOp", "SliceOp"})
+
 
 def _humanize_kind(kind: str) -> str:
     """``RmsNormOp`` → ``rms_norm``, ``SdpaOp`` → ``sdpa`` (CamelCase→snake, drop ``Op``)."""
@@ -191,8 +212,11 @@ def name_for(loop: LoopOp, base_name: str, node_prov: dict, all_totals: dict[str
     A kernel that fully realizes exactly one meaningful op gets ``k_<op>_<h>``
     (e.g. ``k_rms_norm_3f2a1b``); a partial one keeps the ``_<reduce|pointwise>``
     qualifier so the reduce half is told apart from the pointwise tail. Multiple
-    meaningful ops join (``k_linear_sdpa_...``). With no provenance (or only glue
-    ops) it falls back to the node-id name.
+    meaningful ops join dominant-first — sorted by descending piece count (the op
+    the kernel mostly implements leads, e.g. ``k_sdpa_linear_...``), ties broken
+    lexically — so the label is independent of fusion merge order. Layout ops
+    (:data:`_WEAK_KINDS`) label the kernel only when no strong op is present;
+    with no provenance (or only glue ops) it falls back to the node-id name.
 
     ``<h>`` is a short structural-body hash: prov labels are *not* unique (two
     rms_norms, or SDPA's two distinct reduce kernels, share a label), but the
@@ -207,10 +231,12 @@ def name_for(loop: LoopOp, base_name: str, node_prov: dict, all_totals: dict[str
     from deplodock.compiler.ir.stmt import Accum
 
     suffix = "reduce" if any(isinstance(s, Accum) for s in loop) else "pointwise"
-    meaningful = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS]
+    strong = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS | _WEAK_KINDS]
+    meaningful = strong or [oid for oid, e in node_prov.items() if e["kind"] in _WEAK_KINDS]
     if not meaningful:
         return f"k_{_dedup_tokens(base_name)}_{suffix}"
 
+    meaningful.sort(key=lambda oid: (-len(set(node_prov[oid]["pieces"])), _humanize_kind(node_prov[oid]["kind"])))
     labels: list[str] = []
     for oid in meaningful:
         lbl = _humanize_kind(node_prov[oid]["kind"])

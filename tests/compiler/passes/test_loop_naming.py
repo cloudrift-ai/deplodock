@@ -63,6 +63,40 @@ def test_every_loop_op_has_name_after_loop_passes():
     assert all(n.op.name and n.op.name.startswith("k_") for n in loops), [n.op.name for n in loops]
 
 
+def test_single_kernel_linear_has_no_qualifier_under_sm90_fold():
+    """A bias-free Linear lowers to one kernel that IS the whole op, so the
+    name is ``k_linear_<6hex>`` — no ``_reduce``. Regression: the sm_90+
+    weight-transpose fold (``050_fold_into_constant``) used to strand a prov
+    piece on the folded ConstantOp, inflating ``totals`` so the kernel read
+    partial coverage and kept the qualifier."""
+    import re
+
+    from deplodock.compiler import target as target_mod
+    from deplodock.compiler.ir.base import ConstantOp
+    from deplodock.compiler.ir.frontend.ir import LinearOp
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (8, 16)), node_id="x")
+    g.add_node(
+        ConstantOp(name="w", source_path="linear.weight", source_shape=(16, 16), source_dtype="float32"),
+        [],
+        Tensor("w", (16, 16)),
+        node_id="w",
+    )
+    g.add_node(LinearOp(), ["x", "w"], Tensor("linear_0", (8, 16)), node_id="linear_0")
+    g.inputs, g.outputs = ["x"], ["linear_0"]
+
+    target_mod.set_target((9, 0))
+    try:
+        out = Pipeline.build(LOOP_PASSES).run(g)
+    finally:
+        target_mod.set_target(None)
+
+    names = [n.op.name for n in out.nodes.values() if isinstance(n.op, LoopOp)]
+    assert len(names) == 1, names
+    assert re.fullmatch(r"k_linear_[0-9a-f]{6}", names[0]), names[0]
+
+
 # ---------------------------------------------------------------------------
 # Rule idempotence
 # ---------------------------------------------------------------------------
@@ -135,6 +169,46 @@ def test_name_for_partial_coverage_keeps_qualifier():
     totals = {"rms_norm_0": {"o", "other_piece"}}
     name = prov.name_for(loop, "o", prov_map, totals)
     assert name.startswith("k_rms_norm_pointwise_")
+
+
+def test_name_for_drops_weak_kinds_when_strong_present():
+    """Layout/plumbing origins (transpose / reshape / unsqueeze / cat / slice)
+    never label a kernel that also carries a strong op — RoPE plumbing fused
+    into attention stays ``k_sdpa_…``, not ``k_sdpa_cat_slice_…``."""
+    loop = _pointwise_loop()
+    prov_map = {
+        "sdpa_0": {"kind": "SdpaOp", "pieces": ["p1", "p2"]},
+        "cat_0": {"kind": "CatOp", "pieces": ["p3"]},
+        "slice_0": {"kind": "SliceOp", "pieces": ["p4"]},
+        "transpose_0": {"kind": "TransposeOp", "pieces": ["p5"]},
+    }
+    totals = {oid: set(e["pieces"]) for oid, e in prov_map.items()}
+    name = prov.name_for(loop, "o", prov_map, totals)
+    assert name.startswith("k_sdpa_") and "cat" not in name and "slice" not in name and "transpose" not in name
+
+
+def test_name_for_pure_weak_kernel_uses_weak_label():
+    """A kernel whose only origins are layout ops (e.g. a standalone cat copy)
+    still gets the descriptive weak label, not the node-id fallback."""
+    loop = _pointwise_loop()
+    prov_map = {"cat_0": {"kind": "CatOp", "pieces": ["o"]}}
+    totals = {"cat_0": {"o"}}
+    name = prov.name_for(loop, "merged_lift_n42", prov_map, totals)
+    assert name.startswith("k_cat_")
+
+
+def test_name_for_order_is_dominant_first_and_merge_order_independent():
+    """Labels sort by descending piece count (the op the kernel mostly
+    implements leads), so the name is the same whatever order fusion merged
+    the origins in."""
+    loop = _pointwise_loop()
+    sdpa = {"kind": "SdpaOp", "pieces": ["p1", "p2", "p3"]}
+    linear = {"kind": "LinearOp", "pieces": ["p4"]}
+    totals = {"sdpa_0": {"p1", "p2", "p3"}, "linear_0": {"p4", "elsewhere"}}
+    a = prov.name_for(loop, "o", {"sdpa_0": dict(sdpa), "linear_0": dict(linear)}, totals)
+    b = prov.name_for(loop, "o", {"linear_0": dict(linear), "sdpa_0": dict(sdpa)}, totals)
+    assert a == b
+    assert a.startswith("k_sdpa_linear_")
 
 
 def test_name_for_dedups_repeated_labels():
