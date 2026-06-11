@@ -454,6 +454,7 @@ def _bench_per_kernel(args, dump_dir, db):
     sys.stderr.write(f"\n[tune] per-kernel bench: {len(repros)} reproducer(s) at -O3\n")
     rows: list[tuple[str, dict]] = []
     fallback: list[str] = []
+    records: list[dict] = []  # persisted as 62_kernel_bench.json — the `deplodock compare` input
     for repro in repros:
         label = _short_kernel(repro.name)
         try:
@@ -477,10 +478,15 @@ def _bench_per_kernel(args, dump_dir, db):
             sys.stderr.write(f"[tune]   {label}: skipped ({exc})\n")
             continue
         rows.append((label, results))
+        records.append({"kernel": repro.name.removesuffix(".torch.json"), "label": label, "captured": captured, "backends": results})
         if not captured:
             fallback.append(label)
         dp = results.get("Deplodock")
         sys.stderr.write(f"[tune]   {label}: deplodock={dp:.0f}us\n" if dp is not None else f"[tune]   {label}: (no result)\n")
+    if records:
+        # Per-kernel -O3 bench results in machine-readable form, beside the table /
+        # kernels.html — the per-kernel input `deplodock compare <dumpA> <dumpB>` diffs.
+        (Path(dump_dir) / "62_kernel_bench.json").write_text(json.dumps(records, indent=2, default=str))
     return rows, fallback
 
 

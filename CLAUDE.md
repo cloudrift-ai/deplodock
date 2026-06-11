@@ -162,6 +162,13 @@ same worker.
 - `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
 - `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code` — timed under CUDA graph capture (pure GPU time; falls back to uncaptured timing with a printed note if capture fails); non-frontend IR (loop/tile/…) benches deplodock-only.
 - `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
+- `deplodock compare <dumpA> <dumpB> [--tol 0.10]` — diff two dump dirs' bench results: the full-model backend table
+  (`60_bench_compare.json`), the per-kernel deplodock -O3 latencies (`62_kernel_bench.json`, machine-readable per-kernel
+  rows `tune --bench` now writes beside `kernels.html`), and the raw per-launch times (`60_benchmark.json`) as fallback.
+  Kernels match by exact provenance name first, then base name with the trailing content hash stripped (order of
+  appearance), so a re-tuned kernel whose hash moved still pairs and prints as `old -> new`; one-side-only kernels are
+  listed as kernel-set changes (structural fork / fusion differences). Ratios outside `--tol` color green/red. The
+  before/after view for compiler changes — per-kernel rows, not the full-model total, are the stable cross-tune signal.
 The `eval` subcommands share a `--dataset {golden,db}` vocabulary (`commands/dataset_args.py`): `golden` reads the
 recorded `GOLDEN_CONFIGS`, `db` reads the tune DB's measured `perf` rows. Both flow through one read-view —
 `compiler/pipeline/search/data/` (`Sample` / `Dataset` / `ShapeKey`) — which also backs the prior `fit` featurization
