@@ -212,6 +212,7 @@ deplodock
 |   +-- ssh      -- deploy to remote server via SSH
 |   +-- cloud    -- provision cloud VM + deploy via SSH
 +-- bench        -- deploy + benchmark + teardown on cloud VMs
++-- serve        -- vllm serve with the deplodock embedding plugin (optional one-shot bench)
 +-- teardown     -- clean up VMs left by bench --no-teardown
 +-- vm
     +-- create
@@ -252,6 +253,25 @@ deplodock deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 8 [
 ### Hardware-Aware Deploy (Local / SSH)
 
 Both `deploy local` and `deploy ssh` auto-detect the target GPU by scanning PCI sysfs device IDs (locally or over SSH) and select the matching `matrices` entry. If more GPUs are available than the recipe's base configuration needs, a scale-out strategy is applied (`--scale-out-strategy {data-parallelism,replica-parallelism}`, default `data-parallelism`).
+
+### `deplodock serve`
+
+Serves an embedding model through vLLM with the deplodock plugin flags baked in (`serving/` plugin; needs the
+`serving` extra). Unrecognized flags forward to `vllm serve`; tokens after a literal `--` forward verbatim (deplodock's
+own flags are otherwise extracted wherever they appear — argparse REMAINDER swallows everything after MODEL, so the
+handler re-parses it; see `commands/serve.py::_split_own_flags`). `--max-model-len 4096` (the dynamic-dim cap) is
+applied for both engines unless overridden, so `--stock` is an apples-to-apples baseline.
+
+```bash
+deplodock serve Qwen/Qwen3-Embedding-0.6B --gpu-memory-utilization 0.8   # plugin server (Ctrl-C to stop)
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32  # start → bench → results → shutdown
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --stock                # raw-vLLM baseline of the same bench
+```
+
+Without `--bench` the process execs `vllm serve` (signals flow to vLLM directly). With `--bench` the server runs as a
+subprocess (logs to a temp file), `/health` is polled (up to 30 min — first boot compiles the model), then
+`vllm bench serve --backend openai-embeddings --endpoint /v1/embeddings` runs against it
+(`--max-concurrency` / `--num-prompts` / `--random-input-len` / `--bench-seed`) and the server is torn down.
 
 ### `deplodock bench`
 

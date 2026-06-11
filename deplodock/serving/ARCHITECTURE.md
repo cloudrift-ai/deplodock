@@ -9,6 +9,10 @@ vllm serve Qwen/Qwen3-Embedding-0.6B --runner pooling --enforce-eager \
   --max-model-len 4096 --hf-overrides '{"architectures":["DeplodockEmbedModel"]}'
 ```
 
+`deplodock serve` (`commands/serve.py`) wraps that boilerplate: `deplodock serve <model> [vllm flags...]`, with
+`--stock` for the raw-vLLM baseline at the same max-model-len, and `--bench` for a one-shot start → `/health` →
+`vllm bench serve --backend openai-embeddings` → results → shutdown cycle.
+
 Requires the `serving` extra (`pip install -e ".[compile,serving]"` + cupy). vLLM discovers the plugin through the
 `vllm.general_plugins` entry point (`deplodock.serving:register` in pyproject.toml), which registers
 `DeplodockEmbedModel` by lazy string path; `--hf-overrides` swaps the served repo's `architectures` to it, so the

@@ -176,11 +176,14 @@ deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --dry-run
 ```bash
 # vLLM's OpenAI shell (/v1/embeddings, tokenizer, scheduler, pooler) over deplodock-compiled kernels
 pip install -e ".[compile,serving]"
-vllm serve Qwen/Qwen3-Embedding-0.6B --runner pooling --enforce-eager \
-  --max-model-len 4096 --hf-overrides '{"architectures":["DeplodockEmbedModel"]}'
+deplodock serve Qwen/Qwen3-Embedding-0.6B                  # extra flags pass through to vllm serve
 
 curl localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"model":"Qwen/Qwen3-Embedding-0.6B","input":"Hello"}'
+
+# One-shot benchmark (vllm bench serve against the started server), and the raw-vLLM baseline
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32 --stock
 ```
 
 See [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md); embedding recipes
