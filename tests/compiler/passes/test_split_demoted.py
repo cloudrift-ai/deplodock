@@ -9,7 +9,8 @@ buffer). The offer is gated only on the
 cut's WELL-FORMEDNESS (signal-driven design: profitability is the tuner's question, never a
 predicate's). Covers: offered / not-offered cuttability gates, the fragment's structure,
 the rule's option list (fused first) + the offered-marker idempotence, ``DEPLODOCK_SPLIT_CONE``
-pinning, greedy never picking the structural option (compile keeps today's kernel sets),
+pinning, greedy structural pricing (cold compile keeps today's kernel sets; a trained prior
+deploys the split; a failed structural pick falls back to keep-fused),
 tune exploring both branches, no-GPU numpy accuracy of the spliced graph, and CUDA accuracy
 of both the scalar-tier and mma.sync split paths.
 """
@@ -325,7 +326,10 @@ def test_rule_offers_fused_first_then_split() -> None:
     assert keep.knobs[split_rule.SPLIT_CONE.name] is False
     assert keep.body.structural_key() == node.op.body.structural_key()
     assert isinstance(split, OptionFork) and isinstance(split.option, Graph)
-    assert split.knobs == {split_rule.SPLIT_CONE.name: True}
+    # Ranking knobs carry the offer site's full knob base under the decision
+    # delta — feature-identical to the keep side's lifted fork (and to the
+    # composed Σ rows the two-level tuner trains the prior on).
+    assert split.knobs == {**node.op.knobs, split_rule.SPLIT_CONE.name: True}
     # Both split kernels carry the decision on op.knobs too — their perf rows
     # train the prior with SPLIT_CONE=1.
     for n in split.option.nodes.values():
@@ -383,7 +387,68 @@ def _lowered_kernel_ids(graph: Graph) -> list[str]:
 
 def test_greedy_compile_keeps_fused_kernel() -> None:
     out = Pipeline.build(CUDA_PASSES).run(_norm_linear_graph(), ctx=Context.from_target((12, 0)), db=SearchDB())
-    assert len(_lowered_kernel_ids(out)) == 1, "greedy must never pick the structural split"
+    assert len(_lowered_kernel_ids(out)) == 1, "greedy must never pick the structural split cold (untrained prior)"
+
+
+class _SplitFavoringPrior:
+    """Stub 'trained' prior: every knob row carrying ``SPLIT_CONE=True`` (the
+    split fragment's kernels) prices cheap, everything else expensive — so the
+    structural pricing (`GreedySearch._pick_structural`) predicts the split's
+    Σ (2 kernels × 1.0) below the fused side's 100.0 and deploys it. Constant
+    within a side, so ordinary tile picks tie and fall to emission order."""
+
+    fitted = True
+
+    def mean_scores(self, rows: list[dict]) -> list[float]:
+        return [1.0 if r.get(split_rule.SPLIT_CONE.name) is True else 100.0 for r in rows]
+
+
+class _ColdPrior(_SplitFavoringPrior):
+    fitted = False
+
+
+def test_greedy_trained_prior_deploys_split() -> None:
+    """With the trained prior predicting the split kernels cheaper, unpinned
+    greedy prices the structural option and deploys the two-kernel split
+    (plans/structural-forks-in-two-level.md step 3 — the deploy path)."""
+    from deplodock.compiler.pipeline import TILE_PASSES
+    from deplodock.compiler.pipeline.search.policy import GreedySearch
+
+    search = GreedySearch(prior=_SplitFavoringPrior())
+    cand = next(Pipeline.build(TILE_PASSES).tune(_norm_linear_graph(), search=search, ctx=Context.from_target((12, 0)), db=SearchDB()))
+    tiles = [nid for nid, n in cand.graph.nodes.items() if isinstance(n.op, TileOp)]
+    assert search.picked_structural
+    assert len(tiles) == 2, f"the trained-prior pick must deploy the split, got {tiles}"
+    assert any(nid.endswith("__xn") for nid in tiles)
+
+
+def test_greedy_cold_stub_prior_keeps_fused() -> None:
+    """The same prediction surface but unfitted: pricing is gated on the
+    trained model, so the structural leaf stays filtered."""
+    from deplodock.compiler.pipeline import TILE_PASSES
+    from deplodock.compiler.pipeline.search.policy import GreedySearch
+
+    search = GreedySearch(prior=_ColdPrior())
+    cand = next(Pipeline.build(TILE_PASSES).tune(_norm_linear_graph(), search=search, ctx=Context.from_target((12, 0)), db=SearchDB()))
+    assert not search.picked_structural
+    assert sum(1 for n in cand.graph.nodes.values() if isinstance(n.op, TileOp)) == 1
+
+
+def test_greedy_structural_pick_falls_back_on_lowering_failure(monkeypatch) -> None:
+    """A structural pick whose fragment kernel fails to lower must re-drive
+    down the keep-fused branch (the structural choice is blockable as a whole):
+    the xn producer's every KernelOp variant fails validate, so the first drive
+    leaves it un-lowered and the retry retires structural picks — the compile
+    succeeds with the fused kernel instead of raising LoweringError."""
+    from deplodock.compiler.ir.kernel.ir import KernelOp
+    from deplodock.compiler.pipeline.search import prior as prior_pkg
+
+    monkeypatch.setattr(prior_pkg, "load_prior", lambda *a, **kw: _SplitFavoringPrior())
+    real_validate = KernelOp.validate
+    monkeypatch.setattr(KernelOp, "validate", lambda self, ctx: False if self.name.endswith("_xn") else real_validate(self, ctx))
+
+    out = Pipeline.build(CUDA_PASSES).run(_norm_linear_graph(), ctx=Context.from_target((12, 0)), db=SearchDB())
+    assert len(_lowered_kernel_ids(out)) == 1, "the failed structural pick must fall back to the fused kernel"
 
 
 def test_pinned_split_lowers_two_kernels(monkeypatch) -> None:

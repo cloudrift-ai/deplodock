@@ -7,9 +7,10 @@ per-shape cases: each multiply operand is independently a plain Load (stays put)
 computed cone (becomes an ``xn`` producer materialized over exactly the axes it reads,
 with K second-to-last for an N-reading cone so the consumer keeps the canonical B layout).
 Its checks are the cut's well-formedness conditions, not a profitability prediction.
-Whether the split pays is the search's question: the tuner measures both branches inside
-the op's slice; greedy ``compile`` / ``run`` never pick the structural option while an Op
-variant exists (``policy/greedy._is_structural``), so cold kernel sets are unchanged.
+Whether the split pays is the search's question: the tuner compares both branches as outer
+terminals (``search/two_level.py``); greedy ``compile`` / ``run`` deploy the split only when
+the *trained* prior prices it cheaper (``policy/greedy._pick_structural``) — cold kernel
+sets are unchanged.
 
 Emission order is load-bearing: the keep-fused option comes FIRST, the documented
 greedy/no-prior fallback. ``DEPLODOCK_SPLIT_CONE=1/0`` pins either branch.
@@ -93,7 +94,14 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
         return keep_fused
     if pinned == (True,):
         return _stamp(split)
+    # The split fork's ranking knobs carry the offer site's full knob base
+    # (its ``S_*`` identity) under the decision delta — mirroring the keep
+    # side, whose lifted OptionFork copies the Op's knob dict — so the outer
+    # search's ``_node_knobs`` at the two siblings is feature-identical to
+    # the composed Σ rows ``two_level._decomposition_rows`` trains the prior
+    # on. Ranking metadata only; the spliced kernels' own knobs are stamped
+    # by ``_stamp`` / the cut builder.
     return [
         keep_fused,
-        OptionFork(option=_stamp(split), knobs={SPLIT_CONE.name: True}),
+        OptionFork(option=_stamp(split), knobs={**root.op.knobs, SPLIT_CONE.name: True}),
     ]

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.pipeline.fork import Fork, OptionFork
 from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
@@ -489,15 +490,26 @@ class Pipeline:
         # benches-and-skips it, but greedy benches nothing, so on a left-un-lowered
         # node we blocklist its tile and re-drive, falling back to the next
         # prior-ranked sibling. Bounded retries (each adds ≥1 block or stops).
+        # A drive that took a *structural* pick (a prior-priced kernel-set
+        # change — see ``GreedySearch._pick_structural``) gets one coarser
+        # fallback first: any lowering failure on such a drive retires
+        # structural picks wholesale and re-drives down the keep-fused branch,
+        # since a fragment kernel's failure can't be blocklisted at the fork
+        # site (the splice minted fresh node ids).
         blocked: dict[str, set[frozenset]] = {}
+        allow_structural = True
         for _attempt in range(_MAX_GREEDY_RETRIES):
             rejections: list[tuple[str, str, str]] = []
-            cand = next(
-                self.tune(graph, search=GreedySearch(blocked=blocked), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
-            )
+            search = GreedySearch(blocked=blocked, price_structural=allow_structural)
+            cand = next(self.tune(graph, search=search, ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections))
             failed = _unlowered_tiles(cand.graph, rejections)
+            if not failed:
+                break
+            if allow_structural and search.picked_structural:
+                allow_structural = False
+                continue
             new = {nid: ident for nid, ident in failed.items() if ident not in blocked.get(nid, set())}
-            if not new:  # success, or no fresh info to retry on → report below
+            if not new:  # no fresh info to retry on → report below
                 break
             for nid, ident in new.items():
                 blocked.setdefault(nid, set()).add(ident)
@@ -678,6 +690,7 @@ class Run:
                 continue
 
             forks: list[LazyCandidate] | None = None
+            structural = False
             for match in matches:
                 options = cand.try_rewrite(match)
                 if options is None:
@@ -693,14 +706,113 @@ class Run:
                 # resolve advances the cursor when ``match.is_last`` (the
                 # cursor advance the eager loop didn't do here, since we
                 # deferred to forks).
+                #
+                # The fork is classified here, where the raw ``options`` list
+                # is concrete (no thunk fired): any ``Graph`` option makes the
+                # fork **structural** (kernel-set-changing); pure ``Op``
+                # rebinds (and the partition planner's branch Forks) are
+                # op-variant. The flag rides ``Search.push`` so policies can
+                # treat kernel-set decisions specially.
+                structural = any(_is_structural_option(o) for o in options)
+                # A structurally identical offer site already decided on this
+                # trajectory takes the same side inline (no fork), so the
+                # search tree stays linear in *unique* kernels instead of
+                # ``2^sites`` (e.g. one decision for 28 identical per-layer
+                # splits). The earlier decision is read off the candidate's
+                # own graph — see :func:`_replay_structural_decision` — so no
+                # side-table state is threaded through resolves.
+                if structural and (chosen := _replay_structural_decision(cand.graph, match.root.op, options)) is not None:
+                    cand.apply(match, chosen)
+                    continue
                 forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
                 break
 
             if forks is not None:
-                search.push(*forks, parent=token)
+                search.push(*forks, parent=token, structural=structural)
                 continue
 
             search.push(cand.lazy(), parent=token)
+
+
+def _is_structural_option(option: object) -> bool:
+    """Classify one raw rewrite option by its effect (see
+    ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
+    changes which ops exist — **structural**; an ``Op`` rebind is in-place —
+    **op-variant**. The Op/Graph return type IS the classification; rules wrap
+    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/005_split_demoted``),
+    whose ``option`` is readable without firing any thunk. A *branch* ``Fork``
+    reads op-variant: the sole branch-Fork emitter today is the partition
+    planner (all ``TileOp`` leaves), and typing it would require ``expand()`` —
+    the body-normalizing build the lazy tree exists to avoid."""
+    return isinstance(option, Graph) or (isinstance(option, OptionFork) and isinstance(option.option, Graph))
+
+
+def _concrete_option(option: object) -> object | None:
+    """Unwrap one raw rewrite option to the concrete ``Op`` / ``Graph`` a
+    replayed structural decision can apply inline: leaf Forks fire their
+    single-element thunk, concrete options pass through, and a *branch* Fork
+    returns ``None`` (un-applyable without a full expand — the caller falls
+    back to forking normally; no structural branch Fork exists today)."""
+    if isinstance(option, Fork):
+        return option.expand()[0] if option.is_leaf else None
+    return option
+
+
+def _option_decision(option: object, root_knobs: dict) -> dict | None:
+    """The decision-knob delta one raw structural-fork option would stamp vs
+    the offer op: new non-``S_*`` knob keys on the option's op / fork knobs (a
+    ``Graph`` option reads the union over its nodes' op knobs — fragment
+    kernels restamp their own ``S_*``, which describe the child bodies, not
+    the decision). ``None`` when the option stamps nothing new."""
+    if isinstance(option, Graph):
+        knobs: dict = {}
+        for node in option.nodes.values():
+            knobs.update(getattr(node.op, "knobs", None) or {})
+    else:
+        knobs = getattr(option, "knobs", None) or {}
+    delta = {k: v for k, v in knobs.items() if k not in root_knobs and not k.startswith("S_")}
+    return delta or None
+
+
+def _replay_structural_decision(graph: Graph, root_op, options: list) -> object | None:
+    """The concrete option a structurally identical, already-decided offer
+    site on this trajectory took — or ``None`` (undecided / unmatchable →
+    fork normally).
+
+    The earlier decision is read off the candidate's own graph, not a
+    side-table: a decided site leaves its evidence in the IR by contract —
+    every structural rule stamps its decision knob onto the surviving ops
+    (the ``SPLIT_CONE`` considered-vs-declined idiom), and those ops chain to
+    the pre-decision offer op via the engine-owned ``Op.source`` (stamped
+    unconditionally on rebinds, stamped across loop-dialect splices,
+    preserved by ``_rename_buf_in_op``). So: find any op carrying every
+    decision knob whose source chain contains an op structurally identical
+    to this offer (same ``op_cache_key``), and replay the option whose delta
+    matches its stamped values. Matching by decision-knob agreement (not a
+    stored option index) survives rules reordering their emissions."""
+    from deplodock.compiler.pipeline.search.keys import op_cache_key, source_chain  # noqa: PLC0415
+
+    key = op_cache_key(root_op)
+    if key is None:
+        return None
+    deltas = [(opt, _option_decision(opt, root_op.knobs)) for opt in options]
+    decision_keys = {k for _, d in deltas if d for k in d}
+    if not decision_keys:
+        return None
+    for node in graph.nodes.values():
+        knobs = getattr(node.op, "knobs", None)
+        if not knobs or not decision_keys <= set(knobs):
+            continue  # undecided or unrelated op — the cheap pre-filter
+        chain = source_chain(node.op)
+        next(chain)  # the op itself — its key differs from the pre-decision key by the stamp
+        if not any(op_cache_key(anc) == key for anc in chain):
+            continue
+        found = {k: knobs[k] for k in decision_keys}
+        for opt, delta in deltas:
+            if delta == found:
+                return _concrete_option(opt)
+        return None  # decided, but no option matches (emission drift) — fork normally
+    return None
 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:
@@ -894,6 +1006,18 @@ def _bench_terminal(cand, *, backend, db):
             p_dialect = dialect_of(parent_op)
             c_dialect = dialect_of(child_op)
             if p_dialect is None or c_dialect is None:
+                continue
+            if p_dialect == c_dialect == "loop":
+                # loop→loop source hops are structural/decision hops, not
+                # lowering rewrites: the splice attribution stamped by
+                # ``Candidate.apply`` (a decomposition's kernels → the
+                # pre-split op), 005's keep-vs-split rebind, name stamps.
+                # A ``lowering`` row holds ONE best child per parent, so
+                # recording a multi-kernel decomposition's hops would let
+                # ``best_per_op_time``'s chain walk resolve the pre-split
+                # op to a single fragment kernel's median — half the work
+                # masquerading as the whole op. The decomposition's cost
+                # is a Σ, owned by the two-level tuner, never this table.
                 continue
             p_key = op_cache_key(parent_op)
             c_key = op_cache_key(child_op)

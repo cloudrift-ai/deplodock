@@ -16,7 +16,7 @@ pipeline/
 │   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path), Dataset (from_golden/from_db/from_prior + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity)
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
-│   ├── two_level.py  # two-level tuner: outer fusion MCTS + inner separable per-op reward
+│   ├── two_level.py  # two-level tuner: outer structural MCTS + inner separable per-op reward
 │   ├── golden_configs.py  # GoldenConfig + Matmul/Reduce/Pointwise subclasses: autotuned knobs per shape (matmul fp32/fp16, cooperative reduce, pointwise) — the AnalyticPrior fit's ground truth across all kernel regimes
 │   ├── prior/        # the ONE ranking path: Prior ABC + AnalyticPrior (cold heuristic) + CatBoostPrior (learned) composed behind FallbackPrior (load_prior)
 │   └── analytic.py  # golden-config eval harness (evaluate_golden / pick_matmul): ranks a shape's enumeration via a Prior (AnalyticPrior by default) — drives eval analytic / eval prior (weights fit by scripts/golden_knob_heuristics.py)
@@ -132,10 +132,12 @@ K-invariant Load operand, accums not sharing one cone set, cones sharing stmts, 
 mixed-dtype cone leaves, symbolic extents, or more than one N-reading cone — two `(…, K, N)` buffers would
 re-do the matmul's own volume) —
 deliberately NOT on a predicted tier for the clean gemm: profitability is the search's question (an earlier
-eligibility-simulating gate immediately drifted from what the cell tagger accepts). The tuner measures both
-branches inside the op's slice (017-style: both kernels' costs sum into the op's reward; first-class slices
-come with `plans/structural-forks-in-two-level.md`); greedy never picks the structural option (see
-`Pipeline.run` above). The split decision lives in the tile phase, not as a fusion guard: by partition time
+eligibility-simulating gate immediately drifted from what the cell tagger accepts). The two-level tuner owns
+the offer as an **outer structural fork** (`plans/structural-forks-in-two-level.md` step 2): keep-vs-split
+branches the outer tree, each side's kernels are tuned in first-class per-op slices, and the Σ-per-op
+terminal rewards compare the kernel sets (017's sub-partition splice still sums inside the op's slice);
+greedy deploys the split only via the trained prior's structural pricing (see `Pipeline.run` above) — never
+cold. The split decision lives in the tile phase, not as a fusion guard: by partition time
 the fused body is final, so the demotion is visible order-independently (decomposed chains assemble the
 matmul multiply-last — no standalone node is ever eligible mid-fusion). The `op.knobs` stamp is the
 considered-vs-declined idiom (`020_stage_inputs`'s declined `STAGE` row, `search/keys.py`): it is
@@ -320,10 +322,20 @@ three entry points:
   compile via `GreedySearch` (flattens each fork point to its complete leaves and
   picks the `Prior`'s `mean_scores` argmin — `AnalyticPrior` cold, `CatBoostPrior`
   once trained). Stops at the first terminal candidate. **Structural options are
-  never the greedy pick**: a leaf wrapping a `Graph` splice (the `SPLIT_CONE` split,
-  017's atomic-free combine) is filtered out whenever an in-place `Op` variant
-  exists — the per-op prior prices one kernel's knob row, so its score for a
-  multi-kernel Graph option is noise. `tune` explores them; an env pin makes the
+  priced, never raw-scored**: the per-op prior prices one kernel's knob row, so its
+  score for a multi-kernel `Graph` splice (the `SPLIT_CONE` split, 017's atomic-free
+  combine) is noise. With the *trained* prior loaded, `GreedySearch._pick_structural`
+  prices each side properly — a nested greedy descent per kernel (`lowering/tile`
+  only, CPU, no backend) records the prior's predicted µs for the chosen tile at the
+  kernel's partition fork; the structural side is the Σ over its fragment's kernels,
+  memoized per `op_cache_key` — and the cheaper kernel set wins, so an unpinned
+  compile deploys the splits `tune` measured best. Cold (analytic / no prior), or
+  when a side is unpriceable (a pre-tiled combine has no partition fork), the
+  structural leaf is filtered as before — a cold compile never changes kernel sets.
+  If a structural pick leaves a fragment kernel un-lowered (`validate(ctx)`
+  rejection), `Pipeline.run`'s retry retires structural picks wholesale and
+  re-drives down the keep-fused branch before falling back to tile blocklisting.
+  `tune` explores structural forks regardless; an env pin makes the
   Graph the rule's only option, which passes through untouched.
 - `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
   autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
@@ -342,7 +354,12 @@ three entry points:
   `LazyCandidate`, resolves it, runs one rule batch, pushes successors under the pop's token. Selection is
   `TuningSearch`'s job (PUCT over the learned prior; a single-shot compile, prior absent, descends
   emission-order). (The DB-best replay path `_best_fork` and the `best=` push argument were nuked — see "no longer drives
-  selection" above; the perf DB still *records* every bench as the prior's training data.)
+  selection" above; the perf DB still *records* every bench as the prior's training data.) Each fork push is
+  classified by effect at the spawn site, where the raw option list is concrete: any `Graph`-splicing option
+  (a kernel-set change — `tile/005_split_demoted`'s split, `tile/017_atomic_free_splitk`'s combine) marks the
+  push `structural=True`; `Op` rebinds and the partition planner's branch Forks are op-variant (`False`).
+  The flag rides `Search.push(structural=)` so policies can treat kernel-set decisions specially (see
+  `plans/structural-forks-in-two-level.md`).
 
 ### The keying map: two identities
 
@@ -373,7 +390,10 @@ The autotune state is split across two cooperating modules:
   `lowering` edge table (one row per rewrite hop carrying the knob
   delta the rule stamped at that hop plus a best-median upsert, so
   `GreedySearch` can replay the chain by matching forks against the
-  delta at each step), and a backend-partitioned `perf` table carrying
+  delta at each step — loop→loop source hops are skipped: those are
+  structural/decision hops, and a one-best-child row would let a
+  multi-kernel decomposition's parent resolve through ONE fragment
+  kernel's median), and a backend-partitioned `perf` table carrying
   full stats (`latency_us_{median,min,max,mean,variance}`,
   `n_samples`, `backend`, `status`, `knobs`). Selection statistic is
   the median.
@@ -407,22 +427,40 @@ The autotune loop selects one tile-lowering variant per CudaOp by repeatedly run
 different knob choices at each fork point, benching the produced kernels, and steering subsequent rollouts toward the
 configurations that produced the lowest measured latency.
 
-### Two-level search: outer fusion MCTS + inner separable per-op tuning
+### Two-level search: outer structural MCTS + inner separable per-op tuning
 
 `deplodock tune` does **not** run one MCTS over the whole graph. The pipeline applies rules sequentially, so two very
-different kinds of fork — **op-variant** forks (tile / pad / stage choices for one kernel) and **fusion** forks (how ops
-group into kernels) — would nest and cross-product under one global patience. That cross-product is what starved deep
-ops (the bottleneck kernel exhausted patience before an SDPA P@V kernel reached its good tile). The two kinds have
-opposite structure, so `search/two_level.py` splits them:
+different kinds of fork — **op-variant** forks (tile / pad / stage choices for one kernel) and **structural** forks
+(which kernels exist: fusion grouping, the demoted-matmul split) — would nest and cross-product under one global
+patience. That cross-product is what starved deep ops (the bottleneck kernel exhausted patience before an SDPA P@V
+kernel reached its good tile). The two kinds have opposite structure, so `search/two_level.py` splits them on the
+fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — `plans/structural-forks-in-two-level.md`):
 
-- **Outer search** (`run_two_level_tune`) drives only the graph-changing passes (`OUTER_PASSES` = `frontend` + `loop`,
-  i.e. `LOOP_PASSES`). A **terminal** is the state where the cursor would advance into `lowering/tile`
-  (`partition_loops`) — every op post-fusion and structurally final. Each terminal is a candidate fused graph; its
-  **reward** is `1 / Σ best-per-op time` from the inner search, backpropagated by the reused `TuningSearch`. **Today
-  fusion is deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`), so the outer
-  tree has exactly one terminal and this reduces to "tune each op once, sum, assemble". The outer tree is the
-  generalization that lets fusion forks plug in later with no change to the inner search. The outer uses
-  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`.
+- **Outer search** (`run_two_level_tune`) drives the graph-changing passes — `frontend` + `loop` plus the
+  pre-partition head of `lowering/tile` (`outer_pipeline()`, today just `005_split_demoted`'s keep-vs-split offer). A
+  **terminal** is the state where the cursor reaches `partition_loops` with every structural fork resolved — every op
+  post-fusion and structurally final, split producers/consumers included as real `LoopOp` nodes. Each terminal is a
+  candidate fused graph; its **reward** is `1 / Σ best-per-op time` from the inner search, backpropagated by the
+  reused `TuningSearch` — keep-vs-split is an outer-terminal comparison, the natural cost model for a kernel-set
+  decision. Structurally identical offer sites within one trajectory take the same side: `Run.drive` replays the
+  first decision read off the trajectory's own graph (`_replay_structural_decision` — any op carrying the fork's
+  decision knobs whose `Op.source` chain contains an op structurally identical to the offer; the stamped knob values
+  pick the matching option), so the outer tree stays linear in *unique* kernels instead of `2^sites` with no
+  side-table state threaded through resolves; a terminal whose ops are all known is a pure DB read. **Fusion
+  itself is still deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`); a graph
+  with no structural offers yields one terminal and this reduces to "tune each op once, sum, assemble". The outer uses
+  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`. The global
+  prior also drives the outer PUCT (the outer `TuningSearch` carries `prior_model` + ctx `base_knobs`): each terminal
+  emits one **composed Σ row** per structural decision it realized — features `{ctx, pre-decision op knobs, decision
+  delta}`, label = the Σ of that side's per-kernel bests (`_decomposition_rows`) — attributed through the `Op.source`
+  decomposition links `Candidate.apply` stamps on loop-dialect lowering splices (005 sets it explicitly on its
+  keep-fused rebind too, since `replace` would copy the pre-decision op's own source past the offer site;
+  `_rename_buf_in_op` preserves `source` through the splice id-promotion). The row's feature shape is exactly what the
+  outer's `_node_knobs` produces at the fork's siblings (`LazyCandidate.resolved_knobs` keeps a resolved ancestor's
+  delta visible to its descendants — without it the structural branch's continuation would score as a knob-less
+  generic row against its fully-knobed unresolved sibling), so a warm re-tune descends the predicted-cheaper kernel
+  set first instead of emission order. Composed rows are derived value-of-position estimates that *order
+  exploration*; greedy's deploy decision keeps the sharper compositional probe (complete-row predictions per kernel).
 - **Inner search** (`inner_reward`) tunes each finalized kernel **independently** in its own single-node slice
   (`single_node_graph`, `search/slice.py`) with a plain `TuningSearch` over `LOWERING_PASSES` only (`tile → kernel →
   cuda`). The slice keeps the root kernel + its leaf-op closure and turns every other kernel-input into a synthetic
@@ -482,7 +520,7 @@ old rows keep serving replay and prior training and upgrade in place as re-tunes
 goldens keep their original numbers until the next `update-goldens` re-record. See the `capture_graphs` section in
 `backend/cuda/ARCHITECTURE.md`.
 
-**Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over fusion forks, inner
+**Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over structural forks, inner
 over one op's forks — with max-Q normalized UCB1:
 
 - **Selection** is PUCT (`_select`): `Q_norm(c) + ucb_c · P(c) · sqrt(N_parent+1)/(1+N_c)`, where

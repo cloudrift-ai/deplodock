@@ -879,10 +879,13 @@ def _rename_buf_in_op(op, old: str, new: str):
     """Rewrite ``Load.source`` / ``Write.output`` references inside a
     ``LoopOp`` body from ``old`` to ``new`` (recursively into nested Loops).
     Pass-through for op types without internal buf refs. Preserves the op's
-    ``name`` / ``knobs`` identity — a rename after ``991_stamp_loop_names`` /
-    ``992_stamp_structural_features`` (e.g. the splice id-promotion of a
-    lowering-phase fragment like the demoted-matmul split) must not strip the
-    stamped kernel name or the ``S_*`` features."""
+    ``name`` / ``knobs`` / ``source`` identity — a rename after
+    ``991_stamp_loop_names`` / ``992_stamp_structural_features`` (e.g. the
+    splice id-promotion of a lowering-phase fragment like the demoted-matmul
+    split) must not strip the stamped kernel name, the ``S_*`` features, or
+    the decomposition attribution link (``Candidate.apply`` stamps the
+    pre-split op as each fragment kernel's ``source``; the two-level tuner's
+    composed Σ rows group by it)."""
     from deplodock.compiler.ir.loop import Load, LoopOp, Write
 
     if not isinstance(op, LoopOp):
@@ -898,6 +901,7 @@ def _rename_buf_in_op(op, old: str, new: str):
     renamed = LoopOp(body=op.body.map(fn))
     renamed.name = op.name
     renamed.knobs = dict(op.knobs)
+    renamed.source = op.source
     return renamed
 
 

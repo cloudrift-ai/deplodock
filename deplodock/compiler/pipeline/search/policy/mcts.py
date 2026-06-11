@@ -238,9 +238,12 @@ class TuningSearch(Search):
                     merged.update(knobs)
         return merged
 
-    def push(self, *cands: LazyCandidate, parent: object | None = None) -> None:
+    def push(self, *cands: LazyCandidate, parent: object | None = None, structural: bool = False) -> None:
         # ``parent`` is the token the spawning candidate was popped with;
-        # ``None`` seeds the run under the root sentinel.
+        # ``None`` seeds the run under the root sentinel. ``structural``
+        # (kernel-set-changing fork) is accepted for protocol uniformity;
+        # MCTS explores structural siblings like any other fork.
+        del structural
         assert parent is None or isinstance(parent, SearchNode), f"TuningSearch.push needs a SearchNode token, got {type(parent).__name__}"
         self.tree.attach(list(cands), parent=parent if parent is not None else self.tree.root)
 
@@ -318,13 +321,19 @@ class TuningSearch(Search):
         ``S_*`` structural identity) merged with every ``fork.knobs`` delta from
         the root down to ``node``. A branch pins its level slice; a leaf carries
         the complete row, so deeper nodes hold a superset. This is the
-        (partial-or-full) feature input the prior featurizes."""
+        (partial-or-full) feature input the prior featurizes. A RESOLVED
+        ancestor's pending fork is gone (``resolve`` drops it) — its delta is
+        read from ``LazyCandidate.resolved_knobs`` instead, so descendants of
+        a resolved branch keep the full feature prefix (else a structural
+        branch's continuation would score as a knob-less generic row against
+        its fully-knobed unresolved sibling)."""
         chain: list[dict] = []
         cur: SearchNode | None = node
         while cur is not None and cur.candidate is not None:
             fork = cur.candidate.fork
-            if fork is not None:
-                chain.append(fork.knobs)
+            knobs = fork.knobs if fork is not None else cur.candidate.resolved_knobs
+            if knobs:
+                chain.append(knobs)
             cur = cur.parent
         merged: dict = dict(self._base_knobs)
         for knobs in reversed(chain):

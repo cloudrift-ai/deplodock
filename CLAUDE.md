@@ -84,10 +84,16 @@ same worker.
   config recover each op's measured-best config?), median ranking calibration (Spearman), and golden-matmul coverage. Use it to see
   whether the prior can actually reach the best configs it's been tuned on (`compiler/pipeline/search/prior/diagnostics.py`).
 - `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--bench] [-q]` — **two-level** autotune (see
-  `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over fusion forks (graph-changing `frontend`+`loop` passes;
-  today deterministic → one terminal) whose reward is `Σ best-per-op time` from an inner search that tunes each
-  post-fusion kernel **independently** in its own single-node slice (`lowering` passes only, so `Σ_k n_k` benches not
-  the product). Per-op results key structurally (`op_cache_key`) so they transfer/share. The inner search runs for
+  `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over structural forks (the graph-changing
+  `frontend`+`loop` passes plus the pre-partition head of `lowering/tile`, where `005_split_demoted`'s keep-vs-split
+  offer branches the outer tree — one terminal per kernel set; identical offer sites replay the trajectory's
+  first decision, read off the graph via `Op.source` + the stamped decision knobs; a graph with no structural
+  offers yields one terminal) whose reward is
+  `Σ best-per-op time` from an inner search that tunes each post-fusion kernel **independently** in its own
+  single-node slice (post-partition `lowering` forks only, so `Σ_k n_k` benches not the product). Greedy `compile` /
+  `run` deploy a structural option when the *trained* prior prices its kernel-set Σ cheaper (cold compiles never
+  change kernel sets) — see `plans/structural-forks-in-two-level.md`. Per-op results key structurally
+  (`op_cache_key`) so they transfer/share. The inner search runs for
   **every** op on every pass — never skipped on prior effort; replay is cheap, not gated: each benched terminal hits the
   per-variant `perf` cache, so an identical re-run (same prior) replays every variant with no GPU bench, while the
   ever-changing global prior can steer the same-patience search down a new trajectory and bench only the genuinely-new

@@ -13,15 +13,27 @@ have opposite structure:
   time is ``Σ_k t_k`` with each ``t_k`` depending only on op ``k``'s variant;
 - **fusion forks are NOT separable** — they change *which ops exist*.
 
-So we split the search in two:
+So we split the search in two, drawing the boundary on the fork's *effect*
+(the ``Op``-rebind / ``Graph``-splice classification stamped at the engine's
+spawn site — see ``plans/structural-forks-in-two-level.md``), not on a fixed
+pass index:
 
-- **Outer** (:func:`run_two_level_tune`) drives only the graph-changing passes
-  (:data:`OUTER_PASSES` = ``frontend`` + ``loop``). A terminal is the state
-  where the cursor reaches ``partition_loops`` — every op post-fusion and
-  structurally final. Each terminal is a candidate fused graph; its reward is
-  ``1 / Σ best-per-op time`` from the inner search, backpropagated by the
-  reused :class:`TuningSearch`. Today fusion is deterministic (no multi-option
-  fusion forks) so the outer tree has one terminal — but this is the clean
+- **Outer** (:func:`run_two_level_tune`) drives the graph-changing passes —
+  ``frontend`` + ``loop`` plus the pre-partition head of ``lowering/tile``
+  (:func:`outer_pipeline`), where the structural fork emitters live (today
+  ``005_split_demoted``'s keep-vs-split offer). A terminal is the state where
+  the cursor reaches ``partition_loops`` with every structural fork resolved —
+  every op post-fusion and structurally final, split producers/consumers
+  included as real ``LoopOp`` nodes. Each terminal is a candidate fused graph;
+  its reward is ``1 / Σ best-per-op time`` from the inner search,
+  backpropagated by the reused :class:`TuningSearch` — so keep-vs-split is an
+  outer-terminal comparison, the natural cost model for a kernel-set decision.
+  Identical offer sites within a trajectory take the same side — the engine
+  replays the decision read off the trajectory's own graph via the
+  ``Op.source`` decomposition links and the stamped decision knobs
+  (``pipeline._replay_structural_decision``) — keeping the tree linear in
+  *unique* kernels. Fusion itself is still
+  deterministic (no multi-option fusion forks); this remains the clean
   insertion point for fusion search when those forks exist.
 - **Inner** (:func:`inner_reward`) tunes each finalized kernel *independently*
   in its own single-node slice (:func:`single_node_graph`) with a plain
@@ -48,9 +60,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline, TuningSearch
+from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
+from deplodock.compiler.pipeline.search.policy.greedy import PARTITION_RULE
 from deplodock.compiler.pipeline.search.slice import single_node_graph
 
 if TYPE_CHECKING:
@@ -59,18 +72,51 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The graph-changing passes the outer search drives (any fusion forks live
-# here). A terminal is reached when the cursor would advance into
-# ``lowering/tile`` (``partition_loops``).
-OUTER_PASSES = LOOP_PASSES
+# ``PARTITION_RULE`` (imported from the greedy policy, which prices kernels at
+# that fork) is the rule that finalizes the kernel set: everything in
+# ``lowering/tile`` *before* it is a structural (kernel-set-changing) decision
+# the outer search owns; everything from it on is op-variant lowering the
+# inner search tunes.
 
 # Lowering-only passes (post-fusion): ``tile → kernel → cuda``. The inner
 # per-op search runs these on a single-node slice so the finalized LoopOp body
 # — and thus its ``op_cache_key`` — is never re-touched by ``loop/fusion``,
 # which is what keeps inner-tuned ``perf`` / ``lowering`` rows transferable to
 # the assembled graph. Sliced as the tail of ``CUDA_PASSES`` so it tracks
-# pass-list edits automatically.
+# pass-list edits automatically. The pre-partition tile rules (005's split
+# offer) run here too, but every outer-terminal op already carries their
+# decision knob, so the rules' idempotence guards skip — the inner never
+# re-opens an outer-owned structural decision.
 LOWERING_PASSES = CUDA_PASSES[len(LOOP_PASSES) :]
+
+
+def outer_pipeline() -> Pipeline:
+    """The graph-changing passes the outer search drives: ``frontend`` +
+    ``loop`` (any fusion forks) **plus the pre-partition head of
+    ``lowering/tile``** — the structural fork emitters that change which
+    kernels exist before partition finalizes them (today ``005_split_demoted``;
+    the boundary is the *effect*, not the pass index — see
+    ``plans/structural-forks-in-two-level.md`` step 2). An outer terminal is a
+    fused graph whose kernel set is final: the cursor reached
+    :data:`PARTITION_RULE` with every structural fork resolved, so split
+    producers/consumers are real ``LoopOp`` nodes picked up by
+    :func:`inner_reward` like any kernel — own slice, own patience, own
+    progress leaf, deduped by ``op_cache_key`` across layers and terminals.
+
+    Sub-partition splices (``017_atomic_free_splitk``'s combine) stay on the
+    inner slice-sum path — their trigger knob (``SPLITK``) doesn't exist until
+    partition runs."""
+    passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
+    tile_rules = [r.name for r in Pass.load("lowering/tile", index=len(passes)).rules]
+    head = tile_rules[: tile_rules.index(PARTITION_RULE)]
+    # Re-load with ``select`` (rather than slicing the loaded rules) so the
+    # partial pass's ``declared_knobs`` covers only the pre-partition rule
+    # modules — the pass-boundary OFF-fill must not stamp post-partition
+    # lowering knobs onto fused LoopOps (that would churn every op_cache_key
+    # away from what the assembled greedy run derives).
+    passes.append(Pass.load("lowering/tile", index=len(passes), select=set(head)))
+    return Pipeline(passes=passes)
+
 
 # Per-op latency stand-in when the inner search produced no clean ``ok``
 # measurement — large enough to sink the outer reward, finite so the Σ stays a
@@ -130,6 +176,49 @@ def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
     from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
 
     return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)]
+
+
+def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> list[tuple[dict, float]]:
+    """Composed value-of-position training rows for structural decompositions.
+
+    A terminal's kernels attribute back to the op a structural decision was
+    taken on via ``Op.source`` (``Candidate.apply`` stamps loop→loop splice
+    hops; the keep-side ``Op`` rebind stamps as always). Group the terminal's
+    unique kernels by that pre-decision ancestor + the decision-knob delta the
+    hop stamped (``SPLIT_CONE: True/False``, never the per-body ``S_*``
+    restamps), and label each group with the **Σ of its kernels' tuned bests**
+    — the kernel-set cost of taking that side. The row's features
+    (``{ctx, pre-decision op knobs, decision delta}``) are exactly what the
+    outer MCTS's PUCT queries at the structural fork's siblings, so these rows
+    are what make that selection informed instead of uniform. They are
+    estimates for *search ordering*; greedy's deploy decision keeps the sharper
+    compositional probe (``policy/greedy._pick_structural``)."""
+    from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+
+    best = {r.op_key: r.best_us for r in per_op}
+    unique: dict[str, object] = {}
+    for _nid, op in _kernel_nodes(graph):
+        key = op_cache_key(op)
+        if key is not None and key not in unique:
+            unique[key] = op
+    groups: dict[tuple, tuple[dict, list[float | None]]] = {}
+    for key, op in unique.items():
+        site = op.source
+        if site is None or dialect_of(site) != "loop":
+            continue
+        site_key = op_cache_key(site)
+        if site_key is None:
+            continue
+        # The decision delta: knobs this hop introduced. ``S_*`` keys are
+        # excluded — fragment kernels restamp their own structural features,
+        # which describe the child body, not the decision.
+        delta = {k: v for k, v in op.knobs.items() if k not in site.knobs and not k.startswith("S_")}
+        if not delta:
+            continue  # not a decision hop (e.g. a name-only rebind ancestor)
+        gkey = (site_key, tuple(sorted((k, str(v)) for k, v in delta.items())))
+        feats, labels = groups.setdefault(gkey, ({**ctx.features(), **site.knobs, **delta}, []))
+        labels.append(best.get(key))
+    return [(feats, float(sum(labels))) for feats, labels in groups.values() if labels and all(us is not None for us in labels)]
 
 
 def inner_reward(
@@ -279,15 +368,21 @@ def run_two_level_tune(
     progress=None,
     prior_seed: int = 0,
 ) -> TwoLevelResult:
-    """Drive the outer fusion search, scoring each terminal by
+    """Drive the outer structural search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
     the whole graph once for the separability check.
 
     The outer drives a :class:`Run` directly (manual ``observe``)
     because its terminal reward comes from the inner tuning, not
-    ``_bench_terminal``. Today there are no multi-option fusion forks, so the
-    outer yields a single terminal and this reduces to "tune each op once, sum,
-    assemble"."""
+    ``_bench_terminal``. The outer pipeline (:func:`outer_pipeline`) runs
+    through the pre-partition tile rules, so each structural fork (the
+    keep-vs-split offer of ``005_split_demoted``) branches the outer tree —
+    one terminal per kernel-set, compared by Σ-per-op cost. A graph with no
+    structural offers yields a single terminal and this reduces to "tune each
+    op once, sum, assemble". Identical offer sites within one trajectory
+    replay the first decision (read off the graph —
+    ``pipeline._replay_structural_decision``), and a terminal whose kernels
+    are all known is a pure DB read, so extra terminals stay cheap."""
     from deplodock.compiler import provenance  # noqa: PLC0415
     from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
@@ -300,12 +395,17 @@ def run_two_level_tune(
     from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
     prior = load_prior(seed=prior_seed)
-    outer = TuningSearch(patience=patience, ucb_c=ucb_c)
-    # The outer drives only the graph-changing passes — no dump on this Run;
-    # the winning config's full stage artifacts (incl. per-kernel
-    # ``.torch.json`` reproducers) come from the final assembled CUDA_PASSES
-    # run below.
-    outer_run = Run(pipeline=Pipeline.build(OUTER_PASSES), ctx=ctx, search=outer, db=db)
+    # The global prior drives the outer PUCT too: at a structural fork the
+    # siblings' ``_node_knobs`` are ``{ctx, pre-decision op knobs, decision
+    # knob}`` — the exact feature shape :func:`_decomposition_rows` trains on
+    # below — so once composed Σ rows accumulate, the outer descends the
+    # predicted-cheaper kernel set first instead of emission order.
+    outer = TuningSearch(patience=patience, ucb_c=ucb_c, prior_model=prior, base_knobs=ctx.features())
+    # The outer drives only the graph-changing passes (through the
+    # pre-partition tile head) — no dump on this Run; the winning config's
+    # full stage artifacts (incl. per-kernel ``.torch.json`` reproducers) come
+    # from the final assembled CUDA_PASSES run below.
+    outer_run = Run(pipeline=outer_pipeline(), ctx=ctx, search=outer, db=db)
 
     best_fused: Graph | None = None
     best_reward: InnerReward | None = None
@@ -327,6 +427,13 @@ def run_two_level_tune(
         )
         stats = PerfStats(median=reward.total_us, min=reward.total_us, max=reward.total_us, mean=reward.total_us, variance=0.0, n_samples=0)
         outer.observe(token, stats, "ok" if reward.ok else "bench_fail")
+        # Composed Σ rows per structural decision this terminal realized —
+        # the kernel-set cost of each side, attributed via the ``Op.source``
+        # decomposition links. Re-emitted every terminal evaluation, so the
+        # reservoir keeps refreshing the sum as per-kernel bests fall.
+        rows = _decomposition_rows(fused.graph, reward.per_op, ctx)
+        if rows:
+            prior.add_rows(rows)
         positions = sum(r.multiplicity for r in reward.per_op)
         logger.info(
             "[tune] fused terminal #%d: Σ per-op = %.2f us (%d unique kernels, %d positions)",

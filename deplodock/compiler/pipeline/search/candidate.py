@@ -156,13 +156,29 @@ class Candidate:
         ``Op`` rebinds ``root.op`` (id / inputs / hints kept);
         ``Graph`` is a fragment spliced via ``Graph.splice``. On the
         ``Op`` path the chain ``Op.source`` is stamped with the op
-        being replaced (unless the rule already set it) and the
-        predecessor's ``knobs`` are merged forward — so the rewrite
-        chain threads through every in-place rebind for free."""
+        being replaced and the predecessor's ``knobs`` are merged
+        forward — so the rewrite chain threads through every in-place
+        rebind for free. The stamp is UNCONDITIONAL (engine-owned):
+        "the op this op replaced at this node" is a fact about the
+        rewrite, not the rule's to set — a rule building its option
+        via ``dataclasses.replace(root.op, ...)`` copies the root's
+        own ancestor into ``source``, and honoring that copy would
+        skip the replaced op in the chain (and silently disable the
+        knob merge, which is idempotent for rules that already merged
+        manually). A
+        lowering-tier ``Graph`` splice of a loop-dialect kernel (a
+        structural decomposition — ``tile/005_split_demoted``'s split)
+        stamps the consumed root op as each fragment kernel's
+        ``source``, so the chain also records *which op a decomposition
+        came from*: the two-level tuner groups a terminal's kernels by
+        that ancestor to emit composed Σ training rows for the prior
+        (``two_level._decomposition_rows``). Knobs are NOT merged
+        forward on this path — fragment kernels carry their own
+        restamped structural features."""
         self._log_apply(match, option)
         if isinstance(option, Op):
             old_op = self.graph.nodes[match.root_node_id].op
-            if option is not old_op and option.source is None:
+            if option is not old_op:
                 option.source = old_op
                 option.knobs = {**old_op.knobs, **option.knobs}
             self.graph.nodes[match.root_node_id].op = option
@@ -172,6 +188,14 @@ class Candidate:
             # every other fragment splice aggregates the consumed pieces.
             pass_ = match.rule.pass_
             mint_pieces = pass_ is not None and pass_.name.startswith("frontend/decomposition")
+            if pass_ is not None and pass_.name.startswith("lowering/"):
+                from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+
+                root_op = self.graph.nodes[match.root_node_id].op
+                if dialect_of(root_op) == "loop":
+                    for frag_node in option.nodes.values():
+                        if frag_node.op.source is None and dialect_of(frag_node.op) == "loop":
+                            frag_node.op.source = root_op
             self.graph.splice(
                 option,
                 consumed=match.consumed,
@@ -230,6 +254,15 @@ class LazyCandidate:
     inner: Candidate
     cursor: Cursor
     pending: tuple[Match, Fork] | None
+    # The pending fork's knob delta, preserved by :meth:`resolve` (which drops
+    # ``pending`` itself). ``TuningSearch._node_knobs`` accumulates fork knobs
+    # down the tree to featurize a node for the prior — without this, a
+    # RESOLVED ancestor's delta would vanish from every descendant's feature
+    # vector, so e.g. the structural branch's continuation would be scored
+    # without its ``SPLIT_CONE`` (an off-distribution generic row) while the
+    # unresolved keep-fused sibling keeps full knobs — an asymmetric, noisy
+    # PUCT comparison.
+    resolved_knobs: dict | None = None
 
     @classmethod
     def from_option(cls, *, inner: Candidate, cursor: Cursor, match: Match, option: Op | Graph | Fork) -> LazyCandidate:
@@ -294,6 +327,7 @@ class LazyCandidate:
         option = leaves[0]
         resolved = Candidate(run=self.inner.run, graph=self.inner.graph.copy(), cursor=self.cursor)
         resolved.apply(match.remap(resolved.graph), option)
+        self.resolved_knobs = dict(fork.knobs)
         self.pending = None
         self.inner = resolved
         return resolved
