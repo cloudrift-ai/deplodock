@@ -127,10 +127,17 @@ It rides on one chokepoint: `Graph.splice` calls `provenance.propagate` with a `
 fragment node as a fresh piece of the consumed origins; fusion / lifting / optimization folds *aggregate* the consumed
 piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing). Lowering is
 in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
-`Pipeline.tune` entry (idempotent); pure metadata, excluded from structural / cache keys.
+`Pipeline.tune` entry (idempotent); pure metadata, excluded from structural / cache keys. Boundary sentinels
+(`InputOp`/`ConstantOp`) never carry prov: `put` refuses to stamp them and `propagate` scrubs splice outputs that land
+on one (the generic hint merge would otherwise copy prov onto e.g. the ConstantOp produced by the sm_90+
+weight-transpose fold, inflating `totals` so every kernel of that origin read partial coverage).
 
 Consumers: `provenance.name_for` (called from `pipeline/passes/loop/fusion/991_stamp_loop_names`, the last
 loop-dialect rule) names kernels after the ops they realize (`k_rms_norm` when full, `k_rms_norm_reduce` when partial)
 and stamps the name onto `LoopOp.name`; every subsequent dialect (`TileOp`/`KernelOp`/`CudaOp`) just copies it
-through. `pipeline/dump._dump_torch_repro` slices the pristine frontend graph by a kernel's origins into a runnable
+through. Multi-op labels sort dominant-first (descending piece count, lexical tie-break), so the name is independent
+of fusion merge order — the attention kernel is `k_sdpa_linear_reduce`, its QKV-prologue twin `k_linear_sdpa_reduce`.
+Layout/plumbing origins (`_WEAK_KINDS`: transpose / reshape / unsqueeze / cat / slice) label a kernel only when no
+strong op is present — RoPE plumbing fused into attention doesn't pollute the name, while a standalone copy kernel
+still reads `k_cat_…` instead of the node-id fallback. `pipeline/dump._dump_torch_repro` slices the pristine frontend graph by a kernel's origins into a runnable
 `<kname>.torch.json`; `backend/torch_ref` runs that slice through real torch for the `run --ir` vs-torch comparison.
