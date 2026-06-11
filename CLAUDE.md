@@ -187,6 +187,15 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   recorded golden, per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
   rank-under-prior diagnostics; use `eval analytic` / `eval prior` for those). The view to watch while iteratively
   tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
+- `deplodock eval variants [--dataset db] [--db PATH] [--kernel SUBSTR] [--prior PATH] [--top N]` — per-kernel
+  leaderboard of the tune DB's measured variants (leaf configs only, fastest first, knob columns in the shared
+  `commands/table` view), with the config the global `Prior` would deploy marked `◄` + ranked (`pick: rank R/N, X.XXx
+  of best`, flagged when >1.2x — the per-kernel drill-down behind `eval prior --dataset db`'s aggregate reachability),
+  the kernel's `bench_fail` count in the header, and a `-O3 us` column where the prior reservoir holds an `H_opt=3`
+  re-bench for the config (the -O3 re-bench feeds only the reservoir, never a `perf` row, so DB latencies are the
+  tune's -O1 ranking numbers). `--dataset golden` is rejected (goldens carry no per-variant measurements). The view
+  that answers "did the search/prior reach the best measured config for this kernel, and which knobs distinguish it?"
+  without hand-written SQL.
 - `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
   the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
   `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.

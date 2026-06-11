@@ -1,6 +1,6 @@
-"""``deplodock eval <knobs|prior|analytic>`` — evaluate the tuning machinery.
+"""``deplodock eval <knobs|prior|analytic|golden|variants>`` — evaluate the tuning machinery.
 
-Three subcommands:
+Five subcommands:
 
 - ``eval knobs``     — print the registered knob schema, then (with a tune DB)
   per-knob **regret** + a knob-interaction matrix (the analysis below).
@@ -10,6 +10,11 @@ Three subcommands:
 - ``eval prior``     — evaluate the learned ``CatBoostPrior`` on the golden
   configs: the greedy pipeline pick vs golden (per-knob ``found/golden``), the
   golden's rank under the prior, and (``--features``) the regressor input vector.
+- ``eval golden``    — the greedy pipeline pick vs recorded golden per config (the
+  reproduction check, without the rank diagnostics).
+- ``eval variants``  — per-kernel leaderboard of the tune DB's measured variants
+  (fastest first), the config the prior deploys marked + ranked, and the -O3
+  re-bench latency from the prior reservoir where one was recorded.
 
 The ``eval knobs`` regret analysis: for each kernel (grouped by the kernel C
 identifier extracted from ``cuda_op.pretty``), compute per-knob regret:
@@ -39,7 +44,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -100,6 +105,20 @@ def register_eval_command(subparsers) -> None:
     add_dataset_args(pg, default="golden")
     pg.add_argument("--features", action="store_true", help="Also print the prior's regressor feature vector per golden config.")
     pg.set_defaults(func=handle_eval_golden)
+
+    pv = sub.add_parser(
+        "variants",
+        help="Per-kernel leaderboard of the tune DB's measured variants, with the prior's deployed pick marked and ranked",
+    )
+    pv.add_argument("--prior", help="Learned-prior JSON to load (default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json).")
+    add_dataset_args(pv, default="db")
+    pv.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        help="Variants shown per kernel, fastest first (0 = all; the pick row always shows). Default: 20.",
+    )
+    pv.set_defaults(func=handle_eval_variants)
 
 
 def handle_eval_knobs(args) -> None:
@@ -171,6 +190,107 @@ def handle_eval_golden(args) -> None:
         _emit_golden_features(args.kernel)
     configs = _golden_configs(args.kernel)
     _emit_prior_golden_check(configs, title=False)
+
+
+def handle_eval_variants(args) -> None:
+    """``eval variants`` — per-kernel leaderboard of the tune DB's measured
+    variants (fastest first, knob columns aligned), the config the prior would
+    deploy marked + ranked, and the deployable -O3 re-bench latency (from the
+    prior's reservoir) where one was recorded. The per-kernel "did the
+    search/prior reach the best measured config, and which knobs distinguish
+    it?" drill-down view."""
+    require_source(args, {"db"}, "eval variants lists measured tune-DB rows — --dataset golden has no per-variant measurements.")
+    resolve_prior_arg(args)
+    from deplodock import config  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
+
+    db_path = Path(args.db) if args.db else resolve_tune_db()
+    if not db_path.exists():
+        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        return
+    groups = Dataset.from_db(db_path, kernel=args.kernel).group_by_kernel_name()
+    if not groups:
+        logger.info("No measured variants%s in %s.", f" matching --kernel '{args.kernel}'" if args.kernel else "", db_path)
+        return
+    fails = Counter(s.name for s in Dataset.from_db(db_path, kernel=args.kernel, status="bench_fail") if s.name)
+    # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
+    prior = load_prior()
+    if not prior.fitted:
+        logger.info("No fitted prior at %s — the pick is the cold AnalyticPrior's (the ranking compile/run use).", config.prior_path())
+    o3 = _o3_reservoir_index(prior)
+    for name in sorted(groups):
+        _emit_variant_table(name, groups[name], prior, n_fail=fails.get(name, 0), o3=o3, top=args.top)
+
+
+def _variant_key(s) -> tuple:
+    """Hashable identity of one measured config: the full ``S_*`` signature plus
+    the tunable-knob dict (sorted items, lists coerced via :func:`_hashable`) —
+    the join key between a DB row and its -O3 reservoir sibling."""
+    return (
+        tuple(sorted((k, _hashable(v)) for k, v in s.s_features().items())),
+        tuple(sorted((k, _hashable(v)) for k, v in s.knobs.items())),
+    )
+
+
+def _o3_reservoir_index(prior) -> dict[tuple, float]:
+    """Deployable (-O3) latencies from the prior's reservoir, keyed by
+    :func:`_variant_key`. Tuning re-benches every config within ``DEPLODOCK_O3_TOL``
+    of the running -O1 best at ``-Xcicc -O3`` and feeds it to the prior as an
+    ``H_opt=3`` row WITHOUT writing a ``perf`` row — so the reservoir, not the DB,
+    is the only -O3 source (the same reasoning as
+    :func:`diagnostics.golden_deploy_perf`)."""
+    from deplodock.compiler.pipeline.search.data import Sample  # noqa: PLC0415
+
+    out: dict[tuple, float] = {}
+    for knobs, us in getattr(prior, "_dataset", None) or []:
+        s = Sample.from_prior_row(knobs, us)
+        if int(s.all_knobs().get("H_opt", 0)) != 3:
+            continue
+        key = _variant_key(s)
+        if key not in out or us < out[key]:
+            out[key] = us
+    return out
+
+
+def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dict, top: int) -> None:
+    """One kernel's leaderboard: measured leaf configs sorted by tune-ranking
+    latency, the prior's pick marked, knobs in the canonical aligned columns
+    (``tuning_knob_items`` — the same filtered view the ``run --bench`` kernel
+    table renders). Non-leaf rows (partial-knob fork nodes) are dropped,
+    mirroring ``diagnostics.reachability``; the ``-O3 us`` column appears only
+    when the reservoir holds any -O3 row at all."""
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+
+    kmax = max(len(s.knobs) for s in samples)
+    leaves = sorted((s for s in samples if len(s.knobs) == kmax), key=lambda s: s.latency_us)
+    pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
+    rank = leaves.index(pick) + 1
+
+    n_prefix = len(leaves) if not top else min(top, len(leaves))
+    shown = list(enumerate(leaves[:n_prefix], start=1))
+    if rank > n_prefix:
+        shown.append((rank, pick))
+    hidden = len(leaves) - n_prefix - (1 if rank > n_prefix else 0)
+
+    logger.info("")
+    logger.info("%s — %d measured configs%s", name, len(leaves), f", {n_fail} bench_fail" if n_fail else "")
+    kcols, kcells = knob_columns([{k: (v, False) for k, v in tuning_knob_items(s.knobs)} for _, s in shown])
+    columns = [Col("rank", "r"), Col("us", "r")] + ([Col("-O3 us", "r")] if o3 else []) + [Col("pick"), *kcols]
+    data = []
+    for (r, s), kc in zip(shown, kcells, strict=True):
+        row = [str(r), f"{s.latency_us:.1f}"]
+        if o3:
+            o3_us = o3.get(_variant_key(s))
+            row.append(f"{o3_us:.1f}" if o3_us is not None else "—")
+        data.append([*row, ("◄", _GREEN) if s is pick else "", *kc])
+    for line in render_table(columns, data, indent="  "):
+        logger.info(line)
+    if hidden > 0:
+        logger.info("  … %d more (--top 0 shows all)", hidden)
+    if len(leaves) >= 2:
+        ratio = pick.latency_us / leaves[0].latency_us
+        flag = "  <-- misses best" if ratio > 1.2 else ""
+        logger.info("  pick: rank %d/%d, %.2fx of best (tune-ranking latency)%s", rank, len(leaves), ratio, flag)
 
 
 def _emit_registry() -> None:
