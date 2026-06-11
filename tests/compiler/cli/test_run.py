@@ -131,6 +131,49 @@ def test_ab_samples_parse_label_and_shape():
     assert s.shape is None
 
 
+_NCU_CSV = """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
+"0","k_matmul_abc123","gpu__time_duration.sum","nsecond","10,000"
+"0","k_matmul_abc123","sm__warps_active.avg.pct_of_peak_sustained_active","%","41.5"
+"0","k_matmul_abc123","smsp__inst_executed_pipe_lsu.sum","inst","100"
+"1","k_matmul_abc123","gpu__time_duration.sum","nsecond","12,000"
+"1","k_matmul_abc123","sm__warps_active.avg.pct_of_peak_sustained_active","%","42.5"
+"1","k_matmul_abc123","smsp__inst_executed_pipe_lsu.sum","inst","100"
+"2","ampere_sgemm_128x64_nn","gpu__time_duration.sum","nsecond","8,000"
+"2","ampere_sgemm_128x64_nn","sm__warps_active.avg.pct_of_peak_sustained_active","%","80.0"
+"2","ampere_sgemm_128x64_nn","launch__registers_per_thread","register/thread","90"
+"""
+
+
+def test_parse_ncu_csv_keeps_both_sides_and_aggregates():
+    """The parser keeps the reference (cuBLAS / aten) rows beside the ``k_*`` rows
+    (the comparison table needs both) and aggregates multi-launch rows: ``.sum`` /
+    ``smsp__*`` counters add up, percentages average."""
+    from deplodock.commands.run import _ncu_units, _parse_ncu_csv
+
+    parsed = _parse_ncu_csv(_NCU_CSV)
+    assert set(parsed) == {"k_matmul_abc123", "ampere_sgemm_128x64_nn"}
+    dep = parsed["k_matmul_abc123"]
+    assert dep["gpu__time_duration.sum"] == 22000.0  # summed over the two launches
+    assert dep["sm__warps_active.avg.pct_of_peak_sustained_active"] == 42.0  # averaged
+    assert dep["smsp__inst_executed_pipe_lsu.sum"] == 200.0
+    assert _ncu_units(_NCU_CSV)["gpu__time_duration.sum"] == "nsecond"
+
+
+def test_print_ncu_compare_renders_dep_then_ref(capsys):
+    """The compare table puts deplodock rows above the reference rows, carries the
+    duration unit in the header, and dashes out metrics a side didn't report."""
+    from deplodock.commands.run import _ncu_units, _parse_ncu_csv, _print_ncu_compare
+
+    _print_ncu_compare(_parse_ncu_csv(_NCU_CSV), _ncu_units(_NCU_CSV))
+    out = capsys.readouterr().out
+    assert "ncu compare" in out
+    assert out.index("k_matmul_abc123") < out.index("ampere_sgemm_128x64_nn")  # dep side first
+    assert "dur (nsecond)" in out
+    lines = [ln for ln in out.splitlines() if "ampere_sgemm" in ln]
+    assert lines and lines[0].split()[-1] == "90"  # regs lands in the last column
+    assert "-" in lines[0]  # unreported metrics dash out
+
+
 @requires_cuda
 def test_run_ab_bench_shows_pinned_row(run_cli):
     """``run --code ... --bench --ab KNOBS`` benches the pinned config and prints it

@@ -71,8 +71,9 @@ def register_run_command(subparsers):
         "--profile",
         action="store_true",
         help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
-        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%). Skipped if "
-        "ncu is not on PATH or the user lacks performance-counter permissions.",
+        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%) and print a "
+        "side-by-side table of the deplodock kernels vs the torch/cuBLAS reference kernels. "
+        "Skipped if ncu is not on PATH or the user lacks performance-counter permissions.",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
@@ -213,13 +214,11 @@ def handle_run(args):
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
-    # Skip the accuracy check + eager forward when running as the ncu
-    # child of a ``--profile`` invocation: the parent already verified
-    # accuracy outside ncu, and re-running the eager reference under
-    # ncu (a) wastes ~5-10 s of ncu overhead per cuBLAS launch and
-    # (b) pollutes the captured CSV with cutlass / cuBLAS kernel rows
-    # the perf summary then has to filter out. The child only needs to
-    # launch the deplodock kernels so ncu can sample our metrics.
+    # The ncu child of a ``--profile`` invocation skips the accuracy *check*
+    # (the parent already verified it) but still launches both sides once —
+    # the deplodock program AND the eager reference — because the comparison
+    # table needs the cuBLAS / aten kernel rows in the captured CSV beside
+    # the ``k_*`` rows.
     skip_accuracy = config.ncu_child()
 
     try:
@@ -231,9 +230,10 @@ def handle_run(args):
             eager_out = _eager_output(module, example_args, example_kwargs)
             _check_accuracy(run_result.outputs, eager_out)
         else:
-            # ncu child needs at least one deplodock launch for metrics
-            # to populate; skip the eager comparison.
+            # ncu child: one deplodock launch (our metrics) + one eager forward
+            # (the reference rows for the comparison table); no accuracy diff.
             backend.run(compiled, input_data=input_data)
+            _eager_output(module, example_args, example_kwargs)
     except RuntimeError as exc:
         # Per-launch watchdog fired in ``run_program`` (kernel >1 s).
         # The CUDA context is dirty — bypass Python cleanup so cupy's
@@ -762,6 +762,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
     status_text = "\n".join(lines[:csv_start])
 
     parsed = _parse_ncu_csv(csv_text)
+    _print_ncu_compare(parsed, _ncu_units(csv_text))
 
     if dump_dir is not None:
         out_dir = _Path(dump_dir)
@@ -770,17 +771,85 @@ def _run_ncu_profile(args, *, dump_dir=None):
         (out_dir / "61_ncu_metrics.json").write_text(_json.dumps(parsed, indent=2, default=str))
         print(f"ncu metrics → {out_dir / '61_ncu_metrics.csv'}")
         print(f"ncu metrics → {out_dir / '61_ncu_metrics.json'}")
-    else:
-        # No dump dir: relay the CSV (and status lines) so ad-hoc
-        # ``deplodock run --profile`` invocations still surface the data.
-        if status_text.strip():
-            print(status_text)
-        print(csv_text)
+    elif status_text.strip():
+        # No dump dir: the comparison table above is the product; relay the
+        # ==PROF== status lines for diagnostics (the raw CSV lands in the dump
+        # dir when one is set).
+        print(status_text)
 
     if result.returncode != 0:
         logger.warning("ncu exit=%d", result.returncode)
         if result.stderr.strip():
             print(result.stderr, file=sys.stderr)
+
+
+# Display order + short labels for the per-kernel comparison table — keys are
+# entries of the curated ``_NCU_METRICS`` set.
+_NCU_COMPARE_COLS = (
+    ("gpu__time_duration.sum", "dur"),
+    ("sm__warps_active.avg.pct_of_peak_sustained_active", "occ%"),
+    ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "sm%"),
+    ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "dram%"),
+    ("sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active", "fma%"),
+    ("smsp__inst_executed_pipe_lsu.sum", "lsu.inst"),
+    ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum", "ld.cnflct"),
+    ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum", "st.cnflct"),
+    ("launch__registers_per_thread", "regs"),
+)
+
+_NCU_REF_ROWS_MAX = 12  # eager forwards can launch dozens of tiny aten kernels
+
+
+def _print_ncu_compare(parsed: dict, units: dict[str, str] | None = None) -> None:
+    """One aligned table over the parsed ncu metrics: the deplodock ``k_*``
+    kernels first, then the reference backend's kernels (cuBLAS / cutlass /
+    aten) — so the counter deltas (occupancy, SM/DRAM/FMA utilization, smem
+    bank conflicts, register pressure) read straight down a column instead of
+    across two CSV dumps. Each side sorts by duration; reference rows truncate
+    to the :data:`_NCU_REF_ROWS_MAX` slowest with a count of the rest."""
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
+    if not parsed:
+        return
+    dur_key = _NCU_COMPARE_COLS[0][0]
+    dep = sorted((k for k in parsed if k.startswith("k_")), key=lambda k: -parsed[k].get(dur_key, 0.0))
+    ref = sorted((k for k in parsed if not k.startswith("k_")), key=lambda k: -parsed[k].get(dur_key, 0.0))
+    hidden_ref = max(0, len(ref) - _NCU_REF_ROWS_MAX)
+    ref = ref[:_NCU_REF_ROWS_MAX]
+
+    def fmt(v) -> str:
+        if v is None:
+            return "-"
+        return f"{v:,.0f}" if abs(v) >= 100 or v == int(v) else f"{v:.1f}"
+
+    def row(side: str, kname: str) -> list[str]:
+        shown = kname if len(kname) <= 60 else kname[:57] + "..."
+        return [side, shown, *(fmt(parsed[kname].get(metric)) for metric, _ in _NCU_COMPARE_COLS)]
+
+    unit = (units or {}).get(dur_key, "")
+    cols = [Col("side"), Col("kernel")] + [
+        Col(f"dur ({unit})" if label == "dur" and unit else label, "r") for _, label in _NCU_COMPARE_COLS
+    ]
+    data = [row("dep", k) for k in dep] + [row("ref", k) for k in ref]
+    print()
+    print("ncu compare — deplodock kernels vs the torch/cuBLAS reference (same counters, one table):")
+    for line in render_table(cols, data, rule=True):
+        print(line)
+    if hidden_ref:
+        print(f"  … {hidden_ref} more reference kernel(s) below the duration cut")
+
+
+def _ncu_units(csv_text: str) -> dict[str, str]:
+    """``{metric: unit}`` from the CSV's ``Metric Unit`` column (first seen wins)."""
+    import csv as _csv  # noqa: PLC0415
+    import io as _io  # noqa: PLC0415
+
+    units: dict[str, str] = {}
+    for row in _csv.DictReader(_io.StringIO(csv_text)):
+        metric, unit = row.get("Metric Name", ""), row.get("Metric Unit", "")
+        if metric and unit and metric not in units:
+            units[metric] = unit
+    return units
 
 
 def _parse_ncu_csv(csv_text: str) -> dict:
@@ -793,10 +862,10 @@ def _parse_ncu_csv(csv_text: str) -> dict:
     ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
     with the bench-comparison JSON downstream.
 
-    Filters to deplodock-emitted kernels (``k_*`` naming convention) —
-    the ncu child runs in the same process as the eager-reference
-    accuracy check, which would otherwise contribute cutlass / cuBLAS
-    rows that contaminate the per-row aggregate.
+    Keeps every kernel — the deplodock ``k_*`` rows AND the reference
+    backend's (cuBLAS / cutlass / aten) rows the child's eager forward
+    contributes — so :func:`_print_ncu_compare` can put the two sides in
+    one table. Consumers split the sides on the ``k_*`` naming convention.
     """
     import csv as _csv
     import io as _io
@@ -808,8 +877,6 @@ def _parse_ncu_csv(csv_text: str) -> dict:
         metric = row.get("Metric Name", "")
         raw = row.get("Metric Value", "").replace(",", "")
         if not (kname and metric and raw):
-            continue
-        if not kname.startswith("k_"):
             continue
         try:
             val = float(raw)
