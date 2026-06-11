@@ -189,9 +189,14 @@ def _eval(node, ins: list):
         return ins[0].unsqueeze(op.dim)
     if name == "SliceOp":
         t = ins[0]
-        dim = int(ins[1]) if len(ins) > 1 else 0
-        start = int(ins[2]) if len(ins) > 2 else 0
-        end = int(ins[3]) if len(ins) > 3 else t.shape[dim]
+        if op.dim is not None:
+            dim, start = op.dim, op.start or 0
+            extent = op.shape[dim]
+            end = start + int(extent) if isinstance(extent, int) else t.shape[dim]
+        else:  # legacy constant-input convention (pre-field IR dumps)
+            dim = int(ins[1]) if len(ins) > 1 else 0
+            start = int(ins[2]) if len(ins) > 2 else 0
+            end = int(ins[3]) if len(ins) > 3 else t.shape[dim]
         idx = [slice(None)] * t.dim()
         idx[dim] = slice(start, end)
         return t[tuple(idx)]

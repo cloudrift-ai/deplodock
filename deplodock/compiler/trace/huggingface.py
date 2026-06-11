@@ -34,6 +34,18 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
     runs at any seq_len. ``seq_len`` is still used at construction time
     to seed the short-circuit hooks with a same-shape sentinel mask so
     HF's internal validation passes.
+
+    Dynamic mode replaces the rotary embedding too — with cos/sin
+    precomputed for positions ``0..DYNAMIC_DIM_MAX-1`` and sliced to the
+    runtime seq_len in-graph (``_SlicedRotary``). Keeping HF's in-graph
+    rotary instead silently breaks: its ``inv_freq`` buffer is
+    ``persistent=False`` and doesn't survive ``torch.export`` with its
+    real value, so the traced cos/sin constant-fold to ``cos=1, sin=0``
+    and RoPE degenerates to identity. (The bug was invisible to the
+    zero-``input_ids`` accuracy check: identical value rows make the
+    attention output independent of the attention weights.) The sliced
+    buffer assumes positions are ``0..S-1`` — true for full-sequence
+    prefill, which is the only dynamic-mode use.
     """
     import torch
     import torch.nn as nn
@@ -51,6 +63,21 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
 
         def forward(self, *_, **__):
             return self.cos, self.sin
+
+    class _SlicedRotary(nn.Module):
+        """Dynamic-mode rotary replacement: cos/sin precomputed out to
+        ``DYNAMIC_DIM_MAX`` positions, sliced to the runtime seq_len read off
+        the ``position_ids`` argument — the slice end is a SymInt, so the
+        traced graph keeps real rotary values at every seq_len."""
+
+        def __init__(self, cos, sin) -> None:
+            super().__init__()
+            self.register_buffer("cos", cos)
+            self.register_buffer("sin", sin)
+
+        def forward(self, x, position_ids, *_, **__):
+            s = position_ids.shape[1]
+            return self.cos[:, :s], self.sin[:, :s]
 
     class FullModelWrapper(nn.Module):
         def __init__(self) -> None:
@@ -73,14 +100,23 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
             # ``inv_freq`` buffer, ``persistent=False``, doesn't survive tracing
             # with its real value), so RoPE degenerates to identity. Compute the
             # real per-position cos/sin eagerly and return them verbatim — the
-            # trace then captures correct constant tensors. Dynamic mode keeps
-            # the in-graph rotary (cos/sin must follow the runtime position_ids).
+            # trace then captures correct constant tensors. Dynamic mode hits
+            # the same folding, so it precomputes out to DYNAMIC_DIM_MAX and
+            # slices to the runtime seq_len in-graph (_SlicedRotary below).
             rotary = getattr(inner, "rotary_emb", None)
             if not dynamic and rotary is not None:
                 with torch.no_grad():
                     sample = torch.zeros((1, seq_len, model.config.hidden_size), dtype=dtype)
                     cos, sin = rotary(sample, self.position_ids)
                 inner.rotary_emb = _PassThroughRotary(cos, sin)
+            elif rotary is not None:
+                from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX  # noqa: PLC0415
+
+                with torch.no_grad():
+                    sample = torch.zeros((1, DYNAMIC_DIM_MAX, model.config.hidden_size), dtype=dtype)
+                    full_pos = torch.arange(DYNAMIC_DIM_MAX, dtype=torch.long)[None, :]
+                    cos, sin = rotary(sample, full_pos)
+                inner.rotary_emb = _SlicedRotary(cos, sin)
 
         if dynamic:
 

@@ -100,20 +100,35 @@ class ReshapeOp(Op):
 class SliceOp(Op):
     """Extract a sub-tensor along a dimension.
 
-    Inputs: [tensor, dim_const, start_const, end_const] where the
-    constants are scalar ConstantOps from the tracer.
+    ``dim`` / ``start`` are recorded by the tracer from the raw FX args —
+    the constant-input convention below can't represent them when the FX
+    ``start`` is ``None`` or the ``end`` is a SymInt (``_resolve_inputs``
+    drops both, leaving the surviving constants positionally ambiguous).
+    The end never needs recording: ``shape`` already carries the output
+    extent (symbolic or static).
+
+    Legacy inputs convention (pre-field IR dumps): [tensor, dim_const,
+    start_const, end_const] where the constants are scalar ConstantOps
+    from the tracer; consumers fall back to it when ``dim is None``.
     """
 
     shape: tuple[int | str, ...]
+    dim: int | None = None
+    start: int | None = None
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(self.shape)
 
     def forward(self, *inputs):
         tensor = inputs[0]
-        dim = int(inputs[1].flat[0]) if len(inputs) > 1 else 0
-        start = int(inputs[2].flat[0]) if len(inputs) > 2 else 0
-        end = int(inputs[3].flat[0]) if len(inputs) > 3 else tensor.shape[dim]
+        if self.dim is not None:
+            dim, start = self.dim, self.start or 0
+            extent = self.shape[dim]
+            end = start + int(extent) if isinstance(extent, int) else tensor.shape[dim]
+        else:
+            dim = int(inputs[1].flat[0]) if len(inputs) > 1 else 0
+            start = int(inputs[2].flat[0]) if len(inputs) > 2 else 0
+            end = int(inputs[3].flat[0]) if len(inputs) > 3 else tensor.shape[dim]
         slices = [slice(None)] * tensor.ndim
         slices[dim] = slice(start, end)
         return tensor[tuple(slices)]
