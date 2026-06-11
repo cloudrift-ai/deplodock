@@ -1,7 +1,7 @@
 # Deterministic resolution as a fold: `Run.resolve` + decision traces
 
-**Status:** design — proposed 2026-06-10, follow-up to `plans/structural-forks-in-two-level.md` (M3/M3b). Untracked
-draft; promote when scheduled.
+**Status:** implemented 2026-06-10 (M1–M3 on `feature/resolve-trace-driver`) — follow-up to
+`plans/structural-forks-in-two-level.md` (M3/M3b).
 
 ## Problem
 
