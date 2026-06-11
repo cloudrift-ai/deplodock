@@ -84,7 +84,9 @@ class BenchmarkResult:
     # ``time_ms``/``min_ms`` sum per-launch windows that each replay a single
     # kernel back-to-back — accurate per-kernel, but the sum is not an
     # end-to-end number (no cross-kernel cache effects, no inter-kernel gaps).
-    # Only populated when the bench ran with ``measure_e2e`` and capture held.
+    # Populated automatically for multi-launch programs when capture held;
+    # ``None`` for single-launch programs (the solo window IS the program
+    # time) and when capture was off or fell back.
     e2e_ms: float | None = None
     e2e_min_ms: float | None = None
 

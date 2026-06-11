@@ -253,10 +253,12 @@ solo windows mis-attribute at the µs scale: the two gated-MLP gemms `23ab9c_mm0
 (same shape, same knobs; NCU durations 10.3 vs 10.5 µs at locked base clock) yet the per-launch bench splits them
 5.1 µs vs 0.8 µs run after run.
 
-**Fix (this branch).** `benchmark_program(measure_e2e=True)` captures one CUDA graph holding every launch in
-program order and times whole-program replay windows — the exact semantics the captured torch closures get — and
-`run --bench` reports it as the Deplodock row (`BenchmarkResult.e2e_ms`/`e2e_min_ms`; the kernel table prints a
-`whole-program (e2e)` footer beside the per-launch `TOTAL`, and `60_benchmark.json` carries both). Measured: e2e
+**Fix (this branch).** For any multi-launch program `benchmark_program` captures one CUDA graph holding every
+launch in program order and times whole-program replay windows — the exact semantics the captured torch closures
+get — and `run --bench` reports it as the Deplodock row (`BenchmarkResult.e2e_ms`/`e2e_min_ms`; the kernel table
+prints a `whole-program (e2e)` footer beside the per-launch `TOTAL`, and `60_benchmark.json` carries both).
+Automatic, no flag: single-launch programs (the tune sweep's usual slice) skip it — their solo window already is
+the program time. Measured: e2e
 51.2 µs vs per-launch Σ 48.7 µs — the *real* inter-kernel overhead is ~2.5 µs (~5%), and the honest standings are
 eager 99 / tcompile 46 / deplodock 51 µs. Tests in `tests/compiler/backend/test_graph_capture.py` (fields under
 capture, `None` without capture, capture-failure non-fatal).

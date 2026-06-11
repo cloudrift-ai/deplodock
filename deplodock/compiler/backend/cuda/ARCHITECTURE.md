@@ -101,22 +101,20 @@ in place as re-tunes measure them captured. See `tests/compiler/backend/test_gra
 their sum is not an end-to-end time: it misses cross-kernel cache effects and inter-kernel gaps, and on
 multi-kernel programs individual per-launch numbers can mis-attribute wildly (two identical-work gemms in
 the Qwen3 layer-0 assembly measured 5.2 µs vs 0.8 µs solo; NCU shows them equal — finding 6 of
-`plans/qwen3-embedding-layer0-tune-findings.md`). `benchmark_program(measure_e2e=True)` therefore also
-captures **one** CUDA graph holding every launch in program order (`CompiledProgram.capture_program_graph`)
-and, once per measured iter, times one event window around `replays` back-to-back whole-program replays
-(`time_program_window`, replays calibrated to `_BATCH_TARGET_MS`) — the same semantics the captured torch
-closures get in the interleaved bench, so the backend table compares like-for-like. Reported as
-`BenchmarkResult.e2e_ms`/`e2e_min_ms`; `run --bench`'s comparison table prefers `e2e_min_ms` for the
-Deplodock row and the kernel table prints a `whole-program (e2e)` footer beside the per-launch `TOTAL`.
-Requires capture (skipped, fields `None`, when capture is off/fell back; a program-graph capture failure
-warns and skips, never fatal). Every comparison-table path measures it (everything flows through
-`_bench_interleaved_captured`, which passes `measure_e2e` whenever capture is on). Off by default only for
-the autotune sweep's per-variant benches: the sweep ranks on the per-op sum by design (per-op results key
-structurally and transfer across graphs — an e2e scalar can't be cached per-op) and never reads e2e, so
-measuring it there would spend GPU-time budget on an unread statistic. Most sweep slices are single-launch,
-where the one per-launch window *is* the program time anyway; split-K fixup kernels are the multi-launch
-exception, and pricing those variants by slice-e2e instead of the sum is a possible future tune-semantics
-change, not a bench-plumbing one.
+`plans/qwen3-embedding-layer0-tune-findings.md`). For any **multi-launch** program `benchmark_program`
+therefore also captures **one** CUDA graph holding every launch in program order
+(`CompiledProgram.capture_program_graph`) and, once per measured iter, times one event window around
+`replays` back-to-back whole-program replays (`time_program_window`, replays calibrated to
+`_BATCH_TARGET_MS`) — the same semantics the captured torch closures get in the interleaved bench, so the
+backend table compares like-for-like. Reported as `BenchmarkResult.e2e_ms`/`e2e_min_ms`; `run --bench`'s
+comparison table prefers `e2e_min_ms` for the Deplodock row and the kernel table prints a
+`whole-program (e2e)` footer beside the per-launch `TOTAL`. Automatic — no flag: a single-launch program's
+solo window already IS the program time (the autotune sweep's usual single-node slice — fields stay `None`,
+nothing is measured twice), and multi-launch programs get it whenever capture holds (a program-graph capture
+failure warns and skips, never fatal; uncaptured benches skip it too). The sweep still *ranks* variants on
+the per-op sum (`time_ms`) by design — per-op results key structurally and transfer across graphs, which an
+e2e scalar can't — so for its multi-launch slices (split-K fixups) the e2e fields are measured-but-unread
+(~1 ms/iter); pricing those variants by slice-e2e instead is a possible future tune-semantics change.
 
 **One worker, two jobs.** `_bench_worker.py`'s `_run_job` dispatches on `torch_spec`: `None` is the
 deplodock-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /

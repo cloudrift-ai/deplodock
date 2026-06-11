@@ -1564,9 +1564,7 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
                 stop.record()
             torch_events[name].append((start, stop, batch_size))
 
-    bench = backend.benchmark(
-        compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs, measure_e2e=capture_graphs
-    )
+    bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}

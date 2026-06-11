@@ -877,7 +877,6 @@ def benchmark_program(
     compile_timeout_s: float | None = None,
     run_timeout_s: float | None = None,
     capture_graphs: bool = True,
-    measure_e2e: bool = False,
 ) -> BenchmarkResult:
     """Time the graph's launches with per-kernel CUDA events.
 
@@ -931,19 +930,18 @@ def benchmark_program(
     tune sweep persists it on each ``perf`` row (captured measurements
     supersede wall-semantics ones on write — see ``SearchDB.record_perf``).
 
-    ``measure_e2e`` additionally times the WHOLE program per measured iter —
-    one event window around back-to-back replays of a single CUDA graph
-    holding every launch in program order
-    (:meth:`CompiledProgram.time_program_window`) — and reports it as
+    Multi-launch programs additionally get a WHOLE-program time per measured
+    iter — one event window around back-to-back replays of a single CUDA
+    graph holding every launch in program order
+    (:meth:`CompiledProgram.time_program_window`) — reported as
     ``BenchmarkResult.e2e_ms`` / ``e2e_min_ms``. The per-launch windows each
     replay one kernel solo, so their sum misses cross-kernel cache effects;
     only the whole-program window is comparable against a captured torch
-    forward. Requires capture (silently skipped — fields stay ``None`` —
-    when capture is off or fell back). Off by default: the autotune sweep
-    ranks variants on the per-op sum (per-op results key structurally and
-    transfer across graphs) and never reads e2e, so measuring it there would
-    spend GPU-time budget on an unread statistic; every comparison-table
-    caller passes it via ``_bench_interleaved_captured``."""
+    forward. Automatic when capture holds and the program has more than one
+    launch (for a single launch the solo window IS the program time, so the
+    fields stay ``None`` and nothing is measured twice — the common case for
+    the autotune sweep's single-node slices); also ``None`` when capture is
+    off or fell back."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
@@ -958,6 +956,7 @@ def benchmark_program(
         # one-off outliers the autotune's variant ranking previously
         # got confused by; see ``project_..._noise`` write-ups).
         samples: list[list[float]] = [[] for _ in range(n)]
+        measure_e2e = n > 1  # single launch: the solo window IS the program time
         e2e_samples: list[float] = []
         e2e_replays = 0  # calibrated lazily on the first measured iter
         iters_run = 0

@@ -60,9 +60,9 @@ Result dataclasses:
 
 - `RunResult(outputs, time_ms)`
 - `BenchmarkResult(time_ms, min_ms?, max_ms?, num_launches, per_launch?, captured, e2e_ms?, e2e_min_ms?)` —
-  `time_ms`/`min_ms` sum per-launch solo windows; `e2e_ms`/`e2e_min_ms` (when the bench ran with `measure_e2e`)
-  time the whole program as replays of one all-launches CUDA graph — the only end-to-end-comparable number for
-  multi-kernel programs.
+  `time_ms`/`min_ms` sum per-launch solo windows; `e2e_ms`/`e2e_min_ms` (automatic for multi-launch programs
+  under capture) time the whole program as replays of one all-launches CUDA graph — the only
+  end-to-end-comparable number for multi-kernel programs.
 - `LaunchTime(idx, kernel_name, time_ms)` — one per kernel per bench run.
 
 ## Numpy backend (`numpy/`)

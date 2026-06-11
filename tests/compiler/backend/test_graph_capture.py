@@ -9,8 +9,9 @@ event windows measure dense GPU work instead of per-launch dispatch gaps. These 
 - the all-or-nothing fallback: a capture failure on either side falls the *whole*
   ``bench_lowered_vs_torch`` invocation back to uncaptured timing (``captured=False``), never mixing
   semantics within one table,
-- the whole-program (e2e) timing windows (``measure_e2e``): populated under capture, ``None`` when
-  capture is off or the program-graph capture fails, and never fatal.
+- the whole-program (e2e) timing windows: automatic for multi-launch programs under capture, ``None``
+  for single-launch programs (the solo window is the program time) and when capture is off or the
+  program-graph capture fails — which is never fatal.
 """
 
 from deplodock.compiler.backend.cuda.program import GraphCaptureError, benchmark_program
@@ -50,8 +51,8 @@ def _make_two_launch_graph(n: int = 8) -> Graph:
 
 
 @requires_cuda
-def test_benchmark_program_measure_e2e_populates_fields():
-    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=True, measure_e2e=True)
+def test_benchmark_program_e2e_automatic_for_multi_launch():
+    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=True)
     assert result.captured is True
     assert result.e2e_ms is not None and result.e2e_ms > 0
     assert result.e2e_min_ms is not None and 0 < result.e2e_min_ms <= result.e2e_ms
@@ -61,8 +62,15 @@ def test_benchmark_program_measure_e2e_populates_fields():
 
 
 @requires_cuda
+def test_benchmark_program_e2e_skipped_for_single_launch():
+    # One launch: the solo per-launch window already IS the program time — no second measurement.
+    result = benchmark_program(_make_add_graph(1024), warmup=2, num_iters=5, capture_graphs=True)
+    assert result.e2e_ms is None and result.e2e_min_ms is None
+
+
+@requires_cuda
 def test_benchmark_program_e2e_none_without_capture():
-    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=False, measure_e2e=True)
+    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=False)
     assert result.e2e_ms is None and result.e2e_min_ms is None
 
 
@@ -74,7 +82,7 @@ def test_benchmark_program_e2e_capture_failure_is_nonfatal(monkeypatch):
         raise GraphCaptureError("forced whole-program capture failure")
 
     monkeypatch.setattr(CompiledProgram, "capture_program_graph", _boom)
-    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=True, measure_e2e=True)
+    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=True)
     assert result.captured is True  # per-launch capture is independent of the e2e graph
     assert result.time_ms > 0
     assert result.e2e_ms is None and result.e2e_min_ms is None
