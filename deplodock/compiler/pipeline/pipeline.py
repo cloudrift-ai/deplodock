@@ -7,7 +7,11 @@ groups rules, ``Pipeline`` is the frozen pass layout + matcher, ``Run``
 owns ONE drive of that layout (ctx / search / db / backend / dump /
 rejections + the engine loop), ``Cursor`` tracks per-candidate resume
 state inside a Run, and ``Match`` carries ``Rule`` (which backref-resolves
-to ``Pass``).
+to ``Pass``). ``Run`` exposes two entry points over one shared rule-batch
+body (``Run._step``): ``drive`` (exploration — a ``Search`` policy ranks
+the fork frontier) and ``resolve`` (deterministic resolution — a
+``decide`` callback picks at each ``ForkPoint`` and the fold returns the
+terminal graph plus a ``Decision`` trace).
 
 ``Pipeline`` also owns the compile entry points — :meth:`build`,
 :meth:`run`, :meth:`tune` (each constructs a :class:`Run` and drives it).
@@ -597,6 +601,62 @@ class Pipeline:
 
 
 @dataclass
+class ForkPoint:
+    """What a :meth:`Run.resolve` ``decide`` callback sees at one
+    multi-option rewrite: the live :class:`Match`, the raw ``options``
+    list exactly as ``Candidate.try_rewrite`` returned it (concrete
+    ``Op``/``Graph`` leaves and lazy ``Fork``s — branch Forks included,
+    unexpanded), the pre-decision root op, and the run's ``ctx``. No
+    ``LazyCandidate`` wrapping: ``resolve`` holds one live graph and
+    applies the chosen option in place.
+
+    ``score`` is the decide callback's one output channel besides its
+    return value: a decide that ranks options with a prior stamps the
+    chosen option's predicted µs here, and ``resolve`` copies it onto the
+    fork's :class:`Decision` trace entry (where e.g. the structural
+    pricing probe reads a kernel's price off the partition fork)."""
+
+    match: Match
+    options: list
+    root_op: Op
+    ctx: Context
+    structural: bool
+    score: float | None = None
+
+    @property
+    def node_id(self) -> str:
+        """The graph node this fork is rewriting — the blocklist / trace key."""
+        return self.match.root_node_id
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One :meth:`Run.resolve` trace entry — what a deterministic
+    resolution decided at one fork point. The trace is the resolution's
+    only output channel besides the terminal graph: process facts
+    (structural picks taken, per-fork predicted cost) are trace queries,
+    never policy-object state.
+
+    * ``rule_name`` / ``node_id`` — where the fork was offered.
+    * ``chosen_kind`` — ``"graph"`` for a structural (``Graph``-splicing)
+      pick, ``"op"`` for an in-place rebind.
+    * ``knob_delta`` — the chosen option's knob identity: a ``Fork``'s
+      pinned row, an ``Op``'s own knobs, a ``Graph``'s decision-knob delta
+      vs the offer op (:func:`_option_decision`).
+    * ``score`` — the decide callback's predicted µs for the pick
+      (``None`` when the decide didn't rank, e.g. option-0 fallback).
+    * ``n_options`` — raw option count at the fork (a lazy fork tree
+      counts as one — its leaves are the decide callback's to expand)."""
+
+    rule_name: str
+    node_id: str
+    chosen_kind: str
+    knob_delta: dict
+    score: float | None
+    n_options: int
+
+
+@dataclass
 class Run:
     """Mutable per-run state of ONE drive of a pipeline — everything
     scoped to a single compile / tune invocation lives here, so
@@ -606,7 +666,9 @@ class Run:
     * ``pipeline`` — the frozen pass layout being driven.
     * ``ctx`` — the resolved hardware context, shared by every candidate
       (reached as ``cand.ctx``).
-    * ``search`` — the policy (greedy / MCTS) ordering the exploration.
+    * ``search`` — the policy ordering an exploration (:meth:`drive`);
+      ``None`` for a deterministic resolution (:meth:`resolve`), which
+      has no frontier to rank.
     * ``db`` — the autotune store ``_bench_terminal`` persists into (the
       training data for the learned prior).
     * ``backend`` — optional measurement backend (``None`` = stub bench,
@@ -625,11 +687,115 @@ class Run:
 
     pipeline: Pipeline
     ctx: Context
-    search: Search
-    db: SearchDB
+    search: Search | None = None
+    db: SearchDB | None = None
     backend: object | None = None
     dump: CompilerDump | None = None
     rejections: list[tuple[str, str, str]] | None = None
+
+    def _step(self, cand: Candidate) -> tuple[Match, list, bool] | None:
+        """Run one rule batch against ``cand`` — the per-candidate engine
+        body shared by :meth:`drive` and :meth:`resolve`. Single-option
+        rewrites apply inline (via ``Candidate.try_rewrite``), empty /
+        quiescent batches advance the cursor, and a structural fork whose
+        offer site was already decided on this trajectory replays that
+        side inline (:func:`_replay_structural_decision`). Returns ``None``
+        when the batch completed with nothing left to decide, or
+        ``(match, options, structural)`` at the first undecided
+        multi-option fork — selection is the caller's job (``drive``
+        spawns ``LazyCandidate`` siblings for its search; ``resolve``
+        asks its ``decide`` callback)."""
+        cur = cand.cursor
+        pass_ = cur.current_pass
+        # Empty pass (e.g. all rules filtered out) OR no live matches →
+        # no apply fires → advance the cursor directly so the caller's
+        # loop doesn't re-run the same rule batch forever. ``advance``
+        # handles both cases uniformly: with ``n_applied == 0`` it wraps
+        # to the next pass and fires the post-pass log + dump.
+        if not pass_.rules:
+            cur.advance(cand.graph)
+            return None
+        matches = self.pipeline.match(cand.graph, cur.current_rule)
+        if not matches:
+            cur.advance(cand.graph)
+            return None
+        for match in matches:
+            options = cand.try_rewrite(match)
+            if options is None:
+                continue
+            # The fork is classified here, where the raw ``options`` list
+            # is concrete (no thunk fired): any ``Graph`` option makes the
+            # fork **structural** (kernel-set-changing); pure ``Op``
+            # rebinds (and the partition planner's branch Forks) are
+            # op-variant.
+            structural = any(_is_structural_option(o) for o in options)
+            # A structurally identical offer site already decided on this
+            # trajectory takes the same side inline (no fork), so the
+            # search tree stays linear in *unique* kernels instead of
+            # ``2^sites`` (e.g. one decision for 28 identical per-layer
+            # splits). The earlier decision is read off the candidate's
+            # own graph — see :func:`_replay_structural_decision` — so no
+            # side-table state is threaded through resolves.
+            if structural and (chosen := _replay_structural_decision(cand.graph, match.root.op, options)) is not None:
+                cand.apply(match, chosen)
+                continue
+            return match, options, structural
+        return None
+
+    def resolve(self, graph: Graph, decide: Callable[[ForkPoint], object]) -> tuple[Graph, list[Decision]]:
+        """Deterministic resolution — fold the pipeline over ``graph``
+        IN PLACE, asking ``decide`` at every undecided fork point, and
+        return ``(terminal_graph, trace)``. The counterpart of
+        :meth:`drive` for callers with no frontier to rank (greedy
+        compile, structural pricing probes, assembled-graph lowering):
+        one live graph, no ``LazyCandidate`` sibling snapshots, no
+        per-fork graph copies — the returned terminal IS the seeded
+        ``graph`` object.
+
+        ``decide`` receives a :class:`ForkPoint` and returns the option
+        to apply — a concrete ``Op`` / ``Graph`` from the fork's raw
+        options, or a **leaf** ``Fork`` (a decide that wants a lazy fork
+        tree's complete rows expands branch Forks itself; returning a
+        branch Fork is an error). It may stamp ``fp.score`` with the
+        pick's predicted µs — copied onto the trace entry.
+
+        The trace (one :class:`Decision` per decided fork, in resolution
+        order) is the only output channel besides the terminal graph:
+        "did this compile take a structural pick", "what did the
+        partition fork predict for this kernel" are trace queries, not
+        accumulated policy state. Inline replays of an already-decided
+        structural offer site (see :meth:`_step`) are not decisions and
+        don't trace."""
+        from deplodock.compiler import provenance  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.candidate import Candidate  # noqa: PLC0415
+
+        provenance.seed(graph)
+        cand = Candidate(run=self, graph=graph, cursor=Cursor(run=self))
+        trace: list[Decision] = []
+        while not cand.cursor.is_done:
+            step = self._step(cand)
+            if step is None:
+                continue
+            match, options, structural = step
+            root_op = match.root.op  # read before apply rebinds it
+            fp = ForkPoint(match=match, options=options, root_op=root_op, ctx=self.ctx, structural=structural)
+            choice = decide(fp)
+            option = _concrete_option(choice)
+            if option is None:
+                raise ValueError(f"decide returned a branch Fork at {match.rule.name!r} — return a concrete option or a leaf Fork")
+            knob_delta = _choice_knobs(choice, option, root_op)
+            cand.apply(match, option)
+            trace.append(
+                Decision(
+                    rule_name=match.rule.name,
+                    node_id=fp.node_id,
+                    chosen_kind="graph" if isinstance(option, Graph) else "op",
+                    knob_delta=knob_delta,
+                    score=fp.score,
+                    n_options=len(options),
+                )
+            )
+        return cand.graph, trace
 
     def drive(self, graph: Graph) -> Iterator[tuple[object | None, Candidate]]:
         """Seed ``graph`` as the root candidate and drive the search to
@@ -641,19 +807,26 @@ class Run:
         ``search.observe`` so the measurement lands on the terminal's
         own lineage (no "most recently popped" hidden state).
 
-        Per-rule batch semantics: enumerate matches via
-        :meth:`Pipeline.match` (which stamps ``rule`` on each Match plus
-        ``is_last`` on the last live one), call
-        ``Candidate.try_rewrite`` for each. Single-option matches apply
-        inline; the first multi-option match spawns one
-        ``LazyCandidate`` per option and breaks the loop. Cursor advance
-        for the rule batch is owned by :meth:`Cursor.advance`, fired
-        from ``Candidate.apply`` on ``match.is_last`` (and directly here
-        for batches that produced no live matches) even when the rewrite
-        skipped or yielded no valid options."""
+        Per-rule batch semantics live in :meth:`_step` (shared with
+        :meth:`resolve`): single-option matches apply inline; the first
+        undecided multi-option match comes back as ``(match, options,
+        structural)`` and spawns one ``LazyCandidate`` per option, in
+        rule-emission order. Selection is the search's job (tuning
+        explores every fork and ranks the unvisited frontier with its
+        learned prior). Siblings share ``cand`` as ``inner`` so they
+        don't duplicate the snapshot; ``from_option`` lifts concrete
+        ``Op``/``Graph`` options into leaf Forks so every LazyCandidate's
+        pending carries a uniform Fork shape. Cursor advance for the rule
+        batch is owned by :meth:`Cursor.advance`, fired from
+        ``Candidate.apply`` on ``match.is_last`` (the fork's apply on
+        resolve fires it for deferred forks) or directly in ``_step`` for
+        batches that produced no live matches. The ``structural`` flag
+        rides ``Search.push`` so policies can treat kernel-set decisions
+        specially."""
         from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate  # noqa: PLC0415
 
         search = self.search
+        assert search is not None, "Run.drive needs a search policy; use Run.resolve for deterministic resolution"
         # Seed candidate: no parent token — the policy roots it itself.
         search.push(Candidate(run=self, graph=graph, cursor=Cursor(run=self)).lazy())
 
@@ -668,70 +841,16 @@ class Run:
                 search.push(*children, parent=token)
                 continue
             cand = lc.resolve()
-            cur = cand.cursor
-            if cur.is_done:
+            if cand.cursor.is_done:
                 yield token, cand
                 continue
-            pass_ = cur.current_pass
-            # Empty pass (e.g. all rules filtered out) OR no live
-            # matches → no apply fires → advance the cursor directly
-            # so the search loop doesn't re-pop the same rule batch
-            # forever. ``advance`` handles both cases uniformly: with
-            # ``n_applied == 0`` it wraps to the next pass and fires
-            # the post-pass log + dump.
-            if not pass_.rules:
-                cur.advance(cand.graph)
+            step = self._step(cand)
+            if step is None:
                 search.push(cand.lazy(), parent=token)
                 continue
-            matches = self.pipeline.match(cand.graph, cur.current_rule)
-            if not matches:
-                cur.advance(cand.graph)
-                search.push(cand.lazy(), parent=token)
-                continue
-
-            forks: list[LazyCandidate] | None = None
-            structural = False
-            for match in matches:
-                options = cand.try_rewrite(match)
-                if options is None:
-                    continue
-                # Multi-option fork point: spawn one ``LazyCandidate`` per
-                # option, in rule-emission order. Selection is the search's
-                # job (greedy keeps option-0; tuning explores every fork and
-                # ranks the unvisited frontier with its learned prior). Each
-                # shares ``cand`` as ``inner`` so siblings don't duplicate the
-                # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
-                # options into leaf Forks so every LazyCandidate's pending
-                # carries a uniform Fork shape. The fork's apply on
-                # resolve advances the cursor when ``match.is_last`` (the
-                # cursor advance the eager loop didn't do here, since we
-                # deferred to forks).
-                #
-                # The fork is classified here, where the raw ``options`` list
-                # is concrete (no thunk fired): any ``Graph`` option makes the
-                # fork **structural** (kernel-set-changing); pure ``Op``
-                # rebinds (and the partition planner's branch Forks) are
-                # op-variant. The flag rides ``Search.push`` so policies can
-                # treat kernel-set decisions specially.
-                structural = any(_is_structural_option(o) for o in options)
-                # A structurally identical offer site already decided on this
-                # trajectory takes the same side inline (no fork), so the
-                # search tree stays linear in *unique* kernels instead of
-                # ``2^sites`` (e.g. one decision for 28 identical per-layer
-                # splits). The earlier decision is read off the candidate's
-                # own graph — see :func:`_replay_structural_decision` — so no
-                # side-table state is threaded through resolves.
-                if structural and (chosen := _replay_structural_decision(cand.graph, match.root.op, options)) is not None:
-                    cand.apply(match, chosen)
-                    continue
-                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
-                break
-
-            if forks is not None:
-                search.push(*forks, parent=token, structural=structural)
-                continue
-
-            search.push(cand.lazy(), parent=token)
+            match, options, structural = step
+            forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cand.cursor), match=match, option=opt) for opt in options]
+            search.push(*forks, parent=token, structural=structural)
 
 
 def _is_structural_option(option: object) -> bool:
@@ -772,6 +891,19 @@ def _option_decision(option: object, root_knobs: dict) -> dict | None:
         knobs = getattr(option, "knobs", None) or {}
     delta = {k: v for k, v in knobs.items() if k not in root_knobs and not k.startswith("S_")}
     return delta or None
+
+
+def _choice_knobs(choice: object, option: object, root_op) -> dict:
+    """The chosen option's knob identity for a :class:`Decision` trace entry:
+    a ``Fork``'s pinned row when it carries one, a ``Graph``'s decision-knob
+    delta vs the offer op (:func:`_option_decision`), an ``Op``'s own knobs.
+    ``choice`` is what ``decide`` returned (possibly a leaf Fork); ``option``
+    is its unwrapped concrete ``Op`` / ``Graph``."""
+    if isinstance(choice, Fork) and choice.knobs:
+        return dict(choice.knobs)
+    if isinstance(option, Graph):
+        return _option_decision(option, root_op.knobs) or {}
+    return dict(getattr(option, "knobs", None) or {})
 
 
 def _replay_structural_decision(graph: Graph, root_op, options: list) -> object | None:
@@ -1141,4 +1273,4 @@ def _bench_terminal(cand, *, backend, db):
     return agg or _point_stats(0.0), status
 
 
-__all__ = ["LoweringError", "Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]
+__all__ = ["Decision", "ForkPoint", "LoweringError", "Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]

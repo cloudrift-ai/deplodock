@@ -315,8 +315,9 @@ rules — they're shared helpers for the pass's rule modules.
 
 ### Drivers
 
-`Pipeline.build(passes)` wraps a pass list; the resulting object exposes
-three entry points:
+`Pipeline.build(passes)` wraps a pass list; the resulting object exposes the
+compile entry points (`run` / `tune`), each driving one of the `Run` engine
+loops (`drive` for exploration, `resolve` for deterministic resolution):
 
 - `Pipeline.run(graph, *, backend=None, db=None) -> Graph` — single-shot
   compile via `GreedySearch` (flattens each fork point to its complete leaves and
@@ -360,6 +361,18 @@ three entry points:
   push `structural=True`; `Op` rebinds and the partition planner's branch Forks are op-variant (`False`).
   The flag rides `Search.push(structural=)` so policies can treat kernel-set decisions specially (see
   `plans/structural-forks-in-two-level.md`).
+- `Run.resolve(graph, decide) -> (Graph, list[Decision])` — the deterministic-resolution counterpart of `drive`
+  (`plans/resolve-trace-driver.md`). Both entry points share one rule-batch body (`Run._step`: matching, inline
+  single-option applies, cursor advance, the structural-decision replay), but `resolve` is a fold, not a search: ONE
+  live graph mutated in place (no `LazyCandidate` sibling snapshots, no per-fork graph copies — the terminal IS the
+  seeded graph object), and at each undecided fork a `decide` callback gets a `ForkPoint` (the `Match`, the raw
+  options exactly as the rule emitted them — lazy fork trees unexpanded, the pre-decision root op, ctx) and returns
+  the option to apply (a concrete `Op`/`Graph` or a leaf `Fork`; a decide that wants complete tile rows flattens
+  branch Forks itself). The returned trace — one `Decision(rule_name, node_id, chosen_kind, knob_delta, score,
+  n_options)` per decided fork, `score` being the decide's own annotation on the `ForkPoint` — is the resolution's
+  only process-state output: "did this compile take a structural pick", "what did the partition fork predict for
+  this kernel" are trace queries, never accumulated policy attributes. Inline replays of an already-decided offer
+  site don't trace (they are reads of the first decision, not decisions).
 
 ### The keying map: two identities
 
