@@ -1,12 +1,14 @@
 # Structural forks in the two-level search
 
-**Status:** design — rewritten 2026-06-10, after `SPLIT_CONE` landed. Two structural-fork emitters now exist in
-lowering: `tile/005_split_demoted` (the demoted-matmul / SDPA-prologue split, PRs #219/#220 — **shipped**, tolerated
-by the slice-sum mechanism below) and `tile/017_atomic_free_splitk` plus the planned Stream-K combine
-(`plans/atomic-free-streamk.md`). This plan makes kernel-set-changing lowering decisions first-class: each split
-kernel gets its own inner slice, keep-vs-split becomes an outer-terminal comparison, and — the piece `SPLIT_CONE`
-deployment is blocked on (`plans/qwen3-embedding-layer0-tune-findings.md` finding 5, follow-up 2) — greedy
-`compile` / `run` learn to price and pick a structural option unpinned.
+**Status:** Steps 1–3 (milestones M1–M3) **landed** 2026-06-10 on `feature/structural-forks-two-level-search`;
+Step 4 (the `SPLITK` hoist, M4) remains — see the open questions noted under its milestone. Two structural-fork
+emitters exist in lowering: `tile/005_split_demoted` (the demoted-matmul / SDPA-prologue split, PRs #219/#220 — now
+**first-class**: outer-branched, per-kernel slices, greedy-priced) and `tile/017_atomic_free_splitk` plus the
+planned Stream-K combine (`plans/atomic-free-streamk.md`) — both still on the tolerated slice-sum path until M4.
+This plan makes kernel-set-changing lowering decisions first-class: each split kernel gets its own inner slice,
+keep-vs-split becomes an outer-terminal comparison, and — the piece `SPLIT_CONE` deployment was blocked on
+(`plans/qwen3-embedding-layer0-tune-findings.md` finding 5, follow-up 2) — greedy `compile` / `run` price and pick
+a structural option unpinned.
 
 ## Problem
 
@@ -166,23 +168,33 @@ pinned (via the existing `Knob.narrow` pin path) before partition runs. With `SP
 
 ## Milestones (single branch, commit after each `make test` passes)
 
-1. **M1 — classify + plumb (Step 1).** One-liner at the spawn site; thread `structural=` through `Search.push`
-   (default `False`, ignored by `GreedySearch`/`TuningSearch` for now). Inert. Tests: 005's and 017's fork points
-   read `structural=True`; a partition leaf / `020_stage_inputs` rebind reads `False`.
-2. **M2 — boundary redraw (Step 2).** Outer branches on pre-partition structural forks with the per-`(rule,
-   op_cache_key)` decision memo; outer terminal = partition cursor + no structural fork pending; inner keeps
-   tolerating sub-partition splices (017). Acceptance: `tune Qwen/Qwen3-Embedding-0.6B --layer 0` reports > 1 outer
-   terminal; split producers/consumers appear as their own `[tune]` op leaves with own `op_cache_key` rows; tune
-   wall time recovers toward the 859 s pre-split baseline (cross-product gone).
-3. **M3 — greedy pricing (Step 3).** Acceptance: with the trained prior, unpinned `run --layer 0 --bench` deploys
-   the splits the tune measured best — full-layer total at parity with the pinned 138 µs table; cold compile (no
-   prior file) keeps today's fused kernel sets (`test_greedy_compile_keeps_fused_kernel` still green); a
-   lowering-rejected structural pick falls back to keep-fused.
-4. **M4 — `SPLITK` hoist (Step 4).** Re-express 017's combine emission pre-partition; validate accuracy parity with
-   today's atomic / atomic-free paths (`tests/compiler/e2e/test_streamk_matmul.py`, `test_atomic_free_splitk`);
-   confirm the outer enumerates one terminal per combine strategy and Σ-per-op ranks them. Retire the inner
-   slice-sum tolerance + the fused-key bookkeeping row. Update `pipeline/ARCHITECTURE.md` (two-level section) +
-   `two_level.py` module docstring.
+1. **M1 — classify + plumb (Step 1).** ✅ landed. One-liner at the spawn site; `structural=` threaded through
+   `Search.push` (default `False`, accepted-and-ignored by `GreedySearch`/`TuningSearch`). Tests: 005's and 017's
+   fork points read `structural=True`; partition leaves read `False` (`test_structural_push.py`).
+2. **M2 — boundary redraw (Step 2).** ✅ landed. Outer branches on pre-partition structural forks
+   (`two_level.outer_pipeline()`) with the per-`(rule, op_cache_key)` decision memo (`Candidate.structural_memo`,
+   replayed inline by `Run.drive`); outer terminal = partition cursor + no structural fork pending; inner keeps
+   tolerating sub-partition splices (017). Verified live on the norm→linear 32×1024×3072 shape: 2 outer terminals
+   (fused Σ 238.8 µs vs split Σ 20.3 µs), the `_xn` producer tuned as its own op leaf. The full Qwen3-Embedding
+   layer-0 wall-time acceptance (recovery toward the 859 s pre-split baseline) still wants a dedicated re-tune.
+3. **M3 — greedy pricing (Step 3).** ✅ landed. `GreedySearch._pick_structural` prices both sides via nested
+   per-kernel descents (tile-only, CPU, memoized per `op_cache_key`), gated on the *trained* prior; cold compile
+   keeps today's fused kernel sets (`test_greedy_compile_keeps_fused_kernel` green); a lowering-rejected structural
+   pick retires structural picks on `Pipeline.run`'s retry and re-drives keep-fused
+   (`test_greedy_structural_pick_falls_back_on_lowering_failure`). Verified live: after the tune above, unpinned
+   `run --code` deploys the two-kernel split.
+4. **M4 — `SPLITK` hoist (Step 4).** Remaining. Re-express 017's combine emission pre-partition; validate accuracy
+   parity with today's atomic / atomic-free paths (`test_atomic_free_splitk` + new e2e coverage); confirm the outer
+   enumerates one terminal per combine strategy and Σ-per-op ranks them. Retire the inner slice-sum tolerance + the
+   fused-key bookkeeping row. Update `pipeline/ARCHITECTURE.md` (two-level section) + `two_level.py` module
+   docstring. Open design questions found while scoping: (a) the per-op `SPLITK` pin — `Knob.narrow` reads
+   process-global env pins, which can't express a per-branch pin; partition's `_plan_kernel` must learn to clip
+   `splitk_choices` from `op.knobs`; (b) hoisted `SPLITK` candidates must stay consistent with partition's
+   BR/BK-coupled divisor checks (else a hoisted branch can enumerate zero rows and strand the node), which wants
+   the candidate derivation extracted from `_plan_kernel`; (c) the loop-dialect K-split for the atomic-free
+   fragment needs the linear-residual (`matmul_add` / 015) interplay settled — restrict the pre-partition offer to
+   plain-epilogue matmuls first, or move the residual add into the combine; (d) retiring 017 must not strand the
+   in-flight Stream-K B4 branch (`plans/atomic-free-streamk.md`), which reuses 017's fragment shape.
 
 ## Verification
 
