@@ -13,6 +13,8 @@ latencies keyed off each CudaOp's structural key.
 
 from __future__ import annotations
 
+import zlib
+
 import pytest
 
 from deplodock.compiler import dtype as _dt
@@ -72,7 +74,10 @@ class _CountingBackend:
         cuda = [n for n in graph.nodes.values() if isinstance(n.op, CudaOp)]
         per: list[LaunchTime] = []
         for i, n in enumerate(cuda):
-            us = 1.0 + (abs(hash(op_cache_key(n.op))) % 100)
+            # crc32, not hash(): str hashes are salted per process (PYTHONHASHSEED),
+            # which made the MCTS path — and the bench counts the separability test
+            # bounds — vary run to run.
+            us = 1.0 + (zlib.crc32(op_cache_key(n.op).encode()) % 100)
             per.append(LaunchTime(idx=i, kernel_name=getattr(n.op, "kernel_name", "k"), time_ms=us / 1000.0, samples=(us / 1000.0,)))
         return BenchmarkResult(time_ms=sum(p.time_ms for p in per), num_launches=len(per), per_launch=per)
 
@@ -140,7 +145,7 @@ def test_inner_reward_is_separable_not_a_product() -> None:
     # Per-op sharing through the DB perf cache is allowed — an already-measured
     # variant replays without a bench. The exact share count is sensitive to
     # MCTS exploration order: the
-    # ``_CountingBackend`` fakes latency from ``hash(op_cache_key)``, so any
+    # ``_CountingBackend`` fakes latency from ``crc32(op_cache_key)``, so any
     # structural-digest perturbation (e.g. a Source-field rename) shifts the
     # path and the count by a few benches. The hard guarantee is the
     # cross-product upper bound; tighter ``n1+n2`` / ``max(n1,n2)`` bounds
@@ -175,8 +180,8 @@ def test_inner_reward_rerun_is_replay_dominated() -> None:
     keeps the minimum and ``best_per_op_time`` reads it — so ``second.total_us <=
     first.total_us`` always (it does not converge to the *same* total; it converges
     *downward*). The exact bench count is exploration-order-sensitive (same caveat
-    as ``test_inner_reward_separability``); the ``_CountingBackend``'s hash-derived
-    latencies make it host-dependent, so only the two robust invariants are pinned."""
+    as ``test_inner_reward_separability``), so only the two robust invariants are
+    pinned."""
     fused = _fuse(_two_distinct_matmuls())
     db = SearchDB()
     ctx = Context.from_target((8, 0))
@@ -189,8 +194,8 @@ def test_inner_reward_rerun_is_replay_dominated() -> None:
     # The DB's per-op best is monotone non-increasing — more benches never worsen it.
     assert second.total_us <= first.total_us + 1e-6, "rerun must not regress the per-op best total"
     # Warm rerun replays most terminals from the perf cache → fewer benches than cold.
-    # (Only "fewer", not a fixed ratio: the exact count is exploration-order- and
-    # host-dependent — see the docstring — so a `cold // 2`-style bound is not robust.)
+    # (Only "fewer", not a fixed ratio: the exact count is exploration-order-
+    # sensitive — see the docstring — so a `cold // 2`-style bound is not robust.)
     assert rerun_backend.calls < cold_backend.calls, "warm rerun must bench fewer variants than the cold run"
 
 
