@@ -365,17 +365,29 @@ def _loops(graph: Graph) -> list:
 
 
 def test_split_kernels_attribute_to_pre_decision_op() -> None:
-    """The structural splice stamps the pre-decision op as each fragment
-    kernel's ``Op.source`` — the decomposition link the composed Σ rows group
-    by: both split kernels share ONE loop-dialect ancestor whose knobs lack
-    the decision."""
+    """Both sides of the structural fork attribute to the offer-site op via
+    ``Op.source`` — the decomposition link the composed Σ rows group by. The
+    split side is stamped at the splice; the keep side is stamped by the
+    engine's UNCONDITIONAL rebind stamp (005 builds the keep option via
+    ``dataclasses.replace``, which copies the root's own knob-less ancestor
+    into ``source`` — honoring the copy used to point the link past the offer
+    site)."""
     terminals = _outer_terminals(_norm_linear("a"))
     split = next(t for t in terminals if len(_loops(t)) == 2)
     kernels = _loops(split)
     assert all(k.knobs.get("SPLIT_CONE") is True for k in kernels)
     assert all(k.source is not None for k in kernels)
     assert len({id(k.source) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
-    assert "SPLIT_CONE" not in kernels[0].source.knobs
+    site = kernels[0].source
+    assert "SPLIT_CONE" not in site.knobs
+    assert any(k.startswith("S_") for k in site.knobs), "the site is the S_*-stamped offer op, not a bare ancestor"
+
+    fused = next(t for t in terminals if len(_loops(t)) == 1)
+    keep = _loops(fused)[0]
+    assert keep.knobs.get("SPLIT_CONE") is False
+    assert keep.source is not None and op_cache_key(keep.source) == op_cache_key(site), (
+        "the keep side must attribute to the SAME offer-site op as the split side"
+    )
 
 
 def test_outer_descends_prior_preferred_branch_first() -> None:

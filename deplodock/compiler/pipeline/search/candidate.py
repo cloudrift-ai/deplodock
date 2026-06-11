@@ -165,9 +165,16 @@ class Candidate:
         ``Op`` rebinds ``root.op`` (id / inputs / hints kept);
         ``Graph`` is a fragment spliced via ``Graph.splice``. On the
         ``Op`` path the chain ``Op.source`` is stamped with the op
-        being replaced (unless the rule already set it) and the
-        predecessor's ``knobs`` are merged forward — so the rewrite
-        chain threads through every in-place rebind for free. A
+        being replaced and the predecessor's ``knobs`` are merged
+        forward — so the rewrite chain threads through every in-place
+        rebind for free. The stamp is UNCONDITIONAL (engine-owned):
+        "the op this op replaced at this node" is a fact about the
+        rewrite, not the rule's to set — a rule building its option
+        via ``dataclasses.replace(root.op, ...)`` copies the root's
+        own ancestor into ``source``, and honoring that copy would
+        skip the replaced op in the chain (and silently disable the
+        knob merge, which is idempotent for rules that already merged
+        manually). A
         lowering-tier ``Graph`` splice of a loop-dialect kernel (a
         structural decomposition — ``tile/005_split_demoted``'s split)
         stamps the consumed root op as each fragment kernel's
@@ -180,7 +187,7 @@ class Candidate:
         self._log_apply(match, option)
         if isinstance(option, Op):
             old_op = self.graph.nodes[match.root_node_id].op
-            if option is not old_op and option.source is None:
+            if option is not old_op:
                 option.source = old_op
                 option.knobs = {**old_op.knobs, **option.knobs}
             self.graph.nodes[match.root_node_id].op = option

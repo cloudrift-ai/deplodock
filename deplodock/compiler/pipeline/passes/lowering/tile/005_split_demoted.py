@@ -89,12 +89,6 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
     # Only genuine offer sites carry the decision knob — never-offered kernels
     # stay knob-free (the prior's "not considered" NaN state).
     keep_fused = replace(root.op, knobs={**root.op.knobs, SPLIT_CONE.name: False})
-    # ``replace`` copies ``source`` (the pre-S_*-stamp ancestor), which would
-    # stop ``Candidate.apply`` from stamping the op being replaced — pointing
-    # the keep side's decomposition link past the offer site, at a knob-less
-    # grandparent. Both branches must attribute to THIS op (the two-level
-    # tuner's composed Σ rows group by it), so set it explicitly.
-    keep_fused.source = root.op
     pinned = SPLIT_CONE.narrow((False, True))
     if pinned == (False,):
         return keep_fused
