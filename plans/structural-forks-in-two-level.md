@@ -172,8 +172,10 @@ pinned (via the existing `Knob.narrow` pin path) before partition runs. With `SP
    `Search.push` (default `False`, accepted-and-ignored by `GreedySearch`/`TuningSearch`). Tests: 005's and 017's
    fork points read `structural=True`; partition leaves read `False` (`test_structural_push.py`).
 2. **M2 — boundary redraw (Step 2).** ✅ landed. Outer branches on pre-partition structural forks
-   (`two_level.outer_pipeline()`) with the per-`(rule, op_cache_key)` decision memo (`Candidate.structural_memo`,
-   replayed inline by `Run.drive`); outer terminal = partition cursor + no structural fork pending; inner keeps
+   (`two_level.outer_pipeline()`); identical offer sites within a trajectory replay the first decision, originally
+   via a `Candidate.structural_memo` side-table, since replaced by the graph-derived lookup
+   (`pipeline._replay_structural_decision`: the `Op.source` decomposition links + the stamped decision knobs ARE the
+   trajectory's memory); outer terminal = partition cursor + no structural fork pending; inner keeps
    tolerating sub-partition splices (017). Verified live on the norm→linear 32×1024×3072 shape: 2 outer terminals
    (fused Σ 238.8 µs vs split Σ 20.3 µs), the `_xn` producer tuned as its own op leaf. The full Qwen3-Embedding
    layer-0 wall-time acceptance (recovery toward the 859 s pre-split baseline) still wants a dedicated re-tune.

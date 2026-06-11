@@ -28,9 +28,11 @@ pass index:
   its reward is ``1 / Σ best-per-op time`` from the inner search,
   backpropagated by the reused :class:`TuningSearch` — so keep-vs-split is an
   outer-terminal comparison, the natural cost model for a kernel-set decision.
-  Identical offer sites within a trajectory take the same side via the
-  per-``(rule, op_cache_key)`` decision memo (``Candidate.structural_memo``),
-  keeping the tree linear in *unique* kernels. Fusion itself is still
+  Identical offer sites within a trajectory take the same side — the engine
+  replays the decision read off the trajectory's own graph via the
+  ``Op.source`` decomposition links and the stamped decision knobs
+  (``pipeline._replay_structural_decision``) — keeping the tree linear in
+  *unique* kernels. Fusion itself is still
   deterministic (no multi-option fusion forks); this remains the clean
   insertion point for fusion search when those forks exist.
 - **Inner** (:func:`inner_reward`) tunes each finalized kernel *independently*
@@ -377,10 +379,10 @@ def run_two_level_tune(
     keep-vs-split offer of ``005_split_demoted``) branches the outer tree —
     one terminal per kernel-set, compared by Σ-per-op cost. A graph with no
     structural offers yields a single terminal and this reduces to "tune each
-    op once, sum, assemble". Identical offer sites within one trajectory are
-    memoized per ``(rule, op_cache_key)`` (see ``Candidate.structural_memo``),
-    and a terminal whose kernels are all known is a pure DB read, so extra
-    terminals stay cheap."""
+    op once, sum, assemble". Identical offer sites within one trajectory
+    replay the first decision (read off the graph —
+    ``pipeline._replay_structural_decision``), and a terminal whose kernels
+    are all known is a pure DB read, so extra terminals stay cheap."""
     from deplodock.compiler import provenance  # noqa: PLC0415
     from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 

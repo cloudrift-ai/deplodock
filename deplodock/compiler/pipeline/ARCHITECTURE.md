@@ -442,9 +442,11 @@ fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — 
   post-fusion and structurally final, split producers/consumers included as real `LoopOp` nodes. Each terminal is a
   candidate fused graph; its **reward** is `1 / Σ best-per-op time` from the inner search, backpropagated by the
   reused `TuningSearch` — keep-vs-split is an outer-terminal comparison, the natural cost model for a kernel-set
-  decision. Structurally identical offer sites within one trajectory take the same side via the per-`(rule,
-  op_cache_key)` decision memo (`Candidate.structural_memo`, replayed inline by `Run.drive`), so the outer tree stays
-  linear in *unique* kernels instead of `2^sites`; a terminal whose ops are all known is a pure DB read. **Fusion
+  decision. Structurally identical offer sites within one trajectory take the same side: `Run.drive` replays the
+  first decision read off the trajectory's own graph (`_replay_structural_decision` — any op carrying the fork's
+  decision knobs whose `Op.source` chain contains an op structurally identical to the offer; the stamped knob values
+  pick the matching option), so the outer tree stays linear in *unique* kernels instead of `2^sites` with no
+  side-table state threaded through resolves; a terminal whose ops are all known is a pure DB read. **Fusion
   itself is still deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`); a graph
   with no structural offers yields one terminal and this reduces to "tune each op once, sum, assemble". The outer uses
   a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`. The global

@@ -86,8 +86,9 @@ same worker.
 - `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--bench] [-q]` — **two-level** autotune (see
   `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over structural forks (the graph-changing
   `frontend`+`loop` passes plus the pre-partition head of `lowering/tile`, where `005_split_demoted`'s keep-vs-split
-  offer branches the outer tree — one terminal per kernel set, identical offer sites memoized per
-  `(rule, op_cache_key)` within a trajectory; a graph with no structural offers yields one terminal) whose reward is
+  offer branches the outer tree — one terminal per kernel set; identical offer sites replay the trajectory's
+  first decision, read off the graph via `Op.source` + the stamped decision knobs; a graph with no structural
+  offers yields one terminal) whose reward is
   `Σ best-per-op time` from an inner search that tunes each post-fusion kernel **independently** in its own
   single-node slice (post-partition `lowering` forks only, so `Σ_k n_k` benches not the product). Greedy `compile` /
   `run` deploy a structural option when the *trained* prior prices its kernel-set Σ cheaper (cold compiles never

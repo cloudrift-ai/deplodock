@@ -714,33 +714,17 @@ class Run:
                 # op-variant. The flag rides ``Search.push`` so policies can
                 # treat kernel-set decisions specially.
                 structural = any(_is_structural_option(o) for o in options)
-                memo_key: tuple[str, str] | None = None
-                if structural:
-                    # Structural decisions memoize per ``(rule, op_cache_key)``
-                    # within a trajectory: a structurally identical offer site
-                    # seen again on this path takes the same side inline (no
-                    # fork), so the search tree stays linear in *unique*
-                    # kernels instead of ``2^sites`` (e.g. one decision for 28
-                    # identical per-layer splits). Sibling branches keep
-                    # independent memos — each resolve copies the dict.
-                    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
-
-                    key = op_cache_key(match.root.op)
-                    memo_key = (match.rule.name, key) if key is not None else None
-                    decided = cand.structural_memo.get(memo_key) if memo_key is not None else None
-                    if decided is not None and (chosen := _concrete_option(options[decided])) is not None:
-                        cand.apply(match, chosen)
-                        continue
-                forks = [
-                    LazyCandidate.from_option(
-                        inner=cand,
-                        cursor=replace(cur),
-                        match=match,
-                        option=opt,
-                        memo=(*memo_key, i) if memo_key is not None else None,
-                    )
-                    for i, opt in enumerate(options)
-                ]
+                # A structurally identical offer site already decided on this
+                # trajectory takes the same side inline (no fork), so the
+                # search tree stays linear in *unique* kernels instead of
+                # ``2^sites`` (e.g. one decision for 28 identical per-layer
+                # splits). The earlier decision is read off the candidate's
+                # own graph — see :func:`_replay_structural_decision` — so no
+                # side-table state is threaded through resolves.
+                if structural and (chosen := _replay_structural_decision(cand.graph, match.root.op, options)) is not None:
+                    cand.apply(match, chosen)
+                    continue
+                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
                 break
 
             if forks is not None:
@@ -765,13 +749,70 @@ def _is_structural_option(option: object) -> bool:
 
 def _concrete_option(option: object) -> object | None:
     """Unwrap one raw rewrite option to the concrete ``Op`` / ``Graph`` a
-    memo-replayed structural decision can apply inline: leaf Forks fire their
+    replayed structural decision can apply inline: leaf Forks fire their
     single-element thunk, concrete options pass through, and a *branch* Fork
     returns ``None`` (un-applyable without a full expand — the caller falls
     back to forking normally; no structural branch Fork exists today)."""
     if isinstance(option, Fork):
         return option.expand()[0] if option.is_leaf else None
     return option
+
+
+def _option_decision(option: object, root_knobs: dict) -> dict | None:
+    """The decision-knob delta one raw structural-fork option would stamp vs
+    the offer op: new non-``S_*`` knob keys on the option's op / fork knobs (a
+    ``Graph`` option reads the union over its nodes' op knobs — fragment
+    kernels restamp their own ``S_*``, which describe the child bodies, not
+    the decision). ``None`` when the option stamps nothing new."""
+    if isinstance(option, Graph):
+        knobs: dict = {}
+        for node in option.nodes.values():
+            knobs.update(getattr(node.op, "knobs", None) or {})
+    else:
+        knobs = getattr(option, "knobs", None) or {}
+    delta = {k: v for k, v in knobs.items() if k not in root_knobs and not k.startswith("S_")}
+    return delta or None
+
+
+def _replay_structural_decision(graph: Graph, root_op, options: list) -> object | None:
+    """The concrete option a structurally identical, already-decided offer
+    site on this trajectory took — or ``None`` (undecided / unmatchable →
+    fork normally).
+
+    The earlier decision is read off the candidate's own graph, not a
+    side-table: a decided site leaves its evidence in the IR by contract —
+    every structural rule stamps its decision knob onto the surviving ops
+    (the ``SPLIT_CONE`` considered-vs-declined idiom), and those ops chain to
+    the pre-decision offer op via the engine-owned ``Op.source`` (stamped
+    unconditionally on rebinds, stamped across loop-dialect splices,
+    preserved by ``_rename_buf_in_op``). So: find any op carrying every
+    decision knob whose source chain contains an op structurally identical
+    to this offer (same ``op_cache_key``), and replay the option whose delta
+    matches its stamped values. Matching by decision-knob agreement (not a
+    stored option index) survives rules reordering their emissions."""
+    from deplodock.compiler.pipeline.search.keys import op_cache_key, source_chain  # noqa: PLC0415
+
+    key = op_cache_key(root_op)
+    if key is None:
+        return None
+    deltas = [(opt, _option_decision(opt, root_op.knobs)) for opt in options]
+    decision_keys = {k for _, d in deltas if d for k in d}
+    if not decision_keys:
+        return None
+    for node in graph.nodes.values():
+        knobs = getattr(node.op, "knobs", None)
+        if not knobs or not decision_keys <= set(knobs):
+            continue  # undecided or unrelated op — the cheap pre-filter
+        chain = source_chain(node.op)
+        next(chain)  # the op itself — its key differs from the pre-decision key by the stamp
+        if not any(op_cache_key(anc) == key for anc in chain):
+            continue
+        found = {k: knobs[k] for k in decision_keys}
+        for opt, delta in deltas:
+            if delta == found:
+                return _concrete_option(opt)
+        return None  # decided, but no option matches (emission drift) — fork normally
+    return None
 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:

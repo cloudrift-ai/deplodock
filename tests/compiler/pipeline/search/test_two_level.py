@@ -436,10 +436,12 @@ def test_decomposition_rows_sum_kernel_set_costs() -> None:
     assert feats["SPLIT_CONE"] is False
 
 
-def test_structural_memo_collapses_identical_sites() -> None:
+def test_identical_offer_sites_take_the_same_side() -> None:
     """Two structurally identical offer sites take the same side within a
-    trajectory (the per-``(rule, op_cache_key)`` decision memo): the outer tree
-    yields 2 terminals (all-fused, all-split), not the 2^sites cross-product."""
+    trajectory — the engine replays the first decision read off the graph via
+    the ``Op.source`` links + stamped decision knobs
+    (``pipeline._replay_structural_decision``): the outer tree yields 2
+    terminals (all-fused, all-split), not the 2^sites cross-product."""
     g = _norm_linear("b", _norm_linear("a"))
     terminals = [
         cand.graph
