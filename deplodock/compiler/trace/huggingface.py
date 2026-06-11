@@ -112,9 +112,13 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
             elif rotary is not None:
                 from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX  # noqa: PLC0415
 
+                # +1: torch.export guards a symbolic slice end STRICTLY below
+                # the sliced extent (``cos[:, :S]`` with S == extent would
+                # specialize), so the buffer carries one extra position.
+                n_pos = DYNAMIC_DIM_MAX + 1
                 with torch.no_grad():
-                    sample = torch.zeros((1, DYNAMIC_DIM_MAX, model.config.hidden_size), dtype=dtype)
-                    full_pos = torch.arange(DYNAMIC_DIM_MAX, dtype=torch.long)[None, :]
+                    sample = torch.zeros((1, n_pos, model.config.hidden_size), dtype=dtype)
+                    full_pos = torch.arange(n_pos, dtype=torch.long)[None, :]
                     cos, sin = rotary(sample, full_pos)
                 inner.rotary_emb = _SlicedRotary(cos, sin)
 
