@@ -29,6 +29,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import Atom, AtomTile, SerialTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile._atom import classify_matmul_operands
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -130,19 +131,14 @@ def _try_tag_here(body: Body, *, atom: Atom, k_name: str | None, write: Write | 
 
 def _classify_ab(loads: list[Load], *, k_name: str | None, write: Write | None) -> tuple[Load | None, Load | None]:
     """Identify A (M×K) vs B (K×N) by the reduce axis position (gmem-direct,
-    pre-staging): K in the last index dim ⇒ A, K in the first ⇒ B. Shape C
+    pre-staging) via the shared :func:`classify_matmul_operands` — the same
+    classifier the ``is_atom_eligible`` mma gate runs, so any cell that
+    reaches this tagger is classifiable by construction. Shape C
     (``k_name is None``) falls back to the Write's M/N free vars."""
     a_load: Load | None = None
     b_load: Load | None = None
     if k_name is not None:
-        for ld in loads:
-            k_in_last = k_name in {v for e in ld.index[-1:] for v in e.free_vars()}
-            k_in_first = k_name in {v for e in ld.index[:1] for v in e.free_vars()}
-            if k_in_last and not k_in_first:
-                a_load = ld
-            elif k_in_first and not k_in_last:
-                b_load = ld
-        return a_load, b_load
+        return classify_matmul_operands(loads, k_name)
     if write is None or not write.index:
         return None, None
     w_m_vars = set(write.index[0].free_vars())

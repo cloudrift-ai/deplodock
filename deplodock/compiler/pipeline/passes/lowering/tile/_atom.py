@@ -39,6 +39,50 @@ __all__ = [
 ]
 
 
+def classify_matmul_operands(loads, k_name: str):
+    """Identify the A (M×K) / B (K×N) operand ``Load``s of a canonical matmul
+    cell by where the reduce axis ``k_name`` sits in each load's index.
+
+    Primary tests (the historical rule): K in the LAST index dim (and not the
+    first) ⇒ A; K in the FIRST dim (and not the last) ⇒ B. Fallback for K in a
+    *middle* dim — e.g. the SDPA cone-split's 4-D V slab ``(0, k, 0, n)``,
+    where K is dim 1 of 4: a load whose single K dim sits AFTER every other
+    var-carrying dim ⇒ A, BEFORE every one ⇒ B. Ambiguous layouts (transposed
+    B with both operands K-in-last, K folded across dims, K-only indices)
+    classify neither side and return ``None`` for it.
+
+    This is the ONE A/B layout decision: ``011_lower_atom_cell._classify_ab``
+    tags cells with it, and the ``is_atom_eligible`` mma gate calls the same
+    function so the gate mirrors the tagger by construction — a cell the
+    tagger can't classify is never offered the mma tier (an untagged
+    ``AtomTile`` would survive to render and crash there).
+
+    Returns ``(a_load, b_load)``, either possibly ``None``.
+    """
+    a_load = None
+    b_load = None
+    for ld in loads:
+        if not ld.index:
+            continue
+        k_in_first = k_name in ld.index[0].free_vars()
+        k_in_last = k_name in ld.index[-1].free_vars()
+        if k_in_last and not k_in_first:
+            a_load = ld
+            continue
+        if k_in_first and not k_in_last:
+            b_load = ld
+            continue
+        k_dims = [d for d, e in enumerate(ld.index) if k_name in e.free_vars()]
+        var_dims = [d for d, e in enumerate(ld.index) if d not in k_dims and e.free_vars()]
+        if len(k_dims) != 1 or not var_dims:
+            continue
+        if all(k_dims[0] > d for d in var_dims):
+            a_load = ld
+        elif all(k_dims[0] < d for d in var_dims):
+            b_load = ld
+    return a_load, b_load
+
+
 def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Callable[[LoopOp, Context, Graph], bool]:
     """Build an mma.sync eligibility predicate for ``atom`` — its cell shape +
     A-operand dtype come straight off the spec; ``min_cc`` is the device gate.
@@ -117,16 +161,15 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
                 return False
             if accum.value != multiply.name:
                 return False
-            # Operand layout: ``011_lower_atom_cell._classify_ab`` recovers A
-            # as the load with K in its LAST index dim and B as the one whose
-            # K lands earlier (``020_stage_inputs`` collapses it to a [K, N]
-            # smem tile, after which the tagger's K-in-first test passes). A
-            # transposed-B cell — BOTH operands K-in-last, e.g. Q @ K^T — is
-            # unclassifiable in any staging order: the AtomTile would survive
-            # to render unconsumed and crash. Mirror the tagger here so those
-            # shapes fall to the scalar register-tile path instead.
-            k_in_last = [K_name in ld.index[-1].free_vars() for ld in loads if ld.index]
-            if sorted(k_in_last) != [False, True]:
+            # Operand layout: the gate and the tagger share ONE classifier
+            # (:func:`classify_matmul_operands`), so a cell the tagger can't
+            # recover A/B for — e.g. a transposed-B Q @ K^T, where BOTH
+            # operands carry K in their last dim — is never offered the mma
+            # tier (an untagged ``AtomTile`` would survive to render
+            # unconsumed and crash); it falls to the scalar register-tile
+            # path instead.
+            a_ld, b_ld = classify_matmul_operands(loads, K_name)
+            if a_ld is None or b_ld is None:
                 return False
             accum_names.add(accum.name)
         # Post-reduce epilogue: ``kernel/005_lower_atom_tile`` stores the mma

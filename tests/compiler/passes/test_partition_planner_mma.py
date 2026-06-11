@@ -14,13 +14,15 @@ from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
+from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import is_warp
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import (
     ATOM_REGISTRY,
     Atom,
+    classify_matmul_operands,
     is_atom_eligible,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
@@ -609,3 +611,104 @@ def test_planner_mma_name_pin_enables_pre_sm90(monkeypatch):
     warp_rows = [p for p in plan.params if is_warp(p)]
     assert warp_rows, "MMA=<kind> must enable the warp tier on a pin-only arch"
     assert all(p["MMA"] == "mma_m16n8k16_f16" for p in warp_rows)
+
+
+def _sdpa_av_loop_op(*, B0: int = 16, M: int = 32, N: int = 128, K: int = 32) -> LoopOp:
+    """The SDPA cone-split attn@V cell shape that crashed the whole-layer
+    tune (k_sdpa_transpose_reshape_linear_reduce under ``SPLIT_CONE=1`` +
+    ``MMA``): A is 3-D ``(batch, m, k)`` — K in the LAST dim — and B is the
+    4-D V slab ``(0, k, 0, n)`` — K in a MIDDLE dim (dim 1 of 4), matched by
+    neither the K-in-first nor the K-in-last test. The 5-D Write's leading
+    dim is a Literal, so the shape-C Write fallback can't recover M either."""
+    b0, m, n, k = Axis("b0", B0), Axis("m", M), Axis("n", N), Axis("k", K)
+    zero = Literal(value=0, dtype="int")
+    return LoopOp(
+        body=(
+            Loop(
+                axis=b0,
+                body=(
+                    Loop(
+                        axis=m,
+                        body=(
+                            Loop(
+                                axis=n,
+                                body=(
+                                    Loop(
+                                        axis=k,
+                                        body=(
+                                            Load(name="a_v", input="a", index=(Var("b0"), Var("m"), Var("k"))),
+                                            Load(name="b_v", input="b", index=(zero, Var("k"), zero, Var("n"))),
+                                            Assign(name="p", op=ElementwiseImpl("multiply"), args=("a_v", "b_v")),
+                                            Accum(name="acc", value="p"),
+                                        ),
+                                    ),
+                                    Write(output="c", index=(zero, Var("b0"), Var("m"), zero, Var("n")), value="acc"),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _sdpa_av_graph(*, B0: int = 16, M: int = 32, N: int = 128, K: int = 32) -> Graph:
+    g = Graph()
+    _input(g, "a", (B0, M, K), dtype=F16)
+    _input(g, "b", (1, K, 1, N), dtype=F16)
+    op = _sdpa_av_loop_op(B0=B0, M=M, N=N, K=K)
+    g.add_node(op=op, inputs=["a", "b"], output=Tensor("c", (1, B0, M, 1, N), dtype=F32), node_id="c")
+    g.inputs = ["a", "b"]
+    g.outputs = ["c"]
+    return g
+
+
+def test_classify_matmul_operands_middle_dim_k():
+    """The positional fallback classifies the captured SDPA cell: A by the
+    historical K-in-last rule, B by K (dim 1 of 4) sitting before the only
+    other var-carrying dim (n, dim 3)."""
+    zero = Literal(value=0, dtype="int")
+    a = Load(name="a_v", input="a", index=(Var("b0"), Var("m"), Var("k")))
+    b = Load(name="b_v", input="b", index=(zero, Var("k"), zero, Var("n")))
+    a_ld, b_ld = classify_matmul_operands([a, b], "k")
+    assert a_ld is a
+    assert b_ld is b
+
+
+def test_classify_matmul_operands_still_rejects_transposed_b():
+    """Q @ K^T — both operands K-in-last — stays unclassifiable (B is None),
+    so the gate keeps rejecting it and the shape falls to the scalar tier."""
+    a = Load(name="q", input="q", index=(Var("i"), Var("k")))
+    bt = Load(name="kt", input="kt", index=(Var("j"), Var("k")))
+    a_ld, b_ld = classify_matmul_operands([a, bt], "k")
+    assert b_ld is None
+
+
+def test_mma_eligibility_accepts_middle_dim_k_b():
+    """The 4-D middle-K B slab is classifiable since the positional fallback,
+    so the gate (which now calls the same classifier as the tagger) admits
+    the mma tier for it."""
+    g = _sdpa_av_graph()
+    op = g.nodes["c"].op
+    assert is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(8, 0)), graph=g)
+
+
+def test_mma_lowers_middle_dim_k_b_to_renderable_kernel(monkeypatch):
+    """End-to-end regression for the tune-aborting crash: with the failing
+    trajectory's warp knobs pinned, the cell must be tagged by
+    ``011_lower_atom_cell`` and consumed by ``kernel/005_lower_atom_tile`` —
+    before the fix the untagged AtomTile survived to the cuda render and
+    raised NotImplementedError, killing the whole tune."""
+    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("DEPLODOCK_WM", "2")
+    monkeypatch.setenv("DEPLODOCK_WN", "4")
+    monkeypatch.setenv("DEPLODOCK_FM", "1")
+    monkeypatch.setenv("DEPLODOCK_FN", "1")
+    monkeypatch.setenv("DEPLODOCK_BK", "2")
+
+    g = _sdpa_av_graph()
+    lowered = Pipeline.build(CUDA_PASSES).run(g, ctx=_ctx(cc=(8, 0)))
+    kop = lowered.nodes["c"].op
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected the warp-tier mma.sync variant"
+    assert "dpl_mma" in kop.kernel_source
