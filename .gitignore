@@ -31,10 +31,16 @@ _test_data
 
 # Experiment outputs
 experiments/
+# Benchmark run dirs: keep result files (*.txt / *.json) + the run's recipe.yaml snapshot,
+# but drop generated logs/state. (Ignore the dir *contents*, not the dir itself, so the
+# negations below can re-include specific files.)
+recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/*
+!recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/*.txt
+!recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/*.json
+!recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/recipe.yaml
 recipes/**/benchmark*.log
 recipes/**/instances.json
 recipes/**/tasks.json
-recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/
 
 # Claude Code per-user local settings (skills/agents under .claude/ are tracked)
 .claude/settings.local.json
