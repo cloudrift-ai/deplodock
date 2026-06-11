@@ -215,4 +215,6 @@ class CudaBackend(Backend):
             num_launches=result.num_launches,
             per_launch=result.per_launch,
             captured=result.captured,
+            e2e_ms=result.e2e_ms,
+            e2e_min_ms=result.e2e_min_ms,
         )

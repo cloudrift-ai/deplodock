@@ -8,13 +8,84 @@ event windows measure dense GPU work instead of per-launch dispatch gaps. These 
 - captured replays compute the same outputs as the plain launch loop,
 - the all-or-nothing fallback: a capture failure on either side falls the *whole*
   ``bench_lowered_vs_torch`` invocation back to uncaptured timing (``captured=False``), never mixing
-  semantics within one table.
+  semantics within one table,
+- the whole-program (e2e) timing windows: automatic for multi-launch programs under capture, ``None``
+  for single-launch programs (the solo window is the program time) and when capture is off or the
+  program-graph capture fails — which is never fatal.
 """
 
 from deplodock.compiler.backend.cuda.program import GraphCaptureError, benchmark_program
+from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.cuda import CudaOp
 
 from ..conftest import requires_cuda
-from .test_program import _make_add_graph
+from .test_program import EW_ADD_SOURCE, _make_add_graph
+
+
+def _make_two_launch_graph(n: int = 8) -> Graph:
+    """Two chained elementwise adds (C = A + B; D = C + B) — the smallest
+    program where the whole-program window covers more than one launch."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (n,)), node_id="A")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (n,)), node_id="B")
+    op = CudaOp(
+        kernel_source=EW_ADD_SOURCE,
+        kernel_name="ew_add",
+        arg_order=("A", "B", "C"),
+        grid=((n + 255) // 256, 1, 1),
+        block=(256, 1, 1),
+    )
+    g.add_node(op=op, inputs=["A", "B"], output=Tensor("C", (n,)), node_id="C")
+    op2 = CudaOp(
+        kernel_source=EW_ADD_SOURCE,
+        kernel_name="ew_add",
+        arg_order=("C", "B", "D"),
+        grid=((n + 255) // 256, 1, 1),
+        block=(256, 1, 1),
+    )
+    g.add_node(op=op2, inputs=["C", "B"], output=Tensor("D", (n,)), node_id="D")
+    g.inputs = ["A", "B"]
+    g.outputs = ["D"]
+    return g
+
+
+@requires_cuda
+def test_benchmark_program_e2e_automatic_for_multi_launch():
+    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=True)
+    assert result.captured is True
+    assert result.e2e_ms is not None and result.e2e_ms > 0
+    assert result.e2e_min_ms is not None and 0 < result.e2e_min_ms <= result.e2e_ms
+    # Per-launch fields are unaffected by the extra windows.
+    assert result.num_launches == 2
+    assert result.per_launch is not None and len(result.per_launch) == 2
+
+
+@requires_cuda
+def test_benchmark_program_e2e_skipped_for_single_launch():
+    # One launch: the solo per-launch window already IS the program time — no second measurement.
+    result = benchmark_program(_make_add_graph(1024), warmup=2, num_iters=5, capture_graphs=True)
+    assert result.e2e_ms is None and result.e2e_min_ms is None
+
+
+@requires_cuda
+def test_benchmark_program_e2e_none_without_capture():
+    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=False)
+    assert result.e2e_ms is None and result.e2e_min_ms is None
+
+
+@requires_cuda
+def test_benchmark_program_e2e_capture_failure_is_nonfatal(monkeypatch):
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+
+    def _boom(self):
+        raise GraphCaptureError("forced whole-program capture failure")
+
+    monkeypatch.setattr(CompiledProgram, "capture_program_graph", _boom)
+    result = benchmark_program(_make_two_launch_graph(), warmup=2, num_iters=5, capture_graphs=True)
+    assert result.captured is True  # per-launch capture is independent of the e2e graph
+    assert result.time_ms > 0
+    assert result.e2e_ms is None and result.e2e_min_ms is None
 
 
 @requires_cuda

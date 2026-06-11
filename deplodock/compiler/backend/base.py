@@ -79,6 +79,16 @@ class BenchmarkResult:
     # the bench fell back to plain launches — callers that pair this result
     # with peer torch timings use the flag to keep one table single-semantics.
     captured: bool = False
+    # Whole-program time per iteration, measured as replays of ONE CUDA graph
+    # holding every launch in program order (median / min over measured iters).
+    # ``time_ms``/``min_ms`` sum per-launch windows that each replay a single
+    # kernel back-to-back — accurate per-kernel, but the sum is not an
+    # end-to-end number (no cross-kernel cache effects, no inter-kernel gaps).
+    # Populated automatically for multi-launch programs when capture held;
+    # ``None`` for single-launch programs (the solo window IS the program
+    # time) and when capture was off or fell back.
+    e2e_ms: float | None = None
+    e2e_min_ms: float | None = None
 
 
 class Backend(ABC):
