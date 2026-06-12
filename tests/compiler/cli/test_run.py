@@ -218,6 +218,37 @@ def test_ab_samples_parse_label_and_shape():
     assert s.knobs == {"BM": "8", "BN": "16"}  # names uppercased, whitespace tolerated
     assert s.name == "ab bm=8, BN=16"
     assert s.shape is None
+    assert s.dynamic is None
+    # A --dynamic run stamps its specs on the pseudo-sample so the A/B re-trace
+    # builds the same symbolic graph as the greedy run.
+    (d,) = _ab_samples(["BM=8"], dynamic=["seq_len@x0:0"])
+    assert d.dynamic == ("seq_len@x0:0",)
+
+
+def test_bench_golden_variants_retraces_with_dynamic_spec(monkeypatch):
+    """A pinned sample carrying ``dynamic`` specs (a dynamic golden) re-traces its
+    snippet with the matching ``torch.export`` dynamic_shapes, so the pinned kernel
+    is the same masked-tile artifact as the greedy run; a static sample re-traces
+    with ``dynamic_shapes=None``."""
+    from types import SimpleNamespace
+
+    from deplodock.commands import trace as tmod
+    from deplodock.commands.run import _bench_golden_variants
+
+    seen = []
+
+    def fake_graph_from_code(code, dynamic_shapes=None):
+        seen.append(dynamic_shapes)
+        return object(), "slug", (None, (), {})
+
+    monkeypatch.setattr(tmod, "graph_from_code", fake_graph_from_code)
+    backend = SimpleNamespace(compile=lambda g: g, benchmark=lambda g, *, warmup, num_iters: SimpleNamespace())
+    dyn = SimpleNamespace(name="g.dynM", knobs={"BM": 8}, shape=None, dynamic=("seq_len@x0:0",))
+    static = SimpleNamespace(name="g", knobs={"BM": 8}, shape=None, dynamic=None)
+    benches = _bench_golden_variants(backend, "torch.matmul(torch.randn(8,8), torch.randn(8,8))", [dyn, static], warmup=1, iters=1)
+    assert len(benches) == 2
+    assert seen[0] is not None and 0 in seen[0]["x0"]  # {x0: {0: Dim(seq_len)}}
+    assert seen[1] is None
 
 
 _NCU_CSV = """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"

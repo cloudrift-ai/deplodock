@@ -132,8 +132,11 @@ def resolve_golden_arg(args) -> None:
     """If ``--golden NAME`` is set, resolve it to ``args.code = <golden snippet>``
     and stash every config recorded under NAME on ``args.golden_configs`` (a list —
     one shape may carry several golden knob sets; ``run --bench`` echoes each under
-    its matching kernel). Exits 2 on an unknown name (listing the available names)
-    or a conflict with ``--code`` / positional input / ``--ir``."""
+    its matching kernel). A **dynamic** golden also sets ``args.dynamic`` to its own
+    recorded spec (the spec is part of the config, so a CLI ``--dynamic`` next to
+    ``--golden`` is rejected — the same way ``--ir`` rejects it). Exits 2 on an
+    unknown name (listing the available names) or a conflict with ``--code`` /
+    positional input / ``--ir`` / ``--dynamic``."""
     name = getattr(args, "golden", None)
     args.golden_configs = []
     if not name:
@@ -143,6 +146,9 @@ def resolve_golden_arg(args) -> None:
     if args.code or args.input or getattr(args, "ir", None):
         logger.error("--golden is mutually exclusive with --code / positional input / --ir")
         sys.exit(2)
+    if getattr(args, "dynamic", None):
+        logger.error("--dynamic is incompatible with --golden (a dynamic golden's spec is part of its config)")
+        sys.exit(2)
     matches = Dataset.from_golden(name=name).samples
     if not matches:
         from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
@@ -150,9 +156,11 @@ def resolve_golden_arg(args) -> None:
         names = ", ".join(sorted({g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}))
         logger.error("unknown golden config %r.\nAvailable: %s", name, names)
         sys.exit(2)
-    # All configs under one name share the shape, so any snippet is interchangeable.
+    # All configs under one name share the shape (and dynamic spec), so any
+    # snippet is interchangeable.
     args.golden_configs = matches
     args.code = matches[0].snippet
+    args.dynamic = list(matches[0].dynamic) if matches[0].dynamic else None
     logger.info("[golden] %s → --code %s (%d recorded config%s)", name, args.code, len(matches), "" if len(matches) == 1 else "s")
 
 

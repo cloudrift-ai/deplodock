@@ -93,6 +93,7 @@ class Sample:
     source: str = "db"
     s_full: dict | None = None  # full compiled S_* histogram when known (db/prior rows, or golden compile_s_feats)
     error: str | None = None  # bench_fail failure text (db rows only; None on ok rows)
+    dynamic: tuple[str, ...] | None = None  # --dynamic NAME@INPUT:AXIS specs (dynamic goldens only; None = static)
 
     def s_features(self) -> dict[str, float]:
         """The ``S_*`` features this sample featurizes on: the full stamped histogram
@@ -134,6 +135,7 @@ class Sample:
             snippet=cfg.snippet(),
             source="golden",
             s_full=s_full,
+            dynamic=tuple(cfg.dynamic_specs()) or None,
         )
 
     @classmethod

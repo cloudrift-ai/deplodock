@@ -313,7 +313,7 @@ def handle_run(args):
     # ``--golden NAME`` / ``--ab KNOBS``: compile + bench each pinned config so the
     # kernel table can show it as a live A/B row beside the greedy pick.
     golden_benches = None
-    pinned = list(getattr(args, "golden_configs", None) or []) + (_ab_samples(args.ab) if args.ab else [])
+    pinned = list(getattr(args, "golden_configs", None) or []) + (_ab_samples(args.ab, dynamic=args.dynamic) if args.ab else [])
     if pinned:
         golden_benches = _bench_golden_variants(backend, args.code, pinned, warmup=args.warmup, iters=args.iters)
 
@@ -417,16 +417,19 @@ def _pinned_knobs(knobs: dict):
                 os.environ[key] = prev
 
 
-def _ab_samples(specs):
+def _ab_samples(specs, dynamic=None):
     """One shapeless pseudo-sample per ``--ab "K1=V1,K2=V2"`` spec: ``.knobs`` to pin
     (the ``DEPLODOCK_KNOBS`` grammar), ``.name`` the table label, ``.shape None`` —
     the marker :func:`_print_kernel_stats` uses to nest the row by the benched
-    kernel's own ``S_*`` signature instead of a golden's matmul shape."""
+    kernel's own ``S_*`` signature instead of a golden's matmul shape. ``dynamic``
+    stamps the run's own ``--dynamic`` specs on each pseudo-sample so the A/B
+    re-trace builds the same symbolic graph as the greedy run."""
     from types import SimpleNamespace  # noqa: PLC0415
 
     from deplodock.compiler.pipeline.knob import parse_knob_spec  # noqa: PLC0415
 
-    return [SimpleNamespace(name=f"ab {raw}", knobs=parse_knob_spec(raw), shape=None) for raw in specs]
+    dyn = tuple(dynamic) if dynamic else None
+    return [SimpleNamespace(name=f"ab {raw}", knobs=parse_knob_spec(raw), shape=None, dynamic=dyn) for raw in specs]
 
 
 def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
@@ -438,16 +441,22 @@ def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
     or the shapeless ``--ab`` pseudo-samples from :func:`_ab_samples` (same duck
     type). Each config re-traces a **fresh** graph from ``code`` — a frontend graph
     can't be re-compiled (the first lowering mutates it in place, so a reused graph
-    would yield the first config's kernel every time). Best-effort: a config whose
-    pinned knobs fail to compile / bench for the live device is skipped with a
-    warning."""
+    would yield the first config's kernel every time). A sample carrying ``dynamic``
+    specs (a dynamic golden, or an ``--ab`` row of a ``--dynamic`` run) re-traces
+    symbolically, so the pinned kernel is the same masked-tile artifact the greedy
+    run deployed and benches at the same hint. Best-effort: a config whose pinned
+    knobs fail to compile / bench for the live device is skipped with a warning."""
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     out = []
     for sample in golden_configs or []:
+        dyn = getattr(sample, "dynamic", None)
         try:
+            dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs(list(dyn))) if dyn else None
             with _pinned_knobs(sample.knobs):
-                graph, _, _ = graph_from_code(code)  # fresh graph; knobs baked into the kernel source here
+                # Fresh graph; knobs baked into the kernel source here.
+                graph, _, _ = graph_from_code(code, dynamic_shapes=dynamic_shapes)
                 g_compiled = backend.compile(graph)
             g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
         except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
