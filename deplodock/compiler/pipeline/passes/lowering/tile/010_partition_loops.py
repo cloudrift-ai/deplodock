@@ -620,12 +620,25 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         has_nonlinear_epilogue = has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
         # A fused prologue (SDPA P@V: softmax max/sum) carries a per-M-row
-        # reduction whose accumulators must reset per register cell. Masking a
-        # symbolic M/N axis admits FM/FN > 1, register-tiling the row and
-        # sharing one accumulator across cells — wrong. So a prologue matmul
-        # keeps symbolic axes degenerate (E=1, no mask): correct via the
-        # symbolic grid, one output element per thread.
-        mask_ok = not prologue
+        # reduction whose accumulators must reset per register cell — masking
+        # with FM/FN > 1 would register-tile the row and share one accumulator
+        # across cells, which is wrong. THREAD-level masking is safe for the
+        # SYMBOLIC-K prologue class (SDPA P@V — K = seq_len): the boundary
+        # Cond wraps the whole per-row body (prologue + matmul, placed inside
+        # SerialTile(M_r) by the prologue branch of ``_build_split_body``)
+        # and ``mask_f1`` restricts masked prologue rows to FM = FN = 1 —
+        # one row per thread, no shared accumulators, and nothing stages (a
+        # symbolic K never builds a slab), so no collective lives under the
+        # divergent guard. A STATIC-K prologue kernel (fused gated-MLP)
+        # stays degenerate on its symbolic rows: its K pipeline stages, and
+        # ``021_hoist_staged_loads_above_mask`` would hoist the staged
+        # matmul above the Cond while the prologue chain it consumes
+        # (rsqrt of the row stats) stays guarded below — an SSA-ordering
+        # break (undefined value at render). Its deployment path is the
+        # structural split (``005_split_demoted``, which now offers on
+        # symbolic rows); masked staged prologues are follow-up work.
+        prologue_mask_ok = (not prologue) or k_symbolic
+        mask_f1 = bool(prologue)
         # fp16 half2 window (FK on the scalar matmul path): enabled only when
         # every K-indexed operand Load is fp16 and there's no fused prologue
         # (SDPA P@V's softmax stats would interleave with the windowed flush).
@@ -633,16 +646,17 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # ``__hfma2`` throughput — see ``plans/fk-half2-fp16-matmul.md``.
         fp16_window = (not prologue) and not k_symbolic and _is_fp16_matmul(matmul_reduces, graph)
         param_combos = enumerate_cartesian(
-            E_M=E_M if (mask_ok or not m_symbolic) else 1,
-            E_N=E_N if (mask_ok or not n_symbolic) else 1,
+            E_M=E_M if (prologue_mask_ok or not m_symbolic) else 1,
+            E_N=E_N if (prologue_mask_ok or not n_symbolic) else 1,
             E_K=E_K,
             ctx=ctx,
             priority_mode="matmul",
             force_splitk_one=force_splitk_one,
             m_axis_name=outer_m.axis.name if outer_m is not None else None,
             n_axis_name=outer_n.axis.name,
-            m_forced_mask=m_symbolic and mask_ok,
-            n_forced_mask=n_symbolic and mask_ok,
+            m_forced_mask=m_symbolic and prologue_mask_ok,
+            n_forced_mask=n_symbolic and prologue_mask_ok,
+            mask_f1=mask_f1,
             fp16_window=fp16_window,
         )
         # Warp-tier MMA: only when the MMA knob is enabled (default;
@@ -1007,7 +1021,12 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     if n_bound is not None:
         n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", n_pred, n_bound), body=Body(new_inner)),)
-    if m_bound is not None:
+    if m_bound is not None and not shape.prologue:
+        # Prologue kernels emit the M-Cond around the whole per-row body
+        # (prologue + matmul tower) inside SerialTile(M_r) below — the
+        # softmax max/sum loops index ``P[m, k]`` of a possibly
+        # runtime-sized buffer, so an overhang row's prologue reads must be
+        # guarded too, not just the matmul body.
         m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", m_pred, m_bound), body=Body(new_inner)),)
 
@@ -1049,6 +1068,17 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     if shape.prologue:
         matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
         body_inside_mr = prologue_rewritten + matmul_tower
+        if m_bound is not None:
+            # Masked M on a prologue kernel: the boundary Cond wraps the WHOLE
+            # per-row body — prologue reduces (softmax max/sum over the
+            # runtime-sized ``P[m, k]``) plus the matmul tower — as a unit.
+            # FM = FN = 1 on masked rows (``mask_f1``) keeps one row per
+            # thread, so no per-row accumulator spans register cells, and no
+            # collectives live inside (prologue forces SPLITK=1, BR=1) — the
+            # divergence is benign; staged loads are lifted back out by
+            # ``021_hoist_staged_loads_above_mask``.
+            m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
+            body_inside_mr = (Cond(cond=BinaryExpr("<", m_pred, m_bound), body=Body(body_inside_mr)),)
         if M_r is not None:
             # M_r stays serial (not RegisterTile) — the SDPA prologue
             # (softmax max/sum/reciprocal) computes once per output row
