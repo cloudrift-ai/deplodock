@@ -65,7 +65,9 @@ def test_gated_mlp_combine_merges_into_gemm(monkeypatch) -> None:
     assert len(glued) == 1, f"exactly one re-fused composite, got {glued}"
     merged = terminal.nodes[glued[0]].op
     assert merged.knobs.get("SPLIT_CONE") is True, "005's idempotence stamp must survive the merge"
-    assert "SPLIT_GLUE" not in merged.knobs, "the composite marker must stay out of op.knobs (prior training features)"
+    assert all(k == "SPLIT_CONE" or k.startswith("S_") for k in merged.knobs), (
+        "only the split decision + structural features may reach op.knobs — utility markers ride Node.hints"
+    )
     assert any(k.startswith("S_") for k in merged.knobs), "the 009 alias must restamp structural features"
     assert merged.name, "the 008 alias must restamp the kernel name"
     assert _has_accum(merged), "the merged op is the gemm (the combine rode along as epilogue)"
@@ -84,16 +86,6 @@ def test_gated_mlp_second_gemm_does_not_remerge(monkeypatch) -> None:
     glued = set(_glued_ids(terminal))
     standalone_gemms = [nid for nid, op in ops.items() if _has_accum(op) and nid not in glued and "__mm" in nid]
     assert len(standalone_gemms) == 1, f"the second extracted gemm must survive un-merged, got {sorted(ops)}"
-
-
-def test_split_glue_pin_off_keeps_all_four(monkeypatch) -> None:
-    """``DEPLODOCK_SPLIT_GLUE=0`` is the with/without-re-fusion A/B switch: the
-    split's full 4-kernel set survives and nothing carries the stamp."""
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
-    monkeypatch.setenv("DEPLODOCK_SPLIT_GLUE", "0")
-    terminal = _resolve_outer(_gated_mlp_graph())
-    assert len(_loop_ops(terminal)) == 4, "pin off must keep xn + mm0 + mm1 + combine"
-    assert not _glued_ids(terminal)
 
 
 def test_norm_linear_xn_not_reinlined(monkeypatch) -> None:
@@ -134,7 +126,7 @@ def test_outer_terminal_matches_greedy_kernel_count(monkeypatch) -> None:
     """Outer ≡ greedy on the kernel-set cardinality: the outer head (looped to
     quiescence) and the full greedy pipeline (one LoopOp batch per scan) must
     realize the same 3-kernel set for the pinned gated-MLP split — the
-    one-batch contract guard 2 (SPLIT_GLUE marker) exists to keep true."""
+    one-batch contract guard 2 (the GLUE_HINT marker) exists to keep true."""
     from deplodock.compiler.ir.cuda.ir import CudaOp
     from deplodock.compiler.pipeline import CUDA_PASSES
     from deplodock.compiler.pipeline.search.db import SearchDB

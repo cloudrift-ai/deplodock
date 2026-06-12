@@ -58,8 +58,6 @@ ancestor. ``S_*`` features and the kernel name are restamped by the
 ``007``/``008``/``009`` aliases after the body settles. ``005_split_shared_indexmap`` is
 not aliased: the only multi-consumer split product (the shared gated-MLP ``xn``) is
 compute-bearing, which that rule's pure-indexmap gate excludes anyway.
-
-``DEPLODOCK_SPLIT_GLUE=0`` pins the rule off (the with/without-re-fusion A/B).
 """
 
 from __future__ import annotations
@@ -71,7 +69,6 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.loop import Accum, Load, Loop, LoopOp
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.loop.fusion._helpers import build_merged_op, is_pure_indexmap, wrap_merge_fragment
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY, is_atom_eligible
 
@@ -85,23 +82,11 @@ PATTERN = [
     Pattern("consumer", LoopOp),
 ]
 
-# BOOL knob declared ONLY for the env pin (``DEPLODOCK_SPLIT_GLUE=0`` turns the
-# re-fusion off — the with/without A/B). DELIBERATELY never stamped into
-# ``op.knobs``: every knobs entry rides into the prior's training rows
-# (``knob.knob_features`` float-coerces even unregistered keys), and this is a
-# utility marker, not a tuning decision the prior should have to learn. The
-# merged-composite marker lives in ``Node.hints`` (``GLUE_HINT``) instead —
-# pure attribution metadata the featurizer never reads, surviving graph
-# splices like provenance does.
-SPLIT_GLUE = Knob(
-    "SPLIT_GLUE",
-    KnobType.BOOL,
-    hints=(True,),
-    help="Re-fuse a split glue kernel (xn producer / pointwise combine) into its neighbor's epilogue",
-)
-
 _SPLIT_CONE = "SPLIT_CONE"
 # Node-hint key marking a re-fused composite (guard 2's one-level contract).
+# DELIBERATELY a node hint, not an ``op.knobs`` entry: every knobs key rides
+# into the prior's training rows (``knob.knob_features`` float-coerces even
+# unregistered keys), and this is plumbing, not a tuning decision to learn.
 GLUE_HINT = "tile.split_glue"
 
 
@@ -134,8 +119,6 @@ def rewrite(ctx: Context | None, match: Match, producer: Node, consumer: Node) -
     # Guard 1: scope key — only split products and their direct neighbors.
     if not (producer.op.knobs.get(_SPLIT_CONE) is True or consumer.op.knobs.get(_SPLIT_CONE) is True):
         raise RuleSkipped("neither op is a split product (SPLIT_CONE=True) — loop-tier fusion already settled this pair")
-    if True not in SPLIT_GLUE.narrow((False, True)):
-        raise RuleSkipped("post-split re-fusion pinned off (DEPLODOCK_SPLIT_GLUE=0)")
 
     # Guard 2: one-level marker — never compound re-fusions (one-batch ≡ quiescence).
     if producer.hints.get(GLUE_HINT) or consumer.hints.get(GLUE_HINT):
