@@ -275,7 +275,19 @@ def _guard_unsafe_loads(stmt: Stmt, predicate, gated_vars: frozenset[str], smem_
 
 def _guard_unsafe_loads_in_body(body: Body, predicate, gated_vars: frozenset[str], smem_names: frozenset[str]) -> Body:
     """Apply the per-Load guard inside ``body`` and recurse into nested
-    bodies of any block stmts that aren't leaf bodies themselves."""
+    bodies of any block stmts that aren't leaf bodies themselves.
+
+    An MMA cell body (contains an ``Mma``) is left untouched: wrapping the
+    cell in a Cond would hide the ``Mma`` from ``SerialTile.is_reduce``
+    (immediate-body check) and downstream shape classification
+    (``kernel/005_lower_atom_tile`` would flatten the K tower as a
+    K-filtered cell). The cell's unstaged gated loads are made safe by 005
+    instead — the clamped gmem-direct fragment load
+    (``LdmatrixLoad.gmem_guard``), the masked warp tier's read contract."""
+    from deplodock.compiler.ir.stmt import Mma  # noqa: PLC0415
+
+    if any(isinstance(s, Mma) for s in body):
+        return body
     stmts = list(body)
     # First recurse into each stmt's nested bodies (descent first so
     # leaf-level guards are placed at the right scope).
