@@ -759,6 +759,17 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # breaking the cross-thread combine. So a symbolic free axis stays
         # degenerate here (E=1, no forced mask): correct at any seq_len via the
         # symbolic grid, just not register-tiled.
+        #
+        # A masked BR=1 thread-tile family (rows-per-CTA at the hint with the
+        # boundary guard, the symbolic-axis-parity follow-up) is DEFERRED: a
+        # reduce kernel's staged row sweep plus its post-reduce output loop
+        # consume the rsqrt chain between them — the same 021-hoist SSA
+        # interaction that keeps static-K fused-prologue matmuls degenerate
+        # (see the prologue_mask_ok comment in the matmul branch; 021 now
+        # refuses such lifts defensively). These kernels' deployment path is
+        # the structural split (norm + proj slices split like any demoted
+        # matmul); strided-cooperative work over symbolic axes is the M5+
+        # follow-up.
         param_combos = enumerate_cartesian(
             E_M=1 if m_symbolic else E_M,
             E_N=1 if n_symbolic else E_N,

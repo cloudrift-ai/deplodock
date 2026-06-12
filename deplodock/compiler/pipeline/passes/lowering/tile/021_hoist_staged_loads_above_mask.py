@@ -135,6 +135,19 @@ def _lift_if_match(s: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt | 
             inside.append(sub)
     if not _contains_stage_bundle(Body(tuple(hoisted))):
         return s
+    # SSA-dependency safety: refuse the lift when a hoisted pipeline reads a
+    # name defined by a stmt staying inside the Cond (a fused-prologue shape
+    # — e.g. the gated-MLP's matmul consuming the rsqrt of its row stats).
+    # Hoisting would order the consumer ABOVE its definition (undefined
+    # identifier at render). The planner doesn't emit liftable masked
+    # prologue Conds today (static-K prologue kernels stay degenerate;
+    # symbolic-K ones never stage), so this is defense-in-depth for future
+    # planner changes and exotic knob pins — leaving the Cond intact keeps
+    # the body well-formed.
+    hoisted_reads = {name for h in hoisted for st in Body((h,)).iter() for name in st.deps()}
+    inside_defs = {name for i_s in inside for st in Body((i_s,)).iter() for name in st.defines()}
+    if hoisted_reads & inside_defs:
+        return s
     gated_vars = frozenset(s.cond.free_vars())
     hoisted = [_guard_unsafe_loads(h, s.cond, gated_vars) for h in hoisted]
     # Stamp ``gmem_extents`` on every cooperative-load Source being hoisted

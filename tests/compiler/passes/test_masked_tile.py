@@ -386,3 +386,61 @@ def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
     if r_coeff is not None:
         assert r_coeff == 1, f"clean N should be thread-major (register coeff 1), got t={t_coeff} r={r_coeff}"
         assert t_coeff is not None and t_coeff > 1, f"thread axis should stride by FN>1, got t={t_coeff} r={r_coeff}"
+
+
+def test_hoist_refuses_lift_when_pipeline_reads_guarded_defs():
+    """021's lift is refused when a hoisted K-pipeline reads an SSA name
+    defined by a stmt staying inside the boundary Cond (the fused-prologue
+    shape: a matmul consuming the rsqrt of its row stats). Hoisting would
+    order the consumer above its definition — undefined identifier at
+    render. The Cond is left intact instead (defense-in-depth: the planner
+    doesn't emit liftable masked prologue Conds today)."""
+    import importlib
+
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load
+    from deplodock.compiler.ir.tile.ir import AffineAddressing, Source, StageBundle, StagePolicy
+
+    hoist = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.021_hoist_staged_loads_above_mask")
+
+    src = Source(
+        name="w_smem",
+        buf="w",
+        cache_axes=(Axis("a5", 64),),
+        origin=(Literal(0, "int"),),
+        addressing=AffineAddressing(dims=(0,)),
+    )
+    # The staged pipeline consumes ``scale`` — defined by the Assign that
+    # stays inside the Cond (it is not a K-pipeline stmt).
+    pipeline = StageBundle(
+        sources=(src,),
+        body=Body(
+            (
+                Load(name="wv", input="w_smem", index=(Literal(0, "int"),)),
+                Assign(name="prod", op=ElementwiseImpl("multiply"), args=("wv", "scale")),
+                Accum(name="acc", value="prod"),
+            )
+        ),
+        policy=StagePolicy.SYNC,
+    )
+    scale_def = Assign(name="scale", op=ElementwiseImpl("rsqrt"), args=("stat",))
+    write = Write(output="o", index=(Var("m"),), value="acc")
+    cond = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((scale_def, pipeline, write)))
+
+    out = hoist._lift_if_match(cond, {"w": (64,)})
+    assert out is cond, "lift must be refused — the pipeline reads 'scale' defined inside the Cond"
+
+    # Same shape without the dependency lifts normally.
+    indep_pipeline = StageBundle(
+        sources=(src,),
+        body=Body(
+            (
+                Load(name="wv", input="w_smem", index=(Literal(0, "int"),)),
+                Accum(name="acc", value="wv"),
+            )
+        ),
+        policy=StagePolicy.SYNC,
+    )
+    cond2 = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((indep_pipeline, write)))
+    out2 = hoist._lift_if_match(cond2, {"w": (64,)})
+    assert isinstance(out2, tuple) and len(out2) == 2, "independent pipeline must still lift (bundle above, residual Cond below)"
