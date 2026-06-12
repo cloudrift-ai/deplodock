@@ -86,18 +86,46 @@ def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source], graph: Grap
     live ``Source``. The atom spec is read off each cell's ``Mma`` (no knob
     lookup). Returns ``(new_body, found_any)``."""
     found = False
+    outer_loads = _collect_outer_loads(body)
 
     def handler(s: Stmt, sources: dict[str, Source]) -> tuple[Stmt, ...] | None:
         nonlocal found
         if isinstance(s, AtomTile):
             found = True
-            return _lower_cell(s.body, smem_sources=sources, graph=graph)
+            return _lower_cell(s.body, smem_sources=sources, graph=graph, outer_loads=outer_loads)
         return None
 
     return map_staged(body, handler, sources=smem_sources), found
 
 
-def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source], graph: Graph | None = None) -> tuple[Stmt, ...]:
+def _collect_outer_loads(body: Body) -> dict[str, Load]:
+    """Single-name ``Load``s in ``body`` that sit OUTSIDE every ``AtomTile``
+    and outside any reduce loop — the loop-invariant scalar prologue loads the
+    splicer parks at the TileOp root (a real trace's f32 constants). Passed to
+    the epilogue classifier as fallback leaf definitions so the fold sees the
+    same leaves the Loop-IR eligibility gate admitted (SSA names are unique
+    per kernel, so a flat name map is unambiguous)."""
+    outer: dict[str, Load] = {}
+
+    def _walk(stmts: Body) -> None:
+        for s in stmts:
+            if isinstance(s, AtomTile):
+                continue
+            if isinstance(s, Load) and len(s.names) == 1:
+                outer.setdefault(s.names[0], s)
+                continue
+            if isinstance(s, SerialTile) and s.is_reduce:
+                continue
+            for sub in s.nested():
+                _walk(sub)
+
+    _walk(body)
+    return outer
+
+
+def _lower_cell(
+    atom_body: Body, *, smem_sources: dict[str, Source], graph: Graph | None = None, outer_loads: dict[str, Load] | None = None
+) -> tuple[Stmt, ...]:
     """Lower one AtomTile body (operand Loads + ``Mma``) to the fragment chain.
 
     The atom :class:`Atom` spec comes from the cell's ``Mma``. Prepends the
@@ -127,7 +155,7 @@ def _lower_cell(atom_body: Body, *, smem_sources: dict[str, Source], graph: Grap
         raise RuleSkipped("AtomTile body unrecognised — no Write")
     if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
-    epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph)
+    epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph, outer_loads=outer_loads)
 
     c_frag, a_frag, b_frag = f"{c_seed}_frag", f"{a_seed}_frag", f"{b_seed}_frag"
     fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=spec.operand_dtype("c"))
@@ -194,7 +222,9 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
     return write_stmt, a_seed, b_seed, c_seed, has_reduce, spec
 
 
-def _scan_epilogue(body: Body, *, acc_name: str, graph: Graph | None) -> tuple[RegEpilogue | None, frozenset[int]]:
+def _scan_epilogue(
+    body: Body, *, acc_name: str, graph: Graph | None, outer_loads: dict[str, Load] | None = None
+) -> tuple[RegEpilogue | None, frozenset[int]]:
     """Classify the AtomTile body's post-reduce epilogue via the shared
     negative-form classifier (``tile/_atom.classify_fragment_epilogue`` — the
     same walk the planner gate ran on the Loop-IR body, here on the staged
@@ -216,7 +246,7 @@ def _scan_epilogue(body: Body, *, acc_name: str, graph: Graph | None) -> tuple[R
             return None
         return graph.nodes[buf].output.dtype.name
 
-    slice_, blocker = classify_fragment_epilogue(body, {acc_name}, produced=produced, leaf_dtype=_leaf_dtype)
+    slice_, blocker = classify_fragment_epilogue(body, {acc_name}, produced=produced, leaf_dtype=_leaf_dtype, outer_loads=outer_loads)
     if blocker is not None:
         raise RuleSkipped(f"AtomTile epilogue consuming {acc_name!r} is not foldable ({blocker}) — gate out of sync?")
     if slice_ is None:

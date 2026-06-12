@@ -826,10 +826,11 @@ def test_two_sided_split_mma_accuracy_cuda(monkeypatch) -> None:
 
 @requires_cuda
 def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
-    """Pinned split on the gated-MLP dual-accum kernel: four kernels, BOTH
-    extracted gemms run on mma.sync, and the output matches numpy (finding 2's
-    end-to-end shape — the real Qwen3 kernel goes 51 µs scalar-fused →
-    ~13 µs split on an RTX 5090)."""
+    """Pinned split on the gated-MLP dual-accum kernel: three kernels (the
+    ``006_merge_split_glue`` re-fusion folds the pointwise combine into one
+    gemm's epilogue), BOTH extracted gemms run on mma.sync, and the output
+    matches numpy (finding 2's end-to-end shape — the real Qwen3 kernel goes
+    51 µs scalar-fused → ~13 µs split on an RTX 5090)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.numpy import NumpyBackend
     from deplodock.compiler.ir.cuda.ir import CudaOp
@@ -844,7 +845,7 @@ def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
     be = CudaBackend()
     compiled = be.compile(_gated_mlp_graph())
     ids = _lowered_kernel_ids(compiled)
-    assert len(ids) == 4
+    assert len(ids) == 3, "xn + gemm + (gemm with the combine folded as its epilogue)"
     mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
     assert len(mma_kernels) == 2, "both extracted gemms must lower on the warp tier"
     out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]

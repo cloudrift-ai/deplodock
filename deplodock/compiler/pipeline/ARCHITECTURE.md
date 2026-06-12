@@ -162,6 +162,37 @@ separation that keeps each decision state distinct from its parent in the search
 deterministic per offer site, so identical kernels across graphs stamp identically and keep sharing perf
 rows.
 
+**Post-split re-fusion (`SPLIT_GLUE`, rules `006_merge_split_glue` – `009_stamp_structural_features`).** The
+split's glue kernels — `xn` materializations, the pointwise combine — are launch-latency-floor at deploy
+size (the Qwen3 layer-0 findings measured ~23 of 48 per-launch µs in glue at 1–23% DRAM), so right after
+`005_split_demoted` the tile head re-runs the loop-fusion *mechanism* on the still-untiled `Graph[LoopOp]`:
+`006_merge_split_glue` wraps `loop/fusion`'s splice plumbing (`_helpers.build_merged_op` /
+`wrap_merge_fragment`) under a split-preserving guard set, and `007`/`008`/`009` are thin re-export aliases
+of `020_dedup_loads` / `991_stamp_loop_names` / `992_stamp_structural_features` so merged kernels get
+deduped bodies, names, and fresh `S_*` features before partition fixes their `op_cache_key`. The flagship
+merge folds the gated-MLP combine into one extracted gemm's epilogue (the existing
+`classify_fragment_epilogue` / `RegEpilogue` fold lowers it; the fold also resolves prologue-resident scalar
+leaf loads — a real trace's f32 constants the splicer parks at the TileOp root — via
+`005_lower_atom_tile._collect_outer_loads`, keeping the fold in sync with the Loop-IR gate that admitted
+them). The guards: fire only when a matched op carries `SPLIT_CONE: True` (inert in the loop tier and on
+keep-fused branches); never merge a node already carrying the `tile.split_glue` **node hint** (one-level
+contract — the full pipeline gives the rule ONE LoopOp batch per scan while the outer head loops to
+quiescence, and second-order merges firing only in the latter would split `op_cache_key`s between outer
+search and greedy replay; the marker rides `Node.hints` like provenance, NOT `op.knobs`, because every knobs
+key becomes a prior training feature and this is plumbing, not a decision to learn); never inline
+into a consumer that reads the producer inside a reduce loop (re-polluting the K cell = re-demotion); never
+merge two `Accum`-bearing bodies (would rebuild the multi-accum kernel the split cut apart); the base
+blowup + broadcast-materialization economics; and never trade away atom eligibility (`is_atom_eligible` on
+both constituents vs the merged op — the real gate, no simulation). The base multi-load-of-reduce-heavy
+guard is deliberately dropped here: the post-split shapes that read a reduce producer through two Loads
+(RoPE reading the normed row) are exactly the target merges, and the splicer dedups the row stats to one
+emission. The merged op is re-stamped `SPLIT_CONE: True` (005's idempotence — without it the rule re-offers
+a split of the merged kernel and split→merge→re-split never terminates) and forwards a constituent's
+`source` for the outer search's Σ attribution. Unconditional cleanup, NOT a fork — a single deterministic
+`Graph` rewrite adds no outer-tree nodes. `DEPLODOCK_SPLIT_GLUE=0` pins it off (the with/without A/B). Known
+v1 gap: the deployed-graph attn@V→contiguize-copy backward merge (o_proj's `xn`) is rejected by
+`splice_graph` itself (σ-solve of the 4-D SDPA write vs the collapsed read), so that copy stays a launch.
+
 Binding tiers the planner emits today: `Role.BLOCK` (→ `GridTile`),
 `Role.THREAD` (→ `ThreadTile`), `Role.REGISTER` (→ `RegisterTile`).
 `Role.WARP` (→ `WarpTile`) and `Role.ATOM` (→ `AtomTile`, the
@@ -471,7 +502,8 @@ kernel reached its good tile). The two kinds have opposite structure, so `search
 fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — `plans/structural-forks-in-two-level.md`):
 
 - **Outer search** (`run_two_level_tune`) drives the graph-changing passes — `frontend` + `loop` plus the
-  pre-partition head of `lowering/tile` (`outer_pipeline()`, today just `005_split_demoted`'s keep-vs-split offer). A
+  pre-partition head of `lowering/tile` (`outer_pipeline()`: `005_split_demoted`'s keep-vs-split offer followed by the
+  non-forking `006`–`009` post-split re-fusion aliases, which change kernel sets but never branch the tree). A
   **terminal** is the state where the cursor reaches `partition_loops` with every structural fork resolved — every op
   post-fusion and structurally final, split producers/consumers included as real `LoopOp` nodes. Each terminal is a
   candidate fused graph; its **reward** is `1 / Σ best-per-op time` from the inner search, backpropagated by the
@@ -724,6 +756,7 @@ incompatible divisibility still get a sensible default.
 | `WARPSPEC`           | BOOL      | `085_warp_specialize`         | Warp-specialize TMA staging: producer warp(s) issue TMA, consumer warps wait + reduce. Autotune fork on depth-2 TMA rings (so `040_use_ring_buffers` front-loads `RING=2` on the warp tier to keep it eligible). Eligibility also requires the bundle be **reachable by the producer split** — `_split_by_role` recurses only through `serial_outer` / `RegisterTile` / `AtomTile`, so a bundle under any other wrapper (e.g. the fused linear+mean kernel's `SerialTile(kind='plain')` fragment loop) would strand the TMA issues in the consumer branch and deadlock every consumer `mbarrier.wait` (the Qwen3 `k_linear_mean_reduce` hang — `plans/qwen3-embedding-tune-hung-kernel.md`); such shapes stamp WS=False. Both consumer tiers: scalar `ThreadTile` (pointwise / coop-reduce) and the warp-tier MMA tower's `WarpTile` (`consumer_is_warp`). On the **64×64 4-warp** fp16 mma.sync tile WS=1 is the measured win (≈17%: 94 µs vs 115 µs at 2048²) and both greedy and the tuner now pick it; it was ~neutral at the old 128×128 tile, where the gap was mma-schedule-bound. The WS=1 fork is **emitted first** for the warp tier (option-0), the deterministic tie-break the cold picker takes when the prior ties WS=0/WS=1 (the `AnalyticPrior` has no WARPSPEC feature), so it deploys the win cold instead of taking WS=0 and never benching WS=1 (the fp16 cliff in `plans/golden-sweep-report.md`). `DEPLODOCK_WARP_SPECIALIZE` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `NOATOMIC`           | BOOL      | `017_atomic_free_splitk`      | Replace `SPLITK > 1`'s atomicAdd output with a workspace + sibling reduce kernel (deterministic accumulation). `DEPLODOCK_ATOMIC_FREE_SPLITK` is its env **alias** (`Knob.aliases` — either spelling works).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `SPLIT_CONE`         | BOOL      | `005_split_demoted`           | Split a demoted matmul's computed multiply-operand cone(s) into producer kernel(s) + the clean gemm — one producer per cone, each materialized over exactly the axes it reads, an N-reading cone at […, K, N] so the consumer keeps the canonical B layout (see the demoted-matmul split section above). Stamped on `op.knobs` at offer sites only — `False` = considered-and-declined, `True` = every split kernel — the rule's idempotence guard and the prior's training signal (absent = never offered). Deliberately declares no `off=` value: `_off_fill_pass` would stamp an off-default onto every knob-bearing TileOp at the pass boundary, erasing the absent-vs-declined distinction. `DEPLODOCK_SPLIT_CONE=1/0` pins the branch.                                                                                                |
+| `SPLIT_GLUE`         | BOOL      | `006_merge_split_glue`        | Env **pin only** — `DEPLODOCK_SPLIT_GLUE=0` turns the post-split re-fusion off (the with/without A/B); the rule is unconditional cleanup, not a fork. DELIBERATELY never stamped into `op.knobs`: every knobs entry becomes a prior training feature (`knob.knob_features` float-coerces even unregistered keys), and the re-fused-composite marker is plumbing, not a decision to learn — it rides the merged node's `Node.hints` (`tile.split_glue`) instead, like provenance. |
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2 set, char `i` = bit `i`), the keywords `"all"` / `"none"`,
 or a decimal / `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered

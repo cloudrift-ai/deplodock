@@ -37,13 +37,13 @@ through.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp, splice_graph
+from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.loop.fusion._helpers import build_merged_op as _build_merged_op
 from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap as _is_pure_indexmap
-from deplodock.compiler.pipeline.passes.loop.fusion._helpers import rename_write_output as _rename_write_output
+from deplodock.compiler.pipeline.passes.loop.fusion._helpers import wrap_merge_fragment as _wrap_merge_fragment
 
 _BLOWUP_FACTOR = 8
 
@@ -148,34 +148,14 @@ def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
     if _reduce_heavy(producer.op) and _count_loads_from(consumer.op, producer.id) > 1:
         raise RuleSkipped("reduce-heavy producer feeds consumer through >1 Load — fusion would duplicate the reduce")
 
-    # Build a subgraph: producer, consumer, and their non-producer external
-    # inputs as InputOp nodes. ``splice_graph`` classifies each Load via the
-    # graph edges (LoopOp→LoopOp is a splice edge; LoopOp→InputOp is external)
-    # and assigns merged slots in first-seen order.
-    sub = Graph()
-    external_ids: list[str] = []
-    for ext_id in list(producer.inputs) + list(consumer.inputs):
-        if ext_id == producer.id or ext_id in sub.nodes:
-            continue
-        external_ids.append(ext_id)
-        ext = graph.nodes.get(ext_id)
-        shape = ext.output.shape if ext is not None else ()
-        dtype = ext.output.dtype if ext is not None else "f32"
-        sub.add_node(InputOp(), [], Tensor(ext_id, shape, dtype), node_id=ext_id)
-    sub.add_node(producer.op, list(producer.inputs), producer.output, node_id=producer.id)
-    sub.add_node(consumer.op, list(consumer.inputs), consumer.output, node_id=consumer.id)
-    sub.outputs = [consumer.id]
-
-    result = splice_graph(sub)
-    if result is None:
-        # ``splice_graph`` returns None on any unsupported pattern: σ-solve failure
-        # (writer/reader index forms incompatible), missing axis in consumer scope,
-        # or splicer-internal validity issues. The rule treats them uniformly —
-        # the producer/consumer pair stays separate.
+    # ``build_merged_op`` hands a two-node subgraph to ``splice_graph`` and
+    # returns None on any unsupported pattern: σ-solve failure (writer/reader
+    # index forms incompatible), missing axis in consumer scope, or
+    # splicer-internal validity issues. The rule treats them uniformly —
+    # the producer/consumer pair stays separate.
+    merged = _build_merged_op(graph, producer, consumer)
+    if merged is None:
         raise RuleSkipped(f"splice_graph rejected pattern: {producer.id!r} -> {consumer.id!r}")
-    merged, merged_inputs = result
-    new_node_id = f"merged_{consumer.id}"
-    merged = _rename_write_output(merged, old=consumer.id, new=new_node_id)
 
     pre_work = _total_work(producer.op) + _total_work(consumer.op)
     pre_reads = _total_reads(producer.op) + _total_reads(consumer.op)
@@ -197,30 +177,7 @@ def rewrite(match: Match, producer: Node, consumer: Node) -> Graph | None:
             f"compute producer numel {_output_numel(producer.op)}"
         )
 
-    # Wrap the merged LoopOp in the rule's output fragment. The graph node's
-    # ``inputs`` list must be in the SAME order as ``merged.input_bufs`` (the
-    # buf names appearing on body Loads in first-use order) so the
-    # interpreter — which positionally zips ``node.inputs`` against
-    # ``input_bufs`` — keys arrays by the right buf name.
-    merged_inputs = list(merged.inputs)
-    frag = Graph()
-    for inp_id in merged_inputs:
-        ext = graph.nodes.get(inp_id)
-        shape = ext.output.shape if ext is not None else ()
-        dtype = ext.output.dtype if ext is not None else "f32"
-        frag.add_node(InputOp(), [], Tensor(inp_id, shape, dtype), node_id=inp_id)
-    out_id = frag.add_node(
-        merged,
-        merged_inputs,
-        Tensor(
-            consumer.output.name,
-            consumer.output.shape,
-            consumer.output.dtype,
-        ),
-        node_id=new_node_id,
-    )
-    frag.outputs = [out_id]
-
+    frag = _wrap_merge_fragment(graph, merged, consumer)
     match.output = consumer.id
     match.consumed = {producer.id, consumer.id}
     return frag
