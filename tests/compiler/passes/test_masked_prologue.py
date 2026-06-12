@@ -87,15 +87,18 @@ def _fused_prologue_plan(graph: Graph | None = None):
 
 def test_masked_prologue_rows_are_thread_tiled_f1():
     """Symbolic-M prologue kernels enumerate MASKED rows with BM > 1 (thread
-    tiles — previously the whole space was the degenerate E=1 family) and
-    every masked row keeps FM = FN = 1 (no per-row accumulator spans
-    register cells)."""
+    tiles — previously the whole space was the degenerate E=1 family).
+    The MASKED axis's register tiling clamps to 1 (no per-row accumulator
+    spans register cells along it); the unmasked static N axis keeps its F
+    sweep — P@V's best configs carry FN > 1."""
     plan = _fused_prologue_plan()
     masked = [r for r in plan.params if r.get("OVERHANG")]
     assert masked, "symbolic-M prologue kernel must enumerate masked rows"
     assert any(r.get("BM", 1) > 1 for r in masked), "masked rows must include thread tiles (BM > 1)"
-    bad = [r for r in masked if r.get("FM", 1) > 1 or r.get("FN", 1) > 1]
-    assert not bad, f"masked prologue rows must keep FM = FN = 1, got {bad}"
+    m_masked = [r for r in masked if "OVERHANG" in r]
+    bad = [r for r in m_masked if r.get("FM", 1) > 1]
+    assert not bad, f"masked-M prologue rows must keep FM = 1, got {bad}"
+    assert any(r.get("FN", 1) > 1 for r in masked), "the unmasked N axis must keep its register-tile sweep (FN > 1)"
 
 
 def test_static_k_prologue_stays_degenerate():

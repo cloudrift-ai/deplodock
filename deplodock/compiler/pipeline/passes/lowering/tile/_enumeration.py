@@ -481,12 +481,13 @@ def _enumerate_cartesian_impl(
     for the M / N axes respectively (the caller knows them from the LoopOp; we
     don't reconstruct).
 
-    ``mask_f1`` (fused-prologue kernels) restricts every MASKED variant to
-    ``FM = FN = 1``: the prologue's per-row accumulators must not be shared
-    across register cells, so a masked row keeps one output element per
-    thread while unmasked (static, divisible) variants keep the full
-    register-tile sweep. Enumerator-side — not a planner clamp — so the knob
-    row stays the DB/prior identity of what actually materializes.
+    ``mask_f1`` (fused-prologue kernels) restricts a MASKED axis's register
+    tiling to 1 (``FM = 1`` when M is masked, ``FN = 1`` when N is): the
+    prologue's per-row accumulators must not be shared across register cells
+    along the masked axis. The unmasked axis keeps its full F sweep — a
+    static-N register cell never shares a row accumulator (P@V's best
+    configs carry ``FN = 4``). Enumerator-side — not a planner clamp — so
+    the knob row stays the DB/prior identity of what actually materializes.
     """
     # An axis is maskable if the mode allows masking (static non-divisor case)
     # or it's a forced-mask symbolic axis. ``E > 1`` rules out the size-1
@@ -550,9 +551,12 @@ def _enumerate_cartesian_impl(
                 # article's FM=26 (non-divisor of 256) surface in the search.
                 # Fused-prologue kernels (``allow_nondivisor_f_on_mask=False``)
                 # opt out — see the comment in :func:`enumerate_cartesian`.
-                if mask_f1 and (m_overhang or n_overhang):
-                    # Fused-prologue masked row: one output element per thread
-                    # (per-row accumulators must not span register cells).
+                if mask_f1 and m_overhang:
+                    # Fused-prologue masked M: one output ROW per thread (the
+                    # per-row prologue accumulators must not span register
+                    # cells along the masked axis). The OTHER axis keeps its
+                    # register tiling — a static-N register cell never shares
+                    # a row accumulator (P@V's best configs carry FN=4).
                     fm_candidates: tuple[int, ...] = (1,)
                 elif m_overhang or (allow_nondivisor_f_on_mask and m_maskable):
                     fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD)
@@ -569,7 +573,7 @@ def _enumerate_cartesian_impl(
                     if fm_nondiv and not m_maskable:
                         continue
                     fm_overhang = m_overhang or fm_nondiv
-                    if mask_f1 and (m_overhang or n_overhang):
+                    if mask_f1 and n_overhang:
                         fn_candidates: tuple[int, ...] = (1,)
                     elif n_overhang or (allow_nondivisor_f_on_mask and n_maskable):
                         fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD // fm)
@@ -584,10 +588,11 @@ def _enumerate_cartesian_impl(
                         if fn_nondiv and not n_maskable:
                             continue
                         fn_overhang = n_overhang or fn_nondiv
-                        if mask_f1 and (fm_overhang or fn_overhang) and (fm > 1 or fn > 1):
-                            # A pinned non-divisor FM/FN flipped a prologue
-                            # variant to masked after the candidate restriction
-                            # — same accumulator-sharing hazard, skip.
+                        if mask_f1 and ((fm_overhang and fm > 1) or (fn_overhang and fn > 1)):
+                            # A pinned non-divisor F flipped a prologue
+                            # variant's AXIS to masked after the candidate
+                            # restriction — same per-axis accumulator-sharing
+                            # hazard, skip.
                             continue
                         for bk in bk_choices:
                             if per_thread_K % bk != 0:

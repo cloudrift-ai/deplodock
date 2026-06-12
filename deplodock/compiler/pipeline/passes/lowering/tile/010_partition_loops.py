@@ -626,8 +626,9 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # SYMBOLIC-K prologue class (SDPA P@V — K = seq_len): the boundary
         # Cond wraps the whole per-row body (prologue + matmul, placed inside
         # SerialTile(M_r) by the prologue branch of ``_build_split_body``)
-        # and ``mask_f1`` restricts masked prologue rows to FM = FN = 1 —
-        # one row per thread, no shared accumulators, and nothing stages (a
+        # and ``mask_f1`` clamps the MASKED axis's register tiling to 1 (the
+        # unmasked axis keeps its F sweep — a static-N register cell never
+        # shares a row accumulator) — no shared accumulators, and nothing stages (a
         # symbolic K never builds a slab), so no collective lives under the
         # divergent guard. A STATIC-K prologue kernel (fused gated-MLP)
         # stays degenerate on its symbolic rows: its K pipeline stages, and
@@ -1083,7 +1084,7 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
             # Masked M on a prologue kernel: the boundary Cond wraps the WHOLE
             # per-row body — prologue reduces (softmax max/sum over the
             # runtime-sized ``P[m, k]``) plus the matmul tower — as a unit.
-            # FM = FN = 1 on masked rows (``mask_f1``) keeps one row per
+            # FM = 1 on masked-M rows (``mask_f1``) keeps one row per
             # thread, so no per-row accumulator spans register cells, and no
             # collectives live inside (prologue forces SPLITK=1, BR=1) — the
             # divergence is benign; staged loads are lifted back out by
