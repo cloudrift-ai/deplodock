@@ -392,6 +392,65 @@ def test_qwen_whole_model_dynamic_compiles_and_matches_eager():
             np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
 
 
+def test_qwen_layer_dynamic_compiles_and_matches_eager():
+    """Single decoder layer (random-weight Qwen3 trunk) traced through
+    ``build_layer_wrapper`` with dynamic seq_len — the per-layer
+    ``--dynamic seq_len@x:1`` CLI path in test form. Compile once, run at the
+    trace size AND two other seq_lens (via ``CompiledProgram.rebind``),
+    compare against torch eager with non-trivial activations.
+
+    The wrapper is load-bearing: tracing the bare block with concrete
+    ``(cos, sin)`` kwargs specialises rotary to the trace seq_len, so the
+    in-graph sliced-rotary buffers are what make per-layer dynamic work."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import torch
+    from transformers import AutoConfig, AutoModel
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from deplodock.compiler.loader.binder import bind_constants
+    from deplodock.compiler.trace.huggingface import build_layer_wrapper
+    from deplodock.compiler.trace.torch import trace_module
+
+    torch.manual_seed(0)
+    config = AutoConfig.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
+    config.num_hidden_layers = 1
+    model = AutoModel.from_config(config).float().eval()
+
+    hint, dtype = 32, torch.float32
+    wrapper = build_layer_wrapper(model.layers[0], model.rotary_emb, config.hidden_size, dtype)
+    graph = trace_module(wrapper, (torch.randn(1, hint, config.hidden_size, dtype=dtype),), dynamic_shapes={"x": {1: _seq_len_dim()}})
+    compiled = CudaBackend().compile(graph)
+
+    sources: dict[str, np.ndarray] = {}
+    for path, t in wrapper.named_parameters(remove_duplicate=False):
+        sources[path] = t.detach().cpu().numpy().astype(np.float32, copy=False)
+    for path, t in wrapper.named_buffers(remove_duplicate=False):
+        sources[path] = t.detach().cpu().numpy().astype(np.float32, copy=False)
+    const_feed = bind_constants(compiled, sources)
+    in_name = compiled.inputs[0]
+    out_name = compiled.outputs[0]
+
+    with gpu_lock():
+        prog = None
+        for s in (hint, 17, 64):
+            x = np.random.RandomState(s).standard_normal((1, s, config.hidden_size)).astype(np.float32)
+            fd = {in_name: x}
+            if prog is None:
+                prog = CompiledProgram.build(compiled, {**const_feed, **fd})
+            else:
+                prog.rebind(fd)
+            prog.run_once()
+            out = prog.outputs()[out_name]
+            with torch.no_grad():
+                ref = wrapper(torch.from_numpy(x))
+                ref = (ref[0] if isinstance(ref, tuple) else ref).numpy()
+            assert out.shape == ref.shape
+            np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
+
+
 def test_qwen_whole_model_dynamic_traces():
     """End-to-end whole-model dynamic trace on Qwen3-Embedding-0.6B (1 layer,
     random weights so no checkpoint download). Exercises the CLI's

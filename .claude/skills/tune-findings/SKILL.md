@@ -1,7 +1,7 @@
 ---
 name: tune-findings
 description: Use this skill when the user asks to "analyze tune findings for <model>", "tune and analyze model X", "why is deplodock slower than eager / torch.compile on X", "do a per-kernel performance analysis", "drill into kernel performance", "profile the compiled kernels with NCU", or otherwise wants a clean autotune of a model (or one layer), an end-to-end + per-kernel bench against PyTorch eager and torch.compile, a root-cause analysis of every underperforming kernel (search shortfall, tier/optimization lockout, codegen quality, bench failures), and a findings report saved to plans/. Modeled on plans/qwen3-embedding-layer0-tune-findings.md.
-version: 0.2.0
+version: 0.3.0
 ---
 
 # Tune a model and produce a per-kernel findings report
@@ -21,17 +21,25 @@ write ad-hoc bench scripts or hand-written SQL.
 - A CUDA GPU. Check `ncu` is on PATH and perf counters are permitted (`ncu --version`; a later
   `ERR_NVGPUCTRPERM` means the NVIDIA perf-counter permission gate — note it in the report and skip NCU rather
   than fighting it).
-- Scope: default to **one layer** (`--layer 0`) unless the user asks for the whole model — a single-layer clean
-  tune + bench is ~10–20 min; whole-model is much longer. Quick ungated default model:
+- Scope: default to **one layer with dynamic shapes** (`--layer 0 --dynamic seq_len@x:1`) — symbolic-`seq_len`
+  masked-tile kernels are the deployable artifact, and a single-layer clean tune + bench stays ~10–20 min. The
+  per-layer dynamic trace goes through `trace.huggingface.build_layer_wrapper` (in-graph sliced rotary); its one
+  trace input is named `x`, hence the single spec. Whole-model (much longer) only when the user asks — its
+  dynamic specs are `--dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 --dynamic
+  seq_len@attention_mask:3 --dynamic seq_len@position_ids:1`. Quick ungated default model:
   `Qwen/Qwen3-Embedding-0.6B`.
+- Static (no `--dynamic`) only if the user explicitly wants shape-specialised kernels; say so in the report
+  (specialised kernels, no masked-tile guards — not the deployable configuration).
 - Work dir: pick a fresh dir (e.g. `/tmp/tune-findings-<slug>/`) holding the dump dir and tee'd logs — the
   report quotes both, and `deplodock compare` diffs dump dirs across runs.
 
 ## Step 1 — clean tune + -O3 bench
 
 ```bash
-deplodock tune <model> --layer 0 --clean --bench --dump-dir <dir>/dump 2>&1 | tee <dir>/tune.log
+deplodock tune <model> --layer 0 --dynamic seq_len@x:1 --clean --bench --dump-dir <dir>/dump 2>&1 | tee <dir>/tune.log
 ```
+
+(Whole-model scope: drop `--layer 0` and use the four whole-model `--dynamic` specs from Prerequisites.)
 
 One command does the whole measurement pass: `--clean` nukes the tune DB + prior + cubin caches (a *clean* tune —
 no warm-prior carryover), the tune itself fills the DB with -O1 ranking rows and trains the prior, and `--bench`
@@ -46,6 +54,11 @@ Record the run stats for the report header — wall time, benched-variant count,
 **CRITICAL: never mix the two number families.** Tune-DB latencies are `-Xcicc -O1` (ranking signal only —
 reduction/attention kernels run 1.5–3× slower than -O3); the `--bench` tables are -O3 and deployable. Every
 number in the report says which it is; comparisons across the two families are findings-invalidating errors.
+
+**Dynamic-run measurement semantics**: with `--dynamic`, all tune/bench measurements run the symbolic kernels at
+the `Dim` hint (`DEFAULT_SEQ_HINT=512`) — record "benched at seq_len=512 (symbolic)" in the report header. The
+masked-tile boundary guards (`if (coord < seq_len)`) are part of the measured cost; that overhead vs a
+shape-specialised kernel is itself a legitimate finding, not noise.
 
 ## Step 2 — headline tables
 
@@ -94,6 +107,9 @@ For each kernel meaningfully behind eager or tcompile, assign one (or more) of f
       --bench-backends eager,tcompile,deplodock
   ```
 
+  Dumped reproducers already carry the symbolic dims from a dynamic trace — do **not** pass `--dynamic` with
+  `--ir` (rejected: the trace is already complete); the re-bench runs the masked-tile kernel at the hint.
+
 - **Knob A/B in one run** — pin any leaderboard variant beside the greedy pick with `--ab` (repeatable; the
   `DEPLODOCK_KNOBS` grammar). Each config re-lowers fresh and prints as an `ab KNOBS` row in the kernel table,
   knob diffs red:
@@ -134,8 +150,9 @@ Save to `plans/<model-slug>-layer<N>-tune-findings.md` (drop `-layer<N>` for who
 doc's structure:
 
 - **Header**: status line, the exact run command, date, run stats (wall time, benched variants, ok/`bench_fail`
-  counts), and the -O3-vs--O1 disclaimer ("numbers below are the `--bench` -O3 re-bench; tune-DB latencies
-  quoted for ranking context are -O1").
+  counts), the -O3-vs--O1 disclaimer ("numbers below are the `--bench` -O3 re-bench; tune-DB latencies
+  quoted for ranking context are -O1"), and whether the run was dynamic (symbolic `seq_len`, benched at the
+  512 hint — the default) or static (shape-specialised).
 - **Bench results**: both tables (full model + per-kernel with the Layer-op column), then one sentence naming
   the dominating kernels and their combined µs.
 - **One `## Finding N — <title>` per root cause**, ordered by µs at stake. Each finding carries: symptom (the

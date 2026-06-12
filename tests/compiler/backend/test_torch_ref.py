@@ -135,6 +135,29 @@ def test_indexmap_cat_with_select():
     _assert_matches_numpy(g, {"in0": _rng().standard_normal((4, 2)), "in1": _rng().standard_normal((4, 2))})
 
 
+def test_symbolic_shapes_resolve_from_input_tensors():
+    """A symbolic-``Dim`` graph (dynamic-trace reproducer shape) evaluates with
+    concrete tensors: ``build_callable`` binds ``seq_len`` from the supplied
+    tensor's shape, and shape-resolving ops (``ReshapeOp`` target) eval through
+    that env instead of raising on ``as_static``."""
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.ir.frontend.ir import ReshapeOp
+
+    s = Dim("seq_len")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (Dim(1), s, Dim(8))), node_id="x")
+    g.add_node(ElementwiseOp(op="exp"), ["x"], Tensor("e", (Dim(1), s, Dim(8))), node_id="e")
+    g.add_node(ReshapeOp(shape=(1, -1)), ["e"], Tensor("o", (Dim(1), s * Dim(8))), node_id="o")
+    g.inputs, g.outputs = ["x"], ["o"]
+
+    x = torch.randn(1, 6, 8)
+    fn, inputs = torch_ref.build_callable(g, {"x": x})
+    with torch.no_grad():
+        out = fn(*inputs)
+    assert out.shape == (1, 48)
+    np.testing.assert_allclose(out.numpy(), torch.exp(x).reshape(1, 48).numpy(), rtol=1e-5, atol=1e-6)
+
+
 def test_is_runnable_accepts_indexmap():
     g = _imap_graph([(8,)], (4, 8), (IndexSource(input_idx=0, coord_map=(placeholder(1),)),))
     assert torch_ref.is_runnable(g)
