@@ -620,12 +620,26 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         has_nonlinear_epilogue = has_nonlinear_post_reduce_epilogue(outer_n.body)
         force_splitk_one = multi_accum or bool(prologue) or has_nonlinear_epilogue
         # A fused prologue (SDPA P@V: softmax max/sum) carries a per-M-row
-        # reduction whose accumulators must reset per register cell. Masking a
-        # symbolic M/N axis admits FM/FN > 1, register-tiling the row and
-        # sharing one accumulator across cells — wrong. So a prologue matmul
-        # keeps symbolic axes degenerate (E=1, no mask): correct via the
-        # symbolic grid, one output element per thread.
-        mask_ok = not prologue
+        # reduction whose accumulators must reset per register cell — masking
+        # with FM/FN > 1 would register-tile the row and share one accumulator
+        # across cells, which is wrong. THREAD-level masking is safe for the
+        # SYMBOLIC-K prologue class (SDPA P@V — K = seq_len): the boundary
+        # Cond wraps the whole per-row body (prologue + matmul, placed inside
+        # SerialTile(M_r) by the prologue branch of ``_build_split_body``)
+        # and ``mask_f1`` clamps the MASKED axis's register tiling to 1 (the
+        # unmasked axis keeps its F sweep — a static-N register cell never
+        # shares a row accumulator) — no shared accumulators, and nothing stages (a
+        # symbolic K never builds a slab), so no collective lives under the
+        # divergent guard. A STATIC-K prologue kernel (fused gated-MLP)
+        # stays degenerate on its symbolic rows: its K pipeline stages, and
+        # ``021_hoist_staged_loads_above_mask`` would hoist the staged
+        # matmul above the Cond while the prologue chain it consumes
+        # (rsqrt of the row stats) stays guarded below — an SSA-ordering
+        # break (undefined value at render). Its deployment path is the
+        # structural split (``005_split_demoted``, which now offers on
+        # symbolic rows); masked staged prologues are follow-up work.
+        prologue_mask_ok = (not prologue) or k_symbolic
+        mask_f1 = bool(prologue)
         # fp16 half2 window (FK on the scalar matmul path): enabled only when
         # every K-indexed operand Load is fp16 and there's no fused prologue
         # (SDPA P@V's softmax stats would interleave with the windowed flush).
@@ -633,23 +647,30 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # ``__hfma2`` throughput — see ``plans/fk-half2-fp16-matmul.md``.
         fp16_window = (not prologue) and not k_symbolic and _is_fp16_matmul(matmul_reduces, graph)
         param_combos = enumerate_cartesian(
-            E_M=E_M if (mask_ok or not m_symbolic) else 1,
-            E_N=E_N if (mask_ok or not n_symbolic) else 1,
+            E_M=E_M if (prologue_mask_ok or not m_symbolic) else 1,
+            E_N=E_N if (prologue_mask_ok or not n_symbolic) else 1,
             E_K=E_K,
             ctx=ctx,
             priority_mode="matmul",
             force_splitk_one=force_splitk_one,
             m_axis_name=outer_m.axis.name if outer_m is not None else None,
             n_axis_name=outer_n.axis.name,
-            m_forced_mask=m_symbolic and mask_ok,
-            n_forced_mask=n_symbolic and mask_ok,
+            m_forced_mask=m_symbolic and prologue_mask_ok,
+            n_forced_mask=n_symbolic and prologue_mask_ok,
+            mask_f1=mask_f1,
             fp16_window=fp16_window,
         )
         # Warp-tier MMA: only when the MMA knob is enabled (default;
         # ``DEPLODOCK_MMA=0`` for scalar-only, ``DEPLODOCK_MMA=<kind>``
         # to enable + pin one atom kind — see ``_enumeration.mma_mode``),
-        # no prologue (M9 extension), static M/N/K, and the per-kind
-        # eligibility predicate fires. Each eligible kind gets one
+        # no prologue (M9 extension), static K, and the per-kind
+        # eligibility predicate fires. Symbolic M and/or N are admitted as
+        # MASKED warp tiles (tiled at the hint; ceil-div grid + per-element
+        # store guard — the M9 path): the enumerator stamps ``OVERHANG``
+        # via the forced-mask flags, the builder emits the boundary Cond,
+        # and a symbolic-N output resolves its ldm from the runtime kernel
+        # arg at render (``_resolve_ldm``). Symbolic K (flash-style
+        # attention) is out of scope. Each eligible kind gets one
         # warp-tier knob row per (WN, WM, FM, FN, BK, SPLITK); we
         # concatenate them onto the scalar param list — the fork tree in
         # :func:`rewrite` splits the rows by type and emits sibling
@@ -657,7 +678,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
         mma_on, pinned_atom = mma_mode()
-        if mma_on and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
+        if mma_on and graph is not None and not prologue and not k_symbolic:
             eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
             # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
             # tensor-core family (WMMA was removed; the swizzled slab beats
@@ -688,6 +709,10 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     priority_mode=("matmul", "warp"),
                     force_splitk_one=force_splitk_one,
                     atoms=eligible,
+                    m_axis_name=outer_m.axis.name if outer_m is not None else None,
+                    n_axis_name=outer_n.axis.name,
+                    m_forced_mask=m_symbolic,
+                    n_forced_mask=n_symbolic,
                 )
                 # Drop single-warp (WM·WN == 1) variants: ldmatrix is
                 # smem→register only, so the atom REQUIRES staged operands, but
@@ -722,7 +747,12 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # search space honest.
         k_loop = nonmatmul_reduces[0]
         E_K = k_loop.axis.extent.as_static()
-        target_names = frozenset(lp.axis.name for lp in all_loops if lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp))
+        # ``is_static`` guards the ``as_static()`` read: a symbolic free Loop
+        # in the body (e.g. a split producer's row sweep next to a static
+        # row-stat reduce) is never a K-target, not a crash.
+        target_names = frozenset(
+            lp.axis.name for lp in all_loops if lp.axis.extent.is_static and lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp)
+        )
         # Cooperative reduce binds the free axis whole-to-grid (BR>1 forces
         # BN=BM=1, so the grid covers seq exactly — no overhang). A masked
         # register-tile (FN>1) would wrap the reduce body in the boundary Cond
@@ -730,6 +760,17 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # breaking the cross-thread combine. So a symbolic free axis stays
         # degenerate here (E=1, no forced mask): correct at any seq_len via the
         # symbolic grid, just not register-tiled.
+        #
+        # A masked BR=1 thread-tile family (rows-per-CTA at the hint with the
+        # boundary guard, the symbolic-axis-parity follow-up) is DEFERRED: a
+        # reduce kernel's staged row sweep plus its post-reduce output loop
+        # consume the rsqrt chain between them — the same 021-hoist SSA
+        # interaction that keeps static-K fused-prologue matmuls degenerate
+        # (see the prologue_mask_ok comment in the matmul branch; 021 now
+        # refuses such lifts defensively). These kernels' deployment path is
+        # the structural split (norm + proj slices split like any demoted
+        # matmul); strided-cooperative work over symbolic axes is the M5+
+        # follow-up.
         param_combos = enumerate_cartesian(
             E_M=1 if m_symbolic else E_M,
             E_N=1 if n_symbolic else E_N,
@@ -992,7 +1033,12 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     if n_bound is not None:
         n_pred = sigma_outer.reduce(Var(N_name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", n_pred, n_bound), body=Body(new_inner)),)
-    if m_bound is not None:
+    if m_bound is not None and not shape.prologue:
+        # Prologue kernels emit the M-Cond around the whole per-row body
+        # (prologue + matmul tower) inside SerialTile(M_r) below — the
+        # softmax max/sum loops index ``P[m, k]`` of a possibly
+        # runtime-sized buffer, so an overhang row's prologue reads must be
+        # guarded too, not just the matmul body.
         m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", m_pred, m_bound), body=Body(new_inner)),)
 
@@ -1034,6 +1080,17 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     if shape.prologue:
         matmul_tower = _wrap_tower([(N_r, Role.REGISTER)], new_inner)
         body_inside_mr = prologue_rewritten + matmul_tower
+        if m_bound is not None:
+            # Masked M on a prologue kernel: the boundary Cond wraps the WHOLE
+            # per-row body — prologue reduces (softmax max/sum over the
+            # runtime-sized ``P[m, k]``) plus the matmul tower — as a unit.
+            # FM = 1 on masked-M rows (``mask_f1``) keeps one row per
+            # thread, so no per-row accumulator spans register cells, and no
+            # collectives live inside (prologue forces SPLITK=1, BR=1) — the
+            # divergence is benign; staged loads are lifted back out by
+            # ``021_hoist_staged_loads_above_mask``.
+            m_pred = sigma_outer.reduce(Var(M_name), SimplifyCtx({}))
+            body_inside_mr = (Cond(cond=BinaryExpr("<", m_pred, m_bound), body=Body(body_inside_mr)),)
         if M_r is not None:
             # M_r stays serial (not RegisterTile) — the SDPA prologue
             # (softmax max/sum/reciprocal) computes once per output row
@@ -1085,10 +1142,22 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     the matmul-reduce body and rewrites it into the ``MmaFragment`` +
     ``MmaLoad`` + ``MmaSync`` chain.
 
-    No prologue / masked tile support at M3 (matches the warp enumerator,
-    which rejects non-divisor extents). Symbolic axes / cooperative-K
-    are gated off by construction (the eligibility predicate refuses
-    them; ``BR=1`` is enforced on warp-tier rows by construction).
+    No prologue support (matches the warp enumerator gate); cooperative-K
+    is gated off by construction (``BR=1`` on warp-tier rows).
+
+    Masked tiles (the M9 path): an axis in the row's ``OVERHANG`` —
+    stamped by the enumerator for a symbolic (forced-mask) axis, or a
+    static non-divisor one — gets a ceil-div block axis and the body is
+    wrapped in a boundary ``Cond(σ(axis) < bound)``, exactly like the
+    scalar builder. The Cond gates the atom tile's BASE coordinate only
+    (``M_a`` / ``N_a`` are not in σ); ``kernel/005_lower_atom_tile``
+    classifies the predicate and stamps per-element guards onto the
+    ``RegStore`` for tiles straddling the bound, and
+    ``021_hoist_staged_loads_above_mask`` lifts the K-pipeline above the
+    Cond (clamped slab fill, unguarded ldmatrix/mma.sync on the
+    hint-sized slab). The predicate LHS is built with ``sigma_outer
+    .apply`` — pure substitution, the same path the Write index takes —
+    so 005's struct-equality classification holds.
 
     The ``M_a`` / ``N_a`` Vars *do not appear* in ``σ_outer`` — the
     in-fragment lane offset is owned by the mma.sync instruction, not the
@@ -1100,14 +1169,29 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     atom_m, atom_n, atom_k = atom.shape
 
     sigma_map: dict[str, object] = {}
+    overhang = frozenset(params.get("OVERHANG", ()))
+
+    def _block_axis(axis: Axis, name: str, per_block: int, src: Axis) -> tuple[Axis, object | None]:
+        """The BLOCK-tier axis for one output dim + its mask bound (None when
+        unmasked). Mirrors the scalar builder's static/masked/symbolic
+        branches: masked static → ceil-div with ``real_extent``; masked
+        symbolic → composite ceil-div Expr over the runtime extent (the
+        launch resolver evals it; the bound is the symbolic Var)."""
+        if axis.extent.is_static:
+            ext = axis.extent.as_static()
+            if name in overhang:
+                return Axis(f"{name}_b", -(-ext // per_block), source_axis=src, real_extent=ext), Literal(ext, "int")
+            return Axis(f"{name}_b", ext // per_block, source_axis=src), None
+        if name in overhang:
+            return Axis(f"{name}_b", (axis.extent + (per_block - 1)) // per_block, source_axis=src), axis.extent.expr
+        raise RuleSkipped(f"warp-tier axis {name!r} is symbolic but not masked — enumerator/builder out of sync")
 
     # ---- N axis: A_b · (W_n · F_n · A_n) + A_w · (F_n · A_n) + A_r · A_n + A_a
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
     N_src = N_axis.source_axis or N_axis
     n_per_block = params["WN"] * params["FN"] * atom_n
-    E_N = N_axis.extent.as_static()
-    N_b = Axis(f"{N_name}_b", E_N // n_per_block, source_axis=N_src)
+    N_b, n_bound = _block_axis(N_axis, N_name, n_per_block, N_src)
     N_w = Axis(f"{N_name}_w", params["WN"], source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params["FN"], source_axis=N_src)
     N_a = Axis(f"{N_name}_a", atom_n, source_axis=N_src)
@@ -1123,8 +1207,7 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     M_name = M_axis.name
     M_src = M_axis.source_axis or M_axis
     m_per_block = params["WM"] * params["FM"] * atom_m
-    E_M = M_axis.extent.as_static()
-    M_b = Axis(f"{M_name}_b", E_M // m_per_block, source_axis=M_src)
+    M_b, m_bound = _block_axis(M_axis, M_name, m_per_block, M_src)
     M_w = Axis(f"{M_name}_w", params["WM"], source_axis=M_src)
     M_r = Axis(f"{M_name}_r", params["FM"], source_axis=M_src)
     M_a = Axis(f"{M_name}_a", atom_m, source_axis=M_src)
@@ -1160,6 +1243,17 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     )
     if n_replaced == 0:
         raise RuleSkipped("K reduce not found in body")
+
+    # Masked tiles: wrap the cell body (K tower + Write) in the boundary
+    # Cond, INSIDE the AtomTile — `021` lifts the K-pipeline back out so the
+    # cooperative slab fill runs unguarded for every thread, leaving
+    # ``Cond > Write`` for ``005_lower_atom_tile`` to classify into RegStore
+    # guards. ``sigma_outer.apply`` (pure substitution, no simplify) keeps
+    # the predicate LHS struct-equal to the σ-rewritten Write index.
+    if n_bound is not None:
+        new_inner = (Cond(cond=BinaryExpr("<", sigma_outer.apply(Var(N_name)), n_bound), body=Body(new_inner)),)
+    if m_bound is not None:
+        new_inner = (Cond(cond=BinaryExpr("<", sigma_outer.apply(Var(M_name)), m_bound), body=Body(new_inner)),)
 
     # ---- Tower: AtomTile(M_a, N_a) > RegisterTile(M_r, N_r) >
     # WarpTile(M_w, N_w) > GridTile(M_b, N_b, K_s?). Layers innermost-first.

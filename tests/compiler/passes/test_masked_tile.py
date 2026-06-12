@@ -335,6 +335,39 @@ def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatc
     assert "< 64) ?" not in src, f"clean-divisor tile should not clamp the cooperative load:\n{src}"
 
 
+def test_symbolic_m_cooperative_load_clamps_to_runtime_extent(recording_dump, monkeypatch):
+    """A symbolic-M masked tile whose A operand is staged must clamp the
+    hoisted cooperative load's M coord against the RUNTIME extent — the
+    ``seq_len`` kernel arg — not the hint. ``021`` previously skipped
+    symbolic-shaped buffers when stamping ``gmem_extents`` ("M9 follow-up"),
+    so the hoisted load read past the runtime-sized activation for every
+    seq_len that wasn't tile-aligned. The clamp ternary's bound is now the
+    symbolic ``Var``, rendered against the kernel's ``seq_len`` argument."""
+    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+
+    # Same staging-friendly knobs as the static clamp test: K=2048 makes the
+    # operands stage; the symbolic M is force-masked by the planner.
+    for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    g = Graph()
+    _input(g, "a", (Dim("seq_len"), 2048))
+    _input(g, "b", (2048, 64))  # N=64: clean divisor → only M masks
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (Dim("seq_len"), 64)), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    out = Pipeline.build(KERNEL_PASSES).run(g, ctx=Context.from_target((8, 0)), dump=recording_dump)
+    kop = out.nodes["o"].op
+    tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
+    src = render_kernelop(kop, tensors=tensors)
+
+    # The activation 'a' (seq_len, 2048) is the masked-M operand. Its staged
+    # cooperative load must clamp the M coord to < seq_len, falling back to
+    # seq_len - 1 — both referencing the runtime symbol, not a literal.
+    assert "&a[" in src, f"activation 'a' should be staged (cooperative load present):\n{src}"
+    assert "< seq_len) ?" in src, f"masked cooperative load missing runtime-extent clamp ternary:\n{src}"
+    assert "seq_len - 1" in src, f"masked clamp should fall back to seq_len - 1:\n{src}"
+
+
 def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
     """A clean-divisor N tile keeps the blocked (thread-major) decode so a
     thread's FN cells stay contiguous (vectorizable / smem-conflict-free):
@@ -353,3 +386,61 @@ def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
     if r_coeff is not None:
         assert r_coeff == 1, f"clean N should be thread-major (register coeff 1), got t={t_coeff} r={r_coeff}"
         assert t_coeff is not None and t_coeff > 1, f"thread axis should stride by FN>1, got t={t_coeff} r={r_coeff}"
+
+
+def test_hoist_refuses_lift_when_pipeline_reads_guarded_defs():
+    """021's lift is refused when a hoisted K-pipeline reads an SSA name
+    defined by a stmt staying inside the boundary Cond (the fused-prologue
+    shape: a matmul consuming the rsqrt of its row stats). Hoisting would
+    order the consumer above its definition — undefined identifier at
+    render. The Cond is left intact instead (defense-in-depth: the planner
+    doesn't emit liftable masked prologue Conds today)."""
+    import importlib
+
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load
+    from deplodock.compiler.ir.tile.ir import AffineAddressing, Source, StageBundle, StagePolicy
+
+    hoist = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.021_hoist_staged_loads_above_mask")
+
+    src = Source(
+        name="w_smem",
+        buf="w",
+        cache_axes=(Axis("a5", 64),),
+        origin=(Literal(0, "int"),),
+        addressing=AffineAddressing(dims=(0,)),
+    )
+    # The staged pipeline consumes ``scale`` — defined by the Assign that
+    # stays inside the Cond (it is not a K-pipeline stmt).
+    pipeline = StageBundle(
+        sources=(src,),
+        body=Body(
+            (
+                Load(name="wv", input="w_smem", index=(Literal(0, "int"),)),
+                Assign(name="prod", op=ElementwiseImpl("multiply"), args=("wv", "scale")),
+                Accum(name="acc", value="prod"),
+            )
+        ),
+        policy=StagePolicy.SYNC,
+    )
+    scale_def = Assign(name="scale", op=ElementwiseImpl("rsqrt"), args=("stat",))
+    write = Write(output="o", index=(Var("m"),), value="acc")
+    cond = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((scale_def, pipeline, write)))
+
+    out = hoist._lift_if_match(cond, {"w": (64,)})
+    assert out is cond, "lift must be refused — the pipeline reads 'scale' defined inside the Cond"
+
+    # Same shape without the dependency lifts normally.
+    indep_pipeline = StageBundle(
+        sources=(src,),
+        body=Body(
+            (
+                Load(name="wv", input="w_smem", index=(Literal(0, "int"),)),
+                Accum(name="acc", value="wv"),
+            )
+        ),
+        policy=StagePolicy.SYNC,
+    )
+    cond2 = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((indep_pipeline, write)))
+    out2 = hoist._lift_if_match(cond2, {"w": (64,)})
+    assert isinstance(out2, tuple) and len(out2) == 2, "independent pipeline must still lift (bundle above, residual Cond below)"

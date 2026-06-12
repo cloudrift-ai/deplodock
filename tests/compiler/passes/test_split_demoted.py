@@ -877,3 +877,140 @@ def test_layout_split_mma_accuracy_cuda(monkeypatch) -> None:
     assert len(mma_kernels) == 1, "the layout-split gemm must lower on the warp tier"
     out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)
+
+
+# ---------------------------------------------------------------------------
+# Symbolic row axes (dynamic shapes): the cut admits Dim('seq_len') rows
+# ---------------------------------------------------------------------------
+
+
+def _sym_norm_linear_graph() -> Graph:
+    """``_norm_linear_graph`` with the seq axis symbolic (the dynamic-trace
+    shape every Qwen3 layer-0 kernel carries)."""
+    from deplodock.compiler.dim import Dim
+
+    dt = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (1, Dim("seq_len"), _H), dt), node_id="x")
+    g.add_node(InputOp(), [], Tensor("nw", (_H,), dt), node_id="nw")
+    g.add_node(InputOp(), [], Tensor("wg", (_I, _H), dt), node_id="wg")
+    g.add_node(RmsNormOp(eps=1e-6), ["x", "nw"], Tensor("xn", (1, Dim("seq_len"), _H), dt), node_id="xn")
+    g.add_node(LinearOp(), ["xn", "wg"], Tensor("o", (1, Dim("seq_len"), _I), dt), node_id="o")
+    g.inputs = ["x", "nw", "wg"]
+    g.outputs = ["o"]
+    return g
+
+
+def test_split_offered_for_symbolic_rows() -> None:
+    """Symbolic ROW extents don't bail the cut: the producers / consumer
+    re-emit the row Loops verbatim and the ``xn`` buffer carries the symbolic
+    Dim (allocated from the runtime extent like any symbolic intermediate)."""
+    fused = _fuse(_sym_norm_linear_graph())
+    frag = _split(fused)
+    assert frag is not None, "the cut must offer on symbolic-row graphs"
+    xn_nodes = [n for nid, n in frag.nodes.items() if "__xn" in nid]
+    assert xn_nodes, "expected an xn producer in the fragment"
+    seq_dims = [d for d in xn_nodes[0].output.shape if not d.is_static]
+    assert seq_dims and "seq_len" in seq_dims[0].expr.free_vars(), (
+        f"xn buffer must carry the symbolic seq dim, got {xn_nodes[0].output.shape}"
+    )
+
+
+def test_gated_mlp_split_offered_for_symbolic_rows() -> None:
+    """The multi-accum (gated-MLP) cut also admits symbolic rows: each
+    extracted gemm's ``mm_i`` buffer carries the symbolic leading dim."""
+    from deplodock.compiler.dim import Dim
+
+    f16 = _dt.get("f16")
+    S, H, I = Dim("seq_len"), 256, 512  # noqa: E741
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (1, S, H), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("nw", (H,), f16), node_id="nw")
+    g.add_node(InputOp(), [], Tensor("wg", (H, I), f16), node_id="wg")
+    g.add_node(InputOp(), [], Tensor("wu", (H, I), f16), node_id="wu")
+    g.add_node(RmsNormOp(eps=1e-6), ["x", "nw"], Tensor("xn", (1, S, H), f16), node_id="xn")
+    g.add_node(MatmulOp(), ["xn", "wg"], Tensor("gate", (1, S, I), f16), node_id="gate")
+    g.add_node(MatmulOp(), ["xn", "wu"], Tensor("up", (1, S, I), f16), node_id="up")
+    g.add_node(ElementwiseOp("multiply"), ["gate", "up"], Tensor("o", (1, S, I), f16), node_id="o")
+    g.inputs = ["x", "nw", "wg", "wu"]
+    g.outputs = ["o"]
+
+    fused = _fuse(g)
+    frag = _split(fused)
+    assert frag is not None, "the multi-accum cut must offer on symbolic-row graphs"
+    mm_nodes = [n for nid, n in frag.nodes.items() if "__mm" in nid and nid.endswith(("0", "1"))]
+    assert len(mm_nodes) == 2, "expected two extracted gemm producers"
+    for n in mm_nodes:
+        assert any(not d.is_static for d in n.output.shape), f"mm buffer must carry the symbolic leading dim, got {n.output.shape}"
+
+
+def test_no_split_for_symbolic_k() -> None:
+    """The static-K bail is pinned: a symbolic reduce extent keeps the fused
+    path the only outcome (the gemm extraction reasons about K's volume)."""
+    from deplodock.compiler.dim import Dim
+
+    f16 = _dt.get("f16")
+    K = Dim("k_len")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (32, K), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("s", (32, K), f16), node_id="s")
+    g.add_node(InputOp(), [], Tensor("w", (K, 64), f16), node_id="w")
+    g.add_node(ElementwiseOp("multiply"), ["x", "s"], Tensor("xs", (32, K), f16), node_id="xs")
+    g.add_node(MatmulOp(), ["xs", "w"], Tensor("o", (32, 64), f16), node_id="o")
+    g.inputs = ["x", "s", "w"]
+    g.outputs = ["o"]
+    assert _split(_fuse(g)) is None
+
+
+def test_symbolic_split_matches_fused_on_numpy() -> None:
+    """The spliced symbolic-row graph computes the same function as the fused
+    one at a runtime seq != the 512 hint."""
+    from deplodock.compiler.backend.numpy import NumpyBackend
+
+    fused = _fuse(_sym_norm_linear_graph())
+    node = _fused_loop_node(fused)
+    frag = _split(fused)
+    assert frag is not None
+    split_graph = fused.copy()
+    split_graph.splice(frag, consumed={node.id}, output=node.id)
+
+    rng = np.random.default_rng(0)
+    seq = 48
+    npf16 = np.dtype(np.float16)
+    inputs = {
+        "x": rng.standard_normal((1, seq, _H), dtype=np.float32).astype(npf16),
+        "nw": rng.standard_normal((_H,), dtype=np.float32).astype(npf16),
+        "wg": (rng.standard_normal((_I, _H), dtype=np.float32) * 0.05).astype(npf16),
+    }
+    be = NumpyBackend()
+    ref = be.run(be.compile(_sym_norm_linear_graph()), input_data=dict(inputs))[0].outputs["o"]
+    out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
+    _assert_close(out, ref)
+
+
+@requires_cuda
+def test_symbolic_split_accuracy_cuda(monkeypatch) -> None:
+    """Pinned symbolic-row split on the live GPU: one compiled two-kernel
+    program serves two runtime seqs (33 and 80 — neither the hint), matching
+    numpy at both."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.numpy import NumpyBackend
+
+    target_mod.set_target(None)  # live device
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    rng = np.random.default_rng(0)
+    npf16 = np.dtype(np.float16)
+    shared = {
+        "nw": rng.standard_normal((_H,), dtype=np.float32).astype(npf16),
+        "wg": (rng.standard_normal((_I, _H), dtype=np.float32) * 0.05).astype(npf16),
+    }
+    be = CudaBackend()
+    compiled = be.compile(_sym_norm_linear_graph())
+    assert len(_lowered_kernel_ids(compiled)) == 2
+    ref_be = NumpyBackend()
+    ref_compiled = ref_be.compile(_sym_norm_linear_graph())
+    for seq in (33, 80):
+        inputs = {"x": rng.standard_normal((1, seq, _H), dtype=np.float32).astype(npf16), **shared}
+        ref = ref_be.run(ref_compiled, input_data=dict(inputs))[0].outputs["o"]
+        out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
+        _assert_close(out, ref)

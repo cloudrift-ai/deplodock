@@ -259,6 +259,7 @@ def enumerate_cartesian(
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
+    mask_f1: bool = False,
     atoms: tuple[Atom, ...] = (),
     fp16_window: bool = False,
 ) -> list[dict]:
@@ -423,6 +424,7 @@ def enumerate_cartesian(
             n_axis_name=n_axis_name,
             m_forced_mask=m_forced_mask,
             n_forced_mask=n_forced_mask,
+            mask_f1=mask_f1,
         )
 
     result = _run(apply_pins=True)
@@ -462,6 +464,7 @@ def _enumerate_cartesian_impl(
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
+    mask_f1: bool = False,
 ) -> list[dict]:
     """Pure cartesian enumeration: caller supplies the (possibly already
     pin-narrowed) choice tuples, the per-iteration FM/FN narrow callables
@@ -477,6 +480,14 @@ def _enumerate_cartesian_impl(
     ``m_axis_name`` / ``n_axis_name`` are the names stamped into ``overhang``
     for the M / N axes respectively (the caller knows them from the LoopOp; we
     don't reconstruct).
+
+    ``mask_f1`` (fused-prologue kernels) restricts a MASKED axis's register
+    tiling to 1 (``FM = 1`` when M is masked, ``FN = 1`` when N is): the
+    prologue's per-row accumulators must not be shared across register cells
+    along the masked axis. The unmasked axis keeps its full F sweep — a
+    static-N register cell never shares a row accumulator (P@V's best
+    configs carry ``FN = 4``). Enumerator-side — not a planner clamp — so
+    the knob row stays the DB/prior identity of what actually materializes.
     """
     # An axis is maskable if the mode allows masking (static non-divisor case)
     # or it's a forced-mask symbolic axis. ``E > 1`` rules out the size-1
@@ -540,7 +551,14 @@ def _enumerate_cartesian_impl(
                 # article's FM=26 (non-divisor of 256) surface in the search.
                 # Fused-prologue kernels (``allow_nondivisor_f_on_mask=False``)
                 # opt out — see the comment in :func:`enumerate_cartesian`.
-                if m_overhang or (allow_nondivisor_f_on_mask and m_maskable):
+                if mask_f1 and m_overhang:
+                    # Fused-prologue masked M: one output ROW per thread (the
+                    # per-row prologue accumulators must not span register
+                    # cells along the masked axis). The OTHER axis keeps its
+                    # register tiling — a static-N register cell never shares
+                    # a row accumulator (P@V's best configs carry FN=4).
+                    fm_candidates: tuple[int, ...] = (1,)
+                elif m_overhang or (allow_nondivisor_f_on_mask and m_maskable):
                     fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD)
                 else:
                     fm_candidates = _divisors_up_to(E_M // bm_c, _MAX_CELLS_PER_THREAD)
@@ -555,7 +573,9 @@ def _enumerate_cartesian_impl(
                     if fm_nondiv and not m_maskable:
                         continue
                     fm_overhang = m_overhang or fm_nondiv
-                    if n_overhang or (allow_nondivisor_f_on_mask and n_maskable):
+                    if mask_f1 and n_overhang:
+                        fn_candidates: tuple[int, ...] = (1,)
+                    elif n_overhang or (allow_nondivisor_f_on_mask and n_maskable):
                         fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= _MAX_CELLS_PER_THREAD // fm)
                     else:
                         fn_candidates = _divisors_up_to(E_N // bn_c, _MAX_CELLS_PER_THREAD // fm)
@@ -568,6 +588,12 @@ def _enumerate_cartesian_impl(
                         if fn_nondiv and not n_maskable:
                             continue
                         fn_overhang = n_overhang or fn_nondiv
+                        if mask_f1 and ((fm_overhang and fm > 1) or (fn_overhang and fn > 1)):
+                            # A pinned non-divisor F flipped a prologue
+                            # variant's AXIS to masked after the candidate
+                            # restriction — same per-axis accumulator-sharing
+                            # hazard, skip.
+                            continue
                         for bk in bk_choices:
                             if per_thread_K % bk != 0:
                                 continue
@@ -674,10 +700,10 @@ def _enumerate_warp_matmul_impl(
     ctx: Context,
     force_splitk_one: bool,
     atoms: tuple[Atom, ...],
-    m_axis_name: str | None,  # noqa: ARG001 — overhang plumbing for M9 (skewed shapes)
-    n_axis_name: str | None,  # noqa: ARG001
-    m_forced_mask: bool,  # noqa: ARG001 — symbolic-axis masking for warp tier lands in M9
-    n_forced_mask: bool,  # noqa: ARG001
+    m_axis_name: str | None,
+    n_axis_name: str | None,
+    m_forced_mask: bool,
+    n_forced_mask: bool,
 ) -> list[dict]:
     """Pure cartesian enumeration for the warp tier — produces
     warp-tier knob rows. Parallel in spirit to
@@ -686,14 +712,25 @@ def _enumerate_warp_matmul_impl(
     ``plans/mma-fragment-factorization.md``):
     ``E_M % (wm·fm·atom_m) == 0`` / ``wn·wm·32 ≤ max_threads_per_cta``.
 
-    No mask / overhang support at M3 — the warp tier rejects non-divisor
-    extents instead of register-tiling a per-cell guard. Symbolic axes
-    fall through here too (M9 extends with masked tiles for skewed
-    matmul-shapes). BR is forced to 1 (MMA + cooperative-K is incompatible
-    in v1; see Failure modes).
+    A forced-mask axis (symbolic, tuned at its hint — ``m_forced_mask`` /
+    ``n_forced_mask``) skips that axis's divisibility constraints entirely:
+    the runtime extent is unknown, so the planner ceil-divs the grid and the
+    boundary guard handles the partial tile — no hint-divisibility is
+    imposed (mirroring the scalar masked branch). Such rows stamp the axis
+    into ``OVERHANG`` unconditionally. Static non-divisor extents stay
+    rejected (static masked warp tiles are a separate follow-up — the
+    eligibility predicate still gates per-kind). BR is forced to 1 (MMA +
+    cooperative-K is incompatible in v1; see Failure modes).
     """
     if not atoms:
         return []
+    m_masked = m_forced_mask and m_axis_name is not None and E_M > 1
+    n_masked = n_forced_mask and n_axis_name is not None and E_N > 1
+    overhang_axes: tuple[str, ...] = ()
+    if n_masked:
+        overhang_axes = (*overhang_axes, n_axis_name)
+    if m_masked:
+        overhang_axes = (*overhang_axes, m_axis_name)
 
     out: list[dict] = []
     seen: set[tuple] = set()
@@ -722,35 +759,50 @@ def _enumerate_warp_matmul_impl(
     splitk_choices: tuple[int, ...] = (1,)
     for atom in atoms:
         atom_m, atom_n, atom_k = atom.shape
-        if E_M % atom_m != 0 or E_N % atom_n != 0 or E_K % atom_k != 0:
+        if (not m_masked and E_M % atom_m != 0) or (not n_masked and E_N % atom_n != 0) or E_K % atom_k != 0:
             # Outer divisibility — the eligibility predicate already enforced
             # this for the kind it gated, but a different kind in the same
-            # registry could disagree (M9 introduces skewed shapes), so
-            # double-check structurally here.
+            # registry could disagree, so double-check structurally here.
+            # A masked axis ceil-divs instead (boundary guard covers the
+            # partial tile); K stays static-divisor (symbolic-K warp tier is
+            # out of scope).
             continue
-        # Per-axis cell counts available after the atom cell is fixed.
-        cells_M = E_M // atom_m
-        cells_N = E_N // atom_n
+        # Per-axis cell counts available after the atom cell is fixed. For a
+        # masked axis the hint's ceil-div cell count only CAPS the sweep (the
+        # runtime extent imposes no divisibility).
+        cells_M = -(-E_M // atom_m) if m_masked else E_M // atom_m
+        cells_N = -(-E_N // atom_n) if n_masked else E_N // atom_n
         # K iterations consumed by one mma_sync. Total K cells = E_K / atom_k;
         # BK below is the inner stage_inner trip count (number of mma_syncs
         # per K_o iteration).
         k_cells_total = E_K // atom_k
         for wm in wm_choices:
-            if cells_M % wm != 0:
+            if not m_masked and cells_M % wm != 0:
                 continue
             for wn in wn_choices:
-                if cells_N % wn != 0:
+                if not n_masked and cells_N % wn != 0:
                     continue
                 threads = wn * wm * 32
                 if threads > ctx.max_threads_per_cta:
                     continue
-                cells_M_per_warp = cells_M // wm
-                cells_N_per_warp = cells_N // wn
-                fm_candidates = _divisors_up_to(cells_M_per_warp, _MAX_CELLS_PER_WARP_CELL)
+                cells_M_per_warp = max(1, cells_M // wm)
+                cells_N_per_warp = max(1, cells_N // wn)
+                # Masked axis: the curated F sweep up to the hint's per-warp
+                # cells (no divisor constraint — the per-element store guard
+                # covers partial coverage; mirrors the scalar masked branch's
+                # ``_TUNE_F_CHOICES`` widening); clean axis keeps the divisor
+                # sweep.
+                if m_masked:
+                    fm_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= min(cells_M_per_warp, _MAX_CELLS_PER_WARP_CELL))
+                else:
+                    fm_candidates = _divisors_up_to(cells_M_per_warp, _MAX_CELLS_PER_WARP_CELL)
                 fm_candidates = FM.narrow(fm_candidates)
                 for fm in fm_candidates:
                     fn_cap = _MAX_CELLS_PER_WARP_CELL // fm if fm > 0 else _MAX_CELLS_PER_WARP_CELL
-                    fn_candidates = _divisors_up_to(cells_N_per_warp, fn_cap)
+                    if n_masked:
+                        fn_candidates = tuple(f for f in _TUNE_F_CHOICES if f <= min(cells_N_per_warp, fn_cap))
+                    else:
+                        fn_candidates = _divisors_up_to(cells_N_per_warp, fn_cap)
                     fn_candidates = FN.narrow(fn_candidates)
                     for fn in fn_candidates:
                         for bk in bk_choices:
@@ -764,21 +816,22 @@ def _enumerate_warp_matmul_impl(
                             for splitk in splitk_choices:
                                 if splitk < 1 or k_o_total % splitk != 0:
                                     continue
-                                key = (wn, wm, fm, fn, bk, splitk, atom.name)
+                                key = (wn, wm, fm, fn, bk, splitk, atom.name, overhang_axes)
                                 if key in seen:
                                     continue
                                 seen.add(key)
-                                out.append(
-                                    {
-                                        "WN": wn,
-                                        "WM": wm,
-                                        "FM": fm,
-                                        "FN": fn,
-                                        "BK": bk,
-                                        "SPLITK": splitk,
-                                        "MMA": atom.name,
-                                    }
-                                )
+                                row = {
+                                    "WN": wn,
+                                    "WM": wm,
+                                    "FM": fm,
+                                    "FN": fn,
+                                    "BK": bk,
+                                    "SPLITK": splitk,
+                                    "MMA": atom.name,
+                                }
+                                if overhang_axes:
+                                    row["OVERHANG"] = overhang_axes
+                                out.append(row)
 
     # Construction order — the prior ranks; no enumeration sort.
     # OFF-fill the scalar-tier knobs (``BM``/``BN``/``BR``/``FK``) a warp row

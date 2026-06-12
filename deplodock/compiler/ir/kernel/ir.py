@@ -641,7 +641,16 @@ class LdmatrixLoad(Stmt):
     ``dpl_mma_load_{a,b}_gmem`` helper instead — a gmem-direct fragment load that
     replicates the same lane→element map without ldmatrix. Slower (no smem reuse)
     but correct; ``005_lower_atom_tile`` picks per operand based on whether an
-    enclosing ``StageBundle`` staged it."""
+    enclosing ``StageBundle`` staged it.
+
+    ``gmem_guard`` (gmem-direct only) carries a masked-tile boundary as
+    ``(base Expr, bound Expr)`` on the operand's lane-varying output axis
+    (A's M rows, B's N cols): the render switches to the ``_mclamp`` /
+    ``_nclamp`` helper, which clamps the lane coordinate to the ``bound -
+    base`` in-range elements — the gmem-direct analogue of the staged
+    slab-fill clamp, so an unstaged masked cell still lowers instead of
+    reading past the runtime-sized buffer. Clamped lanes read duplicates;
+    their stores are masked by the RegStore guards."""
 
     frag: str
     src_buffer: str
@@ -650,6 +659,7 @@ class LdmatrixLoad(Stmt):
     ldm: int = 0
     swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
     staged: bool = True  # False → gmem-direct fragment load (operand not in smem)
+    gmem_guard: tuple[Expr, Expr] | None = None  # masked-axis (base, bound); gmem-direct only
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -661,12 +671,14 @@ class LdmatrixLoad(Stmt):
         return (self.src_buffer,)
 
     def exprs(self) -> tuple[Expr, ...]:
-        return tuple(self.src_index)
+        guard = () if self.gmem_guard is None else self.gmem_guard
+        return (*self.src_index, *guard)
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.src_index)
         variant = ("x4" if self.role == "a" else "x2.trans") if self.staged else "gmem-direct"
-        return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}, ldm={self.ldm or 'auto'})"]
+        guard = "" if self.gmem_guard is None else f" guard<{self.gmem_guard[1].pretty()}"
+        return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}{guard}, ldm={self.ldm or 'auto'})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
@@ -677,6 +689,13 @@ class LdmatrixLoad(Stmt):
             # Operand not staged in smem — ldmatrix can't reach gmem, so read the
             # fragment straight from gmem (each lane adds its own (row,col) inside
             # the helper). No swizzle: that's a TMA-smem-layout concern only.
+            if self.gmem_guard is not None:
+                # Masked axis: clamp the lane coordinate to the in-range
+                # elements left from the tile base (>= 1 — the boundary Cond
+                # admitted the tile).
+                base, bound = self.gmem_guard[0].render(ctx), self.gmem_guard[1].render(ctx)
+                helper = "dpl_mma_load_a_gmem_mclamp" if self.role == "a" else "dpl_mma_load_b_gmem_nclamp"
+                return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, ({bound}) - ({base}));"]
             helper = "dpl_mma_load_a_gmem" if self.role == "a" else "dpl_mma_load_b_gmem"
             return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm});"]
         lane = "(threadIdx.x & 31)"
@@ -789,7 +808,21 @@ class RegStore(Stmt):
     ``epilogue`` optionally carries a fused pointwise chain
     (:class:`RegEpilogue` — residual adds, bias / scale broadcasts,
     activations): evaluated per fragment element in f32 right before the
-    downconvert (the CUTLASS epilogue-visitor pattern)."""
+    downconvert (the CUTLASS epilogue-visitor pattern).
+
+    ``m_guard`` / ``n_guard`` carry a masked-tile boundary as ``(base Expr,
+    bound Expr)`` — the tile's row / col coordinate of fragment element (0,0)
+    and the axis's real extent (a ``Literal`` for a static overhang axis, the
+    symbolic ``Var`` for a runtime-sized one). The enclosing boundary ``Cond``
+    only gates on the tile base (the atom-lane offsets ``_g`` / ``_t`` are
+    render-local, invisible to σ), so an atom tile *straddling* the bound
+    passes the Cond while its trailing rows / cols are out of range. A guard
+    predicates each fragment element's store (and its epilogue gmem reads) at
+    its own coordinate: ``base + _g (+8) < bound`` per row, ``base + _t*2
+    (+1) < bound`` per col. ``None`` (the default) renders the unguarded
+    fast path unchanged. ``m_guard`` alone keeps the vectorized row-pair
+    stores (a pair shares a row); an ``n_guard`` forces per-element scalar
+    stores (the pair straddles the column bound)."""
 
     dst_buffer: str
     dst_index: tuple
@@ -797,6 +830,8 @@ class RegStore(Stmt):
     shape: tuple[int, int, int]
     ldm: int = 0
     epilogue: RegEpilogue | None = None
+    m_guard: tuple[Expr, Expr] | None = None
+    n_guard: tuple[Expr, Expr] | None = None
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -815,7 +850,8 @@ class RegStore(Stmt):
 
     def exprs(self) -> tuple[Expr, ...]:
         epi = () if self.epilogue is None else tuple(e for ld in self.epilogue.loads for e in ld.index)
-        return (*self.dst_index, *epi)
+        guards = tuple(e for g in (self.m_guard, self.n_guard) if g is not None for e in g)
+        return (*self.dst_index, *epi, *guards)
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.dst_index)
@@ -824,12 +860,19 @@ class RegStore(Stmt):
             chain = ", ".join(op for _, op, _ in self.epilogue.ops)
             bufs = ", ".join(ld.buffer for ld in self.epilogue.loads)
             epi = f" epilogue[{chain}]({bufs or 'no loads'})"
-        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag}{epi} (ldm={self.ldm or 'auto'})"]
+        guards = ""
+        if self.m_guard is not None:
+            guards += f" m<{self.m_guard[1].pretty()}"
+        if self.n_guard is not None:
+            guards += f" n<{self.n_guard[1].pretty()}"
+        return [f"{indent}RegStore {self.dst_buffer}[{idx}] <- {self.frag}{epi}{guards} (ldm={self.ldm or 'auto'})"]
 
-    def _element_values(self, ctx: RenderCtx) -> tuple[list[str], list[str]]:
-        """``(preamble_lines, values)``: the four per-lane store values, plus
-        the per-element leaf-load / chain-op declarations they need. Without
-        an epilogue the values are the bare ``frag[i]`` and the preamble is
+    def _element_values(self, ctx: RenderCtx) -> tuple[list[list[str]], list[str]]:
+        """``(per_element_preamble, values)``: the four per-lane store values,
+        plus, per element, the leaf-load / chain-op declaration lines that
+        element needs (so a guarded render can scope element ``i``'s gmem
+        reads inside element ``i``'s boundary check). Without
+        an epilogue the values are the bare ``frag[i]`` and the preambles are
         empty. With one, each element ``i`` (row ``_g``/``_g+8``, col
         ``2_t+{0,1}``) declares its leaf loads (converted to f32; offsets per
         the dim roles at each buffer's own stride) and the chain ops (via
@@ -838,18 +881,19 @@ class RegStore(Stmt):
         scalar; lanes ``_t = 0..3`` cover 8 contiguous columns, so the warp's
         accesses coalesce regardless."""
         if self.epilogue is None:
-            return [], [f"{self.frag}[{i}]" for i in range(4)]
+            return [[], [], [], []], [f"{self.frag}[{i}]" for i in range(4)]
         from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
         from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
 
         epi = self.epilogue
         conv = {"f16": "__half2float({})", "bf16": "__bfloat162float({})"}
-        lines: list[str] = []
+        per_elem: list[list[str]] = []
         vals: list[str] = []
         for i in range(4):
             row = "_g" if i < 2 else "(_g + 8)"
             col = f"(_t * 2 + {i & 1})"
+            lines: list[str] = []
             env = {epi.acc: f"{self.frag}[{i}]"}
             for ld in epi.loads:
                 temp = f"{ld.name}_e{i}"
@@ -873,8 +917,9 @@ class RegStore(Stmt):
                 expr = op_to_expr(op_name, [Var(env[a]) for a in args])
                 lines.append(f"const float {name}_e{i} = {expr.render(ctx)};")
                 env[name] = f"{name}_e{i}"
+            per_elem.append(lines)
             vals.append(env[epi.result])
-        return lines, vals
+        return per_elem, vals
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
@@ -893,8 +938,10 @@ class RegStore(Stmt):
         # base ``flat`` is tile-aligned and ``2t`` is even, so the pair is
         # 4-/8-byte aligned. The ``{ }`` block scopes _g/_t (and the per-element
         # epilogue temps) per RegStore.
+        if self.m_guard is not None or self.n_guard is not None:
+            return self._render_guarded(ctx, flat=flat, ldm=ldm, dst_dt=dst_dt, pre=pre, vals=vals)
         lines = [f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;"]
-        lines += [f"{pad}  {ln}" for ln in pre]
+        lines += [f"{pad}  {ln}" for group in pre for ln in group]
         vec2 = {"f16": "__half2", "bf16": "__nv_bfloat162", "f32": "float2"}.get(dst_dt)
         if vec2 is not None:
             packer = {"f16": "__floats2half2_rn", "bf16": "__floats2bfloat162_rn", "f32": "make_float2"}[dst_dt]
@@ -914,36 +961,105 @@ class RegStore(Stmt):
         ]
         return lines
 
+    def _render_guarded(self, ctx: RenderCtx, *, flat: str, ldm, dst_dt: str, pre: list[list[str]], vals: list[str]) -> list[str]:
+        """Masked-tile store: each fragment element's store (and its epilogue
+        gmem reads, which index the same possibly-out-of-range coordinates)
+        runs under that element's own boundary check. With only an ``m_guard``
+        the two columns of a row share the row predicate, so the vectorized
+        row-pair store survives; an ``n_guard`` splits the pair (its columns
+        straddle the bound) into per-element scalar stores."""
+        pad = _pad(ctx.indent)
+        lane = "(threadIdx.x & 31)"
+        m_pred: list[str | None] = [None] * 4
+        n_pred: list[str | None] = [None] * 4
+        if self.m_guard is not None:
+            base, bound = self.m_guard[0].render(ctx), self.m_guard[1].render(ctx)
+            m_pred = [f"({base}) + _g < ({bound})"] * 2 + [f"({base}) + _g + 8 < ({bound})"] * 2
+        if self.n_guard is not None:
+            base, bound = self.n_guard[0].render(ctx), self.n_guard[1].render(ctx)
+            n_pred = [
+                f"({base}) + _t * 2 < ({bound})",
+                f"({base}) + _t * 2 + 1 < ({bound})",
+                f"({base}) + _t * 2 < ({bound})",
+                f"({base}) + _t * 2 + 1 < ({bound})",
+            ]
+        lines = [f"{pad}{{ const int _g = {lane} >> 2; const int _t = {lane} & 3;"]
+        vec2 = {"f16": "__half2", "bf16": "__nv_bfloat162", "f32": "float2"}.get(dst_dt)
+        if self.n_guard is None and vec2 is not None:
+            # Row-guarded vectorized pairs: elements {0,1} share row _g,
+            # {2,3} share row _g+8; each pair's preamble + store sit inside
+            # the pair's row check.
+            packer = {"f16": "__floats2half2_rn", "bf16": "__floats2bfloat162_rn", "f32": "make_float2"}[dst_dt]
+            for pair, addr_row in ((0, "_g"), (2, "(_g + 8)")):
+                addr = f"{flat} + {addr_row} * {ldm} + _t * 2"
+                lines.append(f"{pad}  if ({m_pred[pair]}) {{")
+                lines += [f"{pad}    {ln}" for ln in (*pre[pair], *pre[pair + 1])]
+                lines.append(f"{pad}    *reinterpret_cast<{vec2}*>(&{self.dst_buffer}[{addr}]) = {packer}({vals[pair]}, {vals[pair + 1]});")
+                lines.append(f"{pad}  }}")
+            lines.append(f"{pad}}}")
+            return lines
+        # Per-element scalar stores under the conjunction of the live guards.
+        for i in range(4):
+            row = "_g" if i < 2 else "(_g + 8)"
+            preds = " && ".join(p for p in (m_pred[i], n_pred[i]) if p is not None)
+            addr = f"{flat} + {row} * {ldm} + _t * 2 + {i & 1}"
+            lines.append(f"{pad}  if ({preds}) {{")
+            lines += [f"{pad}    {ln}" for ln in pre[i]]
+            lines.append(f"{pad}    {self.dst_buffer}[{addr}] = {vals[i]};")
+            lines.append(f"{pad}  }}")
+        lines.append(f"{pad}}}")
+        return lines
 
-def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int:
+
+def _ext_to_c(ext, ctx: RenderCtx) -> int | str:
+    """One buffer-shape extent as a C term: static dims yield their ``int``,
+    a symbolic ``Dim`` renders its Expr against the runtime kernel arg
+    (parenthesized — the result is interpolated into ``* {…}`` address
+    strings)."""
+    if hasattr(ext, "is_static"):
+        if ext.is_static:
+            return ext.as_static()
+        return f"({ext.expr.render(ctx)})"
+    return int(ext)
+
+
+def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int | str:
     """Row-major element stride of ``buffer``'s dim ``dim`` — the product of
     the trailing extents. Used by the fragment-epilogue render to apply a
     fragment element's row / col motion on an operand dim at that operand's
     own layout (a transposed residual's "n" dim strides by its row width,
-    not by 1)."""
+    not by 1). A symbolic trailing extent makes the stride a C expression
+    string over the runtime kernel arg instead of an int."""
     shape = ctx.shapes.get(buffer)
     if shape is None:
         raise ValueError(f"RegStore epilogue: buffer {buffer!r} not in ctx.shapes (no shape registered)")
-    stride = 1
+    static = 1
+    sym: list[str] = []
     for ext in shape[dim + 1 :]:
-        stride *= ext.as_static() if hasattr(ext, "as_static") else int(ext)
-    return stride
+        term = _ext_to_c(ext, ctx)
+        if isinstance(term, int):
+            static *= term
+        else:
+            sym.append(term)
+    if not sym:
+        return static
+    expr = " * ".join(sym if static == 1 else [str(static), *sym])
+    return f"({expr})"
 
 
-def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int:
+def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int | str:
     """Look up the row-major leading-dimension stride (= inner extent)
     for ``buffer`` from the kernel render context. Used by
     :class:`MmaLoad` / :class:`MmaStore` when ``ldm == 0`` (auto).
-    Accepts both raw int extents and :class:`Dim` extents (Tensor.shape)
-    — for symbolic dims, takes ``.as_static()`` (M9 generalizes to
-    runtime-resolved ldm via a kernel-arg int)."""
+    Accepts both raw int extents and :class:`Dim` extents (Tensor.shape) —
+    a symbolic inner extent (e.g. QK^T's ``(seq, seq)`` output) resolves to
+    a C expression over the runtime kernel arg (the M9 runtime-ldm path);
+    every consumer interpolates ``ldm`` into an address string, so the
+    int/str split is transparent."""
     shape = ctx.shapes.get(buffer)
     if shape is None:
         raise ValueError(f"MmaLoad/MmaStore: buffer {buffer!r} not in ctx.shapes (no shape registered)")
-    last = shape[-1]
-    if hasattr(last, "as_static"):
-        return last.as_static()
-    return int(last)
+    return _ext_to_c(shape[-1], ctx)
 
 
 def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: str = "f32") -> str:
@@ -1300,6 +1416,7 @@ def _(s: LdmatrixLoad, rename, sigma, axis_fn):
         ldm=s.ldm,
         swizzle=s.swizzle,
         staged=s.staged,
+        gmem_guard=None if s.gmem_guard is None else (sigma.apply(s.gmem_guard[0]), sigma.apply(s.gmem_guard[1])),
     )
 
 
@@ -1325,6 +1442,13 @@ def _(s: RegStore, rename, sigma, axis_fn):
             ops=epilogue.ops,
             result=epilogue.result,
         )
+
+    # Guard base/bound Exprs σ-substitute like ``dst_index`` (the per-cell
+    # replicator's offsets must reach the boundary predicate; the bound is a
+    # Literal or free symbolic Var, which σ passes through).
+    def _sub_guard(g):  # noqa: ANN001, ANN202 — tuple[Expr, Expr] | None
+        return None if g is None else (sigma.apply(g[0]), sigma.apply(g[1]))
+
     return RegStore(
         dst_buffer=s.dst_buffer,
         dst_index=tuple(sigma.apply(e) for e in s.dst_index),
@@ -1332,4 +1456,6 @@ def _(s: RegStore, rename, sigma, axis_fn):
         shape=s.shape,
         ldm=s.ldm,
         epilogue=epilogue,
+        m_guard=_sub_guard(s.m_guard),
+        n_guard=_sub_guard(s.n_guard),
     )

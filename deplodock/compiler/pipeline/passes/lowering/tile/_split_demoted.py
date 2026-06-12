@@ -57,7 +57,9 @@ cold), and a lowering failure on either side must surface as a rejection.
 Conservative bails (return ``None``, never raise) keep the fused path the only
 outcome for any shape the cut doesn't fully understand: multiple K loops, no computed
 or K-folded operand, a K-invariant Load operand, distinct-class cones sharing stmts,
-cone values escaping past the multiply, mixed-dtype cell leaves, symbolic extents, more
+cone values escaping past the multiply, mixed-dtype cell leaves, symbolic K or N extents
+(symbolic ROW axes are admitted — the cut re-emits rows verbatim and the ``xn`` / ``mm_i``
+buffers carry the symbolic Dim), more
 than one cone reading the output N axis (two ``(…, K, N)`` buffers would re-do the
 matmul's own volume — the materialization that defeats the split), or — multi-accum only —
 a cell stmt claimed by no gemm / an operand Load doubling as a cone member.
@@ -264,9 +266,11 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
             level = (Loop(axis=lp.axis, body=Body(level)),)
         producer = LoopOp(body=Body((*c.lead.members, *level)))
         producer.name = f"{loop_op.name}_xn{sfx}" if loop_op.name else ""
-        shape = tuple(lp.axis.extent.as_static() for lp in rows_used) + (k_loop.axis.extent.as_static(),)
+        # Row extents pass through as Dims (symbolic rows allocate from the
+        # runtime extent); K / N are static-gated by ``_classify_cut``.
+        shape = tuple(lp.axis.extent for lp in rows_used) + (k_loop.axis.extent,)
         if reads_n:
-            shape += (outer_n.axis.extent.as_static(),)
+            shape += (outer_n.axis.extent,)
         producers.append((producer, Tensor(xn_id, shape, c.dtype)))
         for root in roots:
             if vn[root] == vn[c.root]:
@@ -279,7 +283,9 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     acc_loads: list[Load] = []
     if len(accums) > 1:
         mm_index = (*(Var(lp.axis.name) for lp in rows), Var(n_name))
-        mm_shape = tuple(lp.axis.extent.as_static() for lp in rows) + (outer_n.axis.extent.as_static(),)
+        # Row Dims pass through (symbolic rows allocate at runtime); N is
+        # static-gated by ``_classify_cut``.
+        mm_shape = tuple(lp.axis.extent for lp in rows) + (outer_n.axis.extent,)
         for i, (acc, mul, _) in enumerate(per_acc):
             mm_id = f"{node_id}__mm{i}"
             cell: list[Stmt] = []
@@ -408,8 +414,11 @@ def _classify_cut(loop_op: LoopOp):
     k_loop = k_loops[0]
     if not k_loop.axis.extent.is_static or not outer_n.axis.extent.is_static:
         return None
-    if any(not lp.axis.extent.is_static for lp in rows):
-        return None
+    # Symbolic ROW extents are fine: the cut never tiles the row axes — the
+    # producers and the consumer re-emit them verbatim, and the ``xn`` /
+    # ``mm_i`` buffers carry the symbolic Dim (the backend allocates them
+    # from the runtime extent like any other symbolic intermediate). Only K
+    # and N must be static (the gemm extraction reasons about their volume).
     return tuple(leading), rows, prologue_level, outer_n, k_loop
 
 
