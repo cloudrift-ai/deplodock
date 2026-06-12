@@ -31,7 +31,12 @@ Not a `Backend` — a small Graph→torch evaluator that runs a frontend-dialect
 the torch elementwise/reduce, layout ops→view/transpose/cat). `is_runnable(graph)` is `True` only when every compute op
 has a mapping — layout/data-dependent ops that appear post-decomposition (`IndexMapOp` / `GatherOp` / `ScatterOp`) are
 unsupported, so `run --ir` falls back to deplodock-only benchmarking for non-frontend IR. `build_callable(graph,
-input_tensors)` returns a pure `fn(*tensors)` (scalar constants read inline) so `torch.compile` can trace it. Used to
+input_tensors)` returns a pure `fn(*tensors)` (scalar constants read inline) so `torch.compile` can trace it. Symbolic
+graphs work too: `build_callable` binds every symbolic axis name to its concrete extent read off the supplied tensors
+(the CUDA launch convention) and bakes the env into the per-node callables — shape-resolving sites (`ReshapeOp` target
+shape, `IndexMapOp` out-shape and coord/select exprs) eval through it, so a dynamic-trace `<kname>.torch.json`
+reproducer gets the same vs-torch comparison as a static one (benched at the `Dim` hint by
+`commands/run.py::bench_lowered_vs_torch`, which sizes its random inputs by hint-resolving symbolic dims). Used to
 turn a dumped `<kname>.torch.json` reproducer into an accuracy + latency comparison vs torch — see `../provenance.py`
 and `commands/run.py:_handle_run_ir`.
 

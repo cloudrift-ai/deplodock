@@ -455,10 +455,21 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
 
     hidden_size = decoder.config.hidden_size
     x = torch.randn(1, seq_len, hidden_size, dtype=dtype)
-    position_ids = torch.arange(seq_len).unsqueeze(0)
     # Some architectures (e.g. Gemma's sliding/global split) key RoPE on the
     # layer's attention type; pass it when the rotary module / layer expose it.
     layer_type = getattr(getattr(block, "self_attn", None), "layer_type", None)
+
+    if dynamic_shapes:
+        # Dynamic mode: concrete (cos, sin) kwargs would specialise rotary to
+        # the trace seq_len, so wrap the block with in-graph sliced rotary
+        # instead. The wrapper's input is ``x`` → spec ``--dynamic seq_len@x:1``.
+        from deplodock.compiler.trace.huggingface import build_layer_wrapper
+
+        wrapper = build_layer_wrapper(block, decoder.rotary_emb, hidden_size, dtype, layer_type=layer_type)
+        graph = trace_module(wrapper, (x,), dynamic_shapes=dynamic_shapes)
+        return graph, (wrapper, (x,), {})
+
+    position_ids = torch.arange(seq_len).unsqueeze(0)
     try:
         cos, sin = decoder.rotary_emb(x, position_ids, layer_type)
     except TypeError:

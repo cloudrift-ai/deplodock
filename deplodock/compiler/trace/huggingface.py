@@ -151,6 +151,54 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
     return FullModelWrapper()
 
 
+def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_type=None) -> nn.Module:
+    """Trace-friendly single-decoder-layer wrapper for dynamic mode:
+    ``forward(x)`` slices rotary cos/sin to the runtime seq_len and calls
+    ``block(x, position_embeddings=(cos, sin))``.
+
+    The static per-layer trace passes concrete ``(cos, sin)`` kwargs sized to
+    the trace seq_len — exactly the specialisation dynamic mode must avoid. So
+    this wrapper precomputes cos/sin out to ``DYNAMIC_DIM_MAX`` positions as
+    buffers and slices them in-graph by ``x.shape[1]`` (a SymInt under
+    ``torch.export``), the same trick as the whole-model ``_SlicedRotary``.
+    The sliced buffer assumes positions ``0..S-1`` — full-sequence prefill,
+    the only dynamic-mode use. The forward arg is named ``x``, so the CLI
+    spec is ``--dynamic seq_len@x:1``.
+
+    ``layer_type`` feeds rotary modules that key cos/sin on the layer's
+    attention type (e.g. Gemma's sliding/global split); ``None`` for the
+    common single-rope architectures."""
+    import torch
+    import torch.nn as nn
+
+    from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
+
+    # +1: torch.export guards a symbolic slice end STRICTLY below the sliced
+    # extent (``cos[:, :s]`` with s == extent would specialize) — same as the
+    # whole-model dynamic wrapper's rotary buffer.
+    n_pos = DYNAMIC_DIM_MAX + 1
+    with torch.no_grad():
+        sample = torch.zeros((1, n_pos, hidden_size), dtype=dtype)
+        full_pos = torch.arange(n_pos, dtype=torch.long)[None, :]
+        try:
+            cos, sin = rotary_emb(sample, full_pos, layer_type)
+        except TypeError:
+            cos, sin = rotary_emb(sample, full_pos)
+
+    class LayerWrapper(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = block
+            self.register_buffer("cos", cos)
+            self.register_buffer("sin", sin)
+
+        def forward(self, x):
+            s = x.shape[1]
+            return self.block(x, position_embeddings=(self.cos[:, :s], self.sin[:, :s]))
+
+    return LayerWrapper()
+
+
 def build_causal_mask(seq_len: int, dtype) -> torch.Tensor:  # noqa: F821
     """Return the ``(1, 1, seq_len, seq_len)`` causal mask the wrapper
     uses internally — exposed so callers in dynamic mode can construct a

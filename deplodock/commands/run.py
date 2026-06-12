@@ -991,8 +991,24 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
 
     rng = np.random.default_rng(seed)
 
+    # Symbolic reproducers bench at each dim's hint (``DEFAULT_SEQ_HINT`` for a
+    # bare seq axis) — the same size the backend resolves a symbolic graph to
+    # when no inputs are supplied — so the random inputs built here get concrete
+    # hint-sized shapes. Atomic dims carry their own hint; composite exprs
+    # (e.g. ``S * 2``) eval over the collected env.
+    from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
+
+    sym_env: dict[str, int] = {}
+    for gph in ([frontend] if frontend is not None else []) + [lowered]:
+        for node in gph.nodes.values():
+            for d in node.output.shape:
+                if isinstance(d, Dim) and not d.is_static:
+                    hint = d.hint or DEFAULT_SEQ_HINT
+                    for v in d.expr.free_vars():
+                        sym_env.setdefault(v, hint)
+
     def _static(shape):
-        return tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in shape)
+        return tuple((d.as_static() if d.is_static else int(d.expr.eval(sym_env))) if isinstance(d, Dim) else int(d) for d in shape)
 
     # One random source array per distinct constant ``source_path`` — shared by
     # deplodock (lowered graph) and the torch ref (frontend graph). ``bind_constants``
@@ -1011,7 +1027,9 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
     for nid, node in lowered.nodes.items():
         if isinstance(node.op, InputOp):
             arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32)
-            input_data[nid] = arr.flatten().tolist()
+            # Keep the ndarray shape (no flatten) — a symbolic graph's launch
+            # reads the runtime seq_len off the input array's shape.
+            input_data[nid] = arr
             input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
         elif isinstance(node.op, ConstantOp) and node.op.value is not None:
             input_data[nid] = [float(node.op.value)]
