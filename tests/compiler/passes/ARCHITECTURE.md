@@ -31,6 +31,7 @@ tests/compiler/passes/
 ├── test_partition_planner_forks.py # partition-planner fork generation
 ├── test_launch_geometry_rules.py   # launch-geometry pass
 ├── test_masked_tile.py             # masked-tile pass (dynamic-shape boundary guard)
+├── test_strided_coop_rows.py       # strided-cooperative rows (BR>1 alongside free-axis threads; segmented shuffle)
 ├── test_stage_inputs_classify.py   # Stage-input classifier
 ├── test_lowering_accuracy.py       # 040 / 060 / 070 + TMA end-to-end CUDA accuracy
 ├── test_lowering_blocked_gemm.py   # FN > 1 matmul accuracy (per-cell + replicator)

@@ -4,8 +4,10 @@ A cooperative ``Accum`` whose reduction axis is split across the CTA's
 threads needs a cross-thread reduce after the per-thread partials land.
 ``emit_combine`` picks warp-shuffle / hierarchical / block-wide smem
 tree-halve by thread count; ``find_nested_reduce_accums`` and
-``single_thread_var`` are the small queries the materializer uses to
-locate the Accums and the single THREAD axis the combine runs over.
+``cooperative_combine_geometry`` are the small queries the materializer
+uses to locate the Accums and the combine's tid var + thread count
+(the whole CTA in the BN=BM=1 form, or each row's BR-lane segment when
+free-axis threads ride alongside — strided-cooperative rows).
 
 Pure functions — no shared materializer state. The leading-underscore
 module name keeps the pass loader (globs ``*.py``, skips ``_``-prefixed)
@@ -46,13 +48,36 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
     return {}
 
 
-def single_thread_var(thread_axes: tuple[Axis, ...]) -> str:
-    """Combine + TreeHalve emit a single ``tid_var`` string. Only valid
-    when there's exactly one THREAD axis — softmax-style cooperation
-    (matmul has multi-axis THREAD set but doesn't emit Combine)."""
-    if len(thread_axes) != 1:
-        raise ValueError(f"Combine requires a single THREAD axis; got {len(thread_axes)}")
-    return thread_axes[0].name
+def cooperative_combine_geometry(thread_axes: tuple[Axis, ...], coop_names: frozenset[str], *, warp_size: int) -> tuple[str, int]:
+    """``(tid_var, n_threads)`` for one Accum's cross-thread combine.
+
+    ``coop_names`` is the Accum's cooperative axis set
+    (``Body.coordination.accum_cooperative_axes`` — reduce axes that are
+    also THREAD axes; exactly one ``K_c`` by planner construction).
+
+    - **Whole-CTA** (every THREAD axis cooperative — the BN=BM=1 form):
+      the combine spans the CTA, any size; ``emit_combine`` picks warp
+      shuffle / hierarchical / smem tree-halve.
+    - **Strided-cooperative rows** (free-axis THREAD axes alongside):
+      the combine must be a SEGMENTED warp shuffle over each row's BR
+      lanes, valid only when the cooperative axis is the innermost
+      (fastest-varying) THREAD axis — its lanes then form a contiguous
+      BR-aligned intra-warp group — and BR is a power of two ≤
+      warp_size (a segment must not straddle a warp). The planner /
+      enumerator guarantee both; violations raise here rather than
+      emit a mis-combining kernel.
+    """
+    coop = [ax for ax in thread_axes if ax.name in coop_names]
+    if len(coop) != 1:
+        raise ValueError(f"Combine requires exactly one cooperative THREAD axis; got {[ax.name for ax in coop]}")
+    n_coop = coop[0].extent.as_static()
+    if len(coop) == len(thread_axes):
+        return coop[0].name, n_coop
+    if thread_axes[-1].name != coop[0].name:
+        raise ValueError(f"cooperative axis {coop[0].name!r} must be the innermost THREAD axis for the segmented-shuffle combine")
+    if n_coop > warp_size or n_coop & (n_coop - 1):
+        raise ValueError(f"segmented-shuffle combine needs power-of-two BR <= {warp_size}; got {n_coop}")
+    return coop[0].name, n_coop
 
 
 def emit_combine(
@@ -72,7 +97,11 @@ def emit_combine(
 
     - **Warp** (``n_threads ≤ WARP_SIZE`` and power of two): a single
       ``WarpShuffle`` butterfly via ``__shfl_xor_sync``. No smem, no
-      syncthreads.
+      syncthreads. The XOR butterfly never crosses an aligned
+      ``n_threads``-lane group, so the same emission is the SEGMENTED
+      per-row combine for strided-cooperative rows (caller passes the
+      segment size as ``n_threads`` — see
+      :func:`cooperative_combine_geometry`).
     - **Hierarchical** (``n_threads`` a power-of-two multiple of
       ``WARP_SIZE``): each warp first shuffle-reduces its lanes into
       register-resident ``<acc>_w`` (broadcast within the warp); lane 0
