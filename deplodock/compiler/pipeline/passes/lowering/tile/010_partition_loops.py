@@ -648,14 +648,14 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # Warp-tier MMA: only when the MMA knob is enabled (default;
         # ``DEPLODOCK_MMA=0`` for scalar-only, ``DEPLODOCK_MMA=<kind>``
         # to enable + pin one atom kind — see ``_enumeration.mma_mode``),
-        # no prologue (M9 extension), static N/K, and the per-kind
-        # eligibility predicate fires. A symbolic M is admitted as a
-        # MASKED warp tile (tiled at the hint; ceil-div grid + per-element
+        # no prologue (M9 extension), static K, and the per-kind
+        # eligibility predicate fires. Symbolic M and/or N are admitted as
+        # MASKED warp tiles (tiled at the hint; ceil-div grid + per-element
         # store guard — the M9 path): the enumerator stamps ``OVERHANG``
-        # via ``m_forced_mask`` and the builder emits the boundary Cond.
-        # Symbolic N additionally needs an Expr ldm on the output store
-        # (next step of the M9 work); symbolic K (flash-style attention)
-        # is out of scope. Each eligible kind gets one
+        # via the forced-mask flags, the builder emits the boundary Cond,
+        # and a symbolic-N output resolves its ldm from the runtime kernel
+        # arg at render (``_resolve_ldm``). Symbolic K (flash-style
+        # attention) is out of scope. Each eligible kind gets one
         # warp-tier knob row per (WN, WM, FM, FN, BK, SPLITK); we
         # concatenate them onto the scalar param list — the fork tree in
         # :func:`rewrite` splits the rows by type and emits sibling
@@ -663,7 +663,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
         mma_on, pinned_atom = mma_mode()
-        if mma_on and graph is not None and not prologue and not n_symbolic and not k_symbolic:
+        if mma_on and graph is not None and not prologue and not k_symbolic:
             eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
             # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
             # tensor-core family (WMMA was removed; the swizzled slab beats

@@ -1011,35 +1011,55 @@ class RegStore(Stmt):
         return lines
 
 
-def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int:
+def _ext_to_c(ext, ctx: RenderCtx) -> int | str:
+    """One buffer-shape extent as a C term: static dims yield their ``int``,
+    a symbolic ``Dim`` renders its Expr against the runtime kernel arg
+    (parenthesized — the result is interpolated into ``* {…}`` address
+    strings)."""
+    if hasattr(ext, "is_static"):
+        if ext.is_static:
+            return ext.as_static()
+        return f"({ext.expr.render(ctx)})"
+    return int(ext)
+
+
+def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int | str:
     """Row-major element stride of ``buffer``'s dim ``dim`` — the product of
     the trailing extents. Used by the fragment-epilogue render to apply a
     fragment element's row / col motion on an operand dim at that operand's
     own layout (a transposed residual's "n" dim strides by its row width,
-    not by 1)."""
+    not by 1). A symbolic trailing extent makes the stride a C expression
+    string over the runtime kernel arg instead of an int."""
     shape = ctx.shapes.get(buffer)
     if shape is None:
         raise ValueError(f"RegStore epilogue: buffer {buffer!r} not in ctx.shapes (no shape registered)")
-    stride = 1
+    static = 1
+    sym: list[str] = []
     for ext in shape[dim + 1 :]:
-        stride *= ext.as_static() if hasattr(ext, "as_static") else int(ext)
-    return stride
+        term = _ext_to_c(ext, ctx)
+        if isinstance(term, int):
+            static *= term
+        else:
+            sym.append(term)
+    if not sym:
+        return static
+    expr = " * ".join(sym if static == 1 else [str(static), *sym])
+    return f"({expr})"
 
 
-def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int:
+def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int | str:
     """Look up the row-major leading-dimension stride (= inner extent)
     for ``buffer`` from the kernel render context. Used by
     :class:`MmaLoad` / :class:`MmaStore` when ``ldm == 0`` (auto).
-    Accepts both raw int extents and :class:`Dim` extents (Tensor.shape)
-    — for symbolic dims, takes ``.as_static()`` (M9 generalizes to
-    runtime-resolved ldm via a kernel-arg int)."""
+    Accepts both raw int extents and :class:`Dim` extents (Tensor.shape) —
+    a symbolic inner extent (e.g. QK^T's ``(seq, seq)`` output) resolves to
+    a C expression over the runtime kernel arg (the M9 runtime-ldm path);
+    every consumer interpolates ``ldm`` into an address string, so the
+    int/str split is transparent."""
     shape = ctx.shapes.get(buffer)
     if shape is None:
         raise ValueError(f"MmaLoad/MmaStore: buffer {buffer!r} not in ctx.shapes (no shape registered)")
-    last = shape[-1]
-    if hasattr(last, "as_static"):
-        return last.as_static()
-    return int(last)
+    return _ext_to_c(shape[-1], ctx)
 
 
 def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: str = "f32") -> str:

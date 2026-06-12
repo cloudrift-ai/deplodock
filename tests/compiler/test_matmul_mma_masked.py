@@ -150,6 +150,37 @@ def test_symbolic_m_masked_mma_accuracy(monkeypatch, seq):
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+@pytest.mark.parametrize("seq", [31, 512, 700])
+def test_symbolic_mn_masked_mma_accuracy(monkeypatch, seq):
+    """Both output axes symbolic (the QK^T shape: M = N = seq_len, static
+    K = head_dim): the N-side mask forces per-element scalar stores (a column
+    pair straddles the bound) and the output's ldm resolves from the runtime
+    ``seq_len`` kernel arg (``_resolve_ldm`` Expr path) — one kernel, every
+    runtime size."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("q", (Dim("seq_len"), 128), dtype=F16), node_id="q")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("kT", (128, Dim("seq_len")), dtype=F16), node_id="kT")
+    g.add_node(op=MatmulOp(), inputs=["q", "kT"], output=Tensor("o", (Dim("seq_len"), Dim("seq_len")), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["q", "kT"], ["o"]
+
+    be = CudaBackend()
+    compiled = be.compile(g)
+    rng = np.random.default_rng(0)
+    q = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    kt = (rng.standard_normal((128, seq)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"q": q, "kT": kt})
+    got = result.outputs["o"].astype(np.float32)
+    want = q.astype(np.float32) @ kt.astype(np.float32)
+    assert got.shape == (seq, seq)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: both-symbolic masked MMA mismatch (max abs err {diff})"
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_symbolic_m_masked_mma_residual_epilogue_accuracy(monkeypatch):
     """A fused residual epilogue (``o = a@b + r`` with ``r`` sharing the
     symbolic M) rides the guarded RegStore: masked rows must skip their
