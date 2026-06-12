@@ -587,7 +587,7 @@ all-or-nothing per comparison: if any backend fails to capture, that bench retri
 prints a fallback note. Each `perf` row records whether its measurement was captured (the `captured` column); on write,
 a captured measurement supersedes a wall-semantics one for the same key regardless of median (never the reverse), so
 old rows keep serving replay and prior training and upgrade in place as re-tunes measure them captured. Recorded
-goldens keep their original numbers until the next `update-goldens` re-record. See the `capture_graphs` section in
+goldens keep their original numbers until the next `tune-golden` re-record. See the `capture_graphs` section in
 `backend/cuda/ARCHITECTURE.md`.
 
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over structural forks, inner

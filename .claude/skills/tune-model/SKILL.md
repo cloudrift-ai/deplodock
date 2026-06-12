@@ -1,7 +1,7 @@
 ---
-name: tune-findings
-description: Use this skill when the user asks to "analyze tune findings for <model>", "tune and analyze model X", "why is deplodock slower than eager / torch.compile on X", "do a per-kernel performance analysis", "drill into kernel performance", "profile the compiled kernels with NCU", or otherwise wants a clean autotune of a model (or one layer), an end-to-end + per-kernel bench against PyTorch eager and torch.compile, a root-cause analysis of every underperforming kernel (search shortfall, tier/optimization lockout, codegen quality, bench failures), and a findings report saved to plans/. Modeled on plans/qwen3-embedding-layer0-tune-findings.md.
-version: 0.3.0
+name: tune-model
+description: Use this skill when the user asks to "tune model X", "analyze tune findings for <model>", "tune and analyze model X", "why is deplodock slower than eager / torch.compile on X", "do a per-kernel performance analysis", "drill into kernel performance", "profile the compiled kernels with NCU", or otherwise wants a clean autotune of a model (or one layer), an end-to-end + per-kernel bench against PyTorch eager and torch.compile, a root-cause analysis of every underperforming kernel (search shortfall, tier/optimization lockout, codegen quality, bench failures), and a findings report saved to plans/. Modeled on plans/qwen3-embedding-layer0-tune-findings.md. For the golden matmul shapes use the tune-golden skill instead — there the target config is known, so the analysis evaluates the prior's expectation against it.
+version: 0.4.0
 ---
 
 # Tune a model and produce a per-kernel findings report
@@ -30,7 +30,7 @@ write ad-hoc bench scripts or hand-written SQL.
   `Qwen/Qwen3-Embedding-0.6B`.
 - Static (no `--dynamic`) only if the user explicitly wants shape-specialised kernels; say so in the report
   (specialised kernels, no masked-tile guards — not the deployable configuration).
-- Work dir: pick a fresh dir (e.g. `/tmp/tune-findings-<slug>/`) holding the dump dir and tee'd logs — the
+- Work dir: pick a fresh dir (e.g. `/tmp/tune-model-<slug>/`) holding the dump dir and tee'd logs — the
   report quotes both, and `deplodock compare` diffs dump dirs across runs.
 
 ## Step 1 — clean tune + -O3 bench
