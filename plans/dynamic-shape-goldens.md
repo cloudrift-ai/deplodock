@@ -56,6 +56,18 @@ Symbolic extents leak into machinery that expects ints:
   symbolic rows) differs from static at the same hint; refit via `scripts/golden_knob_heuristics.py` once a few
   symbolic goldens are recorded.
 
+**Status (2026-06-12, implemented with one deviation):** the golden-side key does NOT compute `free_prod` at the
+hint — it **mirrors the 992 stamp**, which *excludes* symbolic axes from the extent products and flags them via
+`S_ext_n_symbolic_axis` (verified live: a symbolic-M 512³ matmul stamps `S_ext_free_prod=512`, i.e. N only). The
+stamped histogram is the only identity the op side has (it doesn't know the hint), so a hint-sized `M*N` key would
+never join it. Landed as `ShapeKey.is_dyn` + `from_matmul(dynamic=)` + `from_s_features` reading the stamped flag,
+with `MatmulGoldenConfig.shape_key()` as the single golden-side constructor (all joins had first been unified on
+`ShapeKey` — that refactor also surfaced that `S_n_mma` is 0.0 on every stamped row, so the old mma-keyed joins were
+dead). `compiled_s_features` threads the dynamic spec so `compile_s_feats=True` histograms come from the symbolic
+trace; the arith fallback stays runnable (no Expr — golden `M` is an int) and is asserted a consistent subset of the
+compiled histogram. `op_cache_key` needed no change (twin-collision tests pin it at loop + cuda stages). The
+`AnalyticPrior` refit for the masked tier remains deferred until `.dynM` goldens are recorded (§4).
+
 ## 4. Eval views and the skill
 
 `eval golden / analytic / prior` follow from `Sample.from_golden` once §3 lands. Fix on the way (both bit the

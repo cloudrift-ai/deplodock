@@ -92,7 +92,7 @@ def _golden_coverage(groups: dict) -> tuple[int, int]:
         if _matmul_sig(d):
             have.add(ShapeKey.from_s_features(d))
     matmuls = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
-    covered = sum(1 for g in matmuls if ShapeKey.from_matmul(g.M, g.N, g.K, g.dtype) in have)
+    covered = sum(1 for g in matmuls if g.shape_key() in have)
     return covered, len(matmuls)
 
 
@@ -129,7 +129,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
-        s_feats = index.get(ShapeKey.from_matmul(g.M, g.N, g.K, g.dtype))
+        s_feats = index.get(g.shape_key())
         if s_feats is None:
             continue
         base = {**Context.from_target(g.compute_cap).features(), **s_feats}
@@ -189,7 +189,7 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
-        leaves = index.get(ShapeKey.from_matmul(g.M, g.N, g.K, g.dtype))
+        leaves = index.get(g.shape_key())
         if not leaves:
             continue
         pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))

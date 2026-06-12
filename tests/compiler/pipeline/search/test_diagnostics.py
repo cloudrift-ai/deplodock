@@ -56,6 +56,33 @@ def test_golden_coverage_counts_dtype_twins_separately():
     assert collider == 0  # non-matmul group at matmul extents doesn't count
 
 
+def test_golden_coverage_splits_dynamic_twin(monkeypatch):
+    """A ``.dynM`` golden is covered only by a symbolic-marked op group
+    (``S_ext_n_symbolic_axis > 0``, ``free_prod`` excluding the symbolic axis —
+    what the 992 stamp emits for a masked-tile kernel); its static twin's group
+    does not satisfy it, and vice versa."""
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    dyn_g = gmod.MatmulGoldenConfig(
+        name="square.512.dynM",
+        M=512,
+        N=512,
+        K=512,
+        knobs={"BM": 8},
+        deplodock_us=10.0,
+        cublas_us=11.0,
+        dynamic={"seq_len": {"input": "x0", "axis": 0}},
+    )
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [dyn_g])
+
+    static_group = _sig(512 * 512, 512)  # the static twin's stamped extents
+    assert diagnostics._golden_coverage({static_group: []}) == (0, 1)
+
+    sym = dict(_sig(512, 512))  # free_prod = N only; symbolic axis flagged
+    sym["S_ext_n_symbolic_axis"] = 1.0
+    assert diagnostics._golden_coverage({tuple(sorted(sym.items())): []}) == (1, 1)
+
+
 class _FakePrior:
     """Constant-score prior with a hand-built reservoir (``golden_prior_eval``
     only needs ``_dataset`` for the op-group index and ``mean_score``)."""

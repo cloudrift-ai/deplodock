@@ -54,6 +54,41 @@ def test_shapekey_from_s_features_joins_with_from_matmul() -> None:
     assert ShapeKey.from_s_features({}) == ShapeKey(free_prod=0, reduce_max=0, is_warp=True)
 
 
+def test_shapekey_dynamic_twin_mirrors_stamp() -> None:
+    """A dynamic (symbolic-M) key MIRRORS the 992 stamp — the symbolic axis is
+    excluded from ``free_prod`` (the stamp doesn't know the hint, so a hint-sized
+    ``M*N`` key would never join the op side) and ``is_dyn`` splits the twin from
+    its static sibling, exactly as ``is_warp`` splits the fp32/fp16 pair."""
+    dyn = ShapeKey.from_matmul(512, 512, 512, "fp32", dynamic=True)
+    assert (dyn.free_prod, dyn.reduce_max, dyn.is_dyn) == (512, 512, True)  # N only — symbolic M excluded
+    assert dyn != ShapeKey.from_matmul(512, 512, 512, "fp32")
+    assert dyn.s_features_arith()["S_ext_n_symbolic_axis"] == 1.0
+    assert "S_ext_n_symbolic_axis" not in ShapeKey.from_matmul(512, 512, 512, "fp32").s_features_arith()
+    # The op side: a stamped symbolic histogram joins the dynamic key, not the static one.
+    stamped = {"S_ext_free_prod": 512.0, "S_ext_reduce_max": 512.0, "S_dtype_f32": 2.0, "S_ext_n_symbolic_axis": 1.0}
+    assert ShapeKey.from_s_features(stamped) == dyn
+
+
+def test_golden_dynamic_compile_s_feats_mirror() -> None:
+    """A dynamic golden's compiled histogram comes from the actually-symbolic
+    (masked-tile) trace: the symbolic axis is excluded from the extent products
+    and ``S_ext_n_symbolic_axis`` is set — and the cheap arith fallback is a
+    consistent subset of it, so grouping and featurization agree across tiers.
+    The op-side constructor closes the join on the full histogram."""
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig
+
+    g = MatmulGoldenConfig(name="square.512.dynM", M=512, N=512, K=512, dynamic={"seq_len": {"input": "x0", "axis": 0}})
+    s = Sample.from_golden(g, compile_s_feats=True)
+    assert s.shape is not None and s.shape.is_dyn is True
+    full = s.s_features()
+    assert full["S_ext_n_symbolic_axis"] == 1.0
+    assert full["S_ext_free_prod"] == 512.0  # N only — the symbolic M is excluded by the stamp
+    arith = Sample.from_golden(g).s_features()
+    assert set(arith) <= set(full)
+    assert all(arith[k] == full[k] for k in arith)
+    assert ShapeKey.from_s_features(full) == s.shape
+
+
 # --- Sample round-trips (the acceptance gates) ------------------------------
 
 

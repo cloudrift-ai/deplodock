@@ -202,8 +202,10 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   latency of the prior's predicted-best **measured** config over the golden's recorded `deplodock_us`, read from the
   prior's reservoir with **no re-bench** (`diagnostics.golden_deploy_perf`). Both sides are -O3 (tuning re-benches every
   winner at `H_opt=3`), so the ratio is a real deployable comparison (<1.0 = the prior's pick beats golden); a shape with
-  no -O3 reservoir row shows `—`. The shape key splits on `S_dtype_f32`, so an fp32 square and its `.fp16` twin (same
-  free-dim product / reduce extent) don't merge. `--dataset db` instead reports the prior's pick
+  no -O3 reservoir row shows `—`. The shape key (`ShapeKey` — the single golden↔measured join key) splits on
+  `S_dtype_f32`, so an fp32 square and its `.fp16` twin (same free-dim product / reduce extent) don't merge, and on
+  the symbolic-axis flag (`S_ext_n_symbolic_axis`), so a `.dynM` golden never merges with its static twin (its key
+  mirrors the 992 stamp: symbolic axes are excluded from the extent products). `--dataset db` instead reports the prior's pick
   **reachability** over the tune DB's *measured* variants (does the prior recover each op's measured-best leaf?) — the
   orthogonal counterpart to the golden views, reusing `diagnostics.reachability` over `Dataset.from_db().group_by_op()`.
   Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also

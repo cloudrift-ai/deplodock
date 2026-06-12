@@ -23,19 +23,30 @@ from dataclasses import dataclass
 class ShapeKey:
     """Arithmetic extent identity of a matmul-shaped op.
 
-    ``free_prod`` is the output free-dim product (``M*N``), ``reduce_max`` the
-    reduce extent (``K``), ``is_warp`` whether it lowers on the tensor-core warp
-    tier (any non-fp32 matmul). Hashable, so it keys ``Dataset`` groupings."""
+    ``free_prod`` is the product of the **static** output free dims (``M*N``; a
+    symbolic axis is excluded, mirroring the ``992`` stamp — see :meth:`from_matmul`),
+    ``reduce_max`` the reduce extent (``K``), ``is_warp`` whether it lowers on the
+    tensor-core warp tier (any non-fp32 matmul), ``is_dyn`` whether an axis is
+    symbolic — the split that keeps a dynamic golden and its static twin apart,
+    exactly as ``is_warp`` keeps the fp32/fp16 twins apart. Hashable, so it keys
+    ``Dataset`` groupings."""
 
     free_prod: int
     reduce_max: int
     is_warp: bool
+    is_dyn: bool = False
 
     @classmethod
-    def from_matmul(cls, M: int, N: int, K: int, dtype: str) -> ShapeKey:
+    def from_matmul(cls, M: int, N: int, K: int, dtype: str, *, dynamic: bool = False) -> ShapeKey:
         """The shape of an ``(M, K) @ (K, N)`` matmul. fp32 lowers on the scalar
-        thread tier; fp16 / bf16 on the warp (MMA) tier."""
-        return cls(free_prod=M * N, reduce_max=K, is_warp=dtype != "fp32")
+        thread tier; fp16 / bf16 on the warp (MMA) tier. ``dynamic`` marks the M
+        axis symbolic (the only symbolic-axis golden form today): the key then
+        MIRRORS what ``992_stamp_structural_features`` puts on the op — symbolic
+        axes are **excluded** from the extent products (``free_prod = N``, not the
+        hint-sized ``M*N``) and flagged via ``S_ext_n_symbolic_axis`` — because
+        the stamped histogram is the only identity the op side has (it doesn't
+        know the hint), so a hint-sized golden key would never join it."""
+        return cls(free_prod=N if dynamic else M * N, reduce_max=K, is_warp=dtype != "fp32", is_dyn=dynamic)
 
     @classmethod
     def from_s_features(cls, s: dict) -> ShapeKey:
@@ -56,15 +67,22 @@ class ShapeKey:
             free_prod=int(s.get("S_ext_free_prod", 0)),
             reduce_max=int(s.get("S_ext_reduce_max", 0)),
             is_warp=not s.get("S_dtype_f32", 0),
+            is_dyn=s.get("S_ext_n_symbolic_axis", 0) > 0,
         )
 
     def s_features_arith(self) -> dict[str, float]:
         """The extent ``S_*`` features derivable without compiling — the exact set
         the cold ``AnalyticPrior`` reads (``analytic._analytic_scorer`` builds the
         same dict). For a matmul the reduce axis is a single contraction, so
-        ``S_ext_reduce_prod == S_ext_reduce_max == K``."""
-        return {
+        ``S_ext_reduce_prod == S_ext_reduce_max == K``. A dynamic key adds the
+        ``S_ext_n_symbolic_axis`` flag (and its ``free_prod`` already excludes the
+        symbolic axis), mirroring the stamped histogram so the arith fallback
+        featurizes like the rows a DB-trained prior saw."""
+        out = {
             "S_ext_free_prod": float(self.free_prod),
             "S_ext_reduce_prod": float(self.reduce_max),
             "S_ext_reduce_max": float(self.reduce_max),
         }
+        if self.is_dyn:
+            out["S_ext_n_symbolic_axis"] = 1.0
+        return out

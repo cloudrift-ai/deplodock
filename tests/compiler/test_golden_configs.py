@@ -153,6 +153,17 @@ def test_sample_from_golden_carries_dynamic_specs():
     assert static.dynamic is None
 
 
+def test_shape_key_carries_dynamic_flag():
+    """``shape_key()`` is the single golden-side join key: static keys are the
+    full ``M*N`` product; a dynamic config's key excludes the symbolic M (mirroring
+    the 992 stamp) and sets ``is_dyn``, so the twins never share a key."""
+    static = MatmulGoldenConfig(name="s", M=512, N=256, K=64)
+    assert (static.shape_key().free_prod, static.shape_key().is_dyn) == (512 * 256, False)
+    dyn = _dyn({"seq_len": {"input": "x0", "axis": 0}})  # M=N=K=512
+    assert (dyn.shape_key().free_prod, dyn.shape_key().is_dyn) == (512, True)
+    assert dyn.shape_key() != MatmulGoldenConfig(name="t", M=512, N=512, K=512).shape_key()
+
+
 def _dup(knobs, us):
     return MatmulGoldenConfig(name="dup.512", M=512, N=512, K=512, knobs=knobs, deplodock_us=us, cublas_us=14.0)
 

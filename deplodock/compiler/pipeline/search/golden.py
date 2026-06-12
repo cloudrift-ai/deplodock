@@ -150,6 +150,15 @@ class MatmulGoldenConfig(GoldenConfig):
         """The torch expression this config tunes / benches / reproduces."""
         return matmul_snippet(self.M, self.N, self.K, self.dtype)
 
+    def shape_key(self):
+        """This config's :class:`~deplodock.compiler.pipeline.search.data.ShapeKey` —
+        the single golden-side join key (``Sample.from_golden`` and every
+        diagnostics join build it here, so the dynamic flag can't be forgotten at
+        a call site). Import deferred to keep this module import-light."""
+        from deplodock.compiler.pipeline.search.data.shape import ShapeKey  # noqa: PLC0415
+
+        return ShapeKey.from_matmul(self.M, self.N, self.K, self.dtype, dynamic=bool(self.dynamic))
+
     def dynamic_specs(self) -> list[str]:
         """``--dynamic NAME@INPUT:AXIS`` spec strings for the tracer — empty for a
         static config. The snippet stays the hint-shaped code; these mark which of
