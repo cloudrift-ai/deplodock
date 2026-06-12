@@ -159,10 +159,29 @@ class Backend(ABC):
         input_set = set(compiled.inputs)
         values: dict[str, np.ndarray] = {}
 
+        # Symbolic dims bind from the supplied input array shapes (mirrors
+        # ``CudaBackend.run``): each atomic symbolic input dim records its
+        # runtime size; downstream node shapes — possibly composite Dim
+        # exprs — resolve via ``expr.eval(sym_env)``.
+        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
+        sym_env: dict[str, int] = {}
+        for nid in input_set:
+            node = compiled.nodes.get(nid)
+            if node is None or nid not in input_data:
+                continue
+            arr_shape = np.asarray(input_data[nid]).shape
+            for i, d in enumerate(node.output.shape):
+                if not d.is_static and isinstance(d.expr, Var) and i < len(arr_shape):
+                    sym_env.setdefault(d.expr.name, int(arr_shape[i]))
+
+        def _shape_of(node) -> tuple[int, ...]:  # noqa: ANN001
+            return tuple(d.as_static() if d.is_static else int(d.expr.eval(sym_env)) for d in node.output.shape)
+
         t0 = time.perf_counter()
         for nid in compiled.topological_order():
             node = compiled.nodes[nid]
-            shape = tuple(d.as_static() for d in node.output.shape if d.is_static)
+            shape = _shape_of(node)
 
             dtype_np = node.output.dtype.np
 

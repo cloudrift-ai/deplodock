@@ -732,7 +732,12 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # search space honest.
         k_loop = nonmatmul_reduces[0]
         E_K = k_loop.axis.extent.as_static()
-        target_names = frozenset(lp.axis.name for lp in all_loops if lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp))
+        # ``is_static`` guards the ``as_static()`` read: a symbolic free Loop
+        # in the body (e.g. a split producer's row sweep next to a static
+        # row-stat reduce) is never a K-target, not a crash.
+        target_names = frozenset(
+            lp.axis.name for lp in all_loops if lp.axis.extent.is_static and lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp)
+        )
         # Cooperative reduce binds the free axis whole-to-grid (BR>1 forces
         # BN=BM=1, so the grid covers seq exactly — no overhang). A masked
         # register-tile (FN>1) would wrap the reduce body in the boundary Cond
