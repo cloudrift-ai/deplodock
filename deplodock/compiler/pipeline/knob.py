@@ -597,6 +597,12 @@ def _geom_feats(
         out["D_log2_waves"] = waves  # CTAs relative to SM count
         out["D_near_waves"] = -abs(waves - 1.0)  # target ~2 waves
         out["D_ctas_ge_sm"] = 1.0 if ctas >= sm else 0.0
+        # Register-tile intensity × occupancy interaction: a wide per-thread
+        # register tile (big FM·FN) is a win only while the grid still covers
+        # the SMs — the flat D_cells* terms can't express that, so the big-FM
+        # goldens (square.2048's FM=26) rank deep under any sign the fit gives
+        # them (2026-06-12 golden-sweep finding 2).
+        out["D_l2_cells_occ"] = l2(cells) if ctas >= sm else 0.0
     return out
 
 

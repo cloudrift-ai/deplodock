@@ -134,9 +134,10 @@ Everything in steps 1–7 applies unchanged — the spec is **part of the config
 - `eval prior --dataset golden` prints a per-shape `SKIPPED: no tuned rows` line for any golden (dynamic or static)
   whose shape has no tuned data — a `.dynM` entry skipping there means the symbolic shape was never tuned, not that
   the join failed.
-- The cold `AnalyticPrior` has not been refit for the masked tier yet (guard overhead, no staged prologue on
-  symbolic rows): expect deeper cold ranks on `.dynM` shapes until `scripts/golden_knob_heuristics.py` is refit
-  with a few recorded dynamic goldens.
+- The cold `AnalyticPrior` ranks `.dynM` shapes under a dedicated masked-tier weight set (`_W_A_DYN`, selected
+  on the stamped `S_ext_n_symbolic_axis`), fit by `scripts/golden_knob_heuristics.py` over the recorded dynamic
+  goldens (2026-06-12 refit: median cold rank 0). Re-run the script after recording new `.dynM` goldens — it
+  prints both `_W_A` and `_W_A_DYN` to paste into `search/prior/analytic.py`.
 
 ## Step 6 — Validate
 

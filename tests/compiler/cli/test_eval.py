@@ -389,6 +389,11 @@ def test_emit_variant_table_o3_column_and_deterministic_pick(caplog):
         def mean_score(self, knobs):
             return knobs["BM"]
 
+        def pick(self, rows):  # the real Prior.pick model-argmin fallback (no evidence here)
+            scores = [self.mean_score(r) for r in rows]
+            best_i = min(range(len(scores)), key=scores.__getitem__)
+            return best_i, scores[best_i]
+
     o3 = {_variant_key(samples[0]): 9.5}
     with caplog.at_level(logging.INFO, logger="deplodock.commands.eval"):
         _emit_variant_table("k_m", samples, _P(), n_fail=0, o3=o3, top=0)

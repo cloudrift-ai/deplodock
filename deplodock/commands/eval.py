@@ -303,8 +303,13 @@ def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dic
 
     kmax = max(len(s.knobs) for s in samples)
     leaves = sorted((s for s in samples if len(s.knobs) == kmax), key=lambda s: s.latency_us)
-    pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
-    rank = leaves.index(pick) + 1
+    # Score in the deploy regime (``H_opt=3``) through ``Prior.pick`` — measured
+    # -O3 evidence first, model argmin otherwise — so the marker shows the config
+    # greedy ``compile`` / ``run`` would actually deploy, not just the model's
+    # favourite (the DB rows themselves carry the tune's ``H_opt=1`` stamp).
+    best_i, _ = prior.pick([{**s.all_knobs(), "H_opt": 3.0} for s in leaves])
+    pick = leaves[best_i]
+    rank = best_i + 1
 
     n_prefix = len(leaves) if not top else min(top, len(leaves))
     shown = list(enumerate(leaves[:n_prefix], start=1))
@@ -494,7 +499,8 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     for g in configs:
         gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
         try:
-            got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
+            dyn = bool(getattr(g, "dynamic", None))
+            got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), dynamic=dyn)
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
             entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
             continue

@@ -48,16 +48,22 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
     return rows, WARP_KNOBS
 
 
-def _analytic_scorer(M: int, N: int, K: int, ctx: Context) -> Callable[[dict], float]:
+def _analytic_scorer(M: int, N: int, K: int, ctx: Context, *, dynamic: bool = False) -> Callable[[dict], float]:
     """Default ranker for :func:`evaluate_golden` — the :class:`AnalyticPrior`
     folded into the higher-is-better convention ``evaluate_golden`` ranks on
     (``-latency``). Merges the shape / regime features the prior featurizes
     (``S_ext_*`` from ``M``/``N``/``K`` + ``H_*`` from the context) into each row,
-    mirroring what the planner stamps in the live pipeline."""
+    mirroring what the planner stamps in the live pipeline. ``dynamic`` mirrors
+    the 992 stamp for a symbolic-M shape: M drops out of the free-dim product and
+    ``S_ext_n_symbolic_axis`` is set — the flag the prior selects its masked-tier
+    weight set on."""
     from deplodock.compiler.pipeline.search.prior import AnalyticPrior  # noqa: PLC0415
 
     ap = AnalyticPrior()
-    base = {**ctx.features(), "S_ext_free_prod": float(M * N), "S_ext_reduce_prod": float(K), "S_ext_reduce_max": float(K)}
+    free = float(N) if dynamic else float(M * N)
+    base = {**ctx.features(), "S_ext_free_prod": free, "S_ext_reduce_prod": float(K), "S_ext_reduce_max": float(K)}
+    if dynamic:
+        base["S_ext_n_symbolic_axis"] = 1.0
     return lambda r: -ap.score({**base, **r})
 
 
@@ -70,6 +76,7 @@ def evaluate_golden(
     ctx: Context,
     sm_count: int | None = None,  # noqa: ARG001 — kept for call-site compat; the analytic prior reads ctx.sm_count
     scorer: Callable[[dict], float] | None = None,
+    dynamic: bool = False,
 ) -> tuple[dict, int | None, int]:
     """Score a matmul shape's full enumeration and return ``(pick, rank, pool)``:
     the argmax pick (higher score = better), the recorded golden's 0-based rank in
@@ -84,7 +91,7 @@ def evaluate_golden(
     if not rows:
         return {}, None, 0
     if scorer is None:
-        scorer = _analytic_scorer(M, N, K, ctx)
+        scorer = _analytic_scorer(M, N, K, ctx, dynamic=dynamic)
     want = tuple(golden_knobs.get(k) for k in match_keys)
     gidx = next((i for i, r in enumerate(rows) if tuple(r.get(k) for k in match_keys) == want), None)
     scores = [scorer(r) for r in rows]

@@ -105,7 +105,15 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     come from the dataset's matching op group (so only shapes with tuned data are
     scored); ``H_*`` is the deployable compile regime (``Context.features``,
     ``H_opt=3``) the greedy ``compile`` / ``run`` actually queries with.
-    ``kernel_filter`` restricts to golden configs whose name contains it."""
+    ``kernel_filter`` restricts to golden configs whose name contains it.
+
+    The rank is a **model diagnostic, not a deploy prediction**: the enumeration
+    rows carry only the planner's tunables, while the rows the model trained on
+    (and the leaves greedy scores late in the descent) also carry decision /
+    transport stamps (``TMA``, ``PIPELINE_STAGES``, …) — absent keys are NaN
+    ("not decided") to CatBoost, so the two surfaces can disagree (the 2026-06-12
+    sweep's finding 6). Deploy reality is ``Prior.pick`` (measured -O3 evidence
+    first); the faithful deploy check is ``eval golden``'s real greedy compile."""
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.pipeline.search import analytic  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
@@ -168,8 +176,9 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
 
     Tuning re-benches every winner at -O3 (``H_opt=3``) and feeds it to the prior, so
     each tuned shape's best config has a deployable row in the reservoir. For each
-    golden shape we take the op group's ``H_opt=3`` rows, pick the one the prior ranks
-    fastest (``mean_score`` argmin), and divide its measured latency by the golden's
+    golden shape we take the op group's ``H_opt=3`` rows, pick the one ``Prior.pick``
+    deploys (measured -O3 evidence first, model argmin otherwise — the same selection
+    greedy ``compile`` / ``run`` make), and divide its measured latency by the golden's
     recorded ``deplodock_us`` (also -O3 → same regime, so the ratio is a real
     deployable speed comparison; <1.0 = the prior's pick is faster than golden). Shapes
     with no -O3 reservoir row are omitted (the caller renders ``—``). The reservoir is
@@ -200,8 +209,8 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
         leaves = index.get(g.shape_key())
         if not leaves:
             continue
-        pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
-        out[g.name] = pick.latency_us / g.deplodock_us
+        best_i, _ = prior.pick([s.all_knobs() for s in leaves])
+        out[g.name] = leaves[best_i].latency_us / g.deplodock_us
     return out
 
 

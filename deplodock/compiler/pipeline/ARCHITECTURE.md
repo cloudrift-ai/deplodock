@@ -74,12 +74,17 @@ matched `Node` objects. Anything else binds positionally to
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
 parent's graph snapshot) and hands them ALL to a `Search` policy, which ranks them via a `Prior`
-(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `greedy_decide` (`compile`/`run`, via `Run.resolve`) by `mean_score` argmin.
-There is ONE ranking path — the `Prior` is the hand-coded `AnalyticPrior` cold (a real heuristic *score* over
-`knob.knob_features`, not emission order) and the learned `CatBoostPrior` once trained, composed behind
-`FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold; a `tune` sweep explores
-every fork. (DB-best replay `_best_fork` and the static `score_of` prior were removed; the old `_priority_*`
-enumeration sort that ranked the cold path by emission order is gone — the `AnalyticPrior` ranks it now.)
+(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `greedy_decide` (`compile`/`run`, via `Run.resolve`) by
+`Prior.pick` — measured -O3 reservoir evidence first (`evidence_pick`: the candidate prefix-consistent with the
+fastest `H_opt=3` row of the same op, value-of-position semantics), the `mean_score` argmin when no candidate
+has evidence. There is ONE ranking path — the `Prior` is the hand-coded `AnalyticPrior` cold (a real heuristic
+*score* over `knob.knob_features`, not emission order; a separate `_W_A_DYN` weight set ranks symbolic-axis
+masked-tile kernels, selected on the stamped `S_ext_n_symbolic_axis`) and the learned `CatBoostPrior` once
+trained, composed behind `FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold;
+a `tune` sweep explores every fork. (DB-best replay `_best_fork` and the static `score_of` prior were removed;
+the old `_priority_*` enumeration sort that ranked the cold path by emission order is gone — the
+`AnalyticPrior` ranks it now. Greedy stays prior-only: the -O3 evidence ships inside the prior's checkpointed
+reservoir, not the DB.)
 Single-option returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
 **Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
@@ -281,11 +286,12 @@ hardware context + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enum
 `knob.knob_features` turns each row into the prior's feature vector and structurally identical
 kernels — the same layer repeated through a whole model — featurize alike and share the prior's rows.
 
-Variant ranking is a single `Prior` over `knob.knob_features` (`search/prior/`): greedy picks the
-`mean_score` argmin, MCTS ranks the PUCT frontier. The `Prior` is the hand-coded `AnalyticPrior` cold (a
-fixed linear model over the engineered `D_*` geometry / occupancy features — the cold path is ranked by a real
-heuristic *score*, not emission order) and the learned `CatBoostPrior` once trained, composed behind
-`FallbackPrior` (`load_prior`). There is ONE ranking path: the old per-variant `Op.lazy_score` /
+Variant ranking is a single `Prior` over `knob.knob_features` (`search/prior/`): greedy picks via
+`Prior.pick` (measured -O3 reservoir evidence first, `mean_score` argmin otherwise), MCTS ranks the PUCT
+frontier. The `Prior` is the hand-coded `AnalyticPrior` cold (a fixed linear model over the engineered `D_*`
+geometry / occupancy features — the cold path is ranked by a real heuristic *score*, not emission order; the
+masked tier rides its own `_W_A_DYN` weight set keyed on `S_ext_n_symbolic_axis`) and the learned
+`CatBoostPrior` once trained, composed behind `FallbackPrior` (`load_prior`). There is ONE ranking path: the old per-variant `Op.lazy_score` /
 `TileOp.score_tile_geometry` formula, the `Fork.score` / `Search.score_of` plumbing, AND the `_priority_*`
 enumeration sort that ranked the cold path were all removed — nothing materializes or scores a TileOp just to
 rank it; the prior featurizes the row knobs directly.

@@ -18,13 +18,19 @@ from deplodock.compiler.pipeline.search.prior import diagnostics
 
 class _FakePrior:
     """A prior with a hand-built reservoir; ``mean_score`` is constant (each group
-    here has one -O3 row, so the argmin pick is unambiguous)."""
+    here has one -O3 row, so the argmin pick is unambiguous). ``pick`` mirrors the
+    real ``Prior.pick`` model-argmin fallback (constant scores → first row)."""
 
     def __init__(self, rows):
         self._dataset = rows  # list[(stamped_knobs, latency_us)]
 
     def mean_score(self, _feats):
         return 0.0
+
+    def pick(self, rows):
+        scores = [self.mean_score(r) for r in rows]
+        best_i = min(range(len(scores)), key=scores.__getitem__)
+        return best_i, scores[best_i]
 
 
 def _row(free_prod, reduce_max, *, fp32, h_opt, latency):

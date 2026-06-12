@@ -46,6 +46,19 @@ class FallbackPrior(Prior):
     def mean_scores(self, knobs_list: list[dict]) -> list[float]:
         return self.learned.mean_scores(knobs_list) if self.learned.fitted else self.analytic.mean_scores(knobs_list)
 
+    def pick(self, rows: list[dict]) -> tuple[int, float]:
+        # Measured -O3 evidence lives in the LEARNED half's reservoir (the
+        # analytic prior has no dataset), and applies even while the model is
+        # cold — a freshly-seeded reservoir below ``min_rows`` still holds real
+        # measurements worth deploying. The score fallback below then ranks the
+        # evidence-less case through whichever half is live.
+        ev = self.learned.evidence_pick(rows)
+        if ev is not None:
+            return ev
+        scores = self.mean_scores(rows)
+        best_i = min(range(len(scores)), key=scores.__getitem__)
+        return best_i, scores[best_i]
+
     # --- training + inspection: delegate to the learned half ------------------
     def fit(self) -> None:
         self.learned.fit()
