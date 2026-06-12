@@ -235,7 +235,9 @@ class EpilogueSlice:
     write: object
 
 
-def classify_fragment_epilogue(body, accum_names: set[str], *, produced: set[str], leaf_dtype) -> tuple[EpilogueSlice | None, str | None]:
+def classify_fragment_epilogue(
+    body, accum_names: set[str], *, produced: set[str], leaf_dtype, outer_loads: dict[str, object] | None = None
+) -> tuple[EpilogueSlice | None, str | None]:
     """Classify the post-reduce epilogue for the mma fragment-store fold.
 
     Returns ``(slice, None)`` when a foldable epilogue exists, ``(None, None)``
@@ -268,7 +270,17 @@ def classify_fragment_epilogue(body, accum_names: set[str], *, produced: set[str
     Dialect-agnostic: works on Loop-IR (the eligibility gate) and Tile-IR (the
     ``005_lower_atom_tile`` fold) bodies — both carry ``Assign`` / ``Load`` /
     ``Write`` leaves and reduce loops duck-typed on ``.is_reduce`` / ``.axis``.
-    ``leaf_dtype`` maps a buffer name to its dtype name (graph lookup)."""
+    ``leaf_dtype`` maps a buffer name to its dtype name (graph lookup).
+
+    ``outer_loads`` (fold side only) maps SSA names to ``Load``s defined in the
+    enclosing kernel body ABOVE this slice — splice/hoist passes park
+    loop-invariant scalar loads (a real trace's f32 constants, e.g. SiLU's
+    ``1``) at the TileOp root, outside the ``AtomTile`` the fold scans. The
+    Loop-IR gate sees the whole body and admits them as leaves, so without
+    this fallback the fold would disagree with the gate on exactly those
+    kernels. An outer leaf passes the same produced / dtype / per-dim role
+    checks as an in-slice one (its indices carry no cell axes by construction
+    — they're not in scope at the root — so it folds as a ``fixed`` load)."""
     from deplodock.compiler.ir.stmt import Assign, Load, Write  # noqa: PLC0415
 
     # One deep walk in body order: stmts with their inside-a-reduce-loop flag,
@@ -351,7 +363,7 @@ def classify_fragment_epilogue(body, accum_names: set[str], *, produced: set[str
                 leaf_names.append(arg)
     leaf_loads = []
     for name in leaf_names:
-        ld = loads_by_name.get(name)
+        ld = loads_by_name.get(name) or (outer_loads or {}).get(name)
         if ld is None:
             return None, f"epilogue operand {name!r} is not a scalar Load or the accumulator"
         if name in loads_in_reduce:
