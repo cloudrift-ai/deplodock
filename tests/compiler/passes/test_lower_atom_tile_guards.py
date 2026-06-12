@@ -1,0 +1,117 @@
+"""Masked-tile boundary guards on the MMA store path (M9).
+
+The boundary ``Cond`` a masked warp tile carries only gates the atom tile's
+BASE coordinate — the fragment lane offsets (``_g`` / ``_t``) are render-local
+— so a tile straddling the bound passes the Cond while its trailing rows /
+cols are out of range. ``kernel/005_lower_atom_tile`` classifies the Cond's
+predicate against the cell Write's M / N coordinates and stamps per-element
+guards onto the ``RegStore``; the render predicates each element's store (and
+its epilogue gmem reads) at its own coordinate. These tests pin the guard
+classification, the guarded/unguarded renders, and the unstaged-gated-operand
+decline — pure unit shapes, no planner involvement (the planner only emits
+masked AtomTiles once the warp tier admits symbolic axes).
+"""
+
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.kernel.ir import RegStore
+from deplodock.compiler.ir.stmt import Body, Cond, Load, Write
+from deplodock.compiler.ir.stmt.base import RenderCtx
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
+from deplodock.compiler.pipeline import RuleSkipped
+
+_mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.005_lower_atom_tile")
+
+
+def _store(**kw) -> RegStore:
+    return RegStore(dst_buffer="o", dst_index=(Var("m0"), Var("n0")), frag="c_frag", shape=(16, 8, 16), ldm=64, **kw)
+
+
+def test_unguarded_regstore_renders_vectorized_unconditionally():
+    """No guards → the existing fast path: one vec2 store per row pair, no
+    boundary ``if``s anywhere."""
+    src = "\n".join(_store().render(RenderCtx(buffer_dtypes={"o": "f16"})))
+    assert src.count("__floats2half2_rn") == 2
+    assert "if (" not in src
+
+
+def test_m_guard_keeps_vectorized_pairs_under_row_checks():
+    """An ``m_guard`` alone predicates each row pair at its own row (``_g`` /
+    ``_g + 8``) against the symbolic bound, keeping the vec2 stores."""
+    src = "\n".join(_store(m_guard=(Var("m0"), Var("seq_len"))).render(RenderCtx(buffer_dtypes={"o": "f16"})))
+    assert "if ((m0) + _g < (seq_len))" in src
+    assert "if ((m0) + _g + 8 < (seq_len))" in src
+    assert src.count("__floats2half2_rn") == 2, f"row-guarded store should keep the vectorized pairs:\n{src}"
+
+
+def test_n_guard_falls_back_to_per_element_scalar_stores():
+    """An ``n_guard`` splits the column pair (its two columns straddle the
+    bound independently) into per-element scalar stores, each under the
+    conjunction of the live guards."""
+    src = "\n".join(
+        _store(m_guard=(Var("m0"), Var("seq_len")), n_guard=(Var("n0"), Literal(47, "int"))).render(RenderCtx(buffer_dtypes={"o": "f16"}))
+    )
+    assert "__floats2half2_rn" not in src
+    assert "(n0) + _t * 2 < (47)" in src
+    assert "(n0) + _t * 2 + 1 < (47)" in src
+    assert "(m0) + _g < (seq_len) && " in src
+    assert src.count("if (") == 4
+
+
+def test_boundary_guards_classify_m_and_n_predicates():
+    """Predicate LHS struct-equal to the Write's second-to-last index dim →
+    ``m_guard``; equal to the last → ``n_guard``. The Conds stay in the body
+    (whole-tile skip); only the classification is extracted here."""
+    m_expr = Var("mb") * Literal(32, "int") + Var("mt")
+    n_expr = Var("nb") * Literal(8, "int")
+    w = Write(output="o", index=(m_expr, n_expr), value="acc")
+    body = Body(
+        (
+            Cond(
+                cond=BinaryExpr("<", m_expr, Var("seq_len")),
+                body=Body((Cond(cond=BinaryExpr("<", n_expr, Literal(47, "int")), body=Body((w,))),)),
+            ),
+        )
+    )
+    m_guard, n_guard = _mod._boundary_guards(body, w)
+    assert m_guard == (m_expr, Var("seq_len"))
+    assert n_guard == (n_expr, Literal(47, "int"))
+
+
+def test_boundary_guards_none_without_conds():
+    w = Write(output="o", index=(Var("m"), Var("n")), value="acc")
+    assert _mod._boundary_guards(Body((w,)), w) == (None, None)
+
+
+def test_boundary_guards_fail_loud_on_unmatched_predicate():
+    """A boundary predicate that matches neither Write coordinate means the
+    planner and this pass disagree about the masked axis — RuleSkipped (the
+    variant pins a bench_fail row) rather than an unguarded straddling store."""
+    w = Write(output="o", index=(Var("m"), Var("n")), value="acc")
+    body = Body((Cond(cond=BinaryExpr("<", Var("something_else"), Var("seq_len")), body=Body((w,))),))
+    with pytest.raises(RuleSkipped, match="matches no Write coordinate"):
+        _mod._boundary_guards(body, w)
+
+
+def test_emit_chain_declines_unstaged_gated_operand():
+    """A masked cell whose gated-axis operand was not staged would read past
+    the runtime-sized buffer through the gmem-direct fragment load — decline."""
+    spec = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    a_load = Load(name="a0", input="a", index=(Var("m"), Var("k")))
+    b_load = Load(name="b0", input="b", index=(Var("k"), Var("n")))
+    with pytest.raises(RuleSkipped, match="M operand is unstaged"):
+        _mod._emit_chain(
+            spec,
+            a_load=a_load,
+            b_load=b_load,
+            a_frag="af",
+            b_frag="bf",
+            c_frag="cf",
+            smem_sources={},
+            m_guard=(Var("m"), Var("seq_len")),
+        )
