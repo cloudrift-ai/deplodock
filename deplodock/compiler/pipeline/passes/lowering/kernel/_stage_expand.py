@@ -20,7 +20,7 @@ from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
 
 
-def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | None) -> int:
+def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | Expr | None) -> int:
     """Elements per ``cp.async`` for a cooperative stage load — the widest
     contiguous vector whose byte size is a legal cp.async width (4 / 8 / 16).
 
@@ -38,8 +38,13 @@ def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing,
     row, so ``PAD_SMEM``'s ``+1`` disables wide cp.async); and (c) the gmem inner
     stride is ``V``-aligned, so each row's chunk start stays ``V*elem``-byte
     aligned (cp.async faults on a misaligned 16-byte copy). Only
-    ``AffineAddressing`` is analyzed; anything else is treated non-contiguous."""
+    ``AffineAddressing`` is analyzed; anything else is treated non-contiguous.
+    A *symbolic* gmem inner stride (an ``Expr`` extent from a runtime-sized
+    buffer) can't be V-alignment-checked at compile time, so it conservatively
+    takes the scalar fallback."""
     if elem_size not in (2, 4) or not padded_extents:
+        return 1 if elem_size == 4 else 0
+    if gmem_inner is not None and not isinstance(gmem_inner, int):
         return 1 if elem_size == 4 else 0
     inner = int(padded_extents[-1])
     contiguous = isinstance(addressing, AffineAddressing) and bool(addressing.dims) and addressing.dims[-1] == n_origin_dims - 1
@@ -55,17 +60,34 @@ def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing,
     return 1 if elem_size == 4 else 0
 
 
-def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int, ...] | None) -> tuple[Expr, ...]:
+def _ext_expr(ext: int | Expr) -> Expr:
+    """An extent as an ``Expr``: static ints become ``Literal``s, symbolic
+    extents (e.g. ``Var('seq_len')``) pass through and render against the
+    runtime kernel arg."""
+    return Literal(ext, "int") if isinstance(ext, int) else ext
+
+
+def _ext_minus_one(ext: int | Expr) -> Expr:
+    return Literal(ext - 1, "int") if isinstance(ext, int) else BinaryExpr("-", ext, Literal(1, "int"))
+
+
+def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int | Expr, ...] | None) -> tuple[Expr, ...]:
     """Clamp each cooperative-load gmem index dim to ``[0, extent)``.
 
     Set only by ``021_hoist_staged_loads_above_mask`` for sources whose
     cooperative load was hoisted above a masked-tile boundary ``Cond``. A
     masked output axis tiles past the real extent (N=256 tiled at 192 → the
-    boundary tile spans [192, 384)), so the producer's gmem read overruns the
-    buffer for the overhang columns — the original cause of the
-    ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked linear-projection kernels. The
-    overhang slab slots get the clamped (duplicate) value, which is harmless:
-    they feed masked output cells that the boundary ``Cond`` never writes.
+    boundary tile spans [192, 384); a symbolic axis tiles at its hint, so the
+    boundary tile overruns whenever the runtime extent isn't tile-aligned),
+    so the producer's gmem read overruns the buffer for the overhang columns
+    — the original cause of the ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked
+    linear-projection kernels. The overhang slab slots get the clamped
+    (duplicate) value, which is harmless: they feed masked output cells that
+    the boundary ``Cond`` never writes.
+
+    Extents are ``int`` for static dims or the dim's symbolic ``Expr``
+    (``Var('seq_len')``) for runtime-sized ones — the ternary's bound then
+    renders against the runtime kernel arg.
 
     Two index shapes occur, both handled:
 
@@ -87,16 +109,28 @@ def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int,
     if len(source_index) == len(gmem_extents):
         out: list[Expr] = []
         for idx, ext in zip(source_index, gmem_extents, strict=True):
-            cond = BinaryExpr("<", idx, Literal(ext, "int"))
-            out.append(TernaryExpr(cond=cond, if_true=idx, if_false=Literal(ext - 1, "int")))
+            cond = BinaryExpr("<", idx, _ext_expr(ext))
+            out.append(TernaryExpr(cond=cond, if_true=idx, if_false=_ext_minus_one(ext)))
         return tuple(out)
     if len(source_index) == 1:
-        total = 1
+        # ∏ extents, folding the static factors into one Literal so the common
+        # all-static case keeps its single-literal bound.
+        total_static = 1
+        total_sym: Expr | None = None
         for e in gmem_extents:
-            total *= e
+            if isinstance(e, int):
+                total_static *= e
+            else:
+                total_sym = e if total_sym is None else BinaryExpr("*", total_sym, e)
+        if total_sym is None:
+            bound: int | Expr = total_static
+        elif total_static == 1:
+            bound = total_sym
+        else:
+            bound = BinaryExpr("*", total_sym, Literal(total_static, "int"))
         idx = source_index[0]
-        cond = BinaryExpr("<", idx, Literal(total, "int"))
-        return (TernaryExpr(cond=cond, if_true=idx, if_false=Literal(total - 1, "int")),)
+        cond = BinaryExpr("<", idx, _ext_expr(bound))
+        return (TernaryExpr(cond=cond, if_true=idx, if_false=_ext_minus_one(bound)),)
     # Unexpected rank shape (multi-dim source_index that doesn't match the
     # buffer rank) — leave untouched rather than mis-clamp.
     return source_index

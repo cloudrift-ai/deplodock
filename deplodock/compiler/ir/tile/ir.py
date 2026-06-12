@@ -513,18 +513,20 @@ class Source:
       materialization can read it off the IR without reaching for the
       matcher-populated graph node. ``None`` keeps legacy fp32-assuming
       behavior for tests that construct Source by hand.
-    - ``gmem_extents`` — the gmem buffer's per-source-dim static shape,
-      stamped by ``021_hoist_staged_loads_above_mask`` ONLY when this
+    - ``gmem_extents`` — the gmem buffer's per-source-dim shape (a static
+      ``int`` per dim, or the dim's symbolic ``Expr`` — e.g. ``Var('seq_len')``,
+      resolved from the runtime kernel arg), stamped by
+      ``021_hoist_staged_loads_above_mask`` ONLY when this
       Source's cooperative load is hoisted above a masked-tile boundary
       ``Cond``. A masked output axis tiles past the real extent (e.g. N=256
-      tiled at 192 → the second tile spans [192, 384)), so the cooperative
-      gmem read overruns the buffer for the overhang columns. When set,
-      ``_stage_expand.emit_stage`` clamps each ``source_index`` dim to
-      ``[0, gmem_extents[d])`` so the producer never reads OOB (the
-      overhang slab slots get a clamped duplicate value, harmless because
-      the masked output cells they feed are never written). ``None`` (the
-      default, clean-divisor tiles) skips the clamp — no perf cost on the
-      common path.
+      tiled at 192 → the second tile spans [192, 384); a symbolic axis tiles
+      at its hint), so the cooperative gmem read overruns the buffer for the
+      overhang columns. When set, ``_stage_expand.emit_stage`` clamps each
+      ``source_index`` dim to ``[0, gmem_extents[d])`` so the producer never
+      reads OOB (the overhang slab slots get a clamped duplicate value,
+      harmless because the masked output cells they feed are never written).
+      ``None`` (the default, clean-divisor tiles) skips the clamp — no perf
+      cost on the common path.
     """
 
     name: str
@@ -534,7 +536,7 @@ class Source:
     pad: tuple[int, ...] = ()
     addressing: AffineAddressing | TemplateAddressing | None = None
     dtype: DataType | None = None
-    gmem_extents: tuple[int, ...] | None = None
+    gmem_extents: tuple[int | Expr, ...] | None = None
     swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:

@@ -78,7 +78,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     K-pipeline above the Cond. Deterministic single-variant pass; raises
     ``RuleSkipped`` when no Cond in the body matches both preconditions.
     """
-    input_shapes = _static_input_shapes(root.op)
+    input_shapes = _input_shapes(root.op)
 
     def lift(s: Stmt) -> Stmt | tuple[Stmt, ...]:
         return _lift_if_match(s, input_shapes)
@@ -89,19 +89,29 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     return [TileOp(body=new_body, name=root.op.name, knobs=root.op.knobs)]
 
 
-def _static_input_shapes(op) -> dict[str, tuple[int, ...]]:  # noqa: ANN001 — TileOp
-    """``{gmem buffer name → static per-dim shape}`` for every kernel input,
-    used to stamp ``Source.gmem_extents`` so the hoisted cooperative load can
-    clamp its gmem read to the buffer bounds. Buffers with any symbolic
-    (non-static) dim are skipped — a runtime-extent clamp is M9 follow-up;
-    today only static-shaped weights hit the masked-overhang path."""
-    shapes: dict[str, tuple[int, ...]] = {}
+def _input_shapes(op) -> dict[str, tuple]:  # noqa: ANN001 — TileOp; values: tuple[int | Expr, ...]
+    """``{gmem buffer name → per-dim shape}`` for every kernel input, used to
+    stamp ``Source.gmem_extents`` so the hoisted cooperative load can clamp
+    its gmem read to the buffer bounds. A static dim contributes its ``int``
+    extent; a symbolic dim contributes its ``Expr`` (e.g. ``Var('seq_len')``),
+    which renders against the runtime kernel arg — so symbolic-extent inputs
+    (a dynamic-seq activation) get the same OOB clamp as static weights.
+    Buffers whose dims carry neither form are skipped."""
+    shapes: dict[str, tuple] = {}
     for buf, tensor in op.inputs.items():
         dims = getattr(tensor, "shape", None)
         if dims is None:
             continue
-        if all(getattr(d, "is_static", False) for d in dims):
-            shapes[buf] = tuple(d.as_static() for d in dims)
+        exts = []
+        for d in dims:
+            if getattr(d, "is_static", False):
+                exts.append(d.as_static())
+            elif getattr(d, "expr", None) is not None:
+                exts.append(d.expr)
+            else:
+                break
+        else:
+            shapes[buf] = tuple(exts)
     return shapes
 
 
@@ -139,9 +149,10 @@ def _lift_if_match(s: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt | 
     return tuple(out)
 
 
-def _stamp_gmem_extents(stmt: Stmt, input_shapes: dict[str, tuple[int, ...]]) -> Stmt:
+def _stamp_gmem_extents(stmt: Stmt, input_shapes: dict[str, tuple]) -> Stmt:
     """Recursively rewrite ``stmt`` so every ``StageBundle`` Source whose
-    ``buf`` is a static-shaped kernel input carries ``gmem_extents``. This
+    ``buf`` is a kernel input carries ``gmem_extents`` (static ``int`` dims
+    or symbolic ``Expr`` dims — see ``_input_shapes``). This
     pass runs before ``030_hoist_invariant_compute``, so no bundle carries a
     ``compute`` phase yet — every Source here is a gmem transport operand.
     Both affine and template (reshape) addressings are stamped: a masked

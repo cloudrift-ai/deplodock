@@ -335,6 +335,39 @@ def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatc
     assert "< 64) ?" not in src, f"clean-divisor tile should not clamp the cooperative load:\n{src}"
 
 
+def test_symbolic_m_cooperative_load_clamps_to_runtime_extent(recording_dump, monkeypatch):
+    """A symbolic-M masked tile whose A operand is staged must clamp the
+    hoisted cooperative load's M coord against the RUNTIME extent — the
+    ``seq_len`` kernel arg — not the hint. ``021`` previously skipped
+    symbolic-shaped buffers when stamping ``gmem_extents`` ("M9 follow-up"),
+    so the hoisted load read past the runtime-sized activation for every
+    seq_len that wasn't tile-aligned. The clamp ternary's bound is now the
+    symbolic ``Var``, rendered against the kernel's ``seq_len`` argument."""
+    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+
+    # Same staging-friendly knobs as the static clamp test: K=2048 makes the
+    # operands stage; the symbolic M is force-masked by the planner.
+    for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    g = Graph()
+    _input(g, "a", (Dim("seq_len"), 2048))
+    _input(g, "b", (2048, 64))  # N=64: clean divisor → only M masks
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (Dim("seq_len"), 64)), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    out = Pipeline.build(KERNEL_PASSES).run(g, ctx=Context.from_target((8, 0)), dump=recording_dump)
+    kop = out.nodes["o"].op
+    tensors = {nid: n.output for nid, n in out.nodes.items() if hasattr(n.output, "shape")}
+    src = render_kernelop(kop, tensors=tensors)
+
+    # The activation 'a' (seq_len, 2048) is the masked-M operand. Its staged
+    # cooperative load must clamp the M coord to < seq_len, falling back to
+    # seq_len - 1 — both referencing the runtime symbol, not a literal.
+    assert "&a[" in src, f"activation 'a' should be staged (cooperative load present):\n{src}"
+    assert "< seq_len) ?" in src, f"masked cooperative load missing runtime-extent clamp ternary:\n{src}"
+    assert "seq_len - 1" in src, f"masked clamp should fall back to seq_len - 1:\n{src}"
+
+
 def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
     """A clean-divisor N tile keeps the blocked (thread-major) decode so a
     thread's FN cells stay contiguous (vectorizable / smem-conflict-free):
