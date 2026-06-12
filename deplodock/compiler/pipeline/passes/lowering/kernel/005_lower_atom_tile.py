@@ -231,12 +231,13 @@ def _boundary_guards(body: Body, write_stmt: Write) -> tuple[tuple[Expr, Expr] |
     range check moves onto the store via the guards.
 
     Classification matches the predicate's LHS structurally against the
-    Write's M / N coordinate exprs (second-to-last / last index dim — the
-    same convention as ``_atom.classify_fragment_epilogue``); both sides were
-    produced by the same planner σ, so a mismatch means the planner and this
-    pass disagree about the masked axis — fail loud (``RuleSkipped`` →
-    the variant pins a ``bench_fail`` row) rather than emit an unguarded
-    straddling store."""
+    Write's M / N coordinate exprs (the second-to-last / last VAR-BEARING
+    index dims — the same convention as ``_atom.classify_fragment_epilogue``;
+    real-trace outputs pad with literal dims, e.g. ``o[0, m, 0, n]``); both
+    sides were produced by the same planner σ, so a mismatch means the
+    planner and this pass disagree about the masked axis — fail loud
+    (``RuleSkipped`` → the variant pins a ``bench_fail`` row) rather than
+    emit an unguarded straddling store."""
     conds = [
         s
         for s in body.iter_of_type(Cond)
@@ -244,9 +245,10 @@ def _boundary_guards(body: Body, write_stmt: Write) -> tuple[tuple[Expr, Expr] |
     ]
     if not conds:
         return None, None
-    if len(write_stmt.index) < 2:
-        raise RuleSkipped(f"masked AtomTile Write has rank {len(write_stmt.index)} — no (m, n) coordinates to guard")
-    m_expr, n_expr = write_stmt.index[-2], write_stmt.index[-1]
+    var_dims = [e for e in write_stmt.index if e.free_vars()]
+    if len(var_dims) < 2:
+        raise RuleSkipped(f"masked AtomTile Write has {len(var_dims)} var-bearing index dims — no (m, n) coordinates to guard")
+    m_expr, n_expr = var_dims[-2], var_dims[-1]
     m_guard: tuple[Expr, Expr] | None = None
     n_guard: tuple[Expr, Expr] | None = None
     for c in conds:

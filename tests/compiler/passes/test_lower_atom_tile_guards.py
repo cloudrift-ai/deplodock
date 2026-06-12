@@ -88,6 +88,20 @@ def test_boundary_guards_none_without_conds():
     assert _mod._boundary_guards(Body((w,)), w) == (None, None)
 
 
+def test_boundary_guards_skip_literal_padding_dims():
+    """Real-trace outputs pad with literal dims (``o[0, m, 0, n]`` — the
+    q_proj reshape); classification must use the var-bearing dims, not raw
+    positions."""
+    zero = Literal(0, "int")
+    m_expr = Var("mb") * Literal(16, "int")
+    n_expr = Var("nb") * Literal(8, "int")
+    w = Write(output="o", index=(zero, m_expr, zero, n_expr), value="acc")
+    body = Body((Cond(cond=BinaryExpr("<", m_expr, Var("seq_len")), body=Body((w,))),))
+    m_guard, n_guard = _mod._boundary_guards(body, w)
+    assert m_guard == (m_expr, Var("seq_len"))
+    assert n_guard is None
+
+
 def test_boundary_guards_fail_loud_on_unmatched_predicate():
     """A boundary predicate that matches neither Write coordinate means the
     planner and this pass disagree about the masked axis — RuleSkipped (the
