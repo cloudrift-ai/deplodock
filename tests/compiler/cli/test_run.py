@@ -67,6 +67,95 @@ def test_pinned_knobs_sets_and_restores_env(monkeypatch):
     assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
 
 
+def _symbolic_input_graph():
+    """Frontend-ish graph with one symbolic input (``x``, seq axis 1) and one
+    static input (``w``) — enough for ``_hint_sized_inputs``' input pairing."""
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, Dim("seq_len"), 8)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (4, 8)), node_id="w")
+    g.inputs = ["x", "w"]
+    g.outputs = ["x"]
+    return g
+
+
+def test_hint_sized_inputs_tiles_symbolic_axes():
+    """A symbolic input axis grows to its Dim hint (DEFAULT_SEQ_HINT) by tiling
+    the trace-time values; static inputs pass through untouched (finding 4 of
+    plans/qwen3-embedding-layer0-dynamic-tune-findings.md: the full-model table
+    must bench torch at the same hint shape deplodock benches at)."""
+    from deplodock.commands.run import _hint_sized_inputs
+    from deplodock.compiler.dim import DEFAULT_SEQ_HINT
+
+    x = torch.randn(1, 32, 8)
+    w = torch.randn(4, 8)
+    args, kwargs, sym_env = _hint_sized_inputs(_symbolic_input_graph(), (x, w), {})
+    assert sym_env == {"seq_len": DEFAULT_SEQ_HINT}
+    assert kwargs == {}
+    rx, rw = args
+    assert rx.shape == (1, DEFAULT_SEQ_HINT, 8)
+    assert rw is w  # static input untouched
+    # Values are tiled repeats of the trace input, not fresh randoms.
+    assert torch.equal(rx[:, :32], x)
+    assert torch.equal(rx[:, 32:64], x)
+
+
+def test_hint_sized_inputs_static_graph_is_noop():
+    from deplodock.commands.run import _hint_sized_inputs
+
+    from ..conftest import matmul_graph
+
+    a, b = torch.randn(4, 8), torch.randn(8, 4)
+    args, kwargs, sym_env = _hint_sized_inputs(matmul_graph(4, 8, 4), (a, b), {})
+    assert sym_env == {}
+    assert args[0] is a and args[1] is b
+
+
+def test_hint_sized_inputs_resizes_kwargs_in_nested_structure():
+    """Tensors inside kwargs containers (HF's ``position_embeddings`` tuple
+    style) are paired in ``_flatten_tensors`` order and rebuilt in place."""
+    from deplodock.commands.run import _hint_sized_inputs
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, Dim("seq_len"), 8)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("cos", (Dim("seq_len"), 4)), node_id="cos")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("sin", (Dim("seq_len"), 4)), node_id="sin")
+    g.inputs = ["x", "cos", "sin"]
+    g.outputs = ["x"]
+
+    x, cos, sin = torch.randn(1, 32, 8), torch.randn(32, 4), torch.randn(32, 4)
+    args, kwargs, sym_env = _hint_sized_inputs(g, (x,), {"position_embeddings": (cos, sin)})
+    assert args[0].shape == (1, 512, 8)
+    rcos, rsin = kwargs["position_embeddings"]
+    assert isinstance(kwargs["position_embeddings"], tuple)
+    assert rcos.shape == (512, 4) and rsin.shape == (512, 4)
+    assert torch.equal(rsin[:32], sin)
+
+
+def test_tile_to_non_divisible_and_dtype():
+    from deplodock.commands.run import _tile_to
+
+    t = torch.tensor([[1, 2]], dtype=torch.long)
+    out = _tile_to(t, 1, 5)
+    assert out.dtype == torch.long
+    assert out.tolist() == [[1, 2, 1, 2, 1]]
+    assert _tile_to(t, 1, 2) is t  # already sized → identity
+
+
+def test_symbolic_bench_note():
+    from deplodock.commands.run import _symbolic_bench_note
+
+    assert _symbolic_bench_note({}) is None
+    note = _symbolic_bench_note({"seq_len": 512})
+    assert "seq_len=512" in note and "symbolic" in note
+
+
 def test_build_torch_fns_resets_dynamo_before_compile(monkeypatch):
     """Persistent bench processes compile a fresh closure of the SAME torch_ref
     ``fn`` code object per row; dynamo's per-code-object recompile limit then

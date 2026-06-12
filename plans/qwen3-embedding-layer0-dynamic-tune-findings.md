@@ -194,6 +194,11 @@ follow-up). The q/k-norm kernels alone are ~90 µs vs tcompile.
 
 ## Finding 4 — the dynamic full-model bench table is shape-mismatched (deplodock@512-hint vs eager@32) — harness defect
 
+> **Status: addressed** on `feature/dynamic-fullmodel-bench-hint` — `_hint_sized_inputs` tiles the torch closures'
+> example inputs out to each `Dim`'s hint (in both `run --bench` and the worker's `bench_full_model_real`), and the
+> table prints a `benched at seq_len=512 (symbolic hint)` note. Verified on the finding's repro: the dynamic layer-0
+> run's eager row now reads 217 µs (the honest static-512 number), not 96.
+
 **Symptom.** The tune's full-model table prints eager 96 µs / tcompile 45 µs — these match today's *static seq-32*
 report (99 / 46) — while a direct static-512 run measures eager at 217 µs. The deplodock row (3229 µs tune-bench,
 2233 µs in a fresh `run --dynamic … --bench`) is consistent with the Σ of the 512-hint per-kernel slices (2,731 µs),

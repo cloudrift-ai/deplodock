@@ -56,9 +56,14 @@ reduction/attention kernels run 1.5–3× slower than -O3); the `--bench` tables
 number in the report says which it is; comparisons across the two families are findings-invalidating errors.
 
 **Dynamic-run measurement semantics**: with `--dynamic`, all tune/bench measurements run the symbolic kernels at
-the `Dim` hint (`DEFAULT_SEQ_HINT=512`) — record "benched at seq_len=512 (symbolic)" in the report header. The
-masked-tile boundary guards (`if (coord < seq_len)`) are part of the measured cost; that overhead vs a
-shape-specialised kernel is itself a legitimate finding, not noise.
+the `Dim` hint (`DEFAULT_SEQ_HINT=512`, hard-coded — `--seq-len` only sizes the trace example tensors, it does NOT
+move the hint) — record "benched at seq_len=512 (symbolic)" in the report header. The full-model `--bench` table
+tiles the torch closures' inputs to the same hint and prints a `benched at seq_len=… (symbolic hint)` note, so its
+eager / tcompile / deplodock rows are one shape and directly comparable (fixed per finding 4 of
+`plans/qwen3-embedding-layer0-dynamic-tune-findings.md`; tables from runs predating that fix mixed trace-seq torch
+rows with hint-sized deplodock rows — distrust their headline ratio). The masked-tile boundary guards
+(`if (coord < seq_len)`) are part of the measured cost; that overhead vs a shape-specialised kernel is itself a
+legitimate finding, not noise.
 
 ## Step 2 — headline tables
 

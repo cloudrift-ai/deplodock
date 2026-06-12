@@ -369,7 +369,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``; when ``None`` (an
     ``--ir`` JSON tune with no module) the full-model bench is skipped and only the
     per-kernel table runs."""
-    from deplodock.commands.run import _print_table
+    from deplodock.commands.run import _collect_sym_env, _print_table, _symbolic_bench_note
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
     from deplodock.compiler.pipeline.search.db import SearchDB
@@ -420,7 +420,13 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
                 seed=args.seed,
                 nvcc_flags=bench_flags,
             )
-            _print_table(full, note=None if full_captured else "(graph-capture fallback: timings include host launch overhead)")
+            # The worker tiled the torch inputs to the hint for a symbolic graph
+            # (``_hint_sized_inputs`` inside ``bench_full_model_real``); label the
+            # table so the reader knows the numbers are hint-shaped.
+            capture_note = None if full_captured else "(graph-capture fallback: timings include host launch overhead)"
+            sym_env = _collect_sym_env([assembled] if assembled is not None else [])
+            notes = [n for n in (_symbolic_bench_note(sym_env), capture_note) if n]
+            _print_table(full, note="\n".join(notes) if notes else None)
         except RuntimeError as exc:
             # Any worker failure (incl. a SIGKILL on a hung kernel) surfaces as RuntimeError. The
             # parent device stays clean — per-kernel runs in its own worker — so continue.
