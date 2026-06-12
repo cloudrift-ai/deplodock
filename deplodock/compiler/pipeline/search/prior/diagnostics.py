@@ -123,7 +123,8 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
 
     thread = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
     warp = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
-    rows, lines = [], ["[prior] golden selection — golden's rank under the prior over the full gated enumeration:"]
+    rows, skipped = [], []
+    lines = ["[prior] golden selection — golden's rank under the prior over the full gated enumeration:"]
     for g in GOLDEN_CONFIGS:
         if not isinstance(g, MatmulGoldenConfig):
             continue
@@ -131,6 +132,9 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
             continue
         s_feats = index.get(g.shape_key())
         if s_feats is None:
+            # A silent skip here hid the fp16 lockout in the 2026-06-12 sweep —
+            # every unjoinable shape gets a per-shape line instead.
+            skipped.append((g.name, "no tuned rows for this shape in the prior dataset"))
             continue
         base = {**Context.from_target(g.compute_cap).features(), **s_feats}
         gold = {k: v for k, v in g.knobs.items() if k in (thread if g.dtype == "fp32" else warp)}
@@ -139,16 +143,20 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
         _, rank, pool = analytic.evaluate_golden(
             g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), scorer=lambda r, b=base: -prior.mean_score({**b, **r})
         )
-        if rank is not None:
-            rows.append((g.name, rank, pool))
+        if rank is None:
+            skipped.append((g.name, f"recorded knobs not in the enumeration ({pool} rows) — pin/dtype mismatch?"))
+            continue
+        rows.append((g.name, rank, pool))
     for name, rank, pool in sorted(rows, key=lambda t: -t[1]):
         lines.append(f"    {name:26}  rank {rank:5}/{pool}")
+    for name, why in skipped:
+        lines.append(f"    {name:26}  SKIPPED: {why}")
     if rows:
         ranks = [r for _, r, _ in rows]
         n = len(ranks)
         cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50))
         lines.append(f"  median rank={sorted(ranks)[n // 2]}  {cov}  (over {n} golden shapes with tuned data)")
-    else:
+    elif not skipped:
         lines.append("  no golden shapes have tuned data in the dataset yet")
     return "\n".join(lines)
 

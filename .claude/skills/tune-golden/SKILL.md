@@ -1,7 +1,7 @@
 ---
 name: tune-golden
-description: Use this skill when the user asks to "tune the goldens", "update the golden configs", "re-tune the goldens", "run the golden sweep", "refresh golden matmul configs", "evaluate goldens and update", or otherwise wants to re-tune the GOLDEN_CONFIGS matmul shapes, A/B the greedy pick against the recorded golden, and record genuine improvements into the per-GPU golden YAML. Tunes the whole golden dataset, benches greedy-vs-golden per shape with `deplodock tune` / `run --bench`, categorizes (better → replace, same → add, worse → leave), edits the goldens YAML by hand, and writes a findings report to plans/ — unlike tune-model, the target config is known here, so the report analyzes the analytic/learned prior's expectation against it (rank, per-knob misses, recommendations) plus workflow notes.
-version: 0.2.0
+description: Use this skill when the user asks to "tune the goldens", "update the golden configs", "re-tune the goldens", "run the golden sweep", "refresh golden matmul configs", "evaluate goldens and update", "tune/seed the dynamic goldens", or otherwise wants to re-tune the GOLDEN_CONFIGS matmul shapes (static and dynamic/.dynM symbolic-axis entries alike), A/B the greedy pick against the recorded golden, and record genuine improvements into the per-GPU golden YAML. Tunes the whole golden dataset, benches greedy-vs-golden per shape with `deplodock tune` / `run --bench`, categorizes (better → replace, same → add, worse → leave), edits the goldens YAML by hand, and writes a findings report to plans/ — unlike tune-model, the target config is known here, so the report analyzes the analytic/learned prior's expectation against it (rank, per-knob misses, recommendations) plus workflow notes.
+version: 0.3.0
 ---
 
 # Evaluate and update the golden matmul configs
@@ -92,6 +92,51 @@ When recording a config:
 
 Keep multiple entries per shape **only** when they're at parity (within ~3%). When a replace makes an old entry
 strictly slower (>3%), **delete** the old entry — don't keep superseded-slower alternates.
+
+## Dynamic (`.dynM`) goldens
+
+A matmul golden may mark its M axis **symbolic** — the kernel is then a masked-tile artifact (ceil-div grid +
+boundary guard, one cached kernel for any runtime seq_len), tuned and benched at the `Dim` hint. In the YAML this is
+the `dynamic:` block; `M` doubles as the hint, and the name carries a `.dynM` suffix:
+
+```yaml
+  - kernel: matmul
+    name: qwen3_06b.q_proj.s512.dynM
+    M: 512            # the Dim hint — MUST equal DEFAULT_SEQ_HINT (512) today, see below
+    N: 2048
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 32, BM: 8, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 2}
+    deplodock_us: 52.0
+    cublas_us: 53.5
+```
+
+**`M` must equal `DEFAULT_SEQ_HINT` (512)** — the pipeline tiles/benches a symbolic axis at the *global* Dim hint,
+not at the traced size, so an M=1024 "dynamic golden" would silently be measured at 512 and duplicate the
+(N, K, hint-512) shape (seen live in the 2026-06-12 seeding: a 1024³ symbolic-M trace produced the exact
+`kv_proj.s512.dynM` kernel). The schema rejects other values until per-Dim hints are plumbed.
+
+Everything in steps 1–7 applies unchanged — the spec is **part of the config**, so `tune --dataset golden`,
+`tune --golden NAME`, and `run --bench --golden NAME` all apply it to the (re-)trace automatically. Never pass a CLI
+`--dynamic` next to `--golden` (it's rejected). Specifics:
+
+- A dynamic golden is a **separate shape** from its static twin (different deployment artifact, own variant space,
+  own `ShapeKey` — `is_dyn` keeps them apart in every eval/diagnostics join). Never merge or cross-compare their
+  entries; the static `qwen3_06b.q_proj.s512` and `…s512.dynM` rows coexist.
+- The A/B benches **at the hint** (the table prints a `benched at seq_len=… (symbolic hint)` note); `cublas_us` is
+  the hint-shaped torch reference, so the ratio is apples-to-apples *at the hint*. Knob comparisons work exactly as
+  for static shapes.
+- **Seeding a new dynamic shape** (no recorded entry yet): tune + bench via the snippet + an explicit spec —
+  `deplodock tune -c "<matmul snippet>" --dynamic seq_len@x0:0` (accumulate into the existing DB/prior — no
+  `--clean`), then `deplodock run --bench -c "<snippet>" --dynamic seq_len@x0:0`; record the greedy kernel's -O3
+  `us` as `deplodock_us`, the same run's eager row as `cublas_us`, and the table's search knobs. `x0` is the
+  snippet's lhs `(M,K)`; only the M axis may be symbolic (symbolic K is future work and the schema rejects it).
+- `eval prior --dataset golden` prints a per-shape `SKIPPED: no tuned rows` line for any golden (dynamic or static)
+  whose shape has no tuned data — a `.dynM` entry skipping there means the symbolic shape was never tuned, not that
+  the join failed.
+- The cold `AnalyticPrior` has not been refit for the masked tier yet (guard overhead, no staged prologue on
+  symbolic rows): expect deeper cold ranks on `.dynM` shapes until `scripts/golden_knob_heuristics.py` is refit
+  with a few recorded dynamic goldens.
 
 ## Step 6 — Validate
 

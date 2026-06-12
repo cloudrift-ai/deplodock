@@ -255,6 +255,63 @@ configs:
     knobs: {BN: 32, BM: 8, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 80.8
     cublas_us: 79.6
+  # --- dynamic (symbolic-M) goldens: masked-tile kernels, M is the Dim hint (== DEFAULT_SEQ_HINT),
+  # benched at the hint. Separate deployment artifacts from their static twins — never merged.
+  # Seeded 2026-06-12 (plans/golden-dynm-seed-rtx5090-findings.md).
+  - kernel: matmul
+    name: square.512.dynM
+    M: 512
+    N: 512
+    K: 512
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 64, BM: 16, FM: 4, FN: 1, FK: 1, BK: 64, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
+    deplodock_us: 18.0
+    cublas_us: 14.0
+  - kernel: matmul
+    name: qwen3_06b.q_proj.s512.dynM
+    M: 512
+    N: 2048
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    deplodock_us: 52.5
+    cublas_us: 47.0
+  - kernel: matmul
+    name: qwen3_06b.kv_proj.s512.dynM
+    M: 512
+    N: 1024
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    deplodock_us: 35.4
+    cublas_us: 39.0
+  - kernel: matmul
+    name: qwen3_06b.o_proj.s512.dynM
+    M: 512
+    N: 1024
+    K: 2048
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    deplodock_us: 62.6
+    cublas_us: 57.0
+  - kernel: matmul
+    name: qwen3_06b.gate_up_proj.s512.dynM
+    M: 512
+    N: 3072
+    K: 1024
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 32, BM: 16, FM: 6, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    deplodock_us: 77.2
+    cublas_us: 79.0
+  - kernel: matmul
+    name: qwen3_06b.down_proj.s512.dynM
+    M: 512
+    N: 1024
+    K: 3072
+    dynamic: {seq_len: {input: x0, axis: 0}}
+    knobs: {BN: 32, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    deplodock_us: 81.2
+    cublas_us: 76.0
   - kernel: reduce
     name: reduce.2048x2048
     M: 2048

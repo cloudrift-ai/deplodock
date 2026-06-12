@@ -101,6 +101,16 @@ def test_golden_prior_eval_joins_fp16_goldens():
     g16 = goldens_by_name("square.512.fp16")[0]
     rows = [({**dict(_sig(g16.M * g16.N, g16.K, fp32=False)), "WM": 4}, 5.0)]
     out = diagnostics.golden_prior_eval(_FakePrior(rows), kernel_filter="square.512")
-    assert "square.512.fp16" in out
-    # The fp32 square.512 has no tuned group here → no rank line for it.
-    assert not any(line.strip().startswith("square.512 ") for line in out.splitlines())
+    assert "square.512.fp16" in out and "rank" in out
+    # The fp32 square.512 has no tuned group here → a per-shape SKIPPED line, not silence.
+    skip_lines = [line for line in out.splitlines() if "SKIPPED" in line]
+    assert any(line.strip().startswith("square.512 ") and "no tuned rows" in line for line in skip_lines)
+
+
+def test_golden_prior_eval_warns_per_unjoinable_shape():
+    """Shapes with no tuned rows must each print a SKIPPED line — the silent drop
+    hid the fp16 lockout in the 2026-06-12 sweep."""
+    out = diagnostics.golden_prior_eval(_FakePrior([]), kernel_filter="square.512")
+    skip_lines = [line for line in out.splitlines() if "SKIPPED" in line and "no tuned rows" in line]
+    # square.512 and its .fp16 twin (one line per recorded config name, deduped by name set)
+    assert {line.split()[0] for line in skip_lines} >= {"square.512", "square.512.fp16"}

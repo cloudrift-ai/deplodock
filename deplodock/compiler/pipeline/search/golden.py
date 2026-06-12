@@ -131,6 +131,18 @@ class MatmulGoldenConfig(GoldenConfig):
             raise ValueError(f"{self.name}: dynamic must be a non-empty mapping of NAME -> {{input, axis}}")
         if self.M < 1:
             raise ValueError(f"{self.name}: M doubles as the symbolic-axis hint and must be >= 1, got {self.M}")
+        from deplodock.compiler.dim import DEFAULT_SEQ_HINT  # noqa: PLC0415 — int constant, import stays light
+
+        if self.M != DEFAULT_SEQ_HINT:
+            # The pipeline tiles/benches a symbolic axis at the GLOBAL Dim hint, not
+            # at the traced M — an M=1024 dynamic golden would silently be measured
+            # at 512 and duplicate the (N, K, hint-512) shape (seen live: a 1024³
+            # symbolic-M seed benched the exact kv_proj.s512.dynM kernel). Reject
+            # until per-Dim hints are plumbed through trace + golden schema.
+            raise ValueError(
+                f"{self.name}: a dynamic golden's M is the Dim hint and must equal DEFAULT_SEQ_HINT "
+                f"({DEFAULT_SEQ_HINT}) — the pipeline ignores any other trace size; got M={self.M}"
+            )
         for sym, loc in self.dynamic.items():
             if not isinstance(sym, str) or not sym:
                 raise ValueError(f"{self.name}: dynamic NAME must be a non-empty string, got {sym!r}")

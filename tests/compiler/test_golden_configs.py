@@ -136,6 +136,17 @@ def test_dynamic_golden_hint_must_be_positive():
         _dyn({"seq_len": {"input": "x0", "axis": 0}}, M=0)
 
 
+def test_dynamic_golden_hint_must_equal_default_seq_hint():
+    """The pipeline tiles/benches a symbolic axis at the global ``DEFAULT_SEQ_HINT``,
+    not the traced M — an M=1024 dynamic golden would silently be measured at 512
+    and duplicate the (N, K, hint-512) shape. Rejected until per-Dim hints exist."""
+    from deplodock.compiler.dim import DEFAULT_SEQ_HINT
+
+    with pytest.raises(ValueError, match="DEFAULT_SEQ_HINT"):
+        _dyn({"seq_len": {"input": "x0", "axis": 0}}, M=1024)
+    _dyn({"seq_len": {"input": "x0", "axis": 0}}, M=DEFAULT_SEQ_HINT)  # the only valid hint today
+
+
 def test_dynamic_is_matmul_only():
     """``dynamic`` is a MatmulGoldenConfig field only — reduce / pointwise goldens
     reject it at construction (the symbolic lowering for those shapes is the split,
