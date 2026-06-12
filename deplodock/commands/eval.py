@@ -303,8 +303,13 @@ def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dic
 
     kmax = max(len(s.knobs) for s in samples)
     leaves = sorted((s for s in samples if len(s.knobs) == kmax), key=lambda s: s.latency_us)
-    pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
-    rank = leaves.index(pick) + 1
+    # Score in the deploy regime (``H_opt=3``) through ``Prior.pick`` — measured
+    # -O3 evidence first, model argmin otherwise — so the marker shows the config
+    # greedy ``compile`` / ``run`` would actually deploy, not just the model's
+    # favourite (the DB rows themselves carry the tune's ``H_opt=1`` stamp).
+    best_i, _ = prior.pick([{**s.all_knobs(), "H_opt": 3.0} for s in leaves])
+    pick = leaves[best_i]
+    rank = best_i + 1
 
     n_prefix = len(leaves) if not top else min(top, len(leaves))
     shown = list(enumerate(leaves[:n_prefix], start=1))
@@ -378,6 +383,16 @@ def _ratio_color(matched: int, total: int) -> str:
     return _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
 
 
+def _knob_eq(a, b) -> bool:
+    """Knob value equality across representations: the pipeline stamps sequence
+    knobs as tuples (``OVERHANG=('a0',)``) while the golden YAML records lists
+    (``['a0']``) — a raw ``==`` false-flags every OVERHANG-carrying golden as a
+    mismatch."""
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return list(a) == list(b)
+    return a == b
+
+
 def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     """``{knob: (value_text, red?)}`` for one renderable entry (no ``NAME=`` prefix —
     :func:`~deplodock.commands.table.knob_columns` puts the name in the column header).
@@ -386,7 +401,7 @@ def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     if entry[0] == "total":
         return entry[2]
     _, _, gold, got = entry
-    return {k: (f"{got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold}
+    return {k: (f"{got.get(k, '-')}/{gold[k]}", not _knob_eq(got.get(k), gold[k])) for k in gold}
 
 
 def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str) -> None:
@@ -484,11 +499,12 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     for g in configs:
         gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
         try:
-            got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
+            dyn = bool(getattr(g, "dynamic", None))
+            got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), dynamic=dyn)
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
             entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
             continue
-        matched = sum(1 for k in gold if got.get(k) == gold[k])
+        matched = sum(1 for k in gold if _knob_eq(got.get(k), gold[k]))
         lead = [g.name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold))), str(rank) if rank is not None else "?", str(pool)]
         entries.append(("row", lead, gold, got))
         if rank is not None:
@@ -603,12 +619,17 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
     from deplodock import config  # noqa: PLC0415
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
     from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     def tunable(knobs: dict) -> dict:
         return {k: v for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
 
-    def picked(snippet: str) -> dict:
-        graph, _, _ = graph_from_code(snippet)
+    def picked(snippet: str, dynamic: tuple[str, ...] = ()) -> dict:
+        # A dynamic golden's greedy pick must come from the symbolic (masked-tile)
+        # trace — a static trace would compare the static twin's pick against the
+        # dynamic golden's knobs (a different artifact / variant space).
+        dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs(list(dynamic))) if dynamic else None
+        graph, _, _ = graph_from_code(snippet, dynamic_shapes=dynamic_shapes)
         compiled = Pipeline.build(TILE_PASSES).run(graph)  # tile dialect only — no codegen/nvcc
         knobs: dict = {}
         for node in compiled.nodes.values():
@@ -644,18 +665,18 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
     try:
         for name, group in groups.items():
             try:
-                got = picked(group[0].snippet())
+                got = picked(group[0].snippet(), tuple(getattr(group[0], "dynamic_specs", list)()))
             except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
                 entries.append(("err", name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
                 continue
             # Closest golden: most knobs reproduced, tie-broken by match fraction.
-            scored = [(sum(1 for k in gd if got.get(k) == gd[k]), gd) for gd in (tunable(c.knobs) for c in group)]
+            scored = [(sum(1 for k in gd if _knob_eq(got.get(k), gd[k])), gd) for gd in (tunable(c.knobs) for c in group)]
             matched, gold = max(scored, key=lambda t: (t[0], t[0] / len(t[1]) if t[1] else 1.0))
             n_match += matched == len(gold)
             n_rows += 1
             for k in gold:
                 knob_total[k] = knob_total.get(k, 0) + 1
-                knob_match[k] = knob_match.get(k, 0) + (got.get(k) == gold[k])
+                knob_match[k] = knob_match.get(k, 0) + _knob_eq(got.get(k), gold[k])
             lead = [name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
             pc = _perf_cell(perf, name)
             if pc is not None:

@@ -307,9 +307,19 @@ def greedy_decide(
             live = [(o, k) for o, k in live if not _tile_blocked(k, node_blocked)]
         if not live:  # every leaf blocklisted → no valid alternative left
             return leaves[0]
-        scores = the_prior.mean_scores([{**base, **k} for _, k in live])  # predicted µs — lower is better
-        best_i = min(range(len(live)), key=scores.__getitem__)
-        fp.score = scores[best_i]
+        rows = [{**base, **k} for _, k in live]
+        picker = getattr(the_prior, "pick", None)
+        if picker is not None:
+            # ``Prior.pick``: measured -O3 reservoir evidence first, model argmin
+            # otherwise — a config the tune proved fastest at -O3 must not lose
+            # the deploy to an unmeasured extrapolation (still prior-only: the
+            # evidence ships inside the prior's checkpoint, not the DB).
+            best_i, price = picker(rows)
+        else:  # bare-mean_scores prior object (tests / custom callers)
+            scores = the_prior.mean_scores(rows)
+            best_i = min(range(len(live)), key=scores.__getitem__)
+            price = scores[best_i]
+        fp.score = price  # measured µs when evidence decided, predicted µs otherwise
         return live[best_i][0]
 
     return decide

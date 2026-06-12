@@ -106,23 +106,84 @@ class GoldenConfig:
 
 @dataclass(frozen=True, kw_only=True)
 class MatmulGoldenConfig(GoldenConfig):
-    """A golden config for a plain 2-D matmul ``(M,K) @ (K,N)``."""
+    """A golden config for a plain 2-D matmul ``(M,K) @ (K,N)``.
+
+    ``dynamic`` (optional, YAML form ``dynamic: {seq_len: {input: x0, axis: 0}}``) marks an
+    axis of a traced snippet input as symbolic: the shape compiles as a masked-tile kernel
+    (``--dynamic NAME@INPUT:AXIS`` semantics) and ``M`` doubles as the ``Dim`` hint the tile
+    is sized / benched at. A dynamic golden is a different deployment artifact than its
+    static twin (boundary guards, masked tiers, different variant space), so it gets its own
+    name (``.dynM`` suffix by convention) and is never merged with the static config. Only
+    the M axis — ``x0`` is the snippet's lhs ``(M,K)`` — may be symbolic for now: that's
+    what the masked thread tier / masked warp MMA / symbolic-row splits deploy today
+    (symbolic K is future work, kept out of the schema until the lowering exists)."""
 
     M: int
     N: int
     K: int
     dtype: str = "fp32"
+    dynamic: dict | None = None  # {NAME: {input: str, axis: int}}, e.g. {seq_len: {input: x0, axis: 0}}
+
+    def __post_init__(self):
+        if self.dynamic is None:
+            return
+        if not isinstance(self.dynamic, dict) or not self.dynamic:
+            raise ValueError(f"{self.name}: dynamic must be a non-empty mapping of NAME -> {{input, axis}}")
+        if self.M < 1:
+            raise ValueError(f"{self.name}: M doubles as the symbolic-axis hint and must be >= 1, got {self.M}")
+        from deplodock.compiler.dim import DEFAULT_SEQ_HINT  # noqa: PLC0415 — int constant, import stays light
+
+        if self.M != DEFAULT_SEQ_HINT:
+            # The pipeline tiles/benches a symbolic axis at the GLOBAL Dim hint, not
+            # at the traced M — an M=1024 dynamic golden would silently be measured
+            # at 512 and duplicate the (N, K, hint-512) shape (seen live: a 1024³
+            # symbolic-M seed benched the exact kv_proj.s512.dynM kernel). Reject
+            # until per-Dim hints are plumbed through trace + golden schema.
+            raise ValueError(
+                f"{self.name}: a dynamic golden's M is the Dim hint and must equal DEFAULT_SEQ_HINT "
+                f"({DEFAULT_SEQ_HINT}) — the pipeline ignores any other trace size; got M={self.M}"
+            )
+        for sym, loc in self.dynamic.items():
+            if not isinstance(sym, str) or not sym:
+                raise ValueError(f"{self.name}: dynamic NAME must be a non-empty string, got {sym!r}")
+            if not isinstance(loc, dict) or set(loc) != {"input", "axis"}:
+                raise ValueError(f"{self.name}: dynamic[{sym!r}] must be {{input: NAME, axis: INT}}, got {loc!r}")
+            if not isinstance(loc["input"], str) or not loc["input"]:
+                raise ValueError(f"{self.name}: dynamic[{sym!r}] input must be a non-empty string, got {loc['input']!r}")
+            if not isinstance(loc["axis"], int) or isinstance(loc["axis"], bool) or loc["axis"] < 0:
+                raise ValueError(f"{self.name}: dynamic[{sym!r}] axis must be an int >= 0, got {loc['axis']!r}")
+            if (loc["input"], loc["axis"]) != ("x0", 0):
+                raise ValueError(
+                    f"{self.name}: dynamic[{sym!r}] must mark the M axis (input x0, axis 0) — "
+                    "symbolic K/N matmul goldens are not supported yet"
+                )
 
     def snippet(self) -> str:
         """The torch expression this config tunes / benches / reproduces."""
         return matmul_snippet(self.M, self.N, self.K, self.dtype)
+
+    def shape_key(self):
+        """This config's :class:`~deplodock.compiler.pipeline.search.data.ShapeKey` —
+        the single golden-side join key (``Sample.from_golden`` and every
+        diagnostics join build it here, so the dynamic flag can't be forgotten at
+        a call site). Import deferred to keep this module import-light."""
+        from deplodock.compiler.pipeline.search.data.shape import ShapeKey  # noqa: PLC0415
+
+        return ShapeKey.from_matmul(self.M, self.N, self.K, self.dtype, dynamic=bool(self.dynamic))
+
+    def dynamic_specs(self) -> list[str]:
+        """``--dynamic NAME@INPUT:AXIS`` spec strings for the tracer — empty for a
+        static config. The snippet stays the hint-shaped code; these mark which of
+        its traced inputs' axes go symbolic."""
+        return [f"{name}@{loc['input']}:{loc['axis']}" for name, loc in (self.dynamic or {}).items()]
 
     def repro_command(self, ir: str = "cuda") -> str:
         """A runnable ``deplodock`` command that rebuilds this config's kernel.
 
         e.g. ``DEPLODOCK_KNOBS="BM=8,..." deplodock compile -c "torch.matmul(...)" --ir cuda``
         """
-        return f'DEPLODOCK_KNOBS="{_knobs_env(self.knobs)}" deplodock compile -c "{self.snippet()}" --ir {ir}'
+        dyn = "".join(f" --dynamic {s}" for s in self.dynamic_specs())
+        return f'DEPLODOCK_KNOBS="{_knobs_env(self.knobs)}" deplodock compile -c "{self.snippet()}"{dyn} --ir {ir}'
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -22,6 +22,7 @@ def _args(**over):
         code=None,
         input=None,
         golden=None,
+        dynamic=None,
         output=None,
         ucb_c=1.4142,
         seed=0,
@@ -51,8 +52,15 @@ def test_single_code_target():
             "torch.matmul(torch.randn(8, 8), torch.randn(8, 8))",
             "torch.matmul(torch.randn(8, 8), torch.randn(8, 8))",
             None,
+            None,
         )
     ]
+
+
+def test_single_code_target_keeps_cli_dynamic():
+    """An ad-hoc --code target traces with the CLI ``--dynamic`` specs."""
+    targets = tune._tune_targets(_args(code="torch.matmul(x, torch.randn(8, 8))", dynamic=["seq_len@x:0"]))
+    assert [t[3] for t in targets] == [["seq_len@x:0"]]
 
 
 def test_golden_dataset_targets_dedup():
@@ -60,7 +68,40 @@ def test_golden_dataset_targets_dedup():
     names = [t[0] for t in targets]
     assert len(names) >= 4
     assert names == list(dict.fromkeys(names))  # de-duplicated by shape name
-    assert all(code.startswith("torch.matmul(") and inp is None for _name, code, inp in targets)
+    assert all(code.startswith("torch.matmul(") and inp is None for _name, code, inp, _dyn in targets)
+
+
+def _dyn_golden(name="square.512.dynM"):
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig
+
+    return MatmulGoldenConfig(
+        name=name,
+        M=512,
+        N=512,
+        K=512,
+        knobs={"BM": 8},
+        deplodock_us=10.0,
+        cublas_us=12.0,
+        dynamic={"seq_len": {"input": "x0", "axis": 0}},
+    )
+
+
+def test_golden_dataset_target_carries_dynamic_spec(monkeypatch):
+    """A dynamic golden expands to a target carrying its own ``--dynamic`` spec; a
+    static golden's target carries ``None``."""
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"BM": 8}, deplodock_us=9.0, cublas_us=14.0)
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [static, _dyn_golden()])
+    targets = tune._tune_targets(_args(dataset="golden"))
+    by_name = {name: dyn for name, _code, _inp, dyn in targets}
+    assert by_name == {"square.512": None, "square.512.dynM": ["seq_len@x0:0"]}
+
+
+def test_dataset_golden_rejects_cli_dynamic():
+    with pytest.raises(SystemExit) as exc:
+        tune._tune_targets(_args(dataset="golden", dynamic=["seq_len@x0:0"]))
+    assert exc.value.code == 2
 
 
 def test_db_source_rejected():
@@ -128,6 +169,29 @@ def test_single_shape_uses_same_loop(monkeypatch):
     assert exc.value.code == 0
     assert tuned_codes == ["torch.matmul(torch.randn(8, 8), torch.randn(8, 8))"]
     assert cleaned == []
+
+
+def test_loop_sets_dynamic_per_target(monkeypatch):
+    """The loop threads each target's dynamic spec onto ``args.dynamic`` before
+    ``_tune_one`` (which traces via ``load_or_trace``), so a dynamic golden in the
+    sweep traces symbolically and its static neighbors don't inherit the spec."""
+    from deplodock.compiler.pipeline.search import golden as gmod
+
+    _stub_runtime(monkeypatch)
+    seen: list[tuple[str, object]] = []
+
+    def capture(a, **_kw):
+        seen.append((a.code, a.dynamic))
+        return SimpleNamespace(best_reward=None, assembled=None), None
+
+    monkeypatch.setattr(tune, "_tune_one", capture)
+    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"BM": 8}, deplodock_us=9.0, cublas_us=14.0)
+    monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [static, _dyn_golden()])
+    with pytest.raises(SystemExit) as exc:
+        tune.handle_tune(_args(dataset="golden"))
+    assert exc.value.code == 0
+    assert sorted(dyn is not None for _code, dyn in seen) == [False, True]
+    assert [dyn for _code, dyn in seen if dyn] == [["seq_len@x0:0"]]
 
 
 def test_runtime_error_aborts_sweep(monkeypatch):

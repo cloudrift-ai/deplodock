@@ -41,6 +41,17 @@ REFIT_SCHEDULE = ((1_000, 100), (10_000, 1_000), (100_000, 10_000))
 # rows ever seen. Bounds memory + fit time for a long-lived global prior.
 MAX_ROWS = 100_000
 
+# ``H_opt`` stamp of the deployable -O3 re-bench rows (``tune`` re-benches every
+# config within ``DEPLODOCK_O3_TOL`` of the -O1 best at -O3 and feeds the row in
+# with this tag) — the measured ground truth :meth:`Prior.evidence_pick` ranks by.
+_O3_OPT = 3.0
+
+
+def _norm_knob(v):
+    """Normalize a knob value for evidence matching — sequence knobs (OVERHANG)
+    are recorded as YAML lists in some sources and tuples in the pipeline."""
+    return tuple(v) if isinstance(v, (list, tuple)) else v
+
 
 class Prior(ABC):
     """Abstract global tuning prior over a bounded, reservoir-sampled dataset.
@@ -68,6 +79,10 @@ class Prior(ABC):
         # Checkpoint binding — set by ``load``; lets :meth:`checkpoint` persist
         # without the caller threading a path.
         self._path = None
+        # Lazily-built -O3 evidence index (see :meth:`_o3_evidence`); the
+        # fingerprint tracks reservoir churn so the index rebuilds on change.
+        self._ev_index: dict[frozenset, list[tuple[dict, float]]] = {}
+        self._ev_fp: tuple[int, int] | None = None
 
     @property
     @abstractmethod
@@ -93,6 +108,71 @@ class Prior(ABC):
         (``CatBoostPrior``) overrides this to score the lot in a single call. The
         default maps element-wise (fine for the cheap analytic prior)."""
         return [self.mean_score(k) for k in knobs_list]
+
+    # --- deployable-evidence pick ------------------------------------------
+
+    def _o3_evidence(self) -> dict[frozenset, list[tuple[dict, float]]]:
+        """Reservoir rows tagged ``H_opt=3`` (real -O3 measurements), indexed by
+        their ``S_*`` structural signature. Rebuilt lazily whenever the reservoir
+        changed (``(_seen, len)`` fingerprint — Algorithm R replacement bumps
+        ``_seen`` even at constant length)."""
+        fp = (self._seen, len(self._dataset))
+        if self._ev_fp != fp:
+            index: dict[frozenset, list[tuple[dict, float]]] = {}
+            for knobs, us in self._dataset:
+                if float(knobs.get("H_opt", 0.0)) != _O3_OPT or us <= 0:
+                    continue
+                sig = frozenset((k, _norm_knob(v)) for k, v in knobs.items() if k.startswith("S_"))
+                tun = {k: _norm_knob(v) for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
+                index.setdefault(sig, []).append((tun, float(us)))
+            self._ev_index = index
+            self._ev_fp = fp
+        return self._ev_index
+
+    def evidence_pick(self, rows: list[dict]) -> tuple[int, float] | None:
+        """Measured-evidence argmin over candidate knob rows: the candidate whose
+        knob prefix is consistent with the **fastest -O3 reservoir row** of the
+        same op (``S_*`` signature). A candidate is consistent with a measured row
+        when every tunable knob the candidate specifies matches the row (knobs the
+        candidate hasn't decided yet are free — value-of-position semantics, so a
+        partial fork prefix inherits the best measured outcome under it).
+
+        Returns ``(index, measured_µs)`` or ``None`` when no candidate has
+        evidence. This is what keeps the greedy deploy from preferring an
+        unmeasured extrapolation over a config the tune already proved fastest at
+        -O3 (the 2026-06-12 golden-sweep findings 2–6 failure class). The model's
+        ranking surface (:meth:`mean_scores`) is untouched — evidence only decides
+        the argmin."""
+        if not rows or float(rows[0].get("H_opt", _O3_OPT)) != _O3_OPT:
+            return None  # deploying a non--O3 regime — -O3 evidence doesn't apply
+        index = self._o3_evidence()
+        if not index:
+            return None
+        best: tuple[int, float] | None = None
+        for i, cand in enumerate(rows):
+            sig = frozenset((k, _norm_knob(v)) for k, v in cand.items() if k.startswith("S_"))
+            measured = index.get(sig)
+            if not measured:
+                continue
+            cand_tun = {k: _norm_knob(v) for k, v in cand.items() if not k.startswith(("S_", "H_"))}
+            for row_tun, us in measured:
+                if any(k in row_tun and row_tun[k] != v for k, v in cand_tun.items()):
+                    continue
+                if best is None or us < best[1]:
+                    best = (i, us)
+        return best
+
+    def pick(self, rows: list[dict]) -> tuple[int, float]:
+        """The deploy argmin: measured -O3 evidence first (:meth:`evidence_pick`),
+        the model's :meth:`mean_scores` argmin when no candidate has evidence.
+        Returns ``(index, µs)`` — measured when evidence decided, predicted
+        otherwise."""
+        ev = self.evidence_pick(rows)
+        if ev is not None:
+            return ev
+        scores = self.mean_scores(rows)
+        best_i = min(range(len(scores)), key=scores.__getitem__)
+        return best_i, scores[best_i]
 
     # --- dataset + batched refit ------------------------------------------
 

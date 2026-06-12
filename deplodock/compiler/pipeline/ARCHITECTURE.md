@@ -13,11 +13,11 @@ pipeline/
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
 │   ├── policy/       # Search ABC (base.py) + TuningSearch (mcts.py, tune) + greedy_decide (greedy.py, the Run.resolve pick for compile/run); both rank via the Prior
 │   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf (per-variant replay cache); open_readonly + iter_perf_samples (perf ⋈ cuda_op) back the data layer
-│   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path), Dataset (from_golden/from_db/from_prior + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity)
+│   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path; golden rows carry the config's `--dynamic` specs in `.dynamic`), Dataset (from_golden/from_db/from_prior + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity AND the single golden↔measured join key: `from_matmul` / `MatmulGoldenConfig.shape_key()` build the golden side, `from_s_features` the stamped-op side — dtype flag from `S_dtype_f32`, never `S_n_mma`, which is 0 on every stamped row; `is_dyn` splits a symbolic-axis golden from its static twin, mirroring the 992 stamp's symbolic-excluded extent products + `S_ext_n_symbolic_axis` flag; all diagnostics joins + run's golden A/B kernel matching key through it)
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
 │   ├── two_level.py  # two-level tuner: outer structural MCTS + inner separable per-op reward
-│   ├── golden_configs.py  # GoldenConfig + Matmul/Reduce/Pointwise subclasses: autotuned knobs per shape (matmul fp32/fp16, cooperative reduce, pointwise) — the AnalyticPrior fit's ground truth across all kernel regimes
+│   ├── golden.py     # GoldenConfig + Matmul/Reduce/Pointwise subclasses: autotuned knobs per shape (matmul fp32/fp16, cooperative reduce, pointwise) — the AnalyticPrior fit's ground truth across all kernel regimes. A matmul golden may mark its M axis symbolic (YAML `dynamic: {NAME: {input, axis}}`, M doubling as the Dim hint, `.dynM` name suffix): the shape then compiles/benches as a masked-tile kernel via its own `--dynamic` spec (`dynamic_specs()`), a separate deployment artifact from its static twin — never merged. Data lives in goldens/<gpu>.yaml
 │   ├── prior/        # the ONE ranking path: Prior ABC + AnalyticPrior (cold heuristic) + CatBoostPrior (learned) composed behind FallbackPrior (load_prior)
 │   └── analytic.py  # golden-config eval harness (evaluate_golden / pick_matmul): ranks a shape's enumeration via a Prior (AnalyticPrior by default) — drives eval analytic / eval prior (weights fit by scripts/golden_knob_heuristics.py)
 │ # SearchTree (in-memory MCTS state) lives in policy/mcts.py — MCTS is the only policy that reads it.
@@ -74,12 +74,17 @@ matched `Node` objects. Anything else binds positionally to
 **Returning a list = autotune fork.** A rule that's unsure which parameter to use returns the
 alternatives as a list, in any order — the engine spawns one `LazyCandidate` per option (sharing the
 parent's graph snapshot) and hands them ALL to a `Search` policy, which ranks them via a `Prior`
-(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `greedy_decide` (`compile`/`run`, via `Run.resolve`) by `mean_score` argmin.
-There is ONE ranking path — the `Prior` is the hand-coded `AnalyticPrior` cold (a real heuristic *score* over
-`knob.knob_features`, not emission order) and the learned `CatBoostPrior` once trained, composed behind
-`FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold; a `tune` sweep explores
-every fork. (DB-best replay `_best_fork` and the static `score_of` prior were removed; the old `_priority_*`
-enumeration sort that ranked the cold path by emission order is gone — the `AnalyticPrior` ranks it now.)
+(`search/prior/`): `TuningSearch` (`tune`) by PUCT, `greedy_decide` (`compile`/`run`, via `Run.resolve`) by
+`Prior.pick` — measured -O3 reservoir evidence first (`evidence_pick`: the candidate prefix-consistent with the
+fastest `H_opt=3` row of the same op, value-of-position semantics), the `mean_score` argmin when no candidate
+has evidence. There is ONE ranking path — the `Prior` is the hand-coded `AnalyticPrior` cold (a real heuristic
+*score* over `knob.knob_features`, not emission order; a separate `_W_A_DYN` weight set ranks symbolic-axis
+masked-tile kernels, selected on the stamped `S_ext_n_symbolic_axis`) and the learned `CatBoostPrior` once
+trained, composed behind `FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold;
+a `tune` sweep explores every fork. (DB-best replay `_best_fork` and the static `score_of` prior were removed;
+the old `_priority_*` enumeration sort that ranked the cold path by emission order is gone — the
+`AnalyticPrior` ranks it now. Greedy stays prior-only: the -O3 evidence ships inside the prior's checkpointed
+reservoir, not the DB.)
 Single-option returns (or bare `Graph` / `Op`) are the deterministic case — no fork.
 
 **Lazy hierarchical forks via `Fork`.** `Fork` is an interface (`pipeline/fork.py`): `knobs` (the knob delta
@@ -281,11 +286,12 @@ hardware context + the live `DEPLODOCK_<KNOB>` pin snapshot (pins fold into enum
 `knob.knob_features` turns each row into the prior's feature vector and structurally identical
 kernels — the same layer repeated through a whole model — featurize alike and share the prior's rows.
 
-Variant ranking is a single `Prior` over `knob.knob_features` (`search/prior/`): greedy picks the
-`mean_score` argmin, MCTS ranks the PUCT frontier. The `Prior` is the hand-coded `AnalyticPrior` cold (a
-fixed linear model over the engineered `D_*` geometry / occupancy features — the cold path is ranked by a real
-heuristic *score*, not emission order) and the learned `CatBoostPrior` once trained, composed behind
-`FallbackPrior` (`load_prior`). There is ONE ranking path: the old per-variant `Op.lazy_score` /
+Variant ranking is a single `Prior` over `knob.knob_features` (`search/prior/`): greedy picks via
+`Prior.pick` (measured -O3 reservoir evidence first, `mean_score` argmin otherwise), MCTS ranks the PUCT
+frontier. The `Prior` is the hand-coded `AnalyticPrior` cold (a fixed linear model over the engineered `D_*`
+geometry / occupancy features — the cold path is ranked by a real heuristic *score*, not emission order; the
+masked tier rides its own `_W_A_DYN` weight set keyed on `S_ext_n_symbolic_axis`) and the learned
+`CatBoostPrior` once trained, composed behind `FallbackPrior` (`load_prior`). There is ONE ranking path: the old per-variant `Op.lazy_score` /
 `TileOp.score_tile_geometry` formula, the `Fork.score` / `Search.score_of` plumbing, AND the `_priority_*`
 enumeration sort that ranked the cold path were all removed — nothing materializes or scores a TileOp just to
 rank it; the prior featurizes the row knobs directly.
@@ -587,7 +593,7 @@ all-or-nothing per comparison: if any backend fails to capture, that bench retri
 prints a fallback note. Each `perf` row records whether its measurement was captured (the `captured` column); on write,
 a captured measurement supersedes a wall-semantics one for the same key regardless of median (never the reverse), so
 old rows keep serving replay and prior training and upgrade in place as re-tunes measure them captured. Recorded
-goldens keep their original numbers until the next `update-goldens` re-record. See the `capture_graphs` section in
+goldens keep their original numbers until the next `tune-golden` re-record. See the `capture_graphs` section in
 `backend/cuda/ARCHITECTURE.md`.
 
 **Search dynamics.** Each level reuses the **same** SP-MCTS (`search/policy/mcts.py`) — outer over structural forks, inner

@@ -322,11 +322,15 @@ def test_prior_db_reachability_smoke(run_cli, tmp_path):
     view — the groups must reach ``diagnostics.reachability`` as ``Sample``s, not
     ``(knobs, latency)`` tuples (the shape mismatch that crashed it)."""
     db = tmp_path / "r.db"
+    # A realistic stamped matmul histogram (``_matmul_sig``: product → reduce-add
+    # over 2 distinct inputs). Real rows never carry ``S_n_mma > 0`` — the stamp
+    # runs before the tile tier emits ``Mma`` — so the label keys on the histogram.
+    mm = {"S_ext_free_prod": 1024.0, "S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0}
     _make_tune_db(
         db,
         [
-            ("a", "k_matmul", {"BM": 8, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 30.0),
-            ("b", "k_matmul", {"BM": 16, "S_ext_free_prod": 1024.0, "S_n_mma": 1.0}, 10.0),
+            ("a", "k_matmul", {"BM": 8, **mm}, 30.0),
+            ("b", "k_matmul", {"BM": 16, **mm}, 10.0),
         ],
     )
     rc, stdout, stderr = run_cli("eval", "prior", "--dataset", "db", "--db", str(db), "--prior", str(tmp_path / "missing.json"))
@@ -384,6 +388,11 @@ def test_emit_variant_table_o3_column_and_deterministic_pick(caplog):
     class _P:  # predicts the slow BM=8 config fastest → pick is rank 2
         def mean_score(self, knobs):
             return knobs["BM"]
+
+        def pick(self, rows):  # the real Prior.pick model-argmin fallback (no evidence here)
+            scores = [self.mean_score(r) for r in rows]
+            best_i = min(range(len(scores)), key=scores.__getitem__)
+            return best_i, scores[best_i]
 
     o3 = {_variant_key(samples[0]): 9.5}
     with caplog.at_level(logging.INFO, logger="deplodock.commands.eval"):

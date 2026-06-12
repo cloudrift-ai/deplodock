@@ -189,13 +189,15 @@ def _exit_flushed(code: int) -> None:
     os._exit(code)
 
 
-def _tune_targets(args) -> list[tuple[str, str | None, str | None]]:
-    """The ``(label, code, input)`` shapes this invocation tunes — the **only** place
-    golden and non-golden diverge. ``--dataset golden`` expands to every recorded
+def _tune_targets(args) -> list[tuple[str, str | None, str | None, list[str] | None]]:
+    """The ``(label, code, input, dynamic)`` shapes this invocation tunes — the **only**
+    place golden and non-golden diverge. ``--dataset golden`` expands to every recorded
     golden shape (deduped by name, ``--kernel SUBSTR`` narrowing); otherwise it's the
-    single ``--code`` / positional input / ``--golden NAME`` target. ``handle_tune``
-    then loops over this list uniformly, so one shape and the whole golden set share
-    one codepath. Exits 2 on a degenerate / conflicting source."""
+    single ``--code`` / positional input / ``--golden NAME`` target. ``dynamic`` is the
+    ``--dynamic NAME@INPUT:AXIS`` spec list the target traces with: a dynamic golden's
+    own recorded spec, or the CLI flag for an ad-hoc target. ``handle_tune`` then loops
+    over this list uniformly, so one shape and the whole golden set share one codepath.
+    Exits 2 on a degenerate / conflicting source."""
     if getattr(args, "dataset", None):
         from deplodock.compiler.pipeline.search.data import Dataset
 
@@ -203,20 +205,24 @@ def _tune_targets(args) -> list[tuple[str, str | None, str | None]]:
         if args.code or args.input or getattr(args, "golden", None):
             logger.error("--dataset golden is mutually exclusive with --code / positional input / --golden NAME")
             sys.exit(2)
-        # Configs under one name share the shape, so any one's snippet is interchangeable.
-        by_name: dict[str, str] = {}
+        if getattr(args, "dynamic", None):
+            logger.error("--dynamic is incompatible with --dataset golden (a dynamic golden's spec is part of its config)")
+            sys.exit(2)
+        # Configs under one name share the shape (and dynamic spec), so any one's
+        # snippet is interchangeable.
+        by_name: dict[str, tuple[str, list[str] | None]] = {}
         for s in Dataset.from_golden(kernel=args.kernel).samples:
-            by_name.setdefault(s.name, s.snippet)
+            by_name.setdefault(s.name, (s.snippet, list(s.dynamic) if s.dynamic else None))
         if not by_name:
             logger.error("no golden shapes matched --kernel %r", args.kernel)
             sys.exit(2)
-        return [(name, code, None) for name, code in by_name.items()]
+        return [(name, code, None, dyn) for name, (code, dyn) in by_name.items()]
 
-    resolve_golden_arg(args)  # --golden NAME → args.code
+    resolve_golden_arg(args)  # --golden NAME → args.code (+ args.dynamic for a dynamic golden)
     if args.code and args.input:
         logger.error("--code and positional input are mutually exclusive")
         sys.exit(2)
-    return [(args.code or args.input, args.code, args.input)]
+    return [(args.code or args.input, args.code, args.input, getattr(args, "dynamic", None))]
 
 
 def _bench_dump(args):
@@ -274,8 +280,8 @@ def handle_tune(args):
     if multi:
         sys.stderr.write(f"[tune] {len(targets)} shape(s) into {db_path}{' (--clean)' if args.clean else ''}\n")
     done = 0
-    for i, (label, code, inp) in enumerate(targets):
-        args.code, args.input = code, inp
+    for i, (label, code, inp, dyn) in enumerate(targets):
+        args.code, args.input, args.dynamic = code, inp, dyn
         if multi:
             sys.stderr.write(f"\n[tune] === {i + 1}/{len(targets)}: {label} → {code} ===\n")
         dump, tmp_dump = _bench_dump(args)
