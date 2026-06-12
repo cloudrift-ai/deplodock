@@ -33,6 +33,10 @@ def _row(free_prod, reduce_max, *, fp32, h_opt, latency):
         "S_ext_free_prod": float(free_prod),
         "S_ext_reduce_max": float(reduce_max),
         ("S_dtype_f32" if fp32 else "S_dtype_f16"): 2.0,
+        # The matmul histogram markers (_matmul_sig): product → reduce-add, 2 inputs.
+        "S_reduce_add": 1.0,
+        "S_pw_multiply": 1.0,
+        "S_n_distinct_input": 2.0,
         "BM": 8,
         "BN": 16,
     }
@@ -70,3 +74,13 @@ def test_kernel_filter_restricts_shapes():
     g32 = goldens_by_name("square.512")[0].deplodock_us
     prior = _FakePrior([_row(512 * 512, 512, fp32=True, h_opt=3, latency=g32)])
     assert set(diagnostics.golden_deploy_perf(prior, "square.512")) <= {"square.512"}
+
+
+def test_non_matmul_group_with_colliding_extents_is_excluded():
+    """A reduce-shaped op group that happens to share a matmul golden's
+    (free_prod, reduce_max, dtype) must not satisfy the join — the index admits
+    only matmul-histogram groups (``_matmul_sig``)."""
+    g32 = goldens_by_name("square.512")[0].deplodock_us
+    knobs, latency = _row(512 * 512, 512, fp32=True, h_opt=3, latency=g32 * 0.1)
+    knobs.pop("S_pw_multiply")  # no product feeding the reduce → not a matmul body
+    assert "square.512" not in diagnostics.golden_deploy_perf(_FakePrior([(knobs, latency)]))

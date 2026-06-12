@@ -484,6 +484,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
     from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
     from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
     from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.data import ShapeKey  # noqa: PLC0415
 
     cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
@@ -515,24 +516,24 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         return grid_total, block_threads, op.smem_bytes / 1024, regs, occ_str
 
     def _op_sig(op):
-        knobs = getattr(op, "knobs", {}) or {}
-        return (int(knobs.get("S_ext_free_prod", 0)), int(knobs.get("S_ext_reduce_max", 0)))
+        return ShapeKey.from_s_features(getattr(op, "knobs", {}) or {})
 
     used_ab: set[int] = set()
 
     def _matching(op):
-        """Benched pinned variants whose shape matches this kernel — keyed on the
-        op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max = K``),
-        the same shape signature the prior diagnostics match goldens on. A golden
-        carries its matmul shape on ``sample.shape``; a shapeless ``--ab`` entry
-        matches through its own benched kernels' signatures and nests under the
-        first greedy kernel it matches (``used_ab`` dedups; unmatched entries are
-        appended after the greedy rows so a row is never silently dropped)."""
+        """Benched pinned variants whose shape matches this kernel — keyed via
+        ``ShapeKey.from_s_features`` over the op's stamped ``S_*`` features, the
+        same join key the prior diagnostics match goldens on (so the dtype flag
+        splits fp32/fp16 twins here too). A golden carries its matmul ``ShapeKey``
+        on ``sample.shape``; a shapeless ``--ab`` entry matches through its own
+        benched kernels' signatures and nests under the first greedy kernel it
+        matches (``used_ab`` dedups; unmatched entries are appended after the
+        greedy rows so a row is never silently dropped)."""
         sig = _op_sig(op)
         out = []
         for gb in golden_benches or []:
             if gb.sample.shape is not None:
-                if (gb.sample.shape.free_prod, gb.sample.shape.reduce_max) == sig:
+                if gb.sample.shape == sig:
                     out.append(gb)
             elif id(gb) not in used_ab and any(_op_sig(n.op) == sig for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)):
                 used_ab.add(id(gb))

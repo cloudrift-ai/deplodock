@@ -15,16 +15,26 @@ from __future__ import annotations
 import math
 import statistics
 
-from deplodock.compiler.pipeline.search.data import Dataset
+from deplodock.compiler.pipeline.search.data import Dataset, ShapeKey
 
 
 def _n_tunable(knobs: dict) -> int:
     return sum(1 for k in knobs if not k.startswith(("S_", "H_")))
 
 
+def _matmul_sig(d: dict) -> bool:
+    """Histogram heuristic for "this op group is a matmul": a product feeding a
+    reduce-add over ≥2 distinct inputs. ``S_n_mma`` is NOT usable as the marker:
+    the stamp pass runs at fusion end, before the tile tier emits ``Mma`` stmts,
+    so it is 0.0 on every stamped row — gating on it made golden coverage
+    permanently empty and dropped every fp16 golden from the rank/deploy joins
+    (see ``ShapeKey.from_s_features``)."""
+    return bool(d.get("S_reduce_add", 0) and d.get("S_pw_multiply", 0) and d.get("S_n_distinct_input", 0) >= 2)
+
+
 def _op_label(sig: tuple) -> str:
     d = dict(sig)
-    if d.get("S_n_mma", 0) > 0:
+    if _matmul_sig(d):
         kind = "matmul"
     elif d.get("S_reduce_add", 0) or d.get("S_reduce_max", 0):
         kind = "reduce"
@@ -71,17 +81,18 @@ def _calibration(prior, groups: dict) -> float | None:
 
 
 def _golden_coverage(groups: dict) -> tuple[int, int]:
-    """How many golden matmul shapes have measured data in the dataset (matched by
-    the op's free-dim product + reduce extent from its ``S_*`` features)."""
+    """How many golden matmul shapes have measured data in the dataset, matched by
+    :class:`ShapeKey` (free-dim product, reduce extent, dtype flag — so an fp32
+    square and its ``.fp16`` twin are counted separately)."""
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     have = set()
     for sig in groups:
         d = dict(sig)
-        if d.get("S_n_mma", 0) > 0:
-            have.add((int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0))))
+        if _matmul_sig(d):
+            have.add(ShapeKey.from_s_features(d))
     matmuls = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
-    covered = sum(1 for g in matmuls if (g.M * g.N, g.K) in have)
+    covered = sum(1 for g in matmuls if ShapeKey.from_matmul(g.M, g.N, g.K, g.dtype) in have)
     return covered, len(matmuls)
 
 
@@ -99,13 +110,16 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     from deplodock.compiler.pipeline.search import analytic  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
-    # Index op groups by (free-dim product, reduce extent, is-matmul) so each
-    # golden shape maps to the S_* signature it was tuned under.
-    index: dict[tuple, dict] = {}
+    # Index the matmul op groups by ShapeKey (free-dim product, reduce extent,
+    # dtype flag — both sides built by the ShapeKey constructors, so the fp32/fp16
+    # twins never merge) so each golden shape maps to the S_* signature it was
+    # tuned under.
+    index: dict[ShapeKey, dict] = {}
     for sig in Dataset.from_prior(prior).group_by_op():
         d = dict(sig)
-        key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_n_mma", 0) > 0)
-        index.setdefault(key, {k: v for k, v in d.items() if k.startswith("S_")})
+        if not _matmul_sig(d):
+            continue
+        index.setdefault(ShapeKey.from_s_features(d), {k: v for k, v in d.items() if k.startswith("S_")})
 
     thread = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
     warp = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
@@ -115,7 +129,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
-        s_feats = index.get((g.M * g.N, g.K, g.dtype != "fp32"))
+        s_feats = index.get(ShapeKey.from_matmul(g.M, g.N, g.K, g.dtype))
         if s_feats is None:
             continue
         base = {**Context.from_target(g.compute_cap).features(), **s_feats}
@@ -155,19 +169,19 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
     columns needed to isolate the deployable measurements."""
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
-    # Deployable (-O3) measured rows per op group, indexed by the shape signature
-    # (free-dim product, reduce extent, is-fp32). The dtype flag must use the
-    # ``S_dtype_f32`` feature, not ``S_n_mma``: an fp32 square and its ``.fp16`` twin
-    # share (free_prod, reduce) and the fp16 row may not carry an mma marker, so keying
-    # on mma would merge them and steal the fp16 latency for the fp32 row.
-    index: dict[tuple, list] = {}
+    # Deployable (-O3) measured rows per matmul op group, indexed by ShapeKey.
+    # An fp32 square and its ``.fp16`` twin share (free_prod, reduce), so the key's
+    # dtype flag is what keeps them apart — ``ShapeKey.from_s_features`` derives it
+    # from ``S_dtype_f32`` (see its docstring for why ``S_n_mma`` can't be the key).
+    index: dict[ShapeKey, list] = {}
     for sig, samples in Dataset.from_prior(prior).group_by_op().items():
+        d = dict(sig)
+        if not _matmul_sig(d):
+            continue
         o3 = [s for s in samples if int(s.all_knobs().get("H_opt", 0)) == 3]
         if not o3:
             continue
-        d = dict(sig)
-        key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_dtype_f32", 0) > 0)
-        index.setdefault(key, []).extend(o3)
+        index.setdefault(ShapeKey.from_s_features(d), []).extend(o3)
 
     out: dict[str, float] = {}
     for g in GOLDEN_CONFIGS:
@@ -175,7 +189,7 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
-        leaves = index.get((g.M * g.N, g.K, g.dtype == "fp32"))
+        leaves = index.get(ShapeKey.from_matmul(g.M, g.N, g.K, g.dtype))
         if not leaves:
             continue
         pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
