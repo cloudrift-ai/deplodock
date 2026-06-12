@@ -98,20 +98,34 @@ def test_boundary_guards_fail_loud_on_unmatched_predicate():
         _mod._boundary_guards(body, w)
 
 
-def test_emit_chain_declines_unstaged_gated_operand():
-    """A masked cell whose gated-axis operand was not staged would read past
-    the runtime-sized buffer through the gmem-direct fragment load — decline."""
+def test_emit_chain_clamps_unstaged_gated_operand():
+    """A masked cell whose gated-axis operand was not staged takes the
+    clamped gmem-direct fragment load (a plain gmem-direct read at
+    straddling-tile coords would run past the runtime-sized buffer); the
+    clean-axis operand keeps the unclamped helper. Every enumerated variant
+    must lower — staging declines (smem budget) are legitimate and a greedy
+    pick must not crash on the fallback."""
+    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad
+    from deplodock.compiler.ir.stmt.base import RenderCtx
+
     spec = ATOM_REGISTRY["mma_m16n8k16_f16"]
     a_load = Load(name="a0", input="a", index=(Var("m"), Var("k")))
     b_load = Load(name="b0", input="b", index=(Var("k"), Var("n")))
-    with pytest.raises(RuleSkipped, match="M operand is unstaged"):
-        _mod._emit_chain(
-            spec,
-            a_load=a_load,
-            b_load=b_load,
-            a_frag="af",
-            b_frag="bf",
-            c_frag="cf",
-            smem_sources={},
-            m_guard=(Var("m"), Var("seq_len")),
-        )
+    chain = _mod._emit_chain(
+        spec,
+        a_load=a_load,
+        b_load=b_load,
+        a_frag="af",
+        b_frag="bf",
+        c_frag="cf",
+        smem_sources={},
+        m_guard=(Var("m"), Var("seq_len")),
+    )
+    a_ld, b_ld = (s for s in chain if isinstance(s, LdmatrixLoad))
+    assert a_ld.gmem_guard == (Var("m"), Var("seq_len"))
+    assert b_ld.gmem_guard is None
+    ctx = RenderCtx(shapes={"a": (512, 64), "b": (64, 512)})
+    src = "\n".join(a_ld.render(ctx))
+    assert "dpl_mma_load_a_gmem_mclamp(" in src
+    assert "(seq_len) - (m)" in src, f"clamp arg should be the in-range rows left from the tile base:\n{src}"
+    assert "dpl_mma_load_b_gmem_nclamp" not in "\n".join(b_ld.render(ctx))

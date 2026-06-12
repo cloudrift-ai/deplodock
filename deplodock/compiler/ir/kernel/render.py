@@ -180,6 +180,44 @@ static __device__ __forceinline__ void dpl_mma_load_b_gmem(unsigned* r, const T*
     }
 }
 
+// Masked-tile (M9) variants of the gmem-direct fragment loads: a tile
+// straddling a masked axis's bound would read rows / cols past the
+// runtime-sized buffer, so the lane coordinate on the gated axis clamps to
+// ``left - 1`` (``left`` = in-range elements from the tile base; >= 1 because
+// the boundary Cond admitted the tile). Clamped lanes read a duplicate
+// in-bounds value — harmless, their stores are masked by the RegStore guard.
+// Same contract as the staged path's slab-fill clamp (_clamp_source_index).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem_mclamp(unsigned* r, const T* g, int ldm, int rows_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);
+        if (row >= rows_left) row = rows_left - 1;   // M: clamp to the runtime extent
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);
+        const T* p = g + row * ldm + col;
+        unsigned packed;
+        ((T*)&packed)[0] = p[0];
+        ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp(unsigned* r, const T* g, int ldm, int cols_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;       // N: clamp to the runtime extent
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed;
+        ((T*)&packed)[0] = g[k * ldm + n];
+        ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"

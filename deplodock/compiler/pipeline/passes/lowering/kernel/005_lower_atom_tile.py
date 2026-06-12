@@ -24,9 +24,10 @@ tiles); ``_boundary_guards`` classifies its predicate against the Write's
 M / N coordinates and stamps the per-element range check onto the ``RegStore``
 (``m_guard`` / ``n_guard``), because the Cond only gates the atom tile's base
 coordinate while a *straddling* tile's trailing rows / cols are out of range.
-Masked cells require the gated-axis operand staged (the clamped smem slab is
-in-bounds by construction; a gmem-direct fragment load is not) — unstaged
-gated operands decline with ``RuleSkipped``.
+A masked cell whose gated-axis operand was NOT staged takes the clamped
+gmem-direct helper (``LdmatrixLoad.gmem_guard`` → ``dpl_mma_load_*_*clamp``)
+— the staged slab is in-bounds by construction, the gmem-direct fallback
+clamps its lane coordinate instead — so every enumerated variant lowers.
 
 This pass walks the ``TileOp`` body, finds each ``AtomTile``, and rewrites its
 cell into ``RegFragment`` decls + per-reduce ``LdmatrixLoad a + LdmatrixLoad b
@@ -414,21 +415,39 @@ def _emit_chain(
     # search needn't avoid unstageable MMA tiles.
     a_staged = a_load.input in smem_sources
     b_staged = b_load.input in smem_sources
-    # Masked cells require the gated-axis operand STAGED: the staged slab is
-    # hint-tile-sized smem whose gmem fill is clamped (021 + _stage_expand), so
-    # ldmatrix reads garbage-but-in-bounds rows for the overhang; a gmem-direct
-    # fragment load at the same coords would read past the runtime-sized
-    # buffer. Decline rather than emit the OOB read — the variant pins a
-    # bench_fail row and the search routes around it.
-    if m_guard is not None and not a_staged:
-        raise RuleSkipped("masked AtomTile M operand is unstaged — gmem-direct fragment load would read past the masked extent")
-    if n_guard is not None and not b_staged:
-        raise RuleSkipped("masked AtomTile N operand is unstaged — gmem-direct fragment load would read past the masked extent")
+    # Masked cells with an UNSTAGED gated-axis operand take the clamped
+    # gmem-direct helper: the staged slab is in-bounds by construction (its
+    # gmem fill is clamped — 021 + _stage_expand), but a plain gmem-direct
+    # fragment load at straddling-tile coords would read past the
+    # runtime-sized buffer, so the lane coordinate clamps to the boundary
+    # instead (``LdmatrixLoad.gmem_guard``). Keeps every enumerated variant
+    # lowerable — the staging passes legitimately decline (smem budget), and
+    # a greedy pick must not crash on the fallback.
+    a_guard = m_guard if (m_guard is not None and not a_staged) else None
+    b_guard = n_guard if (n_guard is not None and not b_staged) else None
     a_swz = smem_sources[a_load.input].swizzle.value if a_staged else "NONE"
     b_swz = smem_sources[b_load.input].swizzle.value if b_staged else "NONE"
     return (
-        LdmatrixLoad(frag=a_frag, src_buffer=a_load.input, src_index=a_src_index, role="a", ldm=a_ldm, swizzle=a_swz, staged=a_staged),
-        LdmatrixLoad(frag=b_frag, src_buffer=b_load.input, src_index=b_src_index, role="b", ldm=b_ldm, swizzle=b_swz, staged=b_staged),
+        LdmatrixLoad(
+            frag=a_frag,
+            src_buffer=a_load.input,
+            src_index=a_src_index,
+            role="a",
+            ldm=a_ldm,
+            swizzle=a_swz,
+            staged=a_staged,
+            gmem_guard=a_guard,
+        ),
+        LdmatrixLoad(
+            frag=b_frag,
+            src_buffer=b_load.input,
+            src_index=b_src_index,
+            role="b",
+            ldm=b_ldm,
+            swizzle=b_swz,
+            staged=b_staged,
+            gmem_guard=b_guard,
+        ),
         MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
     )
 

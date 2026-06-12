@@ -641,7 +641,16 @@ class LdmatrixLoad(Stmt):
     ``dpl_mma_load_{a,b}_gmem`` helper instead — a gmem-direct fragment load that
     replicates the same lane→element map without ldmatrix. Slower (no smem reuse)
     but correct; ``005_lower_atom_tile`` picks per operand based on whether an
-    enclosing ``StageBundle`` staged it."""
+    enclosing ``StageBundle`` staged it.
+
+    ``gmem_guard`` (gmem-direct only) carries a masked-tile boundary as
+    ``(base Expr, bound Expr)`` on the operand's lane-varying output axis
+    (A's M rows, B's N cols): the render switches to the ``_mclamp`` /
+    ``_nclamp`` helper, which clamps the lane coordinate to the ``bound -
+    base`` in-range elements — the gmem-direct analogue of the staged
+    slab-fill clamp, so an unstaged masked cell still lowers instead of
+    reading past the runtime-sized buffer. Clamped lanes read duplicates;
+    their stores are masked by the RegStore guards."""
 
     frag: str
     src_buffer: str
@@ -650,6 +659,7 @@ class LdmatrixLoad(Stmt):
     ldm: int = 0
     swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
     staged: bool = True  # False → gmem-direct fragment load (operand not in smem)
+    gmem_guard: tuple[Expr, Expr] | None = None  # masked-axis (base, bound); gmem-direct only
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -661,12 +671,14 @@ class LdmatrixLoad(Stmt):
         return (self.src_buffer,)
 
     def exprs(self) -> tuple[Expr, ...]:
-        return tuple(self.src_index)
+        guard = () if self.gmem_guard is None else self.gmem_guard
+        return (*self.src_index, *guard)
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.src_index)
         variant = ("x4" if self.role == "a" else "x2.trans") if self.staged else "gmem-direct"
-        return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}, ldm={self.ldm or 'auto'})"]
+        guard = "" if self.gmem_guard is None else f" guard<{self.gmem_guard[1].pretty()}"
+        return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}{guard}, ldm={self.ldm or 'auto'})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
@@ -677,6 +689,13 @@ class LdmatrixLoad(Stmt):
             # Operand not staged in smem — ldmatrix can't reach gmem, so read the
             # fragment straight from gmem (each lane adds its own (row,col) inside
             # the helper). No swizzle: that's a TMA-smem-layout concern only.
+            if self.gmem_guard is not None:
+                # Masked axis: clamp the lane coordinate to the in-range
+                # elements left from the tile base (>= 1 — the boundary Cond
+                # admitted the tile).
+                base, bound = self.gmem_guard[0].render(ctx), self.gmem_guard[1].render(ctx)
+                helper = "dpl_mma_load_a_gmem_mclamp" if self.role == "a" else "dpl_mma_load_b_gmem_nclamp"
+                return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, ({bound}) - ({base}));"]
             helper = "dpl_mma_load_a_gmem" if self.role == "a" else "dpl_mma_load_b_gmem"
             return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm});"]
         lane = "(threadIdx.x & 31)"
@@ -1377,6 +1396,7 @@ def _(s: LdmatrixLoad, rename, sigma, axis_fn):
         ldm=s.ldm,
         swizzle=s.swizzle,
         staged=s.staged,
+        gmem_guard=None if s.gmem_guard is None else (sigma.apply(s.gmem_guard[0]), sigma.apply(s.gmem_guard[1])),
     )
 
 

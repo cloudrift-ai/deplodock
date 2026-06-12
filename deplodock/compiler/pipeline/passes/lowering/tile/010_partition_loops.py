@@ -648,8 +648,14 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # Warp-tier MMA: only when the MMA knob is enabled (default;
         # ``DEPLODOCK_MMA=0`` for scalar-only, ``DEPLODOCK_MMA=<kind>``
         # to enable + pin one atom kind — see ``_enumeration.mma_mode``),
-        # no prologue (M9 extension), static M/N/K, and the per-kind
-        # eligibility predicate fires. Each eligible kind gets one
+        # no prologue (M9 extension), static N/K, and the per-kind
+        # eligibility predicate fires. A symbolic M is admitted as a
+        # MASKED warp tile (tiled at the hint; ceil-div grid + per-element
+        # store guard — the M9 path): the enumerator stamps ``OVERHANG``
+        # via ``m_forced_mask`` and the builder emits the boundary Cond.
+        # Symbolic N additionally needs an Expr ldm on the output store
+        # (next step of the M9 work); symbolic K (flash-style attention)
+        # is out of scope. Each eligible kind gets one
         # warp-tier knob row per (WN, WM, FM, FN, BK, SPLITK); we
         # concatenate them onto the scalar param list — the fork tree in
         # :func:`rewrite` splits the rows by type and emits sibling
@@ -657,7 +663,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
         mma_on, pinned_atom = mma_mode()
-        if mma_on and graph is not None and not prologue and not m_symbolic and not n_symbolic and not k_symbolic:
+        if mma_on and graph is not None and not prologue and not n_symbolic and not k_symbolic:
             eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
             # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
             # tensor-core family (WMMA was removed; the swizzled slab beats
@@ -688,6 +694,10 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     priority_mode=("matmul", "warp"),
                     force_splitk_one=force_splitk_one,
                     atoms=eligible,
+                    m_axis_name=outer_m.axis.name if outer_m is not None else None,
+                    n_axis_name=outer_n.axis.name,
+                    m_forced_mask=m_symbolic,
+                    n_forced_mask=n_symbolic,
                 )
                 # Drop single-warp (WM·WN == 1) variants: ldmatrix is
                 # smem→register only, so the atom REQUIRES staged operands, but
@@ -1085,10 +1095,22 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     the matmul-reduce body and rewrites it into the ``MmaFragment`` +
     ``MmaLoad`` + ``MmaSync`` chain.
 
-    No prologue / masked tile support at M3 (matches the warp enumerator,
-    which rejects non-divisor extents). Symbolic axes / cooperative-K
-    are gated off by construction (the eligibility predicate refuses
-    them; ``BR=1`` is enforced on warp-tier rows by construction).
+    No prologue support (matches the warp enumerator gate); cooperative-K
+    is gated off by construction (``BR=1`` on warp-tier rows).
+
+    Masked tiles (the M9 path): an axis in the row's ``OVERHANG`` —
+    stamped by the enumerator for a symbolic (forced-mask) axis, or a
+    static non-divisor one — gets a ceil-div block axis and the body is
+    wrapped in a boundary ``Cond(σ(axis) < bound)``, exactly like the
+    scalar builder. The Cond gates the atom tile's BASE coordinate only
+    (``M_a`` / ``N_a`` are not in σ); ``kernel/005_lower_atom_tile``
+    classifies the predicate and stamps per-element guards onto the
+    ``RegStore`` for tiles straddling the bound, and
+    ``021_hoist_staged_loads_above_mask`` lifts the K-pipeline above the
+    Cond (clamped slab fill, unguarded ldmatrix/mma.sync on the
+    hint-sized slab). The predicate LHS is built with ``sigma_outer
+    .apply`` — pure substitution, the same path the Write index takes —
+    so 005's struct-equality classification holds.
 
     The ``M_a`` / ``N_a`` Vars *do not appear* in ``σ_outer`` — the
     in-fragment lane offset is owned by the mma.sync instruction, not the
@@ -1100,14 +1122,29 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     atom_m, atom_n, atom_k = atom.shape
 
     sigma_map: dict[str, object] = {}
+    overhang = frozenset(params.get("OVERHANG", ()))
+
+    def _block_axis(axis: Axis, name: str, per_block: int, src: Axis) -> tuple[Axis, object | None]:
+        """The BLOCK-tier axis for one output dim + its mask bound (None when
+        unmasked). Mirrors the scalar builder's static/masked/symbolic
+        branches: masked static → ceil-div with ``real_extent``; masked
+        symbolic → composite ceil-div Expr over the runtime extent (the
+        launch resolver evals it; the bound is the symbolic Var)."""
+        if axis.extent.is_static:
+            ext = axis.extent.as_static()
+            if name in overhang:
+                return Axis(f"{name}_b", -(-ext // per_block), source_axis=src, real_extent=ext), Literal(ext, "int")
+            return Axis(f"{name}_b", ext // per_block, source_axis=src), None
+        if name in overhang:
+            return Axis(f"{name}_b", (axis.extent + (per_block - 1)) // per_block, source_axis=src), axis.extent.expr
+        raise RuleSkipped(f"warp-tier axis {name!r} is symbolic but not masked — enumerator/builder out of sync")
 
     # ---- N axis: A_b · (W_n · F_n · A_n) + A_w · (F_n · A_n) + A_r · A_n + A_a
     N_axis = shape.outer_n.axis
     N_name = N_axis.name
     N_src = N_axis.source_axis or N_axis
     n_per_block = params["WN"] * params["FN"] * atom_n
-    E_N = N_axis.extent.as_static()
-    N_b = Axis(f"{N_name}_b", E_N // n_per_block, source_axis=N_src)
+    N_b, n_bound = _block_axis(N_axis, N_name, n_per_block, N_src)
     N_w = Axis(f"{N_name}_w", params["WN"], source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params["FN"], source_axis=N_src)
     N_a = Axis(f"{N_name}_a", atom_n, source_axis=N_src)
@@ -1123,8 +1160,7 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     M_name = M_axis.name
     M_src = M_axis.source_axis or M_axis
     m_per_block = params["WM"] * params["FM"] * atom_m
-    E_M = M_axis.extent.as_static()
-    M_b = Axis(f"{M_name}_b", E_M // m_per_block, source_axis=M_src)
+    M_b, m_bound = _block_axis(M_axis, M_name, m_per_block, M_src)
     M_w = Axis(f"{M_name}_w", params["WM"], source_axis=M_src)
     M_r = Axis(f"{M_name}_r", params["FM"], source_axis=M_src)
     M_a = Axis(f"{M_name}_a", atom_m, source_axis=M_src)
@@ -1160,6 +1196,17 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     )
     if n_replaced == 0:
         raise RuleSkipped("K reduce not found in body")
+
+    # Masked tiles: wrap the cell body (K tower + Write) in the boundary
+    # Cond, INSIDE the AtomTile — `021` lifts the K-pipeline back out so the
+    # cooperative slab fill runs unguarded for every thread, leaving
+    # ``Cond > Write`` for ``005_lower_atom_tile`` to classify into RegStore
+    # guards. ``sigma_outer.apply`` (pure substitution, no simplify) keeps
+    # the predicate LHS struct-equal to the σ-rewritten Write index.
+    if n_bound is not None:
+        new_inner = (Cond(cond=BinaryExpr("<", sigma_outer.apply(Var(N_name)), n_bound), body=Body(new_inner)),)
+    if m_bound is not None:
+        new_inner = (Cond(cond=BinaryExpr("<", sigma_outer.apply(Var(M_name)), m_bound), body=Body(new_inner)),)
 
     # ---- Tower: AtomTile(M_a, N_a) > RegisterTile(M_r, N_r) >
     # WarpTile(M_w, N_w) > GridTile(M_b, N_b, K_s?). Layers innermost-first.
