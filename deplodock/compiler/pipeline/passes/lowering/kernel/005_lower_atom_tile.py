@@ -199,6 +199,10 @@ def _lower_cell(
         return (*fragments, *transformed)
 
     # Shape C: K filtered — inline chain from the body's operand Loads + store.
+    # A masked cell's boundary Cond is dropped here (the rebuilt body is just
+    # chain + store): correctness doesn't need it — gmem-direct loads clamp
+    # via ``gmem_guard``, staged loads read the in-bounds slab, and the store
+    # carries the per-element guards. The Cond was only a whole-tile skip.
     a_load, b_load = _find_role_loads(atom_body)
     if a_load is None or b_load is None:
         raise RuleSkipped("Atom body (shape C) missing its Mma / A/B loads")
@@ -341,11 +345,14 @@ def _scan_epilogue(
 def _find_role_loads(body: Body) -> tuple[Load | None, Load | None]:
     """The A / B operand Loads of the cell in ``body`` — identified via the
     co-located ``Mma``, which names its operands by SSA value (so the operand
-    Loads need no tensor-core tag of their own)."""
-    mma = next((s for s in body if isinstance(s, Mma)), None)
+    Loads need no tensor-core tag of their own). Recursive: a masked cell
+    wraps the K-filtered (shape C) body in the boundary ``Cond``, so the
+    Loads + ``Mma`` sit one level down — SSA names are unique per kernel, so
+    the deep search is unambiguous."""
+    mma = next(iter(body.iter_of_type(Mma)), None)
     if mma is None:
         return None, None
-    by_name = {ld.names[0]: ld for ld in body if isinstance(ld, Load) and ld.names}
+    by_name = {ld.names[0]: ld for ld in body.iter_of_type(Load) if ld.names}
     return by_name.get(mma.a), by_name.get(mma.b)
 
 

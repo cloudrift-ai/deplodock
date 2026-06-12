@@ -143,3 +143,40 @@ def test_emit_chain_clamps_unstaged_gated_operand():
     assert "dpl_mma_load_a_gmem_mclamp(" in src
     assert "(seq_len) - (m)" in src, f"clamp arg should be the in-range rows left from the tile base:\n{src}"
     assert "dpl_mma_load_b_gmem_nclamp" not in "\n".join(b_ld.render(ctx))
+
+
+def test_masked_shape_c_cell_lowers_through_the_cond():
+    """A masked K-filtered (shape C) cell wraps ``[Load a, Load b, Mma,
+    Write]`` in the boundary Cond; the role loads + Mma sit one level down.
+    The cell must lower (chain + guarded store, Cond dropped — gmem-direct
+    loads clamp, the store carries the per-element guards) instead of
+    raising and leaving the AtomTile to crash render — which killed a whole
+    tune at the first such variant."""
+    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad
+    from deplodock.compiler.ir.stmt import Mma
+
+    m_expr = Var("mb") * Literal(16, "int")
+    n_expr = Var("nb") * Literal(8, "int")
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    cell = Body(
+        (
+            Cond(
+                cond=BinaryExpr("<", m_expr, Var("seq_len")),
+                body=Body(
+                    (
+                        Load(name="a0", input="a", index=(m_expr, Literal(0, "int"))),
+                        Load(name="b0", input="b", index=(Literal(0, "int"), n_expr)),
+                        Mma(a="a0", b="b0", c="acc", atom=atom),
+                        Write(output="o", index=(m_expr, n_expr), value="acc"),
+                    )
+                ),
+            ),
+        )
+    )
+    out = _mod._lower_cell(cell, smem_sources={})
+    kinds = [type(s).__name__ for s in out]
+    assert "MmaSyncPtx" in kinds, f"shape-C masked cell must lower to the mma chain, got {kinds}"
+    store = next(s for s in out if isinstance(s, RegStore))
+    assert store.m_guard == (m_expr, Var("seq_len"))
+    a_ld = next(s for s in out if isinstance(s, LdmatrixLoad) and s.role == "a")
+    assert a_ld.gmem_guard == (m_expr, Var("seq_len")), "unstaged gated A operand must clamp"
