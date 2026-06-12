@@ -703,8 +703,19 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
     # --- Slice ---
     if op_name == "slice":
         if input_ids:
+            # Record dim/start from the raw FX args: ``aten.slice.Tensor(self,
+            # dim, start, end)`` may carry ``start=None`` (``x[:, :s]``) or a
+            # SymInt ``end`` — ``_resolve_inputs`` drops both, leaving the
+            # surviving ConstantOp inputs positionally ambiguous. A non-int
+            # dim/start (a SymInt slice origin) stays ``None`` so the
+            # decomposition rule fails loudly instead of mis-slicing.
+            args = fx_node.args
+            dim_raw = args[1] if len(args) > 1 else 0
+            start_raw = args[2] if len(args) > 2 else None
+            dim = dim_raw if isinstance(dim_raw, int) and not isinstance(dim_raw, bool) else None
+            start = 0 if start_raw is None else (start_raw if isinstance(start_raw, int) and not isinstance(start_raw, bool) else None)
             nid = g.add_node(
-                op=SliceOp(shape=_dim_tuple_to_op_shape(shape)),
+                op=SliceOp(shape=_dim_tuple_to_op_shape(shape), dim=dim, start=start),
                 inputs=input_ids,
                 output=Tensor(name, shape, dtype),
                 node_id=name,

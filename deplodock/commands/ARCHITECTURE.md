@@ -47,7 +47,11 @@ The central orchestration layer. Provides a single entry point for deploying rec
 - `params.py` — `DeployParams` dataclass (holds `recipe: Recipe`, `gpu_device_ids`, etc.)
 - `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
 - `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`. `run_deploy()` / `deploy()` accept an
-  optional `timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics))
+  optional `timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics)). The
+  post-health smoke test branches on `recipe.is_embedding` (`model.task: embed`): chat models POST
+  `/v1/chat/completions` ("What is 2+2?" must contain "4"); embedding models POST `/v1/embeddings` and require a
+  non-empty finite vector with L2 norm in [0.9, 1.1] (the pooler normalizes — garbage/NaN models fail). Same
+  retry/timeout/log-dump loop either way (`_check_chat_response` / `_check_embedding_response`).
 - `log_phases.py` — `parse_engine_load_phases()` (best-effort `weights_load` / `cuda_graph_capture` from container logs)
 - `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
 - `scale_out.py` — `ScaleOutStrategy` ABC, `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy`, `STRATEGIES`, `DEFAULT_STRATEGY`
@@ -76,7 +80,10 @@ Benchmark configuration, task enumeration, and execution.
 **Modules:**
 - `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
 - `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `add_group_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_GroupNameFilter`, `_BenchConsoleFormatter`
-- `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`
+- `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`. Embedding recipes
+  (`model.task: embed`) bench with `vllm bench serve --backend openai-embeddings --endpoint /v1/embeddings` and drop
+  `--random-output-len` (nothing is generated); the output's labels (request/token throughput, E2EL percentiles — no
+  TTFT/TPOT/ITL) already parse via `parse_benchmark_metrics`' missing-field-tolerant label regexes
 - `tasks.py` — `enumerate_tasks()`
 - `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type. Times provisioning (per
   group) + deploy/bench/teardown (per task); task results are `(task, ok, timing)` triples
@@ -205,6 +212,7 @@ deplodock
 |   +-- ssh      -- deploy to remote server via SSH
 |   +-- cloud    -- provision cloud VM + deploy via SSH
 +-- bench        -- deploy + benchmark + teardown on cloud VMs
++-- serve        -- vllm serve with the deplodock embedding plugin (optional one-shot bench)
 +-- teardown     -- clean up VMs left by bench --no-teardown
 +-- vm
     +-- create
@@ -245,6 +253,25 @@ deplodock deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 8 [
 ### Hardware-Aware Deploy (Local / SSH)
 
 Both `deploy local` and `deploy ssh` auto-detect the target GPU by scanning PCI sysfs device IDs (locally or over SSH) and select the matching `matrices` entry. If more GPUs are available than the recipe's base configuration needs, a scale-out strategy is applied (`--scale-out-strategy {data-parallelism,replica-parallelism}`, default `data-parallelism`).
+
+### `deplodock serve`
+
+Serves an embedding model through vLLM with the deplodock plugin flags baked in (`serving/` plugin; needs the
+`serving` extra). Unrecognized flags forward to `vllm serve`; tokens after a literal `--` forward verbatim (deplodock's
+own flags are otherwise extracted wherever they appear — argparse REMAINDER swallows everything after MODEL, so the
+handler re-parses it; see `commands/serve.py::_split_own_flags`). `--max-model-len 4096` (the dynamic-dim cap) is
+applied for both engines unless overridden, so `--stock` is an apples-to-apples baseline.
+
+```bash
+deplodock serve Qwen/Qwen3-Embedding-0.6B --gpu-memory-utilization 0.8   # plugin server (Ctrl-C to stop)
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32  # start → bench → results → shutdown
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --stock                # raw-vLLM baseline of the same bench
+```
+
+Without `--bench` the process execs `vllm serve` (signals flow to vLLM directly). With `--bench` the server runs as a
+subprocess (logs to a temp file), `/health` is polled (up to 30 min — first boot compiles the model), then
+`vllm bench serve --backend openai-embeddings --endpoint /v1/embeddings` runs against it
+(`--max-concurrency` / `--num-prompts` / `--random-input-len` / `--bench-seed`) and the server is torn down.
 
 ### `deplodock bench`
 

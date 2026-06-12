@@ -67,6 +67,17 @@ arg_order).
    before the launch.
 3. Copy `graph.outputs` buffers back to numpy.
 
+**Repeated execution (`CompiledProgram.rebind` / `run_once`).** One built program can serve request after request —
+the serving path (the vLLM plugin runs one compiled dynamic-seq_len program per sequence). `rebind(input_data)`
+re-binds fresh inputs on the existing program: supplied buffers re-upload (in place when the resolved shape is
+unchanged, re-allocated otherwise), un-supplied buffers whose shape carries a symbolic dim (seq_len-sized
+scratch/outputs) re-materialize under the same fill policy as `build` (shared `_materialize`), and static-shaped
+un-supplied buffers — the weights — keep their device arrays untouched. Any re-allocation rebuilds TMA descriptors
+(they embed device pointers + shapes) and drops captured CUDA graphs (they bake old pointers). `run_once()` launches
+every kernel in program order with none of `iter_once`'s per-launch event record/sync/watchdog — bench semantics stay
+in `iter_once`; the caller's `outputs()` `.get()` synchronizes. Both expect the caller to hold `gpu_lock()`. See
+`tests/compiler/test_program_rebind.py`.
+
 `benchmark_program(graph, input_data, warmup, num_iters)` adds a
 warmup loop + timed loop wrapped in `cupy.cuda.Event` pairs — one
 global pair for `BenchmarkResult.time_ms`, one pair per launch index

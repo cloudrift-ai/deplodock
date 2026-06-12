@@ -19,7 +19,11 @@ tests/
 │   ├── test_tasks_json.py   # BenchmarkTask.write_tasks_json(), read_tasks_json()
 │   ├── test_run_dir.py      # BenchmarkTask.create_run_dir()
 │   ├── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
+│   ├── test_embedding_workload.py # embed bench command, embeddings output parsing, smoke-response checks
 │   └── test_command_workload.py # build_substitution_map(), render_command()
+├── serving/                   # mirrors deplodock/serving/ (vLLM embedding plugin)
+│   ├── test_packed.py       # split_spans packed-batch span splitting (pure, no GPU)
+│   └── test_vllm_plugin_gpu.py # in-process vLLM engine + plugin vs HF eager (perf-marked, CUDA + vllm)
 ├── recipe/
 │   ├── test_types.py        # Recipe.from_dict(), LLMConfig properties, dataclass defaults
 │   └── test_engines.py      # build_engine_args(), banned_extra_arg_flags()

@@ -18,6 +18,8 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff"]
 compile = ["torch", "transformers>=5.10", "cppyy==3.5.0", "safetensors"]
+# vLLM out-of-tree embedding plugin (deplodock/serving); vllm pins its own torch.
+serving = ["vllm>=0.22.1,<0.23"]
 visualize = ["playwright>=1.40"]
 # flash-attn requires torch at build time, install separately:
 #   pip install flash-attn --no-build-isolation
@@ -31,6 +33,9 @@ include = ["deplodock*"]
 
 [project.scripts]
 deplodock = "deplodock.deplodock:main"
+
+[project.entry-points."vllm.general_plugins"]
+deplodock_serving = "deplodock.serving:register"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

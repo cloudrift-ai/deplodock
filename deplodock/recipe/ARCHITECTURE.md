@@ -171,6 +171,22 @@ engine:
 
 Each key-value pair is rendered as a `- KEY=VALUE` line in the `environment` section of the generated Docker Compose file.
 
+### Embedding Recipes (`model.task`)
+
+`model.task` declares what the model serves: `"generate"` (the default — completion/chat) or `"embed"`
+(`/v1/embeddings`). `_validate_and_build()` rejects anything else. `Recipe.is_embedding` drives two behavior switches
+downstream: the post-deploy smoke test POSTs `/v1/embeddings` and checks for a finite unit-norm vector
+(`deploy/orchestrate.py`), and the bench workload runs `vllm bench serve --backend openai-embeddings --endpoint
+/v1/embeddings` without `--random-output-len` (`benchmark/workload.py`). Everything else — matrices, images,
+`extra_args`, deploy — is unchanged; serving the deplodock compiler plugin instead of stock vLLM is just a different
+image + `extra_args` pair (see `deplodock/serving/ARCHITECTURE.md` and `recipes/Qwen3-Embedding-*`).
+
+```yaml
+model:
+  huggingface: "Qwen/Qwen3-Embedding-0.6B"
+  task: embed
+```
+
 ### Command Recipes (Generic Workload)
 
 In addition to inference recipes (`engine.llm` block), a recipe may declare a `command` block to run an arbitrary tool on the provisioned VM. The two are mutually exclusive — `_validate_and_build()` raises if both are set. `Recipe.kind` is `"command"` when `command` is set, else `"inference"`.

@@ -9,6 +9,7 @@ Deplodock is a Python tool for deploying and benchmarking LLM inference on GPU s
 The `README.md` is intentionally short — example-driven, no narrative. For details, consult the ARCHITECTURE.md files:
 
 - **CLI usage** (deploy local/ssh/cloud, bench, teardown, vm, hardware-aware deploy, fixed-host mode, experiments, CI workflow) → [`deplodock/commands/ARCHITECTURE.md`](deplodock/commands/ARCHITECTURE.md)
+- **Serving** (vLLM out-of-tree embedding plugin — deplodock-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md)
 - **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`deplodock/recipe/ARCHITECTURE.md`](deplodock/recipe/ARCHITECTURE.md)
 - **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
 
@@ -25,7 +26,7 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 
 All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
 `DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_TUNE_EPS`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_BENCH_BACKENDS`, `DEPLODOCK_CUBIN_CACHE`,
-`DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`,
+`DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`, `DEPLODOCK_SERVING_DTYPE`,
 …) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
 layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
@@ -72,6 +73,13 @@ same worker.
 - `deplodock vm create cloudrift ...` — create a specific CloudRift GPU VM (single-shot manual)
 - `deplodock vm delete gcp ...` — delete a GCP GPU VM
 - `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
+- `deplodock serve <model> [--stock] [--bench] [vllm flags...]` — serve an embedding model via `vllm serve` with the
+  deplodock plugin flags baked in (`--runner pooling --enforce-eager --hf-overrides …DeplodockEmbedModel…`, default
+  `--max-model-len 4096`); unrecognized flags forward to vLLM (after a literal `--`, verbatim). `--stock` drops the
+  plugin for the raw-vLLM baseline (same max-model-len → apples-to-apples A/B in two invocations). `--bench` makes it
+  a one-shot benchmark: start server → wait `/health` → `vllm bench serve --backend openai-embeddings`
+  (`--max-concurrency`/`--num-prompts`/`--random-input-len`/`--bench-seed`) → print results → shut down. Needs the
+  `serving` extra.
 - `deplodock pull <model>` — download a HuggingFace model to local cache
 - `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `trace.huggingface.build_full_model_wrapper`.
 - `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)

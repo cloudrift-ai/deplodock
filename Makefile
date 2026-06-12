@@ -10,6 +10,9 @@ help:
 	@echo "  bench          - Run benchmarks in parallel"
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
 	@echo "  bench-kernels  - Run per-kernel perf comparison vs PyTorch (tests/perf/, requires CUDA)"
+	@echo "  wheel          - Build the deplodock wheel into dist/"
+	@echo "  vllm-deplodock-image - Build the vLLM + deplodock serving image (docker/vllm-deplodock)"
+	@echo "  vllm-deplodock-push  - Push the serving image to Docker Hub (cloudriftai/)"
 	@echo "  clean          - Remove virtual environment and generated files"
 	@echo "  test-compose   - Test docker-compose generation with sample config"
 
@@ -50,6 +53,21 @@ tune-kernels: setup
 	@rm -f /tmp/deplodock-gpu.lock
 	@rm -f ~/.cache/deplodock/tune-kernels.db
 	DEPLODOCK_TUNE=1 DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
+
+# --- vLLM + deplodock serving image (deplodock/serving, docker/vllm-deplodock) ---
+VLLM_VERSION ?= v0.22.1
+VLLM_DEPLODOCK_TAG ?= cloudriftai/vllm-deplodock:$(patsubst v%,%,$(VLLM_VERSION))-$(shell git rev-parse --short HEAD)
+
+wheel: setup
+	./venv/bin/pip install --quiet build
+	rm -rf dist && ./venv/bin/python -m build --wheel -o dist/ .
+
+vllm-deplodock-image: wheel
+	docker build -f docker/vllm-deplodock/Dockerfile --build-arg VLLM_VERSION=$(VLLM_VERSION) \
+		-t $(VLLM_DEPLODOCK_TAG) .
+
+vllm-deplodock-push: vllm-deplodock-image
+	docker push $(VLLM_DEPLODOCK_TAG)
 
 bench: setup
 	@echo "Running benchmarks..."

@@ -13,6 +13,7 @@ from deplodock.commands.eval import register_eval_command
 from deplodock.commands.inspect_graph import register_inspect_command
 from deplodock.commands.pull import register_pull_command
 from deplodock.commands.run import register_run_command
+from deplodock.commands.serve import register_serve_command
 from deplodock.commands.teardown import register_teardown_command
 from deplodock.commands.trace import register_trace_command
 from deplodock.commands.tune import register_tune_command
@@ -32,8 +33,9 @@ def main():
     register_ssh_target(deploy_subparsers)
     register_cloud_target(deploy_subparsers)
 
-    # bench, teardown, vm subcommands
+    # bench, serve, teardown, vm subcommands
     register_bench_command(subparsers)
+    register_serve_command(subparsers)
     register_teardown_command(subparsers)
     register_vm_command(subparsers)
 

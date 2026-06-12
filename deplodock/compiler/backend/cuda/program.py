@@ -267,9 +267,33 @@ def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> dict[str, cp.ndarray]:
+def _materialize(buf: _Buffer, shape: tuple[int, ...], src: np.ndarray | None, constants: dict[str, float]) -> cp.ndarray:
+    """Build one device array for ``buf`` at ``shape`` — the single fill
+    policy shared by :func:`_allocate` and :meth:`CompiledProgram.rebind`."""
     import cupy as cp
 
+    cp_dtype = cupy_dtype(buf.dtype)
+    np_dtype = buf.dtype.np
+    if src is not None:
+        return cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
+    if buf.role == "constant" and buf.name in constants:
+        return cp.full(shape, float(constants[buf.name]), dtype=cp_dtype)
+    if buf.role == "input":
+        # Pseudo-random fill for un-supplied inputs (matches old generated program).
+        n = 1
+        for d in shape:
+            n *= int(d)
+        # Build the index ramp in int64, not ``np_dtype``: a float16 buffer
+        # past 65504 elements would overflow to ``inf`` (then ``inf % 101``
+        # → ``nan``). Compute in fp32 and cast the final values — always in
+        # ``[-0.5, 0.5]``, so fp16-safe.
+        idx = np.arange(n, dtype=np.int64)
+        vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
+        return cp.asarray(vals.reshape(shape))
+    return cp.zeros(shape, dtype=cp_dtype)
+
+
+def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> dict[str, cp.ndarray]:
     input_data = input_data or {}
     sym_values = _resolve_symbolic(compiled, input_data)
     arrays: dict[str, cp.ndarray] = {}
@@ -278,30 +302,8 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     # softmax). Ignore the over/invalid warnings so genuine output stays clean.
     with np.errstate(over="ignore", invalid="ignore"):
         for buf in compiled.bufs:
-            resolved = buf.resolve_shape(sym_values)
-            shape = resolved or (1,)
-            cp_dtype = cupy_dtype(buf.dtype)
-            np_dtype = buf.dtype.np
-            src = input_data.get(buf.name)
-            if src is not None:
-                arr = cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
-            elif buf.role == "constant" and buf.name in compiled.constants:
-                arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp_dtype)
-            elif buf.role == "input":
-                # Pseudo-random fill for un-supplied inputs (matches old generated program).
-                n = 1
-                for d in shape:
-                    n *= int(d)
-                # Build the index ramp in int64, not ``np_dtype``: a float16 buffer
-                # past 65504 elements would overflow to ``inf`` (then ``inf % 101``
-                # → ``nan``). Compute in fp32 and cast the final values — always in
-                # ``[-0.5, 0.5]``, so fp16-safe.
-                idx = np.arange(n, dtype=np.int64)
-                vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
-                arr = cp.asarray(vals.reshape(shape))
-            else:
-                arr = cp.zeros(shape, dtype=cp_dtype)
-            arrays[buf.name] = arr
+            shape = buf.resolve_shape(sym_values) or (1,)
+            arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), compiled.constants)
     return arrays
 
 
@@ -618,6 +620,49 @@ class CompiledProgram:
             ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
         )
         return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values)
+
+    def rebind(self, input_data: dict[str, np.ndarray]) -> None:
+        """Re-bind ``input_data`` on an already-built program, re-sizing
+        symbolic-shaped buffers to the new runtime dims — the serving path,
+        where one compiled dynamic-seq_len program runs request after request.
+
+        Supplied buffers are re-uploaded: in place (``arr.set``) when the
+        resolved shape is unchanged, re-allocated otherwise. Un-supplied
+        buffers whose shape carries a symbolic dim (scratch/outputs sized by
+        seq_len) re-materialize at the new shape under the same fill policy
+        as ``build``; static-shaped un-supplied buffers — the weights — keep
+        their device arrays untouched (no re-upload). When any array was
+        re-allocated, TMA descriptors are rebuilt (they embed device pointers
+        and shapes) and captured CUDA graphs are dropped (they bake old
+        pointers). Caller must hold ``gpu_lock()``."""
+        new_sym = _resolve_symbolic(self.compiled, input_data)
+        realloc = False
+        with np.errstate(over="ignore", invalid="ignore"):
+            for buf in self.compiled.bufs:
+                src = input_data.get(buf.name)
+                if src is None and not buf.is_symbolic:
+                    continue
+                shape = buf.resolve_shape(new_sym) or (1,)
+                arr = self.arrays[buf.name]
+                if tuple(arr.shape) != shape:
+                    self.arrays[buf.name] = _materialize(buf, shape, src, self.compiled.constants)
+                    realloc = True
+                elif src is not None:
+                    arr.set(np.ascontiguousarray(src, dtype=buf.dtype.np).reshape(shape))
+        self.sym_values = new_sym
+        if realloc:
+            self.descs = _prebuild_descriptors(self.compiled, self.arrays)
+            self._graphs = None
+            self._graph_batch_sizes = None
+            self._e2e_graph = None
+
+    def run_once(self) -> None:
+        """Launch every kernel once in program order with no per-launch event
+        record/sync/watchdog — the serving hot path (timing semantics live in
+        :meth:`iter_once`). The default stream orders the launches; the
+        caller's subsequent ``outputs()`` ``.get()`` synchronizes."""
+        for i, launch in enumerate(self.compiled.launches):
+            _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
 
     def capture_launch_graphs(self, batch_sizes: list[int]) -> None:
         """Capture each launch position's batch into one CUDA graph.
