@@ -163,6 +163,14 @@ gets a symbolic leading dim, which the masked-tile path already knows how to all
 > masked thread tiles at `FM=FN=1`; static-K prologue and cooperative-reduce kernels stay degenerate by design
 > (their staged pipelines can't coexist with the per-row guard — deployment path is the finding-2 split;
 > strided-cooperative symbolic axes remain the M5+ follow-up).
+>
+> **Strided-cooperative follow-up: addressed** on `feature/strided-coop-symbolic-rows` — the v1 `BR>1 ⇒
+> BN=BM=1` constraint is lifted for cooperative-reduce kernels: static free axes thread-bind alongside the
+> BR lanes (2D CTA, segmented warp-shuffle combine; 2D rows clip BR to powers of two ≤ warp_size), so the
+> q/k-norm class deploys e.g. `BN=8×BR=32` 256-thread CTAs at 100% occupancy instead of 8-thread ones. A
+> scoped clean tune of the `79cfb6` reproducer (159 rows, 0 bench_fail) picks a 2D row rank-1: 1.8 µs -O3
+> vs 2.1 µs for the best v1 config. Note the slice totals quoted above were matmul-dominated; post-M9 the
+> matmul half runs as a masked MMA kernel, so the norm-kernel remainder is ~2 µs-scale, not ~90 µs.
 
 **Symptom.** attn@V (`a76a28`, 299 µs vs tcompile 28.7) deploys `BM=1, BN=32` — one output element per thread on the
 M side, 0 KB smem, 8,192 blocks of 32 threads at 50% occ. The q/k-norm kernels (`79cfb6` 75.9 µs, `b1a761` 49.1 µs vs

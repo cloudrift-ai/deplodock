@@ -65,8 +65,13 @@ _BK_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (1, 8, 16, 32, 64, 128, 256)
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 26, 28, 32, 40, 48, 64, 96, 128)
 _SPLITK_CANDIDATES = (1, 2, 4, 8, 16, 32)
-# Cooperative-K thread count. v1: BR > 1 requires BN = BM = 1 (single THREAD
-# axis for materializer's _single_thread_var).
+# Cooperative-K thread count. With BN = BM = 1 (the v1 single-THREAD-axis
+# form) every candidate is admissible — the combine may span the whole CTA
+# (warp shuffle / hierarchical / smem tree-halve by size). Alongside
+# free-axis threads (BN·BM > 1, the strided-cooperative form) BR is
+# restricted to powers of two ≤ warp_size: the combine is a SEGMENTED warp
+# shuffle (each row's BR lanes form an aligned intra-warp group), so the
+# segment must not straddle a warp — see ``_combine.cooperative_combine_geometry``.
 _BR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 # Cap on per-thread cell-product. NVRTC compile time explodes past this.
 _MAX_CELLS_PER_THREAD: int = 128
@@ -277,11 +282,12 @@ def enumerate_cartesian(
                    sdpa where ``sum_i (c·a_i + r) = c·sum_i a_i + r``
                    doesn't hold, or for the matmul-with-prologue case
                    where the prologue feeds the matmul). min_k_chunks=2.
-        reduce   : BN/BM = (1, *_TUNE_AXIS_CHOICES) — the leading 1 enables
-                   the cooperative-K v1 constraint (BR>1 ⇒ BN=BM=1, single
-                   THREAD axis for the materializer). SPLITK = (1,) — atomic
+        reduce   : BN/BM = _TUNE_AXIS_CHOICES. SPLITK = (1,) — atomic
                    cross-CTA reduce + barrier for the post-reduce epilogue
-                   isn't wired up. BR = _BR_CANDIDATES.
+                   isn't wired up. BR = _BR_CANDIDATES; with BN·BM > 1
+                   (strided-cooperative rows) BR clips to powers of two
+                   ≤ warp_size so the combine stays a segmented warp
+                   shuffle (see _BR_CANDIDATES comment).
         pointwise: BN/BM = _TUNE_AXIS_CHOICES; BK = SPLITK = BR = (1,) — no
                    K loop to chunk or split.
 
@@ -416,6 +422,7 @@ def enumerate_cartesian(
             sweep_fk=sweep_fk,
             window_fk=window_fk,
             max_threads_per_cta=ctx.max_threads_per_cta,
+            warp_size=ctx.warp_size,
             min_k_chunks=min_k_chunks,
             allow_empty_threads=allow_empty_threads,
             allow_masked=allow_masked,
@@ -456,6 +463,7 @@ def _enumerate_cartesian_impl(
     sweep_fk: bool = False,
     window_fk: bool = False,
     max_threads_per_cta: int,
+    warp_size: int = 32,
     min_k_chunks: int,
     allow_empty_threads: bool = False,
     allow_masked: bool = False,
@@ -514,8 +522,15 @@ def _enumerate_cartesian_impl(
             m_overhang = m_nondiv or (m_forced_mask and m_maskable)
             if bn_c * bm_c > max_threads_per_cta:
                 continue
-            # v1 cooperative constraint: BR > 1 ⇒ BN = BM = 1.
-            br_eligible: tuple[int, ...] = br_choices if (bn_c == 1 and bm_c == 1) else (1,)
+            # Cooperative-K eligibility. BN = BM = 1 (single THREAD axis):
+            # any BR — the combine may span the whole CTA. Alongside
+            # free-axis threads (strided-cooperative rows): BR must be a
+            # power of two ≤ warp_size so each row's lanes form an aligned
+            # intra-warp segment for the segmented-shuffle combine.
+            if bn_c == 1 and bm_c == 1:
+                br_eligible: tuple[int, ...] = br_choices
+            else:
+                br_eligible = tuple(b for b in br_choices if b == 1 or (b <= warp_size and b & (b - 1) == 0))
             for br in br_eligible:
                 if br < 1 or E_K % br != 0:
                     continue
@@ -527,8 +542,9 @@ def _enumerate_cartesian_impl(
                 # / REGISTER and the THREAD set is empty — skip. Symbolic
                 # all-free-axis kernels opt in to ``allow_empty_threads`` so
                 # the planner can still emit a 1-thread-per-CTA variant
-                # (slow but correct; perf optimization for strided
-                # cooperative work over symbolic axes is M5+ follow-up).
+                # (slow but correct; reduce kernels get CTA parallelism
+                # from strided-cooperative rows instead — see br_eligible
+                # above; a matmul-mode BR remains future work).
                 if bn_c * bm_c * br == 1 and not allow_empty_threads:
                     continue
                 per_thread_K = E_K // br

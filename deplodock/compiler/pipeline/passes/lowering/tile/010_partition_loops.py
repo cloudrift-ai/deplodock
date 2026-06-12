@@ -8,8 +8,9 @@ Output axes split as ``A → A_b·(T·R) + A_t·R + A_r`` (T = BN or BM, R = FN 
 FM). K splits as ``K → K_s·(K_o·br·bk) + K_o·(br·bk) + K_i·br + K_c`` (K_s for
 SPLITK > 1, K_c for cooperative-K BR > 1). Resulting nesting:
 
-    K_s BLOCK (split-K) → M_b BLOCK → N_b BLOCK → K_c THREAD (coop-K) →
-      M_t THREAD → N_t THREAD → M_r REGISTER → N_r REGISTER →
+    K_s BLOCK (split-K) → M_b BLOCK → N_b BLOCK → M_t THREAD →
+      N_t THREAD → K_c THREAD (coop-K, innermost = fastest threadIdx bits) →
+      M_r REGISTER → N_r REGISTER →
         prelude → K_o SERIAL_OUTER → K_i STAGE_INNER (reduce σ(body)) →
         (helper-driven cross-thread combine when K_c is cooperative) →
         post-K tower → Write
@@ -91,10 +92,13 @@ shape and rewrites it into an Mma* fragment chain
 this shape.
 
 For cooperative-K reduce (e.g. sum K=512 with BR=256, BK=2), K_c appears as
-a THREAD axis above the BLOCK level and σ_k extends to
-``k = k_o·512 + k_i·256 + k_c``; the materializer emits the cross-thread
-combine after the reduce subtree based on the escape-analysis helper
-(``ir/tile/escape_analysis.py``) reading ``ThreadTile.cooperative_axes``.
+the INNERMOST THREAD axis and σ_k extends to ``k = k_o·512 + k_i·256 + k_c``;
+the materializer emits the cross-thread combine after the reduce subtree
+based on the escape-analysis helper (``Body.coordination`` reading
+``Accum.axes ∩ ThreadTile.axes``). With BN·BM > 1 (strided-cooperative
+rows — free-axis threads alongside the K lanes) the combine is a SEGMENTED
+warp shuffle over each row's aligned BR-lane group, so the enumerator clips
+those rows' BR to powers of two ≤ warp_size.
 
 For the fused-prologue matmul (SDPA P@V — softmax max/sum/reciprocal sitting
 as siblings of an inner output Loop that holds the actual matmul), the chain
@@ -731,8 +735,12 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                 else:
                     param_combos = [*warp_combos, *param_combos]
     elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
-        # Cooperative-K: BR>1 requires the sole THREAD axis (materializer's
-        # _single_thread_var) — bn/bm_choices prepend 1 to enable BN=BM=1.
+        # Cooperative-K: with BN=BM=1 the combine spans the whole CTA (any
+        # BR); with free-axis threads alongside (BN·BM > 1, the strided-
+        # cooperative form) the enumerator clips BR to powers of two ≤
+        # warp_size and the materializer emits a SEGMENTED warp-shuffle
+        # combine per row (``_combine.cooperative_combine_geometry`` —
+        # K_c is the innermost THREAD layer, see the tower below).
         # E_K ≥ warp_size: smaller reduces don't justify a warp-shuffle.
         # target_names includes both K-reduce axes AND per-K post-pointwise
         # axes (non-reduce free Loops sharing E_K), since both get rewritten.
@@ -753,24 +761,25 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         target_names = frozenset(
             lp.axis.name for lp in all_loops if lp.axis.extent.is_static and lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp)
         )
-        # Cooperative reduce binds the free axis whole-to-grid (BR>1 forces
-        # BN=BM=1, so the grid covers seq exactly — no overhang). A masked
-        # register-tile (FN>1) would wrap the reduce body in the boundary Cond
-        # and hide it from the cooperative-reduce + smem-staging passes,
-        # breaking the cross-thread combine. So a symbolic free axis stays
-        # degenerate here (E=1, no forced mask): correct at any seq_len via the
-        # symbolic grid, just not register-tiled.
+        # A SYMBOLIC free axis stays degenerate (E=1, no forced mask): bound
+        # whole-to-grid, correct at any seq_len. A masked register-tile
+        # (FN>1) would wrap the reduce body in the boundary Cond and hide it
+        # from the cooperative-reduce + smem-staging passes, breaking the
+        # cross-thread combine — and the masked BR=1 thread-tile family
+        # (rows-per-CTA at the hint with the boundary guard) is DEFERRED for
+        # the same 021-hoist SSA interaction that keeps static-K
+        # fused-prologue matmuls degenerate (a reduce kernel's staged row
+        # sweep plus its post-reduce output loop consume the rsqrt chain
+        # between them; see the prologue_mask_ok comment in the matmul
+        # branch — 021 refuses such lifts defensively).
         #
-        # A masked BR=1 thread-tile family (rows-per-CTA at the hint with the
-        # boundary guard, the symbolic-axis-parity follow-up) is DEFERRED: a
-        # reduce kernel's staged row sweep plus its post-reduce output loop
-        # consume the rsqrt chain between them — the same 021-hoist SSA
-        # interaction that keeps static-K fused-prologue matmuls degenerate
-        # (see the prologue_mask_ok comment in the matmul branch; 021 now
-        # refuses such lifts defensively). These kernels' deployment path is
-        # the structural split (norm + proj slices split like any demoted
-        # matmul); strided-cooperative work over symbolic axes is the M5+
-        # follow-up.
+        # Thread-level parallelism on a symbolic-row kernel instead comes
+        # from its STATIC free axes (strided-cooperative rows): BN/BM bind
+        # static rows as threads alongside the K_c cooperative lanes, so
+        # e.g. a per-head RMSNorm with symbolic seq deploys
+        # ``grid=(seq·heads/BN), CTA=BN×BR`` rather than the v1 8-thread
+        # degenerate CTA. No masking involved — static rows are divisor-
+        # checked, the symbolic axis keeps its exact symbolic grid.
         param_combos = enumerate_cartesian(
             E_M=1 if m_symbolic else E_M,
             E_N=1 if n_symbolic else E_N,
@@ -1116,11 +1125,19 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     layers.append((N_r, Role.REGISTER))
     if M_r is not None:
         layers.append((M_r, Role.REGISTER))
+    if K_c is not None:
+        # Cooperative-K stride — INNERMOST thread layer (fastest-varying
+        # threadIdx bits), so when free-axis threads coexist (BN·BM > 1,
+        # the strided-cooperative form) each row's BR lanes form a
+        # contiguous aligned intra-warp segment — required by the
+        # segmented-shuffle combine (``_combine.cooperative_combine_geometry``)
+        # — and consecutive lanes read consecutive K elements (σ_k gives
+        # K_c stride 1: coalesced). Invisible to the BN=BM=1 form, where
+        # K_c is the only surviving THREAD layer either way.
+        layers.append((K_c, Role.THREAD))
     layers.append((N_t, Role.THREAD))
     if M_t is not None:
         layers.append((M_t, Role.THREAD))
-    if K_c is not None:
-        layers.append((K_c, Role.THREAD))  # cooperative-K stride
     layers.append((N_b, Role.BLOCK))
     if M_b is not None:
         layers.append((M_b, Role.BLOCK))

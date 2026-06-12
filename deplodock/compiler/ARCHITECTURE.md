@@ -107,7 +107,14 @@ autotuning cache doesn't bust on cosmetic edits.
   with `FM = FN = 1` (`mask_f1`); static-K prologue kernels (fused gated-MLP) and cooperative-reduce
   kernels keep symbolic axes degenerate (one element per thread) — their staged pipelines can't coexist
   with the per-row guard (`021`'s hoist would break the prologue's SSA ordering; it now refuses such
-  lifts), and their deployment path is the structural split, which offers on symbolic rows. The backend
+  lifts), and their deployment path is the structural split, which offers on symbolic rows.
+  Cooperative-reduce kernels still regain CTA-level parallelism on symbolic-row graphs via
+  **strided-cooperative rows**: their STATIC free axes thread-bind alongside the `BR` cooperative lanes
+  (the symbolic axis keeps its exact whole-to-grid bind, no mask), so e.g. a per-head q/k-norm with
+  symbolic seq deploys a `BN×BR` CTA instead of the v1 `BR`-thread degenerate one. The combine for such
+  2D CTAs is a segmented warp shuffle over each row's BR lanes (`K_c` is the innermost THREAD axis; the
+  enumerator clips those rows' BR to powers of two ≤ warp_size —
+  `lowering/kernel/_combine.cooperative_combine_geometry`). The backend
   benches a symbolic graph at the hint when no real inputs are supplied
   (`backend/cuda/program.py:_symbolic_hints` / `_resolve_symbolic`), so `tune` and `compile`
   agree on a hint-sized variant.
