@@ -130,7 +130,11 @@ e2e scalar can't — so for its multi-launch slices (split-K fixups) the e2e fie
 **One worker, two jobs.** `_bench_worker.py`'s `_run_job` dispatches on `torch_spec`: `None` is the
 deplodock-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /
 torch.compile / deplodock comparison — `("trace_args", {code/input/layer/seq_len/dynamic})` →
-`load_or_trace` rebuilds the real module (HF id or `--code` expr) → `bench_full_model_real`;
+`load_or_trace` rebuilds the real module (HF id or `--code` expr) → `bench_full_model_real` (for a
+symbolic graph the torch closures run on hint-**tiled** example inputs — `commands/run._hint_sized_inputs`
+grows every symbolic input axis to its `Dim` hint by repeating the trace values, the same size the
+deplodock side resolves to when benching without inputs, so the full-model table compares one shape; the
+printed table carries a `benched at seq_len=… (symbolic hint)` note);
 `("frontend_graph", Graph|None)` → `bench_lowered_vs_torch`. Rebuilding the torch side **in the
 child** (not pickling a live module) is what lets the interleaved comparison — which couldn't cross a
 subprocess boundary before — run isolated. So `tune --bench` (`commands/tune.py` `_run_bench` /

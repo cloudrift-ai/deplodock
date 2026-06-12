@@ -249,6 +249,10 @@ def handle_run(args):
     cuda_module = module.to("cuda")
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
+    # Symbolic graph: deplodock benches at the hint (synthetic hint-sized
+    # inputs), so tile the torch closures' inputs to the same hint — otherwise
+    # the table compares different shapes (trace seq vs hint).
+    cuda_args, cuda_kwargs, bench_sym_env = _hint_sized_inputs(compiled, cuda_args, cuda_kwargs)
 
     # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT when
     # ``tcompile`` is in the selected backends) *outside* the GPU lock
@@ -313,7 +317,9 @@ def handle_run(args):
     if pinned:
         golden_benches = _bench_golden_variants(backend, args.code, pinned, warmup=args.warmup, iters=args.iters)
 
-    _print_table(results, note=None if captured else "(graph-capture fallback: timings include host launch overhead)")
+    capture_note = None if captured else "(graph-capture fallback: timings include host launch overhead)"
+    notes = [n for n in (_symbolic_bench_note(bench_sym_env), capture_note) if n]
+    _print_table(results, note="\n".join(notes) if notes else None)
     _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -996,16 +1002,9 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
     # when no inputs are supplied — so the random inputs built here get concrete
     # hint-sized shapes. Atomic dims carry their own hint; composite exprs
     # (e.g. ``S * 2``) eval over the collected env.
-    from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
+    from deplodock.compiler.dim import Dim
 
-    sym_env: dict[str, int] = {}
-    for gph in ([frontend] if frontend is not None else []) + [lowered]:
-        for node in gph.nodes.values():
-            for d in node.output.shape:
-                if isinstance(d, Dim) and not d.is_static:
-                    hint = d.hint or DEFAULT_SEQ_HINT
-                    for v in d.expr.free_vars():
-                        sym_env.setdefault(v, hint)
+    sym_env = _collect_sym_env(([frontend] if frontend is not None else []) + [lowered])
 
     def _static(shape):
         return tuple((d.as_static() if d.is_static else int(d.expr.eval(sym_env))) if isinstance(d, Dim) else int(d) for d in shape)
@@ -1090,15 +1089,18 @@ def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, i
     ``torch.compile`` / Deplodock — using the all-or-nothing CUDA-graph-captured
     interleaved bench (real modules occasionally resist capture; those fall back
     to uncaptured wall timing, flagged in ``captured``). The module + its
-    trace-time inputs come from ``load_or_trace``'s bundle. Skips the accuracy
-    check (deplodock's bench uses synthetic activations vs torch's bound inputs, so
-    only latency is comparable here — accuracy lives in the per-kernel path).
+    trace-time inputs come from ``load_or_trace``'s bundle; for a symbolic
+    graph the torch closures run on hint-tiled inputs (``_hint_sized_inputs``)
+    so both sides bench the hint shape. Skips the accuracy check (deplodock's
+    bench uses synthetic activations vs torch's bound inputs, so only latency
+    is comparable here — accuracy lives in the per-kernel path).
     Returns ``(results, bench, captured)``."""
     import torch
 
     cuda_module = module.to("cuda")
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in args_t)
     cuda_kwargs = _to_cuda_kwargs(kwargs)
+    cuda_args, cuda_kwargs, _ = _hint_sized_inputs(lowered, cuda_args, cuda_kwargs)
     backends = _resolve_backends(bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, warmup, backends=backends)
     return _bench_interleaved_captured(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
@@ -1274,6 +1276,99 @@ def _flatten_tensors(value):
             out.extend(_flatten_tensors(v))
         return out
     return []
+
+
+def _collect_sym_env(graphs) -> dict[str, int]:
+    """Map every symbolic dim var appearing in ``graphs`` to its hint
+    (``DEFAULT_SEQ_HINT`` for a bare seq axis) — the size the backend resolves
+    a symbolic graph to when benching without supplied inputs."""
+    from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
+
+    sym_env: dict[str, int] = {}
+    for gph in graphs:
+        for node in gph.nodes.values():
+            for d in node.output.shape:
+                if isinstance(d, Dim) and not d.is_static:
+                    hint = d.hint or DEFAULT_SEQ_HINT
+                    for v in d.expr.free_vars():
+                        sym_env.setdefault(v, hint)
+    return sym_env
+
+
+def _tile_to(tensor, axis: int, size: int):
+    """Resize ``tensor`` along ``axis`` to ``size`` by repeating its values
+    (ceil) and slicing — keeps every element drawn from the original (token
+    ids stay in-vocab, masks keep their value range), unlike fresh randoms."""
+    old = tensor.shape[axis]
+    if old == size:
+        return tensor
+    reps = [1] * tensor.dim()
+    reps[axis] = -(-size // old)
+    return tensor.repeat(*reps).narrow(axis, 0, size)
+
+
+def _map_tensors(value, fn):
+    """Rebuild ``value``'s nested list/tuple structure with ``fn`` applied to
+    each tensor leaf, in :func:`_flatten_tensors` order."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return fn(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_map_tensors(v, fn) for v in value)
+    return value
+
+
+def _hint_sized_inputs(lowered, example_args, example_kwargs):
+    """Tile a symbolic graph's example inputs out to its ``Dim`` hints.
+
+    The deplodock side of the full-model bench runs a symbolic graph at each
+    dim's hint (``backend.benchmark`` builds hint-sized synthetic inputs when
+    none are supplied), while the torch closures close over the trace-time
+    example tensors — different shapes, so the table would compare e.g. a
+    seq-512 deplodock program against seq-32 eager. Grow every symbolic input
+    axis to its hint (positional ``graph.inputs`` ↔ flattened example tensors
+    pairing, same as :func:`_bind_inputs`) so both sides run the hint shape.
+    Values are tiled repeats of the trace inputs — valid for latency, which is
+    all this table compares (accuracy runs on the original trace inputs).
+
+    Returns ``(args, kwargs, sym_env)`` — the inputs unchanged and ``{}`` for
+    a static graph.
+    """
+    sym_env = _collect_sym_env([lowered])
+    if not sym_env:
+        return example_args, example_kwargs, {}
+    from deplodock.compiler.dim import Dim
+
+    flat: list = []
+    for v in example_args:
+        flat.extend(_flatten_tensors(v))
+    for v in example_kwargs.values():
+        flat.extend(_flatten_tensors(v))
+    input_ids = list(lowered.inputs)
+    if len(input_ids) != len(flat):
+        logger.warning("Input arity mismatch (graph %d vs example %d) — benching torch on trace-sized inputs", len(input_ids), len(flat))
+        return example_args, example_kwargs, sym_env
+    resized = []
+    for nid, tensor in zip(input_ids, flat, strict=True):
+        for axis, d in enumerate(lowered.nodes[nid].output.shape):
+            if isinstance(d, Dim) and not d.is_static:
+                tensor = _tile_to(tensor, axis, int(d.expr.eval(sym_env)))
+        resized.append(tensor)
+    it = iter(resized)
+    args = tuple(_map_tensors(v, lambda _: next(it)) for v in example_args)
+    kwargs = {k: _map_tensors(v, lambda _: next(it)) for k, v in example_kwargs.items()}
+    return args, kwargs, sym_env
+
+
+def _symbolic_bench_note(sym_env: dict[str, int]) -> str | None:
+    """The full-model table's shape label for a symbolic graph (``None`` for
+    static): both sides bench at the hint, and the reader should know the
+    number is hint-shaped, not trace-shaped."""
+    if not sym_env:
+        return None
+    dims = ", ".join(f"{name}={size}" for name, size in sorted(sym_env.items()))
+    return f"benched at {dims} (symbolic hint; torch inputs tiled to match)"
 
 
 def _eager_output(module, args, kwargs):
